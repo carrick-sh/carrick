@@ -399,6 +399,14 @@ pub trait FsBackend: Send + Sync {
     /// the dispatcher keeps its in-memory File model there.
     fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> Option<i32>;
 
+    /// Reopen an already-written artifact so the caller can issue `fsync(2)`.
+    /// `Ok(None)` means this backend has no host descriptor (for example the
+    /// in-memory overlay); disk-backed implementations must return `Err` when
+    /// the reopen itself fails so durability cannot silently degrade.
+    fn reopen_for_durability(&self, _path: &str) -> Result<Option<i32>, BackendError> {
+        Ok(None)
+    }
+
     /// Open a REAL host file descriptor and return the metadata needed by the
     /// dispatcher from the same open file. Backends that can answer this avoid a
     /// separate metadata lookup before opening the fd.
@@ -5523,6 +5531,12 @@ impl FsBackend for HostFsBackend {
         self.open_raw_fd_capstd(path, write, create, trunc)
     }
 
+    fn reopen_for_durability(&self, path: &str) -> Result<Option<i32>, BackendError> {
+        self.open_raw_fd(path, true, false, false)
+            .map(Some)
+            .ok_or(BackendError::Io)
+    }
+
     fn open_raw_fd_with_metadata(
         &self,
         path: &str,
@@ -7282,6 +7296,20 @@ mod tests {
         assert_eq!(
             MemoryBackend::new().native_reexec_authority(),
             Err(BackendError::Unsupported)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn durability_reopen_distinguishes_unsupported_from_disk_failure() {
+        let memory = MemoryBackend::new();
+        assert_eq!(memory.reopen_for_durability("/missing"), Ok(None));
+
+        let (host, _scratch) = host_backend();
+        assert_eq!(
+            host.reopen_for_durability("/missing"),
+            Err(BackendError::Io),
+            "a disk-backed reopen failure must not masquerade as unsupported"
         );
     }
 

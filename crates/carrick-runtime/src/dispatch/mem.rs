@@ -279,6 +279,9 @@ pub(super) struct MemState {
     /// [`SyscallDispatcher::set_auxv_image`]. Mirrored to `/proc/self/auxv`.
     /// Empty until an image with an initial stack is loaded.
     pub linux_auxv_image: Vec<u8>,
+    /// Exact NT_FILE provenance. Boot PT_LOAD records are replaced on exec;
+    /// file-backed mmap records are added/trimmed with dynamic VMA commits.
+    pub(super) core_file_mappings: Vec<crate::core_dump::FileMapping>,
     // NOTE: the alias-IPA cursor used to live here, but a per-process field is
     // COPIED on fork, so sibling guest processes reused the same IPAs into the
     // shared `hv_vm` (whose stage-2 TLB can't be flushed) and read each other's
@@ -323,6 +326,7 @@ impl MemState {
             write_sealed_shared_maps: Vec::new(),
             writable_memfd_maps: Vec::new(),
             linux_auxv_image: Vec::new(),
+            core_file_mappings: Vec::new(),
         }
     }
 
@@ -741,9 +745,13 @@ struct MremapMappingMetadata {
     prot: LinuxProtFlags,
     sharing: ProcMapSharing,
     path: String,
+    file_page_offset: Option<u64>,
 }
 
-fn proc_maps_entry_mremap_metadata(map: &ProcMapsEntry) -> MremapMappingMetadata {
+fn proc_maps_entry_mremap_metadata(
+    map: &ProcMapsEntry,
+    file_page_offset: Option<u64>,
+) -> MremapMappingMetadata {
     let mut prot = LinuxProtFlags::empty();
     if map.read {
         prot |= LinuxProtFlags::READ;
@@ -760,6 +768,7 @@ fn proc_maps_entry_mremap_metadata(map: &ProcMapsEntry) -> MremapMappingMetadata
         prot,
         sharing: map.sharing,
         path: map.path.clone(),
+        file_page_offset,
     }
 }
 
@@ -773,6 +782,7 @@ pub(crate) struct HostAliasMmapCommit {
     pub(super) prot: LinuxProtFlags,
     pub(super) sharing: ProcMapSharing,
     pub(super) path: String,
+    pub(super) file_page_offset: Option<u64>,
     pub(super) locked: Option<crate::vfs::GuestMemoryRange>,
     pub(super) resident: bool,
     pub(super) bus_fault: Option<(u64, u64)>,
@@ -964,6 +974,7 @@ fn trim_growdown_ranges_for_range(mem: &mut MemState, start: u64, len: u64) {
 
 fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len: u64) {
     trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
+    trim_core_file_mappings_for_range(&mut mem.core_file_mappings, start, len);
     trim_live_boot_regions_for_range(mem, start, len);
     trim_growdown_ranges_for_range(mem, start, len);
     trim_ranges_for_range(&mut mem.bus_fault_ranges, start, len);
@@ -980,6 +991,39 @@ fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len: u64) {
     remove_fault_range(&mut mem.resident_fault_ranges, remove);
     locked_ranges_remove(&mut mem.write_sealed_shared_maps, remove);
     locked_ranges_remove(&mut mem.host_alias_backed_ranges, remove);
+}
+
+fn trim_core_file_mappings_for_range(
+    mappings: &mut Vec<crate::core_dump::FileMapping>,
+    start: u64,
+    len: u64,
+) {
+    let Some(end) = start.checked_add(len) else {
+        mappings.clear();
+        return;
+    };
+    let mut next = Vec::with_capacity(mappings.len() + 1);
+    for mapping in mappings.drain(..) {
+        if end <= mapping.start || start >= mapping.end {
+            next.push(mapping);
+            continue;
+        }
+        if mapping.start < start {
+            let mut left = mapping.clone();
+            left.end = start;
+            next.push(left);
+        }
+        if end < mapping.end {
+            let mut right = mapping;
+            let removed_pages =
+                end.saturating_sub(right.start) / crate::core_dump::GUEST_PAGE as u64;
+            right.start = end;
+            right.file_page_offset = right.file_page_offset.saturating_add(removed_pages);
+            next.push(right);
+        }
+    }
+    next.sort_by_key(|mapping| (mapping.start, mapping.end));
+    *mappings = next;
 }
 
 fn shared_file_bus_offset(file_len: u64, offset: u64, length: u64, page_size: u64) -> Option<u64> {
@@ -1168,6 +1212,18 @@ impl SyscallDispatcher {
         }
         if let Some(description) = commit.writable_memfd {
             mem.writable_memfd_maps.push((replacement, description));
+        }
+        if let Some(file_page_offset) = commit.file_page_offset
+            && !commit.path.is_empty()
+        {
+            mem.core_file_mappings.push(crate::core_dump::FileMapping {
+                start: commit.start,
+                end,
+                file_page_offset,
+                path: commit.path.clone(),
+            });
+            mem.core_file_mappings
+                .sort_by_key(|mapping| (mapping.start, mapping.end));
         }
         locked_ranges_insert(&mut mem.host_alias_backed_ranges, replacement);
         let entry = ProcMapsEntry {
@@ -1473,6 +1529,7 @@ impl SyscallDispatcher {
             .any(|(_, desc)| std::sync::Arc::ptr_eq(desc, description))
     }
 
+    #[cfg(test)]
     fn record_dynamic_mapping(
         &self,
         start: u64,
@@ -1481,11 +1538,36 @@ impl SyscallDispatcher {
         sharing: ProcMapSharing,
         path: String,
     ) {
+        self.record_dynamic_mapping_with_file_offset(start, len, prot, sharing, path, None);
+    }
+
+    fn record_dynamic_mapping_with_file_offset(
+        &self,
+        start: u64,
+        len: u64,
+        prot: LinuxProtFlags,
+        sharing: ProcMapSharing,
+        path: String,
+        file_page_offset: Option<u64>,
+    ) {
         let Some(end) = start.checked_add(len) else {
             return;
         };
         let (read, write, execute) = prot_to_proc_perms(prot);
         let mut mem = self.mem.lock();
+        trim_core_file_mappings_for_range(&mut mem.core_file_mappings, start, len);
+        if let Some(file_page_offset) = file_page_offset
+            && !path.is_empty()
+        {
+            mem.core_file_mappings.push(crate::core_dump::FileMapping {
+                start,
+                end,
+                file_page_offset,
+                path: path.clone(),
+            });
+            mem.core_file_mappings
+                .sort_by_key(|mapping| (mapping.start, mapping.end));
+        }
         mem.remap_snapshots.remove(&start);
         let entry = ProcMapsEntry {
             start,
@@ -1544,7 +1626,15 @@ impl SyscallDispatcher {
             if first.start > start || first.end < end || overlapping_dynamic.next().is_some() {
                 return Err(LINUX_EFAULT);
             }
-            return Ok(proc_maps_entry_mremap_metadata(first));
+            let file_page_offset = mem
+                .core_file_mappings
+                .iter()
+                .find(|mapping| mapping.start <= start && mapping.end >= end)
+                .map(|mapping| {
+                    mapping.file_page_offset
+                        + (start - mapping.start) / crate::core_dump::GUEST_PAGE as u64
+                });
+            return Ok(proc_maps_entry_mremap_metadata(first, file_page_offset));
         }
 
         // Complete mapping metadata is authoritative over the retained boot
@@ -1579,7 +1669,15 @@ impl SyscallDispatcher {
         if boot_region_source_intersects_hidden_backing(region, &mem, end) {
             return Err(LINUX_EFAULT);
         }
-        Ok(proc_maps_entry_mremap_metadata(region))
+        let file_page_offset = mem
+            .core_file_mappings
+            .iter()
+            .find(|mapping| mapping.start <= start && mapping.end >= end)
+            .map(|mapping| {
+                mapping.file_page_offset
+                    + (start - mapping.start) / crate::core_dump::GUEST_PAGE as u64
+            });
+        Ok(proc_maps_entry_mremap_metadata(region, file_page_offset))
     }
 
     pub(in crate::dispatch) fn record_mmap_bus_fault_range(&self, start: u64, len: u64) {
@@ -2188,6 +2286,7 @@ impl SyscallDispatcher {
                         prot: prot_flags,
                         sharing: ProcMapSharing::Shared,
                         path: "anon_inode:[io_uring]".to_owned(),
+                        file_page_offset: None,
                         locked: this.prepare_mmap_locked_range(map_flags, address, length)?,
                         resident: true,
                         bus_fault: None,
@@ -2442,6 +2541,9 @@ impl SyscallDispatcher {
                     prot: prot_flags,
                     sharing: ProcMapSharing::Private,
                     path: proc_map_path.clone(),
+                    file_page_offset: (!proc_map_path.is_empty()).then_some(
+                        offset / crate::core_dump::GUEST_PAGE as u64,
+                    ),
                     locked: locked_range,
                     resident: !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                         || map_flags.contains(LinuxMmapFlags::POPULATE),
@@ -2567,6 +2669,9 @@ impl SyscallDispatcher {
                             prot: prot_flags,
                             sharing: ProcMapSharing::Shared,
                             path: proc_map_path.clone(),
+                            file_page_offset: (!proc_map_path.is_empty()).then_some(
+                                offset / crate::core_dump::GUEST_PAGE as u64,
+                            ),
                             locked: locked_range,
                             resident: true,
                             bus_fault: None,
@@ -2733,12 +2838,13 @@ impl SyscallDispatcher {
                         )?;
                         return Ok(DispatchOutcome::errno(errno));
                     }
-                    this.record_dynamic_mapping(
+                    this.record_dynamic_mapping_with_file_offset(
                         addr,
                         length,
                         prot_flags,
                         ProcMapSharing::Shared,
                         String::new(),
+                        None,
                     );
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
                     return Ok(DispatchOutcome::Returned { value: addr as i64 });
@@ -2810,12 +2916,13 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 this.commit_mmap_locked_range(memory, locked_range)?;
-                this.record_dynamic_mapping(
+                this.record_dynamic_mapping_with_file_offset(
                     address,
                     length,
                     prot_flags,
                     map_sharing.proc_map_sharing(),
                     String::new(),
+                    None,
                 );
                 if map_flags.contains(LinuxMmapFlags::GROWSDOWN) {
                     this.record_growdown_mapping(address, length);
@@ -2846,12 +2953,13 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 this.commit_mmap_locked_range(memory, locked_range)?;
-                this.record_dynamic_mapping(
+                this.record_dynamic_mapping_with_file_offset(
                     address,
                     length,
                     prot_flags,
                     map_sharing.proc_map_sharing(),
                     String::new(),
+                    None,
                 );
                 if map_flags.contains(LinuxMmapFlags::GROWSDOWN) {
                     this.record_growdown_mapping(address, length);
@@ -3125,6 +3233,9 @@ impl SyscallDispatcher {
                         prot: prot_flags,
                         sharing: map_sharing.proc_map_sharing(),
                         path: proc_map_path.clone(),
+                        file_page_offset: (!proc_map_path.is_empty()).then_some(
+                            offset / crate::core_dump::GUEST_PAGE as u64,
+                        ),
                         locked: locked_range,
                         resident: !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                             || map_flags.contains(LinuxMmapFlags::POPULATE),
@@ -3280,12 +3391,15 @@ impl SyscallDispatcher {
             if let Some(description) = writable_memfd_desc {
                 this.record_writable_memfd_map(address, length, description);
             }
-            this.record_dynamic_mapping(
+            let file_page_offset = (!proc_map_path.is_empty())
+                .then_some(offset / crate::core_dump::GUEST_PAGE as u64);
+            this.record_dynamic_mapping_with_file_offset(
                 address,
                 length,
                 prot_flags,
                 map_sharing.proc_map_sharing(),
                 proc_map_path,
+                file_page_offset,
             );
             this.mark_vma_dispatch(&mut host_alias_dispatch);
             Ok(DispatchOutcome::Returned {
@@ -3820,12 +3934,13 @@ impl SyscallDispatcher {
                             std::process::abort();
                         }
                     }
-                    this.record_dynamic_mapping(
+                    this.record_dynamic_mapping_with_file_offset(
                         old_address.0,
                         new_size,
                         source_metadata.prot,
                         source_metadata.sharing,
                         source_metadata.path.clone(),
+                        source_metadata.file_page_offset,
                     );
                     if new_size != old_size {
                         this.mark_vma_dispatch(&mut host_alias_dispatch);
@@ -3878,12 +3993,13 @@ impl SyscallDispatcher {
                         free_regions_insert(&mut mem.free_regions, tail_start, tail_len);
                     }
                 }
-                this.record_dynamic_mapping(
+                this.record_dynamic_mapping_with_file_offset(
                     old_address.0,
                     new_size,
                     source_metadata.prot,
                     source_metadata.sharing,
                     source_metadata.path.clone(),
+                    source_metadata.file_page_offset,
                 );
                 if new_size != old_size {
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
@@ -3931,12 +4047,13 @@ impl SyscallDispatcher {
                         // munmap+rebump cannot expose bytes dirtied in this tail.
                         mem.mmap_writable_high = mem.mmap_writable_high.max(new_end);
                     }
-                    this.record_dynamic_mapping(
+                    this.record_dynamic_mapping_with_file_offset(
                         old_address.0,
                         new_size,
                         source_metadata.prot,
                         source_metadata.sharing,
                         source_metadata.path.clone(),
+                        source_metadata.file_page_offset,
                     );
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
                     return Ok(DispatchOutcome::Returned {
@@ -4022,12 +4139,13 @@ impl SyscallDispatcher {
                 this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
-            this.record_dynamic_mapping(
+            this.record_dynamic_mapping_with_file_offset(
                 new_addr,
                 new_size,
                 source_metadata.prot,
                 source_metadata.sharing,
                 source_metadata.path.clone(),
+                source_metadata.file_page_offset,
             );
             // mremap MOVE on Linux UNMAPS the source [old, old+old_size) (unless
             // MREMAP_DONTUNMAP — refused above, so never true here: this handler
@@ -4186,6 +4304,7 @@ impl SyscallDispatcher {
                             prot: prot_flags,
                             sharing: reservation.sharing,
                             path: reservation.path,
+                            file_page_offset: reservation.file_page_offset,
                             locked: None,
                             resident: false,
                             bus_fault: None,
@@ -5490,6 +5609,7 @@ mod tests {
             prot: LinuxProtFlags::READ,
             sharing: ProcMapSharing::Private,
             path: String::new(),
+            file_page_offset: None,
             locked: None,
             resident: false,
             bus_fault: None,
@@ -8827,6 +8947,7 @@ mod tests {
             prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
             sharing: ProcMapSharing::Private,
             path: String::new(),
+            file_page_offset: None,
             locked: None,
             resident: false,
             bus_fault: None,
@@ -9027,6 +9148,7 @@ mod tests {
             prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
             sharing: ProcMapSharing::Private,
             path: String::new(),
+            file_page_offset: None,
             locked: None,
             resident: false,
             bus_fault: None,
@@ -10228,6 +10350,7 @@ mod tests {
             prot: LinuxProtFlags::READ | LinuxProtFlags::EXEC,
             sharing: ProcMapSharing::Private,
             path: "replacement".into(),
+            file_page_offset: None,
             locked: None,
             resident: false,
             bus_fault: None,
@@ -10289,6 +10412,47 @@ mod tests {
     }
 
     #[test]
+    fn core_file_provenance_keeps_mmap_offset_and_excludes_anonymous_exec() {
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
+            start: 0x7000_0000,
+            len: 0x2000,
+            prot: LinuxProtFlags::READ | LinuxProtFlags::EXEC,
+            sharing: ProcMapSharing::Private,
+            path: "/tmp/nonzero-map".to_owned(),
+            file_page_offset: Some(3),
+            locked: None,
+            resident: true,
+            bus_fault: None,
+            write_sealed_shared: false,
+            writable_memfd: None,
+        });
+        dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
+            start: 0x7100_0000,
+            len: 0x1000,
+            prot: LinuxProtFlags::READ | LinuxProtFlags::EXEC,
+            sharing: ProcMapSharing::Private,
+            path: String::new(),
+            file_page_offset: None,
+            locked: None,
+            resident: true,
+            bus_fault: None,
+            write_sealed_shared: false,
+            writable_memfd: None,
+        });
+
+        assert_eq!(
+            dispatcher.mem.lock().core_file_mappings,
+            vec![crate::core_dump::FileMapping {
+                start: 0x7000_0000,
+                end: 0x7000_2000,
+                file_page_offset: 3,
+                path: "/tmp/nonzero-map".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
     fn host_alias_inventory_commits_trims_and_fork_clones_exact_ranges() {
         let parent = SyscallDispatcher::new();
         let start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
@@ -10301,6 +10465,7 @@ mod tests {
             prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
             sharing: ProcMapSharing::Shared,
             path: String::new(),
+            file_page_offset: None,
             locked: None,
             resident: false,
             bus_fault: None,
@@ -10385,6 +10550,7 @@ mod tests {
             prot: LinuxProtFlags::READ | LinuxProtFlags::WRITE,
             sharing: ProcMapSharing::Shared,
             path: "replacement".to_string(),
+            file_page_offset: None,
             locked: None,
             resident: false,
             bus_fault: None,
@@ -10446,6 +10612,7 @@ mod tests {
             prot: LinuxProtFlags::READ,
             sharing: ProcMapSharing::Private,
             path: String::new(),
+            file_page_offset: None,
             locked: None,
             resident: false,
             bus_fault: None,
@@ -10488,6 +10655,7 @@ mod tests {
             prot: LinuxProtFlags::READ,
             sharing: ProcMapSharing::Shared,
             path: String::new(),
+            file_page_offset: None,
             locked: None,
             resident: false,
             bus_fault: None,
@@ -10536,6 +10704,7 @@ mod tests {
             prot: LinuxProtFlags::READ,
             sharing: ProcMapSharing::Private,
             path: String::new(),
+            file_page_offset: None,
             locked: None,
             resident: false,
             bus_fault: None,

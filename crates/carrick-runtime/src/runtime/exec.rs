@@ -107,7 +107,8 @@ pub(crate) fn load_execve_image(
                     .read_exec_file(interpreter)
                     .or_else(|| host_read(interpreter))
             })
-            .map_err(|_| LINUX_ENOEXEC)?;
+            .map_err(|_| LINUX_ENOEXEC)?
+            .with_main_file_path(path.clone());
             finalize_hvf_exec_base(dispatcher, raw, false, vdso_enabled)
         })?;
         (base, argv)
@@ -133,7 +134,8 @@ pub(crate) fn load_execve_image(
                 .read_exec_file(interpreter)
                 .or_else(|| host_read(interpreter))
         })
-        .map_err(|_| LINUX_ENOEXEC)?;
+        .map_err(|_| LINUX_ENOEXEC)?
+        .with_main_file_path(path.clone());
         (
             finalize_hvf_exec_base(dispatcher, raw, needs_at_base, vdso_enabled)?,
             argv,

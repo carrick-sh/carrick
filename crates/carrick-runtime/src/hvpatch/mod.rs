@@ -1067,6 +1067,7 @@ where
     });
     drop(launch_context);
     let image = loaded?
+        .with_main_file_path(path.to_string_lossy())
         .with_vdso_auxv(crate::runtime::vdso_enabled_for_debug())
         .with_linux_initial_stack_page_size(argv, env, PAGE_SIZE)?;
     finish_hvpatch_image(image, dispatcher, max_traps, debug_state_path)

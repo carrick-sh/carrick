@@ -156,7 +156,7 @@ pub struct MemoryRegion<'a> {
 }
 
 /// One `NT_FILE` entry: a file-backed mapping.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileMapping {
     pub start: u64,
     pub end: u64,
@@ -188,10 +188,157 @@ pub enum CoreDumpError {
     RegionContentsTooLarge { start: u64, bytes: usize, size: u64 },
     #[error("core requires {required} bytes, exceeding RLIMIT_CORE {limit}")]
     LimitExceeded { limit: u64, required: u64 },
+    #[error("core has {count} program headers, exceeding ELF64 e_phnum")]
+    ProgramHeaderCountOverflow { count: usize },
+    #[error("core ELF layout arithmetic overflowed")]
+    LayoutOverflow,
+    #[error("serialized core failed structural validation: {0}")]
+    InvalidSerialized(String),
 }
 
 fn align_up(value: usize, align: usize) -> usize {
     value.div_ceil(align) * align
+}
+
+fn checked_align_up(value: usize, align: usize) -> Option<usize> {
+    value
+        .checked_add(align.checked_sub(1)?)
+        .map(|rounded| rounded / align * align)
+}
+
+fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(at..at.checked_add(2)?)?.try_into().ok()?,
+    ))
+}
+
+fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+fn read_u64(bytes: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
+    ))
+}
+
+/// Re-read the emitted artifact rather than trusting the in-memory builder.
+/// This is the final authority before publication: every table, segment and
+/// note must be contained in the actual byte vector and counts must match the
+/// snapshot that requested serialization.
+fn validate_serialized_core(
+    bytes: &[u8],
+    expected_loads: usize,
+    expected_notes: usize,
+) -> Result<(), CoreDumpError> {
+    let invalid = |message: &str| CoreDumpError::InvalidSerialized(message.to_owned());
+    if bytes.len() < usize::from(EHDR_SIZE) || bytes.get(..4) != Some(b"\x7fELF") {
+        return Err(invalid("truncated or invalid ELF header"));
+    }
+    let phoff = usize::try_from(read_u64(bytes, 32).ok_or_else(|| invalid("missing e_phoff"))?)
+        .map_err(|_| invalid("e_phoff does not fit host usize"))?;
+    let ehsize = read_u16(bytes, 52).ok_or_else(|| invalid("missing e_ehsize"))?;
+    let phentsize = read_u16(bytes, 54).ok_or_else(|| invalid("missing e_phentsize"))?;
+    let phnum = usize::from(read_u16(bytes, 56).ok_or_else(|| invalid("missing e_phnum"))?);
+    if ehsize != EHDR_SIZE || phentsize != PHDR_SIZE || phoff != usize::from(EHDR_SIZE) {
+        return Err(invalid("non-canonical ELF/program-header geometry"));
+    }
+    if phnum != expected_loads.saturating_add(1) {
+        return Err(invalid("program-header count differs from snapshot"));
+    }
+    let table_bytes = phnum
+        .checked_mul(usize::from(phentsize))
+        .ok_or(CoreDumpError::LayoutOverflow)?;
+    let table_end = phoff
+        .checked_add(table_bytes)
+        .ok_or(CoreDumpError::LayoutOverflow)?;
+    if table_end > bytes.len() {
+        return Err(invalid("program-header table extends beyond artifact"));
+    }
+
+    let mut note_range = None;
+    let mut load_count = 0usize;
+    for index in 0..phnum {
+        let at = phoff
+            .checked_add(
+                index
+                    .checked_mul(usize::from(phentsize))
+                    .ok_or(CoreDumpError::LayoutOverflow)?,
+            )
+            .ok_or(CoreDumpError::LayoutOverflow)?;
+        let kind = read_u32(bytes, at).ok_or_else(|| invalid("truncated program header"))?;
+        let offset = usize::try_from(
+            read_u64(bytes, at + 8).ok_or_else(|| invalid("missing segment offset"))?,
+        )
+        .map_err(|_| invalid("segment offset does not fit host usize"))?;
+        let filesz = usize::try_from(
+            read_u64(bytes, at + 32).ok_or_else(|| invalid("missing segment filesz"))?,
+        )
+        .map_err(|_| invalid("segment filesz does not fit host usize"))?;
+        let memsz = read_u64(bytes, at + 40).ok_or_else(|| invalid("missing segment memsz"))?;
+        let end = offset
+            .checked_add(filesz)
+            .ok_or(CoreDumpError::LayoutOverflow)?;
+        if end > bytes.len() {
+            return Err(invalid("segment extends beyond artifact"));
+        }
+        match kind {
+            PT_NOTE => {
+                if note_range.replace((offset, end)).is_some() {
+                    return Err(invalid("multiple PT_NOTE segments"));
+                }
+            }
+            PT_LOAD => {
+                load_count = load_count
+                    .checked_add(1)
+                    .ok_or(CoreDumpError::LayoutOverflow)?;
+                if u64::try_from(filesz).map_or(true, |size| size > memsz) {
+                    return Err(invalid("PT_LOAD filesz exceeds memsz"));
+                }
+            }
+            _ => return Err(invalid("unexpected program-header type")),
+        }
+    }
+    if load_count != expected_loads {
+        return Err(invalid("PT_LOAD count differs from snapshot"));
+    }
+    let (mut cursor, note_end) = note_range.ok_or_else(|| invalid("missing PT_NOTE"))?;
+    let mut note_count = 0usize;
+    while cursor < note_end {
+        let header_end = cursor
+            .checked_add(12)
+            .ok_or(CoreDumpError::LayoutOverflow)?;
+        if header_end > note_end {
+            return Err(invalid("truncated note header"));
+        }
+        let namesz = usize::try_from(read_u32(bytes, cursor).ok_or_else(|| invalid("namesz"))?)
+            .map_err(|_| invalid("namesz does not fit usize"))?;
+        let descsz = usize::try_from(read_u32(bytes, cursor + 4).ok_or_else(|| invalid("descsz"))?)
+            .map_err(|_| invalid("descsz does not fit usize"))?;
+        let name_end = header_end
+            .checked_add(namesz)
+            .ok_or(CoreDumpError::LayoutOverflow)?;
+        let desc_start =
+            checked_align_up(name_end, NOTE_ALIGN).ok_or(CoreDumpError::LayoutOverflow)?;
+        let desc_end = desc_start
+            .checked_add(descsz)
+            .ok_or(CoreDumpError::LayoutOverflow)?;
+        cursor = checked_align_up(desc_end, NOTE_ALIGN).ok_or(CoreDumpError::LayoutOverflow)?;
+        if cursor > note_end {
+            return Err(invalid("note name or descriptor exceeds PT_NOTE"));
+        }
+        note_count = note_count
+            .checked_add(1)
+            .ok_or(CoreDumpError::LayoutOverflow)?;
+    }
+    if cursor != note_end || (expected_notes != 0 && note_count != expected_notes) {
+        return Err(invalid(
+            "note count or terminal bound differs from snapshot",
+        ));
+    }
+    Ok(())
 }
 
 /// Append one ELF note: `namesz`, `descsz`, `type`, padded name, padded desc.
@@ -511,19 +658,26 @@ impl CoreDump<'_> {
     /// the caller's effective Linux `RLIMIT_CORE`; equality is permitted.
     pub fn to_bytes_bounded(&self, limit: u64) -> Result<Vec<u8>, CoreDumpError> {
         self.validate()?;
-        let bytes = self.to_bytes();
-        let required = bytes.len() as u64;
+        let bytes = self.try_to_bytes()?;
+        let required = u64::try_from(bytes.len()).map_err(|_| CoreDumpError::LayoutOverflow)?;
         if required > limit {
             return Err(CoreDumpError::LimitExceeded { limit, required });
         }
         Ok(bytes)
     }
 
+    #[cfg(test)]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.validate()
+            .and_then(|_| self.try_to_bytes())
+            .expect("test core must serialize")
+    }
+
     /// Serialise the whole core file.
     ///
     /// Layout follows the oracle: ELF header, then the program header table,
     /// then `PT_NOTE`'s contents, then each `PT_LOAD`'s bytes page-aligned.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    fn try_to_bytes(&self) -> Result<Vec<u8>, CoreDumpError> {
         let mut notes = Vec::new();
         // Match Linux's note order exactly: the crashing thread's PRSTATUS,
         // process-wide notes, its optional register sets, then each sibling's
@@ -559,10 +713,23 @@ impl CoreDump<'_> {
             push_thread_arch_notes(&mut notes, thread);
         }
 
-        let phnum = 1 + self.regions.len();
+        let phnum = self
+            .regions
+            .len()
+            .checked_add(1)
+            .ok_or(CoreDumpError::LayoutOverflow)?;
+        let phnum_u16 = u16::try_from(phnum)
+            .map_err(|_| CoreDumpError::ProgramHeaderCountOverflow { count: phnum })?;
         let phoff = usize::from(EHDR_SIZE);
-        let notes_offset = phoff + phnum * usize::from(PHDR_SIZE);
-        let mut data_offset = align_up(notes_offset + notes.len(), GUEST_PAGE);
+        let notes_offset = phnum
+            .checked_mul(usize::from(PHDR_SIZE))
+            .and_then(|table| phoff.checked_add(table))
+            .ok_or(CoreDumpError::LayoutOverflow)?;
+        let notes_end = notes_offset
+            .checked_add(notes.len())
+            .ok_or(CoreDumpError::LayoutOverflow)?;
+        let mut data_offset =
+            checked_align_up(notes_end, GUEST_PAGE).ok_or(CoreDumpError::LayoutOverflow)?;
 
         let mut ident = [0_u8; 16];
         ident[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
@@ -574,10 +741,10 @@ impl CoreDump<'_> {
             e_type: ET_CORE,
             e_machine: EM_AARCH64,
             e_version: 1,
-            e_phoff: phoff as u64,
+            e_phoff: u64::try_from(phoff).map_err(|_| CoreDumpError::LayoutOverflow)?,
             e_ehsize: EHDR_SIZE,
             e_phentsize: PHDR_SIZE,
-            e_phnum: phnum as u16,
+            e_phnum: phnum_u16,
             ..wire::Elf64Ehdr::default()
         };
         let mut out = Vec::new();
@@ -585,24 +752,34 @@ impl CoreDump<'_> {
 
         out.extend_from_slice(as_bytes(&wire::Elf64Phdr {
             p_type: PT_NOTE,
-            p_offset: notes_offset as u64,
-            p_filesz: notes.len() as u64,
+            p_offset: u64::try_from(notes_offset).map_err(|_| CoreDumpError::LayoutOverflow)?,
+            p_filesz: u64::try_from(notes.len()).map_err(|_| CoreDumpError::LayoutOverflow)?,
             p_align: NOTE_ALIGN as u64,
             ..wire::Elf64Phdr::default()
         }));
         for region in &self.regions {
-            let filesz = region.bytes.len() as u64;
+            let filesz =
+                u64::try_from(region.bytes.len()).map_err(|_| CoreDumpError::LayoutOverflow)?;
             out.extend_from_slice(as_bytes(&wire::Elf64Phdr {
                 p_type: PT_LOAD,
                 p_flags: region.flags,
-                p_offset: if filesz == 0 { 0 } else { data_offset as u64 },
+                p_offset: if filesz == 0 {
+                    0
+                } else {
+                    u64::try_from(data_offset).map_err(|_| CoreDumpError::LayoutOverflow)?
+                },
                 p_vaddr: region.start,
                 p_filesz: filesz,
                 p_memsz: region.size,
                 p_align: GUEST_PAGE as u64,
                 ..wire::Elf64Phdr::default()
             }));
-            data_offset += align_up(region.bytes.len(), GUEST_PAGE);
+            data_offset = data_offset
+                .checked_add(
+                    checked_align_up(region.bytes.len(), GUEST_PAGE)
+                        .ok_or(CoreDumpError::LayoutOverflow)?,
+                )
+                .ok_or(CoreDumpError::LayoutOverflow)?;
         }
         debug_assert_eq!(out.len(), notes_offset);
 
@@ -614,7 +791,14 @@ impl CoreDump<'_> {
             out.resize(align_up(out.len(), GUEST_PAGE), 0);
             out.extend_from_slice(region.bytes);
         }
-        out
+        let expected_notes = self
+            .threads
+            .len()
+            .checked_mul(3)
+            .and_then(|count| count.checked_add(4))
+            .ok_or(CoreDumpError::LayoutOverflow)?;
+        validate_serialized_core(&out, self.regions.len(), expected_notes)?;
+        Ok(out)
     }
 }
 
@@ -842,6 +1026,39 @@ mod tests {
             dump.to_bytes_bounded(required).expect("exact limit"),
             dump.to_bytes()
         );
+    }
+
+    #[test]
+    fn bounded_writer_rejects_program_header_count_truncation() {
+        let mut dump = sample();
+        dump.regions = (0..u16::MAX)
+            .map(|_| MemoryRegion {
+                start: 0,
+                flags: 0,
+                bytes: &[],
+                size: 0,
+            })
+            .collect();
+        assert!(matches!(
+            dump.to_bytes_bounded(u64::MAX),
+            Err(CoreDumpError::ProgramHeaderCountOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn serialized_validator_rejects_bad_header_and_segment_bounds() {
+        let bytes = sample().to_bytes();
+
+        let mut bad_phentsize = bytes.clone();
+        let at = std::mem::offset_of!(wire::Elf64Ehdr, e_phentsize);
+        bad_phentsize[at..at + 2].copy_from_slice(&0_u16.to_le_bytes());
+        assert!(validate_serialized_core(&bad_phentsize, 0, 0).is_err());
+
+        let mut bad_note = bytes.clone();
+        let phoff = usize::from(EHDR_SIZE);
+        let filesz = phoff + std::mem::offset_of!(wire::Elf64Phdr, p_filesz);
+        bad_note[filesz..filesz + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(validate_serialized_core(&bad_note, 0, 0).is_err());
     }
 }
 

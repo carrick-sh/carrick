@@ -703,6 +703,19 @@ pub struct AddressSpace {
     /// `plan_windows`/`build_pml4`. Empty for non-ELF images.
     #[serde(skip)]
     ro_spans: Vec<crate::elf::RoSpan>,
+    /// Exact guest file-backed PT_LOAD provenance used by Linux core NT_FILE.
+    /// Runtime/anonymous executable regions never appear here.
+    #[serde(skip)]
+    file_mappings: Vec<AddressSpaceFileMapping>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressSpaceFileMapping {
+    pub start: u64,
+    pub end: u64,
+    /// Offset in 4 KiB guest pages, matching NT_FILE's third column.
+    pub file_page_offset: u64,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -852,7 +865,10 @@ impl AddressSpace {
         let path = path.as_ref();
         let plan = plan_elf_load_for(path, machine)?;
         let file = fs::read(path)?;
-        Self::load_elf_segments_with_interpreter(&file, plan, machine, &|p| fs::read(p).ok())
+        Ok(
+            Self::load_elf_segments_with_interpreter(&file, plan, machine, &|p| fs::read(p).ok())?
+                .with_main_file_path(path.to_string_lossy()),
+        )
     }
 
     pub fn load_elf_bytes(bytes: &[u8]) -> Result<Self, AddressSpaceError> {
@@ -959,12 +975,14 @@ impl AddressSpace {
     fn load_elf_segments(file: &[u8], plan: LoadPlan) -> Result<Self, AddressSpaceError> {
         let linux_auxv = linux_auxv_from_load_plan(&plan, None);
         let ro_spans = crate::elf::ro_page_spans(&plan);
+        let file_mappings = file_mappings_from_load_plan(&plan, "");
         let mut regions = regions_from_load_plan(file, &plan)?;
         regions.extend(linux_runtime_regions()?);
 
         let mut image = Self::from_regions(plan.entry, regions)?;
         image.linux_auxv = linux_auxv;
         image.ro_spans = ro_spans;
+        image.file_mappings = file_mappings;
         Ok(image)
     }
 
@@ -992,6 +1010,7 @@ impl AddressSpace {
         include_runtime_regions: bool,
         shape: LoadRegionShape,
     ) -> Result<Self, AddressSpaceError> {
+        let mut file_mappings = file_mappings_from_load_plan(&plan, "");
         let mut regions = regions_from_load_plan_with_shape(file, &plan, shape)?;
         let mut entry = plan.entry;
         let mut interpreter_base = None;
@@ -1002,6 +1021,10 @@ impl AddressSpace {
                 .ok_or_else(|| AddressSpaceError::Io(std::io::ErrorKind::NotFound.into()))?;
             let interpreter_plan = plan_elf_load_bytes_for(&interpreter, machine)?
                 .with_load_bias(LINUX_INTERPRETER_BASE);
+            file_mappings.extend(file_mappings_from_load_plan(
+                &interpreter_plan,
+                interpreter_path,
+            ));
             ro_spans.extend(crate::elf::ro_page_spans(&interpreter_plan));
             regions.extend(regions_from_load_plan_with_shape(
                 &interpreter,
@@ -1019,6 +1042,7 @@ impl AddressSpace {
         let mut image = Self::from_regions(entry, regions)?;
         image.linux_auxv = linux_auxv;
         image.ro_spans = ro_spans;
+        image.file_mappings = file_mappings;
         Ok(image)
     }
 
@@ -1083,6 +1107,7 @@ impl AddressSpace {
             linux_auxv: Vec::new(),
             linux_auxv_image: Vec::new(),
             ro_spans: Vec::new(),
+            file_mappings: Vec::new(),
         })
     }
 
@@ -1167,6 +1192,22 @@ impl AddressSpace {
     /// `/proc/self/auxv`. Empty until an initial stack has been built.
     pub fn linux_auxv_image(&self) -> &[u8] {
         &self.linux_auxv_image
+    }
+
+    pub fn file_mappings(&self) -> &[AddressSpaceFileMapping] {
+        &self.file_mappings
+    }
+
+    /// Bind the already-parsed main PT_LOAD records to the exact guest path.
+    /// Interpreter mappings already carry their own PT_INTERP path.
+    pub fn with_main_file_path(mut self, path: impl Into<String>) -> Self {
+        let path = path.into();
+        for mapping in &mut self.file_mappings {
+            if mapping.path.is_empty() {
+                mapping.path.clone_from(&path);
+            }
+        }
+        self
     }
 
     pub fn with_vdso_auxv(mut self, enabled: bool) -> Self {
@@ -1304,6 +1345,8 @@ impl AddressSpace {
             linux_auxv,
             linux_auxv_image,
             ro_spans,
+            file_mappings,
+            ..
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
         image.initial_stack_pointer = initial_stack_pointer;
@@ -1313,6 +1356,7 @@ impl AddressSpace {
         image.linux_auxv = linux_auxv;
         image.linux_auxv_image = linux_auxv_image;
         image.ro_spans = ro_spans;
+        image.file_mappings = file_mappings;
         Ok(image)
     }
 
@@ -1390,6 +1434,7 @@ impl AddressSpace {
             el1_vectors_base,
             stage1_page_tables_base,
             ro_spans,
+            file_mappings,
             ..
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
@@ -1403,6 +1448,7 @@ impl AddressSpace {
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
         image.ro_spans = ro_spans;
+        image.file_mappings = file_mappings;
         Ok(image)
     }
 
@@ -1465,6 +1511,7 @@ impl AddressSpace {
             el0_trampoline_entry,
             stage1_page_tables_base,
             ro_spans,
+            file_mappings,
             ..
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
@@ -1475,6 +1522,7 @@ impl AddressSpace {
         image.el1_vectors_base = Some(LINUX_EL1_VECTORS_BASE);
         image.stage1_page_tables_base = stage1_page_tables_base;
         image.ro_spans = ro_spans;
+        image.file_mappings = file_mappings;
         Ok(image)
     }
 
@@ -1522,6 +1570,7 @@ impl AddressSpace {
             el1_vectors_base,
             stage1_page_tables_base,
             ro_spans,
+            file_mappings,
             ..
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
@@ -1532,6 +1581,7 @@ impl AddressSpace {
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
         image.ro_spans = ro_spans;
+        image.file_mappings = file_mappings;
         Ok(image)
     }
 
@@ -1565,7 +1615,7 @@ impl AddressSpace {
             el1_vectors_base,
             stage1_page_tables_base,
             ro_spans,
-            ..
+            file_mappings,
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
         image.initial_stack_pointer = initial_stack_pointer;
@@ -1575,6 +1625,7 @@ impl AddressSpace {
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
         image.ro_spans = ro_spans;
+        image.file_mappings = file_mappings;
         Ok(image)
     }
 
@@ -1664,6 +1715,7 @@ impl AddressSpace {
             el0_trampoline_entry,
             el1_vectors_base,
             ro_spans,
+            file_mappings,
             ..
         } = self;
         let mut image =
@@ -1675,6 +1727,7 @@ impl AddressSpace {
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = Some(LINUX_PAGE_TABLES_BASE);
         image.ro_spans = ro_spans;
+        image.file_mappings = file_mappings;
         Ok(image)
     }
 
@@ -1760,6 +1813,7 @@ impl AddressSpace {
             el1_vectors_base,
             stage1_page_tables_base,
             ro_spans,
+            file_mappings,
         } = self;
         for aux in &mut linux_auxv {
             if aux.a_type == crate::linux_abi::LINUX_AT_SYSINFO_EHDR {
@@ -1775,6 +1829,7 @@ impl AddressSpace {
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
         image.ro_spans = ro_spans;
+        image.file_mappings = file_mappings;
         Ok(image)
     }
 
@@ -1852,6 +1907,7 @@ impl AddressSpace {
             el1_vectors_base,
             stage1_page_tables_base,
             ro_spans,
+            file_mappings,
             ..
         } = self;
         let argv = argv
@@ -1878,6 +1934,7 @@ impl AddressSpace {
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
         image.ro_spans = ro_spans;
+        image.file_mappings = file_mappings;
         Ok(image)
     }
 
@@ -2190,6 +2247,26 @@ fn regions_from_load_plan_with_shape(
 /// own segments. Machine-agnostic; the aarch64 boot path does not use the
 /// page-aligned shape (it uses `HvfMerged`), so exposing this leaves aarch64
 /// byte-identical.
+fn file_mappings_from_load_plan(plan: &LoadPlan, path: &str) -> Vec<AddressSpaceFileMapping> {
+    const PAGE: u64 = 0x1000;
+    plan.segments
+        .iter()
+        .filter_map(|segment| {
+            let start = segment.virtual_address & !(PAGE - 1);
+            let end = segment
+                .virtual_address
+                .checked_add(segment.memory_size)
+                .and_then(|end| align_up_u64(end, PAGE))?;
+            (start < end).then(|| AddressSpaceFileMapping {
+                start,
+                end,
+                file_page_offset: (segment.file_offset & !(PAGE - 1)) / PAGE,
+                path: path.to_owned(),
+            })
+        })
+        .collect()
+}
+
 pub fn regions_from_load_plan_page_aligned(
     file: &[u8],
     plan: &LoadPlan,
@@ -3723,6 +3800,40 @@ mod loader_tests {
     const PT_INTERP: u32 = 3;
     const PF_R: u32 = 4;
     const PF_X: u32 = 1;
+
+    #[test]
+    fn core_file_mappings_preserve_nonzero_page_offset_and_exact_path() {
+        let plan = LoadPlan {
+            entry: 0x401000,
+            program_header_address: None,
+            program_header_entry_size: 56,
+            program_header_count: 1,
+            interpreter: None,
+            segments: vec![LoadSegment {
+                file_offset: 0x3000,
+                virtual_address: 0x403000,
+                file_size: 0x1000,
+                memory_size: 0x2000,
+                alignment: 0x1000,
+                perms: SegmentPerms {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+            }],
+            load_bias: 0,
+            e_type: ElfType::Exec,
+        };
+        assert_eq!(
+            file_mappings_from_load_plan(&plan, "/opt/bin/exact"),
+            vec![AddressSpaceFileMapping {
+                start: 0x403000,
+                end: 0x405000,
+                file_page_offset: 3,
+                path: "/opt/bin/exact".to_owned(),
+            }]
+        );
+    }
 
     fn synthetic_elf(
         e_type: u16,
