@@ -1596,7 +1596,8 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
             fpsimd_enabled: self.vm.fpsimd_enabled(),
             sigreturn_trampoline_base: carrick_mem::memory::LINUX_SIGRETURN_TRAMPOLINE_BASE,
         };
-        <Self as ThreadedEngine>::Arch::build_sigframe(self, params)?;
+        let info = <Self as ThreadedEngine>::Arch::build_sigframe(self, params)?;
+        carrick_observability::probes::signal_inject(signum, info.saved_pc, info.new_sp, handler);
         // The fault ESR is only valid between fault and delivery; clear it so a
         // later async signal doesn't reuse a stale synchronous-fault syndrome.
         self.last_fault_esr = 0;
@@ -1608,6 +1609,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // saved_pc — mirroring the per-backend impls.
         let fpsimd = self.vm.fpsimd_enabled();
         let r = <Self as ThreadedEngine>::Arch::restore_sigframe(self, fpsimd)?;
+        carrick_observability::probes::signal_restore(r.saved_pc, r.frame_sp, r.magic);
         self.vcpu.prepare_register_resume()?;
         Ok(r.sigmask)
     }

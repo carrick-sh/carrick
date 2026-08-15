@@ -1035,6 +1035,7 @@ impl SyscallDispatcher {
         context: &crate::kernel::KernelContext,
         signum: i32,
     ) {
+        crate::probes::signal_publish(0, signum, 0);
         self.mark_process_signal_pending(context, signum);
     }
 
