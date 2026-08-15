@@ -2271,9 +2271,20 @@ impl SyscallDispatcher {
                 command,
                 LINUX_FUTEX_LOCK_PI | LINUX_FUTEX_TRYLOCK_PI | LINUX_FUTEX_UNLOCK_PI
             ) {
-                let guest_tid = thread
-                    .and_then(|t| guest_visible_tid(tid, t.registry))
-                    .unwrap_or_else(crate::namespace::pid::self_ns_pid);
+                let guest_tid = if this.execution_backend()
+                    == crate::page_profile::ExecutionBackend::HvPatch
+                {
+                    u32::try_from(cx.kernel.thread().key().tid.raw()).ok()
+                } else {
+                    Some(
+                        thread
+                            .and_then(|t| guest_visible_tid(tid, t.registry))
+                            .unwrap_or_else(crate::namespace::pid::self_ns_pid),
+                    )
+                };
+                let Some(guest_tid) = guest_tid else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
                 return Ok(dispatch_futex_pi(
                     memory,
                     address.0,

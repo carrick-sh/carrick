@@ -5866,7 +5866,26 @@ impl SyscallDispatcher {
                     };
                 DispatchOutcome::Returned { value: visible }
             }
-            98 => dispatch_threaded_futex(request, memory, reporter, futex, tid, registry),
+            98 => {
+                let hvpatch_linux_tid =
+                    if self.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch {
+                        let Ok(tid) = u32::try_from(kernel.thread().key().tid.raw()) else {
+                            return Some(Ok(DispatchOutcome::errno(LINUX_EINVAL)));
+                        };
+                        Some(tid)
+                    } else {
+                        None
+                    };
+                dispatch_threaded_futex(
+                    request,
+                    memory,
+                    reporter,
+                    futex,
+                    tid,
+                    registry,
+                    hvpatch_linux_tid,
+                )
+            }
             99 => {
                 // set_robust_list: len must equal sizeof(struct
                 // robust_list_head) (24); anything else → EINVAL (matches the
@@ -6398,6 +6417,7 @@ fn dispatch_threaded_futex(
     futex: &crate::thread::FutexTable,
     tid: crate::thread::ThreadId,
     registry: &crate::thread::ThreadRegistry,
+    hvpatch_linux_tid: Option<u32>,
 ) -> DispatchOutcome {
     let address = request.arg(0);
     let operation = request.arg(1);
@@ -6449,7 +6469,7 @@ fn dispatch_threaded_futex(
         command,
         LINUX_FUTEX_LOCK_PI | LINUX_FUTEX_TRYLOCK_PI | LINUX_FUTEX_UNLOCK_PI
     ) {
-        let Some(guest_tid) = guest_visible_tid(tid, registry) else {
+        let Some(guest_tid) = hvpatch_linux_tid.or_else(|| guest_visible_tid(tid, registry)) else {
             return DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             };
@@ -12327,6 +12347,7 @@ mod overlay_dispatch_tests {
             &futex,
             crate::thread::ThreadId::synthetic_for_tests(1001),
             &registry,
+            None,
         );
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
@@ -12359,6 +12380,7 @@ mod overlay_dispatch_tests {
             &futex,
             crate::thread::ThreadId::synthetic_for_tests(1001),
             &registry,
+            None,
         );
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
@@ -12420,6 +12442,7 @@ mod overlay_dispatch_tests {
             &futex,
             crate::thread::ThreadId::synthetic_for_tests(1001),
             &registry,
+            None,
         );
 
         assert_eq!(
@@ -12473,6 +12496,7 @@ mod overlay_dispatch_tests {
             &futex,
             crate::thread::ThreadId::synthetic_for_tests(1001),
             &registry,
+            None,
         );
 
         match outcome {
@@ -12930,6 +12954,53 @@ mod hvpatch_in_process_fork_tests {
             parent.fork_clone_in_process(parent_tid, child_tid, parent_guest_pid, child_guest_pid);
         *child.kernel_binding.write() = child_context.task_binding();
         (child, child_context)
+    }
+
+    #[test]
+    fn hvpatch_pi_futex_owner_uses_kernel_linux_tid() {
+        let mut parent = SyscallDispatcher::new();
+        parent.set_execution_backend(crate::page_profile::ExecutionBackend::HvPatch);
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let parent_tid = parent_context.thread().registry_id();
+        let child_registry_id = crate::thread::ThreadId::synthetic_for_tests(4101);
+        let (child, child_context) =
+            fork_dispatcher(&parent, parent_tid, child_registry_id, 41, 42);
+
+        // HVPatch's host-thread registry id is execution machinery, not the
+        // Linux-visible tid allocated by the authoritative kernel graph.
+        let transport_tid = crate::thread::ThreadId::synthetic_for_tests(9101);
+        let registry = crate::thread::ThreadRegistry::new(transport_tid);
+        let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+        let address = 0x10800;
+        write_u32(&mut memory, address, 0).unwrap();
+
+        let outcome = child
+            .dispatch_threaded(
+                &child_context,
+                SyscallRequest::new(
+                    98,
+                    SyscallArgs::from([
+                        address,
+                        LINUX_FUTEX_LOCK_PI | LINUX_FUTEX_PRIVATE_FLAG,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &CompatReporter::default(),
+                transport_tid,
+                &registry,
+                &crate::thread::FutexTable::new(),
+            )
+            .unwrap();
+
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        assert_eq!(
+            read_u32(&memory, address).unwrap(),
+            u32::try_from(child_context.thread().key().tid.raw()).unwrap()
+        );
     }
 
     #[test]
