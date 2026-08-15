@@ -70,6 +70,7 @@ struct LoadObservation {
     vaddr: u64,
     offset: usize,
     filesz: usize,
+    memsz: u64,
 }
 
 struct FileObservation {
@@ -271,6 +272,7 @@ fn parse_core(bytes: &[u8], executable: &[u8]) -> Option<CoreObservations> {
                     vaddr: read_u64(bytes, header + 16)?,
                     offset,
                     filesz,
+                    memsz: read_u64(bytes, header + 40)?,
                 });
             }
             _ => {}
@@ -664,6 +666,18 @@ fn main() {
                     == Some(FAULT_INSTRUCTION)
             })
         });
+        let pt_load_vmas_nonoverlapping = {
+            let mut ranges = parsed
+                .loads
+                .iter()
+                .filter(|load| load.memsz != 0)
+                .map(|load| load.vaddr.checked_add(load.memsz).map(|end| (load.vaddr, end)))
+                .collect::<Option<Vec<_>>>();
+            ranges.as_mut().is_some_and(|ranges| {
+                ranges.sort_unstable();
+                ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0)
+            })
+        };
         let stack_pointers_distinct = parsed.threads.len() == 3
             && parsed
                 .threads
@@ -754,6 +768,7 @@ fn main() {
             nonzero_offset_file_mapping_exact = nonzero_offset_file_mapping_exact,
             anonymous_exec_not_file_labeled = anonymous_exec_not_file_labeled,
             nt_file_symbolizer_truth = nt_file_symbolizer_truth,
+            pt_load_vmas_nonoverlapping = pt_load_vmas_nonoverlapping,
             auxv_present = parsed.auxv_entries > 0,
             private_cow_sample_present = private_sample,
             shared_sample_present = shared_sample,
