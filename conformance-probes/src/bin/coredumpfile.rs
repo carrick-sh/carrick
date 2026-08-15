@@ -15,6 +15,7 @@ const CHILD_ARG: &str = "--core-crash-child";
 const LIMIT_ZERO_ARG: &str = "--core-limit-zero";
 const LIMIT_SMALL_ARG: &str = "--core-limit-small";
 const EXPECT_NO_CORE_ARG: &str = "--expect-no-core";
+const ARCHIVE_CORE_ARG_PREFIX: &str = "--archive-core=";
 const PROBE_PATH: &str = "/tmp/p";
 const CORE_DIR: &str = "/tmp/coredumpfile";
 const MAPPED_PATH: &str = "/tmp/coredumpfile/mapped.bin";
@@ -374,18 +375,8 @@ unsafe fn fixed_mapping(address: usize, flags: i32, fd: i32, offset: libc::off_t
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn crash_child() -> ! {
-    let private = fixed_mapping(
-        PRIVATE_ADDR,
-        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-        -1,
-        0,
-    );
-    let shared = fixed_mapping(
-        SHARED_ADDR,
-        libc::MAP_SHARED | libc::MAP_ANONYMOUS,
-        -1,
-        0,
-    );
+    let private = fixed_mapping(PRIVATE_ADDR, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+    let shared = fixed_mapping(SHARED_ADDR, libc::MAP_SHARED | libc::MAP_ANONYMOUS, -1, 0);
     let anon_exec = fixed_mapping(
         ANON_EXEC_ADDR,
         libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
@@ -410,12 +401,7 @@ unsafe fn crash_child() -> ! {
         libc::_exit(122);
     }
     std::ptr::write_unaligned(anon_exec.cast::<u32>(), 0xd65f_03c0); // ret
-    if libc::mprotect(
-        anon_exec.cast(),
-        PAGE,
-        libc::PROT_READ | libc::PROT_EXEC,
-    ) != 0
-    {
+    if libc::mprotect(anon_exec.cast(), PAGE, libc::PROT_READ | libc::PROT_EXEC) != 0 {
         libc::_exit(128);
     }
     let crash_pid = libc::getpid();
@@ -444,16 +430,8 @@ unsafe fn crash_child() -> ! {
         libc::_exit(127);
     }
 
-    std::ptr::copy_nonoverlapping(
-        memory_marker(crash_pid, b'P').as_ptr(),
-        private,
-        SAMPLE_LEN,
-    );
-    std::ptr::copy_nonoverlapping(
-        memory_marker(crash_pid, b'F').as_ptr(),
-        file,
-        SAMPLE_LEN,
-    );
+    std::ptr::copy_nonoverlapping(memory_marker(crash_pid, b'P').as_ptr(), private, SAMPLE_LEN);
+    std::ptr::copy_nonoverlapping(memory_marker(crash_pid, b'F').as_ptr(), file, SAMPLE_LEN);
 
     let stack_marker = memory_marker(crash_pid, b'K');
     let heap_marker = Box::new(memory_marker(crash_pid, b'H'));
@@ -555,6 +533,9 @@ fn main() {
         64 * 1024 * 1024
     };
     let expect_no_core = arguments.iter().any(|arg| arg == EXPECT_NO_CORE_ARG);
+    let archive_core = arguments
+        .iter()
+        .find_map(|arg| arg.strip_prefix(ARCHIVE_CORE_ARG_PREFIX));
 
     unsafe {
         let _ = std::fs::remove_dir_all(CORE_DIR);
@@ -588,6 +569,11 @@ fn main() {
             .as_ref()
             .and_then(|path| std::fs::read(path).ok())
             .unwrap_or_default();
+        if let Some(archive_path) = archive_core {
+            if std::fs::write(archive_path, &core_bytes).is_err() {
+                std::process::exit(129);
+            }
+        }
         if requested_limit != 64 * 1024 * 1024 || expect_no_core {
             let no_temporary = std::fs::read_dir(CORE_DIR).is_ok_and(|entries| {
                 entries.flatten().all(|entry| {
@@ -661,14 +647,11 @@ fn main() {
                 && mapping.path == MAPPED_PATH
         });
         let anonymous_exec_not_file_labeled = parsed.file_mappings.iter().all(|mapping| {
-            ANON_EXEC_ADDR as u64 >= mapping.end
-                || (ANON_EXEC_ADDR + PAGE) as u64 <= mapping.start
+            ANON_EXEC_ADDR as u64 >= mapping.end || (ANON_EXEC_ADDR + PAGE) as u64 <= mapping.start
         });
         let nt_file_symbolizer_truth = parsed.threads.first().is_some_and(|crash| {
             parsed.file_mappings.iter().any(|mapping| {
-                if mapping.path != PROBE_PATH
-                    || crash.pc < mapping.start
-                    || crash.pc >= mapping.end
+                if mapping.path != PROBE_PATH || crash.pc < mapping.start || crash.pc >= mapping.end
                 {
                     return false;
                 }
