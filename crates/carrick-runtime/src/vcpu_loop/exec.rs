@@ -420,6 +420,29 @@ where
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::SiblingDrain,
                     sibling_drain_started,
                 );
+                // Every HVPatch exec loser retires its exact authoritative
+                // Kernel thread while the runtime drain waits above. That
+                // advances the task revision, so the syscall-entry context is
+                // deliberately stale by the time only the survivor remains.
+                // Re-capture that survivor before preparing the Kernel exec;
+                // using the pre-drain revision makes every multi-threaded exec
+                // fail closed as a foreign context.
+                let refreshed_hvpatch_context = match kernel.hvpatch_process.as_ref() {
+                    Some(process) => match process.context_for_linux_tid(self.linux_tid) {
+                        Ok(context) => Some(context),
+                        Err(error) => {
+                            return Self::exec_failed_past_no_return(
+                                kernel,
+                                engine,
+                                &format!("capture authoritative Kernel exec survivor: {error}"),
+                            )
+                            .map(Some);
+                        }
+                    },
+                    None => None,
+                };
+                let exec_kernel_context =
+                    refreshed_hvpatch_context.as_ref().unwrap_or(kernel_context);
                 // Kernel preparation follows the runtime sibling drain (whose
                 // exiting host loops retire their own old Kernel threads) but
                 // precedes every destructive image, CLOEXEC, and proc-state
@@ -427,11 +450,11 @@ where
                 // sole owner of nonleader promotion and replacement Mm state.
                 let prepared_kernel_exec = match kernel.hvpatch_process.as_ref() {
                     Some(process) => process
-                        .prepare_exec(kernel_context)
+                        .prepare_exec(exec_kernel_context)
                         .map(RuntimePreparedExec::Hvpatch),
                     None => kernel
                         .dispatcher
-                        .prepare_one_task_kernel_exec(kernel_context)
+                        .prepare_one_task_kernel_exec(exec_kernel_context)
                         .map(RuntimePreparedExec::Other),
                 };
                 let mut prepared_kernel_exec = match prepared_kernel_exec {
@@ -558,7 +581,7 @@ where
                     .set_executable_identity(path.clone(), proc_argv, proc_env);
                 kernel
                     .dispatcher
-                    .reset_signal_handlers_on_execve(kernel_context);
+                    .reset_signal_handlers_on_execve(exec_kernel_context);
                 // Reset + refresh /proc/self/maps and /proc/self/auxv under one
                 // dispatcher memory-authority generation. The historical MM
                 // retains the pre-staging snapshot, but records this deliberate
