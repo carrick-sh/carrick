@@ -12,21 +12,27 @@
 # stdlib path on BOTH Docker and carrick, so the two sides run byte-identical
 # test code by construction.
 #
-# Build:  docker build --build-arg CPYTHON_VERSION=3.12.13 -t cpython-test:3.12.13 docker/cpython-test
+# Build:  docker build --platform linux/arm64 -t cpython-test:3.12.13 docker/cpython-test
 # Then push to carrick's registry so `carrick run` can pull it:
 #         docker tag  cpython-test:3.12.13 localhost:5050/cpython-test:3.12.13
 #         docker push localhost:5050/cpython-test:3.12.13
-FROM python:3.12
-
-# Pin to the interpreter's exact version (must equal `python3 --version` of the
-# base image) so the test code matches the runtime it exercises.
 ARG CPYTHON_VERSION=3.12.13
+# The lane's oracle is canonical linux/arm64. Pin the architecture-specific
+# official image manifest as well as the version so a moving convenience tag
+# cannot silently change libc/userspace underneath the declared suites.
+FROM python:${CPYTHON_VERSION}@sha256:1cdca4a722dc7efb5f63c002a0bcf458e99cb1cbbe04d92493438f24642ba700
 
-# Docker's ADD fetches the URL at build time — the network access is sandboxed in
-# the build, not run on the host, and the layer is content-addressed/cached.
-ADD https://github.com/python/cpython/archive/refs/tags/v${CPYTHON_VERSION}.tar.gz /tmp/cpython-src.tgz
+ARG CPYTHON_VERSION
+
+# Docker's ADD fetches the release archive at build time. The checksum binds the
+# baked Lib/test tree to the exact upstream v3.12.13 source bytes rather than
+# trusting a mutable URL or the build cache.
+ADD --checksum=sha256:ae96425e4b395ea2ebf1c1753ffa71ccdbbc0f715bd675646f5188ca5c8c7609 \
+    https://github.com/python/cpython/archive/refs/tags/v${CPYTHON_VERSION}.tar.gz \
+    /tmp/cpython-src.tgz
 
 RUN set -eux; \
+    test "$(python3 --version)" = "Python ${CPYTHON_VERSION}"; \
     py_lib="$(python3 -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')"; \
     tar -xzf /tmp/cpython-src.tgz -C /tmp "cpython-${CPYTHON_VERSION}/Lib/test"; \
     rm -rf "${py_lib}/test"; \
