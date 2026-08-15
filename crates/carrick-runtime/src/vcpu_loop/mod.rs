@@ -5535,6 +5535,31 @@ mod tests {
     }
 
     #[test]
+    fn clone_admission_cancels_enrolled_process_fork_before_exec_drain() {
+        let gate = CloneAdmissionGate::default();
+        let owner = ThreadId::synthetic_for_tests(1003);
+        let process_fork = gate.try_enroll().expect("process fork admission");
+
+        std::thread::scope(|scope| {
+            let exec = scope.spawn(|| gate.close_for_exec(owner));
+            while !process_fork.is_cancelled() {
+                std::thread::yield_now();
+            }
+            assert!(
+                gate.try_enroll().is_none(),
+                "new process forks must be rejected after exec closes admission"
+            );
+            drop(process_fork);
+            drop(
+                exec.join()
+                    .expect("exec closer")
+                    .expect("exec admission drain"),
+            );
+        });
+        assert!(gate.try_enroll().is_some());
+    }
+
+    #[test]
     fn timed_wait_reclaim_releases_vcpu_for_long_or_indefinite_waits() {
         assert!(should_reclaim_vcpu_for_timed_wait(None));
         assert!(should_reclaim_vcpu_for_timed_wait(Some(
