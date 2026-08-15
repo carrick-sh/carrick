@@ -1580,6 +1580,30 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_binding_preserves_launch_fs_context() {
+        let (process, _root) = authoritative_root();
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.set_cwd("/launch/workdir");
+        dispatcher
+            .capture_one_task_context()
+            .expect("launch context")
+            .resources()
+            .fs_context()
+            .set_chroot_root(Some("/launch/root".to_owned()));
+
+        dispatcher.bind_hvpatch_process(process);
+
+        let rebound = dispatcher
+            .capture_one_task_context()
+            .expect("HVPatch root context");
+        assert_eq!(rebound.resources().fs_context().cwd(), "/launch/workdir");
+        assert_eq!(
+            rebound.resources().fs_context().chroot_root().as_deref(),
+            Some("/launch/root")
+        );
+    }
+
+    #[test]
     fn process_timer_delivery_targets_only_the_exact_hvpatch_task() {
         let (parent, root) = authoritative_root();
         let prepared_mm = parent.mm_resources().prepare_child().unwrap();
