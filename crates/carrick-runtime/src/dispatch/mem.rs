@@ -421,13 +421,16 @@ fn validate_mlock_range(
     range: crate::vfs::GuestMemoryRange,
     populate: bool,
     page_size: u64,
+    committed_vma_covers_range: bool,
 ) -> Result<(), LinuxErrno> {
     let len = range_len_usize(range)?;
-    if memory.has_complete_mapping_metadata()
-        && memory
-            .protections()
-            .is_some_and(|protections| !protections.range_unmapped(range.start().raw(), len))
+    if memory
+        .protections()
+        .is_some_and(|protections| protections.range_unmapped(range.start().raw(), len))
     {
+        return Err(LINUX_ENOMEM);
+    }
+    if committed_vma_covers_range || memory.has_complete_mapping_metadata() {
         return Ok(());
     }
     if !populate && memory.host_ptr_for_read(range.start().raw(), len).is_some() {
@@ -582,6 +585,26 @@ fn guest_vma_overlaps_locked(mem: &MemState, start: u64, len: u64) -> bool {
                 && start < map.end
                 && !boot_region_is_hidden_reservation(map, mem.layout)
         })
+}
+
+fn guest_vma_covers_locked(mem: &MemState, start: u64, len: u64) -> bool {
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+    let mut cursor = start;
+    for vma in project_vma_summaries(mem) {
+        if vma.end.raw() <= cursor {
+            continue;
+        }
+        if vma.start.raw() > cursor {
+            return false;
+        }
+        cursor = cursor.max(vma.end.raw());
+        if cursor >= end {
+            return true;
+        }
+    }
+    false
 }
 
 fn boot_region_is_hidden_mmap_backing(map: &ProcMapsEntry, layout: MemoryLayout) -> bool {
@@ -3686,7 +3709,18 @@ impl SyscallDispatcher {
             let Some(range) = page_rounded_range(address, length, page_size)? else {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             };
-            validate_mlock_range(&mut *cx.memory, range, true, page_size)?;
+            let committed_vma_covers_range = guest_vma_covers_locked(
+                &this.mem.lock(),
+                range.start().raw(),
+                range.len(),
+            );
+            validate_mlock_range(
+                &mut *cx.memory,
+                range,
+                true,
+                page_size,
+                committed_vma_covers_range,
+            )?;
             this.populate_resident_range(&mut *cx.memory, range)?;
             this.add_locked_range(range)?;
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -3698,7 +3732,18 @@ impl SyscallDispatcher {
             let Some(range) = page_rounded_range(address, length, page_size)? else {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             };
-            validate_mlock_range(&mut *cx.memory, range, false, page_size)?;
+            let committed_vma_covers_range = guest_vma_covers_locked(
+                &this.mem.lock(),
+                range.start().raw(),
+                range.len(),
+            );
+            validate_mlock_range(
+                &mut *cx.memory,
+                range,
+                false,
+                page_size,
+                committed_vma_covers_range,
+            )?;
             this.remove_locked_range(range);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -3740,11 +3785,17 @@ impl SyscallDispatcher {
             let Some(range) = page_rounded_range(address, length, page_size)? else {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             };
+            let committed_vma_covers_range = guest_vma_covers_locked(
+                &this.mem.lock(),
+                range.start().raw(),
+                range.len(),
+            );
             validate_mlock_range(
                 &mut *cx.memory,
                 range,
                 !flags.contains(LinuxMlock2Flags::ONFAULT),
                 page_size,
+                committed_vma_covers_range,
             )?;
             if !flags.contains(LinuxMlock2Flags::ONFAULT) {
                 this.populate_resident_range(&mut *cx.memory, range)?;
@@ -5393,6 +5444,10 @@ mod tests {
         inner: CountingMmapMemory,
     }
 
+    struct LazyResidentMemory {
+        protect_calls: usize,
+    }
+
     struct DeferredSetterFailureMemory {
         inner: CountingMmapMemory,
         pending_failure: bool,
@@ -5502,6 +5557,29 @@ mod tests {
             _prot: u64,
         ) -> Result<(), MemoryError> {
             Err(MemoryError::Unsupported)
+        }
+    }
+
+    impl GuestMemory for LazyResidentMemory {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OutOfBounds { address, length })
+        }
+
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            Err(MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            })
+        }
+
+        fn protect_range(
+            &mut self,
+            _address: u64,
+            _len: usize,
+            _prot: u64,
+        ) -> Result<(), MemoryError> {
+            self.protect_calls += 1;
+            Ok(())
         }
     }
 
@@ -9929,6 +10007,39 @@ mod tests {
     }
 
     #[test]
+    fn committed_vma_coverage_rejects_holes_and_accepts_adjacent_mappings() {
+        let dispatcher = SyscallDispatcher::new();
+        let base = LINUX_MMAP_BASE;
+        for start in [base, base + 2 * LINUX_PAGE_SIZE] {
+            dispatcher.record_dynamic_mapping(
+                start,
+                LINUX_PAGE_SIZE,
+                LinuxProtFlags::READ,
+                ProcMapSharing::Private,
+                String::new(),
+            );
+        }
+        assert!(!guest_vma_covers_locked(
+            &dispatcher.mem.lock(),
+            base,
+            3 * LINUX_PAGE_SIZE,
+        ));
+
+        dispatcher.record_dynamic_mapping(
+            base + LINUX_PAGE_SIZE,
+            LINUX_PAGE_SIZE,
+            LinuxProtFlags::READ,
+            ProcMapSharing::Private,
+            String::new(),
+        );
+        assert!(guest_vma_covers_locked(
+            &dispatcher.mem.lock(),
+            base,
+            3 * LINUX_PAGE_SIZE,
+        ));
+    }
+
+    #[test]
     fn trim_dynamic_maps_preserves_sorted_order_without_full_resort() {
         let mut maps = vec![
             ProcMapsEntry {
@@ -9989,6 +10100,47 @@ mod tests {
             dispatcher.mincore_residency_vector(&memory, base, 2, LINUX_PAGE_SIZE),
             Some(vec![1, 0]),
             "only the populated page becomes resident"
+        );
+    }
+
+    #[test]
+    fn eager_mlock_uses_committed_vma_metadata_before_lazy_backing_is_resident() {
+        const SYS_MLOCK2: u64 = 284;
+
+        let base = LINUX_MMAP_BASE;
+        let length = 2 * LINUX_PAGE_SIZE;
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.record_dynamic_mapping(
+            base,
+            length,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+            ProcMapSharing::Shared,
+            String::new(),
+        );
+        dispatcher.track_resident_fault_range(
+            base,
+            length,
+            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+        );
+        let reporter = CompatReporter::default();
+        let mut memory = LazyResidentMemory { protect_calls: 0 };
+        let kernel = dispatcher
+            .capture_one_task_context()
+            .expect("single task context");
+
+        let outcome = dispatcher
+            .dispatch(
+                &kernel,
+                SyscallRequest::new(SYS_MLOCK2, SyscallArgs([base, length, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .expect("mlock2 dispatch");
+
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        assert_eq!(
+            memory.protect_calls, 1,
+            "eager mlock must make the lazy range resident"
         );
     }
 
