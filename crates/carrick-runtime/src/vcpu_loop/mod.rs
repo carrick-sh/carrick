@@ -795,6 +795,17 @@ struct FatalSignalRecord {
     addr: u64,
 }
 
+fn core_note_resume_pair(
+    registers: &carrick_hal::Aarch64CoreRegisters,
+    synchronous_fatal_owner: bool,
+) -> (u64, u64) {
+    if synchronous_fatal_owner {
+        (registers.elr_el1, registers.spsr_el1)
+    } else {
+        (registers.resume_pc, registers.resume_pstate)
+    }
+}
+
 #[derive(Debug)]
 struct FatalSignalState {
     image_generation: u64,
@@ -1791,10 +1802,16 @@ where
                     let mut gregs = [0_u64; crate::core_dump::AARCH64_GREGS];
                     gregs[..31].copy_from_slice(&registers.gprs);
                     gregs[31] = registers.sp_el0;
-                    // ELR/SPSR are the authoritative EL0 resume pair at a trap;
-                    // retain PC/PSTATE separately in Kernel authority above.
-                    gregs[32] = registers.elr_el1;
-                    gregs[33] = registers.spsr_el1;
+                    // The engine selects live PC/PSTATE for a vCPU force-exited
+                    // directly from EL0, or saved ELR/SPSR while a syscall is
+                    // parked in EL1. A synchronous fatal owner is independently
+                    // identified by its positive kernel si_code and uses the raw
+                    // exception ELR/SPSR pair. Raw pairs remain in Kernel authority.
+                    let synchronous_fatal_owner = thread.key().tid == fatal.tid && fatal.code > 0;
+                    let (resume_pc, resume_pstate) =
+                        core_note_resume_pair(&registers, synchronous_fatal_owner);
+                    gregs[32] = resume_pc;
+                    gregs[33] = resume_pstate;
                     collected.push(crate::core_dump::ThreadState {
                         tid: thread.key().tid.raw(),
                         registers: crate::core_dump::ThreadRegisters {
@@ -5131,6 +5148,27 @@ mod tests {
             fatal_for_terminal_owner(Some(fatal), 1, other, Some(11)),
             None,
             "a losing fatal thread cannot core-dump the winning owner"
+        );
+    }
+
+    #[test]
+    fn core_note_uses_exception_pair_only_for_synchronous_fatal_owner() {
+        let registers = carrick_hal::Aarch64CoreRegisters {
+            resume_pc: 0x1111,
+            resume_pstate: 0x2222,
+            elr_el1: 0x3333,
+            spsr_el1: 0x4444,
+            ..carrick_hal::Aarch64CoreRegisters::default()
+        };
+        assert_eq!(
+            core_note_resume_pair(&registers, false),
+            (0x1111, 0x2222),
+            "running and syscall-blocked siblings use the engine-selected EL0 pair"
+        );
+        assert_eq!(
+            core_note_resume_pair(&registers, true),
+            (0x3333, 0x4444),
+            "a positive si_code binds the fatal owner to the synchronous exception pair"
         );
     }
 
