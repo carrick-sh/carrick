@@ -4,6 +4,10 @@ This is an **integration and resume checkpoint**, not a Task 6 completion
 claim. HVPatch remains opt-in, `baseline.hvpatch.jsonl` is not blessed, and the
 default backend remains `native`.
 
+Policy update after this checkpoint: HVPatch is the sole forward lane.
+Regressions in the retired `native`/DSR and `vmm` lanes are explicitly accepted
+and do not block integration; their results are historical context only.
+
 ## Exact source checkpoint
 
 - branch: `codex/hybrid-kernel`
@@ -176,8 +180,7 @@ Before a partial, opt-in checkpoint is fast-forwarded to `main`:
 2. run exact evidence-HEAD `RUST_TEST_THREADS=1 just ci`;
 3. retain the source-identical implementation-HEAD 400/400 signed receipt
    above; rebuild only if the evidence commit changes executable inputs;
-4. run a shipped-default/native smoke gate on the evidence HEAD;
-5. preserve the main checkout's dirty `hybrid.md` patch and verify the branch
+4. preserve the main checkout's dirty `hybrid.md` patch and verify the branch
    controller is its exact semantic superset;
-6. fast-forward only after explicit user approval, then rerun CI on merged
+5. fast-forward only after explicit user approval, then rerun CI on merged
    `main`.
