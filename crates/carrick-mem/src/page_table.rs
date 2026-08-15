@@ -524,8 +524,8 @@ impl PageTableManager {
         self.translate_with_invalid_leaf(va, false)
     }
 
-    /// Resolve the output address retained in a leaf whose valid bit may have
-    /// been cleared by `munmap`/`PROT_NONE` publication.
+    /// Resolve the output address retained in a block/page whose valid bit may
+    /// have been cleared by `munmap`/`PROT_NONE` publication.
     ///
     /// The guest MMU must never use an invalid descriptor, so ordinary access
     /// routes through [`Self::translate`]. Backing maintenance is different: a
@@ -548,8 +548,26 @@ impl PageTableManager {
             }
             let desc = self.read_desc(off);
             if desc & VALID == 0 {
-                return (allow_invalid_leaf && level == 3 && desc & PA_MASK_4KIB != 0)
-                    .then_some((desc & PA_MASK_4KIB) | (va & 0xFFF));
+                if !allow_invalid_leaf {
+                    return None;
+                }
+                // Protection invalidation edits the terminal descriptor in
+                // place, so a coarse L1/L2 alias retains its non-identity PA
+                // just like an L3 page.  The cleared TYPE_BLOCK valid bit
+                // leaves type 0b00; the walk level therefore supplies the
+                // output mask/span.  Interior table descriptors are never
+                // invalidated by `apply`, so a non-zero address here is an
+                // authenticated retained terminal output, not a table pointer.
+                return match level {
+                    1 if desc & PA_MASK_1GIB != 0 => {
+                        Some((desc & PA_MASK_1GIB) | (va & ((1u64 << 30) - 1)))
+                    }
+                    2 if desc & PA_MASK_2MIB != 0 => {
+                        Some((desc & PA_MASK_2MIB) | (va & ((1u64 << 21) - 1)))
+                    }
+                    3 if desc & PA_MASK_4KIB != 0 => Some((desc & PA_MASK_4KIB) | (va & 0xFFF)),
+                    _ => None,
+                };
             }
             let is_table_or_page = desc & TYPE_BITS == TYPE_TABLE_OR_PAGE;
             if level == 3 {
@@ -1089,6 +1107,32 @@ impl PageTableManager {
         self.map_aliased_with_flags(va, ipa, len, block_flags, page_flags)
     }
 
+    /// Build a per-mm VA→IPA translation whose TLB entries are ASID-scoped.
+    ///
+    /// HVPatch uses this for private demand-materialized mmap extents. Their
+    /// output lives in a VM-global IPA arena, but the semantic translation is
+    /// owned by exactly one mm and must therefore carry nG from its first
+    /// publication. Shared aliases keep using [`Self::map_aliased`].
+    pub fn map_private_aliased(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+        writable: bool,
+    ) -> Result<bool, PageTableError> {
+        let block_flags = if writable {
+            USER_BLOCK_FLAGS | NON_GLOBAL
+        } else {
+            (USER_BLOCK_FLAGS & !AP_MASK) | AP_RO | NON_GLOBAL
+        };
+        let page_flags = if writable {
+            USER_PAGE_FLAGS | NON_GLOBAL
+        } else {
+            (USER_PAGE_FLAGS & !AP_MASK) | AP_RO | NON_GLOBAL
+        };
+        self.map_aliased_with_flags(va, ipa, len, block_flags, page_flags)
+    }
+
     /// Repoint an EL1-only Carrick control-page range while preserving the
     /// kernel-hole execution regime: AP=00, UXN=1, PXN=0. Using the ordinary
     /// user alias flags here sets PXN and makes the entry trampoline/vector
@@ -1284,8 +1328,9 @@ impl PageTableManager {
 mod tests {
     use super::*;
     use crate::memory::{
-        LINUX_ALIAS_IPA_BASE, LINUX_HEAP_BASE, LINUX_HIGH_VA_THRESHOLD, LINUX_MMAP_BASE,
-        LINUX_PAGE_TABLES_BASE, LINUX_PRIVATE_OVERLAY_BASE, LINUX_SHARED_FILE_BASE,
+        LINUX_ALIAS_IPA_BASE, LINUX_HEAP_BASE, LINUX_HIGH_VA_THRESHOLD,
+        LINUX_HVPATCH_GLOBAL_FRAME_BASE, LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE,
+        LINUX_PRIVATE_OVERLAY_BASE, LINUX_SHARED_FILE_BASE, mmap_arena_size,
         stage1_identity_page_tables,
     };
 
@@ -1621,6 +1666,70 @@ mod tests {
         assert_eq!(mgr.translate(va + 0x123), None);
         assert_eq!(mgr.translate_retained_output(va + 0x123), Some(ipa + 0x123));
         assert_eq!(mgr.debug_walk(va)[3] & VALID, 0);
+    }
+
+    #[test]
+    fn retained_output_resolves_invalidated_aligned_alias_block() {
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
+        let mut mgr = manager();
+        let va = LINUX_HIGH_VA_THRESHOLD + 2 * TWO_MIB;
+        let ipa = LINUX_ALIAS_IPA_BASE + 4 * TWO_MIB;
+        mgr.map_aliased(va, ipa, TWO_MIB, false)
+            .expect("map aligned block");
+        mgr.invalidate(va, TWO_MIB as usize)
+            .expect("invalidate aligned block");
+
+        let probe = va + 0x12_345;
+        assert_eq!(mgr.translate(probe), None);
+        assert_eq!(
+            mgr.translate_retained_output(probe),
+            Some(ipa + (probe - va)),
+            "an invalidated L2 alias must retain its exact non-identity output"
+        );
+        assert_eq!(terminal_descriptor(mgr.debug_walk(probe)) & VALID, 0);
+    }
+
+    #[test]
+    fn sparse_arena_materializes_only_exact_private_extent() {
+        let mut mgr = manager();
+        mgr.set_prot_none(LINUX_MMAP_BASE, mmap_arena_size() as usize)
+            .expect("reserve sparse arena");
+
+        let va = LINUX_MMAP_BASE + 0x41_000;
+        let ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x81_000;
+        let len = 0x23_000;
+        mgr.map_private_aliased(va, ipa, len, false)
+            .expect("install exact private output");
+        assert_ne!(
+            terminal_descriptor(mgr.debug_walk(va)) & NON_GLOBAL,
+            0,
+            "a per-mm sparse output must be ASID scoped before publication"
+        );
+        mgr.set_prot_none(va, len as usize)
+            .expect("keep new output inaccessible until VMA commit");
+
+        assert_eq!(mgr.translate(va), None);
+        assert_eq!(mgr.translate_retained_output(va), Some(ipa));
+        assert_eq!(
+            mgr.translate_retained_output(va + len - 1),
+            Some(ipa + len - 1)
+        );
+        assert_eq!(
+            mgr.translate_retained_output(va - 1),
+            None,
+            "the uncommitted arena prefix must remain physically absent"
+        );
+        assert_eq!(
+            mgr.translate_retained_output(va + len),
+            None,
+            "the uncommitted arena suffix must remain physically absent"
+        );
+
+        mgr.set_rw(va, len as usize, false)
+            .expect("publish exact VMA writable");
+        assert_eq!(mgr.translate(va + 0x12_345), Some(ipa + 0x12_345));
+        assert_eq!(mgr.translate(va - 1), None);
+        assert_eq!(mgr.translate(va + len), None);
     }
 
     #[test]

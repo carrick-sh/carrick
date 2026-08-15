@@ -4357,7 +4357,16 @@ impl SyscallDispatcher {
                 && !this.range_has_host_alias_backing(address.0, length))
             .then(|| this.mremap_mapping_metadata(cx.memory, address.0, length).ok())
             .flatten();
-            let incomplete_backend_says_unmapped = !cx.memory.has_complete_mapping_metadata()
+            // A committed kernel VMA can deliberately precede physical
+            // backing: HVPatch's low sparse arena and the existing high-alias
+            // reservation both materialize on the first accessible
+            // protection. Raw backing is therefore only a hole oracle when
+            // neither complete backend metadata nor committed VMA metadata
+            // covers the request. Explicit post-munmap state still wins above.
+            let committed_vma_covers_range =
+                guest_vma_covers_locked(&this.mem.lock(), address.0, length);
+            let incomplete_backend_says_unmapped = !committed_vma_covers_range
+                && !cx.memory.has_complete_mapping_metadata()
                 && cx.memory.read_bytes_raw(address.0, 1).is_err();
             if metadata_says_unmapped
                 || lazy_alias_reservation.is_some()
@@ -4491,7 +4500,14 @@ impl SyscallDispatcher {
             // The shared/overlay apertures and high-VA aliases keep
             // host-side checks only (unchanged).
             if range_within(address.0, length, layout.mmap_base, layout.mmap_size) {
-                if cx.memory.protect_range(address.0, len, prot).is_err() {
+                if let Err(error) = cx.memory.protect_range(address.0, len, prot) {
+                    tracing::error!(
+                        address = address.0,
+                        length,
+                        prot,
+                        %error,
+                        "mprotect failed to publish mmap-arena protection"
+                    );
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 // THE SECOND MARK POINT. `mmap` is the first: together they are
@@ -11381,6 +11397,51 @@ mod tests {
             .commit_host_alias_install(install)
             .expect("publish successful lazy host-alias install");
         assert!(dispatcher.range_has_host_alias_backing(address, LINUX_PAGE_SIZE));
+    }
+
+    #[test]
+    fn committed_low_vma_can_materialize_before_raw_backing_exists() {
+        const SYS_MPROTECT: u64 = 226;
+        let address = LINUX_MMAP_BASE + 0x20_0000;
+        let mut dispatcher = SyscallDispatcher::new();
+        // Model HVPatch's sparse low arena: the kernel VMA is committed, while
+        // the backend raw read correctly fails until protect_range performs the
+        // demand materialization.
+        dispatcher.record_dynamic_mapping(
+            address,
+            LINUX_PAGE_SIZE,
+            LinuxProtFlags::empty(),
+            ProcMapSharing::Private,
+            String::new(),
+        );
+        let mut memory = CountingMmapMemory::new(LINUX_HEAP_BASE, LINUX_PAGE_SIZE as usize);
+        let reporter = CompatReporter::default();
+
+        let outcome = dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    SYS_MPROTECT,
+                    SyscallArgs([
+                        address,
+                        LINUX_PAGE_SIZE,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("mprotect dispatch");
+
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        assert_eq!(
+            memory.protect_calls.get(),
+            1,
+            "committed VMA authority must reach sparse backend materialization"
+        );
     }
 
     #[test]
