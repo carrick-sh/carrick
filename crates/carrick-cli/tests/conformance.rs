@@ -2033,7 +2033,10 @@ fn lane_allowed_for_native_host(lane: &Lane, host_arch: &str) -> bool {
 }
 
 fn lane_allowed_for_backend(lane: &Lane, exec_backend: Option<&str>) -> bool {
-    exec_backend != Some("native") || lane_allowed_for_native_host(lane, std::env::consts::ARCH)
+    match exec_backend {
+        Some("native" | "hvpatch") => lane_allowed_for_native_host(lane, std::env::consts::ARCH),
+        _ => true,
+    }
 }
 
 /// Whether a probe set's DIFFs should fail the gate ON THIS HOST. A probe set is
@@ -3729,7 +3732,7 @@ fn conformance_probes() {
     for lane in LANES {
         if !lane_allowed_for_backend(lane, requested_exec_backend.as_deref()) {
             eprintln!(
-                "SKIP conformance_probes[{}]: exec backend {} only supports same-ISA arm64 guests",
+                "SKIP conformance_probes[{}]: exec backend {} only supports the host-matching guest ISA",
                 lane.label,
                 requested_exec_backend.as_deref().unwrap_or("default")
             );
@@ -4820,6 +4823,8 @@ fn native_probe_campaign_selects_only_same_isa_lane() {
     assert!(!lane_allowed_for_native_host(&AMD64, "aarch64"));
     assert!(lane_allowed_for_native_host(&AMD64, "x86_64"));
     assert!(!lane_allowed_for_native_host(&ARM64, "x86_64"));
+    assert!(lane_allowed_for_backend(&ARM64, Some("hvpatch")));
+    assert!(!lane_allowed_for_backend(&AMD64, Some("hvpatch")));
     assert!(lane_allowed_for_backend(&ARM64, Some("vmm")));
     assert!(lane_allowed_for_backend(&AMD64, None));
 }
