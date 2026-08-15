@@ -675,11 +675,12 @@ impl PageTableManager {
     }
 
     /// If every one of a table's 512 entries is a valid leaf of `child_type`
-    /// with contiguous identity PA (`child_pa_mask`/`child_stride`) and IDENTICAL
-    /// attributes — i.e. the table is exactly equivalent to one coarse block —
-    /// return `(base_pa, attrs)` for that block. Otherwise `None` (don't
-    /// coalesce). The strict equality is what makes coalescing safe: the block
-    /// we write maps precisely what the table did.
+    /// with contiguous PA (`child_pa_mask`/`child_stride`), a base aligned for
+    /// the parent block, and IDENTICAL attributes — i.e. the table is exactly
+    /// equivalent to one coarse block — return `(base_pa, attrs)` for that
+    /// block. Otherwise `None` (don't coalesce). The strict equality and parent
+    /// alignment are what make coalescing safe: the block we write maps
+    /// precisely what the table did.
     fn uniform_block(
         &self,
         table_off: usize,
@@ -692,6 +693,10 @@ impl PageTableManager {
             return None;
         }
         let base_pa = e0 & child_pa_mask;
+        let parent_span = child_stride.checked_mul(512)?;
+        if !base_pa.is_multiple_of(parent_span) {
+            return None;
+        }
         let attrs = e0 & !child_pa_mask & !TYPE_BITS;
         for i in 0..512u64 {
             let d = self.read_desc(table_off + (i as usize) * 8);
@@ -1577,6 +1582,32 @@ mod tests {
         assert_eq!(mgr.translate(va + 0x3000 + 0x10), Some(ipa + 0x3000 + 0x10));
         // One page past the mapping is unmapped.
         assert_eq!(mgr.translate(va + len), None);
+    }
+
+    #[test]
+    fn readonly_does_not_coalesce_an_unaligned_physical_alias() {
+        // The merged Go tool image begins at VA 0x10000 and its HVPatch frame
+        // may begin at IPA ...014000. The mapping has a constant +0x4000
+        // VA-to-IPA delta, so a uniform 2 MiB run of read-only L3 leaves is not
+        // representable as an aligned L2 block. Coalescing it masks off that
+        // delta and makes Go read unrelated bytes from .gopclntab.
+        let mut mgr = manager();
+        let va = 0x1_0000;
+        let ipa = crate::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x1_4000;
+        let len = 0xc1_0000;
+        let probe = 0x80_e280;
+
+        mgr.map_aliased(va, ipa, len, true).expect("map image");
+        let expected = ipa + (probe - va);
+        assert_eq!(mgr.translate(probe), Some(expected));
+
+        mgr.set_readonly(0x5a_0000, 0x5d_4000, false)
+            .expect("apply ELF rodata protection");
+        assert_eq!(
+            mgr.translate(probe),
+            Some(expected),
+            "read-only coalescing must preserve a non-block-aligned IPA delta"
+        );
     }
 
     #[test]
