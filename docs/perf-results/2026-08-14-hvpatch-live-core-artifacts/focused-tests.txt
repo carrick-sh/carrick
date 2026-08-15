@@ -1,18 +1,19 @@
-Focused tests at implementation commit 2a84f4cb:
+Focused review-round tests at code HEAD 67f722761
 
-cargo test -p carrick-cli hvpatch_core_profile: 5 passed
-cargo test -p carrick-cli debug_core: 4 passed
-RUST_TEST_THREADS=1 cargo test -p carrick-runtime core_dump --lib: 9 passed
-RUST_TEST_THREADS=1 cargo test -p carrick-runtime core_publication --lib: 3 passed
-RUST_TEST_THREADS=1 cargo test -p carrick-runtime fatal_core_authority --lib: 1 passed
+cargo test -p carrick-cli hvpatch_core_profile: 6 passed
+cargo test -p carrick-cli debug_core: 6 passed
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime core_dump --lib: 11 passed
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime core_publication --lib: 4 passed
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime fatal_core_authority --lib: 2 passed
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime file_mapping --lib: 1 passed
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime durability_reopen --lib: 1 passed
+cargo test -p carrick-aarch64 core_register_capture_rejects_disabled_fpsimd_authority: 1 passed
+cargo test -p carrick-mem file_mapping: 1 passed
 cargo test -p carrick-vmm-hvf guest_copy_mapping --lib: 1 passed
 
-All commands exited 0.
+The fatal authority test uses a deterministic barrier: the stale fatal participant
+is released only after successful exec rebinding, must lose, and the current image
+then records the fatal state used by the later signed crash/core differential.
 
-Final VMA-authority RED/green at validated HEAD 0b076654:
-
-RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib dispatch::mem::tests::guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges -- --exact: RED 0 passed, 1 failed; GREEN 1 passed
-RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib vma_: 11 passed
-RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib mem_authority_: 3 passed
-
-Fresh RUST_TEST_THREADS=1 just ci exited 0 at validated HEAD.
+All commands exited 0. The full just ci receipt is recorded after the evidence
+commit so it tests the exact review handoff.

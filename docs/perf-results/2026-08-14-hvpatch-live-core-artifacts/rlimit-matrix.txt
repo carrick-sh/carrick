@@ -1,18 +1,23 @@
-Final signed RLIMIT_CORE matrix
+Final signed RLIMIT_CORE matrix (review round 1)
 
---core-limit-zero  run=task5-final-rlimit-zero
+zero|task5-round1-final-rlimit-zero|PASS|command=0|cleanup=0
 limit_zero_mode=true
+limit_too_small_mode=false
 requested_limit_applied=true
+reaped=true
+child_died_of_sigsegv=true
 wcoredump_clear=true
 no_published_core=true
 no_temporary_core=true
-status=0 cleanup=0
 
---core-limit-small run=task5-final-rlimit-small limit=4096
-failure=core readable regions require at least 11332377 bytes, exceeding RLIMIT_CORE 4096
+small|task5-round1-final-rlimit-small|PASS|command=0|cleanup=0
+limit_zero_mode=false
 limit_too_small_mode=true
 requested_limit_applied=true
+reaped=true
+child_died_of_sigsegv=true
 wcoredump_clear=true
 no_published_core=true
 no_temporary_core=true
-status=0 cleanup=0
+
+2/2 PASS.

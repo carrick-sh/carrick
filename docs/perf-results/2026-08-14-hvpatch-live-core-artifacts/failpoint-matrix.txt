@@ -1,23 +1,25 @@
-Final signed binary fail-closed matrix
+Final signed binary fail-closed matrix (review round 1)
 command shape: CARRICK_CORE_FAILPOINT=<name> target/release/carrick run --exec-backend hvpatch ... /tmp/p --expect-no-core
-common result per row: guest status=0, wcoredump_clear=true, no_published_core=true, no_temporary_core=true, scoped cleanup=0
+common result per row: command=0, guest parent completed, wcoredump_clear=true, no_published_core=true, no_temporary_core=true, scoped cleanup=0
 
-capture-timeout          task5-final-fp-capture-timeout-1          PASS
-capture-interrupted      task5-final-fp-capture-interrupted-1      PASS
-capture-registers        task5-final-fp-capture-registers-1        PASS
-register-generation      task5-final-fp-register-generation-1      PASS (generation 1 missing tid 5; bounded 10 s)
-missing-thread           task5-final-fp-missing-thread-1           PASS
-capture-mm               task5-final-fp-capture-mm-1               PASS
-missing-auxv             task5-final-fp-missing-auxv-1             PASS
-missing-vma              task5-final-fp-missing-vma-1              PASS
-memory-read              task5-final-fp-memory-read-1              PASS
-missing-file-identity    task5-final-fp-missing-file-identity-1    PASS
-validator                task5-final-fp-validator-1                PASS
-before-create            task5-final-fp-before-create-1            PASS
-unwritable-path          task5-final-fp-unwritable-path-1          PASS
-short-write              task5-final-fp-short-write-1              PASS
-fsync                    task5-final-fp-fsync-1                    PASS
-rename                   task5-final-fp-rename-1                   PASS
-post-publication         task5-final-fp-post-publication-1         PASS
+capture-timeout          task5-round1-final-capture-timeout          PASS
+capture-interrupted      task5-round1-final-capture-interrupted      PASS
+capture-registers        task5-round1-final-capture-registers        PASS
+register-generation      task5-round1-final-register-generation      PASS
+missing-thread           task5-round1-final-missing-thread           PASS
+capture-mm               task5-round1-final-capture-mm               PASS
+missing-auxv             task5-round1-final-missing-auxv             PASS
+missing-vma              task5-round1-final-missing-vma              PASS
+memory-read              task5-round1-final-memory-read              PASS
+missing-file-identity    task5-round1-final-missing-file-identity    PASS
+validator                task5-round1-final-validator                PASS
+sibling-drain            task5-round1-final-sibling-drain            PASS
+before-create            task5-round1-final-before-create            PASS
+unwritable-path          task5-round1-final-unwritable-path          PASS
+short-write              task5-round1-final-short-write              PASS
+fsync                    task5-round1-final-fsync                    PASS
+rename                   task5-round1-final-rename                   PASS
+post-publication         task5-round1-final-post-publication         PASS
+wait-commit              task5-round1-final-wait-commit              PASS
 
-17/17 PASS; all 17 cleanup receipts reported remaining carrick procs = 0.
+19/19 PASS on first measured attempt; all 19 scoped cleanup receipts were zero.

@@ -1,17 +1,15 @@
-validated_head=0b076654c1ad66624657268d3c7d2541514e6d31
-implementation_commit=2a84f4cb5a5f318f129aab761ea5d763c8b6f93e
-base=ec55da029009821215bb6ecb1c3b846364b7ca05
-signed_binary_sha256=a59a2e711c47eb127f5aacece202181ea96228770ef1106b967e1608812144e8
-signed_binary_uuid=2440CE07-746B-378A-8CAA-533E393176F9
-signed_binary_arch=arm64
-entitlement.com.apple.security.hypervisor=true
-codesign_valid_on_disk=true
-codesign_designated_requirement=true
-dof_section=__TEXT,__dof_carrick
-probe_binary_sha256=140554b5782e570bdab27f59e9bac459db8de0afee9efa82776dfbcc055fe03d
-dtrace_script_sha256=f6c6e44cceb6e18653901cb52c603007da4fc49ec044c2be645087532948b7d8
-core_sha256=a643fbc2d3d258fa6db99abd5ff3dda85dbcd2effa3c309f9d376a1c7aa8c7ef
-raw_receipt_sha256=abec059e3a82e1a2aede6248409433ad8555f629c22e12af1e2e9661c94ce188
-receipt_embedded_core_sha256=a643fbc2d3d258fa6db99abd5ff3dda85dbcd2effa3c309f9d376a1c7aa8c7ef
-ci_command=RUST_TEST_THREADS=1 just ci
-ci_exit=0
+Final signed Task 5 review-round provenance
+HEAD=67f7227613e82fa8ebbb160ed276325819383de9
+1614190db25abf74a1123c5e4b57334aaf384c4f54d94f302e98f1ca5f597199  target/release/carrick
+16825b23f3bc3dc4ae1f1646391a4403b42f43062637f4474a5790675069dd4f  conformance-probes/target/aarch64-unknown-linux-musl/release/coredumpfile
+9d15b22d1aaed5b54eb3fd361df801dbf5d094024f5b72fe2423ec5827321d7d  scripts/dtrace/hvpatch-core-lifecycle.d
+0e040266fac5bb2b2001d60e49cb737636a0f60619d86b4cee1491c70b0f5af7  docs/perf-results/2026-08-14-hvpatch-live-core-artifacts/coredumpfile.core
+fdbc23e3f35f6123363012d8875ede2e35a37beb8b3e57a5c842c2f2e86fbd5c  docs/perf-results/2026-08-14-hvpatch-live-core-artifacts/hvpatch-core-lifecycle.raw
+UUID: 368A4393-463C-3897-A7A2-8BA180495BD4 (arm64) target/release/carrick
+target/release/carrick: Mach-O 64-bit executable arm64
+target/release/carrick: valid on disk
+target/release/carrick: satisfies its Designated Requirement
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>
+Section
+  sectname __dof_carrick
+   segname __TEXT
