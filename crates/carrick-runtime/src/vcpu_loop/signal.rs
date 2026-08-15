@@ -239,6 +239,7 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
     context: &crate::kernel::KernelContext,
     engine: &mut E,
     this_tid: ThreadId,
+    fatal_image_generation: u64,
     mut signum: i32,
     mut si_code: i32,
     si_addr: u64,
@@ -291,6 +292,7 @@ pub(super) fn deliver_fault_signal<E: ThreadedEngine>(
             forked_child_die_by_signal(signum, &out, &err);
         }
         kernel.record_fatal_signal(super::FatalSignalRecord {
+            image_generation: fatal_image_generation,
             tid: context.thread().key().tid,
             signo: signum,
             code: si_code,

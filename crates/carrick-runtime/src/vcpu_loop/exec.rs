@@ -781,6 +781,15 @@ where
                     )
                     .map(Some);
                 }
+                self.fatal_image_generation = kernel
+                    .fatal_signal
+                    .rebind_after_exec(self.fatal_image_generation)
+                    .unwrap_or_else(|| {
+                        tracing::error!(
+                            "committed exec could not rebind fatal-signal image authority"
+                        );
+                        std::process::abort();
+                    });
                 emit_runtime_stage(
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::Publication,
                     publication_started,
