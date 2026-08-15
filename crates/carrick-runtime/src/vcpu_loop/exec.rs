@@ -21,6 +21,24 @@ fn word_at(bytes: &[u8], offset: usize) -> Option<u32> {
         .map(u32::from_le_bytes)
 }
 
+fn exec_regions_to_verify_with_mappings<'a>(
+    image: &'a AddressSpace,
+    file_mappings: &'a [crate::memory::AddressSpaceFileMapping],
+) -> impl Iterator<Item = &'a crate::memory::MemoryRegion> {
+    image.regions().iter().filter(move |region| {
+        region.perms.execute
+            || file_mappings
+                .iter()
+                .any(|mapping| mapping.start < region.end && mapping.end > region.start)
+    })
+}
+
+fn exec_regions_to_verify(
+    image: &AddressSpace,
+) -> impl Iterator<Item = &crate::memory::MemoryRegion> {
+    exec_regions_to_verify_with_mappings(image, image.file_mappings())
+}
+
 fn apply_exec_inventory<E>(
     old_mm: crate::kernel::MmId,
     replacement_mm: crate::kernel::MmId,
@@ -114,12 +132,15 @@ fn hvpatch_exec_inventory_failure_injection(
     parse_hvpatch_exec_inventory_failure_injection(&configured, path)
 }
 
-/// Fail-closed, opt-in proof that the image Carrick prepared for `execve` is
-/// the image its freshly rebuilt engine exposes before the vCPU re-enters the
-/// guest.  This deliberately reads through `ThreadedEngine::read_bytes`, the
-/// same mapping-ledger path used by the fatal-fault recorder.  It therefore
-/// distinguishes an already-wrong exec publication from corruption that only
-/// appears after another process reuses the stage-2 bank.
+/// Fail-closed, opt-in proof that the immutable program image Carrick prepared
+/// for `execve` is the image its freshly rebuilt engine exposes before the vCPU
+/// re-enters the guest. This deliberately reads through
+/// `ThreadedEngine::read_bytes`, the same mapping-ledger path used by the
+/// fatal-fault recorder. It therefore distinguishes an already-wrong exec
+/// publication from corruption that only appears after another process reuses
+/// the stage-2 bank. Mutable runtime regions (page tables, vvar, identity page,
+/// and syscall mailboxes) are deliberately excluded; executable runtime code
+/// and every ELF file-backed segment remain covered.
 fn verify_published_exec_image<E: ThreadedEngine>(
     engine: &E,
     image: &AddressSpace,
@@ -127,7 +148,7 @@ fn verify_published_exec_image<E: ThreadedEngine>(
 ) -> Result<(), RuntimeError> {
     const CHUNK_SIZE: usize = 64 * 1024;
 
-    for region in image.regions().iter().filter(|region| region.perms.execute) {
+    for region in exec_regions_to_verify(image) {
         let expected = region.bytes();
         for offset in (0..expected.len()).step_by(CHUNK_SIZE) {
             let end = offset.saturating_add(CHUNK_SIZE).min(expected.len());
@@ -160,9 +181,53 @@ fn verify_published_exec_image<E: ThreadedEngine>(
 #[cfg(test)]
 mod exec_image_verification_tests {
     use super::{
-        HvpatchExecInventoryFailureInjection, apply_exec_inventory, first_byte_mismatch,
+        HvpatchExecInventoryFailureInjection, apply_exec_inventory,
+        exec_regions_to_verify_with_mappings, first_byte_mismatch,
         parse_hvpatch_exec_inventory_failure_injection, should_update_host_process_title,
     };
+
+    #[test]
+    fn hvpatch_exec_verifier_covers_initialized_data_as_well_as_code() {
+        let image = crate::memory::AddressSpace::from_segments(
+            0x1_0000,
+            [
+                (
+                    0x1_0000,
+                    crate::elf::SegmentPerms {
+                        read: true,
+                        write: false,
+                        execute: true,
+                    },
+                    vec![0xaa],
+                    0x1000,
+                ),
+                (
+                    0x2_0000,
+                    crate::elf::SegmentPerms {
+                        read: true,
+                        write: true,
+                        execute: false,
+                    },
+                    vec![0xbb],
+                    0x1000,
+                ),
+            ],
+        )
+        .unwrap();
+        let data_mapping = crate::memory::AddressSpaceFileMapping {
+            start: 0x2_0000,
+            end: 0x2_1000,
+            file_page_offset: 0,
+            path: "/bin/static".to_owned(),
+        };
+
+        assert_eq!(
+            exec_regions_to_verify_with_mappings(&image, &[data_mapping])
+                .map(|region| region.start)
+                .collect::<Vec<_>>(),
+            vec![0x1_0000, 0x2_0000]
+        );
+    }
 
     #[test]
     fn hvpatch_exec_failure_injection_requires_known_point_and_absolute_target() {
