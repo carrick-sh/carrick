@@ -1720,6 +1720,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     fn aarch64_core_registers(
         &self,
     ) -> Result<Option<carrick_hal::Aarch64CoreRegisters>, TrapError> {
+        require_core_fpsimd_authority(self.vm.fpsimd_enabled())?;
         let snapshot = self.vcpu.snapshot()?;
         Ok(Some(carrick_hal::Aarch64CoreRegisters {
             gprs: snapshot.gprs,
@@ -2317,6 +2318,17 @@ fn diagnostic_resume_pc(pending_resume_pc: Option<u64>, live_pc: u64) -> u64 {
     pending_resume_pc.unwrap_or(live_pc)
 }
 
+fn require_core_fpsimd_authority(enabled: bool) -> Result<(), TrapError> {
+    if enabled {
+        Ok(())
+    } else {
+        Err(TrapError::Hypervisor(
+            "complete AArch64 core registers require live FP/SIMD capture; CARRICK_NO_FPSIMD disables that authority"
+                .to_owned(),
+        ))
+    }
+}
+
 /// Recover the original patched `svc #0` address from an HvPatch island. At a
 /// host-dispatched syscall the pending resume PC addresses the island's return
 /// branch (`svc` is the preceding word); the branch target is original-svc+4.
@@ -2623,6 +2635,14 @@ mod tests {
             None,
             "the instruction after svc must be an immediate branch"
         );
+    }
+
+    #[test]
+    fn core_register_capture_rejects_disabled_fpsimd_authority() {
+        let error = require_core_fpsimd_authority(false)
+            .expect_err("zero-fabricated FP/SIMD state cannot be complete core authority");
+        assert!(error.to_string().contains("FP/SIMD"));
+        assert!(require_core_fpsimd_authority(true).is_ok());
     }
 
     #[test]

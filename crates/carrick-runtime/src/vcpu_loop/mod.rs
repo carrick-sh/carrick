@@ -788,18 +788,81 @@ struct ExecCloneAdmission<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FatalSignalRecord {
+    image_generation: u64,
     tid: crate::kernel::LinuxTid,
     signo: i32,
     code: i32,
     addr: u64,
 }
 
+#[derive(Debug)]
+struct FatalSignalState {
+    image_generation: u64,
+    recorded: Option<FatalSignalRecord>,
+}
+
+impl Default for FatalSignalState {
+    fn default() -> Self {
+        Self {
+            image_generation: 1,
+            recorded: None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct FatalSignalAuthority(Mutex<FatalSignalState>);
+
+impl FatalSignalAuthority {
+    fn current_generation(&self) -> u64 {
+        self.0.lock().image_generation
+    }
+
+    /// Rebind write-once fatal authority to the replacement exec image.  The
+    /// expected generation prevents a stale exec owner from clearing a newer
+    /// image's fatal record.
+    fn rebind_after_exec(&self, expected_generation: u64) -> Option<u64> {
+        let mut state = self.0.lock();
+        if state.image_generation != expected_generation {
+            return None;
+        }
+        let next = state.image_generation.checked_add(1)?;
+        state.image_generation = next;
+        state.recorded = None;
+        Some(next)
+    }
+
+    /// Publish at most one fatal record for the image generation that produced
+    /// it. A pre-exec loser that arrives after the replacement is committed is
+    /// rejected rather than poisoning the new image's later crash authority.
+    fn record(&self, record: FatalSignalRecord) -> bool {
+        let mut state = self.0.lock();
+        if state.image_generation != record.image_generation || state.recorded.is_some() {
+            return false;
+        }
+        state.recorded = Some(record);
+        true
+    }
+
+    fn recorded_for(&self, image_generation: u64) -> Option<FatalSignalRecord> {
+        let state = self.0.lock();
+        (state.image_generation == image_generation)
+            .then_some(state.recorded)
+            .flatten()
+    }
+}
+
 fn fatal_for_terminal_owner(
     recorded: Option<FatalSignalRecord>,
+    image_generation: u64,
     owner: crate::kernel::LinuxTid,
     terminating_signal: Option<i32>,
 ) -> Option<FatalSignalRecord> {
-    recorded.filter(|fatal| fatal.tid == owner && terminating_signal == Some(fatal.signo))
+    recorded.filter(|fatal| {
+        fatal.image_generation == image_generation
+            && fatal.tid == owner
+            && terminating_signal == Some(fatal.signo)
+    })
 }
 
 impl Drop for ExecCloneAdmission<'_> {
@@ -860,7 +923,7 @@ pub(crate) struct KernelState {
     /// teardown. The main loop consumes it after sibling-driven exit_group.
     process_terminal: Mutex<Option<Result<RunResult, ()>>>,
     process_terminal_ready: Condvar,
-    fatal_signal: Mutex<Option<FatalSignalRecord>>,
+    fatal_signal: FatalSignalAuthority,
 }
 
 impl KernelState {
@@ -898,15 +961,12 @@ impl KernelState {
             child_exit_signal,
             process_terminal: Mutex::new(None),
             process_terminal_ready: Condvar::new(),
-            fatal_signal: Mutex::new(None),
+            fatal_signal: FatalSignalAuthority::default(),
         }
     }
 
     fn record_fatal_signal(&self, record: FatalSignalRecord) {
-        let mut fatal = self.fatal_signal.lock();
-        if fatal.is_none() {
-            *fatal = Some(record);
-        }
+        let _ = self.fatal_signal.record(record);
     }
 
     pub(crate) fn register_hvpatch_runtime_endpoint(
@@ -1317,6 +1377,9 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// Guest-visible identity allocated in the kernel namespace. It is never
     /// inferred from the backend-local thread registry key.
     linux_tid: crate::kernel::LinuxTid,
+    /// Image generation that owns fatal-signal publication for this loop. It
+    /// changes only after a successful exec has crossed every fallible edge.
+    fatal_image_generation: u64,
     /// Exact authority captured at the current syscall boundary. Lifecycle
     /// outcomes consume it rather than recapturing a newer registry generation.
     service_kernel_context: Option<crate::kernel::KernelContext>,
@@ -1432,6 +1495,7 @@ where
         crash_capture_generation: Option<Arc<std::sync::atomic::AtomicU64>>,
         kernel_thread: Option<crate::kernel::ThreadRef>,
         linux_tid: crate::kernel::LinuxTid,
+        fatal_image_generation: u64,
         this_tid: ThreadId,
         threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
         kicker: Arc<dyn VcpuRegistry>,
@@ -1447,6 +1511,7 @@ where
             crash_capture_generation,
             kernel_thread,
             linux_tid,
+            fatal_image_generation,
             service_kernel_context: None,
             this_tid,
             threads,
@@ -3423,6 +3488,7 @@ where
         kernel.crash_capture_generation.clone(),
         kernel_thread,
         linux_tid,
+        kernel.fatal_signal.current_generation(),
         this_tid,
         threads,
         kicker,
@@ -3583,6 +3649,7 @@ where
                         &signal_context,
                         &mut engine,
                         state.this_tid,
+                        state.fatal_image_generation,
                         None,
                         Some(pc),
                         traps,
@@ -3710,6 +3777,7 @@ where
                             &fault_context,
                             &mut engine,
                             state.this_tid,
+                            state.fatal_image_generation,
                             signum,
                             si_code,
                             si_addr,
@@ -3735,6 +3803,7 @@ where
                             forked_child_die_by_signal(11, &out, &err);
                         }
                         kernel.record_fatal_signal(FatalSignalRecord {
+                            image_generation: state.fatal_image_generation,
                             tid: state.linux_tid,
                             signo: crate::linux_abi::LINUX_SIGSEGV,
                             code: 0,
@@ -3780,6 +3849,7 @@ where
                         &fault_context,
                         &mut engine,
                         state.this_tid,
+                        state.fatal_image_generation,
                         signum,
                         si_code,
                         fault_addr,
@@ -4306,6 +4376,7 @@ where
                 signal_context,
                 &mut engine,
                 state.this_tid,
+                state.fatal_image_generation,
                 last_syscall_retval,
                 signal_interrupted_pc,
                 traps,
@@ -4356,7 +4427,10 @@ where
                 Ok(VcpuLoopOutcome::TrapLimit(_) | VcpuLoopOutcome::ThreadDone) | Err(_) => None,
             };
             let fatal_signal = fatal_for_terminal_owner(
-                *kernel.fatal_signal.lock(),
+                kernel
+                    .fatal_signal
+                    .recorded_for(state.fatal_image_generation),
+                state.fatal_image_generation,
                 state.linux_tid,
                 terminating_signal,
             );
@@ -4758,6 +4832,7 @@ fn service_signals_threaded<E: ThreadedEngine>(
     context: &crate::kernel::KernelContext,
     engine: &mut E,
     this_tid: ThreadId,
+    fatal_image_generation: u64,
     last_syscall_retval: Option<i64>,
     interrupted_pc: Option<u64>,
     traps: usize,
@@ -4801,6 +4876,7 @@ fn service_signals_threaded<E: ThreadedEngine>(
                     forked_child_die_by_signal(signum, &out, &err);
                 }
                 kernel.record_fatal_signal(FatalSignalRecord {
+                    image_generation: fatal_image_generation,
                     tid: context.thread().key().tid,
                     signo: signum,
                     code: 0,
@@ -4850,22 +4926,67 @@ mod tests {
         let context = alias_context(67_104);
         let owner = context.thread().key().tid;
         let fatal = FatalSignalRecord {
+            image_generation: 1,
             tid: owner,
             signo: 11,
             code: 1,
             addr: 0,
         };
         assert_eq!(
-            fatal_for_terminal_owner(Some(fatal), owner, Some(11)),
+            fatal_for_terminal_owner(Some(fatal), 1, owner, Some(11)),
             Some(fatal)
         );
-        assert_eq!(fatal_for_terminal_owner(Some(fatal), owner, None), None);
+        assert_eq!(fatal_for_terminal_owner(Some(fatal), 1, owner, None), None);
 
         let other = alias_context(67_105).thread().key().tid;
         assert_eq!(
-            fatal_for_terminal_owner(Some(fatal), other, Some(11)),
+            fatal_for_terminal_owner(Some(fatal), 1, other, Some(11)),
             None,
             "a losing fatal thread cannot core-dump the winning owner"
+        );
+    }
+
+    #[test]
+    fn fatal_core_authority_rebinds_at_exec_and_rejects_late_old_image_signal() {
+        let context = alias_context(67_106);
+        let owner = context.thread().key().tid;
+        let authority = FatalSignalAuthority::default();
+        let old_image = authority.current_generation();
+        let old_fatal = FatalSignalRecord {
+            image_generation: old_image,
+            tid: owner,
+            signo: 11,
+            code: 1,
+            addr: 0xfeed,
+        };
+        assert!(authority.record(old_fatal));
+
+        let replacement_image = authority
+            .rebind_after_exec(old_image)
+            .expect("current exec generation rebinds");
+        assert_ne!(replacement_image, old_image);
+        assert_eq!(authority.recorded_for(replacement_image), None);
+        assert!(
+            !authority.record(old_fatal),
+            "a losing pre-exec fatal race must not poison replacement-image authority"
+        );
+
+        let replacement_fatal = FatalSignalRecord {
+            image_generation: replacement_image,
+            tid: owner,
+            signo: 6,
+            code: 0,
+            addr: 0,
+        };
+        assert!(authority.record(replacement_fatal));
+        assert_eq!(
+            fatal_for_terminal_owner(
+                authority.recorded_for(replacement_image),
+                replacement_image,
+                owner,
+                Some(6),
+            ),
+            Some(replacement_fatal)
         );
     }
 
