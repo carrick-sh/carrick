@@ -4005,6 +4005,20 @@ where
                 DispatchOutcome::Returned { value } => {
                     last_syscall_retval = Some(state.complete_returned(&mut engine, value)?);
                 }
+                DispatchOutcome::SchedulerYield => {
+                    // Preserve Linux's runnable-thread semantics under a
+                    // bounded M:N backend: surrender the scarce vCPU lease to
+                    // an already-queued guest before competing to reacquire it.
+                    // `park_vcpu_for_blocking_wait` is a no-op for unbounded
+                    // backends, retaining their historical host-only yield.
+                    let reclaim = state.park_vcpu_for_blocking_wait(
+                        &mut engine,
+                        crate::thread::VcpuParkClass::ReleaseSafe,
+                    );
+                    std::thread::yield_now();
+                    state.resume_vcpu_after_blocking_wait(&mut engine, reclaim)?;
+                    last_syscall_retval = Some(state.complete_returned(&mut engine, 0)?);
+                }
                 DispatchOutcome::Errno { errno } => {
                     last_syscall_retval = Some(state.complete_errno(&mut engine, errno)?);
                 }

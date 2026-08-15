@@ -1176,6 +1176,11 @@ where
                 runtime.complete_syscall(value)?;
                 last_syscall_retval = Some(value);
             }
+            DispatchOutcome::SchedulerYield => {
+                std::thread::yield_now();
+                runtime.complete_syscall(0)?;
+                last_syscall_retval = Some(0);
+            }
             DispatchOutcome::Errno { errno } => {
                 let value = errno.guest_retval();
                 runtime.complete_syscall(value)?;
