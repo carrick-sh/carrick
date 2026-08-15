@@ -1290,6 +1290,58 @@ fn unregister_alias_entries(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retained_private_reuse_alias_fragment(
+    registry: &[AliasBacking],
+    va: u64,
+    ipa: u64,
+    len: usize,
+    mm_root_slot: Option<(u64, u64)>,
+) -> Option<AliasBacking> {
+    if len == 0 {
+        return None;
+    }
+    let end = va.checked_add(len as u64)?;
+    let ipa_end = ipa.checked_add(len as u64)?;
+    // An existing semantic fragment is already an exact lifetime owner. Do not
+    // replace a wider entry with this one-page reuse observation.
+    if registry.iter().any(|entry| {
+        alias_matches_process_scope(entry.ownership_scope, mm_root_slot)
+            && va >= entry.start
+            && end <= entry.start.saturating_add(entry.size as u64)
+            && entry.ipa.checked_add(va.saturating_sub(entry.start)) == Some(ipa)
+    }) {
+        return None;
+    }
+
+    let source = registry.iter().rev().find(|entry| {
+        entry.sharing == GuestMappingSharing::Private
+            && alias_matches_process_scope(entry.ownership_scope, mm_root_slot)
+            && ipa >= entry.physical_ipa
+            && ipa_end
+                <= entry
+                    .physical_ipa
+                    .saturating_add(entry.physical_size as u64)
+    })?;
+    let physical_offset = usize::try_from(ipa.checked_sub(source.physical_ipa)?).ok()?;
+    Some(AliasBacking {
+        start: va,
+        ipa,
+        host_addr: source.physical_host_addr.checked_add(physical_offset)?,
+        size: len,
+        physical_ipa: source.physical_ipa,
+        physical_host_addr: source.physical_host_addr,
+        physical_size: source.physical_size,
+        perms: source.perms,
+        guest_writable: true,
+        sharing: GuestMappingSharing::Private,
+        ownership_scope: alias_ownership_scope(GuestMappingSharing::Private, mm_root_slot),
+        inventory_backing: source.inventory_backing,
+        shared_key_base: 0,
+        shared_key_offset: 0,
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn retired_alias_disarm_spans(
     registry: &[AliasBacking],
     va: u64,
@@ -8068,6 +8120,20 @@ impl HvfVmState {
                 .lock()
                 .as_ref()
                 .and_then(|manager| manager.translate_retained_output(chunk_va));
+            // A partial munmap can carve this 4 KiB Linux page out of a live
+            // 16 KiB private frame while preserving the invalid leaf's output
+            // IPA. Reusing that page does not pass through `add_alias`, so
+            // republish its semantic lifetime edge before a later sibling
+            // munmap is allowed to retire the containing stage-2 lease.
+            let retained_fragment = retained_ipa.and_then(|ipa| {
+                retained_private_reuse_alias_fragment(
+                    &alias_registry().lock(),
+                    chunk_va,
+                    ipa,
+                    chunk_len,
+                    self.mm_root_slot,
+                )
+            });
             let target = retained_ipa
                 .and_then(|ipa| {
                     self.mapping_for_live_ipa_range(chunk_va, ipa, chunk_len)
@@ -8089,6 +8155,9 @@ impl HvfVmState {
             };
             unsafe {
                 core::ptr::write_bytes(target, 0u8, chunk_len);
+            }
+            if let Some(fragment) = retained_fragment {
+                register_shared_alias(fragment);
             }
             cleared += chunk_len;
         }
@@ -14426,8 +14495,9 @@ mod tag_strip_tests {
         current_dynamic_alias_ipas, forget_replay_extent, inherited_fork_inventory_extents,
         lookup_shared_alias, mapping_is_current_for_process_fork, missing_process_aliases,
         next_vdso_rng_generation, reapply_global_exec_readonly_spans,
-        rebind_inherited_alias_to_process, register_shared_alias, retired_alias_disarm_spans,
-        strip_pointer_tag, unregister_alias,
+        rebind_inherited_alias_to_process, register_shared_alias,
+        retained_private_reuse_alias_fragment, retired_alias_disarm_spans, strip_pointer_tag,
+        unregister_alias, unregister_alias_entries,
     };
 
     #[test]
@@ -15015,6 +15085,67 @@ mod tag_strip_tests {
             unregister_alias(va, 0xc000, None),
             std::collections::BTreeSet::from([(ipa, 0xc000)]),
             "the last semantic fragment retires the exact physical lease"
+        );
+    }
+
+    #[test]
+    fn retained_private_reuse_republishes_semantic_fragment_before_sibling_unmap() {
+        let va = 0x1383_0800_0000;
+        let physical_ipa = carrick_mem::memory::LINUX_ALIAS_IPA_BASE + 0x7c80_0000;
+        let root_slot = (
+            carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE,
+            2 * 1024 * 1024,
+        );
+        let scope = AliasOwnershipScope::MmRootSlot {
+            base: root_slot.0,
+            size: root_slot.1,
+        };
+        // A prior partial munmap carved the second Linux page out of this
+        // still-live 16 KiB private frame. The first page is the remaining
+        // semantic owner; the invalid second leaf retains its output IPA for
+        // low-arena same-VA reuse.
+        let prefix = AliasBacking {
+            start: va,
+            ipa: physical_ipa,
+            host_addr: 0x4234_0000,
+            size: 0x1000,
+            physical_ipa,
+            physical_host_addr: 0x4234_0000,
+            physical_size: 0x4000,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: scope,
+            inventory_backing: InventoryBackingIdentity::Private(46),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+        };
+        let mut registry = vec![prefix];
+
+        let reused = retained_private_reuse_alias_fragment(
+            &registry,
+            va + 0x1000,
+            physical_ipa + 0x1000,
+            0x1000,
+            Some(root_slot),
+        )
+        .expect("reused Linux page must regain semantic lifetime ownership");
+        assert_eq!(reused.start, va + 0x1000);
+        assert_eq!(reused.ipa, physical_ipa + 0x1000);
+        assert_eq!(reused.host_addr, prefix.physical_host_addr + 0x1000);
+        assert_eq!(reused.size, 0x1000);
+        assert_eq!(reused.physical_ipa, physical_ipa);
+        registry.push(reused);
+
+        assert!(
+            unregister_alias_entries(&mut registry, va, 0x1000, Some(root_slot)).is_empty(),
+            "unmapping the old sibling must retain the frame owned by the reused page",
+        );
+        assert_eq!(registry, vec![reused]);
+        assert_eq!(
+            unregister_alias_entries(&mut registry, va + 0x1000, 0x1000, Some(root_slot),),
+            std::collections::BTreeSet::from([(physical_ipa, 0x4000)]),
+            "the physical lease retires only after the reused page is also unmapped",
         );
     }
 
