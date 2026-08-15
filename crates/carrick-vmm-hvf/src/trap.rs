@@ -4264,6 +4264,30 @@ struct GlobalExecPlan {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn reapply_global_exec_readonly_spans(
+    page_tables: &mut crate::page_table::PageTableManager,
+    ro_spans: &[carrick_mem::elf::RoSpan],
+) -> Result<(), TrapError> {
+    for span in ro_spans {
+        let len = usize::try_from(span.len).map_err(|_| {
+            TrapError::Hypervisor(format!(
+                "HVPatch exec read-only span at 0x{:x} is too large: {}",
+                span.start, span.len
+            ))
+        })?;
+        page_tables
+            .set_readonly(span.start, len, span.exec)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "restore HVPatch exec read-only span at 0x{:x}: {error:?}",
+                    span.start
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Default)]
 struct GlobalFrameOwnerRollback {
     keys: Vec<(u64, u64)>,
@@ -10505,6 +10529,12 @@ impl HvfVmState {
                 ))
             })?;
         }
+        // The loader deliberately merges overlapping PT_LOAD regions into one
+        // writable mapping for the HVF stage-2 backing. Re-aliasing that merged
+        // region above therefore grants write at every stage-1 leaf. Restore the
+        // loader's page-granular non-writable PT_LOAD spans after the rebase;
+        // set_readonly edits attributes in place and preserves each aliased IPA.
+        reapply_global_exec_readonly_spans(&mut page_tables, &global.ro_spans)?;
         for mapping in &global.mappings {
             if page_tables.translate(mapping.guest_start) != Some(mapping.ipa_start) {
                 return Err(TrapError::Hypervisor(format!(
@@ -14315,8 +14345,8 @@ mod tag_strip_tests {
         alias_is_owned_by_process, alias_matches_process_scope, alias_registry,
         current_dynamic_alias_ipas, forget_replay_extent, inherited_fork_inventory_extents,
         lookup_shared_alias, mapping_is_current_for_process_fork, missing_process_aliases,
-        rebind_inherited_alias_to_process, register_shared_alias, retired_alias_disarm_spans,
-        strip_pointer_tag, unregister_alias,
+        reapply_global_exec_readonly_spans, rebind_inherited_alias_to_process,
+        register_shared_alias, retired_alias_disarm_spans, strip_pointer_tag, unregister_alias,
     };
 
     #[test]
@@ -14344,6 +14374,49 @@ mod tag_strip_tests {
             cloned_plan.mappings[0].image.as_ptr(),
             plan.mappings[0].image.as_ptr(),
             "mapping-plan clones must share immutable image bytes"
+        );
+    }
+
+    #[test]
+    fn global_exec_readonly_spans_preserve_rebased_ipa() {
+        let va = 0x20_0000;
+        let ipa = 0x5000_0000;
+        let mut tables = carrick_mem::page_table::PageTableManager::new(
+            carrick_mem::memory::stage1_identity_page_tables(),
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        );
+        tables
+            .map_aliased(va, ipa, 0x20_000, true)
+            .expect("rebase merged writable load region");
+
+        reapply_global_exec_readonly_spans(
+            &mut tables,
+            &[carrick_mem::elf::RoSpan {
+                start: va + 0x4000,
+                len: 0x2000,
+                exec: false,
+            }],
+        )
+        .expect("restore PT_LOAD protection");
+
+        assert_eq!(tables.translate(va + 0x4000), Some(ipa + 0x4000));
+        assert!(
+            !tables
+                .set_readonly(va + 0x4000, 0x1000, false)
+                .expect("span is already read-only"),
+            "reapplying the same read-only protection must be a no-op"
+        );
+        assert!(
+            !tables
+                .set_rw(va + 0x3000, 0x1000, true)
+                .expect("prefix remains writable"),
+            "the page before the span must retain the merged mapping's RWX attributes"
+        );
+        assert!(
+            !tables
+                .set_rw(va + 0x6000, 0x1000, true)
+                .expect("suffix remains writable"),
+            "the page after the span must retain the merged mapping's RWX attributes"
         );
     }
 
