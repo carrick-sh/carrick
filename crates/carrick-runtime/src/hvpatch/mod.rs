@@ -367,15 +367,33 @@ impl ProcessContext {
             })
     }
 
-    pub(crate) fn wait_until_job_control_resumed(&self) {
+    pub(crate) fn wait_until_job_control_resumed(&self) -> bool {
         if let Some(task) = self
             .kernel_graph()
             .registry()
             .task(self.task_id())
             .filter(|task| task.key() == self.task_key())
         {
-            task.wait_until_job_control_resumed();
+            task.wait_until_job_control_resumed()
+        } else {
+            false
         }
+    }
+
+    pub(crate) fn stop_for_ptrace_signal(&self, signum: i32) -> bool {
+        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
+            return false;
+        };
+        self.kernel_graph()
+            .stop_task_for_ptrace(self.task_id(), signal)
+    }
+
+    pub(crate) fn consume_ptrace_resume_signal(&self, signum: i32) -> bool {
+        let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
+            return false;
+        };
+        self.kernel_graph()
+            .consume_ptrace_resume_signal(self.task_id(), signal)
     }
 
     pub(crate) fn kernel_graph(&self) -> &std::sync::Arc<crate::kernel::Kernel> {

@@ -3663,7 +3663,32 @@ where
             // SIGKILL clears the task state and notifies this wait before its
             // pending action is delivered.
             if let Some(process) = kernel.hvpatch_process.as_ref() {
-                process.wait_until_job_control_resumed();
+                if process.wait_until_job_control_resumed() {
+                    // A ptrace resume may inject a signal (PTRACE_KILL is
+                    // SIGKILL). Service it before re-entering the guest: the
+                    // instruction after the stopped syscall may itself be
+                    // exit_group, and Linux guarantees the injected fatal
+                    // action wins that race.
+                    let signal_context =
+                        state.service_kernel_context.as_ref().ok_or_else(|| {
+                            RuntimeError::Configuration(
+                                "HVPatch resume lost its exact Kernel context".to_owned(),
+                            )
+                        })?;
+                    let interrupted_pc = engine.current_pc()?;
+                    if let Some(outcome) = service_signals_threaded(
+                        &kernel,
+                        signal_context,
+                        &mut engine,
+                        state.this_tid,
+                        state.fatal_image_generation,
+                        None,
+                        Some(interrupted_pc),
+                        traps,
+                    )? {
+                        return Ok(outcome);
+                    }
+                }
             }
             // Lock-safe point: no carrick lock is held here. If another thread is
             // forking a multithreaded guest, release this vCPU (so the forker can

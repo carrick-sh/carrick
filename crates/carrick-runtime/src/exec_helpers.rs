@@ -520,6 +520,21 @@ where
 /// not currently owned (including after native detach), so normal delivery
 /// must continue.
 pub(crate) fn stop_for_ptrace_signal(dispatcher: &SyscallDispatcher, signum: i32) -> bool {
+    if let Some(process) = dispatcher.hvpatch_process() {
+        if !dispatcher.is_ptrace_traceme() {
+            return false;
+        }
+        if process.consume_ptrace_resume_signal(signum) {
+            return false;
+        }
+        // SIGKILL is never a ptrace-delivery stop. Let the kernel lane's
+        // ordinary fatal-signal path retire only this logical task; lowering it
+        // to the host would kill every HVPatch process in the carrier.
+        if signum == crate::linux_abi::LINUX_SIGKILL {
+            return false;
+        }
+        return process.stop_for_ptrace_signal(signum);
+    }
     let native = dispatcher.page_geometry().native_profile.is_some();
     let virtual_owner = native && crate::guest_cpu::self_is_virtual_ptrace_tracee();
     match ptrace_signal_route(
@@ -557,7 +572,8 @@ pub(crate) fn stop_for_ptrace_signal(dispatcher: &SyscallDispatcher, signum: i32
 /// After a `PTRACE_TRACEME`d exec, stop with SIGTRAP so a tracer sees the
 /// exec stop.
 pub(crate) fn stop_after_traced_exec(dispatcher: &SyscallDispatcher) {
-    if dispatcher.page_geometry().native_profile.is_some() {
+    if dispatcher.page_geometry().native_profile.is_some() || dispatcher.hvpatch_process().is_some()
+    {
         let _ = stop_for_ptrace_signal(dispatcher, crate::linux_abi::LINUX_SIGTRAP);
     } else if dispatcher.is_ptrace_traceme() {
         stop_by_signal(crate::linux_abi::LINUX_SIGTRAP);

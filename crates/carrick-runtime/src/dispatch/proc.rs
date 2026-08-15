@@ -371,6 +371,7 @@ fn ptrace_user_addr_is_invalid(addr: GuestPtr) -> bool {
 enum PtraceTransport {
     Host,
     VirtualNative,
+    VirtualHvpatch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -398,8 +399,13 @@ enum PtraceRequestRoute {
     VirtualControl(VirtualPtraceControlRequest),
 }
 
-fn select_ptrace_transport(page_geometry: crate::page_profile::PageGeometry) -> PtraceTransport {
-    if page_geometry.native_profile.is_some() {
+fn select_ptrace_transport(
+    page_geometry: crate::page_profile::PageGeometry,
+    hvpatch_lane: bool,
+) -> PtraceTransport {
+    if hvpatch_lane {
+        PtraceTransport::VirtualHvpatch
+    } else if page_geometry.native_profile.is_some() {
         PtraceTransport::VirtualNative
     } else {
         PtraceTransport::Host
@@ -2534,7 +2540,112 @@ impl SyscallDispatcher {
         }
 
         fn ptrace(this, cx, request: u64, pid: Pid, addr: GuestPtr, data: u64) {
-            let transport = select_ptrace_transport(this.page_geometry());
+            let transport =
+                select_ptrace_transport(this.page_geometry(), this.hvpatch_process().is_some());
+            if transport == PtraceTransport::VirtualHvpatch {
+                let Some(process) = this.hvpatch_process() else {
+                    return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                };
+                let kernel = process.kernel_graph();
+                let target = || {
+                    crate::kernel::TaskId::from_abi_positive(pid.0)
+                        .ok()
+                        .and_then(|target| kernel.live_task_key(target))
+                };
+                let outcome = match request {
+                    0 => {
+                        let mut proc = this.proc.lock();
+                        if proc.ptrace_traceme || !kernel.claim_ptrace_traceme(cx.kernel) {
+                            DispatchOutcome::errno(crate::linux_abi::LINUX_EPERM)
+                        } else {
+                            proc.ptrace_traceme = true;
+                            DispatchOutcome::Returned { value: 0 }
+                        }
+                    }
+                    7 => {
+                        let signal = if data == 0 {
+                            None
+                        } else {
+                            match crate::kernel::LinuxSignal::for_signal_number(data as i32) {
+                                Ok(signal) if data <= i32::MAX as u64 => Some(signal),
+                                _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                            }
+                        };
+                        let Some(target) = target() else {
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                        };
+                        if !kernel.resume_task_from_ptrace(
+                            process.task_key(),
+                            target.id,
+                            signal,
+                        ) {
+                            DispatchOutcome::errno(LINUX_ESRCH)
+                        } else {
+                            DispatchOutcome::Returned { value: 0 }
+                        }
+                    }
+                    8 => {
+                        let Some(target) = target() else {
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                        };
+                        let Ok(sigkill) = crate::kernel::LinuxSignal::for_signal_number(
+                            crate::linux_abi::LINUX_SIGKILL,
+                        ) else {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        };
+                        if !kernel.resume_task_from_ptrace(
+                            process.task_key(),
+                            target.id,
+                            Some(sigkill),
+                        ) {
+                            DispatchOutcome::errno(LINUX_ESRCH)
+                        } else {
+                            DispatchOutcome::Returned { value: 0 }
+                        }
+                    }
+                    17 if data == 0 => {
+                        let Some(target) = target() else {
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                        };
+                        if kernel.detach_task_from_ptrace(process.task_key(), target.id) {
+                            DispatchOutcome::Returned { value: 0 }
+                        } else {
+                            DispatchOutcome::errno(LINUX_ESRCH)
+                        }
+                    }
+                    17 => DispatchOutcome::errno(LINUX_EINVAL),
+                    LINUX_PTRACE_ATTACH => {
+                        if target().is_some() {
+                            DispatchOutcome::errno(crate::linux_abi::LINUX_EPERM)
+                        } else {
+                            DispatchOutcome::errno(LINUX_ESRCH)
+                        }
+                    }
+                    LINUX_PTRACE_PEEKTEXT
+                    | LINUX_PTRACE_PEEKDATA
+                    | LINUX_PTRACE_POKETEXT
+                    | LINUX_PTRACE_POKEDATA => {
+                        if target().is_none() {
+                            DispatchOutcome::errno(LINUX_ESRCH)
+                        } else if ptrace_text_data_addr_is_invalid(addr) {
+                            DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)
+                        } else {
+                            DispatchOutcome::errno(LINUX_ENOSYS)
+                        }
+                    }
+                    LINUX_PTRACE_PEEKUSER | LINUX_PTRACE_POKEUSER => {
+                        if target().is_none() {
+                            DispatchOutcome::errno(LINUX_ESRCH)
+                        } else if ptrace_user_addr_is_invalid(addr) {
+                            DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)
+                        } else {
+                            DispatchOutcome::errno(LINUX_ENOSYS)
+                        }
+                    }
+                    _ => DispatchOutcome::errno(LINUX_ENOSYS),
+                };
+                return Ok(outcome);
+            }
             // The tracee in the HOST domain (bare i32, NOT re-wrapped in
             // NsPid: a host pid inside the ns-pid wrapper silently defeats
             // every downstream `.names_self()`/`.to_host()`).
@@ -2838,7 +2949,8 @@ impl SyscallDispatcher {
         }
 
         fn waitid(this, cx, idtype: u64, id: u64, infop_addr: GuestPtr, options: u64) {
-            let transport = select_ptrace_transport(this.page_geometry());
+            let transport =
+                select_ptrace_transport(this.page_geometry(), this.hvpatch_process().is_some());
             // Retain unknown bits so the supported-mask rejection below stays
             // bit-identical to the raw `options & !SUPPORTED != 0` test.
             let options = LinuxWaitOptions::from_bits_retain(options);
@@ -3274,7 +3386,8 @@ impl SyscallDispatcher {
 
         fn wait4(this, cx, pid: Pid, wstatus_addr: GuestPtr, options: u64, rusage_addr: GuestPtr) {
             let memory = &mut *cx.memory;
-            let transport = select_ptrace_transport(this.page_geometry());
+            let transport =
+                select_ptrace_transport(this.page_geometry(), this.hvpatch_process().is_some());
             // Retain unknown bits so the supported-mask rejection stays
             // bit-identical to the raw `options & !SUPPORTED != 0` test.
             let options = LinuxWaitOptions::from_bits_retain(options);
@@ -4689,18 +4802,26 @@ mod native_virtual_ptrace_tests {
     #[test]
     fn native_page_profiles_select_virtual_ptrace_transport() {
         assert_eq!(
-            select_ptrace_transport(geometry(Some(carrick_spec::NativePageProfile::Native16k))),
+            select_ptrace_transport(
+                geometry(Some(carrick_spec::NativePageProfile::Native16k)),
+                false,
+            ),
             PtraceTransport::VirtualNative
         );
         assert_eq!(
-            select_ptrace_transport(geometry(Some(
-                carrick_spec::NativePageProfile::Linux4kOn16k,
-            ))),
+            select_ptrace_transport(
+                geometry(Some(carrick_spec::NativePageProfile::Linux4kOn16k)),
+                false,
+            ),
             PtraceTransport::VirtualNative
         );
         assert_eq!(
-            select_ptrace_transport(geometry(None)),
+            select_ptrace_transport(geometry(None), false),
             PtraceTransport::Host
+        );
+        assert_eq!(
+            select_ptrace_transport(geometry(None), true),
+            PtraceTransport::VirtualHvpatch
         );
     }
 
