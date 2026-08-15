@@ -47,8 +47,8 @@ use carrick_hal::{HostForkCoordinator, PlatformFutex, ThreadedEngine, VcpuRegist
 
 use crate::compat::CompatReporter;
 use crate::dispatch::{
-    DispatchError, DispatchOutcome, GuestMemory, ProcMapSharing, ProcMapsEntry, SyscallDispatcher,
-    SyscallRequest,
+    CorePublicationError, DispatchError, DispatchOutcome, GuestMemory, ProcMapSharing,
+    ProcMapsEntry, SyscallDispatcher, SyscallRequest,
 };
 use crate::linux_abi::LinuxErrno;
 use crate::memory::AddressSpace;
@@ -4597,6 +4597,10 @@ where
                                 prepared.generation,
                                 1,
                             );
+                            if matches!(error, CorePublicationError::Cleanup { .. }) {
+                                tracing::error!(pid = process.pid(), %error, "HVPatch core cleanup failed; refusing authoritative terminal publication");
+                                std::process::abort();
+                            }
                             tracing::warn!(pid = process.pid(), %error, "HVPatch core publication failed closed");
                             None
                         }
@@ -4607,7 +4611,10 @@ where
                     .is_some_and(|value| value == "wait-commit")
                     && let Some(publication) = core_publication.take()
                 {
-                    kernel.dispatcher.rollback_core_publication(&publication);
+                    if let Err(error) = kernel.dispatcher.rollback_core_publication(&publication) {
+                        tracing::error!(pid = process.pid(), %error, "HVPatch core rollback failed; refusing authoritative terminal publication");
+                        std::process::abort();
+                    }
                     crate::probes::hvpatch_core_lifecycle(
                         6,
                         process.pid(),
@@ -4624,7 +4631,15 @@ where
                     Ok(parent) => parent,
                     Err(error) => {
                         if let Some(publication) = &core_publication {
-                            kernel.dispatcher.rollback_core_publication(publication);
+                            if let Err(cleanup_error) =
+                                kernel.dispatcher.rollback_core_publication(publication)
+                            {
+                                tracing::error!(
+                                    pid = process.pid(),
+                                    %cleanup_error,
+                                    "HVPatch core rollback also failed during terminal abort"
+                                );
+                            }
                         }
                         tracing::error!(
                             pid = process.pid(),

@@ -2351,6 +2351,14 @@ pub(crate) enum CorePublicationError {
     RenameMissing { from: String, to: String },
     #[error("core fsync failed for {path}: {errno}")]
     Fsync { path: String, errno: i32 },
+    #[error(
+        "core cleanup failed for {path}: remove error {remove_error:?}; artifact_invalidated={artifact_invalidated}"
+    )]
+    Cleanup {
+        path: String,
+        remove_error: crate::fs_backend::BackendError,
+        artifact_invalidated: bool,
+    },
 }
 
 /// Owns an epoll instance's kqueue and keeps it in the in-memory-wake registry
@@ -2548,6 +2556,90 @@ impl Default for SyscallDispatcher {
 mod core_publication_tests {
     use super::*;
 
+    struct FinalCleanupErrorBackend {
+        inner: crate::fs_backend::MemoryBackend,
+    }
+
+    impl FinalCleanupErrorBackend {
+        fn new() -> Self {
+            Self {
+                inner: crate::fs_backend::MemoryBackend::new(),
+            }
+        }
+    }
+
+    impl crate::fs_backend::FsBackend for FinalCleanupErrorBackend {
+        fn lookup(&self, path: &str) -> Option<crate::fs_backend::OverlayEntry> {
+            self.inner.lookup(path)
+        }
+
+        fn metadata(&self, path: &str) -> Option<crate::rootfs::RootFsMetadata> {
+            self.inner.metadata(path)
+        }
+
+        fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
+            self.inner.file_contents(path)
+        }
+
+        fn make_dir(&self, path: &str) -> Result<(), crate::fs_backend::BackendError> {
+            self.inner.make_dir(path)
+        }
+
+        fn create_file(&self, path: &str) -> Result<(), crate::fs_backend::BackendError> {
+            self.inner.create_file(path)
+        }
+
+        fn set_file_contents(
+            &self,
+            path: &str,
+            contents: Vec<u8>,
+        ) -> Result<(), crate::fs_backend::BackendError> {
+            self.inner.set_file_contents(path, contents)
+        }
+
+        fn remove_entry(&self, path: &str) -> bool {
+            path != "/tmp/coretest/core" && self.inner.remove_entry(path)
+        }
+
+        fn remove_entry_checked(
+            &self,
+            path: &str,
+        ) -> Result<bool, crate::fs_backend::BackendError> {
+            if path == "/tmp/coretest/core" {
+                Err(crate::fs_backend::BackendError::Io)
+            } else {
+                Ok(self.inner.remove_entry(path))
+            }
+        }
+
+        fn mark_deleted(&self, path: &str) -> Result<(), crate::fs_backend::BackendError> {
+            self.inner.mark_deleted(path)
+        }
+
+        fn child_names(
+            &self,
+            dir: &str,
+        ) -> Vec<(String, crate::rootfs::RootFsEntryKind, Option<u64>)> {
+            self.inner.child_names(dir)
+        }
+
+        fn deleted_child_names(&self, dir: &str) -> Vec<String> {
+            self.inner.deleted_child_names(dir)
+        }
+
+        fn rename_overlay_entry(
+            &self,
+            from: &str,
+            to: &str,
+        ) -> Result<bool, crate::fs_backend::BackendError> {
+            self.inner.rename_overlay_entry(from, to)
+        }
+
+        fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> Option<i32> {
+            self.inner.open_raw_fd(path, write, create, trunc)
+        }
+    }
+
     fn snapshot() -> CoreProcessSnapshot {
         CoreProcessSnapshot {
             identity: crate::core_dump::ProcessIdentity {
@@ -2642,7 +2734,9 @@ mod core_publication_tests {
         let publication = dispatcher
             .publish_core_atomic_with_failpoint(&snapshot, 11, b"rollback".to_vec(), None)
             .expect("publish before wait commit");
-        dispatcher.rollback_core_publication(&publication);
+        dispatcher
+            .rollback_core_publication(&publication)
+            .expect("rollback");
         assert!(
             dispatcher
                 .fs
@@ -2658,6 +2752,64 @@ mod core_publication_tests {
                 .overlay
                 .file_contents("/tmp/coretest/core.carrick-tmp-91-11")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn post_publication_cleanup_failure_is_explicit_and_invalidates_artifact() {
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher
+            .fs
+            .rootfs_vfs_mut()
+            .set_overlay(Box::new(FinalCleanupErrorBackend::new()));
+        let error = dispatcher
+            .publish_core_atomic_with_failpoint(
+                &snapshot(),
+                12,
+                b"must-not-look-complete".to_vec(),
+                Some("post-publication"),
+            )
+            .expect_err("failed rollback must fail closed");
+
+        assert!(error.to_string().contains("cleanup"), "{error}");
+        assert_eq!(
+            dispatcher
+                .fs
+                .rootfs_vfs
+                .overlay
+                .file_contents("/tmp/coretest/core"),
+            Some(Vec::new()),
+            "an unlink-resistant final artifact must be structurally invalidated"
+        );
+    }
+
+    #[test]
+    fn wait_owned_rollback_failure_is_explicit_and_invalidates_artifact() {
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher
+            .fs
+            .rootfs_vfs_mut()
+            .set_overlay(Box::new(FinalCleanupErrorBackend::new()));
+        let publication = dispatcher
+            .publish_core_atomic_with_failpoint(
+                &snapshot(),
+                13,
+                b"published-before-wait".to_vec(),
+                None,
+            )
+            .expect("rename before authoritative wait commit");
+        let error = dispatcher
+            .rollback_core_publication(&publication)
+            .expect_err("unlink-resistant rollback must be explicit");
+
+        assert!(error.to_string().contains("cleanup"), "{error}");
+        assert_eq!(
+            dispatcher
+                .fs
+                .rootfs_vfs
+                .overlay
+                .file_contents(&publication.path),
+            Some(Vec::new())
         );
     }
 
@@ -3712,7 +3864,7 @@ impl SyscallDispatcher {
             final_path, snapshot.identity.pid
         );
         let backend = &self.fs.rootfs_vfs.overlay;
-        let _ = backend.remove_entry(&temp_path);
+        self.cleanup_core_artifact(&temp_path)?;
         if failpoint == Some("before-create") {
             return Err(CorePublicationError::Failpoint("before-create"));
         }
@@ -3776,7 +3928,7 @@ impl SyscallDispatcher {
                 });
             }
             if failpoint == Some("post-publication") {
-                let _ = backend.remove_entry(&final_path);
+                self.cleanup_core_artifact(&final_path)?;
                 return Err(CorePublicationError::Failpoint("post-publication"));
             }
             Ok(CorePublication {
@@ -3786,16 +3938,40 @@ impl SyscallDispatcher {
             })
         })();
         if publication.is_err() {
-            let _ = backend.remove_entry(&temp_path);
+            self.cleanup_core_artifact(&temp_path)?;
         }
         publication
     }
 
+    /// Remove a core publication artifact transactionally. If a durable
+    /// backend cannot unlink it, first destroy the serialized ELF identity and
+    /// retry. A persistent failure remains explicit, while a path that survives
+    /// cleanup cannot masquerade as a valid published core.
+    fn cleanup_core_artifact(&self, path: &str) -> Result<(), CorePublicationError> {
+        let backend = &self.fs.rootfs_vfs.overlay;
+        match backend.remove_entry_checked(path) {
+            Ok(_) => Ok(()),
+            Err(remove_error) => {
+                let artifact_invalidated = backend.set_file_contents(path, Vec::new()).is_ok();
+                if artifact_invalidated && backend.remove_entry_checked(path).is_ok() {
+                    return Ok(());
+                }
+                Err(CorePublicationError::Cleanup {
+                    path: path.to_owned(),
+                    remove_error,
+                    artifact_invalidated,
+                })
+            }
+        }
+    }
+
     /// Remove a renamed core whose matching authoritative wait status did not
     /// commit. Publication ownership is not released by rename alone.
-    pub(crate) fn rollback_core_publication(&self, publication: &CorePublication) {
-        let backend = &self.fs.rootfs_vfs.overlay;
-        let _ = backend.remove_entry(&publication.path);
+    pub(crate) fn rollback_core_publication(
+        &self,
+        publication: &CorePublication,
+    ) -> Result<(), CorePublicationError> {
+        self.cleanup_core_artifact(&publication.path)
     }
 
     /// High-water mark (bump cursor) of the anonymous mmap arena: the guest has
