@@ -4346,6 +4346,20 @@ struct GlobalExecPlan {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn global_frame_exec_lease_order(mappings: &[GuestMapping], table_index: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..mappings.len()).collect();
+    order.sort_by_key(|&index| {
+        (
+            u8::from(index != table_index),
+            std::cmp::Reverse(mappings[index].mapped_size),
+            mappings[index].guest_start,
+            index,
+        )
+    });
+    order
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn next_vdso_rng_generation() -> u64 {
     // A host PID distinguished the historical one-guest-process-per-host-process
     // VMM fork path, but HVPatch materializes many Linux processes inside one
@@ -10626,8 +10640,7 @@ impl HvfVmState {
             TrapError::Hypervisor(format!("rebase hvpatch exec page tables: {error:?}"))
         })?;
 
-        let mut order: Vec<usize> = (0..global.mappings.len()).collect();
-        order.sort_by_key(|index| u8::from(*index != table_index));
+        let order = global_frame_exec_lease_order(&global.mappings, table_index);
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         for index in order {
             let mapping = &mut global.mappings[index];
@@ -12952,6 +12965,20 @@ mod vm_create_admission_tests {
 mod frame_inventory_backend_tests {
     use super::*;
 
+    fn exec_mapping_for_order(guest_start: u64, mapped_size: u64) -> GuestMapping {
+        GuestMapping {
+            guest_start,
+            ipa_start: guest_start,
+            mapped_size,
+            offset_in_mapping: 0,
+            payload_size: 0,
+            perms: carrick_mem::elf::SegmentPerms::default(),
+            shared: false,
+            image: std::sync::Arc::new(Vec::new()),
+            private_file_backing: None,
+        }
+    }
+
     fn id(raw: u64) -> std::num::NonZeroU64 {
         std::num::NonZeroU64::new(raw).unwrap()
     }
@@ -13123,6 +13150,22 @@ mod frame_inventory_backend_tests {
             allocator.allocate(LARGE, 2 * 1024 * 1024).unwrap(),
             arena_base,
             "small mappings must not fragment the scarce 32 GiB exec-frame holes"
+        );
+    }
+
+    #[test]
+    fn global_frame_exec_reserves_large_extents_before_small_extents() {
+        let mappings = vec![
+            exec_mapping_for_order(0x10_0000, 0x4000),
+            exec_mapping_for_order(crate::memory::LINUX_PAGE_TABLES_BASE, 0x20_0000),
+            exec_mapping_for_order(0x6000_0000_00, 32 * 1024 * 1024 * 1024),
+            exec_mapping_for_order(0x9000_0000_00, 2 * 1024 * 1024 * 1024),
+        ];
+
+        assert_eq!(
+            global_frame_exec_lease_order(&mappings, 1),
+            vec![1, 2, 3, 0],
+            "the fixed root slot stays first, then scarce global extents descend by size"
         );
     }
 
