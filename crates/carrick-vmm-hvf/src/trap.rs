@@ -3886,8 +3886,8 @@ impl GlobalFrameIpaAllocator {
                 "cannot reserve an empty global frame IPA extent".to_owned(),
             ));
         }
-        for index in 0..self.free.len() {
-            let (free_base, free_len) = self.free[index];
+        let mut best: Option<(u64, u64, usize, u64, u64)> = None;
+        for (index, &(free_base, free_len)) in self.free.iter().enumerate() {
             let base = align_up(free_base, alignment)?;
             let Some(end) = base.checked_add(length) else {
                 continue;
@@ -3896,6 +3896,19 @@ impl GlobalFrameIpaAllocator {
             if end > free_end {
                 continue;
             }
+
+            // Preserve the large contiguous holes needed by HVPatch exec
+            // frames: use the smallest fitting extent, with the lowest base as
+            // a deterministic tie-breaker.  The exact live-extent ledger below
+            // remains the fail-closed authority for release validation.
+            if best.is_none_or(|(best_len, best_base, ..)| {
+                (free_len, free_base) < (best_len, best_base)
+            }) {
+                best = Some((free_len, free_base, index, base, end));
+            }
+        }
+        if let Some((free_len, free_base, index, base, end)) = best {
+            let free_end = free_base.saturating_add(free_len);
             self.free.swap_remove(index);
             if base > free_base {
                 self.free.push((free_base, base - free_base));
@@ -13043,6 +13056,27 @@ mod frame_inventory_backend_tests {
         let _prefix = allocator.allocate(0x4000, 0x4000).unwrap();
         let large = allocator.allocate(TWO_MIB, TWO_MIB).unwrap();
         assert_eq!(large % TWO_MIB, 0);
+    }
+
+    #[test]
+    fn global_frame_allocator_preserves_large_hole_for_large_request() {
+        const LARGE: u64 = 32 * 1024 * 1024 * 1024;
+        const SMALL: u64 = 0x4000;
+        let arena_base = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE;
+        let mut allocator = GlobalFrameIpaAllocator::new();
+        allocator.next = arena_base + carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_SIZE;
+        allocator.free = vec![(arena_base, LARGE), (arena_base + LARGE + SMALL, SMALL)];
+
+        assert_eq!(
+            allocator.allocate(SMALL, SMALL).unwrap(),
+            arena_base + LARGE + SMALL,
+            "a tiny mapping must consume the smallest fitting hole"
+        );
+        assert_eq!(
+            allocator.allocate(LARGE, 2 * 1024 * 1024).unwrap(),
+            arena_base,
+            "small mappings must not fragment the scarce 32 GiB exec-frame holes"
+        );
     }
 
     #[test]
