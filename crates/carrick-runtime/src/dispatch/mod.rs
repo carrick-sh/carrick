@@ -2237,6 +2237,11 @@ pub struct SyscallDispatcher {
     /// context at each backend dispatch boundary. HVPatch replaces the initial
     /// one-task binding when its root/child task is published.
     kernel_binding: RwLock<crate::kernel::KernelTaskBinding>,
+    /// Process-scoped timer delivery for lanes that multiplex multiple Linux
+    /// processes inside one host process. HVPatch binds an exact-task delivery
+    /// here; VMM/native leave it empty and use their established run-global
+    /// backend registered in `crate::timer_delivery`.
+    timer_delivery: RwLock<Option<Arc<dyn carrick_hal::TimerDelivery>>>,
     /// One helper-backed FileAuthority root for this run. Run-loop entry
     /// activates it before any guest host fork; constructors remain side-effect
     /// free so library fixtures never fork from a test-harness worker thread.
@@ -3092,6 +3097,7 @@ impl SyscallDispatcher {
         HVPATCH_LANE.store(true, std::sync::atomic::Ordering::Release);
         process.bind_vma_source(self.vma_snapshot_source());
         *self.kernel_binding.write() = process.task_binding();
+        *self.timer_delivery.write() = Some(process.process_timer_delivery());
         // HVPatch multiplexes Linux tasks inside one host PID, so the mature
         // one-task adapter's host-PID credential projection is inapplicable.
         crate::cred_ipc::unpublish();
@@ -3358,6 +3364,13 @@ impl SyscallDispatcher {
         self.proc.lock().hvpatch_process.clone()
     }
 
+    pub(crate) fn timer_delivery(&self) -> Option<Arc<dyn carrick_hal::TimerDelivery>> {
+        self.timer_delivery
+            .read()
+            .clone()
+            .or_else(crate::timer_delivery::delivery)
+    }
+
     /// Does `pid` name a LIVE Linux process, according to carrick's own kernel?
     ///
     /// `None` means this lane has no kernel task registry to ask — the caller
@@ -3399,6 +3412,10 @@ impl SyscallDispatcher {
         let _vma_snapshot = self.begin_host_alias_dispatch();
         Self {
             kernel_binding: RwLock::new(self.kernel_binding.read().clone()),
+            // Linux interval timers are not inherited across fork. The child
+            // receives a fresh exact-task delivery when bind_hvpatch_process
+            // publishes its authoritative ProcessContext.
+            timer_delivery: RwLock::new(None),
             file_authority: RwLock::new(self.file_authority.read().clone()),
             io: self.io.fork_clone(),
             mem: self.mem.fork_private(),
@@ -3512,6 +3529,7 @@ impl SyscallDispatcher {
     pub fn new() -> Self {
         Self {
             kernel_binding: RwLock::new(bootstrap_one_task_binding()),
+            timer_delivery: RwLock::new(None),
             file_authority: RwLock::new(None),
             io: fs::RuntimeIo::new(),
             mem: Arc::new(mem::MemAuthority::new(mem::MemState::new())),

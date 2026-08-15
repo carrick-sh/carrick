@@ -1381,9 +1381,35 @@ impl Kernel {
         signal: LinuxSignal,
         siginfo: Option<LinuxSiginfo>,
     ) -> bool {
-        let (task, parent) = {
+        let target = {
             let state = self.registry().state.read();
             let Some(record) = state.tasks.get(&target) else {
+                return false;
+            };
+            record.task.key()
+        };
+        self.post_signal_to_task_key(target, signal, siginfo)
+    }
+
+    /// Publish one process-directed signal to an exact live task generation.
+    /// Runtime-owned asynchronous sources (HVPatch process-local timers) use
+    /// this after their syscall context has returned, when no caller context is
+    /// available to authorize a fresh pid lookup. A recycled numeric pid can
+    /// never receive the late event because the complete [`TaskKey`] must
+    /// still match under the registry lock.
+    pub(crate) fn post_signal_to_task_key(
+        &self,
+        target: TaskKey,
+        signal: LinuxSignal,
+        siginfo: Option<LinuxSiginfo>,
+    ) -> bool {
+        let (task, parent) = {
+            let state = self.registry().state.read();
+            let Some(record) = state
+                .tasks
+                .get(&target.id)
+                .filter(|record| record.task.key() == target)
+            else {
                 return false;
             };
             if record.task.lifecycle() != TaskLifecycle::Live {

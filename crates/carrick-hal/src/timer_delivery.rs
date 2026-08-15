@@ -57,6 +57,17 @@ pub fn disarm_fallback_posix_timer(id: i32) {
 }
 
 pub trait TimerDelivery: Send + Sync {
+    /// Whether this delivery object owns interval-timer slot state itself.
+    ///
+    /// The mature VMM/native implementations use the process-global
+    /// `carrick-timer-core` slots because one host process represents one Linux
+    /// process. HVPatch multiplexes multiple Linux processes as host threads,
+    /// so its per-dispatcher delivery must keep independent slots and the
+    /// dispatcher must not mutate the global slots before calling it.
+    fn owns_itimer_state(&self) -> bool {
+        false
+    }
+
     /// Arm interval timer `which`. The neutral slot state is written by the
     /// caller into timer-core FIRST (via `carrick_timer_core::itimer::arm`);
     /// this method initiates DELIVERY. Returns `true` if the backend OWNS
