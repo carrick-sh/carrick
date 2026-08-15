@@ -5013,7 +5013,7 @@ mod tests {
     fn fatal_core_authority_rebinds_at_exec_and_rejects_late_old_image_signal() {
         let context = alias_context(67_106);
         let owner = context.thread().key().tid;
-        let authority = FatalSignalAuthority::default();
+        let authority = Arc::new(FatalSignalAuthority::default());
         let old_image = authority.current_generation();
         let old_fatal = FatalSignalRecord {
             image_generation: old_image,
@@ -5024,15 +5024,26 @@ mod tests {
         };
         assert!(authority.record(old_fatal));
 
-        let replacement_image = authority
-            .rebind_after_exec(old_image)
-            .expect("current exec generation rebinds");
+        let fatal_loser_release = Arc::new(std::sync::Barrier::new(2));
+        let replacement_image = std::thread::scope(|scope| {
+            let losing_authority = authority.clone();
+            let losing_release = fatal_loser_release.clone();
+            let losing_fatal = scope.spawn(move || {
+                losing_release.wait();
+                losing_authority.record(old_fatal)
+            });
+            let replacement_image = authority
+                .rebind_after_exec(old_image)
+                .expect("current exec generation rebinds");
+            fatal_loser_release.wait();
+            assert!(
+                !losing_fatal.join().expect("fatal race participant"),
+                "the pre-exec fatal participant released after exec must lose deterministically"
+            );
+            replacement_image
+        });
         assert_ne!(replacement_image, old_image);
         assert_eq!(authority.recorded_for(replacement_image), None);
-        assert!(
-            !authority.record(old_fatal),
-            "a losing pre-exec fatal race must not poison replacement-image authority"
-        );
 
         let replacement_fatal = FatalSignalRecord {
             image_generation: replacement_image,
