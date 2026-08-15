@@ -69,6 +69,20 @@ pub(crate) enum CoreError {
         filesz: u64,
         len: usize,
     },
+    #[error("invalid ELF header/program-header geometry: {0}")]
+    BadProgramHeaderGeometry(&'static str),
+    #[error("core contains multiple PT_NOTE segments")]
+    DuplicateNoteSegment,
+    #[error("PT_LOAD {index} filesz {filesz} exceeds memsz {memsz}")]
+    LoadFileSizeExceedsMemory {
+        index: usize,
+        filesz: u64,
+        memsz: u64,
+    },
+    #[error("core offset/count arithmetic overflowed")]
+    ArithmeticOverflow,
+    #[error("malformed {0}")]
+    Malformed(&'static str),
 }
 
 /// One thread, as recovered from its `NT_PRSTATUS`.
@@ -158,8 +172,10 @@ fn read_u64(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]))
 }
 
-fn align_up(value: usize, align: usize) -> usize {
-    value.div_ceil(align) * align
+fn checked_align_up(value: usize, align: usize) -> Option<usize> {
+    value
+        .checked_add(align.checked_sub(1)?)
+        .map(|rounded| rounded / align * align)
 }
 
 /// Field offsets come from the writer's own structs, never from counted bytes.
@@ -204,8 +220,27 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
     let phoff = read_u64(bytes, std::mem::offset_of!(wire::Elf64Ehdr, e_phoff));
     let phnum = read_u16(bytes, std::mem::offset_of!(wire::Elf64Ehdr, e_phnum)) as usize;
     let phentsize = read_u16(bytes, std::mem::offset_of!(wire::Elf64Ehdr, e_phentsize)) as usize;
-    let table_size = phnum * phentsize;
-    if phoff as usize + table_size > bytes.len() {
+    let ehsize = read_u16(bytes, std::mem::offset_of!(wire::Elf64Ehdr, e_ehsize)) as usize;
+    if ehsize != size_of::<wire::Elf64Ehdr>() {
+        return Err(CoreError::BadProgramHeaderGeometry("unexpected e_ehsize"));
+    }
+    if phentsize != size_of::<wire::Elf64Phdr>() {
+        return Err(CoreError::BadProgramHeaderGeometry(
+            "e_phentsize is not Elf64_Phdr",
+        ));
+    }
+    if phnum == 0 {
+        return Err(CoreError::BadProgramHeaderGeometry("e_phnum is zero"));
+    }
+    let phoff_usize = usize::try_from(phoff)
+        .map_err(|_| CoreError::BadProgramHeaderGeometry("e_phoff does not fit usize"))?;
+    let table_size = phnum
+        .checked_mul(phentsize)
+        .ok_or(CoreError::ArithmeticOverflow)?;
+    let table_end = phoff_usize
+        .checked_add(table_size)
+        .ok_or(CoreError::ArithmeticOverflow)?;
+    if table_end > bytes.len() {
         return Err(CoreError::PhdrTableTruncated {
             offset: phoff,
             size: table_size,
@@ -219,7 +254,13 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
     let mut load_with_contents = 0_usize;
     let mut memory_bytes = 0_u64;
     for index in 0..phnum {
-        let base = phoff as usize + index * phentsize;
+        let base = phoff_usize
+            .checked_add(
+                index
+                    .checked_mul(phentsize)
+                    .ok_or(CoreError::ArithmeticOverflow)?,
+            )
+            .ok_or(CoreError::ArithmeticOverflow)?;
         let kind = read_u32(
             bytes,
             field(base, std::mem::offset_of!(wire::Elf64Phdr, p_type)),
@@ -237,13 +278,31 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
             field(base, std::mem::offset_of!(wire::Elf64Phdr, p_memsz)),
         );
         if kind == PT_NOTE {
-            note_span = Some((offset, filesz));
+            if note_span.replace((offset, filesz)).is_some() {
+                return Err(CoreError::DuplicateNoteSegment);
+            }
         } else if kind == PT_LOAD {
-            load_segments += 1;
-            memory_bytes += memsz;
+            if filesz > memsz {
+                return Err(CoreError::LoadFileSizeExceedsMemory {
+                    index,
+                    filesz,
+                    memsz,
+                });
+            }
+            load_segments = load_segments
+                .checked_add(1)
+                .ok_or(CoreError::ArithmeticOverflow)?;
+            memory_bytes = memory_bytes
+                .checked_add(memsz)
+                .ok_or(CoreError::ArithmeticOverflow)?;
             if filesz > 0 {
-                load_with_contents += 1;
-                if offset + filesz > bytes.len() as u64 {
+                load_with_contents = load_with_contents
+                    .checked_add(1)
+                    .ok_or(CoreError::ArithmeticOverflow)?;
+                if offset
+                    .checked_add(filesz)
+                    .is_none_or(|end| end > bytes.len() as u64)
+                {
                     return Err(CoreError::LoadTruncated {
                         index,
                         offset,
@@ -256,14 +315,19 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
     }
 
     let (note_offset, note_size) = note_span.ok_or(CoreError::NoNoteSegment)?;
-    if note_offset + note_size > bytes.len() as u64 {
+    let note_end_u64 = note_offset
+        .checked_add(note_size)
+        .ok_or(CoreError::ArithmeticOverflow)?;
+    if note_end_u64 > bytes.len() as u64 {
         return Err(CoreError::NoteSegmentTruncated {
             offset: note_offset,
             size: note_size,
             len: bytes.len(),
         });
     }
-    let notes = &bytes[note_offset as usize..(note_offset + note_size) as usize];
+    let note_start = usize::try_from(note_offset).map_err(|_| CoreError::ArithmeticOverflow)?;
+    let note_end = usize::try_from(note_end_u64).map_err(|_| CoreError::ArithmeticOverflow)?;
+    let notes = &bytes[note_start..note_end];
 
     let mut parsed_threads: Vec<ParsedThread> = Vec::new();
     let mut identity = None;
@@ -274,17 +338,31 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
 
     let header_size = size_of::<wire::NoteHeader>();
     let mut at = 0_usize;
-    while at + header_size <= notes.len() {
+    while at < notes.len() {
+        let header_end = at
+            .checked_add(header_size)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        if header_end > notes.len() {
+            return Err(CoreError::NoteTruncated(at));
+        }
         let namesz = read_u32(notes, at) as usize;
         let descsz = read_u32(notes, at + 4) as usize;
         let note_type = read_u32(notes, at + 8);
-        let name_at = at + header_size;
-        let desc_at = align_up(name_at + namesz, NOTE_ALIGN);
-        if desc_at + descsz > notes.len() {
+        let name_at = header_end;
+        let name_end = name_at
+            .checked_add(namesz)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        let desc_at =
+            checked_align_up(name_end, NOTE_ALIGN).ok_or(CoreError::ArithmeticOverflow)?;
+        let desc_end = desc_at
+            .checked_add(descsz)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        let next = checked_align_up(desc_end, NOTE_ALIGN).ok_or(CoreError::ArithmeticOverflow)?;
+        if name_end > notes.len() || next > notes.len() {
             return Err(CoreError::NoteTruncated(at));
         }
-        let owner = &notes[name_at..name_at + namesz];
-        let desc = &notes[desc_at..desc_at + descsz];
+        let owner = &notes[name_at..name_end];
+        let desc = &notes[desc_at..desc_end];
         // A real Linux core carries notes from other owners beside `CORE` —
         // on aarch64 the kernel emits `LINUX`-owner notes such as the PAC mask
         // and tagged-address control. Verified against a kernel-produced core:
@@ -293,7 +371,7 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
         // skipped, which is what any conforming reader does.
         if owner != NOTE_OWNER && owner != LINUX_ELF_NOTE_OWNER {
             foreign_notes += 1;
-            at = align_up(desc_at + descsz, NOTE_ALIGN);
+            at = next;
             continue;
         }
         match note_type {
@@ -389,16 +467,52 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
                 ));
             }
             NT_AUXV => {
-                // Pairs of (key, value), terminated by AT_NULL.
-                auxv_entries = desc.len() / (2 * size_of::<u64>());
-                auxv_entries = auxv_entries.saturating_sub(1);
+                if desc.is_empty() || !desc.len().is_multiple_of(2 * size_of::<u64>()) {
+                    return Err(CoreError::Malformed("NT_AUXV shape"));
+                }
+                let pairs = desc.chunks_exact(16).collect::<Vec<_>>();
+                if pairs.last().is_none_or(|pair| read_u64(pair, 0) != 0) {
+                    return Err(CoreError::Malformed("NT_AUXV terminator"));
+                }
+                if pairs[..pairs.len() - 1]
+                    .iter()
+                    .any(|pair| read_u64(pair, 0) == 0)
+                {
+                    return Err(CoreError::Malformed("NT_AUXV trailing data"));
+                }
+                auxv_entries = pairs.len() - 1;
             }
             NT_FILE => {
-                file_mappings = Some(read_u64(desc, 0) as usize);
+                if desc.len() < 16 || read_u64(desc, 8) == 0 {
+                    return Err(CoreError::Malformed("NT_FILE header"));
+                }
+                let count = usize::try_from(read_u64(desc, 0))
+                    .map_err(|_| CoreError::Malformed("NT_FILE count"))?;
+                let names_at = count
+                    .checked_mul(24)
+                    .and_then(|triples| 16usize.checked_add(triples))
+                    .ok_or(CoreError::ArithmeticOverflow)?;
+                if names_at > desc.len() {
+                    return Err(CoreError::Malformed("NT_FILE triples"));
+                }
+                let mut names = &desc[names_at..];
+                for _ in 0..count {
+                    let Some(end) = names.iter().position(|byte| *byte == 0) else {
+                        return Err(CoreError::Malformed("NT_FILE paths"));
+                    };
+                    if end == 0 {
+                        return Err(CoreError::Malformed("NT_FILE empty path"));
+                    }
+                    names = &names[end + 1..];
+                }
+                if !names.is_empty() {
+                    return Err(CoreError::Malformed("NT_FILE trailing paths"));
+                }
+                file_mappings = Some(count);
             }
             _ => {}
         }
-        at = align_up(desc_at + descsz, NOTE_ALIGN);
+        at = next;
     }
 
     if parsed_threads.is_empty() {
@@ -464,7 +578,8 @@ mod tests {
 
     fn complete_core() -> Vec<u8> {
         use carrick_runtime::core_dump::{
-            AARCH64_GREGS, CoreDump, ProcessIdentity, SignalInfo, ThreadRegisters, ThreadState,
+            AARCH64_GREGS, CoreDump, MemoryRegion, ProcessIdentity, SignalInfo, ThreadRegisters,
+            ThreadState,
         };
         let mut gregs = [0_u64; AARCH64_GREGS];
         gregs[0] = 0x1111;
@@ -499,7 +614,12 @@ mod tests {
             }],
             auxv: vec![(6, 4096)],
             mappings: Vec::new(),
-            regions: Vec::new(),
+            regions: vec![MemoryRegion {
+                start: 0x1_0000,
+                flags: 5,
+                bytes: b"authoritative-load",
+                size: 0x1_0000,
+            }],
         }
         .to_bytes_bounded(u64::MAX)
         .expect("complete core")
@@ -562,5 +682,78 @@ mod tests {
                 note: "NT_FPREGSET"
             })
         ));
+    }
+    fn mutate_u16(bytes: &mut [u8], at: usize, value: u16) {
+        bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn mutate_u64(bytes: &mut [u8], at: usize, value: u64) {
+        bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn rejects_malformed_program_header_geometry_without_panicking() {
+        for mutate in [
+            |bytes: &mut [u8]| {
+                mutate_u16(bytes, std::mem::offset_of!(wire::Elf64Ehdr, e_phentsize), 0);
+            },
+            |bytes: &mut [u8]| {
+                mutate_u16(bytes, std::mem::offset_of!(wire::Elf64Ehdr, e_phentsize), 8);
+            },
+            |bytes: &mut [u8]| {
+                mutate_u64(
+                    bytes,
+                    std::mem::offset_of!(wire::Elf64Ehdr, e_phoff),
+                    u64::MAX,
+                );
+            },
+        ] {
+            let mut bytes = complete_core();
+            mutate(&mut bytes);
+            assert!(
+                std::panic::catch_unwind(|| validate_bytes(&bytes, "mutated"))
+                    .expect("malformed core reader must not panic")
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_load_and_note_overflow_mutations() {
+        let mut table = complete_core();
+        mutate_u16(
+            &mut table,
+            std::mem::offset_of!(wire::Elf64Ehdr, e_phnum),
+            u16::MAX,
+        );
+        assert!(validate_bytes(&table, "bad-table").is_err());
+
+        let mut load = complete_core();
+        let load_phdr = size_of::<wire::Elf64Ehdr>() + size_of::<wire::Elf64Phdr>();
+        mutate_u64(
+            &mut load,
+            load_phdr + std::mem::offset_of!(wire::Elf64Phdr, p_filesz),
+            u64::MAX,
+        );
+        assert!(matches!(
+            validate_bytes(&load, "bad-load"),
+            Err(CoreError::LoadFileSizeExceedsMemory { .. })
+        ));
+
+        let mut duplicate_note = complete_core();
+        duplicate_note[load_phdr..load_phdr + 4].copy_from_slice(&PT_NOTE.to_le_bytes());
+        assert!(matches!(
+            validate_bytes(&duplicate_note, "duplicate-note"),
+            Err(CoreError::DuplicateNoteSegment)
+        ));
+
+        let mut note = complete_core();
+        let phoff = size_of::<wire::Elf64Ehdr>();
+        let note_offset = read_u64(
+            &note,
+            phoff + std::mem::offset_of!(wire::Elf64Phdr, p_offset),
+        ) as usize;
+        note[note_offset + 4..note_offset + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(validate_bytes(&note, "bad-note").is_err());
     }
 }
