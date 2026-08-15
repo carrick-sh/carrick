@@ -17,7 +17,7 @@ syscall translation layer instead of a guest Linux kernel. There is no guest
 kernel, no second scheduler, no separate hypervisor RAM pool, and the runtime is
 BKL-free (per-subsystem locks, not a global lock).
 
-**Two execution backends, and the distinction is load-bearing — know which one
+**Three execution lanes, and the distinction is load-bearing — know which one
 you are testing:**
 
 - **VMM** (`--exec-backend vmm`): a hardware-virtualized vCPU per guest thread.
@@ -26,6 +26,13 @@ you are testing:**
   host and carrick re-expresses Linux syscalls as Darwin primitives. The
   published conformance results (and `scripts/conformance/baseline.jsonl`) are
   this lane's.
+- **HVPATCH** (`--exec-backend hvpatch`): the experimental kernel lane on
+  macOS/HVF. It keeps Linux tasks, process identity, address spaces, waits and
+  signals in carrick's kernel graph and multiplexes them inside one VM carrier;
+  guest `fork`/`clone` do **not** create Darwin processes. HVPatch is opt-in and
+  incomplete until its dedicated conformance overlay, ecosystem gates and
+  intended one-host-process/one-HVF-VM topology are qualified. Do not infer
+  HVPatch results from the VMM lane merely because both use HVF.
 - **NATIVE / DSR** (`--exec-backend native`): **no hypervisor at all** — guest
   code runs as host-native process state with a JIT for same-ISA translation.
   **This is the shipped DEFAULT** (`ExecBackendRequest::Native`,
@@ -157,13 +164,36 @@ Two conventions the code alone would teach wrong:
 ### Where key subsystems live
 - **Trap loop / syscall dispatch** — mature macOS trap loop in `crates/carrick-vmm-hvf/src/trap.rs`; x86 loop in `crates/carrick-x86/src/engine.rs` with backend adapters; dispatch in `crates/carrick-runtime/src/dispatch/mod.rs` (`SyscallDispatcher`, per-subsystem locks); syscall metadata in `crates/carrick-abi/src/syscall.rs` and guest-arch tables under `carrick-hal`.
 - **VFS / rootfs** — `crates/carrick-runtime/src/dispatch/fs.rs`, `crates/carrick-runtime/src/vfs/` (in-memory OCI layer merge; `--fs host` cap-std backend — see [`docs/fs-host-capstd-amplification.md`](docs/fs-host-capstd-amplification.md)).
-- **Memory / paging** — `crates/carrick-mem/src/memory.rs` (stage-1 identity map, EL0 trampoline, FEAT_PAN3 workaround); mmap arena `crates/carrick-runtime/src/dispatch/mem.rs`.
+- **Memory / paging** — `crates/carrick-mem/src/memory.rs` (the mature VMM
+  stage-1 identity map, EL0 trampoline and FEAT_PAN3 workaround; HVPatch differs
+  below); mmap arena `crates/carrick-runtime/src/dispatch/mem.rs`.
+- **HVPatch memory is non-identity.** Semantic guest VA, stage-1 IPA, reusable
+  global-frame IPA and host-owner generation are distinct domains. Never feed
+  one domain back into a lookup for another: authenticate through the live
+  stage-1 translation and the exact current owner generation. Hidden mmap
+  reservations are semantic metadata and materialize private backing on demand;
+  do not restore a full per-mm 32 GiB physical/global-IPA arena or a VM-wide
+  shared-zero COW source. Stage-1, stage-2 and frame-inventory publication form
+  one rollback-capable transaction. Page-table coalescing additionally requires
+  the output address to be aligned for the parent block; contiguous children
+  alone are insufficient and masking an unaligned IPA silently maps the wrong
+  bytes.
 - **Signals** — `crates/carrick-runtime/src/dispatch/signal.rs` (Linux↔macOS signum translation, sigreturn trampoline).
-- **Threads / futex** — `carrick-thread`; fork barrier `crates/carrick-vmm-hvf/src/fork_quiesce.rs` (one pthread = one vCPU).
+- **Threads / futex** — `carrick-thread`; fork barrier
+  `crates/carrick-vmm-hvf/src/fork_quiesce.rs`. HVPatch has one host pthread per
+  logical guest thread but only a bounded, reclaimable set of HVF vCPU leases.
+  Process-fork admission must win before waiting for a child-vCPU lease; fork
+  participates in exec/exit cancellation; ordinary losing transactions lower
+  to guest `EAGAIN`; and a selected long blocking wait releases its lease even
+  when capacity appears spare before later waiters arrive.
 - **epoll / sockets** — event backends in `carrick-host-bsd` (kqueue) and `carrick-host-linux` (epoll); sockets `crates/carrick-runtime/src/dispatch/net.rs` (synthetic `AF_NETLINK`, AF_UNIX path-hash registry).
 - **ptrace / pty** — `docs/ptrace-darwin-design.md` (Phase 1 only); pty `crates/carrick-runtime/src/pty_relay.rs` + `interactive_supervisor.rs`, `vfs/devpts.rs`.
 - **x86 / Rosetta** — `linux/amd64` images via Apple's in-guest Linux Rosetta (`docs/rosetta.md`).
-- **Event ring (debug)** — always-on lock-free fork/socket/epoll ring `crates/carrick-runtime/src/event_ring.rs`, read via `scripts/carrick_lldb.py`.
+- **Event ring (debug)** — always-on lock-free fork/socket/epoll ring
+  `crates/carrick-runtime/src/event_ring.rs`, read via
+  `scripts/carrick_lldb.py`. For HVPatch the authoritative ring and guest-thread
+  census live in the VM carrier, not an outer namespace supervisor or detached
+  file-authority helper.
 
 ---
 
@@ -179,6 +209,13 @@ If it fails in Docker too, it's not carrick's bug.
   cases. `carrick‖carrick` and `docker‖docker` are fine; `carrick‖docker` is not.
 - **Stamp `CARRICK_RUN_ID`; reap with [`scripts/sudo/kill.sh`](scripts/sudo/kill.sh) `<run-id>`.**
   Never `pkill -f carrick` — it kills concurrent lanes and other worktrees.
+- **A signed result belongs to one exact artifact.** Before calling a checkpoint
+  or integration gate green, record source HEAD plus binary SHA-256, CDHash,
+  LC_UUID, hypervisor entitlement and `__dof_carrick`; then run the full
+  backend-specific probe set on that binary and prove scoped cleanup. Focused
+  tests, `just ci`, or a 400/400 receipt from an earlier link do not qualify a
+  later checkpoint. For HVPatch integration also smoke the still-shipped
+  default/native lane; HVPatch remains opt-in until its own final default gate.
 - **Oracle is native arm64 only.** Never use a Rosetta-translated
   `--platform linux/amd64` container as an x86_64 oracle; if you need an x86
   oracle, ask the user for a native box.
@@ -218,7 +255,12 @@ If it fails in Docker too, it's not carrick's bug.
   with the new schema. That post-gate rewrite is a **legitimate re-bless — commit
   it** (it makes the next gate fast again) *when the run was on the canonical box
   with correct images*. Only `git checkout` it away when the rewrite is spurious
-  (a box missing/with wrong images). Force a clean re-bless with `--refresh-oracle`.
+  (a box missing/with wrong images). Force a clean re-bless with
+  `--refresh-oracle`. In particular, changing the contents behind a mutable
+  image tag makes cached ecosystem rows non-authoritative even though they still
+  hit: verify the live declared row population and image/binary digests, run the
+  Carrick and Docker phases serially with `--refresh-oracle`, and machine-count
+  every declared row.
 - **TDD, red-first.** When adding a conformance probe or fixing a syscall, prove
   the probe is **red against the broken binary first**
   (`git checkout <pre-fix> -- <file>`, rebuild signed, confirm DIFF), then restore
@@ -311,7 +353,12 @@ Use **real debuggers, not `eprintln!`** — and never ship debug spam. Full guid
     are then citable.
 - **When tracing perturbs a Heisenbug away, read the always-on event ring via
   `carrick-lldb`** — works live or from a core, with nothing pre-armed. Attach the
-  **guest** process, not the orchestrator parent (the parent's ring is empty).
+  **guest carrier** process, not the orchestrator parent (the parent's ring is
+  empty). A raw/private-PID HVPatch run may contain an NsSupervisor, a VM
+  carrier and a detached FileAuthority helper; ordinary `lldb run` follows only
+  the outer process and can miss an abort in the carrier. Prefer
+  `carrick debug lldb-run` or enumerate and attach child-first. The carrier alone
+  owns the HVF VM, logical guest threads and authoritative event ring.
   Skill: [`.agents/skills/carrick-lldb`](.agents/skills/carrick-lldb).
 - **For a wedged/deadlocked process, take a real CORE and `bt all`**
   (`sudo lldb -p <pid> -o "process save-core …" -o detach`). `sample`/`SIGQUIT`
@@ -605,10 +652,17 @@ path), and lets a "landed" change never actually land.
   (`sendfile(2)`, `kqueue`/`EVFILT_*` for epoll, `__ulock` for futex, macOS ptys).
   Userspace reimplementations tend to deadlock the vCPU or mishandle
   EAGAIN/backpressure.
-- **Fill Linux/macOS gaps with durable macOS-native state, not in-process maps.**
-  carrick forks real host processes for `clone(2)`, so in-memory `HashMap`/global
-  state is **not fork-coherent** and silently diverges. Use xattrs, fds, host
-  kernel bookkeeping (e.g. guest file modes live in a `user.carrick.mode` xattr).
+- **Choose state authority by execution lane, not by host-process accident.**
+  Native/VMM paths can fork real host processes, so state that must cross those
+  forks cannot live only in a private `HashMap`; use durable/fork-coherent
+  authorities such as xattrs, inherited fds or host-kernel bookkeeping. HVPatch
+  guest `fork` stays inside one carrier, but the inverse trap applies: Darwin
+  PID/process-owned state represents the carrier, not a logical Linux process.
+  Put Linux process semantics in the kernel graph keyed by exact
+  `TaskKey`/generation (or an explicitly shared description/namespace), never a
+  process-global host PID, timer, ptrace session, classic lock owner or similar
+  surrogate. Shared cross-lane code needs a typed backend authority rather than
+  silently choosing either model.
 - **Use the `libc` crate, not ad-hoc `extern "C"` blocks** (`libc::fork`,
   `waitpid`, `pipe`, `ioctl`, …). Exception: `applevisor-sys` raw `hv_*` bindings.
 
