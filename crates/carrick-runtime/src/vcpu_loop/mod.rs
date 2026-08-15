@@ -2495,10 +2495,17 @@ where
                                 ));
                             }
                             crate::dispatch::BlockingHostWriteStep::Wait => {
-                                match self.waiter.wait(
+                                match self.waiter.wait_with_dispatch_pending(
                                     &[crate::io_wait::WaitFd::raw(write.host_fd(), libc::POLLOUT)],
                                     None,
                                     carrick_abi::SigBlockMask::NONE,
+                                    || {
+                                        kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
+                                            &kernel_context,
+                                            self.this_tid,
+                                            carrick_abi::WaitSigMask::NONE,
+                                        )
+                                    },
                                 ) {
                                     crate::io_wait::WaitResult::Ready => continue,
                                     crate::io_wait::WaitResult::Interrupted => {
