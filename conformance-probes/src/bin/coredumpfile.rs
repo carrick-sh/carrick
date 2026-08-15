@@ -35,6 +35,7 @@ const FAULT_INSTRUCTION: u32 = 0xf900_0013; // `str x19, [x0]`
 const PRIVATE_ADDR: usize = 0x67_0000_0000;
 const SHARED_ADDR: usize = 0x67_0010_0000;
 const FILE_ADDR: usize = 0x67_0020_0000;
+const ANON_EXEC_ADDR: usize = 0x67_0030_0000;
 const SAMPLE_LEN: usize = 32;
 const PAGE: usize = 4096;
 
@@ -70,6 +71,13 @@ struct LoadObservation {
     filesz: usize,
 }
 
+struct FileObservation {
+    start: u64,
+    end: u64,
+    file_page_offset: u64,
+    path: String,
+}
+
 #[derive(Default)]
 struct CoreObservations {
     valid_elf_aarch64: bool,
@@ -81,7 +89,7 @@ struct CoreObservations {
     signal_code: i32,
     signal_addr: u64,
     auxv_entries: usize,
-    file_mapping: bool,
+    file_mappings: Vec<FileObservation>,
     fault_instruction: bool,
     threads: Vec<ThreadObservation>,
     loads: Vec<LoadObservation>,
@@ -179,11 +187,19 @@ fn parse_note_segment(bytes: &[u8], observations: &mut CoreObservations) -> Opti
             NT_FILE => {
                 let count = usize::try_from(read_u64(desc, 0)?).ok()?;
                 let paths_at = 16_usize.checked_add(count.checked_mul(24)?)?;
-                observations.file_mapping |= desc.get(paths_at..).is_some_and(|paths| {
-                    paths
-                        .windows(MAPPED_PATH.len())
-                        .any(|window| window == MAPPED_PATH.as_bytes())
-                });
+                let mut paths = desc.get(paths_at..)?;
+                for index in 0..count {
+                    let end = paths.iter().position(|byte| *byte == 0)?;
+                    let path = std::str::from_utf8(paths.get(..end)?).ok()?.to_owned();
+                    paths = paths.get(end + 1..)?;
+                    let triple = 16_usize.checked_add(index.checked_mul(24)?)?;
+                    observations.file_mappings.push(FileObservation {
+                        start: read_u64(desc, triple)?,
+                        end: read_u64(desc, triple + 8)?,
+                        file_page_offset: read_u64(desc, triple + 16)?,
+                        path,
+                    });
+                }
             }
             NT_AUXV => {
                 observations.auxv_entries = desc
@@ -344,37 +360,63 @@ extern "C" fn blocked_worker(arg: *mut libc::c_void) -> *mut libc::c_void {
     }
 }
 
-unsafe fn fixed_mapping(address: usize, flags: i32, fd: i32) -> *mut u8 {
+unsafe fn fixed_mapping(address: usize, flags: i32, fd: i32, offset: libc::off_t) -> *mut u8 {
     libc::mmap(
         address as *mut libc::c_void,
         PAGE,
         libc::PROT_READ | libc::PROT_WRITE,
         flags | libc::MAP_FIXED_NOREPLACE,
         fd,
-        0,
+        offset,
     )
     .cast()
 }
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn crash_child() -> ! {
-    let private = fixed_mapping(PRIVATE_ADDR, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1);
-    let shared = fixed_mapping(SHARED_ADDR, libc::MAP_SHARED | libc::MAP_ANONYMOUS, -1);
+    let private = fixed_mapping(
+        PRIVATE_ADDR,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    let shared = fixed_mapping(
+        SHARED_ADDR,
+        libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    let anon_exec = fixed_mapping(
+        ANON_EXEC_ADDR,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+        -1,
+        0,
+    );
     let path = std::ffi::CString::new(MAPPED_PATH).unwrap_or_default();
     let fd = libc::open(
         path.as_ptr(),
         libc::O_CREAT | libc::O_TRUNC | libc::O_RDWR,
         0o644,
     );
-    if fd >= 0 && libc::ftruncate(fd, PAGE as libc::off_t) != 0 {
+    if fd >= 0 && libc::ftruncate(fd, (2 * PAGE) as libc::off_t) != 0 {
         libc::_exit(121);
     }
-    let file = fixed_mapping(FILE_ADDR, libc::MAP_PRIVATE, fd);
+    let file = fixed_mapping(FILE_ADDR, libc::MAP_PRIVATE, fd, PAGE as libc::off_t);
     if private == libc::MAP_FAILED.cast()
         || shared == libc::MAP_FAILED.cast()
         || file == libc::MAP_FAILED.cast()
+        || anon_exec == libc::MAP_FAILED.cast()
     {
         libc::_exit(122);
+    }
+    std::ptr::write_unaligned(anon_exec.cast::<u32>(), 0xd65f_03c0); // ret
+    if libc::mprotect(
+        anon_exec.cast(),
+        PAGE,
+        libc::PROT_READ | libc::PROT_EXEC,
+    ) != 0
+    {
+        libc::_exit(128);
     }
     let crash_pid = libc::getpid();
     std::ptr::copy_nonoverlapping(
@@ -608,6 +650,37 @@ fn main() {
                 BLOCKED_FPCR as u32,
             )
         });
+        let boot_mapping_path_exact = parsed
+            .file_mappings
+            .iter()
+            .any(|mapping| mapping.path == PROBE_PATH);
+        let nonzero_offset_file_mapping_exact = parsed.file_mappings.iter().any(|mapping| {
+            mapping.start == FILE_ADDR as u64
+                && mapping.end == (FILE_ADDR + PAGE) as u64
+                && mapping.file_page_offset == 1
+                && mapping.path == MAPPED_PATH
+        });
+        let anonymous_exec_not_file_labeled = parsed.file_mappings.iter().all(|mapping| {
+            ANON_EXEC_ADDR as u64 >= mapping.end
+                || (ANON_EXEC_ADDR + PAGE) as u64 <= mapping.start
+        });
+        let nt_file_symbolizer_truth = parsed.threads.first().is_some_and(|crash| {
+            parsed.file_mappings.iter().any(|mapping| {
+                if mapping.path != PROBE_PATH
+                    || crash.pc < mapping.start
+                    || crash.pc >= mapping.end
+                {
+                    return false;
+                }
+                mapping
+                    .file_page_offset
+                    .checked_mul(PAGE as u64)
+                    .and_then(|file_base| file_base.checked_add(crash.pc - mapping.start))
+                    .and_then(|file_offset| usize::try_from(file_offset).ok())
+                    .and_then(|file_offset| read_u32(&executable, file_offset))
+                    == Some(FAULT_INSTRUCTION)
+            })
+        });
         let stack_pointers_distinct = parsed.threads.len() == 3
             && parsed
                 .threads
@@ -694,7 +767,10 @@ fn main() {
                 main_thread.is_some() && running_thread.is_some() && blocked_thread.is_some(),
             thread_stack_pointers_distinct = stack_pointers_distinct,
             running_and_blocked_pcs_exact = running_pc && blocked_pc,
-            file_mapping_note_present = parsed.file_mapping,
+            boot_mapping_path_exact = boot_mapping_path_exact,
+            nonzero_offset_file_mapping_exact = nonzero_offset_file_mapping_exact,
+            anonymous_exec_not_file_labeled = anonymous_exec_not_file_labeled,
+            nt_file_symbolizer_truth = nt_file_symbolizer_truth,
             auxv_present = parsed.auxv_entries > 0,
             private_cow_sample_present = private_sample,
             shared_sample_present = shared_sample,
