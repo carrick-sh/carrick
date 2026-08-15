@@ -1546,6 +1546,22 @@ pub(crate) fn proc_pid_dir_host_pid(path: &str) -> Option<u32> {
     Some(host_pid)
 }
 
+/// Linux pid encoded by a bare `/proc/<pid>` directory path. Unlike
+/// [`proc_pid_dir_host_pid`], this parser does not consult the host process
+/// table: HVPatch processes have no distinct host pid and resolve the result
+/// against Carrick's Kernel task graph instead.
+pub(crate) fn proc_pid_dir_linux_pid(path: &str) -> Option<u32> {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let component = path.strip_prefix("/proc/")?;
+    if component.contains('/') {
+        return None;
+    }
+    if matches!(component, "self" | "thread-self") {
+        return Some(crate::namespace::pid::self_ns_pid());
+    }
+    component.parse().ok()
+}
+
 /// `(., .., <tid>...)` entries for a `/proc/<pid>/task/` path. Accepts the
 /// `self`/`thread-self`/… aliases as well as a numeric pid (so `/proc/self/task`
 /// resolves — it is listed in the self dir's readdir, and must not ENOENT).
@@ -1615,10 +1631,8 @@ const PROC_SELF_FILES: &[&str] = &[
 /// guest thread or a guest process), else `None`. The SELF dir is populated
 /// with the full set of files/symlinks/sub-dirs carrick serves; a foreign pid
 /// gets the subset its synthetic renderer can actually answer.
-fn proc_pid_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
-    // Gate on a numeric /proc/<pid> for a live process (ns-pid → host pid).
-    let host_pid = proc_pid_dir_host_pid(path)?;
-    let is_self = host_pid == std::process::id();
+fn proc_pid_dir_entries_for_known_process(path: &str, is_self: bool) -> Option<Vec<DirEnt>> {
+    proc_pid_dir_linux_pid(path)?;
     let mut entries = vec![
         DirEnt {
             name: ".".to_string(),
@@ -1658,6 +1672,30 @@ fn proc_pid_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     Some(entries)
 }
 
+fn proc_pid_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
+    // Gate on a numeric /proc/<pid> for a live process (ns-pid → host pid).
+    let host_pid = proc_pid_dir_host_pid(path)?;
+    proc_pid_dir_entries_for_known_process(path, host_pid == std::process::id())
+}
+
+fn proc_pid_dir_entries_with_context(
+    path: &str,
+    ctx: &SyntheticProcContext,
+) -> Option<Vec<DirEnt>> {
+    let pid = proc_pid_dir_linux_pid(path)?;
+    if ctx.identity.is_some_and(|identity| identity.pid == pid) {
+        return proc_pid_dir_entries_for_known_process(path, true);
+    }
+    if ctx
+        .zombies
+        .as_ref()
+        .is_some_and(|zombies| zombies.iter().any(|zombie| zombie.pid == pid))
+    {
+        return proc_pid_dir_entries_for_known_process(path, false);
+    }
+    proc_pid_dir_entries(path)
+}
+
 /// Guest process pids (this process + its guest descendants) for enumerating
 /// `/proc`. libproc's all-pids list filtered by `is_guest_process`.
 #[cfg(target_os = "macos")]
@@ -1695,6 +1733,43 @@ impl ProcVfs {
 impl Default for ProcVfs {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn synthetic_proc_context_from_open(ctx: &OpenContext<'_>) -> SyntheticProcContext {
+    SyntheticProcContext {
+        executable_path: ctx.executable_path.unwrap_or("").to_owned(),
+        argv: ctx.argv.unwrap_or(&[]).to_vec(),
+        task_comm: ctx.task_comm.unwrap_or("").to_owned(),
+        timerslack_ns: ctx.timerslack_ns,
+        guest_arch: ctx.guest_arch,
+        guest_hostname: ctx.guest_hostname.unwrap_or("").to_owned(),
+        environ: ctx.environ.unwrap_or(&[]).to_vec(),
+        open_fds: ctx.open_fds.unwrap_or(&[]).to_vec(),
+        network: ctx.network.cloned().unwrap_or_default(),
+        auxv: ctx.auxv.unwrap_or(&[]).to_vec(),
+        address_space_regions: ctx.address_space_regions.map(|regions| regions.to_vec()),
+        locked_memory: ctx.locked_memory.unwrap_or(&[]).to_vec(),
+        brk_current: ctx.brk_current,
+        mmap_next: ctx.mmap_next,
+        heap_base: ctx.heap_base,
+        native_guest_va: ctx.native_guest_va,
+        ruid: ctx.ruid,
+        euid: ctx.euid,
+        suid: ctx.suid,
+        rgid: ctx.rgid,
+        egid: ctx.egid,
+        sgid: ctx.sgid,
+        groups: ctx.groups.unwrap_or(&[]).to_vec(),
+        sig_ignored: ctx.sig_ignored,
+        sig_caught: ctx.sig_caught,
+        sig_shdpnd: ctx.sig_shdpnd,
+        identity: ctx.identity,
+        threads: ctx.threads.map(|threads| threads.to_vec()),
+        zombies: ctx.zombies.map(|zombies| zombies.to_vec()),
+        sysvipc_shm: ctx.sysvipc_shm.unwrap_or("").to_owned(),
+        sysvipc_sem: ctx.sysvipc_sem.unwrap_or("").to_owned(),
+        sysvipc_msg: ctx.sysvipc_msg.unwrap_or("").to_owned(),
     }
 }
 
@@ -1909,6 +1984,7 @@ impl Vfs for ProcVfs {
         flags: OpenFlags,
         ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
+        let synth_ctx = std::cell::OnceCell::new();
         // Opening the /proc directory itself: serve our synthetic listing
         // (`.`/`..`, `self`, the representative top-level files, and every
         // guest process pid) so `getdents64` / `ls /proc` and `ps` enumerate.
@@ -1973,7 +2049,12 @@ impl Vfs for ProcVfs {
             .or_else(|| proc_net_dir_entries(path))
             .or_else(|| proc_ns_dir_entries(path))
             .or_else(|| proc_task_dir_entries(path))
-            .or_else(|| proc_pid_dir_entries(path))
+            .or_else(|| {
+                proc_pid_dir_entries_with_context(
+                    path,
+                    synth_ctx.get_or_init(|| synthetic_proc_context_from_open(ctx)),
+                )
+            })
         {
             return Ok(VfsHandle::Directory {
                 path: path.to_string(),
@@ -1981,41 +2062,10 @@ impl Vfs for ProcVfs {
                 status_flags: 0,
             });
         }
-        let synth_ctx = SyntheticProcContext {
-            executable_path: ctx.executable_path.unwrap_or("").to_owned(),
-            argv: ctx.argv.unwrap_or(&[]).to_vec(),
-            task_comm: ctx.task_comm.unwrap_or("").to_owned(),
-            timerslack_ns: ctx.timerslack_ns,
-            guest_arch: ctx.guest_arch,
-            guest_hostname: ctx.guest_hostname.unwrap_or("").to_owned(),
-            environ: ctx.environ.unwrap_or(&[]).to_vec(),
-            open_fds: ctx.open_fds.unwrap_or(&[]).to_vec(),
-            network: ctx.network.cloned().unwrap_or_default(),
-            auxv: ctx.auxv.unwrap_or(&[]).to_vec(),
-            address_space_regions: ctx.address_space_regions.map(|regions| regions.to_vec()),
-            locked_memory: ctx.locked_memory.unwrap_or(&[]).to_vec(),
-            brk_current: ctx.brk_current,
-            mmap_next: ctx.mmap_next,
-            heap_base: ctx.heap_base,
-            native_guest_va: ctx.native_guest_va,
-            ruid: ctx.ruid,
-            euid: ctx.euid,
-            suid: ctx.suid,
-            rgid: ctx.rgid,
-            egid: ctx.egid,
-            sgid: ctx.sgid,
-            groups: ctx.groups.unwrap_or(&[]).to_vec(),
-            sig_ignored: ctx.sig_ignored,
-            sig_caught: ctx.sig_caught,
-            sig_shdpnd: ctx.sig_shdpnd,
-            identity: ctx.identity,
-            threads: ctx.threads.map(|threads| threads.to_vec()),
-            zombies: ctx.zombies.map(|zombies| zombies.to_vec()),
-            sysvipc_shm: ctx.sysvipc_shm.unwrap_or("").to_owned(),
-            sysvipc_sem: ctx.sysvipc_sem.unwrap_or("").to_owned(),
-            sysvipc_msg: ctx.sysvipc_msg.unwrap_or("").to_owned(),
-        };
-        let Some(contents) = synthetic_file(path, &synth_ctx) else {
+        let Some(contents) = synthetic_file(
+            path,
+            synth_ctx.get_or_init(|| synthetic_proc_context_from_open(ctx)),
+        ) else {
             return Err(crate::linux_abi::LINUX_ENOSYS);
         };
         // The user-namespace map files and the rw tunables (oom_score_adj/…)
@@ -3402,6 +3452,36 @@ mod tests {
         let md = v.lookup("/proc").unwrap();
         assert_eq!(md.kind, EntryKind::Directory);
         assert_eq!(md.mode, 0o555);
+    }
+
+    #[test]
+    fn hvpatch_numeric_self_directory_uses_authoritative_identity() {
+        let v = ProcVfs::new();
+        let ctx = OpenContext {
+            identity: Some(SyntheticProcIdentity {
+                pid: 73,
+                tid: 73,
+                ppid: 1,
+                pgrp: 73,
+                session: 73,
+            }),
+            ..OpenContext::default()
+        };
+        let opened = v
+            .open(
+                "/proc/73",
+                OpenFlags {
+                    read: true,
+                    directory: true,
+                    ..OpenFlags::default()
+                },
+                &ctx,
+            )
+            .expect("logical /proc/<self> directory must open");
+        let VfsHandle::Directory { entries, .. } = opened else {
+            panic!("logical /proc/<self> must be a directory");
+        };
+        assert!(entries.iter().any(|entry| entry.name == "status"));
     }
 
     #[cfg(target_os = "macos")]
