@@ -3118,23 +3118,43 @@ pub(crate) fn hvpatch_lane_active() -> bool {
 }
 
 impl SyscallDispatcher {
-    pub(crate) fn bind_hvpatch_process(&self, process: crate::hvpatch::ProcessContext) {
-        let launch_context = self.capture_one_task_context().unwrap_or_else(|error| {
-            tracing::error!(%error, "cannot capture filesystem context before HVPatch binding");
-            std::process::abort();
-        });
+    pub(crate) fn launch_fs_context_for_hvpatch_bind(
+        &self,
+    ) -> Result<Option<(String, Option<String>)>, crate::kernel::KernelError> {
+        if self.hvpatch_process().is_some() {
+            // An in-process fork already cloned the authoritative kernel
+            // FsContext. Its dispatcher still carries the parent binding until
+            // child publication, but that parent leader may legitimately have
+            // exited. Never recapture through that stale binding or overwrite
+            // the child's exact inherited filesystem authority.
+            return Ok(None);
+        }
+        let launch_context = self.capture_one_task_context()?;
         let launch_fs_context = launch_context.resources().fs_context();
-        let launch_cwd = launch_fs_context.cwd();
-        let launch_chroot_root = launch_fs_context.chroot_root();
+        Ok(Some((
+            launch_fs_context.cwd(),
+            launch_fs_context.chroot_root(),
+        )))
+    }
+
+    pub(crate) fn bind_hvpatch_process(&self, process: crate::hvpatch::ProcessContext) {
+        let launch_fs_context = self
+            .launch_fs_context_for_hvpatch_bind()
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "cannot capture filesystem context before HVPatch binding");
+                std::process::abort();
+            });
         let process_context = process
             .context_for_linux_tid(crate::kernel::LinuxTid::for_task_leader(process.task_id()))
             .unwrap_or_else(|error| {
                 tracing::error!(%error, "cannot capture HVPatch root filesystem context");
                 std::process::abort();
             });
-        let process_fs_context = process_context.resources().fs_context();
-        process_fs_context.set_cwd(launch_cwd);
-        process_fs_context.set_chroot_root(launch_chroot_root);
+        if let Some((launch_cwd, launch_chroot_root)) = launch_fs_context {
+            let process_fs_context = process_context.resources().fs_context();
+            process_fs_context.set_cwd(launch_cwd);
+            process_fs_context.set_chroot_root(launch_chroot_root);
+        }
         HVPATCH_LANE.store(true, std::sync::atomic::Ordering::Release);
         process.bind_vma_source(self.vma_snapshot_source());
         *self.kernel_binding.write() = process.task_binding();

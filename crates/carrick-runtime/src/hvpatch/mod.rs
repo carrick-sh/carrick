@@ -1604,6 +1604,84 @@ mod tests {
     }
 
     #[test]
+    fn fork_child_binding_does_not_recapture_through_a_retired_parent_leader() {
+        let (parent, root) = authoritative_root();
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.set_cwd("/launch/workdir");
+        dispatcher.bind_hvpatch_process(parent.clone());
+
+        let sibling = parent
+            .kernel_graph()
+            .reserve_thread_clone(
+                &root,
+                crate::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::THREAD
+                        | carrick_abi::LinuxCloneFlags::SIGHAND
+                        | carrick_abi::LinuxCloneFlags::VM,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(crate::thread::ThreadId::synthetic_for_tests(10_001))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_context()
+            .expect("surviving parent sibling");
+        let prepared_mm = parent.mm_resources().prepare_child().unwrap();
+        let child_context = parent
+            .kernel_graph()
+            .reserve_fork(
+                &sibling,
+                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+                    .unwrap(),
+                "retired-leader-child".to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_with_mm_backend(
+                prepared_mm.backend(),
+                crate::thread::ThreadId::synthetic_for_tests(10_002),
+            )
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0;
+        let child_backend = parent
+            .mm_resources()
+            .publish_child(child_context.task().key(), prepared_mm)
+            .unwrap();
+        let child = parent.published_child_context(&child_context, child_backend);
+        let child_dispatcher = dispatcher.fork_clone_in_process(
+            sibling.thread().registry_id(),
+            child_context.thread().registry_id(),
+            parent.pid() as u32,
+            child.pid() as u32,
+        );
+
+        parent
+            .kernel_graph()
+            .exit_thread(&root, None)
+            .expect("retire non-final parent leader");
+        assert!(
+            child_dispatcher
+                .launch_fs_context_for_hvpatch_bind()
+                .expect("child binding classification")
+                .is_none(),
+            "a fork child already owns an inherited kernel FsContext"
+        );
+
+        child_dispatcher.bind_hvpatch_process(child);
+        let rebound = child_dispatcher
+            .capture_one_task_context()
+            .expect("bound child context");
+        assert_eq!(rebound.resources().fs_context().cwd(), "/launch/workdir");
+    }
+
+    #[test]
     fn process_timer_delivery_targets_only_the_exact_hvpatch_task() {
         let (parent, root) = authoritative_root();
         let prepared_mm = parent.mm_resources().prepare_child().unwrap();
