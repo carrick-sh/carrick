@@ -32,12 +32,12 @@
 impl carrick_hal::VcpuKick for VcpuKickHandle {
     #[inline]
     fn kick(&self) {
-        // Delegate to the existing kick path: build a one-element id slice and
-        // call kick_ids, which calls hv_vcpus_exit.  On non-HVF targets
-        // valid_id always returns None, so kick_ids is a no-op — same as
-        // today.
-        let ids: Vec<u64> = std::iter::once(self).filter_map(valid_id).collect();
-        kick_ids(&ids);
+        let Some(id) = valid_id(self) else {
+            crate::probes::vcpu_kick(0, 0, 0);
+            return;
+        };
+        let rc = kick_ids(&[id]);
+        crate::probes::vcpu_kick(id, 1, rc);
     }
 }
 
@@ -90,19 +90,19 @@ fn valid_id(_h: &VcpuKickHandle) -> Option<u64> {
 /// in the race window) are ignored — a stale id yields `HV_BAD_ARGUMENT`, never
 /// UB, and the worst case is a missed kick the next syscall boundary catches.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn kick_ids(ids: &[u64]) {
+fn kick_ids(ids: &[u64]) -> i32 {
     if ids.is_empty() {
-        return;
+        return 0;
     }
     // SAFETY: `ids` is a valid slice of `hv_vcpu_t` (u64); `hv_vcpus_exit`
     // reads `count` ids and returns a status we deliberately ignore.
-    unsafe {
-        applevisor_sys::hv_vcpus_exit(ids.as_ptr(), ids.len() as u32);
-    }
+    unsafe { applevisor_sys::hv_vcpus_exit(ids.as_ptr(), ids.len() as u32) }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn kick_ids(_ids: &[u64]) {}
+fn kick_ids(_ids: &[u64]) -> i32 {
+    0
+}
 
 /// Handle for the process-directed signal pump thread. Dropping or stopping it
 /// asks the pump to exit and joins the host thread, which gives the runtime a

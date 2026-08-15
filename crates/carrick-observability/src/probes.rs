@@ -4603,6 +4603,11 @@ mod real {
         /// instead of injecting a signal at this non-guest PC; a nonzero rate here
         /// is the signal-vs-trampoline race being correctly absorbed.
         fn kick__in_kernel(_: u64, _: u32) {}
+        /// One Hypervisor.framework vCPU kick attempt. `vcpu` is the exact HVF
+        /// id, `valid` reports whether the registry's weak handle still names a
+        /// live owner, and `rc` is the raw `hv_vcpus_exit` result. A zero vCPU
+        /// with `valid=0` means no HV call was possible.
+        fn vcpu__kick(_: u64, _: i32, _: i32) {}
         /// Cumulative kick/inject counters fired once at process exit (cheap, one
         /// fire per process) so a trace can read the totals without paying the
         /// per-event `kick-in-kernel` cost: `el1_resumed` (kicks absorbed in the
@@ -6147,6 +6152,10 @@ mod real {
         carrick_usdt::kick__in_kernel!(|| (pc, el));
     }
 
+    pub fn vcpu_kick(vcpu: u64, valid: i32, rc: i32) {
+        carrick_usdt::vcpu__kick!(|| (vcpu, valid, rc));
+    }
+
     pub fn kick_stats(el1_resumed: u64, kick_inject: u64, inject_at_el1: u64) {
         carrick_usdt::kick__stats!(|| (el1_resumed, kick_inject, inject_at_el1));
     }
@@ -6993,6 +7002,7 @@ mod stub {
     stub!(signal_inject(signum: i32, saved_pc: u64, new_sp: u64, handler: u64));
     stub!(signal_restore(saved_pc: u64, sp: u64, magic: u64));
     stub!(kick_in_kernel(pc: u64, el: u32));
+    stub!(vcpu_kick(vcpu: u64, valid: i32, rc: i32));
     stub!(kick_stats(el1_resumed: u64, kick_inject: u64, inject_at_el1: u64));
     stub!(mem_watch(syscall_nr: u64, addr: u64, value: u64));
     stub!(sigaction_read(signum: i32, w0: u64, w1: u64, w2: u64, w3: u64));
