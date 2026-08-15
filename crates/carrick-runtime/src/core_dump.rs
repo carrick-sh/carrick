@@ -237,6 +237,17 @@ fn validate_serialized_core(
     if bytes.len() < usize::from(EHDR_SIZE) || bytes.get(..4) != Some(b"\x7fELF") {
         return Err(invalid("truncated or invalid ELF header"));
     }
+    if bytes[4] != ELF_CLASS64
+        || bytes[5] != ELF_DATA_LSB
+        || bytes[6] != ELF_VERSION_CURRENT
+        || read_u16(bytes, 16) != Some(ET_CORE)
+        || read_u16(bytes, 18) != Some(EM_AARCH64)
+        || read_u32(bytes, 20) != Some(u32::from(ELF_VERSION_CURRENT))
+    {
+        return Err(invalid(
+            "ELF identity/type/machine is not Linux AArch64 core",
+        ));
+    }
     let phoff = usize::try_from(read_u64(bytes, 32).ok_or_else(|| invalid("missing e_phoff"))?)
         .map_err(|_| invalid("e_phoff does not fit host usize"))?;
     let ehsize = read_u16(bytes, 52).ok_or_else(|| invalid("missing e_ehsize"))?;
@@ -245,7 +256,10 @@ fn validate_serialized_core(
     if ehsize != EHDR_SIZE || phentsize != PHDR_SIZE || phoff != usize::from(EHDR_SIZE) {
         return Err(invalid("non-canonical ELF/program-header geometry"));
     }
-    if phnum != expected_loads.saturating_add(1) {
+    let expected_phnum = expected_loads
+        .checked_add(1)
+        .ok_or(CoreDumpError::LayoutOverflow)?;
+    if phnum != expected_phnum {
         return Err(invalid("program-header count differs from snapshot"));
     }
     let table_bytes = phnum
@@ -1053,6 +1067,11 @@ mod tests {
         let at = std::mem::offset_of!(wire::Elf64Ehdr, e_phentsize);
         bad_phentsize[at..at + 2].copy_from_slice(&0_u16.to_le_bytes());
         assert!(validate_serialized_core(&bad_phentsize, 0, 0).is_err());
+
+        let mut bad_machine = bytes.clone();
+        let at = std::mem::offset_of!(wire::Elf64Ehdr, e_machine);
+        bad_machine[at..at + 2].copy_from_slice(&0_u16.to_le_bytes());
+        assert!(validate_serialized_core(&bad_machine, 0, 0).is_err());
 
         let mut bad_note = bytes.clone();
         let phoff = usize::from(EHDR_SIZE);
