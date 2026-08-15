@@ -1,14 +1,20 @@
-Final signed serialized Docker differentials (review round 1)
+Final signed serialized Docker differentials (review round 2)
 
-coredumpbit run=cr-20994-1896 cleanup=0 MATCH
+coredumpfile run=cr-32493-21915 cleanup=0 MATCH
+  exact NT_FILE paths/offsets and symbolizer truth remained true
+  pt_load_vmas_nonoverlapping=true on Carrick and native-arm64 Docker
+
+coredumpbit run=cr-32543-28701 cleanup=0 MATCH
   SIGABRT/SIGSEGV/SIGQUIT: WCOREDUMP set
   SIGTERM/SIGKILL: WCOREDUMP clear
 
-waitidspec run=cr-21040-22794 cleanup=0 MATCH
+waitidspec run=cr-32594-2718 cleanup=0 MATCH
   exit, killed, WNOWAIT peek/reap, and ECHILD observations all true
 
-sigchld run=cr-21084-26854 cleanup=0 MATCH
+sigchld run=cr-32645-26342 cleanup=0 MATCH
   handler, reap, ignored disposition, and sequential delivery observations all true
 
-signalexit run=cr-21127-14075 cleanup=0 MATCH
+signalexit run=cr-32694-16290 cleanup=0 MATCH
   SIGTERM/SIGKILL wait status and clean exit observations all true
+
+5/5 MATCH; every run-scoped cleanup receipt was zero.

@@ -12,8 +12,8 @@
     {
       "tid": 5,
       "current_signal": 11,
-      "pc": 2254620,
-      "sp": 1099511560112,
+      "pc": 2255604,
+      "sp": 1099511560128,
       "pstate": 1610613696,
       "x0": 0,
       "tpidr_el0": 1229801703532086340,
@@ -27,7 +27,7 @@
     {
       "tid": 7,
       "current_signal": 0,
-      "pc": 2736748,
+      "pc": 2753132,
       "sp": 412317022816,
       "pstate": 960,
       "x0": 0,
@@ -42,7 +42,7 @@
     {
       "tid": 8,
       "current_signal": 0,
-      "pc": 2736140,
+      "pc": 2752524,
       "sp": 412317166160,
       "pstate": 536871872,
       "x0": 4,
@@ -60,5 +60,5 @@
   "load_segments": 27,
   "load_segments_with_contents": 23,
   "foreign_notes": 0,
-  "memory_bytes": 11363513
+  "memory_bytes": 11365353
 }

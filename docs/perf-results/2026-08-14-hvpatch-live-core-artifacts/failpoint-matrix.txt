@@ -1,25 +1,20 @@
-Final signed binary fail-closed matrix (review round 1)
-command shape: CARRICK_CORE_FAILPOINT=<name> target/release/carrick run --exec-backend hvpatch ... /tmp/p --expect-no-core
-common result per row: command=0, guest parent completed, wcoredump_clear=true, no_published_core=true, no_temporary_core=true, scoped cleanup=0
-
-capture-timeout          task5-round1-final-capture-timeout          PASS
-capture-interrupted      task5-round1-final-capture-interrupted      PASS
-capture-registers        task5-round1-final-capture-registers        PASS
-register-generation      task5-round1-final-register-generation      PASS
-missing-thread           task5-round1-final-missing-thread           PASS
-capture-mm               task5-round1-final-capture-mm               PASS
-missing-auxv             task5-round1-final-missing-auxv             PASS
-missing-vma              task5-round1-final-missing-vma              PASS
-memory-read              task5-round1-final-memory-read              PASS
-missing-file-identity    task5-round1-final-missing-file-identity    PASS
-validator                task5-round1-final-validator                PASS
-sibling-drain            task5-round1-final-sibling-drain            PASS
-before-create            task5-round1-final-before-create            PASS
-unwritable-path          task5-round1-final-unwritable-path          PASS
-short-write              task5-round1-final-short-write              PASS
-fsync                    task5-round1-final-fsync                    PASS
-rename                   task5-round1-final-rename                   PASS
-post-publication         task5-round1-final-post-publication         PASS
-wait-commit              task5-round1-final-wait-commit              PASS
-
-19/19 PASS on first measured attempt; all 19 scoped cleanup receipts were zero.
+capture-timeout          task5-r2-capture-timeout PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-capture-timeout) = 0
+capture-interrupted      task5-r2-capture-interrupted PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-capture-interrupted) = 0
+capture-registers        task5-r2-capture-registers PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-capture-registers) = 0
+register-generation      task5-r2-register-generation PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-register-generation) = 0
+missing-thread           task5-r2-missing-thread PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-missing-thread) = 0
+capture-mm               task5-r2-capture-mm PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-capture-mm) = 0
+missing-auxv             task5-r2-missing-auxv PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-missing-auxv) = 0
+missing-vma              task5-r2-missing-vma PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-missing-vma) = 0
+memory-read              task5-r2-memory-read PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-memory-read) = 0
+missing-file-identity    task5-r2-missing-file-identity PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-missing-file-identity) = 0
+validator                task5-r2-validator PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-validator) = 0
+sibling-drain            task5-r2-sibling-drain PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-sibling-drain) = 0
+before-create            task5-r2-before-create PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-before-create) = 0
+unwritable-path          task5-r2-unwritable-path PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-unwritable-path) = 0
+short-write              task5-r2-short-write PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-short-write) = 0
+fsync                    task5-r2-fsync PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-fsync) = 0
+rename                   task5-r2-rename PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-rename) = 0
+post-publication         task5-r2-post-publication PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-post-publication) = 0
+wait-commit              task5-r2-wait-commit PASS rc=0 cleanup=remaining carrick procs (run-id task5-r2-wait-commit) = 0
+19/19 PASS

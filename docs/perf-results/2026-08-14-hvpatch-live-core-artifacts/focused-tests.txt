@@ -1,19 +1,24 @@
-Focused review-round tests at code HEAD 67f722761
+Focused Task 5 review-round-2 tests at code HEAD 73513869
 
 cargo test -p carrick-cli hvpatch_core_profile: 6 passed
-cargo test -p carrick-cli debug_core: 6 passed
-RUST_TEST_THREADS=1 cargo test -p carrick-runtime core_dump --lib: 11 passed
-RUST_TEST_THREADS=1 cargo test -p carrick-runtime core_publication --lib: 4 passed
+cargo test -p carrick-cli debug_core: 7 passed
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime core_dump --lib: 12 passed
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime core_publication --lib: 6 passed
 RUST_TEST_THREADS=1 cargo test -p carrick-runtime fatal_core_authority --lib: 2 passed
-RUST_TEST_THREADS=1 cargo test -p carrick-runtime file_mapping --lib: 1 passed
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime core_vma_projection --lib: 1 passed
+RUST_TEST_THREADS=1 cargo test -p carrick-runtime host_checked_remove_distinguishes_unlink_failure_from_absence --lib: 1 passed
 RUST_TEST_THREADS=1 cargo test -p carrick-runtime durability_reopen --lib: 1 passed
 cargo test -p carrick-aarch64 core_register_capture_rejects_disabled_fpsimd_authority: 1 passed
 cargo test -p carrick-mem file_mapping: 1 passed
 cargo test -p carrick-vmm-hvf guest_copy_mapping --lib: 1 passed
 
-The fatal authority test uses a deterministic barrier: the stale fatal participant
-is released only after successful exec rebinding, must lose, and the current image
-then records the fatal state used by the later signed crash/core differential.
+The strict reader mutations cover malformed ELF data/version identity, malformed
+program-header geometry and arithmetic, a missing mandatory NT_AUXV, and
+overlapping PT_LOAD VMAs. The projection test replaces the first live heap page
+with a differently protected MAP_FIXED mapping and proves a sorted,
+non-overlapping partition. The real HostFsBackend test distinguishes absent
+state from non-empty-directory unlink failure and invalid root-path resolution;
+the injected publication backend proves both post-rename and wait-owned cleanup
+failures surface explicitly and leave only an invalidated zero-byte artifact.
 
-All commands exited 0. The full just ci receipt is recorded after the evidence
-commit so it tests the exact review handoff.
+All commands exited 0. The full just ci receipt follows the evidence commit.

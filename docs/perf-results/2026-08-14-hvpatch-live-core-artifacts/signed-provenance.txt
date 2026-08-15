@@ -1,15 +1,14 @@
-Final signed Task 5 review-round provenance
-HEAD=67f7227613e82fa8ebbb160ed276325819383de9
-1614190db25abf74a1123c5e4b57334aaf384c4f54d94f302e98f1ca5f597199  target/release/carrick
-16825b23f3bc3dc4ae1f1646391a4403b42f43062637f4474a5790675069dd4f  conformance-probes/target/aarch64-unknown-linux-musl/release/coredumpfile
+Final signed Task 5 review round 2 provenance
+HEAD=73513869c3c0ce7df933aa40724a9a034abcd8bd
+356e2c51d506727e3a8074345cca7febcf0b4f58b1eadff9e012add24c1d5709  target/release/carrick
+c005c0ea383d3086ae2b009971e0b5335990212608624857e2328f11f0c615bf  conformance-probes/target/aarch64-unknown-linux-musl/release/coredumpfile
 9d15b22d1aaed5b54eb3fd361df801dbf5d094024f5b72fe2423ec5827321d7d  scripts/dtrace/hvpatch-core-lifecycle.d
-0e040266fac5bb2b2001d60e49cb737636a0f60619d86b4cee1491c70b0f5af7  docs/perf-results/2026-08-14-hvpatch-live-core-artifacts/coredumpfile.core
-fdbc23e3f35f6123363012d8875ede2e35a37beb8b3e57a5c842c2f2e86fbd5c  docs/perf-results/2026-08-14-hvpatch-live-core-artifacts/hvpatch-core-lifecycle.raw
-UUID: 368A4393-463C-3897-A7A2-8BA180495BD4 (arm64) target/release/carrick
+717da33d1d0d07811e820209f64d58ef4f6558d6cd0395add05003ae9fcea1cb  docs/perf-results/2026-08-14-hvpatch-live-core-artifacts/coredumpfile.core
+f1ac2ebb9009c82afd783f5e42734e441db300fa141d12aa92c39fe12d60621d  docs/perf-results/2026-08-14-hvpatch-live-core-artifacts/hvpatch-core-lifecycle.raw
+UUID: 2BD332EA-99E7-3AD5-8679-62D63F1E68BF (arm64) target/release/carrick
 target/release/carrick: Mach-O 64-bit executable arm64
 target/release/carrick: valid on disk
 target/release/carrick: satisfies its Designated Requirement
 <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>
-Section
   sectname __dof_carrick
    segname __TEXT
