@@ -11743,6 +11743,11 @@ fn align_down(value: u64, alignment: u64) -> u64 {
 }
 
 fn align_up(value: u64, alignment: u64) -> Result<u64, TrapError> {
+    if alignment == 0 {
+        return Err(TrapError::Hypervisor(
+            "cannot align a guest mapping to zero bytes".to_owned(),
+        ));
+    }
     let remainder = value % alignment;
     if remainder == 0 {
         Ok(value)
@@ -13083,6 +13088,21 @@ mod frame_inventory_backend_tests {
         let _prefix = allocator.allocate(0x4000, 0x4000).unwrap();
         let large = allocator.allocate(TWO_MIB, TWO_MIB).unwrap();
         assert_eq!(large % TWO_MIB, 0);
+    }
+
+    #[test]
+    fn global_frame_allocator_rejects_invalid_allocation_arithmetic() {
+        let mut allocator = GlobalFrameIpaAllocator::new();
+        assert!(allocator.allocate(0x4000, 0).is_err());
+        assert!(allocator.allocate(u64::MAX, 0x4000).is_err());
+        assert!(
+            allocator
+                .release(
+                    carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE,
+                    u64::MAX,
+                )
+                .is_err()
+        );
     }
 
     #[test]
