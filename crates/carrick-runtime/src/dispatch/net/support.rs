@@ -468,10 +468,17 @@ pub(super) fn set_host_sockaddr_header(out: &mut [u8], family: i32) {
 /// The host socket type to actually create for a guest `(family, base_type)`.
 /// macOS has no AF_UNIX `SOCK_SEQPACKET`, so back it with a `SOCK_STREAM` socket;
 /// carrick frames messages on top to recover SEQPACKET boundary semantics (see
-/// `OpenDescription::HostSocket.seqpacket`). Everything else maps 1:1.
+/// `OpenDescription::HostSocket.seqpacket`). Unprivileged BSD processes also
+/// cannot create INET raw sockets, so Carrick uses a datagram fd as their
+/// poll/bind/option carrier while retaining the guest RAW type and protocol.
+/// Raw connect identity is virtualized by the dispatcher.
 pub(super) fn host_socktype_backing(family: i32, base_type: i32) -> i32 {
     if family == LINUX_AF_UNIX && base_type == LINUX_SOCK_SEQPACKET {
         return libc::SOCK_STREAM;
+    }
+    #[cfg(carrick_bsd)]
+    if matches!(family, LINUX_AF_INET | LINUX_AF_INET6) && base_type == LINUX_SOCK_RAW {
+        return libc::SOCK_DGRAM;
     }
     linux_to_host_socktype(base_type)
 }
@@ -479,8 +486,8 @@ pub(super) fn host_socktype_backing(family: i32, base_type: i32) -> i32 {
 /// Linux-canonical `(family, base_type, protocol)` validation applied BEFORE the
 /// tuple reaches the host `socket()`/`socketpair()`. Returns `Some(errno)` for
 /// the combinations Linux rejects with a well-defined errno that macOS reports
-/// differently (invalid type → `EPROTONOSUPPORT`; a protocol/type mismatch or a
-/// raw socket → `EPROTOTYPE`/`EPERM`), and `None` to let the host handle the
+/// differently (invalid type → `EPROTONOSUPPORT`; a protocol/type mismatch →
+/// `EPROTOTYPE`/`EPERM`), and `None` to let the host handle the
 /// tuple (a genuinely unsupported domain still surfaces `EAFNOSUPPORT`; a valid
 /// INET pair still surfaces `EOPNOTSUPP` from `socketpair`). `base_type` must
 /// already have the `SOCK_NONBLOCK`/`SOCK_CLOEXEC` bits stripped.
@@ -531,10 +538,12 @@ pub(super) fn canonical_socket_errno(
                     return Some(crate::linux_abi::LINUX_EPROTONOSUPPORT);
                 }
             }
-            // Raw sockets need CAP_NET_RAW; carrick cannot back an unprivileged
-            // raw socket on macOS and the Linux/container oracle answers
-            // EPROTONOSUPPORT (macOS: EPERM).
-            LINUX_SOCK_RAW => return Some(crate::linux_abi::LINUX_EPROTONOSUPPORT),
+            // Linux accepts an 8-bit IP protocol for raw sockets (subject to
+            // CAP_NET_RAW). Carrick virtualizes the capability boundary and
+            // retains that guest protocol over an unprivileged datagram carrier.
+            LINUX_SOCK_RAW if !(0..=u8::MAX as i32).contains(&protocol) => {
+                return Some(LINUX_EINVAL);
+            }
             _ => {}
         }
     }
@@ -2492,6 +2501,19 @@ pub(in crate::dispatch) fn parse_host_scm_rights_fds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inet_raw_socket_uses_unprivileged_datagram_carrier() {
+        assert_eq!(
+            canonical_socket_errno(LINUX_AF_INET, LINUX_SOCK_RAW, 1),
+            None
+        );
+        #[cfg(carrick_bsd)]
+        assert_eq!(
+            host_socktype_backing(LINUX_AF_INET, LINUX_SOCK_RAW),
+            libc::SOCK_DGRAM
+        );
+    }
 
     #[derive(Debug, PartialEq, Eq)]
     struct DecodedRoute {
