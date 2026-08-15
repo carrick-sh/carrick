@@ -484,7 +484,7 @@ where
         child_tid_addr: u64,
         clear_child_tid_addr: u64,
     ) -> Result<CloneThreadSpawn, RuntimeError> {
-        let Some(clone_permit) = kernel.try_enroll_clone() else {
+        let Some(clone_permit) = kernel.try_enroll_thread_clone() else {
             crate::probes::mn_clone_outcome(
                 self.this_tid.raw(),
                 carrick_observability::probes::HvpatchCloneThreadPhase::AdmissionClosed,

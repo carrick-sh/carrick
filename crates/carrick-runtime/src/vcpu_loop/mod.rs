@@ -661,7 +661,14 @@ impl HvpatchRuntimeDirectory {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CloneAdmissionClose {
     Exec { owner: ThreadId, generation: u64 },
+    Fork { owner: ThreadId, generation: u64 },
     Exit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloneAdmissionKind {
+    ThreadClone,
+    ProcessFork { owner: ThreadId },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -685,7 +692,7 @@ struct CloneAdmissionGate {
 }
 
 impl CloneAdmissionGate {
-    fn try_enroll(&self) -> Option<CloneAdmissionPermit<'_>> {
+    fn try_enroll_kind(&self, kind: CloneAdmissionKind) -> Option<CloneAdmissionPermit<'_>> {
         let mut state = self.state.lock();
         if state.closing.is_some() {
             return None;
@@ -694,23 +701,46 @@ impl CloneAdmissionGate {
         Some(CloneAdmissionPermit {
             gate: self,
             generation: state.generation,
+            kind,
             active: true,
         })
+    }
+
+    fn try_enroll_thread_clone(&self) -> Option<CloneAdmissionPermit<'_>> {
+        self.try_enroll_kind(CloneAdmissionKind::ThreadClone)
+    }
+
+    fn try_enroll_process_fork(&self, owner: ThreadId) -> Option<CloneAdmissionPermit<'_>> {
+        self.try_enroll_kind(CloneAdmissionKind::ProcessFork { owner })
     }
 
     fn is_closing(&self) -> bool {
         self.state.lock().closing.is_some()
     }
 
+    fn is_terminal_closing(&self) -> bool {
+        matches!(
+            self.state.lock().closing,
+            Some(CloneAdmissionClose::Exec { .. } | CloneAdmissionClose::Exit)
+        )
+    }
+
     fn close_for_exec(&self, owner: ThreadId) -> Result<ExecCloneAdmission<'_>, RuntimeError> {
         let mut state = self.state.lock();
-        if let Some(reason) = state.closing {
-            return Err(RuntimeError::Unsupported(format!(
-                "cannot begin exec while clone admission is closing: {reason:?}"
-            )));
-        }
         let generation = state.generation;
-        state.closing = Some(CloneAdmissionClose::Exec { owner, generation });
+        match state.closing {
+            None | Some(CloneAdmissionClose::Fork { .. }) => {
+                // Exec is destructive and wins a race with an ordinary fork.
+                // Promoting the close reason makes the fork permit observe
+                // cancellation and drain itself before exec proceeds.
+                state.closing = Some(CloneAdmissionClose::Exec { owner, generation });
+            }
+            Some(reason) => {
+                return Err(RuntimeError::Unsupported(format!(
+                    "cannot begin exec while clone admission is closing: {reason:?}"
+                )));
+            }
+        }
         self.changed.notify_all();
         let deadline = Instant::now() + Duration::from_secs(5);
         while state.in_flight != 0 {
@@ -734,10 +764,58 @@ impl CloneAdmissionGate {
         })
     }
 
+    fn close_for_fork(
+        &self,
+        owner: ThreadId,
+        generation: u64,
+    ) -> Result<ForkCloneAdmission<'_>, RuntimeError> {
+        let mut state = self.state.lock();
+        if state.generation != generation || state.closing.is_some() {
+            return Err(RuntimeError::Unsupported(
+                "cannot begin fork while clone admission is closing".to_owned(),
+            ));
+        }
+        let close = CloneAdmissionClose::Fork { owner, generation };
+        state.closing = Some(close);
+        self.changed.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // The caller's own process-fork permit remains enrolled. Every other
+        // permit belongs to a thread clone admitted before the fork close and
+        // must finish normally before the task snapshot can be reserved.
+        while state.in_flight != 1 {
+            if state.closing != Some(close) {
+                return Err(RuntimeError::Unsupported(
+                    "fork clone-admission close was superseded".to_owned(),
+                ));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                state.closing = None;
+                self.changed.notify_all();
+                return Err(RuntimeError::Unsupported(format!(
+                    "fork clone-admission drain timed out: in_flight={}",
+                    state.in_flight
+                )));
+            }
+            self.changed
+                .wait_for(&mut state, (deadline - now).min(Duration::from_millis(50)));
+        }
+        Ok(ForkCloneAdmission {
+            gate: self,
+            owner,
+            generation,
+        })
+    }
+
     fn claim_process_exit(&self) -> Result<ProcessExitClaim, RuntimeError> {
         let mut state = self.state.lock();
         match state.closing {
             Some(CloneAdmissionClose::Exec { .. }) => return Ok(ProcessExitClaim::LostToExec),
+            Some(CloneAdmissionClose::Fork { .. }) => {
+                // Whole-process exit wins an ordinary fork. The fork permit
+                // observes Exit as cancellation and drains before teardown.
+                state.closing = Some(CloneAdmissionClose::Exit);
+            }
             Some(CloneAdmissionClose::Exit) => return Ok(ProcessExitClaim::AlreadyOwned),
             None => state.closing = Some(CloneAdmissionClose::Exit),
         }
@@ -761,13 +839,35 @@ impl CloneAdmissionGate {
 struct CloneAdmissionPermit<'a> {
     gate: &'a CloneAdmissionGate,
     generation: u64,
+    kind: CloneAdmissionKind,
     active: bool,
 }
 
 impl CloneAdmissionPermit<'_> {
     fn is_cancelled(&self) -> bool {
         let state = self.gate.state.lock();
-        state.generation != self.generation || state.closing.is_some()
+        if state.generation != self.generation {
+            return true;
+        }
+        match state.closing {
+            Some(CloneAdmissionClose::Exec { .. } | CloneAdmissionClose::Exit) => true,
+            Some(CloneAdmissionClose::Fork { owner, generation }) => match self.kind {
+                CloneAdmissionKind::ThreadClone => false,
+                CloneAdmissionKind::ProcessFork {
+                    owner: permit_owner,
+                } => permit_owner != owner || self.generation != generation,
+            },
+            None => false,
+        }
+    }
+
+    fn close_for_fork(&self, owner: ThreadId) -> Result<ForkCloneAdmission<'_>, RuntimeError> {
+        if self.kind != (CloneAdmissionKind::ProcessFork { owner }) {
+            return Err(RuntimeError::Unsupported(
+                "fork close requires the matching process-fork permit".to_owned(),
+            ));
+        }
+        self.gate.close_for_fork(owner, self.generation)
     }
 }
 
@@ -782,7 +882,28 @@ impl Drop for CloneAdmissionPermit<'_> {
         };
         state.in_flight = in_flight;
         self.active = false;
-        if state.in_flight == 0 {
+        if state.in_flight == 0 || state.closing.is_some() {
+            self.gate.changed.notify_all();
+        }
+    }
+}
+
+struct ForkCloneAdmission<'a> {
+    gate: &'a CloneAdmissionGate,
+    owner: ThreadId,
+    generation: u64,
+}
+
+impl Drop for ForkCloneAdmission<'_> {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock();
+        if state.closing
+            == Some(CloneAdmissionClose::Fork {
+                owner: self.owner,
+                generation: self.generation,
+            })
+        {
+            state.closing = None;
             self.gate.changed.notify_all();
         }
     }
@@ -1087,12 +1208,16 @@ impl KernelState {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn try_enroll_clone(&self) -> Option<CloneAdmissionPermit<'_>> {
-        self.clone_admission.try_enroll()
+    fn try_enroll_thread_clone(&self) -> Option<CloneAdmissionPermit<'_>> {
+        self.clone_admission.try_enroll_thread_clone()
     }
 
     fn clone_admission_cancelled(&self) -> bool {
         self.clone_admission.is_closing()
+    }
+
+    fn clone_admission_terminal_cancelled(&self) -> bool {
+        self.clone_admission.is_terminal_closing()
     }
 
     fn close_clone_admission_for_exec(
@@ -2433,6 +2558,23 @@ where
         }
     }
 
+    fn trace_hvpatch_thread_terminal(
+        &self,
+        reason: carrick_observability::probes::HvpatchThreadTerminalReason,
+        detail: i32,
+    ) {
+        let Some(pid) = self.hvpatch_task_pid else {
+            return;
+        };
+        crate::probes::hvpatch_thread_terminal(
+            pid,
+            self.linux_tid.raw(),
+            self.this_tid.raw(),
+            reason,
+            detail,
+        );
+    }
+
     /// Return-side companion to [`Self::trace_syscall`].
     fn trace_syscall_return(&self, traps: usize, ret: Option<i64>) {
         if !self.trace {
@@ -3689,6 +3831,10 @@ where
                 }
             }
             if thread_should_finish_for_exec_replacement(&state.registry, state.this_tid) {
+                state.trace_hvpatch_thread_terminal(
+                    carrick_observability::probes::HvpatchThreadTerminalReason::ExecRegistryGoneAtLoopTop,
+                    i32::from(!state.registry.is_live(state.this_tid)),
+                );
                 return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
             }
             // HVPatch hosts every Linux task as threads of one Darwin process,
@@ -4209,6 +4355,10 @@ where
                             last_syscall_retval = Some(retval);
                         }
                         BlockingWaitCompletion::ExecReplacedThread => {
+                            state.trace_hvpatch_thread_terminal(
+                                carrick_observability::probes::HvpatchThreadTerminalReason::ExecRegistryGoneAfterBlockingWait,
+                                i32::from(!state.registry.is_live(state.this_tid)),
+                            );
                             return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
                         }
                     }
@@ -4223,6 +4373,10 @@ where
                             last_syscall_retval = Some(retval);
                         }
                         BlockingWaitCompletion::ExecReplacedThread => {
+                            state.trace_hvpatch_thread_terminal(
+                                carrick_observability::probes::HvpatchThreadTerminalReason::ExecRegistryGoneAfterBlockingWait,
+                                i32::from(!state.registry.is_live(state.this_tid)),
+                            );
                             return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
                         }
                     }
@@ -4247,6 +4401,10 @@ where
                             last_syscall_retval = Some(retval);
                         }
                         BlockingWaitCompletion::ExecReplacedThread => {
+                            state.trace_hvpatch_thread_terminal(
+                                carrick_observability::probes::HvpatchThreadTerminalReason::ExecRegistryGoneAfterBlockingWait,
+                                i32::from(!state.registry.is_live(state.this_tid)),
+                            );
                             return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
                         }
                     }
@@ -4270,6 +4428,10 @@ where
                             last_syscall_retval = Some(retval);
                         }
                         BlockingWaitCompletion::ExecReplacedThread => {
+                            state.trace_hvpatch_thread_terminal(
+                                carrick_observability::probes::HvpatchThreadTerminalReason::ExecRegistryGoneAfterBlockingWait,
+                                i32::from(!state.registry.is_live(state.this_tid)),
+                            );
                             return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
                         }
                     }
@@ -4358,6 +4520,12 @@ where
                     );
                 }
                 DispatchOutcome::ThreadExit { code } => {
+                    let reason = if frame.number.raw() == 93 {
+                        carrick_observability::probes::HvpatchThreadTerminalReason::GuestThreadExit
+                    } else {
+                        carrick_observability::probes::HvpatchThreadTerminalReason::ExecRegistryGoneAfterBlockingWait
+                    };
+                    state.trace_hvpatch_thread_terminal(reason, code);
                     return Ok(state.handle_thread_exit(&kernel, &mut engine, code, traps));
                 }
                 DispatchOutcome::SignalThread {
@@ -4475,6 +4643,10 @@ where
                                 Some(state.complete_returned(&mut engine, retval)?);
                         }
                         None => {
+                            state.trace_hvpatch_thread_terminal(
+                                carrick_observability::probes::HvpatchThreadTerminalReason::VforkParentTerminalCancellation,
+                                0,
+                            );
                             return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
                         }
                     }
@@ -4962,6 +5134,14 @@ where
             // the process-wide VM only after lifecycle and backend finalization.
             kernel.publish_process_terminal(terminal_publication);
         } else {
+            state.trace_hvpatch_thread_terminal(
+                carrick_observability::probes::HvpatchThreadTerminalReason::ProcessTerminalLoser,
+                match exit_claim {
+                    ProcessExitClaim::LostToExec => 1,
+                    ProcessExitClaim::AlreadyOwned => 2,
+                    ProcessExitClaim::Owner => 0,
+                },
+            );
             // An exec that claimed admission first owns the replacement. Its
             // terminal sibling must retire its exact old Kernel thread before
             // disappearing so the exec owner can finish the runtime drain and
@@ -5576,13 +5756,15 @@ mod tests {
     #[test]
     fn clone_admission_exit_waits_for_in_flight_and_stays_closed() {
         let gate = CloneAdmissionGate::default();
-        let permit = gate.try_enroll().expect("initial clone permit");
+        let permit = gate
+            .try_enroll_thread_clone()
+            .expect("initial clone permit");
         std::thread::scope(|scope| {
             let closer = scope.spawn(|| gate.claim_process_exit());
             while !permit.is_cancelled() {
                 std::thread::yield_now();
             }
-            assert!(gate.try_enroll().is_none());
+            assert!(gate.try_enroll_thread_clone().is_none());
             drop(permit);
             assert_eq!(
                 closer
@@ -5592,7 +5774,7 @@ mod tests {
                 ProcessExitClaim::Owner
             );
         });
-        assert!(gate.try_enroll().is_none());
+        assert!(gate.try_enroll_thread_clone().is_none());
     }
 
     #[test]
@@ -5600,13 +5782,13 @@ mod tests {
         let gate = CloneAdmissionGate::default();
         let owner = ThreadId::synthetic_for_tests(1002);
         let exec = gate.close_for_exec(owner).expect("exec admission close");
-        assert!(gate.try_enroll().is_none());
+        assert!(gate.try_enroll_thread_clone().is_none());
         assert_eq!(
             gate.claim_process_exit().expect("exit arbitration"),
             ProcessExitClaim::LostToExec
         );
         drop(exec);
-        assert!(gate.try_enroll().is_some());
+        assert!(gate.try_enroll_thread_clone().is_some());
 
         // Once exec releases, exit can claim permanent ownership and a later
         // exec cannot establish a competing terminal drain.
@@ -5615,14 +5797,16 @@ mod tests {
             ProcessExitClaim::Owner
         );
         assert!(gate.close_for_exec(owner).is_err());
-        assert!(gate.try_enroll().is_none());
+        assert!(gate.try_enroll_thread_clone().is_none());
     }
 
     #[test]
     fn clone_admission_cancels_enrolled_process_fork_before_exec_drain() {
         let gate = CloneAdmissionGate::default();
         let owner = ThreadId::synthetic_for_tests(1003);
-        let process_fork = gate.try_enroll().expect("process fork admission");
+        let process_fork = gate
+            .try_enroll_process_fork(owner)
+            .expect("process fork admission");
 
         std::thread::scope(|scope| {
             let exec = scope.spawn(|| gate.close_for_exec(owner));
@@ -5630,7 +5814,7 @@ mod tests {
                 std::thread::yield_now();
             }
             assert!(
-                gate.try_enroll().is_none(),
+                gate.try_enroll_thread_clone().is_none(),
                 "new process forks must be rejected after exec closes admission"
             );
             drop(process_fork);
@@ -5640,7 +5824,79 @@ mod tests {
                     .expect("exec admission drain"),
             );
         });
-        assert!(gate.try_enroll().is_some());
+        assert!(gate.try_enroll_thread_clone().is_some());
+    }
+
+    #[test]
+    fn fork_admission_drains_existing_clones_without_cancelling_them() {
+        let gate = CloneAdmissionGate::default();
+        let owner = ThreadId::synthetic_for_tests(1004);
+        let process_fork = gate
+            .try_enroll_process_fork(owner)
+            .expect("process fork admission");
+        let existing_clone = gate
+            .try_enroll_thread_clone()
+            .expect("existing clone admission");
+
+        std::thread::scope(|scope| {
+            let closer = scope.spawn(|| process_fork.close_for_fork(owner));
+            while !gate.is_closing() {
+                std::thread::yield_now();
+            }
+            assert!(
+                gate.try_enroll_thread_clone().is_none(),
+                "new clones wait behind fork"
+            );
+            assert!(
+                !existing_clone.is_cancelled(),
+                "a clone admitted before fork must finish, not leak EAGAIN"
+            );
+            drop(existing_clone);
+            let fork = closer
+                .join()
+                .expect("fork closer")
+                .expect("fork admission drain");
+            assert!(!process_fork.is_cancelled());
+            drop(fork);
+        });
+
+        drop(process_fork);
+        assert!(gate.try_enroll_thread_clone().is_some());
+    }
+
+    #[test]
+    fn concurrent_fork_close_does_not_retire_a_vfork_parent() {
+        let gate = CloneAdmissionGate::default();
+        let owner = ThreadId::synthetic_for_tests(1005);
+        let process_fork = gate
+            .try_enroll_process_fork(owner)
+            .expect("process fork admission");
+        let fork = process_fork
+            .close_for_fork(owner)
+            .expect("fork admission close");
+
+        assert!(gate.is_closing(), "ordinary fork must close new admission");
+        assert!(
+            !gate.is_terminal_closing(),
+            "an unrelated fork close must not retire a suspended vfork parent"
+        );
+
+        drop(fork);
+        drop(process_fork);
+        let exec = gate.close_for_exec(owner).expect("exec admission close");
+        assert!(
+            gate.is_terminal_closing(),
+            "exec replacement must retire a suspended vfork parent"
+        );
+        drop(exec);
+        assert_eq!(
+            gate.claim_process_exit().expect("process exit close"),
+            ProcessExitClaim::Owner
+        );
+        assert!(
+            gate.is_terminal_closing(),
+            "process exit must retire a suspended vfork parent"
+        );
     }
 
     #[test]
