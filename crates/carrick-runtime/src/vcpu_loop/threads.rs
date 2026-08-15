@@ -485,9 +485,19 @@ where
         clear_child_tid_addr: u64,
     ) -> Result<CloneThreadSpawn, RuntimeError> {
         let Some(clone_permit) = kernel.try_enroll_clone() else {
+            crate::probes::mn_clone_outcome(
+                self.this_tid.raw(),
+                carrick_observability::probes::HvpatchCloneThreadPhase::AdmissionClosed,
+                crate::linux_abi::LINUX_EAGAIN.get(),
+            );
             return Ok(CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN));
         };
         if kernel.process_exiting() || clone_permit.is_cancelled() {
+            crate::probes::mn_clone_outcome(
+                self.this_tid.raw(),
+                carrick_observability::probes::HvpatchCloneThreadPhase::AdmissionCancelled,
+                crate::linux_abi::LINUX_EAGAIN.get(),
+            );
             return Ok(CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN));
         }
         let read_tid_output = |address: u64| -> Option<Option<Vec<u8>>> {
@@ -546,6 +556,11 @@ where
                 };
                 (linux_tid, tid, None)
             };
+        crate::probes::mn_clone_outcome(
+            tid.raw(),
+            carrick_observability::probes::HvpatchCloneThreadPhase::Reserved,
+            0,
+        );
         let spec = match engine.build_sibling_spec(carrick_hal::GuestEntryRegs {
             return_value: 0,
             stack: Some(stack),
@@ -599,6 +614,11 @@ where
         let handle = std::thread::Builder::new()
             .name(host_thread_name)
             .spawn(move || {
+                crate::probes::mn_clone_outcome(
+                    tid.raw(),
+                    carrick_observability::probes::HvpatchCloneThreadPhase::HostThreadStarted,
+                    0,
+                );
                 if trace {
                     eprintln!("[sibling tid#{tid}] thread started, building vCPU");
                 }
@@ -624,6 +644,11 @@ where
                     if child_kernel.process_exiting()
                         || child_kernel.clone_admission_cancelled()
                     {
+                        crate::probes::mn_clone_outcome(
+                            tid.raw(),
+                            carrick_observability::probes::HvpatchCloneThreadPhase::ChildCancelledBeforeSlot,
+                            crate::linux_abi::LINUX_EAGAIN.get(),
+                        );
                         let _ = ready_tx.send(Err(SiblingStartFailure::Cancelled));
                         return;
                     }
@@ -648,6 +673,11 @@ where
                         .budget()
                         .min(u32::MAX as usize) as u32,
                 );
+                crate::probes::mn_clone_outcome(
+                    tid.raw(),
+                    carrick_observability::probes::HvpatchCloneThreadPhase::Admitted,
+                    0,
+                );
                 // `run_vcpu_until_exit` owns lease release for every guest
                 // thread kind, including hvpatch process leaders which can
                 // acquire their first lease only after a blocking wait.
@@ -664,12 +694,22 @@ where
                 if child_kernel.process_exiting()
                     || child_kernel.clone_admission_cancelled()
                 {
+                    crate::probes::mn_clone_outcome(
+                        tid.raw(),
+                        carrick_observability::probes::HvpatchCloneThreadPhase::ChildCancelledBeforeMaterialize,
+                        crate::linux_abi::LINUX_EAGAIN.get(),
+                    );
                     drop(topo);
                     let _ = ready_tx.send(Err(SiblingStartFailure::Cancelled));
                     return;
                 }
                 match E::materialize_sibling(spec) {
                     Ok(mut child_engine) => {
+                        crate::probes::mn_clone_outcome(
+                            tid.raw(),
+                            carrick_observability::probes::HvpatchCloneThreadPhase::Materialized,
+                            0,
+                        );
                         // Release the topology lock BEFORE the start handshake.
                         //
                         // `start_rx.recv()` is a blocking wait on the parent,
@@ -719,6 +759,11 @@ where
                         if child_kernel.process_exiting()
                             || child_kernel.clone_admission_cancelled()
                         {
+                            crate::probes::mn_clone_outcome(
+                                tid.raw(),
+                                carrick_observability::probes::HvpatchCloneThreadPhase::ChildCancelledAfterMaterialize,
+                                crate::linux_abi::LINUX_EAGAIN.get(),
+                            );
                             child_engine.destroy_vcpu_on_thread_exit();
                             drop(topo);
                             return;
@@ -799,6 +844,11 @@ where
                         }
                     }
                     Err(error) => {
+                        crate::probes::mn_clone_outcome(
+                            tid.raw(),
+                            carrick_observability::probes::HvpatchCloneThreadPhase::MaterializationFailed,
+                            0,
+                        );
                         drop(topo);
                         let _ = ready_tx
                             .send(Err(SiblingStartFailure::Materialization(error.to_string())));
@@ -806,6 +856,11 @@ where
                 }
             })
             .map_err(|error| {
+                crate::probes::mn_clone_outcome(
+                    tid.raw(),
+                    carrick_observability::probes::HvpatchCloneThreadPhase::HostThreadSpawnFailed,
+                    error.raw_os_error().unwrap_or(0),
+                );
                 RuntimeError::Trap(TrapError::Hypervisor(format!(
                     "spawn guest thread failed: {error}"
                 )))
@@ -883,6 +938,11 @@ where
                 return Err(error);
             }
             Ok(false) => {
+                crate::probes::mn_clone_outcome(
+                    tid.raw(),
+                    carrick_observability::probes::HvpatchCloneThreadPhase::StartCancelled,
+                    crate::linux_abi::LINUX_EAGAIN.get(),
+                );
                 let _ = start_tx.send(false);
                 let _ = handle.join();
                 if prepared_thread.is_none() {
@@ -904,9 +964,47 @@ where
             }
         };
         let tid_bytes = linux_tid.raw().to_le_bytes();
-        let tid_outputs_published = (parent_tid_addr == 0
-            || engine.write_bytes(parent_tid_addr, &tid_bytes).is_ok())
-            && (child_tid_addr == 0 || engine.write_bytes(child_tid_addr, &tid_bytes).is_ok());
+        let publish_tid_output = |engine: &mut E,
+                                  output: carrick_observability::probes::HvpatchCloneTidOutput,
+                                  address: u64| {
+            if address == 0 {
+                return true;
+            }
+            let result = engine.write_bytes(address, &tid_bytes);
+            let result_kind = match &result {
+                Ok(()) => carrick_observability::probes::HvpatchCloneTidWriteResult::Success,
+                Err(carrick_guest_mem::MemoryError::OutOfBounds { .. }) => {
+                    carrick_observability::probes::HvpatchCloneTidWriteResult::OutOfBounds
+                }
+                Err(carrick_guest_mem::MemoryError::Unsupported) => {
+                    carrick_observability::probes::HvpatchCloneTidWriteResult::Unsupported
+                }
+                Err(carrick_guest_mem::MemoryError::HostMap(detail))
+                    if detail.starts_with("HVPatch sparse mmap backing:") =>
+                {
+                    carrick_observability::probes::HvpatchCloneTidWriteResult::SparseBacking
+                }
+                Err(carrick_guest_mem::MemoryError::HostMap(detail))
+                    if detail.starts_with("HVPatch frame COW:") =>
+                {
+                    carrick_observability::probes::HvpatchCloneTidWriteResult::FrameCow
+                }
+                Err(carrick_guest_mem::MemoryError::HostMap(_)) => {
+                    carrick_observability::probes::HvpatchCloneTidWriteResult::HostMap
+                }
+            };
+            crate::probes::mn_clone_tid_output(tid.raw(), output, address, result_kind);
+            result.is_ok()
+        };
+        let tid_outputs_published = publish_tid_output(
+            engine,
+            carrick_observability::probes::HvpatchCloneTidOutput::Parent,
+            parent_tid_addr,
+        ) && publish_tid_output(
+            engine,
+            carrick_observability::probes::HvpatchCloneTidOutput::Child,
+            child_tid_addr,
+        );
         if !tid_outputs_published {
             restore_tid_outputs(engine);
             let _ = start_tx.send(false);
@@ -960,7 +1058,17 @@ where
         // the child can itself become terminal and must not wait on a permit
         // whose owner is queued behind that child's scheduler slot.
         drop(clone_permit);
+        crate::probes::mn_clone_outcome(
+            tid.raw(),
+            carrick_observability::probes::HvpatchCloneThreadPhase::ChildPublished,
+            0,
+        );
         self.resume_vcpu_after_blocking_wait(engine, parent_reclaim)?;
+        crate::probes::mn_clone_outcome(
+            tid.raw(),
+            carrick_observability::probes::HvpatchCloneThreadPhase::Started,
+            0,
+        );
         Ok(CloneThreadSpawn::Started(linux_tid))
     }
 
