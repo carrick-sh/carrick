@@ -776,6 +776,9 @@ impl SyscallDispatcher {
                 if crate::dispatch::fifo_beacon::read_end_at_eof(host_fd.get()) {
                     ready |= LINUX_EPOLLIN | LINUX_EPOLLHUP;
                 }
+                if requested_events & LINUX_EPOLLIN != 0 && self.staged_splice_pipe_bytes(fd) != 0 {
+                    ready |= LINUX_EPOLLIN;
+                }
                 if requested_events & LINUX_EPOLLRDHUP != 0
                     && let Some(socket_fd) = stream_socket_fd
                     && host_stream_socket_read_eof(socket_fd)
@@ -795,11 +798,12 @@ impl SyscallDispatcher {
         };
         let mut avail: libc::c_int = 0;
         let rc = unsafe { libc::ioctl(host_fd.get(), libc::FIONREAD, &mut avail) };
-        if rc == 0 && avail > 0 {
+        let host = if rc == 0 && avail > 0 {
             avail as u64
         } else {
             0
-        }
+        };
+        host.saturating_add(self.staged_splice_pipe_bytes(fd) as u64)
     }
 
     /// Consumption-based EPOLLET re-arm for the Linux lane's sampled epoll
@@ -1575,6 +1579,9 @@ impl SyscallDispatcher {
                     && crate::dispatch::fifo_beacon::read_end_at_eof(host_fd.raw())
                 {
                     ready |= LINUX_POLLIN | LINUX_POLLHUP;
+                }
+                if requested_events & LINUX_POLLIN != 0 && self.staged_splice_pipe_bytes(fd) != 0 {
+                    ready |= LINUX_POLLIN;
                 }
             }
             OpenDescription::HostSocket {
@@ -3047,6 +3054,53 @@ mod epoll_interest_tests {
     }
 }
 
+#[cfg(test)]
+mod staged_splice_readiness_tests {
+    use super::*;
+
+    #[test]
+    fn staged_splice_pipe_bytes_are_pollin_ready() {
+        let mut host_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
+
+        let dispatcher = SyscallDispatcher::new();
+        let read_open = OpenFile::from_open_description(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                host_fd: HostFdRef::new(host_fds[0]),
+                is_read_end: true,
+                pipe_id: 44,
+                base: OpenDescriptionBase::new(0),
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+            })),
+            0,
+        );
+        let write_open = OpenFile::from_open_description(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                host_fd: HostFdRef::new(host_fds[1]),
+                is_read_end: false,
+                pipe_id: 44,
+                base: OpenDescriptionBase::new(0),
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+            })),
+            0,
+        );
+        let (read_fd, _write_fd) = dispatcher
+            .install_fd_pair_at_or_above(3, read_open, write_open)
+            .expect("install host pipe pair");
+
+        dispatcher.stage_splice_pipe_bytes_owned(read_fd, b"staged".to_vec());
+
+        assert_ne!(
+            dispatcher.poll_ready_events(read_fd, LINUX_POLLIN) & LINUX_POLLIN,
+            0
+        );
+    }
+}
+
 impl SyscallDispatcher {
     /// Shared wait core for `epoll_pwait`/`epoll_pwait2`. Both callers do
     /// their own arg + timeout decode and epfd validation, then hand the
@@ -4438,7 +4492,9 @@ impl SyscallDispatcher {
                 // An eventfd with POLLOUT requested must go the poll_ready_events
                 // path (always-writable); its host read_fd would never report
                 // POLLOUT and the all-host libc::poll would block forever.
-                host_map.push(if w && this.fd_is_eventfd(fd_i32) {
+                host_map.push(if (w && this.fd_is_eventfd(fd_i32))
+                    || (r && this.staged_splice_pipe_bytes(fd_i32) != 0)
+                {
                     None
                 } else {
                     this.host_fd_for_poll(fd_i32).map(HostFd::get)
@@ -4784,7 +4840,10 @@ impl SyscallDispatcher {
             let host_fds: Option<Vec<i32>> = fds
                 .iter()
                 .map(|p| {
-                    if (p.events & LINUX_POLLOUT) != 0 && this.fd_is_eventfd(p.fd) {
+                    if ((p.events & LINUX_POLLOUT) != 0 && this.fd_is_eventfd(p.fd))
+                        || ((p.events & LINUX_POLLIN) != 0
+                            && this.staged_splice_pipe_bytes(p.fd) != 0)
+                    {
                         None
                     } else {
                         this.host_fd_for_poll(p.fd).map(HostFd::get)

@@ -3811,7 +3811,7 @@ impl SyscallDispatcher {
         0
     }
 
-    fn staged_splice_pipe_bytes(&self, guest_fd: i32) -> usize {
+    pub(super) fn staged_splice_pipe_bytes(&self, guest_fd: i32) -> usize {
         self.open_file(guest_fd).map_or(0, |file| {
             self.staged_splice_description_bytes(file.description.id())
         })
@@ -4365,46 +4365,57 @@ impl SyscallDispatcher {
         host_fd: HostFd,
         count: usize,
     ) -> Result<Vec<u8>, DispatchError> {
-        let mut buf = Vec::new();
-        {
-            let description = self
-                .open_file(guest_fd)
-                .ok_or(DispatchError::Errno(LINUX_EBADF))?
-                .description;
-            let files = self.captured_file_table();
-            let mut staged = files.lock_splice_pushback();
-            if let Some(queue) = staged.get(&description.id()).cloned() {
-                let mut queue = queue.lock();
-                buf = queue.take_vec(count);
-                let empty = queue.is_empty();
-                drop(queue);
-                if empty {
-                    staged.remove(&description.id());
-                }
-            }
-        }
-        if buf.len() >= count {
+        let buf = self.take_staged_splice_pipe_bytes(guest_fd, count)?;
+        // A pipe read returns the bytes already available without waiting to
+        // fill the caller's whole buffer. The staged queue is the front of this
+        // host pipe's logical byte stream, so do not probe the empty host fd
+        // after consuming a short staged prefix (that would turn readable data
+        // into EAGAIN and lose the prefix).
+        if !buf.is_empty() {
             return Ok(buf);
         }
 
-        let offset = buf.len();
-        buf.resize(count, 0);
+        let mut buf = vec![0; count];
         // BLOCKING-IO-OK: splice/sendfile source read. The in fd is a regular
         // file or an already-readable pipe end; converting this niche path to
         // the lockless wait is a tracked follow-up, not a server hot path.
         let n = unsafe {
             libc::read(
                 host_fd.get(),
-                buf[offset..].as_mut_ptr().cast::<libc::c_void>(),
-                count - offset,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                count,
             )
         };
         let n = n.host_syscall_errno()?;
-        buf.truncate(offset + n as usize);
+        buf.truncate(n as usize);
         Ok(buf)
     }
 
-    fn stage_splice_pipe_bytes_owned(&self, guest_fd: i32, bytes: Vec<u8>) {
+    fn take_staged_splice_pipe_bytes(
+        &self,
+        guest_fd: i32,
+        count: usize,
+    ) -> Result<Vec<u8>, DispatchError> {
+        let description = self
+            .open_file(guest_fd)
+            .ok_or(DispatchError::Errno(LINUX_EBADF))?
+            .description;
+        let files = self.captured_file_table();
+        let mut staged = files.lock_splice_pushback();
+        let Some(queue) = staged.get(&description.id()).cloned() else {
+            return Ok(Vec::new());
+        };
+        let mut queue = queue.lock();
+        let bytes = queue.take_vec(count);
+        let empty = queue.is_empty();
+        drop(queue);
+        if empty {
+            staged.remove(&description.id());
+        }
+        Ok(bytes)
+    }
+
+    pub(super) fn stage_splice_pipe_bytes_owned(&self, guest_fd: i32, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
         }
@@ -4418,6 +4429,10 @@ impl SyscallDispatcher {
             .or_insert_with(|| Arc::new(Mutex::new(SplicePushback::default())))
             .clone();
         queue.lock().push_back_owned(bytes);
+        // The payload is userspace-resident rather than in the host pipe, so a
+        // host kqueue/poll edge cannot announce it. Wake epoll instances to
+        // force their level-readiness recompute.
+        self.notify_inmem_epoll();
     }
 
     fn restore_splice_pipe_bytes(&self, guest_fd: i32, bytes: &[u8]) {
@@ -8655,12 +8670,25 @@ impl SyscallDispatcher {
                     if !*is_read_end && pty.is_none() && !*bidirectional {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     }
+                    let host_fd_raw = host_fd.raw();
+                    let host_fd_owner = host_fd.clone();
+                    drop(open);
+                    let staged = this.take_staged_splice_pipe_bytes(fd.0, length)?;
+                    if !staged.is_empty() {
+                        if memory.write_bytes(address, &staged).is_err() {
+                            this.restore_splice_pipe_bytes(fd.0, &staged);
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        }
+                        return Ok(DispatchOutcome::Returned {
+                            value: staged.len() as i64,
+                        });
+                    }
                     return Ok(read_host_pipe(
                         memory,
                         address,
                         length,
-                        host_fd.raw(),
-                        Some(host_fd.clone()),
+                        host_fd_raw,
+                        Some(host_fd_owner),
                         nonblocking,
                     ));
                 }
@@ -8793,6 +8821,27 @@ impl SyscallDispatcher {
                     let hfd = host_fd.raw();
                     let owner = Some(host_fd.clone());
                     drop(open);
+                    let staged_capacity = iovecs.iter().try_fold(0usize, |total, iovec| {
+                        usize::try_from(iovec.iov_len)
+                            .ok()
+                            .and_then(|length| total.checked_add(length))
+                    });
+                    let Some(staged_capacity) = staged_capacity else {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    };
+                    let staged = this.take_staged_splice_pipe_bytes(
+                        fd.0,
+                        staged_capacity.min(crate::dispatch::MAX_RW_COUNT),
+                    )?;
+                    if !staged.is_empty() {
+                        let read_len = read_from_contents_at(memory, &staged, 0, &iovecs)?;
+                        if read_len < staged.len() {
+                            this.restore_splice_pipe_bytes(fd.0, &staged[read_len..]);
+                        }
+                        return Ok(DispatchOutcome::Returned {
+                            value: read_len as i64,
+                        });
+                    }
                     return Ok(Self::read_host_pipe_iovecs(
                         memory,
                         &iovecs,
@@ -13795,6 +13844,63 @@ mod tests {
             .take_splice_pipe_bytes(read_fd, host_read, 6)
             .expect("take staged bytes");
         assert_eq!(bytes, b"abcdef");
+    }
+
+    #[test]
+    fn staged_splice_pipe_bytes_are_visible_to_read() {
+        let mut host_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(host_fds.as_mut_ptr()) }, 0);
+        for host_fd in host_fds {
+            assert_ne!(
+                unsafe { libc::fcntl(host_fd, libc::F_SETFL, libc::O_NONBLOCK) },
+                -1
+            );
+        }
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let read_open = OpenFile::from_open_description(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                host_fd: HostFdRef::new(host_fds[0]),
+                is_read_end: true,
+                pipe_id: 43,
+                base: OpenDescriptionBase::new(0),
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+            })),
+            0,
+        );
+        let write_open = OpenFile::from_open_description(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                host_fd: HostFdRef::new(host_fds[1]),
+                is_read_end: false,
+                pipe_id: 43,
+                base: OpenDescriptionBase::new(0),
+                pty: None,
+                bidirectional: false,
+                write_kind: HostWriteKind::PipeLike,
+            })),
+            0,
+        );
+        let (read_fd, _write_fd) = dispatcher
+            .install_fd_pair_at_or_above(3, read_open, write_open)
+            .expect("install host pipe pair");
+
+        dispatcher.stage_splice_pipe_bytes_owned(read_fd, b"AAAABBBB".to_vec());
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let outcome = dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(63, SyscallArgs::from([read_fd as u64, 0x1000, 4, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .expect("read dispatch");
+
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 4 });
+        assert_eq!(memory.read_bytes(0x1000, 4).unwrap(), b"AAAA");
+        assert_eq!(dispatcher.staged_splice_pipe_bytes(read_fd), 4);
     }
 
     /// `splice(2)` from a host-backed file into a pipe must BOTH advance the
