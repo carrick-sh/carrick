@@ -15,6 +15,10 @@
  * - carrick*:::mn-admit is three scalar CTF values: int32 Linux tid,
  *   uint32 slot, uint32 budget; mn-reclaim is int32 Linux tid, uint32 old
  *   slot, uint32 new slot, int32 kind.
+ * - carrick*:::hvpatch-fork-frame-identity carries int32 child pid/tid,
+ *   uint64 mm, uint32 ASID, uint32 kind; the immediately following
+ *   hvpatch-fork-frame carries uint64 parent mapping, child mapping, frame,
+ *   IPA, and length. Kind 0 is a private COW frame; kind 1 is shared.
  *
  * PERTURBATION: HIGH for futex-heavy workloads because this prints every futex
  * route. Use only with a small reducer; conclusions are identity/ordering only,
@@ -63,6 +67,28 @@ carrick*:::mn-reclaim
         pid, tid, (int)arg0, (uint32_t)arg1, (uint32_t)arg2, (int)arg3);
 }
 
+carrick*:::hvpatch-fork-frame-identity
+/(pid == $target || progenyof($target))/
+{
+    fork_linux_pid[pid, tid] = (int)arg0;
+    fork_linux_tid[pid, tid] = (int)arg1;
+    fork_mm[pid, tid] = arg2;
+    fork_asid[pid, tid] = (uint32_t)arg3;
+    fork_kind[pid, tid] = (uint32_t)arg4;
+    fork_identity[pid, tid] = 1;
+}
+
+carrick*:::hvpatch-fork-frame
+/(pid == $target || progenyof($target))/
+{
+    fork_frames++;
+    printf("HVPATCHFUTEX1|phase=fork-frame|host_pid=%d|host_tid=%d|linux_pid=%d|linux_tid=%d|mm=%#x|asid=%u|kind=%u|parent_mapping=%#x|child_mapping=%#x|frame=%#x|ipa=%#x|length=%#x|identity=%d\n",
+        pid, tid, fork_linux_pid[pid, tid], fork_linux_tid[pid, tid],
+        fork_mm[pid, tid], fork_asid[pid, tid], fork_kind[pid, tid],
+        arg0, arg1, arg2, arg3, arg4, fork_identity[pid, tid]);
+    fork_identity[pid, tid] = 0;
+}
+
 carrick*:::hvpatch-syscall-service-clear
 /(pid == $target || progenyof($target)) && arg3 == 98/
 {
@@ -78,7 +104,7 @@ proc:::exit /pid == $target/ { exit(0); }
 
 END
 {
-    printf("HVPATCHFUTEX1|phase=end|routes=%d|admits=%d|reclaims=%d|timed_out=%d\n",
-        routes, admits, reclaims, timed_out);
+    printf("HVPATCHFUTEX1|phase=end|routes=%d|admits=%d|reclaims=%d|fork_frames=%d|timed_out=%d\n",
+        routes, admits, reclaims, fork_frames, timed_out);
     exit(routes == 0 ? 1 : 0);
 }

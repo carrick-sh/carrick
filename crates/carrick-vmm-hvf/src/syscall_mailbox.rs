@@ -197,7 +197,18 @@ pub struct MailboxBinding {
 struct ParkedMailbox {
     sequence: u64,
     state: u32,
+    trap_kind: u32,
     response_action: u32,
+    flags: u32,
+    native_nr: u64,
+    args: [u64; 6],
+    x8: u64,
+    resume_pc: u64,
+    spsr: u64,
+    fp: u64,
+    lr: u64,
+    sp: u64,
+    esr: u64,
     return_value: u64,
     resume_x16: u64,
     resume_x17: u64,
@@ -281,6 +292,119 @@ impl MailboxBinding {
         self.last_sequence
     }
 
+    pub(crate) fn host_address(&self) -> usize {
+        self.host.as_ptr() as usize
+    }
+
+    /// Sample a stopped mailbox backing that may not be the binding's current
+    /// host pointer. Used only to enrich a fail-closed transport error.
+    ///
+    /// # Safety
+    ///
+    /// `host` must point to a complete live mailbox backing while sampled.
+    pub(crate) unsafe fn diagnostics_at(
+        host: NonNull<Aarch64SyscallMailbox>,
+    ) -> MailboxDiagnostics {
+        let mailbox = host.as_ptr();
+        // SAFETY: upheld by the caller; the vCPU is stopped at its synchronous
+        // HVC, and the acquire state load observes any guest publication.
+        unsafe {
+            MailboxDiagnostics {
+                generation: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).generation)),
+                sequence: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sequence)),
+                state: (*mailbox).state.load(Ordering::Acquire),
+                response_action: core::ptr::read_volatile(core::ptr::addr_of!(
+                    (*mailbox).response_action
+                )),
+                native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
+                return_value: core::ptr::read_volatile(core::ptr::addr_of!(
+                    (*mailbox).return_value
+                )),
+            }
+        }
+    }
+
+    fn snapshot_outstanding(&self, state: u32) -> ParkedMailbox {
+        let mailbox = self.host.as_ptr();
+        // SAFETY: callers stop the vCPU or are handling its synchronous exit;
+        // acquire-loading `state` before this call makes the guest's complete
+        // request publication visible.
+        unsafe {
+            ParkedMailbox {
+                sequence: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sequence)),
+                state,
+                trap_kind: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).trap_kind)),
+                response_action: core::ptr::read_volatile(core::ptr::addr_of!(
+                    (*mailbox).response_action
+                )),
+                flags: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).flags)),
+                native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
+                args: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).args)),
+                x8: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).x8)),
+                resume_pc: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_pc)),
+                spsr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).spsr)),
+                fp: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).fp)),
+                lr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).lr)),
+                sp: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sp)),
+                esr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).esr)),
+                return_value: core::ptr::read_volatile(core::ptr::addr_of!(
+                    (*mailbox).return_value
+                )),
+                resume_x16: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_x16)),
+                resume_x17: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_x17)),
+            }
+        }
+    }
+
+    fn restore_outstanding(&self, parked: ParkedMailbox) {
+        let mailbox = self.host.as_ptr();
+        // SAFETY: the binding uniquely owns the complete destination slot and
+        // publishes `state` only after every payload word is restored.
+        unsafe {
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).sequence),
+                parked.sequence,
+            );
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).trap_kind),
+                parked.trap_kind,
+            );
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).response_action),
+                parked.response_action,
+            );
+            self.write_volatile(core::ptr::addr_of_mut!((*mailbox).flags), parked.flags);
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).native_nr),
+                parked.native_nr,
+            );
+            self.write_volatile(core::ptr::addr_of_mut!((*mailbox).args), parked.args);
+            self.write_volatile(core::ptr::addr_of_mut!((*mailbox).x8), parked.x8);
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).resume_pc),
+                parked.resume_pc,
+            );
+            self.write_volatile(core::ptr::addr_of_mut!((*mailbox).spsr), parked.spsr);
+            self.write_volatile(core::ptr::addr_of_mut!((*mailbox).fp), parked.fp);
+            self.write_volatile(core::ptr::addr_of_mut!((*mailbox).lr), parked.lr);
+            self.write_volatile(core::ptr::addr_of_mut!((*mailbox).sp), parked.sp);
+            self.write_volatile(core::ptr::addr_of_mut!((*mailbox).esr), parked.esr);
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).return_value),
+                parked.return_value,
+            );
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).resume_x16),
+                parked.resume_x16,
+            );
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*mailbox).resume_x17),
+                parked.resume_x17,
+            );
+        }
+        self.state().store(parked.state, Ordering::Release);
+    }
+
     /// Snapshot the outstanding response vehicle and release this binding's
     /// finite arena slot while its vCPU is destroyed for an M:N blocking wait.
     /// The guest is stopped immediately after the HVC, so only the continuation
@@ -299,24 +423,7 @@ impl MailboxBinding {
                 },
             ));
         }
-        let mailbox = self.host.as_ptr();
-        // SAFETY: the live lease uniquely owns the complete mailbox and the vCPU
-        // is stopped. Acquire of `state` above makes its preceding guest stores
-        // visible before these field reads.
-        self.parked = Some(unsafe {
-            ParkedMailbox {
-                sequence: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sequence)),
-                state,
-                response_action: core::ptr::read_volatile(core::ptr::addr_of!(
-                    (*mailbox).response_action
-                )),
-                return_value: core::ptr::read_volatile(core::ptr::addr_of!(
-                    (*mailbox).return_value
-                )),
-                resume_x16: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_x16)),
-                resume_x17: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_x17)),
-            }
-        });
+        self.parked = Some(self.snapshot_outstanding(state));
         drop(self.lease.take());
         Ok(())
     }
@@ -343,31 +450,7 @@ impl MailboxBinding {
         // SAFETY: the caller supplies the complete uniquely leased slot.
         unsafe { self.rebind(host, false) };
         self.last_sequence = parked.sequence;
-        let mailbox = self.host.as_ptr();
-        // SAFETY: the newly installed lease uniquely owns this complete slot.
-        unsafe {
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).sequence),
-                parked.sequence,
-            );
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).response_action),
-                parked.response_action,
-            );
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).return_value),
-                parked.return_value,
-            );
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).resume_x16),
-                parked.resume_x16,
-            );
-            self.write_volatile(
-                core::ptr::addr_of_mut!((*mailbox).resume_x17),
-                parked.resume_x17,
-            );
-        }
-        self.state().store(parked.state, Ordering::Release);
+        self.restore_outstanding(parked);
         Ok(())
     }
 
@@ -381,13 +464,16 @@ impl MailboxBinding {
         host: NonNull<Aarch64SyscallMailbox>,
         preserve_outstanding: bool,
     ) {
+        let preserved = preserve_outstanding
+            .then(|| {
+                let state = self.state().load(Ordering::Acquire);
+                (state == MailboxState::RequestReady.raw()
+                    || state == MailboxState::ResponseReady.raw())
+                .then(|| self.snapshot_outstanding(state))
+            })
+            .flatten();
         self.host = host;
         self.generation = fresh_generation();
-        let state = self.state().load(Ordering::Acquire);
-        let preserved_state = preserve_outstanding.then_some(state).filter(|state| {
-            *state == MailboxState::RequestReady.raw()
-                || *state == MailboxState::ResponseReady.raw()
-        });
         // SAFETY: the binding owns this mapped mailbox slot.
         unsafe {
             self.write_volatile(
@@ -406,17 +492,29 @@ impl MailboxBinding {
                 core::ptr::addr_of_mut!((*self.host.as_ptr()).generation),
                 self.generation,
             );
-            if preserved_state.is_none() {
+            if preserved.is_none() {
                 self.write_volatile(core::ptr::addr_of_mut!((*self.host.as_ptr()).sequence), 0);
             }
         }
-        if let Some(state) = preserved_state {
-            self.state().store(state, Ordering::Release);
+        if let Some(parked) = preserved {
+            self.restore_outstanding(parked);
         } else {
             self.last_sequence = 0;
             self.state()
                 .store(MailboxState::Idle.raw(), Ordering::Release);
         }
+    }
+
+    /// Follow a stage-1 COW relocation of this slot without modifying the
+    /// already-published mailbox protocol state in the replacement backing.
+    ///
+    /// # Safety
+    ///
+    /// `host` must point to the complete replacement backing for this binding's
+    /// currently leased guest slot and remain valid until the next relocation,
+    /// rebind, or drop.
+    pub unsafe fn relocate_after_cow(&mut self, host: NonNull<Aarch64SyscallMailbox>) {
+        self.host = host;
     }
 
     pub fn take_request(&mut self) -> Result<Option<MailboxRequest>, MailboxConsumeError> {
@@ -713,6 +811,100 @@ mod tests {
             MailboxState::RequestReady.raw()
         );
         assert!(binding.take_request().expect("valid request").is_some());
+    }
+
+    #[test]
+    fn rebind_moves_an_inflight_request_to_a_rebuilt_mailbox_backing() {
+        let (mut binding, mut old_mailbox) = binding();
+        publish_valid_request(&binding, &mut old_mailbox);
+        let mut rebuilt_mailbox = Box::new(Aarch64SyscallMailbox {
+            magic: 0,
+            version: 0,
+            size: 0,
+            generation: 0,
+            sequence: 0,
+            state: std::sync::atomic::AtomicU32::new(0),
+            trap_kind: 0,
+            response_action: 0,
+            flags: 0,
+            native_nr: 0,
+            args: [0; 6],
+            x8: 0,
+            resume_pc: 0,
+            spsr: 0,
+            fp: 0,
+            lr: 0,
+            sp: 0,
+            esr: 0,
+            return_value: 0,
+            resume_x16: 0,
+            resume_x17: 0,
+            reserved: [0; 72],
+        });
+        let rebuilt_pointer = NonNull::from(rebuilt_mailbox.as_mut());
+
+        unsafe { binding.rebind(rebuilt_pointer, true) };
+
+        assert_eq!(
+            rebuilt_mailbox.state.load(Ordering::Acquire),
+            MailboxState::RequestReady.raw(),
+            "fork/reclaim rebuild must move the request instead of sampling the fresh zero backing",
+        );
+        assert_eq!(rebuilt_mailbox.sequence, 1);
+        assert_eq!(rebuilt_mailbox.trap_kind, MailboxTrapKind::Syscall.raw());
+        assert_eq!(rebuilt_mailbox.native_nr, 64);
+        assert_eq!(rebuilt_mailbox.args, [10, 11, 12, 13, 14, 15]);
+        assert_eq!(rebuilt_mailbox.x8, 64);
+        assert_eq!(rebuilt_mailbox.resume_pc, 0x1234);
+    }
+
+    #[test]
+    fn cow_relocation_follows_the_guest_published_replacement_without_reset() {
+        let (mut binding, old_mailbox) = binding();
+        let mut cow_replacement = Box::new(Aarch64SyscallMailbox {
+            magic: old_mailbox.magic,
+            version: old_mailbox.version,
+            size: old_mailbox.size,
+            generation: old_mailbox.generation,
+            sequence: old_mailbox.sequence,
+            state: std::sync::atomic::AtomicU32::new(old_mailbox.state.load(Ordering::Acquire)),
+            trap_kind: old_mailbox.trap_kind,
+            response_action: old_mailbox.response_action,
+            flags: old_mailbox.flags,
+            native_nr: old_mailbox.native_nr,
+            args: old_mailbox.args,
+            x8: old_mailbox.x8,
+            resume_pc: old_mailbox.resume_pc,
+            spsr: old_mailbox.spsr,
+            fp: old_mailbox.fp,
+            lr: old_mailbox.lr,
+            sp: old_mailbox.sp,
+            esr: old_mailbox.esr,
+            return_value: old_mailbox.return_value,
+            resume_x16: old_mailbox.resume_x16,
+            resume_x17: old_mailbox.resume_x17,
+            reserved: old_mailbox.reserved,
+        });
+        publish_valid_request(&binding, &mut cow_replacement);
+        let generation = binding.generation();
+        let replacement_pointer = NonNull::from(cow_replacement.as_mut());
+
+        unsafe { binding.relocate_after_cow(replacement_pointer) };
+
+        assert_eq!(binding.generation(), generation);
+        assert_eq!(cow_replacement.generation, generation);
+        assert_eq!(cow_replacement.sequence, 1);
+        assert_eq!(
+            cow_replacement.state.load(Ordering::Acquire),
+            MailboxState::RequestReady.raw()
+        );
+        let request = binding
+            .take_request()
+            .expect("valid relocated protocol")
+            .expect("guest-published replacement request");
+        assert_eq!(request.native_nr, 64);
+        assert_eq!(request.frame.x0, 10);
+        assert_eq!(request.resume_pc, 0x1234);
     }
 
     #[test]

@@ -516,6 +516,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         Ok(self.state.try_lazy_alias_remap(gpa, va))
     }
 
+    fn enrich_vcpu_run_error(&self, vcpu: &Self::Vcpu, error: TrapError) -> TrapError {
+        self.state.enrich_mailbox_run_error(&vcpu.mailbox, error)
+    }
+
     // ── guest-memory access (the GuestMemory backing seam) ──
 
     fn read_gpa(&self, gpa: u64, len: usize) -> Result<Vec<u8>, TrapError> {
@@ -572,6 +576,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     ) -> Result<bool, TrapError> {
         self.state
             .resolve_frame_cow_fault(syndrome, far, ttbr0, flush_stage1)
+    }
+
+    fn refresh_vcpu_after_frame_cow(&self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
+        self.state.relocate_mailbox_after_cow(&mut vcpu.mailbox)
     }
 
     fn ensure_frame_cow_write(

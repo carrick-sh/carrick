@@ -3247,6 +3247,57 @@ impl CowArmedRanges {
     }
 }
 
+/// Whether repointing one semantic COW span leaves another Linux leaf in this
+/// address space naming the same 16 KiB physical source frame.
+///
+/// The frame inventory is physical while Linux permissions and mappings are
+/// 4 KiB-semantic. A `brk`, `mprotect`, or partial-unmap boundary can therefore
+/// make one COW transaction repoint only part of a host compound. The old
+/// physical frame must remain inventoried until every sibling leaf has moved;
+/// otherwise the last child reference can retire stage-2 while the parent PTE
+/// still names that frame.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn cow_source_has_retained_sibling(
+    span: CowArmedSpan,
+    old_ipa: u64,
+    old_physical_ipa: u64,
+    mut retained_translation: impl FnMut(u64) -> Option<u64>,
+) -> bool {
+    const PAGE_SIZE: u64 = 4 * 1024;
+    let Some(source_offset) = old_ipa.checked_sub(old_physical_ipa) else {
+        return false;
+    };
+    let Some(source_va) = span.va.checked_sub(source_offset) else {
+        return false;
+    };
+    let repoint_start = span.va & !(PAGE_SIZE - 1);
+    let Some(span_end) = span.va.checked_add(span.len as u64) else {
+        return false;
+    };
+    let Some(repoint_end) = span_end
+        .checked_add(PAGE_SIZE - 1)
+        .map(|end| end & !(PAGE_SIZE - 1))
+    else {
+        return false;
+    };
+
+    (0..CowArmedRanges::COMPOUND_SIZE)
+        .step_by(PAGE_SIZE as usize)
+        .any(|offset| {
+            let Some(page_va) = source_va.checked_add(offset) else {
+                return false;
+            };
+            if page_va >= repoint_start && page_va < repoint_end {
+                return false;
+            }
+            let Some(expected_ipa) = old_physical_ipa.checked_add(offset) else {
+                return false;
+            };
+            retained_translation(page_va)
+                .is_some_and(|translated| align_down(translated, PAGE_SIZE) == expected_ipa)
+        })
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvpatchFrameInventoryState {
     fn new(ledger: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>) -> Self {
@@ -4356,6 +4407,7 @@ impl HvfVmState {
     fn cow_inventory_split_shape(
         inventory: &HvpatchFrameInventory,
         compound_gpa: u64,
+        retain_compound: bool,
     ) -> Result<CowInventorySplitShape, TrapError> {
         let compound_end = compound_gpa
             .checked_add(CowArmedRanges::COMPOUND_SIZE)
@@ -4377,6 +4429,9 @@ impl HvfVmState {
         let mut fragments = Vec::with_capacity(2);
         if old_key.0 < compound_gpa {
             fragments.push((old_key.0, compound_gpa - old_key.0));
+        }
+        if retain_compound {
+            fragments.push((compound_gpa, CowArmedRanges::COMPOUND_SIZE));
         }
         if compound_end < old_end {
             fragments.push((compound_end, old_end - compound_end));
@@ -6418,6 +6473,18 @@ impl HvfVmState {
                     span.va
                 ))
             })?;
+        let old_offset = old_ipa.checked_sub(old_physical_ipa).ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch COW physical offset underflow".to_owned())
+        })?;
+        let retain_old_compound = {
+            let page_tables = self.page_tables.lock();
+            let manager = page_tables.as_ref().ok_or_else(|| {
+                TrapError::Hypervisor("HVPatch COW page-table manager is absent".to_owned())
+            })?;
+            cow_source_has_retained_sibling(span, old_ipa, old_physical_ipa, |va| {
+                manager.translate_retained_output(va)
+            })
+        };
         let CowInventorySplitShape {
             old_key: old_inventory_key,
             old: old_inventory_extent,
@@ -6425,12 +6492,9 @@ impl HvfVmState {
             retire_old_frame,
         } = {
             let inventory = self.frame_inventory.lock();
-            Self::cow_inventory_split_shape(&inventory, old_physical_ipa)?
+            Self::cow_inventory_split_shape(&inventory, old_physical_ipa, retain_old_compound)?
         };
         let old_frame = old_inventory_extent.frame;
-        let old_offset = old_ipa.checked_sub(old_physical_ipa).ok_or_else(|| {
-            TrapError::Hypervisor("HVPatch COW physical offset underflow".to_owned())
-        })?;
         // Resolve every authority needed for stage-1 publication before the
         // first physical/staged-inventory mutation.  A fork-time response can
         // run while the engine's mapping metadata is being rebuilt; failing
@@ -7030,7 +7094,13 @@ impl HvfVmState {
         let size = carrick_aarch64::mailbox::AARCH64_SYSCALL_MAILBOX_SIZE as usize;
         let pointer = self
             .translate_va(address)
-            .and_then(|ipa| self.host_ptr(ipa, size))
+            .and_then(|ipa| {
+                Self::mailbox_mapping_for_range(&self.mappings, address, ipa, size).map(|mapping| {
+                    let offset =
+                        usize::try_from(address.saturating_sub(mapping.start)).unwrap_or_default();
+                    unsafe { mapping.host_addr.add(offset) }
+                })
+            })
             // A persistent-VM exec deliberately drops the software page-table
             // manager until the first real edit. The mailbox lives in a static
             // boot mapping whose guest-VA extent is unambiguous, so resolve that
@@ -7089,6 +7159,55 @@ impl HvfVmState {
         unsafe { binding.rebind(pointer, preserve_outstanding) };
         vcpu.set_sys_reg(SysReg::SP_EL1, binding.slot().guest_address())
             .map_err(hvf_error)
+    }
+
+    pub(crate) fn relocate_mailbox_after_cow(
+        &self,
+        binding: &mut MailboxBinding,
+    ) -> Result<(), TrapError> {
+        let pointer = self.mailbox_host_pointer(binding.slot())?;
+        // SAFETY: the live stage-1 walk resolves the complete replacement
+        // backing for this binding's uniquely leased slot. The COW copied the
+        // prior header before the guest published its request into that backing,
+        // so relocation must not reset or regenerate any protocol field.
+        unsafe { binding.relocate_after_cow(pointer) };
+        let diagnostics = binding.diagnostics();
+        if diagnostics.generation != binding.generation() {
+            return Err(TrapError::Hypervisor(format!(
+                "AArch64 mailbox COW relocation changed generation: binding={} backing={}",
+                binding.generation(),
+                diagnostics.generation
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn enrich_mailbox_run_error(
+        &self,
+        binding: &MailboxBinding,
+        error: TrapError,
+    ) -> TrapError {
+        let TrapError::Hypervisor(message) = error else {
+            return error;
+        };
+        if !message.contains("without a published mailbox request") {
+            return TrapError::Hypervisor(message);
+        }
+        let slot = binding.slot();
+        let address = slot.guest_address();
+        let translated_ipa = self.translate_va(address);
+        let live = self.mailbox_host_pointer(slot).ok();
+        let live_diagnostics = live.map(|pointer| {
+            // SAFETY: `mailbox_host_pointer` authenticated a complete live slot,
+            // and the vCPU is stopped at the HVC that produced `error`.
+            unsafe { MailboxBinding::diagnostics_at(pointer) }
+        });
+        TrapError::Hypervisor(format!(
+            "{message}; mailbox_route={{slot={}, va={address:#x}, translated_ipa={translated_ipa:?}, binding_host={:#x}, live_host={:?}, live={live_diagnostics:?}}}",
+            slot.raw(),
+            binding.host_address(),
+            live.map(|pointer| pointer.as_ptr() as usize),
+        ))
     }
 
     fn release_mailbox_for_reclaim(&self, binding: &mut MailboxBinding) -> Result<(), TrapError> {
@@ -7676,8 +7795,12 @@ impl HvfVmState {
         // global frames deliberately have VA != IPA, so this lookup MUST stay
         // in the raw IPA domain; treating the GPA as a second VA made every
         // fork-shared futex fall through to the process-private table.
-        if let Some(mapping) = Self::mapping_for_ipa_range(&self.mappings, backing_gpa, 4) {
-            return mapping.shared_futex_location_for_ipa(backing_gpa);
+        if let Some(location) = Self::shared_futex_mapping_for_ipa(
+            &self.mappings,
+            backing_gpa,
+            self.persistent_vm_lifecycle,
+        ) {
+            return Some(location);
         }
 
         // A shared-file alias installed by another sibling may be absent from
@@ -7692,6 +7815,28 @@ impl HvfVmState {
             return MappingView::from_alias(alias).shared_futex_location_for_ipa(backing_gpa);
         }
         None
+    }
+
+    fn shared_futex_mapping_for_ipa(
+        mappings: &[HvfMappedRegion],
+        backing_gpa: u64,
+        persistent_vm_lifecycle: bool,
+    ) -> Option<carrick_guest_mem::SharedFutexLocation> {
+        let end = backing_gpa.checked_add(4)?;
+        mappings.iter().rev().find_map(|mapping| {
+            let mapping_end = mapping.ipa.checked_add(mapping.size as u64)?;
+            (mapping.sharing.has_shared_futex_identity()
+                && backing_gpa >= mapping.ipa
+                && end <= mapping_end
+                && (!persistent_vm_lifecycle
+                    || !is_reusable_global_frame_extent(
+                        mapping.physical_ipa,
+                        mapping.physical_size as u64,
+                    )
+                    || global_frame_region_owner_matches(mapping)))
+            .then(|| mapping.view().shared_futex_location_for_ipa(backing_gpa))
+            .flatten()
+        })
     }
 
     pub(crate) fn write_guest_bytes(
@@ -8397,6 +8542,34 @@ impl HvfVmState {
             .find(|mapping| {
                 let mapping_end = mapping.ipa.checked_add(mapping.size as u64);
                 ipa >= mapping.ipa && mapping_end.is_some_and(|limit| end <= limit)
+            })
+            .map(HvfMappedRegion::view)
+    }
+
+    /// Resolve one mailbox route without losing its semantic VA identity.
+    ///
+    /// A raw IPA is not a sufficient key in the persistent VM: the reusable
+    /// allocator can give a retired dynamic row's physical IPA to a later
+    /// process-local kernel-state mapping while that stale row remains in one
+    /// vCPU's metadata solely to retain its host owner. Require the same row to
+    /// cover the mailbox VA *and* express the live VA-to-IPA translation.
+    fn mailbox_mapping_for_range(
+        mappings: &[HvfMappedRegion],
+        semantic_va: u64,
+        ipa: u64,
+        length: usize,
+    ) -> Option<MappingView> {
+        let semantic_end = semantic_va.checked_add(u64::try_from(length).ok()?)?;
+        mappings
+            .iter()
+            .rev()
+            .find(|mapping| {
+                semantic_va >= mapping.start
+                    && semantic_end <= mapping.end
+                    && mapping
+                        .ipa
+                        .checked_add(semantic_va.saturating_sub(mapping.start))
+                        == Some(ipa)
             })
             .map(HvfMappedRegion::view)
     }
@@ -11214,7 +11387,12 @@ impl HvfInner {
             }
             .map_err(|error| {
                 let pc = vcpu.get_reg(Reg::PC).unwrap_or(0);
-                TrapError::Hypervisor(format!("{error}; vcpu_pc={pc:#x}"))
+                let sp_el1 = vcpu.get_sys_reg(SysReg::SP_EL1).unwrap_or(0);
+                let binding_address = mailbox.slot().guest_address();
+                let diagnostics = mailbox.diagnostics();
+                TrapError::Hypervisor(format!(
+                    "{error}; vcpu_pc={pc:#x}; sp_el1={sp_el1:#x}; binding_address={binding_address:#x}; mailbox={diagnostics:?}"
+                ))
             })?;
             crate::probes::hvf_syscall_transport(
                 mailbox.transport().raw(),
@@ -12810,6 +12988,79 @@ mod frame_inventory_backend_tests {
     }
 
     #[test]
+    fn partial_semantic_cow_retains_the_old_physical_compound() {
+        let old_frame = carrick_hal::FrameId::from_kernel_allocation(id(41));
+        let old_mapping = carrick_hal::MappingId::from_kernel_allocation(id(42));
+        let physical_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
+        let mut inventory = HvpatchFrameInventory::default();
+        inventory.extents.insert(
+            (physical_ipa, CowArmedRanges::COMPOUND_SIZE),
+            InventoryExtent {
+                frame: old_frame,
+                mapping: old_mapping,
+                backing: InventoryBackingIdentity::Private(1),
+                stage2_base: physical_ipa,
+                stage2_length: CowArmedRanges::COMPOUND_SIZE,
+            },
+        );
+        {
+            let mut frames = inventory.frames.lock();
+            frames.references.insert(old_frame, 1);
+            frames
+                .extent_references
+                .insert((old_frame, physical_ipa, CowArmedRanges::COMPOUND_SIZE), 1);
+            frames
+                .stage2_references
+                .insert((physical_ipa, CowArmedRanges::COMPOUND_SIZE), 1);
+        }
+
+        let shape = HvfVmState::cow_inventory_split_shape(&inventory, physical_ipa, true)
+            .expect("partial semantic COW split shape");
+
+        assert_eq!(
+            shape.fragments,
+            vec![(physical_ipa, CowArmedRanges::COMPOUND_SIZE)],
+            "a sibling leaf still naming the source frame keeps its exact physical compound live",
+        );
+        assert!(
+            !shape.retire_old_frame,
+            "the source frame cannot retire while this mm retains one of its sibling leaves",
+        );
+    }
+
+    #[test]
+    fn retained_sibling_detection_reads_exact_old_frame_leaves() {
+        let va = 0x6000_004000;
+        let physical_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x24_0000;
+        let one_page = CowArmedSpan {
+            va: va + 0x1000,
+            len: 0x1000,
+            executable: false,
+            kernel_only: false,
+        };
+        let old_ipa = physical_ipa + 0x1000;
+
+        assert!(cow_source_has_retained_sibling(
+            one_page,
+            old_ipa,
+            physical_ipa,
+            |page_va| (page_va == va).then_some(physical_ipa),
+        ));
+        assert!(
+            !cow_source_has_retained_sibling(one_page, old_ipa, physical_ipa, |page_va| (page_va
+                == va + 0x1000)
+                .then_some(old_ipa),),
+            "the semantic pages repointed by this transaction are not retained siblings",
+        );
+        assert!(
+            !cow_source_has_retained_sibling(one_page, old_ipa, physical_ipa, |page_va| (page_va
+                == va)
+                .then_some(physical_ipa + 0x8000),),
+            "a sibling VA naming another physical frame cannot retain this source",
+        );
+    }
+
+    #[test]
     fn begin_exec_injection_is_owned_and_consumed_by_only_the_armed_engine_state() {
         let ledger = std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
         let mut engine_a = HvpatchFrameInventoryState::new(std::sync::Arc::clone(&ledger));
@@ -13491,6 +13742,24 @@ mod thread_sibling_tests {
         assert_eq!(location.waiter_key(), 0x1004);
     }
 
+    #[test]
+    fn shared_futex_route_skips_private_row_at_recycled_ipa() {
+        let backing_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x80_0000;
+        let mut shared = mapped_region(0x100_0080_0000, 0x100_0080_4000, backing_ipa);
+        shared.host_addr = 0x1046_78000usize as *mut u8;
+        shared.sharing = GuestMappingSharing::GlobalShared;
+        let mut retired_private = mapped_region(0x6000_005000, 0x6000_009000, backing_ipa);
+        retired_private.host_addr = 0x1177_d0000usize as *mut u8;
+        // Newest-first raw IPA lookup sees this unrelated private row first.
+        let mappings = [shared, retired_private];
+
+        let location = HvfVmState::shared_futex_mapping_for_ipa(&mappings, backing_ipa + 4, false)
+            .expect("the older exact shared owner must remain routable");
+
+        assert_eq!(location.wait_addr().raw(), 0x1046_78004);
+        assert_eq!(location.waiter_key(), 0x1046_78004);
+    }
+
     fn mapped_region(start: u64, end: u64, ipa: u64) -> HvfMappedRegion {
         HvfMappedRegion {
             start,
@@ -13861,6 +14130,34 @@ mod thread_sibling_tests {
             HvfVmState::mapping_for_ipa_range(&mappings, guest_va + 0x4000, 8).is_none(),
             "raw GPA access must not silently select a VA-only match"
         );
+    }
+
+    #[test]
+    fn mailbox_route_rejects_unrelated_retired_row_at_recycled_ipa() {
+        let mailbox_va = crate::memory::LINUX_SYSCALL_MAILBOX_BASE;
+        let recycled_ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x3c_000;
+        let mut mailbox = mapped_region(mailbox_va, mailbox_va + 0x1_0000, recycled_ipa);
+        mailbox.host_addr = 0x1177_bc000usize as *mut u8;
+        let mut retired = mapped_region(0x6000_005000, 0x6000_009000, recycled_ipa);
+        retired.host_addr = 0x10e2_90000usize as *mut u8;
+        // The retired row is newer in this vCPU-local metadata Vec. A raw IPA
+        // search therefore selects it even though it cannot represent the
+        // mailbox VA in the live stage-1 graph.
+        let mappings = [mailbox, retired];
+
+        let selected = HvfVmState::mailbox_mapping_for_range(
+            &mappings,
+            mailbox_va + 0x400,
+            recycled_ipa + 0x400,
+            carrick_aarch64::mailbox::AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+        )
+        .expect("live mailbox route");
+
+        assert_eq!(
+            selected.start, mailbox_va,
+            "mailbox lookup must preserve semantic VA while authenticating the translated IPA",
+        );
+        assert_eq!(selected.host_addr as usize, 0x1177_bc000);
     }
 }
 
