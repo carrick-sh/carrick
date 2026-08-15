@@ -2927,11 +2927,13 @@ impl SyscallDispatcher {
             let fixed_anonymous = map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && map_flags.contains(LinuxMmapFlags::FIXED);
             let layout = this.mem.lock().layout;
+            let in_arena = range_within(address, length, layout.mmap_base, layout.mmap_size);
             let address_uses_alias = mmap_request_uses_alias(
                 this.execution_backend(),
                 map_flags.contains(LinuxMmapFlags::FIXED),
                 mmap_address_uses_alias(address, length, layout),
                 memory.read_bytes_raw(address, 1).is_ok(),
+                in_arena,
             );
             if (reused || fixed_anonymous) && !address_uses_alias {
                 // Scrub the reused region's PHYSICAL backing. MUST bypass the
@@ -2959,8 +2961,6 @@ impl SyscallDispatcher {
             // page reclaimed from a prior munmap (which invalidated it) must be
             // valid+RW again, and a PROT_NONE mmap must actually fault. No-op
             // (no TLBI) when the page is already at the target protection.
-            let in_arena = range_within(address, length, layout.mmap_base, layout.mmap_size);
-
             let prot_none = prot_flags.is_empty();
             if prot_none && map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
@@ -5201,18 +5201,22 @@ fn mmap_address_uses_alias(address: u64, length: u64, layout: MemoryLayout) -> b
 /// HVPatch cannot create a new identity stage-2 mapping at a low arbitrary VA
 /// after vCPU creation. A `MAP_FIXED` request outside the boot backing must use
 /// the same global-frame alias path as high VAs. Other backends retain their
-/// address-shaped policy, and an already-backed HVPatch range stays identity so
-/// ordinary arena/ELF replacements do not allocate needless aliases.
+/// address-shaped policy. An already-backed HVPatch range stays identity, as
+/// does its semantic mmap arena: sparse HVPatch deliberately leaves that arena
+/// physically absent until protection commits pages on demand, so a raw-backing
+/// miss there is not a low fixed hole.
 fn mmap_request_uses_alias(
     backend: crate::page_profile::ExecutionBackend,
     fixed: bool,
     address_uses_alias: bool,
     has_identity_backing: bool,
+    semantic_identity_range: bool,
 ) -> bool {
     address_uses_alias
         || (backend == crate::page_profile::ExecutionBackend::HvPatch
             && fixed
-            && !has_identity_backing)
+            && !has_identity_backing
+            && !semantic_identity_range)
 }
 
 /// Select the legacy dispatcher IPA token for an alias publication.
@@ -5336,25 +5340,47 @@ mod tests {
     }
 
     #[test]
-    fn hvpatch_low_fixed_hole_uses_alias_but_backed_identity_range_does_not() {
-        assert!(mmap_request_uses_alias(
-            crate::page_profile::ExecutionBackend::HvPatch,
-            true,
-            false,
-            false,
-        ));
-        assert!(!mmap_request_uses_alias(
-            crate::page_profile::ExecutionBackend::HvPatch,
-            true,
-            false,
-            true,
-        ));
-        assert!(!mmap_request_uses_alias(
-            crate::page_profile::ExecutionBackend::Vmm,
-            true,
-            false,
-            false,
-        ));
+    fn hvpatch_sparse_semantic_arena_stays_identity_while_low_fixed_hole_aliases() {
+        assert!(
+            !mmap_request_uses_alias(
+                crate::page_profile::ExecutionBackend::HvPatch,
+                true,
+                false,
+                false,
+                true,
+            ),
+            "an absent sparse page inside the semantic arena must materialize through the identity route"
+        );
+        assert!(
+            mmap_request_uses_alias(
+                crate::page_profile::ExecutionBackend::HvPatch,
+                true,
+                false,
+                false,
+                false,
+            ),
+            "a true low fixed hole still requires alias backing"
+        );
+        assert!(
+            !mmap_request_uses_alias(
+                crate::page_profile::ExecutionBackend::HvPatch,
+                true,
+                false,
+                true,
+                false,
+            ),
+            "already-backed identity memory must not acquire a second alias"
+        );
+        assert!(
+            !mmap_request_uses_alias(
+                crate::page_profile::ExecutionBackend::Vmm,
+                true,
+                false,
+                false,
+                false,
+            ),
+            "non-HVPatch backends retain their existing low fixed mapping route"
+        );
     }
 
     impl CountingMmapMemory {
