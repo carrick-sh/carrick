@@ -567,6 +567,13 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.bind_frame_cow(authority, identity);
     }
 
+    fn refresh_fork_process_state(
+        &mut self,
+        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        self.state.refresh_fork_process_state(flush_stage1)
+    }
+
     fn resolve_frame_cow_fault(
         &mut self,
         syndrome: u64,

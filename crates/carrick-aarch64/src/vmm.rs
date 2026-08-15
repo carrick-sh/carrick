@@ -523,6 +523,15 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     ) {
     }
 
+    /// Refresh fork-private process state after the child frame inventory and
+    /// exact MM/COW authority are live, but before the child enters guest code.
+    fn refresh_fork_process_state(
+        &mut self,
+        _flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        Ok(())
+    }
+
     fn resolve_frame_cow_fault(
         &mut self,
         _syndrome: u64,

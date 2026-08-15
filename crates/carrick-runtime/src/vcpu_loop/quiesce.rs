@@ -1430,6 +1430,14 @@ where
                         asid: child_binding.asid.raw(),
                     },
                 );
+                // The child inventory and exact MM/COW authority are now live,
+                // while the child remains behind the start gate and has never
+                // entered guest code. Refresh fork-private backend state here so
+                // any inherited COW frame is split from the parent first.
+                if let Err(error) = child_engine.refresh_fork_process_state() {
+                    tracing::error!(child_pid, %error, "refresh materialized child process state");
+                    std::process::abort();
+                }
                 // The child inventory is authoritative before this first
                 // kernel-originated write. If the address lies in a fork-COW
                 // frame, the copyout now splits only the child instead of

@@ -4264,6 +4264,16 @@ struct GlobalExecPlan {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn next_vdso_rng_generation() -> u64 {
+    // A host PID distinguished the historical one-guest-process-per-host-process
+    // VMM fork path, but HVPatch materializes many Linux processes inside one
+    // Carrick host process. A process-local monotonic generation distinguishes
+    // every such child; the vDSO uses it only as a reseed epoch, not as entropy.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn reapply_global_exec_readonly_spans(
     page_tables: &mut crate::page_table::PageTableManager,
     ro_spans: &[carrick_mem::elf::RoSpan],
@@ -5157,6 +5167,31 @@ impl HvfVmState {
             register_shared_alias(alias);
         }
         Ok(())
+    }
+
+    pub(crate) fn refresh_fork_process_state(
+        &mut self,
+        flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        // A logical HVPatch child shares Carrick's host PID with its parent, so
+        // the historical post-host-fork PID stamp cannot distinguish their
+        // inherited vDSO getrandom states. Split the child's private vvar frame
+        // before stamping a fresh generation; direct backing writes would
+        // otherwise mutate the parent's still-shared frame as well. The runtime
+        // invokes this only after it publishes the child inventory and binds
+        // exact MM/COW authority, but before the start-gated vCPU enters guest
+        // code.
+        let generation_address =
+            crate::vdso::LINUX_VVAR_BASE + crate::vdso::VVAR_OFF_RNG_GENERATION as u64;
+        self.ensure_frame_cow_write(
+            generation_address,
+            core::mem::size_of::<u64>(),
+            carrick_aarch64::vmm::FrameCowWriteIntent::PrivilegedInternal,
+            flush_stage1,
+        )?;
+        self.stamp_rng_generation().map_err(|error| {
+            TrapError::Hypervisor(format!("stamp HVPatch child vDSO RNG generation: {error}"))
+        })
     }
 
     pub(crate) fn abort_process_materialization(&mut self) -> Result<(), TrapError> {
@@ -8213,23 +8248,23 @@ impl HvfVmState {
     /// counter we calibrate against (CNTKCTL_EL1.EL0VCTEN), so the rate is exact;
     /// monotonic durations depend only on the frequency. Best-effort: silently
     /// skips if the vvar page isn't mapped.
-    /// Stamp this process's host PID into the vvar RNG generation (P2). It is
-    /// unique per process; re-stamped for a forked child in
-    /// `fork_rebuild` so the child's generation never matches the
-    /// snapshot it COW-inherited from its parent — forcing the userspace
-    /// getrandom blob to reseed instead of reusing the parent's keystream.
-    fn stamp_rng_generation(&mut self) {
-        let pid = unsafe { libc::getpid() } as u64;
-        let _ = self.write_guest_bytes(
+    ///
+    /// Stamp a fresh process-local epoch into the vvar RNG generation (P2).
+    /// Re-stamping each forked child ensures the generation never matches the
+    /// state snapshot inherited from its parent, forcing the userspace
+    /// getrandom blob to reseed rather than reuse the parent's keystream.
+    fn stamp_rng_generation(&mut self) -> Result<(), MemoryError> {
+        let generation = next_vdso_rng_generation();
+        self.write_guest_bytes(
             crate::vdso::LINUX_VVAR_BASE + crate::vdso::VVAR_OFF_RNG_GENERATION as u64,
-            &pid.to_le_bytes(),
-        );
+            &generation.to_le_bytes(),
+        )
     }
 
     fn populate_vdso_data_page(&mut self) {
         // Independent of the clock data (getrandom needs no calibrated counter),
         // so stamp it first and unconditionally.
-        self.stamp_rng_generation();
+        let _ = self.stamp_rng_generation();
         let freq = host_counter_frequency();
         if freq == 0 {
             return;
@@ -9554,15 +9589,15 @@ impl HvfVmState {
             let phase_start = std::time::Instant::now();
             let _ = crate::probes::register_dtrace_probes();
             crate::probes::fork_lifecycle(role + 4, 17, elapsed_us(phase_start), 0, 0);
-            // P2 getrandom fork-safety: re-stamp the vvar RNG generation with the
-            // child's new PID. `self` is now the child's rebuilt engine — its vvar
+            // P2 getrandom fork-safety: re-stamp the vvar RNG generation with a
+            // fresh epoch. `self` is now the child's rebuilt engine — its vvar
             // mapping points at the child's freshly re-mapped snapshot buffer, and
             // the vCPU was just recreated (clean stage-2 TLB) — so this write IS
             // visible to the child's guest reads. The child's distinct generation
             // forces the userspace getrandom blob to reseed instead of reusing the
             // parent's keystream (gated by conformance-probes/getrandomvdsofork).
             let phase_start = std::time::Instant::now();
-            self.stamp_rng_generation();
+            let _ = self.stamp_rng_generation();
             crate::probes::fork_lifecycle(role + 4, 18, elapsed_us(phase_start), 0, 0);
         }
         Ok(())
@@ -14345,9 +14380,20 @@ mod tag_strip_tests {
         alias_is_owned_by_process, alias_matches_process_scope, alias_registry,
         current_dynamic_alias_ipas, forget_replay_extent, inherited_fork_inventory_extents,
         lookup_shared_alias, mapping_is_current_for_process_fork, missing_process_aliases,
-        reapply_global_exec_readonly_spans, rebind_inherited_alias_to_process,
-        register_shared_alias, retired_alias_disarm_spans, strip_pointer_tag, unregister_alias,
+        next_vdso_rng_generation, reapply_global_exec_readonly_spans,
+        rebind_inherited_alias_to_process, register_shared_alias, retired_alias_disarm_spans,
+        strip_pointer_tag, unregister_alias,
     };
+
+    #[test]
+    fn logical_hvpatch_processes_receive_distinct_vdso_rng_generations() {
+        let parent = next_vdso_rng_generation();
+        let child = next_vdso_rng_generation();
+
+        assert_ne!(parent, 0);
+        assert_ne!(child, 0);
+        assert_ne!(parent, child);
+    }
 
     #[test]
     fn guest_mapping_plan_shares_address_space_payload() {

@@ -1639,6 +1639,14 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.bind_frame_cow(authority, identity);
     }
 
+    fn refresh_fork_process_state(&mut self) -> Result<(), TrapError> {
+        let vm = &mut self.vm;
+        let vcpu = &mut self.vcpu;
+        let mut flush = || Self::run_el1_maintenance_on(vcpu);
+        vm.refresh_fork_process_state(&mut flush)?;
+        vm.refresh_vcpu_after_frame_cow(vcpu)
+    }
+
     fn resolve_frame_cow_fault(&mut self, syndrome: u64, far: u64) -> Result<bool, TrapError> {
         // Serialize the actual hardware root/ASID and live descriptors for every
         // attempted COW, including the fast EL0-abort route that never reaches
