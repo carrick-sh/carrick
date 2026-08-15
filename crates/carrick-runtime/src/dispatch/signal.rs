@@ -1223,36 +1223,50 @@ impl SyscallDispatcher {
         let Some(target_key) = hvpatch_process_signal_target(kernel, pid) else {
             return Some(DispatchOutcome::errno(LINUX_ESRCH));
         };
+        Some(self.hvpatch_exact_process_signal(ctx.kernel, target_key, signum, siginfo))
+    }
+
+    /// Deliver through one exact HVPatch process identity. Pidfds already hold
+    /// a generation-bearing [`TaskKey`](crate::kernel::TaskKey), so they must
+    /// not collapse back to a numeric pid lookup (or to the shared host pid)
+    /// before applying the same authorization and pending-signal machinery as
+    /// `kill(2)`.
+    pub(super) fn hvpatch_exact_process_signal(
+        &self,
+        context: &crate::kernel::KernelContext,
+        target_key: crate::kernel::TaskKey,
+        signum: u64,
+        siginfo: Option<LinuxSiginfo>,
+    ) -> DispatchOutcome {
+        let kernel = context.kernel();
         let signal = if signum == 0 {
             None
         } else {
             match crate::kernel::LinuxSignal::for_signal_number(signum as i32) {
                 Ok(signal) => Some(signal),
-                Err(_) => return Some(DispatchOutcome::errno(LINUX_EINVAL)),
+                Err(_) => return DispatchOutcome::errno(LINUX_EINVAL),
             }
         };
-        Some(
-            match kernel.authorize_signal_target_exact(ctx.kernel, target_key, None, signal) {
-                crate::kernel::ExactSignalTargetAuthorization::Allowed(ticket) => {
-                    if signal.is_none_or(|signal| {
-                        kernel.post_signal_to_authorized_target(&ticket, signal, siginfo)
-                    }) {
-                        DispatchOutcome::Returned { value: 0 }
-                    } else {
-                        DispatchOutcome::errno(LINUX_ESRCH)
-                    }
-                }
-                crate::kernel::ExactSignalTargetAuthorization::DropProtectedInit => {
+        match kernel.authorize_signal_target_exact(context, target_key, None, signal) {
+            crate::kernel::ExactSignalTargetAuthorization::Allowed(ticket) => {
+                if signal.is_none_or(|signal| {
+                    kernel.post_signal_to_authorized_target(&ticket, signal, siginfo)
+                }) {
                     DispatchOutcome::Returned { value: 0 }
-                }
-                crate::kernel::ExactSignalTargetAuthorization::Denied => {
-                    DispatchOutcome::errno(LINUX_EPERM)
-                }
-                crate::kernel::ExactSignalTargetAuthorization::Missing => {
+                } else {
                     DispatchOutcome::errno(LINUX_ESRCH)
                 }
-            },
-        )
+            }
+            crate::kernel::ExactSignalTargetAuthorization::DropProtectedInit => {
+                DispatchOutcome::Returned { value: 0 }
+            }
+            crate::kernel::ExactSignalTargetAuthorization::Denied => {
+                DispatchOutcome::errno(LINUX_EPERM)
+            }
+            crate::kernel::ExactSignalTargetAuthorization::Missing => {
+                DispatchOutcome::errno(LINUX_ESRCH)
+            }
+        }
     }
 
     /// Route a HVPatch thread target by Linux `(tgid, tid)` identity. With no
@@ -2721,6 +2735,30 @@ mod tests {
             hvpatch_process_signal_target(root.kernel(), sibling_tid.raw()),
             Some(root.task().key())
         );
+    }
+
+    #[test]
+    fn exact_pidfd_signal_preserves_queued_siginfo() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.exact_signal_context_for_test();
+        let tid = context.thread().registry_id();
+        let signum = crate::linux_abi::LINUX_SIGUSR1;
+        let info = LinuxSiginfo::rt_queue(signum, 71, 72, 0x1234_5678);
+
+        assert_eq!(
+            dispatcher.hvpatch_exact_process_signal(
+                &context,
+                context.task().key(),
+                signum as u64,
+                Some(info),
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let pending = dispatcher
+            .take_deliverable_pending_from(&context, tid)
+            .expect("exact pidfd signal must enter the target task queue");
+        assert_eq!(pending.signum, signum);
+        assert_eq!(pending.siginfo, Some(info));
     }
 
     #[test]

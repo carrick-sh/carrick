@@ -1303,6 +1303,17 @@ impl SyscallDispatcher {
     }
 
     /// Resolve a pidfd to its typed process target.
+    fn proc_directory_pidfd_target(&self, path: &str) -> Option<PidfdTarget> {
+        if let Some(process) = self.hvpatch_process()
+            && let Some(pid) = crate::vfs::proc::proc_pid_dir_linux_pid(path)
+            && let Ok(pid) = i32::try_from(pid)
+            && let Some(task) = process.live_process_key(pid)
+        {
+            return Some(PidfdTarget::Hvpatch(task));
+        }
+        crate::vfs::proc::proc_pid_dir_host_pid(path).map(|pid| PidfdTarget::Host(pid as i32))
+    }
+
     fn pidfd_target(&self, fd: i32) -> Option<PidfdTarget> {
         let open = self.open_file(fd)?;
         let desc = open.description.read();
@@ -1312,10 +1323,7 @@ impl SyscallDispatcher {
             // `pidfd_send_signal`/`waitid(P_PIDFD)` accept one). Resolve its
             // backing host pid; any other directory (or non-numeric /proc path)
             // yields None → EBADF. (CPython test_pidfd_send_signal.)
-            OpenDescription::Directory { path, .. } => {
-                crate::vfs::proc::proc_pid_dir_host_pid(path)
-                    .map(|pid| PidfdTarget::Host(pid as i32))
-            }
+            OpenDescription::Directory { path, .. } => self.proc_directory_pidfd_target(path),
             _ => None,
         }
     }
@@ -1342,7 +1350,7 @@ impl SyscallDispatcher {
         match &*desc {
             OpenDescription::Pidfd { base, .. } => Some(base.status_flags()),
             OpenDescription::Directory { path, .. }
-                if crate::vfs::proc::proc_pid_dir_host_pid(path).is_some() =>
+                if self.proc_directory_pidfd_target(path).is_some() =>
             {
                 Some(0)
             }
@@ -4028,11 +4036,36 @@ impl SyscallDispatcher {
                 if !crate::dispatch::signal::is_valid_signum(signum) {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                // A nonzero signal needs a process-table route to the target's
-                // process-private signal state and wake handles. Do not leak it
-                // to the common Carrick host pid; that would signal every Linux
-                // process in the shared VM.
-                return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
+                let siginfo = if info.0 != 0 {
+                    let bytes = match cx.memory.read_bytes(
+                        info.0,
+                        core::mem::size_of::<crate::linux_abi::LinuxSiginfo>(),
+                    ) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                    };
+                    let user_info = match crate::linux_abi::LinuxSiginfo::read_from_bytes(&bytes) {
+                        Ok(info) => info,
+                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                    };
+                    if user_info.si_signo != signum as i32 {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    Some(user_info)
+                } else {
+                    Some(crate::linux_abi::LinuxSiginfo::kill(
+                        signum as i32,
+                        crate::linux_abi::LINUX_SI_USER,
+                        cx.kernel.task().key().id.raw(),
+                        this.cred_snapshot().ruid,
+                    ))
+                };
+                return Ok(this.hvpatch_exact_process_signal(
+                    cx.kernel,
+                    guest_pid,
+                    signum,
+                    siginfo,
+                ));
             }
             let PidfdTarget::Host(host_pid) = target else {
                 unreachable!("HvPatch pidfd handled above")

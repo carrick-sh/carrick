@@ -440,6 +440,11 @@ impl ProcessContext {
         self.kernel_graph().task_key_is_live(target)
     }
 
+    pub(crate) fn live_process_key(&self, target: i32) -> Option<crate::kernel::TaskKey> {
+        let target = crate::kernel::TaskId::from_abi_positive(target).ok()?;
+        self.kernel_graph().live_task_key(target)
+    }
+
     pub(crate) fn is_child(&self) -> bool {
         self.kernel_graph()
             .task_identity(self.task_id())
