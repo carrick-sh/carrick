@@ -15,6 +15,11 @@ pub(super) enum CloneThreadSpawn {
     Errno(crate::linux_abi::LinuxErrno),
 }
 
+enum SiblingStartFailure {
+    Cancelled,
+    Materialization(String),
+}
+
 fn guest_host_thread_name(process_pid: Option<i32>, tid: ThreadId) -> String {
     process_pid.map_or_else(
         || format!("guest-tid-{tid}"),
@@ -619,7 +624,7 @@ where
                     if child_kernel.process_exiting()
                         || child_kernel.clone_admission_cancelled()
                     {
-                        let _ = ready_tx.send(Err("process exited before sibling admission".to_owned()));
+                        let _ = ready_tx.send(Err(SiblingStartFailure::Cancelled));
                         return;
                     }
                     if let Some(lease) = carrick_hal::vcpu_sched::global().acquire_timeout(
@@ -660,7 +665,7 @@ where
                     || child_kernel.clone_admission_cancelled()
                 {
                     drop(topo);
-                    let _ = ready_tx.send(Err("process exited before sibling materialization".to_owned()));
+                    let _ = ready_tx.send(Err(SiblingStartFailure::Cancelled));
                     return;
                 }
                 match E::materialize_sibling(spec) {
@@ -795,7 +800,8 @@ where
                     }
                     Err(error) => {
                         drop(topo);
-                        let _ = ready_tx.send(Err(error.to_string()));
+                        let _ = ready_tx
+                            .send(Err(SiblingStartFailure::Materialization(error.to_string())));
                     }
                 }
             })
@@ -831,8 +837,9 @@ where
         let ready_deadline = Instant::now() + Duration::from_secs(10);
         let ready = loop {
             match ready_rx.recv_timeout(Duration::from_millis(1)) {
-                Ok(Ok(())) => break Ok(()),
-                Ok(Err(error)) => {
+                Ok(Ok(())) => break Ok(true),
+                Ok(Err(SiblingStartFailure::Cancelled)) => break Ok(false),
+                Ok(Err(SiblingStartFailure::Materialization(error))) => {
                     break Err(RuntimeError::Trap(TrapError::Hypervisor(error)));
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -864,15 +871,28 @@ where
                 }
             }
         };
-        if let Err(error) = ready {
-            let _ = start_tx.send(false);
-            let _ = handle.join();
-            if prepared_thread.is_none() {
-                self.registry.exit(tid);
-                let _ = kernel.dispatcher.exit_one_task_thread(linux_tid);
+        match ready {
+            Err(error) => {
+                let _ = start_tx.send(false);
+                let _ = handle.join();
+                if prepared_thread.is_none() {
+                    self.registry.exit(tid);
+                    let _ = kernel.dispatcher.exit_one_task_thread(linux_tid);
+                }
+                self.resume_vcpu_after_blocking_wait(engine, parent_reclaim)?;
+                return Err(error);
             }
-            self.resume_vcpu_after_blocking_wait(engine, parent_reclaim)?;
-            return Err(error);
+            Ok(false) => {
+                let _ = start_tx.send(false);
+                let _ = handle.join();
+                if prepared_thread.is_none() {
+                    self.registry.exit(tid);
+                    let _ = kernel.dispatcher.exit_one_task_thread(linux_tid);
+                }
+                self.resume_vcpu_after_blocking_wait(engine, parent_reclaim)?;
+                return Ok(CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN));
+            }
+            Ok(true) => {}
         }
 
         let restore_tid_outputs = |engine: &mut E| {
