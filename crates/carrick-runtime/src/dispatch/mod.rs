@@ -3119,6 +3119,22 @@ pub(crate) fn hvpatch_lane_active() -> bool {
 
 impl SyscallDispatcher {
     pub(crate) fn bind_hvpatch_process(&self, process: crate::hvpatch::ProcessContext) {
+        let launch_context = self.capture_one_task_context().unwrap_or_else(|error| {
+            tracing::error!(%error, "cannot capture filesystem context before HVPatch binding");
+            std::process::abort();
+        });
+        let launch_fs_context = launch_context.resources().fs_context();
+        let launch_cwd = launch_fs_context.cwd();
+        let launch_chroot_root = launch_fs_context.chroot_root();
+        let process_context = process
+            .context_for_linux_tid(crate::kernel::LinuxTid::for_task_leader(process.task_id()))
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "cannot capture HVPatch root filesystem context");
+                std::process::abort();
+            });
+        let process_fs_context = process_context.resources().fs_context();
+        process_fs_context.set_cwd(launch_cwd);
+        process_fs_context.set_chroot_root(launch_chroot_root);
         HVPATCH_LANE.store(true, std::sync::atomic::Ordering::Release);
         process.bind_vma_source(self.vma_snapshot_source());
         *self.kernel_binding.write() = process.task_binding();
