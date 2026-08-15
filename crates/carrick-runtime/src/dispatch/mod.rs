@@ -1069,12 +1069,14 @@ impl std::fmt::Debug for BlockingHostWrite {
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct BlockingRecordLock {
     #[serde(skip_serializing)]
-    host_fd: std::sync::Arc<PinnedHostFd>,
+    host_fd: Option<std::sync::Arc<PinnedHostFd>>,
     host_cmd: i32,
     l_start: i64,
     l_len: i64,
     l_type: i16,
     l_whence: i16,
+    #[serde(skip_serializing)]
+    logical: Option<fs::LogicalRecordLockWait>,
 }
 
 impl BlockingRecordLock {
@@ -1087,25 +1089,39 @@ impl BlockingRecordLock {
         l_whence: i16,
     ) -> Result<Self, LinuxErrno> {
         Ok(Self {
-            host_fd: std::sync::Arc::new(PinnedHostFd::new(host_fd)?),
+            host_fd: Some(std::sync::Arc::new(PinnedHostFd::new(host_fd)?)),
             host_cmd,
             l_start,
             l_len,
             l_type,
             l_whence,
+            logical: None,
         })
+    }
+
+    pub(crate) fn logical(wait: fs::LogicalRecordLockWait) -> Self {
+        Self {
+            host_fd: None,
+            host_cmd: 0,
+            l_start: 0,
+            l_len: 0,
+            l_type: 0,
+            l_whence: 0,
+            logical: Some(wait),
+        }
     }
 }
 
 impl std::fmt::Debug for BlockingRecordLock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BlockingRecordLock")
-            .field("host_fd", &self.host_fd.fd)
+            .field("host_fd", &self.host_fd.as_ref().map(|fd| fd.fd))
             .field("host_cmd", &self.host_cmd)
             .field("l_start", &self.l_start)
             .field("l_len", &self.l_len)
             .field("l_type", &self.l_type)
             .field("l_whence", &self.l_whence)
+            .field("logical", &self.logical)
             .finish()
     }
 }
@@ -1174,6 +1190,15 @@ pub(crate) fn drive_blocking_host_write(write: &mut BlockingHostWrite) -> Blocki
 }
 
 pub(crate) fn drive_blocking_record_lock(lock: &BlockingRecordLock) -> DispatchOutcome {
+    if let Some(logical) = &lock.logical {
+        return match logical.acquire() {
+            Ok(()) => DispatchOutcome::Returned { value: 0 },
+            Err(errno) => DispatchOutcome::errno(errno),
+        };
+    }
+    let Some(host_fd) = &lock.host_fd else {
+        return DispatchOutcome::errno(LINUX_EINVAL);
+    };
     let mut fl: libc::flock = unsafe { core::mem::zeroed() };
     fl.l_start = lock.l_start as libc::off_t;
     fl.l_len = lock.l_len as libc::off_t;
@@ -1183,7 +1208,7 @@ pub(crate) fn drive_blocking_record_lock(lock: &BlockingRecordLock) -> DispatchO
     // BLOCKING-IO-OK: this is the blocking half of F_SETLKW/F_OFD_SETLKW after
     // the dispatcher has returned its state locks to the run loop. Sibling guest
     // threads can keep running and release the conflicting record lock.
-    let rc = unsafe { libc::fcntl(lock.host_fd.fd, lock.host_cmd, &mut fl as *mut libc::flock) };
+    let rc = unsafe { libc::fcntl(host_fd.fd, lock.host_cmd, &mut fl as *mut libc::flock) };
     match rc.host_syscall_errno() {
         Ok(_) => DispatchOutcome::Returned { value: 0 },
         Err(errno) => DispatchOutcome::Errno { errno },
@@ -3180,7 +3205,7 @@ impl SyscallDispatcher {
             .map_err(|error| error.to_string())?;
         *self.kernel_binding.write() = context.task_binding();
         self.publish_external_credential_projection(&context, &context.resources().credentials());
-        self.close_draining_file_table(&kernel, &old_files);
+        self.close_draining_file_table(&kernel, &old_files, Some(context.task().key()));
         Ok(context)
     }
 
@@ -3188,6 +3213,7 @@ impl SyscallDispatcher {
         &self,
         kernel: &Arc<crate::kernel::Kernel>,
         files: &Arc<crate::kernel::FileTable>,
+        owner: Option<crate::kernel::TaskKey>,
     ) {
         kernel.retire_file_table_if_unreferenced(files);
         let pid = self.event_ring_guest_pid();
@@ -3200,6 +3226,9 @@ impl SyscallDispatcher {
                         self.inotify_close_for_fd(event.fd);
                         self.detach_fd_from_epolls(event.fd);
                         self.record_fd_close_owner(event.fd, pid, &event.slot);
+                        if let Some(owner) = owner {
+                            self.release_hvpatch_classic_record_locks(owner, &event.slot);
+                        }
                         self.close_open_file_and_free_pty(&event.slot);
                     }
                     crate::kernel::core::FileCloseDisposition::Transferred => {
@@ -3338,7 +3367,11 @@ impl SyscallDispatcher {
             let observed = binding.kernel().reservation_epoch();
             match binding.kernel().exit_thread(&context, None) {
                 Ok(_) => {
-                    self.close_draining_file_table(context.kernel(), &context.resources().files());
+                    self.close_draining_file_table(
+                        context.kernel(),
+                        &context.resources().files(),
+                        Some(context.task().key()),
+                    );
                     return Ok(());
                 }
                 Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
@@ -3445,8 +3478,11 @@ impl SyscallDispatcher {
     /// made this exact table generation draining, consume its typed close
     /// events without erasing the rows retained for coherent snapshots.
     pub(crate) fn retire_hvpatch_process_fds(&self, context: &crate::kernel::KernelContext) {
+        self.fs
+            .classic_record_locks
+            .release_owner(context.task().key());
         let files = self.file_table_for_context(context);
-        self.close_draining_file_table(context.kernel(), &files);
+        self.close_draining_file_table(context.kernel(), &files, Some(context.task().key()));
     }
 
     fn event_ring_guest_pid(&self) -> i32 {

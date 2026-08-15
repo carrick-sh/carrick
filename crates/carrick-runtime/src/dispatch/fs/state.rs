@@ -201,6 +201,11 @@ pub(in crate::dispatch) struct FsState {
     /// and re-patch the same ELF. Non-host-backed targets bypass this cache.
     pub(in crate::dispatch) hvpatch_exec_cache:
         std::sync::Arc<parking_lot::Mutex<HashMap<String, crate::memory::AddressSpace>>>,
+
+    /// Classic POSIX record locks for backends that multiplex multiple Linux
+    /// processes inside one host process. HVPatch task generations are the
+    /// owners; host-process-backed lanes continue using the host fcntl table.
+    pub(in crate::dispatch) classic_record_locks: std::sync::Arc<super::LogicalRecordLocks>,
 }
 
 /// Process-local output transport. Linux fd-table authority lives exclusively
@@ -360,6 +365,7 @@ impl FsState {
             dnotify_registry: parking_lot::Mutex::new(Vec::new()),
             resolve_cache: crate::fs_resolve_cache::ResolveCache::new(),
             hvpatch_exec_cache: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            classic_record_locks: std::sync::Arc::new(super::LogicalRecordLocks::default()),
         }
     }
 
@@ -372,6 +378,7 @@ impl FsState {
             dnotify_registry: parking_lot::Mutex::new(self.dnotify_registry.lock().clone()),
             resolve_cache: crate::fs_resolve_cache::ResolveCache::new(),
             hvpatch_exec_cache: std::sync::Arc::clone(&self.hvpatch_exec_cache),
+            classic_record_locks: std::sync::Arc::clone(&self.classic_record_locks),
         }
     }
 }

@@ -395,7 +395,8 @@ fn prepare_readv_targets(
 /// macOS flock (`libc::flock`): l_start:i64, l_len:i64, l_pid:i32, l_type:i16,
 ///   l_whence:i16. l_type: RDLCK=1, UNLCK=2, WRLCK=3. cmd: GETLK=7/SETLK=8/SETLKW=9.
 fn forward_record_lock<M: GuestMemory>(
-    memory: &mut M,
+    this: &SyscallDispatcher,
+    cx: &mut SyscallCtx<'_, M>,
     host_fd: i32,
     linux_cmd: u64,
     arg: u64,
@@ -409,7 +410,7 @@ fn forward_record_lock<M: GuestMemory>(
         LINUX_F_OFD_GETLK | LINUX_F_OFD_SETLK | LINUX_F_OFD_SETLKW
     );
 
-    let bytes = match memory.read_bytes(arg, 32) {
+    let bytes = match cx.memory.read_bytes(arg, 32) {
         Ok(b) => b,
         Err(_) => return DispatchOutcome::errno(LINUX_EFAULT),
     };
@@ -449,6 +450,50 @@ fn forward_record_lock<M: GuestMemory>(
         _ => return DispatchOutcome::errno(LINUX_EINVAL),
     };
 
+    if this.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch && !is_ofd {
+        let file = match logical_record_lock_file(host_fd) {
+            Ok(file) => file,
+            Err(errno) => return DispatchOutcome::errno(errno),
+        };
+        let range = match normalize_logical_record_lock_range(host_fd, l_whence, l_start, l_len) {
+            Ok(range) => range,
+            Err(errno) => return DispatchOutcome::errno(errno),
+        };
+        let owner = LogicalRecordLockOwner::from(cx.kernel.task().key());
+        if l_type_linux == LINUX_F_UNLCK as i16 {
+            if linux_cmd == LINUX_F_GETLK {
+                return DispatchOutcome::errno(LINUX_EINVAL);
+            }
+            this.fs.classic_record_locks.unlock(&file, owner, range);
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        let request = LogicalRecordLockRequest {
+            file,
+            owner,
+            range,
+            write: l_type_linux == LINUX_F_WRLCK as i16,
+        };
+        if linux_cmd == LINUX_F_GETLK {
+            let conflict = this.fs.classic_record_locks.conflict(&request);
+            return write_logical_record_lock_conflict(&mut *cx.memory, arg, conflict);
+        }
+        match this.fs.classic_record_locks.try_set(request.clone()) {
+            Ok(()) => return DispatchOutcome::Returned { value: 0 },
+            Err(errno) if linux_cmd == LINUX_F_SETLK => {
+                return DispatchOutcome::errno(errno);
+            }
+            Err(errno) if errno != LINUX_EAGAIN => return DispatchOutcome::errno(errno),
+            Err(_) => {
+                let wait = LogicalRecordLockWait::new(
+                    Arc::clone(&this.fs.classic_record_locks),
+                    request,
+                    cx.tid(),
+                );
+                return DispatchOutcome::BlockingRecordLock(BlockingRecordLock::logical(wait));
+            }
+        }
+    }
+
     if matches!(linux_cmd, LINUX_F_SETLKW | LINUX_F_OFD_SETLKW) {
         return match BlockingRecordLock::new(
             host_fd,
@@ -484,7 +529,8 @@ fn forward_record_lock<M: GuestMemory>(
             // survives). carrick previously rewrote the whole struct from the
             // macOS flock result, which zeroes l_pid. Touch only l_type@0
             // (an i16 field, so narrow the i32 const to 2 wire bytes).
-            if memory
+            if cx
+                .memory
                 .write_bytes(arg, &(LINUX_F_UNLCK as i16).to_le_bytes())
                 .is_err()
             {
@@ -514,7 +560,7 @@ fn forward_record_lock<M: GuestMemory>(
                 crate::namespace::pid::host_to_ns_or_self(fl.l_pid as u32) as i32
             };
             out[24..28].copy_from_slice(&l_pid_back.to_le_bytes());
-            if memory.write_bytes(arg, &out).is_err() {
+            if cx.memory.write_bytes(arg, &out).is_err() {
                 return DispatchOutcome::errno(LINUX_EFAULT);
             }
         }
@@ -597,10 +643,315 @@ fn tee_host_passthrough(
 /// [`SyscallDispatcher::same_file_other_openers`]). Two open descriptions
 /// conflict for lease purposes iff they name the same underlying file: the host
 /// inode under `--fs host`, or the guest open-path for the in-memory backing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum LeaseFileId {
     Inode { dev: u64, ino: u64 },
     Path(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LogicalRecordLockOwner {
+    pid: i32,
+    serial: u64,
+}
+
+impl From<crate::kernel::TaskKey> for LogicalRecordLockOwner {
+    fn from(key: crate::kernel::TaskKey) -> Self {
+        Self {
+            pid: key.id.raw(),
+            serial: key.serial.raw(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LogicalRecordLockRange {
+    start: u64,
+    end: u64,
+}
+
+impl LogicalRecordLockRange {
+    fn overlaps(self, other: Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogicalRecordLock {
+    file: LeaseFileId,
+    owner: LogicalRecordLockOwner,
+    range: LogicalRecordLockRange,
+    write: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LogicalRecordLockRequest {
+    file: LeaseFileId,
+    owner: LogicalRecordLockOwner,
+    range: LogicalRecordLockRange,
+    write: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct LogicalRecordLocks {
+    locks: parking_lot::Mutex<Vec<LogicalRecordLock>>,
+    changed: parking_lot::Condvar,
+}
+
+impl LogicalRecordLocks {
+    fn conflict_locked(
+        locks: &[LogicalRecordLock],
+        request: &LogicalRecordLockRequest,
+    ) -> Option<LogicalRecordLock> {
+        locks
+            .iter()
+            .filter(|lock| {
+                lock.file == request.file
+                    && lock.owner != request.owner
+                    && lock.range.overlaps(request.range)
+                    && (lock.write || request.write)
+            })
+            .min_by_key(|lock| lock.range.start)
+            .cloned()
+    }
+
+    fn replace_owner_range(
+        locks: &mut Vec<LogicalRecordLock>,
+        file: &LeaseFileId,
+        owner: LogicalRecordLockOwner,
+        range: LogicalRecordLockRange,
+    ) {
+        let mut retained = Vec::with_capacity(locks.len() + 2);
+        for lock in locks.drain(..) {
+            if &lock.file != file || lock.owner != owner || !lock.range.overlaps(range) {
+                retained.push(lock);
+                continue;
+            }
+            if lock.range.start < range.start {
+                let mut prefix = lock.clone();
+                prefix.range.end = range.start;
+                retained.push(prefix);
+            }
+            if range.end < lock.range.end {
+                let mut suffix = lock;
+                suffix.range.start = range.end;
+                retained.push(suffix);
+            }
+        }
+        *locks = retained;
+    }
+
+    fn try_set(&self, request: LogicalRecordLockRequest) -> Result<(), LinuxErrno> {
+        let mut locks = self.locks.lock();
+        if Self::conflict_locked(&locks, &request).is_some() {
+            return Err(LINUX_EAGAIN);
+        }
+        Self::replace_owner_range(&mut locks, &request.file, request.owner, request.range);
+        locks.push(LogicalRecordLock {
+            file: request.file,
+            owner: request.owner,
+            range: request.range,
+            write: request.write,
+        });
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn unlock(
+        &self,
+        file: &LeaseFileId,
+        owner: LogicalRecordLockOwner,
+        range: LogicalRecordLockRange,
+    ) {
+        let mut locks = self.locks.lock();
+        Self::replace_owner_range(&mut locks, file, owner, range);
+        self.changed.notify_all();
+    }
+
+    fn conflict(&self, request: &LogicalRecordLockRequest) -> Option<LogicalRecordLock> {
+        Self::conflict_locked(&self.locks.lock(), request)
+    }
+
+    fn release_file_owner(&self, file: &LeaseFileId, owner: LogicalRecordLockOwner) {
+        let mut locks = self.locks.lock();
+        locks.retain(|lock| lock.file != *file || lock.owner != owner);
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn release_owner(&self, owner: crate::kernel::TaskKey) {
+        let owner = LogicalRecordLockOwner::from(owner);
+        let mut locks = self.locks.lock();
+        locks.retain(|lock| lock.owner != owner);
+        self.changed.notify_all();
+    }
+
+    fn wait_set_interruptibly(
+        &self,
+        request: &LogicalRecordLockRequest,
+        tid: crate::thread::ThreadId,
+    ) -> Result<(), LinuxErrno> {
+        let mut locks = self.locks.lock();
+        loop {
+            if Self::conflict_locked(&locks, request).is_none() {
+                Self::replace_owner_range(&mut locks, &request.file, request.owner, request.range);
+                locks.push(LogicalRecordLock {
+                    file: request.file.clone(),
+                    owner: request.owner,
+                    range: request.range,
+                    write: request.write,
+                });
+                self.changed.notify_all();
+                return Ok(());
+            }
+            if crate::host_signal::has_unblocked_pending_for(
+                tid.raw(),
+                carrick_abi::SigBlockMask::NONE,
+            ) {
+                return Err(LINUX_EINTR);
+            }
+            self.changed
+                .wait_for(&mut locks, std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct LogicalRecordLockWait {
+    locks: Arc<LogicalRecordLocks>,
+    request: LogicalRecordLockRequest,
+    tid: crate::thread::ThreadId,
+}
+
+impl LogicalRecordLockWait {
+    fn new(
+        locks: Arc<LogicalRecordLocks>,
+        request: LogicalRecordLockRequest,
+        tid: crate::thread::ThreadId,
+    ) -> Self {
+        Self {
+            locks,
+            request,
+            tid,
+        }
+    }
+
+    pub(crate) fn acquire(&self) -> Result<(), LinuxErrno> {
+        self.locks.wait_set_interruptibly(&self.request, self.tid)
+    }
+}
+
+impl PartialEq for LogicalRecordLockWait {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.locks, &other.locks)
+            && self.request == other.request
+            && self.tid == other.tid
+    }
+}
+
+impl Eq for LogicalRecordLockWait {}
+
+impl std::fmt::Debug for LogicalRecordLockWait {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LogicalRecordLockWait")
+            .field("request", &self.request)
+            .field("tid", &self.tid)
+            .finish_non_exhaustive()
+    }
+}
+
+fn logical_record_lock_file(host_fd: i32) -> Result<LeaseFileId, LinuxErrno> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    unsafe { libc::fstat(host_fd, &mut stat) }.host_syscall_errno()?;
+    Ok(LeaseFileId::Inode {
+        dev: stat.st_dev as u64,
+        ino: stat.st_ino as u64,
+    })
+}
+
+fn normalize_logical_record_lock_range(
+    host_fd: i32,
+    whence: i16,
+    start: i64,
+    len: i64,
+) -> Result<LogicalRecordLockRange, LinuxErrno> {
+    let origin = match i32::from(whence) {
+        libc::SEEK_SET => 0_i128,
+        libc::SEEK_CUR => {
+            let offset = unsafe { libc::lseek(host_fd, 0, libc::SEEK_CUR) };
+            if offset < 0 {
+                return Err(crate::host_to_linux_errno(
+                    std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EINVAL),
+                ));
+            }
+            i128::from(offset)
+        }
+        libc::SEEK_END => {
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            unsafe { libc::fstat(host_fd, &mut stat) }.host_syscall_errno()?;
+            i128::from(stat.st_size)
+        }
+        _ => return Err(LINUX_EINVAL),
+    };
+    let anchor = origin.checked_add(i128::from(start)).ok_or(LINUX_EINVAL)?;
+    let (range_start, range_end) = match len.cmp(&0) {
+        std::cmp::Ordering::Greater => (
+            anchor,
+            anchor.checked_add(i128::from(len)).ok_or(LINUX_EINVAL)?,
+        ),
+        std::cmp::Ordering::Equal => (anchor, i128::from(i64::MAX) + 1),
+        std::cmp::Ordering::Less => (
+            anchor.checked_add(i128::from(len)).ok_or(LINUX_EINVAL)?,
+            anchor,
+        ),
+    };
+    if range_start < 0 || range_end <= range_start || range_end > i128::from(i64::MAX) + 1 {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(LogicalRecordLockRange {
+        start: u64::try_from(range_start).map_err(|_| LINUX_EINVAL)?,
+        end: u64::try_from(range_end).map_err(|_| LINUX_EINVAL)?,
+    })
+}
+
+fn write_logical_record_lock_conflict(
+    memory: &mut impl GuestMemory,
+    arg: u64,
+    conflict: Option<LogicalRecordLock>,
+) -> DispatchOutcome {
+    let Some(conflict) = conflict else {
+        return if memory
+            .write_bytes(arg, &(LINUX_F_UNLCK as i16).to_le_bytes())
+            .is_ok()
+        {
+            DispatchOutcome::Returned { value: 0 }
+        } else {
+            DispatchOutcome::errno(LINUX_EFAULT)
+        };
+    };
+    let mut out = [0_u8; 32];
+    let lock_type = if conflict.write {
+        LINUX_F_WRLCK
+    } else {
+        LINUX_F_RDLCK
+    } as i16;
+    let len = if conflict.range.end == i64::MAX as u64 + 1 {
+        0_i64
+    } else {
+        i64::try_from(conflict.range.end.saturating_sub(conflict.range.start)).unwrap_or(i64::MAX)
+    };
+    out[0..2].copy_from_slice(&lock_type.to_le_bytes());
+    out[2..4].copy_from_slice(&(libc::SEEK_SET as i16).to_le_bytes());
+    out[8..16].copy_from_slice(&(conflict.range.start as i64).to_le_bytes());
+    out[16..24].copy_from_slice(&len.to_le_bytes());
+    out[24..28].copy_from_slice(&conflict.owner.pid.to_le_bytes());
+    if memory.write_bytes(arg, &out).is_err() {
+        DispatchOutcome::errno(LINUX_EFAULT)
+    } else {
+        DispatchOutcome::Returned { value: 0 }
+    }
 }
 
 /// `/dev/fd` and `/dev/std{in,out,err}` are symlinks into `/proc/self/fd` on
@@ -1082,6 +1433,25 @@ impl SyscallDispatcher {
             }
             OpenDescription::File { path, .. } => Some(LeaseFileId::Path(path.clone())),
             _ => None,
+        }
+    }
+
+    pub(super) fn release_hvpatch_classic_record_locks(
+        &self,
+        owner: crate::kernel::TaskKey,
+        open_file: &OpenFile,
+    ) {
+        if self.execution_backend() != crate::page_profile::ExecutionBackend::HvPatch {
+            return;
+        }
+        let file = {
+            let description = open_file.description.read();
+            Self::lease_file_identity(&description)
+        };
+        if let Some(file) = file {
+            self.fs
+                .classic_record_locks
+                .release_file_owner(&file, LogicalRecordLockOwner::from(owner));
         }
     }
 
@@ -1782,6 +2152,7 @@ impl SyscallDispatcher {
                     let removed = self.captured_file_table().write_open_files().remove(&fd);
                     self.captured_file_table().write_fd_open_paths().remove(&fd);
                     if let Some(open_file) = removed {
+                        self.release_hvpatch_classic_record_locks(context.task().key(), &open_file);
                         self.close_open_file_and_free_pty(&open_file);
                     }
                     self.note_fd_closed(fd);
@@ -3013,6 +3384,7 @@ impl SyscallDispatcher {
 
     fn duplicate_fd_to(
         &self,
+        owner: crate::kernel::TaskKey,
         old_fd: i32,
         new_fd: i32,
         fd_flags: u64,
@@ -3088,6 +3460,7 @@ impl SyscallDispatcher {
             if let Some(replaced) = table.remove(&new_fd) {
                 let pid = self.event_ring_guest_pid();
                 self.record_fd_close_owner(new_fd, pid, &replaced);
+                self.release_hvpatch_classic_record_locks(owner, &replaced);
                 self.close_open_file_and_free_pty(&replaced);
             }
             retain_open_file(&description);
@@ -6310,6 +6683,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             Ok(this.duplicate_fd_to(
+                cx.kernel.task().key(),
                 old_fd.0,
                 new_fd.0,
                 linux_fd_flags_from_open_flags(flags),
@@ -6322,7 +6696,13 @@ impl SyscallDispatcher {
 
             let old_fd: Fd = oldfd;
             let new_fd: Fd = newfd;
-            Ok(this.duplicate_fd_to(old_fd.0, new_fd.0, 0, true))
+            Ok(this.duplicate_fd_to(
+                cx.kernel.task().key(),
+                old_fd.0,
+                new_fd.0,
+                0,
+                true,
+            ))
 
         }
 
@@ -6662,7 +7042,7 @@ impl SyscallDispatcher {
                     }
                     match this.host_file_fd_for_flush(fd.0) {
                         Ok(Some(host_fd)) => {
-                            forward_record_lock(&mut *cx.memory, host_fd, command, arg)
+                            forward_record_lock(this, cx, host_fd, command, arg)
                         }
                         // Not host-backed → preserve the single-tenant no-op,
                         // but still do the kernel's front-door flock validation
@@ -6680,7 +7060,7 @@ impl SyscallDispatcher {
                     }
                     match this.host_file_fd_for_flush(fd.0) {
                         Ok(Some(host_fd)) => {
-                            forward_record_lock(&mut *cx.memory, host_fd, command, arg)
+                            forward_record_lock(this, cx, host_fd, command, arg)
                         }
                         // Not host-backed → "no lock present": leave the
                         // caller's struct flock untouched (l_type=F_UNLCK is
@@ -6714,7 +7094,7 @@ impl SyscallDispatcher {
                     }
                     match this.host_file_fd_for_flush(fd.0) {
                         Ok(Some(host_fd)) => {
-                            forward_record_lock(&mut *cx.memory, host_fd, command, arg)
+                            forward_record_lock(this, cx, host_fd, command, arg)
                         }
                         Ok(None) => match validate_flock_arg(&*cx.memory, arg) {
                             Ok(()) => DispatchOutcome::Returned { value: 0 },
@@ -8142,6 +8522,10 @@ impl SyscallDispatcher {
             Ok(
                 if let Some(open_file) = removed {
                     this.record_fd_close_owner(fd.0, cx.tid().raw(), &open_file);
+                    this.release_hvpatch_classic_record_locks(
+                        cx.kernel.task().key(),
+                        &open_file,
+                    );
                     crate::event_ring::rec(
                         crate::event_ring::FDCLOSE,
                         fd.0,
@@ -8211,6 +8595,10 @@ impl SyscallDispatcher {
                     this.detach_fd_from_epolls(fd);
                     if let Some(open_file) = this.captured_file_table().write_open_files().remove(&fd) {
                         this.record_fd_close_owner(fd, cx.tid().raw(), &open_file);
+                        this.release_hvpatch_classic_record_locks(
+                            cx.kernel.task().key(),
+                            &open_file,
+                        );
                         crate::event_ring::rec(
                             crate::event_ring::FDCLOSE,
                             fd,
@@ -12762,6 +13150,93 @@ fn read_host_dir_entries(_host_dir_fd: i32, _dir_path: &str) -> Option<Vec<RootF
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn logical_lock_request(
+        owner: (i32, u64),
+        range: (u64, u64),
+        write: bool,
+    ) -> LogicalRecordLockRequest {
+        LogicalRecordLockRequest {
+            file: LeaseFileId::Path("/logical-lock".to_owned()),
+            owner: LogicalRecordLockOwner {
+                pid: owner.0,
+                serial: owner.1,
+            },
+            range: LogicalRecordLockRange {
+                start: range.0,
+                end: range.1,
+            },
+            write,
+        }
+    }
+
+    #[test]
+    fn hvpatch_classic_record_locks_conflict_by_task_generation_and_release_on_close() {
+        let locks = LogicalRecordLocks::default();
+        let parent = logical_lock_request((41, 1), (0, 10), true);
+        let child = logical_lock_request((42, 2), (0, 10), true);
+
+        assert_eq!(locks.try_set(parent.clone()), Ok(()));
+        assert_eq!(locks.try_set(child.clone()), Err(LINUX_EAGAIN));
+        let conflict = locks.conflict(&child).expect("parent conflict");
+        assert_eq!(conflict.owner, parent.owner);
+        assert!(conflict.write);
+
+        locks.release_file_owner(&parent.file, parent.owner);
+        assert_eq!(locks.try_set(child), Ok(()));
+    }
+
+    #[test]
+    fn hvpatch_classic_record_lock_replacement_splits_only_the_callers_range() {
+        let locks = LogicalRecordLocks::default();
+        let whole = logical_lock_request((41, 1), (0, 30), true);
+        assert_eq!(locks.try_set(whole.clone()), Ok(()));
+
+        locks.unlock(
+            &whole.file,
+            whole.owner,
+            LogicalRecordLockRange { start: 10, end: 20 },
+        );
+        let state = locks.locks.lock();
+        assert_eq!(state.len(), 2);
+        assert_eq!(state[0].range, LogicalRecordLockRange { start: 0, end: 10 });
+        assert_eq!(
+            state[1].range,
+            LogicalRecordLockRange { start: 20, end: 30 }
+        );
+    }
+
+    #[test]
+    fn hvpatch_blocking_classic_record_lock_wakes_after_unlock() {
+        let locks = Arc::new(LogicalRecordLocks::default());
+        let parent = logical_lock_request((41, 1), (0, 10), true);
+        let child = logical_lock_request((42, 2), (0, 10), true);
+        assert_eq!(locks.try_set(parent.clone()), Ok(()));
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_locks = Arc::clone(&locks);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).expect("publish waiter start");
+            let result = worker_locks
+                .wait_set_interruptibly(&child, crate::thread::ThreadId::synthetic_for_tests(42));
+            done_tx.send(result).expect("publish waiter result");
+        });
+        started_rx.recv().expect("waiter started");
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "conflicting F_SETLKW must remain parked"
+        );
+
+        locks.unlock(&parent.file, parent.owner, parent.range);
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(Ok(()))
+        );
+        worker.join().expect("logical record-lock waiter");
+    }
 
     #[derive(Default)]
     struct HostWriteEvents {

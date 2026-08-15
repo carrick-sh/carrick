@@ -742,9 +742,11 @@ where
                     engine_replace_started,
                 );
                 let close_cloexec_started = std::time::Instant::now();
-                kernel
-                    .dispatcher
-                    .close_draining_file_table(committed_context.kernel(), &old_files);
+                kernel.dispatcher.close_draining_file_table(
+                    committed_context.kernel(),
+                    &old_files,
+                    Some(committed_context.task().key()),
+                );
                 emit_runtime_stage(
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::CloseCloexec,
                     close_cloexec_started,
