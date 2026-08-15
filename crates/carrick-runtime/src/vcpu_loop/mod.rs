@@ -1449,6 +1449,10 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// Exact authority captured at the current syscall boundary. Lifecycle
     /// outcomes consume it rather than recapturing a newer registry generation.
     service_kernel_context: Option<crate::kernel::KernelContext>,
+    /// Last task-wake generation reconciled at a safe guest boundary. Lane
+    /// kicks remain the prompt path; this closes the host-side/rebind interval
+    /// where no vCPU run exists yet to consume one.
+    observed_task_wake_generation: u64,
     this_tid: ThreadId,
     threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
     /// The object-safe vCPU registry (the kicker). The shared loop never names
@@ -1588,6 +1592,7 @@ where
             linux_tid,
             fatal_image_generation,
             service_kernel_context: None,
+            observed_task_wake_generation: 0,
             this_tid,
             threads,
             kicker,
@@ -3644,6 +3649,12 @@ where
         let mut seen_signal_progress = signal_progress_count();
         let mut last_progress = std::time::Instant::now();
         let max_wall = trap_watchdog_wall_window();
+        // Retain the just-completed syscall value until the vCPU actually
+        // leaves Carrick's EL1 return trampoline. A durable task wake can be
+        // observed in that host-side interval; signal injection must then use
+        // the saved EL0 resume pair, exactly like the ordinary post-syscall
+        // boundary, rather than treating the live EL1 `eret` PC as guest code.
+        let mut guest_entry_syscall_retval: Option<i64> = None;
         for traps in 1.. {
             let progress = signal_progress_count();
             if progress != seen_signal_progress {
@@ -3725,6 +3736,45 @@ where
             if pt_barrier().is_quiescing() {
                 pt_barrier().park();
             }
+            // A lane wake has a durable Kernel generation as well as its
+            // immediate host kick. Reconcile it before guest entry: a child can
+            // publish SIGCHLD after the post-syscall drain but while this vCPU
+            // is still host-side, and a reclaimed vCPU may have no registered
+            // kick handle at all. `hv_vcpus_exit` remains the prompt path once
+            // guest execution begins; this branch runs only when a new wake is
+            // observed, not on the steady-state entry path.
+            if state.hvpatch_task_pid.is_some()
+                && let Some(signal_context) = state.service_kernel_context.as_ref()
+            {
+                let wake_generation = signal_context.task().wake_generation();
+                if wake_generation != state.observed_task_wake_generation {
+                    let signal_progress_before = signal_progress_count();
+                    if let Some(outcome) = service_signals_threaded(
+                        &kernel,
+                        signal_context,
+                        &mut engine,
+                        state.this_tid,
+                        state.fatal_image_generation,
+                        guest_entry_syscall_retval,
+                        None,
+                        traps,
+                    )? {
+                        return Ok(outcome);
+                    }
+                    if signal_progress_count() != signal_progress_before {
+                        // A handler frame is now the live resume boundary. If a
+                        // second publication raced this drain, its nested frame
+                        // must preserve the first handler's x0, not reapply the
+                        // syscall return value underneath it.
+                        guest_entry_syscall_retval = None;
+                    }
+                    state.observed_task_wake_generation = wake_generation;
+                    // Re-read on the next iteration. A second publication may
+                    // have raced this drain; acknowledging only the generation
+                    // captured before it ensures that edge is not hidden.
+                    continue;
+                }
+            }
             // Publish that we are about to enter the guest (and may walk page
             // tables). The store here and the re-check below form a Dekker
             // handshake with the edit coordinator, which sets `quiescing` then
@@ -3748,6 +3798,10 @@ where
             // `Blocked` below for the duration of the park (see `block_guard`).
             state.publish_thread_run_state(crate::run_state::RunState::Running, 'R');
             let next = engine.next_syscall();
+            // Any exit surfaced by the engine is past its internal EL1-vector
+            // kick swallow: either guest EL0 ran or a real guest boundary was
+            // reached. The prior syscall resume pair is no longer live.
+            guest_entry_syscall_retval = None;
             // Out of guest now (in host): a coordinator may proceed past us.
             state
                 .in_guest
@@ -4534,6 +4588,7 @@ where
             )? {
                 return Ok(outcome);
             }
+            guest_entry_syscall_retval = last_syscall_retval;
         }
 
         let result = assemble_run_result(&kernel, -1, None, state.max_traps, true);

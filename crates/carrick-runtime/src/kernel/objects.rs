@@ -2327,6 +2327,11 @@ pub struct Task {
     /// on lanes that have none). Held here rather than in a side table so it
     /// cannot outlive the task or be looked up for a retired one.
     waker: Mutex<Option<Arc<dyn TaskWaker>>>,
+    /// Durable counterpart to the lane wake hint. A vCPU can be between a
+    /// syscall boundary and guest re-entry when the host kick fires; retaining
+    /// the generation lets that same boundary reconcile the authoritative
+    /// pending state before it enters guest code.
+    wake_generation: AtomicU64,
 }
 
 /// The two CPU ledgers Linux keeps for every process, owned by the kernel
@@ -2381,6 +2386,7 @@ impl Task {
             threads: Mutex::new(BTreeMap::new()),
             cpu: TaskCpu::default(),
             waker: Mutex::new(None),
+            wake_generation: AtomicU64::new(0),
         }
     }
 
@@ -2400,10 +2406,24 @@ impl Task {
     /// and the woken task decides for itself what it found, so a spurious call
     /// is harmless.
     pub fn wake(&self) {
+        if self
+            .wake_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .is_err()
+        {
+            tracing::error!(task = ?self.key, "task wake generation exhausted");
+            std::process::abort();
+        }
         let waker = self.waker.lock().clone();
         if let Some(waker) = waker {
             waker.wake_task();
         }
+    }
+
+    pub fn wake_generation(&self) -> u64 {
+        self.wake_generation.load(Ordering::Acquire)
     }
 
     /// This task's own CPU (µs): its live threads plus the threads it has
@@ -3959,6 +3979,17 @@ mod tests {
         info.si_code = crate::linux_abi::LINUX_SI_QUEUE;
         info._pad[..4].copy_from_slice(&payload.to_ne_bytes());
         info
+    }
+
+    #[test]
+    fn task_wake_generation_is_durable_without_a_lane_waker() {
+        let fixture = Fixture::new();
+
+        assert_eq!(fixture.task.wake_generation(), 0);
+        fixture.task.wake();
+        assert_eq!(fixture.task.wake_generation(), 1);
+        fixture.task.wake();
+        assert_eq!(fixture.task.wake_generation(), 2);
     }
 
     #[test]
