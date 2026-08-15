@@ -21,6 +21,9 @@
  *
  * The authenticated temporal contract is exact: request, quiesce, context,
  * snapshot, census, hash, serialization, rename, wait-status commit. This
+ * order is carried by seq=1..9 because DTrace may drain per-CPU buffers out of
+ * textual order; order_stage is advanced at probe-fire time, not by output.
+ * This
  * script fails closed on any reordering as well as zero events, a missing or
  * duplicate phase, generation drift, absent census/hash, any failure edge,
  * timeout, DTrace error/drop, or a nonzero Carrick exit.
@@ -98,8 +101,8 @@ carrick*:::hvpatch-core-lifecycle
     identity_drift += arg0 != 0 &&
         ((uint64_t)arg3 != generation || (int32_t)arg1 != linux_pid ||
         (int32_t)arg2 != linux_tid);
-    printf("HVPATCHCORE1|lifecycle|phase=%u|pid=%d|tid=%d|generation=%llu|outcome=%u\n",
-        (uint32_t)arg0, (int32_t)arg1, (int32_t)arg2,
+    printf("HVPATCHCORE1|lifecycle|seq=%d|phase=%u|pid=%d|tid=%d|generation=%llu|outcome=%u\n",
+        order_stage, (uint32_t)arg0, (int32_t)arg1, (int32_t)arg2,
         (uint64_t)arg3, (uint32_t)arg4);
 }
 
@@ -115,8 +118,8 @@ carrick*:::hvpatch-core-census
     notes = (uint64_t)arg2;
     loads = (uint64_t)arg3;
     core_bytes = (uint64_t)arg4;
-    printf("HVPATCHCORE1|census|generation=%llu|mappings=%llu|notes=%llu|loads=%llu|bytes=%llu\n",
-        (uint64_t)arg0, mappings, notes, loads, core_bytes);
+    printf("HVPATCHCORE1|census|seq=%d|generation=%llu|mappings=%llu|notes=%llu|loads=%llu|bytes=%llu\n",
+        order_stage, (uint64_t)arg0, mappings, notes, loads, core_bytes);
 }
 
 carrick*:::hvpatch-core-context
@@ -131,8 +134,8 @@ carrick*:::hvpatch-core-context
     asid = (uint32_t)arg2;
     required_threads = (uint64_t)arg3;
     collected_threads = (uint64_t)arg4;
-    printf("HVPATCHCORE1|context|generation=%llu|mm=%llu|asid=%u|required_threads=%llu|collected_threads=%llu\n",
-        (uint64_t)arg0, mm, asid, required_threads, collected_threads);
+    printf("HVPATCHCORE1|context|seq=%d|generation=%llu|mm=%llu|asid=%u|required_threads=%llu|collected_threads=%llu\n",
+        order_stage, (uint64_t)arg0, mm, asid, required_threads, collected_threads);
 }
 
 carrick*:::hvpatch-core-hash
@@ -147,8 +150,8 @@ carrick*:::hvpatch-core-hash
     hash1 = (uint64_t)arg2;
     hash2 = (uint64_t)arg3;
     hash3 = (uint64_t)arg4;
-    printf("HVPATCHCORE1|hash|generation=%llu|sha256=%016llx%016llx%016llx%016llx\n",
-        (uint64_t)arg0, hash0, hash1, hash2, hash3);
+    printf("HVPATCHCORE1|hash|seq=%d|generation=%llu|sha256=%016llx%016llx%016llx%016llx\n",
+        order_stage, (uint64_t)arg0, hash0, hash1, hash2, hash3);
 }
 
 dtrace:::DROP

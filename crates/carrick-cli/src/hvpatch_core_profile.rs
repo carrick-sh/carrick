@@ -145,21 +145,43 @@ impl HvpatchCoreSummary {
         if status != ProfileCaptureStatus::default() {
             bail!("HVPatch core capture is lossy or interrupted: {status:?}");
         }
+        // DTrace principal buffers are per-CPU and may be drained in a
+        // different textual order than the probe-fire order. The producer's
+        // in-kernel state machine stamps the authoritative sequence; rebuild
+        // that order before applying the strict protocol state machine.
+        let mut ordered_records = Vec::new();
+        for raw in lines {
+            let line = raw.as_ref();
+            if line.is_empty() {
+                continue;
+            }
+            let record = Record::parse(line)?;
+            let order = match record.tag.as_str() {
+                "header" => 0,
+                "lifecycle" | "context" | "census" | "hash" => {
+                    let sequence = record.u64("seq")?;
+                    if !(1..=9).contains(&sequence) {
+                        bail!("HVPatch core sequence {sequence} is outside 1..=9");
+                    }
+                    sequence
+                }
+                "summary" => 10,
+                other => bail!("unknown HVPatch core record {other:?}"),
+            };
+            ordered_records.push((order, record));
+        }
+        ordered_records.sort_by_key(|(order, _)| *order);
+
         let mut stage = 0_u8;
         let mut identity = None;
         let mut context = None;
         let mut census = None;
         let mut hash = None;
         let mut summary = None;
-        for raw in lines {
-            let line = raw.as_ref();
-            if line.is_empty() {
-                continue;
-            }
+        for (_, record) in ordered_records {
             if summary.is_some() {
                 bail!("HVPatch core record appears after the terminal summary");
             }
-            let record = Record::parse(line)?;
             match record.tag.as_str() {
                 "header" => {
                     record.exact_fields(&["version"])?;
@@ -170,7 +192,14 @@ impl HvpatchCoreSummary {
                     stage = 1;
                 }
                 "lifecycle" => {
-                    record.exact_fields(&["phase", "pid", "tid", "generation", "outcome"])?;
+                    record.exact_fields(&[
+                        "seq",
+                        "phase",
+                        "pid",
+                        "tid",
+                        "generation",
+                        "outcome",
+                    ])?;
                     let phase = record.u64("phase")?;
                     let (expected_stage, next_stage) = match phase {
                         0 => (1, 2),
@@ -181,6 +210,9 @@ impl HvpatchCoreSummary {
                         5 => (9, 10),
                         _ => bail!("invalid HVPatch core lifecycle phase {phase}"),
                     };
+                    if record.u64("seq")? != u64::from(expected_stage) {
+                        bail!("HVPatch core lifecycle sequence does not match its phase");
+                    }
                     require_stage(stage, expected_stage, "lifecycle")?;
                     if record.u64("outcome")? != 0 {
                         bail!("HVPatch core lifecycle reports a failure outcome");
@@ -196,12 +228,16 @@ impl HvpatchCoreSummary {
                 "context" => {
                     require_stage(stage, 3, "context")?;
                     record.exact_fields(&[
+                        "seq",
                         "generation",
                         "mm",
                         "asid",
                         "required_threads",
                         "collected_threads",
                     ])?;
+                    if record.u64("seq")? != 3 {
+                        bail!("HVPatch core context sequence is not 3");
+                    }
                     let observed = ContextRecord {
                         generation: record.u64("generation")?,
                         mm: record.u64("mm")?,
@@ -216,7 +252,17 @@ impl HvpatchCoreSummary {
                 }
                 "census" => {
                     require_stage(stage, 5, "census")?;
-                    record.exact_fields(&["generation", "mappings", "notes", "loads", "bytes"])?;
+                    record.exact_fields(&[
+                        "seq",
+                        "generation",
+                        "mappings",
+                        "notes",
+                        "loads",
+                        "bytes",
+                    ])?;
+                    if record.u64("seq")? != 5 {
+                        bail!("HVPatch core census sequence is not 5");
+                    }
                     let observed = CensusRecord {
                         generation: record.u64("generation")?,
                         mappings: record.u64("mappings")?,
@@ -231,7 +277,10 @@ impl HvpatchCoreSummary {
                 }
                 "hash" => {
                     require_stage(stage, 6, "hash")?;
-                    record.exact_fields(&["generation", "sha256"])?;
+                    record.exact_fields(&["seq", "generation", "sha256"])?;
+                    if record.u64("seq")? != 6 {
+                        bail!("HVPatch core hash sequence is not 6");
+                    }
                     let digest = record.value("sha256")?;
                     if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                         bail!("HVPatch core hash is not a SHA-256 digest");
@@ -418,7 +467,18 @@ mod tests {
     }
 
     fn lifecycle(phase: u8) -> String {
-        format!("HVPATCHCORE1|lifecycle|phase={phase}|pid=5|tid=5|generation=1|outcome=0")
+        let sequence = match phase {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            3 => 7,
+            4 => 8,
+            5 => 9,
+            _ => 0,
+        };
+        format!(
+            "HVPATCHCORE1|lifecycle|seq={sequence}|phase={phase}|pid=5|tid=5|generation=1|outcome=0"
+        )
     }
 
     fn valid(artifact: &[u8]) -> Vec<String> {
@@ -426,11 +486,11 @@ mod tests {
             "HVPATCHCORE1|header|version=1".to_owned(),
             lifecycle(0),
             lifecycle(1),
-            "HVPATCHCORE1|context|generation=1|mm=7|asid=2|required_threads=3|collected_threads=3".to_owned(),
+            "HVPATCHCORE1|context|seq=3|generation=1|mm=7|asid=2|required_threads=3|collected_threads=3".to_owned(),
             lifecycle(2),
-            "HVPATCHCORE1|census|generation=1|mappings=4|notes=13|loads=8|bytes=4096".to_owned(),
+            "HVPATCHCORE1|census|seq=5|generation=1|mappings=4|notes=13|loads=8|bytes=4096".to_owned(),
             format!(
-                "HVPATCHCORE1|hash|generation=1|sha256={:x}",
+                "HVPATCHCORE1|hash|seq=6|generation=1|sha256={:x}",
                 Sha256::digest(artifact)
             ),
             lifecycle(3),
@@ -456,7 +516,7 @@ mod tests {
         let artifact = artifact();
         for needle in [
             "|header|",
-            "|lifecycle|phase=4",
+            "phase=4",
             "|context|",
             "|census|",
             "|hash|",
@@ -530,11 +590,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_temporal_reordering_and_requires_an_exit_reason() {
+    fn reassembles_transport_order_but_rejects_temporal_sequence_mutation() {
         let artifact = artifact();
         let mut reordered = valid(&artifact);
         reordered.swap(2, 3);
-        assert!(parse(reordered, &artifact).is_err());
+        assert!(
+            parse(reordered, &artifact).is_ok(),
+            "per-CPU DTrace transport order is not event time"
+        );
+
+        let wrong_sequence = valid(&artifact)
+            .into_iter()
+            .map(|line| {
+                if line.contains("|context|") {
+                    line.replace("seq=3", "seq=2")
+                } else {
+                    line
+                }
+            })
+            .collect();
+        assert!(parse(wrong_sequence, &artifact).is_err());
 
         let no_reason = valid(&artifact)
             .into_iter()
@@ -550,7 +625,10 @@ mod tests {
             .into_iter()
             .map(|line| {
                 if line.contains("|hash|") {
-                    format!("HVPATCHCORE1|hash|generation=1|sha256={}", "ab".repeat(32))
+                    format!(
+                        "HVPATCHCORE1|hash|seq=6|generation=1|sha256={}",
+                        "ab".repeat(32)
+                    )
                 } else {
                     line
                 }
