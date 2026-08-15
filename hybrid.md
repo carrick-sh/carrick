@@ -1,7 +1,8 @@
 # Carrick as a Kernel
 
-**Revision date:** 2026-08-13 (supersedes the 2026-08-09 kernel-first
-revision, which superseded the original HvPatch prototype plan).
+**Revision date:** 2026-08-15 (updates the 2026-08-13 kernel-first revision,
+which superseded the 2026-08-09 revision and the original HvPatch prototype
+plan).
 
 **Status:** This file is the controlling plan. Where any other document
 conflicts with it, this file wins. Prior revisions are recoverable from git
@@ -9,11 +10,15 @@ history; the durable measurements they produced live under
 [`docs/perf-results/`](docs/perf-results/) and remain authoritative as
 evidence.
 
-**Resume checkpoint:** `main` at `53f5da3f5` (`fix(runtime): commit a high-VA
-reservation lazily, so Node.js starts`). The worktree was clean when this
-checkpoint was written. The source audit behind this checkpoint was static:
-the last durable probe/ecosystem receipts remain authoritative until the gates
-named below are rerun on a freshly signed binary.
+**Resume checkpoint:** `codex/hybrid-kernel` implementation at `88aa86494`
+(`fix(hvpatch): reconcile task wakes before guest entry`), based on `main` at
+`53f5da3f5` with ancestry `main...HEAD = 0 125`. The exact signed binary
+(`SHA-256 9eb908e9...0b077`, `CDHash 6aa0f3ad...581f`) has the HVF entitlement
+and DOF section and passes the serialized line-exact HVPatch probe gate 400/400.
+This is a resumable opt-in checkpoint, not Task 6 completion: eight Go rows,
+one-host-process topology, CPython/Node, baseline/default, final CI, and the
+cold-build regression signal remain. See the
+[durable checkpoint](docs/perf-results/2026-08-15-hvpatch-task6-checkpoint.md).
 
 ---
 
@@ -349,7 +354,7 @@ acceptance criteria.
 | 3 — KI identity reseed | **COMPLETE** | `ec4daa24`; [evidence](docs/perf-results/2026-08-14-hvpatch-identity-reseed-and-host-safety.md); signed 64/64 MATCH, strict DTrace host-low/errors/drops=0, Docker SIGKILL WCONTINUED=0/100, `just ci` GREEN |
 | 4 — global frames and stage-1 COW | **COMPLETE** | `d66e0850`; [evidence](docs/perf-results/2026-08-14-hvpatch-global-frame-cow.md); signed 15/15 MATCH, mt COW 12/12, exact v5 structural receipt, stage2 118/118, `just ci` GREEN |
 | 5 — live-state crash artifacts | **COMPLETE** | `58740ce6`; [evidence](docs/perf-results/2026-08-14-hvpatch-live-core.md); real 3-thread core/trace hash exact, strict validator/readelf/LLDB, Docker MATCH, 19 failpoints, `just ci` GREEN |
-| 6 — KP shipped proof | **IN PROGRESS** | CPython 3.12.13 source/image restored exactly; signed r9 reached 400/400; `def32e41` removes the per-mm 32 GiB physical mmap lease through sparse private materialization and signed `go/types` is 571/571 (3 expected skips). The fresh 194-row signed Go phase is fully accounted: 181 MATCH + 3 existing non-gating DIFF + 10 raw gating; clean reruns clear two and retain eight attributed residuals. See the [resumable Task 6 checkpoint](docs/perf-results/2026-08-15-hvpatch-task6-checkpoint.md). One-host-process topology, Go closure, CPython/Node, baseline/default switch, final CI, and cold-build signal remain |
+| 6 — KP shipped proof | **IN PROGRESS** | CPython 3.12.13 source/image restored exactly; `def32e41` removes the per-mm 32 GiB physical mmap lease through sparse private materialization and signed `go/types` is 571/571 (3 expected skips). Commits `ea61dcf6`, `29d9c602`, `c0e5d412`, `b38ad222`, and `88aa8649` close the deterministic 396/400 checkpoint regressions; the exact final signed binary is now 400/400, with SIGCHLD 30/30 untraced plus 10/10 differential and the original four 12/12 differential. The fresh 194-row signed Go phase remains fully accounted at its earlier source point: 181 MATCH + 3 existing non-gating DIFF + 10 raw gating; clean reruns clear two and retain eight attributed residuals. See the [resumable Task 6 checkpoint](docs/perf-results/2026-08-15-hvpatch-task6-checkpoint.md). One-host-process topology, Go closure, CPython/Node, baseline/default switch, final CI, and cold-build signal remain |
 
 **Execution ruling:** Task 4 is mandatory on the structural invariants and KP
 completion gate even though the inherited KM detail later describes a CPU
@@ -445,7 +450,9 @@ conformance probes.
   changing the declared suite semantics.
 - [x] On one exact signed binary, rerun the line-exact HVPatch probe gate and
   record a fresh count. The historical **304 PASS / 90 FAIL** result is not a
-  current count after the identity, exec, and mmap commits.
+  current count after the identity, exec, and mmap commits. The exact
+  `88aa8649` implementation binary is **400 PASS / 0 FAIL**, with 400 unique
+  names and no baseline exception.
 - [ ] Close kernel-lane gaps rather than copying them into a baseline as
   excuses. Then bless `scripts/conformance/baseline.hvpatch.jsonl` from the
   canonical machine and make HVPatch the default backend.
@@ -466,7 +473,7 @@ parked set. Every row names the ONE thing that unblocks its next step.
 | phase | status | landed | next concrete step |
 |---|---|---|---|
 | **KI** kernel identity *(new)* | **step 1 DONE; blocker 2 of 3 CLEARED** | comparators closed; **cross-process signal delivery now runs through the kernel** — `killpg`/broadcast never reach the host | clear the remaining two reseed blockers (the `debug_assert`, the xsig nudge), then **seed the root at 1** |
-| **KP** conformance proof | **started; current count unknown** | kernel lane added to the harness; historical first gate: **304 PASS / 90 FAIL**, 26 kernel-lane-specific | finish Tasks 1–5, rerun the gate, close current kernel-lane gaps, then bless `baseline.hvpatch.jsonl` |
+| **KP** conformance proof | **probe gate 400/400; ecosystem closure open** | exact signed kernel lane: **400 PASS / 0 FAIL**; all 194 Go rows accounted at the earlier sparse-memory checkpoint, with eight real residuals after clean rerun | close the eight Go residuals and one-host-process topology, then run all Go/CPython/Node rows before any baseline/default change |
 | **KD** diagnostics | **partial** | ELF core writer + validator; crash reports as signal death, oracle-matched | build a `CoreDump` from live state — a correct first slice needs NO memory plumbing |
 | **KL** lifecycle | **partial** | per-task user AND system CPU, oracle-matched; `CLONE_PIDFD` scoping; concurrent sibling fork | `ru_maxrss`/`ru_majflt` still host-sourced; per-task `/proc` authority |
 | **KX** kernel exec | **partly built; B4 and evidence ABI open** | Kernel two-phase exec transaction LIVE; three image caches default-on; ordinary lookup/open/loader failures now return errno or die signalled | convert post-teardown inventory failures from `RuntimeError`→127 to signal-shaped death; restore the six-stage runtime receipt |
@@ -489,12 +496,13 @@ constraint visible: the host-pid comparators must close BEFORE the id space is
 reseeded, because they are correct at either seed while the reverse order
 points a signal at `launchd`.
 
-**Where completeness stands.** The last authoritative kernel-lane run failed
-**90** of 394 line-exact probes, **26** of them kernel-lane-specific. That count
-predates the latest signal, exec, and mmap work and must not be quoted as HEAD.
-The lane still has **no blessed baseline**. Node's version/startup smoke now
-passes, but no post-fix Node ecosystem receipt exists. Tasks 1–6 above, not the
-historical count, schedule work now.
+**Where completeness stands.** The exact signed implementation at `88aa8649`
+passes **400/400** line-exact HVPatch probes with no baseline exception. That
+does not complete KP: eight real Go residuals remain, the 438 CPython and three
+Node rows have not run on this checkpoint, and raw/private HVPatch still uses
+an NsSupervisor plus detached FileAuthority instead of the required one host
+process. The lane still has **no blessed baseline** and is not the default.
+Tasks 1–6 above, not the historical 304/394 count, schedule work now.
 
 **Performance, for context only:** cold `go build` is **3.803 CPU-s** / **1,828
 ms** (from 4.223 / 2,051 at the K1 boundary). It is recorded as a regression
