@@ -274,6 +274,35 @@ mod support;
 use support::*;
 pub(super) use support::{drain_netlink_queue, set_host_nonblocking};
 
+fn merge_epoll_edge_sample(
+    accumulated: &mut (u32, u64),
+    edge_bits: u32,
+    edge_readiness_count: u64,
+) {
+    accumulated.0 |= edge_bits;
+    // Darwin reports one kqueue record per direction. EVFILT_WRITE's `data`
+    // is socket send-buffer capacity (often ~8 MiB), not readable bytes. Do
+    // not let that count poison EPOLLET's read-growth baseline when read and
+    // write records for one bidirectional socket land in the same batch.
+    if edge_bits & LINUX_EPOLLIN != 0 {
+        accumulated.1 = accumulated.1.max(edge_readiness_count);
+    }
+}
+
+#[cfg(test)]
+mod epoll_edge_sample_tests {
+    use super::*;
+
+    #[test]
+    fn writable_capacity_does_not_poison_read_growth_baseline() {
+        let mut accumulated = (LINUX_EPOLLIN, 35);
+
+        merge_epoll_edge_sample(&mut accumulated, LINUX_EPOLLOUT, 8 * 1024 * 1024);
+
+        assert_eq!(accumulated, (LINUX_EPOLLIN | LINUX_EPOLLOUT, 35));
+    }
+}
+
 /// Resolve a host `connect` that reported SUCCESS (`rc==0` or `EISCONN`) into the
 /// guest result, consulting `SO_ERROR` first. carrick makes the host socket
 /// non-blocking before `connect` (so it never blocks the dispatcher under the
@@ -3293,8 +3322,11 @@ impl SyscallDispatcher {
                                     if let Some(siblings) = host_to_gfds.get(&hfd) {
                                         for sibling in siblings {
                                             let entry = deliver.entry(*sibling).or_insert((0, 0));
-                                            entry.0 |= edge_bits;
-                                            entry.1 = entry.1.max(edge_readiness_count);
+                                            merge_epoll_edge_sample(
+                                                entry,
+                                                edge_bits,
+                                                edge_readiness_count,
+                                            );
                                         }
                                     }
                                 }
