@@ -2816,26 +2816,99 @@ mod core_publication_tests {
 
     #[test]
     fn crash_register_authority_is_generation_exact() {
+        let authority = crate::kernel::CrashCaptureAuthority::default();
+        let first = authority.issue().expect("first generation");
+        let second = authority.issue().expect("second generation");
+        let third = authority.issue().expect("third generation");
         let dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().expect("context");
         let mut registers = carrick_hal::Aarch64CoreRegisters::default();
         registers.gprs[19] = 0x1919;
-        context.thread().publish_crash_registers(41, registers);
+        context.thread().publish_crash_registers(second, registers);
         assert_eq!(
-            context.thread().crash_registers(41),
-            Some(registers),
+            context.thread().crash_vote(second),
+            Some(crate::kernel::CrashRegisterVote::Published(Box::new(
+                registers
+            ))),
             "matching generation"
         );
+        assert_eq!(context.thread().crash_vote(first), None, "stale generation");
         assert_eq!(
-            context.thread().crash_registers(40),
-            None,
-            "stale generation"
-        );
-        assert_eq!(
-            context.thread().crash_registers(42),
+            context.thread().crash_vote(third),
             None,
             "future generation"
         );
+    }
+
+    #[test]
+    fn crash_withdrawal_never_retracts_a_published_register_file() {
+        let authority = crate::kernel::CrashCaptureAuthority::default();
+        let generation = authority.issue().expect("generation");
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("context");
+        let mut registers = carrick_hal::Aarch64CoreRegisters::default();
+        registers.gprs[3] = 0x3333;
+        context
+            .thread()
+            .publish_crash_registers(generation, registers);
+        // A thread that publishes and then parks somewhere unpublishable keeps
+        // its note: withdrawal answers "I never can", not "forget what I said".
+        context.thread().withdraw_from_crash_capture(generation);
+        assert_eq!(
+            context.thread().crash_vote(generation),
+            Some(crate::kernel::CrashRegisterVote::Published(Box::new(
+                registers
+            )))
+        );
+    }
+
+    #[test]
+    fn crash_quorum_completes_without_a_thread_that_left_its_vcpu_loop() {
+        let authority = crate::kernel::CrashCaptureAuthority::default();
+        let generation = authority.issue().expect("generation");
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("context");
+        let quorum =
+            crate::kernel::CrashQuorum::open(std::sync::Arc::clone(context.task()), generation);
+
+        // A live participant that has not answered is genuinely owed.
+        context.thread().enter_crash_safe_point_participation();
+        assert!(matches!(
+            quorum.poll(),
+            crate::kernel::CrashQuorumPoll::Waiting(_)
+        ));
+
+        // The same thread once its host loop has gone: the task still lists it,
+        // but nothing may keep waiting for a note it can never write. This is
+        // the `exit_group` terminal-claim loser that burned the full 10 s
+        // collection deadline and then published no core at all.
+        context.thread().leave_crash_safe_point_participation();
+        let crate::kernel::CrashQuorumPoll::Complete(files) = quorum.poll() else {
+            panic!("a departed thread must not be expected")
+        };
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn crash_quorum_completes_when_a_live_participant_withdraws() {
+        let authority = crate::kernel::CrashCaptureAuthority::default();
+        let generation = authority.issue().expect("generation");
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("context");
+        let quorum =
+            crate::kernel::CrashQuorum::open(std::sync::Arc::clone(context.task()), generation);
+        context.thread().enter_crash_safe_point_participation();
+        assert!(matches!(
+            quorum.poll(),
+            crate::kernel::CrashQuorumPoll::Waiting(_)
+        ));
+        // Parked where its register file is unreadable: still live, still a
+        // participant, but permanently unable to publish for this generation.
+        context.thread().withdraw_from_crash_capture(generation);
+        let crate::kernel::CrashQuorumPoll::Complete(files) = quorum.poll() else {
+            panic!("a withdrawn participant must not be expected")
+        };
+        assert!(files.is_empty());
     }
 }
 

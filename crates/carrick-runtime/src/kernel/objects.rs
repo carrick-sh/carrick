@@ -15,6 +15,7 @@ use crate::linux_abi::LINUX_DEFAULT_UMASK;
 
 use super::address::MmBackend;
 use super::clone_plan::{CloneObjectMode, ClonePlan, CloneTaskMode};
+use super::crash_capture::{CrashCaptureGeneration, CrashRegisterVote};
 use super::ids::{
     CredentialsId, FileDescriptionId, FileSlotNumber, FileTableId, FsContextId, LinuxSignal,
     LinuxTid, MmId, ObjectIdError, ObjectIdRegistry, ProcessGroupId, SessionId, SighandId, TaskId,
@@ -2975,7 +2976,8 @@ impl Task {
             runner_gate: Arc::new(RunnerGate::new(key)),
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
             system_ns: AtomicU64::new(0),
-            crash_registers: Mutex::new(None),
+            crash_vote: Mutex::new(None),
+            crash_safe_point_participant: AtomicBool::new(false),
             thread_keyring: Mutex::new(None),
         })
     }
@@ -2999,7 +3001,8 @@ impl Task {
             runner_gate: Arc::new(RunnerGate::new(key)),
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
             system_ns: AtomicU64::new(0),
-            crash_registers: Mutex::new(None),
+            crash_vote: Mutex::new(None),
+            crash_safe_point_participant: AtomicBool::new(false),
             thread_keyring: Mutex::new(None),
         })
     }
@@ -3023,7 +3026,8 @@ impl Task {
             runner_gate: Arc::new(RunnerGate::new(key)),
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
             system_ns: AtomicU64::new(0),
-            crash_registers: Mutex::new(None),
+            crash_vote: Mutex::new(None),
+            crash_safe_point_participant: AtomicBool::new(false),
             thread_keyring: Mutex::new(None),
         })
     }
@@ -3047,7 +3051,8 @@ impl Task {
             runner_gate: Arc::clone(&caller.runner_gate),
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
             system_ns: AtomicU64::new(0),
-            crash_registers: Mutex::new(None),
+            crash_vote: Mutex::new(None),
+            crash_safe_point_participant: AtomicBool::new(false),
             thread_keyring: Mutex::new(None),
         })
     }
@@ -3176,6 +3181,11 @@ impl Task {
         // lose the CPU they burned.
         if let Some(thread) = retired.as_ref() {
             self.retain_exited_thread_cpu(thread);
+            // A retired thread has left the graph and can never reach another
+            // safe point. Say so at the source rather than leaving a fatal
+            // sibling's quorum to infer it from a membership snapshot it took
+            // before the retirement.
+            thread.leave_crash_safe_point_participation();
         }
         retired
     }
@@ -3460,10 +3470,17 @@ pub struct Thread {
     /// `CLOCK_THREAD_CPUTIME_ID` so a BLOCKED syscall — `wait4`, `epoll_wait` —
     /// contributes nothing, exactly as on Linux.
     system_ns: AtomicU64,
-    /// Exact architectural state published at a task-local crash safe point.
-    /// The generation prevents a delayed sibling from contaminating a later
-    /// capture attempt and makes incomplete/racing snapshots detectable.
-    crash_registers: Mutex<Option<(u64, carrick_hal::Aarch64CoreRegisters)>>,
+    /// This thread's answer to one task-local crash-capture generation: exact
+    /// architectural state read at a safe point, or an explicit withdrawal
+    /// from a park it cannot publish from. The generation prevents a delayed
+    /// sibling from contaminating a later capture attempt.
+    crash_vote: Mutex<Option<(CrashCaptureGeneration, CrashRegisterVote)>>,
+    /// True exactly while this thread has a live vCPU loop, and therefore can
+    /// still REACH a crash safe point. A thread published into the task graph
+    /// whose host loop was cancelled before it started, or whose loop has
+    /// already returned, is not a member of any crash quorum — waiting on one
+    /// is how a fatal sibling used to burn its whole collection deadline.
+    crash_safe_point_participant: AtomicBool,
     /// `KEY_SPEC_THREAD_KEYRING`, materialised on demand.
     ///
     /// Per-THREAD, keyed by this object's exact [`ThreadKey`] rather than by a
@@ -3497,24 +3514,69 @@ impl Thread {
         f(&mut self.thread_keyring.lock())
     }
 
+    /// Answer `generation` with this thread's exact architectural state. Only
+    /// the thread itself may call this, from a safe point where its register
+    /// file is readable.
     pub(crate) fn publish_crash_registers(
         &self,
-        generation: u64,
+        generation: CrashCaptureGeneration,
         registers: carrick_hal::Aarch64CoreRegisters,
     ) {
-        *self.crash_registers.lock() = Some((generation, registers));
+        *self.crash_vote.lock() = Some((
+            generation,
+            CrashRegisterVote::Published(Box::new(registers)),
+        ));
         self.revision.publish();
     }
 
-    pub(crate) fn crash_registers(
+    /// Answer `generation` with "I cannot publish".
+    ///
+    /// Used by the park paths that reach the task-local quiesce barrier
+    /// WITHOUT a readable register file — a thread waiting for a vCPU lease,
+    /// or one parked while a sibling materialises. It will not resume before
+    /// the barrier drops, so it can never publish for this generation, and a
+    /// collector that kept waiting for it would time out and publish no core
+    /// at all. An already-published vote wins: publishing then parking must
+    /// not retract the register file.
+    pub(crate) fn withdraw_from_crash_capture(&self, generation: CrashCaptureGeneration) {
+        let mut vote = self.crash_vote.lock();
+        if matches!(vote.as_ref(), Some((published, _)) if *published == generation) {
+            return;
+        }
+        *vote = Some((generation, CrashRegisterVote::Withdrawn));
+        self.revision.publish();
+    }
+
+    /// This thread's vote for `generation`, or `None` if it has not answered.
+    pub(crate) fn crash_vote(
         &self,
-        generation: u64,
-    ) -> Option<carrick_hal::Aarch64CoreRegisters> {
-        self.crash_registers
+        generation: CrashCaptureGeneration,
+    ) -> Option<CrashRegisterVote> {
+        self.crash_vote
             .lock()
             .as_ref()
-            .filter(|(published, _)| *published == generation)
-            .map(|(_, registers)| *registers)
+            .filter(|(voted, _)| *voted == generation)
+            .map(|(_, vote)| vote.clone())
+    }
+
+    /// Mark that this thread's vCPU loop is live, so it can reach a crash safe
+    /// point. Paired with [`Self::leave_crash_safe_point_participation`].
+    pub(crate) fn enter_crash_safe_point_participation(&self) {
+        self.crash_safe_point_participant
+            .store(true, Ordering::Release);
+    }
+
+    /// Mark that this thread's vCPU loop has ended. It can never reach another
+    /// safe point, so no crash quorum may keep expecting a vote from it. Any
+    /// vote it already cast stays valid.
+    pub(crate) fn leave_crash_safe_point_participation(&self) {
+        self.crash_safe_point_participant
+            .store(false, Ordering::Release);
+    }
+
+    /// Can this thread still reach a crash safe point?
+    pub(crate) fn is_crash_safe_point_participant(&self) -> bool {
+        self.crash_safe_point_participant.load(Ordering::Acquire)
     }
 
     /// Record the `guest_cpu` slot this thread runs on. Must be called BY the
