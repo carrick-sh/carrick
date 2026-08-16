@@ -690,7 +690,7 @@ impl SyscallDispatcher {
         let info = LinuxSiginfo::kill(
             signum,
             crate::linux_abi::LINUX_SI_TKILL,
-            crate::namespace::pid::self_ns_pid() as i32,
+            self.identity_pid() as i32,
             self.cred_snapshot().ruid.raw(),
         );
         self.record_pending_siginfo(context, tid, signum, info);
@@ -1499,10 +1499,10 @@ impl SyscallDispatcher {
                     let info = crate::linux_abi::LinuxSiginfo::kill(
                         signum as i32,
                         crate::linux_abi::LINUX_SI_USER,
-                        // The sender's identity the handler sees is its ns-pid
-                        // (1 for the init), not its host pid (§5.3). Identity
-                        // when namespaces are off.
-                        crate::namespace::pid::self_ns_pid() as i32,
+                        // The sender's identity the handler sees is the pid its
+                        // own `getpid(2)` reports — never carrick's host pid,
+                        // which under HVPatch names the shared VM carrier.
+                        this.identity_pid() as i32,
                         this.cred_snapshot().ruid.raw(),
                     );
                     this.record_pending_siginfo(cx.kernel, tid, signum as i32, info);
@@ -2280,7 +2280,7 @@ impl SyscallDispatcher {
                     DispatchOutcome::Returned { value: 0 } => {}
                     outcome => return outcome,
                 }
-                let sender_ns = crate::namespace::pid::self_ns_pid() as i32;
+                let sender_ns = self.identity_pid() as i32;
                 // si_value lives at offset 24 of the siginfo = `_pad[0..8]`.
                 let value = user_info
                     .and_then(|i| i._pad.get(0..8).and_then(|b| b.try_into().ok()))
