@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::os::fd::RawFd;
 
 use parking_lot::Mutex;
+use zerocopy::IntoBytes;
 
 #[cfg(any(
     feature = "platform-macos",
@@ -1300,10 +1301,13 @@ fn native_add_watch(inotify_fd: RawFd, host_fd: RawFd, mask: u32) -> Result<i32,
 fn encode_event_raw(wd: i32, mask: u32, cookie: u32, name: Option<&[u8]>) -> Vec<u8> {
     let name_len = name.map(|name| align4(name.len() + 1)).unwrap_or(0);
     let mut record = Vec::with_capacity(INOTIFY_EVENT_HEADER_SIZE + name_len);
-    record.extend_from_slice(&wd.to_ne_bytes());
-    record.extend_from_slice(&mask.to_ne_bytes());
-    record.extend_from_slice(&cookie.to_ne_bytes());
-    record.extend_from_slice(&(name_len as u32).to_ne_bytes());
+    let hdr = carrick_abi::LinuxInotifyEventHeader {
+        wd,
+        mask,
+        cookie,
+        len: name_len as u32,
+    };
+    record.extend_from_slice(hdr.as_bytes());
     if let Some(name) = name {
         record.extend_from_slice(name);
         record.resize(INOTIFY_EVENT_HEADER_SIZE + name_len, 0);

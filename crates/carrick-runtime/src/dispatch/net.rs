@@ -4577,10 +4577,10 @@ impl SyscallDispatcher {
             // mask gates the waiter via `block_signals`: a blocked signal stays
             // pending instead of EINTR-ing the wait (LTP pselect02 case).
             let block_signals: carrick_abi::SigSet = if sigmask_addr != 0 {
-                match memory.read_bytes(sigmask_addr, 16) {
+                match memory.read_struct::<LinuxSigsetArgpack>(sigmask_addr) {
                     Ok(pack) => {
-                        let ss_ptr = u64::from_le_bytes(pack[0..8].try_into().unwrap_or([0; 8]));
-                        let ss_len = u64::from_le_bytes(pack[8..16].try_into().unwrap_or([0; 8]));
+                        let ss_ptr = pack.ss;
+                        let ss_len = pack.ss_len;
                         if ss_ptr != 0 && ss_len == crate::linux_abi::LINUX_RT_SIGSET_SIZE {
                             match memory.read_bytes(ss_ptr, ss_len as usize) {
                                 Ok(bytes) => carrick_abi::SigSet::from_raw(u64::from_le_bytes(

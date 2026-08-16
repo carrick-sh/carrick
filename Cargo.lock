@@ -560,6 +560,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "thiserror",
+ "zerocopy",
 ]
 
 [[package]]
@@ -904,6 +905,7 @@ dependencies = [
  "carrick-host",
  "carrick-mem",
  "libc",
+ "zerocopy",
 ]
 
 [[package]]

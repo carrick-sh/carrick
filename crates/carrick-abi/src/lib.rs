@@ -2170,6 +2170,176 @@ impl LinuxSigaltstack {
     }
 }
 
+/// Linux 64-bit `struct flock` / `struct flock64` used by `fcntl` locking (`F_GETLK`, `F_SETLK`, `F_SETLKW`, `F_OFD_*`).
+#[repr(C, packed)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+    Unaligned,
+)]
+pub struct LinuxFlock64 {
+    pub l_type: i16,
+    pub l_whence: i16,
+    pub __pad1: [u8; 4],
+    pub l_start: i64,
+    pub l_len: i64,
+    pub l_pid: i32,
+    pub __pad2: [u8; 4],
+}
+
+/// Linux `struct f_owner_ex` used by `fcntl(F_GETOWN_EX, F_SETOWN_EX)`.
+#[repr(C, packed)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+    Unaligned,
+)]
+pub struct LinuxFOwnerEx {
+    pub owner_type: i32,
+    pub owner_pid: i32,
+}
+
+/// Linux `struct ifreq` used by network ioctl requests (`SIOCGIFNAME`, `SIOCGIFINDEX`, `SIOCGIFFLAGS`, etc.).
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxIfreq {
+    pub ifr_name: [u8; LINUX_IFNAMSIZ],
+    pub ifr_ifru: [u8; 24],
+}
+
+/// Linux `struct ifconf` used by `SIOCGIFCONF`.
+#[repr(C, packed)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+    Unaligned,
+)]
+pub struct LinuxIfconf {
+    pub ifc_len: i32,
+    pub __pad: [u8; 4],
+    pub ifc_buf: u64,
+}
+
+/// Linux sigset argument pack passed to `pselect6`, `ppoll`, and `epoll_pwait`.
+#[repr(C, packed)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+    Unaligned,
+)]
+pub struct LinuxSigsetArgpack {
+    pub ss: u64,
+    pub ss_len: u64,
+}
+
+/// Linux `struct inotify_event` fixed header (16 bytes).
+#[repr(C, packed)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+    Unaligned,
+)]
+pub struct LinuxInotifyEventHeader {
+    pub wd: i32,
+    pub mask: u32,
+    pub cookie: u32,
+    pub len: u32,
+}
+
+/// Linux `struct iocb` for legacy async I/O (`io_submit`).
+#[repr(C, packed)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+    Unaligned,
+)]
+pub struct LinuxIocb {
+    pub aio_data: u64,
+    pub aio_key: u32,
+    pub aio_reserved1: u32,
+    pub aio_lio_opcode: u16,
+    pub aio_reqprio: i16,
+    pub aio_fildes: u32,
+    pub aio_buf: u64,
+    pub aio_nbytes: u64,
+    pub aio_offset: i64,
+    pub aio_reserved2: u64,
+    pub aio_flags: u32,
+    pub aio_resfd: u32,
+}
+
+/// Linux `struct io_event` for legacy async I/O (`io_getevents`).
+#[repr(C, packed)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+    Unaligned,
+)]
+pub struct LinuxIoEvent {
+    pub data: u64,
+    pub obj: u64,
+    pub result: i64,
+    pub result2: i64,
+}
+
 fn write_linux_c_field<const N: usize>(field: &mut [u8; N], value: &[u8]) {
     let len = value.len().min(N.saturating_sub(1));
     field[..len].copy_from_slice(&value[..len]);
@@ -2410,6 +2580,46 @@ const _: () = assert!(
     "LinuxSigevent must be exactly 64 bytes"
 );
 assert_layout!(LinuxSigevent, sigev_value @ 0, sigev_signo @ 8, sigev_notify @ 12);
+
+kernel_abi!(
+    LinuxFlock64,
+    32,
+    "struct flock64 on 64-bit Linux is 32 bytes"
+);
+assert_layout!(LinuxFlock64, size = 32, l_type @ 0, l_whence @ 2, l_start @ 8, l_len @ 16, l_pid @ 24);
+
+kernel_abi!(
+    LinuxFOwnerEx,
+    8,
+    "struct f_owner_ex is 8 bytes (type:i32 + pid:i32)"
+);
+assert_layout!(LinuxFOwnerEx, size = 8, owner_type @ 0, owner_pid @ 4);
+
+kernel_abi!(LinuxIfreq, 40, "struct ifreq on 64-bit Linux is 40 bytes");
+assert_layout!(LinuxIfreq, size = 40, ifr_name @ 0, ifr_ifru @ 16);
+
+kernel_abi!(LinuxIfconf, 16, "struct ifconf on 64-bit Linux is 16 bytes");
+assert_layout!(LinuxIfconf, size = 16, ifc_len @ 0, ifc_buf @ 8);
+
+kernel_abi!(
+    LinuxSigsetArgpack,
+    16,
+    "sigset argpack is 16 bytes (ss:u64 + len:u64)"
+);
+assert_layout!(LinuxSigsetArgpack, size = 16, ss @ 0, ss_len @ 8);
+
+kernel_abi!(
+    LinuxInotifyEventHeader,
+    16,
+    "struct inotify_event fixed header is 16 bytes"
+);
+assert_layout!(LinuxInotifyEventHeader, size = 16, wd @ 0, mask @ 4, cookie @ 8, len @ 12);
+
+kernel_abi!(LinuxIocb, 64, "struct iocb is 64 bytes");
+assert_layout!(LinuxIocb, size = 64, aio_data @ 0, aio_key @ 8, aio_lio_opcode @ 16, aio_fildes @ 20, aio_buf @ 24, aio_nbytes @ 32, aio_offset @ 40, aio_flags @ 56, aio_resfd @ 60);
+
+kernel_abi!(LinuxIoEvent, 32, "struct io_event is 32 bytes");
+assert_layout!(LinuxIoEvent, size = 32, data @ 0, obj @ 8, result @ 16, result2 @ 24);
 
 /// A POSITIVE Linux errno (the `LINUX_E*` domain). The guest-visible retval is
 /// its single negation — made in exactly ONE place

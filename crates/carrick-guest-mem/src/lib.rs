@@ -417,6 +417,34 @@ pub trait GuestMemory {
         Ok(())
     }
 
+    /// Read a typed `FromBytes` struct from guest memory at `address`.
+    fn read_struct<T: zerocopy::FromBytes>(&self, address: u64) -> Result<T, MemoryError>
+    where
+        Self: Sized,
+    {
+        let mut value = core::mem::MaybeUninit::<T>::uninit();
+        let slice = unsafe {
+            core::slice::from_raw_parts_mut(
+                value.as_mut_ptr() as *mut u8,
+                core::mem::size_of::<T>(),
+            )
+        };
+        self.read_into(address, slice)?;
+        Ok(unsafe { value.assume_init() })
+    }
+
+    /// Write a typed `IntoBytes + Immutable` struct to guest memory at `address`.
+    fn write_struct<T: zerocopy::IntoBytes + zerocopy::Immutable>(
+        &mut self,
+        address: u64,
+        value: &T,
+    ) -> Result<(), MemoryError>
+    where
+        Self: Sized,
+    {
+        self.write_bytes(address, value.as_bytes())
+    }
+
     /// Write `bytes` at `address` WITHOUT enforcing the guest-visible write
     /// permission (`guest_writable`). For carrick-INTERNAL frames the guest must
     /// receive even into a guest-read-only mapping (vdso vvar, the signal frame,
