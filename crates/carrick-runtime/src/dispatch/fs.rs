@@ -3523,6 +3523,11 @@ impl SyscallDispatcher {
         let sysvipc_sem = self.sysvipc_sem_table();
         let sysvipc_msg = self.sysvipc_msg_table();
         let proc_threads = self.synthetic_proc_threads(context, registry);
+        // See `synthetic_proc_context`: the kernel graph is the only authority
+        // that can distinguish two Linux processes sharing this Darwin process.
+        let proc_oom_score_adj = self
+            .hvpatch_process()
+            .map(|process| process.kernel_graph().registry().oom_score_adj_by_pid());
         let proc_zombies = self.hvpatch_process().map(|process| {
             process
                 .kernel_graph()
@@ -3570,6 +3575,7 @@ impl SyscallDispatcher {
             sig_caught,
             sig_shdpnd,
             identity: self.synthetic_proc_identity(context),
+            oom_score_adj: proc_oom_score_adj.as_ref(),
             threads: proc_threads.as_deref(),
             zombies: proc_zombies.as_deref(),
             sysvipc_shm: Some(sysvipc_shm.as_str()),
@@ -11216,11 +11222,51 @@ impl SyscallDispatcher {
                             // then reads it back, and every test that enables it TBROKs
                             // in setup otherwise. The rest (oom_adj/loginuid/
                             // timerslack_ns) carrick has no live state for, so
-                            // accept-and-ignore. `write_tunable` normalizes the
-                            // `/proc/<self-pid>/` form and dispatches.
-                            return Ok(match crate::vfs::proc::write_tunable(path, &bytes) {
-                                Ok(n) => DispatchOutcome::Returned { value: n as i64 },
+                            // accept-and-ignore.
+                            //
+                            // The VFS parses and validates; applying it is the
+                            // dispatcher's job because only here is it known
+                            // which backend owns per-process state. The write
+                            // may name ANOTHER process, so it cannot be routed
+                            // to "the current one" — LTP writes the library
+                            // process's file from the test child.
+                            let written = bytes.len() as i64;
+                            let parsed =
+                                crate::vfs::proc::parse_tunable_write(path, &bytes);
+                            return Ok(match parsed {
                                 Err(errno) => DispatchOutcome::errno(errno),
+                                Ok(crate::vfs::proc::TunableWrite::Ignored) => {
+                                    DispatchOutcome::Returned { value: written }
+                                }
+                                Ok(crate::vfs::proc::TunableWrite::OomScoreAdj {
+                                    pid,
+                                    value,
+                                }) => {
+                                    let target = pid.unwrap_or_else(|| {
+                                        cx.kernel.task().key().id.raw() as u32
+                                    });
+                                    match this.hvpatch_process() {
+                                        Some(process) => {
+                                            if process
+                                                .kernel_graph()
+                                                .registry()
+                                                .set_oom_score_adj(target, value)
+                                            {
+                                                DispatchOutcome::Returned { value: written }
+                                            } else {
+                                                // The process exited between
+                                                // open(2) and write(2).
+                                                DispatchOutcome::errno(LINUX_ESRCH)
+                                            }
+                                        }
+                                        None => {
+                                            crate::vfs::proc::set_single_process_oom_score_adj(
+                                                value,
+                                            );
+                                            DispatchOutcome::Returned { value: written }
+                                        }
+                                    }
+                                }
                             });
                         }
                         _ => return Ok(DispatchOutcome::errno(LINUX_EBADF)),

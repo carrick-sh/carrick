@@ -994,6 +994,41 @@ impl Registry {
             .collect()
     }
 
+    /// Every live process's `oom_score_adj`, keyed by its Linux pid, for the
+    /// `/proc/<pid>/oom_score_adj` renderer. A snapshot rather than a per-read
+    /// lookup because the synthetic-`/proc` context is assembled before the
+    /// requested pid is known; the live-task count is small.
+    pub(crate) fn oom_score_adj_by_pid(&self) -> BTreeMap<u32, i32> {
+        self.state
+            .read()
+            .tasks
+            .iter()
+            .map(|(id, record)| (id.raw() as u32, record.task.oom_score_adj()))
+            .collect()
+    }
+
+    /// Apply a `/proc/<pid>/oom_score_adj` write to the live process `pid`.
+    /// `false` means no such live process — the caller lowers that to ESRCH,
+    /// matching a write to a pid that exited between open(2) and write(2).
+    pub(crate) fn set_oom_score_adj(&self, pid: u32, value: i32) -> bool {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        let state = self.state.read();
+        match state
+            .tasks
+            .iter()
+            .find(|(id, _)| id.raw() == pid)
+            .map(|(_, record)| Arc::clone(&record.task))
+        {
+            Some(task) => {
+                task.set_oom_score_adj(value);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn process_group(&self, id: ProcessGroupId) -> Option<Arc<ProcessGroup>> {
         self.state
             .read()

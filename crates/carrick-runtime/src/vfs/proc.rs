@@ -197,6 +197,13 @@ pub struct SyntheticProcContext {
     /// Exact task identity for the in-process HVPatch kernel lane. `None`
     /// preserves mature native/VMM host-process rendering byte-for-byte.
     pub identity: Option<SyntheticProcIdentity>,
+    /// Every live process's `oom_score_adj`, keyed by Linux pid. The dispatcher
+    /// fills this from whichever backend owns per-process state, so this
+    /// renderer has exactly one lookup path and never has to guess whether a
+    /// guest process is a host process. A pid absent from the map has no live
+    /// process behind it, which is what makes `/proc/<dead-pid>/oom_score_adj`
+    /// ENOENT rather than a fabricated 0.
+    pub oom_score_adj: std::collections::BTreeMap<u32, i32>,
     /// Exact live-thread snapshot for the same task. `None` preserves the
     /// mature one-process-per-host-process registry lookup byte-for-byte.
     pub threads: Option<Vec<SyntheticProcThread>>,
@@ -219,19 +226,79 @@ pub(crate) fn is_userns_map_path(path: &str) -> bool {
     )
 }
 
-/// The per-process tunables Linux exposes read-WRITE that carrick accepts but
-/// does not act on (it has no live OOM/audit/timer-slack state). Making them
-/// writable means systemd/container managers that write them at startup get a
-/// successful write instead of EACCES/EBADF (and the warning that follows);
-/// the read keeps returning the documented default.
+/// The per-process tunables Linux exposes read-WRITE. `oom_score_adj` is
+/// backed by real per-process state (see [`TunableWrite`]); the rest carrick
+/// accepts but does not act on, because it has no live audit/timer-slack
+/// state. Making them writable means systemd/container managers that write
+/// them at startup get a successful write instead of EACCES/EBADF (and the
+/// warning that follows); the read keeps returning the documented default.
+///
+/// The pid component may be `self`, `thread-self`, or ANY numeric pid: Linux
+/// lets one process write another's `oom_score_adj`, and LTP's `tst_test`
+/// setup does exactly that. Liveness is not re-checked here — `open` only
+/// reaches this predicate after `synthetic_file` resolved the path, which
+/// already gates a numeric pid on being a live process.
 pub(crate) fn is_writable_tunable_path(path: &str) -> bool {
     matches!(
-        normalize_self_pid_path(path).as_ref(),
-        "/proc/self/oom_score_adj"
-            | "/proc/self/oom_adj"
-            | "/proc/self/loginuid"
-            | "/proc/self/timerslack_ns"
+        proc_tunable_name(path),
+        Some((
+            "oom_score_adj" | "oom_adj" | "loginuid" | "timerslack_ns",
+            _
+        ))
     )
+}
+
+/// Split a `/proc/<pid>/<tunable>` path into its trailing file name and the
+/// explicit numeric pid it named, if any (`self`/`thread-self` yield `None`
+/// for the pid — the caller substitutes its own).
+fn proc_tunable_name(path: &str) -> Option<(&str, Option<u32>)> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (pid, name) = rest.split_once('/')?;
+    if name.contains('/') {
+        return None;
+    }
+    match pid {
+        "self" | "thread-self" => Some((name, None)),
+        _ if !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) => {
+            Some((name, pid.parse().ok()))
+        }
+        _ => None,
+    }
+}
+
+/// A parsed, already-validated write to a `/proc/<pid>/` tunable. The VFS
+/// parses; the dispatcher applies, because only the dispatcher knows which
+/// backend owns per-process state (the HVPatch kernel graph, where every Linux
+/// process is a thread of one Darwin process, versus a lane where a guest
+/// process IS a host process). Keeping the choice at that one seam is what
+/// stops the two models from being silently conflated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TunableWrite {
+    /// Set `oom_score_adj` on `pid` (`None` = the calling process).
+    OomScoreAdj { pid: Option<u32>, value: i32 },
+    /// Accepted and dropped — carrick models no state behind it.
+    Ignored,
+}
+
+/// Parse a write(2) to a writable `/proc/<pid>/` tunable, applying Linux's
+/// front-door validation. `oom_score_adj` outside [-1000, 1000] or unparseable
+/// is EINVAL, exactly as Linux rejects it before touching the process.
+pub(crate) fn parse_tunable_write(path: &str, data: &[u8]) -> Result<TunableWrite, LinuxErrno> {
+    let Some((name, pid)) = proc_tunable_name(path) else {
+        return Ok(TunableWrite::Ignored);
+    };
+    if name != "oom_score_adj" {
+        return Ok(TunableWrite::Ignored);
+    }
+    let value: i32 = std::str::from_utf8(data)
+        .map_err(|_| crate::namespace::user::EINVAL)?
+        .trim()
+        .parse()
+        .map_err(|_| crate::namespace::user::EINVAL)?;
+    if !(OOM_SCORE_ADJ_MIN..=OOM_SCORE_ADJ_MAX).contains(&value) {
+        return Err(crate::namespace::user::EINVAL);
+    }
+    Ok(TunableWrite::OomScoreAdj { pid, value })
 }
 
 /// Apply a write(2) to one of the user-namespace map files. Returns the
@@ -261,46 +328,28 @@ pub(crate) fn write_userns_map(path: &str, data: &[u8]) -> Result<usize, LinuxEr
     .map(|()| data.len())
 }
 
-/// Per-process `oom_score_adj` (the modern OOM-killer bias knob). A
-/// process-global atomic IS the per-process store: each guest is a real host
-/// process, so fork-COW gives exactly Linux's semantics — inherited at fork,
-/// then independent per-process, shared by the process's threads. `tst_test`'s
-/// OOM-protection setup (`tst_memutils.c`) writes -1000 then reads it back
-/// expecting -1000; without persistence every test that enables OOM protection
-/// TBROKs in setup, hiding all its real assertions.
-static OOM_SCORE_ADJ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// Linux's documented `oom_score_adj` range (proc(5)); anything outside it is
+/// EINVAL at the write, before the process is touched.
 const OOM_SCORE_ADJ_MIN: i32 = -1000;
 const OOM_SCORE_ADJ_MAX: i32 = 1000;
 
-/// Apply a write(2) to a writable `/proc/<self>/...` tunable. Normalizes the
-/// `/proc/<self-pid>/` form to `/proc/self/` (the framework writes the explicit
-/// pid, e.g. `/proc/1/oom_score_adj`), then dispatches: oom_score_adj persists
-/// the value; the rest carrick has no live state for, so accept-and-ignore.
-pub(crate) fn write_tunable(path: &str, data: &[u8]) -> Result<usize, LinuxErrno> {
-    match normalize_self_pid_path(path).as_ref() {
-        "/proc/self/oom_score_adj" => write_oom_score_adj(data),
-        _ => Ok(data.len()),
-    }
+/// `oom_score_adj` for a lane with NO kernel graph, where one Linux process is
+/// one host process and this whole host process therefore IS one Linux
+/// process. On HVPatch the value lives on the kernel-graph task instead (see
+/// `Task::oom_score_adj`) — that is the authority, and the dispatcher picks
+/// between them at the single seam where the backend is known.
+static OOM_SCORE_ADJ_SINGLE_PROCESS: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+
+/// Read the single-host-process lane's `oom_score_adj`.
+pub(crate) fn single_process_oom_score_adj() -> i32 {
+    OOM_SCORE_ADJ_SINGLE_PROCESS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Store a write to `/proc/self/oom_score_adj`. Returns EINVAL (negative errno)
-/// for an unparseable or out-of-range value, mirroring Linux.
-pub(crate) fn write_oom_score_adj(data: &[u8]) -> Result<usize, LinuxErrno> {
-    let value: i32 = std::str::from_utf8(data)
-        .map_err(|_| crate::namespace::user::EINVAL)?
-        .trim()
-        .parse()
-        .map_err(|_| crate::namespace::user::EINVAL)?;
-    if !(OOM_SCORE_ADJ_MIN..=OOM_SCORE_ADJ_MAX).contains(&value) {
-        return Err(crate::namespace::user::EINVAL);
-    }
-    OOM_SCORE_ADJ.store(value, std::sync::atomic::Ordering::Relaxed);
-    Ok(data.len())
-}
-
-/// The current `/proc/self/oom_score_adj` value (default 0).
-pub(crate) fn oom_score_adj() -> i32 {
-    OOM_SCORE_ADJ.load(std::sync::atomic::Ordering::Relaxed)
+/// Store the single-host-process lane's `oom_score_adj`. The value is already
+/// range-checked by [`parse_tunable_write`].
+pub(crate) fn set_single_process_oom_score_adj(value: i32) {
+    OOM_SCORE_ADJ_SINGLE_PROCESS.store(value, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The instant carrick's guest "booted" (first time anything asks). Drives
@@ -709,6 +758,29 @@ fn normalize_self_pid_path(path: &str) -> Cow<'_, str> {
     Cow::Borrowed(path)
 }
 
+/// `oom_score_adj` for `pid`, or `None` when no live process has that pid.
+///
+/// The dispatcher's per-process snapshot is the authority. An EMPTY snapshot
+/// means the lane published none (one Linux process is one host process, so
+/// this host process is the only Linux process there is) and every pid that
+/// reached this renderer resolves to the single-process cell — the liveness
+/// gate upstream already rejected pids with no process behind them.
+fn pid_oom_score_adj(ctx: &SyntheticProcContext, pid: u32) -> Option<i32> {
+    if let Some(value) = ctx.oom_score_adj.get(&pid) {
+        return Some(*value);
+    }
+    ctx.oom_score_adj
+        .is_empty()
+        .then(single_process_oom_score_adj)
+}
+
+/// `oom_score_adj` for the calling process (`pid` = `None`) or an explicit pid.
+fn context_oom_score_adj(ctx: &SyntheticProcContext, pid: Option<u32>) -> i32 {
+    pid.or_else(|| ctx.identity.as_ref().map(|identity| identity.pid))
+        .and_then(|pid| pid_oom_score_adj(ctx, pid))
+        .unwrap_or_else(single_process_oom_score_adj)
+}
+
 /// True iff `path` is a `/proc/<pid>/mem` file (`self`, `thread-self`, or a
 /// numeric pid). Reads of such a file are NOT a byte blob: they translate the
 /// file offset as a GUEST VIRTUAL ADDRESS into the caller's OWN address space
@@ -783,7 +855,9 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         // the legacy knob (0). oom_score_adj persists writes (per-process,
         // fork-inherited) so tst_test's OOM-protection read-back sees its -1000.
         "/proc/self/oom_score" | "/proc/self/oom_adj" => Some(b"0\n".to_vec()),
-        "/proc/self/oom_score_adj" => Some(format!("{}\n", oom_score_adj()).into_bytes()),
+        "/proc/self/oom_score_adj" => {
+            Some(format!("{}\n", context_oom_score_adj(ctx, None)).into_bytes())
+        }
         // 8-digit hex personality flags (default ADDR/Linux = 0), no newline.
         "/proc/self/personality" => Some(b"00000000".to_vec()),
         "/proc/self/schedstat" => Some(b"0 0 1\n".to_vec()),
@@ -1592,7 +1666,21 @@ fn proc_task_dir_entries_with_context(
 
 /// Per-process files Carrick exposes under a FOREIGN `/proc/<pid>/` (matching
 /// what `synthetic_proc_pid_file` serves for another guest process).
-const PROC_PID_FILES: &[&str] = &["cmdline", "comm", "stat", "status"];
+///
+/// The OOM knobs are here and not only under `self/` because Linux lets one
+/// process read and write ANOTHER's: LTP's `tst_test` setup writes -1000 to
+/// `/proc/<lib-pid>/oom_score_adj` from the test child and `access(2)`-checks
+/// it first, so a self-only view TBROKs the entire new-API LTP framework
+/// before a single assertion runs (`tst_memutils.c:set_oom_score_adj`).
+const PROC_PID_FILES: &[&str] = &[
+    "cmdline",
+    "comm",
+    "oom_adj",
+    "oom_score",
+    "oom_score_adj",
+    "stat",
+    "status",
+];
 
 /// The richer file set under the SELF process dir — every `/proc/self/<f>`
 /// flat file `synthetic_file` actually serves — so `ls /proc/self` enumerates
@@ -1741,6 +1829,7 @@ impl Default for ProcVfs {
 
 fn synthetic_proc_context_from_open(ctx: &OpenContext<'_>) -> SyntheticProcContext {
     SyntheticProcContext {
+        oom_score_adj: ctx.oom_score_adj.cloned().unwrap_or_default(),
         executable_path: ctx.executable_path.unwrap_or("").to_owned(),
         argv: ctx.argv.unwrap_or(&[]).to_vec(),
         task_comm: ctx.task_comm.unwrap_or("").to_owned(),
@@ -2780,6 +2869,27 @@ fn synthetic_proc_pid_file(
             return synthetic_proc_pid_file(tid, file, self_comm, ctx);
         }
         return None;
+    }
+
+    // The OOM knobs are process-wide and answerable for ANY live pid, so they
+    // are served before the per-branch renderers below (each of which only
+    // knows how to describe one flavour of process). A pid with no live task
+    // and no zombie record falls through to `None` -> ENOENT, which is what
+    // makes LTP's `access(2)` probe of a dead pid fail the way Linux fails it
+    // rather than reporting a fabricated 0.
+    if matches!(rest, "oom_score" | "oom_adj" | "oom_score_adj") {
+        let known = pid_oom_score_adj(ctx, pid).or_else(|| {
+            ctx.zombies
+                .as_ref()
+                .is_some_and(|zombies| zombies.iter().any(|zombie| zombie.pid == pid))
+                .then_some(0)
+        })?;
+        return Some(match rest {
+            // oom_score is the volatile computed score and oom_adj the legacy
+            // knob; carrick models neither, and 0 is a valid answer for both.
+            "oom_score" | "oom_adj" => b"0\n".to_vec(),
+            _ => format!("{known}\n").into_bytes(),
+        });
     }
 
     if let Some(threads) = ctx.threads.as_ref()
@@ -4050,6 +4160,73 @@ mod tests {
                 .unwrap();
         assert!(rollup.contains("[rollup]"));
         assert!(rollup.contains("Pss:"));
+    }
+
+    /// LTP's `tst_test` setup writes -1000 to ANOTHER process's
+    /// `/proc/<pid>/oom_score_adj` and `access(2)`-checks it first
+    /// (`tst_memutils.c:set_oom_score_adj`). Serving that file only under
+    /// `self/` TBROKs every new-API LTP test before its first assertion, so a
+    /// foreign live pid must resolve and must report ITS OWN value — not the
+    /// reader's, which is what a process-global cell would return once every
+    /// Linux process is a thread of one Darwin process.
+    #[test]
+    fn foreign_pid_oom_score_adj_is_per_process() {
+        let mut ctx = ctx();
+        ctx.oom_score_adj = std::collections::BTreeMap::from([(2, -1000), (7, 250)]);
+
+        for (pid, expected) in [(2u32, "-1000\n"), (7, "250\n")] {
+            let got = synthetic_file(&format!("/proc/{pid}/oom_score_adj"), &ctx)
+                .map(|bytes| String::from_utf8(bytes).unwrap());
+            assert_eq!(got.as_deref(), Some(expected), "/proc/{pid}/oom_score_adj");
+        }
+
+        // A pid with no live process behind it is ENOENT (None), not a
+        // fabricated 0 — LTP's access(2) probe distinguishes the two.
+        assert_eq!(synthetic_file("/proc/9999/oom_score_adj", &ctx), None);
+
+        // The foreign dir must also ENUMERATE it, so `ls /proc/<pid>` agrees
+        // with what open(2) resolves (proc(5)).
+        assert!(PROC_PID_FILES.contains(&"oom_score_adj"));
+    }
+
+    /// A write names a pid, and the pid may be someone else's. The VFS parses
+    /// and validates; the dispatcher applies against the backend that owns
+    /// per-process state.
+    #[test]
+    fn tunable_write_parses_target_pid_and_range() {
+        assert_eq!(
+            parse_tunable_write("/proc/2/oom_score_adj", b"-1000"),
+            Ok(TunableWrite::OomScoreAdj {
+                pid: Some(2),
+                value: -1000
+            })
+        );
+        assert_eq!(
+            parse_tunable_write("/proc/self/oom_score_adj", b"250\n"),
+            Ok(TunableWrite::OomScoreAdj {
+                pid: None,
+                value: 250
+            })
+        );
+        // Out of Linux's [-1000, 1000] and unparseable are both EINVAL, before
+        // the target process is touched.
+        assert!(parse_tunable_write("/proc/self/oom_score_adj", b"-1001").is_err());
+        assert!(parse_tunable_write("/proc/self/oom_score_adj", b"nope").is_err());
+        // Tunables carrick models no state for stay accept-and-ignore.
+        assert_eq!(
+            parse_tunable_write("/proc/self/loginuid", b"0"),
+            Ok(TunableWrite::Ignored)
+        );
+        // Every one of these is writable regardless of how the pid is spelled.
+        for path in [
+            "/proc/2/oom_score_adj",
+            "/proc/self/oom_score_adj",
+            "/proc/thread-self/oom_score_adj",
+            "/proc/self/timerslack_ns",
+        ] {
+            assert!(is_writable_tunable_path(path), "{path} should be writable");
+        }
+        assert!(!is_writable_tunable_path("/proc/self/stat"));
     }
 
     #[test]

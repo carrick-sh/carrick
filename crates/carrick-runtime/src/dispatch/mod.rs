@@ -6724,6 +6724,14 @@ impl SyscallDispatcher {
         }
         let creds = self.cred_snapshot();
         let groups = self.current_groups();
+        // Per-process OOM bias comes from the kernel graph, the only authority
+        // that can tell two Linux processes apart when both are threads of this
+        // one Darwin process. A lane without a kernel graph publishes an empty
+        // map and the renderer falls back to its single-host-process cell.
+        let oom_score_adj = hvpatch_process
+            .as_ref()
+            .map(|process| process.kernel_graph().registry().oom_score_adj_by_pid())
+            .unwrap_or_default();
         let zombies = hvpatch_process.map(|process| {
             process
                 .kernel_graph()
@@ -6771,6 +6779,7 @@ impl SyscallDispatcher {
             sig_caught,
             sig_shdpnd,
             identity: self.synthetic_proc_identity(context),
+            oom_score_adj,
             threads: self.synthetic_proc_threads(context, None),
             zombies,
             sysvipc_shm: self.sysvipc_shm_table(),

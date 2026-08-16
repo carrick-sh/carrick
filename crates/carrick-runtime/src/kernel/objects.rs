@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -2335,6 +2335,17 @@ pub struct Task {
     /// the generation lets that same boundary reconcile the authoritative
     /// pending state before it enters guest code.
     wake_generation: AtomicU64,
+    /// Linux's per-process OOM-killer bias, `/proc/<pid>/oom_score_adj`
+    /// (proc(5)): inherited at fork, independent of the parent afterwards, and
+    /// shared by every thread of the process.
+    ///
+    /// It is task state rather than a host-process global for the same reason
+    /// [`TaskCpu`] is: under HVPatch all Linux processes are threads of ONE
+    /// Darwin process, so a global would publish one guest process's write to
+    /// every other one. LTP's `tst_test` setup writes -1000 to *another*
+    /// process's file and reads it back (`tst_memutils.c:set_oom_score_adj`),
+    /// which a shared cell cannot model.
+    oom_score_adj: AtomicI32,
 }
 
 /// The two CPU ledgers Linux keeps for every process, owned by the kernel
@@ -2390,7 +2401,20 @@ impl Task {
             cpu: TaskCpu::default(),
             waker: Mutex::new(None),
             wake_generation: AtomicU64::new(0),
+            oom_score_adj: AtomicI32::new(0),
         }
+    }
+
+    /// This process's `/proc/<pid>/oom_score_adj` (default 0).
+    pub fn oom_score_adj(&self) -> i32 {
+        self.oom_score_adj.load(Ordering::Relaxed)
+    }
+
+    /// Set this process's `oom_score_adj`. The caller has already range-checked
+    /// `value` against Linux's [-1000, 1000]; fork inheritance copies the
+    /// parent's value into the child at creation.
+    pub fn set_oom_score_adj(&self, value: i32) {
+        self.oom_score_adj.store(value, Ordering::Relaxed);
     }
 
     /// Publish the lane's wake vehicle for this task, replacing any previous
