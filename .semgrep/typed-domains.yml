@@ -62,6 +62,65 @@ rules:
       (.to_host()/.names_self()) — the wait4/ptrace anti-pattern (77a82c15).
       Keep the value as HostPid or an honestly-named host-domain integer.
 
+  # NsUid and HostUid exist to prevent host UID vs namespace UID confusion.
+  # Wrapping a host UID in NsUid (or vice-versa) defeats domain safety.
+  - id: carrick-no-host-uid-in-nsuid
+    languages: [rust]
+    severity: ERROR
+    patterns:
+      - pattern-either:
+          - pattern: NsUid($X)
+          - pattern: NsUid::new($X)
+      - metavariable-regex:
+          metavariable: $X
+          regex: '.*host.*'
+    message: |
+      A host UID inside NsUid confuses host and guest credentials.
+      Use HostUid or convert explicitly through the credential mapping subsystem.
+
+  - id: carrick-no-ns-uid-in-hostuid
+    languages: [rust]
+    severity: ERROR
+    patterns:
+      - pattern-either:
+          - pattern: HostUid($X)
+          - pattern: HostUid::new($X)
+      - metavariable-regex:
+          metavariable: $X
+          regex: '.*ns_.*'
+    message: |
+      A namespace UID inside HostUid confuses host and guest credentials.
+      Use NsUid for guest/namespace credentials.
+
+  # NsGid and HostGid domain safety.
+  - id: carrick-no-host-gid-in-nsgid
+    languages: [rust]
+    severity: ERROR
+    patterns:
+      - pattern-either:
+          - pattern: NsGid($X)
+          - pattern: NsGid::new($X)
+      - metavariable-regex:
+          metavariable: $X
+          regex: '.*host.*'
+    message: |
+      A host GID inside NsGid confuses host and guest credentials.
+      Use HostGid or convert explicitly through the credential mapping subsystem.
+
+  - id: carrick-no-ns-gid-in-hostgid
+    languages: [rust]
+    severity: ERROR
+    patterns:
+      - pattern-either:
+          - pattern: HostGid($X)
+          - pattern: HostGid::new($X)
+      - metavariable-regex:
+          metavariable: $X
+          regex: '.*ns_.*'
+    message: |
+      A namespace GID inside HostGid confuses host and guest credentials.
+      Use NsGid for guest/namespace credentials.
+
   # The private normalized syscall numbers derive from PrivateX86Ordinal so two
   # entries can never collide (alarm dispatched as epoll_create when they were
   # hand-numbered). A fresh hand-numbered constant re-opens that class.
