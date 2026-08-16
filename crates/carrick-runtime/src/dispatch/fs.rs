@@ -1681,14 +1681,27 @@ impl SyscallDispatcher {
         {
             return Ok(self.stat_record_with_device(&path, &real));
         }
-        if let Some(contents) =
-            crate::vfs::proc::synthetic_file(&path, &self.synthetic_proc_context(context))
         {
-            return Ok(StatRecord::synthetic(
-                &path,
-                contents.len(),
-                LINUX_S_IFREG | 0o444,
-            ));
+            // One context assembly serves both consults: it takes the proc lock
+            // and snapshots the address space, so building it twice per stat
+            // would double a hot path's cost.
+            let proc_ctx = self.synthetic_proc_context(context);
+            if let Some(contents) = crate::vfs::proc::synthetic_file(&path, &proc_ctx) {
+                return Ok(StatRecord::synthetic(
+                    &path,
+                    contents.len(),
+                    LINUX_S_IFREG | 0o444,
+                ));
+            }
+            // `/proc/<pid>` and `/proc/<pid>/task` for a PEER exist only in the
+            // kernel task graph — `Vfs::lookup` carries no context and answers
+            // from Darwin's process table, which on HVPatch describes the one
+            // carrier every Linux process is a thread of. Without this consult
+            // `stat("/proc/<peer>")` was ENOENT while `cat /proc/<peer>/stat`
+            // worked.
+            if crate::vfs::proc::synthetic_dir_entries(&path, &proc_ctx).is_some() {
+                return Ok(StatRecord::synthetic(&path, 0, LINUX_S_IFDIR | 0o555));
+            }
         }
         if let Some(contents) = crate::vfs::sys::synthetic_file(&path) {
             return Ok(StatRecord::synthetic(
@@ -13424,15 +13437,28 @@ impl SyscallDispatcher {
             }
 
             let path = this.resolve_at_path(dirfd, &path)?;
-            if let Some(contents) =
-                crate::vfs::proc::synthetic_file(&path, &this.synthetic_proc_context(cx.kernel))
             {
-                return Ok(write_synthetic_statx(
-                    memory,
-                    statxbuf,
-                    &path,
-                    contents.len(),
-                ));
+                // One context assembly for both consults — see the twin block
+                // in `path_stat_record`, including why the kernel task graph is
+                // the only thing that can settle a peer's `/proc/<pid>`.
+                let proc_ctx = this.synthetic_proc_context(cx.kernel);
+                if let Some(contents) = crate::vfs::proc::synthetic_file(&path, &proc_ctx) {
+                    return Ok(write_synthetic_statx(
+                        memory,
+                        statxbuf,
+                        &path,
+                        contents.len(),
+                    ));
+                }
+                if crate::vfs::proc::synthetic_dir_entries(&path, &proc_ctx).is_some() {
+                    return Ok(write_synthetic_statx_mode(
+                        memory,
+                        statxbuf,
+                        &path,
+                        0,
+                        LINUX_S_IFDIR | 0o555,
+                    ));
+                }
             }
             if let Some(contents) = crate::vfs::sys::synthetic_file(&path) {
                 return Ok(write_synthetic_statx(

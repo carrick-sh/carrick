@@ -152,7 +152,12 @@ pub struct SyntheticProcProcess {
     pub pgrp: u32,
     pub session: u32,
     pub state: char,
-    pub threads: usize,
+    /// Every live thread's Linux tid, straight from the kernel graph's per-task
+    /// thread claims. It is what `/proc/<pid>/task/` lists and what `stat`
+    /// field 20 / `status`' `Threads:` count; Darwin's thread table cannot be
+    /// asked, because on HVPatch it describes every process in the carrier at
+    /// once.
+    pub tids: Vec<u32>,
     pub comm: String,
 }
 
@@ -1694,35 +1699,125 @@ fn proc_task_dir_entries_from_tids(tids: impl IntoIterator<Item = String>) -> Ve
     entries
 }
 
-/// Context-aware `/proc/<tgid>/task` listing for HVPatch. Every logical Linux
-/// process shares Carrick's Darwin pid on that lane, so the host-process lookup
-/// used by [`proc_task_dir_entries`] cannot validate a numeric logical tgid.
-/// The open context already carries the exact task generation's identity and
-/// thread snapshot; prefer that authority for self aliases and the matching
-/// numeric tgid, then let the mature host-process path handle other lanes.
+/// How Carrick's kernel task graph knows the pid a `/proc/<pid>` path names.
+enum GraphProcess<'a> {
+    /// The reader itself, named by a `self` alias or by its own pid.
+    Reader,
+    /// A live PEER process, as the graph's live-task snapshot describes it.
+    Peer(&'a SyntheticProcProcess),
+    /// An exited-but-unreaped process. Linux keeps `/proc/<pid>` present for a
+    /// zombie (with a single `task/<pid>` entry) until it is reaped.
+    Zombie,
+}
+
+/// THE liveness authority for the pid component of a `/proc/<pid>…` path:
+/// a `self` alias or a numeric Linux pid resolved against Carrick's kernel task
+/// graph. `None` means "no such process" — the ENOENT Linux reports for a pid
+/// that does not exist.
+///
+/// This exists because [`proc_pid_dir_host_pid`] cannot answer the question on
+/// the lane that matters. Under HVPatch every Linux process is a THREAD of one
+/// Darwin process, so a peer has no host pid of its own and the host process
+/// table cannot tell `/proc/<live-peer>` from a pid that never existed — it
+/// answers `None` for both, and every `/proc/<peer>` `stat`/`opendir` became
+/// ENOENT. The graph reaches the VFS as the `identity`/`processes`/`zombies`
+/// snapshot the dispatcher already assembles for `oom_score_adj` and the
+/// per-pid renderers; this is the same authority, asked one layer earlier.
+///
+/// A lane that publishes no graph leaves `processes` `None`, and the caller
+/// falls back to the host process table.
+fn graph_process<'a>(component: &str, ctx: &'a SyntheticProcContext) -> Option<GraphProcess<'a>> {
+    let identity = ctx.identity?;
+    if matches!(component, "self" | "thread-self" | "curproc" | "this") {
+        return Some(GraphProcess::Reader);
+    }
+    let pid: u32 = component.parse().ok()?;
+    if pid == identity.pid {
+        return Some(GraphProcess::Reader);
+    }
+    if let Some(peer) = ctx
+        .processes
+        .as_ref()?
+        .iter()
+        .find(|process| process.pid == pid)
+    {
+        return Some(GraphProcess::Peer(peer));
+    }
+    ctx.zombies
+        .as_ref()
+        .is_some_and(|zombies| zombies.iter().any(|zombie| zombie.pid == pid))
+        .then_some(GraphProcess::Zombie)
+}
+
+/// The pid component of a `/proc/<pid>` path with `suffix` (`""` for the bare
+/// process directory, `"/task"` for its thread directory).
+fn proc_pid_path_component<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let rest = path.strip_prefix("/proc/")?;
+    let component = if suffix.is_empty() {
+        rest
+    } else {
+        rest.strip_suffix(suffix)?
+    };
+    (!component.is_empty() && !component.contains('/')).then_some(component)
+}
+
+/// Context-aware `/proc/<tgid>/task` listing, resolved through the kernel task
+/// graph ([`graph_process`]) so a live PEER's thread directory exists — not
+/// only the reader's. The tids come from the graph's own per-task thread
+/// claims; Darwin's thread table describes the whole carrier on this lane and
+/// would list every process's threads under every pid.
 fn proc_task_dir_entries_with_context(
     path: &str,
     ctx: &SyntheticProcContext,
 ) -> Option<Vec<DirEnt>> {
-    let p = path.strip_suffix('/').unwrap_or(path);
-    let pid_comp = p.strip_prefix("/proc/")?.strip_suffix("/task")?;
-    let identity = ctx.identity?;
-    let names_current_process = matches!(pid_comp, "self" | "thread-self" | "curproc" | "this")
-        || pid_comp.parse::<u32>().ok() == Some(identity.pid);
-    if !names_current_process {
+    let component = proc_pid_path_component(path, "/task")?;
+    let tids = graph_process_tids(component, ctx)?;
+    Some(proc_task_dir_entries_from_tids(
+        tids.into_iter().map(|tid| tid.to_string()),
+    ))
+}
+
+/// The tids of the process a `/proc/<pid>…` component names, per the kernel
+/// task graph. `None` when no such process exists.
+fn graph_process_tids(component: &str, ctx: &SyntheticProcContext) -> Option<Vec<u32>> {
+    Some(match graph_process(component, ctx)? {
+        GraphProcess::Reader => {
+            let identity = ctx.identity?;
+            ctx.threads
+                .as_ref()
+                .map(|threads| threads.iter().map(|thread| thread.tid).collect())
+                .unwrap_or_else(|| vec![identity.tid])
+        }
+        GraphProcess::Peer(peer) => {
+            if peer.tids.is_empty() {
+                vec![peer.pid]
+            } else {
+                peer.tids.clone()
+            }
+        }
+        GraphProcess::Zombie => vec![component.parse().ok()?],
+    })
+}
+
+/// `/proc/<pid>/task/<tid>` — a per-THREAD directory, which Linux serves with
+/// the same shape as the process directory. LTP `tgkill03` `access(2)`es one
+/// and requires it to vanish (ENOENT) once the thread is joined, so the tid
+/// must be checked against the graph's live claims rather than merely being
+/// numeric.
+fn proc_task_tid_dir_entries_with_context(
+    path: &str,
+    ctx: &SyntheticProcContext,
+) -> Option<Vec<DirEnt>> {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let (pid_comp, tid_comp) = path.strip_prefix("/proc/")?.split_once("/task/")?;
+    if pid_comp.is_empty() || pid_comp.contains('/') || tid_comp.contains('/') {
         return None;
     }
-    let tids = ctx
-        .threads
-        .as_ref()
-        .map(|threads| {
-            threads
-                .iter()
-                .map(|thread| thread.tid.to_string())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| vec![identity.tid.to_string()]);
-    Some(proc_task_dir_entries_from_tids(tids))
+    let tid: u32 = tid_comp.parse().ok()?;
+    graph_process_tids(pid_comp, ctx)?
+        .contains(&tid)
+        .then(|| proc_pid_dir_entries_for_known_process_named(false))
 }
 
 /// Per-process files Carrick exposes under a FOREIGN `/proc/<pid>/` (matching
@@ -1785,6 +1880,13 @@ const PROC_SELF_FILES: &[&str] = &[
 /// gets the subset its synthetic renderer can actually answer.
 fn proc_pid_dir_entries_for_known_process(path: &str, is_self: bool) -> Option<Vec<DirEnt>> {
     proc_pid_dir_linux_pid(path)?;
+    Some(proc_pid_dir_entries_for_known_process_named(is_self))
+}
+
+/// The listing itself, once the pid has been resolved. Split out so the
+/// per-thread `/proc/<pid>/task/<tid>` directory — which Linux gives the same
+/// shape — can share it without re-parsing a `/proc/<pid>` path.
+fn proc_pid_dir_entries_for_known_process_named(is_self: bool) -> Vec<DirEnt> {
     let mut entries = vec![
         DirEnt {
             name: ".".to_string(),
@@ -1821,7 +1923,7 @@ fn proc_pid_dir_entries_for_known_process(path: &str, is_self: bool) -> Option<V
         name: (*f).to_string(),
         kind: EntryKind::File,
     }));
-    Some(entries)
+    entries
 }
 
 fn proc_pid_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
@@ -1834,26 +1936,131 @@ fn proc_pid_dir_entries_with_context(
     path: &str,
     ctx: &SyntheticProcContext,
 ) -> Option<Vec<DirEnt>> {
-    let pid = proc_pid_dir_linux_pid(path)?;
-    if ctx.identity.is_some_and(|identity| identity.pid == pid) {
-        return proc_pid_dir_entries_for_known_process(path, true);
+    let component = proc_pid_path_component(path, "")?;
+    match graph_process(component, ctx) {
+        Some(GraphProcess::Reader) => proc_pid_dir_entries_for_known_process(path, true),
+        Some(GraphProcess::Peer(_) | GraphProcess::Zombie) => {
+            proc_pid_dir_entries_for_known_process(path, false)
+        }
+        // No kernel graph on this lane: the host process table is still the
+        // authority, one Linux process being one host process there.
+        None => proc_pid_dir_entries(path),
     }
-    // A live peer, then a zombie: the kernel graph knows both, and on HVPatch it
-    // is the ONLY thing that does — a peer shares this Darwin pid, so the
-    // host-process gate below cannot tell `/proc/<live-peer>` from a pid that
-    // never existed.
-    if ctx
-        .processes
-        .as_ref()
-        .is_some_and(|processes| processes.iter().any(|process| process.pid == pid))
-        || ctx
-            .zombies
-            .as_ref()
-            .is_some_and(|zombies| zombies.iter().any(|zombie| zombie.pid == pid))
-    {
-        return proc_pid_dir_entries_for_known_process(path, false);
+}
+
+/// Every synthetic `/proc` DIRECTORY whose existence only the kernel task graph
+/// can settle: `/proc`, `/proc/<pid>` and `/proc/<pid>/task`.
+///
+/// [`Vfs::lookup`] and [`Vfs::readdir`] carry no context, so they answer these
+/// from the host process table — which on HVPatch describes the carrier and
+/// therefore reports ENOENT for every peer. The dispatcher DOES hold the
+/// context at `stat`/`access` time, so it consults this first, exactly as it
+/// already consults [`synthetic_file`] for the per-pid FILES. Non-directory and
+/// non-`/proc` paths return `None` and fall through unchanged.
+pub(crate) fn synthetic_dir_entries(path: &str, ctx: &SyntheticProcContext) -> Option<Vec<DirEnt>> {
+    if path == "/proc" {
+        return Some(proc_top_level_entries(ctx));
     }
-    proc_pid_dir_entries(path)
+    proc_task_dir_entries_with_context(path, ctx)
+        .or_else(|| proc_task_tid_dir_entries_with_context(path, ctx))
+        .or_else(|| proc_pid_dir_entries_with_context(path, ctx))
+}
+
+/// The `/proc` top-level listing: `.`/`..`, the self aliases, every synthetic
+/// top-level file carrick actually serves (so `ls /proc` agrees with what
+/// `open()` resolves, proc(5)), the sub-directories, and one entry per LIVE
+/// process.
+///
+/// The process entries come from the kernel task graph when the caller has one.
+/// The host-pid enumeration below cannot see them on HVPatch: every Linux
+/// process is a thread of ONE Darwin process, so `proc_listallpids` reports the
+/// carrier once and `ls /proc | grep <peer>` found nothing while
+/// `cat /proc/<peer>/stat` worked. Zombies are listed too — Linux keeps an
+/// unreaped process's directory present, which is what lets `ps` show a `Z`.
+fn proc_top_level_entries(ctx: &SyntheticProcContext) -> Vec<DirEnt> {
+    let mut entries = vec![
+        DirEnt {
+            name: ".".to_string(),
+            kind: EntryKind::Directory,
+        },
+        DirEnt {
+            name: "..".to_string(),
+            kind: EntryKind::Directory,
+        },
+        // `self`/`thread-self` readlink to the caller's pid dir, but carrick
+        // models them as traversable directories (so `/proc/self/<file>`
+        // resolves without following into an unserved per-pid tree); report
+        // them as directories for getdents consistency with lstat.
+        DirEnt {
+            name: "self".to_string(),
+            kind: EntryKind::Directory,
+        },
+        DirEnt {
+            name: "thread-self".to_string(),
+            kind: EntryKind::Directory,
+        },
+    ];
+    for name in [
+        "cmdline",
+        "config.gz",
+        "cpuinfo",
+        "devices",
+        "diskstats",
+        "filesystems",
+        "loadavg",
+        "locks",
+        "meminfo",
+        "modules",
+        "mounts",
+        "partitions",
+        "stat",
+        "swaps",
+        "uptime",
+        "version",
+        "vmstat",
+    ] {
+        entries.push(DirEnt {
+            name: name.to_string(),
+            kind: EntryKind::File,
+        });
+    }
+    // `/proc/sys` and `/proc/net` are both directories here (net readlinks
+    // to self/net but is served as a traversable dir).
+    for dir in ["sys", "net", "sysvipc"] {
+        entries.push(DirEnt {
+            name: dir.to_string(),
+            kind: EntryKind::Directory,
+        });
+    }
+    let mut pids: Vec<u32> = Vec::new();
+    if let Some(processes) = ctx.processes.as_ref() {
+        pids.extend(processes.iter().map(|process| process.pid));
+        if let Some(zombies) = ctx.zombies.as_ref() {
+            pids.extend(zombies.iter().map(|zombie| zombie.pid));
+        }
+        if let Some(identity) = ctx.identity {
+            pids.push(identity.pid);
+        }
+    } else {
+        // No kernel graph on this lane. Enumerated host pids must be shown as
+        // the NAMESPACE pids the guest sees (what getpid()/$!/status report),
+        // or a guest can't correlate `ls /proc` with its own pids. Identity
+        // when no PID namespace is active; drop host pids that map to no
+        // ns-pid (host_to_ns → 0).
+        pids.extend(
+            enumerate_guest_pids()
+                .into_iter()
+                .map(crate::namespace::pid::host_to_ns_or_self)
+                .filter(|&ns_pid| ns_pid != 0),
+        );
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    entries.extend(pids.into_iter().map(|pid| DirEnt {
+        name: pid.to_string(),
+        kind: EntryKind::Directory,
+    }));
+    entries
 }
 
 /// Guest process pids (this process + its guest descendants) for enumerating
@@ -2018,85 +2225,7 @@ impl Vfs for ProcVfs {
 
     fn readdir(&self, path: &str) -> Result<Vec<super::DirEnt>, VfsError> {
         if path == "/proc" {
-            // Top-level: `.`/`..`, `self`, a representative set of synthetic
-            // files, and every guest process pid (so `ps`/`ls /proc` enumerate).
-            // `self`/`thread-self` readlink to the caller's pid dir, but carrick
-            // models them as traversable directories (so `/proc/self/<file>`
-            // resolves without following into an unserved per-pid tree); report
-            // them as directories for getdents consistency with lstat.
-            let mut entries = vec![
-                DirEnt {
-                    name: ".".to_string(),
-                    kind: EntryKind::Directory,
-                },
-                DirEnt {
-                    name: "..".to_string(),
-                    kind: EntryKind::Directory,
-                },
-                DirEnt {
-                    name: "self".to_string(),
-                    kind: EntryKind::Directory,
-                },
-                DirEnt {
-                    name: "thread-self".to_string(),
-                    kind: EntryKind::Directory,
-                },
-            ];
-            // Every top-level synthetic file carrick actually serves, so
-            // `ls /proc` is consistent with what open() resolves (proc(5)).
-            for name in [
-                "cmdline",
-                "config.gz",
-                "cpuinfo",
-                "devices",
-                "diskstats",
-                "filesystems",
-                "loadavg",
-                "locks",
-                "meminfo",
-                "modules",
-                "mounts",
-                "partitions",
-                "stat",
-                "swaps",
-                "uptime",
-                "version",
-                "vmstat",
-            ] {
-                entries.push(DirEnt {
-                    name: name.to_string(),
-                    kind: EntryKind::File,
-                });
-            }
-            // `/proc/sys` and `/proc/net` are both directories here (net readlinks
-            // to self/net but is served as a traversable dir).
-            entries.push(DirEnt {
-                name: "sys".to_string(),
-                kind: EntryKind::Directory,
-            });
-            entries.push(DirEnt {
-                name: "net".to_string(),
-                kind: EntryKind::Directory,
-            });
-            entries.push(DirEnt {
-                name: "sysvipc".to_string(),
-                kind: EntryKind::Directory,
-            });
-            // Enumerated host pids must be shown as the NAMESPACE pids the guest
-            // sees (what getpid()/$!/status report), or a guest can't correlate
-            // `ls /proc` with its own pids. Identity when no PID namespace is
-            // active; drop host pids that map to no ns-pid (host_to_ns → 0).
-            for host_pid in enumerate_guest_pids() {
-                let ns_pid = crate::namespace::pid::host_to_ns_or_self(host_pid);
-                if ns_pid == 0 {
-                    continue;
-                }
-                entries.push(DirEnt {
-                    name: ns_pid.to_string(),
-                    kind: EntryKind::Directory,
-                });
-            }
-            return Ok(entries);
+            return Ok(proc_top_level_entries(&SyntheticProcContext::default()));
         }
         if path == "/proc/sysvipc" {
             return Ok(vec![
@@ -2153,7 +2282,9 @@ impl Vfs for ProcVfs {
         // Without this branch the open falls through to the (empty) rootfs
         // `/proc` directory and `readdir` is never reached. Mirrors `DevVfs`.
         if path == "/proc" {
-            let entries = self.readdir("/proc").unwrap_or_default();
+            let entries = proc_top_level_entries(
+                synth_ctx.get_or_init(|| synthetic_proc_context_from_open(ctx)),
+            );
             return Ok(VfsHandle::Directory {
                 path: "/proc".to_string(),
                 entries,
@@ -2211,18 +2342,12 @@ impl Vfs for ProcVfs {
             .or_else(|| proc_net_dir_entries(path))
             .or_else(|| proc_ns_dir_entries(path))
             .or_else(|| {
-                proc_task_dir_entries_with_context(
+                synthetic_dir_entries(
                     path,
                     synth_ctx.get_or_init(|| synthetic_proc_context_from_open(ctx)),
                 )
             })
             .or_else(|| proc_task_dir_entries(path))
-            .or_else(|| {
-                proc_pid_dir_entries_with_context(
-                    path,
-                    synth_ctx.get_or_init(|| synthetic_proc_context_from_open(ctx)),
-                )
-            })
         {
             return Ok(VfsHandle::Directory {
                 path: path.to_string(),
@@ -3059,7 +3184,7 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t1\n",
         } else {
             process.comm.as_str()
         };
-        let threads = process.threads.max(1);
+        let threads = process.tids.len().max(1);
         return match rest {
             "stat" => Some(
                 proc_stat_line(
@@ -4911,7 +5036,7 @@ mod tests {
                     pgrp: 1,
                     session: 1,
                     state: 'S',
-                    threads: 1,
+                    tids: vec![1],
                     comm: "sh".to_owned(),
                 },
                 SyntheticProcProcess {
@@ -4920,7 +5045,7 @@ mod tests {
                     pgrp: 1,
                     session: 1,
                     state: 'R',
-                    threads: 1,
+                    tids: vec![2],
                     comm: "cat".to_owned(),
                 },
             ]),
@@ -4969,7 +5094,7 @@ mod tests {
                 pgrp: 5,
                 session: 6,
                 state: 'S',
-                threads: 2,
+                tids: vec![7, 8],
                 comm: "sleep".to_owned(),
             }]),
             ..demo_ctx()
@@ -5034,6 +5159,102 @@ mod tests {
             synthetic_file("/proc/999999/stat", &ctx).is_none(),
             "a pid with no kernel-graph record must not render"
         );
+    }
+
+    fn peer_dir_ctx() -> SyntheticProcContext {
+        SyntheticProcContext {
+            identity: Some(SyntheticProcIdentity {
+                pid: 3,
+                tid: 3,
+                ppid: 1,
+                pgrp: 1,
+                session: 1,
+            }),
+            processes: Some(vec![SyntheticProcProcess {
+                pid: 7,
+                ppid: 3,
+                pgrp: 1,
+                session: 1,
+                state: 'S',
+                tids: vec![7, 9],
+                comm: "sleep".to_owned(),
+            }]),
+            zombies: Some(vec![SyntheticProcZombie {
+                pid: 11,
+                ppid: 3,
+                pgrp: 1,
+                session: 1,
+                comm: "gone".to_owned(),
+            }]),
+            ..demo_ctx()
+        }
+    }
+
+    fn names(entries: &[DirEnt]) -> Vec<&str> {
+        entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    /// `/proc/<peer>` must EXIST, not just render its files. The per-pid file
+    /// renderers were routed through the kernel graph first, which left
+    /// `cat /proc/<peer>/stat` working while `ls -d /proc/<peer>`,
+    /// `test -d /proc/<peer>` and `stat /proc/<peer>` all reported ENOENT —
+    /// `Vfs::lookup` carries no context and asks Darwin, where every HVPatch
+    /// Linux process is a thread of the one carrier.
+    #[test]
+    fn peer_pid_directory_exists_in_the_kernel_graph() {
+        let ctx = peer_dir_ctx();
+        let entries = synthetic_dir_entries("/proc/7", &ctx)
+            .expect("a live peer's /proc/<pid> directory must exist");
+        let names = names(&entries);
+        for expected in ["stat", "status", "cmdline", "comm", "oom_score_adj", "task"] {
+            assert!(
+                names.contains(&expected),
+                "/proc/<peer> listing is missing {expected}: {names:?}"
+            );
+        }
+        assert!(
+            synthetic_dir_entries("/proc/11", &ctx).is_some(),
+            "an unreaped zombie keeps its /proc/<pid> directory until it is reaped"
+        );
+        assert!(
+            synthetic_dir_entries("/proc/999999", &ctx).is_none(),
+            "a pid the graph never knew must stay ENOENT"
+        );
+    }
+
+    /// `/proc/<peer>/task` lists the graph's own per-task thread claims. Asking
+    /// Darwin would list every process in the carrier under every pid.
+    #[test]
+    fn peer_task_directory_lists_graph_tids() {
+        let ctx = peer_dir_ctx();
+        let entries = synthetic_dir_entries("/proc/7/task", &ctx)
+            .expect("a live peer's task directory must exist");
+        let mut tids = names(&entries);
+        tids.sort_unstable();
+        assert_eq!(
+            tids,
+            [".", "..", "7", "9"],
+            "peer tids were not the graph's"
+        );
+        let zombie = synthetic_dir_entries("/proc/11/task", &ctx)
+            .expect("a zombie keeps its leader listed under task/");
+        assert!(names(&zombie).contains(&"11"));
+    }
+
+    /// `ls /proc` must enumerate peers. The host-pid enumeration reports the
+    /// carrier once on HVPatch, so `ls /proc | grep <peer>` found nothing while
+    /// `cat /proc/<peer>/stat` worked.
+    #[test]
+    fn proc_top_level_enumerates_graph_processes() {
+        let ctx = peer_dir_ctx();
+        let entries = proc_top_level_entries(&ctx);
+        let names = names(&entries);
+        for expected in ["3", "7", "11", "self", "stat"] {
+            assert!(
+                names.contains(&expected),
+                "/proc listing is missing {expected}: {names:?}"
+            );
+        }
     }
 
     #[test]
