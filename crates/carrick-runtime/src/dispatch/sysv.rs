@@ -362,6 +362,82 @@ struct SemSet {
     /// which cannot identify an HVPatch logical process; this shared overlay
     /// preserves the exact task id across in-process fork dispatcher clones.
     logical_last_operators: Arc<Mutex<Vec<Option<i32>>>>,
+    /// Linux `semncnt`/`semzcnt` per semaphore. Carrick's `semop` waiters poll
+    /// the host set with IPC_NOWAIT (that is what keeps an untimed wait
+    /// interruptible), so no waiter is ever asleep inside the host `semop` and
+    /// the host's own counters read 0 for every one of them. Same shape and
+    /// same reason as `logical_last_operators`: a host counter cannot describe
+    /// Carrick's logical waiters, and the `Arc` keeps ONE authority across
+    /// in-process fork dispatcher clones so a sibling guest process reading
+    /// GETNCNT/GETZCNT sees the waiters parked in the carrier.
+    logical_wait_counts: SemWaitCounters,
+}
+
+/// Which Linux blocked-waiter counter a `semop` operation feeds while parked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SemWaitKind {
+    /// `sem_op < 0` — waiting for the value to INCREASE (semctl `GETNCNT`).
+    Increase,
+    /// `sem_op == 0` — waiting for the value to reach ZERO (semctl `GETZCNT`).
+    Zero,
+}
+
+impl SemWaitKind {
+    /// The counter a single `sembuf` feeds, or `None` for `sem_op > 0` — an
+    /// increment always completes, so it never parks a waiter.
+    fn for_op(sem_op: i16) -> Option<Self> {
+        match sem_op.cmp(&0) {
+            std::cmp::Ordering::Less => Some(Self::Increase),
+            std::cmp::Ordering::Equal => Some(Self::Zero),
+            std::cmp::Ordering::Greater => None,
+        }
+    }
+
+    /// The counter a semctl command reads, or `None` for every other command.
+    fn for_semctl_cmd(cmd: u64) -> Option<Self> {
+        match cmd {
+            LINUX_GETNCNT => Some(Self::Increase),
+            LINUX_GETZCNT => Some(Self::Zero),
+            _ => None,
+        }
+    }
+}
+
+/// One semaphore set's blocked-waiter counters, shared by `Arc` so every
+/// in-process fork clone of the dispatcher reads and writes the same authority.
+type SemWaitCounters = Arc<Mutex<Vec<SemWaitCounts>>>;
+
+/// Carrick's own blocked-waiter counts for one semaphore of a set.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SemWaitCounts {
+    increase: u32,
+    zero: u32,
+}
+
+impl SemWaitCounts {
+    fn get(self, kind: SemWaitKind) -> u32 {
+        match kind {
+            SemWaitKind::Increase => self.increase,
+            SemWaitKind::Zero => self.zero,
+        }
+    }
+
+    fn slot_mut(&mut self, kind: SemWaitKind) -> &mut u32 {
+        match kind {
+            SemWaitKind::Increase => &mut self.increase,
+            SemWaitKind::Zero => &mut self.zero,
+        }
+    }
+
+    fn enter_wait(&mut self, kind: SemWaitKind) {
+        let slot = self.slot_mut(kind);
+        *slot = slot.saturating_add(1);
+    }
+
+    fn leave_wait(&mut self, kind: SemWaitKind) {
+        let slot = self.slot_mut(kind);
+        *slot = slot.saturating_sub(1);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -579,6 +655,16 @@ impl SemSet {
             .get(index)
             .copied()
             .flatten()
+    }
+
+    /// Carrick's blocked-waiter count for one semaphore, the value semctl
+    /// `GETNCNT`/`GETZCNT` must report.
+    fn logical_wait_count(&self, semnum: i32, kind: SemWaitKind) -> Option<u32> {
+        let index = usize::try_from(semnum).ok()?;
+        self.logical_wait_counts
+            .lock()
+            .get(index)
+            .map(|counts| counts.get(kind))
     }
 }
 
@@ -2910,6 +2996,10 @@ impl SyscallDispatcher {
                             ctime: now,
                             otime: 0,
                             logical_last_operators: Arc::new(Mutex::new(vec![None; nsems_usize])),
+                            logical_wait_counts: Arc::new(Mutex::new(vec![
+                                SemWaitCounts::default();
+                                nsems_usize
+                            ])),
                         },
                     );
                     if key != LINUX_IPC_PRIVATE {
@@ -3420,32 +3510,147 @@ const LINUX_GETZCNT: u64 = 15;
 const LINUX_SETVAL: u64 = 16;
 const LINUX_SETALL: u64 = 17;
 
+/// One parked `semop`'s contribution to a set's `semncnt`/`semzcnt`, held for
+/// exactly as long as the caller is parked. Every registered entry is undone
+/// on `Drop`, so no early return — satisfied, EAGAIN on timeout, EINTR, EIDRM
+/// or any other host error — can leak a count.
+struct SemWaitRegistration {
+    counts: SemWaitCounters,
+    entries: Vec<(usize, SemWaitKind)>,
+}
+
+impl SemWaitRegistration {
+    /// Count this caller against every operation that can park it. The whole
+    /// `sops` array is applied atomically by Linux, so a blocked caller is
+    /// waiting on each of its decrement (`GETNCNT`) and wait-for-zero
+    /// (`GETZCNT`) operations at once.
+    fn arm(counts: &SemWaitCounters, sops: &[carrick_portable::Sembuf]) -> Self {
+        let mut entries = Vec::new();
+        {
+            let mut slots = counts.lock();
+            for sop in sops {
+                let Some(kind) = SemWaitKind::for_op(sop.sem_op) else {
+                    continue;
+                };
+                let index = usize::from(sop.sem_num);
+                let Some(slot) = slots.get_mut(index) else {
+                    continue;
+                };
+                slot.enter_wait(kind);
+                entries.push((index, kind));
+            }
+        }
+        Self {
+            counts: Arc::clone(counts),
+            entries,
+        }
+    }
+}
+
+impl Drop for SemWaitRegistration {
+    fn drop(&mut self) {
+        let mut slots = self.counts.lock();
+        for (index, kind) in self.entries.drain(..) {
+            if let Some(slot) = slots.get_mut(index) {
+                slot.leave_wait(kind);
+            }
+        }
+    }
+}
+
+/// Publishes the guest thread's Blocked/'S' run state for as long as it is
+/// parked in a SysV IPC wait. For `semop` it also carries the blocked-waiter
+/// registration behind `GETNCNT`/`GETZCNT`, so the counts a sibling guest
+/// process reads have exactly the same lifetime as the 'S' state that LTP's
+/// `TST_PROCESS_STATE_WAIT` polls for before reading them.
 struct SysvSemBlockStateGuard {
     tid: crate::thread::ThreadId,
+    waits: Option<SemWaitRegistration>,
 }
 
 impl SysvSemBlockStateGuard {
     fn new(tid: crate::thread::ThreadId) -> Self {
+        Self::with_waits(tid, None)
+    }
+
+    fn for_semop(
+        tid: crate::thread::ThreadId,
+        counts: &SemWaitCounters,
+        sops: &[carrick_portable::Sembuf],
+    ) -> Self {
+        Self::with_waits(tid, Some(SemWaitRegistration::arm(counts, sops)))
+    }
+
+    fn with_waits(tid: crate::thread::ThreadId, waits: Option<SemWaitRegistration>) -> Self {
         crate::run_state::publish(crate::run_state::RunState::Blocked);
         crate::thread::set_current_thread_state(tid, 'S');
         crate::run_state::publish_guest_tid(tid.raw(), crate::run_state::RunState::Blocked);
-        Self { tid }
+        Self { tid, waits }
     }
 }
 
 impl Drop for SysvSemBlockStateGuard {
     fn drop(&mut self) {
+        self.waits = None;
         crate::thread::set_current_thread_state(self.tid, 'R');
         crate::run_state::publish_guest_tid(self.tid.raw(), crate::run_state::RunState::Running);
         crate::run_state::publish(crate::run_state::RunState::Running);
     }
 }
 
+fn semop_is_nowait(sop: &carrick_portable::Sembuf) -> bool {
+    SemOpFlags::from_bits_retain(sop.sem_flg as u16).contains(SemOpFlags::NOWAIT)
+}
+
 fn semop_may_block(sops: &[carrick_portable::Sembuf]) -> bool {
-    sops.iter().any(|s| {
-        s.sem_op <= 0
-            && !SemOpFlags::from_bits_retain(s.sem_flg as u16).contains(SemOpFlags::NOWAIT)
-    })
+    sops.iter().any(|s| s.sem_op <= 0 && !semop_is_nowait(s))
+}
+
+/// Index of the first `sops` entry that cannot be performed against the set's
+/// current values, evaluating the array in order the way Linux applies it.
+/// `None` means every operation was satisfiable at the moment of the read, or
+/// that the values could not be read — in both cases the caller must not claim
+/// to know which operation blocked.
+fn first_blocking_semop(semid: i32, sops: &[carrick_portable::Sembuf]) -> Option<usize> {
+    let host_cmd = linux_semctl_cmd_to_host(LINUX_GETVAL)?;
+    let mut values: HashMap<u16, LinuxSemValue> = HashMap::new();
+    for (index, sop) in sops.iter().enumerate() {
+        let value = match values.get(&sop.sem_num).copied() {
+            Some(value) => value,
+            None => {
+                let raw =
+                    unsafe { carrick_portable::semctl0(semid, i32::from(sop.sem_num), host_cmd) };
+                let value = LinuxSemValue::from_host(raw.host_syscall_errno().ok()?);
+                values.insert(sop.sem_num, value);
+                value
+            }
+        };
+        let next = match sop.sem_op.cmp(&0) {
+            std::cmp::Ordering::Greater => value.checked_add(sop.sem_op)?,
+            std::cmp::Ordering::Less => match value.checked_sub(sop.sem_op) {
+                Some(next) => next,
+                None => return Some(index),
+            },
+            std::cmp::Ordering::Equal if value.is_zero() => value,
+            std::cmp::Ordering::Equal => return Some(index),
+        };
+        values.insert(sop.sem_num, next);
+    }
+    None
+}
+
+/// Would this `semop` fail with EAGAIN rather than park? Linux blocks only when
+/// the operation that cannot be performed lacks IPC_NOWAIT; when it carries the
+/// flag the call fails immediately. Carrick forces NOWAIT on the host array to
+/// keep the wait interruptible, so the host's EAGAIN cannot distinguish the two
+/// and this decides it from the guest's own flags.
+fn semop_nowait_rejects(semid: i32, sops: &[carrick_portable::Sembuf]) -> bool {
+    if !sops.iter().any(semop_is_nowait) {
+        return false;
+    }
+    first_blocking_semop(semid, sops)
+        .and_then(|index| sops.get(index))
+        .is_some_and(semop_is_nowait)
 }
 
 fn validate_semop_value_ranges(
@@ -3486,19 +3691,32 @@ fn validate_semop_value_ranges(
     Ok(())
 }
 
+/// The set-scoped state a parked `semop` needs: the shared blocked-waiter
+/// counters to publish itself into, the predicate that decides EINTR, and the
+/// completion hook that records `sempid`.
+struct SemopWaitCtx<'a> {
+    wait_counts: &'a SemWaitCounters,
+    interrupted: &'a dyn Fn() -> bool,
+    completed: &'a dyn Fn(&[carrick_portable::Sembuf]),
+}
+
 /// Shared semop / semtimedop core. Reads the `nsops` sembuf entries (Linux ==
-/// macOS layout) and forwards to host `semop`. For a timed wait (macOS has no
-/// semtimedop) it retries an IPC_NOWAIT variant until the deadline, mapping a
-/// would-block to ETIMEDOUT/EAGAIN per the deadline.
+/// macOS layout) and forwards to host `semop`. macOS has no `semtimedop` and a
+/// host `semop` cannot be interrupted, so both forms poll an IPC_NOWAIT variant
+/// and decide blocking, timeout and EINTR here.
 fn sysv_semop<M: GuestMemory>(
     cx: &mut SyscallCtx<M>,
     semid: i32,
     sops_addr: u64,
     nsops: usize,
     timeout: Option<LinuxTimespec>,
-    interrupted: &dyn Fn() -> bool,
-    completed: &dyn Fn(&[carrick_portable::Sembuf]),
+    wait: SemopWaitCtx<'_>,
 ) -> Result<DispatchOutcome, DispatchError> {
+    let SemopWaitCtx {
+        wait_counts,
+        interrupted,
+        completed,
+    } = wait;
     if nsops == 0 {
         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
     }
@@ -3523,7 +3741,6 @@ fn sysv_semop<M: GuestMemory>(
         return Ok(DispatchOutcome::errno(errno));
     }
     let may_block = semop_may_block(&sops);
-    let _block_state = may_block.then(|| SysvSemBlockStateGuard::new(cx.tid()));
 
     // BOTH the timed and untimed forms poll with IPC_NOWAIT. Forcing NOWAIT on
     // every op means the host call returns EAGAIN instead of blocking inside
@@ -3547,6 +3764,12 @@ fn sysv_semop<M: GuestMemory>(
     for s in &mut nowait {
         s.sem_flg |= SemOpFlags::NOWAIT.bits() as i16;
     }
+    // Armed on the first would-block, not before: a `semop` that is satisfiable
+    // right away neither sleeps ('S') nor counts towards semncnt/semzcnt. Both
+    // facts are published by this one guard, so the counts LTP semctl01 reads
+    // after `TST_PROCESS_STATE_WAIT(pid, 'S')` are already up, and every exit
+    // path below unwinds them.
+    let mut block_state: Option<SysvSemBlockStateGuard> = None;
     let mut saw_would_block = false;
     loop {
         if interrupted() {
@@ -3561,10 +3784,25 @@ fn sysv_semop<M: GuestMemory>(
             }
             Err(e) if e == LINUX_EAGAIN => {
                 saw_would_block = true;
+                // The forced NOWAIT is carrick's, not the guest's. When the
+                // operation that actually blocked carries the guest's own
+                // IPC_NOWAIT, semop(2) fails with EAGAIN instead of waiting —
+                // `!may_block` is the exact all-NOWAIT case, and a mixed array
+                // needs the current values to say which operation blocked.
+                if !may_block || semop_nowait_rejects(semid, &sops) {
+                    return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                }
                 // Only the TIMED form gives up: semtimedop(2) returns EAGAIN on
                 // timeout. The untimed form keeps waiting, as semop(2) does.
                 if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                     return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                }
+                if block_state.is_none() {
+                    block_state = Some(SysvSemBlockStateGuard::for_semop(
+                        cx.tid(),
+                        wait_counts,
+                        &sops,
+                    ));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
@@ -3614,13 +3852,16 @@ fn linux_semctl_cmd_to_host(cmd: u64) -> Option<i32> {
 }
 
 impl SyscallDispatcher {
-    fn host_semid_for_guest(&self, semid: i32) -> Result<HostSemId, LinuxErrno> {
+    /// The host set plus the shared blocked-waiter counters a `semop` needs.
+    /// The `Arc` is cloned out here so the poll loop below never holds the
+    /// dispatcher's `sysv` lock while parked.
+    fn sem_semop_target(&self, semid: i32) -> Result<(HostSemId, SemWaitCounters), LinuxErrno> {
         let guest_semid = GuestSemId::from_syscall_arg(semid)?;
         let state = self.sysv.lock();
         state
             .semaphores
             .get(&guest_semid)
-            .map(|meta| meta.host_id)
+            .map(|meta| (meta.host_id, Arc::clone(&meta.logical_wait_counts)))
             .ok_or(LINUX_EINVAL)
     }
 
@@ -3632,8 +3873,8 @@ impl SyscallDispatcher {
         nsops: usize,
         timeout: Option<LinuxTimespec>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let host_id = match self.host_semid_for_guest(semid) {
-            Ok(host_id) => host_id,
+        let (host_id, wait_counts) = match self.sem_semop_target(semid) {
+            Ok(target) => target,
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
         };
         let guest_semid = match GuestSemId::from_syscall_arg(semid) {
@@ -3644,28 +3885,33 @@ impl SyscallDispatcher {
             .hvpatch_process()
             .map(|_| cx.kernel.task().key().id.raw());
         let tid = cx.tid();
+        let interrupted = || {
+            crate::host_signal::has_unblocked_pending_for(
+                tid.raw(),
+                carrick_abi::SigBlockMask::NONE,
+            ) || self.has_deliverable_dispatch_pending_for_wait(
+                cx.kernel,
+                tid,
+                carrick_abi::WaitSigMask::NONE,
+            )
+        };
+        let completed = |sops: &[carrick_portable::Sembuf]| {
+            if let Some(pid) = logical_operator
+                && let Some(meta) = self.sysv.lock().semaphores.get(&guest_semid)
+            {
+                meta.record_logical_semop(pid, sops);
+            }
+        };
         sysv_semop(
             cx,
             host_id.raw(),
             sops_addr,
             nsops,
             timeout,
-            &|| {
-                crate::host_signal::has_unblocked_pending_for(
-                    tid.raw(),
-                    carrick_abi::SigBlockMask::NONE,
-                ) || self.has_deliverable_dispatch_pending_for_wait(
-                    cx.kernel,
-                    tid,
-                    carrick_abi::WaitSigMask::NONE,
-                )
-            },
-            &|sops| {
-                if let Some(pid) = logical_operator
-                    && let Some(meta) = self.sysv.lock().semaphores.get(&guest_semid)
-                {
-                    meta.record_logical_semop(pid, sops);
-                }
+            SemopWaitCtx {
+                wait_counts: &wait_counts,
+                interrupted: &interrupted,
+                completed: &completed,
             },
         )
     }
@@ -3747,7 +3993,7 @@ impl SyscallDispatcher {
         let logical_operator = self
             .hvpatch_process()
             .map(|_| cx.kernel.task().key().id.raw());
-        let (host_id, logical_getpid) = {
+        let (host_id, logical_getpid, logical_wait_count) = {
             let state = self.sysv.lock();
             let Some(meta) = state.semaphores.get(&guest_semid) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -3758,16 +4004,25 @@ impl SyscallDispatcher {
             let logical_getpid = (cmd == LINUX_GETPID && logical_operator.is_some())
                 .then(|| meta.logical_last_operator(semnum))
                 .flatten();
-            (meta.host_id, logical_getpid)
+            // GETNCNT/GETZCNT come from carrick on every lane, not just under
+            // HVPatch: carrick's waiters poll the host set with IPC_NOWAIT, so
+            // the host's own semncnt/semzcnt are 0 no matter who is parked.
+            let logical_wait_count = SemWaitKind::for_semctl_cmd(cmd)
+                .and_then(|kind| meta.logical_wait_count(semnum, kind));
+            (meta.host_id, logical_getpid, logical_wait_count)
         };
 
         let mut out = sysv_semctl(cx, host_id.raw(), semnum, cmd, arg, creds)?;
-        if matches!(out, DispatchOutcome::Returned { .. })
-            && let Some(pid) = logical_getpid
-        {
-            out = DispatchOutcome::Returned {
-                value: i64::from(pid),
-            };
+        if matches!(out, DispatchOutcome::Returned { .. }) {
+            if let Some(pid) = logical_getpid {
+                out = DispatchOutcome::Returned {
+                    value: i64::from(pid),
+                };
+            } else if let Some(count) = logical_wait_count {
+                out = DispatchOutcome::Returned {
+                    value: i64::from(count),
+                };
+            }
         }
         if matches!(out, DispatchOutcome::Returned { value: 0 }) {
             let mut state = self.sysv.lock();
@@ -4243,6 +4498,7 @@ mod ipc_set_tests {
             ctime: 0,
             otime: 0,
             logical_last_operators: Arc::new(Mutex::new(vec![None; 3])),
+            logical_wait_counts: Arc::new(Mutex::new(vec![SemWaitCounts::default(); 3])),
         };
         let child = parent.clone();
         child.record_logical_semop(
@@ -4256,6 +4512,354 @@ mod ipc_set_tests {
 
         assert_eq!(parent.logical_last_operator(0), None);
         assert_eq!(parent.logical_last_operator(2), Some(73));
+    }
+
+    /// A live host semaphore set, removed when the fixture drops.
+    struct HostSemFixture {
+        id: i32,
+    }
+
+    impl HostSemFixture {
+        fn new(nsems: i32) -> Self {
+            let rc = unsafe {
+                carrick_portable::semget(LINUX_IPC_PRIVATE as libc::key_t, nsems, 0o600 | 0o1000)
+            };
+            let id = rc.host_syscall_errno().expect("create host semaphore set");
+            Self { id }
+        }
+
+        fn value(&self, semnum: i32) -> i32 {
+            let cmd = linux_semctl_cmd_to_host(LINUX_GETVAL).expect("host GETVAL");
+            let rc = unsafe { carrick_portable::semctl0(self.id, semnum, cmd) };
+            rc.host_syscall_errno().expect("read host semval")
+        }
+
+        fn post(&self, semnum: u16) {
+            let mut sops = [carrick_portable::Sembuf {
+                sem_num: semnum,
+                sem_op: 1,
+                sem_flg: 0,
+            }];
+            let rc = unsafe { carrick_portable::semop(self.id, sops.as_mut_ptr(), 1) };
+            rc.host_syscall_errno().expect("post host semaphore");
+        }
+
+        fn remove(&self) {
+            let _ = unsafe { carrick_portable::semctl0(self.id, 0, libc::IPC_RMID) };
+        }
+    }
+
+    impl Drop for HostSemFixture {
+        fn drop(&mut self) {
+            self.remove();
+        }
+    }
+
+    fn sembuf_bytes(sops: &[carrick_portable::Sembuf]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(sops.len() * 6);
+        for sop in sops {
+            bytes.extend_from_slice(&sop.sem_num.to_le_bytes());
+            bytes.extend_from_slice(&sop.sem_op.to_le_bytes());
+            bytes.extend_from_slice(&sop.sem_flg.to_le_bytes());
+        }
+        bytes
+    }
+
+    const SEMOP_TEST_SOPS_ADDR: u64 = 0x1000;
+
+    /// Drive the real `sysv_semop` poll loop against a live host set. `on_wait`
+    /// runs on every `interrupted()` consultation with the observed count for
+    /// `(watch_semnum, watch_kind)`, and returns whether to interrupt — which is
+    /// how each exit path is steered without a second thread.
+    fn run_semop_probe(
+        fixture: &HostSemFixture,
+        sops: &[carrick_portable::Sembuf],
+        timeout: Option<LinuxTimespec>,
+        counts: &SemWaitCounters,
+        watch: (i32, SemWaitKind),
+        on_wait: impl Fn(usize, u32) -> bool,
+    ) -> DispatchOutcome {
+        let dispatcher = SyscallDispatcher::new();
+        let kernel = dispatcher
+            .capture_one_task_context()
+            .expect("kernel context");
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(SEMOP_TEST_SOPS_ADDR, vec![0; 0x1000]);
+        memory
+            .write_bytes(SEMOP_TEST_SOPS_ADDR, &sembuf_bytes(sops))
+            .expect("stage sembuf array");
+        let mut cx = SyscallCtx {
+            kernel: &kernel,
+            request: SyscallRequest::new(193, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+        };
+        let (watch_semnum, watch_kind) = watch;
+        let consultations = std::cell::Cell::new(0usize);
+        let interrupted = || -> bool {
+            let index = usize::try_from(watch_semnum).expect("watch semnum");
+            let observed = counts.lock().get(index).map_or(0, |c| c.get(watch_kind));
+            let calls = consultations.get() + 1;
+            consultations.set(calls);
+            on_wait(calls, observed)
+        };
+        sysv_semop(
+            &mut cx,
+            fixture.id,
+            SEMOP_TEST_SOPS_ADDR,
+            sops.len(),
+            timeout,
+            SemopWaitCtx {
+                wait_counts: counts,
+                interrupted: &interrupted,
+                completed: &|_| {},
+            },
+        )
+        .expect("semop probe dispatch")
+    }
+
+    fn decrement_sop(sem_num: u16, sem_flg: i16) -> carrick_portable::Sembuf {
+        carrick_portable::Sembuf {
+            sem_num,
+            sem_op: -1,
+            sem_flg,
+        }
+    }
+
+    fn wait_zero_sop(sem_num: u16, sem_flg: i16) -> carrick_portable::Sembuf {
+        carrick_portable::Sembuf {
+            sem_num,
+            sem_op: 0,
+            sem_flg,
+        }
+    }
+
+    fn fresh_wait_counts(nsems: usize) -> SemWaitCounters {
+        Arc::new(Mutex::new(vec![SemWaitCounts::default(); nsems]))
+    }
+
+    fn peak_wait_count(counts: &SemWaitCounters, kind: SemWaitKind) -> u32 {
+        counts
+            .lock()
+            .iter()
+            .map(|slot| slot.get(kind))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// GETNCNT must count a parked `sem_op < 0` waiter and drop back to zero on
+    /// EVERY way out of the poll loop: satisfied, EINTR, EAGAIN-on-timeout, and
+    /// the set being removed underneath the waiter.
+    #[test]
+    fn semop_wait_counts_rise_while_parked_and_unwind_on_every_exit() {
+        // Satisfied: the value rises while the caller is parked.
+        let fixture = HostSemFixture::new(2);
+        let counts = fresh_wait_counts(2);
+        let observed = std::cell::Cell::new(0u32);
+        let outcome = run_semop_probe(
+            &fixture,
+            &[decrement_sop(1, 0)],
+            None,
+            &counts,
+            (1, SemWaitKind::Increase),
+            |calls, count| {
+                observed.set(observed.get().max(count));
+                if calls == 2 {
+                    fixture.post(1);
+                }
+                false
+            },
+        );
+        assert!(
+            matches!(outcome, DispatchOutcome::Returned { value: 0 }),
+            "a posted semaphore completes the wait: {outcome:?}"
+        );
+        assert_eq!(observed.get(), 1, "the parked waiter must show in semncnt");
+        assert_eq!(peak_wait_count(&counts, SemWaitKind::Increase), 0);
+        assert_eq!(fixture.value(1), 0, "the decrement must have been applied");
+
+        // EINTR.
+        let counts = fresh_wait_counts(2);
+        let observed = std::cell::Cell::new(0u32);
+        let outcome = run_semop_probe(
+            &fixture,
+            &[decrement_sop(1, 0)],
+            None,
+            &counts,
+            (1, SemWaitKind::Increase),
+            |calls, count| {
+                observed.set(observed.get().max(count));
+                calls >= 2
+            },
+        );
+        assert!(
+            matches!(outcome, DispatchOutcome::Errno { errno } if errno == LINUX_EINTR),
+            "an interrupted wait reports EINTR: {outcome:?}"
+        );
+        assert_eq!(observed.get(), 1);
+        assert_eq!(peak_wait_count(&counts, SemWaitKind::Increase), 0);
+
+        // EAGAIN on a semtimedop deadline, counted as a GETZCNT waiter.
+        fixture.post(0);
+        let counts = fresh_wait_counts(2);
+        let observed = std::cell::Cell::new(0u32);
+        let outcome = run_semop_probe(
+            &fixture,
+            &[wait_zero_sop(0, 0)],
+            Some(LinuxTimespec {
+                tv_sec: 0,
+                tv_nsec: 20_000_000,
+            }),
+            &counts,
+            (0, SemWaitKind::Zero),
+            |_, count| {
+                observed.set(observed.get().max(count));
+                false
+            },
+        );
+        assert!(
+            matches!(outcome, DispatchOutcome::Errno { errno } if errno == LINUX_EAGAIN),
+            "a timed wait that expires reports EAGAIN: {outcome:?}"
+        );
+        assert_eq!(observed.get(), 1, "the parked waiter must show in semzcnt");
+        assert_eq!(peak_wait_count(&counts, SemWaitKind::Zero), 0);
+
+        // The set is removed while the caller is parked: EIDRM, no leaked count.
+        let counts = fresh_wait_counts(2);
+        let observed = std::cell::Cell::new(0u32);
+        let outcome = run_semop_probe(
+            &fixture,
+            &[decrement_sop(1, 0)],
+            None,
+            &counts,
+            (1, SemWaitKind::Increase),
+            |calls, count| {
+                observed.set(observed.get().max(count));
+                if calls == 2 {
+                    fixture.remove();
+                }
+                false
+            },
+        );
+        assert!(
+            matches!(outcome, DispatchOutcome::Errno { errno } if errno == crate::linux_abi::LINUX_EIDRM),
+            "a removed set reports EIDRM: {outcome:?}"
+        );
+        assert_eq!(observed.get(), 1);
+        assert_eq!(peak_wait_count(&counts, SemWaitKind::Increase), 0);
+    }
+
+    /// The forced IPC_NOWAIT that keeps the wait interruptible is CARRICK's, not
+    /// the guest's. An operation carrying the guest's own IPC_NOWAIT must fail
+    /// with EAGAIN on the first attempt — before `interrupted()` is consulted a
+    /// second time — instead of joining the retry loop. LTP semop02 hung here.
+    #[test]
+    fn guest_nowait_semop_fails_immediately_instead_of_polling() {
+        let fixture = HostSemFixture::new(2);
+        let counts = fresh_wait_counts(2);
+        let nowait = SemOpFlags::NOWAIT.bits() as i16;
+
+        // sem_op = -1 against a zero value.
+        let outcome = run_semop_probe(
+            &fixture,
+            &[decrement_sop(1, nowait)],
+            None,
+            &counts,
+            (1, SemWaitKind::Increase),
+            |calls, _| {
+                assert_eq!(calls, 1, "a guest IPC_NOWAIT op must not park");
+                false
+            },
+        );
+        assert!(
+            matches!(outcome, DispatchOutcome::Errno { errno } if errno == LINUX_EAGAIN),
+            "IPC_NOWAIT decrement must fail with EAGAIN: {outcome:?}"
+        );
+        assert_eq!(peak_wait_count(&counts, SemWaitKind::Increase), 0);
+
+        // sem_op = 0 against a non-zero value.
+        fixture.post(0);
+        let outcome = run_semop_probe(
+            &fixture,
+            &[wait_zero_sop(0, nowait)],
+            None,
+            &counts,
+            (0, SemWaitKind::Zero),
+            |calls, _| {
+                assert_eq!(calls, 1, "a guest IPC_NOWAIT op must not park");
+                false
+            },
+        );
+        assert!(
+            matches!(outcome, DispatchOutcome::Errno { errno } if errno == LINUX_EAGAIN),
+            "IPC_NOWAIT wait-for-zero must fail with EAGAIN: {outcome:?}"
+        );
+        assert_eq!(peak_wait_count(&counts, SemWaitKind::Zero), 0);
+
+        // Mixed array: semaphore 0 is non-zero so the leading decrement is
+        // satisfiable, and semaphore 1 is non-zero so the trailing wait-for-zero
+        // is the operation that blocks — and it carries IPC_NOWAIT, so the whole
+        // call fails rather than parking on the other operation.
+        fixture.post(1);
+        let outcome = run_semop_probe(
+            &fixture,
+            &[decrement_sop(0, 0), wait_zero_sop(1, nowait)],
+            None,
+            &counts,
+            (1, SemWaitKind::Zero),
+            |calls, _| {
+                assert!(calls <= 1, "a blocking IPC_NOWAIT op must not park");
+                false
+            },
+        );
+        assert!(
+            matches!(outcome, DispatchOutcome::Errno { errno } if errno == LINUX_EAGAIN),
+            "mixed array with a blocking IPC_NOWAIT op must fail: {outcome:?}"
+        );
+        assert_eq!(peak_wait_count(&counts, SemWaitKind::Zero), 0);
+    }
+
+    #[test]
+    fn logical_wait_counts_are_shared_across_in_process_fork_clones() {
+        let parent = SemSet {
+            key: LINUX_IPC_PRIVATE,
+            host_id: HostSemId(0),
+            scan_index: SemScanIndex(0),
+            nsems: 3,
+            mode: ShmPermMode::requested(0o600),
+            uid: NsUid::ROOT,
+            gid: NsGid::ROOT,
+            cuid: NsUid::ROOT,
+            cgid: NsGid::ROOT,
+            ctime: 0,
+            otime: 0,
+            logical_last_operators: Arc::new(Mutex::new(vec![None; 3])),
+            logical_wait_counts: Arc::new(Mutex::new(vec![SemWaitCounts::default(); 3])),
+        };
+        let child = parent.clone();
+
+        {
+            let _first = SemWaitRegistration::arm(
+                &child.logical_wait_counts,
+                &[decrement_sop(2, 0), wait_zero_sop(1, 0)],
+            );
+            let _second =
+                SemWaitRegistration::arm(&child.logical_wait_counts, &[decrement_sop(2, 0)]);
+
+            assert_eq!(
+                parent.logical_wait_count(2, SemWaitKind::Increase),
+                Some(2),
+                "a sibling process must see both waiters"
+            );
+            assert_eq!(parent.logical_wait_count(1, SemWaitKind::Zero), Some(1));
+            assert_eq!(parent.logical_wait_count(2, SemWaitKind::Zero), Some(0));
+            assert_eq!(parent.logical_wait_count(0, SemWaitKind::Increase), Some(0));
+            assert_eq!(parent.logical_wait_count(3, SemWaitKind::Increase), None);
+        }
+
+        assert_eq!(parent.logical_wait_count(2, SemWaitKind::Increase), Some(0));
+        assert_eq!(parent.logical_wait_count(1, SemWaitKind::Zero), Some(0));
     }
 
     #[test]
