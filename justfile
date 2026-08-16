@@ -164,7 +164,7 @@ test *ARGS:
         # cases execute real guests. This recipe is defined as the tests that do
         # NOT need the HVF runtime or Docker; those belong to a guest-capable
         # lane.
-        cargo test --workspace --exclude carrick-runtime --exclude carrick-cli --exclude carrick-native-darwin --lib --bins {{ARGS}}
+        cargo test --workspace --exclude carrick-runtime --exclude carrick-cli --exclude carrick-native-darwin --exclude carrick-host --lib --bins {{ARGS}}
         # The authenticated jit-shape builders/parsers have measured >1 MiB
         # debug frames. Several tests need two in one body; libtest's ~2 MiB
         # default has repeatedly been tipped over by unrelated additions. Keep
@@ -173,6 +173,19 @@ test *ARGS:
         # crate (see `test(debug): bound the jit-shape publication test's stack`).
         env RUST_MIN_STACK=8388608 cargo test -p carrick-cli --bin carrick {{ARGS}}
         env RUST_TEST_THREADS=1 cargo test -p carrick-native-darwin --lib {{ARGS}}
+        # carrick-host needs the same serial treatment, for the same reason and
+        # one more. Its `guest_cpu` tests `libc::fork()` from the harness and
+        # drive a real SIGSTOP/waitpid handshake with the child; its
+        # `ulock::imp::reexec_tests` fork too. `guest_cpu`'s own `TEST_LOCK`
+        # cannot cover that: wait/reap is PROCESS-wide, so a fork test in
+        # another module is free to observe or reap a child `guest_cpu` is
+        # mid-handshake with, and the rightful parent then blocks forever on a
+        # stop that was already consumed. Observed on 2026-08-16: four
+        # `guest_cpu` cases sat >11 minutes at 0% CPU with the forked child
+        # parked in `raise(SIGSTOP)` (`guest_cpu.rs:1672`) and the run only
+        # completed after a debugger attach resumed it — an indefinite gate
+        # hang, not a slow test.
+        env RUST_TEST_THREADS=1 cargo test -p carrick-host --lib {{ARGS}}
         env RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib {{ARGS}}
         exit 0
     fi
