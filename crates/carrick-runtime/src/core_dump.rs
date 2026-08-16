@@ -704,11 +704,19 @@ impl CoreDump<'_> {
     /// the caller's effective Linux `RLIMIT_CORE`; equality is permitted.
     pub fn to_bytes_bounded(&self, limit: u64) -> Result<Vec<u8>, CoreDumpError> {
         self.validate()?;
-        let bytes = self.try_to_bytes()?;
-        let required = u64::try_from(bytes.len()).map_err(|_| CoreDumpError::LayoutOverflow)?;
-        if required > limit {
-            return Err(CoreDumpError::LimitExceeded { limit, required });
-        }
+        let mut bytes = self.try_to_bytes()?;
+        // core(5): RLIMIT_CORE is the maximum SIZE of the core file, and a dump
+        // that would exceed it is TRUNCATED — the process still counts as
+        // having dumped core. Refusing the whole publication instead cleared
+        // WCOREDUMP, which is what LTP waitpid01 catches: it deliberately sets
+        // RLIMIT_CORE to one page and still asserts WCOREDUMP for all ten
+        // core-carrying signals in both its variants (20 assertions).
+        //
+        // A zero limit means "no core at all" and is handled by the caller
+        // before we are reached, so a truncated prefix here is never mistaken
+        // for a suppressed dump.
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        bytes.truncate(limit);
         Ok(bytes)
     }
 
@@ -1058,19 +1066,27 @@ mod tests {
         ));
     }
 
-    /// RLIMIT_CORE is a hard byte bound: no prefix is a valid publication.
+    /// core(5): RLIMIT_CORE bounds the core file's SIZE and an oversized dump
+    /// is TRUNCATED, not refused — the process still counts as having dumped
+    /// core. This assertion used to demand the opposite, which is what kept
+    /// WCOREDUMP clear for LTP waitpid01.
     #[test]
-    fn bounded_writer_refuses_a_core_larger_than_the_limit() {
+    fn bounded_writer_truncates_a_core_larger_than_the_limit() {
         let dump = sample();
-        let required = dump.to_bytes().len() as u64;
-        assert!(matches!(
-            dump.to_bytes_bounded(required - 1),
-            Err(CoreDumpError::LimitExceeded { limit, required: actual })
-                if limit == required - 1 && actual == required
-        ));
+        let full = dump.to_bytes();
+        let required = full.len() as u64;
+
+        let truncated = dump
+            .to_bytes_bounded(required - 1)
+            .expect("an oversized core is truncated, not refused");
+        assert_eq!(truncated.len() as u64, required - 1);
+        assert_eq!(truncated[..], full[..full.len() - 1]);
+
+        assert_eq!(dump.to_bytes_bounded(required).expect("exact limit"), full);
         assert_eq!(
-            dump.to_bytes_bounded(required).expect("exact limit"),
-            dump.to_bytes()
+            dump.to_bytes_bounded(u64::MAX).expect("unbounded"),
+            full,
+            "a limit above the requirement must not truncate"
         );
     }
 

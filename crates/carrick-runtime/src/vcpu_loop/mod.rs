@@ -2006,12 +2006,12 @@ where
                         "core readable-region byte count overflowed".to_owned(),
                     )
                 })?;
-            if readable_bytes > process.rlimit_core {
-                return Err(RuntimeError::Configuration(format!(
-                    "core readable regions require at least {readable_bytes} bytes, exceeding RLIMIT_CORE {}",
-                    process.rlimit_core
-                )));
-            }
+            // No pre-emptive refusal on size: core(5) truncates an oversized
+            // dump rather than suppressing it, and `to_bytes_bounded` applies
+            // RLIMIT_CORE at serialisation. Failing closed here published NO
+            // core and therefore cleared WCOREDUMP for any process whose
+            // readable regions merely exceeded the limit.
+            let _ = readable_bytes;
             let mut region_bytes = Vec::with_capacity(process.maps.len());
             for map in &process.maps {
                 if !map.read {
