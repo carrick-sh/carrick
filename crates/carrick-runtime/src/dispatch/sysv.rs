@@ -26,6 +26,7 @@
 
 use super::*;
 use crate::linux_abi::{LINUX_EIO, LINUX_ENOMSG, LINUX_ENOSPC, LinuxErrno};
+use carrick_abi::{NsGid, NsUid};
 
 syscall_table! {
     /// Per-module syscall routing for the `sysv` subsystem (Task A1).
@@ -299,10 +300,10 @@ pub(super) struct ShmSegment {
     pub size: usize,
     /// Guest-visible SysV shm permission/mode bits.
     pub mode: ShmPermMode,
-    pub uid: u32,
-    pub gid: u32,
-    pub cuid: u32,
-    pub cgid: u32,
+    pub uid: NsUid,
+    pub gid: NsGid,
+    pub cuid: NsUid,
+    pub cgid: NsGid,
     /// Number of live attaches in THIS process. Linux's `shm_nattch` is a
     /// PROCESS-AGGREGATED counter — shmat across siblings each increments
     /// it. Since carrick guests fork into separate host processes that
@@ -326,7 +327,7 @@ pub(super) struct ShmSegment {
 
 impl ShmSegment {
     fn can_read(&self, creds: &crate::kernel::Credentials) -> bool {
-        creds.euid == 0
+        creds.euid.is_root()
             || if creds.euid == self.uid {
                 self.mode.owner_readable()
             } else {
@@ -335,7 +336,7 @@ impl ShmSegment {
     }
 
     fn can_write(&self, creds: &crate::kernel::Credentials) -> bool {
-        creds.euid == 0
+        creds.euid.is_root()
             || if creds.euid == self.uid {
                 self.mode.owner_writable()
             } else {
@@ -351,10 +352,10 @@ struct SemSet {
     scan_index: SemScanIndex,
     nsems: usize,
     mode: ShmPermMode,
-    uid: u32,
-    gid: u32,
-    cuid: u32,
-    cgid: u32,
+    uid: NsUid,
+    gid: NsGid,
+    cuid: NsUid,
+    cgid: NsGid,
     ctime: u64,
     otime: u64,
     /// Linux `sempid` per semaphore. Darwin records the one Carrick host pid,
@@ -528,11 +529,11 @@ impl SemScanIndex {
 
 impl SemSet {
     fn can_admin(&self, creds: &crate::kernel::Credentials) -> bool {
-        creds.euid == 0 || creds.euid == self.uid || creds.euid == self.cuid
+        creds.euid.is_root() || creds.euid == self.uid || creds.euid == self.cuid
     }
 
     fn can_read(&self, creds: &crate::kernel::Credentials) -> bool {
-        creds.euid == 0
+        creds.euid.is_root()
             || if creds.euid == self.uid {
                 self.mode.owner_readable()
             } else {
@@ -541,7 +542,7 @@ impl SemSet {
     }
 
     fn can_write(&self, creds: &crate::kernel::Credentials) -> bool {
-        creds.euid == 0
+        creds.euid.is_root()
             || if creds.euid == self.uid {
                 self.mode.owner_writable()
             } else {
@@ -861,10 +862,10 @@ struct MsgQueueFile {
     id: MsgQueueId,
     key: i32,
     mode: ShmPermMode,
-    uid: u32,
-    gid: u32,
-    cuid: u32,
-    cgid: u32,
+    uid: NsUid,
+    gid: NsGid,
+    cuid: NsUid,
+    cgid: NsGid,
     qbytes: u64,
     cbytes: u64,
     stime: u64,
@@ -905,11 +906,11 @@ impl MsgQueueFile {
     }
 
     fn can_admin(&self, creds: &crate::kernel::Credentials) -> bool {
-        creds.euid == 0 || creds.euid == self.uid || creds.euid == self.cuid
+        creds.euid.is_root() || creds.euid == self.uid || creds.euid == self.cuid
     }
 
     fn can_read(&self, creds: &crate::kernel::Credentials) -> bool {
-        creds.euid == 0
+        creds.euid.is_root()
             || if creds.euid == self.uid {
                 self.mode.owner_readable()
             } else {
@@ -918,7 +919,7 @@ impl MsgQueueFile {
     }
 
     fn can_write(&self, creds: &crate::kernel::Credentials) -> bool {
-        creds.euid == 0
+        creds.euid.is_root()
             || if creds.euid == self.uid {
                 self.mode.owner_writable()
             } else {
@@ -966,10 +967,10 @@ impl MsgQueueFile {
             mode: ShmPermMode {
                 bits: rd_u32(buf, MSG_OFF_MODE),
             },
-            uid: rd_u32(buf, MSG_OFF_UID),
-            gid: rd_u32(buf, MSG_OFF_GID),
-            cuid: rd_u32(buf, MSG_OFF_CUID),
-            cgid: rd_u32(buf, MSG_OFF_CGID),
+            uid: NsUid::new(rd_u32(buf, MSG_OFF_UID)),
+            gid: NsGid::new(rd_u32(buf, MSG_OFF_GID)),
+            cuid: NsUid::new(rd_u32(buf, MSG_OFF_CUID)),
+            cgid: NsGid::new(rd_u32(buf, MSG_OFF_CGID)),
             qbytes: rd_u64(buf, MSG_OFF_QBYTES),
             cbytes: rd_u64(buf, MSG_OFF_CBYTES),
             stime: rd_u64(buf, MSG_OFF_STIME),
@@ -994,10 +995,10 @@ impl MsgQueueFile {
         wr_i32(&mut buf, MSG_OFF_KEY, self.key);
         wr_i32(&mut buf, MSG_OFF_ID, self.id.raw());
         wr_u32(&mut buf, MSG_OFF_MODE, self.mode.raw());
-        wr_u32(&mut buf, MSG_OFF_UID, self.uid);
-        wr_u32(&mut buf, MSG_OFF_GID, self.gid);
-        wr_u32(&mut buf, MSG_OFF_CUID, self.cuid);
-        wr_u32(&mut buf, MSG_OFF_CGID, self.cgid);
+        wr_u32(&mut buf, MSG_OFF_UID, self.uid.raw());
+        wr_u32(&mut buf, MSG_OFF_GID, self.gid.raw());
+        wr_u32(&mut buf, MSG_OFF_CUID, self.cuid.raw());
+        wr_u32(&mut buf, MSG_OFF_CGID, self.cgid.raw());
         wr_u64(&mut buf, MSG_OFF_QBYTES, self.qbytes);
         wr_u64(&mut buf, MSG_OFF_CBYTES, self.cbytes);
         wr_u64(&mut buf, MSG_OFF_QNUM, self.messages.len() as u64);
@@ -1022,10 +1023,10 @@ impl MsgQueueFile {
         let ds = LinuxMsqidDs {
             msg_perm: LinuxIpcPerm {
                 key: self.key,
-                uid: self.uid,
-                gid: self.gid,
-                cuid: self.cuid,
-                cgid: self.cgid,
+                uid: self.uid.raw(),
+                gid: self.gid.raw(),
+                cuid: self.cuid.raw(),
+                cgid: self.cgid.raw(),
                 mode: self.mode.raw(),
                 ..Default::default()
             },
@@ -1410,10 +1411,10 @@ impl MsgQueueLock {
                 mode: ShmPermMode {
                     bits: rd_u32(&buf, MSG_OFF_MODE),
                 },
-                uid: rd_u32(&buf, MSG_OFF_UID),
-                gid: rd_u32(&buf, MSG_OFF_GID),
-                cuid: rd_u32(&buf, MSG_OFF_CUID),
-                cgid: rd_u32(&buf, MSG_OFF_CGID),
+                uid: NsUid::new(rd_u32(&buf, MSG_OFF_UID)),
+                gid: NsGid::new(rd_u32(&buf, MSG_OFF_GID)),
+                cuid: NsUid::new(rd_u32(&buf, MSG_OFF_CUID)),
+                cgid: NsGid::new(rd_u32(&buf, MSG_OFF_CGID)),
                 qbytes: rd_u64(&buf, MSG_OFF_QBYTES),
                 cbytes: rd_u64(&buf, MSG_OFF_CBYTES),
                 stime: rd_u64(&buf, MSG_OFF_STIME),
@@ -1977,10 +1978,10 @@ pub(super) fn shmid_ds_bytes(
 ) -> [u8; 112] {
     let ds = LinuxShmidDs {
         shm_perm: LinuxIpcPerm {
-            uid: segment.uid,
-            gid: segment.gid,
-            cuid: segment.cuid,
-            cgid: segment.cgid,
+            uid: segment.uid.raw(),
+            gid: segment.gid.raw(),
+            cuid: segment.cuid.raw(),
+            cgid: segment.cgid.raw(),
             mode: segment.mode.raw(),
             ..Default::default()
         },
@@ -3346,7 +3347,7 @@ fn sysv_msgctl<M: GuestMemory>(
                 qbytes[0], qbytes[1], qbytes[2], qbytes[3], qbytes[4], qbytes[5], qbytes[6],
                 qbytes[7],
             ]);
-            if new_qbytes > LINUX_MSGMNB && creds.euid != 0 {
+            if new_qbytes > LINUX_MSGMNB && !creds.euid.is_root() {
                 return Err(LINUX_EPERM);
             }
             let path = lookup_msg_queue_path(msqid)?;
@@ -3355,8 +3356,8 @@ fn sysv_msgctl<M: GuestMemory>(
             if !queue.can_admin(&creds) {
                 return Err(LINUX_EPERM);
             }
-            queue.uid = new_uid;
-            queue.gid = new_gid;
+            queue.uid = NsUid::new(new_uid);
+            queue.gid = NsGid::new(new_gid);
             queue.mode = ShmPermMode::from_ipc_set(new_mode, queue.mode);
             queue.qbytes = new_qbytes;
             queue.ctime = unix_now_secs();
@@ -3686,10 +3687,10 @@ impl SyscallDispatcher {
                     let out = LinuxSemidDs {
                         sem_perm: LinuxIpcPerm {
                             key: meta.key,
-                            uid: meta.uid,
-                            gid: meta.gid,
-                            cuid: meta.cuid,
-                            cgid: meta.cgid,
+                            uid: meta.uid.raw(),
+                            gid: meta.gid.raw(),
+                            cuid: meta.cuid.raw(),
+                            cgid: meta.cgid.raw(),
                             mode: meta.mode.perms(),
                             seq: 0,
                             ..Default::default()
@@ -3853,10 +3854,10 @@ impl SyscallDispatcher {
             let out = LinuxSemidDs {
                 sem_perm: LinuxIpcPerm {
                     key: meta.key,
-                    uid: meta.uid,
-                    gid: meta.gid,
-                    cuid: meta.cuid,
-                    cgid: meta.cgid,
+                    uid: meta.uid.raw(),
+                    gid: meta.gid.raw(),
+                    cuid: meta.cuid.raw(),
+                    cgid: meta.cgid.raw(),
                     mode: meta.mode.perms(),
                     seq: 0,
                     ..Default::default()
@@ -4038,8 +4039,8 @@ fn sysv_semctl<M: GuestMemory>(
                     // the owner/creator ids from the guest creds.
                     let perm = carrick_portable::IpcPermFields::from_host(
                         ds.sem_perm._key as i32,
-                        creds.euid,
-                        creds.egid,
+                        creds.euid.raw(),
+                        creds.egid.raw(),
                         ds.sem_perm.mode as u32,
                         ds.sem_perm._seq as u16,
                     );
@@ -4160,10 +4161,10 @@ mod ipc_set_tests {
                 key: 0,
                 size,
                 mode: ShmPermMode::requested(0o600),
-                uid: 0,
-                gid: 0,
-                cuid: 0,
-                cgid: 0,
+                uid: NsUid::ROOT,
+                gid: NsGid::ROOT,
+                cuid: NsUid::ROOT,
+                cgid: NsGid::ROOT,
                 nattch: 0,
                 ctime: 1,
                 atime: 0,
@@ -4205,10 +4206,10 @@ mod ipc_set_tests {
             scan_index: SemScanIndex(0),
             nsems: 3,
             mode: ShmPermMode::requested(0o600),
-            uid: 0,
-            gid: 0,
-            cuid: 0,
-            cgid: 0,
+            uid: NsUid::ROOT,
+            gid: NsGid::ROOT,
+            cuid: NsUid::ROOT,
+            cgid: NsGid::ROOT,
             ctime: 0,
             otime: 0,
             logical_last_operators: Arc::new(Mutex::new(vec![None; 3])),
@@ -4247,10 +4248,10 @@ mod ipc_set_tests {
                     key: 0,
                     size: LINUX_PAGE_SIZE as usize,
                     mode: ShmPermMode::requested(0o600),
-                    uid: 0,
-                    gid: 0,
-                    cuid: 0,
-                    cgid: 0,
+                    uid: NsUid::ROOT,
+                    gid: NsGid::ROOT,
+                    cuid: NsUid::ROOT,
+                    cgid: NsGid::ROOT,
                     nattch: 7,
                     ctime: 1,
                     atime: 2,
@@ -4289,10 +4290,10 @@ mod ipc_set_tests {
                 key: 0,
                 size: LINUX_PAGE_SIZE as usize,
                 mode: ShmPermMode::requested(0o600),
-                uid: 0,
-                gid: 0,
-                cuid: 0,
-                cgid: 0,
+                uid: NsUid::ROOT,
+                gid: NsGid::ROOT,
+                cuid: NsUid::ROOT,
+                cgid: NsGid::ROOT,
                 nattch: 1,
                 ctime: 1,
                 atime: 2,
@@ -4428,10 +4429,10 @@ mod ipc_set_tests {
                 key: 0,
                 size: LINUX_PAGE_SIZE as usize,
                 mode: ShmPermMode::requested(0o600),
-                uid: 0,
-                gid: 0,
-                cuid: 0,
-                cgid: 0,
+                uid: NsUid::ROOT,
+                gid: NsGid::ROOT,
+                cuid: NsUid::ROOT,
+                cgid: NsGid::ROOT,
                 nattch: 7,
                 ctime: 1,
                 atime: 2,
@@ -4501,10 +4502,10 @@ mod ipc_set_tests {
                 key: 0,
                 size: 4096,
                 mode: ShmPermMode::requested(0o600),
-                uid: 0,
-                gid: 0,
-                cuid: 0,
-                cgid: 0,
+                uid: NsUid::ROOT,
+                gid: NsGid::ROOT,
+                cuid: NsUid::ROOT,
+                cgid: NsGid::ROOT,
                 nattch: 0,
                 ctime: 1,
                 atime: 0,

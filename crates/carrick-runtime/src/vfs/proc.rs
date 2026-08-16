@@ -62,6 +62,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use carrick_abi::{NsGid, NsUid};
 use carrick_guest_mem::GuestVa;
 
 use crate::linux_abi::{
@@ -215,13 +216,13 @@ pub struct SyntheticProcContext {
     /// Guest VAs are host VAs (native exec backend) — see
     /// [`crate::vfs::OpenContext::native_guest_va`].
     pub native_guest_va: bool,
-    pub ruid: u32,
-    pub euid: u32,
-    pub suid: u32,
-    pub rgid: u32,
-    pub egid: u32,
-    pub sgid: u32,
-    pub groups: Vec<u32>,
+    pub ruid: NsUid,
+    pub euid: NsUid,
+    pub suid: NsUid,
+    pub rgid: NsGid,
+    pub egid: NsGid,
+    pub sgid: NsGid,
+    pub groups: Vec<NsGid>,
     /// Signal-disposition masks for `/proc/<pid>/status` (bit `signum-1`).
     pub sig_ignored: u64,
     pub sig_caught: u64,
@@ -2575,7 +2576,7 @@ fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {
     } else {
         ctx.groups
             .iter()
-            .map(u32::to_string)
+            .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(" ")
     };
@@ -3075,8 +3076,8 @@ Threads:\t1\n",
                 // uid/gid (501/20) `host_proc` reads — a sibling guest process
                 // is root:0 in the default rootful container, consistent with
                 // its own getuid()==0 and with /proc/self/status.
-                uid = crate::cred_ipc::read_target(host_pid as i32).unwrap_or(0),
-                gid = 0,
+                uid = crate::cred_ipc::read_target(host_pid as i32).unwrap_or(NsUid::ROOT),
+                gid = NsGid::ROOT,
             )
             .into_bytes(),
         ),
@@ -3973,13 +3974,18 @@ mod tests {
     #[test]
     fn self_status_reflects_live_credentials_and_groups() {
         let ctx = SyntheticProcContext {
-            ruid: 101,
-            euid: 102,
-            suid: 103,
-            rgid: 201,
-            egid: 202,
-            sgid: 203,
-            groups: vec![0, 1, 2, 3],
+            ruid: carrick_abi::NsUid::new(101),
+            euid: carrick_abi::NsUid::new(102),
+            suid: carrick_abi::NsUid::new(103),
+            rgid: carrick_abi::NsGid::new(201),
+            egid: carrick_abi::NsGid::new(202),
+            sgid: carrick_abi::NsGid::new(203),
+            groups: vec![
+                carrick_abi::NsGid::new(0),
+                carrick_abi::NsGid::new(1),
+                carrick_abi::NsGid::new(2),
+                carrick_abi::NsGid::new(3),
+            ],
             ..demo_ctx()
         };
         let s = String::from_utf8(synthetic_file("/proc/self/status", &ctx).unwrap()).unwrap();

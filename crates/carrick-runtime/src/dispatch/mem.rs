@@ -4917,7 +4917,7 @@ impl SyscallDispatcher {
         }
         let length = align_up_u64(length, self.linux_page_size()).ok_or(LINUX_ENOMEM)?;
         let creds = self.cred_snapshot();
-        if creds.euid == 0 {
+        if creds.euid.is_root() {
             return Ok(Some(length));
         }
         let limit = self.effective_resource_limit(LINUX_RLIMIT_MEMLOCK).rlim_cur;
@@ -4936,7 +4936,7 @@ impl SyscallDispatcher {
         range: crate::vfs::GuestMemoryRange,
     ) -> Result<(), LinuxErrno> {
         let creds = self.cred_snapshot();
-        let memlock_limit = if creds.euid == 0 {
+        let memlock_limit = if creds.euid.is_root() {
             None
         } else {
             Some(self.effective_resource_limit(LINUX_RLIMIT_MEMLOCK).rlim_cur)
@@ -5085,7 +5085,7 @@ impl SyscallDispatcher {
         drop(mem);
 
         let creds = self.cred_snapshot();
-        if creds.euid != 0 {
+        if !creds.euid.is_root() {
             let limit = self.effective_resource_limit(LINUX_RLIMIT_MEMLOCK).rlim_cur;
             if limit == 0 {
                 return Err(LINUX_EPERM);

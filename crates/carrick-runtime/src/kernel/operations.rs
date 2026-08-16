@@ -3917,7 +3917,8 @@ mod tests {
             .expect("private-FS child");
         let shared = kernel
             .update_credentials(&shared, |credentials| {
-                credentials.seed_identity(1001, 2001);
+                credentials
+                    .seed_identity(carrick_abi::NsUid::new(1001), carrick_abi::NsGid::new(2001));
             })
             .expect("independent child identity");
         let root_context = root
@@ -3950,7 +3951,10 @@ mod tests {
             .expect("private peer after umask");
         assert_eq!(root_after.resources().credentials().umask(), 0o027);
         assert_eq!(shared_after.resources().credentials().umask(), 0o027);
-        assert_eq!(shared_after.resources().credentials().euid(), 1001);
+        assert_eq!(
+            shared_after.resources().credentials().euid(),
+            carrick_abi::NsUid::new(1001)
+        );
         assert_eq!(private_after.resources().credentials().umask(), 0o022);
     }
 
@@ -4179,10 +4183,16 @@ mod tests {
             )
             .expect("fork child");
         let root = kernel
-            .update_credentials(&root, |credentials| credentials.seed_identity(1000, 1000))
+            .update_credentials(&root, |credentials| {
+                credentials
+                    .seed_identity(carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(1000))
+            })
             .expect("set caller credentials");
         let child = kernel
-            .update_credentials(&child, |credentials| credentials.seed_identity(2000, 2000))
+            .update_credentials(&child, |credentials| {
+                credentials
+                    .seed_identity(carrick_abi::NsUid::new(2000), carrick_abi::NsGid::new(2000))
+            })
             .expect("set target credentials");
         let child_id = child.task().key().id;
         let child_tid = child.thread().key().tid;
@@ -4311,10 +4321,16 @@ mod tests {
             .expect("clone sibling");
         let child_id = child.task().key().id;
         let root = kernel
-            .update_credentials(&root, |credentials| credentials.seed_identity(2000, 2000))
+            .update_credentials(&root, |credentials| {
+                credentials
+                    .seed_identity(carrick_abi::NsUid::new(2000), carrick_abi::NsGid::new(2000))
+            })
             .expect("set non-root caller credentials");
         let child = kernel
-            .update_credentials(&child, |credentials| credentials.seed_identity(2000, 2000))
+            .update_credentials(&child, |credentials| {
+                credentials
+                    .seed_identity(carrick_abi::NsUid::new(2000), carrick_abi::NsGid::new(2000))
+            })
             .expect("set leader credentials");
         kernel
             .exit_thread(&child, None)
@@ -7008,7 +7024,10 @@ mod credential_authority_tests {
     fn sibling_thread_credential_cow_diverges_only_calling_thread() {
         let (kernel, root) = bootstrap(8_100);
         let root = kernel
-            .update_credentials(&root, |credentials| credentials.seed_identity(1000, 1000))
+            .update_credentials(&root, |credentials| {
+                credentials
+                    .seed_identity(carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(1000))
+            })
             .expect("seed root credentials");
         let plan = ClonePlan::from_flags(
             LinuxCloneFlags::VM
@@ -7028,29 +7047,41 @@ mod credential_authority_tests {
 
         let sibling = kernel
             .update_credentials(&sibling, |credentials| {
-                credentials.set_fsuid(2000);
-                credentials.set_supplementary_groups(vec![7, 11]);
+                credentials.set_fsuid(carrick_abi::NsUid::new(2000));
+                credentials.set_supplementary_groups(vec![
+                    carrick_abi::NsGid::new(7),
+                    carrick_abi::NsGid::new(11),
+                ]);
             })
             .expect("publish sibling credentials");
-        assert_eq!(root.resources().credentials().fsuid(), 1000);
+        assert_eq!(
+            root.resources().credentials().fsuid(),
+            carrick_abi::NsUid::new(1000)
+        );
         assert_eq!(
             root.resources()
                 .credentials()
                 .supplementary_groups_override(),
             None
         );
-        assert_eq!(sibling.resources().credentials().fsuid(), 2000);
+        assert_eq!(
+            sibling.resources().credentials().fsuid(),
+            carrick_abi::NsUid::new(2000)
+        );
         assert_eq!(
             sibling
                 .resources()
                 .credentials()
                 .supplementary_groups_override(),
-            Some([7, 11].as_slice())
+            Some([carrick_abi::NsGid::new(7), carrick_abi::NsGid::new(11)].as_slice())
         );
         let fresh_root = kernel
             .context(root.task().key().id, root.thread().key().tid)
             .expect("fresh root context");
-        assert_eq!(fresh_root.resources().credentials().fsuid(), 1000);
+        assert_eq!(
+            fresh_root.resources().credentials().fsuid(),
+            carrick_abi::NsUid::new(1000)
+        );
     }
 
     #[test]
@@ -7058,11 +7089,16 @@ mod credential_authority_tests {
         let (kernel, root) = bootstrap(8_200);
         let root = kernel
             .update_credentials(&root, |credentials| {
-                credentials.seed_identity(123, 456);
-                credentials.set_fsuid(321);
-                credentials.set_fsgid(654);
+                credentials
+                    .seed_identity(carrick_abi::NsUid::new(123), carrick_abi::NsGid::new(456));
+                credentials.set_fsuid(carrick_abi::NsUid::new(321));
+                credentials.set_fsgid(carrick_abi::NsGid::new(654));
                 credentials.set_umask(0o077);
-                credentials.set_supplementary_groups(vec![2, 4, 8]);
+                credentials.set_supplementary_groups(vec![
+                    carrick_abi::NsGid::new(2),
+                    carrick_abi::NsGid::new(4),
+                    carrick_abi::NsGid::new(8),
+                ]);
             })
             .expect("seed parent credentials");
         let child = kernel
@@ -7083,7 +7119,14 @@ mod credential_authority_tests {
         );
         assert_eq!(
             child.supplementary_groups_override(),
-            Some([2, 4, 8].as_slice())
+            Some(
+                [
+                    carrick_abi::NsGid::new(2),
+                    carrick_abi::NsGid::new(4),
+                    carrick_abi::NsGid::new(8)
+                ]
+                .as_slice()
+            )
         );
         assert_eq!(
             (
@@ -7119,8 +7162,11 @@ mod credential_authority_tests {
             .expect("clone sibling");
         let sibling = kernel
             .update_credentials(&sibling, |credentials| {
-                credentials.set_fsuid(9250);
-                credentials.set_supplementary_groups(vec![25, 26]);
+                credentials.set_fsuid(carrick_abi::NsUid::new(9250));
+                credentials.set_supplementary_groups(vec![
+                    carrick_abi::NsGid::new(25),
+                    carrick_abi::NsGid::new(26),
+                ]);
             })
             .expect("diverge sibling credentials");
 
@@ -7134,14 +7180,20 @@ mod credential_authority_tests {
             )
             .expect("fork from sibling");
 
-        assert_eq!(root.resources().credentials().fsuid(), 0);
-        assert_eq!(child.resources().credentials().fsuid(), 9250);
+        assert_eq!(
+            root.resources().credentials().fsuid(),
+            carrick_abi::NsUid::ROOT
+        );
+        assert_eq!(
+            child.resources().credentials().fsuid(),
+            carrick_abi::NsUid::new(9250)
+        );
         assert_eq!(
             child
                 .resources()
                 .credentials()
                 .supplementary_groups_override(),
-            Some([25, 26].as_slice())
+            Some([carrick_abi::NsGid::new(25), carrick_abi::NsGid::new(26)].as_slice())
         );
     }
 
@@ -7165,7 +7217,7 @@ mod credential_authority_tests {
             .expect("refresh root after thread clone");
         kernel
             .update_credentials(&sibling, |credentials| {
-                credentials.set_fsuid(9275);
+                credentials.set_fsuid(carrick_abi::NsUid::new(9275));
             })
             .expect("diverge sibling credentials");
 
@@ -7179,7 +7231,10 @@ mod credential_authority_tests {
             )
             .expect("fork exact root after sibling publication");
 
-        assert_eq!(child.resources().credentials().fsuid(), 0);
+        assert_eq!(
+            child.resources().credentials().fsuid(),
+            carrick_abi::NsUid::ROOT
+        );
     }
 
     #[test]
@@ -7187,7 +7242,7 @@ mod credential_authority_tests {
         let (kernel, root) = bootstrap(8_300);
         let root = kernel
             .update_credentials(&root, |credentials| {
-                credentials.seed_identity(77, 88);
+                credentials.seed_identity(carrick_abi::NsUid::new(77), carrick_abi::NsGid::new(88));
                 credentials.set_supplementary_groups(Vec::new());
             })
             .expect("seed credentials");
@@ -7200,7 +7255,10 @@ mod credential_authority_tests {
             .expect("commit exec");
         let after = committed.resources().credentials();
         assert!(Arc::ptr_eq(&before, &after));
-        assert_eq!((after.ruid(), after.rgid()), (77, 88));
+        assert_eq!(
+            (after.ruid(), after.rgid()),
+            (carrick_abi::NsUid::new(77), carrick_abi::NsGid::new(88))
+        );
         assert_eq!(after.supplementary_groups_override(), Some([].as_slice()));
     }
 
@@ -7209,7 +7267,7 @@ mod credential_authority_tests {
         let (kernel, root) = bootstrap(8_315);
         kernel
             .update_credentials(&root, |credentials| {
-                credentials.set_fsuid(9315);
+                credentials.set_fsuid(carrick_abi::NsUid::new(9315));
             })
             .expect("replace caller credentials");
 
@@ -7239,7 +7297,7 @@ mod credential_authority_tests {
             .expect("refresh root after thread clone");
         kernel
             .update_credentials(&sibling, |credentials| {
-                credentials.set_fsuid(9325);
+                credentials.set_fsuid(carrick_abi::NsUid::new(9325));
             })
             .expect("diverge sibling credentials");
 
@@ -7248,7 +7306,10 @@ mod credential_authority_tests {
             .expect("prepare exec from exact root after sibling publication");
         let exec = kernel.commit_exec(prepared, None).expect("commit exec");
 
-        assert_eq!(exec.resources().credentials().fsuid(), 0);
+        assert_eq!(
+            exec.resources().credentials().fsuid(),
+            carrick_abi::NsUid::ROOT
+        );
     }
 
     #[test]
@@ -7267,7 +7328,7 @@ mod credential_authority_tests {
         let (sent, received) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
             let result = updating.update_credentials(&exact, |credentials| {
-                credentials.set_fsuid(8350);
+                credentials.set_fsuid(carrick_abi::NsUid::new(8350));
             });
             sent.send(result).unwrap();
         });
@@ -7282,24 +7343,37 @@ mod credential_authority_tests {
             .expect("credential publication wakes")
             .expect("credential publication succeeds");
         worker.join().unwrap();
-        assert_eq!(updated.resources().credentials().fsuid(), 8350);
+        assert_eq!(
+            updated.resources().credentials().fsuid(),
+            carrick_abi::NsUid::new(8350)
+        );
     }
 
     #[test]
     fn stale_context_cannot_publish_credentials() {
         let (kernel, original) = bootstrap(8_400);
         let current = kernel
-            .update_credentials(&original, |credentials| credentials.set_fsuid(42))
+            .update_credentials(&original, |credentials| {
+                credentials.set_fsuid(carrick_abi::NsUid::new(42))
+            })
             .expect("publish current credentials");
 
         assert!(matches!(
-            kernel.update_credentials(&original, |credentials| credentials.set_fsuid(99)),
+            kernel.update_credentials(&original, |credentials| {
+                credentials.set_fsuid(carrick_abi::NsUid::new(99))
+            }),
             Err(KernelOperationError::StaleContext)
         ));
-        assert_eq!(current.resources().credentials().fsuid(), 42);
+        assert_eq!(
+            current.resources().credentials().fsuid(),
+            carrick_abi::NsUid::new(42)
+        );
         let fresh = kernel
             .context(current.task().key().id, current.thread().key().tid)
             .expect("fresh context");
-        assert_eq!(fresh.resources().credentials().fsuid(), 42);
+        assert_eq!(
+            fresh.resources().credentials().fsuid(),
+            carrick_abi::NsUid::new(42)
+        );
     }
 }

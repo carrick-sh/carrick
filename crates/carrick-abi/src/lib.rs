@@ -2621,6 +2621,246 @@ assert_layout!(LinuxIocb, size = 64, aio_data @ 0, aio_key @ 8, aio_lio_opcode @
 kernel_abi!(LinuxIoEvent, 32, "struct io_event is 32 bytes");
 assert_layout!(LinuxIoEvent, size = 32, data @ 0, obj @ 8, result @ 16, result2 @ 24);
 
+/// A host-level User ID (e.g. Darwin / host Linux UID returned by `geteuid(2)`).
+#[repr(transparent)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+)]
+pub struct HostUid(pub u32);
+
+impl HostUid {
+    pub const ROOT: Self = Self(0);
+
+    #[inline]
+    pub const fn new(uid: u32) -> Self {
+        Self(uid)
+    }
+
+    #[inline]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn is_root(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl core::fmt::Display for HostUid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<u32> for HostUid {
+    #[inline]
+    fn from(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+impl From<HostUid> for u32 {
+    #[inline]
+    fn from(v: HostUid) -> Self {
+        v.0
+    }
+}
+
+/// A guest namespace / Linux User ID (the UID inside a Linux user/pid namespace).
+#[repr(transparent)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+)]
+pub struct NsUid(pub u32);
+
+impl NsUid {
+    pub const ROOT: Self = Self(0);
+
+    #[inline]
+    pub const fn new(uid: u32) -> Self {
+        Self(uid)
+    }
+
+    #[inline]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn is_root(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl core::fmt::Display for NsUid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<u32> for NsUid {
+    #[inline]
+    fn from(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+impl From<NsUid> for u32 {
+    #[inline]
+    fn from(v: NsUid) -> Self {
+        v.0
+    }
+}
+
+/// A host-level Group ID.
+#[repr(transparent)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+)]
+pub struct HostGid(pub u32);
+
+impl HostGid {
+    pub const ROOT: Self = Self(0);
+
+    #[inline]
+    pub const fn new(gid: u32) -> Self {
+        Self(gid)
+    }
+
+    #[inline]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn is_root(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl core::fmt::Display for HostGid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<u32> for HostGid {
+    #[inline]
+    fn from(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+impl From<HostGid> for u32 {
+    #[inline]
+    fn from(v: HostGid) -> Self {
+        v.0
+    }
+}
+
+/// A guest namespace / Linux Group ID (the GID inside a Linux user namespace).
+#[repr(transparent)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+)]
+pub struct NsGid(pub u32);
+
+impl NsGid {
+    pub const ROOT: Self = Self(0);
+
+    #[inline]
+    pub const fn new(gid: u32) -> Self {
+        Self(gid)
+    }
+
+    #[inline]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn is_root(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl core::fmt::Display for NsGid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<u32> for NsGid {
+    #[inline]
+    fn from(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+impl From<NsGid> for u32 {
+    #[inline]
+    fn from(v: NsGid) -> Self {
+        v.0
+    }
+}
+
 /// A POSITIVE Linux errno (the `LINUX_E*` domain). The guest-visible retval is
 /// its single negation — made in exactly ONE place
 /// ([`LinuxErrno::guest_retval`]) so a pre-negated value can never be

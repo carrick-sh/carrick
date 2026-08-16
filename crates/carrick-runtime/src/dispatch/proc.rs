@@ -334,13 +334,13 @@ fn sched_pid_exists<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
 /// `kill`/`setpriority` use, NOT a root-only proxy (a SAME-OWNER non-root set
 /// must succeed: LTP sched_setparam05 / sched_setaffinity01). Returns true when
 /// the set is PERMITTED. `pid` is the guest-supplied ns-pid of the target.
-fn sched_cross_owner_ok(pid: u64, caller_euid: u32) -> bool {
-    if caller_euid == 0 {
+fn sched_cross_owner_ok(pid: u64, caller_euid: carrick_abi::NsUid) -> bool {
+    if caller_euid.is_root() {
         return true;
     }
     let target_euid = crate::namespace::pid::ns_to_host_or_self(pid as u32)
         .and_then(|host| crate::cred_ipc::read_target(host as i32))
-        .unwrap_or(0);
+        .unwrap_or(carrick_abi::NsUid::ROOT);
     caller_euid == target_euid
 }
 
@@ -2000,7 +2000,7 @@ impl SyscallDispatcher {
         /// carrick has no real controlling tty to revoke, so success is a
         /// no-op.
         fn vhangup(this, cx) {
-            if this.cred_snapshot().euid != 0 {
+            if !this.cred_snapshot().euid.is_root() {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -4144,7 +4144,7 @@ impl SyscallDispatcher {
                         signum as i32,
                         crate::linux_abi::LINUX_SI_USER,
                         cx.kernel.task().key().id.raw(),
-                        this.cred_snapshot().ruid,
+                        this.cred_snapshot().ruid.raw(),
                     ))
                 };
                 return Ok(this.hvpatch_exact_process_signal(
@@ -4167,7 +4167,7 @@ impl SyscallDispatcher {
             let target_euid = if host_pid as u32 == std::process::id() {
                 caller_euid
             } else {
-                crate::cred_ipc::read_target(host_pid).unwrap_or(0)
+                crate::cred_ipc::read_target(host_pid).unwrap_or(carrick_abi::NsUid::ROOT)
             };
             if info.0 != 0 {
                 let bytes = match cx
@@ -4188,7 +4188,7 @@ impl SyscallDispatcher {
                 if user_info.si_signo != signum_i32 {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                if caller_euid != 0 && caller_euid != target_euid {
+                if !caller_euid.is_root() && caller_euid != target_euid {
                     return Ok(DispatchOutcome::errno(LINUX_EPERM));
                 }
                 user_info.si_signo = signum_i32;
@@ -4203,7 +4203,7 @@ impl SyscallDispatcher {
                     signum_i32,
                     user_info.si_code,
                     crate::namespace::pid::self_ns_pid() as i32,
-                    this.cred_snapshot().euid,
+                    this.cred_snapshot().euid.raw(),
                     value,
                     // A pidfd names exactly one PROCESS (never a specific
                     // thread), so this send is always process-directed.
@@ -4214,7 +4214,7 @@ impl SyscallDispatcher {
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
             }
-            if caller_euid != 0 && caller_euid != target_euid {
+            if !caller_euid.is_root() && caller_euid != target_euid {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             // A pidfd names exactly one process by the HOST pid recorded at
@@ -4423,8 +4423,8 @@ impl SyscallDispatcher {
                 let caller_euid = self.cred_snapshot().euid;
                 let target_euid = crate::namespace::pid::ns_to_host_or_self(pid.raw() as u32)
                     .and_then(|host| crate::cred_ipc::read_target(host as i32))
-                    .unwrap_or(0);
-                if caller_euid != 0 && caller_euid != target_euid {
+                    .unwrap_or(carrick_abi::NsUid::ROOT);
+                if !caller_euid.is_root() && caller_euid != target_euid {
                     return Ok(DispatchOutcome::errno(LINUX_EPERM));
                 }
                 // The peer runs in a separate host process with its own HVF VM;

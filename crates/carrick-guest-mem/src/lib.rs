@@ -64,7 +64,7 @@
 //! `serde::Serialize`, and `thiserror::Error` — precisely so it sits at the
 //! bottom of the build graph and almost never has to be rebuilt.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Neutral guest-memory region lookup + the combined PROT_NONE/region access
@@ -122,7 +122,7 @@ pub struct X8664SyscallFrame {
 /// `u64`s in mapping signatures like `map_aliased(va, gpa, len)` — a va↔gpa
 /// transposition is page-aligned on both sides, so alignment guards cannot
 /// catch it; only the type can.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct GuestVa(pub u64);
 
 impl GuestVa {
@@ -130,6 +130,76 @@ impl GuestVa {
     #[inline]
     pub const fn raw(self) -> u64 {
         self.0
+    }
+}
+
+/// A contiguous range of guest virtual addresses `[start, start + len)`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub struct GuestVaRange {
+    start: GuestVa,
+    len: usize,
+}
+
+impl GuestVaRange {
+    #[inline]
+    pub const fn new(start: GuestVa, len: usize) -> Self {
+        Self { start, len }
+    }
+
+    #[inline]
+    pub const fn from_raw(start: u64, len: usize) -> Self {
+        Self {
+            start: GuestVa(start),
+            len,
+        }
+    }
+
+    #[inline]
+    pub const fn start(self) -> GuestVa {
+        self.start
+    }
+
+    #[inline]
+    pub const fn start_raw(self) -> u64 {
+        self.start.0
+    }
+
+    #[inline]
+    pub const fn len(self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    pub const fn end_raw(self) -> u64 {
+        self.start.0.saturating_add(self.len as u64)
+    }
+
+    #[inline]
+    pub const fn end_va(self) -> GuestVa {
+        GuestVa(self.end_raw())
+    }
+
+    #[inline]
+    pub const fn contains_va(self, va: GuestVa) -> bool {
+        va.0 >= self.start.0 && va.0 < self.end_raw()
+    }
+
+    #[inline]
+    pub const fn contains_raw(self, va: u64) -> bool {
+        va >= self.start.0 && va < self.end_raw()
+    }
+
+    #[inline]
+    pub const fn overlaps(self, other: Self) -> bool {
+        !self.is_empty()
+            && !other.is_empty()
+            && self.start_raw() < other.end_raw()
+            && other.start_raw() < self.end_raw()
     }
 }
 

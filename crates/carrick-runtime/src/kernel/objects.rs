@@ -6,7 +6,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use carrick_abi::{LinuxSigaction, LinuxSigaltstack, LinuxSiginfo, SigSet};
+use carrick_abi::{LinuxSigaction, LinuxSigaltstack, LinuxSiginfo, NsGid, NsUid, SigSet};
 use carrick_hal::ThreadId;
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -1427,36 +1427,38 @@ impl FsContext {
 }
 
 /// Immutable Linux credential register file. A mutation publishes a fresh
-/// object and replaces only the calling thread's `ThreadResources` association.
+/// Thread credentials. `clone` creates an independent copy; `set*uid`/`set*gid`
+/// creates a new [`Credentials`] object and replaces only the calling thread's
+/// `ThreadResources` association.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Credentials {
     id: CredentialsId,
-    pub(crate) ruid: u32,
-    pub(crate) euid: u32,
-    pub(crate) suid: u32,
-    pub(crate) rgid: u32,
-    pub(crate) egid: u32,
-    pub(crate) sgid: u32,
-    pub(crate) fsuid: u32,
-    pub(crate) fsgid: u32,
+    pub(crate) ruid: NsUid,
+    pub(crate) euid: NsUid,
+    pub(crate) suid: NsUid,
+    pub(crate) rgid: NsGid,
+    pub(crate) egid: NsGid,
+    pub(crate) sgid: NsGid,
+    pub(crate) fsuid: NsUid,
+    pub(crate) fsgid: NsGid,
     pub(crate) umask: u32,
     /// `None` preserves launch-time `/etc/group` fallback; `Some`, including an
     /// empty vector, is the complete set installed by `setgroups(2)`.
-    supplementary_groups_override: Option<Vec<u32>>,
+    supplementary_groups_override: Option<Vec<NsGid>>,
 }
 
 impl Credentials {
     pub const fn root(id: CredentialsId) -> Self {
         Self {
             id,
-            ruid: 0,
-            euid: 0,
-            suid: 0,
-            rgid: 0,
-            egid: 0,
-            sgid: 0,
-            fsuid: 0,
-            fsgid: 0,
+            ruid: NsUid::ROOT,
+            euid: NsUid::ROOT,
+            suid: NsUid::ROOT,
+            rgid: NsGid::ROOT,
+            egid: NsGid::ROOT,
+            sgid: NsGid::ROOT,
+            fsuid: NsUid::ROOT,
+            fsgid: NsGid::ROOT,
             umask: LINUX_DEFAULT_UMASK,
             supplementary_groups_override: None,
         }
@@ -1465,14 +1467,14 @@ impl Credentials {
     #[allow(clippy::too_many_arguments)]
     pub const fn from_values(
         id: CredentialsId,
-        ruid: u32,
-        euid: u32,
-        suid: u32,
-        rgid: u32,
-        egid: u32,
-        sgid: u32,
-        fsuid: u32,
-        fsgid: u32,
+        ruid: NsUid,
+        euid: NsUid,
+        suid: NsUid,
+        rgid: NsGid,
+        egid: NsGid,
+        sgid: NsGid,
+        fsuid: NsUid,
+        fsgid: NsGid,
         umask: u32,
     ) -> Self {
         Self {
@@ -1499,38 +1501,38 @@ impl Credentials {
     pub const fn id(&self) -> CredentialsId {
         self.id
     }
-    pub const fn ruid(&self) -> u32 {
+    pub const fn ruid(&self) -> NsUid {
         self.ruid
     }
-    pub const fn euid(&self) -> u32 {
+    pub const fn euid(&self) -> NsUid {
         self.euid
     }
-    pub const fn suid(&self) -> u32 {
+    pub const fn suid(&self) -> NsUid {
         self.suid
     }
-    pub const fn rgid(&self) -> u32 {
+    pub const fn rgid(&self) -> NsGid {
         self.rgid
     }
-    pub const fn egid(&self) -> u32 {
+    pub const fn egid(&self) -> NsGid {
         self.egid
     }
-    pub const fn sgid(&self) -> u32 {
+    pub const fn sgid(&self) -> NsGid {
         self.sgid
     }
-    pub const fn fsuid(&self) -> u32 {
+    pub const fn fsuid(&self) -> NsUid {
         self.fsuid
     }
-    pub const fn fsgid(&self) -> u32 {
+    pub const fn fsgid(&self) -> NsGid {
         self.fsgid
     }
     pub const fn umask(&self) -> u32 {
         self.umask
     }
-    pub fn supplementary_groups_override(&self) -> Option<&[u32]> {
+    pub fn supplementary_groups_override(&self) -> Option<&[NsGid]> {
         self.supplementary_groups_override.as_deref()
     }
 
-    pub(crate) fn seed_identity(&mut self, uid: u32, gid: u32) {
+    pub(crate) fn seed_identity(&mut self, uid: NsUid, gid: NsGid) {
         self.ruid = uid;
         self.euid = uid;
         self.suid = uid;
@@ -1542,30 +1544,30 @@ impl Credentials {
     }
 
     pub(crate) const fn is_privileged(&self) -> bool {
-        self.euid == 0
+        self.euid.is_root()
     }
-    pub(crate) fn set_uid_triple(&mut self, ruid: u32, euid: u32, suid: u32) {
+    pub(crate) fn set_uid_triple(&mut self, ruid: NsUid, euid: NsUid, suid: NsUid) {
         self.ruid = ruid;
         self.euid = euid;
         self.suid = suid;
         self.fsuid = euid;
     }
-    pub(crate) fn set_gid_triple(&mut self, rgid: u32, egid: u32, sgid: u32) {
+    pub(crate) fn set_gid_triple(&mut self, rgid: NsGid, egid: NsGid, sgid: NsGid) {
         self.rgid = rgid;
         self.egid = egid;
         self.sgid = sgid;
         self.fsgid = egid;
     }
-    pub(crate) fn set_fsuid(&mut self, fsuid: u32) {
+    pub(crate) fn set_fsuid(&mut self, fsuid: NsUid) {
         self.fsuid = fsuid;
     }
-    pub(crate) fn set_fsgid(&mut self, fsgid: u32) {
+    pub(crate) fn set_fsgid(&mut self, fsgid: NsGid) {
         self.fsgid = fsgid;
     }
     pub(crate) fn set_umask(&mut self, umask: u32) {
         self.umask = umask;
     }
-    pub(crate) fn set_supplementary_groups(&mut self, groups: Vec<u32>) {
+    pub(crate) fn set_supplementary_groups(&mut self, groups: Vec<NsGid>) {
         self.supplementary_groups_override = Some(groups);
     }
     pub(crate) fn copy_values_from(&mut self, source: &Self) {

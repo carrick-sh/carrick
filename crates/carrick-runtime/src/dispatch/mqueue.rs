@@ -523,7 +523,7 @@ impl SyscallDispatcher {
                 wr_u32(&mut hdr, OFF_MSGSIZE, msgsize);
                 // Stamp the creator's guest euid (fork-coherent in the file) so
                 // mq_unlink can enforce the owner check Linux applies.
-                wr_u32(&mut hdr, OFF_OWNER_UID, this.cred_snapshot().euid);
+                wr_u32(&mut hdr, OFF_OWNER_UID, this.cred_snapshot().euid.raw());
                 let written = unsafe {
                     libc::pwrite(
                         host_fd,
@@ -603,9 +603,9 @@ impl SyscallDispatcher {
             // Read the stored creator euid from the header; root (euid 0)
             // bypasses, matching the kernel's CAP_FOWNER / dir-owner allowances.
             let euid = this.cred_snapshot().euid;
-            if euid != 0 {
+            if !euid.is_root() {
                 if let Some(owner) = read_queue_owner(&path_str) {
-                    if owner != euid {
+                    if owner != euid.raw() {
                         return Ok(DispatchOutcome::errno(LINUX_EACCES));
                     }
                 }
@@ -921,7 +921,7 @@ fn deliver_notify(
             let info = crate::linux_abi::LinuxSiginfo::message_queue(
                 signo,
                 crate::namespace::pid::self_ns_pid() as i32,
-                this.cred_snapshot().ruid,
+                this.cred_snapshot().ruid.raw(),
                 value,
             );
             if pid == std::process::id() as i32 {
@@ -933,7 +933,7 @@ fn deliver_notify(
                 signo,
                 crate::linux_abi::LINUX_SI_MESGQ,
                 crate::namespace::pid::self_ns_pid() as i32,
-                this.cred_snapshot().ruid,
+                this.cred_snapshot().ruid.raw(),
                 value,
                 0,
             ) {

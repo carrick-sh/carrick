@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
-use carrick_abi::{LinuxSigaction, LinuxSigaltstack, LinuxSiginfo, SigSet};
+use carrick_abi::{LinuxSigaction, LinuxSigaltstack, LinuxSiginfo, NsGid, NsUid, SigSet};
 use carrick_hal::{FrameId, MappingId, ThreadId};
 
 use super::address::{MmBackend, MmBinding, SnapshotError, SnapshotTable};
@@ -200,18 +200,18 @@ pub struct FsContextSnapshotRow {
 pub struct CredentialsSnapshotRow {
     pub id: CredentialsId,
     pub class: ObjectSnapshotClass,
-    pub ruid: u32,
-    pub euid: u32,
-    pub suid: u32,
-    pub rgid: u32,
-    pub egid: u32,
-    pub sgid: u32,
-    pub fsuid: u32,
-    pub fsgid: u32,
+    pub ruid: NsUid,
+    pub euid: NsUid,
+    pub suid: NsUid,
+    pub rgid: NsGid,
+    pub egid: NsGid,
+    pub sgid: NsGid,
+    pub fsuid: NsUid,
+    pub fsgid: NsGid,
     pub umask: u32,
     /// Exact explicit `setgroups(2)` authority. `None` means the runtime will
     /// derive launch-time compatibility membership from `/etc/group`.
-    pub supplementary_groups_override: Option<Vec<u32>>,
+    pub supplementary_groups_override: Option<Vec<NsGid>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -499,7 +499,7 @@ impl Kernel {
                 umask: credentials.umask(),
                 supplementary_groups_override: credentials
                     .supplementary_groups_override()
-                    .map(<[u32]>::to_vec),
+                    .map(<[NsGid]>::to_vec),
             })
             .collect();
 
@@ -1889,7 +1889,10 @@ mod tests {
             .set_chroot_root(Some("/snapshot/root".to_owned()));
         let context = kernel
             .update_credentials(&context, |credentials| {
-                credentials.set_supplementary_groups(vec![9, 10]);
+                credentials.set_supplementary_groups(vec![
+                    carrick_abi::NsGid::new(9),
+                    carrick_abi::NsGid::new(10),
+                ]);
             })
             .expect("publish credential snapshot values");
         let usr1 = LinuxSignal::for_signal_number(10).unwrap();
@@ -1938,7 +1941,10 @@ mod tests {
         assert_eq!(live_credentials.umask, 0o022);
         assert_eq!(
             live_credentials.supplementary_groups_override,
-            Some(vec![9, 10])
+            Some(vec![
+                carrick_abi::NsGid::new(9),
+                carrick_abi::NsGid::new(10)
+            ])
         );
         let draining_credentials = first
             .credentials
