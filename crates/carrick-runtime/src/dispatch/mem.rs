@@ -555,26 +555,45 @@ fn validate_mlock_range(
     Ok(())
 }
 
+/// Insert `range` into a SORTED, MERGED, non-overlapping range set, coalescing
+/// with every entry it touches or abuts.
+///
+/// The sorted-merged shape is the set's invariant, maintained by this function
+/// and by [`locked_ranges_remove`], so only the run of entries that actually
+/// touch `range` can change: `partition_point` finds that run's head in
+/// O(log n) and one `splice` rewrites just the run.
+///
+/// This used to `push` + `sort_by_key` the WHOLE vector and then rebuild it
+/// into a fresh `Vec` on EVERY insert — O(n log n) time and an O(n) copy per
+/// mapping, so O(n^2 log n) over a process's lifetime. LTP `munmap04` builds
+/// ~65,000 VMAs and a `sample` of the guest carrier put 769 of ~1,300
+/// non-idle samples in this function, with its `slice::sort` (263) and
+/// `memmove` (257) callees taking essentially all the rest: the suite ran
+/// 2,936 ms against a 402 ms Docker oracle almost entirely inside here. This
+/// is the same shape the 2026-07-07 bless fixed in
+/// `MemoryProtections::RangeSet` and `dynamic_maps`; this set was missed.
 fn locked_ranges_insert(
     ranges: &mut Vec<crate::vfs::GuestMemoryRange>,
     range: crate::vfs::GuestMemoryRange,
 ) {
-    ranges.push(range);
-    ranges.sort_by_key(|range| range.start());
-    let mut merged: Vec<crate::vfs::GuestMemoryRange> = Vec::with_capacity(ranges.len());
-    for range in ranges.drain(..) {
-        if let Some(last) = merged.last_mut()
-            && range.start().raw() <= last.end().raw()
-        {
-            let end = GuestVa(last.end().raw().max(range.end().raw()));
-            if let Some(coalesced) = crate::vfs::GuestMemoryRange::new(last.start(), end) {
-                *last = coalesced;
-            }
-            continue;
+    let mut start = range.start().raw();
+    let mut end = range.end().raw();
+    // `<` not `<=`: an entry ending exactly where this one starts ABUTS it and
+    // must be coalesced, which is what the old whole-vector merge did.
+    let index = ranges.partition_point(|existing| existing.end().raw() < start);
+    let mut remove_end = index;
+    while let Some(existing) = ranges.get(remove_end) {
+        if existing.start().raw() > end {
+            break;
         }
-        merged.push(range);
+        start = start.min(existing.start().raw());
+        end = end.max(existing.end().raw());
+        remove_end += 1;
     }
-    *ranges = merged;
+    let Some(merged) = crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) else {
+        return;
+    };
+    ranges.splice(index..remove_end, [merged]);
 }
 
 fn locked_ranges_remove(
@@ -1659,7 +1678,7 @@ impl SyscallDispatcher {
         if let Some(range) =
             crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
-            self.mem.lock().write_sealed_shared_maps.push(range);
+            locked_ranges_insert(&mut self.mem.lock().write_sealed_shared_maps, range);
         }
     }
 
@@ -1667,7 +1686,7 @@ impl SyscallDispatcher {
         if let Some(range) =
             crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
         {
-            self.mem.lock().read_only_shared_file_maps.push(range);
+            locked_ranges_insert(&mut self.mem.lock().read_only_shared_file_maps, range);
         }
     }
 
