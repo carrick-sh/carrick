@@ -85,7 +85,7 @@ compile/lint/test only.
 | `just build-debug [ARGS]` 🔏 | Build + codesign with debug entitlements (`get-task-allow` for lldb attaching). |
 | `just run [ARGS]` 🔏 | `just build` then run `target/release/carrick ARGS`. |
 | `just check [ARGS]` | Fast **unsigned** `cargo build` — compile-check only, cannot run a guest. |
-| `just test` | Host lib tests (no HVF/Docker). **Use the recipe, never a bare `cargo test --workspace --lib`** — carrick-runtime's tests fork from the harness and deadlock when run in parallel, so the recipe runs every OTHER crate in parallel and then carrick-runtime alone under `RUST_TEST_THREADS=1`. |
+| `just test` | Host lib tests (no HVF/Docker). **Use the recipe, never a bare `cargo test --workspace --lib`** — `carrick-runtime`, `carrick-host` and `carrick-native-darwin` all fork from the test harness and deadlock when run in parallel, so the recipe runs every OTHER crate in parallel and then those three alone under `RUST_TEST_THREADS=1`. A per-module `TEST_LOCK` does **not** substitute: child reaping is PROCESS-wide, so a fork test in a sibling module can consume a stop/exit another module is mid-handshake with, and the rightful parent blocks forever (seen 2026-08-16 as an 11-minute `just test` hang at 0% CPU). |
 | `just test-integration` | Host integration suites (`carrick-runtime`/`engine`/`image`; no HVF). |
 | `just clippy` | `cargo clippy --workspace --all-targets -- -D warnings` (no-panic gate). |
 | `just fmt` / `just fmt-check` | Apply / check formatting. |
