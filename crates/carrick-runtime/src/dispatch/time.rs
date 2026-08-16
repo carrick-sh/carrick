@@ -130,7 +130,7 @@ impl SyscallDispatcher {
     define_syscall! {
         fn timerfd_create(this, cx, clock_id: u64, flags: u64) {
             if linux_clock_duration(clock_id).is_none()
-                || flags & !(LINUX_TFD_NONBLOCK | LINUX_TFD_CLOEXEC) != 0
+                || flags & !LinuxTfdFlags::CREATE_SUPPORTED != 0
             {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -148,7 +148,7 @@ impl SyscallDispatcher {
             // CLOCK_REALTIME discontinuity, which carrick's virtual clock never
             // produces, so it is accepted and ignored — but rejecting it as
             // EINVAL is wrong.
-            if flags & !(LINUX_TIMER_ABSTIME | crate::linux_abi::LINUX_TFD_TIMER_CANCEL_ON_SET) != 0 {
+            if flags & !LinuxTfdFlags::SETTIME_SUPPORTED != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let spec = read_itimerspec(memory, new_value)?;

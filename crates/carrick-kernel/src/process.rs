@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use bitflags::bitflags;
+
 use crate::arena::ArenaError;
 use crate::domains::{HostPid, ProcessGeneration};
 
@@ -8,10 +10,21 @@ pub const PROCESS_RECORDS: usize = 4096;
 /// Claim-sentinel: `host_pid == REGISTERING` while a record is being filled.
 pub const REGISTERING: u32 = u32::MAX;
 
-pub const FLAG_ALIVE: u32 = 1 << 0;
-pub const FLAG_ORPHANED: u32 = 1 << 1;
-pub const FLAG_DEAD: u32 = 1 << 2;
-pub const FLAG_ADOPTED: u32 = 1 << 3;
+bitflags! {
+    /// Process lifecycle flags stored in [`ProcessRecord.flags`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ProcessFlags: u32 {
+        const ALIVE = 1 << 0;
+        const ORPHANED = 1 << 1;
+        const DEAD = 1 << 2;
+        const ADOPTED = 1 << 3;
+    }
+}
+
+pub const FLAG_ALIVE: u32 = ProcessFlags::ALIVE.bits();
+pub const FLAG_ORPHANED: u32 = ProcessFlags::ORPHANED.bits();
+pub const FLAG_DEAD: u32 = ProcessFlags::DEAD.bits();
+pub const FLAG_ADOPTED: u32 = ProcessFlags::ADOPTED.bits();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]

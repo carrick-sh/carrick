@@ -6550,8 +6550,7 @@ impl SyscallDispatcher {
             // The asm-generic value 0o40000 is NOT what musl/glibc ship for
             // aarch64 — checking the wrong value silently rejects every
             // O_DIRECT pipe2 call (the bit's still present in the flags).
-            const LINUX_O_DIRECT: u64 = 0o200000;
-            if flags & !(LINUX_O_CLOEXEC | LINUX_O_NONBLOCK | LINUX_O_DIRECT) != 0 {
+            if LinuxPipe2Flags::from_bits(flags).is_none() {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
 
@@ -12434,41 +12433,30 @@ impl SyscallDispatcher {
         }
 
         fn renameat2(this, cx, olddirfd: u64, oldpath: GuestPtr, newdirfd: u64, newpath: GuestPtr, flags: u64) {
-
-            // RENAME_NOREPLACE=1, RENAME_EXCHANGE=2, RENAME_WHITEOUT=4. We
-            // implement NOREPLACE and EXCHANGE; WHITEOUT (an overlayfs-internal
-            // marker) is not. renameat2(2): any unknown flag → EINVAL, and the
-            // flags are mutually exclusive — RENAME_NOREPLACE|RENAME_EXCHANGE
-            // and RENAME_WHITEOUT|RENAME_EXCHANGE both → EINVAL (renameat201
-            // cases 5,6). do_renameat performs the swap for RENAME_EXCHANGE.
-            const RENAME_NOREPLACE: u64 = 1;
-            const RENAME_EXCHANGE: u64 = 2;
-            const RENAME_WHITEOUT: u64 = 4;
-            const RENAME_KNOWN: u64 = RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT;
-            if flags & !RENAME_KNOWN != 0 {
+            let Some(rf) = LinuxRenameat2Flags::from_bits(flags) else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
+            if rf.contains(LinuxRenameat2Flags::EXCHANGE)
+                && (rf.contains(LinuxRenameat2Flags::NOREPLACE)
+                    || rf.contains(LinuxRenameat2Flags::WHITEOUT))
+            {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            // RENAME_EXCHANGE is incompatible with NOREPLACE and WHITEOUT.
-            if flags & RENAME_EXCHANGE != 0 && flags & (RENAME_NOREPLACE | RENAME_WHITEOUT) != 0 {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            // WHITEOUT on its own (or with NOREPLACE) is unsupported here.
-            if flags & RENAME_WHITEOUT != 0 {
+            if rf.contains(LinuxRenameat2Flags::WHITEOUT) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             this.do_renameat(
                 cx.kernel,
                 RenameAtRequest {
-                olddirfd,
+                    olddirfd,
                     oldpath: oldpath.0,
-                newdirfd,
+                    newdirfd,
                     newpath: newpath.0,
-                flags,
+                    flags,
                     target_tid: Some(cx.tid()),
                 },
                 &*cx.memory,
             )
-
         }
 
         fn memfd_create(this, cx, name: GuestPtr, flags: u64) {
@@ -12477,22 +12465,10 @@ impl SyscallDispatcher {
             // (same shape as O_TMPFILE). MFD_CLOEXEC → FD_CLOEXEC;
             // MFD_ALLOW_SEALING is accepted (fcntl F_ADD_SEALS sealing itself is
             // a separate follow-up — that's what gates memfd_create01).
-            const MFD_CLOEXEC: u64 = 0x0001;
-            const MFD_ALLOW_SEALING: u64 = 0x0002;
-            const MFD_HUGETLB: u64 = 0x0004;
-            const MFD_KNOWN: u64 = MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB;
-            // The huge-page size selector lives in bits [26..31]
-            // (MFD_HUGE_MASK << MFD_HUGE_SHIFT); MFD_HUGE_2MB/1GB/… encode a
-            // log2 page size there. Linux only permits those bits alongside
-            // MFD_HUGETLB (mm/memfd.c): with MFD_HUGETLB set the size selector
-            // is accepted, otherwise any extra bit is EINVAL.
-            const MFD_HUGE_SHIFT: u64 = 26;
-            const MFD_HUGE_MASK: u64 = 0x3f;
-            const MFD_HUGE_BITS: u64 = MFD_HUGE_MASK << MFD_HUGE_SHIFT;
-            let allowed = if flags & MFD_HUGETLB != 0 {
-                MFD_KNOWN | MFD_HUGE_BITS
+            let allowed = if flags & LINUX_MFD_HUGETLB != 0 {
+                LinuxMemfdFlags::KNOWN_MASK | LinuxMemfdFlags::HUGE_BITS
             } else {
-                MFD_KNOWN
+                LinuxMemfdFlags::KNOWN_MASK
             };
             // Linux validates the flags BEFORE the name (LTP memfd_create02
             // passes a valid name with bad flags and still expects EINVAL).
@@ -12530,7 +12506,7 @@ impl SyscallDispatcher {
             // initial seal set is empty; without it F_SEAL_SEAL is preset so no
             // seals can ever be added (F_ADD_SEALS → EPERM) while F_GET_SEALS
             // still succeeds. (memfd_create01)
-            let initial_seals = if flags & MFD_ALLOW_SEALING != 0 {
+            let initial_seals = if flags & LINUX_MFD_ALLOW_SEALING != 0 {
                 0
             } else {
                 LINUX_F_SEAL_SEAL
@@ -12552,7 +12528,7 @@ impl SyscallDispatcher {
                 base,
                 writable: true,
             };
-            let fd_flags = if flags & MFD_CLOEXEC != 0 {
+            let fd_flags = if flags & LINUX_MFD_CLOEXEC != 0 {
                 LINUX_FD_CLOEXEC
             } else {
                 0
