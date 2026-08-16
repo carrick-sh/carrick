@@ -453,10 +453,20 @@ impl SyscallDispatcher {
         path: &str,
         mode: u64,
     ) -> Option<DispatchOutcome> {
-        if !crate::vfs::is_synthetic_virtual_file(path, &self.synthetic_proc_context(context)) {
-            return None;
+        let proc_ctx = self.synthetic_proc_context(context);
+        if crate::vfs::is_synthetic_virtual_file(path, &proc_ctx) {
+            return Some(synthetic_readonly_access_for_path(path, mode));
         }
-        Some(synthetic_readonly_access_for_path(path, mode))
+        // `/proc/<pid>` and its `task/` tree for a PEER exist only in the
+        // kernel task graph — see `path_stat_record`. Without this,
+        // `access("/proc/<peer>", F_OK)` fell through to `Vfs::lookup`, which
+        // carries no context and asks Darwin's process table.
+        if crate::vfs::proc::synthetic_dir_entries(path, &proc_ctx).is_some() {
+            // A `/proc` directory is r-xr-xr-x: readable and searchable, never
+            // writable (LTP `tgkill03` probes `R_OK`).
+            return Some(synthetic_readonly_access_with_errno(mode, LINUX_EACCES));
+        }
+        None
     }
 }
 

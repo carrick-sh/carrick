@@ -995,11 +995,12 @@ pub(crate) struct LiveProcess {
     pub process_group: ProcessGroupId,
     pub session: SessionId,
     pub lifecycle: TaskLifecycle,
-    /// Live thread count, for `/proc/<pid>/stat` field 20 and `status`'
-    /// `Threads:`. Read from the registry's own per-task thread claims — the
-    /// authority that admits and retires a thread — not from a host thread
-    /// table, which under HVPatch describes the whole carrier.
-    pub thread_count: usize,
+    /// Every live thread's Linux tid, for `/proc/<pid>/task/` and — by its
+    /// length — `/proc/<pid>/stat` field 20 and `status`' `Threads:`. Read from
+    /// the registry's own per-task thread claims — the authority that admits
+    /// and retires a thread — not from a host thread table, which under
+    /// HVPatch describes the whole carrier.
+    pub tids: Vec<LinuxTid>,
     pub diagnostic_name: String,
 }
 
@@ -1051,7 +1052,7 @@ impl Registry {
                 process_group: record.task.process_group(),
                 session: record.task.session(),
                 lifecycle: record.task.lifecycle(),
-                thread_count: record.thread_claims.len(),
+                tids: record.thread_claims.keys().copied().collect(),
                 diagnostic_name: record.diagnostic_name.clone(),
             })
             .collect()

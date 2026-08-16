@@ -6757,7 +6757,7 @@ impl SyscallDispatcher {
                     // zombie only when the registry moves it, which is when the
                     // zombie arm takes over.
                     state: crate::run_state::published_stat_char(pid).unwrap_or('R'),
-                    threads: process.thread_count,
+                    tids: process.tids.iter().map(|tid| tid.raw() as u32).collect(),
                     // HONEST GAP: this is the registry's fork-time label, not
                     // the Linux `comm`. Linux's is the exec basename as later
                     // amended by `prctl(PR_SET_NAME)`, and carrick keeps that
