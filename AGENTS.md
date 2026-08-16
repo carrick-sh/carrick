@@ -224,6 +224,18 @@ If it fails in Docker too, it's not carrick's bug.
   of bending the gate to match carrick: it makes the oracle measure the Linux
   semantics the case was written to test. Confirm by running the case under
   Docker with and without the capability before changing anything.
+- **Concurrent agents contaminate a conformance measurement — verify against
+  UNMODIFIED main before believing a result.** Sibling agents running release
+  builds and guests will make LTP cases fail identically and en masse; two hours
+  were nearly lost chasing that as a code bug. The tell is that the SAME failures
+  reproduce on a rebuilt unmodified base revision, so measure that pair rather
+  than trusting one run. The harness helps: it self-classifies a starved timeout
+  as `[starved]` versus a real `[blocked]` hang — read that field before filing a
+  hang. Two related traps in the same family: a measurement run must use a binary
+  REBUILT AFTER every merge it claims to cover (a stale `target/release/carrick`
+  silently re-reports already-fixed failures — 28 of 126 gating failures in one
+  run), and a suite must be invoked the way the HARNESS invokes it (wrapped in
+  `/bin/sh -c` with `--max-traps` disabled) — a direct exec hangs as PID 1.
 - **The Docker oracle is cached** (`scripts/conformance/oracle-cache.jsonl`) so
   routine gates run carrick-only. Single-run gating is non-deterministic
   (Go-under-HVF races); treat flaky flips as flakiness (retry / `known_gaps`),
