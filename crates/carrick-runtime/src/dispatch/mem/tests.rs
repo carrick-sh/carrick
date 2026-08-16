@@ -3,6 +3,74 @@ use crate::linux_abi::LINUX_PROT_EXEC;
 use crate::memory::{LINUX_HEAP_BASE, LINUX_MMAP_BASE};
 use std::cell::Cell;
 
+/// The Darwin constraint behind [`host_fd_can_back_shared_alias`], asserted
+/// against the live host kernel rather than trusted as folklore: a
+/// `MAP_SHARED` mapping of an `O_RDONLY` fd is capped at a read-only
+/// `max_protection`, so it can never be granted write — which is exactly why
+/// `hv_vm_map` refuses such a region with `HV_ERROR` and why that fd must not
+/// back a live stage-2 alias. The same file opened `O_RDWR` re-protects fine,
+/// so the fd's ACCESS MODE, not the requested protection, is the discriminator.
+#[cfg(target_os = "macos")]
+#[test]
+fn readonly_host_fd_cannot_carry_a_writable_shared_file_mapping() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    let dir = std::env::temp_dir().join(format!("carrick-alias-maxprot-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("backing");
+    {
+        let mut file = std::fs::File::create(&path).expect("create backing");
+        file.write_all(&[0u8; 16384]).expect("size backing");
+    }
+
+    let map_then_grant_write = |file: &std::fs::File| -> (bool, i32) {
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                16384,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED, "PROT_READ MAP_SHARED must map");
+        let rc = unsafe { libc::mprotect(addr, 16384, libc::PROT_READ | libc::PROT_WRITE) };
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        unsafe { libc::munmap(addr, 16384) };
+        (rc == 0, errno)
+    };
+
+    let readonly = std::fs::File::open(&path).expect("open O_RDONLY");
+    assert!(
+        !host_fd_can_back_shared_alias(readonly.as_raw_fd()),
+        "an O_RDONLY host fd must be refused as alias backing"
+    );
+    let (granted, errno) = map_then_grant_write(&readonly);
+    assert!(
+        !granted && errno == libc::EACCES,
+        "Darwin must cap max_protection of an O_RDONLY MAP_SHARED mapping (granted={granted} errno={errno})"
+    );
+
+    let readwrite = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("open O_RDWR");
+    assert!(
+        host_fd_can_back_shared_alias(readwrite.as_raw_fd()),
+        "an O_RDWR host fd is valid alias backing"
+    );
+    let (granted, errno) = map_then_grant_write(&readwrite);
+    assert!(
+        granted,
+        "an O_RDWR-backed MAP_SHARED mapping must accept PROT_WRITE (errno={errno})"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 struct CountingMmapMemory {
     base: u64,
     bytes: Vec<u8>,

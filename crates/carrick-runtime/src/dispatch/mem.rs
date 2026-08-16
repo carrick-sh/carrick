@@ -1075,6 +1075,40 @@ fn shared_file_bus_offset(file_len: u64, offset: u64, length: u64, page_size: u6
     (bus_start < length).then_some(bus_start)
 }
 
+/// Can `fd` back a live `MAP_SHARED` stage-2 alias?
+///
+/// Darwin caps a `MAP_SHARED` file mapping's `max_protection` at the backing
+/// fd's access mode: an `O_RDONLY` fd yields `max_protection = READ|EXECUTE`,
+/// and `mprotect(PROT_WRITE)` on that region fails `EACCES` no matter what
+/// `protection` the mapping was created with. `hv_vm_map` then refuses the
+/// region outright with `HV_ERROR` — carrick installs alias extents with
+/// permissive RWX stage-2 rights, so HVF requires a host region whose
+/// `max_protection` includes write. The requested protection is NOT the
+/// discriminator: a `PROT_READ` mapping of an `O_RDWR` fd maps fine.
+///
+/// carrick already prefers an `O_RDWR` host fd even for a guest `O_RDONLY`
+/// open (`fs_backend::fast_open_for_guest`, `open_raw_fd_capstd`,
+/// `dispatch::fs`'s trusted-dirfd lane) precisely for this reason. Files
+/// served from the IMMUTABLE shared layer cache are the case that preference
+/// cannot cover, and deliberately so: that store is content-addressed and
+/// shared across containers and runs, so handing a guest an RWX stage-2 view
+/// of it would let one guest corrupt every other run's cache and would defeat
+/// the overlay's copy-up. Such a mapping falls back to the snapshot path
+/// instead — observationally equivalent for a read-only mapping of a layer
+/// that cannot change under it.
+///
+/// Only Darwin/HVF carries this constraint; other hosts keep the live alias.
+#[cfg(target_os = "macos")]
+fn host_fd_can_back_shared_alias(fd: i32) -> bool {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    flags >= 0 && flags & libc::O_ACCMODE == libc::O_RDWR
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_fd_can_back_shared_alias(_fd: i32) -> bool {
+    true
+}
+
 fn host_fd_file_len(fd: i32) -> Option<u64> {
     let mut st: libc::stat = unsafe { core::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut st) } == 0 && st.st_size >= 0 {
@@ -2642,11 +2676,18 @@ impl SyscallDispatcher {
                     let open = open_file.description.read();
                     match &*open {
                         OpenDescription::HostFile { host_fd, .. } => {
+                            // Two named preconditions decide the live alias, so
+                            // neither is discovered as an opaque hypervisor
+                            // error deep inside the VMM backend: the mapping
+                            // must not run past EOF (that tail is BUS_ADRERR,
+                            // served by the snapshot path below), and the host
+                            // fd must be able to carry a write max-protection.
                             if host_fd_file_len(host_fd.raw())
                                 .and_then(|len| {
                                     shared_file_bus_offset(len, offset, length, page_size)
                                 })
                                 .is_some()
+                                || !host_fd_can_back_shared_alias(host_fd.raw())
                             {
                                 None
                             } else {
