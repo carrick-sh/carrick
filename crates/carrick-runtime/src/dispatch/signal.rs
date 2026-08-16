@@ -1312,6 +1312,16 @@ impl SyscallDispatcher {
                 Err(_) => return Some(DispatchOutcome::errno(LINUX_EINVAL)),
             }
         };
+        // RLIMIT_SIGPENDING caps the number of QUEUED real-time signals;
+        // tgkill(2)/sigqueue(3) report EAGAIN once it is reached. The check
+        // already exists and its own comment cites LTP tgkill02, but its only
+        // callers were `route_thread_signal` (the non-HVPatch route) and
+        // `sigqueueinfo_common` — the HVPatch branch returned before reaching
+        // either, so the limit was simply never enforced on this lane.
+        if signum != 0 && is_rt_signal(signum as i32) && self.sigpending_limit_exceeded(ctx.kernel)
+        {
+            return Some(DispatchOutcome::errno(crate::linux_abi::LINUX_EAGAIN));
+        }
         Some(
             match kernel.authorize_signal_target_exact(
                 ctx.kernel,
@@ -2181,6 +2191,16 @@ impl SyscallDispatcher {
             if let Ok(bytes) = memory.read_bytes(info_ptr.0, core::mem::size_of::<LinuxSiginfo>())
                 && let Ok(mut info) = LinuxSiginfo::read_from_bytes(&bytes)
             {
+                // rt_sigqueueinfo(2): "EPERM ... or `info->si_code` is invalid:
+                // it must be negative (i.e. not one of the codes the kernel
+                // generates) unless the signal is being sent to the caller's
+                // own thread group." Without this a guest can forge a
+                // kernel-origin si_code such as SI_USER into ANOTHER thread
+                // group's siginfo, which is a real cross-process spoof and not
+                // merely a missing assertion (LTP rt_sigqueueinfo02).
+                if info.si_code >= 0 && ns_target != i64::from(self.identity_pid()) {
+                    return DispatchOutcome::errno(LINUX_EPERM);
+                }
                 info.si_signo = s;
                 user_info = Some(info);
             }

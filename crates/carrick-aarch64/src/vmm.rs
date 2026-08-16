@@ -404,6 +404,10 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         None
     }
 
+    fn abandon_alias_inventory(&mut self) -> bool {
+        false
+    }
+
     fn frame_inventory_exec_extent_counts(&self, _new_image: &AddressSpace) -> (usize, usize) {
         (0, 0)
     }

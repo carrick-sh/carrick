@@ -1493,6 +1493,36 @@ impl SyscallDispatcher {
         record
     }
 
+    /// Give a layered-lookup result the identity of the host inode that
+    /// actually backs it.
+    ///
+    /// The layered resolver owns EXISTENCE and kind — whiteouts, copy-up,
+    /// cross-layer symlinks. It cannot own identity: `vfs::Metadata` and
+    /// `RootFsMetadata` carry no inode, no link count and no timestamps, so
+    /// `StatRecord::from_metadata` hashes the path instead. That is fine for a
+    /// synthetic entry, but an entry only the immutable cache lower holds is a
+    /// REAL host file — `open()` hands back its host fd, `fstat` reports its
+    /// APFS inode and `getdents64` already publishes that inode as `d_ino`.
+    /// A path hash here made `stat(p).st_ino != fstat(open(p)).st_ino`, which
+    /// GNU coreutils `cp` reads as the source being replaced mid-copy
+    /// (`cp: skipping file '…', as it was replaced while being copied` →
+    /// LTP `execve02` TBROK once the cached lower was enabled for HvPatch).
+    ///
+    /// Kind agreement gates the adoption: a mismatch means the resolver landed
+    /// on something other than the lower entry of that name, so its answer
+    /// stands.
+    pub(super) fn layered_identity_record(
+        &self,
+        path: &str,
+        follow: bool,
+        metadata: &RootFsMetadata,
+    ) -> StatRecord {
+        match self.fs.rootfs_vfs.immutable_lower_real_stat(path, follow) {
+            Some(real) if real.kind == metadata.kind => StatRecord::from_real(path, &real),
+            _ => StatRecord::from_metadata(metadata),
+        }
+    }
+
     /// `statx` twin of [`stat_record_with_device`](Self::stat_record_with_device):
     /// write a statx record from a real backing stat with the `mknod(2)`
     /// device-node override applied (S_IFCHR/S_IFBLK + stx_rdev_{major,minor}).
@@ -1643,7 +1673,8 @@ impl SyscallDispatcher {
         } else {
             self.fs.rootfs_vfs.lookup_nofollow(&path)
         };
-        lookup.map(|md| StatRecord::from_metadata(&vfs_md_to_rootfs_md(&path, &md)))
+        lookup
+            .map(|md| self.layered_identity_record(&path, follow, &vfs_md_to_rootfs_md(&path, &md)))
     }
 
     fn statfs(
@@ -3061,9 +3092,11 @@ impl SyscallDispatcher {
                 return None;
             }
             if host_dir.immutable_lower_generation.is_some() {
-                // The layered immutable-rootfs stat intentionally synthesizes
-                // stable guest inode/time fields. A raw fstat of the cache
-                // directory would expose unrelated APFS identity instead.
+                // A lower dirfd's own identity is now the cache directory's
+                // real host inode either way (`layered_identity_record`), so
+                // this is no longer about which inode to report — it is that
+                // the anchor may have been whiteout-shadowed or copied up
+                // since it was opened, which only the layered walk can see.
                 return None;
             }
             if !self.cred_snapshot().euid.is_root() {
@@ -13117,11 +13150,17 @@ impl SyscallDispatcher {
                 this.fs.rootfs_vfs.lookup_nofollow(&path)
             };
             match lookup {
-                Ok(md) => Ok(write_statx(
-                    memory,
-                    statxbuf,
-                    &vfs_md_to_rootfs_md(&path, &md),
-                )),
+                Ok(md) => {
+                    // Same identity reconciliation newfstatat performs, so
+                    // statx and stat cannot report different inodes for one
+                    // immutable-lower file.
+                    let record = this.layered_identity_record(
+                        &path,
+                        follow,
+                        &vfs_md_to_rootfs_md(&path, &md),
+                    );
+                    Ok(write_statx_record(memory, statxbuf, &record))
+                }
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
 
