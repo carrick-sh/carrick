@@ -6350,3 +6350,89 @@ fn every_mmap_refusal_names_itself() {
         "the mmap handler no longer routes refusals through MmapRequest::refused"
     );
 }
+
+/// A core is a Linux artifact: it may only contain VMAs the guest itself can
+/// see. Carrick's kernel hole is `AP=00` (EL1-only) — the EL0 trampoline, the
+/// EL1 vectors, the stage-1 page tables, the maintenance trampoline, the
+/// per-process identity page and the syscall mailbox arena — so Linux has no
+/// such VMA and neither may the core.
+///
+/// This is not cosmetic. The identity page at `LINUX_IDENTITY_PAGE_BASE` has a
+/// live stage-1 leaf pointing into a reusable global frame that the host-side
+/// guest-memory reader cannot authenticate, so dumping it failed the WHOLE
+/// core closed with `live core read has no current backing:
+/// va=0x2d001e4000` — observed on `ltp-mmap18` and `ltp-munmap04`.
+#[test]
+fn core_maps_exclude_carricks_el1_only_kernel_hole() {
+    let mut mem = MemState::new();
+    let kernel_hole = |start: u64, size: u64| ProcMapsEntry {
+        start,
+        end: start + size,
+        read: true,
+        write: true,
+        execute: false,
+        sharing: crate::vfs::ProcMapSharing::Private,
+        path: String::new(),
+    };
+    let guest_text = ProcMapsEntry {
+        start: 0x1_0000_0000,
+        end: 0x1_0001_0000,
+        read: true,
+        write: false,
+        execute: true,
+        sharing: crate::vfs::ProcMapSharing::Private,
+        path: String::new(),
+    };
+    mem.address_space_regions = Some(vec![
+        guest_text.clone(),
+        kernel_hole(crate::memory::LINUX_EL0_TRAMPOLINE_BASE, 0x4000),
+        kernel_hole(crate::memory::LINUX_EL1_VECTORS_BASE, 0x4000),
+        kernel_hole(
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+            crate::memory::LINUX_PAGE_TABLES_SIZE,
+        ),
+        kernel_hole(
+            crate::memory::LINUX_IDENTITY_PAGE_BASE,
+            crate::memory::LINUX_IDENTITY_PAGE_SIZE,
+        ),
+        kernel_hole(
+            crate::memory::LINUX_SYSCALL_MAILBOX_BASE,
+            crate::memory::LINUX_SYSCALL_MAILBOX_ARENA_SIZE,
+        ),
+    ]);
+
+    let maps = project_core_maps(&mem);
+    assert_eq!(
+        maps.iter().map(|map| map.start).collect::<Vec<_>>(),
+        vec![guest_text.start],
+        "only the guest's own VMA belongs in a core"
+    );
+}
+
+/// The guest-visible neighbours of the kernel hole must NOT be swept up with
+/// it: the vvar/vDSO pair and the rt_sigreturn trampoline are mapped for EL0
+/// and a real Linux core carries their equivalents.
+#[test]
+fn core_maps_keep_guest_visible_neighbours_of_the_kernel_hole() {
+    let mut mem = MemState::new();
+    let region = |start: u64, size: u64| ProcMapsEntry {
+        start,
+        end: start + size,
+        read: true,
+        write: false,
+        execute: true,
+        sharing: crate::vfs::ProcMapSharing::Private,
+        path: String::new(),
+    };
+    mem.address_space_regions = Some(vec![
+        region(crate::memory::LINUX_SIGRETURN_TRAMPOLINE_BASE, 0x4000),
+        region(
+            crate::memory::LINUX_KERNEL_REGION_BASE + crate::memory::LINUX_KERNEL_REGION_SIZE,
+            0x1000,
+        ),
+        region(crate::memory::LINUX_KERNEL_REGION_BASE - 0x10000, 0x1000),
+    ]);
+
+    let maps = project_core_maps(&mem);
+    assert_eq!(maps.len(), 3, "nothing outside the kernel hole is dropped");
+}

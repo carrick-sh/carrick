@@ -757,6 +757,22 @@ fn boot_region_is_hidden_private_overlay(map: &ProcMapsEntry) -> bool {
                 .saturating_add(crate::memory::LINUX_PRIVATE_OVERLAY_SIZE)
 }
 
+/// Is `map` one of carrick's own EL1-only pages in the kernel hole?
+///
+/// The 2 MiB block at [`LINUX_KERNEL_REGION_BASE`](crate::memory::LINUX_KERNEL_REGION_BASE)
+/// holds the EL0 entry trampoline, the EL1 vector table, the stage-1 page
+/// tables, the EL1 maintenance trampoline, the per-process identity page and
+/// the syscall mailbox arena. `stage1_identity_page_tables` maps that whole
+/// block `AP=00` — kernel-only — so guest EL0 can neither read nor write it.
+/// It is carrick implementation exactly like the hidden mmap/heap
+/// reservations, Linux has no such VMA, and a real Linux core has no such
+/// `PT_LOAD`.
+fn boot_region_is_carrick_kernel_hole(map: &ProcMapsEntry) -> bool {
+    let base = crate::memory::LINUX_KERNEL_REGION_BASE;
+    let end = base.saturating_add(crate::memory::LINUX_KERNEL_REGION_SIZE);
+    map.start >= base && map.end <= end && map.start < map.end
+}
+
 fn boot_region_is_hidden_reservation(map: &ProcMapsEntry, layout: MemoryLayout) -> bool {
     boot_region_is_hidden_mmap_backing(map, layout)
         || boot_region_is_hidden_heap_backing(map, layout)
@@ -803,14 +819,15 @@ fn project_vma_summaries(mem: &MemState) -> Vec<crate::kernel::VmaSummary> {
 }
 
 /// Exact Linux-visible mapping metadata used by the live core publisher.
-/// Hidden reservation apertures are implementation backing, not VMAs; the
-/// heap is clamped to `brk`, and dynamic mappings supply the committed pieces
-/// of the hidden mmap arena.
+/// Hidden reservation apertures and carrick's own EL1-only kernel hole are
+/// implementation backing, not VMAs; the heap is clamped to `brk`, and dynamic
+/// mappings supply the committed pieces of the hidden mmap arena.
 pub(super) fn project_core_maps(mem: &MemState) -> Vec<ProcMapsEntry> {
     let mut maps: Vec<ProcMapsEntry> = mem
         .address_space_regions
         .iter()
         .flatten()
+        .filter(|map| !boot_region_is_carrick_kernel_hole(map))
         .filter(|map| {
             !boot_region_is_hidden_reservation(map, mem.layout)
                 || boot_region_is_hidden_heap_backing(map, mem.layout)
