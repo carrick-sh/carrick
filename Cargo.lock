@@ -855,6 +855,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tracing",
  "usdt",
  "zerocopy",
 ]

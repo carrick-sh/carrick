@@ -6660,6 +6660,7 @@ impl HvfVmState {
             shared_key_base: 0,
             shared_key_offset: 0,
         });
+        self.supersede_cow_receipts("sparse-mmap-extent", start, semantic_len as u64);
         self.cow_deferred_publications
             .lock()
             .push(PendingFrameCowPublication {
@@ -6668,6 +6669,72 @@ impl HvfVmState {
                 expected_ipa: semantic_ipa,
             });
         Ok(end)
+    }
+
+    /// Void every pending deferred-COW receipt naming `[va, va+len)`.
+    ///
+    /// A receipt is a promise about ONE `(VA -> IPA)` publication, redeemed by
+    /// the `protect_range` that completes it. The moment a later transaction
+    /// repoints those leaves the promise is void: authenticating it compares
+    /// the live translation against an owner that has been DELIBERATELY
+    /// replaced, and `observe_frame_cow_protection` then fails a publication
+    /// that is in fact correct — which the dispatcher can only lower to a
+    /// guest `ENOMEM`. That is how CPython's thread stacks came back
+    /// MAP_FAILED ("Can't start 20 threads, only 4 threads started"): a
+    /// sparse-mmap extent's receipt was falsified by a frame COW running
+    /// between its publication and its protection commit.
+    ///
+    /// Every stage-1 repointer calls this before publishing its own receipt.
+    /// No authentication coverage is lost: each repointer verifies its own
+    /// leaves inline and leaves a receipt for the state that actually
+    /// survives. A receipt only partly covered is split, never widened.
+    fn supersede_cow_receipts(&self, site: &'static str, va: u64, len: u64) {
+        let Some(end) = va.checked_add(len) else {
+            return;
+        };
+        let mut receipts = self.cow_deferred_publications.lock();
+        if receipts.is_empty() {
+            return;
+        }
+        let mut remaining = Vec::with_capacity(receipts.len());
+        for receipt in receipts.drain(..) {
+            let receipt_end = receipt.va.saturating_add(receipt.len as u64);
+            if receipt_end <= va || receipt.va >= end {
+                remaining.push(receipt);
+                continue;
+            }
+            tracing::debug!(
+                target: "carrick::cow",
+                site,
+                repoint = format_args!("{va:#x}+{len:#x}"),
+                receipt = format_args!("{:#x}+{:#x}", receipt.va, receipt.len),
+                expected_ipa = format_args!("{:#x}", receipt.expected_ipa),
+                "superseding deferred COW receipt",
+            );
+            let overlap_start = receipt.va.max(va);
+            let overlap_end = receipt_end.min(end);
+            if receipt.va < overlap_start
+                && let Ok(prefix) = usize::try_from(overlap_start - receipt.va)
+            {
+                remaining.push(PendingFrameCowPublication {
+                    va: receipt.va,
+                    len: prefix,
+                    expected_ipa: receipt.expected_ipa,
+                });
+            }
+            if overlap_end < receipt_end
+                && let Ok(suffix) = usize::try_from(receipt_end - overlap_end)
+                && let Some(expected_ipa) =
+                    receipt.expected_ipa.checked_add(overlap_end - receipt.va)
+            {
+                remaining.push(PendingFrameCowPublication {
+                    va: overlap_end,
+                    len: suffix,
+                    expected_ipa,
+                });
+            }
+        }
+        *receipts = remaining;
     }
 
     /// Replace an invalid stage-1 output whose exact stage-2 lease was retired
@@ -7007,6 +7074,7 @@ impl HvfVmState {
             shared_key_base: 0,
             shared_key_offset: 0,
         });
+        self.supersede_cow_receipts("retained-reuse", page_va, span_len as u64);
         let mut pending = self.cow_deferred_publications.lock();
         let mut current = page_va;
         while current < span_end {
@@ -7553,6 +7621,13 @@ impl HvfVmState {
             }
         }
         emit_cow(carrick_observability::probes::HvpatchFrameCowPhase::Committed);
+        // The repoint above replaced this span's stage-1 output. Any receipt
+        // still naming the PREVIOUS owner for these VAs — typically the
+        // sparse-mmap extent published moments earlier in the very same guest
+        // `mmap`, whose leaves are deliberately invalid until the protection
+        // commit — is now a false promise, and would fail the authentication
+        // that completes this mapping.
+        self.supersede_cow_receipts("frame-cow", span.va, span.len as u64);
         if let Some((va, leaf, expected_ipa, expected_ap)) = preserved_denied_receipt {
             crate::probes::pt_alias_receipt(va, leaf, expected_ipa, expected_ap, 3);
             if intent == carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance {
