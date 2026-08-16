@@ -584,6 +584,7 @@ where
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     }));
     let install = transaction
@@ -3899,6 +3900,7 @@ fn native16k_rejects_write_exec_alias_mprotect() {
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     });
     let registry =
@@ -4100,6 +4102,7 @@ fn native16k_allows_private_alias_write_exec_for_translation_backend() {
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     });
     let registry =
@@ -5426,6 +5429,7 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     });
 
@@ -5496,6 +5500,7 @@ fn core_file_provenance_keeps_mmap_offset_and_excludes_anonymous_exec() {
         resident: true,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     });
     dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
@@ -5509,6 +5514,7 @@ fn core_file_provenance_keeps_mmap_offset_and_excludes_anonymous_exec() {
         resident: true,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     });
 
@@ -5541,6 +5547,7 @@ fn host_alias_inventory_commits_trims_and_fork_clones_exact_ranges() {
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     }));
     assert!(
@@ -5626,6 +5633,7 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     }));
 
@@ -5688,6 +5696,7 @@ fn pending_host_alias_transaction_drop_aborts_and_notifies_waiters() {
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     }));
     let sibling = std::sync::Arc::clone(&dispatcher);
@@ -5731,6 +5740,7 @@ fn dropping_unconsumed_host_alias_outcome_closes_fd_and_aborts_transaction() {
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     }));
     let mut pipe = [-1; 2];
@@ -5780,6 +5790,7 @@ fn installing_host_alias_blocks_sibling_mapping_dispatch_until_resolution() {
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     }));
     let install = transaction
