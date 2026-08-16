@@ -6,6 +6,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use carrick_abi::keyring::{KeyRequestDefault, KeySerial};
 use carrick_abi::{LinuxSigaction, LinuxSigaltstack, LinuxSiginfo, NsGid, NsUid, SigSet};
 use carrick_hal::ThreadId;
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -2346,6 +2347,34 @@ pub struct Task {
     /// process's file and reads it back (`tst_memutils.c:set_oom_score_adj`),
     /// which a shared cell cannot model.
     oom_score_adj: AtomicI32,
+    /// This process's keyring pointers (`keyrings(7)`): the process keyring,
+    /// the session keyring, and the `KEYCTL_SET_REQKEY_KEYRING` default.
+    ///
+    /// They are task state, not thread state, because Linux shares them across
+    /// every thread of a process — and they are not a host-process global for
+    /// the same reason [`Task::oom_score_adj`] is not: under HVPatch every
+    /// Linux process is a thread of ONE Darwin process, so a global would let
+    /// one guest's `KEYCTL_JOIN_SESSION_KEYRING` reassign every other guest's
+    /// session keyring.
+    keyrings: Mutex<ProcessKeyrings>,
+}
+
+/// A process's keyring pointers. Serials rather than object references: the
+/// keys themselves live in the VM-wide [`crate::keyring::KeyringService`], and
+/// naming them by serial is what lets a `fork` child share the parent's session
+/// keyring by simply copying the number.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProcessKeyrings {
+    /// `KEY_SPEC_PROCESS_KEYRING`, materialised on demand.
+    pub process: Option<KeySerial>,
+    /// `KEY_SPEC_SESSION_KEYRING`. `None` means this process has never joined
+    /// one, so its session keyring IS its user-session keyring — Linux's
+    /// default, and the reason a fresh guest can still `add_key` to
+    /// `KEY_SPEC_SESSION_KEYRING`.
+    pub session: Option<KeySerial>,
+    /// Where `request_key(2)` links a constructed key when the caller passes
+    /// destination 0.
+    pub request_key_default: KeyRequestDefault,
 }
 
 /// The two CPU ledgers Linux keeps for every process, owned by the kernel
@@ -2402,7 +2431,31 @@ impl Task {
             waker: Mutex::new(None),
             wake_generation: AtomicU64::new(0),
             oom_score_adj: AtomicI32::new(0),
+            keyrings: Mutex::new(ProcessKeyrings::default()),
         }
+    }
+
+    /// This process's keyring pointers.
+    pub fn keyrings(&self) -> ProcessKeyrings {
+        *self.keyrings.lock()
+    }
+
+    /// Mutate this process's keyring pointers under the task lock, so a
+    /// materialise-if-absent (`KEYCTL_GET_KEYRING_ID` with create) cannot race
+    /// a sibling thread into two keyrings for one process.
+    pub fn with_keyrings<R>(&self, f: impl FnOnce(&mut ProcessKeyrings) -> R) -> R {
+        f(&mut self.keyrings.lock())
+    }
+
+    /// Copy the parent's keyring pointers into a fresh `fork` child.
+    ///
+    /// `keyrings(7)`: the session keyring is INHERITED — parent and child go on
+    /// sharing one keyring object until one of them joins another — and so is
+    /// the request-key default. The THREAD keyring is deliberately absent here:
+    /// Linux does not pass it to a child, and neither does carrick (a fresh
+    /// [`Thread`] starts with none).
+    pub fn inherit_keyrings_from(&self, parent: &Task) {
+        *self.keyrings.lock() = parent.keyrings();
     }
 
     /// This process's `/proc/<pid>/oom_score_adj` (default 0).
@@ -2922,6 +2975,7 @@ impl Task {
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
             system_ns: AtomicU64::new(0),
             crash_registers: Mutex::new(None),
+            thread_keyring: Mutex::new(None),
         })
     }
 
@@ -2945,6 +2999,7 @@ impl Task {
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
             system_ns: AtomicU64::new(0),
             crash_registers: Mutex::new(None),
+            thread_keyring: Mutex::new(None),
         })
     }
 
@@ -2968,6 +3023,7 @@ impl Task {
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
             system_ns: AtomicU64::new(0),
             crash_registers: Mutex::new(None),
+            thread_keyring: Mutex::new(None),
         })
     }
 
@@ -2991,6 +3047,7 @@ impl Task {
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
             system_ns: AtomicU64::new(0),
             crash_registers: Mutex::new(None),
+            thread_keyring: Mutex::new(None),
         })
     }
 
@@ -3406,6 +3463,15 @@ pub struct Thread {
     /// The generation prevents a delayed sibling from contaminating a later
     /// capture attempt and makes incomplete/racing snapshots detectable.
     crash_registers: Mutex<Option<(u64, carrick_hal::Aarch64CoreRegisters)>>,
+    /// `KEY_SPEC_THREAD_KEYRING`, materialised on demand.
+    ///
+    /// Per-THREAD, keyed by this object's exact [`ThreadKey`] rather than by a
+    /// host tid: under HVPatch a guest thread is a host pthread of one carrier,
+    /// so a tid-keyed table would alias across guest processes and would go
+    /// stale the moment a tid was reused. `keyrings(7)` makes this the one
+    /// keyring a `fork` child does NOT inherit, which every constructor here
+    /// gets for free by starting it at `None`.
+    thread_keyring: Mutex<Option<KeySerial>>,
 }
 
 /// A thread that has not yet run guest code and so owns no `guest_cpu` slot.
@@ -3414,6 +3480,20 @@ pub const CPU_SLOT_UNBOUND: usize = usize::MAX;
 impl Thread {
     pub const fn key(&self) -> ThreadKey {
         self.key
+    }
+
+    /// This thread's `KEY_SPEC_THREAD_KEYRING`, or `None` if it has never
+    /// needed one.
+    pub fn thread_keyring(&self) -> Option<KeySerial> {
+        *self.thread_keyring.lock()
+    }
+
+    /// Materialise-or-read this thread's keyring under the thread lock, so two
+    /// racing `KEYCTL_GET_KEYRING_ID(KEY_SPEC_THREAD_KEYRING, 1)` calls cannot
+    /// leave the thread with two keyrings and leak the first — the shape
+    /// `keyctl04` (CVE-2017-7472) checks for.
+    pub fn with_thread_keyring<R>(&self, f: impl FnOnce(&mut Option<KeySerial>) -> R) -> R {
+        f(&mut self.thread_keyring.lock())
     }
 
     pub(crate) fn publish_crash_registers(

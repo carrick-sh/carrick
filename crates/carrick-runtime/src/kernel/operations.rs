@@ -533,6 +533,10 @@ impl ForkReservation {
         // oom_score_adj is inherited across fork (proc(5)) and independent
         // thereafter — copy the parent's value into the fresh child task.
         child.set_oom_score_adj(self.caller_task.oom_score_adj());
+        // The session and process keyrings and the request-key default are
+        // inherited across fork (`keyrings(7)`); the thread keyring is not, and
+        // the fresh leader below starts without one.
+        child.inherit_keyrings_from(&self.caller_task);
         let leader_tid = LinuxTid::for_task_leader(self.child_id);
         let leader = child.attach_fork_thread(
             ThreadKey {
