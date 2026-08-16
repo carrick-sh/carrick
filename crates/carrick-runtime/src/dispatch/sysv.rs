@@ -708,10 +708,12 @@ impl SysvIpcService {
         creds: &crate::kernel::Credentials,
         msg_type: MsgType,
         payload: &[u8],
+        operator: i32,
     ) -> Result<bool, LinuxErrno> {
-        msg_queue_try_send(id, creds, msg_type, payload)
+        msg_queue_try_send(id, creds, msg_type, payload, operator)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn msgrcv<M: GuestMemory>(
         cx: &mut SyscallCtx<M>,
         id: MsgQueueId,
@@ -720,8 +722,9 @@ impl SysvIpcService {
         msgsz: usize,
         wanted: MsgType,
         flags: MsgOpFlags,
+        operator: i32,
     ) -> Result<Option<usize>, LinuxErrno> {
-        msg_queue_receive(cx, id, creds, msgp, msgsz, wanted, flags)
+        msg_queue_receive(cx, id, creds, msgp, msgsz, wanted, flags, operator)
     }
 
     fn msgctl<M: GuestMemory>(
@@ -1452,6 +1455,11 @@ impl MsgQueueLock {
         Ok(())
     }
 
+    /// `operator` is the SENDING Linux process's own pid, recorded as
+    /// `msg_lspid`. It is threaded in from the dispatch boundary rather than
+    /// read from the host: under HVPatch every logical process shares the VM
+    /// carrier's host pid, so `self_ns_pid()` would stamp one value for all of
+    /// them (LTP msgsnd01 "PID of last msgsnd(2) mismatched").
     fn append_message(
         &self,
         queue: &MsgQueueFile,
@@ -1459,6 +1467,7 @@ impl MsgQueueLock {
         file_size: usize,
         msg_type: MsgType,
         payload: &[u8],
+        operator: i32,
     ) -> Result<(), LinuxErrno> {
         let append_offset = if queue.qnum == 0 {
             MSG_QUEUE_HEADER_SIZE
@@ -1481,7 +1490,7 @@ impl MsgQueueLock {
             unix_now_secs(),
             queue.rtime,
             queue.ctime,
-            crate::namespace::pid::self_ns_pid() as i32,
+            operator,
             queue.lrpid,
             if queue.qnum == 0 {
                 MSG_QUEUE_HEADER_SIZE
@@ -1510,11 +1519,15 @@ impl MsgQueueLock {
         ))
     }
 
+    /// `operator` is the RECEIVING Linux process's own pid, recorded as
+    /// `msg_lrpid`; see [`MsgQueueLock::append_message`] for why it is threaded
+    /// in rather than read from the host (LTP msgrcv01).
     fn consume_head_message(
         &self,
         queue: &MsgQueueFile,
         next_head: usize,
         payload_len: usize,
+        operator: i32,
     ) -> Result<(), LinuxErrno> {
         let next_qnum = queue.qnum.saturating_sub(1);
         let next_cbytes = queue.cbytes.saturating_sub(payload_len as u64);
@@ -1529,7 +1542,7 @@ impl MsgQueueLock {
                 unix_now_secs(),
                 queue.ctime,
                 queue.lspid,
-                crate::namespace::pid::self_ns_pid() as i32,
+                operator,
                 MSG_QUEUE_HEADER_SIZE,
             )?;
         } else {
@@ -1541,7 +1554,7 @@ impl MsgQueueLock {
                 unix_now_secs(),
                 queue.ctime,
                 queue.lspid,
-                crate::namespace::pid::self_ns_pid() as i32,
+                operator,
                 next_head,
             )?;
         }
@@ -1822,12 +1835,18 @@ fn adjust_shm_nattch(segment: &ShmSegment, delta: i64) -> u64 {
 
 /// Open (or create) the backing file for `key`, ftruncate to `size`, and
 /// return (shmid, path, mode). On error returns `Err(linux_errno)`.
+///
+/// `creator` is the CALLING Linux process's own pid, recorded as `shm_cpid`.
+/// It is threaded in from the dispatch boundary because under HVPatch every
+/// logical process shares the VM carrier's host pid, so a host-derived value
+/// would name the carrier rather than the creator.
 pub(super) fn shmget_open(
     state: &mut SysvShmState,
     creds: &crate::kernel::Credentials,
     key: i32,
     size: usize,
     flags: u64,
+    creator: i32,
 ) -> Result<i32, LinuxErrno> {
     SysvShmState::ensure_dir();
 
@@ -1902,7 +1921,6 @@ pub(super) fn shmget_open(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let guest_pid = crate::namespace::pid::self_ns_pid() as i32;
     state
         .segments
         .entry(shmid)
@@ -1925,7 +1943,7 @@ pub(super) fn shmget_open(
             ctime: now,
             atime: 0,
             dtime: 0,
-            cpid: guest_pid,
+            cpid: creator,
             lpid: 0,
         });
     unsafe { libc::close(fd) };
@@ -2068,11 +2086,15 @@ impl SyscallDispatcher {
     pub(crate) fn sysv_after_fork_child(&self) {
         let mut state = self.sysv.lock();
         SysvIpcService::after_fork_child();
+        // `self` is already the CHILD's dispatcher clone, so `identity_pid()`
+        // is the child's own Linux pid — the value Linux records in `shm_lpid`
+        // for the attachments the child inherited.
+        let lpid = self.identity_pid() as i32;
         let ids = state.attachments.values().copied().collect::<Vec<_>>();
         for shmid in ids {
             if let Some(seg) = state.segments.get_mut(&shmid) {
                 seg.nattch = adjust_shm_nattch(seg, 1);
-                seg.lpid = crate::namespace::pid::self_ns_pid() as i32;
+                seg.lpid = lpid;
             }
         }
     }
@@ -2162,6 +2184,7 @@ impl SyscallDispatcher {
 
     fn cleanup_sysv_shm_attachments_on_process_exit(&self) {
         let mut state = self.sysv.lock();
+        let lpid = self.identity_pid() as i32;
         let ids = state
             .attachments
             .drain()
@@ -2170,7 +2193,7 @@ impl SyscallDispatcher {
         for shmid in ids {
             if let Some(seg) = state.segments.get_mut(&shmid) {
                 seg.nattch = adjust_shm_nattch(seg, -1);
-                seg.lpid = crate::namespace::pid::self_ns_pid() as i32;
+                seg.lpid = lpid;
             }
         }
     }
@@ -2212,7 +2235,7 @@ impl SyscallDispatcher {
             let size = size as usize;
             let creds = this.cred_snapshot();
             let mut state = this.sysv.lock();
-            match shmget_open(&mut state, &creds, key, size, flags) {
+            match shmget_open(&mut state, &creds, key, size, flags, this.identity_pid() as i32) {
                 Ok(shmid) => Ok(DispatchOutcome::Returned { value: shmid as i64 }),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
@@ -2280,7 +2303,7 @@ impl SyscallDispatcher {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0);
-                            seg.lpid = crate::namespace::pid::self_ns_pid() as i32;
+                            seg.lpid = this.identity_pid() as i32;
                         }
                     }
                     unsafe { libc::close(host_fd) };
@@ -2361,7 +2384,7 @@ impl SyscallDispatcher {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0),
-                    lpid: crate::namespace::pid::self_ns_pid() as i32,
+                    lpid: this.identity_pid() as i32,
                 },
             ));
 
@@ -2428,7 +2451,7 @@ impl SyscallDispatcher {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let lpid = crate::namespace::pid::self_ns_pid() as i32;
+            let lpid = this.identity_pid() as i32;
             let mut state = this.sysv.lock();
             if state.remapped_attachments.contains(&addr)
                 || state.attachments.get(&addr).copied() != Some(shmid)
@@ -2665,12 +2688,13 @@ impl SyscallDispatcher {
             let payload = buf[8..].to_vec();
             let flags = MsgOpFlags::from_bits_retain(msgflg);
             let creds = this.cred_snapshot();
+            let operator = this.identity_pid() as i32;
             let tid = cx.tid();
             let _block_state = (!flags.contains(MsgOpFlags::NOWAIT))
                 .then(|| SysvSemBlockStateGuard::new(tid));
             let mut saw_would_block = false;
             loop {
-                match SysvIpcService::msgsnd(msqid, &creds, msg_type, &payload) {
+                match SysvIpcService::msgsnd(msqid, &creds, msg_type, &payload, operator) {
                     Ok(true) => {
                         clear_msg_queue_block(msqid);
                         return Ok(DispatchOutcome::Returned { value: 0 });
@@ -2684,7 +2708,7 @@ impl SyscallDispatcher {
                             return Ok(DispatchOutcome::errno(LINUX_EINTR));
                         }
                         if let Ok(token) = MsgQueueWaitToken::for_queue(msqid) {
-                            match SysvIpcService::msgsnd(msqid, &creds, msg_type, &payload) {
+                            match SysvIpcService::msgsnd(msqid, &creds, msg_type, &payload, operator) {
                                 Ok(true) => {
                                     clear_msg_queue_block(msqid);
                                     return Ok(DispatchOutcome::Returned { value: 0 });
@@ -2741,12 +2765,13 @@ impl SyscallDispatcher {
             }
             let msgtyp = MsgType::from_syscall_arg(msgtyp);
             let creds = this.cred_snapshot();
+            let operator = this.identity_pid() as i32;
             let tid = cx.tid();
             let _block_state = (!flags.contains(MsgOpFlags::NOWAIT))
                 .then(|| SysvSemBlockStateGuard::new(tid));
             let mut saw_would_block = false;
             loop {
-                match SysvIpcService::msgrcv(cx, msqid, &creds, msgp.0, sz, msgtyp, flags) {
+                match SysvIpcService::msgrcv(cx, msqid, &creds, msgp.0, sz, msgtyp, flags, operator) {
                     Ok(Some(received)) => {
                         clear_msg_queue_block(msqid);
                         return Ok(DispatchOutcome::Returned { value: received as i64 });
@@ -2760,7 +2785,7 @@ impl SyscallDispatcher {
                             return Ok(DispatchOutcome::errno(LINUX_EINTR));
                         }
                         if let Ok(token) = MsgQueueWaitToken::for_queue(msqid) {
-                            match SysvIpcService::msgrcv(cx, msqid, &creds, msgp.0, sz, msgtyp, flags)
+                            match SysvIpcService::msgrcv(cx, msqid, &creds, msgp.0, sz, msgtyp, flags, operator)
                             {
                                 Ok(Some(received)) => {
                                     clear_msg_queue_block(msqid);
@@ -3019,6 +3044,7 @@ fn msg_queue_try_send(
     creds: &crate::kernel::Credentials,
     msg_type: MsgType,
     payload: &[u8],
+    operator: i32,
 ) -> Result<bool, LinuxErrno> {
     let path = lookup_msg_queue_path(id)?;
     let lock = MsgQueueLock::acquire_cached(&path)?;
@@ -3032,7 +3058,7 @@ fn msg_queue_try_send(
     if full_by_bytes || full_by_count {
         return Ok(false);
     }
-    lock.append_message(&queue, head, file_size, msg_type, payload)?;
+    lock.append_message(&queue, head, file_size, msg_type, payload, operator)?;
     wake_msg_queue_waiters(&path);
     Ok(true)
 }
@@ -3075,6 +3101,7 @@ fn selected_msg_index(messages: &[MsgRecord], wanted: MsgType, flags: MsgOpFlags
     best.map(|(idx, _)| idx)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn msg_queue_receive<M: GuestMemory>(
     cx: &mut SyscallCtx<M>,
     id: MsgQueueId,
@@ -3083,6 +3110,7 @@ fn msg_queue_receive<M: GuestMemory>(
     msgsz: usize,
     wanted: MsgType,
     flags: MsgOpFlags,
+    operator: i32,
 ) -> Result<Option<usize>, LinuxErrno> {
     let path = lookup_msg_queue_path(id)?;
     let lock = MsgQueueLock::acquire_cached(&path)?;
@@ -3116,7 +3144,12 @@ fn msg_queue_receive<M: GuestMemory>(
             return Err(LINUX_EFAULT);
         }
         if !flags.contains(MsgOpFlags::COPY) {
-            lock.consume_head_message(&queue_header, next_head, head_message.payload.len())?;
+            lock.consume_head_message(
+                &queue_header,
+                next_head,
+                head_message.payload.len(),
+                operator,
+            )?;
             wake_msg_queue_waiters(&path);
         }
         return Ok(Some(copy_len));
@@ -3155,7 +3188,7 @@ fn msg_queue_receive<M: GuestMemory>(
         queue.cbytes = queue.cbytes.saturating_sub(removed.payload.len() as u64);
         queue.qnum = queue.messages.len() as u64;
         queue.rtime = unix_now_secs();
-        queue.lrpid = crate::namespace::pid::self_ns_pid() as i32;
+        queue.lrpid = operator;
         lock.write_queue(&queue)?;
         wake_msg_queue_waiters(&path);
     }

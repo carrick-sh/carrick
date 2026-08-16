@@ -314,7 +314,16 @@ impl SyscallDispatcher {
         }
     }
 
-    /// Namespace-visible process identity without taking the credential lock.
+    /// The CALLING Linux process's own pid — exactly what `getpid(2)` reports.
+    ///
+    /// This is the only correct source for a guest-visible "my pid" field
+    /// (`si_pid`, SysV `msg_lspid`/`msg_lrpid`/`shm_cpid`/`shm_lpid`, …).
+    /// NEVER reach for `crate::namespace::pid::self_ns_pid()` there: it starts
+    /// from `std::process::id()`, and under HVPatch every logical Linux process
+    /// is a thread of ONE VM carrier, so that value is identical for all of
+    /// them. `virtual_pid` is the carrier's kernel-graph task id for this exact
+    /// process, published by `bind_hvpatch_process`; the `self_ns_pid()`
+    /// fallback only runs where no kernel-graph process is bound.
     pub(crate) fn identity_pid(&self) -> u32 {
         if let Some(pid) = self.proc.lock().virtual_pid {
             return pid;
