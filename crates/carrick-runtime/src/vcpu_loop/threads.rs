@@ -200,9 +200,16 @@ impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
 where
     E::SiblingSpec: 'static,
 {
+    /// Publish this thread's live vCPU into the kicker: the fresh kick handle
+    /// AND the thread's lifetime in-guest flag, in one entry.
+    ///
+    /// This is the ONLY production caller of
+    /// [`carrick_hal::VcpuRegistry::register`]. Every rebind path (blocking-wait
+    /// reclaim, fork park, post-fork rebuild) funnels through here, so a
+    /// re-registration cannot restore one facet and silently drop the other.
     pub(super) fn register_vcpu(&self, engine: &E) {
         let handle: Box<dyn carrick_hal::VcpuKickDyn> = Box::new(engine.kick_handle());
-        self.kicker.register(self.this_tid, handle);
+        self.kicker.register(self.this_tid, handle, &self.in_guest);
         self.registry
             .record_thread_port(self.this_tid, crate::host_proc::current_thread_port());
     }
@@ -366,8 +373,7 @@ where
                     engine
                         .rebind_to_slot(new.slot, &st)
                         .map_err(RuntimeError::Trap)?;
-                    let handle: Box<dyn carrick_hal::VcpuKickDyn> = Box::new(engine.kick_handle());
-                    self.kicker.register(self.this_tid, handle);
+                    self.register_vcpu(engine);
                 } else {
                     // If a fork quiesce began while (or right after) we
                     // acquired, park FIRST — slot-less threads must not
@@ -844,9 +850,15 @@ where
                             drop(topo);
                             return;
                         }
+                        // The sibling's lifetime in-guest flag: created ONCE
+                        // here, published with this bootstrap registration so
+                        // the sibling is kickable before its loop starts, then
+                        // moved into `run_vcpu_until_exit` so the loop stores
+                        // into the very cell the kicker holds.
+                        let sibling_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
                         let handle: Box<dyn carrick_hal::VcpuKickDyn> =
                             Box::new(child_engine.kick_handle());
-                        child_kicker.register(tid, handle);
+                        child_kicker.register(tid, handle, &sibling_in_guest);
                         drop(topo);
                         if trace {
                             let pc = child_engine.program_counter().unwrap_or(0);
@@ -863,6 +875,7 @@ where
                             tid,
                             child_threads,
                             child_kicker,
+                            sibling_in_guest,
                             max_traps,
                         );
                         match r {

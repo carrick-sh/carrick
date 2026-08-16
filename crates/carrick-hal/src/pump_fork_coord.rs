@@ -149,7 +149,7 @@ impl<P: HostSignalPump> HostForkCoordinator for PumpForkCoordinator<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -187,9 +187,12 @@ mod tests {
 
     struct InertRegistry;
     impl VcpuRegistry for InertRegistry {
-        fn register(&self, _t: crate::ThreadId, _h: Box<dyn crate::VcpuKickDyn>) {}
-        fn register_in_guest(&self, _t: crate::ThreadId) -> Arc<AtomicBool> {
-            Arc::new(AtomicBool::new(false))
+        fn register(
+            &self,
+            _t: crate::ThreadId,
+            _h: Box<dyn crate::VcpuKickDyn>,
+            _in_guest: &crate::InGuestFlag,
+        ) {
         }
         fn unregister(&self, _t: crate::ThreadId) {}
         fn kick(&self, _t: crate::ThreadId) {}
@@ -198,7 +201,6 @@ mod tests {
         fn any_other_in_guest(&self, _e: crate::ThreadId) -> bool {
             false
         }
-        fn set_in_guest(&self, _t: crate::ThreadId, _g: bool) {}
         fn count(&self) -> usize {
             0
         }
