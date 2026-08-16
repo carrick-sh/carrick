@@ -419,6 +419,7 @@ pub enum FileDescriptionBackingKind {
     HostFile,
     HostSocket,
     Inotify,
+    Fanotify,
     SignalFd,
     Netlink,
     Mqueue,

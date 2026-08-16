@@ -352,11 +352,17 @@ mod macos_helper_stubs {
         };
         // Absolutize a relative target against the guest cwd, then resolve any
         // `#!` shebang to its interpreter via the shared cross-platform helper.
-        let (path, argv) = crate::exec_helpers::resolve_shebang(
-            dispatcher,
-            dispatcher.resolve_exec_path(path),
-            argv,
-        )?;
+        let named_target = dispatcher.resolve_exec_path(path);
+        // fanotify FAN_OPEN_EXEC, kept in step with the macOS twin in
+        // `crate::runtime::exec::load_execve_image` so the two lanes report the
+        // same events. (This lane has no `check_exec_target` gate, so the event
+        // precedes validation here; a load failure below still aborts the exec.)
+        dispatcher.fanotify_notify_exec(&named_target);
+        let (path, argv) =
+            crate::exec_helpers::resolve_shebang(dispatcher, named_target.clone(), argv)?;
+        if path != named_target {
+            dispatcher.fanotify_notify_exec(&path);
+        }
         trace_execve(&path, format_args!("load path={path}"));
         // Read the binary overlay-first. Fall back to the literal host fs ONLY
         // for a bare run-elf boot (host-staged target, no container fs). In a
