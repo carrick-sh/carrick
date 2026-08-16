@@ -170,11 +170,16 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         if self.kicker.count() <= 1 || quiesce::current_thread_holds_pt_pause() {
             return Ok(Box::new(()));
         }
+        // The LAZY, cross-thread acquisition — the A-then-P half of the ABBA
+        // above, and the one a caller can reach while already holding the
+        // dispatcher's host-alias phase. Its election is bounded for that exact
+        // reason: giving up here surfaces as a frame-COW error the syscall can
+        // report, where waiting forever stops the whole carrier.
         quiesce::acquire_pt_pause(
             quiesce::pt_barrier(),
             &*self.kicker,
             self.tid,
-            Duration::from_millis(500),
+            quiesce::PtPauseBudget::DEFAULT,
         )
         .map(|guard| Box::new(guard) as Box<dyn carrick_hal::FrameCowQuiesce>)
         .map_err(|error| {

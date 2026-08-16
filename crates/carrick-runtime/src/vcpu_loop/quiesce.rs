@@ -190,22 +190,74 @@ pub(super) enum PtPauseError {
     TimedOut,
 }
 
+/// The two independent budgets in a page-table pause.
+///
+/// Named rather than passed as two adjacent `Duration`s because they mean
+/// opposite things and swapping them is silent: the election would get 500 ms
+/// (spurious `ENOMEM` the moment two threads `mmap` at once) and the drain 30 s
+/// (one stalled sibling freezing the VM for half a minute).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PtPauseBudget {
+    /// Wait for the CURRENT coordinator to finish, before we hold anything.
+    ///
+    /// Far larger than `drain`, and deliberately not shared with it: charging a
+    /// loser for the winner's whole editing syscall would turn honest
+    /// multi-threaded `mmap` contention into spurious `ENOMEM` — trading a rare
+    /// wedge for a common correctness bug. Real contention resolves in low
+    /// milliseconds (a loser waits out one page-table edit), so a wait this long
+    /// is not contention: the coordinator is blocked on something the waiter
+    /// holds. That was a live deadlock — the host-alias/pt-pause ABBA — and the
+    /// class survives its fix, since any syscall that takes the host-alias phase
+    /// and then triggers frame COW can rebuild it. Bounding here makes the next
+    /// instance a named `pt__pause__election__timeout` and a guest `ENOMEM`
+    /// instead of a silent, unrecoverable carrier stop.
+    election: Duration,
+    /// Wait for siblings to leave guest once WE are the coordinator.
+    drain: Duration,
+}
+
+impl PtPauseBudget {
+    pub(super) const DEFAULT: Self = Self {
+        election: Duration::from_secs(30),
+        drain: Duration::from_millis(500),
+    };
+}
+
 pub(super) fn acquire_pt_pause(
     barrier: &'static crate::fork_quiesce::PtQuiesce,
     kicker: &dyn carrick_hal::VcpuRegistry,
     tid: ThreadId,
-    timeout: Duration,
+    budget: PtPauseBudget,
 ) -> Result<PtPauseGuard, PtPauseError> {
     // Serialize editors: at most one stop-the-world at a time. A loser parks
     // (if the winner has raised quiescing) or yields (tiny pre-flag window),
     // then retries. This stays independent of the fork/topology lock.
+    let election_start = Instant::now();
+    let election_deadline = election_start + budget.election;
     loop {
         if barrier.try_become_coordinator() {
             break;
         }
+        // Give up only from the LOSER side, and only before taking anything:
+        // no coordinator flag, no `quiescing`, so there is nothing to roll
+        // back and — critically — no `barrier.end()`, which from here would
+        // clear the live coordinator's state and let it edit unpaused tables.
         if barrier.is_quiescing() {
-            barrier.park();
+            if !barrier.park_until(election_deadline) {
+                crate::probes::pt_pause_election_timeout(
+                    tid.raw(),
+                    election_start.elapsed().as_micros() as i64,
+                );
+                return Err(PtPauseError::TimedOut);
+            }
         } else {
+            if Instant::now() >= election_deadline {
+                crate::probes::pt_pause_election_timeout(
+                    tid.raw(),
+                    election_start.elapsed().as_micros() as i64,
+                );
+                return Err(PtPauseError::TimedOut);
+            }
             std::thread::yield_now();
         }
     }
@@ -217,7 +269,7 @@ pub(super) fn acquire_pt_pause(
     );
 
     let start = Instant::now();
-    let deadline = start + timeout;
+    let deadline = start + budget.drain;
     let mut spins: i32 = 0;
     while kicker.any_other_in_guest(tid) {
         kicker.kick_all_except(tid);
@@ -254,13 +306,14 @@ where
 {
     /// Pause sibling vCPUs for a stage-1 page-table edit (mmap/mprotect/munmap),
     /// returning an RAII guard that resumes them on drop. A timeout is a typed
-    /// clean failure: the barrier request is rolled back and no edit may begin.
+    /// clean failure: nothing is held on the election path and the barrier
+    /// request is rolled back on the drain path, so no edit may begin either way.
     pub(super) fn pt_pause(&self) -> Result<PtPauseGuard, PtPauseError> {
         acquire_pt_pause(
             pt_barrier(),
             &*self.kicker,
             self.this_tid,
-            Duration::from_millis(500),
+            PtPauseBudget::DEFAULT,
         )
     }
 
@@ -1991,7 +2044,15 @@ mod pt_pause_tests {
             sibling_resumed.store(true, Ordering::SeqCst);
         });
         let backend_repoint_calls = AtomicUsize::new(0);
-        let result = acquire_pt_pause(barrier, &*registry, coordinator, Duration::from_millis(20));
+        let result = acquire_pt_pause(
+            barrier,
+            &*registry,
+            coordinator,
+            PtPauseBudget {
+                election: Duration::from_secs(30),
+                drain: Duration::from_millis(20),
+            },
+        );
         if result.is_ok() {
             backend_repoint_calls.fetch_add(1, Ordering::SeqCst);
         }
@@ -2004,6 +2065,54 @@ mod pt_pause_tests {
         assert!(
             barrier.try_become_coordinator(),
             "timeout must release coordinator ownership"
+        );
+        barrier.end();
+    }
+
+    /// A coordinator that never finishes must not wedge the next editor.
+    ///
+    /// This is the ABBA's second half in isolation: the "coordinator" here
+    /// stands in for a thread blocked on a resource the waiter holds. Before the
+    /// election bound this test did not fail — it HUNG, because the loser's
+    /// `park()` was an unbounded `Condvar::wait` with no deadline to re-check.
+    #[test]
+    fn pt_pause_election_timeout_gives_up_without_disturbing_the_coordinator() {
+        let barrier: &'static crate::fork_quiesce::PtQuiesce =
+            Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+        let registry = Arc::new(GenericVcpuRegistry::new());
+        let waiter = tid(1521);
+        registry.register_in_guest(waiter);
+        registry.register(waiter, Box::new(NoopKick));
+
+        // A stuck coordinator: holds the flags and never calls `end()`.
+        assert!(barrier.try_become_coordinator());
+        barrier.set_quiescing();
+
+        let result = acquire_pt_pause(
+            barrier,
+            &*registry,
+            waiter,
+            PtPauseBudget {
+                election: Duration::from_millis(50),
+                drain: Duration::from_secs(30),
+            },
+        );
+
+        assert_eq!(result.err(), Some(PtPauseError::TimedOut));
+        // The loser must leave the stuck coordinator's state completely alone:
+        // calling `end()` from here would drop a pause that is still in force
+        // and let the coordinator edit live page tables under running siblings.
+        assert!(
+            barrier.is_quiescing(),
+            "election loser must not clear the live coordinator's pause"
+        );
+        assert!(
+            !barrier.try_become_coordinator(),
+            "election loser must not release the live coordinator's ownership"
+        );
+        assert!(
+            !current_thread_holds_pt_pause(),
+            "a failed election must leave no pause on this thread"
         );
         barrier.end();
     }
@@ -2025,8 +2134,16 @@ mod pt_pause_tests {
         );
 
         assert!(!current_thread_holds_pt_pause());
-        let guard = acquire_pt_pause(barrier, &*registry, coordinator, Duration::from_secs(1))
-            .expect("sibling drains exactly after kick");
+        let guard = acquire_pt_pause(
+            barrier,
+            &*registry,
+            coordinator,
+            PtPauseBudget {
+                election: Duration::from_secs(30),
+                drain: Duration::from_secs(1),
+            },
+        )
+        .expect("sibling drains exactly after kick");
         assert!(
             current_thread_holds_pt_pause(),
             "nested backend work must borrow the syscall's outer pause",

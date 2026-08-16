@@ -500,6 +500,33 @@ impl PtQuiesce {
         }
     }
 
+    /// Bounded `park`, for a caller that may hold ANOTHER process-wide
+    /// serializer. Returns `false` if `deadline` passed with the pause still in
+    /// force.
+    ///
+    /// The unbounded `park` above is right for a sibling at the run-loop top:
+    /// it holds nothing, so waiting forever is just yielding to the editor. A
+    /// coordinator-election loser is a different animal — it can already own
+    /// the dispatcher's host-alias phase, and then an unbounded wait is not
+    /// contention but the second half of a deadlock. Bounding it downgrades a
+    /// silent carrier-wide stop to a typed, probed, guest-visible failure.
+    pub fn park_until(&self, deadline: Instant) -> bool {
+        let mut g = self.lock.lock().unwrap();
+        loop {
+            if !self.quiescing.load(Ordering::SeqCst) {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, _timed_out) = self.cv.wait_timeout(g, remaining).unwrap();
+            g = next;
+        }
+    }
+
     /// Coordinator: end the pause, wake parked threads, drop coordinator.
     pub fn end(&self) {
         let _g = self.lock.lock().unwrap();
