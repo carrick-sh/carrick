@@ -6253,3 +6253,36 @@ fn shared_anonymous_high_advisory_hint_is_selected_then_committed_lazily() {
     assert_eq!(va, GuestVa(address));
     assert!(shared);
 }
+
+/// The `mmap` handler must not be able to hand the guest a `MAP_FAILED` it
+/// cannot explain.
+///
+/// Ten CPython suites produced zero assertions for as long as CPython had been
+/// run on the HVPatch lane, because a `dlopen` segment mapping was refused with
+/// `ENOMEM` and carrick logged nothing at all — glibc renders every such
+/// failure as the same opaque "failed to map segment from shared object".
+/// Every error return in the handler now goes through
+/// [`MmapRequest::refused`], which names the refusal. This test is the
+/// mechanical guard on that: a new branch reaching for a bare
+/// `DispatchOutcome::errno` reintroduces the diagnostic hole and fails here,
+/// rather than months later inside a workload.
+#[test]
+fn every_mmap_refusal_names_itself() {
+    const SOURCE: &str = include_str!("../mem.rs");
+    let start = SOURCE
+        .find("fn mmap(this, cx, requested: GuestPtr,")
+        .expect("mmap handler header");
+    let end = SOURCE
+        .find("fn munmap(this, cx, address: GuestPtr,")
+        .expect("munmap handler header");
+    let body = &SOURCE[start..end];
+    assert!(
+        !body.contains("DispatchOutcome::errno("),
+        "the mmap handler contains a bare DispatchOutcome::errno; every refusal \
+         must go through MmapRequest::refused/refused_by so it names itself"
+    );
+    assert!(
+        body.contains("request.refused("),
+        "the mmap handler no longer routes refusals through MmapRequest::refused"
+    );
+}

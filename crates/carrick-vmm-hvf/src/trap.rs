@@ -6749,7 +6749,43 @@ impl HvfVmState {
             .ok_or_else(|| {
                 TrapError::Hypervisor("HVPatch retained reuse compound overflow".to_owned())
             })?;
-        let span_end = requested_end.min(compound_end);
+        // Extend past the trigger page only across pages in EXACTLY its state.
+        //
+        // The predicate above (a retained stage-1 output naming no live
+        // physical source) selected `page_va` alone; the rest of the compound
+        // was taken on trust. That is wrong, because a page whose backing was
+        // published moments earlier by `materialize_sparse_mmap_extent` is
+        // indistinguishable from a retired one AT THE LEAF: sparse
+        // materialization deliberately leaves its stage-1 receipts invalid
+        // until the protection commit. Repointing such a page replaces a live
+        // physical owner and falsifies the `PendingFrameCowPublication` that
+        // names it, so the `protect_range` that follows in the same guest
+        // `mmap` fails to authenticate its own receipt and the guest gets
+        // MAP_FAILED — with, before this, no explanation anywhere. That is the
+        // shape that broke every CPython `dlopen` of a DSO whose PROT_NONE
+        // reservation started one page into a 16 KiB compound.
+        //
+        // Authenticate each page against the live translation and the exact
+        // current owner instead, and stop at the first page that already has
+        // one. Splitting a compound across frames is already supported — the
+        // repoint covers exactly `[page_va, span_end)`.
+        let mut span_end = requested_end.min(compound_end);
+        let mut probe = page_va.saturating_add(PAGE_SIZE);
+        while probe < span_end {
+            let retained = self
+                .page_tables
+                .lock()
+                .as_ref()
+                .and_then(|manager| manager.translate_retained_output(probe));
+            let needs_materialization = retained
+                .is_some_and(|ipa| self.physical_cow_source(probe, ipa).is_none())
+                && self.protections.range_unmapped(probe, 1);
+            if !needs_materialization {
+                span_end = probe;
+                break;
+            }
+            probe = probe.saturating_add(PAGE_SIZE);
+        }
         let span_len = usize::try_from(span_end.checked_sub(page_va).ok_or_else(|| {
             TrapError::Hypervisor("HVPatch retained reuse span underflow".to_owned())
         })?)
@@ -7771,7 +7807,8 @@ impl HvfVmState {
                     || access_is_valid != must_be_valid
                 {
                     return Err(TrapError::Hypervisor(format!(
-                        "deferred COW protection authentication failed at VA 0x{page:x}: leaf=0x{leaf:x} translated={translated:x?} expected_ipa=0x{expected_ipa:x} expected_ap=0x{expected_ap:x} valid={must_be_valid}"
+                        "deferred COW protection authentication failed at VA 0x{page:x}: leaf=0x{leaf:x} translated={translated:x?} expected_ipa=0x{expected_ipa:x} expected_ap=0x{expected_ap:x} valid={must_be_valid} receipt=0x{:x}+0x{:x}",
+                        receipt.va, receipt.len
                     )));
                 }
                 first_leaf.get_or_insert((page, leaf, expected_ipa));

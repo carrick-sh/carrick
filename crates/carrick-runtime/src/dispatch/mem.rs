@@ -87,6 +87,106 @@ enum PrivateRepointRecovery {
     FailStopRetainingOwners,
 }
 
+/// Why a guest `mmap` was refused — and whether the guest can work that out
+/// from its own errno.
+///
+/// A `MAP_FAILED` carrick cannot explain is a diagnostic hole in its own right.
+/// glibc's `dlopen` renders any failed segment mapping as the single line
+/// "failed to map segment from shared object", so when carrick refuses one of
+/// its own mappings and says nothing, the only evidence left is that string.
+/// Ten CPython suites died on exactly that, silently, for as long as CPython
+/// had been running on this lane. Every refusal in [`mmap`](SyscallDispatcher)
+/// now reports itself through [`MmapRequest::refused`].
+///
+/// [`SyscallDispatcher::mmap`]: SyscallDispatcher
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MmapRefusal {
+    /// Linux itself rejects this request, so the errno handed back IS the
+    /// explanation. Logged at `debug`: LTP provokes these by the hundred on
+    /// purpose, and promoting them would bury the refusals that matter.
+    Spec(&'static str),
+    /// Carrick exhausted one of its own arenas, or an internal publication
+    /// step failed. Nothing in the guest's arguments predicts it and the
+    /// errno names no resource, so it is logged at `warn` — visible under
+    /// carrick's default filter — and always names what ran out.
+    Internal(&'static str),
+}
+
+/// The guest's `mmap` arguments exactly as they arrived, captured before any
+/// normalization so a refusal reports what the guest asked for rather than
+/// what carrick rewrote it to.
+#[derive(Clone, Copy, Debug)]
+struct MmapRequest {
+    addr: u64,
+    length: u64,
+    prot: u64,
+    flags: u64,
+    fd: i32,
+    offset: u64,
+}
+
+impl MmapRequest {
+    /// Record this refusal and build the outcome that carries it to the guest.
+    ///
+    /// Every `mmap` error return goes through here; there is deliberately no
+    /// bare `DispatchOutcome::errno` left in the handler, so a future branch
+    /// cannot reintroduce a silent `MAP_FAILED`.
+    fn refused(self, refusal: MmapRefusal, errno: LinuxErrno) -> DispatchOutcome {
+        self.refused_by(refusal, errno, format_args!("-"))
+    }
+
+    /// Same, carrying the failing operation's own error text.
+    ///
+    /// Use this wherever a fallible host/stage-1 operation produced the
+    /// refusal: "protection publication failed" without the backend's reason,
+    /// and without the address carrick actually chose, is half a diagnosis —
+    /// the guest only ever asked for `addr=0`.
+    fn refused_by(
+        self,
+        refusal: MmapRefusal,
+        errno: LinuxErrno,
+        cause: std::fmt::Arguments<'_>,
+    ) -> DispatchOutcome {
+        let Self {
+            addr,
+            length,
+            prot,
+            flags,
+            fd,
+            offset,
+        } = self;
+        match refusal {
+            MmapRefusal::Spec(reason) => tracing::debug!(
+                target: "carrick::mmap",
+                reason,
+                errno = errno.get(),
+                addr = format_args!("{addr:#x}"),
+                length = format_args!("{length:#x}"),
+                prot = format_args!("{prot:#x}"),
+                flags = format_args!("{flags:#x}"),
+                fd,
+                offset = format_args!("{offset:#x}"),
+                cause,
+                "mmap refused: invalid request",
+            ),
+            MmapRefusal::Internal(reason) => tracing::warn!(
+                target: "carrick::mmap",
+                reason,
+                errno = errno.get(),
+                addr = format_args!("{addr:#x}"),
+                length = format_args!("{length:#x}"),
+                prot = format_args!("{prot:#x}"),
+                flags = format_args!("{flags:#x}"),
+                fd,
+                offset = format_args!("{offset:#x}"),
+                cause,
+                "mmap refused: carrick internal limit",
+            ),
+        }
+        DispatchOutcome::errno(errno)
+    }
+}
+
 /// Dispatcher-owned, revisioned wrapper around the sole production memory/VMA
 /// authority. Ordinary syscall and `/proc` access keeps using this same
 /// `MemState` mutex; the K1 observer only derives owned occupancy rows from it.
@@ -2222,6 +2322,17 @@ impl SyscallDispatcher {
             // un-stripped value is kept to reject a non-canonical hint below.
             // No-op for native (top-16-zero) guests.
             let requested_raw = requested.0;
+            // The exact request, for `MmapRequest::refused`. Captured before
+            // MAP_FIXED_NOREPLACE normalization and page rounding so a refusal
+            // reports the guest's own arguments, not carrick's rewrite of them.
+            let request = MmapRequest {
+                addr: requested_raw,
+                length,
+                prot,
+                flags,
+                fd: fd.0,
+                offset,
+            };
             let requested = GuestPtr(requested.0 & 0x0000_FFFF_FFFF_FFFF);
 
             let fixed_noreplace = flags & LINUX_MAP_FIXED_NOREPLACE != 0;
@@ -2239,7 +2350,10 @@ impl SyscallDispatcher {
             // bad length — LTP mmap08 maps length 0 on a closed fd and expects
             // EBADF, not EINVAL. (Anonymous mappings take no fd → skip.)
             if !map_flags.contains(LinuxMmapFlags::ANONYMOUS) && this.open_file(fd.0).is_none() {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                return Ok(request.refused(
+                    MmapRefusal::Spec("file mapping on a descriptor that is not open"),
+                    LINUX_EBADF,
+                ));
             }
             // `/proc/*/maps` and NT_FILE identify the backing pathname, not
             // merely that a mapping was file-backed. Preserve the guest path
@@ -2278,7 +2392,10 @@ impl SyscallDispatcher {
                     // bits for back-compat). mmap20. Otherwise behaves like
                     // MAP_SHARED.
                     if map_flags.bits() & !LinuxMmapFlags::SUPPORTED_MASK != 0 {
-                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EOPNOTSUPP));
+                        return Ok(request.refused(
+                            MmapRefusal::Spec("MAP_SHARED_VALIDATE with an unknown flag bit"),
+                            crate::linux_abi::LINUX_EOPNOTSUPP,
+                        ));
                     }
                     Some(MmapSharing::Shared)
                 } else if t == LinuxMmapFlags::SHARED {
@@ -2300,15 +2417,24 @@ impl SyscallDispatcher {
                 || (map_flags.contains(LinuxMmapFlags::FIXED)
                     && !requested.0.is_multiple_of(page_size))
             {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                return Ok(request.refused(
+                    MmapRefusal::Spec("zero length, unsupported prot/flag bits, no map type, or a misaligned offset/fixed address"),
+                    LINUX_EINVAL,
+                ));
             }
             let Some(map_sharing) = map_sharing else {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                return Ok(request.refused(
+                    MmapRefusal::Spec("neither MAP_SHARED nor MAP_PRIVATE"),
+                    LINUX_EINVAL,
+                ));
             };
             let length = match align_up_u64(length, page_size) {
                 Some(length) => length,
                 None => {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return Ok(request.refused(
+                        MmapRefusal::Spec("length rounds up past the end of the address space"),
+                        LINUX_ENOMEM,
+                    ));
                 }
             };
             let length_usize =
@@ -2324,20 +2450,32 @@ impl SyscallDispatcher {
                     std::process::abort();
                 };
                 let Some((region, region_layout)) = backing.region(offset) else {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    return Ok(request.refused(
+                        MmapRefusal::Spec("offset does not name an io_uring region"),
+                        LINUX_EINVAL,
+                    ));
                 };
                 if map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                     || map_sharing != MmapSharing::Shared
                     || length < region_layout.required_len
                     || length > region_layout.mapped_extent
                 {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    return Ok(request.refused(
+                        MmapRefusal::Spec("io_uring mapping must be MAP_SHARED and cover exactly its region"),
+                        LINUX_EINVAL,
+                    ));
                 }
                 if fixed_noreplace && this.dynamic_mapping_overlaps(requested.0, length) {
-                    return Ok(DispatchOutcome::errno(linux_errno::EEXIST));
+                    return Ok(request.refused(
+                        MmapRefusal::Spec("MAP_FIXED_NOREPLACE over a live io_uring mapping"),
+                        linux_errno::EEXIST,
+                    ));
                 }
                 let Some(owned_fd) = backing.dup_data_fd() else {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return Ok(request.refused(
+                        MmapRefusal::Internal("io_uring backing descriptor could not be duplicated"),
+                        LINUX_ENOMEM,
+                    ));
                 };
                 let fixed_va = map_flags.contains(LinuxMmapFlags::FIXED);
                 let Some(ipa) = alloc_alias_ipa_for_publication(
@@ -2345,7 +2483,10 @@ impl SyscallDispatcher {
                     length,
                     fixed_va,
                 ) else {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return Ok(request.refused(
+                        MmapRefusal::Internal("alias IPA arena exhausted (io_uring mapping)"),
+                        LINUX_ENOMEM,
+                    ));
                 };
                 let address = if fixed_va {
                     requested.0
@@ -2354,7 +2495,10 @@ impl SyscallDispatcher {
                         + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE)
                 };
                 let Some(end) = address.checked_add(length) else {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return Ok(request.refused(
+                        MmapRefusal::Spec("io_uring mapping end overflows the address space"),
+                        LINUX_ENOMEM,
+                    ));
                 };
                 let mut host_prot = 0;
                 if prot_flags.intersects(LinuxProtFlags::READ | LinuxProtFlags::EXEC) {
@@ -2412,14 +2556,20 @@ impl SyscallDispatcher {
                 && let Some(open_file) = this.open_file(fd.0)
                 && open_file.description.read().status_flags() & crate::linux_abi::LINUX_O_PATH != 0
             {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                return Ok(request.refused(
+                    MmapRefusal::Spec("mmap of an O_PATH descriptor"),
+                    LINUX_EBADF,
+                ));
             }
 
             if !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && let Some(open_file) = this.open_file(fd.0)
                 && open_file.description.read().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
             {
-                return Ok(DispatchOutcome::errno(LINUX_EACCES));
+                return Ok(request.refused(
+                    MmapRefusal::Spec("mmap of a write-only descriptor"),
+                    LINUX_EACCES,
+                ));
             }
 
             // A memfd sealed F_SEAL_WRITE (or F_SEAL_FUTURE_WRITE) cannot back a
@@ -2440,7 +2590,10 @@ impl SyscallDispatcher {
                         | carrick_abi::LinuxMemfdSeals::FUTURE_WRITE,
                 )
             {
-                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                return Ok(request.refused(
+                    MmapRefusal::Spec("shared writable mapping of a write-sealed memfd"),
+                    LINUX_EPERM,
+                ));
             }
 
             let fixed_write_exec_alias = if map_flags.contains(LinuxMmapFlags::FIXED) {
@@ -2463,11 +2616,17 @@ impl SyscallDispatcher {
                     cx.raw_args(),
                     reason,
                 ));
-                return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+                return Ok(request.refused(
+                    MmapRefusal::Internal("PROT_WRITE|PROT_EXEC is unsupported on this backend"),
+                    LINUX_EOPNOTSUPP,
+                ));
             }
 
             if fixed_noreplace && this.dynamic_mapping_overlaps(requested.0, length) {
-                return Ok(DispatchOutcome::errno(linux_errno::EEXIST));
+                return Ok(request.refused(
+                    MmapRefusal::Spec("MAP_FIXED_NOREPLACE over a live mapping"),
+                    linux_errno::EEXIST,
+                ));
             }
 
             if map_flags.contains(LinuxMmapFlags::FIXED)
@@ -2475,7 +2634,10 @@ impl SyscallDispatcher {
                 && this.proc.lock().reported_arch()
                     == crate::vfs::GuestReportedArch::Aarch64
             {
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                return Ok(request.refused(
+                    MmapRefusal::Spec("MAP_FIXED at a high-half address on an aarch64 guest"),
+                    LINUX_ENOMEM,
+                ));
             }
 
             // MAP_FIXED|MAP_PRIVATE landing on a shared-aperture VA needs a
@@ -2498,7 +2660,10 @@ impl SyscallDispatcher {
                 } else {
                     match this.snapshot_private_mmap_file(fd, offset, length_usize) {
                         Ok(snapshot) => snapshot,
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        Err(errno) => return Ok(request.refused(
+                            MmapRefusal::Internal("private-overlay snapshot of the mapped file failed"),
+                            errno,
+                        )),
                     }
                 };
                 let bus_fault = snapshot.bus_fault_offset.and_then(|bus_offset| {
@@ -2521,11 +2686,17 @@ impl SyscallDispatcher {
                         .source_range_is_carvable(requested.0, length, None)
                         || !mem.shared.guest_range_is_carvable(requested.0, length)
                     {
-                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                        return Ok(request.refused(
+                            MmapRefusal::Internal("shared-aperture range is not carvable for a private overlay"),
+                            LINUX_ENOMEM,
+                        ));
                     }
                     let Some(displaced) = mem.shared.guest_range_fragments(requested.0, length)
                     else {
-                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                        return Ok(request.refused(
+                            MmapRefusal::Internal("shared-aperture range exposes no carvable fragments"),
+                            LINUX_ENOMEM,
+                        ));
                     };
                     let overlay = mem.overlay.alloc_sourced(
                         length,
@@ -2535,7 +2706,10 @@ impl SyscallDispatcher {
                     (overlay, displaced)
                 };
                 let Some(overlay_va) = overlay_va else {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return Ok(request.refused(
+                        MmapRefusal::Internal("private overlay aperture exhausted"),
+                        LINUX_ENOMEM,
+                    ));
                 };
                 // Capture exact SharedFile fragments while the old translation
                 // is live, but defer pwrite until repoint succeeds. A clean
@@ -2553,7 +2727,10 @@ impl SyscallDispatcher {
                 ) {
                     match this.recover_private_repoint_failure(overlay_va, failure) {
                         PrivateRepointRecovery::RecoveredCleanly => {
-                            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                            return Ok(request.refused(
+                                MmapRefusal::Internal("stage-1 repoint into the private overlay failed"),
+                                LINUX_ENOMEM,
+                            ));
                         }
                         PrivateRepointRecovery::FailStopRetainingOwners => {
                             // Live translation state is unknown. Retain BOTH the
@@ -2671,7 +2848,10 @@ impl SyscallDispatcher {
             {
                 let dup_fd = {
                     let Some(open_file) = this.open_file(fd.0) else {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        return Ok(request.refused(
+                            MmapRefusal::Internal("file description vanished mid-dispatch (shared file alias)"),
+                            LINUX_EBADF,
+                        ));
                     };
                     let open = open_file.description.read();
                     match &*open {
@@ -2704,7 +2884,10 @@ impl SyscallDispatcher {
                         Ok(length) => length,
                         Err(errno) => {
                             unsafe { libc::close(dup_fd) };
-                            return Ok(DispatchOutcome::errno(errno));
+                            return Ok(request.refused(
+                                MmapRefusal::Spec("MAP_LOCKED refused by RLIMIT_MEMLOCK (shared file alias)"),
+                                errno,
+                            ));
                         }
                     };
                     // Reserve a FRESH alias IPA (2 MiB-block-aligned so no two
@@ -2720,7 +2903,10 @@ impl SyscallDispatcher {
                     let Some(ipa) = crate::memory::alloc_alias_ipa(length) else {
                         // Alias arena exhausted: drop the dup, surface ENOMEM.
                         unsafe { libc::close(dup_fd) };
-                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                        return Ok(request.refused(
+                            MmapRefusal::Internal("alias IPA arena exhausted (shared file mapping)"),
+                            LINUX_ENOMEM,
+                        ));
                     };
                     let va = crate::memory::LINUX_HIGH_VA_THRESHOLD
                         + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE);
@@ -2731,7 +2917,10 @@ impl SyscallDispatcher {
                             Some(range) => Some(range),
                             None => {
                                 unsafe { libc::close(dup_fd) };
-                                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                                return Ok(request.refused(
+                                    MmapRefusal::Internal("alias VA range overflows the address space"),
+                                    LINUX_ENOMEM,
+                                ));
                             }
                         },
                         None => None,
@@ -2831,16 +3020,18 @@ impl SyscallDispatcher {
                         .map_err(|_| DispatchError::LengthTooLarge(map_len))?;
                     let locked_range = this.prepare_mmap_locked_range(map_flags, addr, length)?;
                     if reused
-                        && memory
-                            .zero_anonymous_reuse(
-                                addr,
-                                map_len_usize,
-                                carrick_guest_mem::MappingSharing::Shared,
-                            )
-                            .is_err()
+                        && let Err(error) = memory.zero_anonymous_reuse(
+                            addr,
+                            map_len_usize,
+                            carrick_guest_mem::MappingSharing::Shared,
+                        )
                     {
                         this.mem.lock().shared.free(addr);
-                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                        return Ok(request.refused_by(
+                            MmapRefusal::Internal("anonymous-reuse scrub failed (shared aperture)"),
+                            LINUX_ENOMEM,
+                            format_args!("at {addr:#x}+{map_len:#x}: {error}"),
+                        ));
                     }
                     let needs_identity_restore = this
                         .mem
@@ -2916,14 +3107,22 @@ impl SyscallDispatcher {
                         // setter; an error must roll the allocation back.
                         memory.protect_range(addr, map_len_usize, prot)
                     };
-                    if protection.is_err() && memory.supports_concurrent_exec_protection() {
+                    if let Err(error) = protection
+                        && memory.supports_concurrent_exec_protection()
+                    {
                         this.rollback_shared_anon_mapping(
                             memory,
                             addr,
                             length,
                             map_len_usize,
                         )?;
-                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                        return Ok(request.refused_by(
+                            MmapRefusal::Internal(
+                                "protection publication failed (shared anonymous mapping)",
+                            ),
+                            LINUX_ENOMEM,
+                            format_args!("at {addr:#x}+{map_len:#x}: {error}"),
+                        ));
                     }
                     if let Err(errno) = this.commit_mmap_locked_range(memory, locked_range) {
                         memory.set_mapping_protection(addr, map_len_usize, false, false);
@@ -2939,7 +3138,10 @@ impl SyscallDispatcher {
                             length,
                             map_len_usize,
                         )?;
-                        return Ok(DispatchOutcome::errno(errno));
+                        return Ok(request.refused(
+                            MmapRefusal::Spec("MAP_LOCKED population refused by RLIMIT_MEMLOCK (shared anonymous)"),
+                            errno,
+                        ));
                     }
                     this.record_dynamic_mapping_with_file_offset(
                         addr,
@@ -2952,13 +3154,27 @@ impl SyscallDispatcher {
                     this.mark_vma_dispatch(&mut host_alias_dispatch);
                     return Ok(DispatchOutcome::Returned { value: addr as i64 });
                 }
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                return Ok(request.refused(
+                    MmapRefusal::Internal("shared aperture exhausted"),
+                    LINUX_ENOMEM,
+                ));
             }
 
             let (address, reused) = match this.next_mmap_address(requested.0, length, prot, flags) {
                 Some(pair) => pair,
                 None => {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    // A length that could not fit an EMPTY arena is a property
+                    // of the request, and Linux answers ENOMEM for it too —
+                    // CPython's `test_io` asks for 0x8000_0000_0000_1000 on
+                    // purpose. Only a request that would have fitted, and did
+                    // not, is carrick's own arena running out.
+                    let arena = this.mem.lock().layout.mmap_size;
+                    let refusal = if length > arena {
+                        MmapRefusal::Spec("length exceeds the entire mmap address-space arena")
+                    } else {
+                        MmapRefusal::Internal("no free address-space region: mmap arena exhausted")
+                    };
+                    return Ok(request.refused(refusal, LINUX_ENOMEM));
                 }
             };
 
@@ -2983,15 +3199,16 @@ impl SyscallDispatcher {
                 // Pool built on a freed 16 MiB b'X' buffer → 0x58.. ptr → SIGSEGV).
                 // MAP_FIXED|ANON also overwrites a caller-selected range, so it
                 // cannot rely on the bump allocator's pristine-tail invariant.
-                if memory
-                    .zero_anonymous_reuse(
-                        address,
-                        length_usize,
-                        map_sharing.guest_mapping_sharing(),
-                    )
-                    .is_err()
-                {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                if let Err(error) = memory.zero_anonymous_reuse(
+                    address,
+                    length_usize,
+                    map_sharing.guest_mapping_sharing(),
+                ) {
+                    return Ok(request.refused_by(
+                        MmapRefusal::Internal("anonymous-reuse scrub failed (mmap arena)"),
+                        LINUX_ENOMEM,
+                        format_args!("at {address:#x}+{length:#x}: {error}"),
+                    ));
                 }
             }
 
@@ -3016,12 +3233,18 @@ impl SyscallDispatcher {
                 // is fatal only inside the eager arena (where eager backends
                 // must succeed); an out-of-arena protect_range failure is
                 // benign (KVM/NVMM host-map lazily, HVF maps the arena eagerly).
-                if memory.protect_range(address, length_usize, 0).is_err()
+                if let Err(error) = memory.protect_range(address, length_usize, 0)
                     && (in_arena || memory.supports_concurrent_exec_protection())
                     && !address_uses_alias
                 {
                     mark_range_unmapped(memory, address, length_usize);
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return Ok(request.refused_by(
+                        MmapRefusal::Internal("PROT_NONE reservation failed in the mmap arena"),
+                        LINUX_ENOMEM,
+                        format_args!(
+                            "at {address:#x}+{length:#x} in_arena={in_arena}: {error}"
+                        ),
+                    ));
                 }
                 this.commit_mmap_locked_range(memory, locked_range)?;
                 this.record_dynamic_mapping_with_file_offset(
@@ -3057,11 +3280,17 @@ impl SyscallDispatcher {
                 );
                 // Unconditional (see the PROT_NONE arm above): reserve across
                 // the whole arena for demand-paged backends; fatal only in-arena.
-                if memory.protect_range(address, length_usize, prot).is_err()
+                if let Err(error) = memory.protect_range(address, length_usize, prot)
                     && (in_arena || memory.supports_concurrent_exec_protection())
                 {
                     mark_range_unmapped(memory, address, length_usize);
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return Ok(request.refused_by(
+                        MmapRefusal::Internal("protection publication failed (anonymous mapping)"),
+                        LINUX_ENOMEM,
+                        format_args!(
+                            "at {address:#x}+{length:#x} in_arena={in_arena}: {error}"
+                        ),
+                    ));
                 }
                 this.commit_mmap_locked_range(memory, locked_range)?;
                 this.record_dynamic_mapping_with_file_offset(
@@ -3141,7 +3370,10 @@ impl SyscallDispatcher {
             } else {
                 let mut bytes = vec![0; length_usize];
                 let Some(open_file) = this.open_file(fd.0) else {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    return Ok(request.refused(
+                        MmapRefusal::Internal("file description vanished mid-dispatch (content load)"),
+                        LINUX_EBADF,
+                    ));
                 };
                 // Independently opened in-memory descriptions are snapshots of
                 // one shared overlay inode. Another process can extend/write
@@ -3272,12 +3504,18 @@ impl SyscallDispatcher {
                             && (st.st_mode as u32 & libc::S_IFMT as u32)
                                 == libc::S_IFCHR as u32;
                         if !is_chardev {
-                            return Ok(DispatchOutcome::errno(linux_errno::ENODEV));
+                            return Ok(request.refused(
+                                MmapRefusal::Spec("mmap of a pipe or FIFO"),
+                                linux_errno::ENODEV,
+                            ));
                         }
                         // chardev zero-fill: keep `bytes` zeroed (no read).
                     }
                     _ => {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        return Ok(request.refused(
+                            MmapRefusal::Spec("mmap of a descriptor with no mappable backing"),
+                            LINUX_EBADF,
+                        ));
                     }
                 }
                 bytes
@@ -3305,7 +3543,10 @@ impl SyscallDispatcher {
                         cx.raw_args(),
                         reason,
                     ));
-                    return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+                    return Ok(request.refused(
+                        MmapRefusal::Internal("PROT_WRITE|PROT_EXEC is unsupported on this backend (alias VA)"),
+                        LINUX_EOPNOTSUPP,
+                    ));
                 }
                 // Reject a genuinely non-canonical hint (bits 55:48 of the
                 // ORIGINAL address neither all-0 nor all-1). With TCR_EL1.TBI on,
@@ -3315,9 +3556,15 @@ impl SyscallDispatcher {
                 let bits_55_48 = (requested_raw >> 48) & 0xff;
                 if bits_55_48 != 0x00 && bits_55_48 != 0xff {
                     if map_flags.contains(LinuxMmapFlags::FIXED_NOREPLACE) {
-                        return Ok(DispatchOutcome::errno(linux_errno::EEXIST));
+                        return Ok(request.refused(
+                            MmapRefusal::Spec("MAP_FIXED_NOREPLACE at a non-canonical address"),
+                            linux_errno::EEXIST,
+                        ));
                     }
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return Ok(request.refused(
+                        MmapRefusal::Spec("non-canonical address hint"),
+                        LINUX_ENOMEM,
+                    ));
                 }
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
                 // The guest VA is final. Mature VMM consumes a fresh monotonic
@@ -3329,7 +3576,10 @@ impl SyscallDispatcher {
                     length,
                     true,
                 ) else {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return Ok(request.refused(
+                        MmapRefusal::Internal("alias IPA arena exhausted (guest-chosen VA)"),
+                        LINUX_ENOMEM,
+                    ));
                 };
                 // Alias VMA/lock/residency/bus/seal state is a pending commit:
                 // no dispatcher metadata changes until the runtime reports the
@@ -3392,11 +3642,17 @@ impl SyscallDispatcher {
                 let Some(open_file) = this.open_file(fd.0) else {
                     // The description vanished mid-dispatch; the eager path's
                     // own EBADF position for the same state.
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    return Ok(request.refused(
+                        MmapRefusal::Internal("file description vanished mid-dispatch (file-backed lowering)"),
+                        LINUX_EBADF,
+                    ));
                 };
                 let open = open_file.description.read();
                 let OpenDescription::HostFile { host_fd, .. } = &*open else {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    return Ok(request.refused(
+                        MmapRefusal::Internal("file description changed type mid-dispatch (file-backed lowering)"),
+                        LINUX_EBADF,
+                    ));
                 };
                 if let Some(file_len) = host_fd_file_len(host_fd.raw()) {
                     bus_fault_offset =
@@ -3440,15 +3696,27 @@ impl SyscallDispatcher {
             // requested Linux permission immediately afterward.
             if !bytes.is_empty() {
                 let rw = crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE;
-                if memory.protect_range(address, length_usize, rw).is_err()
+                if let Err(error) = memory.protect_range(address, length_usize, rw)
                     && (in_arena || memory.supports_concurrent_exec_protection())
                 {
                     mark_range_unmapped(memory, address, length_usize);
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return Ok(request.refused_by(
+                        MmapRefusal::Internal(
+                            "temporary writable protection failed while loading file content",
+                        ),
+                        LINUX_ENOMEM,
+                        format_args!(
+                            "at {address:#x}+{length:#x} in_arena={in_arena}: {error}"
+                        ),
+                    ));
                 }
-                if memory.write_bytes_unchecked(address, &bytes).is_err() {
+                if let Err(error) = memory.write_bytes_unchecked(address, &bytes) {
                     mark_range_unmapped(memory, address, length_usize);
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return Ok(request.refused_by(
+                        MmapRefusal::Internal("file content could not be copied into the mapping"),
+                        LINUX_ENOMEM,
+                        format_args!("at {address:#x}+{length:#x}: {error}"),
+                    ));
                 }
             }
             memory.set_mapping_protection_and_sharing(
@@ -3461,11 +3729,15 @@ impl SyscallDispatcher {
             // Make the requested protection guest-visible (also restores RW for
             // a reused range). prot==0 here means file-backed PROT_NONE.
             // Unconditional: reserve across the whole arena; fatal only in-arena.
-            if memory.protect_range(address, length_usize, prot).is_err()
+            if let Err(error) = memory.protect_range(address, length_usize, prot)
                 && (in_arena || memory.supports_concurrent_exec_protection())
             {
                 mark_range_unmapped(memory, address, length_usize);
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                return Ok(request.refused_by(
+                    MmapRefusal::Internal("requested protection could not be published"),
+                    LINUX_ENOMEM,
+                    format_args!("at {address:#x}+{length:#x} in_arena={in_arena}: {error}"),
+                ));
             }
             if let Some(bus_offset) = bus_fault_offset
                 && let Some(bus_start) = address.checked_add(bus_offset)
@@ -3482,10 +3754,14 @@ impl SyscallDispatcher {
                     );
                 }
                 memory.set_no_access(bus_start, bus_len_usize, true);
-                if memory.protect_range(bus_start, bus_len_usize, 0).is_err()
+                if let Err(error) = memory.protect_range(bus_start, bus_len_usize, 0)
                     && memory.supports_concurrent_exec_protection()
                 {
-                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    return Ok(request.refused_by(
+                        MmapRefusal::Internal("beyond-EOF SIGBUS protection could not be published"),
+                        LINUX_ENOMEM,
+                        format_args!("at {bus_start:#x}+{bus_len:#x}: {error}"),
+                    ));
                 }
                 this.record_mmap_bus_fault_range(bus_start, bus_len);
             }
