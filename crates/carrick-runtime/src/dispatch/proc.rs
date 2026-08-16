@@ -4253,7 +4253,7 @@ impl SyscallDispatcher {
                     host_pid,
                     signum_i32,
                     user_info.si_code,
-                    crate::namespace::pid::self_ns_pid() as i32,
+                    this.identity_pid() as i32,
                     this.cred_snapshot().euid.raw(),
                     value,
                     // A pidfd names exactly one PROCESS (never a specific
