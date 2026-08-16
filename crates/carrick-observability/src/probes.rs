@@ -4709,10 +4709,19 @@ mod real {
         ///  * `pt__pause__timeout`: the convergence deadline was hit. MUST never
         ///    fire — a nonzero rate means a sibling stayed in guest (exactly the
         ///    corruption PMR prevents). `wait_us` is the deadline budget.
+        ///  * `pt__pause__election__timeout`: this thread waited past the
+        ///    election bound for the CURRENT coordinator to finish, and gave up
+        ///    without ever pausing. Distinct from `pt__pause__timeout`, which is
+        ///    the coordinator failing to drain its siblings. Contention alone
+        ///    does not reach this bound, so a firing means the coordinator is
+        ///    itself blocked — historically on a resource this thread already
+        ///    held (the dispatcher host-alias phase; see the ABBA fixed by
+        ///    hoisting the `MADV_DONTNEED` pause). `wait_us` is the budget.
         ///  * `pt__pause__end`: the pause was released and siblings resumed. `tid`.
         fn pt__pause__begin(_: i32, _: i32, _: i32) {}
         fn pt__pause__ready(_: i32, _: i32, _: i64) {}
         fn pt__pause__timeout(_: i32, _: i64) {}
+        fn pt__pause__election__timeout(_: i32, _: i64) {}
         fn pt__pause__end(_: i32) {}
         /// Stage-1 spare sub-table pool occupancy, fired after each table edit.
         /// `in_use` live split tables, `free_list` reclaimable pages, `capacity`
@@ -6272,6 +6281,10 @@ mod real {
         carrick_usdt::pt__pause__timeout!(|| (tid, wait_us));
     }
 
+    pub fn pt_pause_election_timeout(tid: i32, wait_us: i64) {
+        carrick_usdt::pt__pause__election__timeout!(|| (tid, wait_us));
+    }
+
     pub fn pt_pause_end(tid: i32) {
         carrick_usdt::pt__pause__end!(|| tid);
     }
@@ -7090,6 +7103,7 @@ mod stub {
     stub!(pt_pause_begin(tid: i32, others_in_guest: i32, count: i32));
     stub!(pt_pause_ready(tid: i32, spins: i32, wait_us: i64));
     stub!(pt_pause_timeout(tid: i32, wait_us: i64));
+    stub!(pt_pause_election_timeout(tid: i32, wait_us: i64));
     stub!(pt_pause_end(tid: i32));
     stub!(pt_pool(in_use: u32, free_list: u32, capacity: u32, changed: i32));
     stub!(pt_fault_walk(far: u64, l0: u64, l1: u64, l2: u64, l3: u64));
