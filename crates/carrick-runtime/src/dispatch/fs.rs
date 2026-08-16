@@ -4870,6 +4870,14 @@ impl SyscallDispatcher {
     /// given offset on a regular HostFile and advances `*off_out` (Linux allows
     /// off_out when fd_out is a regular file even though fd_in is a pipe —
     /// test_os.test_splice_offset_out). off_out on a non-regular target → EINVAL.
+    ///
+    /// The destination is written with `splice(2)`'s PARTIAL contract
+    /// ([`Self::write_output_fd_partial`]): a pipe or socket that fills
+    /// mid-transfer yields a short count, never a park until every byte lands.
+    /// Every caller either re-stages the undelivered tail
+    /// ([`Self::restore_splice_pipe_bytes`], [`Self::restore_pipe_bytes`]) or
+    /// never consumed it (`vmsplice` gathers from guest memory), so a short
+    /// count loses nothing.
     fn splice_write_out<M: GuestMemory>(
         &self,
         out_fd: i32,
@@ -4877,9 +4885,19 @@ impl SyscallDispatcher {
         bytes: &[u8],
         memory: &mut M,
         tid: crate::thread::ThreadId,
+        nonblocking: bool,
     ) -> DispatchOutcome {
         if off_out_addr == 0 {
-            return self.write_output_fd(out_fd, bytes, tid);
+            return match self.write_output_fd_partial(out_fd, bytes, tid) {
+                // The destination could not take a single byte. A blocking
+                // `splice(2)` waits for room; the partial write path reports
+                // that as `EAGAIN` because it asked non-blocking, so restore
+                // the guest's own blocking mode here.
+                DispatchOutcome::Errno { errno } if errno == LINUX_EAGAIN && !nonblocking => {
+                    self.splice_output_would_block(out_fd, false)
+                }
+                other => other,
+            };
         }
         let out_off = match read_u64(memory, off_out_addr) {
             Ok(v) => v,
@@ -4918,12 +4936,23 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: n as i64 }
     }
 
+    /// Pull up to `count` bytes off a `splice(2)` SOURCE pipe.
+    ///
+    /// `Ok(Ok(bytes))` is the transfer (empty = EOF, the writers are gone).
+    /// `Ok(Err(outcome))` is "nothing available": `EAGAIN` for a non-blocking
+    /// splice, a `WaitOnFds` readiness park for a blocking one — the same
+    /// classification `blocking_io`/`read_host_pipe` apply to every other host
+    /// read. carrick's host pipe fds are FORCED `O_NONBLOCK` at creation, so a
+    /// bare `read` here surfaced a host `EAGAIN` verbatim and a blocking guest
+    /// `splice` on an empty pipe failed instead of waiting.
     fn take_splice_pipe_bytes(
         &self,
         guest_fd: i32,
         host_fd: HostFd,
+        host_fd_owner: Option<HostFdRef>,
         count: usize,
-    ) -> Result<Vec<u8>, DispatchError> {
+        nonblocking: bool,
+    ) -> Result<Result<Vec<u8>, DispatchOutcome>, DispatchError> {
         let buf = self.take_staged_splice_pipe_bytes(guest_fd, count)?;
         // A pipe read returns the bytes already available without waiting to
         // fill the caller's whole buffer. The staged queue is the front of this
@@ -4931,13 +4960,12 @@ impl SyscallDispatcher {
         // after consuming a short staged prefix (that would turn readable data
         // into EAGAIN and lose the prefix).
         if !buf.is_empty() {
-            return Ok(buf);
+            return Ok(Ok(buf));
         }
 
         let mut buf = vec![0; count];
-        // BLOCKING-IO-OK: splice/sendfile source read. The in fd is a regular
-        // file or an already-readable pipe end; converting this niche path to
-        // the lockless wait is a tracked follow-up, not a server hot path.
+        // BLOCKING-IO-OK: the host fd is O_NONBLOCK by construction; EAGAIN is
+        // classified below rather than reaching the guest raw.
         let n = unsafe {
             libc::read(
                 host_fd.get(),
@@ -4945,9 +4973,22 @@ impl SyscallDispatcher {
                 count,
             )
         };
-        let n = n.host_syscall_errno()?;
+        let n = match n.host_syscall_errno() {
+            Ok(n) => n,
+            // EINTR is carrick's own machinery (the SIGURG vCPU kick), never
+            // the guest's: route it through readiness like `read_host_pipe`.
+            Err(errno) if errno == LINUX_EAGAIN || errno == LINUX_EINTR => {
+                return Ok(Err(super::would_block_outcome(
+                    host_fd.get(),
+                    libc::POLLIN,
+                    nonblocking,
+                    host_fd_owner,
+                )));
+            }
+            Err(errno) => return Err(DispatchError::Errno(errno)),
+        };
         buf.truncate(n as usize);
-        Ok(buf)
+        Ok(Ok(buf))
     }
 
     fn take_staged_splice_pipe_bytes(
@@ -4992,6 +5033,45 @@ impl SyscallDispatcher {
         // host kqueue/poll edge cannot announce it. Wake epoll instances to
         // force their level-readiness recompute.
         self.notify_inmem_epoll();
+    }
+
+    /// Push an undelivered `splice(2)` tail back onto the FRONT of an
+    /// in-memory pipe, the [`Self::restore_splice_pipe_bytes`] twin for the
+    /// legacy `PipeReader` source. A short destination write must leave the
+    /// source byte stream exactly as it found it minus what was delivered.
+    fn restore_pipe_bytes(pipe: &PipeRef, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut pipe = pipe.lock();
+        for byte in bytes.iter().rev() {
+            pipe.buffer.push_front(*byte);
+        }
+    }
+
+    /// The destination's readiness park for a blocking `splice`/`vmsplice`
+    /// whose output could not take a single byte. Nothing has been consumed
+    /// when this is reached, so the runtime re-dispatches the whole call after
+    /// the wait; a non-blocking caller gets `EAGAIN` instead.
+    fn splice_output_would_block(&self, fd: i32, nonblocking: bool) -> DispatchOutcome {
+        let target = self.open_file(fd).and_then(|file| {
+            let open = file.description.read();
+            match &*open {
+                OpenDescription::HostPipe { host_fd, .. }
+                | OpenDescription::HostSocket { host_fd, .. } => {
+                    Some((host_fd.raw(), Some(host_fd.clone())))
+                }
+                _ => None,
+            }
+        });
+        match target {
+            Some((host_fd, owner)) => {
+                super::would_block_outcome(host_fd, libc::POLLOUT, nonblocking, owner)
+            }
+            // No host readiness source to park on (in-memory pipe destination):
+            // report the condition rather than parking on nothing.
+            None => DispatchOutcome::errno(LINUX_EAGAIN),
+        }
     }
 
     fn restore_splice_pipe_bytes(&self, guest_fd: i32, bytes: &[u8]) {
@@ -10450,9 +10530,35 @@ impl SyscallDispatcher {
             if !this.is_genuine_pipe(in_fd.0) && !this.is_genuine_pipe(out_fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            // An `io_uring` ring is an anonymous inode with no splice file
+            // operations, so Linux answers EINVAL for either end. carrick backs
+            // the ring fd with a plain `SyntheticFile`, which
+            // `splice_source_not_readable` accepts: the call fell through to the
+            // file->pipe path, `sendfile_bytes` read the description's empty
+            // `contents`, and splice reported a successful 0-byte transfer
+            // (splice07 "splice() on io uring -> pipe write end succeeded").
+            if this.io_uring_description(in_fd.0).is_some()
+                || this.io_uring_description(out_fd.0).is_some()
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             if count == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
+            // A guest that did not ask for SPLICE_F_NONBLOCK still gets
+            // non-blocking behaviour when the DESTINATION fd is O_NONBLOCK,
+            // exactly like write(2) on the same fd.
+            let out_nonblocking = splice_flags.contains(LinuxSpliceFlags::NONBLOCK)
+                || this.fd_status_flags(out_fd.0) & LINUX_O_NONBLOCK != 0;
+            // Never hand the destination more than it can take in one go. The
+            // write path returns a SHORT count rather than parking (splice(2)'s
+            // own contract), and bounding the SOURCE read by the same figure
+            // keeps the undelivered tail out of carrick's hands entirely.
+            let count = match this.splice_pipe_write_room(out_fd.0) {
+                Some(0) => return Ok(this.splice_output_would_block(out_fd.0, out_nonblocking)),
+                Some(room) => count.min(room),
+                None => count,
+            };
 
             if let Some((pipe, status_flags)) = this.pipe_reader(in_fd.0) {
                 // A pipe source has no seekable offset → a non-NULL off_in is
@@ -10465,8 +10571,16 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(errno));
                 }
                 let bytes = take_pipe_bytes(&pipe, count, status_flags)?;
-                let outcome = this.splice_write_out(out_fd.0, off_out_address, &bytes, cx.memory, tid);
-                return Ok(outcome);
+                let outcome = this.splice_write_out(out_fd.0, off_out_address, &bytes, cx.memory, tid, out_nonblocking);
+                let DispatchOutcome::Returned { value } = outcome else {
+                    Self::restore_pipe_bytes(&pipe, &bytes);
+                    return Ok(outcome);
+                };
+                let written = usize::try_from(value).unwrap_or(0).min(bytes.len());
+                if written < bytes.len() {
+                    Self::restore_pipe_bytes(&pipe, &bytes[written..]);
+                }
+                return Ok(DispatchOutcome::Returned { value: written as i64 });
             }
 
             // Splice OUT of a real host pipe's read end (the fork-safe pipe model;
@@ -10482,11 +10596,32 @@ impl SyscallDispatcher {
                 if let Some(errno) = this.splice_output_errno(out_fd.0) {
                     return Ok(DispatchOutcome::errno(errno));
                 }
-                let buf = this.take_splice_pipe_bytes(in_fd.0, host_fd, count)?;
+                // A source read that finds nothing waits (or reports EAGAIN)
+                // like every other blocking-mode host read; the guest's own
+                // O_NONBLOCK on fd_in counts alongside SPLICE_F_NONBLOCK.
+                let in_nonblocking = splice_flags.contains(LinuxSpliceFlags::NONBLOCK)
+                    || this.fd_status_flags(in_fd.0) & LINUX_O_NONBLOCK != 0;
+                let host_fd_owner = this.open_file(in_fd.0).and_then(|file| {
+                    let open = file.description.read();
+                    match &*open {
+                        OpenDescription::HostPipe { host_fd, .. } => Some(host_fd.clone()),
+                        _ => None,
+                    }
+                });
+                let buf = match this.take_splice_pipe_bytes(
+                    in_fd.0,
+                    host_fd,
+                    host_fd_owner,
+                    count,
+                    in_nonblocking,
+                )? {
+                    Ok(buf) => buf,
+                    Err(outcome) => return Ok(outcome),
+                };
                 if buf.is_empty() {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
-                let outcome = this.splice_write_out(out_fd.0, off_out_address, &buf, cx.memory, tid);
+                let outcome = this.splice_write_out(out_fd.0, off_out_address, &buf, cx.memory, tid, out_nonblocking);
                 let DispatchOutcome::Returned { value } = outcome else {
                     this.restore_splice_pipe_bytes(in_fd.0, &buf);
                     return Ok(outcome);
@@ -10607,7 +10742,7 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 buf.truncate(n as usize);
-                let outcome = this.splice_write_out(out_fd.0, off_out_address, &buf, cx.memory, tid);
+                let outcome = this.splice_write_out(out_fd.0, off_out_address, &buf, cx.memory, tid, out_nonblocking);
                 let DispatchOutcome::Returned { value } = outcome else {
                     // EAGAIN / WaitOnFds / Errno on the destination — propagate
                     // WITHOUT consuming any socket bytes (the peek left them).
@@ -10755,7 +10890,10 @@ impl SyscallDispatcher {
                 usize::try_from(nr_segs).map_err(|_| DispatchError::LengthTooLarge(nr_segs))?;
             let memory = &mut *cx.memory;
             let iovecs = read_iovecs(memory, iov.0, nr)?;
-            let nonblocking = splice_flags.contains(LinuxSpliceFlags::NONBLOCK);
+            // SPLICE_F_NONBLOCK *or* an O_NONBLOCK pipe: vmsplice(2) blocks
+            // only when both say it may.
+            let nonblocking = splice_flags.contains(LinuxSpliceFlags::NONBLOCK)
+                || this.fd_status_flags(fd.0) & LINUX_O_NONBLOCK != 0;
 
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -10793,6 +10931,18 @@ impl SyscallDispatcher {
 
             match dir {
                 VmDir::Write => {
+                    // vmsplice(2) into a pipe moves AT MOST what the pipe can
+                    // hold and reports a SHORT count; the caller loops. Bound
+                    // the gather by the destination's room so the transfer is
+                    // a single non-blocking write. Without the bound, LTP
+                    // `vmsplice01` handed 128 KiB to a 64 KiB pipe, the
+                    // full-delivery write path parked on POLLOUT for the
+                    // remainder, and the only reader could not run until this
+                    // call returned — a hang until the 30 s test timeout.
+                    let room = this.splice_pipe_write_room(fd.0);
+                    if room == Some(0) {
+                        return Ok(this.splice_output_would_block(fd.0, nonblocking));
+                    }
                     let bytes = match gather_bounded_iovec_bytes(memory, &iovecs) {
                         Ok(Some(bytes)) => bytes,
                         Ok(None) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
@@ -10801,7 +10951,8 @@ impl SyscallDispatcher {
                     if bytes.is_empty() {
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
-                    Ok(this.splice_write_out(fd.0, 0, &bytes, memory, tid))
+                    let bytes = &bytes[..room.map_or(bytes.len(), |room| bytes.len().min(room))];
+                    Ok(this.splice_write_out(fd.0, 0, bytes, memory, tid, nonblocking))
                 }
                 VmDir::ReadHost(hfd, owner) => Ok(Self::read_host_pipe_iovecs(
                     memory,

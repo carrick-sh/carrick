@@ -2461,6 +2461,7 @@ impl SyscallDispatcher {
                     resident: true,
                     bus_fault: None,
                     write_sealed_shared: false,
+                    read_only_shared_file: false,
                     writable_memfd: None,
                 },
                 HostAliasShmatCommit {
@@ -5004,6 +5005,7 @@ mod ipc_set_tests {
             resident: true,
             bus_fault: Some((addr, len)),
             write_sealed_shared: true,
+            read_only_shared_file: false,
             writable_memfd: Some(writable_memfd),
         });
         assert!(dispatcher.range_has_mapping_metadata_for_test(addr, len));
@@ -5045,6 +5047,7 @@ mod ipc_set_tests {
             resident: false,
             bus_fault: None,
             write_sealed_shared: false,
+            read_only_shared_file: false,
             writable_memfd: None,
         });
         let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
@@ -5136,6 +5139,7 @@ mod ipc_set_tests {
                 resident: true,
                 bus_fault: None,
                 write_sealed_shared: false,
+                read_only_shared_file: false,
                 writable_memfd: None,
             },
             HostAliasShmatCommit {

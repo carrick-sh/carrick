@@ -3637,6 +3637,62 @@ mod tests {
         assert!(rcvbuf.unwrap() >= HOST_STREAM_BUF_REQUIRED);
     }
 
+    /// The `socketpair(2)` HANDLER - not just the helper - must widen both
+    /// host fds. `socket` and `accept` called `widen_stream_socket_buffers`;
+    /// `socketpair` was the one creation site that never did, so an AF_UNIX
+    /// stream pair kept macOS' 8 KiB `net.local.stream.sendspace` where Linux
+    /// gives ~208 KiB, and a guest that filled the pair before draining it
+    /// (LTP splice05) deadlocked. `stream_buffer_widening_covers_unix_stream_sockets`
+    /// above proves the helper works on exactly this socket shape and passed
+    /// throughout; only a test that goes through the SYSCALL catches the gap.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn socketpair_syscall_widens_both_host_stream_buffers() {
+        use crate::dispatch::{LinearMemory, SyscallArgs, SyscallRequest};
+
+        const SYS_SOCKETPAIR: u64 = 199;
+        let reporter = CompatReporter::default();
+        let mut dispatcher = SyscallDispatcher::new();
+        let sv = 0x1_0000_u64;
+        let mut memory = LinearMemory::new(sv, vec![0u8; 0x1000]);
+
+        let outcome = dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    SYS_SOCKETPAIR,
+                    SyscallArgs::from([
+                        LINUX_AF_UNIX as u64,
+                        LINUX_SOCK_STREAM as u64,
+                        0,
+                        sv,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("socketpair dispatch");
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+
+        let pair = memory.read_bytes(sv, 8).expect("read sv");
+        for chunk in pair.chunks_exact(4) {
+            let guest_fd = i32::from_ne_bytes(chunk.try_into().unwrap());
+            let host_fd = dispatcher
+                .host_fd_for_poll(guest_fd)
+                .expect("socketpair end has a host fd");
+            for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+                let size = host_socket_buffer_size(host_fd.get(), opt)
+                    .expect("read back the host socket buffer size");
+                assert!(
+                    size >= HOST_STREAM_BUF_REQUIRED,
+                    "socketpair end {guest_fd} opt {opt} is {size}, below the Linux-sized floor",
+                );
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn host_socket_install_forces_host_nonblocking_even_for_blocking_guest_fd() {
