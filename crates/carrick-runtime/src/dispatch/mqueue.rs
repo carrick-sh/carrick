@@ -920,7 +920,7 @@ fn deliver_notify(
         NotifyDelivery::Signal { pid, signo, value } => {
             let info = crate::linux_abi::LinuxSiginfo::message_queue(
                 signo,
-                crate::namespace::pid::self_ns_pid() as i32,
+                this.identity_pid() as i32,
                 this.cred_snapshot().ruid.raw(),
                 value,
             );
@@ -932,7 +932,7 @@ fn deliver_notify(
                 pid,
                 signo,
                 crate::linux_abi::LINUX_SI_MESGQ,
-                crate::namespace::pid::self_ns_pid() as i32,
+                this.identity_pid() as i32,
                 this.cred_snapshot().ruid.raw(),
                 value,
                 0,

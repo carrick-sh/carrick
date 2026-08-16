@@ -3095,6 +3095,30 @@ fn resolve_handler<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
 /// every caller would be a larger change than the fact warrants.
 static HVPATCH_LANE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// How carrick's own kernel graph sees a guest-supplied pid that names some
+/// OTHER Linux process. See [`SyscallDispatcher::guest_process_target`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GuestProcessTarget {
+    /// A live Linux process, running as `euid`.
+    Live { euid: carrick_abi::NsUid },
+    /// Exited but not yet reaped — still addressable, still owned by the `euid`
+    /// it held at exit.
+    Zombie { euid: carrick_abi::NsUid },
+    /// No such Linux process — ESRCH.
+    Missing,
+}
+
+impl GuestProcessTarget {
+    /// The euid to compare a caller against, or `None` when no such process
+    /// exists.
+    pub(crate) fn euid(self) -> Option<carrick_abi::NsUid> {
+        match self {
+            Self::Live { euid } | Self::Zombie { euid } => Some(euid),
+            Self::Missing => None,
+        }
+    }
+}
+
 pub(crate) fn hvpatch_lane_active() -> bool {
     HVPATCH_LANE.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -3418,6 +3442,37 @@ impl SyscallDispatcher {
             return None;
         };
         Some(process.kernel_graph().task_is_live(task))
+    }
+
+    /// Resolve a guest-supplied positive pid to another Linux PROCESS and the
+    /// effective uid that process runs as.
+    ///
+    /// `None` has the same meaning as in [`Self::guest_pid_is_live`]: this lane
+    /// has no kernel task registry, so the caller keeps its host probe.
+    ///
+    /// Otherwise the answer comes entirely from carrick's kernel graph. That is
+    /// the whole point: the caller's own credentials already come from there
+    /// (`cred_snapshot`), while the TARGET's used to come from
+    /// `cred_ipc::read_target(host_pid)` — one host file keyed by the carrier's
+    /// pid, therefore the same file for every HVPatch logical process. The two
+    /// halves of one ownership comparison were reading different authorities.
+    ///
+    /// A zombie is reported, not dropped: Linux keeps an exited-but-unreaped
+    /// process addressable by `sched_*`, `setpriority` and `process_vm_*`, and
+    /// applies the same ownership rule using the credentials it held at exit.
+    pub(crate) fn guest_process_target(&self, pid: i32) -> Option<GuestProcessTarget> {
+        let process = self.hvpatch_process()?;
+        let Ok(task) = crate::kernel::TaskId::from_abi_positive(pid) else {
+            return None;
+        };
+        let kernel = process.kernel_graph();
+        if let Some(euid) = kernel.live_task_process_euid(task) {
+            return Some(GuestProcessTarget::Live { euid });
+        }
+        Some(match kernel.registry().zombie(task) {
+            Some(zombie) => GuestProcessTarget::Zombie { euid: zombie.euid },
+            None => GuestProcessTarget::Missing,
+        })
     }
 
     /// Clone process-private dispatcher state for an hvpatch in-process fork.
