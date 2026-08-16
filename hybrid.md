@@ -10,12 +10,18 @@ history; the durable measurements they produced live under
 [`docs/perf-results/`](docs/perf-results/) and remain authoritative as
 evidence.
 
-**Resume checkpoint:** `codex/hybrid-kernel` implementation at `88aa86494`
-(`fix(hvpatch): reconcile task wakes before guest entry`), based on `main` at
-`53f5da3f5` with ancestry `main...HEAD = 0 125`. The exact signed binary
-(`SHA-256 9eb908e9...0b077`, `CDHash 6aa0f3ad...581f`) has the HVF entitlement
-and DOF section and passes the serialized line-exact HVPatch probe gate 400/400.
-This is a resumable opt-in checkpoint, not Task 6 completion: eight Go rows,
+**Resume checkpoint:** `codex/hybrid-kernel` implementation at `8513d8677`
+(`diagnostics(hvpatch): retain Go wait and terminal traces`), based on `main` at
+`53f5da3f5` with ancestry `main...HEAD = 0 131`. The exact signed source binary
+(`SHA-256 a823acdf...523f5`, `CDHash f2646971...76c39`, UUID
+`759448DE-6473-3964-8B4F-29E87F188277`) has the HVF entitlement and DOF section.
+The last serialized line-exact HVPatch gate remains 400/400 at `88aa86494`.
+The current Go `TestCorrectMethodPackage` STW blocker is closed: seven of eight
+untraced signed reducer attempts pass, including the two final exact-source
+runs in 10.98 s and 11.51 s with cleanup zero; the one other attempt is a
+separately attributed sibling-materialization start-gate timeout and is
+explicitly deferred. This is a resumable opt-in checkpoint, not Task 6
+completion: eight Go rows (including that lifecycle residual),
 one-host-process topology, CPython/Node, baseline/default, final CI, and the
 cold-build regression signal remain. See the
 [durable checkpoint](docs/perf-results/2026-08-15-hvpatch-task6-checkpoint.md).
