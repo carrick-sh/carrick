@@ -11,6 +11,59 @@ use std::cell::Cell;
 /// back a live stage-2 alias. The same file opened `O_RDWR` re-protects fine,
 /// so the fd's ACCESS MODE, not the requested protection, is the discriminator.
 #[cfg(target_os = "macos")]
+/// `locked_ranges_insert` keeps a SORTED, MERGED, non-overlapping set. It used
+/// to re-sort and rebuild the whole vector on every insert; it now splices only
+/// the run of entries the new range touches. Pin the shape the callers depend
+/// on — including the two cases a local splice could plausibly get wrong:
+/// inserting BEFORE everything already present, and coalescing a range that
+/// merely ABUTS its neighbours rather than overlapping them.
+#[test]
+fn locked_ranges_insert_keeps_the_set_sorted_and_merged() {
+    fn range(start: u64, end: u64) -> crate::vfs::GuestMemoryRange {
+        crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)).expect("valid range")
+    }
+    fn pairs(ranges: &[crate::vfs::GuestMemoryRange]) -> Vec<(u64, u64)> {
+        ranges
+            .iter()
+            .map(|r| (r.start().raw(), r.end().raw()))
+            .collect()
+    }
+
+    // Inserted out of order, disjoint: the set sorts itself.
+    let mut ranges = Vec::new();
+    for (start, end) in [(0x3000, 0x4000), (0x1000, 0x2000), (0x9000, 0xa000)] {
+        locked_ranges_insert(&mut ranges, range(start, end));
+    }
+    assert_eq!(
+        pairs(&ranges),
+        vec![(0x1000, 0x2000), (0x3000, 0x4000), (0x9000, 0xa000)]
+    );
+
+    // Abutting on BOTH sides coalesces the three into one, even though it
+    // overlaps none of them.
+    locked_ranges_insert(&mut ranges, range(0x2000, 0x3000));
+    assert_eq!(pairs(&ranges), vec![(0x1000, 0x4000), (0x9000, 0xa000)]);
+
+    // A range spanning a gap swallows every entry it now covers.
+    locked_ranges_insert(&mut ranges, range(0x3800, 0x9800));
+    assert_eq!(pairs(&ranges), vec![(0x1000, 0xa000)]);
+
+    // Wholly contained: no change.
+    locked_ranges_insert(&mut ranges, range(0x2000, 0x3000));
+    assert_eq!(pairs(&ranges), vec![(0x1000, 0xa000)]);
+
+    // Inserting below everything present keeps the order.
+    locked_ranges_insert(&mut ranges, range(0x100, 0x200));
+    assert_eq!(pairs(&ranges), vec![(0x100, 0x200), (0x1000, 0xa000)]);
+
+    // And `locked_ranges_remove` still splits an interior hole out of it.
+    locked_ranges_remove(&mut ranges, range(0x4000, 0x5000));
+    assert_eq!(
+        pairs(&ranges),
+        vec![(0x100, 0x200), (0x1000, 0x4000), (0x5000, 0xa000)]
+    );
+}
+
 #[test]
 fn readonly_host_fd_cannot_carry_a_writable_shared_file_mapping() {
     use std::io::Write;
