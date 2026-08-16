@@ -370,6 +370,8 @@ where
         main_tid,
         Arc::clone(&threads),
         Arc::clone(&kicker),
+        // The main guest thread's lifetime in-guest handshake flag.
+        carrick_hal::InGuestFlag::for_guest_thread(),
         max_traps,
     );
     // Process children are not Linux thread-group siblings of their creator.

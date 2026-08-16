@@ -1600,10 +1600,14 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// The object-safe vCPU registry (the kicker). The shared loop never names
     /// the concrete `VcpuKicker`.
     kicker: Arc<dyn VcpuRegistry>,
-    /// This vCPU's "currently in `next_syscall`" flag, shared with the kicker so
-    /// a page-table-edit coordinator can tell whether this thread is walking
-    /// guest memory. Set true around `next_syscall`, false otherwise.
-    in_guest: Arc<std::sync::atomic::AtomicBool>,
+    /// This guest thread's ONE "currently in `next_syscall`" flag, created when
+    /// the guest thread is born and held for its whole life, so a
+    /// page-table-edit coordinator can tell whether this thread is walking
+    /// guest memory. Set true around `next_syscall`, false otherwise. Every
+    /// (re-)registration of this thread hands the kicker THIS flag — see
+    /// [`carrick_hal::InGuestFlag`], whose whole point is that the two halves
+    /// of a registration cannot drift apart.
+    in_guest: carrick_hal::InGuestFlag,
     waiter: crate::io_wait::ThreadWaiter,
     max_traps: usize,
     trace: bool,
@@ -1742,9 +1746,9 @@ where
         this_tid: ThreadId,
         threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
         kicker: Arc<dyn VcpuRegistry>,
+        in_guest: carrick_hal::InGuestFlag,
         max_traps: usize,
     ) -> Self {
-        let in_guest = kicker.register_in_guest(this_tid);
         Self {
             registry,
             futex,
@@ -2598,8 +2602,7 @@ where
                     .rebind_to_slot(new_lease.slot, &reclaim.state)
                     .map_err(RuntimeError::Trap)?;
             }
-            let handle: Box<dyn carrick_hal::VcpuKickDyn> = Box::new(engine.kick_handle());
-            self.kicker.register(self.this_tid, handle);
+            self.register_vcpu(engine);
         } else {
             if self.fork_is_quiescing() {
                 if !kicker_dropped {
@@ -3865,6 +3868,7 @@ pub(crate) fn run_vcpu_until_exit<E: ThreadedEngine + 'static>(
     this_tid: ThreadId,
     threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
     kicker: Arc<dyn VcpuRegistry>,
+    in_guest: carrick_hal::InGuestFlag,
     max_traps: usize,
 ) -> Result<VcpuLoopOutcome, RuntimeError>
 where
@@ -3919,6 +3923,7 @@ where
         this_tid,
         threads,
         kicker,
+        in_guest,
         max_traps,
     );
     if let Some(process) = kernel.hvpatch_process.as_ref() {
@@ -4103,13 +4108,9 @@ where
             // handshake with the edit coordinator, which sets `quiescing` then
             // reads `in_guest`: SeqCst guarantees at least one side observes the
             // other, so this vCPU never enters guest concurrently with an edit.
-            state
-                .in_guest
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            state.in_guest.enter_guest();
             if pt_barrier().is_quiescing() {
-                state
-                    .in_guest
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                state.in_guest.leave_guest();
                 pt_barrier().park();
                 continue;
             }
@@ -4126,9 +4127,7 @@ where
             // reached. The prior syscall resume pair is no longer live.
             guest_entry_syscall_retval = None;
             // Out of guest now (in host): a coordinator may proceed past us.
-            state
-                .in_guest
-                .store(false, std::sync::atomic::Ordering::SeqCst);
+            state.in_guest.leave_guest();
             let frame = match next {
                 Ok(Some(f)) => f,
                 Ok(None) => {

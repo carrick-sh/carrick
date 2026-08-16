@@ -110,10 +110,8 @@ pub type KvmKicker = carrick_hal::GenericVcpuRegistry;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-
     use super::*;
-    use carrick_hal::{VcpuKick, VcpuRegistry};
+    use carrick_hal::{InGuestFlag, VcpuKick, VcpuRegistry};
 
     /// A pure-data stand-in for a real `KvmKickHandle`: it records nothing and
     /// kicks nothing, so the registry bookkeeping tests run on ANY host (no
@@ -134,15 +132,17 @@ mod tests {
     }
 
     /// register / unregister / count bookkeeping: `count` reflects the number of
-    /// registered handles, and unregister removes both maps' entries.
+    /// registered vCPUs, and unregister removes the whole entry (both facets).
     #[test]
     fn register_unregister_count() {
         let k = KvmKicker::new();
+        let f10 = InGuestFlag::for_guest_thread();
+        let f11 = InGuestFlag::for_guest_thread();
         assert_eq!(k.count(), 0, "fresh kicker is empty");
 
-        k.register(t(10), boxed());
-        k.register(t(11), boxed());
-        assert_eq!(k.count(), 2, "two handles registered");
+        k.register(t(10), boxed(), &f10);
+        k.register(t(11), boxed(), &f11);
+        assert_eq!(k.count(), 2, "two vCPUs registered");
 
         // Kicking an unknown tid, kick_all, kick_all_except are harmless no-ops
         // on inert handles (no pthread_kill fires).
@@ -151,7 +151,7 @@ mod tests {
         k.kick_all_except(t(10));
 
         k.unregister(t(10));
-        assert_eq!(k.count(), 1, "one handle after unregister");
+        assert_eq!(k.count(), 1, "one vCPU after unregister");
         k.unregister(t(11));
         assert_eq!(k.count(), 0, "empty after unregistering both");
         // Unregistering an absent tid is a no-op.
@@ -159,21 +159,23 @@ mod tests {
         assert_eq!(k.count(), 0);
     }
 
-    /// `set_in_guest` + `any_other_in_guest` SeqCst bookkeeping (the Dekker
+    /// `InGuestFlag` + `any_other_in_guest` SeqCst bookkeeping (the Dekker
     /// handshake state) — pure HashMap/AtomicBool, no pthread/KVM.
     #[test]
-    fn set_in_guest_any_other_in_guest() {
+    fn in_guest_flag_drives_any_other_in_guest() {
         let k = KvmKicker::new();
-        // Two threads register their in-guest flags.
-        let _f1 = k.register_in_guest(t(1));
-        let _f2 = k.register_in_guest(t(2));
+        // Two threads register their vCPUs, each with its lifetime flag.
+        let f1 = InGuestFlag::for_guest_thread();
+        let f2 = InGuestFlag::for_guest_thread();
+        k.register(t(1), boxed(), &f1);
+        k.register(t(2), boxed(), &f2);
 
         // Nobody in guest yet.
         assert!(!k.any_other_in_guest(t(1)), "no other thread in guest");
         assert!(!k.any_other_in_guest(t(2)));
 
         // Thread 2 enters the guest.
-        k.set_in_guest(t(2), true);
+        f2.enter_guest();
         assert!(
             k.any_other_in_guest(t(1)),
             "thread 1 must observe thread 2 in guest"
@@ -185,26 +187,42 @@ mod tests {
         );
 
         // Thread 2 leaves the guest.
-        k.set_in_guest(t(2), false);
+        f2.leave_guest();
         assert!(!k.any_other_in_guest(t(1)), "thread 2 left the guest");
 
-        // set_in_guest for an UNREGISTERED tid is a no-op (no panic, no insert).
-        k.set_in_guest(t(999), true);
+        // A thread that never registered cannot make anyone in-guest.
+        let stranger = InGuestFlag::for_guest_thread();
+        stranger.enter_guest();
         assert!(!k.any_other_in_guest(t(1)));
     }
 
-    /// The handle returned by `register_in_guest` is the SAME `Arc<AtomicBool>`
-    /// the registry mutates — so a `set_in_guest(true)` is observable through the
-    /// handle the run loop kept (the Dekker handshake relies on this aliasing).
+    /// The registry stores a CLONE of the caller's own cell, so the run loop's
+    /// stores are what a coordinator reads — including across the
+    /// unregister/re-register cycle every blocking wait performs. This is the
+    /// aliasing the Dekker handshake relies on.
     #[test]
-    fn register_in_guest_returns_shared_flag() {
+    fn registry_aliases_the_callers_flag_across_reregistration() {
         let k = KvmKicker::new();
-        let flag = k.register_in_guest(t(7));
-        assert!(!flag.load(Ordering::SeqCst));
-        k.set_in_guest(t(7), true);
+        let flag = InGuestFlag::for_guest_thread();
+        let observer = InGuestFlag::for_guest_thread();
+        k.register(t(7), boxed(), &flag);
+        k.register(t(8), boxed(), &observer);
+        assert!(!k.any_other_in_guest(t(8)));
+
+        flag.enter_guest();
         assert!(
-            flag.load(Ordering::SeqCst),
-            "the returned flag must alias the registry's flag"
+            k.any_other_in_guest(t(8)),
+            "the registry must read the caller's cell"
+        );
+
+        // Blocking-wait reclaim: unregister, then re-register the same thread.
+        flag.leave_guest();
+        k.unregister(t(7));
+        k.register(t(7), boxed(), &flag);
+        flag.enter_guest();
+        assert!(
+            k.any_other_in_guest(t(8)),
+            "re-registration must restore the in-guest facet, not only the kick handle"
         );
     }
 }
