@@ -3525,29 +3525,24 @@ fn sysv_semop<M: GuestMemory>(
     let may_block = semop_may_block(&sops);
     let _block_state = may_block.then(|| SysvSemBlockStateGuard::new(cx.tid()));
 
-    if timeout.is_none() {
-        let rc = unsafe { carrick_portable::semop(semid, sops.as_mut_ptr(), nsops) };
-        return match rc.host_syscall_errno() {
-            Ok(_) => {
-                completed(&sops);
-                Ok(DispatchOutcome::Returned { value: 0 })
-            }
-            Err(errno) => Ok(DispatchOutcome::errno(errno)),
-        };
-    }
-
-    // Timed: poll with IPC_NOWAIT until the relative deadline. Force NOWAIT on
-    // every op so the host call returns EAGAIN instead of blocking past the
-    // timeout; on EAGAIN we sleep briefly and retry until the deadline, then
-    // surface EAGAIN (Linux semtimedop returns EAGAIN on timeout).
-    // `timeout.is_none()` returned above, so this is always Some; the else arm
-    // is unreachable but keeps us off `unwrap()` (workspace denies it).
-    let Some(ts) = timeout else {
-        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-    };
-    let total_ns = (ts.tv_sec.max(0) as u128) * 1_000_000_000 + ts.tv_nsec.max(0) as u128;
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_nanos(total_ns.min(u64::MAX as u128) as u64);
+    // BOTH the timed and untimed forms poll with IPC_NOWAIT. Forcing NOWAIT on
+    // every op means the host call returns EAGAIN instead of blocking inside
+    // the kernel, so `interrupted()` is actually reachable between attempts.
+    //
+    // The untimed form used to call the host `semop` directly and block there.
+    // semop(2) documents EINTR ("the sleep was interrupted by a signal"), and a
+    // thread parked inside a host semop could not be interrupted at all — not
+    // even by SIGKILL. LTP semctl01 ends by SIGKILLing five children that are
+    // parked in an untimed semop and then waiting for them; none died, so the
+    // suite wedged to the harness timeout rather than merely failing.
+    //
+    // `deadline: None` is the untimed form: retry until satisfied or
+    // interrupted, exactly as Linux blocks indefinitely.
+    let deadline = timeout.map(|ts| {
+        let total_ns = (ts.tv_sec.max(0) as u128) * 1_000_000_000 + ts.tv_nsec.max(0) as u128;
+        std::time::Instant::now()
+            + std::time::Duration::from_nanos(total_ns.min(u64::MAX as u128) as u64)
+    });
     let mut nowait = sops.clone();
     for s in &mut nowait {
         s.sem_flg |= SemOpFlags::NOWAIT.bits() as i16;
@@ -3566,7 +3561,9 @@ fn sysv_semop<M: GuestMemory>(
             }
             Err(e) if e == LINUX_EAGAIN => {
                 saw_would_block = true;
-                if std::time::Instant::now() >= deadline {
+                // Only the TIMED form gives up: semtimedop(2) returns EAGAIN on
+                // timeout. The untimed form keeps waiting, as semop(2) does.
+                if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                     return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
