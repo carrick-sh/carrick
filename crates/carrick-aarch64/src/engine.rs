@@ -1159,6 +1159,10 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         self.vm.take_alias_inventory()
     }
 
+    fn abandon_alias_inventory(&mut self) -> bool {
+        self.vm.abandon_alias_inventory()
+    }
+
     fn frame_inventory_exec_extent_counts(&self, new_image: &AddressSpace) -> (usize, usize) {
         self.vm.frame_inventory_exec_extent_counts(new_image)
     }

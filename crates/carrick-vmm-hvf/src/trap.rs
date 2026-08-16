@@ -3389,6 +3389,40 @@ impl HvpatchFrameInventoryState {
         self.ledger.lock().process_reservation.take().is_some()
     }
 
+    fn begin_alias_inventory(
+        &mut self,
+        reservation: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        let mut inventory = self.ledger.lock();
+        if inventory.alias_reservation.is_some() || inventory.alias_commit.is_some() {
+            return Err(TrapError::Hypervisor(
+                "overlapping HVPatch alias inventory transaction".to_owned(),
+            ));
+        }
+        inventory.alias_reservation = Some(reservation);
+        Ok(())
+    }
+
+    /// Discard whatever alias staging a FAILED install left armed, so the next
+    /// guest `mmap` can arm its own transaction instead of being rejected as
+    /// overlapping.
+    ///
+    /// Both slots are cleared because the failure can land on either side of the
+    /// hand-off: `add_alias_with_sharing` returning early leaves the
+    /// `alias_reservation` it never consumed, while a stage-1 `map_aliased`
+    /// failure after a successful stage-2 install leaves the `alias_commit` it
+    /// already staged. Reservations and commits are pointer-free data with no
+    /// `Drop` side effects — dropping one only burns its candidate IDs, which
+    /// the runtime's monotonic registry never reissues — so the backend's own
+    /// stage-1/stage-2 unwind (RAII host mappings and global-frame IPA leases)
+    /// plus this discard leave no residue.
+    fn cancel_alias_inventory(&mut self) -> bool {
+        let mut inventory = self.ledger.lock();
+        let reservation = inventory.alias_reservation.take();
+        let commit = inventory.alias_commit.take();
+        reservation.is_some() || commit.is_some()
+    }
+
     fn begin_exec_inventory(
         &mut self,
         retired: carrick_hal::FrameInventoryReservation,
@@ -5208,18 +5242,15 @@ impl HvfVmState {
         &mut self,
         reservation: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
-        let mut inventory = self.frame_inventory.lock();
-        if inventory.alias_reservation.is_some() || inventory.alias_commit.is_some() {
-            return Err(TrapError::Hypervisor(
-                "overlapping HVPatch alias inventory transaction".to_owned(),
-            ));
-        }
-        inventory.alias_reservation = Some(reservation);
-        Ok(())
+        self.frame_inventory.begin_alias_inventory(reservation)
     }
 
     pub(crate) fn take_alias_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
         self.frame_inventory.lock().alias_commit.take()
+    }
+
+    pub(crate) fn abandon_alias_inventory(&mut self) -> bool {
+        self.frame_inventory.cancel_alias_inventory()
     }
 
     pub(crate) fn begin_exec_inventory(
@@ -13589,6 +13620,55 @@ mod frame_inventory_backend_tests {
             .expect("retry after an EFAULT/build/spawn failure");
         assert!(state.cancel_process_inventory());
         assert!(ledger.lock().process_reservation.is_none());
+    }
+
+    /// A guest `mmap` whose alias install fails used to `abort()` the carrier —
+    /// killing every Linux process multiplexed into it — precisely because the
+    /// reservation `begin_alias_inventory` armed had nowhere to go: returning
+    /// ENOMEM instead would have left it armed and wedged the NEXT guest mmap
+    /// with "overlapping HVPatch alias inventory transaction". Prove the
+    /// rollback seam actually clears the staging, from BOTH states a failure can
+    /// leave: the untouched reservation (`add_alias_with_sharing` returned
+    /// early) and the staged commit (stage-1 `map_aliased` failed after stage-2
+    /// succeeded).
+    #[test]
+    fn abandoned_alias_inventory_does_not_poison_the_next_guest_mmap() {
+        let ledger = std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+        let mut state = HvpatchFrameInventoryState::new(std::sync::Arc::clone(&ledger));
+
+        // Failure BEFORE the backend consumed the reservation.
+        state
+            .begin_alias_inventory(empty_inventory_reservation(81))
+            .expect("first alias reservation");
+        // Red without the seam: a second arm is refused while staging is live.
+        state
+            .begin_alias_inventory(empty_inventory_reservation(82))
+            .expect_err("overlapping alias inventory must be refused");
+        assert!(state.cancel_alias_inventory());
+        assert!(ledger.lock().alias_reservation.is_none());
+        state
+            .begin_alias_inventory(empty_inventory_reservation(83))
+            .expect("the mmap after a failed alias install must still arm");
+
+        // Failure AFTER the backend staged its commit (stage-1 unwind path).
+        {
+            let mut inventory = ledger.lock();
+            let reservation = inventory
+                .alias_reservation
+                .take()
+                .expect("armed reservation");
+            inventory.alias_commit = Some(reservation.commit(()));
+        }
+        state
+            .begin_alias_inventory(empty_inventory_reservation(84))
+            .expect_err("a staged commit must also block a second arm");
+        assert!(state.cancel_alias_inventory());
+        assert!(ledger.lock().alias_commit.is_none());
+        state
+            .begin_alias_inventory(empty_inventory_reservation(85))
+            .expect("the mmap after a failed stage-1 publication must still arm");
+        assert!(state.cancel_alias_inventory());
+        assert!(!state.cancel_alias_inventory());
     }
 
     #[test]
