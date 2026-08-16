@@ -131,6 +131,7 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         | 168
         | 172
         | 173
+        | 217..=219
         | 270
         | 271
         | 277
@@ -396,9 +397,9 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(214, "brk", "mm", SupportLevel::BringUp),
     syscall(215, "munmap", "mm", SupportLevel::BringUp),
     syscall(216, "mremap", "mm", SupportLevel::BringUp),
-    syscall(217, "add_key", "process", SupportLevel::Deferred),
-    syscall(218, "request_key", "process", SupportLevel::Deferred),
-    syscall(219, "keyctl", "process", SupportLevel::Deferred),
+    syscall(217, "add_key", "process", SupportLevel::BringUp),
+    syscall(218, "request_key", "process", SupportLevel::BringUp),
+    syscall(219, "keyctl", "process", SupportLevel::BringUp),
     syscall(220, "clone", "process", SupportLevel::BringUp),
     syscall(221, "execve", "process", SupportLevel::BringUp),
     syscall(222, "mmap", "mm", SupportLevel::BringUp),
