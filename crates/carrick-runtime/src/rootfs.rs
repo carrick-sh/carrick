@@ -706,6 +706,19 @@ impl RootFs {
         self.metadata_for_normalized(&path)
     }
 
+    /// The REAL host stat of an entry the immutable cache lower holds.
+    ///
+    /// The lower is a real host directory, so an entry only it holds is
+    /// `open`ed as a real host fd whose `fstat` reports that host inode — and
+    /// `directory_entries` already publishes the same inode as `d_ino`. This
+    /// is the identity the path lane must report too; [`RootFsMetadata`]
+    /// carries only kind/mode/size and cannot. Returns `None` for an
+    /// in-memory rootfs, which has no host inode at all.
+    pub fn immutable_real_stat(&self, path: impl AsRef<Path>, follow: bool) -> Option<RealStat> {
+        let host = self.immutable_host.as_ref()?;
+        host_real_stat(host, path.as_ref(), follow)
+    }
+
     pub fn symlink_metadata(&self, path: impl AsRef<Path>) -> Result<RootFsMetadata, RootFsError> {
         if let Some(host) = self.immutable_host.as_ref() {
             return host_metadata(host, path.as_ref(), false);
@@ -999,6 +1012,15 @@ impl RootFs {
     }
 }
 
+/// The lower's own view of a path — the single place the immutable host root
+/// is stat'd, so `host_metadata` and [`RootFs::immutable_real_stat`] can never
+/// answer from different reads.
+fn host_real_stat(host: &ImmutableHostRoot, path: &Path, follow: bool) -> Option<RealStat> {
+    let normalized = normalize_rootfs_path(path).ok()?;
+    host.backend
+        .real_stat(&display_rootfs_path(&normalized), follow)
+}
+
 fn host_metadata(
     host: &ImmutableHostRoot,
     path: &Path,
@@ -1006,10 +1028,8 @@ fn host_metadata(
 ) -> Result<RootFsMetadata, RootFsError> {
     let normalized = normalize_rootfs_path(path)?;
     let display = display_rootfs_path(&normalized);
-    let stat = host
-        .backend
-        .real_stat(&display, follow)
-        .ok_or_else(|| RootFsError::NotFound(display.clone()))?;
+    let stat =
+        host_real_stat(host, path, follow).ok_or_else(|| RootFsError::NotFound(display.clone()))?;
     Ok(RootFsMetadata {
         path: normalized,
         kind: stat.kind,
