@@ -14,7 +14,7 @@ use carrick_runtime::core_dump::{
     AARCH64_FPREGSET_SIZE, AARCH64_TLS_SIZE, ELF_CLASS64, ELF_DATA_LSB, ELF_VERSION_CURRENT,
     EM_AARCH64, ET_CORE, LINUX_ELF_NOTE_OWNER, NOTE_ALIGN, NOTE_OWNER, NT_ARM_TLS, NT_AUXV,
     NT_FILE, NT_FPREGSET, NT_PRPSINFO, NT_PRSTATUS, NT_SIGINFO, ORACLE_PRPSINFO_SIZE,
-    ORACLE_PRSTATUS_SIZE, ORACLE_SIGINFO_SIZE, PT_LOAD, PT_NOTE, wire,
+    ORACLE_PRSTATUS_SIZE, ORACLE_SIGINFO_SIZE, PN_XNUM, PT_LOAD, PT_NOTE, wire,
 };
 use std::path::Path;
 
@@ -155,6 +155,10 @@ pub(crate) struct CoreSummary {
     pub threads: Vec<ThreadSummary>,
     pub auxv_entries: usize,
     pub file_mappings: usize,
+    /// Program headers the core actually has, after resolving the `PN_XNUM`
+    /// escape hatch. Reported so a reader can see when `e_phnum` was too
+    /// narrow to hold it rather than having to parse the section table itself.
+    pub program_headers: usize,
     /// PT_LOAD segments and how many carry bytes rather than only a mapping.
     pub load_segments: usize,
     pub load_segments_with_contents: usize,
@@ -185,6 +189,41 @@ fn checked_align_up(value: usize, align: usize) -> Option<usize> {
 /// Field offsets come from the writer's own structs, never from counted bytes.
 const fn ehdr(field: usize) -> usize {
     field
+}
+
+/// Resolve the program-header count, honouring the `PN_XNUM` escape hatch.
+///
+/// The 16-bit `e_phnum` cannot state a count of `PN_XNUM` or more; the gABI
+/// puts the real count in section header 0's `sh_info`. A reader that skips
+/// this reports a truncated segment list for exactly the processes whose cores
+/// matter most (LTP `munmap04` reaches ~65,000 VMAs).
+fn resolve_program_header_count(bytes: &[u8], declared: u16) -> Result<usize, CoreError> {
+    if declared != PN_XNUM {
+        return Ok(usize::from(declared));
+    }
+    let shoff = read_u64(bytes, std::mem::offset_of!(wire::Elf64Ehdr, e_shoff));
+    let shentsize = read_u16(bytes, std::mem::offset_of!(wire::Elf64Ehdr, e_shentsize)) as usize;
+    if shentsize != size_of::<wire::Elf64Shdr>() {
+        return Err(CoreError::BadProgramHeaderGeometry(
+            "PN_XNUM core has no Elf64_Shdr section table",
+        ));
+    }
+    let shoff = usize::try_from(shoff)
+        .map_err(|_| CoreError::BadProgramHeaderGeometry("e_shoff does not fit usize"))?;
+    let end = shoff
+        .checked_add(shentsize)
+        .ok_or(CoreError::ArithmeticOverflow)?;
+    if end > bytes.len() {
+        return Err(CoreError::BadProgramHeaderGeometry(
+            "PN_XNUM section header 0 runs past the file",
+        ));
+    }
+    let count = read_u32(
+        bytes,
+        shoff + std::mem::offset_of!(wire::Elf64Shdr, sh_info),
+    );
+    usize::try_from(count)
+        .map_err(|_| CoreError::BadProgramHeaderGeometry("sh_info does not fit usize"))
 }
 
 /// Parse and validate, returning the summary.
@@ -235,12 +274,17 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
     }
 
     let phoff = read_u64(bytes, std::mem::offset_of!(wire::Elf64Ehdr, e_phoff));
-    let phnum = read_u16(bytes, std::mem::offset_of!(wire::Elf64Ehdr, e_phnum)) as usize;
+    let declared_phnum = read_u16(bytes, std::mem::offset_of!(wire::Elf64Ehdr, e_phnum));
     let phentsize = read_u16(bytes, std::mem::offset_of!(wire::Elf64Ehdr, e_phentsize)) as usize;
     let ehsize = read_u16(bytes, std::mem::offset_of!(wire::Elf64Ehdr, e_ehsize)) as usize;
     if ehsize != size_of::<wire::Elf64Ehdr>() {
         return Err(CoreError::BadProgramHeaderGeometry("unexpected e_ehsize"));
     }
+    // `e_phnum == PN_XNUM` means the real count did not fit 16 bits and lives
+    // in section header 0's `sh_info`. Resolve it the way an external debugger
+    // does; reading `e_phnum` literally would silently truncate a ~65,000-VMA
+    // core to 65,535 segments.
+    let phnum = resolve_program_header_count(bytes, declared_phnum)?;
     if phentsize != size_of::<wire::Elf64Phdr>() {
         return Err(CoreError::BadProgramHeaderGeometry(
             "e_phentsize is not Elf64_Phdr",
@@ -593,6 +637,7 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
         threads,
         auxv_entries,
         file_mappings,
+        program_headers: phnum,
         load_segments,
         load_segments_with_contents: load_with_contents,
         foreign_notes,
