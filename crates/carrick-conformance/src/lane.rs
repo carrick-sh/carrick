@@ -1,13 +1,19 @@
-//! Conformance LANE: how a suite's `carrick run` is executed. `Hvf` runs the
-//! local signed binary (the existing behavior); `MacosNativeDsr` runs that same
-//! binary with the opt-in native backend and native16k page profile, whose sole
-//! execution path is DSR; `Kvm` wraps the SAME carrick argv as `limactl shell
-//! <vm> -- env … <carrick-in-guest> run …`,
+//! Conformance LANE: WHERE a suite's `carrick run` is executed. It never selects
+//! an execution backend — carrick has exactly one (HVPatch) and defaults to it,
+//! so no lane passes `--exec-backend`.
+//!
+//! `Hvf` is the single local macOS lane: the signed binary on this host, running
+//! AArch64 guests on `Hypervisor.framework`. It is the default and it owns the
+//! shared baseline (`scripts/conformance/baseline.jsonl`).
+//!
+//! The remaining lanes are the cross-platform bring-up lanes. `Kvm` wraps the
+//! SAME carrick argv as `limactl shell <vm> -- env … <carrick-in-guest> run …`,
 //! rewriting the `localhost` conformance-registry host to the lima gateway so
 //! the guest can pull from the mac registry. `KvmLocal` runs a platform-linux
 //! carrick binary directly on a Linux host with `/dev/kvm`. `BhyveLocal` and
 //! `NvmmLocal` do the same for platform-freebsd/platform-netbsd carrick binaries
-//! on hosts with `/dev/vmm` or `/dev/nvmm`.
+//! on hosts with `/dev/vmm` or `/dev/nvmm`. Those three run x86_64 guests and so
+//! request `--platform linux/amd64`.
 
 use crate::engine::carrick_argv;
 use crate::manifest::Suite;
@@ -25,21 +31,6 @@ pub struct LimaConfig {
     /// Nested KVM roughly doubles toolchain-heavy suites (go-build straddled
     /// its 180 s budget: pass / timeout-then-recover / double-timeout across
     /// three otherwise-green tiers), and a flaky deadline is a flaky GATE.
-    pub timeout_scale: f64,
-}
-
-/// Darwin-native DSR lane configuration. Its quality-first workloads are
-/// deliberately allowed more wall time without changing HVF or oracle limits.
-#[derive(Clone, Debug)]
-pub struct NativeDsrConfig {
-    pub timeout_scale: f64,
-}
-
-/// Kernel-lane configuration. Separate from `NativeDsrConfig` rather than
-/// reused so the two lanes' deadlines can diverge without one silently
-/// inheriting the other's — they are different backends with different costs.
-#[derive(Clone, Debug)]
-pub struct HvpatchConfig {
     pub timeout_scale: f64,
 }
 
@@ -81,17 +72,11 @@ impl DockerPlatform {
     }
 }
 
-/// The selected lane. `Kvm` carries the lima wiring.
+/// The selected lane. `Hvf` is the single local macOS lane; `Kvm` carries the
+/// lima wiring.
 #[derive(Clone, Debug)]
 pub enum Lane {
     Hvf,
-    MacosNativeDsr(NativeDsrConfig),
-    /// The KERNEL lane: the same local signed binary run with
-    /// `--exec-backend hvpatch`, where every Linux process is a thread of one
-    /// host process inside one HVF VM. It is a local Darwin lane exactly like
-    /// `MacosNativeDsr`, so it shares that lane's registry, platform and
-    /// timeout handling and differs only in the backend flag it injects.
-    Hvpatch(HvpatchConfig),
     Kvm(LimaConfig),
     KvmLocal(LocalKvmConfig),
     BhyveLocal(LocalBhyveConfig),
@@ -106,20 +91,13 @@ impl Lane {
     pub fn needs_local_registry_env(&self) -> bool {
         matches!(
             self,
-            Lane::Hvf
-                | Lane::MacosNativeDsr(_)
-                | Lane::Hvpatch(_)
-                | Lane::KvmLocal(_)
-                | Lane::BhyveLocal(_)
-                | Lane::NvmmLocal(_)
+            Lane::Hvf | Lane::KvmLocal(_) | Lane::BhyveLocal(_) | Lane::NvmmLocal(_)
         )
     }
 
     pub fn docker_platform(&self) -> DockerPlatform {
         match self {
-            Lane::Hvf | Lane::MacosNativeDsr(_) | Lane::Hvpatch(_) | Lane::Kvm(_) => {
-                DockerPlatform::LinuxArm64
-            }
+            Lane::Hvf | Lane::Kvm(_) => DockerPlatform::LinuxArm64,
             Lane::KvmLocal(_) | Lane::BhyveLocal(_) | Lane::NvmmLocal(_) => {
                 DockerPlatform::LinuxAmd64
             }
@@ -127,13 +105,12 @@ impl Lane {
     }
 
     /// The carrick-run deadline for a suite on this lane: `timeout_s` as-is on
-    /// Hvf (behavior-preserving), scaled by the selected bring-up lane's
-    /// `timeout_scale`. Docker oracles always use the unscaled `timeout_s`.
+    /// Hvf (the manifest budget is written for it), scaled by the selected
+    /// bring-up lane's `timeout_scale`. Docker oracles always use the unscaled
+    /// `timeout_s`.
     pub fn scaled_timeout(&self, timeout_s: u64) -> u64 {
         match self {
             Lane::Hvf => timeout_s,
-            Lane::MacosNativeDsr(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
-            Lane::Hvpatch(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
             Lane::Kvm(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
             Lane::KvmLocal(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
             Lane::BhyveLocal(cfg) => (timeout_s as f64 * cfg.timeout_scale).ceil() as u64,
@@ -183,11 +160,8 @@ pub fn carrick_invocation_argv(
 ) -> Vec<String> {
     let base = carrick_argv(suite, carrick_bin, run_id); // [carrick_bin, "run", …flags…, image, …cmd]
     match lane {
-        Lane::Hvf => carrick_argv_with_exec_backend(base, &suite.image, "vmm"),
-        Lane::MacosNativeDsr(_) => carrick_argv_with_native_dsr(base, &suite.image),
-        Lane::Hvpatch(_) => carrick_argv_with_exec_backend(base, &suite.image, "hvpatch"),
+        Lane::Hvf => base,
         Lane::KvmLocal(_) | Lane::BhyveLocal(_) | Lane::NvmmLocal(_) => {
-            let base = carrick_argv_with_exec_backend(base, &suite.image, "vmm");
             carrick_argv_with_platform(base, &suite.image, DockerPlatform::LinuxAmd64)
         }
         Lane::Kvm(cfg) => {
@@ -201,7 +175,6 @@ pub fn carrick_invocation_argv(
                 inner.push("env".to_string());
                 inner.push(format!("CARRICK_INSECURE_REGISTRIES={host}"));
             }
-            let base = carrick_argv_with_exec_backend(base, &suite.image, "vmm");
             inner.extend(base.into_iter().map(|tok| {
                 if tok == suite.image {
                     rewrite_registry_host(&tok, "localhost", &cfg.gateway)
@@ -256,35 +229,6 @@ pub fn carrick_invocation_argv(
     }
 }
 
-fn carrick_argv_with_native_dsr(mut argv: Vec<String>, image: &str) -> Vec<String> {
-    argv = carrick_argv_with_exec_backend(argv, image, "native");
-    let image_idx = argv
-        .iter()
-        .position(|tok| tok == image)
-        .unwrap_or(argv.len());
-    argv.splice(
-        image_idx..image_idx,
-        ["--native-page-profile".to_string(), "native16k".to_string()],
-    );
-    argv
-}
-
-fn carrick_argv_with_exec_backend(
-    mut argv: Vec<String>,
-    image: &str,
-    backend: &str,
-) -> Vec<String> {
-    let image_idx = argv
-        .iter()
-        .position(|tok| tok == image)
-        .unwrap_or(argv.len());
-    argv.splice(
-        image_idx..image_idx,
-        ["--exec-backend".to_string(), backend.to_string()],
-    );
-    argv
-}
-
 fn carrick_argv_with_platform(
     mut argv: Vec<String>,
     image: &str,
@@ -330,24 +274,18 @@ fn shell_quote(s: &str) -> String {
     out
 }
 
-/// Map the lane CLI strings to a `Lane`. Native DSR, Lima, and direct local
-/// x86_64 lanes keep independent timeout scales so one bring-up lane cannot
-/// weaken another backend's deadlines.
+/// Map the lane CLI strings to a `Lane`. The Lima and direct local x86_64 lanes
+/// keep independent timeout scales so one bring-up lane cannot weaken another
+/// host backend's deadlines. Anything unrecognized (including `hvf` itself) is
+/// the local macOS lane.
 pub fn lane_from_args(
     lane: &str,
     lima_vm: &str,
     lima_gateway: &str,
     lima_timeout_scale: f64,
-    native_timeout_scale: f64,
     local_timeout_scale: f64,
 ) -> Lane {
     match lane {
-        "hvpatch" | "macos-hvpatch" => Lane::Hvpatch(HvpatchConfig {
-            timeout_scale: native_timeout_scale,
-        }),
-        "macos-native-dsr" | "native-dsr" => Lane::MacosNativeDsr(NativeDsrConfig {
-            timeout_scale: native_timeout_scale,
-        }),
         "kvm" => Lane::Kvm(LimaConfig {
             vm: lima_vm.to_string(),
             gateway: lima_gateway.to_string(),
@@ -375,23 +313,22 @@ mod tests {
         Suite::for_test("localhost:5005/carrick-go-conformance:1.24", &["true"])
     }
 
-    fn assert_explicit_backend_before_image(argv: &[String], image: &str, backend: &str) {
-        let backend_pairs = argv
-            .windows(2)
-            .filter(|window| window[0] == "--exec-backend" && window[1] == backend)
-            .count();
-        assert_eq!(backend_pairs, 1, "unexpected backend argv: {argv:?}");
-        let backend_index = argv
-            .iter()
-            .position(|argument| argument == "--exec-backend")
-            .expect("backend flag");
-        let image_index = argv
-            .iter()
-            .position(|argument| argument == image)
-            .expect("image argument");
+    /// Carrick has exactly ONE execution backend and defaults to it, and
+    /// `ExecBackendRequest` hard-errors on every retired spelling ("native",
+    /// "vmm", "hvf"). A lane that injects `--exec-backend` therefore cannot be
+    /// right — it is either redundant or it kills the run at argument parsing,
+    /// which is exactly how `just conformance` came to launch nothing at all.
+    /// Every lane's argv is checked against this.
+    fn assert_no_backend_selection(argv: &[String]) {
         assert!(
-            backend_index < image_index,
-            "backend must precede image: {argv:?}"
+            !argv.iter().any(|argument| argument == "--exec-backend"),
+            "no lane may select an execution backend: {argv:?}"
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|argument| argument == "--native-page-profile"),
+            "no lane may select a native page profile: {argv:?}"
         );
     }
 
@@ -439,82 +376,28 @@ mod tests {
         assert_eq!(argv[1], "run");
         assert!(argv.contains(&"localhost:5005/carrick-go-conformance:1.24".to_string()));
         assert!(!argv.contains(&"limactl".to_string()));
-        assert_explicit_backend_before_image(&argv, &s.image, "vmm");
+        assert_no_backend_selection(&argv);
     }
 
-    /// The KERNEL lane must be a local Darwin invocation carrying
-    /// `--exec-backend hvpatch` BEFORE the image, and must NOT carry the
-    /// native lane's page-profile flag — that flag selects a DSR page geometry
-    /// which means nothing under HVF, and inheriting it silently would make
-    /// the lane measure something other than what it claims.
+    /// `hvf` is the ONE local macOS lane, and every retired local spelling now
+    /// resolves to it rather than to a second lane with its own overlay and its
+    /// own timeout scale.
     #[test]
-    fn hvpatch_invocation_is_local_and_injects_only_the_kernel_backend() {
-        let s = demo_suite();
-        let lane = lane_from_args("hvpatch", "carrick", "host.lima.internal", 2.0, 5.0, 1.0);
-        let argv = carrick_invocation_argv(&s, "target/release/carrick", "conf-1-2", &lane);
-
-        assert!(matches!(lane, Lane::Hvpatch(_)));
-        assert_eq!(lane.docker_platform(), DockerPlatform::LinuxArm64);
-        assert_eq!(lane.scaled_timeout(s.timeout_s), s.timeout_s * 5);
-        assert!(lane.needs_local_registry_env());
-        assert_eq!(argv[0], "target/release/carrick");
-        assert_eq!(argv[1], "run");
-        assert!(!argv.contains(&"limactl".to_string()));
-        assert_explicit_backend_before_image(&argv, &s.image, "hvpatch");
-        assert!(
-            !argv.iter().any(|tok| tok == "--native-page-profile"),
-            "the kernel lane must not inherit the DSR page-profile flag: {argv:?}"
-        );
-        // `macos-hvpatch` is the same lane under its long name.
-        assert!(matches!(
-            lane_from_args(
-                "macos-hvpatch",
-                "carrick",
-                "host.lima.internal",
-                2.0,
-                5.0,
-                1.0
-            ),
-            Lane::Hvpatch(_)
-        ));
-    }
-
-    #[test]
-    fn native_dsr_invocation_is_local_and_injects_typed_backend_flags() {
-        let s = demo_suite();
-        let lane = lane_from_args(
+    fn every_local_lane_spelling_is_the_single_hvf_lane() {
+        for spelling in [
+            "hvf",
+            "hvpatch",
+            "macos-hvpatch",
+            "native-dsr",
             "macos-native-dsr",
-            "carrick",
-            "host.lima.internal",
-            2.0,
-            5.0,
-            1.0,
-        );
-        let argv = carrick_invocation_argv(&s, "target/release/carrick", "conf-1-2", &lane);
-
-        assert!(matches!(lane, Lane::MacosNativeDsr(_)));
-        assert_eq!(lane.docker_platform(), DockerPlatform::LinuxArm64);
-        assert_eq!(lane.scaled_timeout(s.timeout_s), s.timeout_s * 5);
-        assert!(lane.needs_local_registry_env());
-        assert_eq!(argv[0], "target/release/carrick");
-        assert_eq!(argv[1], "run");
-        assert!(
-            argv.windows(2)
-                .any(|w| { w[0] == "--exec-backend" && w[1] == "native" })
-        );
-        assert!(
-            argv.windows(2)
-                .any(|w| { w[0] == "--native-page-profile" && w[1] == "native16k" })
-        );
-        let image = argv
-            .iter()
-            .position(|arg| arg == &s.image)
-            .expect("image must remain in argv");
-        let removed_mode_flag = concat!("--native-code-", "mode");
-        assert!(!argv.iter().any(|arg| arg == removed_mode_flag));
-        assert!(image > 1);
-        assert_explicit_backend_before_image(&argv, &s.image, "native");
-        assert!(!argv.iter().any(|argument| argument == "vmm"));
+            "",
+        ] {
+            let lane = lane_from_args(spelling, "carrick", "host.lima.internal", 2.0, 1.0);
+            assert!(
+                matches!(lane, Lane::Hvf),
+                "{spelling:?} must resolve to the single local macOS lane"
+            );
+        }
     }
 
     #[test]
@@ -541,7 +424,7 @@ mod tests {
         assert!(inner.contains("CARRICK_INSECURE_REGISTRIES=host.lima.internal:5005"));
         assert!(inner.contains("/home/user/carrick/target/release/carrick"));
         assert!(inner.contains(" run "));
-        assert_eq!(inner.matches("--exec-backend vmm").count(), 1, "{inner}");
+        assert!(!inner.contains("--exec-backend"), "{inner}");
         // image-ref host rewritten to the gateway, un-rewritten host absent:
         assert!(inner.contains("host.lima.internal:5005/carrick-go-conformance:1.24"));
         assert!(!inner.contains("localhost:5005/carrick-go-conformance:1.24"));
@@ -578,20 +461,13 @@ mod tests {
         );
         assert!(argv.contains(&"localhost:5005/carrick-go-conformance:1.24".to_string()));
         assert!(!argv.contains(&"limactl".to_string()));
-        assert_explicit_backend_before_image(&argv, &s.image, "vmm");
+        assert_no_backend_selection(&argv);
     }
 
     #[test]
     fn bhyve_local_invocation_runs_carrick_directly_as_amd64() {
         let s = demo_suite();
-        let lane = lane_from_args(
-            "bhyve-local",
-            "carrick",
-            "host.lima.internal",
-            2.0,
-            5.0,
-            1.5,
-        );
+        let lane = lane_from_args("bhyve-local", "carrick", "host.lima.internal", 2.0, 1.5);
         let argv = carrick_invocation_argv(&s, "/root/ct/release/carrick", "conf-1-2", &lane);
 
         assert_eq!(lane.docker_platform(), DockerPlatform::LinuxAmd64);
@@ -605,13 +481,13 @@ mod tests {
         );
         assert!(argv.contains(&"localhost:5005/carrick-go-conformance:1.24".to_string()));
         assert!(!argv.contains(&"limactl".to_string()));
-        assert_explicit_backend_before_image(&argv, &s.image, "vmm");
+        assert_no_backend_selection(&argv);
     }
 
     #[test]
     fn nvmm_local_invocation_runs_carrick_directly_as_amd64() {
         let s = demo_suite();
-        let lane = lane_from_args("nvmm-local", "carrick", "host.lima.internal", 2.0, 5.0, 1.5);
+        let lane = lane_from_args("nvmm-local", "carrick", "host.lima.internal", 2.0, 1.5);
         let argv = carrick_invocation_argv(&s, "/root/ct/release/carrick", "conf-1-2", &lane);
 
         assert_eq!(lane.docker_platform(), DockerPlatform::LinuxAmd64);
@@ -625,7 +501,7 @@ mod tests {
         );
         assert!(argv.contains(&"localhost:5005/carrick-go-conformance:1.24".to_string()));
         assert!(!argv.contains(&"limactl".to_string()));
-        assert_explicit_backend_before_image(&argv, &s.image, "vmm");
+        assert_no_backend_selection(&argv);
     }
 
     #[test]
@@ -640,14 +516,10 @@ mod tests {
     #[test]
     fn lane_from_args_builds_kvm_with_defaults() {
         assert!(matches!(
-            lane_from_args("hvf", "carrick", "host.lima.internal", 2.0, 5.0, 1.0),
+            lane_from_args("hvf", "carrick", "host.lima.internal", 2.0, 1.0),
             Lane::Hvf
         ));
-        assert!(matches!(
-            lane_from_args("native-dsr", "carrick", "host.lima.internal", 2.0, 5.0, 1.0,),
-            Lane::MacosNativeDsr(_)
-        ));
-        match lane_from_args("kvm", "carrick", "host.lima.internal", 2.0, 5.0, 1.0) {
+        match lane_from_args("kvm", "carrick", "host.lima.internal", 2.0, 1.0) {
             Lane::Kvm(cfg) => {
                 assert_eq!(cfg.vm, "carrick");
                 assert_eq!(cfg.gateway, "host.lima.internal");
@@ -655,11 +527,11 @@ mod tests {
             }
             _ => panic!("expected Kvm"),
         }
-        match lane_from_args("kvm-local", "carrick", "host.lima.internal", 3.0, 5.0, 1.0) {
+        match lane_from_args("kvm-local", "carrick", "host.lima.internal", 3.0, 1.0) {
             Lane::KvmLocal(cfg) => assert_eq!(cfg.timeout_scale, 1.0),
             _ => panic!("expected KvmLocal"),
         }
-        match lane_from_args("kvm-local", "carrick", "host.lima.internal", 3.0, 5.0, 1.5) {
+        match lane_from_args("kvm-local", "carrick", "host.lima.internal", 3.0, 1.5) {
             Lane::KvmLocal(cfg) => assert_eq!(cfg.timeout_scale, 1.5),
             _ => panic!("expected KvmLocal"),
         }
@@ -686,17 +558,15 @@ mod tests {
         );
     }
 
+    /// The local macOS lane adds NOTHING to the plain suite argv: no backend
+    /// selection, no page profile, no platform. Whatever `carrick run` does by
+    /// default is exactly what the gate measures.
     #[test]
-    fn dry_run_hvf_changes_only_explicit_backend_policy() {
+    fn hvf_lane_argv_is_the_bare_suite_argv() {
         let s = demo_suite();
-        let legacy = crate::engine::carrick_argv(&s, "target/release/carrick", "conf-1-2");
-        let mut now = carrick_invocation_argv(&s, "target/release/carrick", "conf-1-2", &Lane::Hvf);
-        let backend_index = now
-            .iter()
-            .position(|argument| argument == "--exec-backend")
-            .expect("explicit backend policy");
-        assert_eq!(now[backend_index + 1], "vmm");
-        now.drain(backend_index..backend_index + 2);
-        assert_eq!(legacy, now);
+        let plain = crate::engine::carrick_argv(&s, "target/release/carrick", "conf-1-2");
+        let lane_argv =
+            carrick_invocation_argv(&s, "target/release/carrick", "conf-1-2", &Lane::Hvf);
+        assert_eq!(plain, lane_argv);
     }
 }

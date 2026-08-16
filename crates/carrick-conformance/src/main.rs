@@ -56,11 +56,11 @@ struct Args {
     /// Which tier to run: `smoke` (fast gate) or `full` (everything).
     #[arg(long, default_value = "full")]
     tier: String,
-    /// Execution lane: `hvf` (local signed binary, default), `kvm` (carrick in
-    /// the lima guest), `kvm-local` (direct platform-linux carrick on this host),
-    /// `hvpatch` (local Darwin KERNEL lane — one host process, one HVF VM),
-    /// `macos-native-dsr` (local Darwin-native native16k DSR),
-    /// `bhyve-local` (direct platform-freebsd carrick on this host), or
+    /// WHERE the carrick side runs — not which backend it uses; carrick has one
+    /// (HVPatch) and no lane selects it. `hvf` (the local signed binary on this
+    /// mac, the default, and the owner of the shared baseline), `kvm` (carrick
+    /// in the lima guest), `kvm-local` (direct platform-linux carrick on this
+    /// host), `bhyve-local` (direct platform-freebsd carrick on this host), or
     /// `nvmm-local` (direct platform-netbsd carrick on this host).
     #[arg(long, default_value = "hvf")]
     lane: String,
@@ -76,15 +76,6 @@ struct Args {
     /// 1.0, which makes the gate flaky.
     #[arg(long, default_value_t = 2.0)]
     lima_timeout_scale: f64,
-    /// Timeout multiplier for the Darwin-native DSR lane. Native quality lanes
-    /// currently trade throughput for coverage, so their Carrick side gets a
-    /// larger deadline while Docker and HVF keep the manifest budget.
-    #[arg(
-        long,
-        default_value_t = 5.0,
-        env = "CARRICK_CONFORMANCE_NATIVE_TIMEOUT_SCALE"
-    )]
-    native_timeout_scale: f64,
     /// Timeout multiplier for direct local x86_64 lanes (`kvm-local`,
     /// `bhyve-local`, `nvmm-local`). Defaults to 1.0: on same-host x86_64,
     /// Carrick should be close to Docker; a timeout is a bug signal, not
@@ -108,7 +99,7 @@ struct Args {
     /// Additional baseline UNIONed onto `--baseline` before classification: a
     /// divergence is excused iff it matches the shared baseline OR this overlay.
     /// DEFAULT IS LANE-DERIVED (`baseline.<lane>.jsonl` next to `--baseline`):
-    /// the native-dsr/kvm/bhyve/nvmm lanes each carry their OWN overlay (starts
+    /// the kvm/bhyve/nvmm bring-up lanes each carry their OWN overlay (starts
     /// empty) so every lane-only divergence is a gap until proven environmental,
     /// and the mature hvf lane carries NO overlay (it IS the shared ground
     /// truth). Pass an explicit path to override the lane-derived default;
@@ -202,8 +193,7 @@ struct Args {
     /// Require every selected suite to have a cached oracle, and FAIL UP FRONT
     /// naming the misses instead of falling back to docker.
     ///
-    /// For docker-less runners (a GitHub-hosted macOS runner executes guests on
-    /// the native backend — no entitlement, no nested virt — but has no Docker).
+    /// For docker-less runners (a GitHub-hosted macOS runner has no Docker).
     /// There, a cache miss would otherwise surface as a confusing mid-run docker
     /// failure, or as a determinant-field change silently invalidating every key
     /// and triggering a full fresh docker pass. Failing early, naming the
@@ -249,22 +239,15 @@ fn run() -> anyhow::Result<ExitCode> {
             args.local_timeout_scale
         );
     }
-    if !args.native_timeout_scale.is_finite() || args.native_timeout_scale < 1.0 {
-        anyhow::bail!(
-            "--native-timeout-scale must be finite and >= 1.0 (got {})",
-            args.native_timeout_scale
-        );
-    }
 
-    // Execution lane for the carrick side, built from the CLI args. `hvf` (the
-    // default) runs the local signed binary unchanged; `kvm` wraps carrick in the
-    // lima guest. The Hvf path is byte-for-byte the pre-lane behavior.
+    // WHERE the carrick side runs, built from the CLI args. `hvf` (the default)
+    // runs the local signed binary with its own default backend and nothing
+    // added; `kvm` wraps carrick in the lima guest.
     let lane = lane::lane_from_args(
         &args.lane,
         &args.lima_vm,
         &args.lima_gateway,
         args.lima_timeout_scale,
-        args.native_timeout_scale,
         args.local_timeout_scale,
     );
 
@@ -405,7 +388,7 @@ fn run() -> anyhow::Result<ExitCode> {
     // when the overlay is absent/empty). A divergence is "expected" iff it
     // matches the shared baseline OR the overlay. The overlay path is LANE-
     // DERIVED by default (`baseline.<lane>.jsonl` beside `--baseline`): each
-    // non-HVF lane (native-dsr/kvm/bhyve/nvmm) carries its OWN initially-empty overlay so
+    // bring-up lane (kvm/bhyve/nvmm) carries its OWN initially-empty overlay so
     // every lane-only divergence is a gap until proven environmental, while the
     // mature hvf lane carries none. An explicit `--baseline-overlay` overrides.
     let overlay_path = args
@@ -914,7 +897,7 @@ fn seed_oracle(
 
 /// What a `--bless` on a given lane is permitted to rewrite. The mature `hvf`
 /// lane rewrites the SHARED baseline + `support-matrix.md` (the ground truth); a
-/// native-dsr/kvm/bhyve/nvmm lane rewrites ONLY its own overlay
+/// kvm/bhyve/nvmm bring-up lane rewrites ONLY its own overlay
 /// (`baseline.<key>.jsonl`) — never the shared baseline, never the matrix — so a
 /// lane's observations can never overwrite the hvf ground truth. An unrecognized
 /// lane is refused outright.
@@ -922,7 +905,7 @@ fn seed_oracle(
 enum BlessTarget {
     /// hvf: rewrite the shared `baseline.jsonl` + `docs/support-matrix.md`.
     SharedBaseline,
-    /// native-dsr/kvm/bhyve/nvmm: rewrite ONLY `baseline.<key>.jsonl` (the overlay).
+    /// kvm/bhyve/nvmm: rewrite ONLY `baseline.<key>.jsonl` (the overlay).
     LaneOverlay(&'static str),
 }
 
@@ -936,7 +919,7 @@ fn bless_target(lane: &str) -> Result<BlessTarget, String> {
         Some(key) => Ok(BlessTarget::LaneOverlay(key)),
         None => Err(format!(
             "--bless: unrecognized lane {lane:?} — bless is the hvf lane (shared \
-             baseline + matrix) or a native-dsr/kvm/bhyve/nvmm lane (its overlay only)"
+             baseline + matrix) or a kvm/bhyve/nvmm lane (its overlay only)"
         )),
     }
 }
@@ -945,8 +928,7 @@ fn bless_target(lane: &str) -> Result<BlessTarget, String> {
 /// genuine carrick failures and block on EVERY lane. ORACLE_FAIL (Docker produced
 /// nothing comparable for this arch) blocks ONLY the mature hvf shared-baseline
 /// bless: hvf runs the native arm64 oracle, which should always exist, so a missing
-/// one is a broken oracle to fix before re-blessing. The native DSR lane uses that
-/// same arm64 oracle and therefore also blocks on ORACLE_FAIL. A kvm/bhyve/nvmm lane
+/// one is a broken oracle to fix before re-blessing. A kvm/bhyve/nvmm lane
 /// blesses only its OWN overlay and runs an amd64 oracle that legitimately cannot
 /// cover every suite yet, so ORACLE_FAIL there is an expected coverage gap, not a
 /// bless blocker. Pure (no IO) so the guard is unit-tested directly.
@@ -1000,10 +982,7 @@ fn timeout_blocks_bless(kind: Option<crate::engine::TimeoutKind>) -> bool {
 fn bless_blocks(target: BlessTarget, verdict: Verdict) -> bool {
     match verdict {
         Verdict::Timeout | Verdict::CarrickCrash => true,
-        Verdict::OracleFail => matches!(
-            target,
-            BlessTarget::SharedBaseline | BlessTarget::LaneOverlay("native-dsr")
-        ),
+        Verdict::OracleFail => matches!(target, BlessTarget::SharedBaseline),
         Verdict::Match | Verdict::Diff | Verdict::Regression | Verdict::New => false,
     }
 }
@@ -1726,7 +1705,7 @@ fn load_baseline(path: &Path) -> Baseline {
 // `baseline.<key>.jsonl` and lives beside the shared `baseline.jsonl`.
 
 /// The overlay KEY for a lane string (the `<key>` in `baseline.<key>.jsonl`).
-/// native-dsr/kvm/bhyve/nvmm each map to their own overlay; the mature `hvf` lane (and any
+/// kvm/bhyve/nvmm each map to their own overlay; the mature `hvf` lane (and any
 /// unknown string) has NONE, because hvf IS the shared baseline ground truth.
 ///
 /// The KVM backend runs under two guest arches whose results DIVERGE, so they
@@ -1738,12 +1717,6 @@ fn load_baseline(path: &Path) -> Baseline {
 /// amd64-only (no arm64 sibling), so they need no arch suffix.
 fn lane_overlay_key(lane: &str) -> Option<&'static str> {
     match lane {
-        "macos-native-dsr" | "native-dsr" => Some("native-dsr"),
-        // The kernel lane carries its OWN overlay: it is a different backend
-        // from `native-dsr` with a different failure set (measured: 90 probe
-        // failures against native's 124, of which only 64 are shared), so one
-        // lane's bless must never excuse the other's regressions.
-        "hvpatch" | "macos-hvpatch" => Some("hvpatch"),
         "kvm-local" | "linux-kvm" => Some("kvm"),
         "kvm" => Some("kvm-arm64"),
         "bhyve-local" | "freebsd-bhyve" => Some("bhyve"),
@@ -2015,9 +1988,9 @@ mod tests {
     #[test]
     fn results_paths_do_not_collide_across_runs() {
         use super::default_results_path;
-        let full = default_results_path("macos-native-dsr", Tier::Full, false);
-        let filtered = default_results_path("macos-native-dsr", Tier::Full, true);
-        let smoke = default_results_path("macos-native-dsr", Tier::Smoke, false);
+        let full = default_results_path("kvm-local", Tier::Full, false);
+        let filtered = default_results_path("kvm-local", Tier::Full, true);
+        let smoke = default_results_path("kvm-local", Tier::Smoke, false);
         let other_lane = default_results_path("hvf", Tier::Full, false);
 
         // The three ways runs actually clobbered each other, all now distinct.
@@ -2029,7 +2002,7 @@ mod tests {
         assert_ne!(full, other_lane, "lanes must not overwrite each other");
         assert_ne!(filtered, smoke);
 
-        assert!(full.to_string_lossy().contains("macos-native-dsr"));
+        assert!(full.to_string_lossy().contains("kvm-local"));
         assert!(full.to_string_lossy().contains("full"));
         assert!(filtered.to_string_lossy().contains("filtered"));
         assert!(!full.to_string_lossy().contains("filtered"));
@@ -2136,7 +2109,6 @@ mod tests {
         // wrongly skipped on it.
         assert_eq!(amd64_bringup_key(LinuxArm64, "kvm"), None);
         assert_eq!(amd64_bringup_key(LinuxArm64, "hvf"), None);
-        assert_eq!(amd64_bringup_key(LinuxArm64, "macos-native-dsr"), None);
     }
 
     #[test]
@@ -2195,14 +2167,6 @@ mod tests {
         // SEPARATE files: amd64 native (`kvm-local`/`linux-kvm`) -> baseline.kvm,
         // arm64 lima (`kvm`) -> baseline.kvm-arm64, so neither clobbers the other.
         for (lane, want) in [
-            (
-                "macos-native-dsr",
-                "scripts/conformance/baseline.native-dsr.jsonl",
-            ),
-            (
-                "native-dsr",
-                "scripts/conformance/baseline.native-dsr.jsonl",
-            ),
             ("kvm", "scripts/conformance/baseline.kvm-arm64.jsonl"),
             ("kvm-local", "scripts/conformance/baseline.kvm.jsonl"),
             ("linux-kvm", "scripts/conformance/baseline.kvm.jsonl"),
@@ -2217,9 +2181,11 @@ mod tests {
                 "lane {lane} overlay path"
             );
         }
-        // hvf (the shared ground truth) and any unknown lane have NO overlay.
-        assert_eq!(lane_overlay_path(baseline, "hvf"), None);
-        assert_eq!(lane_overlay_path(baseline, "bogus"), None);
+        // hvf (the shared ground truth) and any unknown lane have NO overlay —
+        // including the retired local spellings, which are no longer lanes.
+        for lane in ["hvf", "bogus", "hvpatch", "macos-hvpatch", "native-dsr"] {
+            assert_eq!(lane_overlay_path(baseline, lane), None, "lane {lane}");
+        }
     }
 
     #[test]
@@ -2236,14 +2202,6 @@ mod tests {
     fn bless_target_guards_per_lane() {
         // hvf rewrites the shared baseline + matrix.
         assert_eq!(bless_target("hvf"), Ok(BlessTarget::SharedBaseline));
-        assert_eq!(
-            bless_target("macos-native-dsr"),
-            Ok(BlessTarget::LaneOverlay("native-dsr"))
-        );
-        assert_eq!(
-            bless_target("native-dsr"),
-            Ok(BlessTarget::LaneOverlay("native-dsr"))
-        );
         // Each bring-up lane writes ONLY its own overlay key, never the shared
         // baseline. The two KVM guest arches write SEPARATE overlays: arm64 lima
         // `kvm` -> "kvm-arm64", amd64 native `kvm-local` -> "kvm".
@@ -2263,20 +2221,24 @@ mod tests {
             bless_target("nvmm-local"),
             Ok(BlessTarget::LaneOverlay("nvmm"))
         );
-        // An unrecognized lane is refused outright (no silent shared-baseline write).
-        assert!(bless_target("rosetta").is_err());
+        // An unrecognized lane is refused outright (no silent shared-baseline
+        // write) — including the retired local lane spellings. `hvf` is the ONE
+        // local macOS lane, so blessing the shared baseline has to be spelled
+        // that way and cannot be reached under an old name.
+        for lane in ["rosetta", "hvpatch", "macos-hvpatch", "native-dsr"] {
+            assert!(bless_target(lane).is_err(), "lane {lane}");
+        }
     }
 
     #[test]
     fn bless_blocks_scopes_oracle_fail_to_shared_baseline() {
         use Verdict::*;
         let overlay = BlessTarget::LaneOverlay("kvm");
-        let native_dsr = BlessTarget::LaneOverlay("native-dsr");
         let shared = BlessTarget::SharedBaseline;
 
         // TIMEOUT / CARRICK_CRASH are genuine carrick failures: they block on
         // EVERY lane, mature or bring-up.
-        for target in [shared, native_dsr, overlay] {
+        for target in [shared, overlay] {
             assert!(
                 bless_blocks(target, Timeout),
                 "TIMEOUT must block {target:?}"
@@ -2290,9 +2252,6 @@ mod tests {
         // ORACLE_FAIL blocks the mature hvf shared-baseline bless (the arm64
         // oracle should always exist)...
         assert!(bless_blocks(shared, OracleFail));
-        // Native DSR uses the same authoritative arm64 Docker oracle as HVF,
-        // despite writing an isolated overlay.
-        assert!(bless_blocks(native_dsr, OracleFail));
         // ...but NOT a bring-up lane's overlay bless, where the amd64 oracle
         // legitimately can't cover every suite yet.
         assert!(!bless_blocks(overlay, OracleFail));
@@ -2408,7 +2367,7 @@ mod tests {
     #[test]
     fn allow_hang_carries_named_hangs_and_still_blocks_the_rest() {
         use crate::engine::TimeoutKind;
-        let target = BlessTarget::LaneOverlay("native-dsr");
+        let target = BlessTarget::LaneOverlay("kvm");
         let reports = [
             gate_report(
                 "ltp-epoll-ltp",
@@ -2442,7 +2401,7 @@ mod tests {
     #[test]
     fn allow_hang_reports_stale_entries_and_leaves_starved_unblocking() {
         use crate::engine::TimeoutKind;
-        let target = BlessTarget::LaneOverlay("native-dsr");
+        let target = BlessTarget::LaneOverlay("kvm");
         let reports = [
             gate_report("ltp-fixed", Verdict::Match, None),
             gate_report("ltp-noisy", Verdict::Timeout, Some(TimeoutKind::Starved)),
