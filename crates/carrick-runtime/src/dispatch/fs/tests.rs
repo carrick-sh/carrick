@@ -46,13 +46,66 @@ fn hvpatch_classic_record_lock_replacement_splits_only_the_callers_range() {
         whole.owner,
         LogicalRecordLockRange { start: 10, end: 20 },
     );
-    let state = locks.locks.lock();
-    assert_eq!(state.len(), 2);
-    assert_eq!(state[0].range, LogicalRecordLockRange { start: 0, end: 10 });
+    let state = locks.state.lock();
+    assert_eq!(state.locks.len(), 2);
     assert_eq!(
-        state[1].range,
+        state.locks[0].range,
+        LogicalRecordLockRange { start: 0, end: 10 }
+    );
+    assert_eq!(
+        state.locks[1].range,
         LogicalRecordLockRange { start: 20, end: 30 }
     );
+}
+
+/// fcntl(2): "EDEADLK — It was detected that the specified F_SETLKW command
+/// would cause a deadlock." LTP fcntl17 builds exactly this cycle with three
+/// processes and reports `TFAIL: Alarm expired, deadlock not detected` when the
+/// kernel never returns EDEADLK — carrick had no wait-for graph at all, so the
+/// waiters simply parked forever and the suite TIMEOUTed.
+#[test]
+fn f_setlkw_cycle_reports_edeadlk_instead_of_parking_forever() {
+    let locks = Arc::new(LogicalRecordLocks::default());
+    let a = logical_lock_request((41, 1), (0, 10), true);
+    let b = logical_lock_request((42, 1), (10, 20), true);
+    assert_eq!(locks.try_set(a.clone()), Ok(()));
+    assert_eq!(locks.try_set(b.clone()), Ok(()));
+
+    // Owner A blocks waiting for B's range. Park it on a helper thread so the
+    // wait-for edge is live while the main thread closes the cycle.
+    let waiter = {
+        let locks = Arc::clone(&locks);
+        let a_wants_b = logical_lock_request((41, 1), (10, 20), true);
+        std::thread::spawn(move || {
+            locks
+                .wait_set_interruptibly(&a_wants_b, crate::thread::ThreadId::synthetic_for_tests(1))
+        })
+    };
+    // Wait for A's edge to appear rather than sleeping a fixed amount.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if locks.state.lock().waiting_on.contains_key(&a.owner) {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        locks.state.lock().waiting_on.contains_key(&a.owner),
+        "owner A should have published a wait-for edge"
+    );
+
+    // B now wants A's range: A waits on B, B would wait on A. That is a cycle.
+    let b_wants_a = logical_lock_request((42, 1), (0, 10), true);
+    assert_eq!(
+        locks.wait_set_interruptibly(&b_wants_a, crate::thread::ThreadId::synthetic_for_tests(2)),
+        Err(crate::linux_abi::LINUX_EDEADLK),
+        "closing the cycle must be EDEADLK, not an unbounded park"
+    );
+
+    // Releasing B lets A through, proving the edge was retracted, not leaked.
+    locks.unlock(&b.file, b.owner, b.range);
+    assert_eq!(waiter.join().expect("waiter thread"), Ok(()));
+    assert!(locks.state.lock().waiting_on.is_empty());
 }
 
 #[test]
