@@ -1681,14 +1681,27 @@ impl SyscallDispatcher {
         {
             return Ok(self.stat_record_with_device(&path, &real));
         }
-        if let Some(contents) =
-            crate::vfs::proc::synthetic_file(&path, &self.synthetic_proc_context(context))
         {
-            return Ok(StatRecord::synthetic(
-                &path,
-                contents.len(),
-                LINUX_S_IFREG | 0o444,
-            ));
+            // One context assembly serves both consults: it takes the proc lock
+            // and snapshots the address space, so building it twice per stat
+            // would double a hot path's cost.
+            let proc_ctx = self.synthetic_proc_context(context);
+            if let Some(contents) = crate::vfs::proc::synthetic_file(&path, &proc_ctx) {
+                return Ok(StatRecord::synthetic(
+                    &path,
+                    contents.len(),
+                    LINUX_S_IFREG | 0o444,
+                ));
+            }
+            // `/proc/<pid>` and `/proc/<pid>/task` for a PEER exist only in the
+            // kernel task graph — `Vfs::lookup` carries no context and answers
+            // from Darwin's process table, which on HVPatch describes the one
+            // carrier every Linux process is a thread of. Without this consult
+            // `stat("/proc/<peer>")` was ENOENT while `cat /proc/<peer>/stat`
+            // worked.
+            if crate::vfs::proc::synthetic_dir_entries(&path, &proc_ctx).is_some() {
+                return Ok(StatRecord::synthetic(&path, 0, LINUX_S_IFDIR | 0o555));
+            }
         }
         if let Some(contents) = crate::vfs::sys::synthetic_file(&path) {
             return Ok(StatRecord::synthetic(
@@ -9298,7 +9311,17 @@ impl SyscallDispatcher {
                     // LTP read their own mappings this way). An unmapped VA is EIO,
                     // like Linux. Every OTHER synthetic file serves its precomputed
                     // byte blob.
-                    if crate::vfs::proc::is_proc_self_mem_path(path) {
+                    //
+                    // `memory` is the CALLER's address space, so the predicate
+                    // must reject a peer's pid — otherwise this arm answers
+                    // `/proc/<peer>/mem` with the reader's own bytes. The open
+                    // side refuses a peer first; this is the second gate on the
+                    // same invariant, kept because the two are reached
+                    // independently (an fd can outlive the check that made it).
+                    let self_pid = crate::vfs::proc::self_linux_pid(
+                        this.synthetic_proc_identity(cx.kernel),
+                    );
+                    if crate::vfs::proc::is_proc_self_mem_path(path, self_pid) {
                         let va = *offset as u64;
                         match memory.read_bytes(va, length) {
                             Ok(bytes) => {
@@ -9311,7 +9334,7 @@ impl SyscallDispatcher {
                                 return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EIO));
                             }
                         }
-                    } else if crate::vfs::proc::is_proc_self_pagemap_path(path) {
+                    } else if crate::vfs::proc::is_proc_self_pagemap_path(path, self_pid) {
                         let present = (1u64 << 63).to_le_bytes();
                         let mut bytes = vec![0u8; length];
                         for (i, byte) in bytes.iter_mut().enumerate() {
@@ -13575,15 +13598,28 @@ impl SyscallDispatcher {
             }
 
             let path = this.resolve_at_path(dirfd, &path)?;
-            if let Some(contents) =
-                crate::vfs::proc::synthetic_file(&path, &this.synthetic_proc_context(cx.kernel))
             {
-                return Ok(write_synthetic_statx(
-                    memory,
-                    statxbuf,
-                    &path,
-                    contents.len(),
-                ));
+                // One context assembly for both consults — see the twin block
+                // in `path_stat_record`, including why the kernel task graph is
+                // the only thing that can settle a peer's `/proc/<pid>`.
+                let proc_ctx = this.synthetic_proc_context(cx.kernel);
+                if let Some(contents) = crate::vfs::proc::synthetic_file(&path, &proc_ctx) {
+                    return Ok(write_synthetic_statx(
+                        memory,
+                        statxbuf,
+                        &path,
+                        contents.len(),
+                    ));
+                }
+                if crate::vfs::proc::synthetic_dir_entries(&path, &proc_ctx).is_some() {
+                    return Ok(write_synthetic_statx_mode(
+                        memory,
+                        statxbuf,
+                        &path,
+                        0,
+                        LINUX_S_IFDIR | 0o555,
+                    ));
+                }
             }
             if let Some(contents) = crate::vfs::sys::synthetic_file(&path) {
                 return Ok(write_synthetic_statx(
