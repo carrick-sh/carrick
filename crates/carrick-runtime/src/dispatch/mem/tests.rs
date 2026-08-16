@@ -11,6 +11,59 @@ use std::cell::Cell;
 /// back a live stage-2 alias. The same file opened `O_RDWR` re-protects fine,
 /// so the fd's ACCESS MODE, not the requested protection, is the discriminator.
 #[cfg(target_os = "macos")]
+/// `locked_ranges_insert` keeps a SORTED, MERGED, non-overlapping set. It used
+/// to re-sort and rebuild the whole vector on every insert; it now splices only
+/// the run of entries the new range touches. Pin the shape the callers depend
+/// on — including the two cases a local splice could plausibly get wrong:
+/// inserting BEFORE everything already present, and coalescing a range that
+/// merely ABUTS its neighbours rather than overlapping them.
+#[test]
+fn locked_ranges_insert_keeps_the_set_sorted_and_merged() {
+    fn range(start: u64, end: u64) -> crate::vfs::GuestMemoryRange {
+        crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)).expect("valid range")
+    }
+    fn pairs(ranges: &[crate::vfs::GuestMemoryRange]) -> Vec<(u64, u64)> {
+        ranges
+            .iter()
+            .map(|r| (r.start().raw(), r.end().raw()))
+            .collect()
+    }
+
+    // Inserted out of order, disjoint: the set sorts itself.
+    let mut ranges = Vec::new();
+    for (start, end) in [(0x3000, 0x4000), (0x1000, 0x2000), (0x9000, 0xa000)] {
+        locked_ranges_insert(&mut ranges, range(start, end));
+    }
+    assert_eq!(
+        pairs(&ranges),
+        vec![(0x1000, 0x2000), (0x3000, 0x4000), (0x9000, 0xa000)]
+    );
+
+    // Abutting on BOTH sides coalesces the three into one, even though it
+    // overlaps none of them.
+    locked_ranges_insert(&mut ranges, range(0x2000, 0x3000));
+    assert_eq!(pairs(&ranges), vec![(0x1000, 0x4000), (0x9000, 0xa000)]);
+
+    // A range spanning a gap swallows every entry it now covers.
+    locked_ranges_insert(&mut ranges, range(0x3800, 0x9800));
+    assert_eq!(pairs(&ranges), vec![(0x1000, 0xa000)]);
+
+    // Wholly contained: no change.
+    locked_ranges_insert(&mut ranges, range(0x2000, 0x3000));
+    assert_eq!(pairs(&ranges), vec![(0x1000, 0xa000)]);
+
+    // Inserting below everything present keeps the order.
+    locked_ranges_insert(&mut ranges, range(0x100, 0x200));
+    assert_eq!(pairs(&ranges), vec![(0x100, 0x200), (0x1000, 0xa000)]);
+
+    // And `locked_ranges_remove` still splits an interior hole out of it.
+    locked_ranges_remove(&mut ranges, range(0x4000, 0x5000));
+    assert_eq!(
+        pairs(&ranges),
+        vec![(0x100, 0x200), (0x1000, 0x4000), (0x5000, 0xa000)]
+    );
+}
+
 #[test]
 fn readonly_host_fd_cannot_carry_a_writable_shared_file_mapping() {
     use std::io::Write;
@@ -584,6 +637,7 @@ where
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     }));
     let install = transaction
@@ -3899,6 +3953,7 @@ fn native16k_rejects_write_exec_alias_mprotect() {
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     });
     let registry =
@@ -4100,6 +4155,7 @@ fn native16k_allows_private_alias_write_exec_for_translation_backend() {
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     });
     let registry =
@@ -5426,6 +5482,7 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     });
 
@@ -5496,6 +5553,7 @@ fn core_file_provenance_keeps_mmap_offset_and_excludes_anonymous_exec() {
         resident: true,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     });
     dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
@@ -5509,6 +5567,7 @@ fn core_file_provenance_keeps_mmap_offset_and_excludes_anonymous_exec() {
         resident: true,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     });
 
@@ -5541,6 +5600,7 @@ fn host_alias_inventory_commits_trims_and_fork_clones_exact_ranges() {
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     }));
     assert!(
@@ -5626,6 +5686,7 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     }));
 
@@ -5688,6 +5749,7 @@ fn pending_host_alias_transaction_drop_aborts_and_notifies_waiters() {
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     }));
     let sibling = std::sync::Arc::clone(&dispatcher);
@@ -5731,6 +5793,7 @@ fn dropping_unconsumed_host_alias_outcome_closes_fd_and_aborts_transaction() {
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     }));
     let mut pipe = [-1; 2];
@@ -5780,6 +5843,7 @@ fn installing_host_alias_blocks_sibling_mapping_dispatch_until_resolution() {
         resident: false,
         bus_fault: None,
         write_sealed_shared: false,
+        read_only_shared_file: false,
         writable_memfd: None,
     }));
     let install = transaction

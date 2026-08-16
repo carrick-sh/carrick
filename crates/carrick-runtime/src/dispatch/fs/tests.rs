@@ -1374,8 +1374,9 @@ fn staged_splice_pipe_bytes_preserve_fifo_order() {
     dispatcher.stage_splice_pipe_bytes_owned(read_fd, b"def".to_vec());
 
     let bytes = dispatcher
-        .take_splice_pipe_bytes(read_fd, host_read, 6)
-        .expect("take staged bytes");
+        .take_splice_pipe_bytes(read_fd, host_read, None, 6, false)
+        .expect("take staged bytes")
+        .expect("staged bytes are available without waiting");
     assert_eq!(bytes, b"abcdef");
 }
 
