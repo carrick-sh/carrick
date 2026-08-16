@@ -703,6 +703,7 @@ mod fifo_beacon;
 pub(crate) mod ioring;
 #[macro_use]
 mod fs;
+mod keys;
 pub(crate) use fs::{LegacyAioContextId, SplicePushback};
 #[macro_use]
 mod mem;
@@ -3078,6 +3079,7 @@ fn resolve_handler<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
         .or_else(|| net::dispatch_net(number))
         .or_else(|| mem::dispatch_mem(number))
         .or_else(|| proc::dispatch_proc(number))
+        .or_else(|| keys::dispatch_keys(number))
         .or_else(|| signal::dispatch_signal(number))
         .or_else(|| time::dispatch_time(number))
         .or_else(|| creds::dispatch_creds(number))

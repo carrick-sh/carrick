@@ -14,10 +14,16 @@
 //!
 //! Recorded maintainer ruling (2026-07-10): Linux keyring syscalls are
 //! available to unprivileged processes; Docker's EPERM comes from its
-//! launch-time policy. carrick must NOT edit absent keyring handlers to
-//! return EPERM (probe-shaped policy fabrication) — handlers keep their
-//! honest ENOSYS when this layer is off, and the layer is plain launch
+//! launch-time policy. carrick must NOT edit its keyring handlers to return
+//! EPERM (probe-shaped policy fabrication) — the handlers answer with real
+//! keyring semantics when this layer is off, and the layer is plain launch
 //! configuration when it is on, exactly where Docker's seccomp sits.
+//!
+//! That ruling predated the keyring subsystem itself. It still holds, and the
+//! separation is now load-bearing in BOTH directions: `crate::keyring` really
+//! does implement `add_key`/`request_key`/`keyctl`, so this table is the only
+//! thing that makes a default `carrick run` reproduce Docker's EPERM, and the
+//! handlers must never learn about it.
 //!
 //! # Inheritance
 //!

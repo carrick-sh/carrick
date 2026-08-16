@@ -380,11 +380,22 @@ async fn create_security_opt_flows_to_launch_policy() {
     let docker =
         bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
 
-    for (name, security_opt, expected_errno) in [
-        // Explicit unconfined: policy off, honest absent-backend ENOSYS(38).
-        ("m0secoptunconfined", Some(vec!["seccomp=unconfined"]), 38),
-        // No SecurityOpt: docker-shaped default profile model, EPERM(1).
-        ("m0secoptdefault", None, 1),
+    // `expected` is (add_key, request_key, keyctl_join) errno, per probe key.
+    // The keyring family is IMPLEMENTED, so the unconfined arm is no longer one
+    // errno for all three: `add_key` and `keyctl(KEYCTL_JOIN_SESSION_KEYRING)`
+    // succeed unprivileged and leave errno at the probe's reset 0, while
+    // `request_key` for a key that must be constructed reports ENOKEY(126) —
+    // there is no `/sbin/request-key` helper. That triple is the recorded
+    // Docker/ubuntu:24.04 unconfined differential in `container_policy.rs`.
+    for (name, security_opt, expected) in [
+        (
+            "m0secoptunconfined",
+            Some(vec!["seccomp=unconfined"]),
+            [0, 126, 0],
+        ),
+        // No SecurityOpt: docker-shaped default profile model, EPERM(1) for the
+        // whole family, denied at the dispatch seam before any handler runs.
+        ("m0secoptdefault", None, [1, 1, 1]),
     ] {
         let _ = std::process::Command::new(assert_cmd::cargo::cargo_bin("carrick"))
             .args(["rm", "-f", name])
@@ -428,7 +439,10 @@ async fn create_security_opt_flows_to_launch_policy() {
             .unwrap();
         wait_container_exit(&docker, name).await;
         let output = container_output(&docker, name).await;
-        for key in ["add_key_errno", "request_key_errno", "keyctl_join_errno"] {
+        for (key, expected_errno) in ["add_key_errno", "request_key_errno", "keyctl_join_errno"]
+            .into_iter()
+            .zip(expected)
+        {
             assert!(
                 output.contains(&format!("{key}={expected_errno}")),
                 "{name}: expected {key}={expected_errno} in probe output:\n{output}"

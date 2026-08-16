@@ -240,6 +240,15 @@ pub struct Kernel {
     pub(super) exit_subscribers: TaskExitSubscribers,
     pub(super) pending_file_closes: Mutex<Vec<FileCloseEvent>>,
     reservation_gate: ReservationGate,
+    /// The VM-wide kernel keyring store (`keyrings(7)`).
+    ///
+    /// It belongs to the kernel, not to a `SyscallDispatcher` or a host-process
+    /// static, for the same reason the task registry does: under HVPatch every
+    /// guest process is a thread of ONE carrier, so a per-dispatcher store
+    /// would fragment a single Linux key namespace and a process-global one
+    /// would merge every guest's keys together. Key SERIALS are only meaningful
+    /// because this allocator is VM-wide.
+    keyrings: crate::keyring::KeyringService,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -643,9 +652,15 @@ impl Kernel {
             exit_subscribers: TaskExitSubscribers::default(),
             pending_file_closes: Mutex::new(Vec::new()),
             reservation_gate: ReservationGate::default(),
+            keyrings: crate::keyring::KeyringService::new(),
         });
         let context = KernelContext::capture(kernel.clone(), task, leader, TaskRevision::INITIAL);
         Ok((kernel, context))
+    }
+
+    /// The VM-wide keyring store. See the field docs for why it lives here.
+    pub(crate) const fn keyrings(&self) -> &crate::keyring::KeyringService {
+        &self.keyrings
     }
 
     pub(super) fn domain(&self) -> &Arc<KernelDomain> {

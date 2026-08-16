@@ -124,6 +124,15 @@ pub mod syscall_x86_64;
 /// that `use carrick_abi::SyscallRemap`.
 pub use syscall_x86_64::SyscallRemap;
 
+// Linux kernel-keyring ABI (`add_key(2)`, `request_key(2)`, `keyctl(2)`,
+// `keyrings(7)`): serials, special keyring selectors, keyctl commands and the
+// permission word. Its own module because the keyring wire format is a set of
+// interlocking domains (a serial is either an allocated id OR a negative
+// special selector) that only stay separated if they are separate types. The
+// rendered docs live in the module itself (`keyring.rs`), so the intra-doc
+// links there resolve in that module's own scope.
+pub mod keyring;
+
 pub const LINUX_S_IFMT: u32 = 0o170000;
 pub const LINUX_S_IFDIR: u32 = 0o040000;
 pub const LINUX_S_IFREG: u32 = 0o100000;
@@ -3020,6 +3029,14 @@ pub const LINUX_EUCLEAN: LinuxErrno = LinuxErrno::new(117);
 pub const LINUX_EREMOTE: LinuxErrno = LinuxErrno::new(121);
 pub const LINUX_EDQUOT: LinuxErrno = LinuxErrno::new(122);
 pub const LINUX_ECANCELED: LinuxErrno = LinuxErrno::new(125);
+// The keyring errno block (`keyctl(2)`, `request_key(2)`). ENOKEY is the one a
+// guest sees most: `request_key(2)` for a key that does not exist and cannot be
+// constructed reports it, and the Docker-unconfined differential recorded in
+// `container_policy.rs` pins it at 126.
+pub const LINUX_ENOKEY: LinuxErrno = LinuxErrno::new(126);
+pub const LINUX_EKEYEXPIRED: LinuxErrno = LinuxErrno::new(127);
+pub const LINUX_EKEYREVOKED: LinuxErrno = LinuxErrno::new(128);
+pub const LINUX_EKEYREJECTED: LinuxErrno = LinuxErrno::new(129);
 // Linux setxattr(2) flags. Same semantics as the macOS XATTR_CREATE/
 // XATTR_REPLACE options (which carry different numeric values).
 pub const LINUX_XATTR_CREATE: i32 = 0x1;
