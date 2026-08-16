@@ -111,10 +111,13 @@ fn gettid_returns_per_thread_tid_not_pid() {
     assert_eq!(registry.register_child(0), test_tid(1001));
     let futex = Arc::new(FutexTable::new());
     let tid = registry.register_child(0);
+    let root_ctx = dispatcher.capture_one_task_context().unwrap();
+    let child_tid = dispatcher.register_one_task_thread(&root_ctx, tid).unwrap();
+    let child_ctx = dispatcher.capture_kernel_context(child_tid).unwrap();
     // gettid is syscall 178.
     let outcome = dispatcher
         .dispatch_threaded(
-            &dispatcher.capture_one_task_context().unwrap(),
+            &child_ctx,
             SyscallRequest::new(178, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -126,7 +129,7 @@ fn gettid_returns_per_thread_tid_not_pid() {
     assert_eq!(
         outcome,
         DispatchOutcome::Returned {
-            value: i64::from(tid.raw())
+            value: i64::from(child_tid.raw())
         }
     );
 }
@@ -140,10 +143,13 @@ fn set_tid_address_records_clear_child_tid_and_returns_tid() {
     assert_eq!(registry.register_child(0), test_tid(1001));
     let futex = Arc::new(FutexTable::new());
     let tid = registry.register_child(0);
+    let root_ctx = dispatcher.capture_one_task_context().unwrap();
+    let child_tid = dispatcher.register_one_task_thread(&root_ctx, tid).unwrap();
+    let child_ctx = dispatcher.capture_kernel_context(child_tid).unwrap();
     // set_tid_address(addr) is syscall 96.
     let outcome = dispatcher
         .dispatch_threaded(
-            &dispatcher.capture_one_task_context().unwrap(),
+            &child_ctx,
             SyscallRequest::new(96, SyscallArgs::from([0x10500, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -155,7 +161,7 @@ fn set_tid_address_records_clear_child_tid_and_returns_tid() {
     assert_eq!(
         outcome,
         DispatchOutcome::Returned {
-            value: i64::from(tid.raw())
+            value: i64::from(child_tid.raw())
         }
     );
     assert_eq!(registry.clear_child_tid(tid), Some(0x10500));
@@ -413,10 +419,16 @@ fn futex_lock_pi_private_uncontended_records_owner_tid() {
     let futex = Arc::new(FutexTable::new());
     write_u32_le(&mut memory, 0x10800, 0);
 
+    let root_ctx = dispatcher.capture_one_task_context().unwrap();
+    let child_tid = dispatcher
+        .register_one_task_thread(&root_ctx, test_tid(1001))
+        .unwrap();
+    let child_ctx = dispatcher.capture_kernel_context(child_tid).unwrap();
+
     let op = LINUX_FUTEX_LOCK_PI | LINUX_FUTEX_PRIVATE_FLAG;
     let outcome = dispatcher
         .dispatch_threaded(
-            &dispatcher.capture_one_task_context().unwrap(),
+            &child_ctx,
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -427,7 +439,7 @@ fn futex_lock_pi_private_uncontended_records_owner_tid() {
         .unwrap();
 
     assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
-    assert_eq!(read_i32_le(&memory, 0x10800), 1001);
+    assert_eq!(read_i32_le(&memory, 0x10800), child_tid.raw());
 }
 
 #[test]
@@ -438,12 +450,17 @@ fn futex_trylock_pi_private_owned_by_self_is_deadlock() {
     let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
     assert_eq!(registry.register_child(0), test_tid(1001));
     let futex = Arc::new(FutexTable::new());
-    write_u32_le(&mut memory, 0x10800, 1001);
+    let root_ctx = dispatcher.capture_one_task_context().unwrap();
+    let child_tid = dispatcher
+        .register_one_task_thread(&root_ctx, test_tid(1001))
+        .unwrap();
+    let child_ctx = dispatcher.capture_kernel_context(child_tid).unwrap();
+    write_u32_le(&mut memory, 0x10800, child_tid.raw() as u32);
 
     let op = LINUX_FUTEX_TRYLOCK_PI | LINUX_FUTEX_PRIVATE_FLAG;
     let outcome = dispatcher
         .dispatch_threaded(
-            &dispatcher.capture_one_task_context().unwrap(),
+            &child_ctx,
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -459,7 +476,7 @@ fn futex_trylock_pi_private_owned_by_self_is_deadlock() {
             errno: LINUX_EDEADLK
         }
     );
-    assert_eq!(read_i32_le(&memory, 0x10800), 1001);
+    assert_eq!(read_i32_le(&memory, 0x10800), child_tid.raw());
 }
 
 #[test]
@@ -470,12 +487,17 @@ fn futex_unlock_pi_private_owned_by_self_clears_word() {
     let registry = Arc::new(ThreadRegistry::new(test_tid(1000)));
     assert_eq!(registry.register_child(0), test_tid(1001));
     let futex = Arc::new(FutexTable::new());
-    write_u32_le(&mut memory, 0x10800, 1001);
+    let root_ctx = dispatcher.capture_one_task_context().unwrap();
+    let child_tid = dispatcher
+        .register_one_task_thread(&root_ctx, test_tid(1001))
+        .unwrap();
+    let child_ctx = dispatcher.capture_kernel_context(child_tid).unwrap();
+    write_u32_le(&mut memory, 0x10800, child_tid.raw() as u32);
 
     let op = LINUX_FUTEX_UNLOCK_PI | LINUX_FUTEX_PRIVATE_FLAG;
     let outcome = dispatcher
         .dispatch_threaded(
-            &dispatcher.capture_one_task_context().unwrap(),
+            &child_ctx,
             SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 0, 0, 0, 0])),
             &mut memory,
             &reporter,

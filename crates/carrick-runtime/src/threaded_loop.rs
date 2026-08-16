@@ -417,23 +417,13 @@ mod tests {
     use std::num::NonZeroU64;
 
     #[test]
-    fn hvpatch_main_registry_id_is_linux_init_while_reference_lanes_keep_host_identity() {
+    fn hvpatch_main_registry_id_is_linux_init() {
         let host_pid = 67_000;
         assert_eq!(
-            main_registry_id_for_backend(crate::page_profile::ExecutionBackend::HvPatch, host_pid,)
+            main_registry_id_for_backend(crate::page_profile::ExecutionBackend::HvPatch, host_pid)
                 .raw(),
             carrick_abi::LINUX_BOOTSTRAP_PID as i32,
         );
-        for backend in [
-            crate::page_profile::ExecutionBackend::Native,
-            crate::page_profile::ExecutionBackend::Vmm,
-        ] {
-            assert_eq!(
-                main_registry_id_for_backend(backend, host_pid).raw(),
-                host_pid,
-                "{backend:?} bootstrap identity must stay host-derived",
-            );
-        }
     }
 
     fn root_context(pid: i32) -> crate::kernel::KernelContext {
@@ -542,14 +532,5 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(retire_count.get(), 1);
-
-        let mature_retire_count = std::cell::Cell::new(0_u32);
-        let result = resolve_hvpatch_setup::<(), _>(
-            crate::page_profile::ExecutionBackend::Vmm,
-            Err(RuntimeError::Unsupported("mature setup failure".to_owned())),
-            || mature_retire_count.set(mature_retire_count.get() + 1),
-        );
-        assert!(result.is_err());
-        assert_eq!(mature_retire_count.get(), 0);
     }
 }

@@ -308,6 +308,7 @@ pub(crate) struct SeccompSnapshot {
 }
 
 impl SeccompSnapshot {
+    #[allow(dead_code)]
     pub(crate) fn validate(&self) -> bool {
         self.filters
             .iter()
@@ -343,6 +344,7 @@ impl SeccompState {
         self.programs.lock().clone()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn restore(&self, snapshot: &SeccompSnapshot) -> Result<(), &'static str> {
         if !snapshot.validate() {
             return Err("invalid seccomp snapshot");

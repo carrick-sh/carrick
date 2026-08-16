@@ -32,7 +32,6 @@ cc = "1"
 
 [dev-dependencies]
 carrick-dsr = { path = "../carrick-dsr", features = ["test-hooks"] }
-carrick-native-freebsd = { path = "../carrick-native-freebsd" }
 libc.workspace = true
 goblin.workspace = true
 tempfile.workspace = true

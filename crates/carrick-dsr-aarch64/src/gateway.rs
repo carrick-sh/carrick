@@ -771,6 +771,22 @@ mod native_gateway {
         fn carrick_dsr_exit_signal();
     }
 
+    /// # Safety
+    ///
+    /// Test placeholder stub for the DSR guest entry ABI.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn carrick_native_dsr_enter_guest_abi(
+        _context: *mut std::ffi::c_void,
+    ) -> libc::c_int {
+        0
+    }
+
+    /// # Safety
+    ///
+    /// Test placeholder stub for the DSR host entry ABI.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn carrick_native_dsr_enter_host_abi(_context: *mut std::ffi::c_void) {}
+
     // The six exit labels are assembled into the SAME object as
     // `carrick_dsr_enter_raw`, which calls the runtime's C ABI helpers
     // (`carrick_native_dsr_enter_{guest,host}_abi`). Standalone crate tests do

@@ -236,8 +236,7 @@ pub enum FsBackendKind {
 #[serde(rename_all = "snake_case")]
 pub enum ExecBackendRequest {
     #[default]
-    Native,
-    Vmm,
+    #[serde(rename = "hvpatch")]
     HvPatch,
 }
 
@@ -251,22 +250,16 @@ impl ExecBackendRequest {
             }
         };
 
-        if matches("native") {
-            Ok(Self::Native)
-        } else if matches("vmm") {
-            Ok(Self::Vmm)
-        } else if matches("hvpatch") {
+        if matches("hvpatch") || matches("hv_patch") || matches("auto") {
             Ok(Self::HvPatch)
-        } else if matches("auto") {
+        } else if matches("native") || matches("vmm") || matches("hvf") {
             Err(
-                "execution backend 'auto' was removed; omit --exec-backend for native execution or pass --exec-backend vmm"
+                "native and legacy vmm backends were retired; only 'hvpatch' is supported"
                     .to_string(),
             )
-        } else if matches("hvf") {
-            Err("execution backend 'hvf' was renamed; pass --exec-backend vmm".to_string())
         } else {
             Err(format!(
-                "unknown execution backend '{input}'; expected 'native', 'vmm', or 'hvpatch'"
+                "unknown execution backend '{input}'; expected 'hvpatch'"
             ))
         }
     }
@@ -285,7 +278,7 @@ impl<'de> Deserialize<'de> for ExecBackendRequest {
 #[cfg(feature = "clap")]
 impl clap::ValueEnum for ExecBackendRequest {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self::Native, Self::Vmm, Self::HvPatch]
+        &[Self::HvPatch]
     }
 
     fn from_str(input: &str, ignore_case: bool) -> Result<Self, String> {
@@ -294,8 +287,6 @@ impl clap::ValueEnum for ExecBackendRequest {
 
     fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
         Some(match self {
-            Self::Native => clap::builder::PossibleValue::new("native"),
-            Self::Vmm => clap::builder::PossibleValue::new("vmm"),
             Self::HvPatch => clap::builder::PossibleValue::new("hvpatch"),
         })
     }
@@ -901,61 +892,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exec_backend_defaults_to_native() {
-        assert_eq!(ExecBackendRequest::default(), ExecBackendRequest::Native);
+    fn exec_backend_defaults_to_hvpatch() {
+        assert_eq!(ExecBackendRequest::default(), ExecBackendRequest::HvPatch);
     }
 
     #[test]
-    fn exec_backend_serde_accepts_native_vmm_and_hvpatch() {
-        assert_eq!(
-            serde_json::from_str::<ExecBackendRequest>(r#""native""#)
-                .expect("native backend should deserialize"),
-            ExecBackendRequest::Native
-        );
-        assert_eq!(
-            serde_json::from_str::<ExecBackendRequest>(r#""vmm""#)
-                .expect("vmm backend should deserialize"),
-            ExecBackendRequest::Vmm
-        );
+    fn exec_backend_serde_accepts_hvpatch() {
         assert_eq!(
             serde_json::from_str::<ExecBackendRequest>(r#""hvpatch""#)
                 .expect("hvpatch backend should deserialize"),
             ExecBackendRequest::HvPatch
         );
-
-        let auto = serde_json::from_str::<ExecBackendRequest>(r#""auto""#)
-            .expect_err("auto must be rejected");
-        assert!(
-            auto.to_string().contains(
-                "execution backend 'auto' was removed; omit --exec-backend for native execution or pass --exec-backend vmm"
-            ),
-            "unexpected auto migration error: {auto}"
+        assert_eq!(
+            serde_json::from_str::<ExecBackendRequest>(r#""auto""#)
+                .expect("auto backend should deserialize"),
+            ExecBackendRequest::HvPatch
         );
 
-        let hvf = serde_json::from_str::<ExecBackendRequest>(r#""hvf""#)
-            .expect_err("hvf must be rejected");
+        let native = serde_json::from_str::<ExecBackendRequest>(r#""native""#)
+            .expect_err("native must be rejected");
         assert!(
-            hvf.to_string()
-                .contains("execution backend 'hvf' was renamed; pass --exec-backend vmm"),
-            "unexpected hvf migration error: {hvf}"
+            native.to_string().contains(
+                "native and legacy vmm backends were retired; only 'hvpatch' is supported"
+            ),
+            "unexpected native migration error: {native}"
+        );
+
+        let vmm = serde_json::from_str::<ExecBackendRequest>(r#""vmm""#)
+            .expect_err("vmm must be rejected");
+        assert!(
+            vmm.to_string().contains(
+                "native and legacy vmm backends were retired; only 'hvpatch' is supported"
+            ),
+            "unexpected vmm migration error: {vmm}"
         );
     }
 
     #[cfg(feature = "clap")]
     #[test]
-    fn exec_backend_clap_accepts_native_vmm_and_hvpatch() {
+    fn exec_backend_clap_accepts_hvpatch() {
         use clap::ValueEnum;
 
         assert_eq!(
-            ExecBackendRequest::from_str("native", false).expect("native should parse"),
-            ExecBackendRequest::Native
-        );
-        assert_eq!(
-            ExecBackendRequest::from_str("vmm", false).expect("vmm should parse"),
-            ExecBackendRequest::Vmm
-        );
-        assert_eq!(
             ExecBackendRequest::from_str("hvpatch", false).expect("hvpatch should parse"),
+            ExecBackendRequest::HvPatch
+        );
+        assert_eq!(
+            ExecBackendRequest::from_str("auto", false).expect("auto should parse"),
             ExecBackendRequest::HvPatch
         );
 
@@ -966,18 +949,18 @@ mod tests {
                 .filter_map(clap::ValueEnum::to_possible_value)
                 .map(|value| value.get_name().to_owned())
                 .collect::<Vec<_>>(),
-            ["native", "vmm", "hvpatch"]
+            ["hvpatch"]
         );
 
-        let auto = ExecBackendRequest::from_str("auto", false).expect_err("auto must fail");
+        let native = ExecBackendRequest::from_str("native", false).expect_err("native must fail");
         assert_eq!(
-            auto,
-            "execution backend 'auto' was removed; omit --exec-backend for native execution or pass --exec-backend vmm"
+            native,
+            "native and legacy vmm backends were retired; only 'hvpatch' is supported"
         );
-        let hvf = ExecBackendRequest::from_str("hvf", false).expect_err("hvf must fail");
+        let vmm = ExecBackendRequest::from_str("vmm", false).expect_err("vmm must fail");
         assert_eq!(
-            hvf,
-            "execution backend 'hvf' was renamed; pass --exec-backend vmm"
+            vmm,
+            "native and legacy vmm backends were retired; only 'hvpatch' is supported"
         );
     }
 

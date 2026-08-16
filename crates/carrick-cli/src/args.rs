@@ -160,17 +160,7 @@ pub(crate) enum Commands {
         #[arg(long, default_value_t = false)]
         interrupted: bool,
     },
-    /// Internal transport-only diagnostic for the native host self-reexec path.
-    #[command(name = "__native-exec-pid-probe", hide = true)]
-    NativeExecPidProbe,
-    /// Internal resume entry. A valid one-shot capsule is mandatory.
-    #[command(name = "__native-exec-resume", hide = true)]
-    NativeExecResume {
-        #[arg(long)]
-        capsule_fd: i32,
-        #[arg(long)]
-        nonce: String,
-    },
+
     InspectElf {
         path: PathBuf,
     },
@@ -231,7 +221,7 @@ pub(crate) enum Commands {
         #[arg(long = "forward-env", value_name = "KEY=VAL")]
         forward_env: Vec<String>,
         /// Execution backend policy. `native` is experimental and trusted-code-only.
-        #[arg(long = "exec-backend", value_parser = ExecBackendValueParser, default_value = "native", env = "CARRICK_EXEC_BACKEND")]
+        #[arg(long = "exec-backend", value_parser = ExecBackendValueParser, default_value = "hvpatch", env = "CARRICK_EXEC_BACKEND")]
         exec_backend: ExecBackendRequest,
         /// Page profile for the native execution backend.
         #[arg(long = "native-page-profile", value_enum, default_value_t = NativePageProfileRequest::Auto, env = "CARRICK_NATIVE_PAGE_PROFILE")]
@@ -417,7 +407,7 @@ pub(crate) enum Commands {
         #[arg(long, value_enum)]
         fs: Option<FsBackendKind>,
         /// Execution backend policy. `native` is experimental and trusted-code-only.
-        #[arg(long = "exec-backend", value_parser = ExecBackendValueParser, default_value = "native", env = "CARRICK_EXEC_BACKEND")]
+        #[arg(long = "exec-backend", value_parser = ExecBackendValueParser, default_value = "hvpatch", env = "CARRICK_EXEC_BACKEND")]
         exec_backend: ExecBackendRequest,
         /// Page profile for the native execution backend.
         #[arg(long = "native-page-profile", value_enum, default_value_t = NativePageProfileRequest::Auto, env = "CARRICK_NATIVE_PAGE_PROFILE")]
@@ -527,7 +517,7 @@ pub(crate) enum Commands {
         #[arg(long, value_enum)]
         fs: Option<FsBackendKind>,
         /// Execution backend policy. `native` is experimental and trusted-code-only.
-        #[arg(long = "exec-backend", value_parser = ExecBackendValueParser, default_value = "native", env = "CARRICK_EXEC_BACKEND")]
+        #[arg(long = "exec-backend", value_parser = ExecBackendValueParser, default_value = "hvpatch", env = "CARRICK_EXEC_BACKEND")]
         exec_backend: ExecBackendRequest,
         /// Page profile for the native execution backend.
         #[arg(long = "native-page-profile", value_enum, default_value_t = NativePageProfileRequest::Auto, env = "CARRICK_NATIVE_PAGE_PROFILE")]

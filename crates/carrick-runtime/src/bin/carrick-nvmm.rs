@@ -86,8 +86,7 @@ fn main() {
                 seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
                 // This bin drives the NVMM VMM backend, so it selects the VMM
                 // exec path; the native page profile is irrelevant to the VMM
-                // dispatcher and takes the default.
-                exec_backend: carrick_spec::ExecBackendRequest::Vmm,
+                exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
                 native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
             };
             match carrick_runtime::runtime::run_oci(&spec) {

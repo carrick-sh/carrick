@@ -444,7 +444,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 pid: carrick_spec::PidMode::Private,
                 detach: false,
                 forward_env: vec![],
-                exec_backend: carrick_spec::ExecBackendRequest::Native,
+                exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
                 native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
                 command: vec!["/bin/sh".to_owned()],
             }
@@ -500,29 +500,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             } else {
                 validate_v2_path(&input, capture_status)?;
                 println!("DSRPROF2_VALID");
-            }
-        }
-        Commands::NativeExecPidProbe => {
-            carrick_runtime::native_self_reexec_pid_probe()?;
-            anyhow::bail!("native self-reexec unexpectedly returned successfully")
-        }
-        Commands::NativeExecResume { capsule_fd, nonce } => {
-            match carrick_runtime::resume_native_self_reexec(capsule_fd, &nonce)? {
-                carrick_runtime::NativeSelfReexecOutcome::PidProbe { before, after } => {
-                    println!("native_self_reexec_pid_before={before}");
-                    println!("native_self_reexec_pid_after={after}");
-                    println!("native_self_reexec_pid_preserved={}", before == after);
-                }
-                carrick_runtime::NativeSelfReexecOutcome::GuestExit(code) => {
-                    // Untraced lifecycle gauge: an exec'd guest child exits
-                    // HERE, not via `forked_child_exit` — the runtime has
-                    // fully unwound (dispatcher/memory drops included), so
-                    // this is the last stamp before the host process dies.
-                    carrick_runtime::exec_stamps::stamp(
-                        carrick_runtime::exec_stamps::ExecStampPhase::PreHostExit,
-                    );
-                    std::process::exit(code);
-                }
             }
         }
         Commands::InspectElf { path } => {
@@ -1668,10 +1645,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     Some(NativeShapeTarget::parse_for_backends(
                         "native-amplification",
                         &command,
-                        &[
-                            carrick_spec::ExecBackendRequest::Native,
-                            carrick_spec::ExecBackendRequest::HvPatch,
-                        ],
+                        &[carrick_spec::ExecBackendRequest::HvPatch],
                     )?)
                 } else {
                     None

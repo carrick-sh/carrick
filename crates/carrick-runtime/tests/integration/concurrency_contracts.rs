@@ -67,9 +67,16 @@ fn shared_dispatcher_services_syscalls_from_multiple_host_threads() {
     let futex = Arc::new(FutexTable::new());
     assert_eq!(registry.register_child(0), t(2));
 
-    let handles: Vec<_> = [t(1), t(2)]
+    let root_ctx = dispatcher.capture_one_task_context().unwrap();
+    let thread1_tid = root_ctx.thread().key().tid;
+    let thread2_tid = dispatcher
+        .register_one_task_thread(&root_ctx, t(2))
+        .unwrap();
+    let thread2_ctx = dispatcher.capture_kernel_context(thread2_tid).unwrap();
+
+    let handles: Vec<_> = vec![(t(1), root_ctx), (t(2), thread2_ctx)]
         .into_iter()
-        .map(|tid| {
+        .map(|(tid, ctx)| {
             let dispatcher = Arc::clone(&dispatcher);
             let reporter = Arc::clone(&reporter);
             let registry = Arc::clone(&registry);
@@ -78,7 +85,7 @@ fn shared_dispatcher_services_syscalls_from_multiple_host_threads() {
                 let mut memory = LinearMemory::new(0x4000, Vec::new());
                 dispatcher
                     .dispatch_threaded(
-                        &dispatcher.capture_one_task_context().unwrap(),
+                        &ctx,
                         SyscallRequest::new(178, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                         &mut memory,
                         &reporter,
@@ -103,13 +110,19 @@ fn shared_dispatcher_services_syscalls_from_multiple_host_threads() {
         DispatchOutcome::Returned { value } => *value,
         other => panic!("expected gettid return, got {other:?}"),
     });
-    assert_eq!(
-        outcomes,
-        vec![
-            DispatchOutcome::Returned { value: 1 },
-            DispatchOutcome::Returned { value: 2 }
-        ]
-    );
+    let mut expected = vec![
+        DispatchOutcome::Returned {
+            value: i64::from(thread1_tid.raw()),
+        },
+        DispatchOutcome::Returned {
+            value: i64::from(thread2_tid.raw()),
+        },
+    ];
+    expected.sort_by_key(|outcome| match outcome {
+        DispatchOutcome::Returned { value } => *value,
+        _ => 0,
+    });
+    assert_eq!(outcomes, expected);
 }
 
 #[test]
@@ -131,9 +144,15 @@ fn shared_dispatcher_services_thread_registry_and_futex_syscalls() {
     // distinct worker whose set_tid_address returns its own tid.
     registry.register_child(0);
 
+    let root_ctx = dispatcher.capture_one_task_context().unwrap();
+    let thread_tid = dispatcher
+        .register_one_task_thread(&root_ctx, t(10))
+        .unwrap();
+    let thread_ctx = dispatcher.capture_kernel_context(thread_tid).unwrap();
+
     let set_tid = dispatcher
         .dispatch_threaded(
-            &dispatcher.capture_one_task_context().unwrap(),
+            &thread_ctx,
             SyscallRequest::new(96, SyscallArgs::from([0x10840, 0, 0, 0, 0, 0])),
             &mut memory,
             &reporter,
@@ -142,7 +161,12 @@ fn shared_dispatcher_services_thread_registry_and_futex_syscalls() {
             &futex,
         )
         .unwrap();
-    assert_eq!(set_tid, DispatchOutcome::Returned { value: 10 });
+    assert_eq!(
+        set_tid,
+        DispatchOutcome::Returned {
+            value: i64::from(thread_tid.raw())
+        }
+    );
     assert_eq!(registry.clear_child_tid(t(10)), Some(0x10840));
 
     let futex_wait = dispatcher
