@@ -110,13 +110,19 @@ jobs:
   # Scope honestly: this proves the shipped backend still executes go/node/cpython
   # workloads and matches the blessed oracle. It is the smoke tier (23 suites), not
   # the full 2104-suite gate, and the oracle side is cached rather than re-observed.
+  # There is exactly ONE lane here (`hvf`, the default): carrick has one execution
+  # backend, so the gate cannot select one and this IS `just conformance-quick`.
+  # Caveat to keep honest: this job predates the HVPatch consolidation, when the
+  # retired 1:1 native backend needed no entitlement and no nested virt. HVPatch
+  # runs guests on Hypervisor.framework, so whether a HOSTED macOS runner can
+  # execute this at all is unproven here.
   #
   # Not on pull_request: hosted macOS minutes bill at 10x, and the run is ~15-25
   # min. Push-to-main, nightly, and manual keep the signal without taxing every PR.
-  native-conformance:
-    name: native backend · guest conformance (smoke)
+  guest-conformance:
+    name: guest conformance (smoke)
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: macos-14 # Apple Silicon; hosted, unentitled
+    runs-on: macos-14 # Apple Silicon
     steps:
       - uses: actions/checkout@v4
 
@@ -134,12 +140,12 @@ jobs:
       # the guest range, and 2048 is demonstrably too few (the default 256 far
       # more so). Same sysctl+ulimit pattern as the unit-test steps above —
       # `ulimit` does not persist across steps, so raise it in this shell.
-      - name: Native lane smoke (carrick-only, cached oracle)
+      - name: Smoke tier (carrick-only, cached oracle)
         run: |
           sudo sysctl -w kern.maxfiles=524288 kern.maxfilesperproc=524288 || true
           ulimit -n 65536 || ulimit -n "$(ulimit -Hn)" || true
           echo "RLIMIT_NOFILE: soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
-          just conformance-native smoke --require-cached-oracle
+          just conformance-quick --require-cached-oracle
 
       # The per-suite jsonl is the evidence for a failed run: it carries each
       # verdict plus, for a TIMEOUT, the starved-vs-blocked-vs-spinning
@@ -148,8 +154,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: native-conformance-smoke
-          path: target/conformance/results.macos-native-dsr.smoke.jsonl
+          name: guest-conformance-smoke
+          path: target/conformance/results.hvf.smoke.jsonl
           if-no-files-found: warn
 
   # L1 — cross-compile our OWNED crates for aarch64-linux + assert the

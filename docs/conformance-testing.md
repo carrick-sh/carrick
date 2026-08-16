@@ -10,12 +10,12 @@ commands for different reasons:
   no Docker, no signed binary.
 * **Runtime conformance** — observable behavior is pinned by differential tests
   that run an identical workload under carrick and under a real Linux container
-  (the Docker oracle) and diff the output. The default conformance lane is
-  macOS/HVF and explicitly passes `--exec-backend vmm`; this is distinct from
-  the user CLI's native default. It uses `linux/arm64`; local x86_64 backend
-  lanes use `linux/amd64` and likewise request `vmm`. Guest-running
-  macOS lanes need a signed release binary and a reachable Docker daemon unless
-  the oracle verdict is cached.
+  (the Docker oracle) and diff the output. A LANE selects only *where* the
+  carrick side runs, never which execution backend it uses — carrick has one
+  (HVPatch) and defaults to it, so no lane passes `--exec-backend`. The default
+  lane is `hvf`: the local signed binary on this mac, `linux/arm64`. The local
+  x86_64 bring-up lanes use `linux/amd64`. The macOS lane needs a signed release
+  binary and a reachable Docker daemon unless the oracle verdict is cached.
 
 Compile-time checks pin *what the bytes are*; runtime probes pin *what the
 syscall does*. Both are gates: a green build plus a green probe suite is the
@@ -58,7 +58,7 @@ they run from a plain `cargo build` artifact and stay green on any machine.
 The primary runtime gate is `carrick-conformance`, driven through `just`:
 
 ```sh
-just conformance                 # full tier, explicit local VMM/HVF lane
+just conformance                 # full tier, local macOS (`hvf`) lane
 just conformance smoke           # smoke tier
 just conformance full --bless    # refresh baseline/oracle outputs when intended
 just matrix                      # re-render docs/support-matrix.md from results
@@ -66,8 +66,8 @@ just matrix                      # re-render docs/support-matrix.md from results
 
 The harness reads `scripts/conformance/suites.toml`, runs carrick and Docker in
 separate phases, classifies verdicts against committed baselines, writes JSONL
-reports, and renders [support-matrix.md](support-matrix.md). It also has local
-backend lanes:
+reports, and renders [support-matrix.md](support-matrix.md). It also has the
+cross-platform bring-up lanes:
 
 ```sh
 cargo run -p carrick-conformance -- --lane kvm-local --tier smoke
@@ -76,9 +76,11 @@ cargo run -p carrick-conformance -- --lane nvmm-local --tier smoke
 ```
 
 Those lanes expect a platform-native `carrick` binary built with the matching
-`platform-*` feature and inject `--exec-backend vmm` plus, where appropriate,
-`--platform linux/amd64`. Backend expected gaps belong in backend overlays, not
-in the main HVF baseline.
+`platform-*` feature and inject `--platform linux/amd64` (they run x86_64
+guests). That platform flag is the ONLY thing a lane adds to the suite argv.
+Lane-specific expected gaps belong in that lane's overlay
+(`scripts/conformance/baseline.<key>.jsonl`), not in the shared `hvf` baseline —
+`hvf` carries no overlay because it IS the shared ground truth.
 
 ## Legacy differential probe suite vs Docker
 
