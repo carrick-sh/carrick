@@ -847,39 +847,96 @@ fn context_oom_score_adj(ctx: &SyntheticProcContext, pid: Option<u32>) -> i32 {
         .unwrap_or_else(single_process_oom_score_adj)
 }
 
-/// True iff `path` is a `/proc/<pid>/mem` file (`self`, `thread-self`, or a
-/// numeric pid). Reads of such a file are NOT a byte blob: they translate the
-/// file offset as a GUEST VIRTUAL ADDRESS into the caller's OWN address space
-/// (see the `read` handler's `SyntheticFile` arm). Debuggers and LTP read their
-/// own mappings this way.
-pub(crate) fn is_proc_self_mem_path(path: &str) -> bool {
-    path.strip_prefix("/proc/")
-        .and_then(|rest| rest.strip_suffix("/mem"))
-        .is_some_and(|mid| {
-            mid == "self"
-                || mid == "thread-self"
-                || (!mid.is_empty() && mid.bytes().all(|b| b.is_ascii_digit()))
-        })
+/// The reader's own Linux pid, for the callers that hold an identity rather
+/// than a whole [`SyntheticProcContext`]. See [`context_self_pid`] for why the
+/// host pid cannot answer this on the HVPatch lane.
+pub(crate) fn self_linux_pid(identity: Option<SyntheticProcIdentity>) -> u32 {
+    identity.map_or_else(crate::namespace::pid::self_ns_pid, |identity| identity.pid)
 }
 
-pub(crate) fn is_proc_self_pagemap_path(path: &str) -> bool {
+/// True iff the `<pid>` component of a `/proc/<pid>/…` live-memory path names
+/// the CALLER — a `self` alias or its own pid spelled numerically.
+///
+/// This gate is load-bearing, not cosmetic. Reads of `/proc/<pid>/mem` are NOT
+/// a byte blob: the `read` handler's `SyntheticFile` arm translates the file
+/// offset as a GUEST VIRTUAL ADDRESS and reads it out of the CALLER's address
+/// space. When the predicate accepted any all-digit pid, `/proc/<peer>/mem`
+/// therefore returned the READER's bytes at that address, presented as the
+/// peer's — silent wrong data, which a debugger cannot tell from truth.
+/// Measured live: a parent reading a forked child's `/proc/<child>/mem` at a
+/// COW-broken page got its own `READERAA` marker where the Docker oracle
+/// returned the child's `PEERBBBB`.
+fn names_calling_process(mid: &str, self_pid: u32) -> bool {
+    mid == "self" || mid == "thread-self" || (self_pid != 0 && mid.parse::<u32>() == Ok(self_pid))
+}
+
+/// True iff `path` is the CALLER's own `/proc/<pid>/mem`. A peer's is never
+/// this — see [`names_calling_process`].
+pub(crate) fn is_proc_self_mem_path(path: &str, self_pid: u32) -> bool {
+    path.strip_prefix("/proc/")
+        .and_then(|rest| rest.strip_suffix("/mem"))
+        .is_some_and(|mid| names_calling_process(mid, self_pid))
+}
+
+/// True iff `path` is the CALLER's own `/proc/<pid>/pagemap`. Same shape and
+/// same hazard as [`is_proc_self_mem_path`]: the renderer describes the
+/// caller's address space, so a peer's pid must not reach it.
+pub(crate) fn is_proc_self_pagemap_path(path: &str, self_pid: u32) -> bool {
     path.strip_prefix("/proc/")
         .and_then(|rest| rest.strip_suffix("/pagemap"))
-        .is_some_and(|mid| {
-            mid == "self"
-                || mid == "thread-self"
-                || (!mid.is_empty() && mid.bytes().all(|b| b.is_ascii_digit()))
-        })
+        .is_some_and(|mid| names_calling_process(mid, self_pid))
+}
+
+/// The errno an open of a FOREIGN `/proc/<pid>/{mem,pagemap}` must fail with,
+/// or `None` when `path` is not one of those (or names the caller, which is
+/// served normally).
+///
+/// Carrick cannot address a non-current HVPatch `mm` — the same missing
+/// capability that blocks cross-process `process_vm_readv`/`writev` — so these
+/// two files cannot be SERVED for a peer. The choice is between failing and
+/// lying, and this is a deliberate, stated DIVERGENCE from Linux, which does
+/// serve them for a ptrace-eligible target (measured: the Docker oracle returns
+/// the child's bytes). `EACCES` is the errno Linux itself produces on this exact
+/// path when `mm_access` denies, so a caller sees a Linux-shaped refusal rather
+/// than fabricated memory.
+///
+/// A pid the kernel graph does not know is `ENOENT`: its `/proc/<pid>`
+/// directory does not exist, which is what the oracle reports and what carrick
+/// used to get wrong by opening `/proc/424242/mem` successfully.
+pub(crate) fn proc_foreign_live_memory_open_errno(
+    path: &str,
+    ctx: &SyntheticProcContext,
+) -> Option<crate::linux_abi::LinuxErrno> {
+    let mid = path.strip_prefix("/proc/").and_then(|rest| {
+        rest.strip_suffix("/mem")
+            .or_else(|| rest.strip_suffix("/pagemap"))
+    })?;
+    if mid.contains('/') || names_calling_process(mid, context_self_pid(ctx)) {
+        return None;
+    }
+    if !mid.bytes().all(|b| b.is_ascii_digit()) || mid.is_empty() {
+        return None;
+    }
+    // Without a kernel graph this lane cannot enumerate peers at all; leave its
+    // behaviour to the mature host-process path rather than inventing a refusal.
+    ctx.processes.as_ref()?;
+    Some(match graph_process(mid, ctx) {
+        Some(_) => crate::linux_abi::LINUX_EACCES,
+        None => LINUX_ENOENT,
+    })
 }
 
 pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<Vec<u8>> {
     let normalized = normalize_self_pid_path(path, ctx);
     let path = normalized.as_ref();
-    // `/proc/<pid>/mem` and `/proc/<pid>/pagemap` are live files, not
-    // precomputed blobs: return an EMPTY blob so they OPEN as `SyntheticFile`;
-    // the read handler recognizes the path and derives bytes from guest memory
-    // or from the sparse pagemap offset.
-    if is_proc_self_mem_path(path) || is_proc_self_pagemap_path(path) {
+    // The CALLER's own `/proc/<pid>/mem` and `/proc/<pid>/pagemap` are live
+    // files, not precomputed blobs: return an EMPTY blob so they OPEN as
+    // `SyntheticFile`; the read handler recognizes the path and derives bytes
+    // from guest memory or from the sparse pagemap offset. A PEER's must not
+    // reach that handler — it would describe this caller's address space; see
+    // `proc_foreign_live_memory_open_errno`.
+    let self_pid = context_self_pid(ctx);
+    if is_proc_self_mem_path(path, self_pid) || is_proc_self_pagemap_path(path, self_pid) {
         return Some(Vec::new());
     }
     match path {
@@ -2355,6 +2412,15 @@ impl Vfs for ProcVfs {
                 status_flags: 0,
             });
         }
+        // A PEER's `/proc/<pid>/{mem,pagemap}` fails here rather than falling
+        // through to a generic errno, and above all rather than being served
+        // from THIS caller's address space.
+        if let Some(errno) = proc_foreign_live_memory_open_errno(
+            path,
+            synth_ctx.get_or_init(|| synthetic_proc_context_from_open(ctx)),
+        ) {
+            return Err(errno);
+        }
         let Some(contents) = synthetic_file(
             path,
             synth_ctx.get_or_init(|| synthetic_proc_context_from_open(ctx)),
@@ -3816,17 +3882,62 @@ mod tests {
 
     #[test]
     fn recognizes_proc_self_mem_paths() {
-        // `/proc/<pid>/mem` for self, thread-self, or a numeric pid.
-        assert!(is_proc_self_mem_path("/proc/self/mem"));
-        assert!(is_proc_self_mem_path("/proc/thread-self/mem"));
-        assert!(is_proc_self_mem_path("/proc/1/mem"));
-        assert!(is_proc_self_mem_path("/proc/12345/mem"));
+        // `/proc/<pid>/mem` for self, thread-self, or the caller's OWN pid.
+        assert!(is_proc_self_mem_path("/proc/self/mem", 3));
+        assert!(is_proc_self_mem_path("/proc/thread-self/mem", 3));
+        assert!(is_proc_self_mem_path("/proc/3/mem", 3));
+        // A PEER's pid is NOT the caller's address space. Accepting it made
+        // `/proc/<peer>/mem` return the READER's bytes at that VA.
+        assert!(!is_proc_self_mem_path("/proc/1/mem", 3));
+        assert!(!is_proc_self_mem_path("/proc/12345/mem", 3));
+        assert!(!is_proc_self_pagemap_path("/proc/12345/pagemap", 3));
+        assert!(is_proc_self_pagemap_path("/proc/3/pagemap", 3));
         // Not a mem file: other proc files, a bad pid, or a deeper path.
-        assert!(!is_proc_self_mem_path("/proc/self/maps"));
-        assert!(!is_proc_self_mem_path("/proc/self/status"));
-        assert!(!is_proc_self_mem_path("/proc/meminfo"));
-        assert!(!is_proc_self_mem_path("/proc//mem"));
-        assert!(!is_proc_self_mem_path("/proc/self/mem/extra"));
+        assert!(!is_proc_self_mem_path("/proc/self/maps", 3));
+        assert!(!is_proc_self_mem_path("/proc/self/status", 3));
+        assert!(!is_proc_self_mem_path("/proc/meminfo", 3));
+        assert!(!is_proc_self_mem_path("/proc//mem", 3));
+        assert!(!is_proc_self_mem_path("/proc/self/mem/extra", 3));
+    }
+
+    /// A peer's live-memory files must FAIL, and fail differently for a live
+    /// peer (refused) than for a pid that never existed (absent) — Linux's
+    /// `/proc/424242/mem` is ENOENT, which carrick used to open successfully.
+    #[test]
+    fn foreign_live_memory_is_refused_not_fabricated() {
+        let ctx = peer_dir_ctx();
+        assert_eq!(
+            proc_foreign_live_memory_open_errno("/proc/7/mem", &ctx),
+            Some(crate::linux_abi::LINUX_EACCES)
+        );
+        assert_eq!(
+            proc_foreign_live_memory_open_errno("/proc/7/pagemap", &ctx),
+            Some(crate::linux_abi::LINUX_EACCES)
+        );
+        assert_eq!(
+            proc_foreign_live_memory_open_errno("/proc/424242/mem", &ctx),
+            Some(LINUX_ENOENT)
+        );
+        // The caller's own is served normally, by pid or by alias.
+        assert_eq!(
+            proc_foreign_live_memory_open_errno("/proc/3/mem", &ctx),
+            None
+        );
+        assert_eq!(
+            proc_foreign_live_memory_open_errno("/proc/self/mem", &ctx),
+            None
+        );
+        assert!(synthetic_file("/proc/3/mem", &ctx).is_some());
+        assert!(
+            synthetic_file("/proc/7/mem", &ctx).is_none(),
+            "a peer's /proc/<pid>/mem must not open as a live-memory file"
+        );
+        // A lane with no kernel graph keeps the mature host-process behaviour.
+        let no_graph = SyntheticProcContext::default();
+        assert_eq!(
+            proc_foreign_live_memory_open_errno("/proc/7/mem", &no_graph),
+            None
+        );
     }
 
     #[test]
