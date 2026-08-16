@@ -15,3 +15,4 @@ workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 parking_lot.workspace = true
+zerocopy.workspace = true

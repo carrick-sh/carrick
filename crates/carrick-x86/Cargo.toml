@@ -31,3 +31,4 @@ carrick-abi = { path = "../carrick-abi" }
 carrick-host = { path = "../carrick-host" }
 bitflags.workspace = true
 libc.workspace = true
+zerocopy.workspace = true

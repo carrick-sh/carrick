@@ -410,20 +410,14 @@ fn forward_record_lock<M: GuestMemory>(
         LINUX_F_OFD_GETLK | LINUX_F_OFD_SETLK | LINUX_F_OFD_SETLKW
     );
 
-    let bytes = match cx.memory.read_bytes(arg, 32) {
-        Ok(b) => b,
+    let flock: LinuxFlock64 = match cx.memory.read_struct(arg) {
+        Ok(f) => f,
         Err(_) => return DispatchOutcome::errno(LINUX_EFAULT),
     };
-    let i16_at = |o: usize| i16::from_le_bytes([bytes[o], bytes[o + 1]]);
-    let i64_at = |o: usize| {
-        let mut a = [0u8; 8];
-        a.copy_from_slice(&bytes[o..o + 8]);
-        i64::from_le_bytes(a)
-    };
-    let l_type_linux = i16_at(0);
-    let l_whence = i16_at(2);
-    let l_start = i64_at(8);
-    let l_len = i64_at(16);
+    let l_type_linux = flock.l_type;
+    let l_whence = flock.l_whence;
+    let l_start = flock.l_start;
+    let l_len = flock.l_len;
 
     // l_whence must be SEEK_SET/SEEK_CUR/SEEK_END; Linux rejects anything else
     // with EINVAL in flock_to_posix_lock, before attempting the lock.
@@ -529,11 +523,12 @@ fn forward_record_lock<M: GuestMemory>(
             // survives). carrick previously rewrote the whole struct from the
             // macOS flock result, which zeroes l_pid. Touch only l_type@0
             // (an i16 field, so narrow the i32 const to 2 wire bytes).
-            if cx
-                .memory
-                .write_bytes(arg, &(LINUX_F_UNLCK as i16).to_le_bytes())
-                .is_err()
-            {
+            let mut flock: LinuxFlock64 = match cx.memory.read_struct(arg) {
+                Ok(f) => f,
+                Err(_) => return DispatchOutcome::errno(LINUX_EFAULT),
+            };
+            flock.l_type = LINUX_F_UNLCK as i16;
+            if cx.memory.write_struct(arg, &flock).is_err() {
                 return DispatchOutcome::errno(LINUX_EFAULT);
             }
         } else {
@@ -544,11 +539,6 @@ fn forward_record_lock<M: GuestMemory>(
             } else {
                 LINUX_F_WRLCK as i16
             };
-            let mut out = [0u8; 32];
-            out[0..2].copy_from_slice(&l_type_back.to_le_bytes());
-            out[2..4].copy_from_slice(&fl.l_whence.to_le_bytes());
-            out[8..16].copy_from_slice(&(fl.l_start as i64).to_le_bytes());
-            out[16..24].copy_from_slice(&(fl.l_len as i64).to_le_bytes());
             // OFD locks are not process-owned: Linux reports a conflicting OFD
             // lock's l_pid as -1. A classic lock's holder pid comes back from
             // macOS flock as the HOST pid; present it in the caller's PID
@@ -559,8 +549,16 @@ fn forward_record_lock<M: GuestMemory>(
             } else {
                 crate::namespace::pid::host_to_ns_or_self(fl.l_pid as u32) as i32
             };
-            out[24..28].copy_from_slice(&l_pid_back.to_le_bytes());
-            if cx.memory.write_bytes(arg, &out).is_err() {
+            let out = LinuxFlock64 {
+                l_type: l_type_back,
+                l_whence: fl.l_whence,
+                __pad1: [0; 4],
+                l_start: fl.l_start as i64,
+                l_len: fl.l_len as i64,
+                l_pid: l_pid_back,
+                __pad2: [0; 4],
+            };
+            if cx.memory.write_struct(arg, &out).is_err() {
                 return DispatchOutcome::errno(LINUX_EFAULT);
             }
         }
@@ -575,9 +573,9 @@ fn forward_record_lock<M: GuestMemory>(
 /// this, so LTP fcntl13 (fd=1 with a bad address / bad l_whence) wrongly
 /// succeeded. Mirrors the host-backed path's checks in `forward_record_lock`.
 fn validate_flock_arg<M: GuestMemory>(memory: &M, arg: u64) -> Result<(), LinuxErrno> {
-    let bytes = memory.read_bytes(arg, 32).map_err(|_| LINUX_EFAULT)?;
-    let l_type = i16::from_le_bytes([bytes[0], bytes[1]]);
-    let l_whence = i16::from_le_bytes([bytes[2], bytes[3]]);
+    let flock: LinuxFlock64 = memory.read_struct(arg).map_err(|_| LINUX_EFAULT)?;
+    let l_type = flock.l_type;
+    let l_whence = flock.l_whence;
     // l_type: RDLCK=0/WRLCK=1/UNLCK=2; l_whence: SEEK_SET=0/SEEK_CUR=1/SEEK_END=2.
     if !(0..=2).contains(&l_type) || !(0..=2).contains(&l_whence) {
         return Err(LINUX_EINVAL);
@@ -1253,15 +1251,16 @@ fn host_iff_to_linux(flags_host: u32) -> u16 {
 
 /// Build one Linux `struct ifreq` (40 bytes) carrying `name` and an
 /// `AF_INET` `ifr_addr` for `addr_be`. The trailing union bytes are zero.
-fn linux_ifreq_inet4(name: &str, addr_be: [u8; 4]) -> [u8; LINUX_IFREQ_SIZE] {
-    let mut req = [0u8; LINUX_IFREQ_SIZE];
+fn linux_ifreq_inet4(name: &str, addr_be: [u8; 4]) -> LinuxIfreq {
+    let mut ifr_name = [0u8; LINUX_IFNAMSIZ];
     let nb = name.as_bytes();
     let n = nb.len().min(LINUX_IFNAMSIZ - 1);
-    req[..n].copy_from_slice(&nb[..n]);
-    // ifr_addr starts at offset IFNAMSIZ: sockaddr_in { family(2) port(2) addr(4) }.
-    req[LINUX_IFNAMSIZ..LINUX_IFNAMSIZ + 2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
-    req[LINUX_IFNAMSIZ + 4..LINUX_IFNAMSIZ + 8].copy_from_slice(&addr_be);
-    req
+    ifr_name[..n].copy_from_slice(&nb[..n]);
+    let mut ifr_ifru = [0u8; 24];
+    // ifr_addr starts at offset 0 of union: sockaddr_in { family(2) port(2) addr(4) }.
+    ifr_ifru[0..2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+    ifr_ifru[4..8].copy_from_slice(&addr_be);
+    LinuxIfreq { ifr_name, ifr_ifru }
 }
 
 struct RenameAtRequest {
@@ -7258,16 +7257,17 @@ impl SyscallDispatcher {
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
-                    let bytes = cx.memory.read_bytes(arg, 8)?;
-                    let owner_type = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                    let owner_pid = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-                    if owner_type != LINUX_F_OWNER_TID
-                        && owner_type != LINUX_F_OWNER_PID
-                        && owner_type != LINUX_F_OWNER_PGRP
+                    let owner: LinuxFOwnerEx = cx.memory.read_struct(arg)?;
+                    if owner.owner_type != LINUX_F_OWNER_TID
+                        && owner.owner_type != LINUX_F_OWNER_PID
+                        && owner.owner_type != LINUX_F_OWNER_PGRP
                     {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
-                    open_file.description.write().set_owner(owner_type, owner_pid);
+                    open_file
+                        .description
+                        .write()
+                        .set_owner(owner.owner_type, owner.owner_pid);
                     this.sync_fasync_registration(fd.0);
                     DispatchOutcome::Returned { value: 0 }
                 }
@@ -7276,10 +7276,11 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
                     let (owner_type, owner_pid) = open_file.description.read().owner();
-                    let mut buf = [0u8; 8];
-                    buf[0..4].copy_from_slice(&owner_type.to_le_bytes());
-                    buf[4..8].copy_from_slice(&owner_pid.to_le_bytes());
-                    cx.memory.write_bytes(arg, &buf)?;
+                    let owner = LinuxFOwnerEx {
+                        owner_type,
+                        owner_pid,
+                    };
+                    cx.memory.write_struct(arg, &owner)?;
                     DispatchOutcome::Returned { value: 0 }
                 }
                 LINUX_F_SETSIG => {
@@ -8022,21 +8023,19 @@ impl SyscallDispatcher {
                         if arg == 0 {
                             return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                         }
-                        let Ok(hdr) = cx.memory.read_bytes(arg, LINUX_IFCONF_SIZE) else {
-                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        let conf: LinuxIfconf = match cx.memory.read_struct(arg) {
+                            Ok(c) => c,
+                            Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                         };
-                        let ifc_len =
-                            i32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]).max(0) as usize;
-                        let ifc_buf = u64::from_le_bytes([
-                            hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
-                        ]);
+                        let ifc_len = conf.ifc_len.max(0) as usize;
+                        let ifc_buf = conf.ifc_buf;
                         let ifaces = host_inet4_interfaces();
                         // Linux convention: a NULL ifc_buf is a size query that
                         // reports the bytes required without writing entries.
                         let cap = if ifc_buf == 0 {
                             usize::MAX
                         } else {
-                            ifc_len / LINUX_IFREQ_SIZE
+                            ifc_len / std::mem::size_of::<LinuxIfreq>()
                         };
                         let mut written = 0usize;
                         let mut blob: Vec<u8> = Vec::new();
@@ -8045,7 +8044,7 @@ impl SyscallDispatcher {
                                 break;
                             }
                             let req = linux_ifreq_inet4(&iface.name, iface.addr_be);
-                            blob.extend_from_slice(&req);
+                            blob.extend_from_slice(req.as_bytes());
                             written += 1;
                         }
                         if ifc_buf != 0
@@ -8054,7 +8053,7 @@ impl SyscallDispatcher {
                         {
                             return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                         }
-                        let new_len = (written * LINUX_IFREQ_SIZE) as i32;
+                        let new_len = (written * std::mem::size_of::<LinuxIfreq>()) as i32;
                         write_packed(&mut *cx.memory, arg, &new_len.to_le_bytes())
                     }
                     Err(errno) => DispatchOutcome::errno(errno),

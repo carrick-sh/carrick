@@ -157,12 +157,14 @@ impl FaultDoorbellRecord {
     }
 }
 
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+
 /// Memory-backed SP4.3 fault record written by guest IDT stubs for VMMs whose
 /// PIO exits do not expose the `OUT` payload. All fields are u64 so the guest
 /// stub can use plain 64-bit stores and the host can convert to the compact
 /// [`FaultDoorbellRecord`] used by the shared trap engine.
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 pub struct FaultMemoryRecord {
     vector: u64,
     error_code: u64,
@@ -210,18 +212,8 @@ impl FaultMemoryRecord {
                 std::mem::size_of::<Self>()
             )));
         }
-        let mut record = Self::default();
-        // SAFETY: `record` is a plain packed integer struct and `bytes` was
-        // length-checked. Copying into it avoids creating references to packed
-        // fields.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                std::ptr::addr_of_mut!(record).cast::<u8>(),
-                std::mem::size_of::<Self>(),
-            );
-        }
-        Ok(record)
+        Self::read_from_bytes(&bytes[..std::mem::size_of::<Self>()])
+            .map_err(|e| fault_error(format!("invalid memory fault record: {e:?}")))
     }
 
     pub fn to_doorbell_record(self) -> Result<FaultDoorbellRecord, TrapError> {

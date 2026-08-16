@@ -93,28 +93,14 @@ struct LegacyAioIocb {
 }
 
 impl LegacyAioIocb {
-    const WIRE_SIZE: usize = 64;
-    const OPCODE_OFFSET: usize = 16;
-    const FD_OFFSET: usize = 20;
-
     fn read(memory: &impl GuestMemory, address: GuestPtr) -> Result<Self, LinuxErrno> {
         if address.0 == 0 {
             return Err(LINUX_EFAULT);
         }
-        let bytes = memory
-            .read_bytes(address.0, Self::WIRE_SIZE)
-            .map_err(|_| LINUX_EFAULT)?;
-        let opcode_raw =
-            u16::from_le_bytes([bytes[Self::OPCODE_OFFSET], bytes[Self::OPCODE_OFFSET + 1]]);
-        let fd_raw = i32::from_le_bytes([
-            bytes[Self::FD_OFFSET],
-            bytes[Self::FD_OFFSET + 1],
-            bytes[Self::FD_OFFSET + 2],
-            bytes[Self::FD_OFFSET + 3],
-        ]);
+        let iocb: LinuxIocb = memory.read_struct(address.0).map_err(|_| LINUX_EFAULT)?;
         Ok(Self {
-            opcode: LegacyAioOpcode::from_wire(opcode_raw)?,
-            fd: Fd(fd_raw),
+            opcode: LegacyAioOpcode::from_wire(iocb.aio_lio_opcode)?,
+            fd: Fd(iocb.aio_fildes as i32),
         })
     }
 }
