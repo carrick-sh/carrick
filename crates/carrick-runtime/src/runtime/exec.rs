@@ -70,7 +70,19 @@ pub(crate) fn load_execve_image(
     // `resolve_shebang`).
     let abs_path = dispatcher.resolve_exec_path(path);
     dispatcher.check_exec_target(&abs_path)?;
+    // fanotify FAN_OPEN_EXEC, emitted after validation so a failed execve
+    // generates nothing — the event means "this image is being executed", and
+    // an ENOENT/EACCES target never is. Placed before shebang resolution so
+    // `abs_path` is still the file the guest actually named.
+    dispatcher.fanotify_notify_exec(&abs_path);
+    let named_target = abs_path.clone();
     let (path, argv) = resolve_shebang(dispatcher, abs_path, argv)?;
+    // Executing a `#!` script also opens its INTERPRETER for execution, and
+    // Linux reports that as a second FAN_OPEN_EXEC. Skip it for a plain binary,
+    // where `resolve_shebang` hands back the same path it was given.
+    if path != named_target {
+        dispatcher.fanotify_notify_exec(&path);
+    }
 
     // Read the main binary AND resolve its interpreter OVERLAY-FIRST via
     // `read_exec_file`, so execve works for guest-created/overlay binaries

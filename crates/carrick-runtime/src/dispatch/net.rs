@@ -1300,6 +1300,16 @@ impl SyscallDispatcher {
                 // inotify readiness is the backing kqueue's fd, so poll/epoll/
                 // blocking-read wait on it natively.
                 OpenDescription::Inotify { state, .. } => Some(HostFd(state.poll_fd())),
+                // fanotify readiness is the group's readiness pipe: readable iff
+                // an event is queued, so poll/epoll and a blocking read all
+                // park on one real host fd. If the pipe could not be created
+                // the group has no host fd at all — report `None` so the caller
+                // falls through to the synthetic in-memory readiness below,
+                // rather than polling fd -1 forever.
+                OpenDescription::Fanotify { group, .. } => match group.poll_fd() {
+                    fd if fd >= 0 => Some(HostFd(fd)),
+                    _ => None,
+                },
                 _ => None,
             };
         }
@@ -1704,6 +1714,15 @@ impl SyscallDispatcher {
             // Inotify readiness is likewise the backing kqueue's job
             // (host_fd_for_poll returns its fd); no in-memory readiness here.
             OpenDescription::Inotify { .. } => {}
+            // fanotify normally reports readiness through its readiness pipe
+            // (`host_fd_for_poll`). This in-memory answer is the degraded path
+            // for a group whose pipe could not be created: without it such a
+            // group would never poll readable even with events queued.
+            OpenDescription::Fanotify { group, .. } => {
+                if requested_events & LINUX_POLLIN != 0 && group.has_events() {
+                    ready |= LINUX_POLLIN;
+                }
+            }
             // signalfd readiness would track pending masked signals; delivery is
             // a tracked follow-up, so there is no in-memory readiness here.
             OpenDescription::SignalFd { .. } => {}

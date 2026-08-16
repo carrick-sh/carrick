@@ -2306,7 +2306,9 @@ impl SyscallDispatcher {
                 // IN_CREATE on the parent dir; every successful open is IN_OPEN
                 // on the object. The fd's path is recorded by try_vfs_open's
                 // install path already (host-backed) or below for read hooks.
-                if !self.fs.inotify_registry.is_empty() {
+                if !self.fs.inotify_registry.is_empty()
+                    && !crate::fanotify::internal_open_in_progress()
+                {
                     let is_dir = self.inotify_path_kind(&path).unwrap_or(false);
                     if want_create && !vfs_preexisted {
                         self.inotify_child(&path, carrick_abi::LINUX_IN_CREATE, is_dir);
@@ -2315,6 +2317,19 @@ impl SyscallDispatcher {
                         .inotify_registry
                         .notify_self(&path, carrick_abi::LINUX_IN_OPEN, is_dir);
                     // Ensure read/write/close hooks can recover this fd's path.
+                    if self.lookup_recorded_fd_open_path(fd).is_none() {
+                        self.record_fd_open_path(fd, path.clone());
+                    }
+                }
+                // Same for fanotify. Kept as its own block (rather than folded
+                // into the inotify one) because it must fire when a fanotify
+                // mark exists and NO inotify watch does — the two registries
+                // are independent, and sharing the `is_empty` guard would make
+                // fanotify silently depend on an unrelated inotify watch.
+                if !self.fs.fanotify_registry.is_empty()
+                    && !crate::fanotify::internal_open_in_progress()
+                {
+                    self.fanotify_notify(context, &path, carrick_abi::LinuxFanotifyEvents::OPEN);
                     if self.lookup_recorded_fd_open_path(fd).is_none() {
                         self.record_fd_open_path(fd, path.clone());
                     }
@@ -2654,18 +2669,30 @@ impl SyscallDispatcher {
         let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
             return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
         };
-        // Always record the path for inotify's read/write/close hooks, even for
-        // in-memory File/Directory descriptions (they otherwise skip recording);
-        // the recorded entry is dropped when the fd closes. This is the only path
-        // by which a later read(2)/write(2) recovers the watched guest path.
-        if needs_recorded_path || !self.fs.inotify_registry.is_empty() {
+        // Always record the path for the inotify AND fanotify read/write/close
+        // hooks, even for in-memory File/Directory descriptions (they otherwise
+        // skip recording); the recorded entry is dropped when the fd closes.
+        // This is the only path by which a later read(2)/write(2)/close(2)
+        // recovers the watched guest path.
+        //
+        // The fanotify half is load-bearing for a DIRECTORY: under `--fs host`
+        // a regular file gets a `HostFile` description (which records anyway)
+        // but a directory gets `Directory`, which does not. Omitting fanotify
+        // here silently dropped `FAN_CLOSE_NOWRITE` for `close(2)` on a marked
+        // directory — fanotify02's eighth and final event — while every event
+        // on a file still worked, which is exactly the kind of gap that reads
+        // as "delivery works" until one case disagrees.
+        if needs_recorded_path
+            || !self.fs.inotify_registry.is_empty()
+            || !self.fs.fanotify_registry.is_empty()
+        {
             self.record_fd_open_path(fd, record_path.clone());
         }
         // inotify: O_CREAT that created the file is IN_CREATE on the parent dir;
         // any other successful open is IN_OPEN on the object itself (and, for a
         // directory open, IN_OPEN|IN_ISDIR). The registry fast-exits when nothing
         // is watched, so this is ~free in the common case.
-        if !self.fs.inotify_registry.is_empty() {
+        if !self.fs.inotify_registry.is_empty() && !crate::fanotify::internal_open_in_progress() {
             if inotify_created {
                 self.inotify_child(&record_path, carrick_abi::LINUX_IN_CREATE, opened_is_dir);
             }
@@ -2679,6 +2706,15 @@ impl SyscallDispatcher {
             self.inotify_child(&record_path, carrick_abi::LINUX_IN_OPEN, opened_is_dir);
             self.inotify_self(&record_path, carrick_abi::LINUX_IN_OPEN);
         }
+        // fanotify FAN_OPEN. One event per open regardless of how many marks
+        // match; `opened_is_dir` is passed through because it is already known
+        // here and gates FAN_ONDIR.
+        self.fanotify_notify_kind(
+            context,
+            &record_path,
+            carrick_abi::LinuxFanotifyEvents::OPEN,
+            opened_is_dir,
+        );
         if inotify_created {
             self.dnotify_child(context, &record_path, LinuxDnotifyMask::CREATE);
         }
@@ -6690,6 +6726,7 @@ impl SyscallDispatcher {
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
                 | OpenDescription::Inotify { .. }
+                | OpenDescription::Fanotify { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
@@ -8716,6 +8753,10 @@ impl SyscallDispatcher {
             // or directory — emitted while the fd is still in the table so its
             // description (writability) and recorded path are still readable.
             this.inotify_close_for_fd(fd.0);
+            // fanotify FAN_CLOSE_WRITE/FAN_CLOSE_NOWRITE, emitted here for the
+            // same reason: the description's writability and recorded path are
+            // only readable while the fd is still in the table.
+            this.fanotify_close_for_fd(cx.kernel, fd.0);
             // Auto-remove this fd from every epoll interest set BEFORE freeing
             // the fd number from open_files. ORDER IS LOAD-BEARING: the instant
             // the fd leaves open_files another thread's open/pipe/dup can recycle
@@ -9022,7 +9063,8 @@ impl SyscallDispatcher {
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
-                | OpenDescription::Inotify { .. } => {
+                | OpenDescription::Inotify { .. }
+                | OpenDescription::Fanotify { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
             };
@@ -9053,6 +9095,7 @@ impl SyscallDispatcher {
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
                 | OpenDescription::Inotify { .. }
+                | OpenDescription::Fanotify { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
@@ -9106,6 +9149,14 @@ impl SyscallDispatcher {
             // IN_ACCESS on that file. The kernel reports it per read syscall,
             // independent of bytes returned. Fast-exits when nothing is watched.
             this.inotify_emit_for_fd(fd.0, carrick_abi::LINUX_IN_ACCESS);
+            // fanotify FAN_ACCESS: same operation, one event. fanotify has no
+            // self/child split — the registry decides whether an inode mark or
+            // an FAN_EVENT_ON_CHILD directory mark receives it.
+            this.fanotify_emit_for_fd(
+                cx.kernel,
+                fd.0,
+                carrick_abi::LinuxFanotifyEvents::ACCESS,
+            );
             // A stdio fd the guest explicitly closed (and did not reopen) is a
             // genuinely closed descriptor: read is EBADF, not a host-stdin read.
             if this.stdio_is_closed(fd.0) {
@@ -9249,6 +9300,26 @@ impl SyscallDispatcher {
                         }
                         Err(errno) => DispatchOutcome::errno(errno),
                     });
+                }
+                OpenDescription::Fanotify { base, group } => {
+                    let group = Arc::clone(group);
+                    // FAN_NONBLOCK (init) and O_NONBLOCK (a later fcntl) are
+                    // independent switches; either one makes the read
+                    // non-blocking.
+                    let nonblocking = group.init_nonblocking()
+                        || base.status_flags() & LINUX_O_NONBLOCK != 0;
+                    drop(open);
+                    return read_fanotify(
+                        this,
+                        cx.kernel,
+                        cx.thread.as_ref().map(|thread| thread.registry),
+                        cx.reporter,
+                        memory,
+                        address,
+                        length,
+                        &group,
+                        nonblocking,
+                    );
                 }
                 OpenDescription::PipeReader { base, pipe } => {
                     return Ok(read_pipe(memory, address, length, pipe, base.status_flags()));
@@ -9491,6 +9562,7 @@ impl SyscallDispatcher {
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
                 | OpenDescription::Inotify { .. }
+                | OpenDescription::Fanotify { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
@@ -9569,6 +9641,7 @@ impl SyscallDispatcher {
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
                 | OpenDescription::Inotify { .. }
+                | OpenDescription::Fanotify { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
@@ -9719,6 +9792,7 @@ impl SyscallDispatcher {
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
                 | OpenDescription::Inotify { .. }
+                | OpenDescription::Fanotify { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
@@ -9882,7 +9956,8 @@ impl SyscallDispatcher {
                 | OpenDescription::Netlink { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
-                | OpenDescription::Inotify { .. } => LINUX_ESPIPE,
+                | OpenDescription::Inotify { .. }
+                | OpenDescription::Fanotify { .. } => LINUX_ESPIPE,
             };
             Ok(DispatchOutcome::errno(errno))
 
@@ -10028,7 +10103,8 @@ impl SyscallDispatcher {
                 | OpenDescription::Netlink { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
-                | OpenDescription::Inotify { .. } => LINUX_ESPIPE,
+                | OpenDescription::Inotify { .. }
+                | OpenDescription::Fanotify { .. } => LINUX_ESPIPE,
             };
             Ok(DispatchOutcome::errno(errno))
 
@@ -10869,19 +10945,171 @@ impl SyscallDispatcher {
             })
         }
 
-        fn fanotify_init(this, cx, _flags: u64, _event_f_flags: u64) {
-            // Carrick has no fanotify backend at all, so ENOSYS (the honest
-            // "unimplemented") is correct — not a fabricated EPERM that would
-            // claim the syscall is implemented-but-denied. Consistent with
-            // keyring/pidfd_getfd: report-only against an unconfined,
-            // CAP_SYS_ADMIN oracle that can run the real syscall.
-            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
+        fn fanotify_init(this, cx, flags: u64, event_f_flags: u64) {
+            // fanotify_init(2) requires CAP_SYS_ADMIN. Carrick has no capability
+            // model finer than the credential snapshot, so gate on effective
+            // root — the same answer Linux gives an unprivileged caller, and
+            // NOT a fabricated success that would let a non-root guest believe
+            // it is monitoring a filesystem it cannot.
+            if !this.cred_snapshot().euid.is_root() {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
+            if flags & !LinuxFanotifyInitFlags::KNOWN_MASK != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let init_flags = LinuxFanotifyInitFlags::from_bits_retain(flags);
+            // The class is a 2-bit FIELD, not a bit — `flags & FAN_CLASS_NOTIF`
+            // is always false because FAN_CLASS_NOTIF is 0. Only the reserved
+            // fourth encoding (both class bits set) is invalid.
+            //
+            // All THREE classes are accepted, including the permission classes
+            // carrick cannot serve verdicts for. That is not a fudge — it is
+            // what a kernel built without CONFIG_FANOTIFY_ACCESS_PERMISSIONS
+            // does: `fanotify_init(FAN_CLASS_CONTENT, ...)` SUCCEEDS there, and
+            // it is the later `fanotify_mark` carrying FAN_ACCESS_PERM /
+            // FAN_OPEN_PERM that returns EINVAL. `fanotify_mark` below enforces
+            // exactly that, so a permission-class group can still receive the
+            // ordinary notification events it asks for and can never block
+            // waiting for a verdict nothing will deliver.
+            //
+            // Failing the init instead is what LTP's
+            // `require_fanotify_access_permissions_supported_on_fs` cannot
+            // survive: it wraps the init in SAFE_FANOTIFY_INIT, so an EINVAL
+            // there is a hard TBROK, where the real kernel's success followed
+            // by a mark EINVAL is the intended TCONF (fanotify07).
+            if init_flags.class().is_none() {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            // The FID/PIDFD reporting families need file handles
+            // (`name_to_handle_at`) and pidfd info records, neither of which
+            // carrick has. Refusing them here is what makes the corresponding
+            // event bits refusable at `fanotify_mark` below.
+            const UNSUPPORTED_INIT: LinuxFanotifyInitFlags = LinuxFanotifyInitFlags::from_bits_retain(
+                carrick_abi::LINUX_FAN_REPORT_FID
+                    | carrick_abi::LINUX_FAN_REPORT_DIR_FID
+                    | carrick_abi::LINUX_FAN_REPORT_NAME
+                    | carrick_abi::LINUX_FAN_REPORT_TARGET_FID
+                    | carrick_abi::LINUX_FAN_REPORT_FD_ERROR
+                    | carrick_abi::LINUX_FAN_REPORT_PIDFD
+                    | carrick_abi::LINUX_FAN_ENABLE_AUDIT,
+            );
+            if init_flags.intersects(UNSUPPORTED_INIT) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            // `event_f_flags` are the open flags for the descriptors delivered
+            // with each event; only the access mode is constrained.
+            let access = event_f_flags & LINUX_O_ACCMODE;
+            if access != LINUX_O_RDONLY && access != LINUX_O_WRONLY && access != LINUX_O_RDWR {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let group = Arc::new(crate::fanotify::FanotifyGroup::new(init_flags, event_f_flags));
+            // Linux mirrors FAN_NONBLOCK into the description's O_NONBLOCK, so
+            // fcntl(F_GETFL) reports it and a later F_SETFL can clear it.
+            let status_flags = if init_flags.contains(LinuxFanotifyInitFlags::NONBLOCK) {
+                LINUX_O_NONBLOCK
+            } else {
+                0
+            };
+            let description = OpenDescription::Fanotify {
+                base: OpenDescriptionBase::new(status_flags),
+                group,
+            };
+            // FAN_CLOEXEC is bit 0, NOT O_CLOEXEC — the generic
+            // `linux_fd_flags_from_open_flags` would silently map the wrong bit
+            // and fanotify08 asserts exactly this FD_CLOEXEC round-trip.
+            let fd_flags = if init_flags.contains(LinuxFanotifyInitFlags::CLOEXEC) {
+                carrick_abi::LinuxFdFlags::CLOEXEC.bits()
+            } else {
+                0
+            };
+            Ok(this.install_fd(description, fd_flags))
         }
 
-        fn fanotify_mark(this, cx, _fanotify_fd: Fd, _flags: u64, _mask: u64, _dirfd: Fd, _pathname: GuestPtr) {
-            // See fanotify_init: no fanotify backend, so honest ENOSYS, not a
-            // fabricated EPERM denial.
-            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
+        fn fanotify_mark(this, cx, fanotify_fd: Fd, flags: u64, mask: u64, dirfd: Fd, pathname: GuestPtr) {
+            let Some(group) = this.fanotify_group(fanotify_fd.0) else {
+                // A live fd that is not a fanotify group is EINVAL, not EBADF
+                // (fanotify_mark(2): "fanotify_fd was not an fanotify file
+                // descriptor"); only an absent fd is EBADF.
+                return Ok(DispatchOutcome::errno(if this.fd_is_valid(fanotify_fd.0) {
+                    LINUX_EINVAL
+                } else {
+                    LINUX_EBADF
+                }));
+            };
+            if flags & !LinuxFanotifyMarkFlags::KNOWN_MASK != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let mark_flags = LinuxFanotifyMarkFlags::from_bits_retain(flags);
+            // Exactly one of ADD / REMOVE / FLUSH, and at most one object type.
+            let (Some(command), Some(mark_type)) = (mark_flags.command(), mark_flags.mark_type())
+            else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
+            // FAN_MARK_FLUSH ignores `mask` AND `pathname` entirely — it drops
+            // every mark of one class from this group. Resolving the path here
+            // would wrongly ENOENT a flush aimed at an already-deleted dir.
+            if command == LinuxFanotifyMarkFlags::FLUSH {
+                this.fs.fanotify_registry.flush(&group, mark_type);
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            // ADD and REMOVE both require a non-empty mask.
+            if mask == 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let events = LinuxFanotifyEvents::from_bits_retain(mask);
+            // Everything outside NOTIF_MARKABLE needs a class or a reporting
+            // mode carrick refused at `fanotify_init`: permission events need
+            // FAN_CLASS_CONTENT; the dirent / inode-identity events
+            // (FAN_CREATE, FAN_ATTRIB, FAN_MOVE, FAN_DELETE_SELF, ...) need
+            // FAN_REPORT_FID. `fanotify_mark(2)` specifies EINVAL for both.
+            if !LinuxFanotifyEvents::NOTIF_MARKABLE.contains(events) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let path = read_guest_c_string(&*cx.memory, pathname.0)?;
+            if path.is_empty() {
+                return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+            }
+            // Resolve intermediates but not the final component; that IS the
+            // FAN_MARK_DONT_FOLLOW behaviour. Without the flag the final
+            // symlink is followed too, so a mark placed through a symlink lands
+            // on the target — fanotify04 marks the same symlink both ways and
+            // asserts opening the TARGET fires only in the following case.
+            let resolved = this.resolve_at_path(dirfd.0 as u64, &path)?;
+            let resolved = if mark_flags.contains(LinuxFanotifyMarkFlags::DONT_FOLLOW) {
+                resolved
+            } else {
+                match this.canonicalize_following(&resolved) {
+                    Ok(target) => target,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                }
+            };
+            let Some(is_dir) = this.inotify_path_kind(&resolved) else {
+                return Ok(DispatchOutcome::errno(LINUX_ENOENT));
+            };
+            if mark_flags.contains(LinuxFanotifyMarkFlags::ONLYDIR) && !is_dir {
+                return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+            }
+            // FAN_MARK_IGNORED_MASK / FAN_MARK_IGNORE update the mark's IGNORE
+            // mask instead of its event mask; both live on one mark, so an
+            // ignore mark added after a normal mark filters it.
+            let ignored = mark_flags
+                .intersects(LinuxFanotifyMarkFlags::IGNORED_MASK | LinuxFanotifyMarkFlags::IGNORE);
+            if command == LinuxFanotifyMarkFlags::ADD {
+                this.fs
+                    .fanotify_registry
+                    .add_mark(&resolved, mark_type, &group, events, ignored);
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            // REMOVE from an object this group never marked is ENOENT.
+            if this
+                .fs
+                .fanotify_registry
+                .remove_mark(&resolved, mark_type, &group, events, ignored)
+            {
+                Ok(DispatchOutcome::Returned { value: 0 })
+            } else {
+                Ok(DispatchOutcome::errno(LINUX_ENOENT))
+            }
         }
 
         fn sync(this, cx) {
@@ -11065,6 +11293,7 @@ impl SyscallDispatcher {
                     | OpenDescription::Epoll { .. }
                     | OpenDescription::Pidfd { .. }
                     | OpenDescription::Inotify { .. }
+                    | OpenDescription::Fanotify { .. }
                     | OpenDescription::SignalFd { .. }
                     | OpenDescription::Mqueue { .. }
                     | OpenDescription::Netlink { .. }
@@ -11183,6 +11412,11 @@ impl SyscallDispatcher {
             // generates no event, matching Linux. Fast-exits when unwatched.
             if length > 0 {
                 this.inotify_emit_for_fd(fd, carrick_abi::LINUX_IN_MODIFY);
+                this.fanotify_emit_for_fd(
+                    cx.kernel,
+                    fd,
+                    carrick_abi::LinuxFanotifyEvents::MODIFY,
+                );
             }
 
             #[cfg(feature = "trace-io")]
@@ -13388,6 +13622,93 @@ fn read_host_dir_entries(host_dir_fd: i32, dir_path: &str) -> Option<Vec<RootFsD
 #[cfg(not(target_os = "macos"))]
 fn read_host_dir_entries(_host_dir_fd: i32, _dir_path: &str) -> Option<Vec<RootFsDirEntry>> {
     None
+}
+
+/// `read(2)` on a fanotify group fd: drain queued events into the guest buffer
+/// as `struct fanotify_event_metadata` records.
+///
+/// The subtle part is the per-event descriptor. Linux allocates it in the
+/// READING process's file-descriptor table at read time, not in the table of
+/// whatever process generated the event — a forked child that triggers an event
+/// must not burn an fd of its own, and the reader must get a descriptor it can
+/// `fstat` and `close` (LTP `fanotify04` does exactly that, and asserts the fd
+/// refers to an object of the expected type). So the queue stores PATHS and the
+/// open happens here, with the group's `event_f_flags`.
+///
+/// Partial-record protection: only whole 24-byte records are ever written, and
+/// a copyout fault un-does the whole call — the descriptors just opened are
+/// closed and the events are pushed back on the front of the queue, so the
+/// guest's `EFAULT` leaves nothing consumed and no fd leaked.
+#[allow(clippy::too_many_arguments)]
+fn read_fanotify<M: GuestMemory>(
+    this: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
+    registry: Option<&crate::thread::ThreadRegistry>,
+    reporter: &CompatReporter,
+    memory: &mut M,
+    address: u64,
+    length: usize,
+    group: &Arc<crate::fanotify::FanotifyGroup>,
+    nonblocking: bool,
+) -> Result<DispatchOutcome, DispatchError> {
+    // A buffer too small for even one record can never make progress.
+    if length < carrick_abi::LINUX_FANOTIFY_EVENT_METADATA_LEN {
+        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+    }
+    let capacity = length / carrick_abi::LINUX_FANOTIFY_EVENT_METADATA_LEN;
+    let events = group.take(capacity);
+    if events.is_empty() {
+        // Park on the group's readiness pipe rather than returning EAGAIN to a
+        // blocking fd: `fanotify11` starts a worker thread and reads
+        // immediately, so the queue is legitimately empty at read time and the
+        // read must sleep until the worker's open lands.
+        return Ok(super::would_block_outcome(
+            group.poll_fd(),
+            libc::POLLIN,
+            nonblocking,
+            None,
+        ));
+    }
+    let mut bytes =
+        Vec::with_capacity(events.len() * carrick_abi::LINUX_FANOTIFY_EVENT_METADATA_LEN);
+    let mut opened: Vec<i32> = Vec::with_capacity(events.len());
+    // Every open below is carrick's own; without this the FAN_OPEN it would
+    // emit lands right back on the queue this read is draining.
+    let _internal = crate::fanotify::InternalOpenGuard::enter();
+    for event in &events {
+        // An object that has since been unlinked (or that this process cannot
+        // open) still yields a record — with FAN_NOFD, exactly as Linux does
+        // when it cannot open the object for the reader.
+        let fd = match this.open_at_path_string(
+            context,
+            registry,
+            LINUX_AT_FDCWD,
+            &event.path,
+            group.event_f_flags(),
+            0,
+            reporter,
+        ) {
+            Ok(DispatchOutcome::Returned { value }) if value >= 0 => {
+                let fd = value as i32;
+                opened.push(fd);
+                fd
+            }
+            _ => crate::fanotify::NOFD,
+        };
+        bytes.extend_from_slice(&crate::fanotify::encode_event(event.mask, fd, event.pid));
+    }
+    if memory.write_bytes(address, &bytes).is_err() {
+        // Roll the whole call back: close the descriptors we just handed out
+        // and restore the events, so a faulting read consumes nothing.
+        for fd in opened {
+            this.close_fd_for_internal_rollback(fd);
+        }
+        group.requeue_front(events);
+        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+    }
+    Ok(DispatchOutcome::Returned {
+        value: bytes.len() as i64,
+    })
 }
 
 #[cfg(test)]

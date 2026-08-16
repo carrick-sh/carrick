@@ -566,6 +566,9 @@ use crate::linux_abi::{
     LinuxEpollEvents,
     LinuxEventfdValue,
     LinuxFOwnerEx,
+    LinuxFanotifyEvents,
+    LinuxFanotifyInitFlags,
+    LinuxFanotifyMarkFlags,
     LinuxFdFlags,
     LinuxFdPair,
     LinuxFlock64,
@@ -4463,6 +4466,7 @@ impl SyscallDispatcher {
         let mut pty_master_index = None;
         let mut fifo_host_fd = None;
         let mut closing_inotify = None;
+        let mut closing_fanotify = false;
         if last_ref
             && open_file
                 .description
@@ -4484,13 +4488,28 @@ impl SyscallDispatcher {
                 OpenDescription::Inotify { state, .. } => {
                     closing_inotify = Some(Arc::clone(state));
                 }
+                // A fanotify fd closing is NOT automatically the end of its
+                // group: a `dup`, or a guest fork that shared the description,
+                // may still hold it, and a forked child routinely closes its
+                // inherited fd while the parent keeps reading. So do not drop
+                // the marks here — just note that a reference went away and let
+                // the sweep below remove marks whose group actually died.
+                OpenDescription::Fanotify { .. } => {
+                    closing_fanotify = true;
+                }
                 _ => {}
             }
         }
         if let Some(state) = closing_inotify {
             self.fs.inotify_registry.unregister_all(&state);
         }
+        // Drop `open_file` first so the description — and with it the last
+        // `Arc<FanotifyGroup>`, if this really was the last reference — is gone
+        // before the sweep asks which groups are still alive.
         close_open_file(open_file);
+        if closing_fanotify {
+            self.fs.fanotify_registry.prune_dead_groups();
+        }
         if let Some(index) = pty_master_index {
             self.pty_table()
                 .lock()

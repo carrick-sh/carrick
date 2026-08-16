@@ -140,10 +140,10 @@ const DOCKER_FLAG_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[
         ],
     ),
     // fanotify_init needs CAP_SYS_ADMIN. Grant it (plus unconfine) so the
-    // oracle can attempt the real syscall — carrick has no fanotify backend
-    // and honestly returns ENOSYS, so the divergence is report-only (see
-    // known_gap below), not a fabricated EPERM match against the container's
-    // seccomp policy.
+    // oracle runs the real syscall instead of a seccomp-blocked stand-in.
+    // Carrick implements fanotify and also requires effective root for
+    // `fanotify_init`, so with the capability granted both sides answer the
+    // same question and the rows MATCH on their merits.
     (
         "ltp-fanotify",
         &[
@@ -167,24 +167,27 @@ const OVERRIDE_EXCLUSIONS: &[&str] = &["ltp-setrlimit06"];
 
 /// Suites whose single LTP `"summary"` divergence is a TRACKED-unimplemented-
 /// capability marker (maintainer-approved report-only), NOT an edge-case excuse.
-/// pidfd_getfd and fanotify have no carrick backend: with the oracle unconfined
-/// the docker side runs the real syscall and SUCCEEDS while carrick returns
-/// ENOSYS, so they legitimately DIFF. Stamping the `"summary"` id known keeps
-/// the gate green while the gap stays visible. Matched by PREFIX. `"summary"`
-/// is the ONLY id the LTP parser emits (see parsers/ltp.rs), so it is the exact
-/// diverging id — verified empirically from a focused oracle run, not invented.
+/// `pidfd_getfd` has no carrick backend: with the oracle unconfined the docker
+/// side runs the real syscall and SUCCEEDS while carrick returns ENOSYS, so it
+/// legitimately DIFFs. Stamping the `"summary"` id known keeps the gate green
+/// while the gap stays visible. Matched by PREFIX. `"summary"` is the ONLY id
+/// the LTP parser emits (see parsers/ltp.rs), so it is the exact diverging id —
+/// verified empirically from a focused oracle run, not invented.
 ///
-/// The keyring families (`ltp-add_key`, `ltp-request_key`, `ltp-keyctl`) USED
-/// to be listed here and no longer are: carrick implements the keyring
-/// subsystem, all twenty suites MATCH the unconfined oracle, and a report-only
-/// marker on an implemented capability is worse than no marker — because
-/// `"summary"` is the only id these suites emit, keeping it would make a
-/// keyring REGRESSION non-gating too. They keep their unconfined `docker_flags`
-/// (that is what makes the oracle exercise the real syscall) and carry no gap.
-const KNOWN_GAP_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[
-    ("ltp-pidfd_getfd", &["summary"]),
-    ("ltp-fanotify", &["summary"]),
-];
+/// TWO families used to be listed here and no longer are, both because carrick
+/// now implements the capability. A report-only marker on an IMPLEMENTED
+/// capability is worse than no marker: because `"summary"` is the only id these
+/// suites emit, keeping it would make a genuine REGRESSION non-gating too.
+///  - The keyring families (`ltp-add_key`, `ltp-request_key`, `ltp-keyctl`):
+///    carrick implements the keyring subsystem and all twenty suites MATCH the
+///    unconfined oracle. They keep their unconfined `docker_flags` — that is
+///    what makes the oracle exercise the real syscall — and carry no gap.
+///  - `ltp-fanotify`: `fanotify_init`/`fanotify_mark` are implemented and
+///    02/04/08/11/12 match the oracle TPASS-for-TPASS. Only `ltp-fanotify25`
+///    still diverges, and it is an EXACT-NAME entry below with a documented
+///    permanent reason — a whole-family prefix here would re-mask 24 genuinely
+///    gated rows.
+const KNOWN_GAP_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[("ltp-pidfd_getfd", &["summary"])];
 
 /// Exact-name known_gaps for suites that a whole-family prefix would over-mark.
 /// The setrlimit family mostly MATCHes with the unconfined+cap oracle (the
@@ -215,10 +218,28 @@ const KNOWN_GAP_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[
 /// of forked children still times out, so keep the LTP summary mismatch
 /// report-only until Carrick has a fork-coherent requeue authority instead of
 /// side-table credit accounting.
+///
+/// fanotify25 is the ONE fanotify row that is still report-only, and it is a
+/// documented PERMANENT gap rather than a pending fix. The case mounts
+/// `tracefs` on `/sys/kernel/tracing` and writes kprobe definitions to
+/// `kprobe_events`, expecting `FAN_MARK_MOUNT` + `FAN_MODIFY` events for those
+/// writes. Carrick has no kernel tracer and deliberately does not declare
+/// `CONFIG_TRACING`, so the case TCONFs — correctly. Passing it would mean
+/// synthesizing a `kprobe_events` file that accepts kprobe definitions and
+/// silently does nothing, i.e. fabricating kernel functionality to satisfy a
+/// test. The `FAN_MARK_MOUNT` delivery it would exercise IS implemented and
+/// unit-tested; only the tracefs half is missing. See the fanotify section of
+/// `docs/syscalls-emulation-map.md`.
+///
+/// The rest of the fanotify family was moved OFF the report-only prefix when
+/// `fanotify_init`/`fanotify_mark` were implemented: 02/04/08/11/12 now match
+/// the oracle TPASS-for-TPASS and the remaining rows match on their own, so
+/// they are genuinely gated and a regression in them fails the gate.
 const KNOWN_GAP_EXACT_OVERRIDES: &[(&str, &[&str])] = &[
     ("ltp-acct01", &["summary"]),
     ("ltp-bind06", &["summary"]),
     ("ltp-delete_module02", &["summary"]),
+    ("ltp-fanotify25", &["summary"]),
     ("ltp-fgetxattr02", &["summary"]),
     ("ltp-flistxattr01", &["summary"]),
     ("ltp-flistxattr02", &["summary"]),
@@ -771,8 +792,10 @@ mod tests {
                 "{name} lost known_gap summary"
             );
         }
-        // fanotify: unconfined + CAP_SYS_ADMIN + known_gap "summary" (no
-        // carrick backend — report-only).
+        // fanotify: the oracle still needs unconfined + CAP_SYS_ADMIN to run
+        // the real syscall, but the rows are no longer report-only — carrick
+        // implements fanotify and these MATCH, so a known_gap here would
+        // silently stop gating them.
         for name in ["ltp-fanotify02", "ltp-fanotify04", "ltp-fanotify07"] {
             let s = find(name);
             assert!(
@@ -784,10 +807,19 @@ mod tests {
                 "{name} lost cap SYS_ADMIN"
             );
             assert!(
-                s.known_gaps.iter().any(|g| g == "summary"),
-                "{name} lost known_gap summary"
+                s.known_gaps.is_empty(),
+                "{name} regained a known_gap; fanotify rows are gated now"
             );
         }
+        // fanotify25 is the one exception: a permanent tracefs/CONFIG_TRACING
+        // gap, kept report-only BY EXACT NAME so it cannot re-mask the family.
+        assert!(
+            find("ltp-fanotify25")
+                .known_gaps
+                .iter()
+                .any(|g| g == "summary"),
+            "ltp-fanotify25 lost its permanent-gap known_gap"
+        );
         // setrlimit01: unconfined + CAP_SYS_RESOURCE + known_gap "summary"
         // (genuine FSIZE-enforcement gap — report-only).
         {
@@ -939,12 +971,16 @@ mod tests {
         // pidfd_open/pidfd_send_signal are genuinely implemented — no override.
         assert_eq!(docker_flag_overrides("ltp-pidfd_open01"), None);
         assert_eq!(known_gap_overrides("ltp-pidfd_send_signal01"), None);
-        // fanotify: unconfined + SYS_ADMIN + known_gap summary.
+        // fanotify: the oracle keeps unconfined + SYS_ADMIN, but fanotify is
+        // implemented now, so no row is report-only EXCEPT the permanent
+        // tracefs gap in 25.
         let f = docker_flag_overrides("ltp-fanotify02").unwrap();
         assert!(f.iter().any(|x| x == "seccomp=unconfined"));
         assert!(f.iter().any(|x| x == "SYS_ADMIN"));
+        assert_eq!(known_gap_overrides("ltp-fanotify07"), None);
+        assert_eq!(known_gap_overrides("ltp-fanotify02"), None);
         assert_eq!(
-            known_gap_overrides("ltp-fanotify07"),
+            known_gap_overrides("ltp-fanotify25"),
             Some(vec!["summary".into()])
         );
         // setrlimit01-05: unconfined + SYS_RESOURCE. Only 01 (FSIZE-enforcement
