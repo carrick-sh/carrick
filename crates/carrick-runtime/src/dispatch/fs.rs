@@ -10454,6 +10454,18 @@ impl SyscallDispatcher {
             if !this.is_genuine_pipe(in_fd.0) && !this.is_genuine_pipe(out_fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            // An `io_uring` ring is an anonymous inode with no splice file
+            // operations, so Linux answers EINVAL for either end. carrick backs
+            // the ring fd with a plain `SyntheticFile`, which
+            // `splice_source_not_readable` accepts: the call fell through to the
+            // file->pipe path, `sendfile_bytes` read the description's empty
+            // `contents`, and splice reported a successful 0-byte transfer
+            // (splice07 "splice() on io uring -> pipe write end succeeded").
+            if this.io_uring_description(in_fd.0).is_some()
+                || this.io_uring_description(out_fd.0).is_some()
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             if count == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
