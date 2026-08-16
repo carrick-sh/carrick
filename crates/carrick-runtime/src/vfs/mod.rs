@@ -321,6 +321,10 @@ pub struct OpenContext<'a> {
     pub sig_caught: u64,
     pub sig_shdpnd: u64,
     pub identity: Option<SyntheticProcIdentity>,
+    /// Every live process's `oom_score_adj` keyed by Linux pid — see
+    /// [`SyntheticProcContext::oom_score_adj`]. `None` on a lane with no kernel
+    /// graph, where one Linux process is one host process.
+    pub oom_score_adj: Option<&'a std::collections::BTreeMap<u32, i32>>,
     pub threads: Option<&'a [SyntheticProcThread]>,
     pub zombies: Option<&'a [SyntheticProcZombie]>,
     pub sysvipc_shm: Option<&'a str>,

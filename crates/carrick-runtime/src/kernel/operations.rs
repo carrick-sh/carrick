@@ -530,6 +530,9 @@ impl ForkReservation {
             Arc::clone(&child_shared),
             child_resources.credentials(),
         ));
+        // oom_score_adj is inherited across fork (proc(5)) and independent
+        // thereafter — copy the parent's value into the fresh child task.
+        child.set_oom_score_adj(self.caller_task.oom_score_adj());
         let leader_tid = LinuxTid::for_task_leader(self.child_id);
         let leader = child.attach_fork_thread(
             ThreadKey {
