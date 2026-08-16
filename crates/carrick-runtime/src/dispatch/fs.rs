@@ -1686,6 +1686,29 @@ impl SyscallDispatcher {
         write_statfs(memory, buf.0)
     }
 
+    /// `EFBIG` iff growing a file to `length` would exceed this process's
+    /// `RLIMIT_FSIZE` soft limit.
+    ///
+    /// truncate(2)/ftruncate(2): "EFBIG — the argument `length` is larger than
+    /// the maximum file size", and getrlimit(2) defines RLIMIT_FSIZE as that
+    /// maximum. carrick consulted no limit at all, so LTP truncate03's
+    /// `{ TEST_FILE3, MAX_FSIZE*2, EFBIG }` case simply succeeded.
+    ///
+    /// DELIBERATE DIVERGENCE, stated plainly: Linux also generates SIGXFSZ
+    /// alongside the errno. carrick returns the errno only. Raising a signal
+    /// whose default disposition terminates the process is not something to
+    /// add speculatively; it is tracked separately and gated on a probe that
+    /// observes what the Docker oracle actually delivers.
+    fn rlimit_fsize_errno(&self, length: i64) -> Option<LinuxErrno> {
+        let limit = self
+            .effective_resource_limit(carrick_abi::LINUX_RLIMIT_FSIZE)
+            .rlim_cur;
+        if limit == carrick_abi::LINUX_RLIM_INFINITY {
+            return None;
+        }
+        (length as u64 > limit).then_some(crate::linux_abi::LINUX_EFBIG)
+    }
+
     fn truncate(
         &self,
         context: &crate::kernel::KernelContext,
@@ -1718,6 +1741,9 @@ impl SyscallDispatcher {
         // is EACCES (truncate03 sets euid to nobody and truncates a 0444 file).
         // Root bypasses; `--fs memory` (no real owner/mode) falls through.
         if let Some(errno) = self.may_write(&resolved) {
+            return Ok(DispatchOutcome::errno(errno));
+        }
+        if let Some(errno) = self.rlimit_fsize_errno(length) {
             return Ok(DispatchOutcome::errno(errno));
         }
         // Disk-backed: open the real file and ftruncate it. The whole rootfs
@@ -8379,6 +8405,12 @@ impl SyscallDispatcher {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
+            // RLIMIT_FSIZE caps the resulting file size — see
+            // `rlimit_fsize_errno`. Checked after EBADF so an invalid fd still
+            // reports EBADF, matching Linux's argument-validation order.
+            if let Some(errno) = this.rlimit_fsize_errno(length) {
+                return Ok(DispatchOutcome::errno(errno));
+            }
             // Snapshot the path + new contents in a scope so the borrow drops
             // before we touch this.fs.rootfs_vfs.overlay.
             let writeback: Option<(String, Vec<u8>)>;
