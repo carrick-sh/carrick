@@ -172,11 +172,12 @@ reparent-to-init, and `wait4`/`waitid` status all match Linux semantics.
 | `pidfd_open`, `pidfd_send_signal` | 434,424 | Emulated (Partial) | host pid handle + signal | `pidfd_open` sets FD_CLOEXEC. |
 | `capget`/`capset`, `seccomp`, `personality`, `membarrier`, `rseq`, `ptrace` | 90,91,277,92,283,293,117 | Emulated (Partial) | per-process model / no-op-accept | `ptrace` Phase 1: guest BRK/step/HW-debug deliver SIGTRAP; `ptrace(2)` op surface itself is otherwise `ENOSYS`. `unshare`/`reboot` accepted in a degraded form. |
 | `getrusage` | 165 | Emulated (Full) | Darwin `getrusage` + `task_info` | HVF guest CPU is folded in via wall-time-in-`hv_vcpu_run` (not in host rusage). |
+| `process_vm_readv`, `process_vm_writev` | 270,271 | Emulated (Partial) | in-address-space iovec walk | SELF-transfer only (`pid == getpid()`), plus the full argument contract: `flags != 0` → EINVAL, `iov_len`/total overflow → EINVAL, bad iov array → EFAULT, `pid == 0` or unknown task → ESRCH, unprivileged non-owner → EPERM. A permitted CROSS-process transfer is unimplemented and lowers to EFAULT — carrick has no foreign-mm VA→IPA→host path and does not publish peer-side VMA protections. (Not a "peer VM" problem: under HVPatch every Linux process is a thread of one carrier in one VM.) |
 | `add_key`, `request_key`, `keyctl` | 217,218,219 | Emulated (Partial) | carrick-owned keyring service on the kernel graph (`runtime/src/keyring.rs`) | Key objects + serial allocator are VM-wide; thread keyring per `Thread`, process/session keyring + reqkey default per `Task`, user/user-session keyrings per `NsUid`. `keyring` and `user` types only — every other type is genuinely absent and reports `ENODEV`. No `/sbin/request-key` upcall (construction negatively instantiates and reports `ENOKEY`), no per-user quotas/`EDQUOT`, no `/proc/key-users`, no garbage collector. Possession-based permissions ARE implemented. Under a default `carrick run` the family is still EPERM — Docker's launch-time seccomp model, not a handler decision. |
 
 **Deferred:** `acct`, `kexec_load`/`kexec_file_load`, `init_module`/
 `finit_module`/`delete_module`, `bpf`,
-`perf_event_open`, `process_vm_readv`/`writev`, `kcmp`, `setns`,
+`perf_event_open`, `kcmp`, `setns`,
 `pidfd_getfd`, `process_mrelease`, `landlock_*`, `lsm_*`, `get_robust_list`
 (#100 is `Deferred` in the table though the `robustlist` probe exercises an
 errno-contract path).
