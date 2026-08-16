@@ -413,7 +413,7 @@ fn page_rounded_range(
 }
 
 fn range_len_usize(range: crate::vfs::GuestMemoryRange) -> Result<usize, LinuxErrno> {
-    usize::try_from(range.len()).map_err(|_| LINUX_ENOMEM)
+    Ok(range.len())
 }
 
 fn validate_mlock_range(
@@ -493,7 +493,7 @@ fn locked_ranges_remove(
 }
 
 fn locked_ranges_total(ranges: &[crate::vfs::GuestMemoryRange]) -> u64 {
-    ranges.iter().map(|range| range.len()).sum()
+    ranges.iter().map(|range| range.len() as u64).sum()
 }
 
 fn ranges_contain_page(ranges: &[crate::vfs::GuestMemoryRange], page: u64) -> bool {
@@ -2396,11 +2396,15 @@ impl SyscallDispatcher {
                 && map_sharing == MmapSharing::Shared
                 && prot_flags.contains(LinuxProtFlags::WRITE)
                 && let Some(open_file) = this.open_file(fd.0)
-                && let Some(seals) = open_file.description.read().seals()
-                && seals
-                    & (crate::linux_abi::LINUX_F_SEAL_WRITE
-                        | crate::linux_abi::LINUX_F_SEAL_FUTURE_WRITE)
-                    != 0
+                && let Some(seals) = open_file
+                    .description
+                    .read()
+                    .seals()
+                    .and_then(carrick_abi::LinuxMemfdSeals::from_bits)
+                && seals.intersects(
+                    carrick_abi::LinuxMemfdSeals::WRITE
+                        | carrick_abi::LinuxMemfdSeals::FUTURE_WRITE,
+                )
             {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
@@ -3150,10 +3154,13 @@ impl SyscallDispatcher {
                             ));
                         }
                         if map_sharing == MmapSharing::Shared
-                            && matches!(base.seals(), Some(s) if s
-                                & (crate::linux_abi::LINUX_F_SEAL_WRITE
-                                    | crate::linux_abi::LINUX_F_SEAL_FUTURE_WRITE)
-                                != 0)
+                            && matches!(
+                                base.seals().and_then(carrick_abi::LinuxMemfdSeals::from_bits),
+                                Some(s) if s.intersects(
+                                    carrick_abi::LinuxMemfdSeals::WRITE
+                                        | carrick_abi::LinuxMemfdSeals::FUTURE_WRITE,
+                                )
+                            )
                         {
                             mmap_write_sealed_shared = true;
                         }
@@ -3705,7 +3712,7 @@ impl SyscallDispatcher {
             let committed_vma_covers_range = guest_vma_covers_locked(
                 &this.mem.lock(),
                 range.start().raw(),
-                range.len(),
+                range.len() as u64,
             );
             validate_mlock_range(
                 &mut *cx.memory,
@@ -3728,7 +3735,7 @@ impl SyscallDispatcher {
             let committed_vma_covers_range = guest_vma_covers_locked(
                 &this.mem.lock(),
                 range.start().raw(),
-                range.len(),
+                range.len() as u64,
             );
             validate_mlock_range(
                 &mut *cx.memory,
@@ -3781,7 +3788,7 @@ impl SyscallDispatcher {
             let committed_vma_covers_range = guest_vma_covers_locked(
                 &this.mem.lock(),
                 range.start().raw(),
-                range.len(),
+                range.len() as u64,
             );
             validate_mlock_range(
                 &mut *cx.memory,

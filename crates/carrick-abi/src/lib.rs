@@ -3178,6 +3178,9 @@ pub const LINUX_F_UNLCK: i32 = 2;
 pub const LINUX_F_DUPFD_CLOEXEC: u64 = 1030;
 pub const LINUX_F_SETPIPE_SZ: u64 = 1031;
 pub const LINUX_F_GETPIPE_SZ: u64 = 1032;
+/// `close_range(2)` flags.
+pub const LINUX_CLOSE_RANGE_UNSHARE: u32 = 2;
+pub const LINUX_CLOSE_RANGE_CLOEXEC: u32 = 4;
 pub const LINUX_F_ADD_SEALS: u64 = 1033;
 pub const LINUX_F_GET_SEALS: u64 = 1034;
 /// File seals (memfd_create(2)/fcntl F_ADD_SEALS). Each is a bit in the seal
@@ -4377,6 +4380,13 @@ bitflags! {
         const TRACESECCOMP = LINUX_PTRACE_O_TRACESECCOMP;
         const EXITKILL = LINUX_PTRACE_O_EXITKILL;
         const SUSPEND_SECCOMP = LINUX_PTRACE_O_SUSPEND_SECCOMP;
+    }
+
+    /// `close_range(2)` flags.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxCloseRangeFlags: u32 {
+        const UNSHARE = LINUX_CLOSE_RANGE_UNSHARE;
+        const CLOEXEC = LINUX_CLOSE_RANGE_CLOEXEC;
     }
 }
 

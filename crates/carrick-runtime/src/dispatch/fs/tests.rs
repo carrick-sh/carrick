@@ -270,7 +270,7 @@ fn chroot_no_search_permission_precedes_capability_error() {
 
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.set_fs_backend(Box::new(backend));
-    dispatcher.set_credentials(1000, 1000);
+    dispatcher.set_credentials(carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(1000));
     let reporter = CompatReporter::default();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
     memory.write_bytes(0x4000, b"/jail\0").unwrap();
@@ -330,7 +330,13 @@ fn trusted_lower_lane_fixture() -> (tempfile::TempDir, tempfile::TempDir, Syscal
     std::os::unix::fs::symlink("file.txt", lower.path().join("walk/link")).unwrap();
     let lower_metadata = crate::fs_backend::HostFsBackend::attach(lower.path()).unwrap();
     lower_metadata.set_mode("/walk/file.txt", 0o4711).unwrap();
-    lower_metadata.set_owner("/walk/file.txt", 7, 9).unwrap();
+    lower_metadata
+        .set_owner(
+            "/walk/file.txt",
+            Some(carrick_abi::NsUid::new(7)),
+            Some(carrick_abi::NsGid::new(9)),
+        )
+        .unwrap();
     drop(lower_metadata);
 
     let rootfs = RootFs::from_immutable_host_dir(lower.path()).unwrap();
@@ -734,7 +740,11 @@ fn trusted_dirfd_stat_matches_slow_path() {
         .fs
         .rootfs_vfs
         .overlay
-        .set_owner("/walk/file.txt", 7, 9)
+        .set_owner(
+            "/walk/file.txt",
+            Some(carrick_abi::NsUid::new(7)),
+            Some(carrick_abi::NsGid::new(9)),
+        )
         .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
     let root = lane_openat(
@@ -1493,7 +1503,7 @@ fn f_add_seals_waits_for_alias_dispatch_and_publishes_under_same_exclusion() {
                     SyscallArgs::from([
                         fd as u64,
                         LINUX_F_ADD_SEALS,
-                        u64::from(LINUX_F_SEAL_SHRINK),
+                        u64::from(carrick_abi::LinuxMemfdSeals::SHRINK.bits()),
                         0,
                         0,
                         0,
@@ -1519,7 +1529,10 @@ fn f_add_seals_waits_for_alias_dispatch_and_publishes_under_same_exclusion() {
             .is_err(),
         "F_ADD_SEALS raced an in-flight alias dispatch"
     );
-    assert_eq!(description.read().seals(), Some(0));
+    assert_eq!(
+        description.read().seals(),
+        Some(carrick_abi::LinuxMemfdSeals::empty().bits())
+    );
 
     drop(guard);
 
@@ -1529,7 +1542,10 @@ fn f_add_seals_waits_for_alias_dispatch_and_publishes_under_same_exclusion() {
             .expect("F_ADD_SEALS resumes after alias dispatch exits"),
         DispatchOutcome::Returned { value: 0 }
     );
-    assert_eq!(description.read().seals(), Some(LINUX_F_SEAL_SHRINK));
+    assert_eq!(
+        description.read().seals(),
+        Some(carrick_abi::LinuxMemfdSeals::SHRINK.bits())
+    );
     thread.join().expect("join F_ADD_SEALS thread");
 }
 

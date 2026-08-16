@@ -21,6 +21,7 @@ fs-memory = []
 
 [dependencies]
 camino = { workspace = true, features = ["serde1"] }
+carrick-abi = { path = "../carrick-abi" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 clap = { workspace = true, features = ["derive", "env"], optional = true }
 oci-client = { workspace = true }

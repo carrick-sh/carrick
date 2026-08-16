@@ -143,8 +143,8 @@ mod tests {
             hostname: None,
             network: carrick_spec::NetworkNamespaceSpec::default(),
             extra_hosts: Vec::new(),
-            uid: 0,
-            gid: 0,
+            uid: carrick_abi::NsUid::ROOT,
+            gid: carrick_abi::NsGid::ROOT,
             seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
         }
     }

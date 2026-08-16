@@ -339,15 +339,15 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
     // a user/group NAME needs in-image /etc/passwd resolution (not yet
     // supported), so warn and run as root rather than silently mis-mapping.
     let (uid, gid) = match req.user.clone().or_else(|| image.config.user.clone()) {
-        None => (0, 0),
-        Some(s) if s.is_empty() => (0, 0),
+        None => (carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT),
+        Some(s) if s.is_empty() => (carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT),
         Some(s) => match parse_numeric_user(&s) {
             Some((u, g)) => (u, g),
             None => {
                 eprintln!(
                     "carrick: --user {s:?}: name resolution is not yet supported; running as root (use a numeric uid[:gid])"
                 );
-                (0, 0)
+                (carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT)
             }
         },
     };
@@ -488,7 +488,7 @@ fn parse_bridge_ipv4(ipv4: &str) -> Result<std::net::Ipv4Addr, String> {
 /// when only a uid is given (docker's behavior for a numeric user with no passwd
 /// lookup). Returns `None` for a non-numeric user/group name — carrick has no
 /// in-image `/etc/passwd` resolution yet, so the caller warns and runs as root.
-fn parse_numeric_user(spec: &str) -> Option<(u32, u32)> {
+fn parse_numeric_user(spec: &str) -> Option<(carrick_abi::NsUid, carrick_abi::NsGid)> {
     let (u, g) = match spec.split_once(':') {
         Some((u, g)) => (u, Some(g)),
         None => (spec, None),
@@ -498,7 +498,7 @@ fn parse_numeric_user(spec: &str) -> Option<(u32, u32)> {
         Some(g) => g.parse().ok()?,
         None => 0,
     };
-    Some((uid, gid))
+    Some((carrick_abi::NsUid::new(uid), carrick_abi::NsGid::new(gid)))
 }
 
 pub struct Engine {
@@ -752,7 +752,10 @@ mod tests {
     fn user_numeric_uid_and_gid() {
         let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
         let spec = resolve_run_spec(base_req(Some("1000:2000")), image).unwrap();
-        assert_eq!((spec.uid, spec.gid), (1000, 2000));
+        assert_eq!(
+            (spec.uid, spec.gid),
+            (carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(2000))
+        );
     }
 
     #[test]
@@ -760,7 +763,10 @@ mod tests {
         // docker: `--user 1000` with no group → gid 0.
         let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
         let spec = resolve_run_spec(base_req(Some("1000")), image).unwrap();
-        assert_eq!((spec.uid, spec.gid), (1000, 0));
+        assert_eq!(
+            (spec.uid, spec.gid),
+            (carrick_abi::NsUid::new(1000), carrick_abi::NsGid::ROOT)
+        );
     }
 
     #[test]
@@ -768,7 +774,10 @@ mod tests {
         // No --user; the test image's USER is the name "root" (unresolved) → root.
         let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
         let spec = resolve_run_spec(base_req(None), image).unwrap();
-        assert_eq!((spec.uid, spec.gid), (0, 0));
+        assert_eq!(
+            (spec.uid, spec.gid),
+            (carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT)
+        );
     }
 
     #[test]

@@ -142,7 +142,15 @@ pub struct GuestVaRange {
 
 impl GuestVaRange {
     #[inline]
-    pub const fn new(start: GuestVa, len: usize) -> Self {
+    pub fn new(start: GuestVa, end: GuestVa) -> Option<Self> {
+        (start.0 < end.0).then_some(Self {
+            start,
+            len: end.0.saturating_sub(start.0) as usize,
+        })
+    }
+
+    #[inline]
+    pub const fn from_len(start: GuestVa, len: usize) -> Self {
         Self { start, len }
     }
 
@@ -175,6 +183,16 @@ impl GuestVaRange {
     }
 
     #[inline]
+    pub fn from_bounds(start: GuestVa, end: GuestVa) -> Option<Self> {
+        Self::new(start, end)
+    }
+
+    #[inline]
+    pub const fn end(self) -> GuestVa {
+        self.end_va()
+    }
+
+    #[inline]
     pub const fn end_raw(self) -> u64 {
         self.start.0.saturating_add(self.len as u64)
     }
@@ -182,6 +200,13 @@ impl GuestVaRange {
     #[inline]
     pub const fn end_va(self) -> GuestVa {
         GuestVa(self.end_raw())
+    }
+
+    #[inline]
+    pub fn overlap_bytes(self, start: u64, end: u64) -> u64 {
+        let lo = self.start.0.max(start);
+        let hi = self.end_raw().min(end);
+        hi.saturating_sub(lo)
     }
 
     #[inline]

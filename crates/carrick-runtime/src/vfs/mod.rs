@@ -441,8 +441,8 @@ pub trait Vfs: Send + Sync {
     fn chown(
         &self,
         _path: &str,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        _uid: Option<carrick_abi::NsUid>,
+        _gid: Option<carrick_abi::NsGid>,
         _nofollow: bool,
     ) -> Result<(), VfsError> {
         Err(crate::linux_abi::LINUX_EROFS)
