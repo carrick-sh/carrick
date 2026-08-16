@@ -5678,7 +5678,13 @@ impl SyscallDispatcher {
     /// overwhelming majority of guests run as root, so this returns immediately.
     fn check_search_access(&self, abs: &str) -> Result<(), LinuxErrno> {
         let creds = self.cred_snapshot();
-        if creds.euid.is_root() {
+        // fsuid, not euid: setfsuid(2) moves every file-access check onto the
+        // fsuid, and capabilities(7) drops CAP_DAC_READ_SEARCH on an fsuid
+        // 0 -> nonzero transition. This function already selected its
+        // permission class from `creds.fsuid` below while bypassing on
+        // `creds.euid` — two identities in one check, so a process that had
+        // dropped only its fsuid searched as root.
+        if creds.fsuid.is_root() {
             return Ok(());
         }
         let trimmed = abs.trim_end_matches('/');
@@ -5723,7 +5729,8 @@ impl SyscallDispatcher {
 
     fn check_directory_search_access(&self, abs: &str) -> Result<(), LinuxErrno> {
         let creds = self.cred_snapshot();
-        if creds.euid.is_root() {
+        // fsuid — same rule as `check_search_access`.
+        if creds.fsuid.is_root() {
             return Ok(());
         }
         let md = self.layered_metadata(abs)?;
