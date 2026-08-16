@@ -385,6 +385,28 @@ dead ends, so every change is judged against those two first and against
 elegance, generality or effort saved second. Overhead is not a "later"
 concern — it is half the product.
 
+**The two gates are ORDERED, and pathology is a correctness signal.** The
+owner's ranking is explicit: reach 100% conformance first, then get within 2x of
+Docker; going sub-1x is welcome but is never the thing to chase first. The
+corollary is the useful part — **a pathological ratio is evidence of an INCORRECT
+implementation, not merely a slow one.** When a suite runs 30-50x the oracle,
+look for the wrong algorithm, not a tuning knob: `ltp-munmap04` at 47x and
+`ltp-mmap18` at 34x COMPLETE, so they are not hangs — carrick is doing
+structurally wrong work per operation. Treat that as a bug hunt with a
+correctness fix at the end of it.
+
+**Read a conformance perf ratio with the timeout budget in hand.** A hung suite
+reports as spectacularly "slow" because it sits on its deadline: on the
+2026-08-16 run the ten worst ratios (cpython-mmap 490x, context 297x,
+tracemalloc 212x, ...) were all exactly 300.3 s — the suite budget — and a second
+tier at exactly 30.5 s was LTP's own internal timeout. Excluding timeouts moved
+the picture from a misleading 2.53x MEAN to a 0.94x MEDIAN, with 88.3% of suites
+inside the 2x bar and LTP aggregating at 1.11x. So: fixing a hang removes a
+"490x" row, and quoting the raw ratio of a timed-out suite as a performance
+number is simply wrong. (That whole dataset also ran 8 workers on a 10-core
+host, which makes every number contention-inflated and therefore a hypothesis,
+never a controlled measurement.)
+
 - **The overhead bar is WITHIN 2x of native-arm64 Docker** on the same workload.
   That is the number to rank against. As of 2026-08-01 the native lane was
   **~14.5x** on the cold go-build; **as of 2026-08-07** (the Move-3 campaign's
