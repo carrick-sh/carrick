@@ -41,6 +41,10 @@ parking_lot_core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# Deferred-COW receipt bookkeeping reports which repointer voided which
+# receipt; a stale receipt failing its authentication is only ever visible to
+# the guest as `mmap` -> MAP_FAILED, so the backend has to say so itself.
+tracing.workspace = true
 usdt.workspace = true
 zerocopy.workspace = true
 
