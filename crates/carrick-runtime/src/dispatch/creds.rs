@@ -40,6 +40,7 @@
 //! dispatcher struct and the normalized dispatch table.
 use super::*;
 use crate::linux_abi::LinuxErrno;
+use carrick_abi::{NsGid, NsUid};
 
 syscall_table! {
     /// Per-module syscall routing for the `creds` subsystem (Task A1).
@@ -96,7 +97,7 @@ enum PrioTarget {
     /// Another live carrick guest process, carrying its published effective uid
     /// (root/0 when the peer hasn't published — the conservative reading for the
     /// container init, which is root and never drops privilege).
-    Other { euid: u32 },
+    Other { euid: NsUid },
     /// No such process — ESRCH.
     NotFound,
 }
@@ -123,7 +124,7 @@ fn resolve_prio_process_target<M: GuestMemory>(cx: &SyscallCtx<'_, M>, who: i32)
     }
     match crate::namespace::pid::ns_to_host_or_self(who as u32) {
         Some(h) if crate::host_proc::is_guest_process(h) => PrioTarget::Other {
-            euid: crate::cred_ipc::read_target(h as i32).unwrap_or(0),
+            euid: crate::cred_ipc::read_target(h as i32).unwrap_or(NsUid::ROOT),
         },
         _ => PrioTarget::NotFound,
     }
@@ -134,9 +135,14 @@ fn resolve_prio_process_target<M: GuestMemory>(cx: &SyscallCtx<'_, M>, who: i32)
 /// "keep", any other value as a concrete id. (The old `arg as i64 != -1` check
 /// was wrong: 0xFFFFFFFF as i64 is 4294967295, never -1, so a `-1` arg was
 /// treated as a real uid 4294967295.)
-fn keep_or(arg: u64) -> Option<u32> {
+fn keep_or_uid(arg: u64) -> Option<NsUid> {
     let v = arg as u32;
-    if v == u32::MAX { None } else { Some(v) }
+    if v == u32::MAX { None } else { Some(NsUid(v)) }
+}
+
+fn keep_or_gid(arg: u64) -> Option<NsGid> {
+    let v = arg as u32;
+    if v == u32::MAX { None } else { Some(NsGid(v)) }
 }
 
 /// Linux set*id transition rules (kernel/sys.c). Each returns `Err(())` ⇒ the
@@ -145,16 +151,16 @@ fn keep_or(arg: u64) -> Option<u32> {
 mod setid {
     /// setresuid/setresgid: when unprivileged, every non-(-1) target id must
     /// already be one of {real, effective, saved}; privileged sets anything.
-    pub(super) fn setres(
+    pub(super) fn setres<T: Copy + Eq>(
         privileged: bool,
-        cur: (u32, u32, u32),
-        r: Option<u32>,
-        e: Option<u32>,
-        s: Option<u32>,
-    ) -> Result<(u32, u32, u32), ()> {
+        cur: (T, T, T),
+        r: Option<T>,
+        e: Option<T>,
+        s: Option<T>,
+    ) -> Result<(T, T, T), ()> {
         let (mut real, mut eff, mut saved) = cur;
         if !privileged {
-            let allowed = |id: u32| id == real || id == eff || id == saved;
+            let allowed = |id: T| id == real || id == eff || id == saved;
             for id in [r, e, s].into_iter().flatten() {
                 if !allowed(id) {
                     return Err(());
@@ -176,12 +182,12 @@ mod setid {
     /// setreuid/setregid + the saved-id rule. Unprivileged: new real ∈
     /// {real, eff}; new eff ∈ {real, eff, saved}. If real is changed, OR eff is
     /// set to a value != the PREVIOUS real, the saved id becomes the new eff.
-    pub(super) fn setre(
+    pub(super) fn setre<T: Copy + Eq>(
         privileged: bool,
-        cur: (u32, u32, u32),
-        r: Option<u32>,
-        e: Option<u32>,
-    ) -> Result<(u32, u32, u32), ()> {
+        cur: (T, T, T),
+        r: Option<T>,
+        e: Option<T>,
+    ) -> Result<(T, T, T), ()> {
         let (old_real, old_eff, old_saved) = cur;
         if !privileged {
             if let Some(nr) = r
@@ -210,11 +216,11 @@ mod setid {
 
     /// setuid/setgid. Privileged sets real=eff=saved=u. Unprivileged: u must be
     /// the real or saved id, and only the EFFECTIVE id changes.
-    pub(super) fn set(
+    pub(super) fn set<T: Copy + Eq>(
         privileged: bool,
-        cur: (u32, u32, u32),
-        u: u32,
-    ) -> Result<(u32, u32, u32), ()> {
+        cur: (T, T, T),
+        u: T,
+    ) -> Result<(T, T, T), ()> {
         let (real, _eff, saved) = cur;
         if privileged {
             return Ok((u, u, u));
@@ -332,15 +338,15 @@ impl SyscallDispatcher {
     fn supplementary_groups_from_files(
         &self,
         credentials: &crate::kernel::Credentials,
-    ) -> Vec<u32> {
+    ) -> Vec<NsGid> {
         let c = credentials;
         let (euid, egid) = (c.euid, c.egid);
-        let mut gids: Vec<u32> = vec![egid];
+        let mut gids: Vec<NsGid> = vec![egid];
         // uid -> username via /etc/passwd (name:passwd:uid:gid:...).
         let username = self.read_exec_file("/etc/passwd").and_then(|b| {
             String::from_utf8_lossy(&b).lines().find_map(|line| {
                 let f: Vec<&str> = line.split(':').collect();
-                if f.len() >= 3 && f[2].parse::<u32>().ok() == Some(euid) {
+                if f.len() >= 3 && f[2].parse::<u32>().ok() == Some(euid.raw()) {
                     Some(f[0].to_string())
                 } else {
                     None
@@ -357,6 +363,7 @@ impl SyscallDispatcher {
                 let Ok(gid) = f[2].parse::<u32>() else {
                     continue;
                 };
+                let gid = NsGid::new(gid);
                 if !gids.contains(&gid) && f[3].split(',').any(|m| !m.is_empty() && m == user) {
                     gids.push(gid);
                 }
@@ -365,7 +372,7 @@ impl SyscallDispatcher {
         gids
     }
 
-    pub(super) fn current_groups(&self) -> Vec<u32> {
+    pub(super) fn current_groups(&self) -> Vec<NsGid> {
         let credentials = self.cred_snapshot();
         match credentials.supplementary_groups_override() {
             Some(groups) => groups.to_vec(),
@@ -540,7 +547,7 @@ impl SyscallDispatcher {
                     // affect a process whose euid matches its own (setpriority02
                     // case 6 — `nobody` targeting init/root).
                     PrioTarget::Other { euid: target_euid }
-                        if euid != 0 && euid != target_euid =>
+                        if !euid.is_root() && euid != target_euid =>
                     {
                         return Ok(DispatchOutcome::errno(LINUX_EPERM));
                     }
@@ -563,7 +570,7 @@ impl SyscallDispatcher {
             // CAP_SYS_NICE, so an unprivileged caller gets EACCES (setpriority02
             // cases 4 and 5). EPERM (above) is target-ownership; EACCES is the
             // privilege to raise one's own priority.
-            if clamped < NICE_VALUE.load(Ordering::Relaxed) && euid != 0 {
+            if clamped < NICE_VALUE.load(Ordering::Relaxed) && !euid.is_root() {
                 return Ok(DispatchOutcome::errno(LINUX_EACCES));
             }
             if which == LINUX_PRIO_PROCESS {
@@ -610,7 +617,9 @@ impl SyscallDispatcher {
             let (ruid, euid, suid) = match setid::setres(
                 current.is_privileged(),
                 (current.ruid, current.euid, current.suid),
-                keep_or(r), keep_or(e), keep_or(s),
+                keep_or_uid(r),
+                keep_or_uid(e),
+                keep_or_uid(s),
             ) {
                 Ok(values) => values,
                 Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
@@ -627,7 +636,9 @@ impl SyscallDispatcher {
             let (rgid, egid, sgid) = match setid::setres(
                 current.is_privileged(),
                 (current.rgid, current.egid, current.sgid),
-                keep_or(r), keep_or(e), keep_or(s),
+                keep_or_gid(r),
+                keep_or_gid(e),
+                keep_or_gid(s),
             ) {
                 Ok(values) => values,
                 Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
@@ -642,7 +653,9 @@ impl SyscallDispatcher {
             let current = this.cred_snapshot();
             let (ruid, euid, suid) = match setid::setre(
                 current.is_privileged(),
-                (current.ruid, current.euid, current.suid), keep_or(r), keep_or(e),
+                (current.ruid, current.euid, current.suid),
+                keep_or_uid(r),
+                keep_or_uid(e),
             ) {
                 Ok(values) => values,
                 Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
@@ -658,7 +671,9 @@ impl SyscallDispatcher {
             let current = this.cred_snapshot();
             let (rgid, egid, sgid) = match setid::setre(
                 current.is_privileged(),
-                (current.rgid, current.egid, current.sgid), keep_or(r), keep_or(e),
+                (current.rgid, current.egid, current.sgid),
+                keep_or_gid(r),
+                keep_or_gid(e),
             ) {
                 Ok(values) => values,
                 Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
@@ -672,7 +687,9 @@ impl SyscallDispatcher {
         fn setuid(this, cx, u: u64) {
             let current = this.cred_snapshot();
             let (ruid, euid, suid) = match setid::set(
-                current.is_privileged(), (current.ruid, current.euid, current.suid), u as u32,
+                current.is_privileged(),
+                (current.ruid, current.euid, current.suid),
+                NsUid::new(u as u32),
             ) {
                 Ok(values) => values,
                 Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
@@ -687,7 +704,9 @@ impl SyscallDispatcher {
         fn setgid(this, cx, g: u64) {
             let current = this.cred_snapshot();
             let (rgid, egid, sgid) = match setid::set(
-                current.is_privileged(), (current.rgid, current.egid, current.sgid), g as u32,
+                current.is_privileged(),
+                (current.rgid, current.egid, current.sgid),
+                NsGid::new(g as u32),
             ) {
                 Ok(values) => values,
                 Err(()) => return Ok(DispatchOutcome::errno(LINUX_EPERM)),
@@ -708,7 +727,7 @@ impl SyscallDispatcher {
                 if ptr.0 == 0 {
                     continue;
                 }
-                cx.memory.write_bytes(ptr.0, &value.to_le_bytes())?;
+                cx.memory.write_bytes(ptr.0, &value.raw().to_le_bytes())?;
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -723,7 +742,7 @@ impl SyscallDispatcher {
                 if ptr.0 == 0 {
                     continue;
                 }
-                cx.memory.write_bytes(ptr.0, &value.to_le_bytes())?;
+                cx.memory.write_bytes(ptr.0, &value.raw().to_le_bytes())?;
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -748,7 +767,7 @@ impl SyscallDispatcher {
             }
             let mut bytes = Vec::with_capacity(groups.len() * 4);
             for g in &groups {
-                bytes.extend_from_slice(&g.to_le_bytes());
+                bytes.extend_from_slice(&g.raw().to_le_bytes());
             }
             cx.memory.write_bytes(list.0, &bytes)?;
             Ok(DispatchOutcome::Returned {
@@ -759,33 +778,41 @@ impl SyscallDispatcher {
         fn sys_setfsuid(this, cx, uid: u64) {
             let current = this.cred_snapshot();
             let previous = current.fsuid;
-            let uid = uid as u32;
-            if uid != u32::MAX
-                && (current.is_privileged()
+            let raw_uid = uid as u32;
+            if raw_uid != u32::MAX {
+                let uid = NsUid::new(raw_uid);
+                if (current.is_privileged()
                     || uid == current.ruid
                     || uid == current.euid
                     || uid == current.suid)
-                && uid != current.fsuid
-            {
-                this.update_credentials(cx.kernel, |credentials| credentials.set_fsuid(uid))?;
+                    && uid != current.fsuid
+                {
+                    this.update_credentials(cx.kernel, |credentials| credentials.set_fsuid(uid))?;
+                }
             }
-            Ok(DispatchOutcome::Returned { value: i64::from(previous) })
+            Ok(DispatchOutcome::Returned {
+                value: i64::from(previous.raw()),
+            })
         }
 
         fn sys_setfsgid(this, cx, gid: u64) {
             let current = this.cred_snapshot();
             let previous = current.fsgid;
-            let gid = gid as u32;
-            if gid != u32::MAX
-                && (current.is_privileged()
+            let raw_gid = gid as u32;
+            if raw_gid != u32::MAX {
+                let gid = NsGid::new(raw_gid);
+                if (current.is_privileged()
                     || gid == current.rgid
                     || gid == current.egid
                     || gid == current.sgid)
-                && gid != current.fsgid
-            {
-                this.update_credentials(cx.kernel, |credentials| credentials.set_fsgid(gid))?;
+                    && gid != current.fsgid
+                {
+                    this.update_credentials(cx.kernel, |credentials| credentials.set_fsgid(gid))?;
+                }
             }
-            Ok(DispatchOutcome::Returned { value: i64::from(previous) })
+            Ok(DispatchOutcome::Returned {
+                value: i64::from(previous.raw()),
+            })
         }
 
         fn sys_setgroups(this, cx, size: u64, list: GuestPtr) {
@@ -794,7 +821,7 @@ impl SyscallDispatcher {
             // EPERM (setgroups03). This precedes the size/EFAULT checks, matching
             // the kernel's ordering (the EPERM case runs as `nobody`, the EINVAL
             // and EFAULT cases as root).
-            if this.cred_snapshot().euid != 0 {
+            if !this.cred_snapshot().euid.is_root() {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             // Linux caps the supplementary set at NGROUPS_MAX (65536).
@@ -807,7 +834,9 @@ impl SyscallDispatcher {
             if n > 0 {
                 let bytes = cx.memory.read_bytes(list.0, n * 4)?;
                 for chunk in bytes.chunks_exact(4) {
-                    groups.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                    groups.push(NsGid::new(u32::from_le_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3],
+                    ])));
                 }
             }
             // Replace the whole supplementary set (Linux semantics): getgroups
@@ -863,28 +892,28 @@ impl SyscallDispatcher {
         fn sys_getuid(this, cx) {
             let creds = this.cred_snapshot();
             Ok(DispatchOutcome::Returned {
-                value: i64::from(creds.ruid),
+                value: i64::from(creds.ruid.raw()),
             })
         }
 
         fn sys_geteuid(this, cx) {
             let creds = this.cred_snapshot();
             Ok(DispatchOutcome::Returned {
-                value: i64::from(creds.euid),
+                value: i64::from(creds.euid.raw()),
             })
         }
 
         fn sys_getgid(this, cx) {
             let creds = this.cred_snapshot();
             Ok(DispatchOutcome::Returned {
-                value: i64::from(creds.rgid),
+                value: i64::from(creds.rgid.raw()),
             })
         }
 
         fn sys_getegid(this, cx) {
             let creds = this.cred_snapshot();
             Ok(DispatchOutcome::Returned {
-                value: i64::from(creds.egid),
+                value: i64::from(creds.egid.raw()),
             })
         }
     }
@@ -1137,7 +1166,10 @@ mod identity_snapshot_tests {
         assert_eq!(id.pid, crate::namespace::pid::self_ns_pid());
         // Credentials remain Kernel authority and are deliberately absent from
         // the shared process identity page.
-        assert_eq!((c.ruid, c.euid, c.rgid, c.egid), (0, 0, 0, 0));
+        assert_eq!(
+            (c.ruid, c.euid, c.rgid, c.egid),
+            (NsUid::ROOT, NsUid::ROOT, NsGid::ROOT, NsGid::ROOT)
+        );
     }
 
     #[test]
@@ -1167,7 +1199,7 @@ mod identity_snapshot_tests {
                 .resources()
                 .credentials()
                 .supplementary_groups_override(),
-            Some([9, 10].as_slice())
+            Some([NsGid::new(9), NsGid::new(10)].as_slice())
         );
         let outcome = dispatcher
             .dispatch(

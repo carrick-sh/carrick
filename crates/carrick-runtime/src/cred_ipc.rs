@@ -30,6 +30,8 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use carrick_abi::{HostUid, NsUid};
+
 const CRED_DIR: &str = "/tmp";
 
 /// Cached `(host_pid, euid)` publication; including the host PID keeps a
@@ -41,13 +43,13 @@ fn cred_path(pid: i32) -> PathBuf {
     PathBuf::from(CRED_DIR).join(format!("carrick-cred-{pid}"))
 }
 
-fn publication_key(host_pid: u32, euid: u32) -> u64 {
-    (u64::from(host_pid) << 32) | u64::from(euid)
+fn publication_key(host_pid: u32, euid: NsUid) -> u64 {
+    (u64::from(host_pid) << 32) | u64::from(euid.raw())
 }
 
 /// Write `euid` to the current process's cred file. Idempotent + cheap on
 /// the unchanged path.
-pub fn publish_self(euid: u32) {
+pub fn publish_self(euid: NsUid) {
     let host_pid = std::process::id();
     let publication = publication_key(host_pid, euid);
     if LAST_PUBLISHED.swap(publication, Ordering::Relaxed) == publication {
@@ -58,7 +60,7 @@ pub fn publish_self(euid: u32) {
     // reader catching us mid-write either sees the old contents (rename
     // not yet committed) or the new ones, never a partial.
     let tmp = path.with_extension("tmp");
-    let bytes = euid.to_le_bytes();
+    let bytes = euid.raw().to_le_bytes();
     // Create the tmp file 0600 (owner-only) with O_NOFOLLOW so a pre-planted
     // symlink at <tmp> makes the open fail (ELOOP) rather than following it.
     // We own the host uid in /tmp and the name is per-pid, so this is
@@ -83,14 +85,14 @@ pub fn publish_self(euid: u32) {
 /// the owner / permission / staleness guards below. Falling to `None` is
 /// always safe: the kill(2) caller then takes the conservative ALLOW path,
 /// so kill conformance is byte-for-byte unchanged.
-pub fn read_target(pid: i32) -> Option<u32> {
+pub fn read_target(pid: i32) -> Option<NsUid> {
     use std::os::unix::fs::MetadataExt as _;
     let path = cred_path(pid);
     let meta = std::fs::metadata(&path).ok()?;
     // Owner guard: only trust a cred file written by THIS host process's uid.
     // Guest set*id is virtualized, so legit files are always our uid.
-    let our_uid = unsafe { libc::getuid() };
-    if meta.uid() != our_uid {
+    let our_uid = HostUid::new(unsafe { libc::getuid() });
+    if HostUid::new(meta.uid()) != our_uid {
         return None;
     }
     // Reject a group/other-writable (tampered/forged) cred file.
@@ -111,7 +113,9 @@ pub fn read_target(pid: i32) -> Option<u32> {
     if bytes.len() < 4 {
         return None;
     }
-    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    Some(NsUid::new(u32::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3],
+    ])))
 }
 
 /// Remove our cred file on process exit. Best-effort.
@@ -123,10 +127,17 @@ pub fn unpublish() {
 #[cfg(test)]
 mod tests {
     use super::publication_key;
+    use carrick_abi::NsUid;
 
     #[test]
     fn publication_cache_key_distinguishes_forked_host_processes() {
-        assert_ne!(publication_key(41, 1000), publication_key(42, 1000));
-        assert_ne!(publication_key(41, 1000), publication_key(41, 1001));
+        assert_ne!(
+            publication_key(41, NsUid::new(1000)),
+            publication_key(42, NsUid::new(1000))
+        );
+        assert_ne!(
+            publication_key(41, NsUid::new(1000)),
+            publication_key(41, NsUid::new(1001))
+        );
     }
 }

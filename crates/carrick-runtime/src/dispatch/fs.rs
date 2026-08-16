@@ -2114,7 +2114,7 @@ impl SyscallDispatcher {
             && !want_trunc
             && !writable_request
             && open_flags.contains(LinuxOpenFlags::DIRECTORY)
-            && self.cred_snapshot().euid == 0
+            && self.cred_snapshot().euid.is_root()
             && let Some(outcome) = self.try_open_trusted_dir(&path, flags)
         {
             return Ok(outcome);
@@ -2204,9 +2204,9 @@ impl SyscallDispatcher {
         // not-yet-existent O_CREAT target has no owner to compare against.
         if open_flags.contains(LinuxOpenFlags::NOATIME) {
             let creds = self.cred_snapshot();
-            if creds.euid != 0
+            if !creds.euid.is_root()
                 && let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, true)
-                && real.uid != creds.euid
+                && real.uid != creds.euid.raw()
             {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
@@ -2445,10 +2445,10 @@ impl SyscallDispatcher {
                         && pmd.mode & 0o2000 != 0
                         && let Some((_, pgid)) = self.fs.rootfs_vfs.overlay.get_owner(&parent_str)
                     {
-                        create_gid = pgid;
+                        create_gid = carrick_abi::NsGid::new(pgid);
                     }
                 }
-                let stamp_owner = create_uid != 0 || create_gid != 0;
+                let stamp_owner = !create_uid.is_root() || !create_gid.is_root();
                 if let Some(host_fd) = self
                     .fs
                     .rootfs_vfs
@@ -2460,11 +2460,11 @@ impl SyscallDispatcher {
                     // guest-requested mode onto the new file.
                     let _ = self.fs.rootfs_vfs.overlay.set_mode(&path, create_mode);
                     if stamp_owner {
-                        let _ = self
-                            .fs
-                            .rootfs_vfs
-                            .overlay
-                            .set_owner(&path, create_uid, create_gid);
+                        let _ = self.fs.rootfs_vfs.overlay.set_owner(
+                            &path,
+                            create_uid.raw(),
+                            create_gid.raw(),
+                        );
                     }
                     OpenDescription::HostFile {
                         host_fd: HostFdRef::new(host_fd),
@@ -2483,11 +2483,11 @@ impl SyscallDispatcher {
                     }
                     let _ = self.fs.rootfs_vfs.overlay.set_mode(&path, create_mode);
                     if stamp_owner {
-                        let _ = self
-                            .fs
-                            .rootfs_vfs
-                            .overlay
-                            .set_owner(&path, create_uid, create_gid);
+                        let _ = self.fs.rootfs_vfs.overlay.set_owner(
+                            &path,
+                            create_uid.raw(),
+                            create_gid.raw(),
+                        );
                     }
                     OpenDescription::File {
                         path,
@@ -2633,7 +2633,7 @@ impl SyscallDispatcher {
         if !trusted_fs_lane_enabled()
             || dirfd != LINUX_AT_FDCWD
             || !path.starts_with('/')
-            || self.cred_snapshot().euid != 0
+            || !self.cred_snapshot().euid.is_root()
             || !self.fs.inotify_registry.is_empty()
         {
             return None;
@@ -2813,7 +2813,7 @@ impl SyscallDispatcher {
         // inotify watches need the slow path's IN_OPEN bookkeeping; a
         // non-root euid needs its DAC checks (root — the overwhelming
         // default — bypasses both DAC and search permission).
-        if !self.fs.inotify_registry.is_empty() || self.cred_snapshot().euid != 0 {
+        if !self.fs.inotify_registry.is_empty() || !self.cred_snapshot().euid.is_root() {
             return None;
         }
         let access = flags & LINUX_O_ACCMODE;
@@ -3026,7 +3026,7 @@ impl SyscallDispatcher {
                 // directory would expose unrelated APFS identity instead.
                 return None;
             }
-            if self.cred_snapshot().euid != 0 {
+            if !self.cred_snapshot().euid.is_root() {
                 return None;
             }
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -3073,7 +3073,7 @@ impl SyscallDispatcher {
         }
         let full = self.trusted_child_path(&dir_path, name)?;
         // A non-root euid needs the ancestor search-permission checks.
-        if self.cred_snapshot().euid != 0 {
+        if !self.cred_snapshot().euid.is_root() {
             return None;
         }
         let name_c = std::ffi::CString::new(name).ok()?;
@@ -5672,7 +5672,7 @@ impl SyscallDispatcher {
     /// overwhelming majority of guests run as root, so this returns immediately.
     fn check_search_access(&self, abs: &str) -> Result<(), LinuxErrno> {
         let creds = self.cred_snapshot();
-        if creds.euid == 0 {
+        if creds.euid.is_root() {
             return Ok(());
         }
         let trimmed = abs.trim_end_matches('/');
@@ -5701,9 +5701,9 @@ impl SyscallDispatcher {
             // Pick the permission class: owner, then group, else other. (carrick
             // tracks the primary fsgid, not the full supplementary set — a close
             // approximation that the LTP search-permission cases exercise.)
-            let x_bit = if creds.fsuid == uid {
+            let x_bit = if creds.fsuid.raw() == uid {
                 0o100
-            } else if creds.fsgid == gid {
+            } else if creds.fsgid.raw() == gid {
                 0o010
             } else {
                 0o001
@@ -5717,7 +5717,7 @@ impl SyscallDispatcher {
 
     fn check_directory_search_access(&self, abs: &str) -> Result<(), LinuxErrno> {
         let creds = self.cred_snapshot();
-        if creds.euid == 0 {
+        if creds.euid.is_root() {
             return Ok(());
         }
         let md = self.layered_metadata(abs)?;
@@ -5725,9 +5725,9 @@ impl SyscallDispatcher {
             return Ok(());
         }
         let (uid, gid) = self.fs.rootfs_vfs.overlay.get_owner(abs).unwrap_or((0, 0));
-        let x_bit = if creds.fsuid == uid {
+        let x_bit = if creds.fsuid.raw() == uid {
             0o100
-        } else if creds.fsgid == gid {
+        } else if creds.fsgid.raw() == gid {
             0o010
         } else {
             0o001
@@ -6068,7 +6068,7 @@ impl SyscallDispatcher {
             return mode;
         }
         let creds = self.cred_snapshot();
-        if creds.euid == 0 {
+        if creds.euid.is_root() {
             return mode;
         }
         let file_gid = self
@@ -6078,7 +6078,7 @@ impl SyscallDispatcher {
             .get_owner(path)
             .map(|(_, g)| g)
             .unwrap_or(0);
-        if file_gid != creds.egid {
+        if file_gid != creds.egid.raw() {
             return mode & !S_ISGID;
         }
         mode
@@ -6107,7 +6107,7 @@ impl SyscallDispatcher {
                 && pmd.mode & S_ISGID != 0
                 && let Some((_, pgid)) = self.fs.rootfs_vfs.overlay.get_owner(&parent_str)
             {
-                owner_gid = pgid;
+                owner_gid = carrick_abi::NsGid::new(pgid);
                 inherited_gid = true;
                 let _ = self
                     .fs
@@ -6116,24 +6116,24 @@ impl SyscallDispatcher {
                     .set_mode(path, node_mode | S_ISGID);
             }
         }
-        if creds.euid != 0 || owner_gid != 0 || inherited_gid {
+        if !creds.euid.is_root() || !owner_gid.is_root() || inherited_gid {
             let _ = self
                 .fs
                 .rootfs_vfs
                 .overlay
-                .set_owner(path, creds.euid, owner_gid);
+                .set_owner(path, creds.euid.raw(), owner_gid.raw());
         }
     }
 
     fn chown_permission_errno(&self, uid: Option<u32>, gid: Option<u32>) -> Option<LinuxErrno> {
         let creds = self.cred_snapshot();
-        if creds.euid == 0 {
+        if creds.euid.is_root() {
             return None;
         }
         if uid.is_some() {
             return Some(LINUX_EPERM);
         }
-        if gid.is_some_and(|gid| gid != creds.egid) {
+        if gid.is_some_and(|gid| gid != creds.egid.raw()) {
             return Some(LINUX_EPERM);
         }
         None
@@ -6147,11 +6147,11 @@ impl SyscallDispatcher {
     /// elsewhere on that backend (and mirroring `maybe_clear_setgid`'s lookup).
     fn chmod_permission_errno(&self, path: &str) -> Option<LinuxErrno> {
         let creds = self.cred_snapshot();
-        if creds.euid == 0 {
+        if creds.euid.is_root() {
             return None;
         }
         match self.fs.rootfs_vfs.overlay.get_owner(path) {
-            Some((owner_uid, _)) if owner_uid != creds.euid => Some(LINUX_EPERM),
+            Some((owner_uid, _)) if owner_uid != creds.euid.raw() => Some(LINUX_EPERM),
             _ => None,
         }
     }
@@ -6267,7 +6267,7 @@ impl SyscallDispatcher {
     /// apt/python demos) is unaffected.
     fn guest_can_modify_dir(&self, dir_path: &str) -> bool {
         let creds = self.cred_snapshot();
-        if creds.euid == 0 {
+        if creds.euid.is_root() {
             return true;
         }
         let Ok(md) = self.layered_metadata(dir_path) else {
@@ -6280,9 +6280,9 @@ impl SyscallDispatcher {
             .overlay
             .get_owner(dir_path)
             .unwrap_or((0, 0));
-        let class_bits = if creds.fsuid == ouid {
+        let class_bits = if creds.fsuid.raw() == ouid {
             mode >> 6
-        } else if creds.fsgid == ogid {
+        } else if creds.fsgid.raw() == ogid {
             mode >> 3
         } else {
             mode
@@ -6299,7 +6299,7 @@ impl SyscallDispatcher {
     fn guest_sticky_delete_ok(&self, dir_path: &str, entry_path: &str) -> bool {
         const S_ISVTX: u32 = 0o1000;
         let creds = self.cred_snapshot();
-        if creds.euid == 0 {
+        if creds.euid.is_root() {
             return true;
         }
         let Ok(md) = self.layered_metadata(dir_path) else {
@@ -6316,7 +6316,7 @@ impl SyscallDispatcher {
             .get_owner(entry_path)
             .map(|o| o.0);
         // Allowed only if the caller owns the entry or the directory.
-        entry_owner == Some(creds.fsuid) || dir_owner == Some(creds.fsuid)
+        entry_owner == Some(creds.fsuid.raw()) || dir_owner == Some(creds.fsuid.raw())
     }
 }
 
@@ -6460,7 +6460,7 @@ impl SyscallDispatcher {
             // chroot(2) requires CAP_SYS_CHROOT. carrick models the capability
             // set as "effective uid 0"; a guest that has dropped to a non-root
             // euid no longer holds it (chroot01 expects EPERM).
-            if this.cred_snapshot().euid != 0 {
+            if !this.cred_snapshot().euid.is_root() {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             // The request is valid and we accept it. Full per-process root
@@ -6495,7 +6495,7 @@ impl SyscallDispatcher {
                     // EACCES (fchdir03); root (euid 0) bypasses via
                     // CAP_DAC_OVERRIDE.
                     let creds = this.cred_snapshot();
-                    if creds.euid != 0
+                    if !creds.euid.is_root()
                         && let Some(real) =
                             this.fs.rootfs_vfs.overlay.real_stat(&dir_path, true)
                         && crate::dispatch::dac_check(
@@ -11900,8 +11900,8 @@ impl SyscallDispatcher {
                     Ok(()) => {
                         let _ = m.vfs.chown(
                             &m.full_path,
-                            Some(creds.euid),
-                            Some(creds.egid),
+                            Some(creds.euid.raw()),
+                            Some(creds.egid.raw()),
                             false,
                         );
                         // inotify IN_CREATE|IN_ISDIR on the parent dir watch.
@@ -11949,7 +11949,7 @@ impl SyscallDispatcher {
                             if let Some((_, pgid)) =
                                 this.fs.rootfs_vfs.overlay.get_owner(&parent_str)
                             {
-                                owner_gid = pgid;
+                                owner_gid = carrick_abi::NsGid::new(pgid);
                                 inherited_gid = true;
                             }
                         }
@@ -11958,12 +11958,12 @@ impl SyscallDispatcher {
                     // Stamp the owner when it's non-root OR the gid was inherited
                     // from a setgid parent (so a root-created dir still records the
                     // inherited group).
-                    if creds.euid != 0 || owner_gid != 0 || inherited_gid {
+                    if !creds.euid.is_root() || !owner_gid.is_root() || inherited_gid {
                         let _ = this
                             .fs
                             .rootfs_vfs
                             .overlay
-                            .set_owner(&resolved, creds.euid, owner_gid);
+                            .set_owner(&resolved, creds.euid.raw(), owner_gid.raw());
                     }
                     // inotify IN_CREATE|IN_ISDIR on the parent dir watch.
                     this.inotify_child(&resolved, carrick_abi::LINUX_IN_CREATE, true);

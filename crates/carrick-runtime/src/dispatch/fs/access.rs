@@ -66,7 +66,7 @@ impl SyscallDispatcher {
         }
         self.trusted_child_path(&dir_path, name)?;
         // access(2) checks the REAL ids; mirror `fast_root_f_ok_absolute`.
-        if self.cred_snapshot().ruid != 0 {
+        if !self.cred_snapshot().ruid.is_root() {
             return None;
         }
         let name_c = std::ffi::CString::new(name).ok()?;
@@ -110,7 +110,7 @@ impl SyscallDispatcher {
         {
             return None;
         }
-        if self.cred_snapshot().ruid != 0 {
+        if !self.cred_snapshot().ruid.is_root() {
             return None;
         }
         self.fs
@@ -197,7 +197,7 @@ impl SyscallDispatcher {
         want_create: bool,
     ) -> Option<LinuxErrno> {
         let creds = self.cred_snapshot();
-        if creds.euid == 0 {
+        if creds.euid.is_root() {
             return None;
         }
         let (uid, gid) = (creds.euid, creds.egid);
@@ -260,7 +260,7 @@ impl SyscallDispatcher {
     /// `resolve_at_path`/`check_search_access`, so this gates only the leaf.
     pub(super) fn may_write(&self, path: &str) -> Option<LinuxErrno> {
         let creds = self.cred_snapshot();
-        if creds.euid == 0 {
+        if creds.euid.is_root() {
             return None;
         }
         let real = self.fs.rootfs_vfs.overlay.real_stat(path, true)?;
@@ -357,7 +357,12 @@ impl SyscallDispatcher {
 
     /// Verify the caller has search (X) permission on every ancestor directory
     /// of `path`. Returns `Some(EACCES)` on the first non-searchable parent.
-    fn dac_ancestors_searchable(&self, path: &str, uid: u32, gid: u32) -> Option<LinuxErrno> {
+    fn dac_ancestors_searchable(
+        &self,
+        path: &str,
+        uid: carrick_abi::NsUid,
+        gid: carrick_abi::NsGid,
+    ) -> Option<LinuxErrno> {
         let p = std::path::Path::new(path);
         // ancestors() yields the path itself first; skip it — we only gate the
         // parent directories.

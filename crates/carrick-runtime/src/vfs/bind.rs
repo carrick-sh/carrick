@@ -485,7 +485,7 @@ impl Vfs for BindVfs {
             }
         }
         if flags.create && !existed_before_create {
-            let _ = write_owner_xattrs(&host, Some(ctx.euid), Some(ctx.egid), false);
+            let _ = write_owner_xattrs(&host, Some(ctx.euid.raw()), Some(ctx.egid.raw()), false);
         }
 
         let status_flags = if flags.nonblock {

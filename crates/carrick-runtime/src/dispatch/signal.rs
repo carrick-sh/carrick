@@ -691,7 +691,7 @@ impl SyscallDispatcher {
             signum,
             crate::linux_abi::LINUX_SI_TKILL,
             crate::namespace::pid::self_ns_pid() as i32,
-            self.cred_snapshot().ruid,
+            self.cred_snapshot().ruid.raw(),
         );
         self.record_pending_siginfo(context, tid, signum, info);
     }
@@ -1179,7 +1179,7 @@ impl SyscallDispatcher {
             signum as i32,
             crate::linux_abi::LINUX_SI_USER,
             caller.key().id.raw(),
-            creds.ruid,
+            creds.ruid.raw(),
         );
         let mut accepted = 0_usize;
         let mut denied = 0_usize;
@@ -1412,7 +1412,7 @@ impl SyscallDispatcher {
                     signum as i32,
                     crate::linux_abi::LINUX_SI_USER,
                     cx.kernel.task().key().id.raw(),
-                    this.cred_snapshot().ruid,
+                    this.cred_snapshot().ruid.raw(),
                 )
             });
             if let Some(outcome) =
@@ -1491,7 +1491,7 @@ impl SyscallDispatcher {
                         // (1 for the init), not its host pid (§5.3). Identity
                         // when namespaces are off.
                         crate::namespace::pid::self_ns_pid() as i32,
-                        this.cred_snapshot().ruid,
+                        this.cred_snapshot().ruid.raw(),
                     );
                     this.record_pending_siginfo(cx.kernel, tid, signum as i32, info);
                 }
@@ -1581,7 +1581,7 @@ impl SyscallDispatcher {
                         signum as i32,
                         crate::linux_abi::LINUX_SI_TKILL,
                         cx.kernel.task().key().id.raw(),
-                        this.cred_snapshot().ruid,
+                        this.cred_snapshot().ruid.raw(),
                     )
                 });
                 return Ok(this
@@ -1625,7 +1625,7 @@ impl SyscallDispatcher {
                         signum as i32,
                         crate::linux_abi::LINUX_SI_TKILL,
                         cx.kernel.task().key().id.raw(),
-                        this.cred_snapshot().ruid,
+                        this.cred_snapshot().ruid.raw(),
                     )
                 });
                 if let Some(outcome) = this.hvpatch_specific_thread_signal(
@@ -2277,7 +2277,7 @@ impl SyscallDispatcher {
                     s,
                     code,
                     sender_ns,
-                    sender_uid,
+                    sender_uid.raw(),
                     value,
                     target_ns_tid,
                 ) {
@@ -2365,8 +2365,9 @@ fn rt_sigtimedwait_deliver(
             let sender_host = crate::host_signal::last_sender_for(signum);
             (sender_host > 0).then(|| {
                 let ns_pid = crate::namespace::pid::host_to_ns_or_self(sender_host as u32) as i32;
-                let uid = crate::cred_ipc::read_target(sender_host).unwrap_or(0);
-                LinuxSiginfo::kill(signum, crate::linux_abi::LINUX_SI_USER, ns_pid, uid)
+                let uid =
+                    crate::cred_ipc::read_target(sender_host).unwrap_or(carrick_abi::NsUid::ROOT);
+                LinuxSiginfo::kill(signum, crate::linux_abi::LINUX_SI_USER, ns_pid, uid.raw())
             })
         });
         let mut si = queued.unwrap_or_else(LinuxSiginfo::empty);
@@ -2546,7 +2547,7 @@ pub(crate) fn bootstrap_signal_send(target: SignalTarget, signum: u64) -> Dispat
 pub(crate) fn bootstrap_signal_send_as(
     target: SignalTarget,
     signum: u64,
-    caller_euid: Option<u32>,
+    caller_euid: Option<carrick_abi::NsUid>,
 ) -> DispatchOutcome {
     if !is_valid_signum(signum) {
         return DispatchOutcome::errno(LINUX_EINVAL);
@@ -2620,7 +2621,7 @@ pub(crate) fn bootstrap_signal_send_as(
     // behaviour for processes outside the published set.
     if let (Some(caller), Some(target_euid)) =
         (caller_euid, crate::cred_ipc::read_target(target as i32))
-        && caller != 0
+        && !caller.is_root()
         && caller != target_euid
     {
         return DispatchOutcome::errno(LINUX_EPERM);
@@ -2647,7 +2648,9 @@ pub(crate) fn bootstrap_signal_send_as(
     let route_xsig = target > 0 && should_route_specific_xsig(target as i32, signum as i32);
     if route_xsig {
         let sender_ns = crate::namespace::pid::self_ns_pid() as i32;
-        let sender_uid = caller_euid.unwrap_or_else(|| unsafe { libc::getuid() });
+        let sender_uid = caller_euid
+            .map(|u| u.raw())
+            .unwrap_or_else(|| unsafe { libc::getuid() });
         // Routing still addresses the ring by host pid (`target`), so
         // cross-process thread-directed delivery only reaches a tid the
         // target process's registry actually has live — in practice this
@@ -3212,10 +3215,11 @@ mod tests {
             .spawn()
             .expect("spawn signal target");
         let child_pid = i64::from(child.id());
-        let target_euid = 2000u32;
+        let target_euid = carrick_abi::NsUid::new(2000);
         let cred_path = std::path::PathBuf::from(format!("/tmp/carrick-cred-{child_pid}"));
         let _ = std::fs::remove_file(&cred_path);
-        std::fs::write(&cred_path, target_euid.to_le_bytes()).expect("publish target guest euid");
+        std::fs::write(&cred_path, target_euid.raw().to_le_bytes())
+            .expect("publish target guest euid");
         let mut permissions = std::fs::metadata(&cred_path)
             .expect("read target cred metadata")
             .permissions();
@@ -3276,10 +3280,11 @@ mod tests {
             .spawn()
             .expect("spawn signal target");
         let child_pid = i64::from(child.id());
-        let target_euid = 2000u32;
+        let target_euid = carrick_abi::NsUid::new(2000);
         let cred_path = std::path::PathBuf::from(format!("/tmp/carrick-cred-{child_pid}"));
         let _ = std::fs::remove_file(&cred_path);
-        std::fs::write(&cred_path, target_euid.to_le_bytes()).expect("publish target guest euid");
+        std::fs::write(&cred_path, target_euid.raw().to_le_bytes())
+            .expect("publish target guest euid");
         let mut permissions = std::fs::metadata(&cred_path)
             .expect("read target cred metadata")
             .permissions();

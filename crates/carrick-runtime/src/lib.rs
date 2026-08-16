@@ -179,7 +179,7 @@ pub use carrick_dsr::address::BIAS_CANDIDATES as NATIVE_HOST_BIAS_CANDIDATES;
 // The guest-virtual address domain the census records are keyed on. Exported
 // beside `xlat_census` so an out-of-crate aggregator keys its sets on the typed
 // address instead of degrading them to `u64` at the crate boundary.
-pub use carrick_guest_mem::GuestVa;
+pub use carrick_guest_mem::{GuestVa, GuestVaRange};
 // guest_cpu/host_facts/host_mapping/host_proc/ulock were lifted into the leaf
 // crate `carrick-host` (Darwin host primitives — machine facts, __ulock, host
 // shared mappings, CPU accounting, libproc introspection; no dispatch/trap/VFS

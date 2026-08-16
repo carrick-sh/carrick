@@ -737,16 +737,19 @@ impl KernelDebugSnapshot {
                     .map(|row| DebugCredentialsRow {
                         id: row.id.raw(),
                         class: row.class.into(),
-                        ruid: row.ruid,
-                        euid: row.euid,
-                        suid: row.suid,
-                        rgid: row.rgid,
-                        egid: row.egid,
-                        sgid: row.sgid,
-                        fsuid: row.fsuid,
-                        fsgid: row.fsgid,
+                        ruid: row.ruid.raw(),
+                        euid: row.euid.raw(),
+                        suid: row.suid.raw(),
+                        rgid: row.rgid.raw(),
+                        egid: row.egid.raw(),
+                        sgid: row.sgid.raw(),
+                        fsuid: row.fsuid.raw(),
+                        fsgid: row.fsgid.raw(),
                         umask: row.umask,
-                        supplementary_groups_override: row.supplementary_groups_override.clone(),
+                        supplementary_groups_override: row
+                            .supplementary_groups_override
+                            .as_ref()
+                            .map(|g| g.iter().map(|id| id.raw()).collect()),
                     })
                     .collect()
             }),

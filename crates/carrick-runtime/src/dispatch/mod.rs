@@ -2881,8 +2881,8 @@ mod kernel_context_tests {
         let sibling = sibling
             .kernel()
             .update_credentials(&sibling, |credentials| {
-                credentials.set_fsuid(7_777);
-                credentials.set_supplementary_groups(vec![77]);
+                credentials.set_fsuid(carrick_abi::NsUid::new(7_777));
+                credentials.set_supplementary_groups(vec![carrick_abi::NsGid::new(77)]);
             })
             .expect("diverge sibling credentials");
 
@@ -2894,14 +2894,20 @@ mod kernel_context_tests {
             .expect("register from nonleader");
         let child = dispatcher.capture_kernel_context(child_tid).unwrap();
 
-        assert_eq!(leader.resources().credentials().fsuid(), 0);
-        assert_eq!(child.resources().credentials().fsuid(), 7_777);
+        assert_eq!(
+            leader.resources().credentials().fsuid(),
+            carrick_abi::NsUid::ROOT
+        );
+        assert_eq!(
+            child.resources().credentials().fsuid(),
+            carrick_abi::NsUid::new(7_777)
+        );
         assert_eq!(
             child
                 .resources()
                 .credentials()
                 .supplementary_groups_override(),
-            Some([77].as_slice())
+            Some([carrick_abi::NsGid::new(77)].as_slice())
         );
     }
 
@@ -2919,15 +2925,22 @@ mod kernel_context_tests {
         let sibling = sibling
             .kernel()
             .update_credentials(&sibling, |credentials| {
-                credentials.set_uid_triple(71, 72, 73);
+                credentials.set_uid_triple(
+                    carrick_abi::NsUid::new(71),
+                    carrick_abi::NsUid::new(72),
+                    carrick_abi::NsUid::new(73),
+                );
             })
             .expect("diverge sibling credentials");
 
         let observed =
-            dispatcher.with_kernel_credentials(&sibling, || dispatcher.cred_snapshot().euid());
+            dispatcher.with_kernel_credentials(&sibling, || dispatcher.cred_snapshot().euid);
 
-        assert_eq!(observed, 72);
-        assert_eq!(leader.resources().credentials().euid(), 0);
+        assert_eq!(observed, carrick_abi::NsUid::new(72));
+        assert_eq!(
+            leader.resources().credentials().euid(),
+            carrick_abi::NsUid::ROOT
+        );
     }
 
     #[test]
@@ -2974,11 +2987,15 @@ mod kernel_context_tests {
         let original = original
             .kernel()
             .update_credentials(&original, |credentials| {
-                credentials.seed_identity(1001, 2001);
-                credentials.set_fsuid(1002);
-                credentials.set_fsgid(2002);
+                credentials
+                    .seed_identity(carrick_abi::NsUid::new(1001), carrick_abi::NsGid::new(2001));
+                credentials.set_fsuid(carrick_abi::NsUid::new(1002));
+                credentials.set_fsgid(carrick_abi::NsGid::new(2002));
                 credentials.set_umask(0o077);
-                credentials.set_supplementary_groups(vec![9, 10]);
+                credentials.set_supplementary_groups(vec![
+                    carrick_abi::NsGid::new(9),
+                    carrick_abi::NsGid::new(10),
+                ]);
             })
             .expect("seed inherited credentials");
         let old_kernel = Arc::clone(original.kernel());
@@ -3026,8 +3043,14 @@ mod kernel_context_tests {
             })));
         assert_ne!(description.id(), post_fork_description.id());
         assert!(description.id() < post_fork_description.id());
-        assert_eq!((credentials.ruid(), credentials.rgid()), (1001, 2001));
-        assert_eq!((credentials.fsuid(), credentials.fsgid()), (1002, 2002));
+        assert_eq!(
+            (credentials.ruid(), credentials.rgid()),
+            (carrick_abi::NsUid::new(1001), carrick_abi::NsGid::new(2001))
+        );
+        assert_eq!(
+            (credentials.fsuid(), credentials.fsgid()),
+            (carrick_abi::NsUid::new(1002), carrick_abi::NsGid::new(2002))
+        );
         assert_eq!(credentials.umask(), 0o077);
         assert_eq!(rebound.resources().fs_context().cwd(), "/inherited/cwd");
         assert_eq!(
@@ -3036,7 +3059,7 @@ mod kernel_context_tests {
         );
         assert_eq!(
             credentials.supplementary_groups_override(),
-            Some([9, 10].as_slice())
+            Some([carrick_abi::NsGid::new(9), carrick_abi::NsGid::new(10)].as_slice())
         );
     }
 }
@@ -4100,7 +4123,8 @@ impl SyscallDispatcher {
         });
         let credentials = self
             .update_credentials(&context, |credentials| {
-                credentials.seed_identity(uid, gid);
+                credentials
+                    .seed_identity(carrick_abi::NsUid::new(uid), carrick_abi::NsGid::new(gid));
             })
             .unwrap_or_else(|errno| {
                 tracing::error!(errno = errno.get(), "publish launch Kernel credentials");
@@ -7367,8 +7391,8 @@ fn access_metadata(metadata: &RootFsMetadata, mode: u64) -> DispatchOutcome {
 /// owner, else group if `gid` matches, else other — matching the kernel
 /// (owner perms apply even when more restrictive than group/other).
 pub(super) fn dac_check(
-    uid: u32,
-    gid: u32,
+    uid: carrick_abi::NsUid,
+    gid: carrick_abi::NsGid,
     file_uid: u32,
     file_gid: u32,
     file_mode: u32,
@@ -7381,15 +7405,15 @@ pub(super) fn dac_check(
     if need == 0 {
         return Ok(());
     }
-    if uid == 0 {
+    if uid.is_root() {
         if need & 1 != 0 && !is_dir && file_mode & 0o111 == 0 {
             return Err(LINUX_EACCES);
         }
         return Ok(());
     }
-    let triplet = if uid == file_uid {
+    let triplet = if uid.raw() == file_uid {
         (file_mode >> 6) & 7
-    } else if gid == file_gid {
+    } else if gid.raw() == file_gid {
         (file_mode >> 3) & 7
     } else {
         file_mode & 7

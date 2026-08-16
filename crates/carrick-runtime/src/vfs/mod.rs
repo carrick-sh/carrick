@@ -81,6 +81,8 @@
 //! The refactor unified all of them behind [`Vfs`] + the mount table; the only
 //! surviving direct-access path is the `/` rootfs hot path described above.
 
+use carrick_abi::{NsGid, NsUid};
+
 pub mod bind;
 pub mod dev;
 pub mod devpts;
@@ -306,13 +308,13 @@ pub struct OpenContext<'a> {
     /// True when guest virtual addresses ARE host virtual addresses (the
     /// native exec backend), enabling measured VmRSS over the guest's VMAs.
     pub native_guest_va: bool,
-    pub ruid: u32,
-    pub euid: u32,
-    pub suid: u32,
-    pub rgid: u32,
-    pub egid: u32,
-    pub sgid: u32,
-    pub groups: Option<&'a [u32]>,
+    pub ruid: NsUid,
+    pub euid: NsUid,
+    pub suid: NsUid,
+    pub rgid: NsGid,
+    pub egid: NsGid,
+    pub sgid: NsGid,
+    pub groups: Option<&'a [NsGid]>,
     /// Signal-disposition masks for `/proc/<pid>/status` (bit `signum-1`):
     /// ignored (SigIgn), caught/handled (SigCgt), shared-pending (ShdPnd).
     pub sig_ignored: u64,

@@ -477,12 +477,13 @@ where
                     (sender_host > 0).then(|| {
                         let ns_pid =
                             crate::namespace::pid::host_to_ns_or_self(sender_host as u32) as i32;
-                        let uid = crate::cred_ipc::read_target(sender_host).unwrap_or(0);
+                        let uid = crate::cred_ipc::read_target(sender_host)
+                            .unwrap_or(carrick_abi::NsUid::ROOT);
                         crate::linux_abi::LinuxSiginfo::kill(
                             pending,
                             crate::linux_abi::LINUX_SI_USER,
                             ns_pid,
-                            uid,
+                            uid.raw(),
                         )
                     })
                 });
