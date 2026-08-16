@@ -2777,7 +2777,7 @@ impl SyscallDispatcher {
             let operator = this.identity_pid() as i32;
             let tid = cx.tid();
             let _block_state = (!flags.contains(MsgOpFlags::NOWAIT))
-                .then(|| SysvSemBlockStateGuard::new(tid));
+                .then(|| SysvSemBlockStateGuard::new(sysv_run_state_task_pid(this, cx.kernel), tid));
             let mut saw_would_block = false;
             loop {
                 match SysvIpcService::msgsnd(msqid, &creds, msg_type, &payload, operator) {
@@ -2854,7 +2854,7 @@ impl SyscallDispatcher {
             let operator = this.identity_pid() as i32;
             let tid = cx.tid();
             let _block_state = (!flags.contains(MsgOpFlags::NOWAIT))
-                .then(|| SysvSemBlockStateGuard::new(tid));
+                .then(|| SysvSemBlockStateGuard::new(sysv_run_state_task_pid(this, cx.kernel), tid));
             let mut saw_would_block = false;
             loop {
                 match SysvIpcService::msgrcv(cx, msqid, &creds, msgp.0, sz, msgtyp, flags, operator) {
@@ -3564,28 +3564,68 @@ impl Drop for SemWaitRegistration {
 /// process reads have exactly the same lifetime as the 'S' state that LTP's
 /// `TST_PROCESS_STATE_WAIT` polls for before reading them.
 struct SysvSemBlockStateGuard {
+    task_pid: Option<i32>,
     tid: crate::thread::ThreadId,
     waits: Option<SemWaitRegistration>,
 }
 
+/// The authoritative Linux task pid this run-state publication belongs to, or
+/// `None` off the kernel lane.
+///
+/// HVPatch multiplexes every Linux process inside ONE Darwin carrier, so
+/// `run_state::publish` — which keys on `std::process::id()` — writes the
+/// CARRIER's slot, a slot no guest pid ever names. `/proc/<pid>/stat` for a
+/// peer resolves through `published_stat_char(process.key.id)` (the logical
+/// Linux pid), so the publisher must use that same domain via
+/// `publish_task_thread`. Mirrors `ThreadRuntimeState::publish_process_run_state`.
+fn sysv_run_state_task_pid(
+    this: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
+) -> Option<i32> {
+    (this.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch)
+        .then(|| context.task().key().id.raw())
+}
+
+fn publish_sysv_block_run_state(
+    task_pid: Option<i32>,
+    tid: crate::thread::ThreadId,
+    state: crate::run_state::RunState,
+) {
+    match task_pid {
+        Some(task_pid) => crate::run_state::publish_task_thread(task_pid, tid.raw(), state),
+        None => {
+            crate::run_state::publish(state);
+            crate::run_state::publish_guest_tid(tid.raw(), state);
+        }
+    }
+}
+
 impl SysvSemBlockStateGuard {
-    fn new(tid: crate::thread::ThreadId) -> Self {
-        Self::with_waits(tid, None)
+    fn new(task_pid: Option<i32>, tid: crate::thread::ThreadId) -> Self {
+        Self::with_waits(task_pid, tid, None)
     }
 
     fn for_semop(
+        task_pid: Option<i32>,
         tid: crate::thread::ThreadId,
         counts: &SemWaitCounters,
         sops: &[carrick_portable::Sembuf],
     ) -> Self {
-        Self::with_waits(tid, Some(SemWaitRegistration::arm(counts, sops)))
+        Self::with_waits(task_pid, tid, Some(SemWaitRegistration::arm(counts, sops)))
     }
 
-    fn with_waits(tid: crate::thread::ThreadId, waits: Option<SemWaitRegistration>) -> Self {
-        crate::run_state::publish(crate::run_state::RunState::Blocked);
+    fn with_waits(
+        task_pid: Option<i32>,
+        tid: crate::thread::ThreadId,
+        waits: Option<SemWaitRegistration>,
+    ) -> Self {
+        publish_sysv_block_run_state(task_pid, tid, crate::run_state::RunState::Blocked);
         crate::thread::set_current_thread_state(tid, 'S');
-        crate::run_state::publish_guest_tid(tid.raw(), crate::run_state::RunState::Blocked);
-        Self { tid, waits }
+        Self {
+            task_pid,
+            tid,
+            waits,
+        }
     }
 }
 
@@ -3593,8 +3633,7 @@ impl Drop for SysvSemBlockStateGuard {
     fn drop(&mut self) {
         self.waits = None;
         crate::thread::set_current_thread_state(self.tid, 'R');
-        crate::run_state::publish_guest_tid(self.tid.raw(), crate::run_state::RunState::Running);
-        crate::run_state::publish(crate::run_state::RunState::Running);
+        publish_sysv_block_run_state(self.task_pid, self.tid, crate::run_state::RunState::Running);
     }
 }
 
@@ -3695,6 +3734,9 @@ fn validate_semop_value_ranges(
 /// counters to publish itself into, the predicate that decides EINTR, and the
 /// completion hook that records `sempid`.
 struct SemopWaitCtx<'a> {
+    /// Authoritative Linux task pid for run-state publication, or `None` off
+    /// the kernel lane. See [`sysv_run_state_task_pid`].
+    task_pid: Option<i32>,
     wait_counts: &'a SemWaitCounters,
     interrupted: &'a dyn Fn() -> bool,
     completed: &'a dyn Fn(&[carrick_portable::Sembuf]),
@@ -3713,6 +3755,7 @@ fn sysv_semop<M: GuestMemory>(
     wait: SemopWaitCtx<'_>,
 ) -> Result<DispatchOutcome, DispatchError> {
     let SemopWaitCtx {
+        task_pid,
         wait_counts,
         interrupted,
         completed,
@@ -3799,6 +3842,7 @@ fn sysv_semop<M: GuestMemory>(
                 }
                 if block_state.is_none() {
                     block_state = Some(SysvSemBlockStateGuard::for_semop(
+                        task_pid,
                         cx.tid(),
                         wait_counts,
                         &sops,
@@ -3909,6 +3953,7 @@ impl SyscallDispatcher {
             nsops,
             timeout,
             SemopWaitCtx {
+                task_pid: sysv_run_state_task_pid(self, cx.kernel),
                 wait_counts: &wait_counts,
                 interrupted: &interrupted,
                 completed: &completed,
@@ -4611,6 +4656,7 @@ mod ipc_set_tests {
             sops.len(),
             timeout,
             SemopWaitCtx {
+                task_pid: None,
                 wait_counts: counts,
                 interrupted: &interrupted,
                 completed: &|_| {},
