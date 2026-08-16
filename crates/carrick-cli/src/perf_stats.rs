@@ -78,7 +78,7 @@ pub fn bootstrap_median_ratio(
     seed: u64,
     resamples: usize,
 ) -> Option<RatioInterval> {
-    use rand::{Rng, SeedableRng, rngs::StdRng};
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     if baseline.is_empty()
         || candidate.is_empty()
