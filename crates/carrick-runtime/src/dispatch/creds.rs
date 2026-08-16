@@ -106,19 +106,41 @@ enum PrioTarget {
 /// guest process model. Deliberately does NOT treat the bootstrap pid (1) as
 /// self (unlike [`is_self_priority_target`]): a non-init caller naming init
 /// (pid 1) must resolve to that OTHER, root-owned process so the ownership check
-/// can reject it with EPERM (LTP setpriority02). The peer's effective uid is
-/// read from the fork-coherent cred publication that `kill(2)` already uses.
-fn resolve_prio_process_target<M: GuestMemory>(cx: &SyscallCtx<'_, M>, who: i32) -> PrioTarget {
+/// can reject it with EPERM (LTP setpriority02).
+///
+/// On the HVPatch lane both the "is it me?" test and the peer's euid come from
+/// carrick's kernel graph. Neither can come from the host there: every logical
+/// Linux process is a thread of one VM carrier, so `std::process::id()` is the
+/// same value for all of them — guest pid 1 aliased to the caller and the
+/// EPERM case degraded into the EACCES self case — and
+/// `cred_ipc::read_target(host_pid)` is one file keyed by that shared pid, so
+/// it described the carrier rather than the target.
+fn resolve_prio_process_target<M: GuestMemory>(
+    this: &SyscallDispatcher,
+    cx: &SyscallCtx<'_, M>,
+    who: i32,
+) -> PrioTarget {
+    let is_live_sibling_thread = cx.thread.as_ref().is_some_and(|t| {
+        t.registry
+            .is_live(crate::thread::ThreadId::from_guest_supplied_tid(who))
+    });
+    if who == 0 || is_live_sibling_thread {
+        return PrioTarget::Caller;
+    }
+    if this.hvpatch_process().is_some() {
+        if who == this.identity_pid() as i32 {
+            return PrioTarget::Caller;
+        }
+        return match this.guest_process_target(who).and_then(|t| t.euid()) {
+            Some(euid) => PrioTarget::Other { euid },
+            None => PrioTarget::NotFound,
+        };
+    }
     let host = std::process::id();
-    let is_self = who == 0
-        || who as u32 == host
+    let is_self = who as u32 == host
         || (crate::namespace::pid::enabled()
             && (who as u32 == crate::namespace::pid::self_ns_pid()
-                || crate::namespace::pid::ns_to_host_or_self(who as u32) == Some(host)))
-        || cx.thread.as_ref().is_some_and(|t| {
-            t.registry
-                .is_live(crate::thread::ThreadId::from_guest_supplied_tid(who))
-        });
+                || crate::namespace::pid::ns_to_host_or_self(who as u32) == Some(host)));
     if is_self {
         return PrioTarget::Caller;
     }
@@ -549,7 +571,7 @@ impl SyscallDispatcher {
             // per-thread). Resolve its identity/ownership against the guest
             // process model.
             if which == LINUX_PRIO_PROCESS {
-                match resolve_prio_process_target(cx, who.0) {
+                match resolve_prio_process_target(this, cx, who.0) {
                     // The caller itself → fall through to the self nice rule.
                     PrioTarget::Caller => {}
                     // Ownership (setpriority(2) EPERM): a non-root caller may only

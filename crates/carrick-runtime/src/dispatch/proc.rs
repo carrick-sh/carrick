@@ -285,9 +285,9 @@ enum SchedTarget {
     /// 0, the caller's own pid/alias, or one of its live sibling thread tids —
     /// operate on the calling process.
     SelfProc,
-    /// Another live carrick guest process (EPERM for an unprivileged caller
-    /// changing its scheduling attributes).
-    OtherGuest,
+    /// Another Linux process, carrying the effective uid it runs as (EPERM for
+    /// an unprivileged, non-owning caller changing its scheduling attributes).
+    OtherGuest { euid: carrick_abi::NsUid },
     /// No such guest task — ESRCH.
     NotFound,
 }
@@ -295,26 +295,45 @@ enum SchedTarget {
 /// Resolve a guest-supplied sched/affinity `pid` against carrick's guest process
 /// model — the single resolver shared by every sched_* handler. Self (0, our own
 /// pid/alias, our own thread, a live sibling thread) is `SelfProc`; any other
-/// LIVE carrick guest process is `OtherGuest`; anything else is `NotFound`
-/// (ESRCH).
+/// Linux process is `OtherGuest` carrying its own euid; anything else is
+/// `NotFound` (ESRCH).
 ///
-/// The guest names processes by ns-pid (what `getpid()` reports). We translate
-/// the ns-pid to its host pid and consult the guest process table
-/// (`is_guest_process`) rather than `kill(pid, 0)` an arbitrary host pid: a raw
-/// ns-pid probed against the host would spuriously match an unrelated host
-/// process/kthread sharing the numeric value (over-inclusive), and a valid
-/// sibling's ns-pid would never be recognised as a peer guest (under-inclusive).
-/// An ns-pid naming no member — or a host pid that is not one of carrick's own
-/// guest descendants — is `NotFound`. Identity when namespaces are off.
-fn resolve_sched_target<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> SchedTarget {
+/// On the HVPatch lane the answer comes from carrick's kernel graph, because
+/// there is nothing else to ask: every logical Linux process is a THREAD of one
+/// VM carrier, so `host_proc::is_guest_process` — which walks the DARWIN ppid
+/// chain via libproc — finds no host process for any live sibling and reported
+/// ESRCH for every one of them (LTP sched_getparam01, sched_setparam05,
+/// sched_setaffinity01, process_vm01). The target's euid comes from the same
+/// graph, so it is read from the same authority as the caller's own
+/// `cred_snapshot()`.
+///
+/// Off that lane a Linux process IS a host process: the guest names it by
+/// ns-pid, so translate to the host pid and consult the guest process table
+/// rather than `kill(pid, 0)`-ing an arbitrary host pid — a raw ns-pid probed
+/// against the host would spuriously match an unrelated host process/kthread
+/// sharing the numeric value (over-inclusive), and a valid sibling's ns-pid
+/// would never be recognised as a peer guest (under-inclusive).
+fn resolve_sched_target<M: GuestMemory>(
+    this: &SyscallDispatcher,
+    cx: &SyscallCtx<'_, M>,
+    pid: u64,
+) -> SchedTarget {
     if sched_pid_is_self(cx, pid) || sched_pid_is_live_guest_thread(cx, pid) {
         return SchedTarget::SelfProc;
     }
     if pid == 0 || pid > i32::MAX as u64 {
         return SchedTarget::NotFound;
     }
+    if let Some(target) = this.guest_process_target(pid as i32) {
+        return match target.euid() {
+            Some(euid) => SchedTarget::OtherGuest { euid },
+            None => SchedTarget::NotFound,
+        };
+    }
     match crate::namespace::pid::ns_to_host_or_self(pid as u32) {
-        Some(host) if crate::host_proc::is_guest_process(host) => SchedTarget::OtherGuest,
+        Some(host) if crate::host_proc::is_guest_process(host) => SchedTarget::OtherGuest {
+            euid: crate::cred_ipc::read_target(host as i32).unwrap_or(carrick_abi::NsUid::ROOT),
+        },
         _ => SchedTarget::NotFound,
     }
 }
@@ -323,25 +342,23 @@ fn resolve_sched_target<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> Sch
 /// live carrick guest). Used by the sched_get*/policy queries, which answer the
 /// same for every valid pid under our uniform SCHED_OTHER + prio 0 model; only
 /// the "does it exist?" check varies. Backed by [`resolve_sched_target`].
-fn sched_pid_exists<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
-    resolve_sched_target(cx, pid) != SchedTarget::NotFound
+fn sched_pid_exists<M: GuestMemory>(
+    this: &SyscallDispatcher,
+    cx: &SyscallCtx<'_, M>,
+    pid: u64,
+) -> bool {
+    resolve_sched_target(this, cx, pid) != SchedTarget::NotFound
 }
 
 /// `check_same_owner` for a cross-process `sched_setparam`/`sched_setaffinity`
 /// (an already-resolved `SchedTarget::OtherGuest`). Root always may; a non-root
-/// caller may change another guest process's scheduling attributes only when its
-/// euid matches the target's published euid — the same ownership rule carrick's
-/// `kill`/`setpriority` use, NOT a root-only proxy (a SAME-OWNER non-root set
-/// must succeed: LTP sched_setparam05 / sched_setaffinity01). Returns true when
-/// the set is PERMITTED. `pid` is the guest-supplied ns-pid of the target.
-fn sched_cross_owner_ok(pid: u64, caller_euid: carrick_abi::NsUid) -> bool {
-    if caller_euid.is_root() {
-        return true;
-    }
-    let target_euid = crate::namespace::pid::ns_to_host_or_self(pid as u32)
-        .and_then(|host| crate::cred_ipc::read_target(host as i32))
-        .unwrap_or(carrick_abi::NsUid::ROOT);
-    caller_euid == target_euid
+/// caller may change another process's scheduling attributes only when its euid
+/// matches the target's — the same ownership rule carrick's `kill`/`setpriority`
+/// use, NOT a root-only proxy (a SAME-OWNER non-root set must succeed: LTP
+/// sched_setparam05 / sched_setaffinity01). Returns true when the set is
+/// PERMITTED.
+fn sched_cross_owner_ok(target_euid: carrick_abi::NsUid, caller_euid: carrick_abi::NsUid) -> bool {
+    caller_euid.is_root() || caller_euid == target_euid
 }
 
 /// True when `policy` is one of the kernel's known scheduling policies.
@@ -2016,7 +2033,7 @@ impl SyscallDispatcher {
 
             // Resolve the target BEFORE borrowing cx.memory (resolve reads
             // cx.thread; the mutable memory borrow below would otherwise alias).
-            if resolve_sched_target(cx, pid) == SchedTarget::NotFound {
+            if resolve_sched_target(this, cx, pid) == SchedTarget::NotFound {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             let memory = &mut *cx.memory;
@@ -2038,12 +2055,12 @@ impl SyscallDispatcher {
 
             let read_len = size.min(128);
             let bytes = memory.read_bytes(address.0, read_len)?;
-            let target = resolve_sched_target(cx, pid);
+            let target = resolve_sched_target(this, cx, pid);
             if target == SchedTarget::NotFound {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
-            if target == SchedTarget::OtherGuest
-                && !sched_cross_owner_ok(pid, this.cred_snapshot().euid)
+            if let SchedTarget::OtherGuest { euid } = target
+                && !sched_cross_owner_ok(euid, this.cred_snapshot().euid)
             {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
@@ -2087,7 +2104,7 @@ impl SyscallDispatcher {
             if (pid as i32) < 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if !sched_pid_exists(cx, pid) {
+            if !sched_pid_exists(this, cx, pid) {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             Ok(DispatchOutcome::Returned { value: LINUX_SCHED_OTHER as i64 })
@@ -2104,7 +2121,7 @@ impl SyscallDispatcher {
             if (pid as i32) < 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if !sched_pid_exists(cx, pid) {
+            if !sched_pid_exists(this, cx, pid) {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             if address.0 == 0 {
@@ -2139,7 +2156,7 @@ impl SyscallDispatcher {
             if (pid as i32) < 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if !sched_pid_exists(cx, pid) {
+            if !sched_pid_exists(this, cx, pid) {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             // SCHED_OTHER, nice 0, priority 0 — a zeroed sched_attr with only
@@ -2161,7 +2178,7 @@ impl SyscallDispatcher {
             if (pid as i32) < 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if !sched_pid_exists(cx, pid) {
+            if !sched_pid_exists(this, cx, pid) {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             let policy_i = policy as i32;
@@ -2192,7 +2209,7 @@ impl SyscallDispatcher {
             if (pid as i32) < 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let target = resolve_sched_target(cx, pid);
+            let target = resolve_sched_target(this, cx, pid);
             if target == SchedTarget::NotFound {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
@@ -2200,8 +2217,8 @@ impl SyscallDispatcher {
             if prio != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if target == SchedTarget::OtherGuest
-                && !sched_cross_owner_ok(pid, this.cred_snapshot().euid)
+            if let SchedTarget::OtherGuest { euid } = target
+                && !sched_cross_owner_ok(euid, this.cred_snapshot().euid)
             {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
@@ -2212,7 +2229,7 @@ impl SyscallDispatcher {
         /// quantum into `*timespec`. SCHED_OTHER tasks aren't on a RR
         /// schedule; Linux returns {0, 0} (and 0). We mirror that.
         fn sched_rr_get_interval(this, cx, pid: u64, address: GuestPtr) {
-            if !sched_pid_exists(cx, pid) {
+            if !sched_pid_exists(this, cx, pid) {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
             if address.0 == 0 {
@@ -4436,7 +4453,7 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::errno(LINUX_ESRCH));
         }
 
-        match resolve_sched_target(cx, pid.raw() as u64) {
+        match resolve_sched_target(self, cx, pid.raw() as u64) {
             SchedTarget::NotFound => Ok(DispatchOutcome::errno(LINUX_ESRCH)),
             SchedTarget::SelfProc => {
                 let (src, dst) = if is_read {
@@ -4449,21 +4466,22 @@ impl SyscallDispatcher {
                     Err(errno) => Ok(DispatchOutcome::errno(errno)),
                 }
             }
-            SchedTarget::OtherGuest => {
+            SchedTarget::OtherGuest { euid: target_euid } => {
                 // ptrace_may_access(PTRACE_MODE_ATTACH_REALCREDS): a non-root
                 // caller that does not own the target is denied (process_vm01
                 // test_invalid_perm drops to `nobody` then reads root's pid).
-                // carrick models CAP_SYS_PTRACE as euid 0.
+                // carrick models CAP_SYS_PTRACE as euid 0. The target's euid
+                // comes from its own kernel-graph credentials, the same
+                // authority `cred_snapshot()` answers the caller from.
                 let caller_euid = self.cred_snapshot().euid;
-                let target_euid = crate::namespace::pid::ns_to_host_or_self(pid.raw() as u32)
-                    .and_then(|host| crate::cred_ipc::read_target(host as i32))
-                    .unwrap_or(carrick_abi::NsUid::ROOT);
                 if !caller_euid.is_root() && caller_euid != target_euid {
                     return Ok(DispatchOutcome::errno(LINUX_EPERM));
                 }
-                // The peer runs in a separate host process with its own HVF VM;
-                // carrick cannot translate/read a peer guest's private VA space,
-                // so its address range is inaccessible.
+                // A permitted cross-process transfer is still unimplemented:
+                // carrick has no translation from one Linux process's guest VA
+                // to another's backing, so the peer's range reads as
+                // inaccessible. That is a divergence from Linux, not a
+                // permission answer.
                 Ok(DispatchOutcome::errno(LINUX_EFAULT))
             }
         }

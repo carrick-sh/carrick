@@ -3837,6 +3837,11 @@ pub struct Zombie {
     pub process_group: ProcessGroupId,
     pub session: SessionId,
     pub status: LinuxWaitStatus,
+    /// The effective uid this process held when it exited. An unreaped process
+    /// is still addressable by `sched_*`/`setpriority`/`process_vm_*`, and
+    /// those calls apply the same ownership rule they apply to a live target,
+    /// so the answer has to survive the task object.
+    pub euid: NsUid,
     pub rusage: TaskRusage,
     /// What this task had itself accumulated from reaping its own children.
     /// Kept separate from `rusage` so `wait4` can report the child's own CPU
@@ -3860,6 +3865,7 @@ impl Zombie {
             process_group: task.process_group(),
             session: task.session(),
             status,
+            euid: task.process_credentials().euid(),
             rusage: TaskRusage {
                 user_time: Duration::from_micros(task.self_cpu_us()),
                 system_time: Duration::from_micros(task.self_system_cpu_us()),

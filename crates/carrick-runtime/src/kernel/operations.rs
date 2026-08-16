@@ -1003,6 +1003,23 @@ impl Kernel {
         self.registry().state.read().tasks.contains_key(&task_id)
     }
 
+    /// The effective uid a LIVE task runs as, read from its own retained
+    /// process credentials.
+    ///
+    /// This is the authority for every "does the caller own that process?"
+    /// check that crosses a Linux process boundary (`setpriority`,
+    /// `sched_setparam`, `sched_setaffinity`, `process_vm_*`). The host cannot
+    /// answer it under HVPatch: every logical process shares the carrier's
+    /// pid, so a host-pid-keyed credential publication describes the carrier
+    /// rather than the target.
+    pub(crate) fn live_task_process_euid(&self, task_id: TaskId) -> Option<carrick_abi::NsUid> {
+        let state = self.registry().state.read();
+        state.tasks.get(&task_id).and_then(|record| {
+            (record.task.lifecycle() == TaskLifecycle::Live)
+                .then(|| record.task.process_credentials().euid())
+        })
+    }
+
     pub(crate) fn live_task_key(&self, task_id: TaskId) -> Option<TaskKey> {
         let state = self.registry().state.read();
         state.tasks.get(&task_id).and_then(|record| {
