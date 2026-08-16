@@ -176,14 +176,14 @@ impl SyscallDispatcher {
     /// case that was wrong. Routing every check through one accessor is what
     /// stops the euid and fsuid families drifting apart again: the overlay-side
     /// checks in `fs.rs` already used fsuid while these used euid.
-    fn dac_identity(&self) -> (carrick_abi::NsUid, carrick_abi::NsGid) {
+    pub(super) fn dac_identity(&self) -> (carrick_abi::NsUid, carrick_abi::NsGid) {
         let creds = self.cred_snapshot();
         (creds.fsuid, creds.fsgid)
     }
 
     /// True iff the caller keeps the DAC-override capabilities. See
     /// [`Self::dac_identity`] — this is fsuid, never euid.
-    fn dac_overrides_permissions(&self) -> bool {
+    pub(super) fn dac_overrides_permissions(&self) -> bool {
         self.cred_snapshot().fsuid.is_root()
     }
 

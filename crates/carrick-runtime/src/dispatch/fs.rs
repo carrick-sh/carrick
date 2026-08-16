@@ -1549,6 +1549,15 @@ impl SyscallDispatcher {
             && !path.starts_with("/proc")
             && !path.starts_with("/sys")
             && !path.split('/').any(|c| c == "..")
+            // The cache answers from a contained parent fd and therefore skips
+            // `resolve_at_path`, which is where `check_search_access` enforces
+            // execute permission on every ancestor. Serving a hit to a caller
+            // that has dropped privilege would let it stat through a directory
+            // it cannot search — so the fast path is for DAC-override callers
+            // only, the same guard `try_trusted_dirfd_stat` carries. That is
+            // also the hot case: the overwhelming majority of guests run as
+            // root, so the measured win is kept.
+            && self.dac_overrides_permissions()
             && let Some(real) = self.fs.rootfs_vfs.overlay.stat_cache_lookup(path)
         {
             return Ok(self.stat_record_with_device(path, &real));
@@ -1566,6 +1575,11 @@ impl SyscallDispatcher {
             && !path.starts_with("/proc")
             && !path.starts_with("/sys")
             && !path.split('/').any(|c| c == "..")
+            // Same DAC-override guard as the pre-resolution consult above.
+            // `resolve_at_path` has run by here, but it resolves the path — it
+            // does not re-check the leaf, and a cache hit still bypasses the
+            // per-ancestor search checks for a dropped-privilege caller.
+            && self.dac_overrides_permissions()
             && let Some(real) = self.fs.rootfs_vfs.overlay.stat_cache_lookup(&path)
         {
             return Ok(self.stat_record_with_device(&path, &real));
@@ -3072,8 +3086,11 @@ impl SyscallDispatcher {
             return None;
         }
         let full = self.trusted_child_path(&dir_path, name)?;
-        // A non-root euid needs the ancestor search-permission checks.
-        if !self.cred_snapshot().euid.is_root() {
+        // A non-root fsuid needs the ancestor search-permission checks. fsuid,
+        // not euid: it is the identity every DAC check uses (setfsuid(2)), and
+        // a bypass keyed on the other one is how a permission check gets
+        // skipped for a caller that has genuinely dropped privilege.
+        if !self.dac_overrides_permissions() {
             return None;
         }
         let name_c = std::ffi::CString::new(name).ok()?;
