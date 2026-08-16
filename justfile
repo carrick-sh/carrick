@@ -40,6 +40,15 @@ build *ARGS:
     fi
     exec cargo build --release -p carrick-cli {{_platform_features}} {{ARGS}}
 
+# Build the runnable binary with debug entitlements (get-task-allow) for lldb attaching.
+build-debug *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{os()}}" = "macos" ]; then
+        exec ./scripts/build-signed.sh --debug {{ARGS}}
+    fi
+    exec cargo build -p carrick-cli {{_platform_features}} {{ARGS}}
+
 # Build + sign, then run the signed binary (e.g. `just run run ubuntu:24.04 /bin/echo hi`).
 run *ARGS: build
     ./target/release/carrick {{ARGS}}
@@ -155,7 +164,7 @@ test *ARGS:
         # cases execute real guests. This recipe is defined as the tests that do
         # NOT need the HVF runtime or Docker; those belong to a guest-capable
         # lane.
-        cargo test --workspace --exclude carrick-runtime --exclude carrick-cli --lib --bins {{ARGS}}
+        cargo test --workspace --exclude carrick-runtime --exclude carrick-cli --exclude carrick-native-darwin --lib --bins {{ARGS}}
         # The authenticated jit-shape builders/parsers have measured >1 MiB
         # debug frames. Several tests need two in one body; libtest's ~2 MiB
         # default has repeatedly been tipped over by unrelated additions. Keep
@@ -163,6 +172,7 @@ test *ARGS:
         # scoped to the bin-only CLI test process rather than every workspace
         # crate (see `test(debug): bound the jit-shape publication test's stack`).
         env RUST_MIN_STACK=8388608 cargo test -p carrick-cli --bin carrick {{ARGS}}
+        env RUST_TEST_THREADS=1 cargo test -p carrick-native-darwin --lib {{ARGS}}
         env RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib {{ARGS}}
         exit 0
     fi

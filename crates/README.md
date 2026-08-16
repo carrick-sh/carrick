@@ -1,6 +1,6 @@
 # Carrick Crate Map
 
-Carrick is a 31-crate Cargo workspace. The product path is:
+Carrick is a 30-crate Cargo workspace. The product path is:
 
 ```text
 carrick-cli -> carrick-engine -> { carrick-image, carrick-runtime } -> carrick-spec
@@ -26,6 +26,7 @@ Platform code is selected by Cargo features. The default feature is
 | --- | --- |
 | `carrick-abi` | Linux ABI constants and wire structs, with compile-time layout/constant assertions. |
 | `carrick-guest-mem` | Guest-memory trait, memory error type, and syscall-frame hub types shared by handlers and VMM engines. |
+| `carrick-kernel` | Kernel-graph shared memory structures: arenas, process/task identity, robust lock registries. |
 | `carrick-mem` | Guest address-space construction: ELF layout, page tables, trampolines, VDSO/vvar, region helpers. |
 | `carrick-hal` | OS/VMM-neutral traits and shared types: trap contract, hypervisor traits, guest-arch tables, event/futex/threaded-loop/signal/timer surfaces. |
 | `carrick-thread` | Thread registry, private-futex park table, and fork/page-table quiesce barriers. |
@@ -53,15 +54,14 @@ Platform code is selected by Cargo features. The default feature is
 | `carrick-x86` | Shared x86_64 engine: long-mode bring-up, register/snapshot model, fault tables, VDSO helpers, generic `X86EngineCore<V>`. |
 | `carrick-aarch64` | Shared AArch64 engine (`Aarch64EngineCore`) used by the HVF AArch64 path (and shared with the KVM AArch64 lane). |
 
-## Native (DSR) Backend
+## Binary Patching & Translation Core (DSR)
 
 | Crate | Role |
 | --- | --- |
-| `carrick-dsr` | Platform-neutral DSR core: the `NativeLane`/`GuestIsa`/`NativeHost` seam traits, translation cache + publication behind the `NativeHostJit` seam, `prepared_image`, profiling census, page-geometry vocabulary, probe-sink seam, test hooks. Deliberately `ring`/`usdt`-free (darwin-cross-checkable from a non-mac rig). |
-| `carrick-dsr-aarch64` | AArch64 guest-ISA lane: bad64/dynasmrt decode + emit, block planner + exclusive fusion, gateway (`gateway_aarch64.S`), counter virtualization, artifact store, mapped memory + translator. Compiles on every host; only the gateway's assembled surface is macos/aarch64-gated. |
-| `carrick-dsr-x86` | x86_64 guest-ISA lane: `iced-x86` decode/classify, block planning + control-flow lowering, a hand-rolled byte-level block emitter (no dynasmrt dependency), gateway (`gateway_x86_64.S`) + x87/SSE/AVX state transfer; already runs real Linux/x86_64 ELF binaries on FreeBSD/amd64 through `native_freebsd.rs`. |
-| `carrick-native-darwin` | Darwin `NativeHost` impl: `MAP_JIT`/`pthread_jit_write_protect_np` JIT cache (`DarwinHost`), the byte-for-byte-moved `csrc/native_darwin.c` trap/kick shim. |
-| `carrick-native-freebsd` | FreeBSD `NativeHost` impl: SHM_ANON dual-mapped W^X JIT cache with no process-wide `mprotect` flip (`FreebsdHost`), amd64 `mcontext_t` trap shim. |
+| `carrick-dsr` | Platform-neutral DSR core: the `NativeLane`/`GuestIsa`/`NativeHost` seam traits, translation cache + publication behind the `NativeHostJit` seam, `prepared_image`, profiling census, page-geometry vocabulary, probe-sink seam, test hooks. |
+| `carrick-dsr-aarch64` | AArch64 guest-ISA lane: bad64/dynasmrt decode + emit, block planner + exclusive fusion, gateway (`gateway_aarch64.S`), counter virtualization, artifact store, mapped memory + translator. |
+| `carrick-dsr-x86` | x86_64 guest-ISA lane: `iced-x86` decode/classify, block planning + control-flow lowering, a hand-rolled byte-level block emitter (no dynasmrt dependency), gateway (`gateway_x86_64.S`) + x87/SSE/AVX state transfer. |
+| `carrick-native-darwin` | **Preserved for future OS-level optimisation.** Darwin host primitives: Apple Silicon `MAP_JIT` W^X JIT backend (`DarwinHostJit`, implementing `NativeHostJit`), Tier-D binary patching (svc island generation, x18/TLS virtualisation), persistent AOT cache. Not actively wired into the HVPatch execution path. |
 
 ## Test and Harness Support
 

@@ -17,38 +17,26 @@ syscall translation layer instead of a guest Linux kernel. There is no guest
 kernel, no second scheduler, no separate hypervisor RAM pool, and the runtime is
 BKL-free (per-subsystem locks, not a global lock).
 
-**Three execution lanes, and the distinction is load-bearing — know which one
-you are testing:**
+**Execution Architecture — HVPatch Unified Kernel:**
 
-- **VMM** (`--exec-backend vmm`): a hardware-virtualized vCPU per guest thread.
-  The macOS / Apple Silicon `Hypervisor.framework` (HVF) path running AArch64
-  Linux guests is the **mature reference** lane — every `svc #0` traps to the
-  host and carrick re-expresses Linux syscalls as Darwin primitives. The
-  published conformance results (and `scripts/conformance/baseline.jsonl`) are
-  this lane's.
-- **HVPATCH** (`--exec-backend hvpatch`): the experimental kernel lane on
-  macOS/HVF. It keeps Linux tasks, process identity, address spaces, waits and
-  signals in carrick's kernel graph and multiplexes them inside one VM carrier;
-  guest `fork`/`clone` do **not** create Darwin processes. HVPatch is opt-in and
-  incomplete until its dedicated conformance overlay, ecosystem gates and
-  intended one-host-process/one-HVF-VM topology are qualified. Do not infer
-  HVPatch results from the VMM lane merely because both use HVF.
-- **NATIVE / DSR** (`--exec-backend native`): **no hypervisor at all** — guest
-  code runs as host-native process state with a JIT for same-ISA translation.
-  **This is the shipped DEFAULT** (`ExecBackendRequest::Native`,
-  `crates/carrick-spec/src/lib.rs`), and it is the direction of travel (native
-  is intended to replace VMM as the primary stable backend). Its conformance
-  overlay (`baseline.native-dsr.jsonl`) is essentially empty, so its standing is
-  materially less proven than the VMM numbers suggest — measure, do not assume.
+- **HVPATCH** (`--exec-backend hvpatch`, default): Carrick's execution model.
+  It keeps Linux tasks, process identity, address spaces, waits, and signals in
+  Carrick's kernel graph and multiplexes them inside one VM carrier; guest
+  `fork`/`clone` do **not** create separate host processes.
+- **Host Hypervisor Implementations**:
+  Hardware-assisted virtualization is provided per host: macOS / Apple Silicon
+  `Hypervisor.framework` (HVF) running AArch64 guests is the release-quality
+  reference lane; Linux/KVM, FreeBSD/bhyve, and NetBSD/NVMM bring the Carrick
+  kernel to additional host platforms, with x86_64 guest bring-up through the
+  shared `carrick-x86` engine.
+- **Binary Patching & Translation Primitives (Preserved for Optimization)**:
+  `carrick-native-darwin`, `carrick-dsr`, `carrick-dsr-aarch64`, and
+  `carrick-dsr-x86` provide JIT translation, Apple Silicon `MAP_JIT` W^X
+  primitives, and Tier-D direct binary patching, preserved as building blocks
+  for future OS-level performance optimizations.
 
-Because the default and the well-measured lane are NOT the same, a gate that
-does not name its backend is telling you about the other one.
-
-The portability work splits that model across host/VMM and guest-ISA axes:
-macOS/HVF, Linux/KVM, FreeBSD/bhyve, NetBSD/NVMM, and active x86_64 guest
-bring-up through the shared `carrick-x86` engine. Treat the macOS/HVF path as
-the release-quality reference lane; treat non-macOS and x86_64 paths as active
-bring-up unless the exact target-host gate proves otherwise.
+The legacy 1:1 host-process-per-guest-process execution backends (legacy `vmm`
+and `native`) have been retired in favor of the consolidated HVPatch kernel.
 
 **Status — experimental, not production-ready.** Be honest in code, comments,
 docs, and commit messages: syscall coverage is partial (225 emulated, 112
@@ -61,18 +49,12 @@ under it, and never describe it as "complete" or "production-ready."
 
 ---
 
-## ⚠️ Rule 0 — codesign before you run the VMM path
+## ⚠️ Rule 0 — codesign before you run on macOS / HVF
 
-**Scope:** this rule is about the **VMM/HVF** backend. A guest on that path only
-runs from a **codesigned** binary: a bare `cargo build` strips the
-`com.apple.security.hypervisor` entitlement, so `carrick run --exec-backend vmm`
-dies with **`HV_DENIED` (`0xfae94007`)**.
-
-**The NATIVE backend (the shipped default) needs NO entitlement and no
-hypervisor** — it uses `MAP_JIT` under ad-hoc signing with no hardened runtime
-(`crates/carrick-native-darwin/src/jit.rs`), which is why native guest tests run
-from an ordinary `cargo test` binary. If you are on the native path and hit
-`HV_DENIED`, you are not on the native path — check `--exec-backend`.
+**Scope:** running guests on macOS uses the **`Hypervisor.framework` (HVF)**
+path. A guest on that path only runs from a **codesigned** binary: a bare
+`cargo build` strips the `com.apple.security.hypervisor` entitlement, so
+`carrick run` dies with **`HV_DENIED` (`0xfae94007`)**.
 
 - **Build/run via `just build` / `just run`** — both go through
   [`scripts/build-signed.sh`](scripts/build-signed.sh), which re-applies the
@@ -100,6 +82,7 @@ compile/lint/test only.
 | Command | Purpose |
 |---|---|
 | `just build [ARGS]` 🔏 | Build + codesign the release binary (required to run a guest). |
+| `just build-debug [ARGS]` 🔏 | Build + codesign with debug entitlements (`get-task-allow` for lldb attaching). |
 | `just run [ARGS]` 🔏 | `just build` then run `target/release/carrick ARGS`. |
 | `just check [ARGS]` | Fast **unsigned** `cargo build` — compile-check only, cannot run a guest. |
 | `just test` | Host lib tests (no HVF/Docker). **Use the recipe, never a bare `cargo test --workspace --lib`** — carrick-runtime's tests fork from the harness and deadlock when run in parallel, so the recipe runs every OTHER crate in parallel and then carrick-runtime alone under `RUST_TEST_THREADS=1`. |
@@ -135,31 +118,15 @@ The HAL/platform split ([`docs/hal.md`](docs/hal.md)) separates platform-neutral
 contracts from per-VMM and per-host implementations so KVM/bhyve/NVMM can share
 the runtime without pulling in HVF/applevisor.
 
-Two conventions the code alone would teach wrong:
+Two conventions to keep in mind:
 
 - **Use the `carrick-vmm-*` names for VMM crates** (`carrick-vmm-hvf`, not the
   historical `carrick-hvf`).
-- **The native (DSR) drivers have exactly ONE wiring point.** Two driver FILES
-  serve THREE lanes: `carrick-runtime/src/native_darwin.rs` (aarch64) and
-  `src/native_freebsd.rs` — which despite its name is the shared x86_64 run
-  loop for BOTH FreeBSD and NetBSD (`cfg(any(freebsd, netbsd), x86_64)`; a
-  rename to a lane-neutral name is deferred for git-blame continuity). They
-  route exclusively through `carrick-runtime/src/native/mod.rs`
-  (`type HostNativeLane` resolves to `DarwinAarch64Lane`, `FreebsdX8664Lane`,
-  or `NetbsdX8664Lane`), plus its `native/fork_child.rs` shared post-fork
-  dispatcher reset. Don't add a second.
-  Seam design:
-  [`docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md`](docs/superpowers/specs/2026-07-17-native-backend-portability-seams-design.md);
-  Phase 1 plan:
-  [`docs/superpowers/plans/2026-07-23-native-lane-seam-phase1.md`](docs/superpowers/plans/2026-07-23-native-lane-seam-phase1.md).
-  The once-planned Phase-2 merge of the two drivers' thread loops was
-  **evaluated and SKIPPED** — a precision scout found the loops share only
-  ~10% and that the danger zones (fault lowering, x86 XSAVE vs aarch64 FP
-  xstate) are not callback-able without semantic entanglement. What landed
-  instead is engine-level symmetry: the x86 translate/cache engine was
-  extracted to `carrick-dsr-x86::translator`, mirroring
-  `carrick-dsr-aarch64::translator`. Do not re-plan the loop merge without
-  reading that finding first.
+- **DSR translation & binary patching core**: `carrick-dsr` provides the
+  platform-neutral traits and translation cache; `carrick-dsr-aarch64` and
+  `carrick-dsr-x86` provide the ISA-specific decoder/emitter/translator engines;
+  and `carrick-native-darwin` provides Darwin `MAP_JIT` and Tier-D binary
+  patching primitives. These are preserved for future OS-level optimization.
 
 ### Where key subsystems live
 - **Trap loop / syscall dispatch** — mature macOS trap loop in `crates/carrick-vmm-hvf/src/trap.rs`; x86 loop in `crates/carrick-x86/src/engine.rs` with backend adapters; dispatch in `crates/carrick-runtime/src/dispatch/mod.rs` (`SyscallDispatcher`, per-subsystem locks); syscall metadata in `crates/carrick-abi/src/syscall.rs` and guest-arch tables under `carrick-hal`.
