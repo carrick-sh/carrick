@@ -752,10 +752,6 @@ impl ProcessContext {
         }
     }
 
-    pub(crate) fn wait_child(&self, target: Option<i32>, nohang: bool, nowait: bool) -> WaitResult {
-        self.wait_child_with_job_control(target, nohang, nowait, false, false)
-    }
-
     pub(crate) fn wait_child_with_job_control(
         &self,
         target: Option<i32>,
@@ -836,11 +832,21 @@ impl ProcessContext {
                         status: zombie.status.raw(),
                     });
                 }
-                Ok(
-                    crate::kernel::WaitOutcome::Stopped { .. }
-                    | crate::kernel::WaitOutcome::Continued { .. },
-                ) => {
-                    break WaitResult::StillRunning;
+                // A P_PIDFD wait runs in Consume mode too, so reporting a
+                // job-control event as "still running" DISCARDS it. Render the
+                // same wait-status encoding `wait_child_with_job_control`
+                // produces and let the caller decide whether it asked for it.
+                Ok(crate::kernel::WaitOutcome::Stopped { task, signal }) => {
+                    break WaitResult::StateChanged(ChildExit {
+                        pid: task,
+                        status: (signal.raw() << 8) | 0x7f,
+                    });
+                }
+                Ok(crate::kernel::WaitOutcome::Continued { task }) => {
+                    break WaitResult::StateChanged(ChildExit {
+                        pid: task,
+                        status: 0xffff,
+                    });
                 }
                 Ok(crate::kernel::WaitOutcome::StillRunning) => {
                     break WaitResult::StillRunning;
@@ -981,8 +987,14 @@ fn identity_operation_errno(
 ) -> crate::linux_abi::LinuxErrno {
     match error {
         crate::kernel::KernelOperationError::UnknownTask(_) => crate::linux_abi::LINUX_ESRCH,
+        // setpgid(2) singles this case out: "EACCES — An attempt was made to
+        // change the process group ID of one of the children of the calling
+        // process and the child had already performed an execve(2)." The kernel
+        // graph models it exactly (`ChildExeced` off a real `has_execed` flag),
+        // and the pre-HVPatch path already returned EACCES; only this errno
+        // mapping collapsed it into the neighbouring EPERM cases.
+        crate::kernel::KernelOperationError::ChildExeced(_) => crate::linux_abi::LINUX_EACCES,
         crate::kernel::KernelOperationError::IdentityPermission
-        | crate::kernel::KernelOperationError::ChildExeced(_)
         | crate::kernel::KernelOperationError::AlreadyProcessGroupLeader => {
             crate::linux_abi::LINUX_EPERM
         }
@@ -1461,7 +1473,13 @@ mod tests {
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
         let handle = std::thread::spawn(move || {
             result_tx
-                .send(waiting_parent.wait_child(Some(child_key.id.raw()), true, false))
+                .send(waiting_parent.wait_child_with_job_control(
+                    Some(child_key.id.raw()),
+                    true,
+                    false,
+                    false,
+                    false,
+                ))
                 .unwrap();
         });
         parent
@@ -2238,7 +2256,7 @@ mod tests {
         assert_eq!(parent.live_process_count(), 2);
         assert_eq!(child.process_group(None).unwrap(), parent.pid());
         assert!(matches!(
-            parent.wait_child(Some(child.pid()), true, false),
+            parent.wait_child_with_job_control(Some(child.pid()), true, false, false, false),
             WaitResult::StillRunning
         ));
 
@@ -2249,7 +2267,9 @@ mod tests {
                 .root_slot(child_context.task().key())
                 .is_none()
         );
-        let WaitResult::Exited(exit) = parent.wait_child(Some(child.pid()), true, false) else {
+        let WaitResult::Exited(exit) =
+            parent.wait_child_with_job_control(Some(child.pid()), true, false, false, false)
+        else {
             panic!("kernel zombie was not visible through adapter wait");
         };
         assert_eq!(exit.pid(), child_id);
@@ -2318,7 +2338,7 @@ mod tests {
 
         finalize_test_child(&child, 0, child_tid);
         assert!(matches!(
-            parent.wait_child(Some(child.pid()), true, false),
+            parent.wait_child_with_job_control(Some(child.pid()), true, false, false, false),
             WaitResult::Exited(_)
         ));
     }
