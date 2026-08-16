@@ -54,6 +54,15 @@ pub const ET_CORE: u16 = 4;
 pub const EM_AARCH64: u16 = 183;
 pub const PT_LOAD: u32 = 1;
 pub const PT_NOTE: u32 = 4;
+/// `e_phnum` escape value (ELF gABI). `e_phnum` is 16-bit, so a core with
+/// `PN_XNUM` or more program headers cannot state its own count there: the
+/// header carries this sentinel and section header 0's `sh_info` carries the
+/// real count. LTP `munmap04` deliberately builds ~65,000 VMAs, one PT_LOAD
+/// each, so this is reached by a real workload rather than a theoretical one.
+pub const PN_XNUM: u16 = 0xffff;
+/// Section header 0 is the reserved inactive entry. It exists in a core only
+/// as the carrier for `sh_info`.
+pub const SHT_NULL: u32 = 0;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
@@ -69,6 +78,11 @@ pub const AARCH64_TLS_SIZE: usize = 0x10;
 
 const EHDR_SIZE: u16 = 64;
 const PHDR_SIZE: u16 = 56;
+const SHDR_SIZE: u16 = 64;
+/// Every core carries exactly one section header: the reserved index-0 entry.
+/// It is written unconditionally rather than only when [`PN_XNUM`] fires, so
+/// the layout a reader sees is the same one every core exercises.
+const SHNUM: u16 = 1;
 
 /// Guest page size recorded in `NT_FILE`. The oracle reported 4096; carrick's
 /// guests are 4 KiB-paged Linux regardless of the host's 16 KiB pages, and this
@@ -190,7 +204,9 @@ pub enum CoreDumpError {
     OverlappingRegions { previous_end: u64, start: u64 },
     #[error("core requires {required} bytes, exceeding RLIMIT_CORE {limit}")]
     LimitExceeded { limit: u64, required: u64 },
-    #[error("core has {count} program headers, exceeding ELF64 e_phnum")]
+    /// Past `e_phnum` the count moves into section header 0's 32-bit
+    /// `sh_info` (see [`PN_XNUM`]); this is the failure past THAT.
+    #[error("core has {count} program headers, exceeding the ELF64 PN_XNUM sh_info carrier")]
     ProgramHeaderCountOverflow { count: usize },
     #[error("core ELF layout arithmetic overflowed")]
     LayoutOverflow,
@@ -252,11 +268,44 @@ fn validate_serialized_core(
     }
     let phoff = usize::try_from(read_u64(bytes, 32).ok_or_else(|| invalid("missing e_phoff"))?)
         .map_err(|_| invalid("e_phoff does not fit host usize"))?;
+    let shoff = usize::try_from(read_u64(bytes, 40).ok_or_else(|| invalid("missing e_shoff"))?)
+        .map_err(|_| invalid("e_shoff does not fit host usize"))?;
     let ehsize = read_u16(bytes, 52).ok_or_else(|| invalid("missing e_ehsize"))?;
     let phentsize = read_u16(bytes, 54).ok_or_else(|| invalid("missing e_phentsize"))?;
-    let phnum = usize::from(read_u16(bytes, 56).ok_or_else(|| invalid("missing e_phnum"))?);
+    let declared_phnum = read_u16(bytes, 56).ok_or_else(|| invalid("missing e_phnum"))?;
+    let shentsize = read_u16(bytes, 58).ok_or_else(|| invalid("missing e_shentsize"))?;
+    let shnum = read_u16(bytes, 60).ok_or_else(|| invalid("missing e_shnum"))?;
     if ehsize != EHDR_SIZE || phentsize != PHDR_SIZE || phoff != usize::from(EHDR_SIZE) {
         return Err(invalid("non-canonical ELF/program-header geometry"));
+    }
+    if shentsize != SHDR_SIZE || shnum != SHNUM {
+        return Err(invalid("non-canonical ELF section-header geometry"));
+    }
+    let section0_end = shoff
+        .checked_add(usize::from(SHDR_SIZE))
+        .ok_or(CoreDumpError::LayoutOverflow)?;
+    if section0_end > bytes.len() {
+        return Err(invalid("section-header table extends beyond artifact"));
+    }
+    let section_phnum = read_u32(
+        bytes,
+        shoff + std::mem::offset_of!(wire::Elf64Shdr, sh_info),
+    )
+    .ok_or_else(|| invalid("missing section 0 sh_info"))?;
+    // The gABI escape hatch: `PN_XNUM` in `e_phnum` delegates the real count to
+    // section header 0's `sh_info`. Read it exactly the way an external
+    // debugger does, so an off-by-one here fails the writer rather than the
+    // reader.
+    let phnum = if declared_phnum == PN_XNUM {
+        usize::try_from(section_phnum).map_err(|_| invalid("sh_info does not fit host usize"))?
+    } else {
+        if section_phnum != 0 {
+            return Err(invalid("sh_info is set without PN_XNUM"));
+        }
+        usize::from(declared_phnum)
+    };
+    if phnum < usize::from(PN_XNUM) && declared_phnum == PN_XNUM {
+        return Err(invalid("PN_XNUM used for a count that fits e_phnum"));
     }
     let expected_phnum = expected_loads
         .checked_add(1)
@@ -524,6 +573,25 @@ pub mod wire {
         pub p_align: u64,
     }
 
+    /// One section header. A core has no sections; index 0 is emitted purely
+    /// as the ELF-defined carrier for the real program-header count when it
+    /// overflows `e_phnum` (see [`PN_XNUM`](super::PN_XNUM)).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct Elf64Shdr {
+        pub sh_name: u32,
+        pub sh_type: u32,
+        pub sh_flags: u64,
+        pub sh_addr: u64,
+        pub sh_offset: u64,
+        pub sh_size: u64,
+        pub sh_link: u32,
+        /// Real program-header count when `e_phnum == PN_XNUM`, else zero.
+        pub sh_info: u32,
+        pub sh_addralign: u64,
+        pub sh_entsize: u64,
+    }
+
     /// The fixed head of an ELF note, before the padded name and descriptor.
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -549,6 +617,7 @@ const _: () = assert!(size_of::<wire::ElfPrPsInfo>() == ORACLE_PRPSINFO_SIZE);
 const _: () = assert!(size_of::<wire::SigInfo>() == ORACLE_SIGINFO_SIZE);
 const _: () = assert!(size_of::<wire::Elf64Ehdr>() == EHDR_SIZE as usize);
 const _: () = assert!(size_of::<wire::Elf64Phdr>() == PHDR_SIZE as usize);
+const _: () = assert!(size_of::<wire::Elf64Shdr>() == SHDR_SIZE as usize);
 
 /// Byte image of a wire struct.
 ///
@@ -772,12 +841,30 @@ impl CoreDump<'_> {
             .len()
             .checked_add(1)
             .ok_or(CoreDumpError::LayoutOverflow)?;
-        let phnum_u16 = u16::try_from(phnum)
-            .map_err(|_| CoreDumpError::ProgramHeaderCountOverflow { count: phnum })?;
+        // `e_phnum` is 16-bit. A count it cannot hold is not an error — the
+        // gABI escape hatch is to store `PN_XNUM` there and the real count in
+        // section header 0's `sh_info`, which is 32-bit. Only a count past
+        // THAT is unrepresentable.
+        let (phnum_u16, section_phnum) = if phnum >= usize::from(PN_XNUM) {
+            (
+                PN_XNUM,
+                u32::try_from(phnum)
+                    .map_err(|_| CoreDumpError::ProgramHeaderCountOverflow { count: phnum })?,
+            )
+        } else {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the branch condition proves the count fits u16"
+            )]
+            (phnum as u16, 0)
+        };
         let phoff = usize::from(EHDR_SIZE);
-        let notes_offset = phnum
+        let shoff = phnum
             .checked_mul(usize::from(PHDR_SIZE))
             .and_then(|table| phoff.checked_add(table))
+            .ok_or(CoreDumpError::LayoutOverflow)?;
+        let notes_offset = shoff
+            .checked_add(usize::from(SHNUM) * usize::from(SHDR_SIZE))
             .ok_or(CoreDumpError::LayoutOverflow)?;
         let notes_end = notes_offset
             .checked_add(notes.len())
@@ -796,9 +883,12 @@ impl CoreDump<'_> {
             e_machine: EM_AARCH64,
             e_version: 1,
             e_phoff: u64::try_from(phoff).map_err(|_| CoreDumpError::LayoutOverflow)?,
+            e_shoff: u64::try_from(shoff).map_err(|_| CoreDumpError::LayoutOverflow)?,
             e_ehsize: EHDR_SIZE,
             e_phentsize: PHDR_SIZE,
             e_phnum: phnum_u16,
+            e_shentsize: SHDR_SIZE,
+            e_shnum: SHNUM,
             ..wire::Elf64Ehdr::default()
         };
         let mut out = Vec::new();
@@ -835,6 +925,12 @@ impl CoreDump<'_> {
                 )
                 .ok_or(CoreDumpError::LayoutOverflow)?;
         }
+        debug_assert_eq!(out.len(), shoff);
+        out.extend_from_slice(as_bytes(&wire::Elf64Shdr {
+            sh_type: SHT_NULL,
+            sh_info: section_phnum,
+            ..wire::Elf64Shdr::default()
+        }));
         debug_assert_eq!(out.len(), notes_offset);
 
         out.extend_from_slice(&notes);
@@ -1090,21 +1186,68 @@ mod tests {
         );
     }
 
+    /// LTP `munmap04` builds ~65,000 VMAs, so the program-header count really
+    /// does overflow the 16-bit `e_phnum`. The gABI answer is `PN_XNUM` plus
+    /// section header 0's `sh_info`; refusing to serialise instead published
+    /// no core at all for that whole class of process.
     #[test]
-    fn bounded_writer_rejects_program_header_count_truncation() {
+    fn program_header_count_past_e_phnum_uses_pn_xnum() {
         let mut dump = sample();
         dump.regions = (0..u16::MAX)
-            .map(|_| MemoryRegion {
-                start: 0,
-                flags: 0,
+            .map(|index| MemoryRegion {
+                start: u64::from(index) * GUEST_PAGE as u64,
+                flags: region_flags(true, false, false),
                 bytes: &[],
-                size: 0,
+                size: GUEST_PAGE as u64,
             })
             .collect();
-        assert!(matches!(
-            dump.to_bytes_bounded(u64::MAX),
-            Err(CoreDumpError::ProgramHeaderCountOverflow { .. })
-        ));
+        let expected = dump.regions.len() + 1;
+        let bytes = dump.to_bytes_bounded(u64::MAX).expect("PN_XNUM core");
+
+        let at = std::mem::offset_of!(wire::Elf64Ehdr, e_phnum);
+        assert_eq!(
+            u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()),
+            PN_XNUM,
+            "e_phnum must be the escape sentinel"
+        );
+        let at = std::mem::offset_of!(wire::Elf64Ehdr, e_shoff);
+        let shoff =
+            usize::try_from(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())).unwrap();
+        assert_eq!(
+            shoff,
+            usize::from(EHDR_SIZE) + expected * usize::from(PHDR_SIZE),
+            "section header table follows the program header table"
+        );
+        let at = shoff + std::mem::offset_of!(wire::Elf64Shdr, sh_info);
+        assert_eq!(
+            u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize,
+            expected,
+            "section 0 sh_info carries the real program-header count"
+        );
+        let at = shoff + std::mem::offset_of!(wire::Elf64Shdr, sh_type);
+        assert_eq!(
+            u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()),
+            SHT_NULL
+        );
+    }
+
+    /// A count that still fits must NOT set the sentinel, and `sh_info` stays
+    /// zero — a reader that trusts `sh_info` unconditionally would otherwise
+    /// disagree with `e_phnum` on every ordinary core.
+    #[test]
+    fn ordinary_core_keeps_a_literal_e_phnum_and_empty_sh_info() {
+        let bytes = sample().to_bytes();
+        let at = std::mem::offset_of!(wire::Elf64Ehdr, e_phnum);
+        assert_eq!(
+            u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()),
+            1,
+            "PT_NOTE only"
+        );
+        let at = std::mem::offset_of!(wire::Elf64Ehdr, e_shoff);
+        let shoff =
+            usize::try_from(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())).unwrap();
+        let at = shoff + std::mem::offset_of!(wire::Elf64Shdr, sh_info);
+        assert_eq!(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()), 0);
     }
 
     #[test]
@@ -1251,5 +1394,63 @@ mod oracle_validation {
             ],
         };
         std::fs::write(&path, dump.to_bytes()).expect("emit core");
+    }
+
+    /// Emit a core whose program-header count overflows `e_phnum` to
+    /// `CARRICK_CORE_EMIT_PN_XNUM_PATH`, for the same reason as above: the
+    /// `PN_XNUM` escape hatch only matters if an INDEPENDENT debugger resolves
+    /// it. LTP `munmap04` reaches ~65,000 VMAs on the live lane, but building
+    /// them through a guest takes minutes; this reproduces the exact wire shape
+    /// in milliseconds so `lldb`/`readelf` can be pointed at it on demand.
+    #[test]
+    fn emit_pn_xnum_core_for_an_independent_reader() {
+        let Ok(path) = std::env::var("CARRICK_CORE_EMIT_PN_XNUM_PATH") else {
+            return;
+        };
+        // One readable page per VMA, one unmapped page between them — the shape
+        // a max_map_count workload leaves behind, and the reason the VMAs
+        // cannot be coalesced away.
+        let page = [0x5a_u8; GUEST_PAGE];
+        let regions = (0..u32::from(PN_XNUM) + 64)
+            .map(|index| MemoryRegion {
+                start: 0x0000_bbbb_0000_0000 + u64::from(index) * 2 * GUEST_PAGE as u64,
+                flags: region_flags(true, true, false),
+                bytes: &page,
+                size: GUEST_PAGE as u64,
+            })
+            .collect();
+        let dump = CoreDump {
+            identity: ProcessIdentity {
+                pid: 4321,
+                ppid: 1,
+                pgrp: 4321,
+                session: 1,
+                comm: "carrickxnum".to_string(),
+                psargs: "carrickxnum --emit".to_string(),
+            },
+            signal: SignalInfo {
+                signo: 11,
+                code: 1,
+                errno: 0,
+                addr: 0x0000_bbbb_0000_0000,
+            },
+            threads: vec![ThreadState {
+                tid: 4321,
+                registers: ThreadRegisters {
+                    gregs: [0x0000_bbbb_0000_0000; AARCH64_GREGS],
+                    ..ThreadRegisters::default()
+                },
+                current_signal: 11,
+            }],
+            auxv: vec![(6, GUEST_PAGE as u64)],
+            mappings: vec![FileMapping {
+                start: 0x0000_bbbb_0000_0000,
+                end: 0x0000_bbbb_0000_1000,
+                file_page_offset: 0,
+                path: "/usr/bin/carrickxnum".to_string(),
+            }],
+            regions,
+        };
+        std::fs::write(&path, dump.to_bytes()).expect("emit PN_XNUM core");
     }
 }
