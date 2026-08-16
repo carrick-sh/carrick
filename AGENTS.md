@@ -203,6 +203,27 @@ If it fails in Docker too, it's not carrick's bug.
   ONLY the files you yourself changed (and `md5`-verify a dependency before
   trusting box state) — a blanket `rsync crates/` ships another agent's mid-edit
   breakage into your box build.
+- **"No guest output" means "died before flushing" — never "did not run".** LTP
+  writes its transcript to **stderr** under the new `tst_test` API and to
+  **stdout** under the old one, so ALWAYS read BOTH `target/conformance/raw/
+  <run-id>.err` and `.out`, with `grep -a` (they carry binary bytes). Old-API
+  tests block-buffer stdout and only flush in `tst_exit()`, so an abort or a
+  harness `SIGKILL` DISCARDS everything queued: a file containing only
+  carrick's one-line `--user "root"` banner is a CRASH SIGNATURE, not an empty
+  result. Recover the lost lines by re-running under a pty (`run -t`) or
+  `stdbuf -o0`, and read the exit code (134 = abort, 139 = SIGSEGV). This cost
+  several investigations a full cycle each before it was written down.
+- **An inversion can mean the ORACLE is under-privileged, not that carrick is
+  wrong.** The documented trap is a carrick false pass; the opposite direction
+  is just as real and is easy to mis-file as a carrick gap. Twelve xattr suites
+  were recorded as carrick gaps for months because they set `security.*`
+  attributes, which need `CAP_SYS_ADMIN` — dropped by Docker's default cap set,
+  so the ORACLE TBROKed with EPERM while carrick passed. Granting an oracle row
+  the privilege its LTP `.needs_root`/`.needs_devfs` declaration implies (via
+  `docker_flags`, as the fanotify and add_key rows already do) is the OPPOSITE
+  of bending the gate to match carrick: it makes the oracle measure the Linux
+  semantics the case was written to test. Confirm by running the case under
+  Docker with and without the capability before changing anything.
 - **The Docker oracle is cached** (`scripts/conformance/oracle-cache.jsonl`) so
   routine gates run carrick-only. Single-run gating is non-deterministic
   (Go-under-HVF races); treat flaky flips as flakiness (retry / `known_gaps`),
@@ -637,6 +658,15 @@ path), and lets a "landed" change never actually land.
 
 ## Commits, hooks & CI
 
+- **NEVER `git stash` in this checkout — the stash is REPO-GLOBAL, shared by
+  every worktree.** Two agents in sibling worktrees collided on it: one's `git
+  stash pop` restored the OTHER's entry into the wrong tree and dropped it from
+  the list. It was recovered (a dropped stash survives as a dangling commit —
+  `git fsck --no-reflog`, then `git stash store -m <msg> <sha>`), but only
+  because someone noticed. Indices shift under you with no warning, so
+  `stash@{0}` is never a safe handle. To set work aside, commit it on your own
+  branch; to measure a "before", commit and then `git checkout` the base
+  revision. Same class as the shared-working-tree `rsync` hazard above.
 - **Subject — Conventional Commits: `type(scope): subject`** (imperative,
   lowercase, no trailing period, ≤~72 chars). Types in use: `feat`, `fix`,
   `refactor`, `docs`, `test`, `diagnostics`. Real scopes: `bhyve`, `kvm`, `nvmm`,
