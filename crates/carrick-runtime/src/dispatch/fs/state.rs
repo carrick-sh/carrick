@@ -180,6 +180,14 @@ pub(in crate::dispatch) struct FsState {
     /// handlers' notify calls are a single `is_empty` read and return.
     pub(in crate::dispatch) inotify_registry: crate::inotify::InotifyRegistry,
 
+    /// Dispatch-layer fanotify mark table. Same seam as `inotify_registry`, but
+    /// SHARED by `Arc` across guest fork rather than deep-copied: a fanotify
+    /// mark lives on the inode and its group outlives any one fd, so a forked
+    /// child must keep generating events into the group its parent reads even
+    /// after the child closes its own inherited fd (LTP `fanotify12`). Empty in
+    /// the common case → the fs hooks cost one uncontended read lock.
+    pub(in crate::dispatch) fanotify_registry: crate::fanotify::FanotifyRegistry,
+
     /// Dnotify (`F_NOTIFY`) directory watches. Linux delivers `SIGIO` to the
     /// fd's async owner on matching directory changes. Carrick implements the
     /// same-process create/delete/rename cases exercised by LTP by piggybacking
@@ -362,6 +370,7 @@ impl FsState {
             rootfs_vfs: std::sync::Arc::new(crate::vfs::RootFsVfs::new()),
             pty_table,
             inotify_registry: crate::inotify::InotifyRegistry::default(),
+            fanotify_registry: crate::fanotify::FanotifyRegistry::default(),
             dnotify_registry: parking_lot::Mutex::new(Vec::new()),
             resolve_cache: crate::fs_resolve_cache::ResolveCache::new(),
             hvpatch_exec_cache: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -375,6 +384,8 @@ impl FsState {
             rootfs_vfs: std::sync::Arc::clone(&self.rootfs_vfs),
             pty_table: std::sync::Arc::clone(&self.pty_table),
             inotify_registry: self.inotify_registry.clone(),
+            // Arc clone: the SAME table, not a copy. See the field docs.
+            fanotify_registry: self.fanotify_registry.clone(),
             dnotify_registry: parking_lot::Mutex::new(self.dnotify_registry.lock().clone()),
             resolve_cache: crate::fs_resolve_cache::ResolveCache::new(),
             hvpatch_exec_cache: std::sync::Arc::clone(&self.hvpatch_exec_cache),

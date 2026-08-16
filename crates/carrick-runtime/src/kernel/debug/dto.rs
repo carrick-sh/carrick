@@ -1109,6 +1109,7 @@ fn backing_kind_name(backing: &FileDescriptionBackingSnapshot) -> &'static str {
         Kind::HostFile => "host-file",
         Kind::HostSocket => "host-socket",
         Kind::Inotify => "inotify",
+        Kind::Fanotify => "fanotify",
         Kind::SignalFd => "signalfd",
         Kind::Netlink => "netlink",
         Kind::Mqueue => "mqueue",

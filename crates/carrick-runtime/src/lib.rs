@@ -132,6 +132,7 @@ pub mod event_mux;
 pub mod event_ring;
 pub(crate) mod eventfd_shm;
 pub(crate) mod exec_helpers;
+pub(crate) mod fanotify;
 pub mod fs_backend;
 pub mod fs_resolve_cache;
 pub mod host_tty;
