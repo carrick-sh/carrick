@@ -135,6 +135,27 @@ pub struct SyntheticProcThread {
     pub comm: Option<String>,
 }
 
+/// One LIVE Linux process other than the reader, rendered by the in-process
+/// HVPatch `/proc` view — the sibling of [`SyntheticProcZombie`], covering the
+/// interval before a process exits.
+///
+/// It exists for the same reason: under HVPatch every Linux process is a thread
+/// of ONE Darwin process, so Darwin's process table cannot describe a peer at
+/// all. Asking it yields the CARRIER's identity — which is how a guest reading
+/// `/proc/<peer>/stat` used to receive five-digit host ppid/pgrp/session values
+/// straight out of macOS. The authoritative Kernel task record must cross the
+/// dispatcher/VFS boundary instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticProcProcess {
+    pub pid: u32,
+    pub ppid: u32,
+    pub pgrp: u32,
+    pub session: u32,
+    pub state: char,
+    pub threads: usize,
+    pub comm: String,
+}
+
 /// One exited-but-unreaped Linux process rendered by the in-process HVPatch
 /// `/proc` view. HVPatch children are host threads, so Darwin's process table
 /// cannot observe their zombie interval; the authoritative Kernel record must
@@ -204,6 +225,13 @@ pub struct SyntheticProcContext {
     /// process behind it, which is what makes `/proc/<dead-pid>/oom_score_adj`
     /// ENOENT rather than a fabricated 0.
     pub oom_score_adj: std::collections::BTreeMap<u32, i32>,
+    /// Every LIVE Linux process, from the kernel graph. This is the authority
+    /// for a `/proc/<peer-pid>/…` read: HVPatch peers have no host process of
+    /// their own, so without it the renderer falls through to a host-derived
+    /// answer that describes the Darwin carrier. `None` on a lane with no
+    /// kernel graph, where one Linux process IS one host process and the
+    /// mature host-process derivation is correct.
+    pub processes: Option<Vec<SyntheticProcProcess>>,
     /// Exact live-thread snapshot for the same task. `None` preserves the
     /// mature one-process-per-host-process registry lookup byte-for-byte.
     pub threads: Option<Vec<SyntheticProcThread>>,
@@ -752,19 +780,39 @@ fn sysctl_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     Some(entries)
 }
 
-/// A numeric `/proc/<self-pid>/<rest>` is the same object as `/proc/self/<rest>`
-/// (carrick is one guest process), whether the pid is the host pid or the
-/// guest's ns-pid. Rewrite it so the literal `/proc/self/*` renderers (which
-/// hold the live `SyntheticProcContext`) serve it too — keeping `ls /proc/<pid>`
-/// consistent with what `open()` resolves for the self process.
-fn normalize_self_pid_path(path: &str) -> Cow<'_, str> {
+/// The reader's OWN Linux pid — the one and only numeric `/proc/<n>` that is an
+/// alias for `/proc/self`.
+///
+/// On HVPatch this MUST come from the kernel graph. Every Linux process there is
+/// a thread of one Darwin process, so `std::process::id()` and
+/// `namespace::pid::self_ns_pid()` both name the CARRIER, not the caller — and
+/// inside a container the carrier's ns-pid is **1**. Treating that as "self"
+/// aliased every guest process's `/proc/1/*` onto whichever process happened to
+/// be reading it: `cat /proc/1/stat` from a shell that really was pid 1 printed
+/// `2 (cat) R …`, and LTP `getpgid01` read the reader's pgrp out of
+/// `/proc/1/stat` field 5 while `getpgid(1)` correctly answered 1.
+///
+/// Without a kernel graph one Linux process IS one host process, so the host
+/// pid and its namespace translation are both genuinely this caller.
+fn context_self_pid(ctx: &SyntheticProcContext) -> u32 {
+    ctx.identity
+        .map_or_else(crate::namespace::pid::self_ns_pid, |identity| identity.pid)
+}
+
+/// A numeric `/proc/<self-pid>/<rest>` is the same object as `/proc/self/<rest>`.
+/// Rewrite it so the literal `/proc/self/*` renderers (which hold the live
+/// `SyntheticProcContext`) serve it too — keeping `ls /proc/<pid>` consistent
+/// with what `open()` resolves for the self process. Any OTHER pid is a peer and
+/// must fall through to `synthetic_proc_pid_file`; see [`context_self_pid`] for
+/// why "self" cannot be recognised from a host-process identity here.
+fn normalize_self_pid_path<'a>(path: &'a str, ctx: &SyntheticProcContext) -> Cow<'a, str> {
     if let Some(rest) = path.strip_prefix("/proc/")
         && let Some((pid, sub)) = rest.split_once('/')
         && !pid.is_empty()
         && pid.bytes().all(|b| b.is_ascii_digit())
     {
         let n: u32 = pid.parse().unwrap_or(0);
-        if n != 0 && (n == std::process::id() || n == crate::namespace::pid::self_ns_pid()) {
+        if n != 0 && n == context_self_pid(ctx) {
             return Cow::Owned(format!("/proc/self/{sub}"));
         }
     }
@@ -820,7 +868,7 @@ pub(crate) fn is_proc_self_pagemap_path(path: &str) -> bool {
 }
 
 pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<Vec<u8>> {
-    let normalized = normalize_self_pid_path(path);
+    let normalized = normalize_self_pid_path(path, ctx);
     let path = normalized.as_ref();
     // `/proc/<pid>/mem` and `/proc/<pid>/pagemap` are live files, not
     // precomputed blobs: return an EMPTY blob so they OPEN as `SyntheticFile`;
@@ -1790,10 +1838,18 @@ fn proc_pid_dir_entries_with_context(
     if ctx.identity.is_some_and(|identity| identity.pid == pid) {
         return proc_pid_dir_entries_for_known_process(path, true);
     }
+    // A live peer, then a zombie: the kernel graph knows both, and on HVPatch it
+    // is the ONLY thing that does — a peer shares this Darwin pid, so the
+    // host-process gate below cannot tell `/proc/<live-peer>` from a pid that
+    // never existed.
     if ctx
-        .zombies
+        .processes
         .as_ref()
-        .is_some_and(|zombies| zombies.iter().any(|zombie| zombie.pid == pid))
+        .is_some_and(|processes| processes.iter().any(|process| process.pid == pid))
+        || ctx
+            .zombies
+            .as_ref()
+            .is_some_and(|zombies| zombies.iter().any(|zombie| zombie.pid == pid))
     {
         return proc_pid_dir_entries_for_known_process(path, false);
     }
@@ -1870,6 +1926,7 @@ fn synthetic_proc_context_from_open(ctx: &OpenContext<'_>) -> SyntheticProcConte
         sig_caught: ctx.sig_caught,
         sig_shdpnd: ctx.sig_shdpnd,
         identity: ctx.identity,
+        processes: ctx.processes.map(|processes| processes.to_vec()),
         threads: ctx.threads.map(|threads| threads.to_vec()),
         zombies: ctx.zombies.map(|zombies| zombies.to_vec()),
         sysvipc_shm: ctx.sysvipc_shm.unwrap_or("").to_owned(),
@@ -2980,6 +3037,74 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{count}\n",
                     "Name:\t{name}\nState:\tZ (zombie)\nTgid:\t{pid}\n\
 Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t1\n",
                     ppid = zombie.ppid,
+                )
+                .into_bytes(),
+            ),
+            _ => None,
+        };
+    }
+
+    // A live PEER process, straight from the kernel graph. This must be answered
+    // BEFORE every host-derived branch below: on HVPatch a peer has no host
+    // process of its own, so those branches describe the Darwin CARRIER and
+    // leaked its ppid/pgrp/session (five-digit macOS pids) into the guest.
+    // Ordered after the thread arm so a tid of the READER's own task — which
+    // can numerically equal a peer's pid only if the graph is inconsistent —
+    // still resolves through the richer per-thread snapshot.
+    if let Some(processes) = ctx.processes.as_ref()
+        && let Some(process) = processes.iter().find(|process| process.pid == pid)
+    {
+        let name = if process.comm.is_empty() {
+            self_comm
+        } else {
+            process.comm.as_str()
+        };
+        let threads = process.threads.max(1);
+        return match rest {
+            "stat" => Some(
+                proc_stat_line(
+                    pid,
+                    name,
+                    process.state,
+                    process.ppid,
+                    process.pgrp,
+                    process.session,
+                    threads,
+                    // CPU accounting is per-carrier, not per-Linux-process, so
+                    // charging a peer this process's ticks would be a fresh
+                    // instance of exactly the bug this arm fixes. 0 until the
+                    // kernel graph carries per-task CPU.
+                    0,
+                )
+                .into_bytes(),
+            ),
+            "comm" => Some(format!("{name}\n").into_bytes()),
+            "cmdline" => {
+                let mut bytes = name.as_bytes().to_vec();
+                bytes.push(0);
+                Some(bytes)
+            }
+            "status" => Some(
+                format!(
+                    "Name:\t{name}\n\
+State:\t{state} ({state_long})\n\
+Tgid:\t{pid}\n\
+Pid:\t{pid}\n\
+PPid:\t{ppid}\n\
+TracerPid:\t0\n\
+Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n\
+Gid:\t{gid}\t{gid}\t{gid}\t{gid}\n\
+Threads:\t{threads}\n",
+                    state = process.state,
+                    state_long = proc_state_long(process.state),
+                    ppid = process.ppid,
+                    // Per-process credentials are not in the kernel graph yet.
+                    // The reader's own modeled container credentials are the
+                    // honest stand-in — every process in the default rootful
+                    // container shares them — and they are at least a GUEST
+                    // value, unlike the macOS 501/20 the host path reported.
+                    uid = ctx.euid,
+                    gid = ctx.egid,
                 )
                 .into_bytes(),
             ),
@@ -4755,6 +4880,158 @@ mod tests {
         assert!(
             btime > 1_600_000_000,
             "btime should be a recent epoch: {btime}"
+        );
+    }
+
+    /// A reader that is NOT pid 1 asking for `/proc/1` must be told about
+    /// pid 1, not about itself.
+    ///
+    /// Under HVPatch the whole guest shares one Darwin process whose ns-pid
+    /// inside a container is 1, so recognising "self" from the host identity
+    /// rewrote EVERY process's `/proc/1/*` to `/proc/self/*`. Live, from a
+    /// shell that really was pid 1: `cat /proc/1/stat` printed
+    /// `2 (cat) R 1 1 1` — the reader. LTP `getpgid01` compares
+    /// `getpgid(1)` (right, from the kernel graph) against `/proc/1/stat`
+    /// field 5 (the reader's pgrp).
+    #[test]
+    fn proc_one_renders_init_not_the_reader() {
+        let ctx = SyntheticProcContext {
+            identity: Some(SyntheticProcIdentity {
+                pid: 2,
+                tid: 2,
+                ppid: 1,
+                pgrp: 1,
+                session: 1,
+            }),
+            processes: Some(vec![
+                SyntheticProcProcess {
+                    pid: 1,
+                    ppid: 0,
+                    pgrp: 1,
+                    session: 1,
+                    state: 'S',
+                    threads: 1,
+                    comm: "sh".to_owned(),
+                },
+                SyntheticProcProcess {
+                    pid: 2,
+                    ppid: 1,
+                    pgrp: 1,
+                    session: 1,
+                    state: 'R',
+                    threads: 1,
+                    comm: "cat".to_owned(),
+                },
+            ]),
+            ..demo_ctx()
+        };
+
+        let init = String::from_utf8(synthetic_file("/proc/1/stat", &ctx).unwrap()).unwrap();
+        assert!(
+            init.starts_with("1 (sh) S 0 1 1 "),
+            "/proc/1/stat aliased onto the reader instead of rendering pid 1: {init:?}"
+        );
+
+        // …while the reader's own `/proc/self` is untouched: the alias is a
+        // rewrite of exactly one pid, not a disabled feature.
+        let own = String::from_utf8(synthetic_file("/proc/self/stat", &ctx).unwrap()).unwrap();
+        assert!(
+            own.starts_with("2 ("),
+            "the reader's own /proc/self/stat regressed: {own:?}"
+        );
+        let via_pid = String::from_utf8(synthetic_file("/proc/2/stat", &ctx).unwrap()).unwrap();
+        assert_eq!(
+            via_pid, own,
+            "/proc/<own-pid> must still alias to /proc/self"
+        );
+    }
+
+    /// A live peer's ppid/pgrp/session/comm come from the kernel graph, never
+    /// from Darwin. HVPatch peers are threads of one carrier, so the
+    /// host-derived fallback answered with the CARRIER's identity: live,
+    /// `cat /proc/2/stat` for a `sleep` peer printed
+    /// `2 (cat) S 27206 27207 27207` — a macOS ppid, pgrp and session, plus
+    /// the READER's comm.
+    #[test]
+    fn live_peer_identity_comes_from_the_kernel_graph() {
+        let ctx = SyntheticProcContext {
+            identity: Some(SyntheticProcIdentity {
+                pid: 3,
+                tid: 3,
+                ppid: 1,
+                pgrp: 1,
+                session: 1,
+            }),
+            processes: Some(vec![SyntheticProcProcess {
+                pid: 7,
+                ppid: 4,
+                pgrp: 5,
+                session: 6,
+                state: 'S',
+                threads: 2,
+                comm: "sleep".to_owned(),
+            }]),
+            ..demo_ctx()
+        };
+
+        let stat = String::from_utf8(synthetic_file("/proc/7/stat", &ctx).unwrap()).unwrap();
+        assert!(
+            stat.starts_with("7 (sleep) S 4 5 6 "),
+            "peer identity was not taken from the kernel graph: {stat:?}"
+        );
+        // Field 20 is num_threads: the graph's live thread count, not 1.
+        assert_eq!(
+            stat.split_whitespace().nth(19),
+            Some("2"),
+            "peer thread count was not taken from the kernel graph: {stat:?}"
+        );
+
+        let status = String::from_utf8(synthetic_file("/proc/7/status", &ctx).unwrap()).unwrap();
+        assert!(
+            status.contains("Name:\tsleep\n") && status.contains("PPid:\t4\n"),
+            "peer status was not taken from the kernel graph: {status:?}"
+        );
+
+        let comm = synthetic_file("/proc/7/comm", &ctx).unwrap();
+        assert_eq!(comm, b"sleep\n");
+
+        // No host identity may reach the guest. The bug this guards put
+        // 5-digit macOS pids in stat fields 4-6 and in `status`' PPid.
+        let identity_fields: Vec<&str> = stat.split_whitespace().skip(3).take(3).collect();
+        assert_eq!(
+            identity_fields,
+            ["4", "5", "6"],
+            "stat ppid/pgrp/session were host values: {stat:?}"
+        );
+        for line in status.lines() {
+            let Some((_, value)) = line.split_once('\t') else {
+                continue;
+            };
+            assert!(
+                value.parse::<u32>().ok().is_none_or(|n| n < 1000),
+                "a host-scale pid leaked into /proc/7/status: {line:?}"
+            );
+        }
+    }
+
+    /// A pid the kernel graph has never heard of stays ENOENT: the peer arm
+    /// answers from a snapshot, so it must not fabricate one.
+    #[test]
+    fn unknown_peer_pid_is_not_fabricated() {
+        let ctx = SyntheticProcContext {
+            identity: Some(SyntheticProcIdentity {
+                pid: 3,
+                tid: 3,
+                ppid: 1,
+                pgrp: 1,
+                session: 1,
+            }),
+            processes: Some(Vec::new()),
+            ..demo_ctx()
+        };
+        assert!(
+            synthetic_file("/proc/999999/stat", &ctx).is_none(),
+            "a pid with no kernel-graph record must not render"
         );
     }
 
