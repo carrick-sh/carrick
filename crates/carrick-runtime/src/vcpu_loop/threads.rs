@@ -10,6 +10,17 @@ enum SharedWordWaitRaw {
     ExecReplacedThread,
 }
 
+/// One cross-process (`MAP_SHARED`) futex wait target. The three values always
+/// travel together — the shared word's location, the waiter-table key, and the
+/// value the guest expects to still be there — so they cross the wait API as
+/// one named thing rather than three positional arguments.
+#[derive(Clone, Copy)]
+pub(super) struct SharedWordWait {
+    pub(super) location: carrick_guest_mem::SharedFutexLocation,
+    pub(super) waiter_key: usize,
+    pub(super) value: u32,
+}
+
 pub(super) enum CloneThreadSpawn {
     Started(crate::kernel::LinuxTid),
     Errno(crate::linux_abi::LinuxErrno),
@@ -39,6 +50,34 @@ fn has_dispatch_signal_for_futex_wait(
             carrick_abi::WaitSigMask::NONE,
         )
     })
+}
+
+/// The ONE interrupt vocabulary shared by BOTH futex-wait implementations —
+/// the private `parking_lot` table and the cross-process `__ulock` word.
+///
+/// They used to disagree: the shared path omitted the kernel-graph term, and
+/// on HVPatch that store is the ONLY place a guest signal lands
+/// (`post_signal_to_authorized_target` records into the kernel graph and never
+/// writes `host_signal`'s per-tid words). A thread parked on a `MAP_SHARED`
+/// futex was therefore deaf to every `tgkill` / `pidfd_send_signal` /
+/// `rt_sigqueueinfo` until an unrelated `FUTEX_WAKE` happened to arrive.
+///
+/// No new wake vehicle is needed to make the term effective: a shared wait is
+/// sliced at `SHARED_FUTEX_MAX_SLICE_NS` (20 ms) and re-evaluates this
+/// predicate at every slice boundary — that slice cap exists precisely because
+/// a vCPU kick cannot interrupt a thread inside the host wait primitive.
+fn futex_wait_is_interrupted(
+    dispatcher: &SyscallDispatcher,
+    context: Option<&crate::kernel::KernelContext>,
+    registry: &ThreadRegistry,
+    tid: ThreadId,
+    fork_quiescing: bool,
+) -> bool {
+    crate::host_signal::has_pending_for(tid.raw())
+        || has_dispatch_signal_for_futex_wait(dispatcher, context, tid)
+        || fork_quiescing
+        || crate::fork_quiesce::exec_replacing_other_thread(tid)
+        || !registry.is_live(tid)
 }
 
 fn acquire_vcpu_lease_while_live<A, R>(
@@ -127,6 +166,34 @@ mod tests {
             tid
         ));
     }
+
+    /// The cross-process (`MAP_SHARED`, `__ulock`) futex wait must use the SAME
+    /// interrupt vocabulary as the private one. It did not: it omitted the
+    /// kernel-graph term, which on HVPatch is the only place a guest signal is
+    /// recorded, so a thread parked on a shared futex was deaf to every signal.
+    /// Both paths now call this one predicate, so they cannot drift again.
+    #[test]
+    fn futex_wait_interrupt_vocabulary_sees_a_kernel_graph_signal() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.exact_signal_context_for_test();
+        let tid = context.thread().registry_id();
+        let registry = ThreadRegistry::new(tid);
+
+        assert!(
+            !futex_wait_is_interrupted(&dispatcher, Some(&context), &registry, tid, false),
+            "an idle waiter is not interrupted"
+        );
+        assert!(
+            futex_wait_is_interrupted(&dispatcher, Some(&context), &registry, tid, true),
+            "a fork quiesce always interrupts"
+        );
+
+        dispatcher.mark_signal_pending(&context, tid, 33);
+        assert!(
+            futex_wait_is_interrupted(&dispatcher, Some(&context), &registry, tid, false),
+            "a signal posted into the kernel graph must interrupt the wait"
+        );
+    }
 }
 
 impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
@@ -208,15 +275,13 @@ where
             let raw = self
                 .futex
                 .wait_prepared_for_thread(wait, timeout, self.this_tid, &|| {
-                    crate::host_signal::has_pending_for(self.this_tid.raw())
-                        || has_dispatch_signal_for_futex_wait(
-                            &kernel.dispatcher,
-                            self.service_kernel_context.as_ref(),
-                            self.this_tid,
-                        )
-                        || self.fork_is_quiescing()
-                        || crate::fork_quiesce::exec_replacing_other_thread(self.this_tid)
-                        || !self.registry.is_live(self.this_tid)
+                    futex_wait_is_interrupted(
+                        &kernel.dispatcher,
+                        self.service_kernel_context.as_ref(),
+                        &self.registry,
+                        self.this_tid,
+                        self.fork_is_quiescing(),
+                    )
                 });
             crate::event_ring::rec_futex_end(
                 wait.addr,
@@ -352,42 +417,47 @@ where
 
     pub(super) fn complete_shared_futex_wait(
         &self,
+        kernel: &Kernel,
         engine: &mut E,
-        location: carrick_guest_mem::SharedFutexLocation,
-        waiter_key: usize,
-        value: u32,
+        wait: SharedWordWait,
         timeout: Option<Duration>,
     ) -> Result<BlockingWaitCompletion, RuntimeError> {
-        self.complete_shared_futex_wait_with_value(engine, location, waiter_key, value, timeout, 0)
+        self.complete_shared_futex_wait_with_value(kernel, engine, wait, timeout, 0)
     }
 
     pub(super) fn complete_shared_futex_waitv(
         &self,
+        kernel: &Kernel,
         engine: &mut E,
-        location: carrick_guest_mem::SharedFutexLocation,
-        waiter_key: usize,
-        value: u32,
+        wait: SharedWordWait,
         timeout: Option<Duration>,
         index: i64,
     ) -> Result<BlockingWaitCompletion, RuntimeError> {
-        self.complete_shared_futex_wait_with_value(
-            engine, location, waiter_key, value, timeout, index,
-        )
+        self.complete_shared_futex_wait_with_value(kernel, engine, wait, timeout, index)
     }
 
     fn wait_on_shared_word_retval(
         &self,
+        kernel: &Kernel,
         engine: &mut E,
-        location: carrick_guest_mem::SharedFutexLocation,
-        waiter_key: usize,
-        value: u32,
+        wait: SharedWordWait,
         timeout: Option<Duration>,
     ) -> Result<SharedWordWaitRaw, RuntimeError> {
+        let SharedWordWait {
+            location,
+            waiter_key,
+            value,
+        } = wait;
+        // Exactly the vocabulary the PRIVATE futex wait uses — see
+        // `futex_wait_is_interrupted`.
         let interrupted = || {
-            crate::host_signal::has_pending_for(self.this_tid.raw())
-                || self.fork_is_quiescing()
-                || crate::fork_quiesce::exec_replacing_other_thread(self.this_tid)
-                || !self.registry.is_live(self.this_tid)
+            futex_wait_is_interrupted(
+                &kernel.dispatcher,
+                self.service_kernel_context.as_ref(),
+                &self.registry,
+                self.this_tid,
+                self.fork_is_quiescing(),
+            )
         };
         let retval = loop {
             // Shared park/resume pair (mod.rs): reclaim this thread's vCPU —
@@ -432,12 +502,11 @@ where
 
     pub(super) fn wait_on_shared_word(
         &self,
+        kernel: &Kernel,
         engine: &mut E,
-        location: carrick_guest_mem::SharedFutexLocation,
-        waiter_key: usize,
-        value: u32,
+        wait: SharedWordWait,
     ) -> Result<SharedWordWaitCompletion, RuntimeError> {
-        match self.wait_on_shared_word_retval(engine, location, waiter_key, value, None)? {
+        match self.wait_on_shared_word_retval(kernel, engine, wait, None)? {
             SharedWordWaitRaw::ExecReplacedThread => {
                 Ok(SharedWordWaitCompletion::ExecReplacedThread)
             }
@@ -452,20 +521,18 @@ where
 
     fn complete_shared_futex_wait_with_value(
         &self,
+        kernel: &Kernel,
         engine: &mut E,
-        location: carrick_guest_mem::SharedFutexLocation,
-        waiter_key: usize,
-        value: u32,
+        wait: SharedWordWait,
         timeout: Option<Duration>,
         woken_value: i64,
     ) -> Result<BlockingWaitCompletion, RuntimeError> {
-        let retval =
-            match self.wait_on_shared_word_retval(engine, location, waiter_key, value, timeout)? {
-                SharedWordWaitRaw::Retval(retval) => retval,
-                SharedWordWaitRaw::ExecReplacedThread => {
-                    return Ok(BlockingWaitCompletion::ExecReplacedThread);
-                }
-            };
+        let retval = match self.wait_on_shared_word_retval(kernel, engine, wait, timeout)? {
+            SharedWordWaitRaw::Retval(retval) => retval,
+            SharedWordWaitRaw::ExecReplacedThread => {
+                return Ok(BlockingWaitCompletion::ExecReplacedThread);
+            }
+        };
         let retval = if retval == 0 { woken_value } else { retval };
         self.complete_returned(engine, retval)
             .map(BlockingWaitCompletion::Retval)
