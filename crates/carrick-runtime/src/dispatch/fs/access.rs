@@ -159,15 +159,45 @@ impl SyscallDispatcher {
         }
     }
 
+    /// THE identity every file-permission check uses: `fsuid`/`fsgid`, not
+    /// `euid`/`egid`.
+    ///
+    /// setfsuid(2): "All of the file-access permission checks that were
+    /// previously performed with the effective UID are now performed with the
+    /// fsuid." capabilities(7) adds the half that bites hardest — an fsuid
+    /// transition 0 -> nonzero drops `CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH`
+    /// and `CAP_FOWNER` from the effective set, so the root bypass must key on
+    /// fsuid too. Checking `euid.is_root()` let a process that had dropped only
+    /// its fsuid keep full root file access (LTP setfsuid04).
+    ///
+    /// `fsuid`/`fsgid` track `euid`/`egid` through every `set*uid`/`set*gid`
+    /// (see `dispatch::creds`), so this differs from the old behaviour ONLY
+    /// after a deliberate `setfsuid`/`setfsgid` split — which is exactly the
+    /// case that was wrong. Routing every check through one accessor is what
+    /// stops the euid and fsuid families drifting apart again: the overlay-side
+    /// checks in `fs.rs` already used fsuid while these used euid.
+    fn dac_identity(&self) -> (carrick_abi::NsUid, carrick_abi::NsGid) {
+        let creds = self.cred_snapshot();
+        (creds.fsuid, creds.fsgid)
+    }
+
+    /// True iff the caller keeps the DAC-override capabilities. See
+    /// [`Self::dac_identity`] — this is fsuid, never euid.
+    fn dac_overrides_permissions(&self) -> bool {
+        self.cred_snapshot().fsuid.is_root()
+    }
+
     /// DAC check for `path` using the backend's real owner+mode (`--fs host`).
     /// Returns `None` when the backend can't supply owner/mode (so the caller
-    /// falls back to the legacy root model). `use_effective` selects effective
-    /// vs real caller ids.
+    /// falls back to the legacy root model). `use_effective` selects the
+    /// filesystem identity (fsuid/fsgid) vs the REAL ids — access(2) is
+    /// deliberately different from every other check here: it answers "could
+    /// the real user do this", so it keeps ruid/rgid.
     fn dac_access(&self, path: &str, mask: u64, use_effective: bool) -> Option<DispatchOutcome> {
         let real = self.fs.rootfs_vfs.overlay.real_stat(path, true)?;
         let creds = self.cred_snapshot();
         let (uid, gid) = if use_effective {
-            (creds.euid, creds.egid)
+            (creds.fsuid, creds.fsgid)
         } else {
             (creds.ruid, creds.rgid)
         };
@@ -196,11 +226,10 @@ impl SyscallDispatcher {
         access: u64,
         want_create: bool,
     ) -> Option<LinuxErrno> {
-        let creds = self.cred_snapshot();
-        if creds.euid.is_root() {
+        if self.dac_overrides_permissions() {
             return None;
         }
-        let (uid, gid) = (creds.euid, creds.egid);
+        let (uid, gid) = self.dac_identity();
         match self.fs.rootfs_vfs.overlay.real_stat(path, true) {
             Some(real) => {
                 // Existing file: ancestor search + the requested access.
@@ -259,16 +288,14 @@ impl SyscallDispatcher {
     /// op to the backend. Ancestor search permission is already enforced by
     /// `resolve_at_path`/`check_search_access`, so this gates only the leaf.
     pub(super) fn may_write(&self, path: &str) -> Option<LinuxErrno> {
-        let creds = self.cred_snapshot();
-        if creds.euid.is_root() {
+        if self.dac_overrides_permissions() {
             return None;
         }
+        let (uid, gid) = self.dac_identity();
         let real = self.fs.rootfs_vfs.overlay.real_stat(path, true)?;
         let is_dir = matches!(real.kind, RootFsEntryKind::Directory);
-        crate::dispatch::dac_check(
-            creds.euid, creds.egid, real.uid, real.gid, real.mode, is_dir, LINUX_W_OK,
-        )
-        .err()
+        crate::dispatch::dac_check(uid, gid, real.uid, real.gid, real.mode, is_dir, LINUX_W_OK)
+            .err()
     }
 
     /// Validate an `execve(2)`/`execveat(2)` target the way the kernel does
@@ -338,11 +365,11 @@ impl SyscallDispatcher {
     /// `CAP_DAC_OVERRIDE` does not apply (`mode & 0o111 == 0 -> EACCES`).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn exec_access_errno(&self, path: &str) -> Option<LinuxErrno> {
-        let creds = self.cred_snapshot();
+        let (fsuid, fsgid) = self.dac_identity();
         if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(path, true) {
             let is_dir = matches!(real.kind, RootFsEntryKind::Directory);
             return crate::dispatch::dac_check(
-                creds.euid, creds.egid, real.uid, real.gid, real.mode, is_dir, LINUX_X_OK,
+                fsuid, fsgid, real.uid, real.gid, real.mode, is_dir, LINUX_X_OK,
             )
             .err();
         }
@@ -354,10 +381,7 @@ impl SyscallDispatcher {
             .overlay
             .get_owner(path)
             .unwrap_or((carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT));
-        crate::dispatch::dac_check(
-            creds.euid, creds.egid, uid, gid, md.mode, is_dir, LINUX_X_OK,
-        )
-        .err()
+        crate::dispatch::dac_check(fsuid, fsgid, uid, gid, md.mode, is_dir, LINUX_X_OK).err()
     }
 
     /// Verify the caller has search (X) permission on every ancestor directory
