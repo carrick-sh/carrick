@@ -106,6 +106,24 @@ fn should_reclaim_vcpu_for_timed_wait(timeout: Option<Duration>) -> bool {
     }
 }
 
+/// Whether this syscall must take the process-wide page-table pause BEFORE the
+/// dispatcher runs — see the call site in `service_threaded_syscall` for the
+/// lock-order argument. `arg2` is the third syscall argument (madvise's
+/// `advice`); it is ignored for every other number.
+fn syscall_takes_pre_dispatch_pt_pause(number: u64, arg2: u64, multi_vcpu: bool) -> bool {
+    if !multi_vcpu {
+        return false;
+    }
+    match number {
+        // munmap, mremap, mmap, mprotect: they edit the stage-1 descriptors.
+        215 | 216 | 222 | 226 => true,
+        // madvise: only MADV_DONTNEED reaches `zero_backing`, the one path that
+        // would otherwise request the pause AFTER the host-alias phase.
+        233 => arg2 == carrick_abi::LINUX_MADV_DONTNEED,
+        _ => false,
+    }
+}
+
 fn should_keep_vcpu_for_blocking_wait(
     force_reclaim: bool,
     has_spare_capacity: bool,
@@ -2597,8 +2615,36 @@ where
         // mprotect(226) — mutate the shared guest descriptors from the host.
         // With sibling vCPUs live, Pause-Modify-Resume them so none walks a
         // half-edited descriptor tree.
-        let _pt_pause = match frame.number.raw() {
-            215 | 216 | 222 | 226 if self.kicker.count() > 1 => match self.pt_pause() {
+        //
+        // `MADV_DONTNEED` madvise(233) joins them, and the reason is a LOCK
+        // ORDER, not a descriptor edit of its own. Two process-wide serializers
+        // are in play: this page-table pause (P) and the dispatcher's
+        // `HostAliasTransactions` phase (A, `dispatch/mod.rs`). The four
+        // editors above take P here and A inside their handler. `madvise`
+        // takes A in its handler (`begin_host_alias_dispatch`) and then reaches
+        // P lazily and cross-thread, because `MADV_DONTNEED` calls
+        // `zero_backing` -> `ensure_frame_cow_write` ->
+        // `materialize_sparse_mmap_extent` -> `FrameCowAuthority::quiesce`.
+        // That is A-then-P against the editors' P-then-A: a live ABBA. Captured
+        // in a core of a wedged carrier (`bt all` + `PtQuiesce` bytes
+        // `coordinator=1 quiescing=1` with NO thread in the drain): a munmap
+        // thread held P and slept in `begin_dispatch` for A while a madvise
+        // thread held A and slept in `acquire_pt_pause`'s coordinator election
+        // for P. Every other guest thread then parked at the run-loop top on
+        // `quiescing`, so the whole guest stopped at ~0% CPU.
+        //
+        // Taking P here makes the order uniformly P-then-A. The nested
+        // acquisition inside the backend then borrows this pause for free —
+        // `KernelFrameCowAuthority::quiesce` short-circuits on
+        // `current_thread_holds_pt_pause()` — so the only new cost is a pause
+        // on a `MADV_DONTNEED` whose backing needed no COW. The advice check
+        // keeps it off every other advice, which never reaches `zero_backing`.
+        let _pt_pause = if syscall_takes_pre_dispatch_pt_pause(
+            frame.number.raw(),
+            frame.args[2],
+            self.kicker.count() > 1,
+        ) {
+            match self.pt_pause() {
                 Ok(guard) => Some(guard),
                 Err(quiesce::PtPauseError::TimedOut) => {
                     // No dispatcher/backend mapping call has started yet. Return
@@ -2606,8 +2652,9 @@ where
                     // request back and resumed already-parked siblings.
                     return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ENOMEM));
                 }
-            },
-            _ => None,
+            }
+        } else {
+            None
         };
         let mut signal_wait_deadline = None;
         // Completed FULL (≥1 s) parked service slices in this syscall's
@@ -5767,6 +5814,37 @@ mod tests {
         assert!(should_destroy_departing_vcpu(false, false));
     }
 
+    /// The pre-dispatch page-table pause exists to keep ONE global lock order
+    /// (pause, then the dispatcher's host-alias phase). `MADV_DONTNEED` is in
+    /// the set because it is the one host-alias-taking syscall that reaches the
+    /// backend's self-quiescing `zero_backing` path; without it the two orders
+    /// crossed and deadlocked a whole guest at ~0% CPU.
+    #[test]
+    fn pre_dispatch_pt_pause_covers_madvise_dontneed() {
+        let dontneed = carrick_abi::LINUX_MADV_DONTNEED;
+        for editor in [215u64, 216, 222, 226] {
+            assert!(syscall_takes_pre_dispatch_pt_pause(editor, 0, true));
+            assert!(
+                !syscall_takes_pre_dispatch_pt_pause(editor, 0, false),
+                "a single-vCPU process has no sibling to pause"
+            );
+        }
+        assert!(syscall_takes_pre_dispatch_pt_pause(233, dontneed, true));
+        assert!(
+            !syscall_takes_pre_dispatch_pt_pause(233, dontneed, false),
+            "single-vCPU madvise keeps the plain fast path"
+        );
+        for other_advice in [0u64, 1, 2, 3, 8] {
+            assert_ne!(other_advice, dontneed);
+            assert!(
+                !syscall_takes_pre_dispatch_pt_pause(233, other_advice, true),
+                "only MADV_DONTNEED reaches zero_backing"
+            );
+        }
+        assert!(!syscall_takes_pre_dispatch_pt_pause(214, dontneed, true));
+        assert!(!syscall_takes_pre_dispatch_pt_pause(63, 0, true));
+    }
+
     #[test]
     fn timed_wait_reclaim_keeps_vcpu_for_short_finite_timeouts() {
         assert!(!should_reclaim_vcpu_for_timed_wait(Some(
@@ -5954,6 +6032,7 @@ mod tests {
             SHORT_TIMED_WAIT_RECLAIM_CUTOFF + Duration::from_millis(1)
         )));
         assert!(should_keep_vcpu_for_blocking_wait(false, true, false));
+        // (see `pre_dispatch_pt_pause_covers_madvise_dontneed` below)
         assert!(!should_keep_vcpu_for_blocking_wait(false, false, false));
         assert!(!should_keep_vcpu_for_blocking_wait(false, true, true));
         assert!(
