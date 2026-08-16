@@ -809,15 +809,33 @@ mod tests {
                 "{name} lost known_gap summary"
             );
         }
-        // xattr/listxattr rows: current Docker/LTP setup trips over
-        // container-blocked security xattrs; keep these report-only until the
-        // oracle environment can exercise the intended Linux semantics.
+        // ltp-fsetxattr02 stays report-only, and NOT for an xattr reason: it
+        // TCONFs on CONFIG_BLK_DEV_RAM, which carrick deliberately does not
+        // declare. Filing it under xattr misattributes the work.
+        {
+            let name = "ltp-fsetxattr02";
+            let s = find(name);
+            assert!(
+                s.known_gaps.iter().any(|g| g == "summary"),
+                "{name} lost known_gap summary"
+            );
+        }
+        // The rest of the xattr family was report-only on the premise that the
+        // "current Docker/LTP setup trips over container-blocked security
+        // xattrs". That premise no longer holds: the oracle rows now carry the
+        // privilege their LTP `.needs_root` implies, so Docker exercises the
+        // intended Linux semantics and all twelve MATCH. carrick's xattr
+        // emulation was never the deficient side.
+        //
+        // Assert the REPLACEMENT invariant rather than dropping the guard: each
+        // row must keep an explicit docker privilege flag AND must not silently
+        // reacquire a gap marker, so a future edit cannot quietly return them to
+        // report-only.
         for name in [
             "ltp-fgetxattr02",
             "ltp-flistxattr01",
             "ltp-flistxattr02",
             "ltp-flistxattr03",
-            "ltp-fsetxattr02",
             "ltp-lgetxattr01",
             "ltp-lgetxattr02",
             "ltp-listxattr01",
@@ -829,8 +847,14 @@ mod tests {
         ] {
             let s = find(name);
             assert!(
-                s.known_gaps.iter().any(|g| g == "summary"),
-                "{name} lost known_gap summary"
+                s.docker_flags
+                    .iter()
+                    .any(|f| f == "SYS_ADMIN" || f == "--privileged"),
+                "{name} must grant the oracle the privilege its security.* xattrs need"
+            );
+            assert!(
+                !s.known_gaps.iter().any(|g| g == "summary"),
+                "{name} is no longer a carrick gap; it MATCHes with a privileged oracle"
             );
         }
         // setrlimit02/03/04/05: unconfined + CAP_SYS_RESOURCE and DELIBERATELY no

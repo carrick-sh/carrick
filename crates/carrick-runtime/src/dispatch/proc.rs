@@ -2939,19 +2939,40 @@ impl SyscallDispatcher {
                 // not Darwin children, so a host waitid would truthfully return
                 // ECHILD. Route terminal child state through the same table as
                 // wait4 and synthesize Linux's SIGCHLD siginfo layout.
-                if !options.contains(LinuxWaitOptions::WEXITED) {
-                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
-                }
+                // waitid(2) reports three kinds of state change, selected by
+                // WEXITED / WSTOPPED / WCONTINUED. carrick previously ECHILD'd
+                // unless WEXITED was set and ECHILD'd P_PGID outright, so a
+                // guest could never observe a stopped or continued child.
+                // The kernel graph has recorded both events all along
+                // (`pending_stop`/`pending_continue`, consumed by
+                // `waitable_job_control_event`) and `wait4` already asks for
+                // them — this routes `waitid` through the same helpers.
+                let include_stopped = options.contains(LinuxWaitOptions::WSTOPPED);
+                let include_continued = options.contains(LinuxWaitOptions::WCONTINUED);
+                let nowait = options.contains(LinuxWaitOptions::WNOWAIT);
                 let mut pidfd_target = None;
+                let mut group_target = None;
                 let target = match idtype {
                     LINUX_P_ALL => None,
                     LINUX_P_PID if id > 0 && id <= i32::MAX as u64 => Some(id as i32),
                     LINUX_P_PID => {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
                     }
-                    // Process-group membership needs its own process-table
-                    // index; do not fall through to Darwin and accidentally
-                    // inspect an unrelated host process.
+                    // P_PGID waits on a process group; id 0 means the caller's
+                    // own group. The kernel graph indexes process groups, so
+                    // this resolves there and never consults Darwin.
+                    LINUX_P_PGID if id <= i32::MAX as u64 => {
+                        let group = if id == 0 {
+                            match process.process_group(None) {
+                                Ok(group) => group,
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            }
+                        } else {
+                            id as i32
+                        };
+                        group_target = Some(group);
+                        None
+                    }
                     LINUX_P_PGID => {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD));
                     }
@@ -2965,19 +2986,33 @@ impl SyscallDispatcher {
                     _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
                 };
                 let guest_nohang = options.contains(LinuxWaitOptions::WNOHANG);
-                let waited = match pidfd_target {
-                    Some(task) => process.wait_child_key(
-                        task,
-                        options.contains(LinuxWaitOptions::WNOWAIT),
-                    ),
-                    None => process.wait_child(
+                let waited = match (pidfd_target, group_target) {
+                    (Some(task), _) => process.wait_child_key(task, nowait),
+                    (None, Some(group)) => process
+                        .wait_child_in_process_group_with_job_control(
+                            group,
+                            nowait,
+                            include_stopped,
+                            include_continued,
+                        ),
+                    (None, None) => process.wait_child_with_job_control(
                         target,
                         true,
-                        options.contains(LinuxWaitOptions::WNOWAIT),
+                        nowait,
+                        include_stopped,
+                        include_continued,
                     ),
                 };
                 match waited {
-                    crate::hvpatch::WaitResult::Exited(exit) => {
+                    // A stop or continue is a REPORTABLE event, not "nothing
+                    // happened". Folding `StateChanged` into the park arm did
+                    // not merely fail to report it — the kernel-graph event was
+                    // consumed by the wait above and then thrown away, so a
+                    // ptrace stop (which `waitable_job_control_event` surfaces
+                    // regardless of WSTOPPED) could be silently swallowed by an
+                    // ordinary waitid(WEXITED).
+                    crate::hvpatch::WaitResult::Exited(exit)
+                    | crate::hvpatch::WaitResult::StateChanged(exit) => {
                         if infop_addr.0 != 0 {
                             let (si_code, si_status) =
                                 hvpatch_waitid_exit_fields(exit.status());
@@ -2991,8 +3026,7 @@ impl SyscallDispatcher {
                         }
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
-                    crate::hvpatch::WaitResult::StateChanged(_)
-                    | crate::hvpatch::WaitResult::StillRunning => {
+                    crate::hvpatch::WaitResult::StillRunning => {
                         if guest_nohang {
                             if infop_addr.0 != 0 {
                                 (*cx.memory).write_bytes(
@@ -4682,6 +4716,21 @@ fn waitid_host_state_option(si_code: i32) -> Option<i32> {
 /// Decode the Linux wait-status word stored by the in-process process table
 /// into the `si_code`/`si_status` pair returned by `waitid(2)`.
 fn hvpatch_waitid_exit_fields(wait_status: i32) -> (i32, i32) {
+    // Job-control statuses are decoded FIRST: their encodings collide with the
+    // exited/killed ones. A stop is `(signal << 8) | 0x7f` and a continue is
+    // 0xffff (see `ProcessContext::wait_child_with_job_control`), so a stopped
+    // child read through the terminal-status arms below would come back as
+    // CLD_KILLED with si_status 0x7f.
+    if wait_status == 0xffff {
+        // LINUX_SIGCONT (18), never `libc::SIGCONT` — this value is written
+        // into the GUEST's siginfo, and Darwin numbers SIGCONT 19. The stop arm
+        // below needs no translation because its signal comes from the kernel
+        // graph and is already a Linux signum.
+        return (libc::CLD_CONTINUED, crate::linux_abi::LINUX_SIGCONT);
+    }
+    if wait_status & 0xff == 0x7f {
+        return (libc::CLD_STOPPED, (wait_status >> 8) & 0xff);
+    }
     let signal = wait_status & 0x7f;
     if signal == 0 {
         (libc::CLD_EXITED, (wait_status >> 8) & 0xff)
