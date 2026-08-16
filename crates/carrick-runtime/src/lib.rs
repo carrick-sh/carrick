@@ -137,6 +137,12 @@ pub mod fs_resolve_cache;
 pub mod host_tty;
 pub(crate) mod inotify;
 pub mod interactive_supervisor;
+// The Linux kernel keyring subsystem behind `add_key`/`request_key`/`keyctl`.
+// The key objects are VM-wide (one service on `kernel::Kernel`); the
+// per-thread, per-process and per-uid keyring POINTERS live in the kernel
+// graph, never in a host-process global. Rendered docs live in the module
+// itself so its intra-doc links resolve in its own scope.
+pub(crate) mod keyring;
 pub mod layer_cache;
 pub mod namespace;
 

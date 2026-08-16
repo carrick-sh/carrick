@@ -167,17 +167,21 @@ const OVERRIDE_EXCLUSIONS: &[&str] = &["ltp-setrlimit06"];
 
 /// Suites whose single LTP `"summary"` divergence is a TRACKED-unimplemented-
 /// capability marker (maintainer-approved report-only), NOT an edge-case excuse.
-/// keyring, pidfd_getfd, and fanotify have no carrick backend: with the oracle
-/// unconfined the docker side runs the real syscall and SUCCEEDS while carrick
-/// returns ENOSYS, so they legitimately DIFF. Stamping the `"summary"` id known
-/// keeps the gate green while the gap stays visible. Matched by PREFIX.
-/// `"summary"` is the ONLY id the LTP parser emits (see parsers/ltp.rs), so it
-/// is the exact diverging id — verified empirically from a focused oracle run,
-/// not invented.
+/// pidfd_getfd and fanotify have no carrick backend: with the oracle unconfined
+/// the docker side runs the real syscall and SUCCEEDS while carrick returns
+/// ENOSYS, so they legitimately DIFF. Stamping the `"summary"` id known keeps
+/// the gate green while the gap stays visible. Matched by PREFIX. `"summary"`
+/// is the ONLY id the LTP parser emits (see parsers/ltp.rs), so it is the exact
+/// diverging id — verified empirically from a focused oracle run, not invented.
+///
+/// The keyring families (`ltp-add_key`, `ltp-request_key`, `ltp-keyctl`) USED
+/// to be listed here and no longer are: carrick implements the keyring
+/// subsystem, all twenty suites MATCH the unconfined oracle, and a report-only
+/// marker on an implemented capability is worse than no marker — because
+/// `"summary"` is the only id these suites emit, keeping it would make a
+/// keyring REGRESSION non-gating too. They keep their unconfined `docker_flags`
+/// (that is what makes the oracle exercise the real syscall) and carry no gap.
 const KNOWN_GAP_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[
-    ("ltp-add_key", &["summary"]),
-    ("ltp-request_key", &["summary"]),
-    ("ltp-keyctl", &["summary"]),
     ("ltp-pidfd_getfd", &["summary"]),
     ("ltp-fanotify", &["summary"]),
 ];
@@ -734,7 +738,12 @@ mod tests {
         .unwrap();
         let m = Manifest::from_toml(&text).unwrap();
         let find = |name: &str| m.suite.iter().find(|s| s.name == name).unwrap();
-        // Keyring: unconfined oracle + known_gap "summary" (report-only).
+        // Keyring: unconfined oracle and DELIBERATELY no gap. carrick now
+        // implements the keyring subsystem, so these MATCH; the unconfined flag
+        // must stay (it is what makes the oracle run the real syscall instead
+        // of Docker's seccomp EPERM), and a gap must never come back — with
+        // "summary" as the only id an LTP suite emits, a gap here would make a
+        // keyring regression silently non-gating.
         for name in ["ltp-add_key02", "ltp-keyctl01", "ltp-request_key01"] {
             let s = find(name);
             assert!(
@@ -742,8 +751,8 @@ mod tests {
                 "{name} lost seccomp=unconfined"
             );
             assert!(
-                s.known_gaps.iter().any(|g| g == "summary"),
-                "{name} lost known_gap summary"
+                !s.known_gaps.iter().any(|g| g == "summary"),
+                "{name} is no longer a carrick gap; the keyring subsystem is implemented"
             );
         }
         // pidfd_getfd: unconfined + CAP_SYS_PTRACE + known_gap "summary".
@@ -907,7 +916,8 @@ mod tests {
     /// caps and known_gaps, and honor the setrlimit06 exclusion.
     #[test]
     fn family_prefix_overrides_apply() {
-        // keyring: unconfined, no cap, known_gap summary.
+        // keyring: unconfined, no cap, and NO gap (the subsystem is implemented
+        // and every keyring suite MATCHes the unconfined oracle).
         for name in [
             "ltp-add_key01",
             "ltp-add_key05",
@@ -917,11 +927,7 @@ mod tests {
             let f = docker_flag_overrides(name).unwrap();
             assert!(f.iter().any(|x| x == "seccomp=unconfined"), "{name}");
             assert!(!f.iter().any(|x| x == "SYS_PTRACE"), "{name}");
-            assert_eq!(
-                known_gap_overrides(name),
-                Some(vec!["summary".into()]),
-                "{name}"
-            );
+            assert_eq!(known_gap_overrides(name), None, "{name}");
         }
         // pidfd_getfd: unconfined + SYS_PTRACE + known_gap summary.
         let f = docker_flag_overrides("ltp-pidfd_getfd01").unwrap();

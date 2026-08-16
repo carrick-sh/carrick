@@ -3814,6 +3814,7 @@ mod container_policy_dispatch_tests {
     //! and survival across the dispatcher's execve-time state resets.
     use super::*;
     use crate::compat::CompatReporter;
+    use carrick_abi::LINUX_ENOKEY;
     use carrick_spec::SeccompPolicy;
 
     const SYS_ADD_KEY: u64 = 217;
@@ -3895,19 +3896,29 @@ mod container_policy_dispatch_tests {
     }
 
     #[test]
-    fn unconfined_opt_out_keeps_handlers_honest_enosys() {
+    fn unconfined_opt_out_reaches_the_real_keyring_handlers() {
         // Unconfined (run-elf default / --security-opt seccomp=unconfined):
-        // the keyring handlers keep their honest absent-backend ENOSYS — the
-        // policy layer NEVER leaks into handler behavior.
+        // the policy layer is off and the syscall reaches carrick's keyring
+        // implementation. The differential recorded in `container_policy.rs`
+        // is that these SUCCEED unprivileged on real Linux, so the one thing
+        // that must never come back is ENOSYS — an honest "absent backend"
+        // answer that stopped being true when the subsystem landed.
+        //
+        // `dispatch_one` passes all-zero arguments, i.e. a NULL `type`
+        // pointer for add_key/request_key and command 0
+        // (`KEYCTL_GET_KEYRING_ID`) with key id 0 for keyctl. Linux answers
+        // those EFAULT and ENOKEY respectively, and so does carrick.
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher.apply_seccomp_policy(SeccompPolicy::Unconfined);
-        for nr in [SYS_ADD_KEY, SYS_REQUEST_KEY, SYS_KEYCTL] {
+        for (nr, expected) in [
+            (SYS_ADD_KEY, LINUX_EFAULT),
+            (SYS_REQUEST_KEY, LINUX_EFAULT),
+            (SYS_KEYCTL, LINUX_ENOKEY),
+        ] {
             assert_eq!(
                 dispatch_one(&mut dispatcher, nr),
-                DispatchOutcome::Errno {
-                    errno: LINUX_ENOSYS
-                },
-                "unconfined keyring syscall {nr} must stay honest ENOSYS"
+                DispatchOutcome::Errno { errno: expected },
+                "unconfined keyring syscall {nr} must reach its handler"
             );
         }
         // And a fresh dispatcher (no policy applied at all) is unconfined too.
@@ -3915,9 +3926,82 @@ mod container_policy_dispatch_tests {
         assert_eq!(
             dispatch_one(&mut bare, SYS_ADD_KEY),
             DispatchOutcome::Errno {
-                errno: LINUX_ENOSYS
+                errno: LINUX_EFAULT
             }
         );
+    }
+
+    #[test]
+    fn unconfined_add_key_and_keyctl_succeed_unprivileged() {
+        // The other half of the recorded Docker-unconfined differential
+        // (`container_policy.rs`): `add_key` returns a key SERIAL and
+        // `keyctl(KEYCTL_JOIN_SESSION_KEYRING, NULL)` returns a keyring serial,
+        // both without any privilege. A guest that only ever saw errnos could
+        // not tell a real keyring from a well-shaped refusal, so assert the
+        // success path end-to-end through the dispatcher.
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.apply_seccomp_policy(SeccompPolicy::Unconfined);
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; 4096]);
+        // "user\0" then "desc\0" then a two-byte payload.
+        let type_at = MEM_BASE;
+        let desc_at = MEM_BASE + 0x20;
+        let payload_at = MEM_BASE + 0x40;
+        memory.write_bytes(type_at, b"user\0").unwrap();
+        memory.write_bytes(desc_at, b"desc\0").unwrap();
+        memory.write_bytes(payload_at, b"hi").unwrap();
+
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let joined = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_KEYCTL,
+                    SyscallArgs([
+                        carrick_abi::keyring::KeyctlOp::JoinSessionKeyring
+                            .raw()
+                            .into(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch");
+        let DispatchOutcome::Returned { value: session } = joined else {
+            panic!("JOIN_SESSION_KEYRING must return a serial, got {joined:?}");
+        };
+        assert!(session > 0, "session keyring serial {session} must be > 0");
+
+        let added = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    SYS_ADD_KEY,
+                    SyscallArgs([
+                        type_at,
+                        desc_at,
+                        payload_at,
+                        2,
+                        // KEY_SPEC_SESSION_KEYRING, sign-extended as the guest
+                        // passes it.
+                        carrick_abi::keyring::KeySpec::Session.serial().get() as u64,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .expect("dispatch");
+        let DispatchOutcome::Returned { value: serial } = added else {
+            panic!("add_key must return a serial, got {added:?}");
+        };
+        assert!(serial > 0, "key serial {serial} must be > 0");
+        assert_ne!(serial, session, "the key must not be the keyring itself");
     }
 
     #[test]

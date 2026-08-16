@@ -101,9 +101,6 @@ syscall_table! {
     162 => setdomainname,
     167 => prctl,
     168 => getcpu,
-    217 => add_key,
-    218 => request_key,
-    219 => keyctl,
     220 => clone,
     221 => execve,
     449 => futex_waitv,
@@ -2789,27 +2786,6 @@ impl SyscallDispatcher {
 
         fn setdomainname(this, cx) {
             Ok(DispatchOutcome::errno(LINUX_EPERM))
-        }
-
-        fn add_key(this, cx) {
-            // Real Linux supports UNPRIVILEGED user keyrings (add_key/request_key/
-            // keyctl work without CAP_*), so an EPERM would falsely claim
-            // "implemented but denied". Carrick has no kernel keyring backend at
-            // all, so ENOSYS (the honest "unimplemented" that glibc treats as a
-            // fallback trigger) is correct. Reverts commit 980bf69a's intent.
-            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
-        }
-
-        fn request_key(this, cx) {
-            // See add_key: no kernel keyring backend, so honest ENOSYS, not a
-            // fabricated EPERM denial (real Linux allows this unprivileged).
-            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
-        }
-
-        fn keyctl(this, cx) {
-            // See add_key: no kernel keyring backend, so honest ENOSYS, not a
-            // fabricated EPERM denial (real Linux allows this unprivileged).
-            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
         }
 
         fn setpgid(this, cx, pid: Pid, pgid: Pid) {

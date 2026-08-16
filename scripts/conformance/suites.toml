@@ -7359,7 +7359,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -7372,7 +7371,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -7385,7 +7383,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -7398,7 +7395,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -7411,7 +7407,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -13757,7 +13752,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -13770,7 +13764,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -13783,7 +13776,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -13796,7 +13788,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -13809,7 +13800,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -13822,7 +13812,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -13835,7 +13824,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -13848,7 +13836,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -13861,7 +13848,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -18686,7 +18672,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -18699,7 +18684,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -18712,7 +18696,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -18725,7 +18708,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -18738,7 +18720,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
@@ -18751,7 +18732,6 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
