@@ -204,6 +204,24 @@ impl RootFsVfs {
         self.lookup(path)
     }
 
+    /// Real host identity for a path the writable upper does not hold, read
+    /// from the immutable cache lower.
+    ///
+    /// EXISTENCE is not this method's business — whiteouts, copy-up and
+    /// cross-layer symlinks are the layered resolver's job, and a caller must
+    /// have already established through it that `path` resolves to the lower.
+    /// This only supplies the identity fields ([`crate::vfs::Metadata`] and
+    /// [`crate::rootfs::RootFsMetadata`] carry neither an inode nor a link
+    /// count nor a timestamp) so the path lane can report the SAME host inode
+    /// the fd lane's `fstat` and `getdents64`'s `d_ino` already report.
+    pub(crate) fn immutable_lower_real_stat(
+        &self,
+        path: &str,
+        follow: bool,
+    ) -> Option<crate::fs_backend::RealStat> {
+        self.rootfs.as_ref()?.immutable_real_stat(path, follow)
+    }
+
     /// Open an upper-absent immutable-lower regular file without first
     /// re-walking every intermediate component through the layered resolver.
     ///

@@ -162,6 +162,20 @@ impl SyscallDispatcher {
                     // fd fell back to the path-HASH inode while the path-stat
                     // returned the real host inode.
                     Ok(StatRecord::from_real(&path, &real))
+                } else if let Some(real) = self
+                    .fs
+                    .rootfs_vfs
+                    .immutable_lower_real_stat(&path, true)
+                    .map(|real| StatRecord::from_real(&path, &real))
+                    .filter(|real| real.mode & LINUX_S_IFMT == fallback.mode & LINUX_S_IFMT)
+                {
+                    // A DIRECTORY only the immutable cache lower holds. Its
+                    // path-stat now reports the lower's real host inode (see
+                    // `layered_identity_record`), so this lane must too —
+                    // otherwise fixing the regular-file case would simply move
+                    // the `samestat` disagreement onto directories. Regular
+                    // files never reach here: they open as a real `HostFile`.
+                    Ok(real)
                 } else {
                     Ok(fallback)
                 }
