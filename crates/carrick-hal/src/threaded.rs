@@ -121,16 +121,76 @@ impl<T: VcpuKick> VcpuKickDyn for T {
     }
 }
 
+/// One guest thread's half of the `in_guest` ↔ `quiescing` Dekker handshake:
+/// "this vCPU is about to enter, or is inside, guest code".
+///
+/// EXACTLY ONE of these exists per guest thread. It is created with the
+/// thread's runtime state and lives as long as the thread does, across every
+/// blocking-wait reclaim, fork park and vCPU rebind. Registration
+/// ([`VcpuRegistry::register`]) publishes a clone of this same cell into the
+/// registry, so the run loop's stores and a coordinator's
+/// [`VcpuRegistry::any_other_in_guest`] reads always name the SAME memory —
+/// there is no second cell for either side to go stale against.
+///
+/// The type carries the polarity that a bare `bool` lost: construction is
+/// through ONE named semantic constructor, mutation is through
+/// [`InGuestFlag::enter_guest`] / [`InGuestFlag::leave_guest`], and there is
+/// deliberately no `Clone`/`Default` (docs/typed-interfaces-audit.md P1.3) —
+/// a second flag for one thread would silently split the handshake in half.
+pub struct InGuestFlag(Arc<AtomicBool>);
+
+impl InGuestFlag {
+    /// The one flag belonging to ONE guest thread, created together with that
+    /// thread's runtime state. Call this exactly once per guest thread; every
+    /// later (re-)registration of that thread hands `register` this same flag.
+    pub fn for_guest_thread() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Publish "entering guest code" before the guest-entry re-check of the
+    /// coordinator's `quiescing` flag. SeqCst on both sides of the handshake
+    /// guarantees at least one side observes the other.
+    pub fn enter_guest(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Publish "back in host code" — a coordinator may now proceed past us.
+    pub fn leave_guest(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The current handshake state (diagnostics and tests; coordination uses
+    /// [`VcpuRegistry::any_other_in_guest`]).
+    pub fn is_in_guest(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The registry's clone of this thread's cell, taken at registration.
+    fn share(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0)
+    }
+}
+
 /// The process-wide registry of live vCPUs the run loop kicks/counts. Held as
 /// `Arc<dyn VcpuRegistry>` so the shared loop never names a concrete kicker.
+///
+/// A registration is ONE indivisible entry carrying BOTH facets — the
+/// cross-thread kick handle and the thread's [`InGuestFlag`]. That is a
+/// correctness requirement, not tidiness: the two used to be separate maps with
+/// a `register` that restored only the kick handle, so every blocking-wait
+/// unregister/re-register cycle silently dropped the thread's in-guest facet
+/// forever and `any_other_in_guest` reported FALSE for a thread executing guest
+/// code. It also gives the drain its real invariant — anything observable as
+/// in-guest is, by construction, kickable.
 pub trait VcpuRegistry: Send + Sync {
-    fn register(&self, tid: ThreadId, handle: Box<dyn VcpuKickDyn>);
-    /// Register (and return) this thread's "currently in `hv_vcpu_run`" flag.
-    /// The shared loop sets it true immediately before entering the guest and
-    /// false immediately after, forming a Dekker handshake with the fork /
-    /// page-table-edit coordinators (which set their quiesce flag and read this
-    /// — SeqCst on both sides guarantees at least one observes the other).
-    fn register_in_guest(&self, tid: ThreadId) -> Arc<AtomicBool>;
+    /// Register (or RE-register, after a reclaim/rebind) this thread's vCPU.
+    ///
+    /// `in_guest` is the thread's one lifetime flag, not a fresh cell: the
+    /// registry stores a clone of it, and the caller keeps storing through the
+    /// flag it already owns.
+    fn register(&self, tid: ThreadId, handle: Box<dyn VcpuKickDyn>, in_guest: &InGuestFlag);
+    /// Drop this thread's whole registration — it holds no live vCPU, so it can
+    /// neither be kicked nor counted as in-guest until it registers again.
     fn unregister(&self, tid: ThreadId);
     fn kick(&self, tid: ThreadId);
     /// Kick every registered vCPU (including the caller's, if registered). The
@@ -139,11 +199,12 @@ pub trait VcpuRegistry: Send + Sync {
     fn kick_all(&self);
     fn kick_all_except(&self, except: ThreadId);
     fn any_other_in_guest(&self, except: ThreadId) -> bool;
-    fn set_in_guest(&self, tid: ThreadId, in_guest: bool);
     fn count(&self) -> usize;
     /// Bounded timeout diagnostics only: registered vCPU identities and their
-    /// current in-guest handshake state. Ordinary coordination must use the
-    /// scalar predicates above rather than snapshots.
+    /// current in-guest handshake state, read from the SAME entries
+    /// [`VcpuRegistry::any_other_in_guest`] reads, so a timeout dump cannot
+    /// disagree with the predicate that produced the timeout. Ordinary
+    /// coordination must use the scalar predicates above rather than snapshots.
     fn debug_registered_vcpus(&self) -> Vec<(ThreadId, bool)> {
         Vec::new()
     }
@@ -151,9 +212,10 @@ pub trait VcpuRegistry: Send + Sync {
 
 /// The platform-NEUTRAL [`VcpuRegistry`] implementation, shared by every backend.
 ///
-/// It is two maps — per-tid kick handles and per-tid "currently in-guest" flags
-/// — plus the SeqCst Dekker handshake the fork / page-table-edit coordinators
-/// rely on. The only platform-specific piece is the kick MECHANISM, which is
+/// It is ONE map of per-tid `VcpuRegistration`s — kick handle plus in-guest
+/// flag, registered and dropped together — plus the SeqCst Dekker handshake the
+/// fork / page-table-edit coordinators rely on. The only platform-specific
+/// piece is the kick MECHANISM, which is
 /// already behind [`VcpuKickDyn`] (HVF `hv_vcpus_exit`, KVM `pthread_kill`,
 /// bhyve `_umtx_op`/`vm_suspend_cpu`), so the registry itself names no backend.
 /// Kicks are per-handle (`kick_all` calls each handle's `kick()`); a backend that
@@ -167,8 +229,21 @@ pub trait VcpuRegistry: Send + Sync {
 /// [`VcpuRegistry`], so it intentionally has no inherent kick API.
 #[derive(Default)]
 pub struct GenericVcpuRegistry {
-    handles: std::sync::Mutex<std::collections::HashMap<ThreadId, Box<dyn VcpuKickDyn>>>,
-    in_guest: std::sync::Mutex<std::collections::HashMap<ThreadId, Arc<AtomicBool>>>,
+    vcpus: std::sync::Mutex<std::collections::HashMap<ThreadId, VcpuRegistration>>,
+}
+
+/// One live vCPU's registration: the two facets that must exist together or
+/// not at all. Splitting them into separate maps is what let the in-guest half
+/// decay away across a reclaim.
+struct VcpuRegistration {
+    kick: Box<dyn VcpuKickDyn>,
+    in_guest: Arc<AtomicBool>,
+}
+
+impl VcpuRegistration {
+    fn is_in_guest(&self) -> bool {
+        self.in_guest.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl GenericVcpuRegistry {
@@ -176,83 +251,63 @@ impl GenericVcpuRegistry {
         Self::default()
     }
 
-    fn lock_handles(
+    fn lock(
         &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<ThreadId, Box<dyn VcpuKickDyn>>> {
-        self.handles.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn lock_in_guest(
-        &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<ThreadId, Arc<AtomicBool>>> {
-        self.in_guest.lock().unwrap_or_else(|e| e.into_inner())
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<ThreadId, VcpuRegistration>> {
+        self.vcpus.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
 impl VcpuRegistry for GenericVcpuRegistry {
-    fn register(&self, tid: ThreadId, handle: Box<dyn VcpuKickDyn>) {
-        self.lock_handles().insert(tid, handle);
-    }
-
-    fn register_in_guest(&self, tid: ThreadId) -> Arc<AtomicBool> {
-        let flag = Arc::new(AtomicBool::new(false));
-        self.lock_in_guest().insert(tid, Arc::clone(&flag));
-        flag
+    fn register(&self, tid: ThreadId, handle: Box<dyn VcpuKickDyn>, in_guest: &InGuestFlag) {
+        self.lock().insert(
+            tid,
+            VcpuRegistration {
+                kick: handle,
+                in_guest: in_guest.share(),
+            },
+        );
     }
 
     fn unregister(&self, tid: ThreadId) {
-        self.lock_handles().remove(&tid);
-        self.lock_in_guest().remove(&tid);
+        self.lock().remove(&tid);
     }
 
     fn kick(&self, tid: ThreadId) {
-        if let Some(h) = self.lock_handles().get(&tid) {
-            h.kick();
+        if let Some(entry) = self.lock().get(&tid) {
+            entry.kick.kick();
         }
     }
 
     fn kick_all(&self) {
-        for h in self.lock_handles().values() {
-            h.kick();
+        for entry in self.lock().values() {
+            entry.kick.kick();
         }
     }
 
     fn kick_all_except(&self, except: ThreadId) {
-        for (tid, h) in self.lock_handles().iter() {
+        for (tid, entry) in self.lock().iter() {
             if *tid != except {
-                h.kick();
+                entry.kick.kick();
             }
         }
     }
 
     fn any_other_in_guest(&self, except: ThreadId) -> bool {
-        self.lock_in_guest()
+        self.lock()
             .iter()
-            .any(|(tid, f)| *tid != except && f.load(std::sync::atomic::Ordering::SeqCst))
-    }
-
-    fn set_in_guest(&self, tid: ThreadId, in_guest: bool) {
-        if let Some(flag) = self.lock_in_guest().get(&tid) {
-            flag.store(in_guest, std::sync::atomic::Ordering::SeqCst);
-        }
+            .any(|(tid, entry)| *tid != except && entry.is_in_guest())
     }
 
     fn count(&self) -> usize {
-        self.lock_handles().len()
+        self.lock().len()
     }
 
     fn debug_registered_vcpus(&self) -> Vec<(ThreadId, bool)> {
-        let handles = self.lock_handles();
-        let in_guest = self.lock_in_guest();
-        let mut snapshot: Vec<_> = handles
-            .keys()
-            .copied()
-            .map(|tid| {
-                let active = in_guest
-                    .get(&tid)
-                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
-                (tid, active)
-            })
+        let mut snapshot: Vec<_> = self
+            .lock()
+            .iter()
+            .map(|(tid, entry)| (*tid, entry.is_in_guest()))
             .collect();
         snapshot.sort_by_key(|(tid, _)| tid.raw());
         snapshot
@@ -275,12 +330,18 @@ mod generic_registry_tests {
         }
     }
 
+    fn noop() -> Box<dyn VcpuKickDyn> {
+        Box::new(CountingHandle(Arc::new(AtomicU64::new(0))))
+    }
+
     #[test]
     fn register_unregister_count() {
         let r = GenericVcpuRegistry::new();
+        let f1 = InGuestFlag::for_guest_thread();
+        let f2 = InGuestFlag::for_guest_thread();
         assert_eq!(r.count(), 0);
-        r.register(t(1), Box::new(CountingHandle(Arc::new(AtomicU64::new(0)))));
-        r.register(t(2), Box::new(CountingHandle(Arc::new(AtomicU64::new(0)))));
+        r.register(t(1), noop(), &f1);
+        r.register(t(2), noop(), &f2);
         assert_eq!(r.count(), 2);
         r.unregister(t(1));
         assert_eq!(r.count(), 1);
@@ -291,8 +352,10 @@ mod generic_registry_tests {
         let r = GenericVcpuRegistry::new();
         let c1 = Arc::new(AtomicU64::new(0));
         let c2 = Arc::new(AtomicU64::new(0));
-        r.register(t(1), Box::new(CountingHandle(Arc::clone(&c1))));
-        r.register(t(2), Box::new(CountingHandle(Arc::clone(&c2))));
+        let f1 = InGuestFlag::for_guest_thread();
+        let f2 = InGuestFlag::for_guest_thread();
+        r.register(t(1), Box::new(CountingHandle(Arc::clone(&c1))), &f1);
+        r.register(t(2), Box::new(CountingHandle(Arc::clone(&c2))), &f2);
         r.kick_all_except(t(1));
         assert_eq!(c1.load(Ordering::SeqCst), 0, "caller must not be kicked");
         assert_eq!(c2.load(Ordering::SeqCst), 1, "the other vCPU is kicked");
@@ -304,14 +367,78 @@ mod generic_registry_tests {
     #[test]
     fn in_guest_flag_handshake() {
         let r = GenericVcpuRegistry::new();
-        let _flag = r.register_in_guest(t(1));
-        r.register_in_guest(t(2));
+        let f1 = InGuestFlag::for_guest_thread();
+        let f2 = InGuestFlag::for_guest_thread();
+        r.register(t(1), noop(), &f1);
+        r.register(t(2), noop(), &f2);
         assert!(!r.any_other_in_guest(t(1)));
-        r.set_in_guest(t(2), true);
+        f2.enter_guest();
         assert!(r.any_other_in_guest(t(1)), "tid 2 is in-guest");
         assert!(!r.any_other_in_guest(t(2)), "except self → false");
-        r.set_in_guest(t(2), false);
+        f2.leave_guest();
         assert!(!r.any_other_in_guest(t(1)));
+    }
+
+    /// An unregistered thread holds no live vCPU: it is neither kickable nor
+    /// countable as in-guest, even though it still owns its flag.
+    #[test]
+    fn unregistered_thread_is_invisible_to_the_drain() {
+        let r = GenericVcpuRegistry::new();
+        let f1 = InGuestFlag::for_guest_thread();
+        let f2 = InGuestFlag::for_guest_thread();
+        r.register(t(1), noop(), &f1);
+        r.register(t(2), noop(), &f2);
+        f1.enter_guest();
+        assert!(r.any_other_in_guest(t(2)));
+        r.unregister(t(1));
+        assert!(
+            !r.any_other_in_guest(t(2)),
+            "a thread with no live vCPU cannot be in the guest"
+        );
+        assert_eq!(r.debug_registered_vcpus(), vec![(t(2), false)]);
+    }
+
+    /// RED-FIRST reproducer for the in-guest registry decay.
+    ///
+    /// A guest thread obtains its in-guest flag ONCE (at
+    /// `ThreadRuntimeState::new`) and stores into that same `Arc` for its whole
+    /// life. Every blocking wait on a kicker-refreshing backend (HVF) and every
+    /// fork park unregisters the thread and then re-registers only its kick
+    /// handle. If `unregister` drops the in-guest facet and `register` does not
+    /// restore it, the thread's stores land in an `Arc` the registry no longer
+    /// references and `any_other_in_guest` reports FALSE for a thread that is
+    /// executing guest code — the page-table-edit coordinator then edits
+    /// stage-1 descriptors under a live vCPU.
+    #[test]
+    fn reregistration_keeps_the_in_guest_facet() {
+        let r = GenericVcpuRegistry::new();
+        let blocker = t(1);
+        let coordinator = t(2);
+        // Each thread's ONE lifetime flag, as `ThreadRuntimeState::new` makes it.
+        let blocker_in_guest = InGuestFlag::for_guest_thread();
+        let coordinator_in_guest = InGuestFlag::for_guest_thread();
+        r.register(blocker, noop(), &blocker_in_guest);
+        r.register(coordinator, noop(), &coordinator_in_guest);
+
+        // The thread blocks: a kicker-refreshing backend unregisters it while
+        // it has no live vCPU.
+        r.unregister(blocker);
+        // It wakes, rebinds a vCPU and re-registers — exactly what
+        // `ThreadRuntimeState::register_vcpu` does, with the same flag.
+        r.register(blocker, noop(), &blocker_in_guest);
+
+        // It re-enters the guest through the flag it has held since birth.
+        blocker_in_guest.enter_guest();
+        assert!(
+            r.any_other_in_guest(coordinator),
+            "a re-registered thread that entered the guest must be visible to \
+             the page-table-edit coordinator's drain"
+        );
+        assert_eq!(
+            r.debug_registered_vcpus(),
+            vec![(blocker, true), (coordinator, false)],
+            "the timeout diagnostic must read the same authority as the predicate"
+        );
     }
 }
 

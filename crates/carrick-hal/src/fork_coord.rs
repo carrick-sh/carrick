@@ -127,9 +127,12 @@ mod tests {
 
     struct InertRegistry;
     impl VcpuRegistry for InertRegistry {
-        fn register(&self, _tid: crate::ThreadId, _h: Box<dyn crate::VcpuKickDyn>) {}
-        fn register_in_guest(&self, _tid: crate::ThreadId) -> Arc<AtomicBool> {
-            Arc::new(AtomicBool::new(false))
+        fn register(
+            &self,
+            _tid: crate::ThreadId,
+            _h: Box<dyn crate::VcpuKickDyn>,
+            _in_guest: &crate::InGuestFlag,
+        ) {
         }
         fn unregister(&self, _tid: crate::ThreadId) {}
         fn kick(&self, _tid: crate::ThreadId) {}
@@ -138,7 +141,6 @@ mod tests {
         fn any_other_in_guest(&self, _except: crate::ThreadId) -> bool {
             false
         }
-        fn set_in_guest(&self, _tid: crate::ThreadId, _in_guest: bool) {}
         fn count(&self) -> usize {
             0
         }

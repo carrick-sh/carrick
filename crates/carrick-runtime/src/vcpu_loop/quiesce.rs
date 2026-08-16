@@ -1063,10 +1063,10 @@ where
                     stamp_guest_tid(engine, self.this_tid, &self.registry, Some(self.linux_tid));
                     kernel.dispatcher.sysv_after_fork_child();
                     self.waiter = crate::io_wait::ThreadWaiter::new(self.this_tid);
-                    let handle: Box<dyn carrick_hal::VcpuKickDyn> = Box::new(engine.kick_handle());
-                    self.kicker.register(self.this_tid, handle);
-                    self.registry
-                        .record_thread_port(self.this_tid, crate::host_proc::current_thread_port());
+                    // This host-fork child carries the calling thread's runtime
+                    // state, so it re-publishes its OWN lifetime in-guest flag
+                    // into the fresh child kicker along with the new handle.
+                    self.register_vcpu(engine);
                     kernel.fork.restart_after_child_fork(
                         prepared_fork,
                         &self.kicker,
@@ -1613,9 +1613,15 @@ where
                     tracing::error!(child_pid, %error, "materialized child TID copyout diverged from preflight");
                     std::process::abort();
                 }
+                // The child leader thread's lifetime in-guest flag. It is
+                // created ONCE here, published with this bootstrap registration
+                // so the child is kickable before its loop starts, and then
+                // moved into `run_vcpu_until_exit` — the loop stores into the
+                // very cell the kicker holds.
+                let child_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
                 let handle: Box<dyn carrick_hal::VcpuKickDyn> =
                     Box::new(child_engine.kick_handle());
-                child_kicker.register(child_tid, handle);
+                child_kicker.register(child_tid, handle, &child_in_guest);
                 let _ = stamp_identity_page(
                     &mut child_engine,
                     &child_kernel.dispatcher,
@@ -1640,6 +1646,7 @@ where
                     child_tid,
                     child_threads,
                     child_kicker,
+                    child_in_guest,
                     max_traps,
                 ) {
                     Ok(
@@ -1902,11 +1909,13 @@ mod pt_pause_tests {
         fn kick(&self) {}
     }
 
-    struct LeaveGuestOnKick(Arc<AtomicBool>);
+    /// A kick handle that answers the drain the way a real vCPU does: forced
+    /// out of the guest, it clears its OWN in-guest flag.
+    struct LeaveGuestOnKick(Arc<carrick_hal::InGuestFlag>);
 
     impl VcpuKickDyn for LeaveGuestOnKick {
         fn kick(&self) {
-            self.0.store(false, Ordering::SeqCst);
+            self.0.leave_guest();
         }
     }
 
@@ -2028,11 +2037,11 @@ mod pt_pause_tests {
         let registry = Arc::new(GenericVcpuRegistry::new());
         let coordinator = tid(1501);
         let sibling = tid(1502);
-        registry.register_in_guest(coordinator);
-        let sibling_in_guest = registry.register_in_guest(sibling);
-        sibling_in_guest.store(true, Ordering::SeqCst);
-        registry.register(coordinator, Box::new(NoopKick));
-        registry.register(sibling, Box::new(NoopKick));
+        let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        let sibling_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        sibling_in_guest.enter_guest();
+        registry.register(coordinator, Box::new(NoopKick), &coordinator_in_guest);
+        registry.register(sibling, Box::new(NoopKick), &sibling_in_guest);
 
         let resumed = Arc::new(AtomicBool::new(false));
         let sibling_resumed = Arc::clone(&resumed);
@@ -2081,8 +2090,8 @@ mod pt_pause_tests {
             Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
         let registry = Arc::new(GenericVcpuRegistry::new());
         let waiter = tid(1521);
-        registry.register_in_guest(waiter);
-        registry.register(waiter, Box::new(NoopKick));
+        let waiter_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        registry.register(waiter, Box::new(NoopKick), &waiter_in_guest);
 
         // A stuck coordinator: holds the flags and never calls `end()`.
         assert!(barrier.try_become_coordinator());
@@ -2124,13 +2133,14 @@ mod pt_pause_tests {
         let registry = Arc::new(GenericVcpuRegistry::new());
         let coordinator = tid(1511);
         let sibling = tid(1512);
-        registry.register_in_guest(coordinator);
-        let sibling_in_guest = registry.register_in_guest(sibling);
-        sibling_in_guest.store(true, Ordering::SeqCst);
-        registry.register(coordinator, Box::new(NoopKick));
+        let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        let sibling_in_guest = Arc::new(carrick_hal::InGuestFlag::for_guest_thread());
+        sibling_in_guest.enter_guest();
+        registry.register(coordinator, Box::new(NoopKick), &coordinator_in_guest);
         registry.register(
             sibling,
             Box::new(LeaveGuestOnKick(Arc::clone(&sibling_in_guest))),
+            &sibling_in_guest,
         );
 
         assert!(!current_thread_holds_pt_pause());
@@ -2155,5 +2165,58 @@ mod pt_pause_tests {
         drop(guard);
         assert!(!current_thread_holds_pt_pause());
         assert!(!barrier.is_quiescing());
+    }
+
+    /// The drain must still see a sibling that went through the blocking-wait
+    /// unregister/re-register cycle.
+    ///
+    /// This is the CONSEQUENCE test for the in-guest registry decay: on a
+    /// kicker-refreshing backend (HVF) every futex block unregisters the thread
+    /// and re-registers it on wake. When registration carried only the kick
+    /// handle, the thread's in-guest flag was gone from the registry forever,
+    /// `any_other_in_guest` answered FALSE while the sibling executed guest
+    /// code, and `acquire_pt_pause` returned a guard IMMEDIATELY — licensing a
+    /// stage-1 page-table edit under a live vCPU with no error, hang, or event.
+    /// With one indivisible registration the drain correctly refuses to
+    /// complete (here the sibling never leaves, so it is a clean timeout).
+    #[test]
+    fn pt_pause_drain_sees_a_sibling_that_reregistered_after_a_block() {
+        let barrier: &'static crate::fork_quiesce::PtQuiesce =
+            Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
+        let registry = Arc::new(GenericVcpuRegistry::new());
+        let coordinator = tid(1531);
+        let sibling = tid(1532);
+        let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        // The sibling's ONE lifetime flag, as `ThreadRuntimeState` holds it.
+        let sibling_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        registry.register(coordinator, Box::new(NoopKick), &coordinator_in_guest);
+        registry.register(sibling, Box::new(NoopKick), &sibling_in_guest);
+
+        // The sibling blocks in a futex: HVF destroys its vCPU, so the runtime
+        // unregisters the dead kick handle...
+        registry.unregister(sibling);
+        // ...and re-registers the rebound vCPU on wake (`register_vcpu`).
+        registry.register(sibling, Box::new(NoopKick), &sibling_in_guest);
+        // It then re-enters guest code through the flag it has held all along.
+        sibling_in_guest.enter_guest();
+
+        let result = acquire_pt_pause(
+            barrier,
+            &*registry,
+            coordinator,
+            PtPauseBudget {
+                election: Duration::from_secs(30),
+                drain: Duration::from_millis(20),
+            },
+        );
+        assert_eq!(
+            result.err(),
+            Some(PtPauseError::TimedOut),
+            "the coordinator must NOT be handed a pause while a re-registered \
+             sibling is executing guest code"
+        );
+        assert!(!barrier.is_quiescing(), "a timeout rolls the request back");
+        assert!(barrier.try_become_coordinator());
+        barrier.end();
     }
 }
