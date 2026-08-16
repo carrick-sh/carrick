@@ -2,17 +2,20 @@
 
 Carrick is an experimental Linux binary compatibility layer. It runs unmodified
 Linux binaries on macOS / Apple Silicon as native host processes and
-re-expresses Linux behavior with host kernel primitives. The ordinary same-ISA
-path executes guest instructions directly with the dynamic syscall rewriter
-(DSR); an explicit portable VMM policy retains the more mature macOS/HVF path.
-There is no guest Linux kernel, no second scheduler, and no separate VM process
-for each container.
+re-expresses Linux behavior with host kernel primitives. It uses the **HVPatch
+unified kernel architecture** where guest tasks, process identity, address
+spaces, waits, and signals live in Carrick's kernel graph inside a single VM
+carrier; guest `fork`/`clone` do not create separate host processes.
 
-The same runtime is being split along two explicit axes:
-
-- **Host/VMM backends:** macOS/HVF, Linux/KVM, FreeBSD/bhyve, and NetBSD/NVMM.
-- **Guest ISAs:** AArch64 on the mature macOS/HVF path, plus active x86_64
+Hardware-assisted virtualization is provided per platform:
+- **Host/VMM backends:** macOS/HVF (`Hypervisor.framework`), Linux/KVM,
+  FreeBSD/bhyve, and NetBSD/NVMM.
+- **Guest ISAs:** AArch64 on the reference macOS/HVF path, plus active x86_64
   bring-up through KVM, bhyve, and NVMM.
+- **Binary Patching & Translation Core (Preserved):** `carrick-native-darwin`,
+  `carrick-dsr`, `carrick-dsr-aarch64`, and `carrick-dsr-x86` provide JIT
+  translation, `MAP_JIT` W^X primitives, and Tier-D direct binary patching
+  preserved for future OS-level performance optimizations.
 
 The name refers to a type of knot used to join two heavy ropes of different
 sizes.
@@ -40,8 +43,8 @@ brew install --HEAD carrick
 ```
 
 The formula builds from source and ad-hoc codesigns the `carrick` binary with
-the `com.apple.security.hypervisor` entitlement so the optional VMM backend can
-use Hypervisor.framework. Non-macOS backends are source builds for target hosts
+the `com.apple.security.hypervisor` entitlement required for
+`Hypervisor.framework`. Non-macOS backends are source builds for target hosts
 today.
 
 ---
@@ -50,74 +53,32 @@ today.
 
 ```sh
 just build                                  # build + codesign the release binary
-just run run ubuntu:24.04 /bin/echo hi      # omitted backend: native DSR
+just run run ubuntu:24.04 /bin/echo hi
 ./target/release/carrick run python:3.12-slim python3 -m http.server 8000
-./target/release/carrick run --exec-backend vmm ubuntu:24.04 /bin/echo hi
+./target/release/carrick run ubuntu:24.04 /bin/echo hi
 ```
 
 > [!IMPORTANT]
-> On macOS, the **VMM backend** can only run from a codesigned binary. `cargo
-> build` strips the signature, so `--exec-backend vmm` fails with `HV_DENIED`
-> (`0xfae94007`). `just build` uses
-> [`scripts/build-signed.sh`](scripts/build-signed.sh) to re-apply the
-> entitlement after linking. Use plain `cargo build`/`cargo test` for
-> compile-checking only, never to run a guest.
+> On macOS, Carrick runs via `Hypervisor.framework` and must execute from a
+> codesigned binary. `cargo build` strips the signature, resulting in
+> `HV_DENIED` (`0xfae94007`). Always build with `just build` or
+> [`scripts/build-signed.sh`](scripts/build-signed.sh) to apply the entitlement
+> after linking. Use plain `cargo build`/`cargo test` for compile-checking only.
 
 ---
 
-## Execution Backends
+## Architecture
 
-Carrick defaults to an experimental Darwin-native backend for same-ISA
-`linux/arm64` binaries. It executes guest instructions directly in a macOS
-process, without an HVF vCPU. Darwin-native execution always uses the dynamic
-syscall rewriter (DSR); there is no alternate native instruction-execution
-mode. Omit `--exec-backend` (or pass `native`) to select it. Native execution is
-trusted-code-only and does not fall back when it encounters a compatibility
-gap:
+Carrick runs Linux binaries inside a consolidated VM carrier on macOS using
+Apple's `Hypervisor.framework` (HVF). Guest tasks and threads are managed
+within Carrick's kernel graph:
 
-```sh
-target/release/carrick run \
-  --native-page-profile native16k \
-  ubuntu:24.04 /bin/echo hi
-```
-
-Select the portable VMM compatibility policy explicitly when a workload needs
-the more mature macOS/HVF implementation:
-
-```sh
-target/release/carrick run --exec-backend vmm ubuntu:24.04 /bin/echo hi
-```
-
-The backend choice is container policy: create, start, restart, exec, fork,
-clone, and guest `execve` retain it unchanged. A native compatibility error may
-recommend `--exec-backend vmm`, but Carrick never retries automatically.
-
-The native backend has two page profiles:
-
-- **`native16k` (preferred):** exposes the host's 16K page geometry and uses
-  direct Darwin mappings and protections. Neither OCI image metadata nor the
-  AArch64 ISA by itself requires 4K pages; use this profile unless the workload
-  depends on Linux-visible 4K mapping, protection, or fault boundaries.
-- **`linux4k` (compatibility):** presents 4K Linux page semantics on a 16K
-  Darwin host. It has a guarded slow path for a bounded set of mixed-page data
-  accesses, but it is incomplete and may reject mixed executable pages,
-  mixed shared-file aliases, or unsupported guarded AArch64 instructions.
-
-Selecting `linux4k` never falls back to HVF. An unsupported mapping or
-instruction fails with a native-backend diagnostic so the compatibility gap is
-visible. Every native image mapping must lie above macOS's hard 4 GiB arm64
-`__PAGEZERO`. PIE/`ET_DYN` is the practical supported path; a high-address
-`ET_EXEC` image can work, while ordinary low-address `ET_EXEC` images are
-rejected.
-
-See the dated
-[native feasibility and conformance evidence](docs/2026-07-09-no-vmm-native-feasibility-evidence.md)
-and the
-[native fork benchmark](docs/2026-07-10-native-fork-benchmark-evidence.md)
-for measurements and known gaps. As of 2026-07-11 the native16k musl
-conformance lane measures 376/376 probes byte-identical with Docker arm64,
-and native `fork` is ~3.4x faster than HVF (1.53x host Darwin) with
-host-COW memory scaling.
+- Guest `fork` and `clone` clone address spaces and register state inside
+  the VM carrier without spawning new Darwin host processes.
+- Syscalls trap directly to host handlers where they are re-expressed as host
+  operations (kqueue, BSD sockets, APFS cloning, and in-memory VFS).
+- Thread scheduling multiplexes logical guest threads over bounded host
+  vCPUs.
 
 ---
 
