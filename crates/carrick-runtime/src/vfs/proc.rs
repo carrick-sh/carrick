@@ -567,6 +567,19 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
     // Present but read-only in Docker's LTP container. LTP io_uring tests use
     // this save/restore path to skip when they cannot change the kernel knob.
     ("/proc/sys/kernel/io_uring_disabled", Sysctl::Static(b"0\n")),
+    // The keyring quota knobs (proc(5) "kernel/keys/*"). carrick implements no
+    // keyring — add_key/keyctl return ENOSYS — but LTP's `tst_sys_conf` save/
+    // restore does NOT probe the syscall: it `access(path, F_OK)`s the leaf,
+    // and only `access(path, W_OK)` failing yields the TST_SR_TCONF_RO skip.
+    // Missing leaves take the TST_SR_SKIP_MISSING branch instead, which merely
+    // TINFOs and lets the test run against a keyring that is not there. The
+    // sysctl-leaf writability gate already answers W_OK with EROFS, so
+    // declaring the leaves is what converts add_key05 from a blind run into
+    // the same honest TCONF Docker produces — the same declare-it-absent
+    // pattern as `io_uring_disabled` above. Values are Linux's defaults.
+    ("/proc/sys/kernel/keys/gc_delay", Sysctl::Static(b"300\n")),
+    ("/proc/sys/kernel/keys/maxkeys", Sysctl::Static(b"200\n")),
+    ("/proc/sys/kernel/keys/maxbytes", Sysctl::Static(b"20000\n")),
     // Host-powered process/thread ceiling. This is intentionally not used to
     // tune SysV IPC workloads; queue throughput belongs to the SysV service.
     (
@@ -3921,6 +3934,12 @@ mod tests {
             ("/proc/sys/fs/file-nr", "256\t0\t1048576\n"),
             ("/proc/sys/fs/aio-max-nr", "65536\n"),
             ("/proc/sys/kernel/random/entropy_avail", "256\n"),
+            // LTP's tst_sys_conf save/restore only TCONFs a test when the leaf
+            // EXISTS and is not writable; a missing leaf silently lets the test
+            // run against a keyring carrick does not implement (add_key05).
+            ("/proc/sys/kernel/keys/gc_delay", "300\n"),
+            ("/proc/sys/kernel/keys/maxkeys", "200\n"),
+            ("/proc/sys/kernel/keys/maxbytes", "20000\n"),
         ] {
             let got = synthetic_file(path, &ctx()).unwrap();
             assert_eq!(String::from_utf8(got).unwrap(), want, "{path}");
