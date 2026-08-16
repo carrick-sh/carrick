@@ -11,8 +11,8 @@ use super::ids::{
 };
 use super::objects::{
     Credentials, FileSlot, FileTable, FsContext, Mm, ObjectGraphError, ProcessGroup, Session,
-    Sighand, Task, TaskKey, TaskRef, TaskShared, Thread, ThreadKey, ThreadRef, ThreadResources,
-    Zombie,
+    Sighand, Task, TaskKey, TaskLifecycle, TaskRef, TaskShared, Thread, ThreadKey, ThreadRef,
+    ThreadResources, Zombie,
 };
 use super::registry::{IdError, IdRegistry, TaskClaim, ThreadClaim};
 
@@ -968,6 +968,26 @@ impl RegistryLock {
     }
 }
 
+/// One LIVE process's Linux identity, as [`Registry::live_processes`] reports
+/// it. The field set deliberately matches the identity half of
+/// [`super::snapshot::TaskSnapshotRow`] and the whole of
+/// [`super::objects::Zombie`]'s identity, because the three describe the same
+/// process at three points in its life and `/proc` must render them alike.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LiveProcess {
+    pub key: TaskKey,
+    pub parent: Option<TaskKey>,
+    pub process_group: ProcessGroupId,
+    pub session: SessionId,
+    pub lifecycle: TaskLifecycle,
+    /// Live thread count, for `/proc/<pid>/stat` field 20 and `status`'
+    /// `Threads:`. Read from the registry's own per-task thread claims — the
+    /// authority that admits and retires a thread — not from a host thread
+    /// table, which under HVPatch describes the whole carrier.
+    pub thread_count: usize,
+    pub diagnostic_name: String,
+}
+
 impl Registry {
     pub fn task(&self, id: TaskId) -> Option<TaskRef> {
         self.state
@@ -991,6 +1011,34 @@ impl Registry {
             .zombies
             .values()
             .map(|record| record.zombie.clone())
+            .collect()
+    }
+
+    /// Every LIVE process's Linux identity, for the `/proc/<pid>/{stat,status,
+    /// comm,cmdline}` renderers. The sibling of [`Registry::zombies`]: that one
+    /// describes the exited-but-unreaped interval, this one the interval before
+    /// it, and together they are the whole set of processes a guest can name.
+    ///
+    /// This is a narrow read rather than a [`super::snapshot`] `TaskSnapshotRow`
+    /// pass — which carries exactly these fields — because the snapshot
+    /// re-derives and re-checks the entire object graph under a deadline, and
+    /// the `/proc` context is rebuilt on EVERY synthetic open. The live-task
+    /// count is small, so one `state` read collecting five identity fields is
+    /// the whole cost.
+    pub(crate) fn live_processes(&self) -> Vec<LiveProcess> {
+        self.state
+            .read()
+            .tasks
+            .values()
+            .map(|record| LiveProcess {
+                key: record.task.key(),
+                parent: record.task.parent(),
+                process_group: record.task.process_group(),
+                session: record.task.session(),
+                lifecycle: record.task.lifecycle(),
+                thread_count: record.thread_claims.len(),
+                diagnostic_name: record.diagnostic_name.clone(),
+            })
             .collect()
     }
 
