@@ -1222,7 +1222,9 @@ impl SyscallDispatcher {
         }
         let kernel = ctx.kernel.kernel();
         let Some(target_key) = hvpatch_process_signal_target(kernel, pid) else {
-            if hvpatch_null_signal_observes_zombie(kernel, pid, signum) {
+            if hvpatch_signal_observes_zombie(kernel, pid) {
+                // Addressable but no longer running: the signal is dropped and
+                // the call succeeds, exactly as Linux does for a zombie.
                 return Some(DispatchOutcome::Returned { value: 0 });
             }
             return Some(DispatchOutcome::errno(LINUX_ESRCH));
@@ -2516,17 +2518,18 @@ fn hvpatch_process_signal_target(
     })
 }
 
-fn hvpatch_null_signal_observes_zombie(
-    kernel: &crate::kernel::Kernel,
-    pid: i32,
-    signum: u64,
-) -> bool {
+fn hvpatch_signal_observes_zombie(kernel: &crate::kernel::Kernel, pid: i32) -> bool {
     // Linux keeps an exited child addressable until its parent consumes the
     // wait result. Numeric reuse cannot race this lookup: the zombie retains
     // its TaskClaim until that same consuming wait removes it.
-    if signum != 0 {
-        return false;
-    }
+    //
+    // This holds for EVERY signal, not just the signum-0 existence probe.
+    // kill(2) is explicit: "Note that an existing process might be a zombie, a
+    // process that has terminated execution but has not yet been wait(2)ed
+    // for." The signal is discarded, but the call SUCCEEDS. Restricting this to
+    // signum 0 made carrick return ESRCH for a real signal to an unreaped
+    // child, which is what LTP's `SAFE_KILL(child, SIGTERM)` teardown does to
+    // the one-shot signal helper `create_sig_proc()` spawns.
     crate::kernel::TaskId::from_abi_positive(pid)
         .ok()
         .is_some_and(|target| kernel.registry().zombie(target).is_some())
@@ -2761,7 +2764,7 @@ mod tests {
     }
 
     #[test]
-    fn hvpatch_null_signal_observes_zombie_until_reap() {
+    fn hvpatch_signal_observes_zombie_until_reap() {
         let dispatcher = SyscallDispatcher::new();
         let parent = dispatcher.capture_one_task_context().expect("context");
         let child_thread =
@@ -2792,20 +2795,16 @@ mod tests {
             .expect("child exit");
 
         assert!(hvpatch_process_signal_target(parent.kernel(), child_pid).is_none());
-        assert!(hvpatch_null_signal_observes_zombie(
-            parent.kernel(),
-            child_pid,
-            0
-        ));
-        assert!(!hvpatch_null_signal_observes_zombie(
-            parent.kernel(),
-            child_pid,
-            crate::linux_abi::LINUX_SIGUSR1 as u64,
-        ));
-        assert!(!hvpatch_null_signal_observes_zombie(
+        // Addressable until reaped, for EVERY signal — not just the signum-0
+        // existence probe. The predicate no longer takes a signum at all; it
+        // used to, and the assertion here demanded that a real signal NOT
+        // observe the zombie, pinning the ESRCH bug in place. kill(2): "an
+        // existing process might be a zombie ... that has not yet been
+        // wait(2)ed for."
+        assert!(hvpatch_signal_observes_zombie(parent.kernel(), child_pid));
+        assert!(!hvpatch_signal_observes_zombie(
             parent.kernel(),
             child_pid + 1000,
-            0,
         ));
 
         parent
@@ -2816,11 +2815,7 @@ mod tests {
                 crate::kernel::WaitMode::Consume,
             )
             .expect("consume child wait");
-        assert!(!hvpatch_null_signal_observes_zombie(
-            parent.kernel(),
-            child_pid,
-            0,
-        ));
+        assert!(!hvpatch_signal_observes_zombie(parent.kernel(), child_pid));
     }
 
     #[test]
