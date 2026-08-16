@@ -1863,7 +1863,15 @@ where
                 ));
             }
             self.publish_crash_registers_if_requested(engine)?;
-            if self.kicker.count() > 1 {
+            // Count the siblings that owe a register file from the TASK, not
+            // from the kicker. A thread parked in a futex or fd wait has
+            // already released its vCPU and unregistered, so `kicker.count()`
+            // reads 1 for a two-thread process. Keying the quiesce on the
+            // kicker therefore never raised the barrier, the sleeper's
+            // `fork_is_quiescing()` interrupt never fired, it never reached the
+            // safe point that publishes crash registers, and the collector
+            // below spun its FULL 10 s deadline before failing the core closed.
+            if context.task().threads().len() > 1 {
                 barrier.set_quiescing();
                 quiesced = true;
                 self.kicker.kick_all_except(self.this_tid);
