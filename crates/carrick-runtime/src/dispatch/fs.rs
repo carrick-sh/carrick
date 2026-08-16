@@ -8347,11 +8347,46 @@ impl SyscallDispatcher {
             // through; EWOULDBLOCK maps to Linux EAGAIN via host_syscall_errno.
             // A non-host fd (in-memory backend) keeps the single-tenant no-op.
             if let Some(host_fd) = this.regular_host_file_fd(fd.0) {
-                let rc = unsafe { libc::flock(host_fd.get(), operation as i32) };
-                return Ok(match rc.host_syscall_errno() {
-                    Ok(_) => DispatchOutcome::Returned { value: 0 },
-                    Err(errno) => DispatchOutcome::errno(errno),
-                });
+                // flock(2): "EINTR — while waiting to acquire a lock, the call
+                // was interrupted by delivery of a signal caught by a handler."
+                // A bare blocking host flock cannot honour that: the thread
+                // parks inside the macOS kernel where carrick can observe
+                // nothing, so no guest signal — not even SIGKILL — ends it, and
+                // LTP flock07 (child blocks on LOCK_EX, parent signals it after
+                // 1 s, test asserts EINTR) wedged to the harness timeout.
+                //
+                // Always ask the host NON-blocking and own the waiting here, so
+                // the interrupt check is reachable between attempts. LOCK_UN and
+                // an uncontended acquire still complete on the first pass.
+                let guest_nonblock = operation & LINUX_LOCK_NB != 0;
+                let host_operation = (operation as i32) | libc::LOCK_NB;
+                let tid = cx.tid();
+                loop {
+                    let rc = unsafe { libc::flock(host_fd.get(), host_operation) };
+                    match rc.host_syscall_errno() {
+                        Ok(_) => return Ok(DispatchOutcome::Returned { value: 0 }),
+                        // The guest asked for LOCK_NB itself: report the
+                        // would-block verbatim rather than waiting on its
+                        // behalf.
+                        Err(errno) if errno == LINUX_EAGAIN && guest_nonblock => {
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                        Err(errno) if errno == LINUX_EAGAIN => {
+                            let non_interrupting =
+                                this.non_interrupting_signal_mask(cx.kernel, tid);
+                            if this.signal_wait_should_eintr(
+                                cx.kernel,
+                                tid,
+                                carrick_abi::SigSet::EMPTY,
+                                carrick_abi::SigBlockMask::blocking_all_of(non_interrupting),
+                            ) {
+                                return Ok(DispatchOutcome::errno(LINUX_EINTR));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    }
+                }
             }
             Ok(DispatchOutcome::Returned { value: 0 })
 
