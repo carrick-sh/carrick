@@ -3432,8 +3432,47 @@ pub const LINUX_WAIT4_SUPPORTED_FLAGS: u64 = LINUX_WNOHANG
     | LINUX_WCLONE
     | LINUX_WALL
     | LINUX_WNOTHREAD;
+pub const LINUX_STATX_TYPE: u32 = 0x0001;
+pub const LINUX_STATX_MODE: u32 = 0x0002;
+pub const LINUX_STATX_NLINK: u32 = 0x0004;
+pub const LINUX_STATX_UID: u32 = 0x0008;
+pub const LINUX_STATX_GID: u32 = 0x0010;
+pub const LINUX_STATX_ATIME: u32 = 0x0020;
+pub const LINUX_STATX_MTIME: u32 = 0x0040;
+pub const LINUX_STATX_CTIME: u32 = 0x0080;
+pub const LINUX_STATX_INO: u32 = 0x0100;
+pub const LINUX_STATX_SIZE: u32 = 0x0200;
+pub const LINUX_STATX_BLOCKS: u32 = 0x0400;
 pub const LINUX_STATX_BASIC_STATS: u32 = 0x7ff;
+pub const LINUX_STATX_BTIME: u32 = 0x0800;
+pub const LINUX_STATX_MNT_ID: u32 = 0x1000;
+pub const LINUX_STATX_DIOALIGN: u32 = 0x2000;
+pub const LINUX_STATX_MNT_ID_UNIQUE: u32 = 0x4000;
+pub const LINUX_STATX_ALL: u32 = 0x0fff;
 pub const LINUX_STATX_RESERVED: u64 = 0x8000_0000;
+
+pub const LINUX_MFD_CLOEXEC: u64 = 0x0001;
+pub const LINUX_MFD_ALLOW_SEALING: u64 = 0x0002;
+pub const LINUX_MFD_HUGETLB: u64 = 0x0004;
+pub const LINUX_MFD_NOEXEC_SEAL: u64 = 0x0008;
+pub const LINUX_MFD_EXEC: u64 = 0x0010;
+
+pub const LINUX_RENAME_NOREPLACE: u64 = 1;
+pub const LINUX_RENAME_EXCHANGE: u64 = 2;
+pub const LINUX_RENAME_WHITEOUT: u64 = 4;
+
+pub const LINUX_SS_AUTODISARM: u64 = 0x8000_0000;
+
+pub const LINUX_PTRACE_O_TRACESYSGOOD: u64 = 0x0000_0001;
+pub const LINUX_PTRACE_O_TRACEFORK: u64 = 0x0000_0002;
+pub const LINUX_PTRACE_O_TRACEVFORK: u64 = 0x0000_0004;
+pub const LINUX_PTRACE_O_TRACECLONE: u64 = 0x0000_0008;
+pub const LINUX_PTRACE_O_TRACEEXEC: u64 = 0x0000_0010;
+pub const LINUX_PTRACE_O_TRACEVFORKDONE: u64 = 0x0000_0020;
+pub const LINUX_PTRACE_O_TRACEEXIT: u64 = 0x0000_0040;
+pub const LINUX_PTRACE_O_TRACESECCOMP: u64 = 0x0000_0080;
+pub const LINUX_PTRACE_O_EXITKILL: u64 = 0x0010_0000;
+pub const LINUX_PTRACE_O_SUSPEND_SECCOMP: u64 = 0x0020_0000;
 pub const LINUX_IOV_MAX: usize = 1024;
 /// Linux's conventional maximum aggregate argv+env payload for `execve(2)`.
 pub const LINUX_ARG_MAX: usize = 2 * 1024 * 1024;
@@ -3712,6 +3751,183 @@ bitflags! {
         const WALL = LINUX_WALL;
         const WCLONE = LINUX_WCLONE;
     }
+
+    /// `inotify_add_watch` and `struct inotify_event.mask` event bits.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxInotifyFlags: u32 {
+        const ACCESS = LINUX_IN_ACCESS;
+        const MODIFY = LINUX_IN_MODIFY;
+        const ATTRIB = LINUX_IN_ATTRIB;
+        const CLOSE_WRITE = LINUX_IN_CLOSE_WRITE;
+        const CLOSE_NOWRITE = LINUX_IN_CLOSE_NOWRITE;
+        const OPEN = LINUX_IN_OPEN;
+        const MOVED_FROM = LINUX_IN_MOVED_FROM;
+        const MOVED_TO = LINUX_IN_MOVED_TO;
+        const CREATE = LINUX_IN_CREATE;
+        const DELETE = LINUX_IN_DELETE;
+        const DELETE_SELF = LINUX_IN_DELETE_SELF;
+        const MOVE_SELF = LINUX_IN_MOVE_SELF;
+        const UNMOUNT = LINUX_IN_UNMOUNT;
+        const Q_OVERFLOW = LINUX_IN_Q_OVERFLOW;
+        const IGNORED = LINUX_IN_IGNORED;
+        const ONLYDIR = LINUX_IN_ONLYDIR;
+        const DONT_FOLLOW = LINUX_IN_DONT_FOLLOW;
+        const EXCL_UNLINK = LINUX_IN_EXCL_UNLINK;
+        const MASK_CREATE = LINUX_IN_MASK_CREATE;
+        const MASK_ADD = LINUX_IN_MASK_ADD;
+        const ISDIR = LINUX_IN_ISDIR;
+        const ONESHOT = LINUX_IN_ONESHOT;
+        const CLOSE = LINUX_IN_CLOSE;
+        const MOVE = LINUX_IN_MOVE;
+        const ALL_EVENTS = LINUX_IN_ALL_EVENTS;
+    }
+
+    /// `fallocate(2)` allocation mode flags.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxFallocateFlags: u64 {
+        const KEEP_SIZE = LINUX_FALLOC_FL_KEEP_SIZE;
+        const PUNCH_HOLE = LINUX_FALLOC_FL_PUNCH_HOLE;
+        const COLLAPSE_RANGE = LINUX_FALLOC_FL_COLLAPSE_RANGE;
+        const ZERO_RANGE = LINUX_FALLOC_FL_ZERO_RANGE;
+        const INSERT_RANGE = LINUX_FALLOC_FL_INSERT_RANGE;
+        const UNSHARE_RANGE = LINUX_FALLOC_FL_UNSHARE_RANGE;
+    }
+
+    /// `preadv2`/`pwritev2` per-call RWF_* flags.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxRwfFlags: u64 {
+        const HIPRI = LINUX_RWF_HIPRI;
+        const DSYNC = LINUX_RWF_DSYNC;
+        const SYNC = LINUX_RWF_SYNC;
+        const NOWAIT = LINUX_RWF_NOWAIT;
+        const APPEND = LINUX_RWF_APPEND;
+    }
+
+    /// `memfd_create(2)` flag bits.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxMemfdFlags: u64 {
+        const CLOEXEC = LINUX_MFD_CLOEXEC;
+        const ALLOW_SEALING = LINUX_MFD_ALLOW_SEALING;
+        const HUGETLB = LINUX_MFD_HUGETLB;
+        const NOEXEC_SEAL = LINUX_MFD_NOEXEC_SEAL;
+        const EXEC = LINUX_MFD_EXEC;
+    }
+
+    /// File seals for `memfd_create`/`fcntl(F_ADD_SEALS/F_GET_SEALS)`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxMemfdSeals: u32 {
+        const SEAL = LINUX_F_SEAL_SEAL;
+        const SHRINK = LINUX_F_SEAL_SHRINK;
+        const GROW = LINUX_F_SEAL_GROW;
+        const WRITE = LINUX_F_SEAL_WRITE;
+        const FUTURE_WRITE = LINUX_F_SEAL_FUTURE_WRITE;
+        const EXEC = LINUX_F_SEAL_EXEC;
+    }
+
+    /// `flock(2)` file lock operations.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxFlockFlags: u64 {
+        const SH = LINUX_LOCK_SH;
+        const EX = LINUX_LOCK_EX;
+        const NB = LINUX_LOCK_NB;
+        const UN = LINUX_LOCK_UN;
+    }
+
+    /// `renameat2(2)` flags.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxRenameat2Flags: u64 {
+        const NOREPLACE = LINUX_RENAME_NOREPLACE;
+        const EXCHANGE = LINUX_RENAME_EXCHANGE;
+        const WHITEOUT = LINUX_RENAME_WHITEOUT;
+    }
+
+    /// `access(2)` / `faccessat(2)` check mode bits.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxAccessMode: u64 {
+        const R_OK = LINUX_R_OK;
+        const W_OK = LINUX_W_OK;
+        const X_OK = LINUX_X_OK;
+    }
+
+    /// `pipe2(2)` creation flags.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxPipe2Flags: u64 {
+        const CLOEXEC = LINUX_O_CLOEXEC;
+        const NONBLOCK = LINUX_O_NONBLOCK;
+        const DIRECT = 0o200000;
+    }
+
+    /// `poll(2)` events / revents interest/readiness mask.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxPollEvents: i16 {
+        const IN = LINUX_POLLIN;
+        const OUT = LINUX_POLLOUT;
+        const ERR = LINUX_POLLERR;
+        const HUP = LINUX_POLLHUP;
+        const NVAL = LINUX_POLLNVAL;
+        const PRI = 0x0002;
+        const RDHUP = 0x2000;
+    }
+
+    /// `timerfd_create` and `timerfd_settime` flags.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxTfdFlags: u64 {
+        const NONBLOCK = LINUX_TFD_NONBLOCK;
+        const CLOEXEC = LINUX_TFD_CLOEXEC;
+        const TIMER_ABSTIME = LINUX_TIMER_ABSTIME;
+        const TIMER_CANCEL_ON_SET = LINUX_TFD_TIMER_CANCEL_ON_SET;
+    }
+
+    /// `signalfd4(2)` creation flags.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxSignalfdFlags: u64 {
+        const NONBLOCK = LINUX_O_NONBLOCK;
+        const CLOEXEC = LINUX_O_CLOEXEC;
+    }
+
+    /// `sigaltstack(2)` flags.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxSigaltstackFlags: u64 {
+        const ONSTACK = LINUX_SS_ONSTACK;
+        const DISABLE = LINUX_SS_DISABLE;
+        const AUTODISARM = LINUX_SS_AUTODISARM;
+    }
+
+    /// `statx(2)` request mask.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxStatxMask: u32 {
+        const TYPE = LINUX_STATX_TYPE;
+        const MODE = LINUX_STATX_MODE;
+        const NLINK = LINUX_STATX_NLINK;
+        const UID = LINUX_STATX_UID;
+        const GID = LINUX_STATX_GID;
+        const ATIME = LINUX_STATX_ATIME;
+        const MTIME = LINUX_STATX_MTIME;
+        const CTIME = LINUX_STATX_CTIME;
+        const INO = LINUX_STATX_INO;
+        const SIZE = LINUX_STATX_SIZE;
+        const BLOCKS = LINUX_STATX_BLOCKS;
+        const BASIC_STATS = LINUX_STATX_BASIC_STATS;
+        const BTIME = LINUX_STATX_BTIME;
+        const MNT_ID = LINUX_STATX_MNT_ID;
+        const DIOALIGN = LINUX_STATX_DIOALIGN;
+        const MNT_ID_UNIQUE = LINUX_STATX_MNT_ID_UNIQUE;
+    }
+
+    /// `ptrace(PTRACE_SETOPTIONS)` option bits.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxPtraceOptions: u64 {
+        const TRACESYSGOOD = LINUX_PTRACE_O_TRACESYSGOOD;
+        const TRACEFORK = LINUX_PTRACE_O_TRACEFORK;
+        const TRACEVFORK = LINUX_PTRACE_O_TRACEVFORK;
+        const TRACECLONE = LINUX_PTRACE_O_TRACECLONE;
+        const TRACEEXEC = LINUX_PTRACE_O_TRACEEXEC;
+        const TRACEVFORKDONE = LINUX_PTRACE_O_TRACEVFORKDONE;
+        const TRACEEXIT = LINUX_PTRACE_O_TRACEEXIT;
+        const TRACESECCOMP = LINUX_PTRACE_O_TRACESECCOMP;
+        const EXITKILL = LINUX_PTRACE_O_EXITKILL;
+        const SUSPEND_SECCOMP = LINUX_PTRACE_O_SUSPEND_SECCOMP;
+    }
 }
 
 impl LinuxProtFlags {
@@ -3767,6 +3983,55 @@ impl LinuxCloneFlags {
 
 impl LinuxSocketTypeFlags {
     pub const SUPPORTED_MASK: i32 = Self::NONBLOCK.bits() | Self::CLOEXEC.bits();
+}
+
+impl LinuxFallocateFlags {
+    pub const SUPPORTED_MASK: u64 = LINUX_FALLOC_FL_SUPPORTED;
+}
+
+impl LinuxRwfFlags {
+    pub const SUPPORTED_MASK: u64 = LINUX_RWF_SUPPORTED;
+}
+
+impl LinuxMemfdFlags {
+    pub const KNOWN_MASK: u64 = LINUX_MFD_CLOEXEC | LINUX_MFD_ALLOW_SEALING | LINUX_MFD_HUGETLB;
+    pub const HUGE_SHIFT: u64 = 26;
+    pub const HUGE_MASK: u64 = 0x3f;
+    pub const HUGE_BITS: u64 = Self::HUGE_MASK << Self::HUGE_SHIFT;
+}
+
+impl LinuxMemfdSeals {
+    pub const ALL_SEALS: Self = Self::from_bits_retain(LINUX_F_SEAL_ALL);
+}
+
+impl LinuxFlockFlags {
+    pub const SUPPORTED_MASK: u64 = LINUX_LOCK_SH | LINUX_LOCK_EX | LINUX_LOCK_NB | LINUX_LOCK_UN;
+}
+
+impl LinuxRenameat2Flags {
+    pub const KNOWN_MASK: u64 =
+        LINUX_RENAME_NOREPLACE | LINUX_RENAME_EXCHANGE | LINUX_RENAME_WHITEOUT;
+}
+
+impl LinuxAccessMode {
+    pub const MASK: u64 = LINUX_R_OK | LINUX_W_OK | LINUX_X_OK;
+}
+
+impl LinuxPipe2Flags {
+    pub const SUPPORTED_MASK: u64 = LINUX_O_CLOEXEC | LINUX_O_NONBLOCK | 0o200000;
+}
+
+impl LinuxTfdFlags {
+    pub const CREATE_SUPPORTED: u64 = LINUX_TFD_NONBLOCK | LINUX_TFD_CLOEXEC;
+    pub const SETTIME_SUPPORTED: u64 = LINUX_TIMER_ABSTIME | LINUX_TFD_TIMER_CANCEL_ON_SET;
+}
+
+impl LinuxSignalfdFlags {
+    pub const SUPPORTED_MASK: u64 = LINUX_O_NONBLOCK | LINUX_O_CLOEXEC;
+}
+
+impl LinuxSigaltstackFlags {
+    pub const SUPPORTED_MASK: u64 = LINUX_SS_ONSTACK | LINUX_SS_DISABLE | LINUX_SS_AUTODISARM;
 }
 
 impl LinuxWaitOptions {

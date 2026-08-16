@@ -1525,7 +1525,7 @@ impl SyscallDispatcher {
         /// (signalfd4_01/02); a read()/poll() delivery path that drains the
         /// process's pending masked signals is a tracked follow-up.
         fn signalfd4(this, cx, fd: Fd, mask: GuestPtr, sizemask: u64, flags: u64) {
-            if flags & !(LINUX_O_NONBLOCK | LINUX_O_CLOEXEC) != 0 {
+            if LinuxSignalfdFlags::from_bits(flags).is_none() {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // The kernel sigset_t ABI is exactly 8 bytes (_NSIG/8 on aarch64); any

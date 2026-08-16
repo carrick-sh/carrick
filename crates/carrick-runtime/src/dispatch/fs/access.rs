@@ -15,9 +15,7 @@ impl SyscallDispatcher {
         flags: u64,
         memory: &impl GuestMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
-        if mode & !(LINUX_R_OK | LINUX_W_OK | LINUX_X_OK) != 0
-            || !linux_access_flags_are_supported(flags)
-        {
+        if LinuxAccessMode::from_bits(mode).is_none() || !linux_access_flags_are_supported(flags) {
             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
         }
 
