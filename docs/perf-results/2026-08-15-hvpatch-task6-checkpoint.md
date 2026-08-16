@@ -147,11 +147,54 @@ restored, but the 438-row Carrick/Docker phase has not run on this checkpoint.
 The three Node rows also remain. Therefore neither baseline blessing nor the
 HVPatch default switch is permitted.
 
+## Terminal-scope addendum at `8513d8677`
+
+The `TestCorrectMethodPackage` stop-the-world hang is closed without changing
+suite semantics. Typed signed trace
+`target/conformance/task6/task6-gcimporter-terminal-r2.dtrace` (SHA-256
+`1881f4b775ebb9d4c7ea8a0895161c4be0b16732732c034ad217bea559e42bb5`)
+proved that inner Go pid 20 Linux tids 22, 27, and 28 were retired from the
+suspended vfork-parent path and then became the exact three `tgkill(SIGURG)`
+`ESRCH` targets. None issued guest `exit(93)`.
+
+The vfork wait had treated every clone-admission close as terminal. An
+unrelated concurrent process fork temporarily publishes
+`CloneAdmissionClose::Fork`, so three suspended vfork parents were retired as
+if exec/exit had replaced them. `433e50347` adds a terminal-only predicate
+(`Exec|Exit`) at this edge. Ordinary fork serialization and true exec/exit
+cancellation remain intact. The regression test was red before the predicate
+existed and is green with the fix.
+
+Seven of eight signed untraced reducer attempts pass, including the final two
+exact-source runs at 10.98 s and 11.51 s; every run had scoped cleanup zero.
+The sole other attempt is the distinct, already-open sibling-materialization
+start-gate timeout. It did not reproduce the retired-vfork root and remains
+deferred with the other Go lifecycle residuals. A post-fix causal trace
+recorded zero reason-3 terminals and zero `tgkill` `ESRCH`, but timed out after
+emitting 1,091 other terminal receipts; its durable script is therefore marked
+high-perturbation and is not a liveness gate.
+
+The exact signed implementation-source binary at `8513d8677` is SHA-256
+`a823acdf3c0ca8a00947a09f7680d3955f2a3edc1e49dcc6b38ce7fd053523f5`,
+CDHash `f26469713b36d6e6d15296ef7531d2b15b476c39`, UUID
+`759448DE-6473-3964-8B4F-29E87F188277`, with the HVF entitlement and
+`__TEXT,__dof_carrick`. Formatting, typed-domain lint, affected-crate Clippy,
+and focused signal/filesystem/admission/terminal-provider tests are green.
+
+Per the explicit terminal scope, the following remain future work rather than
+requirements for this checkpoint integration: the start-gate residual and all
+remaining eight Go rows, HVPatch-only one-host-process migration, CPython and
+Node phases, baseline/default changes, broad final CI/Tasks 1–5 proof, and the
+cold-build regression signal. Native/DSR and legacy VMM are non-gating product
+lanes. No baseline or default was changed here.
+
 ## Resume here
 
-The next correctness target remains the common fork-quiesce/start-gate cluster
-from the eight-row Go residual table above. Reproduce it with the purpose-built
-child-first debugger:
+The next future-session correctness target is the remaining
+fork-quiesce/start-gate cluster from the eight-row Go residual table above. The
+STW/vfork-parent root is already closed and must not be reopened by inference.
+Reproduce the distinct start-gate signature with the purpose-built child-first
+debugger:
 
 ```sh
 target/release/carrick debug lldb-run \
