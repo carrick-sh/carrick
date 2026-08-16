@@ -513,21 +513,13 @@ pub(crate) use quiesce::{fork_barrier, pt_barrier};
 // reuses the architecture lowering and Linux signal-frame half below.
 use signal::deliver_fault_signal;
 pub(crate) use signal::is_default_ignore_signal;
+#[cfg(test)]
+pub(crate) use signal::upgrade_protection_si_code;
 pub(crate) use signal::{
     deliver_pending_signal, lower_el0_fault, partial_write_interrupt_outcome,
     raise_sigpipe_for_blocking_write, signal_progress_count, signal_wait_expired,
     signal_wait_remaining, signal_wait_slice,
 };
-// `FaultSignalDisposition`/`inject_fault_signal` are consumed only by
-// `native_darwin.rs`'s fault-injection path (its own lane gate matches this
-// one). `upgrade_protection_si_code` has an additional portable consumer:
-// `dispatch/mem.rs`'s `#[cfg(test)]` protection-fault tests call it via this
-// same `crate::vcpu_loop::` re-export on every host, so it needs the `test`
-// arm too or a non-macOS test build sees it as an unused import.
-#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
-pub(crate) use signal::upgrade_protection_si_code;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) use signal::{FaultSignalDisposition, inject_fault_signal};
 // Test-only consumer since the DSR translator (the lib-side caller) moved to
 // the arch crate; the ESR decode itself lives in carrick_dsr_aarch64::esr and
 // signal.rs re-exports it.
@@ -1474,16 +1466,14 @@ fn stamp_identity_values<M: GuestMemory>(
 /// exec — since vCPU sysregs reset.
 pub(crate) fn stamp_guest_tid<E: ThreadedEngine>(
     engine: &E,
-    this_tid: ThreadId,
-    registry: &ThreadRegistry,
+    _this_tid: ThreadId,
+    _registry: &ThreadRegistry,
     hvpatch_linux_tid: Option<crate::kernel::LinuxTid>,
 ) {
     if !crate::syscall_shim_enabled() {
         return;
     }
-    let tid = hvpatch_linux_tid
-        .and_then(|tid| u32::try_from(tid.raw()).ok())
-        .or_else(|| crate::dispatch::guest_visible_tid(this_tid, registry));
+    let tid = hvpatch_linux_tid.and_then(|tid| u32::try_from(tid.raw()).ok());
     if let Some(tid) = tid {
         let _ = engine.set_guest_thread_id(u64::from(tid));
     }

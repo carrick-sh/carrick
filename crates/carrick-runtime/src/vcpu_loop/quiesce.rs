@@ -1007,7 +1007,7 @@ where
                         let tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
                         let _ = engine.write_bytes(addr, &tid);
                     }
-                    stamp_guest_tid(engine, self.this_tid, &self.registry, None);
+                    stamp_guest_tid(engine, self.this_tid, &self.registry, Some(self.linux_tid));
                     kernel.dispatcher.sysv_after_fork_child();
                     self.waiter = crate::io_wait::ThreadWaiter::new(self.this_tid);
                     let handle: Box<dyn carrick_hal::VcpuKickDyn> = Box::new(engine.kick_handle());

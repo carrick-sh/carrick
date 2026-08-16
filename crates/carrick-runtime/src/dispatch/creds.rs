@@ -253,6 +253,7 @@ impl SyscallDispatcher {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn credentials_from_context(
         &self,
         kernel: &crate::kernel::KernelContext,

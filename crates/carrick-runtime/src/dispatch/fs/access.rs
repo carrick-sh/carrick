@@ -280,9 +280,7 @@ impl SyscallDispatcher {
     /// that a non-executable `#!` script is EACCES rather than a followed
     /// interpreter (matching Linux). The ELF/shebang FORMAT check (ENOEXEC) is
     /// left to image-load time. (execve03 / execveat02 / execve02.)
-    // Called from `native_darwin.rs` and `runtime/exec.rs` (the macOS/HVF
-    // execve path) — both lane/feature-gated to macOS/aarch64, no test
-    // exercises this directly.
+    // Called from `runtime/exec.rs` (the macOS/HVF execve path).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn check_exec_target(&self, path: &str) -> Result<(), LinuxErrno> {
         // Existence via the SAME layered reader the loader uses, so a symlinked

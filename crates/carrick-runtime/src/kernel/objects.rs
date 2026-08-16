@@ -546,6 +546,7 @@ impl FileDescription {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn concrete_restored<T>(
         stable_id: u64,
         backing: Arc<T>,

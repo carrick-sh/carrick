@@ -102,6 +102,7 @@ pub(crate) fn with_active_context<R>(
     })
 }
 
+#[cfg(test)]
 pub(super) fn with_resources<R>(resources: CapturedResources, operation: impl FnOnce() -> R) -> R {
     with_resource_scope(resources, std::ptr::null(), operation)
 }

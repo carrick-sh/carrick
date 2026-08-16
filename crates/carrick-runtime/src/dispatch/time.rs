@@ -110,6 +110,7 @@ impl SyscallDispatcher {
     /// reset child process state, then arm exactly one child-local helper for a
     /// finite limit. `arm_rlimit_cpu` advances the child COW generation first,
     /// so no inherited generation can be mistaken for a live helper.
+    #[allow(dead_code)]
     pub(crate) fn begin_rlimit_cpu_fork_guard_until(
         &self,
         deadline: std::time::Instant,
@@ -117,6 +118,7 @@ impl SyscallDispatcher {
         try_hold_rlimit_cpu_for_fork_until(deadline)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn rlimit_cpu_after_fork_child(
         &self,
     ) -> Result<RlimitCpuChildRearm, std::io::Error> {
@@ -995,10 +997,12 @@ thread_local! {
     };
 }
 
+#[allow(dead_code)]
 pub(crate) struct RlimitCpuForkGuard {
     _guard: std::sync::MutexGuard<'static, ()>,
 }
 
+#[allow(dead_code)]
 pub(crate) fn try_hold_rlimit_cpu_for_fork_until(
     deadline: std::time::Instant,
 ) -> Option<RlimitCpuForkGuard> {

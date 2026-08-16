@@ -552,6 +552,7 @@ pub(crate) enum HostWriteKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct NativeReexecFdTableV1 {
     pub(crate) files: Vec<NativeReexecFdV1>,
     pub(crate) descriptions: Vec<NativeReexecDescriptionV1>,
@@ -560,6 +561,7 @@ pub(crate) struct NativeReexecFdTableV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct NativeReexecFdV1 {
     pub(crate) guest_fd: i32,
     pub(crate) fd_flags: u64,
@@ -567,6 +569,7 @@ pub(crate) struct NativeReexecFdV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
 pub(crate) enum NativeReexecDescriptionV1 {
     Pipe {
         stable_id: u64,
@@ -621,6 +624,7 @@ pub(crate) enum NativeReexecDescriptionV1 {
 }
 
 impl NativeReexecDescriptionV1 {
+    #[allow(dead_code)]
     pub(crate) const fn stable_id(&self) -> u64 {
         match self {
             Self::Pipe { stable_id, .. }
@@ -632,6 +636,7 @@ impl NativeReexecDescriptionV1 {
 }
 
 impl NativeReexecFdTableV1 {
+    #[allow(dead_code)]
     pub(crate) fn survivor_host_fds(&self) -> Vec<(i32, i32)> {
         self.descriptions
             .iter()
@@ -1253,6 +1258,7 @@ pub(super) fn kernel_file_description(
     )
 }
 
+#[allow(dead_code)]
 pub(super) fn restored_kernel_file_description(
     stable_id: u64,
     description: OpenDescriptionRef,
@@ -1273,6 +1279,7 @@ impl OpenDescription {
     // (`dispatch/mod.rs`), which carries the identical
     // `#[cfg(any(test, ...))]` gate.
     #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+    #[allow(dead_code)]
     pub(super) fn reexec_host_fd(&self) -> Option<i32> {
         match self {
             Self::HostPipe { host_fd, .. }
@@ -1284,6 +1291,7 @@ impl OpenDescription {
     }
 
     #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+    #[allow(dead_code)]
     pub(super) fn reexec_kind_name(&self) -> &'static str {
         match self {
             Self::Closed { .. } => "closed",
