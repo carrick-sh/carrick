@@ -368,6 +368,14 @@ pub(super) struct MemState {
     /// MAP_GROWSDOWN VMAs that may expand downward on a stack fault:
     /// `(low_bound, current_start, end)`.
     pub growdown_ranges: Vec<(u64, u64, u64)>,
+    /// VA ranges of MAP_SHARED mappings whose backing file was opened
+    /// read-only. Linux clears `VM_MAYWRITE` for them, so `mprotect(PROT_WRITE)`
+    /// is EACCES no matter what the mapping's current protection is
+    /// (`mprotect(2)`: "you mmap(2) a file to which you have read-only access,
+    /// then ask mprotect() to mark it PROT_WRITE"; LTP mprotect01 case 3). The
+    /// ceiling is a MAP TIME fact — the fd may be closed long before the
+    /// mprotect — so it is recorded here rather than re-derived.
+    read_only_shared_file_maps: Vec<crate::vfs::GuestMemoryRange>,
     /// VA ranges of MAP_SHARED mappings backed by a memfd sealed F_SEAL_WRITE
     /// (or F_SEAL_FUTURE_WRITE): `mprotect(PROT_WRITE)` on them must fail EPERM,
     /// since the sealed backing can never gain a shared writable view
@@ -430,6 +438,7 @@ impl MemState {
             resident_tracked_ranges: Vec::new(),
             resident_fault_ranges: Vec::new(),
             growdown_ranges: Vec::new(),
+            read_only_shared_file_maps: Vec::new(),
             write_sealed_shared_maps: Vec::new(),
             writable_memfd_maps: Vec::new(),
             linux_auxv_image: Vec::new(),
@@ -929,6 +938,7 @@ pub(crate) struct HostAliasMmapCommit {
     pub(super) resident: bool,
     pub(super) bus_fault: Option<(u64, u64)>,
     pub(super) write_sealed_shared: bool,
+    pub(super) read_only_shared_file: bool,
     pub(super) writable_memfd: Option<Arc<crate::kernel::FileDescription>>,
 }
 
@@ -1132,6 +1142,7 @@ fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len: u64) {
     locked_ranges_remove(&mut mem.resident_tracked_ranges, remove);
     remove_fault_range(&mut mem.resident_fault_ranges, remove);
     locked_ranges_remove(&mut mem.write_sealed_shared_maps, remove);
+    locked_ranges_remove(&mut mem.read_only_shared_file_maps, remove);
     locked_ranges_remove(&mut mem.host_alias_backed_ranges, remove);
     locked_ranges_remove(&mut mem.alias_vma_ranges, remove);
 }
@@ -1386,6 +1397,9 @@ impl SyscallDispatcher {
         }
         if commit.write_sealed_shared {
             locked_ranges_insert(&mut mem.write_sealed_shared_maps, replacement);
+        }
+        if commit.read_only_shared_file {
+            locked_ranges_insert(&mut mem.read_only_shared_file_maps, replacement);
         }
         if let Some(description) = commit.writable_memfd {
             mem.writable_memfd_maps.push((replacement, description));
@@ -1647,6 +1661,22 @@ impl SyscallDispatcher {
         {
             self.mem.lock().write_sealed_shared_maps.push(range);
         }
+    }
+
+    fn record_read_only_shared_file_map(&self, start: u64, len: u64) {
+        if let Some(range) =
+            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+        {
+            self.mem.lock().read_only_shared_file_maps.push(range);
+        }
+    }
+
+    fn range_is_read_only_shared_file(&self, start: u64, len: u64) -> bool {
+        self.mem
+            .lock()
+            .read_only_shared_file_maps
+            .iter()
+            .any(|r| ranges_overlap(start, len, r.start().raw(), r.end().raw()))
     }
 
     fn range_is_write_sealed_shared(&self, start: u64, len: u64) -> bool {
@@ -2527,6 +2557,7 @@ impl SyscallDispatcher {
                         resident: true,
                         bus_fault: None,
                         write_sealed_shared: false,
+                        read_only_shared_file: false,
                         writable_memfd: None,
                     },
                     mapping,
@@ -2822,6 +2853,7 @@ impl SyscallDispatcher {
                         || map_flags.contains(LinuxMmapFlags::POPULATE),
                     bus_fault,
                     write_sealed_shared: false,
+                    read_only_shared_file: false,
                     writable_memfd: None,
                 });
                 return Ok(DispatchOutcome::Returned {
@@ -2968,6 +3000,7 @@ impl SyscallDispatcher {
                             resident: true,
                             bus_fault: None,
                             write_sealed_shared: false,
+                            read_only_shared_file: false,
                             writable_memfd: None,
                         },
                     ));
@@ -3316,6 +3349,21 @@ impl SyscallDispatcher {
             // read-only here (a writable one already returned EPERM above); record
             // it so a later mprotect(PROT_WRITE) is rejected.
             let mut mmap_write_sealed_shared = false;
+            // mprotect(2) EACCES ceiling: a MAP_SHARED mapping of a file opened
+            // read-only can never be made PROT_WRITE. Decided here, at map time,
+            // because the backing fd can be closed long before the mprotect.
+            // MAP_PRIVATE is deliberately excluded — Linux keeps VM_MAYWRITE for
+            // a private map of a read-only file, since its stores are COW and
+            // never reach the file.
+            let mut mmap_read_only_shared_file = false;
+            if map_sharing == MmapSharing::Shared
+                && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                && let Some(open_file) = this.open_file(fd.0)
+            {
+                mmap_read_only_shared_file = open_file.description.read().status_flags()
+                    & LINUX_O_ACCMODE
+                    == LINUX_O_RDONLY;
+            }
             // A live MAP_SHARED, PROT_WRITE mapping of an (unsealed) memfd — its
             // backing description is recorded so F_ADD_SEALS F_SEAL_WRITE can
             // EBUSY while it is mapped.
@@ -3605,6 +3653,7 @@ impl SyscallDispatcher {
                             || map_flags.contains(LinuxMmapFlags::POPULATE),
                         bus_fault,
                         write_sealed_shared: mmap_write_sealed_shared,
+                        read_only_shared_file: mmap_read_only_shared_file,
                         writable_memfd: writable_memfd_desc,
                     },
                 ));
@@ -3777,6 +3826,9 @@ impl SyscallDispatcher {
             this.commit_mmap_locked_range(memory, locked_range)?;
             if mmap_write_sealed_shared {
                 this.record_write_sealed_shared_map(address, length);
+            }
+            if mmap_read_only_shared_file {
+                this.record_read_only_shared_file_map(address, length);
             }
             if let Some(description) = writable_memfd_desc {
                 this.record_writable_memfd_map(address, length, description);
@@ -4168,7 +4220,7 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn mremap(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, _new_address: GuestPtr) {
+        fn mremap(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, new_address: GuestPtr) {
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch();
             let memory = &mut *cx.memory;
             let page_size = this.linux_page_size();
@@ -4206,6 +4258,27 @@ impl SyscallDispatcher {
             }
             if dontunmap && new_size != old_size {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            // Two more well-formedness checks real Linux performs on a
+            // MREMAP_FIXED request, both EINVAL, both BEFORE it would attempt
+            // the move — so they must precede carrick's "not yet implemented"
+            // EOPNOTSUPP stand-in below for the same reason the checks above
+            // do. Without them a malformed fixed request reported carrick's
+            // refusal instead of the errno Linux gives (mremap05 cases 2/3:
+            // "new_addr has to be page aligned" and "old/new area must not
+            // overlap", both answered EOPNOTSUPP).
+            if move_fixed {
+                if !new_address.0.is_multiple_of(page_size) {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                if ranges_overlap(
+                    old_address.0,
+                    old_size,
+                    new_address.0,
+                    new_address.0.saturating_add(new_size),
+                ) {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
             }
             if this
                 .captured_mm()
@@ -4741,6 +4814,7 @@ impl SyscallDispatcher {
                             resident: false,
                             bus_fault: None,
                             write_sealed_shared: false,
+                            read_only_shared_file: false,
                             writable_memfd: None,
                         }));
                     return Ok(DispatchOutcome::MapHostAlias {
@@ -4763,6 +4837,15 @@ impl SyscallDispatcher {
             // writable (memfd_create01 check_mfd_non_writeable).
             if prot & LINUX_PROT_WRITE != 0 && this.range_is_write_sealed_shared(address.0, length) {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
+            // A MAP_SHARED mapping of a read-only file cannot be upgraded to
+            // writable: its stores would have to reach a file the process never
+            // opened for writing (mprotect(2) EACCES; LTP mprotect01 case 3,
+            // which carrick used to answer with success).
+            if prot & LINUX_PROT_WRITE != 0
+                && this.range_is_read_only_shared_file(address.0, length)
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EACCES));
             }
             let layout = this.mem.lock().layout;
             if prot_flags.contains(LinuxProtFlags::EXEC)
