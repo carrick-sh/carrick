@@ -226,7 +226,7 @@ impl EventFdState {
 /// in-memory recompute + EVFILT_USER broadcast). The returned [`HostFdRef`]s
 /// own the two ends; their `Drop`s close them (per process — each forked host
 /// process independently closes its inherited copies, as before).
-fn make_readiness_pipe() -> Option<(HostFdRef, HostFdRef)> {
+pub(crate) fn make_readiness_pipe() -> Option<(HostFdRef, HostFdRef)> {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return None;
@@ -1052,6 +1052,16 @@ pub(super) enum OpenDescription {
         base: OpenDescriptionBase,
         state: Arc<crate::inotify::InotifyState>,
     },
+    /// A Linux fanotify group (syscall 262 `fanotify_init`). Like `Inotify` it
+    /// is a pollable, non-seekable, non-file fd; `read(2)` drains queued
+    /// `struct fanotify_event_metadata` records, allocating one descriptor per
+    /// event in the READING process's table. The group is shared by `Arc` so a
+    /// `dup` or a guest `fork` refers to the same queue and the same marks —
+    /// see [`crate::fanotify`].
+    Fanotify {
+        base: OpenDescriptionBase,
+        group: Arc<crate::fanotify::FanotifyGroup>,
+    },
     /// A Linux signalfd (syscall 74 `signalfd4`). macOS has no signalfd, so this
     /// is emulated: `mask` records the signal set the fd accepts. Today only the
     /// fd-flag surface (SFD_CLOEXEC→FD_CLOEXEC, SFD_NONBLOCK→O_NONBLOCK, both via
@@ -1223,7 +1233,7 @@ impl Drop for HostFdOwner {
 /// drop closes the fd. Borrow the number for a libc call via [`HostFdRef::raw`]
 /// or as the Copy view type via [`HostFdRef::view`].
 #[derive(Debug, Clone)]
-pub(super) struct HostFdRef(Arc<HostFdOwner>);
+pub(crate) struct HostFdRef(Arc<HostFdOwner>);
 
 impl HostFdRef {
     pub(super) fn new(fd: i32) -> Self {
@@ -1233,7 +1243,7 @@ impl HostFdRef {
     /// The raw fd number for a host `libc` call (borrowed — the caller must
     /// keep a `HostFdRef` alive for as long as the number is used).
     #[inline]
-    pub(super) fn raw(&self) -> i32 {
+    pub(crate) fn raw(&self) -> i32 {
         self.0.fd
     }
 
@@ -1303,6 +1313,7 @@ impl OpenDescription {
             Self::Epoll { .. } => "epoll",
             Self::Pidfd { .. } => "pidfd",
             Self::Inotify { .. } => "inotify",
+            Self::Fanotify { .. } => "fanotify",
             Self::SignalFd { .. } => "signalfd",
             Self::PipeReader { .. } => "pipe_reader",
             Self::PipeWriter { .. } => "pipe_writer",
@@ -1351,6 +1362,7 @@ impl OpenDescription {
             OpenDescription::Epoll { .. } => "anon_inode:[eventpoll]".to_owned(),
             OpenDescription::Pidfd { .. } => "anon_inode:[pidfd]".to_owned(),
             OpenDescription::Inotify { .. } => "anon_inode:[inotify]".to_owned(),
+            OpenDescription::Fanotify { .. } => "anon_inode:[fanotify]".to_owned(),
             OpenDescription::SignalFd { .. } => "anon_inode:[signalfd]".to_owned(),
             OpenDescription::Mqueue { .. } => "anon_inode:[mqueue]".to_owned(),
             // A pty slave readlinks to its /dev/pts/N node (ttyname(3)); the
@@ -1413,6 +1425,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::HostFile { .. } => Kind::HostFile,
             OpenDescription::HostSocket { .. } => Kind::HostSocket,
             OpenDescription::Inotify { .. } => Kind::Inotify,
+            OpenDescription::Fanotify { .. } => Kind::Fanotify,
             OpenDescription::SignalFd { .. } => Kind::SignalFd,
             OpenDescription::Netlink { .. } => Kind::Netlink,
             OpenDescription::Mqueue { .. } => Kind::Mqueue,
@@ -1768,6 +1781,7 @@ impl OpenDescription {
             | OpenDescription::HostFile { base, .. }
             | OpenDescription::HostSocket { base, .. }
             | OpenDescription::Inotify { base, .. }
+            | OpenDescription::Fanotify { base, .. }
             | OpenDescription::SignalFd { base, .. }
             | OpenDescription::Netlink { base, .. }
             | OpenDescription::Mqueue { base, .. } => base,
@@ -1793,6 +1807,7 @@ impl OpenDescription {
             | OpenDescription::HostFile { base, .. }
             | OpenDescription::HostSocket { base, .. }
             | OpenDescription::Inotify { base, .. }
+            | OpenDescription::Fanotify { base, .. }
             | OpenDescription::SignalFd { base, .. }
             | OpenDescription::Netlink { base, .. }
             | OpenDescription::Mqueue { base, .. } => base,
@@ -1931,6 +1946,9 @@ impl OpenDescription {
             }
             OpenDescription::Inotify { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic("anon_inode:[inotify]", 0, 0o600))
+            }
+            OpenDescription::Fanotify { .. } => {
+                OpenStatSource::Record(StatRecord::synthetic("anon_inode:[fanotify]", 0, 0o600))
             }
             OpenDescription::SignalFd { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic("anon_inode:[signalfd]", 0, 0o600))

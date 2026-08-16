@@ -21,6 +21,7 @@ pub(super) fn event_ring_host_fd(open_file: &OpenFile) -> i32 {
         }
         OpenDescription::Pidfd { kqueue, .. } => kqueue.poll_fd(),
         OpenDescription::Inotify { state, .. } => state.poll_fd(),
+        OpenDescription::Fanotify { group, .. } => group.poll_fd(),
         _ => -1,
     }
 }
@@ -297,6 +298,37 @@ impl SyscallDispatcher {
         }
     }
 
+    /// The [`FanotifyGroup`](crate::fanotify::FanotifyGroup) behind `fd` iff it
+    /// is a fanotify group.
+    pub(in crate::dispatch) fn fanotify_group(
+        &self,
+        fd: i32,
+    ) -> Option<Arc<crate::fanotify::FanotifyGroup>> {
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::Fanotify { group, .. } => Some(Arc::clone(group)),
+            _ => None,
+        }
+    }
+
+    /// Close a descriptor carrick installed on the guest's behalf while a
+    /// syscall was still assembling its result.
+    ///
+    /// The guest never saw this fd number — a fanotify `read(2)` opens one
+    /// descriptor per event and then faults copying the records out — so the
+    /// close must free the slot without the guest-visible `close(2)`
+    /// bookkeeping (no close-owner record, no event-ring entry). It still goes
+    /// through the shared teardown so a host fd or pty entry cannot leak.
+    pub(in crate::dispatch) fn close_fd_for_internal_rollback(&self, fd: i32) {
+        self.detach_fd_from_epolls(fd);
+        let removed = self.captured_file_table().write_open_files().remove(&fd);
+        if let Some(open_file) = removed {
+            self.close_open_file_and_free_pty(&open_file);
+            self.note_fd_closed(fd);
+        }
+    }
+
     /// Existence + kind probe for the inotify path: `Some(is_dir)` when `path`
     /// resolves to a live entry (in a VFS mount or the rootfs+overlay),
     /// `None` if it doesn't exist. Used by `inotify_add_watch` (a watch on a
@@ -467,6 +499,153 @@ impl SyscallDispatcher {
         // watches the dir and asserts IN_CLOSE_WRITE with name=test_file1.
         self.inotify_self(&path, mask);
         self.fs.inotify_registry.notify_child(&path, mask, is_dir);
+    }
+
+    /// Fan one guest operation on `path` out to every matching fanotify mark.
+    ///
+    /// Unlike inotify — which splits an operation into a *self* event on the
+    /// object and a *child* event on its parent — fanotify has ONE event per
+    /// operation; whether a mark on the object or a mark on its parent
+    /// directory receives it is decided inside the registry. So this is called
+    /// once per operation, right beside the inotify hooks, and never twice.
+    ///
+    /// No-op (one uncontended read lock) when nothing is marked.
+    pub(in crate::dispatch) fn fanotify_notify(
+        &self,
+        context: &crate::kernel::KernelContext,
+        path: &str,
+        events: carrick_abi::LinuxFanotifyEvents,
+    ) {
+        if self.fs.fanotify_registry.is_empty() {
+            return;
+        }
+        let is_dir = self.inotify_path_kind(path).unwrap_or(false);
+        self.fanotify_notify_kind(context, path, events, is_dir);
+    }
+
+    /// [`Self::fanotify_notify`] with the object's kind already known — used by
+    /// the close/delete paths, where the entry may be gone by the time the
+    /// event fires and a fresh lookup would report the wrong kind.
+    pub(in crate::dispatch) fn fanotify_notify_kind(
+        &self,
+        context: &crate::kernel::KernelContext,
+        path: &str,
+        events: carrick_abi::LinuxFanotifyEvents,
+        is_dir: bool,
+    ) {
+        if self.fs.fanotify_registry.is_empty() || crate::fanotify::internal_open_in_progress() {
+            return;
+        }
+        // `identity_pid` is the guest-visible thread-group id (the value the
+        // guest's own `getpid()` returns, honouring the pid namespace); the
+        // kernel graph's thread key is the guest-visible tid. A group created
+        // with FAN_REPORT_TID wants the latter (fanotify11 asserts exactly this
+        // distinction from a worker thread).
+        let tgid = self.identity_pid() as i32;
+        let tid = context.thread().key().tid.raw();
+        self.fs
+            .fanotify_registry
+            .notify(path, events, is_dir, tgid, tid);
+    }
+
+    /// Emit a fanotify event for a read/write on `fd` (`FAN_ACCESS` /
+    /// `FAN_MODIFY`), mirroring [`Self::inotify_emit_for_fd`]. Only regular
+    /// files and directories generate these, and only when the fd's open path
+    /// is recoverable.
+    pub(in crate::dispatch) fn fanotify_emit_for_fd(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+        events: carrick_abi::LinuxFanotifyEvents,
+    ) {
+        if self.fs.fanotify_registry.is_empty() {
+            return;
+        }
+        let Some(open_file) = self.open_file(fd) else {
+            return;
+        };
+        let is_dir = {
+            let open = open_file.description.read();
+            match &*open {
+                OpenDescription::File { .. }
+                | OpenDescription::SyntheticFile { .. }
+                | OpenDescription::HostFile { .. } => false,
+                OpenDescription::Directory { .. } => true,
+                // A pipe/socket/eventfd read is not a filesystem-object event.
+                _ => return,
+            }
+        };
+        let Some(path) = self.lookup_recorded_fd_open_path(fd) else {
+            return;
+        };
+        self.fanotify_notify_kind(context, &path, events, is_dir);
+    }
+
+    /// Emit `FAN_CLOSE_WRITE` (fd was writable) or `FAN_CLOSE_NOWRITE` for a
+    /// `close(2)`, mirroring [`Self::inotify_close_for_fd`]. Which of the two
+    /// fires is decided by the description's writability, exactly as inotify
+    /// picks between `IN_CLOSE_WRITE` and `IN_CLOSE_NOWRITE`.
+    pub(in crate::dispatch) fn fanotify_close_for_fd(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+    ) {
+        if self.fs.fanotify_registry.is_empty() {
+            return;
+        }
+        let Some(open_file) = self.open_file(fd) else {
+            return;
+        };
+        let (events, is_dir) = {
+            let open = open_file.description.read();
+            let writable = match &*open {
+                OpenDescription::File { writable, .. }
+                | OpenDescription::HostFile { writable, .. } => *writable,
+                // A synthetic file or a directory is always read-only.
+                OpenDescription::SyntheticFile { .. } | OpenDescription::Directory { .. } => false,
+                _ => return,
+            };
+            let events = if writable {
+                carrick_abi::LinuxFanotifyEvents::CLOSE_WRITE
+            } else {
+                carrick_abi::LinuxFanotifyEvents::CLOSE_NOWRITE
+            };
+            (events, matches!(&*open, OpenDescription::Directory { .. }))
+        };
+        let Some(path) = self.lookup_recorded_fd_open_path(fd) else {
+            return;
+        };
+        self.fanotify_notify_kind(context, &path, events, is_dir);
+    }
+
+    /// Emit `FAN_OPEN | FAN_OPEN_EXEC` for an `execve(2)` of `path`.
+    ///
+    /// Both bits ride ONE event because they describe one operation: the kernel
+    /// opens the binary (`FAN_OPEN`) in order to execute it (`FAN_OPEN_EXEC`).
+    /// A mark that asked for only one of them sees only that one, which is what
+    /// LTP `fanotify12` walks through six mask/ignore-mask combinations to
+    /// check — including the case where the ignore mask leaves a bare
+    /// `FAN_OPEN`.
+    ///
+    /// The reporting pid is the thread-group id. That is exact rather than an
+    /// approximation even for a `FAN_REPORT_TID` group: a successful `execve`
+    /// destroys every other thread and the surviving thread takes the group's
+    /// id, so the execing task's tid and tgid are the same value. This is a
+    /// public entry point (not `pub(in crate::dispatch)`) because the exec
+    /// image loader lives outside the dispatch module.
+    pub(crate) fn fanotify_notify_exec(&self, path: &str) {
+        if self.fs.fanotify_registry.is_empty() {
+            return;
+        }
+        let pid = self.identity_pid() as i32;
+        self.fs.fanotify_registry.notify(
+            path,
+            carrick_abi::LinuxFanotifyEvents::OPEN | carrick_abi::LinuxFanotifyEvents::OPEN_EXEC,
+            // An executable is never a directory, so FAN_ONDIR cannot apply.
+            false,
+            pid,
+            pid,
+        );
     }
 
     pub(in crate::dispatch) fn pipe_reader(&self, fd: i32) -> Option<(PipeRef, u64)> {

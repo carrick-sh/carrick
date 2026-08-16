@@ -186,6 +186,7 @@ impl SyscallDispatcher {
             | OpenDescription::Epoll { .. }
             | OpenDescription::Pidfd { .. }
             | OpenDescription::Inotify { .. }
+            | OpenDescription::Fanotify { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
@@ -242,6 +243,7 @@ impl SyscallDispatcher {
             | OpenDescription::Epoll { .. }
             | OpenDescription::Pidfd { .. }
             | OpenDescription::Inotify { .. }
+            | OpenDescription::Fanotify { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }

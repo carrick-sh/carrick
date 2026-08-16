@@ -94,10 +94,39 @@ cap-std with `--fs host`). Each open file is an `OpenDescription` behind an
 | `utimensat`, `inotify_init1`/`add_watch`/`rm_watch`, `ioctl` | 88,26–28,29 | Emulated (Partial) | host `utimensat`; host fd ioctls | `ioctl` covers the terminal/`FIONREAD`/sizing set workloads use, not the full ioctl surface. |
 | `memfd_create`, `cachestat`, `sync_file_range` | 279,451,84 | Stub/Deferred | — | `memfd_create` (#279) and `cachestat` (#451) are `Deferred` in the table; the conformance probes exercise emulated paths added later — treat the table's `SupportLevel` as authoritative for the report. |
 
+| `fanotify_init`, `fanotify_mark` | 262,263 | Partial | dispatch-seam event synthesis (`crates/carrick-runtime/src/fanotify.rs`) | `FAN_CLASS_NOTIF` groups only. Events are synthesized from the guest's own syscalls on the same seam inotify uses, NOT from host vnode watches — a `EVFILT_VNODE`/FSEvents observer cannot report which guest process acted, the mark's mask, the ignore mask, or child-vs-self. See the per-flag table below. |
+
+### fanotify support, flag by flag
+
+| Requested | Result | Why |
+|---|---|---|
+| `FAN_CLASS_NOTIF` | Works | The implemented class. |
+| `FAN_CLOEXEC`, `FAN_NONBLOCK` | Works | Mapped to `FD_CLOEXEC` / `O_NONBLOCK` on the group fd. |
+| `FAN_REPORT_TID` | Works | Event `pid` becomes the acting guest tid instead of its tgid. |
+| `FAN_ACCESS`, `FAN_MODIFY`, `FAN_OPEN`, `FAN_CLOSE_WRITE`, `FAN_CLOSE_NOWRITE`, `FAN_OPEN_EXEC` | Works | Synthesized at the `read`/`write`/`open`/`close`/`execve` dispatch hooks. |
+| `FAN_EVENT_ON_CHILD`, `FAN_ONDIR` | Works | Mark-mask modifiers; never appear in a delivered mask. |
+| inode / `FAN_MARK_MOUNT` / `FAN_MARK_FILESYSTEM` marks | Works | Mount and filesystem marks cover their root's subtree. |
+| `FAN_MARK_ADD`/`REMOVE`/`FLUSH`, `DONT_FOLLOW`, `ONLYDIR`, `IGNORED_MASK`, `IGNORE` | Works | Including per-mark ignore masks. |
+| `FAN_CLASS_CONTENT`, `FAN_CLASS_PRE_CONTENT` | Accepted at `init` | A kernel without `CONFIG_FANOTIFY_ACCESS_PERMISSIONS` also accepts these at `fanotify_init`; only the mark fails. Such a group still receives the ordinary notification events it asks for. |
+| `FAN_OPEN_PERM`, `FAN_ACCESS_PERM`, `FAN_OPEN_EXEC_PERM` in a mark mask | `EINVAL` | Permission events let the monitor veto another process's open, and carrick has no verdict path — a group that accepted them would wedge every marked open forever. `EINVAL` at the MARK is precisely what a kernel without `CONFIG_FANOTIFY_ACCESS_PERMISSIONS` returns, so a caller's feature probe reaches its intended "unsupported" branch instead of dying at the init. |
+| `FAN_REPORT_FID`/`DIR_FID`/`NAME`/`TARGET_FID`/`FD_ERROR`, `FAN_REPORT_PIDFD`, `FAN_ENABLE_AUDIT` | `EINVAL` | Need `name_to_handle_at` file handles, pidfd info records, or an audit subsystem — none of which carrick has. |
+| `FAN_CREATE`, `FAN_DELETE`, `FAN_MOVED_*`, `FAN_ATTRIB`, `FAN_DELETE_SELF`, `FAN_MOVE_SELF`, `FAN_RENAME`, `FAN_FS_ERROR` in a mark mask | `EINVAL` | `fanotify_mark(2)` already specifies `EINVAL` for these without `FAN_REPORT_FID`, which is refused above. This is the spec's own boundary, not a carrick-invented subset. |
+
+**Known permanent gap — `ltp-fanotify25`.** The case mounts `tracefs` on
+`/sys/kernel/tracing`, writes kprobe definitions to `kprobe_events`, and expects
+`FAN_MARK_MOUNT` + `FAN_MODIFY` events for those writes. Carrick has no kernel
+tracer and deliberately does not declare `CONFIG_TRACING`, so the case correctly
+`TCONF`s. Making it pass would mean synthesizing a fake `kprobe_events` file that
+accepts kprobe definitions and does nothing — fabricating kernel functionality to
+satisfy a test, which is worse than an honest `TCONF`. The `FAN_MARK_MOUNT`
+delivery the case would exercise IS implemented and unit-tested
+(`fanotify::tests::mount_mark_covers_the_whole_subtree_but_not_a_sibling_prefix`);
+only the tracefs half is missing.
+
 **Deferred in this category:** `mount`/`umount2`/`pivot_root`/`chroot`,
 `quotactl`, `name_to_handle_at`/`open_by_handle_at`, the new-mount API
 (`open_tree`, `move_mount`, `fsopen`/`fsconfig`/`fsmount`/`fspick`,
-`mount_setattr`, `statmount`/`listmount`), `fanotify_*`,
+`mount_setattr`, `statmount`/`listmount`),
 and the `*_time64` fs variants (`utimensat_time64`, `pselect6_time64`,
 `ppoll_time64`). The 32-bit-time variants are unreachable from a 64-bit aarch64
 guest.

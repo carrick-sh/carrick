@@ -100,6 +100,10 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         | 75..=77
         | 78..=83
         | 88
+        // 262/263 fanotify_init/fanotify_mark: fs handlers in
+        // `dispatch/fs.rs`, backed by `crate::fanotify`.
+        | 262
+        | 263
         | 267
         | 276
         | 285
@@ -425,8 +429,8 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(243, "recvmmsg", "net", SupportLevel::BringUp),
     syscall(260, "wait4", "process", SupportLevel::BringUp),
     syscall(261, "prlimit64", "process", SupportLevel::BringUp),
-    syscall(262, "fanotify_init", "fs", SupportLevel::Deferred),
-    syscall(263, "fanotify_mark", "fs", SupportLevel::Deferred),
+    syscall(262, "fanotify_init", "fs", SupportLevel::BringUp),
+    syscall(263, "fanotify_mark", "fs", SupportLevel::BringUp),
     syscall(264, "name_to_handle_at", "fs", SupportLevel::Deferred),
     syscall(265, "open_by_handle_at", "fs", SupportLevel::Deferred),
     syscall(266, "clock_adjtime", "time", SupportLevel::BringUp),
