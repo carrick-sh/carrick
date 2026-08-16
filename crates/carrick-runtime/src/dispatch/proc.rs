@@ -4393,10 +4393,44 @@ impl SyscallDispatcher {
     ///
     /// When the target is the CALLER (`pid == getpid()`, the LTP process_vm01
     /// success cases and every setup sanity probe) the transfer runs entirely
-    /// within this guest's address space. A privileged cross-guest transfer
-    /// (LTP process_vm_readv02/03, process_vm_writev02) would require reading a
-    /// PEER HVF VM's private RAM — carrick has no cross-VM VA translation, so the
-    /// peer address space is reported inaccessible (EFAULT).
+    /// within this guest's address space.
+    ///
+    /// A permitted cross-process transfer (LTP process_vm_readv02/03,
+    /// process_vm_writev02) is still UNIMPLEMENTED and lowers to EFAULT. That
+    /// is a divergence from Linux, not a permission answer. There is no "peer
+    /// VM" involved: under HVPatch every Linux process is a thread of ONE
+    /// carrier inside ONE VM, so the target's pages are already in this VM's
+    /// stage-2 map. What is missing is a FOREIGN-MM translation path:
+    ///
+    /// * VA→IPA for another mm. `Aarch64EngineCore` resolves a syscall buffer
+    ///   through `self.page_tables`, which is bound to the live vCPU's own
+    ///   `TTBR0_EL1` and hard-errors if the root disagrees; it cannot describe
+    ///   another mm. The peer's stage-1 root GPA *is* reachable
+    ///   (`Mm::backend()` → `MmBackend::snapshot()` → `MmBinding::stage1_root`),
+    ///   so a foreign walk is buildable on `carrick_mem::page_table`, but no
+    ///   such walker exists.
+    /// * IPA→host for another mm. Reads have a mm-agnostic path already
+    ///   (`copy_from_global_frame_owner` over the process-global frame-owner
+    ///   map in `carrick-vmm-hvf`), but it is private and has no write twin;
+    ///   the per-thread mapping lookups deliberately exclude other mms.
+    /// * Peer PROT_NONE/unmapped enforcement. `MemoryProtections` and the
+    ///   per-VMA `prot` bits are per-process and are NOT published into the
+    ///   kernel graph — `MmBackendSnapshot::vmas` carries bare `VmaSummary`
+    ///   ranges with no permissions — so a faithful peer-side EFAULT cannot be
+    ///   decided today.
+    ///
+    /// Measured state of the four LTP suites, invoked the way the conformance
+    /// harness invokes them (under `/bin/sh -c`; a direct exec makes the test
+    /// guest PID 1 and breaks LTP's own reaper, which TBROKs every `tst_test`
+    /// suite with "Main test process might have exit!" and says nothing about
+    /// the syscall): `process_vm01` is 25/25 PASS, matching the Docker oracle.
+    /// `process_vm_readv02`, `process_vm_readv03` and `process_vm_writev02`
+    /// fail on exactly this EFAULT and nothing else, so the cross-process
+    /// transfer is the single remaining blocker for all three. Beware that
+    /// `process_vm_readv02` MISREPORTS the errno as "EPERM": it prints
+    /// `tst_strerrno(-TST_RET)` where `TST_RET` is the raw `-1`, so it always
+    /// names errno 1. `carrick trace` shows that call returning `errno=14`,
+    /// the same EFAULT as the other two.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn process_vm_rw<M: GuestMemory>(
         &self,
@@ -4453,11 +4487,12 @@ impl SyscallDispatcher {
                 if !caller_euid.is_root() && caller_euid != target_euid {
                     return Ok(DispatchOutcome::errno(LINUX_EPERM));
                 }
-                // A permitted cross-process transfer is still unimplemented:
-                // carrick has no translation from one Linux process's guest VA
-                // to another's backing, so the peer's range reads as
-                // inaccessible. That is a divergence from Linux, not a
-                // permission answer.
+                // A permitted cross-process transfer is still unimplemented, so
+                // the peer's range reads as inaccessible — a divergence from
+                // Linux, not a permission answer. The missing piece is a
+                // foreign-mm VA→IPA→host path (and peer-side protections);
+                // see this method's doc comment. It is NOT "another VM's
+                // private RAM": under HVPatch there is exactly one VM.
                 Ok(DispatchOutcome::errno(LINUX_EFAULT))
             }
         }
