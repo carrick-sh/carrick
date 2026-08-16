@@ -3609,6 +3609,102 @@ pub const LINUX_IN_ALL_EVENTS: u32 = LINUX_IN_ACCESS
 /// mask; __u32 cookie; __u32 len; char name[]; }` — 16 bytes, name follows,
 /// NUL-padded so the next record is 4-byte aligned.
 pub const LINUX_INOTIFY_EVENT_HEADER_SIZE: usize = 16;
+// fanotify(7) ABI. Values are the published Linux UAPI numbers, taken from the
+// BSD-licensed `golang.org/x/sys/unix` constant table and cross-checked against
+// `fanotify_init(2)`/`fanotify_mark(2)`/`fanotify(7)`, so no GPL kernel header
+// was consulted. Event bits are 64-bit (the `mask` argument of `fanotify_mark`
+// and the `mask` field of `struct fanotify_event_metadata` are both `__u64`);
+// the init and mark FLAG words are 32-bit `unsigned int`.
+//
+// Event bits (also valid in a delivered event mask).
+pub const LINUX_FAN_ACCESS: u64 = 0x0000_0001;
+pub const LINUX_FAN_MODIFY: u64 = 0x0000_0002;
+pub const LINUX_FAN_ATTRIB: u64 = 0x0000_0004;
+pub const LINUX_FAN_CLOSE_WRITE: u64 = 0x0000_0008;
+pub const LINUX_FAN_CLOSE_NOWRITE: u64 = 0x0000_0010;
+pub const LINUX_FAN_OPEN: u64 = 0x0000_0020;
+pub const LINUX_FAN_MOVED_FROM: u64 = 0x0000_0040;
+pub const LINUX_FAN_MOVED_TO: u64 = 0x0000_0080;
+pub const LINUX_FAN_CREATE: u64 = 0x0000_0100;
+pub const LINUX_FAN_DELETE: u64 = 0x0000_0200;
+pub const LINUX_FAN_DELETE_SELF: u64 = 0x0000_0400;
+pub const LINUX_FAN_MOVE_SELF: u64 = 0x0000_0800;
+pub const LINUX_FAN_OPEN_EXEC: u64 = 0x0000_1000;
+/// Queue-overflow notice; delivered regardless of the mark mask, with no fd.
+pub const LINUX_FAN_Q_OVERFLOW: u64 = 0x0000_4000;
+pub const LINUX_FAN_FS_ERROR: u64 = 0x0000_8000;
+// Permission events (FAN_CLASS_CONTENT / FAN_CLASS_PRE_CONTENT). carrick
+// declines these classes at `fanotify_init`, but the bits are named so the
+// mark-mask validator can reject them explicitly instead of by omission.
+pub const LINUX_FAN_OPEN_PERM: u64 = 0x0001_0000;
+pub const LINUX_FAN_ACCESS_PERM: u64 = 0x0002_0000;
+pub const LINUX_FAN_OPEN_EXEC_PERM: u64 = 0x0004_0000;
+pub const LINUX_FAN_RENAME: u64 = 0x1000_0000;
+/// Mark-mask modifier: also report events for children of a marked directory.
+/// Never appears in a delivered event mask.
+pub const LINUX_FAN_EVENT_ON_CHILD: u64 = 0x0800_0000;
+/// Mark-mask modifier: also report events whose object is a directory. Never
+/// appears in a delivered event mask for a `FAN_CLASS_NOTIF` group without
+/// `FAN_REPORT_FID` (fanotify04 asserts `event->mask == FAN_OPEN` exactly for a
+/// directory open under a `FAN_OPEN | FAN_ONDIR` mark).
+pub const LINUX_FAN_ONDIR: u64 = 0x4000_0000;
+/// `FAN_CLOSE = FAN_CLOSE_WRITE | FAN_CLOSE_NOWRITE`,
+/// `FAN_MOVE = FAN_MOVED_FROM | FAN_MOVED_TO` (convenience aggregates).
+pub const LINUX_FAN_CLOSE: u64 = LINUX_FAN_CLOSE_WRITE | LINUX_FAN_CLOSE_NOWRITE;
+pub const LINUX_FAN_MOVE: u64 = LINUX_FAN_MOVED_FROM | LINUX_FAN_MOVED_TO;
+// `fanotify_init` flags word.
+pub const LINUX_FAN_CLOEXEC: u64 = 0x0000_0001;
+pub const LINUX_FAN_NONBLOCK: u64 = 0x0000_0002;
+/// Notification class selector. `FAN_CLASS_NOTIF` is 0 (the default), so the
+/// class is read as a 2-bit FIELD (`flags & FAN_ALL_CLASS_BITS`), never as a
+/// set bit — testing `flags & FAN_CLASS_NOTIF` is always false and would let
+/// every class through.
+pub const LINUX_FAN_CLASS_NOTIF: u64 = 0x0000_0000;
+pub const LINUX_FAN_CLASS_CONTENT: u64 = 0x0000_0004;
+pub const LINUX_FAN_CLASS_PRE_CONTENT: u64 = 0x0000_0008;
+/// The class FIELD mask: `FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT`. The
+/// fourth encoding (both bits set) is invalid and must yield EINVAL.
+pub const LINUX_FAN_ALL_CLASS_BITS: u64 = LINUX_FAN_CLASS_CONTENT | LINUX_FAN_CLASS_PRE_CONTENT;
+pub const LINUX_FAN_UNLIMITED_QUEUE: u64 = 0x0000_0010;
+pub const LINUX_FAN_UNLIMITED_MARKS: u64 = 0x0000_0020;
+pub const LINUX_FAN_ENABLE_AUDIT: u64 = 0x0000_0040;
+pub const LINUX_FAN_REPORT_PIDFD: u64 = 0x0000_0080;
+/// Report the acting THREAD id in `fanotify_event_metadata.pid` instead of the
+/// thread-group id (fanotify11).
+pub const LINUX_FAN_REPORT_TID: u64 = 0x0000_0100;
+pub const LINUX_FAN_REPORT_FID: u64 = 0x0000_0200;
+pub const LINUX_FAN_REPORT_DIR_FID: u64 = 0x0000_0400;
+pub const LINUX_FAN_REPORT_NAME: u64 = 0x0000_0800;
+pub const LINUX_FAN_REPORT_TARGET_FID: u64 = 0x0000_1000;
+pub const LINUX_FAN_REPORT_FD_ERROR: u64 = 0x0000_2000;
+// `fanotify_mark` flags word: exactly one command, at most one object type,
+// plus modifiers.
+pub const LINUX_FAN_MARK_ADD: u64 = 0x0000_0001;
+pub const LINUX_FAN_MARK_REMOVE: u64 = 0x0000_0002;
+pub const LINUX_FAN_MARK_DONT_FOLLOW: u64 = 0x0000_0004;
+pub const LINUX_FAN_MARK_ONLYDIR: u64 = 0x0000_0008;
+pub const LINUX_FAN_MARK_MOUNT: u64 = 0x0000_0010;
+pub const LINUX_FAN_MARK_IGNORED_MASK: u64 = 0x0000_0020;
+pub const LINUX_FAN_MARK_IGNORED_SURV_MODIFY: u64 = 0x0000_0040;
+pub const LINUX_FAN_MARK_FLUSH: u64 = 0x0000_0080;
+pub const LINUX_FAN_MARK_FILESYSTEM: u64 = 0x0000_0100;
+pub const LINUX_FAN_MARK_EVICTABLE: u64 = 0x0000_0200;
+pub const LINUX_FAN_MARK_IGNORE: u64 = 0x0000_0400;
+/// Object-type FIELD of the mark flags. Like the init class this is a field,
+/// not a bit: `FAN_MARK_INODE` is 0, so the type is
+/// `flags & FAN_MARK_TYPES` and more than one set bit is EINVAL.
+pub const LINUX_FAN_MARK_INODE: u64 = 0x0000_0000;
+pub const LINUX_FAN_MARK_TYPES: u64 = LINUX_FAN_MARK_MOUNT | LINUX_FAN_MARK_FILESYSTEM;
+/// `FAN_NOFD` (-1): the `fd` field of an event that carries no descriptor
+/// (`FAN_Q_OVERFLOW`, or an FID-reporting group).
+pub const LINUX_FAN_NOFD: i32 = -1;
+/// `FANOTIFY_METADATA_VERSION`: the `vers` byte every event carries. Userspace
+/// aborts on a mismatch, so this is a hard ABI constant, not a carrick choice.
+pub const LINUX_FANOTIFY_METADATA_VERSION: u8 = 3;
+/// `FAN_EVENT_METADATA_LEN` — the wire size of
+/// `struct fanotify_event_metadata { __u32 event_len; __u8 vers; __u8 reserved;
+/// __u16 metadata_len; __aligned_u64 mask; __s32 fd; __s32 pid; }` = 24 bytes.
+pub const LINUX_FANOTIFY_EVENT_METADATA_LEN: usize = 24;
 pub const LINUX_LOCK_SH: u64 = 1;
 pub const LINUX_LOCK_EX: u64 = 2;
 pub const LINUX_LOCK_NB: u64 = 4;
@@ -4235,6 +4331,76 @@ bitflags! {
         const ALL_EVENTS = LINUX_IN_ALL_EVENTS;
     }
 
+    /// fanotify event bits: the `mask` argument of `fanotify_mark(2)` and the
+    /// `mask` field of a delivered `struct fanotify_event_metadata`.
+    ///
+    /// The two MODIFIER bits (`EVENT_ON_CHILD`, `ONDIR`) are legal in a mark
+    /// mask but are NOT event bits: they steer which objects a mark covers and
+    /// never appear in a delivered mask. Use [`Self::DELIVERABLE`] to separate
+    /// them — masking with the raw mark mask would leak a modifier into the
+    /// wire event and break `event->mask == FAN_OPEN` equality checks.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxFanotifyEvents: u64 {
+        const ACCESS = LINUX_FAN_ACCESS;
+        const MODIFY = LINUX_FAN_MODIFY;
+        const ATTRIB = LINUX_FAN_ATTRIB;
+        const CLOSE_WRITE = LINUX_FAN_CLOSE_WRITE;
+        const CLOSE_NOWRITE = LINUX_FAN_CLOSE_NOWRITE;
+        const OPEN = LINUX_FAN_OPEN;
+        const MOVED_FROM = LINUX_FAN_MOVED_FROM;
+        const MOVED_TO = LINUX_FAN_MOVED_TO;
+        const CREATE = LINUX_FAN_CREATE;
+        const DELETE = LINUX_FAN_DELETE;
+        const DELETE_SELF = LINUX_FAN_DELETE_SELF;
+        const MOVE_SELF = LINUX_FAN_MOVE_SELF;
+        const OPEN_EXEC = LINUX_FAN_OPEN_EXEC;
+        const Q_OVERFLOW = LINUX_FAN_Q_OVERFLOW;
+        const FS_ERROR = LINUX_FAN_FS_ERROR;
+        const OPEN_PERM = LINUX_FAN_OPEN_PERM;
+        const ACCESS_PERM = LINUX_FAN_ACCESS_PERM;
+        const OPEN_EXEC_PERM = LINUX_FAN_OPEN_EXEC_PERM;
+        const RENAME = LINUX_FAN_RENAME;
+        const EVENT_ON_CHILD = LINUX_FAN_EVENT_ON_CHILD;
+        const ONDIR = LINUX_FAN_ONDIR;
+        const CLOSE = LINUX_FAN_CLOSE;
+        const MOVE = LINUX_FAN_MOVE;
+    }
+
+    /// `fanotify_init(2)` flags word.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxFanotifyInitFlags: u64 {
+        const CLOEXEC = LINUX_FAN_CLOEXEC;
+        const NONBLOCK = LINUX_FAN_NONBLOCK;
+        const CLASS_CONTENT = LINUX_FAN_CLASS_CONTENT;
+        const CLASS_PRE_CONTENT = LINUX_FAN_CLASS_PRE_CONTENT;
+        const UNLIMITED_QUEUE = LINUX_FAN_UNLIMITED_QUEUE;
+        const UNLIMITED_MARKS = LINUX_FAN_UNLIMITED_MARKS;
+        const ENABLE_AUDIT = LINUX_FAN_ENABLE_AUDIT;
+        const REPORT_PIDFD = LINUX_FAN_REPORT_PIDFD;
+        const REPORT_TID = LINUX_FAN_REPORT_TID;
+        const REPORT_FID = LINUX_FAN_REPORT_FID;
+        const REPORT_DIR_FID = LINUX_FAN_REPORT_DIR_FID;
+        const REPORT_NAME = LINUX_FAN_REPORT_NAME;
+        const REPORT_TARGET_FID = LINUX_FAN_REPORT_TARGET_FID;
+        const REPORT_FD_ERROR = LINUX_FAN_REPORT_FD_ERROR;
+    }
+
+    /// `fanotify_mark(2)` flags word.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxFanotifyMarkFlags: u64 {
+        const ADD = LINUX_FAN_MARK_ADD;
+        const REMOVE = LINUX_FAN_MARK_REMOVE;
+        const DONT_FOLLOW = LINUX_FAN_MARK_DONT_FOLLOW;
+        const ONLYDIR = LINUX_FAN_MARK_ONLYDIR;
+        const MOUNT = LINUX_FAN_MARK_MOUNT;
+        const IGNORED_MASK = LINUX_FAN_MARK_IGNORED_MASK;
+        const IGNORED_SURV_MODIFY = LINUX_FAN_MARK_IGNORED_SURV_MODIFY;
+        const FLUSH = LINUX_FAN_MARK_FLUSH;
+        const FILESYSTEM = LINUX_FAN_MARK_FILESYSTEM;
+        const EVICTABLE = LINUX_FAN_MARK_EVICTABLE;
+        const IGNORE = LINUX_FAN_MARK_IGNORE;
+    }
+
     /// `fallocate(2)` allocation mode flags.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct LinuxFallocateFlags: u64 {
@@ -4447,6 +4613,140 @@ impl LinuxSocketTypeFlags {
 
 impl LinuxFallocateFlags {
     pub const SUPPORTED_MASK: u64 = LINUX_FALLOC_FL_SUPPORTED;
+}
+
+/// Which kind of object a `fanotify_mark(2)` call marks. This is a FIELD of the
+/// mark flags word, not a bit — `FAN_MARK_INODE` is 0, so a `flags &
+/// FAN_MARK_INODE` test is always false. Decode through
+/// [`LinuxFanotifyMarkFlags::mark_type`], which also rejects the illegal
+/// both-bits-set encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxFanotifyMarkType {
+    /// Mark this one inode (the default).
+    Inode,
+    /// Mark the whole mount the path resolves into.
+    Mount,
+    /// Mark the whole filesystem the path resolves into.
+    Filesystem,
+}
+
+/// Which notification class a `fanotify_init(2)` group belongs to. Also a
+/// FIELD, not a bit (`FAN_CLASS_NOTIF` is 0); decode through
+/// [`LinuxFanotifyInitFlags::class`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxFanotifyClass {
+    /// Pure notification — the only class carrick implements.
+    Notif,
+    /// Permission decisions after content is available.
+    Content,
+    /// Permission decisions before content is available.
+    PreContent,
+}
+
+impl LinuxFanotifyEvents {
+    /// Event bits that may appear in a DELIVERED event mask. Excludes the two
+    /// mark-mask modifiers (`FAN_EVENT_ON_CHILD`, `FAN_ONDIR`), which steer
+    /// which objects a mark covers and are never reported back: fanotify04
+    /// asserts `event->mask == FAN_OPEN` exactly for a directory opened under a
+    /// `FAN_OPEN | FAN_ONDIR` mark, so leaking `ONDIR` into the wire mask is a
+    /// visible ABI break rather than a harmless extra bit.
+    pub const DELIVERABLE: Self = Self::from_bits_retain(
+        LINUX_FAN_ACCESS
+            | LINUX_FAN_MODIFY
+            | LINUX_FAN_ATTRIB
+            | LINUX_FAN_CLOSE_WRITE
+            | LINUX_FAN_CLOSE_NOWRITE
+            | LINUX_FAN_OPEN
+            | LINUX_FAN_MOVED_FROM
+            | LINUX_FAN_MOVED_TO
+            | LINUX_FAN_CREATE
+            | LINUX_FAN_DELETE
+            | LINUX_FAN_DELETE_SELF
+            | LINUX_FAN_MOVE_SELF
+            | LINUX_FAN_OPEN_EXEC
+            | LINUX_FAN_Q_OVERFLOW
+            | LINUX_FAN_FS_ERROR
+            | LINUX_FAN_RENAME,
+    );
+
+    /// Permission-event bits. Only legal on a `FAN_CLASS_CONTENT` /
+    /// `FAN_CLASS_PRE_CONTENT` group, which carrick does not implement, so a
+    /// mark requesting one of these is EINVAL rather than a silently ignored
+    /// bit that would leave the guest waiting forever for a verdict.
+    pub const PERM: Self = Self::from_bits_retain(
+        LINUX_FAN_OPEN_PERM | LINUX_FAN_ACCESS_PERM | LINUX_FAN_OPEN_EXEC_PERM,
+    );
+
+    /// The subset of `self` that a `FAN_CLASS_NOTIF` mark may legally request:
+    /// every deliverable event bit plus the two modifiers. Anything outside it
+    /// (permission events, unknown bits) makes the mark EINVAL.
+    pub const NOTIF_MARKABLE: Self = Self::from_bits_retain(
+        Self::DELIVERABLE.bits() | LINUX_FAN_EVENT_ON_CHILD | LINUX_FAN_ONDIR,
+    );
+}
+
+impl LinuxFanotifyInitFlags {
+    /// Every flag bit `fanotify_init(2)` defines. An unknown bit is EINVAL.
+    pub const KNOWN_MASK: u64 = LINUX_FAN_CLOEXEC
+        | LINUX_FAN_NONBLOCK
+        | LINUX_FAN_ALL_CLASS_BITS
+        | LINUX_FAN_UNLIMITED_QUEUE
+        | LINUX_FAN_UNLIMITED_MARKS
+        | LINUX_FAN_ENABLE_AUDIT
+        | LINUX_FAN_REPORT_PIDFD
+        | LINUX_FAN_REPORT_TID
+        | LINUX_FAN_REPORT_FID
+        | LINUX_FAN_REPORT_DIR_FID
+        | LINUX_FAN_REPORT_NAME
+        | LINUX_FAN_REPORT_TARGET_FID
+        | LINUX_FAN_REPORT_FD_ERROR;
+
+    /// Decode the 2-bit notification-class FIELD. `None` is the reserved
+    /// fourth encoding (both class bits set), which is EINVAL.
+    pub fn class(self) -> Option<LinuxFanotifyClass> {
+        match self.bits() & LINUX_FAN_ALL_CLASS_BITS {
+            LINUX_FAN_CLASS_NOTIF => Some(LinuxFanotifyClass::Notif),
+            LINUX_FAN_CLASS_CONTENT => Some(LinuxFanotifyClass::Content),
+            LINUX_FAN_CLASS_PRE_CONTENT => Some(LinuxFanotifyClass::PreContent),
+            _ => None,
+        }
+    }
+}
+
+impl LinuxFanotifyMarkFlags {
+    /// Every flag bit `fanotify_mark(2)` defines. An unknown bit is EINVAL.
+    pub const KNOWN_MASK: u64 = LINUX_FAN_MARK_ADD
+        | LINUX_FAN_MARK_REMOVE
+        | LINUX_FAN_MARK_DONT_FOLLOW
+        | LINUX_FAN_MARK_ONLYDIR
+        | LINUX_FAN_MARK_TYPES
+        | LINUX_FAN_MARK_IGNORED_MASK
+        | LINUX_FAN_MARK_IGNORED_SURV_MODIFY
+        | LINUX_FAN_MARK_FLUSH
+        | LINUX_FAN_MARK_EVICTABLE
+        | LINUX_FAN_MARK_IGNORE;
+
+    /// The three mutually exclusive commands. Exactly one must be present.
+    pub const COMMANDS: Self =
+        Self::from_bits_retain(LINUX_FAN_MARK_ADD | LINUX_FAN_MARK_REMOVE | LINUX_FAN_MARK_FLUSH);
+
+    /// Decode the object-type FIELD. `None` is the illegal both-bits-set
+    /// encoding (`FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM`), which is EINVAL.
+    pub fn mark_type(self) -> Option<LinuxFanotifyMarkType> {
+        match self.bits() & LINUX_FAN_MARK_TYPES {
+            LINUX_FAN_MARK_INODE => Some(LinuxFanotifyMarkType::Inode),
+            LINUX_FAN_MARK_MOUNT => Some(LinuxFanotifyMarkType::Mount),
+            LINUX_FAN_MARK_FILESYSTEM => Some(LinuxFanotifyMarkType::Filesystem),
+            _ => None,
+        }
+    }
+
+    /// The single command this call carries, or `None` when zero or more than
+    /// one of `ADD`/`REMOVE`/`FLUSH` is set (both are EINVAL).
+    pub fn command(self) -> Option<Self> {
+        let cmd = self & Self::COMMANDS;
+        (cmd.bits().count_ones() == 1).then_some(cmd)
+    }
 }
 
 impl LinuxRwfFlags {
