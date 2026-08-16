@@ -1065,10 +1065,9 @@ pub(crate) struct KernelState {
     /// Per-Linux-process fork pause for the shared-VM backend. The legacy
     /// barrier is host-process-global because it assumed one process per VM.
     process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
-    /// Non-zero while a fatal owner is collecting one task-local register
-    /// generation. Sibling loops observe it at their quiesce safe point.
-    crash_capture_generation: Option<Arc<std::sync::atomic::AtomicU64>>,
-    next_crash_capture_generation: std::sync::atomic::AtomicU64,
+    /// Issues crash-capture generations and broadcasts the one currently
+    /// collecting. Sibling loops read it at their quiesce safe point.
+    crash_capture: Option<Arc<crate::kernel::CrashCaptureAuthority>>,
     /// Number of host vCPU loops still alive for this Linux process.
     process_vcpu_live: std::sync::atomic::AtomicUsize,
     /// Cross-layer thread-clone admission spans Kernel reservation through
@@ -1099,9 +1098,9 @@ impl KernelState {
         let process_fork_barrier = hvpatch_process
             .as_ref()
             .map(|_| Arc::new(crate::fork_quiesce::QuiesceBarrier::new()));
-        let crash_capture_generation = hvpatch_process
+        let crash_capture = hvpatch_process
             .as_ref()
-            .map(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
+            .map(|_| Arc::new(crate::kernel::CrashCaptureAuthority::default()));
         let hvpatch_runtime = hvpatch_process.as_ref().map(|_| {
             inherited_hvpatch_runtime
                 .unwrap_or_else(|| Arc::new(HvpatchRuntimeDirectory::default()))
@@ -1114,8 +1113,7 @@ impl KernelState {
             hvpatch_process,
             process_exiting: std::sync::atomic::AtomicBool::new(false),
             process_fork_barrier,
-            crash_capture_generation,
-            next_crash_capture_generation: std::sync::atomic::AtomicU64::new(0),
+            crash_capture,
             process_vcpu_live: std::sync::atomic::AtomicUsize::new(0),
             clone_admission: CloneAdmissionGate::default(),
             hvpatch_runtime,
@@ -1579,7 +1577,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     platform_futex_factory: PlatformFutexFactory,
     /// `Some` only for a process multiplexed in the shared HvPatch VM.
     process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
-    crash_capture_generation: Option<Arc<std::sync::atomic::AtomicU64>>,
+    crash_capture: Option<Arc<crate::kernel::CrashCaptureAuthority>>,
     kernel_thread: Option<crate::kernel::ThreadRef>,
     /// Authoritative Linux TGID for a task multiplexed by HVPatch. `None` on
     /// the one-host-process-per-task native/VMM lanes.
@@ -1702,6 +1700,29 @@ impl Drop for ProcessVcpuLiveGuard<'_> {
     }
 }
 
+/// Marks a Kernel thread as able to reach a crash safe point for exactly as
+/// long as its vCPU loop runs.
+///
+/// "How many Linux threads does this task have" and "how many can answer a
+/// crash capture right now" are different questions; this guard is the second
+/// one. A thread published into the task graph whose host loop was cancelled
+/// before it started never holds it, and a loop that returns — including the
+/// `exit_group` terminal-claim loser, which retires nothing — releases it.
+struct CrashSafePointParticipation(crate::kernel::ThreadRef);
+
+impl CrashSafePointParticipation {
+    fn enter(thread: &crate::kernel::ThreadRef) -> Self {
+        thread.enter_crash_safe_point_participation();
+        Self(Arc::clone(thread))
+    }
+}
+
+impl Drop for CrashSafePointParticipation {
+    fn drop(&mut self) {
+        self.0.leave_crash_safe_point_participation();
+    }
+}
+
 impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
 where
     E::SiblingSpec: 'static,
@@ -1713,7 +1734,7 @@ where
         platform_futex: Arc<dyn PlatformFutex>,
         platform_futex_factory: PlatformFutexFactory,
         process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
-        crash_capture_generation: Option<Arc<std::sync::atomic::AtomicU64>>,
+        crash_capture: Option<Arc<crate::kernel::CrashCaptureAuthority>>,
         kernel_thread: Option<crate::kernel::ThreadRef>,
         hvpatch_task_pid: Option<i32>,
         linux_tid: crate::kernel::LinuxTid,
@@ -1730,7 +1751,7 @@ where
             platform_futex,
             platform_futex_factory,
             process_fork_barrier,
-            crash_capture_generation,
+            crash_capture,
             kernel_thread,
             hvpatch_task_pid,
             linux_tid,
@@ -1777,18 +1798,22 @@ where
         }
     }
 
+    /// The crash generation this thread's safe point should answer, if a fatal
+    /// sibling is collecting one right now.
+    fn collecting_crash_generation(&self) -> Option<crate::kernel::CrashCaptureGeneration> {
+        self.crash_capture
+            .as_ref()
+            .and_then(|authority| authority.collecting())
+    }
+
     fn publish_crash_registers_if_requested(&self, engine: &E) -> Result<(), RuntimeError> {
-        let Some(generation) = self.crash_capture_generation.as_ref() else {
+        let Some(mut generation) = self.collecting_crash_generation() else {
             return Ok(());
         };
-        let mut generation = generation.load(std::sync::atomic::Ordering::Acquire);
-        if generation == 0 {
-            return Ok(());
-        }
         if std::env::var_os("CARRICK_CORE_FAILPOINT")
             .is_some_and(|value| value == "register-generation")
         {
-            generation = generation.saturating_add(1);
+            generation = generation.skewed_for_failpoint();
         }
         let registers = engine.aarch64_core_registers()?.ok_or_else(|| {
             RuntimeError::Configuration(
@@ -1802,6 +1827,24 @@ where
         })?;
         thread.publish_crash_registers(generation, registers);
         Ok(())
+    }
+
+    /// Answer a collecting fatal sibling with "I cannot publish".
+    ///
+    /// Every park that reaches the task-local quiesce barrier WITHOUT a
+    /// readable register file must call this before blocking. Such a thread
+    /// (waiting for a vCPU lease, or for a sibling to materialise) does not
+    /// resume until the barrier drops, so it can never publish for this
+    /// generation — and a collector that kept waiting for it burned its full
+    /// ten-second deadline and then published no core at all.
+    fn withdraw_from_crash_capture(&self) {
+        let (Some(generation), Some(thread)) = (
+            self.collecting_crash_generation(),
+            self.kernel_thread.as_ref(),
+        ) else {
+            return;
+        };
+        thread.withdraw_from_crash_capture(generation);
     }
 
     fn capture_core_for_publication(
@@ -1833,24 +1876,20 @@ where
         let barrier = kernel.process_fork_barrier.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("HVPatch crash capture lacks task-local barrier".to_owned())
         })?;
-        let advertised = kernel.crash_capture_generation.as_ref().ok_or_else(|| {
+        let authority = kernel.crash_capture.as_ref().ok_or_else(|| {
             RuntimeError::Configuration(
                 "HVPatch crash capture lacks generation authority".to_owned(),
             )
         })?;
-        let generation = kernel
-            .next_crash_capture_generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            .checked_add(1)
-            .ok_or_else(|| {
-                RuntimeError::Configuration("HVPatch crash generation exhausted".to_owned())
-            })?;
+        let generation = authority
+            .issue()
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let lifecycle = |phase, outcome| {
             crate::probes::hvpatch_core_lifecycle(
                 phase,
                 process_pid,
                 fatal.tid.raw(),
-                generation,
+                generation.get(),
                 outcome,
             );
         };
@@ -1881,7 +1920,9 @@ where
             }
             std::thread::yield_now();
         }
-        advertised.store(generation, std::sync::atomic::Ordering::Release);
+        // Advertise BEFORE the barrier rises: a thread that parked without
+        // seeing the generation would owe a register file it can never publish.
+        authority.advertise(generation);
         let mut quiesced = false;
         let result = (|| {
             if std::env::var_os("CARRICK_CORE_FAILPOINT")
@@ -1892,14 +1933,15 @@ where
                 ));
             }
             self.publish_crash_registers_if_requested(engine)?;
-            // Count the siblings that owe a register file from the TASK, not
-            // from the kicker. A thread parked in a futex or fd wait has
-            // already released its vCPU and unregistered, so `kicker.count()`
-            // reads 1 for a two-thread process. Keying the quiesce on the
-            // kicker therefore never raised the barrier, the sleeper's
-            // `fork_is_quiescing()` interrupt never fired, it never reached the
-            // safe point that publishes crash registers, and the collector
-            // below spun its FULL 10 s deadline before failing the core closed.
+            // Raise the barrier whenever this task has a sibling at all. The
+            // kicker counts LIVE vCPU leases, not threads: a sibling parked in
+            // a futex has already released its lease, so keying the decision on
+            // `kicker.count()` left the barrier down and the sleeper never
+            // reached a publish safe point (`ltp-mmap18`, 33.6x). The DRAIN
+            // below still keys on the kicker, which is the right question for
+            // its own purpose — "is any sibling still executing guest code?" —
+            // because the memory snapshot that follows needs that and nothing
+            // more. It is NOT the register-collection predicate; the quorum is.
             if context.task().threads().len() > 1 {
                 barrier.set_quiescing();
                 quiesced = true;
@@ -1911,7 +1953,8 @@ where
                 while self.kicker.count() > 1 {
                     if std::time::Instant::now() >= deadline {
                         return Err(RuntimeError::Configuration(format!(
-                            "HVPatch crash generation {generation} timed out: {} sibling vCPUs remain",
+                            "HVPatch crash generation {} timed out: {} sibling vCPUs remain",
+                            generation.get(),
                             self.kicker.count().saturating_sub(1)
                         )));
                     }
@@ -1946,8 +1989,6 @@ where
                 return Ok(None);
             }
 
-            let task_threads = context.task().threads();
-            let required_threads = u64::try_from(task_threads.len()).unwrap_or(u64::MAX);
             if std::env::var_os("CARRICK_CORE_FAILPOINT")
                 .is_some_and(|value| value == "missing-thread")
             {
@@ -1955,52 +1996,69 @@ where
                     "core publication failpoint missing-thread".to_owned(),
                 ));
             }
+            // The quorum is the ONLY register-collection predicate, and it
+            // re-reads the task's live membership on every poll. Three
+            // populations used to be conflated here: the task's thread count,
+            // the live vCPU-lease count, and a one-shot membership snapshot.
+            // Each over-counted, and every over-count cost the full deadline
+            // and then published no core: a thread retiring mid-collection, a
+            // thread whose host loop had already returned (a terminal-claim
+            // loser after `exit_group`), a thread admitted into the graph whose
+            // host loop was cancelled before it ever ran, and a live thread
+            // parked at the barrier from a path with no readable register file.
+            let quorum =
+                crate::kernel::CrashQuorum::open(std::sync::Arc::clone(context.task()), generation);
             let collect_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             let mut threads = loop {
-                let mut collected = Vec::with_capacity(task_threads.len());
-                let mut missing_tid = None;
-                for thread in &task_threads {
-                    let Some(registers) = thread.crash_registers(generation) else {
-                        missing_tid = Some(thread.key().tid.raw());
-                        break;
-                    };
-                    let mut gregs = [0_u64; crate::core_dump::AARCH64_GREGS];
-                    gregs[..31].copy_from_slice(&registers.gprs);
-                    gregs[31] = registers.sp_el0;
-                    // The engine selects live PC/PSTATE for a vCPU force-exited
-                    // directly from EL0, or saved ELR/SPSR while a syscall is
-                    // parked in EL1. A synchronous fatal owner is independently
-                    // identified by its positive kernel si_code and uses the raw
-                    // exception ELR/SPSR pair. Raw pairs remain in Kernel authority.
-                    let synchronous_fatal_owner = thread.key().tid == fatal.tid && fatal.code > 0;
-                    let (resume_pc, resume_pstate) =
-                        core_note_resume_pair(&registers, synchronous_fatal_owner);
-                    gregs[32] = resume_pc;
-                    gregs[33] = resume_pstate;
-                    collected.push(crate::core_dump::ThreadState {
-                        tid: thread.key().tid.raw(),
-                        registers: crate::core_dump::ThreadRegisters {
-                            gregs,
-                            tpidr_el0: registers.tpidr_el0,
-                            vregs: registers.vregs,
-                            fpsr: registers.fpsr,
-                            fpcr: registers.fpcr,
-                        },
-                        current_signal: if thread.key().tid == fatal.tid {
-                            fatal.signo
-                        } else {
-                            0
-                        },
-                    });
-                }
-                if missing_tid.is_none() {
-                    break collected;
-                }
-                if std::time::Instant::now() >= collect_deadline {
-                    return Err(RuntimeError::Configuration(format!(
-                        "core generation {generation} missing registers for tid {}",
-                        missing_tid.unwrap_or_default()
-                    )));
+                match quorum.poll() {
+                    crate::kernel::CrashQuorumPoll::Complete(files) => {
+                        break files
+                            .into_iter()
+                            .map(|file| {
+                                let registers = file.registers;
+                                let mut gregs = [0_u64; crate::core_dump::AARCH64_GREGS];
+                                gregs[..31].copy_from_slice(&registers.gprs);
+                                gregs[31] = registers.sp_el0;
+                                // The engine selects live PC/PSTATE for a vCPU
+                                // force-exited directly from EL0, or saved
+                                // ELR/SPSR while a syscall is parked in EL1. A
+                                // synchronous fatal owner is independently
+                                // identified by its positive kernel si_code and
+                                // uses the raw exception ELR/SPSR pair. Raw
+                                // pairs remain in Kernel authority.
+                                let synchronous_fatal_owner =
+                                    file.tid == fatal.tid && fatal.code > 0;
+                                let (resume_pc, resume_pstate) =
+                                    core_note_resume_pair(&registers, synchronous_fatal_owner);
+                                gregs[32] = resume_pc;
+                                gregs[33] = resume_pstate;
+                                crate::core_dump::ThreadState {
+                                    tid: file.tid.raw(),
+                                    registers: crate::core_dump::ThreadRegisters {
+                                        gregs,
+                                        tpidr_el0: registers.tpidr_el0,
+                                        vregs: registers.vregs,
+                                        fpsr: registers.fpsr,
+                                        fpcr: registers.fpcr,
+                                    },
+                                    current_signal: if file.tid == fatal.tid {
+                                        fatal.signo
+                                    } else {
+                                        0
+                                    },
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                    }
+                    crate::kernel::CrashQuorumPoll::Waiting(tid) => {
+                        if std::time::Instant::now() >= collect_deadline {
+                            return Err(RuntimeError::Configuration(format!(
+                                "core generation {} missing registers for tid {}",
+                                generation.get(),
+                                tid.raw()
+                            )));
+                        }
+                    }
                 }
                 self.kicker.kick_all_except(self.this_tid);
                 self.futex.notify_signal_pending();
@@ -2087,6 +2145,13 @@ where
                 })
                 .collect::<Vec<_>>();
             let mappings = process.file_mappings.clone();
+            // How many `NT_PRSTATUS` notes Linux would have written, versus how
+            // many carrick actually collected. They differ exactly when a live
+            // thread WITHDREW from the quorum — parked where its register file
+            // is unreadable — which is a real, bounded fidelity gap and is
+            // reported rather than hidden behind a failed-closed core.
+            let required_threads =
+                u64::try_from(context.task().threads().len()).unwrap_or(u64::MAX);
             let thread_count = u64::try_from(threads.len()).unwrap_or(u64::MAX);
             let mapping_count = u64::try_from(mappings.len()).unwrap_or(u64::MAX);
             let region_count = u64::try_from(regions.len()).unwrap_or(u64::MAX);
@@ -2109,7 +2174,7 @@ where
                     )
                 })?;
             crate::probes::hvpatch_core_context(
-                generation,
+                generation.get(),
                 mm,
                 asid,
                 required_threads,
@@ -2149,25 +2214,27 @@ where
                 *word = u64::from_be_bytes(octet_array);
             }
             crate::probes::hvpatch_core_census(
-                generation,
+                generation.get(),
                 mapping_count,
                 4_u64.saturating_add(thread_count.saturating_mul(3)),
                 region_count,
                 u64::try_from(bytes.len()).unwrap_or(u64::MAX),
             );
-            crate::probes::hvpatch_core_hash(generation, hash_words);
+            crate::probes::hvpatch_core_hash(generation.get(), hash_words);
             lifecycle(3, 0);
             Ok(Some(PreparedCorePublication {
                 snapshot: process,
                 bytes,
-                generation,
+                // Wire boundary: the publication path and its probes carry the
+                // raw generation number.
+                generation: generation.get(),
                 fatal_tid: fatal.tid.raw(),
             }))
         })();
         if result.is_err() || matches!(&result, Ok(None)) {
             lifecycle(6, if result.is_err() { 1 } else { 2 });
         }
-        advertised.store(0, std::sync::atomic::Ordering::Release);
+        authority.stop_collecting();
         if quiesced {
             barrier.end_quiesce();
         }
@@ -2486,6 +2553,10 @@ where
                     self.kicker.unregister(self.this_tid);
                     kicker_dropped = true;
                 }
+                // Waiting for a lease to resume from a blocking wait: the
+                // register file lives in the saved wait state, not in a live
+                // vCPU, so withdraw instead of owing an unpublishable note.
+                self.withdraw_from_crash_capture();
                 self.park_if_fork_quiescing();
             }
         };
@@ -2535,6 +2606,9 @@ where
                     self.kicker.unregister(self.this_tid);
                     kicker_dropped = true;
                 }
+                // Same reason as the refresh branch above: nothing readable to
+                // publish while the vCPU is being rebound.
+                self.withdraw_from_crash_capture();
                 self.park_if_fork_quiescing();
             }
             if kicker_dropped {
@@ -3822,13 +3896,22 @@ where
     } else {
         None
     };
+    // A crash quorum may only wait on threads that can still REACH a safe
+    // point. Membership is exactly the lifetime of this loop, and the guard
+    // releases it on every exit path — normal return, error, or unwind — so a
+    // fatal sibling can never be left waiting on a thread whose host loop has
+    // gone (a terminal-claim loser after `exit_group`) or on one whose loop was
+    // cancelled before it ever started.
+    let _crash_participation = kernel_thread
+        .as_ref()
+        .map(CrashSafePointParticipation::enter);
     let mut state = ThreadRuntimeState::new(
         registry,
         futex,
         platform_futex,
         platform_futex_factory,
         kernel.process_fork_barrier.clone(),
-        kernel.crash_capture_generation.clone(),
+        kernel.crash_capture.clone(),
         kernel_thread,
         kernel.hvpatch_process.as_ref().map(|process| process.pid()),
         linux_tid,

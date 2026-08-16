@@ -6,6 +6,7 @@
 pub mod address;
 pub mod clone_plan;
 pub mod core;
+pub mod crash_capture;
 pub mod debug;
 pub mod exec;
 pub mod frame_inventory;
@@ -24,6 +25,11 @@ pub use clone_plan::{
     CloneObjectMode, ClonePlan, ClonePlanError, CloneTaskMode, ForkParentMode, ForkPidfdMode,
     VforkMode,
 };
+pub use crash_capture::{
+    CrashCaptureAuthority, CrashCaptureGeneration, CrashGenerationExhausted, CrashQuorum,
+    CrashQuorumPoll, CrashRegisterFile, CrashRegisterVote,
+};
+
 pub use core::{
     Kernel, KernelContext, KernelError, KernelTaskBinding, Registry, RegistryInvariantError,
     RootBootstrap, TaskExitSubscriber, TaskRevision, VforkParentWait, VforkReleaseReason,

@@ -337,6 +337,12 @@ where
                                 self.kicker.unregister(self.this_tid);
                                 kicker_dropped = true;
                             }
+                            // Parked while waiting for a vCPU lease: there is
+                            // no readable register file here and this thread
+                            // will not resume before the barrier drops, so it
+                            // must withdraw rather than silently owe a fatal
+                            // sibling a note it can never write.
+                            self.withdraw_from_crash_capture();
                             self.park_if_fork_quiescing();
                         }
                     },
@@ -375,6 +381,9 @@ where
                             self.kicker.unregister(self.this_tid);
                             kicker_dropped = true;
                         }
+                        // Slot-less and mid-rebind: no readable register file,
+                        // and no resume before the barrier drops.
+                        self.withdraw_from_crash_capture();
                         self.park_if_fork_quiescing();
                     }
                     // Re-register BEFORE the re-bind so a quiesce that starts
@@ -980,6 +989,9 @@ where
                     // on that lock while this caller waits for `ready`.
                     if self.fork_is_quiescing() {
                         if parent_reclaim.is_some() {
+                            // This vCPU is already reclaimed for the blocking
+                            // wait, so there is nothing to publish from.
+                            self.withdraw_from_crash_capture();
                             self.park_if_fork_quiescing();
                         } else {
                             self.release_and_park_vcpu_for_fork(engine)?;
