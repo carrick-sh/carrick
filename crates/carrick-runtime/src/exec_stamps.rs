@@ -225,6 +225,7 @@ pub fn stamp_run_complete() {
 /// thread closure terminates with raw `_exit(2)`, bypassing both the initial
 /// thread's runtime-return seam and the CLI tail, so export both terminal
 /// records immediately before the irreversible host exit.
+#[allow(dead_code)]
 pub(crate) fn spawned_guest_process_exit(code: i32) -> ! {
     stamp(ExecStampPhase::RuntimeReturn);
     stamp(ExecStampPhase::PreHostExit);

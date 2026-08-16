@@ -17,11 +17,7 @@ pub(crate) enum VdsoDebugMode {
     ClockSyscalls,
 }
 
-// Callers today: `runtime.rs` (`cfg(feature = "platform-macos")`) and
-// `native_darwin.rs` (`cfg(target_os = "macos", target_arch = "aarch64")`).
-// FreeBSD's native lane doesn't call this yet (out of scope here to add), so
-// gate to the union of both existing callers' cfgs rather than leave it
-// unconditional and dead on that lane.
+// Callers: `runtime.rs` (`cfg(feature = "platform-macos")`).
 #[cfg(any(
     feature = "platform-macos",
     all(target_os = "macos", target_arch = "aarch64")

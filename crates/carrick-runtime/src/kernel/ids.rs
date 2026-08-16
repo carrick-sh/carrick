@@ -246,6 +246,7 @@ pub enum ObjectIdError {
     Exhausted,
 }
 
+#[allow(dead_code)]
 pub(crate) fn restore_file_description_id(raw: u64) -> Result<FileDescriptionId, ObjectIdError> {
     let value = NonZeroU64::new(raw).ok_or(ObjectIdError::Exhausted)?;
     let next = raw.checked_add(1).ok_or(ObjectIdError::Exhausted)?;

@@ -953,18 +953,8 @@ impl SyscallDispatcher {
         std::process::id() != self.proc.lock().bootstrap_host_pid
     }
 
-    /// Host pid of the top-level guest process. The FreeBSD native backend uses
-    /// it as the fallback orphan-adoption target after acquiring host reaper
-    /// status; syscall-facing code translates that implementation pid back to
-    /// guest init PID 1 unless the guest explicitly selected a subreaper.
-    ///
-    /// Only that FreeBSD/x86_64 native lane (`native_freebsd.rs`) calls this
-    /// today, so it is otherwise unreachable — same target-gating rationale as
-    /// `carrick-dsr-x86`'s Cargo dependency edge.
-    #[cfg_attr(
-        not(all(target_os = "freebsd", target_arch = "x86_64")),
-        allow(dead_code)
-    )]
+    /// Host pid of the top-level guest process.
+    #[allow(dead_code)]
     pub(crate) fn bootstrap_host_pid(&self) -> u32 {
         self.proc.lock().bootstrap_host_pid
     }
@@ -1822,6 +1812,19 @@ impl SyscallDispatcher {
         }
 
         fn gettid(this, cx) {
+            if let Some(t) = cx.thread
+                && t.registry.live_count() > 1
+            {
+                let tid = t.tid.raw() as u32;
+                let ns_tid = if tid == std::process::id() {
+                    crate::namespace::pid::host_to_ns_or_self(tid)
+                } else {
+                    tid
+                };
+                return Ok(DispatchOutcome::Returned {
+                    value: i64::from(ns_tid),
+                });
+            }
             if let Some(tid) = hvpatch_reported_tid(
                 this.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch,
                 cx.kernel.thread().key().tid.raw(),
@@ -1830,24 +1833,6 @@ impl SyscallDispatcher {
                     value: i64::from(tid),
                 });
             }
-            if let Some(t) = cx.thread
-                && t.registry.live_count() > 1 {
-                    // Multi-threaded: report the per-thread tid. The MAIN
-                    // thread's tid equals the process's host pid, so in a PID
-                    // namespace it must read as the process's ns-pid (a thread
-                    // whose tid == its tgid). Worker tids (> main_tid) are
-                    // per-process and not ns-translated (§5.3). Identity when
-                    // namespaces are off.
-                    let tid = t.tid.raw() as u32;
-                    let ns_tid = if tid == std::process::id() {
-                        crate::namespace::pid::host_to_ns_or_self(tid)
-                    } else {
-                        tid
-                    };
-                    return Ok(DispatchOutcome::Returned {
-                        value: i64::from(ns_tid),
-                    });
-                }
             Ok(this.getpid())
         }
 
@@ -2285,18 +2270,7 @@ impl SyscallDispatcher {
                 command,
                 LINUX_FUTEX_LOCK_PI | LINUX_FUTEX_TRYLOCK_PI | LINUX_FUTEX_UNLOCK_PI
             ) {
-                let guest_tid = if this.execution_backend()
-                    == crate::page_profile::ExecutionBackend::HvPatch
-                {
-                    u32::try_from(cx.kernel.thread().key().tid.raw()).ok()
-                } else {
-                    Some(
-                        thread
-                            .and_then(|t| guest_visible_tid(tid, t.registry))
-                            .unwrap_or_else(crate::namespace::pid::self_ns_pid),
-                    )
-                };
-                let Some(guest_tid) = guest_tid else {
+                let Some(guest_tid) = u32::try_from(cx.kernel.thread().key().tid.raw()).ok() else {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
                 return Ok(dispatch_futex_pi(

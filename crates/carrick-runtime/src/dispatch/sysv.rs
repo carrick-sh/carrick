@@ -736,19 +736,11 @@ impl SysvIpcService {
 
 static SYSV_FALLBACK_ROOT_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Freeze the no-run-id SysV IPC scope before a backend creates its first guest
+/// Freeze the no-run-id SysV IPC scope before creating the first guest
 /// process. Descendants must keep using the top-level runtime pid: recomputing
 /// `pid-{getpid()}` after a host fork splits one guest IPC namespace into one
 /// directory namespace per process.
-///
-/// Only the FreeBSD/x86_64 native lane (`native_freebsd.rs`, via the
-/// `SyscallDispatcher::init_sysv_run_scope` method below) calls this today, so
-/// it is otherwise unreachable — same target-gating rationale as
-/// `carrick-dsr-x86`'s Cargo dependency edge.
-#[cfg_attr(
-    not(all(target_os = "freebsd", target_arch = "x86_64")),
-    allow(dead_code)
-)]
+#[allow(dead_code)]
 pub(crate) fn init_sysv_run_scope() {
     let _ = SYSV_FALLBACK_ROOT_PID.compare_exchange(
         0,
@@ -2067,13 +2059,7 @@ impl SyscallDispatcher {
         segment.lpid = commit.lpid;
     }
 
-    /// Only the FreeBSD/x86_64 native lane (`native_freebsd.rs`) calls this
-    /// today, so it is otherwise unreachable — same target-gating rationale as
-    /// `carrick-dsr-x86`'s Cargo dependency edge.
-    #[cfg_attr(
-        not(all(target_os = "freebsd", target_arch = "x86_64")),
-        allow(dead_code)
-    )]
+    #[allow(dead_code)]
     pub(crate) fn init_sysv_run_scope(&self) {
         init_sysv_run_scope();
     }
