@@ -128,9 +128,11 @@ mod tests {
 
         let kicks = Arc::new(AtomicU64::new(0));
         let registry = Arc::new(GenericVcpuRegistry::new());
+        let in_guest = crate::InGuestFlag::for_guest_thread();
         registry.register(
             ThreadId::synthetic_for_tests(1),
             Box::new(CountingKick(Arc::clone(&kicks))),
+            &in_guest,
         );
         let kicker: Arc<dyn VcpuRegistry> = registry;
         let id = carrick_timer_core::posix::create(0, 14);

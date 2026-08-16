@@ -37,9 +37,10 @@ pub mod threaded;
 pub use threaded::{
     Aarch64CoreRegisters, FrameCowAuthority, FrameCowIdentity, FrameCowQuiesce, FutexOutcome,
     GenericVcpuRegistry, GuestEntryRegs, GuestWaitRegisters, HostForkCoordinator, HostVa,
-    PlatformFutex, PreparedHostFork, ProcessForkRequest, RegAccess, SharedFutexLocation, ThreadId,
-    ThreadedEngine, VcpuKick, VcpuKickDyn, VcpuRegistry, X86SignalXstate, X86XstateCapabilities,
-    X86XstateComponent, aarch64_signal_pstate_source, read_aarch64_syscall_frame,
+    InGuestFlag, PlatformFutex, PreparedHostFork, ProcessForkRequest, RegAccess,
+    SharedFutexLocation, ThreadId, ThreadedEngine, VcpuKick, VcpuKickDyn, VcpuRegistry,
+    X86SignalXstate, X86XstateCapabilities, X86XstateComponent, aarch64_signal_pstate_source,
+    read_aarch64_syscall_frame,
 };
 pub mod sigframe;
 pub mod signal_arrival;
