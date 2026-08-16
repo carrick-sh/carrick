@@ -3671,6 +3671,7 @@ impl SyscallDispatcher {
         let proc_oom_score_adj = self
             .hvpatch_process()
             .map(|process| process.kernel_graph().registry().oom_score_adj_by_pid());
+        let proc_processes = Self::synthetic_proc_processes(self.hvpatch_process().as_ref());
         let proc_zombies = self.hvpatch_process().map(|process| {
             process
                 .kernel_graph()
@@ -3719,6 +3720,7 @@ impl SyscallDispatcher {
             sig_shdpnd,
             identity: self.synthetic_proc_identity(context),
             oom_score_adj: proc_oom_score_adj.as_ref(),
+            processes: proc_processes.as_deref(),
             threads: proc_threads.as_deref(),
             zombies: proc_zombies.as_deref(),
             sysvipc_shm: Some(sysvipc_shm.as_str()),

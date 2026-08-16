@@ -100,7 +100,8 @@ pub use etc_services::EtcServicesVfs;
 pub use mount::VfsMounts;
 pub use proc::{
     GuestMemoryRange, GuestReportedArch, ProcMapSharing, ProcMapsEntry, ProcVfs,
-    SyntheticProcContext, SyntheticProcIdentity, SyntheticProcThread, SyntheticProcZombie,
+    SyntheticProcContext, SyntheticProcIdentity, SyntheticProcProcess, SyntheticProcThread,
+    SyntheticProcZombie,
 };
 pub use resolvconf::ResolvConfVfs;
 pub use rootfs::RootFsVfs;
@@ -325,6 +326,10 @@ pub struct OpenContext<'a> {
     /// [`SyntheticProcContext::oom_score_adj`]. `None` on a lane with no kernel
     /// graph, where one Linux process is one host process.
     pub oom_score_adj: Option<&'a std::collections::BTreeMap<u32, i32>>,
+    /// Every live Linux process from the kernel graph — see
+    /// [`SyntheticProcContext::processes`]. `None` on a lane with no kernel
+    /// graph, where one Linux process is one host process.
+    pub processes: Option<&'a [SyntheticProcProcess]>,
     pub threads: Option<&'a [SyntheticProcThread]>,
     pub zombies: Option<&'a [SyntheticProcZombie]>,
     pub sysvipc_shm: Option<&'a str>,

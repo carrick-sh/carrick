@@ -6698,6 +6698,63 @@ impl SyscallDispatcher {
             })
     }
 
+    /// Every LIVE Linux process, for the synthetic `/proc/<peer-pid>`
+    /// renderers. `None` off the kernel-graph lane, where one Linux process is
+    /// one host process and the mature host-process derivation is correct.
+    ///
+    /// Takes the process binding rather than calling `hvpatch_process()`:
+    /// `synthetic_proc_context` builds this while already holding `self.proc`,
+    /// and re-acquiring it there deadlocks every synthetic-file lookup.
+    fn synthetic_proc_processes(
+        hvpatch_process: Option<&crate::hvpatch::ProcessContext>,
+    ) -> Option<Vec<crate::vfs::SyntheticProcProcess>> {
+        let mut processes: Vec<_> = hvpatch_process?
+            .kernel_graph()
+            .registry()
+            .live_processes()
+            .into_iter()
+            .map(|process| {
+                let pid = process.key.id.raw() as u32;
+                let init = carrick_abi::LINUX_BOOTSTRAP_PID as u32;
+                crate::vfs::SyntheticProcProcess {
+                    pid,
+                    // A parentless task is an orphan reparented to init — except
+                    // for init ITSELF, which Linux reports with ppid 0. Without
+                    // that case `/proc/1/stat` claims pid 1 is its own parent.
+                    ppid: process
+                        .parent
+                        .map_or(if pid == init { 0 } else { init }, |parent| {
+                            parent.id.raw() as u32
+                        }),
+                    pgrp: process.process_group.raw() as u32,
+                    session: process.session.raw() as u32,
+                    // The run-state table is keyed by the LOGICAL task pid on
+                    // this lane (`publish_task_thread`), so it is the one live
+                    // per-Linux-process state carrick has. A task that has not
+                    // published yet reads as runnable, and one already inside
+                    // its exit path reads `R` rather than `Z` — it becomes a
+                    // zombie only when the registry moves it, which is when the
+                    // zombie arm takes over.
+                    state: crate::run_state::published_stat_char(pid).unwrap_or('R'),
+                    threads: process.thread_count,
+                    // HONEST GAP: this is the registry's fork-time label, not
+                    // the Linux `comm`. Linux's is the exec basename as later
+                    // amended by `prctl(PR_SET_NAME)`, and carrick keeps that
+                    // in the per-process `ProcState.task_name` — which is
+                    // reachable only from the process that owns it, so a peer
+                    // cannot be asked. The same substitution already ships on
+                    // the zombie arm. Closing it means promoting `comm` to a
+                    // `Task` field (as `oom_score_adj` was) and retiring
+                    // `ProcState.task_name`; identity is fixed first because
+                    // it is what LTP and `getpgid`/`getsid` actually read.
+                    comm: process.diagnostic_name,
+                }
+            })
+            .collect();
+        processes.sort_by_key(|process| process.pid);
+        Some(processes)
+    }
+
     fn synthetic_proc_threads(
         &self,
         context: &crate::kernel::KernelContext,
@@ -6787,6 +6844,7 @@ impl SyscallDispatcher {
             .as_ref()
             .map(|process| process.kernel_graph().registry().oom_score_adj_by_pid())
             .unwrap_or_default();
+        let processes = Self::synthetic_proc_processes(hvpatch_process.as_ref());
         let zombies = hvpatch_process.map(|process| {
             process
                 .kernel_graph()
@@ -6835,6 +6893,7 @@ impl SyscallDispatcher {
             sig_shdpnd,
             identity: self.synthetic_proc_identity(context),
             oom_score_adj,
+            processes,
             threads: self.synthetic_proc_threads(context, None),
             zombies,
             sysvipc_shm: self.sysvipc_shm_table(),
