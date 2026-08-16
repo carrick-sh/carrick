@@ -103,6 +103,22 @@ pub trait SyscallTrap {
         None
     }
 
+    /// Roll back the staging armed by [`Self::begin_alias_inventory`] after the
+    /// alias install FAILED, so the transaction the runtime abandons leaves no
+    /// residue in the backend.
+    ///
+    /// Stage-1, stage-2 and frame-inventory publication are one transaction.
+    /// The backend already unwinds its own stage-1/stage-2 work on every alias
+    /// failure path (host mapping and global-frame IPA leases are RAII), but the
+    /// armed reservation — or, when stage-1 fails after stage-2 succeeded, the
+    /// staged commit — outlives that unwind and would make the NEXT guest `mmap`
+    /// fail with "overlapping HVPatch alias inventory transaction". Returns
+    /// whether staging was actually discarded; backends with no HVPatch
+    /// inventory never arm any and answer `false`.
+    fn abandon_alias_inventory(&mut self) -> bool {
+        false
+    }
+
     /// Exact old/new sparse extent counts for a destructive exec replacement.
     fn frame_inventory_exec_extent_counts(&self, _new_image: &AddressSpace) -> (usize, usize) {
         (0, 0)

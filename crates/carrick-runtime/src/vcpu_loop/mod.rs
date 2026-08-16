@@ -3536,18 +3536,48 @@ where
                         return Err(error.into());
                     }
 
-                    if engine
-                        .map_host_alias_with_sharing(
-                            va,
-                            ipa,
-                            len,
-                            &payload,
-                            file.map(|(fd, offset, prot)| (fd.into_raw_fd(), offset, prot)),
+                    if let Err(error) = engine.map_host_alias_with_sharing(
+                        va,
+                        ipa,
+                        len,
+                        &payload,
+                        file.map(|(fd, offset, prot)| (fd.into_raw_fd(), offset, prot)),
+                        shared,
+                    ) {
+                        // A failed alias install is guest-argument-reachable
+                        // (an oversized/awkwardly-placed mmap can exhaust the
+                        // global frame IPA arena or fail hv_vm_map), so it must
+                        // lower to a guest errno, never abort the VM carrier —
+                        // one Linux process's bad mmap would otherwise kill
+                        // EVERY process multiplexed into this carrier.
+                        //
+                        // Stage-1/stage-2 unwind is the backend's own (RAII host
+                        // mappings and global-frame IPA leases); this arm rolls
+                        // back the two publications it armed itself: the
+                        // backend's alias staging — without which the NEXT guest
+                        // mmap fails as an "overlapping HVPatch alias inventory
+                        // transaction" — and the kernel's frame-inventory
+                        // transaction. `install` is dropped unclaimed, which
+                        // aborts the dispatcher's pending VMA commit and wakes
+                        // blocked sibling mapping syscalls.
+                        engine.abandon_alias_inventory();
+                        let abandoned = kernel_context
+                            .kernel()
+                            .frame_inventory()
+                            .abandon(inventory_transaction);
+                        debug_assert!(abandoned);
+                        drop(topology);
+                        drop(install);
+                        tracing::error!(
+                            va = format_args!("{:#x}", va.raw()),
+                            len = format_args!("{len:#x}"),
                             shared,
-                        )
-                        .is_err()
-                    {
-                        std::process::abort();
+                            %error,
+                            "HVPatch alias install failed; guest mmap lowered to ENOMEM"
+                        );
+                        break Ok(DispatchOutcome::Returned {
+                            value: crate::linux_abi::LINUX_ENOMEM.guest_retval(),
+                        });
                     }
                     let Some(commit) = engine.take_alias_inventory() else {
                         std::process::abort();
@@ -4664,19 +4694,33 @@ where
                             drop(file);
                             crate::linux_abi::LINUX_ENOMEM.guest_retval()
                         }
-                        Some(install) => {
-                            if engine
-                                .map_host_alias_with_sharing(
-                                    va,
-                                    ipa,
-                                    len,
-                                    &payload,
-                                    file.map(|(fd, offset, prot)| (fd.into_raw_fd(), offset, prot)),
+                        Some(install) => 'install: {
+                            if let Err(error) = engine.map_host_alias_with_sharing(
+                                va,
+                                ipa,
+                                len,
+                                &payload,
+                                file.map(|(fd, offset, prot)| (fd.into_raw_fd(), offset, prot)),
+                                shared,
+                            ) {
+                                // Same guest-argument-reachable class as the
+                                // HVPatch arm above: a failed backend alias
+                                // install (arena exhaustion, a rejected GPA, a
+                                // failed host mmap) is an out-of-memory answer
+                                // to one guest `mmap`, not an invariant
+                                // violation, so it lowers to ENOMEM. `install`
+                                // drops unclaimed, which aborts the
+                                // dispatcher's pending VMA commit and wakes
+                                // blocked sibling mapping syscalls.
+                                drop(install);
+                                tracing::error!(
+                                    va = format_args!("{:#x}", va.raw()),
+                                    len = format_args!("{len:#x}"),
                                     shared,
-                                )
-                                .is_err()
-                            {
-                                std::process::abort();
+                                    %error,
+                                    "alias install failed; guest mmap lowered to ENOMEM"
+                                );
+                                break 'install crate::linux_abi::LINUX_ENOMEM.guest_retval();
                             }
                             let Ok(len) = usize::try_from(len) else {
                                 std::process::abort();
