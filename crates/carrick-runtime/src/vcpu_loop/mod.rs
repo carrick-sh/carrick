@@ -3470,7 +3470,15 @@ where
                     location,
                     waiter_key,
                     value,
-                } => match self.wait_on_shared_word(engine, location, waiter_key, value)? {
+                } => match self.wait_on_shared_word(
+                    kernel,
+                    engine,
+                    threads::SharedWordWait {
+                        location,
+                        waiter_key,
+                        value,
+                    },
+                )? {
                     SharedWordWaitCompletion::Changed => continue,
                     SharedWordWaitCompletion::Interrupted => {
                         if let Some(outcome) = self.exec_replaced_thread_exit() {
@@ -4411,10 +4419,13 @@ where
                     // keyed by the shared physical page, with the dispatcher lock
                     // released. Interruptible by a signal deliverable to this thread.
                     match state.complete_shared_futex_wait(
+                        &kernel,
                         &mut engine,
-                        location,
-                        waiter_key,
-                        value,
+                        threads::SharedWordWait {
+                            location,
+                            waiter_key,
+                            value,
+                        },
                         timeout,
                     )? {
                         BlockingWaitCompletion::Retval(retval) => {
@@ -4437,10 +4448,13 @@ where
                     index,
                 } => {
                     match state.complete_shared_futex_waitv(
+                        &kernel,
                         &mut engine,
-                        location,
-                        waiter_key,
-                        value,
+                        threads::SharedWordWait {
+                            location,
+                            waiter_key,
+                            value,
+                        },
                         timeout,
                         index,
                     )? {
