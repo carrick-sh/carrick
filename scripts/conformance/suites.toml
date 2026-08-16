@@ -10987,8 +10987,14 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+# This case declares .needs_devfs and open(2)s a block-device node it creates
+# under its mountpoint, which Docker's default (and even --cap-add SYS_ADMIN)
+# refuses with EPERM — the ORACLE TBROKs at fgetxattr02.c:239 while carrick
+# passes 9/9. Verified 2026-08-15: --privileged is the smallest flag that lets
+# the oracle run the case at all. This image is a local conformance fixture
+# that is never deployed (see docker/ltp/Dockerfile).
+docker_flags = ["--privileged"]
 
 [[suite]]
 name = "ltp-fgetxattr03"
@@ -11087,8 +11093,14 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+# The security.* xattr namespace needs CAP_SYS_ADMIN, which Docker drops by
+# default: the ORACLE TBROKs with EPERM on setxattr(security.ltptest*) while
+# carrick passes. Verified 2026-08-15: with --cap-add SYS_ADMIN the oracle
+# reproduces carrick exactly. Granting the capability the test's .needs_root
+# implies makes the oracle measure the Linux semantics the case intends;
+# same pattern as the fanotify/add_key rows above.
+docker_flags = ["--cap-add", "SYS_ADMIN"]
 
 [[suite]]
 name = "ltp-flistxattr02"
@@ -11099,8 +11111,14 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+# The security.* xattr namespace needs CAP_SYS_ADMIN, which Docker drops by
+# default: the ORACLE TBROKs with EPERM on setxattr(security.ltptest*) while
+# carrick passes. Verified 2026-08-15: with --cap-add SYS_ADMIN the oracle
+# reproduces carrick exactly. Granting the capability the test's .needs_root
+# implies makes the oracle measure the Linux semantics the case intends;
+# same pattern as the fanotify/add_key rows above.
+docker_flags = ["--cap-add", "SYS_ADMIN"]
 
 [[suite]]
 name = "ltp-flistxattr03"
@@ -11111,8 +11129,14 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+# The security.* xattr namespace needs CAP_SYS_ADMIN, which Docker drops by
+# default: the ORACLE TBROKs with EPERM on setxattr(security.ltptest*) while
+# carrick passes. Verified 2026-08-15: with --cap-add SYS_ADMIN the oracle
+# reproduces carrick exactly. Granting the capability the test's .needs_root
+# implies makes the oracle measure the Linux semantics the case intends;
+# same pattern as the fanotify/add_key rows above.
+docker_flags = ["--cap-add", "SYS_ADMIN"]
 
 [[suite]]
 name = "ltp-flock01"
@@ -14114,8 +14138,14 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+# The security.* xattr namespace needs CAP_SYS_ADMIN, which Docker drops by
+# default: the ORACLE TBROKs with EPERM on setxattr(security.ltptest*) while
+# carrick passes. Verified 2026-08-15: with --cap-add SYS_ADMIN the oracle
+# reproduces carrick exactly. Granting the capability the test's .needs_root
+# implies makes the oracle measure the Linux semantics the case intends;
+# same pattern as the fanotify/add_key rows above.
+docker_flags = ["--cap-add", "SYS_ADMIN"]
 
 [[suite]]
 name = "ltp-lgetxattr02"
@@ -14126,8 +14156,14 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+# The security.* xattr namespace needs CAP_SYS_ADMIN, which Docker drops by
+# default: the ORACLE TBROKs with EPERM on setxattr(security.ltptest*) while
+# carrick passes. Verified 2026-08-15: with --cap-add SYS_ADMIN the oracle
+# reproduces carrick exactly. Granting the capability the test's .needs_root
+# implies makes the oracle measure the Linux semantics the case intends;
+# same pattern as the fanotify/add_key rows above.
+docker_flags = ["--cap-add", "SYS_ADMIN"]
 
 [[suite]]
 name = "ltp-link02"
@@ -14259,8 +14295,14 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+# The security.* xattr namespace needs CAP_SYS_ADMIN, which Docker drops by
+# default: the ORACLE TBROKs with EPERM on setxattr(security.ltptest*) while
+# carrick passes. Verified 2026-08-15: with --cap-add SYS_ADMIN the oracle
+# reproduces carrick exactly. Granting the capability the test's .needs_root
+# implies makes the oracle measure the Linux semantics the case intends;
+# same pattern as the fanotify/add_key rows above.
+docker_flags = ["--cap-add", "SYS_ADMIN"]
 
 [[suite]]
 name = "ltp-listxattr02"
@@ -14271,8 +14313,14 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+# The security.* xattr namespace needs CAP_SYS_ADMIN, which Docker drops by
+# default: the ORACLE TBROKs with EPERM on setxattr(security.ltptest*) while
+# carrick passes. Verified 2026-08-15: with --cap-add SYS_ADMIN the oracle
+# reproduces carrick exactly. Granting the capability the test's .needs_root
+# implies makes the oracle measure the Linux semantics the case intends;
+# same pattern as the fanotify/add_key rows above.
+docker_flags = ["--cap-add", "SYS_ADMIN"]
 
 [[suite]]
 name = "ltp-listxattr03"
@@ -14283,8 +14331,14 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+# The security.* xattr namespace needs CAP_SYS_ADMIN, which Docker drops by
+# default: the ORACLE TBROKs with EPERM on setxattr(security.ltptest*) while
+# carrick passes. Verified 2026-08-15: with --cap-add SYS_ADMIN the oracle
+# reproduces carrick exactly. Granting the capability the test's .needs_root
+# implies makes the oracle measure the Linux semantics the case intends;
+# same pattern as the fanotify/add_key rows above.
+docker_flags = ["--cap-add", "SYS_ADMIN"]
 
 [[suite]]
 name = "ltp-listxattr04"
@@ -14306,8 +14360,14 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+# The security.* xattr namespace needs CAP_SYS_ADMIN, which Docker drops by
+# default: the ORACLE TBROKs with EPERM on setxattr(security.ltptest*) while
+# carrick passes. Verified 2026-08-15: with --cap-add SYS_ADMIN the oracle
+# reproduces carrick exactly. Granting the capability the test's .needs_root
+# implies makes the oracle measure the Linux semantics the case intends;
+# same pattern as the fanotify/add_key rows above.
+docker_flags = ["--cap-add", "SYS_ADMIN"]
 
 [[suite]]
 name = "ltp-llistxattr02"
@@ -14318,8 +14378,14 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+# The security.* xattr namespace needs CAP_SYS_ADMIN, which Docker drops by
+# default: the ORACLE TBROKs with EPERM on setxattr(security.ltptest*) while
+# carrick passes. Verified 2026-08-15: with --cap-add SYS_ADMIN the oracle
+# reproduces carrick exactly. Granting the capability the test's .needs_root
+# implies makes the oracle measure the Linux semantics the case intends;
+# same pattern as the fanotify/add_key rows above.
+docker_flags = ["--cap-add", "SYS_ADMIN"]
 
 [[suite]]
 name = "ltp-llistxattr03"
@@ -14330,8 +14396,14 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-known_gaps = ["summary"]
 carrick_flags = ["--raw", "--fs", "host"]
+# The security.* xattr namespace needs CAP_SYS_ADMIN, which Docker drops by
+# default: the ORACLE TBROKs with EPERM on setxattr(security.ltptest*) while
+# carrick passes. Verified 2026-08-15: with --cap-add SYS_ADMIN the oracle
+# reproduces carrick exactly. Granting the capability the test's .needs_root
+# implies makes the oracle measure the Linux semantics the case intends;
+# same pattern as the fanotify/add_key rows above.
+docker_flags = ["--cap-add", "SYS_ADMIN"]
 
 [[suite]]
 name = "ltp-llseek01"
