@@ -278,12 +278,6 @@ use crate::linux_abi::{
     LINUX_F_OWNER_PID,
     LINUX_F_OWNER_TID,
     LINUX_F_RDLCK,
-    LINUX_F_SEAL_ALL,
-    LINUX_F_SEAL_FUTURE_WRITE,
-    LINUX_F_SEAL_GROW,
-    LINUX_F_SEAL_SEAL,
-    LINUX_F_SEAL_SHRINK,
-    LINUX_F_SEAL_WRITE,
     LINUX_F_SETFD,
     LINUX_F_SETFL,
     LINUX_F_SETLEASE,
@@ -349,8 +343,6 @@ use crate::linux_abi::{
     LINUX_MAP_FIXED_NOREPLACE,
     LINUX_MAX_SIGNUM,
     LINUX_MEMBARRIER_CMD_QUERY,
-    LINUX_MFD_ALLOW_SEALING,
-    LINUX_MFD_CLOEXEC,
     LINUX_MFD_HUGETLB,
     LINUX_MINSIGSTKSZ,
     LINUX_MREMAP_DONTUNMAP,
@@ -4116,15 +4108,14 @@ impl SyscallDispatcher {
 
     /// Seed the guest's initial credentials (`docker run --user` / image `USER`).
     /// Applied once before the guest starts; defaults to (0, 0) = root.
-    pub fn set_credentials(&self, uid: u32, gid: u32) {
+    pub fn set_credentials(&self, uid: carrick_abi::NsUid, gid: carrick_abi::NsGid) {
         let context = self.capture_one_task_context().unwrap_or_else(|error| {
             tracing::error!(%error, "cannot capture launch credential context");
             std::process::abort();
         });
         let credentials = self
             .update_credentials(&context, |credentials| {
-                credentials
-                    .seed_identity(carrick_abi::NsUid::new(uid), carrick_abi::NsGid::new(gid));
+                credentials.seed_identity(uid, gid);
             })
             .unwrap_or_else(|errno| {
                 tracing::error!(errno = errno.get(), "publish launch Kernel credentials");
@@ -5199,13 +5190,17 @@ fn memfd_seal_write_check(
     write_len: usize,
     cur_len: usize,
 ) -> Result<(), LinuxErrno> {
-    let Some(seals) = seals else {
+    let Some(seals) = seals.and_then(carrick_abi::LinuxMemfdSeals::from_bits) else {
         return Ok(());
     };
-    if seals & (LINUX_F_SEAL_WRITE | LINUX_F_SEAL_FUTURE_WRITE) != 0 {
+    if seals.intersects(
+        carrick_abi::LinuxMemfdSeals::WRITE | carrick_abi::LinuxMemfdSeals::FUTURE_WRITE,
+    ) {
         return Err(LINUX_EPERM);
     }
-    if seals & LINUX_F_SEAL_GROW != 0 && offset.saturating_add(write_len) > cur_len {
+    if seals.contains(carrick_abi::LinuxMemfdSeals::GROW)
+        && offset.saturating_add(write_len) > cur_len
+    {
         return Err(LINUX_EPERM);
     }
     Ok(())
@@ -5218,13 +5213,13 @@ fn memfd_seal_resize_check(
     new_len: usize,
     cur_len: usize,
 ) -> Result<(), LinuxErrno> {
-    let Some(seals) = seals else {
+    let Some(seals) = seals.and_then(carrick_abi::LinuxMemfdSeals::from_bits) else {
         return Ok(());
     };
-    if seals & LINUX_F_SEAL_SHRINK != 0 && new_len < cur_len {
+    if seals.contains(carrick_abi::LinuxMemfdSeals::SHRINK) && new_len < cur_len {
         return Err(LINUX_EPERM);
     }
-    if seals & LINUX_F_SEAL_GROW != 0 && new_len > cur_len {
+    if seals.contains(carrick_abi::LinuxMemfdSeals::GROW) && new_len > cur_len {
         return Err(LINUX_EPERM);
     }
     Ok(())
@@ -6439,8 +6434,8 @@ fn write_stat_record(
         st_ino: record.ino,
         st_mode: record.mode,
         st_nlink: record.nlink,
-        st_uid: record.uid,
-        st_gid: record.gid,
+        st_uid: record.uid.raw(),
+        st_gid: record.gid.raw(),
         st_rdev: record.rdev,
         __pad1: 0,
         st_size: record.size as i64,
@@ -6477,8 +6472,8 @@ fn write_x8664_stat_record(
         st_ino: record.ino,
         st_nlink: record.nlink as u64,
         st_mode: record.mode,
-        st_uid: record.uid,
-        st_gid: record.gid,
+        st_uid: record.uid.raw(),
+        st_gid: record.gid.raw(),
         __pad0: 0,
         st_rdev: record.rdev,
         st_size: record.size as i64,
@@ -6530,8 +6525,8 @@ pub(super) fn real_stat_from_libc(st: &libc::stat) -> crate::fs_backend::RealSta
         mode: st.st_mode as u32 & 0o7777,
         // Owner defaults to root; the HostFile fstat/statx path overrides from
         // the guest owner xattr where present.
-        uid: 0,
-        gid: 0,
+        uid: carrick_abi::NsUid::ROOT,
+        gid: carrick_abi::NsGid::ROOT,
         size: st.st_size as u64,
         atime: (st.st_atime, carrick_portable::stat_atime_nsec(st)),
         mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(st)),
@@ -6574,8 +6569,8 @@ fn write_statx_record(
         stx_blksize: LINUX_PAGE_SIZE as u32,
         stx_attributes: 0,
         stx_nlink: record.nlink,
-        stx_uid: record.uid,
-        stx_gid: record.gid,
+        stx_uid: record.uid.raw(),
+        stx_gid: record.gid.raw(),
         stx_mode: record.mode as u16,
         __spare0: [0; 1],
         stx_ino: record.ino,
@@ -7393,8 +7388,8 @@ fn access_metadata(metadata: &RootFsMetadata, mode: u64) -> DispatchOutcome {
 pub(super) fn dac_check(
     uid: carrick_abi::NsUid,
     gid: carrick_abi::NsGid,
-    file_uid: u32,
-    file_gid: u32,
+    file_uid: carrick_abi::NsUid,
+    file_gid: carrick_abi::NsGid,
     file_mode: u32,
     is_dir: bool,
     mask: u64,
@@ -7411,9 +7406,9 @@ pub(super) fn dac_check(
         }
         return Ok(());
     }
-    let triplet = if uid.raw() == file_uid {
+    let triplet = if uid == file_uid {
         (file_mode >> 6) & 7
-    } else if gid.raw() == file_gid {
+    } else if gid == file_gid {
         (file_mode >> 3) & 7
     } else {
         file_mode & 7

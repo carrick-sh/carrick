@@ -193,8 +193,8 @@ impl SyscallDispatcher {
                         None => None,
                     };
                     let (uid, gid) = crate::fs_backend::fget_owner_xattr(host_fd.get());
-                    real.uid = uid.unwrap_or(0);
-                    real.gid = gid.unwrap_or(0);
+                    real.uid = uid.unwrap_or(carrick_abi::NsUid::ROOT);
+                    real.gid = gid.unwrap_or(carrick_abi::NsGid::ROOT);
                     let mut record = StatRecord::from_real(&path, &real);
                     record.apply_device_node(device);
                     return Ok(record);

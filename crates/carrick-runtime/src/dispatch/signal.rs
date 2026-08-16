@@ -3228,7 +3228,7 @@ mod tests {
         let published_euid = crate::cred_ipc::read_target(child_pid as i32);
 
         let d = SyscallDispatcher::new();
-        d.set_credentials(1000, 1000);
+        d.set_credentials(carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(1000));
         let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
         let reporter = crate::compat::CompatReporter::default();
         let siginfo = LinuxSiginfo::rt_queue(usr1, me, 1000, 0x5eed_cafe);
@@ -3293,7 +3293,7 @@ mod tests {
         let published_euid = crate::cred_ipc::read_target(child_pid as i32);
 
         let d = SyscallDispatcher::new();
-        d.set_credentials(1000, 1000);
+        d.set_credentials(carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(1000));
         let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
         let reporter = crate::compat::CompatReporter::default();
         let kernel = d.capture_one_task_context().unwrap();

@@ -63,7 +63,6 @@ use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use carrick_abi::{NsGid, NsUid};
-use carrick_guest_mem::GuestVa;
 
 use crate::linux_abi::{
     LINUX_DEFAULT_TIMERSLACK_NS, LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR, LINUX_EROFS, LinuxErrno,
@@ -114,39 +113,7 @@ pub enum GuestReportedArch {
     X86_64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GuestMemoryRange {
-    start: GuestVa,
-    end: GuestVa,
-}
-
-impl GuestMemoryRange {
-    pub fn new(start: GuestVa, end: GuestVa) -> Option<Self> {
-        (start < end).then_some(Self { start, end })
-    }
-
-    pub fn start(self) -> GuestVa {
-        self.start
-    }
-
-    pub fn end(self) -> GuestVa {
-        self.end
-    }
-
-    pub fn len(self) -> u64 {
-        self.end.raw().saturating_sub(self.start.raw())
-    }
-
-    pub fn is_empty(self) -> bool {
-        self.len() == 0
-    }
-
-    fn overlap_bytes(self, start: u64, end: u64) -> u64 {
-        let lo = self.start.raw().max(start);
-        let hi = self.end.raw().min(end);
-        hi.saturating_sub(lo)
-    }
-}
+pub type GuestMemoryRange = carrick_guest_mem::GuestVaRange;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyntheticProcIdentity {
@@ -3272,7 +3239,7 @@ fn synthetic_proc_self_mountinfo() -> &'static [u8] {
 fn locked_memory_kb(ctx: &SyntheticProcContext) -> u64 {
     ctx.locked_memory
         .iter()
-        .map(|range| range.len())
+        .map(|range| range.len() as u64)
         .sum::<u64>()
         / 1024
 }

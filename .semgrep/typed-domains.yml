@@ -201,3 +201,22 @@ rules:
       Errno → guest retval negation happens in exactly one place:
       carrick_abi::LinuxErrno::guest_retval() (and from_guest_retval for the
       reverse). Inline negations reintroduce the double-negation class.
+
+  # Prefer GuestVaRange over raw (start, end) or (start, len) integer pairs for address ranges.
+  - id: carrick-prefer-guest-va-range
+    languages: [rust]
+    severity: WARNING
+    paths:
+      exclude:
+        - crates/carrick-abi/
+        - crates/carrick-guest-mem/
+    patterns:
+      - pattern-either:
+          - pattern: "fn $F(..., $A: GuestVa, $B: GuestVa, ...) { ... }"
+          - pattern: "fn $F(..., $A: GuestVa, $B: usize, ...) { ... }"
+      - metavariable-regex:
+          metavariable: $F
+          regex: '.*(range|region|span|protect|lock|mmap|munmap).*'
+    message: |
+      Prefer carrick_guest_mem::GuestVaRange for address ranges instead of separate
+      (start, end) or (start, len) parameters to ensure bounds safety.

@@ -874,11 +874,11 @@ pub struct RunSpec {
     /// Initial guest user id (`docker run --user` / image `USER`). The guest's
     /// real/effective/saved/fs uid are all seeded to this. Defaults to 0 (root).
     #[serde(default)]
-    pub uid: u32,
+    pub uid: carrick_abi::NsUid,
     /// Initial guest group id. Defaults to 0 (root); for a numeric `--user UID`
     /// with no group, docker uses gid 0.
     #[serde(default)]
-    pub gid: u32,
+    pub gid: carrick_abi::NsGid,
     /// Launch-time container syscall policy (`--security-opt seccomp=...`).
     /// Serde-defaults to [`SeccompPolicy::ContainerDefault`]: a container spec
     /// is docker-shaped, and docker applies its default profile unless the user

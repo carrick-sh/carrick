@@ -348,7 +348,12 @@ impl SyscallDispatcher {
         }
         let md = self.layered_metadata(path).ok()?;
         let is_dir = md.kind == RootFsEntryKind::Directory;
-        let (uid, gid) = self.fs.rootfs_vfs.overlay.get_owner(path).unwrap_or((0, 0));
+        let (uid, gid) = self
+            .fs
+            .rootfs_vfs
+            .overlay
+            .get_owner(path)
+            .unwrap_or((carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT));
         crate::dispatch::dac_check(
             creds.euid, creds.egid, uid, gid, md.mode, is_dir, LINUX_X_OK,
         )

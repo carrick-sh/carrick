@@ -1610,8 +1610,8 @@ pub(super) struct StatRecord {
     pub(super) ino: u64,
     pub(super) mode: u32,
     pub(super) nlink: u32,
-    pub(super) uid: u32,
-    pub(super) gid: u32,
+    pub(super) uid: carrick_abi::NsUid,
+    pub(super) gid: carrick_abi::NsGid,
     /// Device id this entry REPRESENTS (`st_rdev`) — non-zero only for a
     /// character/block device node materialised by `mknod(2)` (see
     /// `FsBackend::create_device`). Zero for every ordinary file/dir/etc.
@@ -1632,8 +1632,8 @@ impl StatRecord {
             } else {
                 1
             },
-            uid: 0,
-            gid: 0,
+            uid: carrick_abi::NsUid::ROOT,
+            gid: carrick_abi::NsGid::ROOT,
             rdev: 0,
             size: metadata.size as u64,
             atime: (0, 0),
@@ -1670,8 +1670,8 @@ impl StatRecord {
             ino: inode_for_path(&path),
             mode,
             nlink: 1,
-            uid: 0,
-            gid: 0,
+            uid: carrick_abi::NsUid::ROOT,
+            gid: carrick_abi::NsGid::ROOT,
             rdev: 0,
             size: size as u64,
             atime: (0, 0),

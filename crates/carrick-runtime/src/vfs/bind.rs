@@ -152,8 +152,8 @@ fn link_owner_sidecar_path(link: &Path) -> Option<PathBuf> {
 #[cfg(not(target_os = "macos"))]
 fn write_symlink_owner_sidecar(
     link: &Path,
-    uid: Option<u32>,
-    gid: Option<u32>,
+    uid: Option<carrick_abi::NsUid>,
+    gid: Option<carrick_abi::NsGid>,
 ) -> Result<(), VfsError> {
     let Some(sidecar) = link_owner_sidecar_path(link) else {
         return Ok(());
@@ -168,15 +168,17 @@ fn write_symlink_owner_sidecar(
         cur_gid = Some(g);
     }
     let mut buf = [0u8; 8];
-    buf[0..4].copy_from_slice(&cur_uid.unwrap_or(u32::MAX).to_le_bytes());
-    buf[4..8].copy_from_slice(&cur_gid.unwrap_or(u32::MAX).to_le_bytes());
+    buf[0..4].copy_from_slice(&cur_uid.map(|u| u.raw()).unwrap_or(u32::MAX).to_le_bytes());
+    buf[4..8].copy_from_slice(&cur_gid.map(|g| g.raw()).unwrap_or(u32::MAX).to_le_bytes());
     std::fs::write(&sidecar, buf).map_err(map_io_error)
 }
 
 /// Read a symlink's sidecar-stored owner, `(uid, gid)` each `Some` when present.
 /// A `u32::MAX` field means "unset" (lchown never sets uid/gid to -1/`u32::MAX`).
 #[cfg(not(target_os = "macos"))]
-fn read_symlink_owner_sidecar(link: &Path) -> (Option<u32>, Option<u32>) {
+fn read_symlink_owner_sidecar(
+    link: &Path,
+) -> (Option<carrick_abi::NsUid>, Option<carrick_abi::NsGid>) {
     let Some(sidecar) = link_owner_sidecar_path(link) else {
         return (None, None);
     };
@@ -189,7 +191,10 @@ fn read_symlink_owner_sidecar(link: &Path) -> (Option<u32>, Option<u32>) {
     let uid = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     let gid = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
     let unset = |v: u32| (v != u32::MAX).then_some(v);
-    (unset(uid), unset(gid))
+    (
+        unset(uid).map(carrick_abi::NsUid::new),
+        unset(gid).map(carrick_abi::NsGid::new),
+    )
 }
 
 fn read_u32_xattr(host: &Path, name: &str, nofollow: bool) -> Option<u32> {
@@ -249,11 +254,16 @@ fn write_u32_xattr(host: &Path, name: &str, value: u32, nofollow: bool) -> Resul
     Ok(())
 }
 
-fn owner_from_host_xattrs(host: &Path, nofollow: bool) -> (Option<u32>, Option<u32>) {
+fn owner_from_host_xattrs(
+    host: &Path,
+    nofollow: bool,
+) -> (Option<carrick_abi::NsUid>, Option<carrick_abi::NsGid>) {
     #[allow(unused_mut)]
-    let mut uid = read_u32_xattr(host, crate::fs_backend::CARRICK_UID_XATTR_NAME, nofollow);
+    let mut uid = read_u32_xattr(host, crate::fs_backend::CARRICK_UID_XATTR_NAME, nofollow)
+        .map(carrick_abi::NsUid::new);
     #[allow(unused_mut)]
-    let mut gid = read_u32_xattr(host, crate::fs_backend::CARRICK_GID_XATTR_NAME, nofollow);
+    let mut gid = read_u32_xattr(host, crate::fs_backend::CARRICK_GID_XATTR_NAME, nofollow)
+        .map(carrick_abi::NsGid::new);
     // A symlink's owner can't live in an xattr on Linux (the kernel rejects
     // `user.*`/`trusted.*` xattrs on symlinks), so a NOFOLLOW lookup that found
     // no xattr falls back to the adjacent owner sidecar. The sidecar only exists
@@ -275,15 +285,15 @@ fn is_socket_marker(host: &Path, nofollow: bool) -> bool {
 
 fn write_owner_xattrs(
     host: &Path,
-    uid: Option<u32>,
-    gid: Option<u32>,
+    uid: Option<carrick_abi::NsUid>,
+    gid: Option<carrick_abi::NsGid>,
     nofollow: bool,
 ) -> Result<(), VfsError> {
     if let Some(uid) = uid {
         write_u32_xattr(
             host,
             crate::fs_backend::CARRICK_UID_XATTR_NAME,
-            uid,
+            uid.raw(),
             nofollow,
         )?;
     }
@@ -291,7 +301,7 @@ fn write_owner_xattrs(
         write_u32_xattr(
             host,
             crate::fs_backend::CARRICK_GID_XATTR_NAME,
-            gid,
+            gid.raw(),
             nofollow,
         )?;
     }
@@ -313,8 +323,12 @@ fn metadata_from_host(host: &Path, meta: std::fs::Metadata, nofollow: bool) -> M
         kind,
         mode: meta.mode() & 0o7777,
         size: meta.len(),
-        uid: uid.unwrap_or(meta.uid()),
-        gid: gid.unwrap_or(meta.gid()),
+        uid: uid
+            .unwrap_or_else(|| carrick_abi::NsUid::new(meta.uid()))
+            .raw(),
+        gid: gid
+            .unwrap_or_else(|| carrick_abi::NsGid::new(meta.gid()))
+            .raw(),
         mtime_secs: meta.mtime(),
         mtime_nanos: meta.mtime_nsec() as u32,
     }
@@ -338,8 +352,8 @@ fn real_stat_from_host(
         ino: st.st_ino,
         nlink: st.st_nlink as u32,
         mode: st.st_mode as u32 & 0o7777,
-        uid: uid.unwrap_or(st.st_uid),
-        gid: gid.unwrap_or(st.st_gid),
+        uid: uid.unwrap_or_else(|| carrick_abi::NsUid::new(st.st_uid)),
+        gid: gid.unwrap_or_else(|| carrick_abi::NsGid::new(st.st_gid)),
         size: st.st_size.max(0) as u64,
         atime: (st.st_atime, carrick_portable::stat_atime_nsec(st)),
         mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(st)),
@@ -485,7 +499,7 @@ impl Vfs for BindVfs {
             }
         }
         if flags.create && !existed_before_create {
-            let _ = write_owner_xattrs(&host, Some(ctx.euid.raw()), Some(ctx.egid.raw()), false);
+            let _ = write_owner_xattrs(&host, Some(ctx.euid), Some(ctx.egid), false);
         }
 
         let status_flags = if flags.nonblock {
@@ -683,8 +697,8 @@ impl Vfs for BindVfs {
     fn chown(
         &self,
         path: &str,
-        uid: Option<u32>,
-        gid: Option<u32>,
+        uid: Option<carrick_abi::NsUid>,
+        gid: Option<carrick_abi::NsGid>,
         nofollow: bool,
     ) -> Result<(), VfsError> {
         if self.readonly {

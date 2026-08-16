@@ -544,6 +544,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "camino",
+ "carrick-abi",
  "carrick-image",
  "carrick-runtime",
  "carrick-spec",
@@ -771,6 +772,7 @@ name = "carrick-spec"
 version = "0.1.0"
 dependencies = [
  "camino",
+ "carrick-abi",
  "carrick-guest-mem",
  "clap",
  "oci-client",

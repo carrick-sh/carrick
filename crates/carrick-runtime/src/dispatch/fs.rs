@@ -2206,7 +2206,7 @@ impl SyscallDispatcher {
             let creds = self.cred_snapshot();
             if !creds.euid.is_root()
                 && let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, true)
-                && real.uid != creds.euid.raw()
+                && real.uid != creds.euid
             {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
@@ -2445,7 +2445,7 @@ impl SyscallDispatcher {
                         && pmd.mode & 0o2000 != 0
                         && let Some((_, pgid)) = self.fs.rootfs_vfs.overlay.get_owner(&parent_str)
                     {
-                        create_gid = carrick_abi::NsGid::new(pgid);
+                        create_gid = pgid;
                     }
                 }
                 let stamp_owner = !create_uid.is_root() || !create_gid.is_root();
@@ -2462,8 +2462,8 @@ impl SyscallDispatcher {
                     if stamp_owner {
                         let _ = self.fs.rootfs_vfs.overlay.set_owner(
                             &path,
-                            create_uid.raw(),
-                            create_gid.raw(),
+                            Some(create_uid),
+                            Some(create_gid),
                         );
                     }
                     OpenDescription::HostFile {
@@ -2485,8 +2485,8 @@ impl SyscallDispatcher {
                     if stamp_owner {
                         let _ = self.fs.rootfs_vfs.overlay.set_owner(
                             &path,
-                            create_uid.raw(),
-                            create_gid.raw(),
+                            Some(create_uid),
+                            Some(create_gid),
                         );
                     }
                     OpenDescription::File {
@@ -3054,8 +3054,8 @@ impl SyscallDispatcher {
                     } else {
                         on_disk_mode
                     }),
-                uid: uid.unwrap_or(0),
-                gid: gid.unwrap_or(0),
+                uid: uid.unwrap_or(carrick_abi::NsUid::ROOT),
+                gid: gid.unwrap_or(carrick_abi::NsGid::ROOT),
                 size: st.st_size as u64,
                 atime: (st.st_atime, carrick_portable::stat_atime_nsec(&st)),
                 mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
@@ -3148,8 +3148,8 @@ impl SyscallDispatcher {
             } else {
                 on_disk_mode
             }),
-            uid: uid.unwrap_or(0),
-            gid: gid.unwrap_or(0),
+            uid: uid.unwrap_or(carrick_abi::NsUid::ROOT),
+            gid: gid.unwrap_or(carrick_abi::NsGid::ROOT),
             size: st.st_size as u64,
             atime: (st.st_atime, carrick_portable::stat_atime_nsec(&st)),
             mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
@@ -5697,13 +5697,13 @@ impl SyscallDispatcher {
                 .rootfs_vfs
                 .overlay
                 .get_owner(&prefix)
-                .unwrap_or((0, 0));
+                .unwrap_or((carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT));
             // Pick the permission class: owner, then group, else other. (carrick
             // tracks the primary fsgid, not the full supplementary set — a close
             // approximation that the LTP search-permission cases exercise.)
-            let x_bit = if creds.fsuid.raw() == uid {
+            let x_bit = if creds.fsuid == uid {
                 0o100
-            } else if creds.fsgid.raw() == gid {
+            } else if creds.fsgid == gid {
                 0o010
             } else {
                 0o001
@@ -5724,10 +5724,15 @@ impl SyscallDispatcher {
         if md.kind != RootFsEntryKind::Directory {
             return Ok(());
         }
-        let (uid, gid) = self.fs.rootfs_vfs.overlay.get_owner(abs).unwrap_or((0, 0));
-        let x_bit = if creds.fsuid.raw() == uid {
+        let (uid, gid) = self
+            .fs
+            .rootfs_vfs
+            .overlay
+            .get_owner(abs)
+            .unwrap_or((carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT));
+        let x_bit = if creds.fsuid == uid {
             0o100
-        } else if creds.fsgid.raw() == gid {
+        } else if creds.fsgid == gid {
             0o010
         } else {
             0o001
@@ -6077,16 +6082,21 @@ impl SyscallDispatcher {
             .overlay
             .get_owner(path)
             .map(|(_, g)| g)
-            .unwrap_or(0);
-        if file_gid != creds.egid.raw() {
+            .unwrap_or(carrick_abi::NsGid::ROOT);
+        if file_gid != creds.egid {
             return mode & !S_ISGID;
         }
         mode
     }
 
-    fn chown_arg(arg: u64) -> Option<u32> {
+    fn chown_uid_arg(arg: u64) -> Option<carrick_abi::NsUid> {
         let value = arg as u32;
-        (value != u32::MAX).then_some(value)
+        (value != u32::MAX).then_some(carrick_abi::NsUid::new(value))
+    }
+
+    fn chown_gid_arg(arg: u64) -> Option<carrick_abi::NsGid> {
+        let value = arg as u32;
+        (value != u32::MAX).then_some(carrick_abi::NsGid::new(value))
     }
 
     /// Stamp the owner (and, when inherited, the setgid bit) on a freshly
@@ -6107,7 +6117,7 @@ impl SyscallDispatcher {
                 && pmd.mode & S_ISGID != 0
                 && let Some((_, pgid)) = self.fs.rootfs_vfs.overlay.get_owner(&parent_str)
             {
-                owner_gid = carrick_abi::NsGid::new(pgid);
+                owner_gid = pgid;
                 inherited_gid = true;
                 let _ = self
                     .fs
@@ -6121,11 +6131,15 @@ impl SyscallDispatcher {
                 .fs
                 .rootfs_vfs
                 .overlay
-                .set_owner(path, creds.euid.raw(), owner_gid.raw());
+                .set_owner(path, Some(creds.euid), Some(owner_gid));
         }
     }
 
-    fn chown_permission_errno(&self, uid: Option<u32>, gid: Option<u32>) -> Option<LinuxErrno> {
+    fn chown_permission_errno(
+        &self,
+        uid: Option<carrick_abi::NsUid>,
+        gid: Option<carrick_abi::NsGid>,
+    ) -> Option<LinuxErrno> {
         let creds = self.cred_snapshot();
         if creds.euid.is_root() {
             return None;
@@ -6133,7 +6147,7 @@ impl SyscallDispatcher {
         if uid.is_some() {
             return Some(LINUX_EPERM);
         }
-        if gid.is_some_and(|gid| gid != creds.egid.raw()) {
+        if gid.is_some_and(|gid| gid != creds.egid) {
             return Some(LINUX_EPERM);
         }
         None
@@ -6151,7 +6165,7 @@ impl SyscallDispatcher {
             return None;
         }
         match self.fs.rootfs_vfs.overlay.get_owner(path) {
-            Some((owner_uid, _)) if owner_uid != creds.euid.raw() => Some(LINUX_EPERM),
+            Some((owner_uid, _)) if owner_uid != creds.euid => Some(LINUX_EPERM),
             _ => None,
         }
     }
@@ -6164,8 +6178,8 @@ impl SyscallDispatcher {
         &self,
         context: &crate::kernel::KernelContext,
         fd: i32,
-        uid: Option<u32>,
-        gid: Option<u32>,
+        uid: Option<carrick_abi::NsUid>,
+        gid: Option<carrick_abi::NsGid>,
     ) -> DispatchOutcome {
         let path = self
             .open_file(fd)
@@ -6186,11 +6200,7 @@ impl SyscallDispatcher {
                     return DispatchOutcome::errno(errno);
                 }
             } else {
-                let _ = self.fs.rootfs_vfs.overlay.set_owner(
-                    &path,
-                    uid.unwrap_or(u32::MAX),
-                    gid.unwrap_or(u32::MAX),
-                );
+                let _ = self.fs.rootfs_vfs.overlay.set_owner(&path, uid, gid);
             }
             self.clear_setid_on_chown(&path);
             self.dnotify_attrib(context, &path);
@@ -6279,10 +6289,10 @@ impl SyscallDispatcher {
             .rootfs_vfs
             .overlay
             .get_owner(dir_path)
-            .unwrap_or((0, 0));
-        let class_bits = if creds.fsuid.raw() == ouid {
+            .unwrap_or((carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT));
+        let class_bits = if creds.fsuid == ouid {
             mode >> 6
-        } else if creds.fsgid.raw() == ogid {
+        } else if creds.fsgid == ogid {
             mode >> 3
         } else {
             mode
@@ -6316,7 +6326,7 @@ impl SyscallDispatcher {
             .get_owner(entry_path)
             .map(|o| o.0);
         // Allowed only if the caller owns the entry or the directory.
-        entry_owner == Some(creds.fsuid.raw()) || dir_owner == Some(creds.fsuid.raw())
+        entry_owner == Some(creds.fsuid) || dir_owner == Some(creds.fsuid)
     }
 }
 
@@ -7178,12 +7188,12 @@ impl SyscallDispatcher {
                     }
                 }
                 LINUX_F_ADD_SEALS => {
-                    let new_seals = arg as u32;
-                    // Unknown seal bits → EINVAL (before the sealable check, as
-                    // Linux validates the arg first).
-                    if u64::from(new_seals) != arg || new_seals & !LINUX_F_SEAL_ALL != 0 {
+                    let Ok(new_seals_raw) = u32::try_from(arg) else {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                    }
+                    };
+                    let Some(new_seals) = carrick_abi::LinuxMemfdSeals::from_bits(new_seals_raw) else {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    };
                     // Hold the SAME alias-dispatch exclusion mmap/shmat use for
                     // publication, so a sibling cannot race between the seal
                     // check and the new seal becoming visible. Acquire it before
@@ -7193,27 +7203,28 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
                     let mut open = open_file.description.write();
-                    let Some(current) = open.seals() else {
+                    let Some(current_raw) = open.seals() else {
                         // Not a sealable fd (regular file, socket, …).
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     };
+                    let current = carrick_abi::LinuxMemfdSeals::from_bits_retain(current_raw);
                     // F_ADD_SEALS needs the fd open for writing.
                     if open.status_flags() & LINUX_O_ACCMODE == LINUX_O_RDONLY {
                         return Ok(DispatchOutcome::errno(LINUX_EPERM));
                     }
                     // Already fully sealed → no further seals may be added.
-                    if current & LINUX_F_SEAL_SEAL != 0 {
+                    if current.contains(carrick_abi::LinuxMemfdSeals::SEAL) {
                         return Ok(DispatchOutcome::errno(LINUX_EPERM));
                     }
                     // F_SEAL_WRITE cannot be set while a shared, writable mapping
                     // of the memfd is live (Linux → EBUSY; memfd_create01
                     // test_share_mmap).
-                    if new_seals & LINUX_F_SEAL_WRITE != 0
+                    if new_seals.contains(carrick_abi::LinuxMemfdSeals::WRITE)
                         && this.memfd_has_writable_shared_map(&open_file.description)
                     {
                         return Ok(DispatchOutcome::errno(LINUX_EBUSY));
                     }
-                    open.set_seals(Some(current | new_seals));
+                    open.set_seals(Some((current | new_seals).bits()));
                     DispatchOutcome::Returned { value: 0 }
                 }
                 // Async-I/O owner + signal (F_SETOWN/F_GETOWN, F_SETOWN_EX/
@@ -8239,8 +8250,10 @@ impl SyscallDispatcher {
                         // blocked only by F_SEAL_GROW when it extends the file —
                         // F_SEAL_WRITE does NOT block a pure grow (memfd_create01
                         // seals WRITE then grows via fallocate successfully).
-                        if matches!(base.seals(), Some(s) if s & LINUX_F_SEAL_GROW != 0)
-                            && new_size as usize > contents.len()
+                        if matches!(
+                            base.seals().and_then(carrick_abi::LinuxMemfdSeals::from_bits),
+                            Some(s) if s.contains(carrick_abi::LinuxMemfdSeals::GROW)
+                        ) && new_size as usize > contents.len()
                         {
                             return Ok(DispatchOutcome::errno(LINUX_EPERM));
                         }
@@ -8554,16 +8567,13 @@ impl SyscallDispatcher {
         }
 
         fn close_range(this, cx, first: u64, last: u64, flags: u64) {
-
-            // CLOSE_RANGE_UNSHARE=2 is a no-op for us (single fd table);
-            // CLOSE_RANGE_CLOEXEC=4 would mark fds CLOEXEC instead of
-            // closing — accept the bit and apply CLOEXEC.
-            const CLOSE_RANGE_UNSHARE: u64 = 2;
-            const CLOSE_RANGE_CLOEXEC: u64 = 4;
-            if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || first > last {
+            let Some(flags) = carrick_abi::LinuxCloseRangeFlags::from_bits(flags as u32) else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
+            if first > last {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let cloexec_only = flags & CLOSE_RANGE_CLOEXEC != 0;
+            let cloexec_only = flags.contains(carrick_abi::LinuxCloseRangeFlags::CLOEXEC);
             // Drain matching fds out of the table so we don't iterate a
             // gigantic [first, last] (callers commonly pass last=u32::MAX).
             let fds: Vec<i32> = this
@@ -11900,8 +11910,8 @@ impl SyscallDispatcher {
                     Ok(()) => {
                         let _ = m.vfs.chown(
                             &m.full_path,
-                            Some(creds.euid.raw()),
-                            Some(creds.egid.raw()),
+                            Some(creds.euid),
+                            Some(creds.egid),
                             false,
                         );
                         // inotify IN_CREATE|IN_ISDIR on the parent dir watch.
@@ -11949,7 +11959,7 @@ impl SyscallDispatcher {
                             if let Some((_, pgid)) =
                                 this.fs.rootfs_vfs.overlay.get_owner(&parent_str)
                             {
-                                owner_gid = carrick_abi::NsGid::new(pgid);
+                                owner_gid = pgid;
                                 inherited_gid = true;
                             }
                         }
@@ -11963,7 +11973,7 @@ impl SyscallDispatcher {
                             .fs
                             .rootfs_vfs
                             .overlay
-                            .set_owner(&resolved, creds.euid.raw(), owner_gid.raw());
+                            .set_owner(&resolved, Some(creds.euid), Some(owner_gid));
                     }
                     // inotify IN_CREATE|IN_ISDIR on the parent dir watch.
                     this.inotify_child(&resolved, carrick_abi::LINUX_IN_CREATE, true);
@@ -12047,8 +12057,8 @@ impl SyscallDispatcher {
             if this.fd_is_o_path(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
-            let uid = Self::chown_arg(owner);
-            let gid = Self::chown_arg(group);
+            let uid = Self::chown_uid_arg(owner);
+            let gid = Self::chown_gid_arg(group);
             Ok(this.fchown_by_fd(cx.kernel, fd.0, uid, gid))
 
         }
@@ -12056,12 +12066,15 @@ impl SyscallDispatcher {
         fn fchownat(this, cx, dirfd: u64, pathname: GuestPtr, owner: u64, group: u64, flags: u64) {
 
             let pathname = pathname.0;
-            if flags & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH) != 0 {
+            let Some(at_flags) = carrick_abi::LinuxAtFlags::from_bits(flags) else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
+            if at_flags.bits() & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH) != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let path = read_guest_c_string(&*cx.memory, pathname)?;
             if path.is_empty() {
-                if flags & LINUX_AT_EMPTY_PATH == 0 {
+                if !at_flags.contains(carrick_abi::LinuxAtFlags::EMPTY_PATH) {
                     return Ok(DispatchOutcome::errno(LINUX_ENOENT));
                 }
                 if dirfd == LINUX_AT_FDCWD {
@@ -12072,14 +12085,14 @@ impl SyscallDispatcher {
                 }
                 // AT_EMPTY_PATH operates on the fd ITSELF — record the owner like
                 // fchown (was a silent no-op success that never set_owner'd).
-                let uid = Self::chown_arg(owner);
-                let gid = Self::chown_arg(group);
+                let uid = Self::chown_uid_arg(owner);
+                let gid = Self::chown_gid_arg(group);
                 return Ok(this.fchown_by_fd(cx.kernel, dirfd as i32, uid, gid));
             }
-            let uid = Self::chown_arg(owner);
-            let gid = Self::chown_arg(group);
+            let uid = Self::chown_uid_arg(owner);
+            let gid = Self::chown_gid_arg(group);
             let resolved = this.resolve_at_path(dirfd, &path)?;
-            let nofollow = flags & LINUX_AT_SYMLINK_NOFOLLOW != 0;
+            let nofollow = at_flags.contains(carrick_abi::LinuxAtFlags::SYMLINK_NOFOLLOW);
             if this.fs.vfs_mounts.resolve(&resolved).is_some() {
                 let lookup = {
                     if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
@@ -12124,8 +12137,8 @@ impl SyscallDispatcher {
                     }
                     let _ = this.fs.rootfs_vfs.overlay.set_owner(
                         &resolved,
-                        uid.unwrap_or(u32::MAX),
-                        gid.unwrap_or(u32::MAX),
+                        uid,
+                        gid,
                     );
                     this.clear_setid_on_chown(&resolved);
                     Ok(DispatchOutcome::Returned { value: 0 })
@@ -12505,10 +12518,15 @@ impl SyscallDispatcher {
             // initial seal set is empty; without it F_SEAL_SEAL is preset so no
             // seals can ever be added (F_ADD_SEALS → EPERM) while F_GET_SEALS
             // still succeeds. (memfd_create01)
-            let initial_seals = if flags & LINUX_MFD_ALLOW_SEALING != 0 {
-                0
+            let Some(memfd_flags) =
+                LinuxMemfdFlags::from_bits(flags & LinuxMemfdFlags::KNOWN_MASK)
+            else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
+            let initial_seals = if memfd_flags.contains(LinuxMemfdFlags::ALLOW_SEALING) {
+                carrick_abi::LinuxMemfdSeals::empty().bits()
             } else {
-                LINUX_F_SEAL_SEAL
+                carrick_abi::LinuxMemfdSeals::SEAL.bits()
             };
             // A memfd is opened O_RDWR (memfd_create(2)); F_ADD_SEALS requires
             // the description carry write access (FMODE_WRITE).
@@ -12527,7 +12545,7 @@ impl SyscallDispatcher {
                 base,
                 writable: true,
             };
-            let fd_flags = if flags & LINUX_MFD_CLOEXEC != 0 {
+            let fd_flags = if memfd_flags.contains(LinuxMemfdFlags::CLOEXEC) {
                 LINUX_FD_CLOEXEC
             } else {
                 0
@@ -12538,7 +12556,10 @@ impl SyscallDispatcher {
         fn unlinkat(this, cx, dirfd: u64, pathname: GuestPtr, flags: u64) {
 
             let pathname = pathname.0;
-            if flags & !LINUX_AT_REMOVEDIR != 0 {
+            let Some(at_flags) = carrick_abi::LinuxAtFlags::from_bits(flags) else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
+            if at_flags.bits() & !LINUX_AT_REMOVEDIR != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let path = read_guest_c_string(&*cx.memory, pathname)?;
@@ -12546,7 +12567,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
             }
             let resolved = this.resolve_at_path(dirfd, &path)?;
-            let remove_dir = flags & LINUX_AT_REMOVEDIR != 0;
+            let remove_dir = at_flags.contains(carrick_abi::LinuxAtFlags::REMOVEDIR);
             // Synthetic /proc /sys paths can't be unlinked.
             if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context(cx.kernel)) {
                 return Ok(DispatchOutcome::errno(LINUX_EROFS));
@@ -12812,10 +12833,12 @@ impl SyscallDispatcher {
         }
 
         fn newfstatat(this, cx, dirfd: u64, pathname: GuestPtr, statbuf: GuestPtr, flags: u64) {
-
+            let Some(at_flags) = carrick_abi::LinuxAtFlags::from_bits(flags) else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
             // Only AT_SYMLINK_NOFOLLOW, AT_NO_AUTOMOUNT and AT_EMPTY_PATH are
             // valid; any other bit is EINVAL (fstatat01 case 4 passes flags=9999).
-            if flags & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_NO_AUTOMOUNT | LINUX_AT_EMPTY_PATH) != 0 {
+            if at_flags.bits() & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_NO_AUTOMOUNT | LINUX_AT_EMPTY_PATH) != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let pathname = pathname.0;

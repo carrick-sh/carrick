@@ -31,6 +31,7 @@
 //! backend live behind the same trait.
 
 use crate::linux_abi::LinuxErrno;
+use carrick_abi::{NsGid, NsUid};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -100,8 +101,8 @@ pub struct RealStat {
     /// Guest-visible owner uid/gid (`st_uid`/`st_gid`). Tracked in xattrs
     /// because carrick can't really chown the scratch as a non-root macOS
     /// process; defaults to 0 (root) when unset.
-    pub uid: u32,
-    pub gid: u32,
+    pub uid: NsUid,
+    pub gid: NsGid,
     pub size: u64,
     /// Last-access time `(sec, nsec)` from the real on-disk inode.
     pub atime: (i64, i64),
@@ -480,16 +481,21 @@ pub trait FsBackend: Send + Sync {
         Err(BackendError::Unsupported)
     }
 
-    /// Set the guest-visible owner of `path` (`u32::MAX` = leave unchanged, the
-    /// `chown(-1)` sentinel). Default: no-op success (tmpfs-like). The host
-    /// backend records it durably in xattrs since it can't really chown.
-    fn set_owner(&self, _path: &str, _uid: u32, _gid: u32) -> Result<(), BackendError> {
+    /// Set the guest-visible owner of `path`. Pass `None` to leave unchanged.
+    /// Default: no-op success (tmpfs-like). The host backend records it durably
+    /// in xattrs since it can't really chown.
+    fn set_owner(
+        &self,
+        _path: &str,
+        _uid: Option<NsUid>,
+        _gid: Option<NsGid>,
+    ) -> Result<(), BackendError> {
         Ok(())
     }
 
     /// Read the guest-visible (uid, gid) of `path`, or `None` if unknown.
     /// Defaults to root (0,0) on backends that don't track ownership.
-    fn get_owner(&self, _path: &str) -> Option<(u32, u32)> {
+    fn get_owner(&self, _path: &str) -> Option<(NsUid, NsGid)> {
         None
     }
 
@@ -3162,8 +3168,8 @@ impl HostFsBackend {
             } else {
                 on_disk_mode
             }),
-            uid: uid.unwrap_or(0),
-            gid: gid.unwrap_or(0),
+            uid: uid.unwrap_or(NsUid::ROOT),
+            gid: gid.unwrap_or(NsGid::ROOT),
             size: st.st_size as u64,
             atime: (st.st_atime, carrick_portable::stat_atime_nsec(&st)),
             mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
@@ -3350,8 +3356,8 @@ impl HostFsBackend {
             } else {
                 on_disk_mode
             }),
-            uid: uid.unwrap_or(0),
-            gid: gid.unwrap_or(0),
+            uid: uid.unwrap_or(NsUid::ROOT),
+            gid: gid.unwrap_or(NsGid::ROOT),
             size: st.st_size as u64,
             atime: (st.st_atime, carrick_portable::stat_atime_nsec(&st)),
             mtime: (st.st_mtime, carrick_portable::stat_mtime_nsec(&st)),
@@ -3872,7 +3878,7 @@ pub(crate) fn fget_rdev_xattr(fd: std::os::fd::RawFd) -> Option<u64> {
 /// if the name buffer is too small (a file with unusually many xattrs).
 pub(crate) fn fd_carrick_meta(
     fd: std::os::fd::RawFd,
-) -> (Option<u32>, Option<u32>, Option<u32>, bool) {
+) -> (Option<u32>, Option<NsUid>, Option<NsGid>, bool) {
     let mut names = [0u8; 1024];
     let n = unsafe {
         carrick_portable::flistxattr(fd, names.as_mut_ptr() as *mut libc::c_char, names.len())
@@ -3882,8 +3888,8 @@ pub(crate) fn fd_carrick_meta(
         // attribute directly (correct, just not collapsed). Rare on scratch.
         return (
             fget_u32_xattr(fd, CARRICK_MODE_XATTR),
-            fget_u32_xattr(fd, CARRICK_UID_XATTR),
-            fget_u32_xattr(fd, CARRICK_GID_XATTR),
+            fget_u32_xattr(fd, CARRICK_UID_XATTR).map(NsUid::new),
+            fget_u32_xattr(fd, CARRICK_GID_XATTR).map(NsGid::new),
             fget_u32_xattr(fd, CARRICK_SOCKET_XATTR).is_some(),
         );
     }
@@ -3894,17 +3900,17 @@ pub(crate) fn fd_carrick_meta(
     let read_if = |present: bool, name| present.then(|| fget_u32_xattr(fd, name)).flatten();
     (
         read_if(has(CARRICK_MODE_XATTR), CARRICK_MODE_XATTR),
-        read_if(has(CARRICK_UID_XATTR), CARRICK_UID_XATTR),
-        read_if(has(CARRICK_GID_XATTR), CARRICK_GID_XATTR),
+        read_if(has(CARRICK_UID_XATTR), CARRICK_UID_XATTR).map(NsUid::new),
+        read_if(has(CARRICK_GID_XATTR), CARRICK_GID_XATTR).map(NsGid::new),
         has(CARRICK_SOCKET_XATTR),
     )
 }
 
 /// Read the (uid, gid) owner xattrs from a fd. `None` for either if unset.
-pub(crate) fn fget_owner_xattr(fd: std::os::fd::RawFd) -> (Option<u32>, Option<u32>) {
+pub(crate) fn fget_owner_xattr(fd: std::os::fd::RawFd) -> (Option<NsUid>, Option<NsGid>) {
     (
-        fget_u32_xattr(fd, CARRICK_UID_XATTR),
-        fget_u32_xattr(fd, CARRICK_GID_XATTR),
+        fget_u32_xattr(fd, CARRICK_UID_XATTR).map(NsUid::new),
+        fget_u32_xattr(fd, CARRICK_GID_XATTR).map(NsGid::new),
     )
 }
 
@@ -4273,59 +4279,61 @@ fn read_owner_xattr(
     rel: &Path,
     is_dir: bool,
     symlink: bool,
-) -> (Option<u32>, Option<u32>) {
-    if symlink {
-        return (
+) -> (Option<NsUid>, Option<NsGid>) {
+    let (uid, gid) = if symlink {
+        (
             symlink_get_u32_xattr(dir, rel, CARRICK_UID_XATTR),
             symlink_get_u32_xattr(dir, rel, CARRICK_GID_XATTR),
-        );
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = is_dir;
-        (
-            path_get_u32_xattr(dir, rel, CARRICK_UID_XATTR, false),
-            path_get_u32_xattr(dir, rel, CARRICK_GID_XATTR, false),
         )
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        with_entry_fd(dir, rel, is_dir, false, |fd| {
+    } else {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = is_dir;
             (
-                fget_u32_xattr(fd, CARRICK_UID_XATTR),
-                fget_u32_xattr(fd, CARRICK_GID_XATTR),
+                path_get_u32_xattr(dir, rel, CARRICK_UID_XATTR, false),
+                path_get_u32_xattr(dir, rel, CARRICK_GID_XATTR, false),
             )
-        })
-        .unwrap_or((None, None))
-    }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            with_entry_fd(dir, rel, is_dir, false, |fd| {
+                (
+                    fget_u32_xattr(fd, CARRICK_UID_XATTR),
+                    fget_u32_xattr(fd, CARRICK_GID_XATTR),
+                )
+            })
+            .unwrap_or((None, None))
+        }
+    };
+    (uid.map(NsUid::new), gid.map(NsGid::new))
 }
 
-/// Write the guest owner uid/gid xattrs for `rel`. A value of `u32::MAX`
-/// (the `chown(-1)` sentinel) leaves that field unchanged. Best-effort.
+/// Write the guest owner uid/gid xattrs for `rel`. Pass `None` to leave unchanged.
+/// Best-effort.
 pub(crate) fn write_owner_xattr(
     dir: &cap_std::fs::Dir,
     rel: &Path,
     is_dir: bool,
     symlink: bool,
-    uid: u32,
-    gid: u32,
+    uid: Option<NsUid>,
+    gid: Option<NsGid>,
 ) {
     if symlink {
         // lchown: the owner lives on the LINK itself (XATTR_NOFOLLOW).
-        if uid != u32::MAX {
-            symlink_set_u32_xattr(dir, rel, CARRICK_UID_XATTR, uid);
+        if let Some(uid) = uid {
+            symlink_set_u32_xattr(dir, rel, CARRICK_UID_XATTR, uid.raw());
         }
-        if gid != u32::MAX {
-            symlink_set_u32_xattr(dir, rel, CARRICK_GID_XATTR, gid);
+        if let Some(gid) = gid {
+            symlink_set_u32_xattr(dir, rel, CARRICK_GID_XATTR, gid.raw());
         }
         return;
     }
     let _ = with_entry_fd(dir, rel, is_dir, !is_dir, |fd| {
-        if uid != u32::MAX {
-            fset_u32_xattr(fd, CARRICK_UID_XATTR, uid);
+        if let Some(uid) = uid {
+            fset_u32_xattr(fd, CARRICK_UID_XATTR, uid.raw());
         }
-        if gid != u32::MAX {
-            fset_u32_xattr(fd, CARRICK_GID_XATTR, gid);
+        if let Some(gid) = gid {
+            fset_u32_xattr(fd, CARRICK_GID_XATTR, gid.raw());
         }
     });
 }
@@ -5944,7 +5952,12 @@ impl FsBackend for HostFsBackend {
         Ok(())
     }
 
-    fn set_owner(&self, path: &str, uid: u32, gid: u32) -> Result<(), BackendError> {
+    fn set_owner(
+        &self,
+        path: &str,
+        uid: Option<NsUid>,
+        gid: Option<NsGid>,
+    ) -> Result<(), BackendError> {
         self.stamp_root_marker(CARRICK_HAS_META_XATTRS_XATTR, &self.meta_xattr_seen);
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
@@ -5967,11 +5980,11 @@ impl FsBackend for HostFsBackend {
                 .map(|m| m.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32)
                 .unwrap_or(false);
             if !symlink && is_fifo {
-                if uid != u32::MAX {
-                    path_set_u32_xattr(&dir, &at_rel, CARRICK_UID_XATTR, uid);
+                if let Some(uid) = uid {
+                    path_set_u32_xattr(&dir, &at_rel, CARRICK_UID_XATTR, uid.raw());
                 }
-                if gid != u32::MAX {
-                    path_set_u32_xattr(&dir, &at_rel, CARRICK_GID_XATTR, gid);
+                if let Some(gid) = gid {
+                    path_set_u32_xattr(&dir, &at_rel, CARRICK_GID_XATTR, gid.raw());
                 }
                 return Ok(());
             }
@@ -5980,7 +5993,7 @@ impl FsBackend for HostFsBackend {
         Ok(())
     }
 
-    fn get_owner(&self, path: &str) -> Option<(u32, u32)> {
+    fn get_owner(&self, path: &str) -> Option<(NsUid, NsGid)> {
         use cap_std::fs::MetadataExt;
         let normalized = normalize(path)?;
         let rel = Self::rel_path(&normalized)?;
@@ -5996,13 +6009,16 @@ impl FsBackend for HostFsBackend {
             {
                 let uid = path_get_u32_xattr(&dir, &at_rel, CARRICK_UID_XATTR, false);
                 let gid = path_get_u32_xattr(&dir, &at_rel, CARRICK_GID_XATTR, false);
-                return Some((uid.unwrap_or(0), gid.unwrap_or(0)));
+                return Some((
+                    uid.map(NsUid::new).unwrap_or(NsUid::ROOT),
+                    gid.map(NsGid::new).unwrap_or(NsGid::ROOT),
+                ));
             }
             #[cfg(not(target_os = "macos"))]
-            return Some((0, 0));
+            return Some((NsUid::ROOT, NsGid::ROOT));
         }
         let (uid, gid) = read_owner_xattr(&dir, &at_rel, meta.is_dir(), meta.is_symlink());
-        Some((uid.unwrap_or(0), gid.unwrap_or(0)))
+        Some((uid.unwrap_or(NsUid::ROOT), gid.unwrap_or(NsGid::ROOT)))
     }
 
     fn set_times(
@@ -6636,8 +6652,10 @@ impl FsBackend for HostFsBackend {
                     Some((dir, at_rel)) => (
                         None,
                         (
-                            path_get_u32_xattr(dir, at_rel, CARRICK_UID_XATTR, false),
-                            path_get_u32_xattr(dir, at_rel, CARRICK_GID_XATTR, false),
+                            path_get_u32_xattr(dir, at_rel, CARRICK_UID_XATTR, false)
+                                .map(NsUid::new),
+                            path_get_u32_xattr(dir, at_rel, CARRICK_GID_XATTR, false)
+                                .map(NsGid::new),
                         ),
                     ),
                     None => (None, (None, None)),
@@ -6654,8 +6672,8 @@ impl FsBackend for HostFsBackend {
                 Some((dir, at_rel)) => (
                     None,
                     (
-                        symlink_get_u32_xattr(dir, at_rel, CARRICK_UID_XATTR),
-                        symlink_get_u32_xattr(dir, at_rel, CARRICK_GID_XATTR),
+                        symlink_get_u32_xattr(dir, at_rel, CARRICK_UID_XATTR).map(NsUid::new),
+                        symlink_get_u32_xattr(dir, at_rel, CARRICK_GID_XATTR).map(NsGid::new),
                     ),
                 ),
                 None => (None, (None, None)),
@@ -6677,8 +6695,8 @@ impl FsBackend for HostFsBackend {
             ino: meta.ino(),
             nlink: meta.nlink() as u32,
             mode: override_mode.unwrap_or(if mode == 0 { default_mode } else { mode }),
-            uid: owner.0.unwrap_or(0),
-            gid: owner.1.unwrap_or(0),
+            uid: owner.0.unwrap_or(NsUid::ROOT),
+            gid: owner.1.unwrap_or(NsGid::ROOT),
             size: meta.len(),
             atime: (meta.atime(), meta.atime_nsec()),
             mtime: (meta.mtime(), meta.mtime_nsec()),
@@ -8027,7 +8045,12 @@ mod tests {
 
         b.set_file_contents("/f", b"x".to_vec()).unwrap();
         b.set_mode("/f", 0o600).unwrap();
-        b.set_owner("/f", 123, 456).unwrap();
+        b.set_owner(
+            "/f",
+            Some(carrick_abi::NsUid::new(123)),
+            Some(carrick_abi::NsGid::new(456)),
+        )
+        .unwrap();
 
         for name in [
             CARRICK_MODE_XATTR_NAME,
