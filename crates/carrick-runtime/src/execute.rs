@@ -125,7 +125,7 @@ fn prepare_host_root(
 fn cached_lower_enabled(execution_plan: &crate::page_profile::ExecutionPlan) -> bool {
     #[cfg(target_os = "macos")]
     {
-        execution_plan.backend == crate::page_profile::ExecutionBackend::Native
+        execution_plan.backend == crate::page_profile::ExecutionBackend::HvPatch
             && std::env::var_os("CARRICK_FS_CACHED_LOWER").as_deref()
                 != Some(std::ffi::OsStr::new("0"))
     }
@@ -204,12 +204,10 @@ impl Runtime {
             rosetta_license_notice();
         }
         let execution_plan = crate::page_profile::resolve_execution_plan(spec)?;
-        if execution_plan.backend != crate::page_profile::ExecutionBackend::Native {
-            debug_assert_eq!(
-                execution_plan.page_geometry.linux_page_size,
-                crate::page_profile::DEFAULT_LINUX_PAGE_SIZE
-            );
-        }
+        debug_assert_eq!(
+            execution_plan.page_geometry.linux_page_size,
+            crate::page_profile::DEFAULT_LINUX_PAGE_SIZE
+        );
         // Container launch (`carrick run <image>`) places the root guest in a
         // fresh PID namespace so its init sees getpid()==1, ns-local child
         // pids, and an ns-filtered /proc — the headline docker-run behavior
@@ -402,28 +400,15 @@ impl Runtime {
                     .debug_state_path
                     .as_ref()
                     .map(|p| PathBuf::from(p.as_std_path()));
-                let run_result =
-                    if execution_plan.backend == crate::page_profile::ExecutionBackend::Native {
-                        crate::native::run_oci_native(
-                            &spec.executable,
-                            dispatcher,
-                            spec.argv.clone(),
-                            env,
-                            spec.max_traps,
-                            debug_path.as_ref(),
-                            &execution_plan,
-                        )
-                    } else {
-                        run_elf_from_dispatcher_with_backend_debug(
-                            &spec.executable,
-                            dispatcher,
-                            spec.argv.clone(),
-                            env,
-                            spec.max_traps,
-                            debug_path.as_ref(),
-                            execution_plan.backend,
-                        )
-                    };
+                let run_result = run_elf_from_dispatcher_with_backend_debug(
+                    &spec.executable,
+                    dispatcher,
+                    spec.argv.clone(),
+                    env,
+                    spec.max_traps,
+                    debug_path.as_ref(),
+                    execution_plan.backend,
+                );
                 match run_result {
                     Ok(r) => r,
                     Err(e) if is_entrypoint_not_found(&e) => {
@@ -523,28 +508,15 @@ impl Runtime {
                     .debug_state_path
                     .as_ref()
                     .map(|p| PathBuf::from(p.as_std_path()));
-                let run_result =
-                    if execution_plan.backend == crate::page_profile::ExecutionBackend::Native {
-                        crate::native::run_oci_native(
-                            &spec.executable,
-                            dispatcher,
-                            spec.argv.clone(),
-                            env,
-                            spec.max_traps,
-                            debug_path.as_ref(),
-                            &execution_plan,
-                        )
-                    } else {
-                        run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
-                            &spec.executable,
-                            &rootfs,
-                            dispatcher,
-                            spec.argv.clone(),
-                            env,
-                            spec.max_traps,
-                            debug_path.as_ref(),
-                        )
-                    };
+                let run_result = run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
+                    &spec.executable,
+                    &rootfs,
+                    dispatcher,
+                    spec.argv.clone(),
+                    env,
+                    spec.max_traps,
+                    debug_path.as_ref(),
+                );
                 match run_result {
                     Ok(r) => r,
                     Err(e) if is_entrypoint_not_found(&e) => {
@@ -835,7 +807,7 @@ mod exit_code_tests {
         RuntimeError::AddressSpace(AddressSpaceError::Elf(ElfInspectError::NotElf))
     }
 
-    fn native_run_spec(page_profile: NativePageProfileRequest) -> RunSpec {
+    fn hvpatch_run_spec() -> RunSpec {
         RunSpec {
             executable: "/bin/sh".to_string(),
             argv: vec!["/bin/sh".to_string()],
@@ -850,8 +822,8 @@ mod exit_code_tests {
             max_traps: 100,
             debug_state_path: None,
             platform: Platform::Aarch64,
-            exec_backend: ExecBackendRequest::Native,
-            native_page_profile: page_profile,
+            exec_backend: ExecBackendRequest::HvPatch,
+            native_page_profile: NativePageProfileRequest::Auto,
             pid: PidMode::Host,
             hostname: None,
             network: NetworkNamespaceSpec::default(),
@@ -972,9 +944,9 @@ mod exit_code_tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn explicit_native_linux4k_uses_container_entrypoint_resolution() {
-        let result = Runtime::execute(&native_run_spec(NativePageProfileRequest::Linux4k))
-            .expect("native container setup should classify a missing entrypoint");
+    fn hvpatch_uses_container_entrypoint_resolution() {
+        let result = Runtime::execute(&hvpatch_run_spec())
+            .expect("hvpatch container setup should classify a missing entrypoint");
 
         assert_eq!(result.exit_code, 127);
         assert!(result.stdout.is_empty());

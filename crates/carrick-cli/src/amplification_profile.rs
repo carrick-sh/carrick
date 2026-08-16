@@ -978,7 +978,7 @@ pub(crate) fn fixture_target() -> crate::native_shape_profile::NativeShapeTarget
         &[
             "run".to_owned(),
             "--exec-backend".to_owned(),
-            "native".to_owned(),
+            "hvpatch".to_owned(),
             format!("docker.io/library/ubuntu@sha256:{}", "aa".repeat(32)),
             "/bin/true".to_owned(),
         ],

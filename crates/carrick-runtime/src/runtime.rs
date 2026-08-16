@@ -155,7 +155,7 @@ pub use crate::trap::SyscallTrap;
 // native backend resolves them on every host OS. Re-exported here so the
 // original `crate::runtime::…` paths are unchanged on this arm.
 pub(crate) use crate::vdso_policy::{
-    debug_env_flag_enabled, vdso_enabled_for_debug, with_optional_vdso, with_optional_vdso_at,
+    debug_env_flag_enabled, vdso_enabled_for_debug, with_optional_vdso,
 };
 
 pub use crate::debug_state::{DebugRegionSnapshot, DebugStateSnapshot, maybe_dump_debug_state};
@@ -306,16 +306,6 @@ where
     )?;
     dispatcher.set_execution_backend(plan.backend);
     match plan.backend {
-        crate::page_profile::ExecutionBackend::Vmm => {
-            run_static_elf_with_hvf_args_and_dispatcher_debug(
-                path,
-                dispatcher,
-                argv,
-                env,
-                options.max_traps,
-                options.debug_state_path,
-            )
-        }
         crate::page_profile::ExecutionBackend::HvPatch => crate::hvpatch::run_static_hvpatch(
             path.as_ref(),
             dispatcher,
@@ -323,15 +313,6 @@ where
             env,
             options.max_traps,
             options.debug_state_path,
-        ),
-        crate::page_profile::ExecutionBackend::Native => crate::native::run_static_native(
-            path.as_ref(),
-            dispatcher,
-            argv,
-            env,
-            options.max_traps,
-            options.debug_state_path,
-            &plan,
         ),
     }
 }
@@ -489,7 +470,7 @@ where
         env,
         max_traps,
         debug_state_path,
-        crate::page_profile::ExecutionBackend::Vmm,
+        crate::page_profile::ExecutionBackend::HvPatch,
     )
 }
 
@@ -915,7 +896,6 @@ fn with_hvf_syscall_mailbox(image: AddressSpace) -> Result<AddressSpace, Address
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImageFinalizer {
-    Vmm,
     HvPatch,
 }
 
@@ -927,11 +907,7 @@ fn image_finalizer_for_backend(
     backend: crate::page_profile::ExecutionBackend,
 ) -> Result<ImageFinalizer, RuntimeError> {
     match backend {
-        crate::page_profile::ExecutionBackend::Vmm => Ok(ImageFinalizer::Vmm),
         crate::page_profile::ExecutionBackend::HvPatch => Ok(ImageFinalizer::HvPatch),
-        crate::page_profile::ExecutionBackend::Native => Err(RuntimeError::Unsupported(
-            "native images must use the native backend finalizer".to_string(),
-        )),
     }
 }
 
@@ -943,7 +919,6 @@ fn finish_image_for_backend(
     backend: crate::page_profile::ExecutionBackend,
 ) -> Result<RunResult, RuntimeError> {
     match image_finalizer_for_backend(backend)? {
-        ImageFinalizer::Vmm => finish_and_run_image(image, dispatcher, max_traps, debug_state_path),
         ImageFinalizer::HvPatch => {
             crate::hvpatch::finish_hvpatch_image(image, dispatcher, max_traps, debug_state_path)
         }
@@ -2600,17 +2575,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn image_finalizer_routes_hvpatch_without_native_fallthrough() {
-        assert_eq!(
-            image_finalizer_for_backend(crate::page_profile::ExecutionBackend::Vmm).unwrap(),
-            ImageFinalizer::Vmm
-        );
+    fn image_finalizer_routes_hvpatch() {
         assert_eq!(
             image_finalizer_for_backend(crate::page_profile::ExecutionBackend::HvPatch).unwrap(),
             ImageFinalizer::HvPatch
-        );
-        assert!(
-            image_finalizer_for_backend(crate::page_profile::ExecutionBackend::Native).is_err()
         );
     }
 
@@ -2618,12 +2586,6 @@ mod tests {
     fn only_hvpatch_selects_persistent_hvf_vm_lifecycle() {
         assert!(persistent_hvf_vm_lifecycle(
             crate::page_profile::ExecutionBackend::HvPatch
-        ));
-        assert!(!persistent_hvf_vm_lifecycle(
-            crate::page_profile::ExecutionBackend::Vmm
-        ));
-        assert!(!persistent_hvf_vm_lifecycle(
-            crate::page_profile::ExecutionBackend::Native
         ));
     }
 

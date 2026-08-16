@@ -1804,7 +1804,7 @@ mod tests {
                 workdir: Some("/w".into()),
                 user: Some("1000".into()),
                 hostname: None,
-                exec_backend: carrick_spec::ExecBackendRequest::Native,
+                exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
                 native_page_profile: carrick_spec::NativePageProfileRequest::Linux4k,
                 pid: carrick_spec::PidMode::Private,
                 network: carrick_spec::NetworkMode::Host,
@@ -1857,7 +1857,7 @@ mod tests {
         assert_eq!(req.fs, Some(carrick_spec::FsBackendKind::Host));
         assert!(req.tty);
         assert_eq!(req.max_traps, 4242);
-        assert_eq!(req.exec_backend, carrick_spec::ExecBackendRequest::Native);
+        assert_eq!(req.exec_backend, carrick_spec::ExecBackendRequest::HvPatch);
         assert_eq!(
             req.native_page_profile,
             carrick_spec::NativePageProfileRequest::Linux4k
@@ -1871,18 +1871,21 @@ mod tests {
     }
 
     #[test]
-    fn create_and_relaunch_preserve_explicit_vmm_backend() {
+    fn create_and_relaunch_preserve_explicit_hvpatch_backend() {
         let mut req = rebuild_request_from_state(&sample_state());
-        req.exec_backend = carrick_spec::ExecBackendRequest::Vmm;
+        req.exec_backend = carrick_spec::ExecBackendRequest::HvPatch;
 
         let state = build_created_state(&req, "container-id", None, 17, None);
         assert_eq!(
             state.config.exec_backend,
-            carrick_spec::ExecBackendRequest::Vmm
+            carrick_spec::ExecBackendRequest::HvPatch
         );
 
         let rebuilt = rebuild_request_from_state(&state);
-        assert_eq!(rebuilt.exec_backend, carrick_spec::ExecBackendRequest::Vmm);
+        assert_eq!(
+            rebuilt.exec_backend,
+            carrick_spec::ExecBackendRequest::HvPatch
+        );
     }
 
     #[test]

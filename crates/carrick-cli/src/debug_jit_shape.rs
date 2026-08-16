@@ -1846,7 +1846,7 @@ mod tests {
         let target_argv = vec![
             "run".to_owned(),
             "--exec-backend".to_owned(),
-            "native".to_owned(),
+            "hvpatch".to_owned(),
             "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             "/bin/true".to_owned(),
         ];

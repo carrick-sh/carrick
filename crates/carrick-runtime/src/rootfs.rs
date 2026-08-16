@@ -93,9 +93,7 @@ use flate2::read::GzDecoder;
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::fs_backend::{
-    FsBackend, HostFsBackend, HostFsReexecAuthority, ImmutableHostFileOpen, RealStat,
-};
+use crate::fs_backend::{FsBackend, HostFsBackend, ImmutableHostFileOpen, RealStat};
 
 const WHITEOUT_PREFIX: &str = ".wh.";
 const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
@@ -121,26 +119,6 @@ pub struct RootFs {
 #[derive(Debug, Clone)]
 struct ImmutableHostRoot {
     backend: Arc<HostFsBackend>,
-    authority: ImmutableHostRootAuthority,
-}
-
-/// Exact authority for reopening a shared immutable host lower after native
-/// PID-preserving self-reexec. Unlike the writable upper authority, cleanup is
-/// forbidden: no process that merely consumes a cache entry may delete it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct ImmutableHostRootAuthority(HostFsReexecAuthority);
-
-impl ImmutableHostRootAuthority {
-    pub(crate) fn capsule_shape_is_valid(&self, max_path_len: usize) -> bool {
-        !self.0.cleanup_on_drop
-            && !self.0.root_path.is_empty()
-            && self.0.root_path.len() <= max_path_len
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_cleanup_on_drop_for_test(&mut self, cleanup: bool) {
-        self.0.cleanup_on_drop = cleanup;
-    }
 }
 
 impl PartialEq for RootFs {
@@ -148,8 +126,11 @@ impl PartialEq for RootFs {
         self.files == other.files
             && self.directories == other.directories
             && self.symlinks == other.symlinks
-            && self.immutable_host.as_ref().map(|host| &host.authority)
-                == other.immutable_host.as_ref().map(|host| &host.authority)
+            && match (&self.immutable_host, &other.immutable_host) {
+                (Some(a), Some(b)) => Arc::ptr_eq(&a.backend, &b.backend),
+                (None, None) => true,
+                _ => false,
+            }
     }
 }
 
@@ -482,35 +463,6 @@ impl RootFs {
             symlinks: HashMap::new(),
             immutable_host: Some(ImmutableHostRoot {
                 backend: Arc::new(backend),
-                authority: ImmutableHostRootAuthority(authority),
-            }),
-        })
-    }
-
-    pub(crate) fn immutable_host_authority(&self) -> Option<ImmutableHostRootAuthority> {
-        self.immutable_host
-            .as_ref()
-            .map(|host| host.authority.clone())
-    }
-
-    pub(crate) fn from_immutable_host_authority(
-        authority: &ImmutableHostRootAuthority,
-    ) -> Result<Self, RootFsError> {
-        if authority.0.cleanup_on_drop {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "immutable host lower authority requested cleanup",
-            )
-            .into());
-        }
-        let backend = HostFsBackend::attach_for_reexec(&authority.0)?;
-        Ok(Self {
-            files: HashMap::new(),
-            directories: HashSet::new(),
-            symlinks: HashMap::new(),
-            immutable_host: Some(ImmutableHostRoot {
-                backend: Arc::new(backend),
-                authority: authority.clone(),
             }),
         })
     }

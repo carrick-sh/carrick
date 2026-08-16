@@ -589,7 +589,7 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
             pull: carrick_image::PullPolicy::Missing,
-            exec_backend: carrick_spec::ExecBackendRequest::Native,
+            exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
             native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
             pid: PidMode::default(),
             network: NetworkMode::Host,
@@ -614,28 +614,17 @@ mod tests {
     #[test]
     fn execution_backend_and_page_profile_flow_into_run_spec() {
         let mut req = base_req(None);
-        req.exec_backend = carrick_spec::ExecBackendRequest::Native;
+        req.exec_backend = carrick_spec::ExecBackendRequest::HvPatch;
         req.native_page_profile = carrick_spec::NativePageProfileRequest::Linux4k;
 
         let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
         let spec = resolve_run_spec(req, image).expect("resolve run spec");
 
-        assert_eq!(spec.exec_backend, carrick_spec::ExecBackendRequest::Native);
+        assert_eq!(spec.exec_backend, carrick_spec::ExecBackendRequest::HvPatch);
         assert_eq!(
             spec.native_page_profile,
             carrick_spec::NativePageProfileRequest::Linux4k
         );
-    }
-
-    #[test]
-    fn portable_vmm_backend_flows_into_run_spec() {
-        let mut req = base_req(None);
-        req.exec_backend = carrick_spec::ExecBackendRequest::Vmm;
-
-        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
-        let spec = resolve_run_spec(req, image).expect("resolve vmm request");
-
-        assert_eq!(spec.exec_backend, carrick_spec::ExecBackendRequest::Vmm);
     }
 
     #[test]
@@ -843,7 +832,7 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
             pull: carrick_image::PullPolicy::Missing,
-            exec_backend: carrick_spec::ExecBackendRequest::Native,
+            exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
             native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
             pid: PidMode::default(),
             network: NetworkMode::Host,
@@ -894,7 +883,7 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
             pull: carrick_image::PullPolicy::Missing,
-            exec_backend: carrick_spec::ExecBackendRequest::Native,
+            exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
             native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
             pid: PidMode::default(),
             network: NetworkMode::Host,
@@ -944,7 +933,7 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
             pull: carrick_image::PullPolicy::Missing,
-            exec_backend: carrick_spec::ExecBackendRequest::Native,
+            exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
             native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
             pid: PidMode::default(),
             network: NetworkMode::Host,
@@ -994,7 +983,7 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
             pull: carrick_image::PullPolicy::Missing,
-            exec_backend: carrick_spec::ExecBackendRequest::Native,
+            exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
             native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
             pid: PidMode::default(),
             network: NetworkMode::Host,
@@ -1053,7 +1042,7 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Host),
             pull: carrick_image::PullPolicy::Missing,
-            exec_backend: carrick_spec::ExecBackendRequest::Native,
+            exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
             native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
             pid: PidMode::default(),
             network: NetworkMode::Host,
@@ -1101,7 +1090,7 @@ mod tests {
                 debug_state_path: None,
                 fs: Some(FsBackendKind::Host),
                 pull: carrick_image::PullPolicy::Missing,
-                exec_backend: carrick_spec::ExecBackendRequest::Native,
+                exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
                 native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
                 pid: PidMode::default(),
                 network: NetworkMode::Host,

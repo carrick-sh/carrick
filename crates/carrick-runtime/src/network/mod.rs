@@ -379,25 +379,6 @@ impl RuntimeNetwork {
     pub fn resolve_dns_name(&self, name: &str) -> Result<Vec<Ipv4Addr>, String> {
         self.provider.resolve_dns_name(&self.spec, name)
     }
-
-    pub(crate) fn fork_guard_until(
-        &self,
-        deadline: std::time::Instant,
-    ) -> Option<NetworkForkGuard<'_>> {
-        loop {
-            if let Some(guard) = self.provider.try_fork_guard() {
-                return Some(guard);
-            }
-            if std::time::Instant::now() >= deadline {
-                return None;
-            }
-            std::thread::yield_now();
-        }
-    }
-
-    pub(crate) fn after_fork_child(&self) {
-        self.provider.after_fork_child();
-    }
 }
 
 impl Drop for RuntimeNetwork {

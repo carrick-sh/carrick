@@ -2416,35 +2416,18 @@ mod tests {
     }
 
     #[test]
-    fn exec_replacement_is_repatched_only_for_the_hvpatch_backend() {
+    fn exec_replacement_is_repatched_for_the_hvpatch_backend() {
         let make_image = || {
             AddressSpace::from_segments(0x400000, [(0x400000, RX, text(&[0xd400_0001]), 0x1000)])
                 .unwrap()
         };
 
-        let vmm_dispatcher = SyscallDispatcher::new();
-        let vmm_image = prepare_exec_image_for_dispatcher(make_image(), &vmm_dispatcher)
-            .expect("VMM exec image");
-        assert_eq!(
-            u32::from_le_bytes(vmm_image.regions()[0].bytes()[0..4].try_into().unwrap()),
-            SVC_ZERO,
-            "the mature VMM reload must remain byte-identical"
-        );
-
-        let mut hvpatch_dispatcher = SyscallDispatcher::new();
-        hvpatch_dispatcher.set_execution_backend(crate::page_profile::ExecutionBackend::HvPatch);
+        let hvpatch_dispatcher = SyscallDispatcher::new();
         let hvpatch_image = prepare_exec_image_for_dispatcher(make_image(), &hvpatch_dispatcher)
             .expect("HvPatch exec image");
         assert_ne!(
             u32::from_le_bytes(hvpatch_image.regions()[0].bytes()[0..4].try_into().unwrap()),
             SVC_ZERO,
-            "an HvPatch exec replacement must not silently fall back to VMM text"
-        );
-        assert!(
-            hvpatch_image
-                .regions()
-                .iter()
-                .any(|region| region.start == INFO_PAGE_BASE)
         );
     }
 }

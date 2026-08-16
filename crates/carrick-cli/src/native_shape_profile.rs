@@ -50,7 +50,7 @@ impl NativeShapeTarget {
     /// Parse a target that must name the `native` backend. `native-shape`
     /// censuses DSR translation shapes, which only that backend produces.
     pub(crate) fn parse(label: &str, command: &[String]) -> Result<Self> {
-        Self::parse_for_backends(label, command, &[ExecBackendRequest::Native])
+        Self::parse_for_backends(label, command, &[ExecBackendRequest::HvPatch])
     }
 
     /// Parse a target for a profile that can measure more than one backend.
@@ -154,8 +154,6 @@ fn backend_list(allowed: &[ExecBackendRequest]) -> String {
     allowed
         .iter()
         .map(|backend| match backend {
-            ExecBackendRequest::Native => "native",
-            ExecBackendRequest::Vmm => "vmm",
             ExecBackendRequest::HvPatch => "hvpatch",
         })
         .collect::<Vec<_>>()
@@ -1639,9 +1637,9 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::Path;
 
-    const ARGV_SHA256: &str = "0963ca356c238c24a4e5fe8644feafc07941d94b0cc9e9118a312821b8584f65";
+    const ARGV_SHA256: &str = "d37800dfa53f13f0cee59ecf0769e631c674ecd45963214e8917fa3a4de6ad4c";
     const AUTHORITY_SHA256: &str =
-        "97c2468f4384acb3f176ecbc30a45a3d1aa8f2112213f7059d59424149cb731a";
+        "56466cbb5aaedd017ff5c5b0781a48ae9e662c05c12987d5fb6135eecc2c88f2";
     const FIXTURE_HEADER: &str = concat!(
         "NSHAPE2|header|profile=native-shape|raw_schema=carrick.native-shape.raw.v2",
         "|os_build=26A5388g",
@@ -1649,7 +1647,7 @@ mod tests {
         "|birth_qualification_sha256=3333333333333333333333333333333333333333333333333333333333333333",
         "|terminal_qualification_sha256=4444444444444444444444444444444444444444444444444444444444444444",
         "|sampling_hz=997",
-        "|authority_sha256=97c2468f4384acb3f176ecbc30a45a3d1aa8f2112213f7059d59424149cb731a"
+        "|authority_sha256=56466cbb5aaedd017ff5c5b0781a48ae9e662c05c12987d5fb6135eecc2c88f2"
     );
 
     fn fixture_authority() -> NativeShapeAuthority {
@@ -1667,7 +1665,7 @@ mod tests {
             target_argv: vec![
                 "run".to_owned(),
                 "--exec-backend".to_owned(),
-                "native".to_owned(),
+                "hvpatch".to_owned(),
                 "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
                 "/bin/true".to_owned(),
             ],
@@ -1688,7 +1686,7 @@ mod tests {
             "|birth_qualification_sha256=3333333333333333333333333333333333333333333333333333333333333333",
             "|terminal_qualification_sha256=4444444444444444444444444444444444444444444444444444444444444444",
             "|sampling_hz=997",
-            "|authority_sha256=97c2468f4384acb3f176ecbc30a45a3d1aa8f2112213f7059d59424149cb731a\n",
+            "|authority_sha256=56466cbb5aaedd017ff5c5b0781a48ae9e662c05c12987d5fb6135eecc2c88f2\n",
             "NSHAPE2|fork|parent=10|child=11\n",
             "NSHAPE2|exit|pid=11|reason=1\n",
             "NSHAPE2|exit|pid=10|reason=1\n",
@@ -2508,7 +2506,7 @@ mod tests {
         let accepted_argv = [
             "run".to_owned(),
             "--exec-backend".to_owned(),
-            "native".to_owned(),
+            "hvpatch".to_owned(),
             "docker.io/library/ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             "/bin/true".to_owned(),
         ];
@@ -2552,14 +2550,14 @@ mod tests {
             vec![
                 "run".to_owned(),
                 "--exec-backend".to_owned(),
-                "native".to_owned(),
+                "hvpatch".to_owned(),
                 "ubuntu:24.04".to_owned(),
                 "/bin/true".to_owned(),
             ],
             vec![
                 "run".to_owned(),
                 "--exec-backend".to_owned(),
-                "native".to_owned(),
+                "hvpatch".to_owned(),
                 "ubuntu@sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
                     .to_owned(),
                 "/bin/true".to_owned(),
@@ -2567,7 +2565,7 @@ mod tests {
             vec![
                 "run".to_owned(),
                 "--exec-backend".to_owned(),
-                "native".to_owned(),
+                "hvpatch".to_owned(),
                 digest.to_owned(),
             ],
             Vec::new(),
@@ -2771,9 +2769,9 @@ mod tests {
                 "explicit",
             ),
             (
-                "explicit VMM",
+                "retired VMM",
                 substituted(&["run", "--exec-backend", "vmm", IMAGE, "/bin/true"], IMAGE),
-                "explicit",
+                "retired",
             ),
             (
                 "non-run command",
@@ -2786,7 +2784,7 @@ mod tests {
                     &[
                         "run",
                         "--exec-backend",
-                        "native",
+                        "hvpatch",
                         "ubuntu:24.04",
                         "/bin/true",
                     ],
@@ -2800,7 +2798,7 @@ mod tests {
                     &[
                         "run",
                         "--exec-backend",
-                        "native",
+                        "hvpatch",
                         "ubuntu@sha256:aaaa",
                         "/bin/true",
                     ],
@@ -2810,13 +2808,13 @@ mod tests {
             ),
             (
                 "empty guest command",
-                substituted(&["run", "--exec-backend", "native", IMAGE], IMAGE),
+                substituted(&["run", "--exec-backend", "hvpatch", IMAGE], IMAGE),
                 "target command is empty",
             ),
             (
                 "image differs from argv",
                 substituted(
-                    &["run", "--exec-backend", "native", IMAGE, "/bin/true"],
+                    &["run", "--exec-backend", "hvpatch", IMAGE, "/bin/true"],
                     "docker.io/library/ubuntu@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 ),
                 "image does not match",

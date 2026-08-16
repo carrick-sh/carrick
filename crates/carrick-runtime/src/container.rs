@@ -206,7 +206,7 @@ impl Default for RunConfig {
     fn default() -> Self {
         Self {
             platform: None,
-            exec_backend: carrick_spec::ExecBackendRequest::Native,
+            exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
             native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
             env: Vec::new(),
             workdir: None,
@@ -589,7 +589,7 @@ mod tests {
         assert!(s.config.region_path.is_none());
         assert_eq!(
             s.config.exec_backend,
-            carrick_spec::ExecBackendRequest::Native
+            carrick_spec::ExecBackendRequest::HvPatch
         );
         // Load-bearing: a legacy entry with NO config object must default
         // max_traps to DEFAULT_MAX_TRAPS, not 0 (0 trips the trap limit at once).
@@ -604,7 +604,7 @@ mod tests {
         assert_eq!(s_nt.config.max_traps, crate::runtime::DEFAULT_MAX_TRAPS);
         assert_eq!(
             s_nt.config.exec_backend,
-            carrick_spec::ExecBackendRequest::Native
+            carrick_spec::ExecBackendRequest::HvPatch
         );
 
         // A fully-populated config round-trips (all P5 relaunch fields).
@@ -623,7 +623,7 @@ mod tests {
         s2.config.max_traps = 4242;
         s2.config.stop_signal = Some(3);
         s2.config.stop_timeout = Some(7);
-        s2.config.exec_backend = carrick_spec::ExecBackendRequest::Vmm;
+        s2.config.exec_backend = carrick_spec::ExecBackendRequest::HvPatch;
         let json = serde_json::to_string(&s2).expect("serialize");
         let round: ContainerState = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round.config.scratch_path.as_deref(), Some("/p/scratch"));
@@ -639,12 +639,13 @@ mod tests {
         assert_eq!(round.config.stop_timeout, Some(7));
         assert_eq!(
             round.config.exec_backend,
-            carrick_spec::ExecBackendRequest::Vmm
+            carrick_spec::ExecBackendRequest::HvPatch
         );
 
         for (legacy_backend, guidance) in [
-            ("auto", "omit --exec-backend"),
-            ("hvf", "--exec-backend vmm"),
+            ("native", "retired"),
+            ("vmm", "retired"),
+            ("hvf", "retired"),
         ] {
             let incompatible = no_traps.replace(
                 r#""config":{"env":["A=1"]}"#,
@@ -677,7 +678,9 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains(&path.display().to_string()), "{message}");
         assert!(
-            message.contains("recreate the container with --exec-backend vmm"),
+            message.contains(
+                "native and legacy vmm backends were retired; only 'hvpatch' is supported"
+            ),
             "{message}"
         );
         let _ = ContainerState::remove(&id);

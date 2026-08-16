@@ -1,20 +1,10 @@
 //! Backend selection + page-geometry plumbing for a run.
-//!
-//! The neutral page-geometry VOCABULARY (`PageGeometry`, `HostPageState`,
-//! `classify_host_page_state`, …) moved to `carrick_dsr::page_geometry` as
-//! part of the staged native-DSR extraction; it is re-exported here so every
-//! call site keeps its `crate::page_profile::*` path. What REMAINS here is
-//! the runtime-side backend-selection gate: `ExecutionBackend`,
-//! `ExecutionPlan`, and the `resolve_execution_plan*` policy that turns a
-//! `RunSpec` request into a backend + geometry decision.
 
 use crate::runtime::RuntimeError;
 use carrick_spec::{
-    BackendCapabilities, ExecBackendRequest, HostExecution, HostOs, NativePageProfile,
-    NativePageProfileRequest, Platform, RunSpec,
+    BackendCapabilities, ExecBackendRequest, HostOs, NativePageProfileRequest, Platform, RunSpec,
 };
 
-use carrick_dsr::page_geometry::DARWIN_NATIVE_PAGE_SIZE;
 pub(crate) use carrick_dsr::page_geometry::DEFAULT_LINUX_PAGE_SIZE;
 pub use carrick_dsr::page_geometry::{
     HostPageState, MappingPolicyDecision, MixedPageReason, PageBacking, PageGeometry, PagePerms,
@@ -23,16 +13,9 @@ pub use carrick_dsr::page_geometry::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExecutionBackend {
-    Vmm,
     /// HVF execution with static text patched to enter in-guest syscall
     /// islands. This lane is intentionally limited to macOS/AArch64.
     HvPatch,
-    /// The native (DSR) backend. Host-neutral by design — which (host OS,
-    /// host ISA) lanes actually exist is the capability table's business in
-    /// `resolve_execution_plan_for_request_for_host`, not this enum's.
-    /// (Renamed from `NativeDarwin` when the FreeBSD/x86_64 lane bring-up
-    /// started; Darwin/AArch64 is the reference lane.)
-    Native,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,9 +25,6 @@ pub(crate) struct ExecutionPlan {
     pub diagnostics: Vec<String>,
 }
 
-// Called only by the macOS `runtime` arm today (`run_oci`/`run_elf` planning);
-// the non-macOS arms plan via `resolve_execution_plan_for_request` until M0.8
-// wires the native run path on every host.
 #[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
 pub(crate) fn resolve_execution_plan(spec: &RunSpec) -> Result<ExecutionPlan, RuntimeError> {
     resolve_execution_plan_for_request_for_host(
@@ -90,26 +70,15 @@ fn resolve_execution_plan_for_request_for_host(
     exec_backend: ExecBackendRequest,
     native_page_profile: NativePageProfileRequest,
     host_caps: BackendCapabilities,
-    host_page_size: u64,
+    _host_page_size: u64,
 ) -> Result<ExecutionPlan, RuntimeError> {
-    if exec_backend != ExecBackendRequest::Native
-        && native_page_profile != NativePageProfileRequest::Auto
-    {
+    if native_page_profile != NativePageProfileRequest::Auto {
         return Err(RuntimeError::Unsupported(
-            "native page profile requires --exec-backend=native".to_string(),
+            "native page profile is not supported (native backend retired)".to_string(),
         ));
     }
 
     match exec_backend {
-        ExecBackendRequest::Vmm => Ok(ExecutionPlan {
-            backend: ExecutionBackend::Vmm,
-            page_geometry: PageGeometry {
-                host_page_size: DEFAULT_LINUX_PAGE_SIZE,
-                linux_page_size: DEFAULT_LINUX_PAGE_SIZE,
-                native_profile: None,
-            },
-            diagnostics: Vec::new(),
-        }),
         ExecBackendRequest::HvPatch => {
             if host_caps.host_os != HostOs::Macos
                 || host_caps.host_isa != Platform::Aarch64
@@ -130,121 +99,7 @@ fn resolve_execution_plan_for_request_for_host(
                 diagnostics: Vec::new(),
             })
         }
-        ExecBackendRequest::Native => {
-            // Same-ISA is a lane-independent requirement of the native
-            // model: guest ISA == host ISA, always (cross-ISA stays VMM /
-            // Rosetta).
-            if host_caps.host_execution(platform) != HostExecution::Native {
-                return Err(RuntimeError::Unsupported(format!(
-                    "native execution backend does not support cross-ISA guest platform {:?} on {:?} host; pass --exec-backend vmm to request the platform VMM",
-                    platform, host_caps.host_isa
-                )));
-            }
-            // The native-lane capability table: which (host OS, host ISA)
-            // pairs have a working DSR translator + host layer, and each
-            // lane's page-geometry policy. Flipping a lane on is ONE arm
-            // here (plus its plan fn) — nothing else consults the host OS.
-            match (host_caps.host_os, host_caps.host_isa) {
-                (HostOs::Macos, Platform::Aarch64) => {
-                    native_plan(native_page_profile, host_page_size)
-                }
-                (HostOs::FreeBsd, Platform::Amd64) => {
-                    x86_native_plan(native_page_profile, host_page_size)
-                }
-                // NetBSD/x86_64 is the same-ISA native lane as FreeBSD/x86_64:
-                // x86_64 is natively 4 KiB (== the Linux page size) so it shares
-                // the exact identity-map plan with no page-profile knob.
-                (HostOs::NetBsd, Platform::Amd64) => {
-                    x86_native_plan(native_page_profile, host_page_size)
-                }
-                (os, isa) => Err(RuntimeError::Unsupported(format!(
-                    "no native execution lane for {os:?}/{isa:?} host; pass --exec-backend vmm to request the platform VMM"
-                ))),
-            }
-        }
     }
-}
-
-fn native_plan(
-    request: NativePageProfileRequest,
-    host_page_size: u64,
-) -> Result<ExecutionPlan, RuntimeError> {
-    let profile = match request {
-        NativePageProfileRequest::Auto => {
-            if host_page_size != DARWIN_NATIVE_PAGE_SIZE {
-                return Err(RuntimeError::Unsupported(format!(
-                    "native execution unsupported on host page size {host_page_size}; pass --exec-backend vmm to request the platform VMM"
-                )));
-            }
-            NativePageProfile::Native16k
-        }
-        NativePageProfileRequest::Native16k => {
-            if host_page_size != DARWIN_NATIVE_PAGE_SIZE {
-                return Err(RuntimeError::Unsupported(format!(
-                    "native16k requires host page size 16384, got {host_page_size}; pass --exec-backend vmm to request the platform VMM"
-                )));
-            }
-            NativePageProfile::Native16k
-        }
-        NativePageProfileRequest::Linux4k => {
-            if host_page_size != DARWIN_NATIVE_PAGE_SIZE {
-                return Err(RuntimeError::Unsupported(format!(
-                    "linux4k native page profile requires host page size 16384, got {host_page_size}; pass --exec-backend vmm to request the platform VMM"
-                )));
-            }
-            NativePageProfile::Linux4kOn16k
-        }
-    };
-
-    let linux_page_size = match profile {
-        NativePageProfile::Native16k => host_page_size,
-        NativePageProfile::Linux4kOn16k => DEFAULT_LINUX_PAGE_SIZE,
-    };
-    Ok(ExecutionPlan {
-        backend: ExecutionBackend::Native,
-        page_geometry: PageGeometry {
-            host_page_size,
-            linux_page_size,
-            native_profile: Some(profile),
-        },
-        diagnostics: vec![format!(
-            "native page profile selected: profile={profile:?} host_page_size={host_page_size} linux_page_size={linux_page_size}"
-        )],
-    })
-}
-
-/// The FreeBSD/amd64 native-lane plan. x86_64 is natively 4 KiB, matching the
-/// Linux page size, so there is no 16k-geometry policy (the Darwin lane's
-/// `native_plan` juggles a 16k host page under a 4k or 16k guest); the driver
-/// uses a plain identity map. A non-Auto native page-profile request is
-/// therefore meaningless here and refused rather than silently ignored.
-fn x86_native_plan(
-    request: NativePageProfileRequest,
-    host_page_size: u64,
-) -> Result<ExecutionPlan, RuntimeError> {
-    if request != NativePageProfileRequest::Auto {
-        return Err(RuntimeError::Unsupported(format!(
-            "the FreeBSD/x86_64 native lane has no page-profile knob (x86_64 is natively 4 KiB); \
-             got {request:?}"
-        )));
-    }
-    if host_page_size != DEFAULT_LINUX_PAGE_SIZE {
-        return Err(RuntimeError::Unsupported(format!(
-            "the FreeBSD/x86_64 native lane requires a {DEFAULT_LINUX_PAGE_SIZE}-byte host page, got {host_page_size}"
-        )));
-    }
-    Ok(ExecutionPlan {
-        backend: ExecutionBackend::Native,
-        page_geometry: PageGeometry {
-            host_page_size: DEFAULT_LINUX_PAGE_SIZE,
-            linux_page_size: DEFAULT_LINUX_PAGE_SIZE,
-            // No 16k-on-4k profile: the identity driver needs no native
-            // geometry, so `native_geometry()` stays None and the aarch64
-            // 16k-only paths are never reached on this lane.
-            native_profile: None,
-        },
-        diagnostics: vec!["FreeBSD/x86_64 native lane (identity DSR map)".to_string()],
-    })
 }
 
 fn host_page_size() -> u64 {
@@ -260,7 +115,8 @@ fn host_page_size() -> u64 {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
-    use carrick_spec::{NativePageGeometry, Platform};
+    use carrick_dsr::page_geometry::DARWIN_NATIVE_PAGE_SIZE;
+    use carrick_spec::Platform;
 
     fn spec_with_platform(
         platform: carrick_spec::Platform,
@@ -299,22 +155,6 @@ mod tests {
 
     fn caps(host_os: HostOs, host_isa: Platform) -> BackendCapabilities {
         BackendCapabilities { host_os, host_isa }
-    }
-
-    #[test]
-    fn vmm_request_uses_linux_page_geometry() {
-        let plan = resolve_execution_plan(&spec(
-            ExecBackendRequest::Vmm,
-            NativePageProfileRequest::Auto,
-        ))
-        .expect("vmm plan");
-        assert_eq!(plan.backend, ExecutionBackend::Vmm);
-        assert_eq!(
-            plan.page_geometry.linux_page_size,
-            carrick_abi::LINUX_PAGE_SIZE
-        );
-        assert_eq!(plan.page_geometry.native_profile, None);
-        assert_eq!(plan.page_geometry.native_geometry(), None);
     }
 
     #[test]
@@ -357,197 +197,15 @@ mod tests {
     }
 
     #[test]
-    fn explicit_vmm_rejects_explicit_native_page_profile() {
+    fn explicit_native_page_profile_rejected() {
         let err = resolve_execution_plan(&spec(
-            ExecBackendRequest::Vmm,
+            ExecBackendRequest::HvPatch,
             NativePageProfileRequest::Linux4k,
         ))
-        .expect_err("explicit native page profile requires native backend");
+        .expect_err("explicit native page profile rejected");
         assert!(
             err.to_string()
-                .contains("native page profile requires --exec-backend=native")
+                .contains("native page profile is not supported")
         );
-    }
-
-    #[test]
-    fn omitted_backend_resolves_native_on_macos_aarch64() {
-        let plan = resolve_execution_plan_for_host(
-            &spec(
-                ExecBackendRequest::default(),
-                NativePageProfileRequest::Auto,
-            ),
-            caps(HostOs::Macos, Platform::Aarch64),
-            DARWIN_NATIVE_PAGE_SIZE,
-        )
-        .expect("default backend should resolve to native");
-
-        assert_eq!(plan.backend, ExecutionBackend::Native);
-    }
-
-    #[test]
-    fn native_backend_rejects_cross_isa_guest_platform() {
-        let err = resolve_execution_plan_for_host(
-            &spec_with_platform(
-                carrick_spec::Platform::Amd64,
-                ExecBackendRequest::Native,
-                NativePageProfileRequest::Auto,
-            ),
-            caps(HostOs::Macos, Platform::Aarch64),
-            DARWIN_NATIVE_PAGE_SIZE,
-        )
-        .expect_err("native backend must reject cross-ISA guest requests");
-
-        assert!(matches!(
-            err,
-            RuntimeError::Unsupported(message)
-                if message.contains("cross-ISA")
-                    && message.contains("Amd64")
-                    && message.contains("Aarch64")
-                    && message.contains("--exec-backend vmm")
-        ));
-    }
-
-    #[test]
-    fn native_lane_table_rejects_hosts_without_a_lane() {
-        let err = resolve_execution_plan_for_host(
-            &spec(ExecBackendRequest::Native, NativePageProfileRequest::Auto),
-            caps(HostOs::Linux, Platform::Aarch64),
-            DARWIN_NATIVE_PAGE_SIZE,
-        )
-        .expect_err("native backend must reject hosts without a lane");
-
-        assert!(matches!(
-            err,
-            RuntimeError::Unsupported(message)
-                if message.contains("no native execution lane")
-                    && message.contains("Linux")
-                    && message.contains("--exec-backend vmm")
-        ));
-    }
-
-    #[test]
-    fn freebsd_amd64_lane_resolves_the_native_identity_plan() {
-        // The FreeBSD/amd64 native lane is LIVE (M2-runtime): `--exec-backend
-        // native` resolves a 4 KiB identity plan, not the old bring-up error
-        // and never the VMM.
-        let plan = resolve_execution_plan_for_host(
-            &spec_with_platform(
-                Platform::Amd64,
-                ExecBackendRequest::Native,
-                NativePageProfileRequest::Auto,
-            ),
-            caps(HostOs::FreeBsd, Platform::Amd64),
-            DEFAULT_LINUX_PAGE_SIZE,
-        )
-        .expect("freebsd/amd64 native lane resolves a plan");
-
-        assert_eq!(plan.backend, ExecutionBackend::Native);
-        assert_eq!(plan.page_geometry.host_page_size, DEFAULT_LINUX_PAGE_SIZE);
-        assert_eq!(plan.page_geometry.linux_page_size, DEFAULT_LINUX_PAGE_SIZE);
-        // The identity driver needs no native page geometry.
-        assert_eq!(plan.page_geometry.native_geometry(), None);
-    }
-
-    #[test]
-    fn freebsd_amd64_native_rejects_a_page_profile_knob() {
-        // x86_64 is natively 4 KiB — there is no 16k-geometry policy, so a
-        // non-Auto native page-profile request is refused, not ignored.
-        let err = resolve_execution_plan_for_host(
-            &spec_with_platform(
-                Platform::Amd64,
-                ExecBackendRequest::Native,
-                NativePageProfileRequest::Native16k,
-            ),
-            caps(HostOs::FreeBsd, Platform::Amd64),
-            DEFAULT_LINUX_PAGE_SIZE,
-        )
-        .expect_err("no page-profile knob on the x86 lane");
-        assert!(matches!(
-            err,
-            RuntimeError::Unsupported(message) if message.contains("no page-profile knob")
-        ));
-    }
-
-    #[test]
-    fn netbsd_amd64_lane_resolves_the_native_identity_plan() {
-        // NetBSD/amd64 is the same-ISA native lane as FreeBSD/amd64:
-        // `--exec-backend native` resolves the identical 4 KiB identity plan
-        // (no page-profile knob), never the VMM.
-        let plan = resolve_execution_plan_for_host(
-            &spec_with_platform(
-                Platform::Amd64,
-                ExecBackendRequest::Native,
-                NativePageProfileRequest::Auto,
-            ),
-            caps(HostOs::NetBsd, Platform::Amd64),
-            DEFAULT_LINUX_PAGE_SIZE,
-        )
-        .expect("netbsd/amd64 native lane resolves a plan");
-
-        assert_eq!(plan.backend, ExecutionBackend::Native);
-        assert_eq!(plan.page_geometry.host_page_size, DEFAULT_LINUX_PAGE_SIZE);
-        assert_eq!(plan.page_geometry.linux_page_size, DEFAULT_LINUX_PAGE_SIZE);
-        // The identity driver needs no native page geometry.
-        assert_eq!(plan.page_geometry.native_geometry(), None);
-    }
-
-    #[test]
-    fn netbsd_amd64_native_rejects_a_page_profile_knob() {
-        // Same as the FreeBSD twin: x86_64 is natively 4 KiB, so a non-Auto
-        // native page-profile request is refused, not ignored.
-        let err = resolve_execution_plan_for_host(
-            &spec_with_platform(
-                Platform::Amd64,
-                ExecBackendRequest::Native,
-                NativePageProfileRequest::Native16k,
-            ),
-            caps(HostOs::NetBsd, Platform::Amd64),
-            DEFAULT_LINUX_PAGE_SIZE,
-        )
-        .expect_err("no page-profile knob on the x86 lane");
-        assert!(matches!(
-            err,
-            RuntimeError::Unsupported(message) if message.contains("no page-profile knob")
-        ));
-    }
-
-    #[test]
-    fn native16k_plan_has_no_instruction_vehicle_policy() {
-        let plan = native_plan(NativePageProfileRequest::Native16k, DARWIN_NATIVE_PAGE_SIZE)
-            .expect("native16k plan");
-        assert_eq!(plan.backend, ExecutionBackend::Native);
-        assert_eq!(
-            plan.page_geometry.native_profile,
-            Some(NativePageProfile::Native16k)
-        );
-    }
-
-    #[test]
-    fn native_linux4k_plan_reports_4k_linux_on_16k_host() {
-        let result = resolve_execution_plan(&spec(
-            ExecBackendRequest::Native,
-            NativePageProfileRequest::Linux4k,
-        ));
-
-        let supported_current_lane = BackendCapabilities::current().host_os == HostOs::Macos
-            && BackendCapabilities::current().host_isa == Platform::Aarch64
-            && host_page_size() == DARWIN_NATIVE_PAGE_SIZE;
-
-        if supported_current_lane {
-            let plan = result.expect("linux4k native plan on Darwin 16K AArch64");
-            assert_eq!(plan.backend, ExecutionBackend::Native);
-            assert_eq!(plan.page_geometry.host_page_size, 16_384);
-            assert_eq!(
-                plan.page_geometry.native_geometry(),
-                Some(NativePageGeometry {
-                    host_page_size: 16_384,
-                    linux_page_size: carrick_abi::LINUX_PAGE_SIZE,
-                    profile: NativePageProfile::Linux4kOn16k,
-                })
-            );
-        } else {
-            let err = result.expect_err("unsupported off the Darwin 16K native lane");
-            assert!(matches!(err, RuntimeError::Unsupported(_)));
-        }
     }
 }

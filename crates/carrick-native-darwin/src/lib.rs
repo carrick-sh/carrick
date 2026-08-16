@@ -1,22 +1,31 @@
-//! `carrick-native-darwin` — the macOS host layer for the native (DSR)
-//! backend.
+//! `carrick-native-darwin` — macOS host-level primitives for OS-integrated
+//! execution.
 //!
-//! The single-mapping MAP_JIT W^X JIT backend (M0.6) lives here: [`jit`]
-//! provides `DarwinHostJit` (the real Apple-Silicon MAP_JIT /
-//! `pthread_jit_write_protect_np` implementation) plus [`active_host_jit`],
-//! moved byte-for-byte out of the transitional
-//! `carrick-runtime/src/native_darwin/darwin_jit.rs` shim (which becomes a
-//! thin re-export of this crate). The C trap/kick shim
-//! (`csrc/native_darwin.c`) moved with it — `build.rs` compiles it under the
-//! same target gate it always used.
+//! **Status: preserved for future optimisation, not actively wired into the
+//! HVPatch execution path.**
 //!
-//! The whole crate is macOS-only by construction; other targets compile it
-//! to nothing (same `#![cfg]` pattern as `carrick-native-freebsd`). Within
-//! that macOS gate, [`jit`] narrows further to aarch64 for the real
-//! implementation — Apple Silicon is the only hardware `MAP_JIT`'s
-//! per-thread write-protect toggle exists on — with a fail-closed fallback
-//! for any other macOS arch, mirroring the runtime shim's own "unsupported"
-//! arm.
+//! This crate contains the Darwin-specific building blocks that exploit
+//! host-OS primitives for guest performance optimisation:
+//!
+//! - **[`jit`]** — the Apple Silicon `MAP_JIT` / `pthread_jit_write_protect_np`
+//!   W^X JIT backend (`DarwinHostJit`, implementing
+//!   [`carrick_dsr::host::NativeHostJit`]). This is the concrete Darwin
+//!   implementor of the host JIT trait. The C support shim
+//!   (`csrc/native_darwin.c`) provides `sys_icache_invalidate` and
+//!   signal/kick plumbing.
+//!
+//! - **[`direct`]** (aarch64-only) — Tier-D binary patching: same-ISA
+//!   execution by patching `svc #0` → island trampolines, virtualising
+//!   Darwin-reserved `x18` and guest `TPIDR_EL0`, and proving unallocated
+//!   opcode safety. Does not require a hypervisor or JIT translation.
+//!
+//! - **[`aot_cache`]** — persistent on-disk translation cache
+//!   (`~/.carrick`), SHA-256-verified, `flock`-elected, LRU-evicted.
+//!
+//! The whole crate is macOS-only by construction (`#![cfg(target_os =
+//! "macos")]`). Within that gate, [`jit`] and [`direct`] narrow further to
+//! `target_arch = "aarch64"` — Apple Silicon is the only hardware where
+//! `MAP_JIT`'s per-thread write-protect toggle exists.
 
 #![cfg(target_os = "macos")]
 
