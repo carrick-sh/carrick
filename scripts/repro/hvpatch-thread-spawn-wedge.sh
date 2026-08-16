@@ -38,4 +38,4 @@ echo "exit=$?"
 grep -a "SPAWN" "$SCRATCH/$TAG.sout" || echo "NO SPAWN LINE"
 echo -n "mmap refusals: "; grep -ac "mmap refused" "$SCRATCH/$TAG.serr"
 echo -n "superseded receipts: "; grep -ac "superseding deferred COW receipt" "$SCRATCH/$TAG.serr"
-bash "$WT/scripts/sudo/kill.sh" "$CARRICK_RUN_ID" 2>&1 | tail -1
+bash "$REPO/scripts/sudo/kill.sh" "$CARRICK_RUN_ID" 2>&1 | tail -1
