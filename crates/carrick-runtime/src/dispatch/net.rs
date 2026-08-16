@@ -5238,6 +5238,21 @@ impl SyscallDispatcher {
             }
             set_host_nonblocking(host_fds[0]);
             set_host_nonblocking(host_fds[1]);
+            // Same Linux-sized backing every other stream-socket creation site
+            // gets. macOS gives an AF_UNIX stream pair 8 KiB
+            // (`net.local.stream.sendspace`) where Linux gives ~208 KiB, so a
+            // guest that fills the pair before draining it — LTP `splice05`
+            // pushes 64 KiB pipe→socket and only reads afterwards — blocked
+            // forever on a peer buffer 1/26th the size it was written for.
+            for host_fd in host_fds {
+                if let Err(errno) = widen_stream_socket_buffers(host_fd, family, base_type) {
+                    unsafe {
+                        libc::close(host_fds[0]);
+                        libc::close(host_fds[1]);
+                    }
+                    return Ok(DispatchOutcome::errno(errno));
+                }
+            }
             let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
             let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
             let first = OpenFile::from_open_description(
