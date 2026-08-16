@@ -432,6 +432,37 @@ fn lane_getdents(
     out
 }
 
+/// `lane_getdents`'s identity twin: the guest-visible `(name, d_ino)` records.
+#[cfg(target_os = "macos")]
+fn lane_getdents_inos(
+    dispatcher: &mut SyscallDispatcher,
+    memory: &mut LinearMemory,
+    fd: i64,
+) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    loop {
+        let n = lane_syscall(dispatcher, memory, 61, [fd as u64, 0x8000, 4096, 0, 0, 0]);
+        assert!(n >= 0, "getdents64 failed: {n}");
+        if n == 0 {
+            break;
+        }
+        let buf = memory.read_bytes(0x8000, n as usize).unwrap();
+        let mut pos = 0usize;
+        while pos < buf.len() {
+            let d_ino = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+            let reclen = u16::from_le_bytes([buf[pos + 16], buf[pos + 17]]) as usize;
+            let name_bytes = &buf[pos + LINUX_DIRENT64_HEADER_SIZE..pos + reclen];
+            let end = name_bytes.iter().position(|&b| b == 0).unwrap();
+            out.push((
+                String::from_utf8(name_bytes[..end].to_vec()).unwrap(),
+                d_ino,
+            ));
+            pos += reclen;
+        }
+    }
+    out
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn trusted_dirfd_lane_serves_walk_and_recurses() {
@@ -615,6 +646,121 @@ fn trusted_immutable_lower_stat_preserves_layered_guest_identity() {
         .unwrap();
     assert_eq!(fast, slow, "trusted lower stat must equal layered stat");
     assert_eq!(fast.mode & 0o7777, 0o4711);
+}
+
+/// The three lanes that publish a file's identity — `stat(path)`,
+/// `fstat(open(path))` and `getdents64`'s `d_ino` — must agree for an entry
+/// only the immutable cache lower holds.
+///
+/// The fd lane opens the lower's REAL host file and reports its APFS inode,
+/// and `getdents64` already publishes that same inode, but the path lane
+/// dropped it at the `RootFsMetadata` boundary and hashed the path instead.
+/// GNU coreutils `cp` stats its source through the path AND the fd it opened,
+/// and refuses the copy when the two disagree — `cp: skipping file '…', as it
+/// was replaced while being copied` — which broke LTP `execve02`'s setup with
+/// TBROK the moment the cached lower was enabled for HvPatch.
+#[cfg(target_os = "macos")]
+#[test]
+fn immutable_lower_reports_one_inode_through_stat_fstat_and_getdents() {
+    let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+    for (dir, name) in [("/walk", "file.txt"), ("/walk/sub", "deep.txt")] {
+        let full = format!("{dir}/{name}");
+        let by_path = dispatcher
+            .path_stat_record(
+                &dispatcher.exact_signal_context_for_test(),
+                LINUX_AT_FDCWD,
+                &full,
+                LINUX_AT_SYMLINK_NOFOLLOW,
+            )
+            .unwrap();
+
+        let fd = lane_openat(&mut dispatcher, &mut memory, LINUX_AT_FDCWD, &full, 0);
+        assert!(fd >= 0, "open lower-only {full}: {fd}");
+        let by_fd = dispatcher.fd_stat_record(fd as i32).unwrap();
+        assert_eq!(
+            by_path.ino, by_fd.ino,
+            "stat({full}).st_ino must equal fstat(open({full})).st_ino"
+        );
+
+        let dirfd = lane_openat(
+            &mut dispatcher,
+            &mut memory,
+            LINUX_AT_FDCWD,
+            dir,
+            LINUX_O_DIRECTORY,
+        );
+        assert!(dirfd >= 0, "open lower-only dir {dir}: {dirfd}");
+        let d_ino = lane_getdents_inos(&mut dispatcher, &mut memory, dirfd)
+            .into_iter()
+            .find(|(entry, _)| entry == name)
+            .unwrap_or_else(|| panic!("{name} missing from getdents64 of {dir}"))
+            .1;
+        assert_eq!(
+            d_ino, by_path.ino,
+            "getdents64 d_ino for {full} must equal its stat st_ino"
+        );
+    }
+}
+
+/// A lower-only DIRECTORY must satisfy the same identity invariant: Python's
+/// `shutil.rmtree` and Go's `os.SameFile` compare `lstat(dir)` against
+/// `fstat(open(dir))` and refuse to recurse when they differ.
+#[cfg(target_os = "macos")]
+#[test]
+fn immutable_lower_directory_path_stat_matches_its_fd_stat() {
+    let (_lower, _upper, mut dispatcher) = trusted_lower_lane_fixture();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
+
+    let by_path = dispatcher
+        .path_stat_record(
+            &dispatcher.exact_signal_context_for_test(),
+            LINUX_AT_FDCWD,
+            "/walk/sub",
+            LINUX_AT_SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+    let dirfd = lane_openat(
+        &mut dispatcher,
+        &mut memory,
+        LINUX_AT_FDCWD,
+        "/walk/sub",
+        LINUX_O_DIRECTORY,
+    );
+    assert!(dirfd >= 0, "open lower-only directory: {dirfd}");
+    let by_fd = dispatcher.fd_stat_record(dirfd as i32).unwrap();
+    assert_eq!(
+        by_path.ino, by_fd.ino,
+        "lstat(dir).st_ino must equal fstat(open(dir)).st_ino"
+    );
+}
+
+/// A lower-only file's `st_mtime`/`st_nlink` must come from the real host
+/// inode too. The path lane reported `mtime=0`/`nlink=1` for every untouched
+/// image file, so `make`-style newer-than comparisons saw the epoch.
+#[cfg(target_os = "macos")]
+#[test]
+fn immutable_lower_path_stat_reports_real_mtime_and_nlink() {
+    let (lower, _upper, dispatcher) = trusted_lower_lane_fixture();
+    let host = std::fs::metadata(lower.path().join("walk/sub/deep.txt")).unwrap();
+
+    let record = dispatcher
+        .path_stat_record(
+            &dispatcher.exact_signal_context_for_test(),
+            LINUX_AT_FDCWD,
+            "/walk/sub/deep.txt",
+            LINUX_AT_SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+
+    use std::os::unix::fs::MetadataExt as _;
+    assert_eq!(
+        record.mtime.0,
+        host.mtime(),
+        "an untouched lower file must not report the epoch as its mtime"
+    );
+    assert_eq!(record.nlink, host.nlink() as u32);
 }
 
 #[cfg(target_os = "macos")]
