@@ -9231,7 +9231,17 @@ impl SyscallDispatcher {
                     // LTP read their own mappings this way). An unmapped VA is EIO,
                     // like Linux. Every OTHER synthetic file serves its precomputed
                     // byte blob.
-                    if crate::vfs::proc::is_proc_self_mem_path(path) {
+                    //
+                    // `memory` is the CALLER's address space, so the predicate
+                    // must reject a peer's pid — otherwise this arm answers
+                    // `/proc/<peer>/mem` with the reader's own bytes. The open
+                    // side refuses a peer first; this is the second gate on the
+                    // same invariant, kept because the two are reached
+                    // independently (an fd can outlive the check that made it).
+                    let self_pid = crate::vfs::proc::self_linux_pid(
+                        this.synthetic_proc_identity(cx.kernel),
+                    );
+                    if crate::vfs::proc::is_proc_self_mem_path(path, self_pid) {
                         let va = *offset as u64;
                         match memory.read_bytes(va, length) {
                             Ok(bytes) => {
@@ -9244,7 +9254,7 @@ impl SyscallDispatcher {
                                 return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EIO));
                             }
                         }
-                    } else if crate::vfs::proc::is_proc_self_pagemap_path(path) {
+                    } else if crate::vfs::proc::is_proc_self_pagemap_path(path, self_pid) {
                         let present = (1u64 << 63).to_le_bytes();
                         let mut bytes = vec![0u8; length];
                         for (i, byte) in bytes.iter_mut().enumerate() {
