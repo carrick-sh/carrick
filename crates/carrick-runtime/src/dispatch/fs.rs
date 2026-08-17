@@ -6395,7 +6395,11 @@ impl SyscallDispatcher {
     /// group and the node itself becomes setgid. Without this the host assigns
     /// its own gid and a later stat reports the wrong st_gid (LTP mknod08
     /// expects st_gid == the process egid because the parent isn't setgid).
-    fn stamp_new_node_owner(&self, path: &str, node_mode: u32) {
+    /// Record the creating process as the owner of a just-created node, with
+    /// Linux's setgid-parent gid inheritance. Called by every path that
+    /// materialises a new node — `openat(O_CREAT)`, `mknod`, and `bind(2)` on an
+    /// AF_UNIX socket (`dispatch::net`), which is why this is `pub(super)`.
+    pub(super) fn stamp_new_node_owner(&self, path: &str, node_mode: u32) {
         const S_ISGID: u32 = 0o2000;
         let creds = self.cred_snapshot();
         let mut owner_gid = creds.egid;

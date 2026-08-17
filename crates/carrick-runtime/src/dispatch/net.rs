@@ -5559,8 +5559,20 @@ impl SyscallDispatcher {
                 let mode = 0o777 & !umask;
                 if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
                     let _ = m.vfs.create_socket(&m.full_path, mode);
-                } else {
-                    let _ = this.fs.rootfs_vfs.overlay.create_socket(&resolved, mode);
+                } else if this
+                    .fs
+                    .rootfs_vfs
+                    .overlay
+                    .create_socket(&resolved, mode)
+                    .is_ok()
+                {
+                    // Stamp the creator, exactly as `mknod(S_IFSOCK)` and
+                    // `openat(O_CREAT)` do. Without this the node has no owner
+                    // xattr, `get_owner` falls back to root, and a non-root
+                    // guest cannot `chmod` the socket it just created — libuv's
+                    // `pipe_set_chmod` saw EPERM and skipped, where Linux (whose
+                    // socket inode is owned by the uid that bound it) runs.
+                    this.stamp_new_node_owner(&resolved, mode);
                 }
             }
             Ok(DispatchOutcome::Returned { value: 0 })
