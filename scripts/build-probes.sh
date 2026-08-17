@@ -58,7 +58,10 @@ if [ "$MODE" = "--closure-arm64" ]; then
     -v "$PWD/conformance-probes:/p" -w /p \
     rust:alpine sh -ec '
       rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
-      set -- cargo build --release --target aarch64-unknown-linux-musl
+      # Cargo/rustc has twice lost the package rlib while fanning 430 bins out
+      # against this bind-mounted target (`E0463` / "rlib format not found").
+      # Closure is an evidence gate, so make the strict build deterministic.
+      set -- cargo build --release --jobs 1 --target aarch64-unknown-linux-musl
       for name in $CARRICK_CLOSURE_BINS; do
         set -- "$@" --bin "$name"
       done
@@ -72,7 +75,7 @@ if [ "$MODE" = "--closure-arm64" ]; then
     -v "$PWD/conformance-probes:/p" -w /p \
     rust:bookworm sh -ec '
       rustup target add aarch64-unknown-linux-gnu >/dev/null 2>&1 || true
-      set -- cargo build --release --target aarch64-unknown-linux-gnu
+      set -- cargo build --release --jobs 1 --target aarch64-unknown-linux-gnu
       for name in $CARRICK_CLOSURE_BINS; do
         set -- "$@" --bin "$name"
       done
