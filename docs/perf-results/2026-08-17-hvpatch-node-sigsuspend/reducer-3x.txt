@@ -1,0 +1,22 @@
+source_head=9f754b6ca85dd26e2ce19d1be99aed71d4ab5acf
+binary_sha256=c1a87b072a8f64d186fcabf6d4f9a10f0ec265c19f5e4130c9f11e7e968b6a39
+fixture_sha256=e68ea3b3ffd8610bf08508c9b72d71cb3875607146c6640b5c8da9112884f42b
+run_id=node-worker-receipt-d
+command=CARRICK_RUN_ID=node-worker-receipt-d target/release/carrick run --name node-worker-receipt-d --max-traps 18446744073709551615 --raw --fs host -v /Volumes/CaseSensitive/carrick/.worktrees/node-worker-teardown/docker/nodejs-conformance/fixtures/worker-exit-smoke.js:/tmp/worker-exit-smoke.js:ro --entrypoint /bin/bash localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0 -c 'timeout -s KILL 5 /opt/nodejs-conformance/bin/node24 /tmp/worker-exit-smoke.js'
+worker-message ok
+worker-exit ok
+rc=0
+scoped_cleanup_count=0
+run_id=node-worker-receipt-e
+command=CARRICK_RUN_ID=node-worker-receipt-e target/release/carrick run --name node-worker-receipt-e --max-traps 18446744073709551615 --raw --fs host -v /Volumes/CaseSensitive/carrick/.worktrees/node-worker-teardown/docker/nodejs-conformance/fixtures/worker-exit-smoke.js:/tmp/worker-exit-smoke.js:ro --entrypoint /bin/bash localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0 -c 'timeout -s KILL 5 /opt/nodejs-conformance/bin/node24 /tmp/worker-exit-smoke.js'
+worker-message ok
+worker-exit ok
+rc=0
+scoped_cleanup_count=0
+run_id=node-worker-receipt-f
+command=CARRICK_RUN_ID=node-worker-receipt-f target/release/carrick run --name node-worker-receipt-f --max-traps 18446744073709551615 --raw --fs host -v /Volumes/CaseSensitive/carrick/.worktrees/node-worker-teardown/docker/nodejs-conformance/fixtures/worker-exit-smoke.js:/tmp/worker-exit-smoke.js:ro --entrypoint /bin/bash localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0 -c 'timeout -s KILL 5 /opt/nodejs-conformance/bin/node24 /tmp/worker-exit-smoke.js'
+worker-message ok
+worker-exit ok
+rc=0
+scoped_cleanup_count=0
+transcript_pipeline_exit=0

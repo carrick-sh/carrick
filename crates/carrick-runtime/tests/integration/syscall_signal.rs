@@ -784,6 +784,37 @@ fn rt_sigsuspend_restores_nondefault_mask_when_no_handler_runs() {
 }
 
 #[test]
+fn rt_sigsuspend_stays_parked_for_pending_default_ignored_sigchld() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let tid = context.thread().registry_id();
+    let chld = 17;
+    let original = carrick_abi::SigSet::EMPTY.with(chld);
+    dispatcher.restore_signal_mask(&context, tid, original);
+    dispatcher.mark_process_signal_pending(&context, chld);
+    memory.write_bytes(0x4000, &0u64.to_le_bytes()).unwrap();
+
+    assert!(matches!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(133, SyscallArgs::from([0x4000, 8, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::WaitOnSignals { timeout: None, .. }
+    ));
+    assert_eq!(
+        dispatcher.signal_mask_for(&dispatcher.capture_one_task_context().unwrap(), tid),
+        carrick_abi::SigSet::EMPTY,
+        "the temporary sigsuspend mask remains active while no wakeable signal exists"
+    );
+}
+
+#[test]
 fn signalfd_read_drains_pending_masked_signals() {
     // H4: read() on a signalfd must drain pending signals that match the fd's
     // mask into signalfd_siginfo records (was: EINVAL — the API was unusable).

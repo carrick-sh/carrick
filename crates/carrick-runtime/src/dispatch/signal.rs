@@ -248,11 +248,9 @@ impl SyscallDispatcher {
         )
     }
 
-    fn any_signal_thread_blocks(context: &crate::kernel::KernelContext, signum: i32) -> bool {
-        context
-            .task()
-            .threads()
-            .into_iter()
+    fn any_thread_blocks(threads: &[crate::kernel::ThreadRef], signum: i32) -> bool {
+        threads
+            .iter()
             .any(|thread| thread.signal_state().blocked().contains(signum))
     }
 
@@ -346,6 +344,16 @@ impl SyscallDispatcher {
         context: &crate::kernel::KernelContext,
         exit_signal: u32,
     ) -> bool {
+        let threads = context.task().threads();
+        self.child_exit_signal_needs_pump_for_threads(context, &threads, exit_signal)
+    }
+
+    fn child_exit_signal_needs_pump_for_threads(
+        &self,
+        context: &crate::kernel::KernelContext,
+        threads: &[crate::kernel::ThreadRef],
+        exit_signal: u32,
+    ) -> bool {
         let signum = if exit_signal == 0 {
             return false;
         } else if (1..=64).contains(&exit_signal) {
@@ -359,13 +367,23 @@ impl SyscallDispatcher {
         match Self::signal_action_entry(context, signum).map(|action| action.sa_handler) {
             Some(handler) if handler == crate::linux_abi::LINUX_SIG_IGN => false,
             Some(handler) if handler == crate::linux_abi::LINUX_SIG_DFL => {
-                Self::any_signal_thread_blocks(context, signum) || !is_default_ignore_signum(signum)
+                Self::any_thread_blocks(threads, signum) || !is_default_ignore_signum(signum)
             }
             Some(_) => true,
-            None => {
-                Self::any_signal_thread_blocks(context, signum) || !is_default_ignore_signum(signum)
-            }
+            None => Self::any_thread_blocks(threads, signum) || !is_default_ignore_signum(signum),
         }
+    }
+
+    pub(crate) fn child_exit_signal_snapshot_needs_pump(
+        &self,
+        snapshot: &crate::kernel::core::KernelTaskSignalSnapshot,
+        exit_signal: u32,
+    ) -> bool {
+        self.child_exit_signal_needs_pump_for_threads(
+            snapshot.context(),
+            snapshot.threads(),
+            exit_signal,
+        )
     }
 
     pub fn non_interrupting_signal_mask(
@@ -1756,12 +1774,17 @@ impl SyscallDispatcher {
             // caller's guest-memory borrow and starve the sibling that must
             // dispatch tgkill/tkill to wake us.
             let original = this.begin_sigsuspend(cx.kernel, tid, suspend_mask);
+            let ignored = this.wait_ignored_disposition_mask(cx.kernel);
             let dispatcher_pending = Self::required_signal_thread(cx.kernel, tid)
                 .signal_state()
                 .pending()
                 .union(cx.kernel.shared().pending_signals().present())
-                .difference(suspend_mask);
-            let block_mask = SigBlockMask::blocking_all_of(suspend_mask);
+                .difference(suspend_mask.union(ignored));
+            // Ignored dispositions are not part of the guest's temporary mask,
+            // but they must be blocked in the HOST wait policy: POSIX
+            // sigsuspend returns only after a caught/terminating signal. A
+            // pending default-ignore SIGCHLD neither returns EINTR nor spins.
+            let block_mask = SigBlockMask::blocking_all_of(suspend_mask.union(ignored));
             let host_pending = crate::host_signal::has_unblocked_pending_for(
                 tid.raw(),
                 block_mask,
@@ -4007,6 +4030,22 @@ mod tests {
     }
 
     #[test]
+    fn default_ignored_sigchld_does_not_wake_sigsuspend_without_a_handler() {
+        let d = SyscallDispatcher::new();
+        let context = d.exact_signal_context_for_test();
+        let tid = context.thread().registry_id();
+        let chld = crate::linux_abi::LINUX_SIGCHLD;
+
+        d.restore_signal_mask(&context, tid, SigSet::EMPTY.with(chld));
+        let original = d.begin_sigsuspend(&context, tid, SigSet::EMPTY);
+
+        assert!(original.contains(chld));
+        assert!(!d.signal_mask_for(&context, tid).contains(chld));
+        assert!(!d.child_exit_signal_needs_pump(&context, tid, chld as u32));
+        assert!(!d.child_exit_signal_needs_process_pump(&context, chld as u32));
+    }
+
+    #[test]
     fn process_child_exit_predicate_follows_surviving_thread_masks() {
         let d = SyscallDispatcher::new();
         let survivor = d.capture_one_task_context().unwrap().thread().registry_id();
@@ -4556,6 +4595,7 @@ mod tests {
             .expect("write suspend mask");
         let original = SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGUSR1);
         d.restore_signal_mask(&d.exact_signal_context_for_test(), tid, original);
+        let ignored = d.wait_ignored_disposition_mask(&context);
 
         let started = Instant::now();
         let outcome = d
@@ -4584,7 +4624,7 @@ mod tests {
                 block_mask,
                 timeout: None,
             } if wait_set == SigSet::EMPTY.complement()
-                && block_mask == SigBlockMask::blocking_all_of(SigSet::EMPTY)
+                && block_mask == SigBlockMask::blocking_all_of(ignored)
         ));
         assert_eq!(
             d.signal_mask_for(&d.exact_signal_context_for_test(), tid),

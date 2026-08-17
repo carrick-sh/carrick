@@ -145,6 +145,24 @@ pub struct KernelTaskBinding {
     task: TaskKey,
 }
 
+/// One coherent task-level signal observation selected under the registry read
+/// lock. The context's Sighand/pending set and the live-thread roster all belong
+/// to the same pre- or post-exec task revision.
+pub(crate) struct KernelTaskSignalSnapshot {
+    context: KernelContext,
+    threads: Vec<ThreadRef>,
+}
+
+impl KernelTaskSignalSnapshot {
+    pub(crate) fn context(&self) -> &KernelContext {
+        &self.context
+    }
+
+    pub(crate) fn threads(&self) -> &[ThreadRef] {
+        &self.threads
+    }
+}
+
 impl KernelTaskBinding {
     pub const fn task_id(&self) -> TaskId {
         self.task.id
@@ -164,6 +182,39 @@ impl KernelTaskBinding {
             return Err(KernelError::StaleTaskBinding(self.task.id));
         }
         Ok(context)
+    }
+
+    /// Capture current signal authority for this exact task generation.
+    ///
+    /// The registry read lock spans task-generation validation, live-thread
+    /// selection, and context capture. Exec's registry write lock therefore
+    /// makes the result coherently pre- or post-exec; it can never mix the old
+    /// Sighand with the replacement thread set. Selecting any live thread also
+    /// handles a valid process whose original leader has retired.
+    pub(crate) fn capture_signal_snapshot(&self) -> Result<KernelTaskSignalSnapshot, KernelError> {
+        let state = self.kernel.registry.state.read();
+        let record = state
+            .tasks
+            .get(&self.task.id)
+            .ok_or(KernelError::UnknownTask(self.task.id))?;
+        if record.task.key() != self.task {
+            return Err(KernelError::StaleTaskBinding(self.task.id));
+        }
+        let task = Arc::clone(&record.task);
+        let threads = task.threads();
+        let thread = threads
+            .first()
+            .cloned()
+            .ok_or_else(|| KernelError::UnknownThread(LinuxTid::for_task_leader(self.task.id)))?;
+        Ok(KernelTaskSignalSnapshot {
+            context: KernelContext::capture(
+                Arc::clone(&self.kernel),
+                task,
+                thread,
+                record.revision,
+            ),
+            threads,
+        })
     }
 }
 
@@ -1351,6 +1402,38 @@ mod tests {
             stale.capture(leader.thread.key().tid),
             Err(KernelError::StaleTaskBinding(id)) if id == leader.task.key().id
         ));
+        assert!(matches!(
+            stale.capture_signal_snapshot(),
+            Err(KernelError::StaleTaskBinding(id)) if id == leader.task.key().id
+        ));
+    }
+
+    #[test]
+    fn task_binding_signal_snapshot_survives_a_retired_leader() {
+        let (kernel, leader) = bootstrap(4301);
+        let worker = kernel
+            .clone_thread(
+                &leader,
+                ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::THREAD
+                        | carrick_abi::LinuxCloneFlags::SIGHAND
+                        | carrick_abi::LinuxCloneFlags::VM,
+                )
+                .expect("thread plan"),
+                ThreadId::synthetic_for_tests(101),
+                None,
+            )
+            .expect("worker");
+        let binding = leader.task_binding();
+
+        kernel.exit_thread(&leader, None).expect("retire leader");
+
+        let captured = binding
+            .capture_signal_snapshot()
+            .expect("surviving worker context");
+        assert_eq!(captured.context().task().key(), leader.task().key());
+        assert_eq!(captured.context().thread().key(), worker.thread().key());
+        assert_eq!(captured.threads().len(), 1);
     }
 
     #[test]
