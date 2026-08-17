@@ -45,6 +45,7 @@
 // allow is module-scoped because every lock site shares the identical
 // invariant; a per-line allow would be pure noise.
 #![allow(clippy::unwrap_used)]
+use std::cell::Cell;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, TryLockError};
@@ -86,11 +87,35 @@ pub fn topology_lock() -> &'static Mutex<()> {
     L.get_or_init(|| Mutex::new(()))
 }
 
+thread_local! {
+    /// How many topology-lock guards THIS thread currently holds.
+    ///
+    /// The lock excludes *threads*, so a thread that already owns it has by
+    /// definition already established the invariant it protects and must be
+    /// allowed to re-enter. Before this counter existed, re-entry blocked on a
+    /// non-reentrant `Mutex` and wedged the carrier forever at 0% CPU: a failed
+    /// alias install under `AliasMap` (held across the whole install by the
+    /// vCPU loop) ran a cleanup path that re-acquired the same lock as
+    /// `AliasUnmap`. That turned a recoverable `ENOMEM` into an unkillable
+    /// hang, which is the worst possible failure mode.
+    static TOPOLOGY_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// True while the calling thread already owns the topology lock.
+fn topology_held_by_current_thread() -> bool {
+    TOPOLOGY_DEPTH.with(|depth| depth.get() > 0)
+}
+
+fn enter_topology_depth() {
+    TOPOLOGY_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+}
+
 /// RAII topology-lock guard that emits a typed release event on every exit
-/// path. The wrapped mutex guard preserves the existing serialization
-/// contract; the additional fields are observability-only.
+/// path. The guard is `None` for a re-entrant acquisition, which owns a depth
+/// count but not the mutex, so only the OUTERMOST guard releases it. The
+/// additional fields are observability-only.
 pub struct TopologyLockGuard {
-    _guard: MutexGuard<'static, ()>,
+    _guard: Option<MutexGuard<'static, ()>>,
     operation: carrick_observability::probes::HvpatchTopologyOperation,
     guest_pid: i32,
     guest_tid: i32,
@@ -117,6 +142,9 @@ fn emit_topology_lock(
 
 impl Drop for TopologyLockGuard {
     fn drop(&mut self) {
+        // Drop the depth before `_guard` releases the mutex, so the counter is
+        // never observed as held by a thread that no longer owns it.
+        TOPOLOGY_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
         emit_topology_lock(
             self.operation,
             carrick_observability::probes::HvpatchTopologyPhase::Released,
@@ -142,9 +170,18 @@ pub fn acquire_topology_lock(
         guest_tid,
         0,
     );
-    let guard = topology_lock()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    // A thread that already owns the lock re-enters without touching the mutex;
+    // blocking on it here would deadlock the carrier against itself.
+    let guard = if topology_held_by_current_thread() {
+        None
+    } else {
+        Some(
+            topology_lock()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        )
+    };
+    enter_topology_depth();
     emit_topology_lock(
         operation,
         carrick_observability::probes::HvpatchTopologyPhase::Acquired,
@@ -177,20 +214,25 @@ pub fn try_acquire_topology_lock(
         guest_tid,
         0,
     );
-    let guard = match topology_lock().try_lock() {
-        Ok(guard) => guard,
-        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-        Err(TryLockError::WouldBlock) => {
-            emit_topology_lock(
-                operation,
-                carrick_observability::probes::HvpatchTopologyPhase::TryMiss,
-                guest_pid,
-                guest_tid,
-                topology_elapsed_ns(requested_at),
-            );
-            return None;
+    let guard = if topology_held_by_current_thread() {
+        None
+    } else {
+        match topology_lock().try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                emit_topology_lock(
+                    operation,
+                    carrick_observability::probes::HvpatchTopologyPhase::TryMiss,
+                    guest_pid,
+                    guest_tid,
+                    topology_elapsed_ns(requested_at),
+                );
+                return None;
+            }
         }
     };
+    enter_topology_depth();
     emit_topology_lock(
         operation,
         carrick_observability::probes::HvpatchTopologyPhase::Acquired,
@@ -212,17 +254,58 @@ mod topology_probe_tests {
     use super::*;
     use carrick_observability::probes::HvpatchTopologyOperation;
 
+    /// True iff a FRESH thread cannot take the process-wide topology mutex.
+    fn excluded_from_another_thread() -> bool {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    try_acquire_topology_lock(HvpatchTopologyOperation::VmRelease, 41, 43).is_none()
+                })
+                .join()
+                .expect("probe thread")
+        })
+    }
+
+    // One test, because every case here contends for the SAME process-wide
+    // mutex; splitting them lets the harness run them concurrently and they
+    // then observe each other's guards rather than their own.
     #[test]
-    fn typed_topology_guard_serializes_blocking_and_try_acquisitions() {
+    fn topology_guard_excludes_other_threads_and_re_enters_on_the_owning_one() {
         let guard = acquire_topology_lock(HvpatchTopologyOperation::InProcessFork, 41, 42);
+        // The lock excludes THREADS, so contention must be observed from a
+        // different thread — asking on the owning thread is re-entry, not
+        // contention.
         assert!(
-            try_acquire_topology_lock(HvpatchTopologyOperation::VmRelease, 41, 43).is_none(),
+            excluded_from_another_thread(),
             "try acquisition must report contention while a typed guard is live"
         );
         drop(guard);
         assert!(
-            try_acquire_topology_lock(HvpatchTopologyOperation::VmRelease, 41, 43).is_some(),
+            !excluded_from_another_thread(),
             "typed guard drop must release the shared topology mutex"
+        );
+
+        // A failed alias install re-enters this lock from its cleanup path
+        // while the vCPU loop still holds it for the enclosing AliasMap. When
+        // re-entry blocked, the carrier wedged forever at 0% CPU instead of
+        // lowering the failure to a guest ENOMEM.
+        let outer = acquire_topology_lock(HvpatchTopologyOperation::AliasMap, 7, 7);
+        let inner = acquire_topology_lock(HvpatchTopologyOperation::AliasUnmap, 7, 7);
+        let reentrant_try = try_acquire_topology_lock(HvpatchTopologyOperation::VmRelease, 7, 7);
+        assert!(
+            reentrant_try.is_some(),
+            "re-entry must also be granted through the non-blocking door"
+        );
+        drop(reentrant_try);
+        drop(inner);
+        assert!(
+            excluded_from_another_thread(),
+            "an inner guard drop must NOT release the mutex the outer guard owns"
+        );
+        drop(outer);
+        assert!(
+            !excluded_from_another_thread(),
+            "the outermost guard drop must release the mutex process-wide"
         );
     }
 }
