@@ -253,6 +253,48 @@ class ClosureReportTest(unittest.TestCase):
             "ltp-post-assertion", semantic_summary["infrastructure_failures"]
         )
 
+    def test_post_assertion_exception_rejects_inconsistent_totals_and_cardinality(self):
+        scope = scope_2127()
+        scope["suite_names"][0] = "ltp-inconsistent-post-assertion"
+        base_results = [result(name) for name in scope["suite_names"]]
+        cases = [
+            {
+                "name": "partial-pass-total",
+                "totals": {"n": 2, "passed": 1, "failed": 0, "broken": 0, "skipped": 0},
+                "pairs": {"msgstress.c:10#1": ["ok", "ok"]},
+            },
+            {
+                "name": "failed-total-with-ok-pair",
+                "totals": {"n": 1, "passed": 0, "failed": 1, "broken": 0, "skipped": 0},
+                "pairs": {"msgstress.c:10#1": ["ok", "ok"]},
+            },
+            {
+                "name": "assertion-cardinality-mismatch",
+                "totals": {"n": 3, "passed": 3, "failed": 0, "broken": 0, "skipped": 0},
+                "pairs": {"msgstress.c:10#1": ["ok", "ok"]},
+            },
+        ]
+
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                inconsistent = result(
+                    "ltp-inconsistent-post-assertion",
+                    verdict="incomplete",
+                    pairs=case["pairs"],
+                )
+                inconsistent["carrick"] = {
+                    "result": "failure",
+                    "totals": dict(case["totals"]),
+                }
+                inconsistent["docker"] = {
+                    "result": "success",
+                    "totals": dict(case["totals"]),
+                }
+                results = list(base_results)
+                results[0] = inconsistent
+                with self.assertRaises(closure_report.ReportError):
+                    closure_report.summarize(scope, results)
+
     def test_report_rejects_unexpected_rows_and_malformed_performance(self):
         scope = scope_2127()
         complete = [result(name) for name in scope["suite_names"]]
