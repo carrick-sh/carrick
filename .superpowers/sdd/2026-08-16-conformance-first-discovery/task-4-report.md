@@ -451,3 +451,62 @@ The signed binary and Node image identities are unchanged and verified live.
 
 No broad measurement was run. The coordinator still owns the authoritative
 2,127-suite and 858-probe runtime discoveries.
+
+## Runtime fix round 3/5
+
+The coordinator completed the broad runtime discovery before this round. This
+round used the observed result shape only; it did not run guests or Docker and
+did not read, rewrite, stage, or commit the dirty refreshed oracle cache.
+
+### Red-first evidence
+
+A complete synthetic 2,127-row fixture included the real discovery shape:
+`verdict=incomplete`, both side results `success`, all totals zero, and
+`pairs={}`. Before the fix the focused test failed at the same guard as live
+`cpython-abc`:
+
+```text
+ERROR: test_both_success_zero_assertion_suite_is_retained_as_unexercised
+ReportError: result row 'cpython-zero' is non-match without an attributable assertion
+```
+
+### Minimal fix
+
+`summarize` now recognizes only the exact both-success zero-assertion shape and
+adds this suite-level synthetic assertion to the unexercised ledger:
+
+```text
+assertion: <no assertions>
+carrick: absent
+docker: absent
+```
+
+The row is not verified and cannot become a valid `>=10x` pathology even when
+it carries a large timing ratio. Other empty-pairs non-match shapes remain
+fail-closed: the same fixture with a nonzero Carrick assertion total is tested
+and still raises `ReportError`.
+
+### Green verification
+
+```text
+python3 -m unittest discover -s scripts/tests -p 'test_*closure*.py'
+Ran 21 tests; OK
+
+python3 -m py_compile scripts/conformance/closure-report.py \
+  scripts/tests/test_closure_report.py
+exit 0
+
+cargo fmt --check
+exit 0
+
+git diff --check
+exit 0
+```
+
+### Commit and retained external state
+
+- `240d711bb02f7a2a3e54146e338a61b4f260beee`
+  `fix(conformance): retain zero-assertion closure rows`
+
+The pre-existing modified `scripts/conformance/oracle-cache.jsonl` remains
+unstaged and uncommitted exactly as received. No target artifact was touched.
