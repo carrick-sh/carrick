@@ -1484,8 +1484,9 @@ mod netbsd_sockopt {
 
 /// Darwin's `struct ip_mreq_source` (`<netinet/in.h>`).
 ///
-/// Same three `struct in_addr` fields as [`LinuxIpMreqSource`], in a DIFFERENT
-/// ORDER: Darwin puts the source before the interface. Modelling both layouts
+/// Same three `struct in_addr` fields as
+/// [`crate::linux_abi::LinuxIpMreqSource`], in a DIFFERENT ORDER: Darwin puts
+/// the source before the interface. Modelling both layouts
 /// as named types means the conversion below reads as what it is — a field
 /// remap between two ABIs — instead of an index-arithmetic swap that the next
 /// reader has to decode and that silently rots if either layout gains a field.
