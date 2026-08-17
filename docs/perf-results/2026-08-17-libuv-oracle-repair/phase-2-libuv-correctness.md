@@ -127,6 +127,28 @@ for this suite alone once a full closure run is taken. No such run has been
 made since the repair; the counts in `docs/conformance-closure-ledger.md` and
 the handoff's "current counts" still describe the pre-repair state.
 
+## Measured Darwin facts (keep these — each cost an experiment)
+
+Every one of these was established with a small host-only C program, no guest
+involved. They are the difference between "Carrick is slow/wrong somewhere" and
+a known host capability gap with a known bridge.
+
+| question | answer |
+|---|---|
+| `IPV6_MULTICAST_IF` with ifindex 0 (Linux's "clear") | `EINVAL`. And there is NO way to clear it once set: 0 as `u32`, 0 as `int`, and a zero-length optval all `EINVAL`, readback keeps the old index. |
+| IPv4 multicast join on `239.255.0.1`, `imr_interface = INADDR_ANY` | Fully supported: join / send / receive-own-datagram / drop all return 0. The blanket `ENODEV` was an excuse, not a limitation. |
+| `struct ip_mreq_source` field order | Darwin `{ multiaddr, sourceaddr, interface }` vs Linux `{ multiaddr, interface, sourceaddr }`; option numbers 70..73 vs 37..40. |
+| `SO_REUSEPORT` distribution, 2 sockets / 10 connections | TCP `listener0=0 listener1=10`; UDP `receiver0=0 receiver1=10`. Darwin never distributes — the last binder takes everything. |
+| write to a TCP socket whose peer closed | `ECONNRESET` after ~27 four-byte writes. Darwin does the right thing here, so `tcp_try_write_error`'s EAGAIN is Carrick's, not the host's. |
+| ICMP port-unreachable on an UNCONNECTED UDP socket | Not reported at all: `SO_ERROR` stays 0, `poll` shows nothing, `recv` gives `EAGAIN`. |
+| ICMP port-unreachable on a CONNECTED UDP socket | `recv` returns `ECONNREFUSED`. |
+| **shadow-socket bridge for the above** | **Works.** A second socket bound to the SAME local `addr:port` with `SO_REUSEADDR|SO_REUSEPORT` and `connect`ed to the destination receives the `ECONNREFUSED`, while the original unconnected socket still receives from third parties normally and the shadow does not steal them. |
+
+That last row is the whole feasibility question for `IP_RECVERR`: Linux reports
+ICMP errors on an unconnected UDP socket *because* `IP_RECVERR` asks it to, and
+Darwin will not — but a same-address connected shadow can be made to, without
+changing the packets on the wire or what the real socket receives.
+
 ## Provenance
 
 Signed artifacts used, in order:
