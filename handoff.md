@@ -320,11 +320,29 @@ names.
    NOT in the divergence list precisely because it usually passes, which is why
    it must be fixed before any clean final pass. Genuine Heisenbug: under
    `carrick trace` it passed 6 of 6 (~4.7% likely by chance), so use the event
-   ring via `carrick-lldb`, NOT a tracer. Known: `uv_try_write` returns EAGAIN
-   where Linux gives EPIPE/ECONNRESET after the peer closes; Darwin itself
-   returns ECONNRESET after ~27 writes and `blocking_io` really does call the
-   host write, so the peer's host socket was still open when the guest had
-   closed it. Suspect a lingering `HostFdRef`.
+   ring via `carrick-lldb`, NOT a tracer.
+
+   **Do NOT look in the socket layer.** The `-11` the test reports is
+   libuv-INTERNAL, not a syscall result: `uv_try_write2` returns `UV_EAGAIN`
+   with no syscall at all when `stream->connect_req != NULL ||
+   stream->write_queue_size != 0` (`src/unix/stream.c:1436`). The client never
+   queues a write, so the failing condition is `connect_req != NULL` — the
+   client's `connect_cb` had not run when the server's `incoming_close_cb`
+   did. It is a LOOP-ORDERING divergence, not a write bug.
+
+   Ruled out by measurement against the Docker oracle, so do not redo it:
+   - guest `send` and `writev` on a socket whose peer closed both return
+     EPIPE/ECONNRESET, never EAGAIN — 120 tight-race iterations, zero EAGAIN,
+     the same distribution Docker produces;
+   - the host itself returns ECONNRESET after ~27 four-byte writes.
+
+   The remaining suspect is readiness ORDERING: libuv runs its io callbacks
+   before its closing-handle phase, so a batch containing BOTH the listener's
+   EPOLLIN and the client's EPOLLOUT passes, while a batch with only the
+   listener fails. A 30-trial probe put Carrick at 29/30 both-in-one-batch
+   against Docker's 30/30 — the right shape but far short of the observed ~40%
+   failure rate, so the probe is not yet reproducing the real condition.
+   Instrument the actual failing run.
 
 Once libuv closes, move to the next correctness cluster. Per the ledger the
 largest remaining assertion fan-out is CPython multiprocessing/process
