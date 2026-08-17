@@ -192,12 +192,13 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
     // INVARIANT: the `action.is_none()` arm above returned, so this is `Some`.
     #[allow(clippy::unwrap_used)]
     let action = action.unwrap();
-    let restorer = if action.sa_flags & crate::linux_abi::LINUX_SA_RESTORER != 0 {
+    let sa_flags = carrick_abi::LinuxSaFlags::from_bits_truncate(action.sa_flags);
+    let restorer = if sa_flags.contains(carrick_abi::LinuxSaFlags::RESTORER) {
         action.sa_restorer
     } else {
         0
     };
-    let altstack = if action.sa_flags & crate::linux_abi::LINUX_SA_ONSTACK != 0 {
+    let altstack = if sa_flags.contains(carrick_abi::LinuxSaFlags::ONSTACK) {
         dispatcher.signal_altstack(context, this_tid)
     } else {
         None
@@ -420,14 +421,15 @@ where
             note_signal_progress();
             // Block the signal (+ its sa_mask) for the duration of the handler, as
             // the kernel does — restored by rt_sigreturn.
-            let restorer = if action.sa_flags & crate::linux_abi::LINUX_SA_RESTORER != 0 {
+            let sa_flags = carrick_abi::LinuxSaFlags::from_bits_truncate(action.sa_flags);
+            let restorer = if sa_flags.contains(carrick_abi::LinuxSaFlags::RESTORER) {
                 action.sa_restorer
             } else {
                 0
             };
             // SA_ONSTACK: run the handler on the alternate signal stack if one is
             // installed.
-            let altstack = if action.sa_flags & crate::linux_abi::LINUX_SA_ONSTACK != 0 {
+            let altstack = if sa_flags.contains(carrick_abi::LinuxSaFlags::ONSTACK) {
                 dispatcher.signal_altstack(context, tid)
             } else {
                 None
@@ -437,7 +439,7 @@ where
             // EINTR.
             let restart_syscall = interrupted_pc.is_none()
                 && last_syscall_retval == Some(crate::linux_abi::LINUX_EINTR.guest_retval())
-                && action.sa_flags & crate::linux_abi::LINUX_SA_RESTART != 0
+                && sa_flags.contains(carrick_abi::LinuxSaFlags::RESTART)
                 && trap.last_syscall_nr().is_some_and(is_restartable_syscall);
             // Wire form for the sigframe build (see the synchronous-fault arm).
             let saved_sigmask = dispatcher

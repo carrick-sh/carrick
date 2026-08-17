@@ -7829,16 +7829,17 @@ impl HvfVmState {
                     "deferred COW protection has no page-table backing".to_owned(),
                 )
             })?;
-        let (expected_ap, phase, must_be_valid) = if prot & crate::linux_abi::LINUX_PROT_WRITE != 0
-        {
-            (AP_USER_RW, 4, true)
-        } else if prot & (crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_EXEC)
-            != 0
-        {
-            (AP_USER_RO, 5, true)
-        } else {
-            (AP_USER_RO, 6, false)
-        };
+        let prot_flags = carrick_abi::LinuxProtFlags::from_bits_truncate(prot);
+        let (expected_ap, phase, must_be_valid) =
+            if prot_flags.contains(carrick_abi::LinuxProtFlags::WRITE) {
+                (AP_USER_RW, 4, true)
+            } else if prot_flags
+                .intersects(carrick_abi::LinuxProtFlags::READ | carrick_abi::LinuxProtFlags::EXEC)
+            {
+                (AP_USER_RO, 5, true)
+            } else {
+                (AP_USER_RO, 6, false)
+            };
 
         let page_tables = self.page_tables.lock();
         let manager = page_tables.as_ref().ok_or_else(|| {

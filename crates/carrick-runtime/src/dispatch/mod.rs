@@ -6018,7 +6018,8 @@ pub(super) fn dispatch_futex_waitv_args(
             };
         }
         let expected = value as u32;
-        let private = waiter_flags & LINUX_FUTEX_PRIVATE_FLAG != 0;
+        let private = carrick_abi::LinuxFutexFlags::from_bits_truncate(waiter_flags)
+            .contains(carrick_abi::LinuxFutexFlags::PRIVATE);
         match read_futex_word(memory, address) {
             Ok(word) if word == expected => {}
             Ok(_) => {
@@ -7596,7 +7597,8 @@ fn access_metadata(metadata: &RootFsMetadata, mode: u64) -> DispatchOutcome {
     // made dpkg refuse /var/lib/dpkg ("required read/write access") even
     // though writes actually work. For execute, root still requires at least
     // one x bit on a regular file.
-    if mode & LINUX_X_OK != 0
+    if carrick_abi::LinuxAccessMode::from_bits_truncate(mode)
+        .contains(carrick_abi::LinuxAccessMode::X_OK)
         && metadata.kind == RootFsEntryKind::File
         && metadata.mode & 0o111 == 0
     {
@@ -7627,9 +7629,20 @@ pub(super) fn dac_check(
     is_dir: bool,
     mask: u64,
 ) -> Result<(), LinuxErrno> {
-    let need = (if mask & LINUX_R_OK != 0 { 4 } else { 0 })
-        | (if mask & LINUX_W_OK != 0 { 2 } else { 0 })
-        | (if mask & LINUX_X_OK != 0 { 1 } else { 0 });
+    let access_mode = carrick_abi::LinuxAccessMode::from_bits_truncate(mask);
+    let need = (if access_mode.contains(carrick_abi::LinuxAccessMode::R_OK) {
+        4
+    } else {
+        0
+    }) | (if access_mode.contains(carrick_abi::LinuxAccessMode::W_OK) {
+        2
+    } else {
+        0
+    }) | (if access_mode.contains(carrick_abi::LinuxAccessMode::X_OK) {
+        1
+    } else {
+        0
+    });
     if need == 0 {
         return Ok(());
     }
@@ -7658,7 +7671,9 @@ fn synthetic_readonly_access(mode: u64) -> DispatchOutcome {
 }
 
 fn synthetic_readonly_access_with_errno(mode: u64, write_errno: LinuxErrno) -> DispatchOutcome {
-    if mode & LINUX_W_OK != 0 {
+    if carrick_abi::LinuxAccessMode::from_bits_truncate(mode)
+        .contains(carrick_abi::LinuxAccessMode::W_OK)
+    {
         DispatchOutcome::Errno { errno: write_errno }
     } else {
         DispatchOutcome::Returned { value: 0 }

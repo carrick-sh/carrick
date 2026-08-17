@@ -21,13 +21,13 @@
 
 use super::*;
 use crate::linux_abi::{
-    LINUX_IORING_ENTER_EXT_ARG, LINUX_IORING_ENTER_FLAGS_MASK, LINUX_IORING_FEAT_SINGLE_MMAP,
-    LINUX_IORING_OFF_CQ_RING, LINUX_IORING_OFF_SQ_RING, LINUX_IORING_OFF_SQES,
-    LINUX_IORING_OP_ACCEPT, LINUX_IORING_OP_CLOSE, LINUX_IORING_OP_CONNECT, LINUX_IORING_OP_FSYNC,
-    LINUX_IORING_OP_NOP, LINUX_IORING_OP_POLL_ADD, LINUX_IORING_OP_READ, LINUX_IORING_OP_READV,
-    LINUX_IORING_OP_RECV, LINUX_IORING_OP_RECVMSG, LINUX_IORING_OP_SEND, LINUX_IORING_OP_SENDMSG,
-    LINUX_IORING_OP_WRITE, LINUX_IORING_OP_WRITEV, LinuxIoCqringOffsets, LinuxIoSqringOffsets,
-    LinuxIoUringCqe, LinuxIoUringParams, LinuxIoUringSqe, LinuxIovec, LinuxMsghdr,
+    LINUX_IORING_ENTER_FLAGS_MASK, LINUX_IORING_FEAT_SINGLE_MMAP, LINUX_IORING_OFF_CQ_RING,
+    LINUX_IORING_OFF_SQ_RING, LINUX_IORING_OFF_SQES, LINUX_IORING_OP_ACCEPT, LINUX_IORING_OP_CLOSE,
+    LINUX_IORING_OP_CONNECT, LINUX_IORING_OP_FSYNC, LINUX_IORING_OP_NOP, LINUX_IORING_OP_POLL_ADD,
+    LINUX_IORING_OP_READ, LINUX_IORING_OP_READV, LINUX_IORING_OP_RECV, LINUX_IORING_OP_RECVMSG,
+    LINUX_IORING_OP_SEND, LINUX_IORING_OP_SENDMSG, LINUX_IORING_OP_WRITE, LINUX_IORING_OP_WRITEV,
+    LinuxIoCqringOffsets, LinuxIoSqringOffsets, LinuxIoUringCqe, LinuxIoUringParams,
+    LinuxIoUringSqe, LinuxIovec, LinuxMsghdr,
 };
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
@@ -871,7 +871,8 @@ impl SyscallDispatcher {
         // reject EXT_ARG and any nonzero argp/argsz too, rather than silently
         // ignoring them. (audit M4; probe iouringenterflag)
         if flags & !LINUX_IORING_ENTER_FLAGS_MASK != 0
-            || flags & LINUX_IORING_ENTER_EXT_ARG != 0
+            || carrick_abi::LinuxIoUringEnterFlags::from_bits_truncate(flags)
+                .contains(carrick_abi::LinuxIoUringEnterFlags::EXT_ARG)
             || argp != 0
             || argsz != 0
         {

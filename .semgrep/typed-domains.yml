@@ -234,3 +234,26 @@ rules:
     message: |
       Do not define custom GuestPtr pointer wrappers. Use the canonical
       `carrick_guest_mem::GuestVa` type across the codebase.
+
+  # Enforce typed bitflags instead of raw bitwise masking on ABI flag constants.
+  - id: rust-use-bitflags-for-abi-flags
+    languages: [rust]
+    severity: ERROR
+    message: |
+      Raw bitwise operation on Linux ABI flags detected.
+      Prefer using a typed `bitflags!` representation (e.g. `LinuxCloneFlags`,
+      `LinuxOpenFlags`, `LinuxProtFlags`, etc.) defined in the ABI layer.
+    patterns:
+      - pattern-either:
+          - pattern: $X & crate::linux_abi::$FLAG != 0
+          - pattern: $X & crate::linux_abi::$FLAG == 0
+          - pattern: ($X & crate::linux_abi::$FLAG) != 0
+          - pattern: ($X & crate::linux_abi::$FLAG) == 0
+    paths:
+      include:
+        - "crates/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/*_test.rs"
+        - "**/test_*.rs"
+        - "crates/carrick-abi/**"

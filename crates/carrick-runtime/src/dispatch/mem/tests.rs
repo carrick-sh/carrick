@@ -568,8 +568,12 @@ impl GuestMemory for ProtectionTrackingMemory {
                 "injected private protection failure".into(),
             ));
         }
-        self.protections
-            .set_executable(address, len, prot & LINUX_PROT_EXEC != 0);
+        self.protections.set_executable(
+            address,
+            len,
+            carrick_abi::LinuxProtFlags::from_bits_truncate(prot)
+                .contains(carrick_abi::LinuxProtFlags::EXEC),
+        );
         self.inner.protect_range(address, len, prot)
     }
 }

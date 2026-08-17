@@ -3709,9 +3709,8 @@ mod tests {
             other => panic!("socket install failed: {other:?}"),
         };
 
-        assert_eq!(
-            dispatcher.fd_status_flags(linux_fd) & LINUX_O_NONBLOCK,
-            0,
+        assert!(
+            !dispatcher.fd_is_nonblocking(linux_fd),
             "Linux-visible fd status must preserve blocking mode",
         );
         let host_fd = dispatcher.host_fd_for_poll(linux_fd).unwrap();

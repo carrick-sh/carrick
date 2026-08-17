@@ -423,13 +423,15 @@ impl SyscallDispatcher {
                 max_msg,
             } => {
                 let flags = base.status_flags();
+                let access = flags & LINUX_O_ACCMODE;
+                let nonblock = base.is_nonblocking();
                 Ok(MqFd {
                     host_fd: host_fd.raw(),
                     path: path.clone(),
                     msg_size: *msg_size,
                     max_msg: *max_msg,
-                    access: flags & LINUX_O_ACCMODE,
-                    nonblock: flags & LINUX_O_NONBLOCK != 0,
+                    access,
+                    nonblock,
                 })
             }
             _ => Err(LINUX_EBADF),
@@ -458,8 +460,9 @@ impl SyscallDispatcher {
             if access != LINUX_O_RDONLY && access != LINUX_O_WRONLY && access != LINUX_O_RDWR {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let create = oflag & LINUX_O_CREAT != 0;
-            let exclusive = oflag & LINUX_O_EXCL != 0;
+            let open_flags = LinuxOpenFlags::from_bits_truncate(oflag);
+            let create = open_flags.contains(LinuxOpenFlags::CREAT);
+            let exclusive = open_flags.contains(LinuxOpenFlags::EXCL);
 
             ensure_dir();
             let exists = path.exists();
@@ -556,7 +559,12 @@ impl SyscallDispatcher {
             // mq_unlink removes only the name while open mqd_t values continue
             // to operate on the same queue.
             let backing_path = hidden_object_path(&path_str, host_fd);
-            let status_flags = access | (oflag & LINUX_O_NONBLOCK);
+            let status_flags = access
+                | if open_flags.contains(LinuxOpenFlags::NONBLOCK) {
+                    LINUX_O_NONBLOCK
+                } else {
+                    0
+                };
             let description = OpenDescription::Mqueue {
                 base: OpenDescriptionBase::new(status_flags),
                 host_fd: HostFdRef::new(host_fd),
@@ -872,7 +880,8 @@ impl SyscallDispatcher {
                         Ok(a) => a,
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     };
-                let want_nonblock = new_attr.mq_flags & LINUX_O_NONBLOCK as i64 != 0;
+                let want_nonblock =
+                    (new_attr.mq_flags as u64) & LinuxOpenFlags::NONBLOCK.bits() != 0;
                 if let Some(open_file) = this.open_file(mqd as i32) {
                     let mut open = open_file.description.write();
                     let cur = open.status_flags();
