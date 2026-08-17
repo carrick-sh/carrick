@@ -131,11 +131,24 @@ Ruled OUT by measurement, so the next session does not repeat it:
 - `/proc/net/if_inet6` in bridge mode now correctly holds only `::1` on `lo`,
   matching the oracle exactly.
 
-Next suspect is the synthetic netlink `RTM_GETADDR` reply glibc's `__check_pf`
-parses (`dispatch/net/support.rs`), since that is the remaining input to the
-RFC 3484 sort that differs between the two modes. Note one known defect there
-already: `ifa_scope` is emitted as `RT_SCOPE_UNIVERSE` for every non-loopback
-address, where a real `fe80::` carries `RT_SCOPE_LINK` (253).
+Also RULED OUT: the synthetic netlink `RTM_GETADDR` reply. It really did
+differ from Linux (no `IFA_F_PERMANENT`, no `IFA_CACHEINFO`/`IFA_FLAGS`,
+spurious `IFA_LOCAL`/`IFA_LABEL` on IPv6, `fe80::` scoped UNIVERSE instead of
+LINK) and has been corrected to match the oracle's shape exactly — the crash
+still reproduces, so that was not the cause either.
+
+And it is PRE-EXISTING: it reproduces on the network model from before this
+campaign touched it, so dropping the fabricated uplink link-local did not
+introduce it.
+
+What still correlates is the one remaining difference: bridge mode has NO
+non-loopback IPv6 address while host mode does. Docker's netns is in the same
+position (only `::1` on `lo`) and does NOT crash, so something else about how
+Carrick answers glibc's per-candidate source-address probe must differ. The
+next step is to observe the exact syscall sequence glibc makes in each mode —
+`carrick trace` on the Carrick side, bpftrace inside Docker for the Linux
+ground truth — rather than more black-box differential probing, which has now
+eliminated every cheap hypothesis.
 
 This is a crash in a shipped network mode, so it outranks the two rows it
 blocks.
