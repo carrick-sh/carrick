@@ -510,3 +510,67 @@ exit 0
 
 The pre-existing modified `scripts/conformance/oracle-cache.jsonl` remains
 unstaged and uncommitted exactly as received. No target artifact was touched.
+
+## Runtime fix round 4/5
+
+This round addressed the real `ltp-msgstress01` and `ltp-shmget04` result shape
+without running guests or Docker and without touching the dirty oracle cache or
+target artifacts.
+
+### Red-first evidence
+
+The complete 2,127-row fixture reproduced the exact observation:
+
+- verdict `incomplete`;
+- Carrick suite result `failure`;
+- Docker suite result `success`;
+- equal nonzero totals;
+- every recorded assertion pair `ok/ok`.
+
+Before the fix, the focused test reached the same unattributable guard as the
+ledger preview:
+
+```text
+ERROR: test_post_assertion_process_failure_is_infrastructure_not_assertion_semantics
+ReportError: result row 'ltp-post-assertion' is non-match without an attributable assertion
+```
+
+### Minimal fix
+
+`summarize` now identifies a post-assertion/process failure only when all of the
+following hold:
+
+- verdict is `incomplete`;
+- Carrick is `failure` and Docker is `success`;
+- both sides have identical totals with `n > 0`;
+- assertion pairs are nonempty and every pair is `ok/ok`.
+
+That exact shape is retained as a suite-level infrastructure failure and cannot
+enter verified or pathological output, even with a `>=10x` ratio. The test then
+changes the pair to `fail/ok` and proves the row remains an assertion-level
+semantic gap and is not indiscriminately reclassified as infrastructure.
+
+### Green verification
+
+```text
+python3 -m unittest discover -s scripts/tests -p 'test_*closure*.py'
+Ran 22 tests; OK
+
+python3 -m py_compile scripts/conformance/closure-report.py \
+  scripts/tests/test_closure_report.py
+exit 0
+
+cargo fmt --check
+exit 0
+
+git diff --check
+exit 0
+```
+
+### Commit and retained external state
+
+- `e2cdd9973021185321ba537bfdf7326f1ff87c7f`
+  `fix(conformance): retain post-assertion failures`
+
+The pre-existing modified `scripts/conformance/oracle-cache.jsonl` remains the
+sole unstaged path. No broad measurement or target-artifact operation occurred.
