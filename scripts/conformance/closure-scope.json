@@ -1,5 +1,5 @@
 {
-  "binary_sha256": "bdd69fae3d124db3d69978b70447ea05dc7f48a5cd2522a09fed72a7b38adbad",
+  "binary_sha256": "809f10dd3f4bdcdc61eb5e6af2ee43ce1a2a65b9d06fe53f35a49f6a85d2bf5f",
   "declared_image_refs": [
     "localhost:5005/carrick-go-conformance:1.24",
     "localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0",
@@ -15,10 +15,10 @@
       ]
     },
     "localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0": {
-      "docker_id": "sha256:50d22d4ee6776c57f6ad06ecc82e8219a9e5026e327aebab5847e17f61d46cbd",
-      "registry_digest": "sha256:50d22d4ee6776c57f6ad06ecc82e8219a9e5026e327aebab5847e17f61d46cbd",
+      "docker_id": "sha256:1ed49af83bd30401e1b275957b99a1c28f6c582ab3d987997afb5888fa302718",
+      "registry_digest": "sha256:1ed49af83bd30401e1b275957b99a1c28f6c582ab3d987997afb5888fa302718",
       "repo_digests": [
-        "localhost:5005/carrick-nodejs-conformance@sha256:50d22d4ee6776c57f6ad06ecc82e8219a9e5026e327aebab5847e17f61d46cbd"
+        "localhost:5005/carrick-nodejs-conformance@sha256:1ed49af83bd30401e1b275957b99a1c28f6c582ab3d987997afb5888fa302718"
       ]
     },
     "localhost:5050/cpython-test:3.12.13": {
@@ -39,7 +39,7 @@
   },
   "manifest_sha256": "36042b91814ca767d61a6615c0023aa07773b7f5649fc65038fae6c34367d282",
   "schema": "carrick-closure-scope-v1",
-  "source_head": "370ef6836dcc244fd5f278570f60c8de692a18e8",
+  "source_head": "8164f767fe584696e383a401b5784677a19c19c2",
   "suite_count": 2127,
   "suite_counts_by_ecosystem": {
     "cpython": 438,

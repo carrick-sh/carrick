@@ -340,6 +340,7 @@ conformance-probes-closure: build
     ./scripts/build-probes.sh --closure-arm64
     CARRICK_PROBE_MODE=closure CARRICK_PROBE_LANE=arm64 CARRICK_EXEC_BACKEND=hvpatch \
       cargo test -p carrick-cli --test conformance conformance_probes -- --exact --nocapture
+    python3 scripts/conformance/closure-probe-scenarios.py
 
 # Re-sign an already-built release binary (rarely needed on its own).
 sign:

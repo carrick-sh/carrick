@@ -27,6 +27,41 @@ fn serve_help_lists_docker_api_flag() {
         .stdout(predicates::str::contains("--docker-api"));
 }
 
+#[test]
+fn closure_sidecar_scenario_selects_both_arm64_libc_artifact_sets() {
+    assert_eq!(
+        dedicated_scenario_probe_target(false, None),
+        Ok("aarch64-unknown-linux-musl")
+    );
+    assert_eq!(
+        dedicated_scenario_probe_target(true, Some("musl")),
+        Ok("aarch64-unknown-linux-musl")
+    );
+    assert_eq!(
+        dedicated_scenario_probe_target(true, Some("gnu")),
+        Ok("aarch64-unknown-linux-gnu")
+    );
+    assert!(dedicated_scenario_probe_target(true, None).is_err());
+    assert!(dedicated_scenario_probe_target(true, Some("bogus")).is_err());
+}
+
+fn dedicated_scenario_probe_target(
+    closure_mode: bool,
+    closure_libc: Option<&str>,
+) -> Result<&'static str, String> {
+    if !closure_mode {
+        return Ok("aarch64-unknown-linux-musl");
+    }
+    match closure_libc {
+        Some("musl") => Ok("aarch64-unknown-linux-musl"),
+        Some("gnu") => Ok("aarch64-unknown-linux-gnu"),
+        Some(value) => Err(format!(
+            "invalid CARRICK_PROBE_SCENARIO_LIBC={value:?}; expected musl or gnu"
+        )),
+        None => Err("closure dedicated scenario requires CARRICK_PROBE_SCENARIO_LIBC".to_string()),
+    }
+}
+
 /// Codesign the test binary once with the hypervisor entitlement. The server we
 /// spawn shells out to ITSELF (current_exe) to boot a guest under HVF, which
 /// requires the `com.apple.security.hypervisor` entitlement; an unsigned binary
@@ -67,7 +102,14 @@ fn spawn_server() -> (ServerGuard, String, tempfile::TempDir) {
         // This integration suite is the codesigned macOS/HVF lane. Keep that
         // execution model explicit now that ordinary CLI policy defaults to
         // native DSR; the server's self-spawned `carrick create` inherits it.
-        .env("CARRICK_EXEC_BACKEND", "vmm")
+        .env(
+            "CARRICK_EXEC_BACKEND",
+            if std::env::var("CARRICK_PROBE_MODE").as_deref() == Ok("closure") {
+                "hvpatch"
+            } else {
+                "vmm"
+            },
+        )
         .args(["serve", "--docker-api", "--host", &sock_str])
         .spawn()
         .unwrap();
@@ -1848,10 +1890,14 @@ async fn docker_compose_shared_network_namespace_smoke() {
         .parent()
         .and_then(|path| path.parent())
         .unwrap_or_else(|| panic!("workspace root"));
+    let closure_mode = std::env::var("CARRICK_PROBE_MODE").as_deref() == Ok("closure");
+    let closure_libc = std::env::var("CARRICK_PROBE_SCENARIO_LIBC").ok();
+    let target = dedicated_scenario_probe_target(closure_mode, closure_libc.as_deref())
+        .unwrap_or_else(|error| panic!("dedicated probe artifact selection failed: {error}"));
     let probe_target = workspace
         .join("conformance-probes")
         .join("target")
-        .join("aarch64-unknown-linux-musl");
+        .join(target);
     let find_probe = |name: &str| {
         ["debug", "release"]
             .into_iter()

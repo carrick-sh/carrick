@@ -1209,7 +1209,10 @@ fn conformance_bridge_tcp_peer() {
         eprintln!("SKIP conformance_bridge_tcp_peer: Docker not reachable");
         return;
     }
-    let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_tcp_peer");
+    let probe = probes_dir(
+        selected_dedicated_probe_target(&lane).expect("select dedicated probe artifact"),
+    )
+    .join("bridge_tcp_peer");
     if !probe.exists() {
         eprintln!(
             "SKIP conformance_bridge_tcp_peer: probe not built ({})",
@@ -1255,7 +1258,10 @@ fn conformance_bridge_publish_tcp() {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    let probe = probes_dir(musl_target_for_lane(&lane)).join("bridge_publish_tcp");
+    let probe = probes_dir(
+        selected_dedicated_probe_target(&lane).expect("select dedicated probe artifact"),
+    )
+    .join("bridge_publish_tcp");
     if !probe.exists() {
         eprintln!(
             "SKIP conformance_bridge_publish_tcp: probe not built ({})",
@@ -1319,7 +1325,10 @@ fn conformance_bridge_udp_peer() {
         eprintln!("SKIP conformance_bridge_udp_peer: Docker not reachable");
         return;
     }
-    let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_udp_peer");
+    let probe = probes_dir(
+        selected_dedicated_probe_target(&lane).expect("select dedicated probe artifact"),
+    )
+    .join("bridge_udp_peer");
     if !probe.exists() {
         eprintln!(
             "SKIP conformance_bridge_udp_peer: probe not built ({})",
@@ -1379,7 +1388,10 @@ fn conformance_bridge_tcp_nonblocking_refused() {
         eprintln!("SKIP conformance_bridge_tcp_nonblocking_refused: Docker not reachable");
         return;
     }
-    let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_tcp_nonblocking_refused");
+    let probe = probes_dir(
+        selected_dedicated_probe_target(&lane).expect("select dedicated probe artifact"),
+    )
+    .join("bridge_tcp_nonblocking_refused");
     if !probe.exists() {
         eprintln!(
             "SKIP conformance_bridge_tcp_nonblocking_refused: probe not built ({})",
@@ -1432,7 +1444,10 @@ fn conformance_bridge_udp_connected_unreachable() {
         eprintln!("SKIP conformance_bridge_udp_connected_unreachable: Docker not reachable");
         return;
     }
-    let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_udp_connected_unreachable");
+    let probe = probes_dir(
+        selected_dedicated_probe_target(&lane).expect("select dedicated probe artifact"),
+    )
+    .join("bridge_udp_connected_unreachable");
     if !probe.exists() {
         eprintln!(
             "SKIP conformance_bridge_udp_connected_unreachable: probe not built ({})",
@@ -1485,7 +1500,10 @@ fn conformance_bridge_udp_sendto_unreachable() {
         eprintln!("SKIP conformance_bridge_udp_sendto_unreachable: Docker not reachable");
         return;
     }
-    let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_udp_sendto_unreachable");
+    let probe = probes_dir(
+        selected_dedicated_probe_target(&lane).expect("select dedicated probe artifact"),
+    )
+    .join("bridge_udp_sendto_unreachable");
     if !probe.exists() {
         eprintln!(
             "SKIP conformance_bridge_udp_sendto_unreachable: probe not built ({})",
@@ -1536,7 +1554,10 @@ fn conformance_bridge_reuse_sockopts() {
         eprintln!("SKIP conformance_bridge_reuse_sockopts: Docker not reachable");
         return;
     }
-    let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_reuse_sockopts");
+    let probe = probes_dir(
+        selected_dedicated_probe_target(&lane).expect("select dedicated probe artifact"),
+    )
+    .join("bridge_reuse_sockopts");
     if !probe.exists() {
         eprintln!(
             "SKIP conformance_bridge_reuse_sockopts: probe not built ({})",
@@ -1575,7 +1596,9 @@ fn conformance_bridge_compose_pair() {
         );
         return;
     }
-    let probes = probes_dir(musl_target_for_lane(&lane));
+    let probes = probes_dir(
+        selected_dedicated_probe_target(&lane).expect("select dedicated probe artifact"),
+    );
     let server_probe = probes.join("bridge_compose_server");
     if !server_probe.exists() {
         eprintln!(
@@ -1621,7 +1644,8 @@ fn conformance_bridge_compose_pair() {
 #[test]
 fn conformance_native_udp_service_pair() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if std::env::var("CARRICK_EXEC_BACKEND").as_deref() != Ok("native") {
+    if std::env::var("CARRICK_EXEC_BACKEND").as_deref() != Ok("native") && !dedicated_closure_mode()
+    {
         eprintln!("SKIP conformance_native_udp_service_pair: native backend not requested");
         return;
     }
@@ -1630,7 +1654,9 @@ fn conformance_native_udp_service_pair() {
         return;
     };
     let lane = same_isa_lane();
-    let probes = probes_dir(musl_target_for_lane(&lane));
+    let probes = probes_dir(
+        selected_dedicated_probe_target(&lane).expect("select dedicated probe artifact"),
+    );
     let server = probes.join("udp_published_server");
     let client = probes.join("udp_published_client");
     if !server.is_file() || !client.is_file() {
@@ -1673,7 +1699,8 @@ fn conformance_native_udp_service_pair() {
 #[test]
 fn conformance_native_multi_network_roles() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if std::env::var("CARRICK_EXEC_BACKEND").as_deref() != Ok("native") {
+    if std::env::var("CARRICK_EXEC_BACKEND").as_deref() != Ok("native") && !dedicated_closure_mode()
+    {
         eprintln!("SKIP conformance_native_multi_network_roles: native backend not requested");
         return;
     }
@@ -1682,7 +1709,9 @@ fn conformance_native_multi_network_roles() {
         return;
     };
     let lane = same_isa_lane();
-    let probes = probes_dir(musl_target_for_lane(&lane));
+    let probes = probes_dir(
+        selected_dedicated_probe_target(&lane).expect("select dedicated probe artifact"),
+    );
     let server = probes.join("multi_network_server");
     let client = probes.join("multi_network_client");
     let dns = probes.join("multi_network_dns_client");
@@ -1831,7 +1860,8 @@ fn conformance_native_host_gateway() {
     use std::io::{Read, Write};
 
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if std::env::var("CARRICK_EXEC_BACKEND").as_deref() != Ok("native") {
+    if std::env::var("CARRICK_EXEC_BACKEND").as_deref() != Ok("native") && !dedicated_closure_mode()
+    {
         eprintln!("SKIP conformance_native_host_gateway: native backend not requested");
         return;
     }
@@ -1840,7 +1870,10 @@ fn conformance_native_host_gateway() {
         return;
     };
     let lane = same_isa_lane();
-    let probe = probes_dir(musl_target_for_lane(&lane)).join("host_gateway_client");
+    let probe = probes_dir(
+        selected_dedicated_probe_target(&lane).expect("select dedicated probe artifact"),
+    )
+    .join("host_gateway_client");
     if !probe.is_file() {
         eprintln!("SKIP conformance_native_host_gateway: probe not built");
         return;
@@ -1901,7 +1934,10 @@ fn conformance_bridge_net_identity() {
         eprintln!("SKIP conformance_bridge_net_identity: Docker not reachable");
         return;
     }
-    let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_net_identity");
+    let probe = probes_dir(
+        selected_dedicated_probe_target(&lane).expect("select dedicated probe artifact"),
+    )
+    .join("bridge_net_identity");
     if !probe.exists() {
         eprintln!(
             "SKIP conformance_bridge_net_identity: probe not built ({})",
@@ -1951,7 +1987,10 @@ fn conformance_bridge_loopback_isolation() {
         eprintln!("SKIP conformance_bridge_loopback_isolation: Docker not reachable");
         return;
     }
-    let probe = probes_dir("aarch64-unknown-linux-musl").join("bridge_loopback_isolation");
+    let probe = probes_dir(
+        selected_dedicated_probe_target(&lane).expect("select dedicated probe artifact"),
+    )
+    .join("bridge_loopback_isolation");
     if !probe.exists() {
         eprintln!(
             "SKIP conformance_bridge_loopback_isolation: probe not built ({})",
@@ -2009,6 +2048,40 @@ fn musl_target_for_lane(lane: &Lane) -> &'static str {
         "linux/amd64" => "x86_64-unknown-linux-musl",
         _ => "aarch64-unknown-linux-musl",
     }
+}
+
+fn dedicated_closure_mode() -> bool {
+    std::env::var("CARRICK_PROBE_MODE").as_deref() == Ok("closure")
+}
+
+fn dedicated_probe_target(
+    lane: &Lane,
+    closure_mode: bool,
+    closure_libc: Option<&str>,
+) -> Result<&'static str, String> {
+    if !closure_mode {
+        return Ok(musl_target_for_lane(lane));
+    }
+    if lane.platform != "linux/arm64" {
+        return Err(format!(
+            "closure dedicated scenarios require linux/arm64, got {}",
+            lane.platform
+        ));
+    }
+    match closure_libc {
+        Some("musl") => Ok("aarch64-unknown-linux-musl"),
+        Some("gnu") => Ok("aarch64-unknown-linux-gnu"),
+        Some(value) => Err(format!(
+            "invalid CARRICK_PROBE_SCENARIO_LIBC={value:?}; expected musl or gnu"
+        )),
+        None => Err("closure dedicated scenarios require CARRICK_PROBE_SCENARIO_LIBC".to_string()),
+    }
+}
+
+fn selected_dedicated_probe_target(lane: &Lane) -> Result<&'static str, String> {
+    let closure_mode = dedicated_closure_mode();
+    let libc = std::env::var("CARRICK_PROBE_SCENARIO_LIBC").ok();
+    dedicated_probe_target(lane, closure_mode, libc.as_deref())
 }
 
 fn lane_runnable_here(lane: &Lane) -> bool {
@@ -5307,6 +5380,25 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     let mut shrunken_sources = sources.clone();
     shrunken_sources.remove("abortdeath");
     assert!(validate_closure_probe_rows(&shrunken_inventory, &shrunken_sources).is_err());
+}
+
+#[test]
+fn closure_dedicated_scenarios_select_both_arm64_libc_artifact_sets() {
+    assert_eq!(
+        dedicated_probe_target(&ARM64, true, Some("musl")),
+        Ok("aarch64-unknown-linux-musl")
+    );
+    assert_eq!(
+        dedicated_probe_target(&ARM64, true, Some("gnu")),
+        Ok("aarch64-unknown-linux-gnu")
+    );
+    assert!(dedicated_probe_target(&ARM64, true, None).is_err());
+    assert!(dedicated_probe_target(&ARM64, true, Some("bogus")).is_err());
+    assert!(dedicated_probe_target(&AMD64, true, Some("musl")).is_err());
+    assert_eq!(
+        dedicated_probe_target(&ARM64, false, None),
+        Ok("aarch64-unknown-linux-musl")
+    );
 }
 
 #[test]
