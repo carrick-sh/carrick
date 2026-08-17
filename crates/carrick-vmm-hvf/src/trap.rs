@@ -8336,11 +8336,19 @@ impl HvfVmState {
             write: true,
             execute: true,
         });
+        // Reserve the global-frame lease on a 2 MiB boundary, NOT the 16 KiB
+        // COW compound granule. The dispatcher hands this path a 2 MiB-aligned
+        // alias VA, so a 2 MiB-aligned output keeps VA and IPA congruent and
+        // lets the stage-1 editor express the mapping as 1 GiB/2 MiB block
+        // leaves. A 16 KiB-aligned base breaks that congruence, and since no
+        // block leaf can then be expressed ANYWHERE the whole alias falls to
+        // 4 KiB pages — one fresh L3 table per 2 MiB, which exhausts the
+        // 440-page spare pool at ~850 MiB and fails the build (CPython's
+        // `test_mmap` LargeMmapTests hung there). The sparse-arena sibling
+        // reserves on `TWO_MIB` for exactly this reason.
+        const TWO_MIB: u64 = 2 * 1024 * 1024;
         let mut global_lease = if self.persistent_vm_lifecycle {
-            Some(GlobalFrameStage2Lease::reserve(
-                hvf_len,
-                CowArmedRanges::COMPOUND_SIZE,
-            )?)
+            Some(GlobalFrameStage2Lease::reserve(hvf_len, TWO_MIB)?)
         } else {
             None
         };
