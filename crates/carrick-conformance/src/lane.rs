@@ -276,31 +276,34 @@ fn shell_quote(s: &str) -> String {
 
 /// Map the lane CLI strings to a `Lane`. The Lima and direct local x86_64 lanes
 /// keep independent timeout scales so one bring-up lane cannot weaken another
-/// host backend's deadlines. Anything unrecognized (including `hvf` itself) is
-/// the local macOS lane.
+/// host backend's deadlines. Every accepted spelling is enumerated explicitly:
+/// a typo must fail rather than silently selecting the local macOS lane.
 pub fn lane_from_args(
     lane: &str,
     lima_vm: &str,
     lima_gateway: &str,
     lima_timeout_scale: f64,
     local_timeout_scale: f64,
-) -> Lane {
+) -> Result<Lane, String> {
     match lane {
-        "kvm" => Lane::Kvm(LimaConfig {
+        "hvf" => Ok(Lane::Hvf),
+        "kvm" => Ok(Lane::Kvm(LimaConfig {
             vm: lima_vm.to_string(),
             gateway: lima_gateway.to_string(),
             timeout_scale: lima_timeout_scale,
-        }),
-        "kvm-local" | "linux-kvm" => Lane::KvmLocal(LocalKvmConfig {
+        })),
+        "kvm-local" | "linux-kvm" => Ok(Lane::KvmLocal(LocalKvmConfig {
             timeout_scale: local_timeout_scale,
-        }),
-        "bhyve-local" | "freebsd-bhyve" => Lane::BhyveLocal(LocalBhyveConfig {
+        })),
+        "bhyve-local" | "freebsd-bhyve" => Ok(Lane::BhyveLocal(LocalBhyveConfig {
             timeout_scale: local_timeout_scale,
-        }),
-        "nvmm-local" | "netbsd-nvmm" => Lane::NvmmLocal(LocalNvmmConfig {
+        })),
+        "nvmm-local" | "netbsd-nvmm" => Ok(Lane::NvmmLocal(LocalNvmmConfig {
             timeout_scale: local_timeout_scale,
-        }),
-        _ => Lane::Hvf,
+        })),
+        _ => Err(format!(
+            "unrecognized lane {lane:?}; expected hvf, kvm, kvm-local, linux-kvm, bhyve-local, freebsd-bhyve, nvmm-local, or netbsd-nvmm"
+        )),
     }
 }
 
@@ -379,23 +382,38 @@ mod tests {
         assert_no_backend_selection(&argv);
     }
 
-    /// `hvf` is the ONE local macOS lane, and every retired local spelling now
-    /// resolves to it rather than to a second lane with its own overlay and its
-    /// own timeout scale.
+    /// Unknown spellings must never quietly select the local HVF lane: a typo
+    /// changes the measured environment and invalidates the result.
     #[test]
-    fn every_local_lane_spelling_is_the_single_hvf_lane() {
+    fn unknown_lane_does_not_fall_back_to_hvf() {
+        assert!(lane_from_args("bogus", "carrick", "host.lima.internal", 2.0, 1.0).is_err());
+        assert!(lane_from_args("hvpatch", "carrick", "host.lima.internal", 2.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn accepted_lane_spellings_are_explicit() {
         for spelling in [
             "hvf",
-            "hvpatch",
-            "macos-hvpatch",
-            "native-dsr",
-            "macos-native-dsr",
-            "",
+            "kvm",
+            "kvm-local",
+            "linux-kvm",
+            "bhyve-local",
+            "freebsd-bhyve",
+            "nvmm-local",
+            "netbsd-nvmm",
         ] {
-            let lane = lane_from_args(spelling, "carrick", "host.lima.internal", 2.0, 1.0);
+            let lane = lane_from_args(spelling, "carrick", "host.lima.internal", 2.0, 1.0)
+                .unwrap_or_else(|error| panic!("{spelling:?} rejected: {error}"));
             assert!(
-                matches!(lane, Lane::Hvf),
-                "{spelling:?} must resolve to the single local macOS lane"
+                matches!(
+                    lane,
+                    Lane::Hvf
+                        | Lane::Kvm(_)
+                        | Lane::KvmLocal(_)
+                        | Lane::BhyveLocal(_)
+                        | Lane::NvmmLocal(_)
+                ),
+                "{spelling:?} must resolve to an explicitly accepted lane"
             );
         }
     }
@@ -467,7 +485,8 @@ mod tests {
     #[test]
     fn bhyve_local_invocation_runs_carrick_directly_as_amd64() {
         let s = demo_suite();
-        let lane = lane_from_args("bhyve-local", "carrick", "host.lima.internal", 2.0, 1.5);
+        let lane = lane_from_args("bhyve-local", "carrick", "host.lima.internal", 2.0, 1.5)
+            .unwrap_or_else(|error| panic!("bhyve-local rejected: {error}"));
         let argv = carrick_invocation_argv(&s, "/root/ct/release/carrick", "conf-1-2", &lane);
 
         assert_eq!(lane.docker_platform(), DockerPlatform::LinuxAmd64);
@@ -487,7 +506,8 @@ mod tests {
     #[test]
     fn nvmm_local_invocation_runs_carrick_directly_as_amd64() {
         let s = demo_suite();
-        let lane = lane_from_args("nvmm-local", "carrick", "host.lima.internal", 2.0, 1.5);
+        let lane = lane_from_args("nvmm-local", "carrick", "host.lima.internal", 2.0, 1.5)
+            .unwrap_or_else(|error| panic!("nvmm-local rejected: {error}"));
         let argv = carrick_invocation_argv(&s, "/root/ct/release/carrick", "conf-1-2", &lane);
 
         assert_eq!(lane.docker_platform(), DockerPlatform::LinuxAmd64);
@@ -517,10 +537,10 @@ mod tests {
     fn lane_from_args_builds_kvm_with_defaults() {
         assert!(matches!(
             lane_from_args("hvf", "carrick", "host.lima.internal", 2.0, 1.0),
-            Lane::Hvf
+            Ok(Lane::Hvf)
         ));
         match lane_from_args("kvm", "carrick", "host.lima.internal", 2.0, 1.0) {
-            Lane::Kvm(cfg) => {
+            Ok(Lane::Kvm(cfg)) => {
                 assert_eq!(cfg.vm, "carrick");
                 assert_eq!(cfg.gateway, "host.lima.internal");
                 assert_eq!(cfg.timeout_scale, 2.0);
@@ -528,11 +548,11 @@ mod tests {
             _ => panic!("expected Kvm"),
         }
         match lane_from_args("kvm-local", "carrick", "host.lima.internal", 3.0, 1.0) {
-            Lane::KvmLocal(cfg) => assert_eq!(cfg.timeout_scale, 1.0),
+            Ok(Lane::KvmLocal(cfg)) => assert_eq!(cfg.timeout_scale, 1.0),
             _ => panic!("expected KvmLocal"),
         }
         match lane_from_args("kvm-local", "carrick", "host.lima.internal", 3.0, 1.5) {
-            Lane::KvmLocal(cfg) => assert_eq!(cfg.timeout_scale, 1.5),
+            Ok(Lane::KvmLocal(cfg)) => assert_eq!(cfg.timeout_scale, 1.5),
             _ => panic!("expected KvmLocal"),
         }
     }

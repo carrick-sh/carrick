@@ -38,7 +38,7 @@ pub fn render(reports: &[SuiteReport]) -> String {
          file after a run is the regression review.\n\n",
     );
     out.push_str(
-        "Verdicts: **MATCH** identical · **DIFF** diverges but every divergence is a \
+        "Verdicts: **MATCH** identical · **INCOMPLETE** closure run lacked an identical, nonempty all-pass result · **DIFF** diverges but every divergence is a \
          tracked/known or unchanged gap (green) · **REGRESSION** a new, unexcused \
          break (red, fails the gate) · **NEW** first observation, not yet baselined · \
          **CARRICK_CRASH**/**TIMEOUT** carrick aborted/hung · **ORACLE_FAIL** the \
@@ -89,6 +89,7 @@ fn headline(rows: &[&SuiteReport]) -> String {
     }
     let order = [
         Verdict::Match,
+        Verdict::Incomplete,
         Verdict::Diff,
         Verdict::New,
         Verdict::Regression,
