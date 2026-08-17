@@ -158,6 +158,10 @@ fn apply_alias_frame_inventory(
 struct KernelFrameCowAuthority {
     kernel: Arc<crate::kernel::Kernel>,
     mm: crate::kernel::MmId,
+    /// Whether a stop-the-world pause is needed at all. The `kicker` below is
+    /// the DRAIN's instrument once one is being taken; it is not the raise
+    /// predicate.
+    guest_executors: Arc<crate::kernel::GuestExecutorCensus>,
     kicker: Arc<dyn carrick_hal::VcpuRegistry>,
     tid: carrick_hal::ThreadId,
 }
@@ -167,7 +171,11 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         &self,
     ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
     {
-        if self.kicker.count() <= 1 || quiesce::current_thread_holds_pt_pause() {
+        // Frame COW rewrites backing the guest can be reading. Raise the pause
+        // whenever another thread could reach guest code before the copy
+        // completes — a parked sibling included. Keying this on the kicker's
+        // lease count skipped the pause for exactly that sibling.
+        if !self.guest_executors.has_peer_executor() || quiesce::current_thread_holds_pt_pause() {
             return Ok(Box::new(()));
         }
         // The LAZY, cross-thread acquisition — the A-then-P half of the ABBA
@@ -178,6 +186,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         quiesce::acquire_pt_pause(
             quiesce::pt_barrier(),
             &*self.kicker,
+            &self.guest_executors,
             self.tid,
             quiesce::PtPauseBudget::DEFAULT,
         )
@@ -1068,8 +1077,11 @@ pub(crate) struct KernelState {
     /// Issues crash-capture generations and broadcasts the one currently
     /// collecting. Sibling loops read it at their quiesce safe point.
     crash_capture: Option<Arc<crate::kernel::CrashCaptureAuthority>>,
-    /// Number of host vCPU loops still alive for this Linux process.
-    process_vcpu_live: std::sync::atomic::AtomicUsize,
+    /// The threads that can execute guest code for this Linux process — the
+    /// population every stop-the-world barrier's RAISE decision is keyed on,
+    /// and the one thread-group teardown waits out. Deliberately NOT
+    /// `kicker.count()`: see `kernel::guest_execution`.
+    guest_executors: Arc<crate::kernel::GuestExecutorCensus>,
     /// Cross-layer thread-clone admission spans Kernel reservation through
     /// runtime registration, handle visibility, and child start.
     clone_admission: CloneAdmissionGate,
@@ -1114,7 +1126,7 @@ impl KernelState {
             process_exiting: std::sync::atomic::AtomicBool::new(false),
             process_fork_barrier,
             crash_capture,
-            process_vcpu_live: std::sync::atomic::AtomicUsize::new(0),
+            guest_executors: Arc::new(crate::kernel::GuestExecutorCensus::default()),
             clone_admission: CloneAdmissionGate::default(),
             hvpatch_runtime,
             child_exit_signal,
@@ -1246,9 +1258,25 @@ impl KernelState {
         self.clone_admission.close_for_exec(owner)
     }
 
-    fn process_vcpu_live(&self) -> usize {
-        self.process_vcpu_live
-            .load(std::sync::atomic::Ordering::SeqCst)
+    /// How many vCPU loops are still live for this Linux process. Exec and
+    /// exit teardown wait this out; the barrier RAISE decisions read the
+    /// predicate below.
+    fn guest_executor_count(&self) -> usize {
+        self.guest_executors.live()
+    }
+
+    /// Must this thread raise a stop-the-world barrier before it mutates state
+    /// the guest shares — stage-1 descriptors, or process topology?
+    ///
+    /// Answered from the guest-executor census rather than the vCPU registry.
+    /// The registry counts LEASES, so a sibling parked in a futex / epoll / fd
+    /// wait has already unregistered and a two-thread process reads 1 — while
+    /// that sibling can still be woken back into guest by a host fd readying,
+    /// an `EVFILT_TIMER`, a cross-process futex wake or the signal pump, with
+    /// nothing in its path to stop it walking a half-edited structure. Callers
+    /// are all inside a vCPU loop and therefore count themselves.
+    fn has_peer_guest_executor(&self) -> bool {
+        self.guest_executors.has_peer_executor()
     }
 
     fn publish_process_terminal(&self, terminal: Result<RunResult, ()>) {
@@ -1693,37 +1721,6 @@ impl Drop for HvpatchSyscallServiceGuard {
             crate::probes::hvpatch_syscall_service(event);
             crate::probes::hvpatch_syscall_service_clear(event);
         }
-    }
-}
-
-struct ProcessVcpuLiveGuard<'a>(&'a std::sync::atomic::AtomicUsize);
-
-impl Drop for ProcessVcpuLiveGuard<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-/// Marks a Kernel thread as able to reach a crash safe point for exactly as
-/// long as its vCPU loop runs.
-///
-/// "How many Linux threads does this task have" and "how many can answer a
-/// crash capture right now" are different questions; this guard is the second
-/// one. A thread published into the task graph whose host loop was cancelled
-/// before it started never holds it, and a loop that returns — including the
-/// `exit_group` terminal-claim loser, which retires nothing — releases it.
-struct CrashSafePointParticipation(crate::kernel::ThreadRef);
-
-impl CrashSafePointParticipation {
-    fn enter(thread: &crate::kernel::ThreadRef) -> Self {
-        thread.enter_crash_safe_point_participation();
-        Self(Arc::clone(thread))
-    }
-}
-
-impl Drop for CrashSafePointParticipation {
-    fn drop(&mut self) {
-        self.0.leave_crash_safe_point_participation();
     }
 }
 
@@ -2735,12 +2732,18 @@ where
         // `current_thread_holds_pt_pause()` — so the only new cost is a pause
         // on a `MADV_DONTNEED` whose backing needed no COW. The advice check
         // keeps it off every other advice, which never reaches `zero_backing`.
+        // The population this decision needs is "who can execute guest code",
+        // NOT "who holds a vCPU lease right now" — see
+        // `KernelState::has_peer_guest_executor`. A sibling parked in
+        // `epoll_wait` is absent from the kicker and present here, and it is
+        // exactly the thread a lease-keyed predicate let walk a half-edited
+        // descriptor tree.
         let _pt_pause = if syscall_takes_pre_dispatch_pt_pause(
             frame.number.raw(),
             frame.args[2],
-            self.kicker.count() > 1,
+            kernel.has_peer_guest_executor(),
         ) {
-            match self.pt_pause() {
+            match self.pt_pause(&kernel.guest_executors) {
                 Ok(guard) => Some(guard),
                 Err(quiesce::PtPauseError::TimedOut) => {
                     // No dispatcher/backend mapping call has started yet. Return
@@ -3879,12 +3882,6 @@ where
     // wake, and then exit.  Before this guard those late leases leaked until
     // the global pool was exhausted during a cold Go build.
     let _vcpu_lease_guard = VcpuLeaseGuard;
-    let _process_vcpu_live_guard = kernel.hvpatch_process.as_ref().map(|_| {
-        kernel
-            .process_vcpu_live
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        ProcessVcpuLiveGuard(&kernel.process_vcpu_live)
-    });
     let kernel_thread = if kernel.hvpatch_process.is_some() {
         Some(Arc::clone(
             kernel
@@ -3900,15 +3897,20 @@ where
     } else {
         None
     };
-    // A crash quorum may only wait on threads that can still REACH a safe
-    // point. Membership is exactly the lifetime of this loop, and the guard
-    // releases it on every exit path — normal return, error, or unwind — so a
-    // fatal sibling can never be left waiting on a thread whose host loop has
-    // gone (a terminal-claim loser after `exit_group`) or on one whose loop was
-    // cancelled before it ever started.
-    let _crash_participation = kernel_thread
-        .as_ref()
-        .map(CrashSafePointParticipation::enter);
+    // Join the guest-executor population for exactly the lifetime of this loop.
+    // ONE guard carries both facets that mean "this thread's vCPU loop is live":
+    // the census a stop-the-world barrier's raise decision reads, and the crash
+    // quorum's safe-point participation. Splitting them into two guards would
+    // let one population drift from the other, which is the shape of the bug
+    // each was introduced to close. The guard releases on every exit path —
+    // normal return, error, unwind — so a mutator never raises a barrier for a
+    // thread that has gone, and a fatal sibling never waits on one that can no
+    // longer answer (a terminal-claim loser after `exit_group`, or a loop
+    // cancelled before it ever started).
+    //
+    // Entered BEFORE `register_vcpu` below, so a thread is a census member for
+    // strictly longer than it holds a vCPU lease — the whole point.
+    let _guest_execution = kernel.guest_executors.enter(kernel_thread.clone());
     let mut state = ThreadRuntimeState::new(
         registry,
         futex,
@@ -3946,6 +3948,7 @@ where
             Arc::new(KernelFrameCowAuthority {
                 kernel: Arc::clone(context.kernel()),
                 mm: context.shared().mm().id(),
+                guest_executors: Arc::clone(&kernel.guest_executors),
                 kicker: Arc::clone(&state.kicker),
                 tid: state.this_tid,
             });

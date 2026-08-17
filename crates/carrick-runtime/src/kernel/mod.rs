@@ -10,6 +10,7 @@ pub mod crash_capture;
 pub mod debug;
 pub mod exec;
 pub mod frame_inventory;
+pub mod guest_execution;
 pub mod ids;
 pub mod objects;
 pub mod operations;
@@ -46,6 +47,7 @@ pub use frame_inventory::{
     FrameInventoryAuthority, FrameInventoryError, FrameInventoryReserveError,
     FrameInventorySnapshot, FrameRow, MappingRow,
 };
+pub use guest_execution::{GuestExecutorCensus, GuestExecutorParticipation};
 pub use ids::{
     CredentialsId, FileDescriptionId, FileSlotNumber, FileTableId, FsContextId, InvalidFileSlot,
     InvalidLinuxSignal, LinuxSignal, LinuxTid, MmId, ObjectIdError, ObjectIdRegistry,

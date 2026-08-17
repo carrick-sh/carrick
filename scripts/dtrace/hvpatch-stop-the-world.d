@@ -10,8 +10,9 @@
  *                             `pt-pause-begin` fires only when an editor
  *                             actually became coordinator, so its COUNT is the
  *                             raise decision. arg1 (`others_in_guest`) and arg2
- *                             (`leases`, the live vCPU-lease count) are the
- *                             drain's inputs.
+ *                             (`leases`) are the drain's inputs; arg3
+ *                             (`executors`) is the population the raise is
+ *                             keyed on.
  *       hvpatch-fork-quiesce  fires UNCONDITIONALLY at the end of the HVPatch
  *                             in-process fork quiesce phase, whether or not the
  *                             barrier went up. arg2 is `initial_siblings`, the
@@ -47,7 +48,11 @@
  *         `carrick trace` spawns the traced command, so `$target` is the
  *         `carrick run` it launched; `progenyof` follows the carrier and any
  *         helper it forks.
- *       * `pt-pause-begin` args are (tid, others_in_guest, leases) as i32.
+ *       * `pt-pause-begin` args are
+ *         (tid, others_in_guest, leases, executors) as i32. `leases` is the
+ *         vCPU-registry count and `executors` the guest-executor census; a row
+ *         with leases == 1 and executors > 1 is a pause the historical
+ *         lease-keyed predicate would have skipped.
  *       * `hvpatch-fork-quiesce` args are
  *         (parent_pid i32, forking_tid i32, initial_siblings u32,
  *          poll_iterations u64, elapsed_ns u64).
@@ -106,6 +111,18 @@ carrick*:::pt-pause-begin
 /(pid == $target || progenyof($target)) && arg1 != 0/
 {
 	@c["pt-raised-with-sibling-in-guest"] = count();
+}
+
+/*
+ * THE DEFECT, made positive: a pause taken while the vCPU registry held only
+ * this thread's lease. Every one of these is an edit the lease-keyed predicate
+ * would have run with the barrier down, against a sibling parked in a futex /
+ * epoll / fd wait that a host wake can return to guest at any moment.
+ */
+carrick*:::pt-pause-begin
+/(pid == $target || progenyof($target)) && arg2 <= 1 && arg3 > 1/
+{
+	@c["pt-raised-LEASES-WOULD-HAVE-MISSED"] = count();
 }
 
 carrick*:::pt-pause-ready

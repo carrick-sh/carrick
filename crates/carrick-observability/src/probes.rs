@@ -4702,8 +4702,16 @@ mod real {
         /// these probes let a `carrick trace` PROVE the stop-the-world engages and
         /// converges (rather than guessing).
         ///  * `pt__pause__begin`: an editing vCPU became the sole coordinator.
-        ///    `tid` editor, `others_in_guest` siblings still walking tables at entry,
-        ///    `count` live vCPUs.
+        ///    `tid` editor, `others_in_guest` siblings still walking tables at
+        ///    entry, `leases` live vCPU LEASES, `executors` live vCPU LOOPS.
+        ///    The last two are different populations and the difference is the
+        ///    point: a sibling parked in a futex / epoll / fd wait has released
+        ///    its lease and left the registry, so `leases` can read 1 while
+        ///    `executors` reads 2. `executors` is what the RAISE decision is
+        ///    keyed on (`kernel::guest_execution`); `leases` is what the drain
+        ///    below must still see fall. A row with `leases == 1` and
+        ///    `executors > 1` is a pause that the old lease-keyed predicate
+        ///    would have skipped entirely.
         ///  * `pt__pause__ready`: all siblings left guest; the edit may proceed.
         ///    `spins` wait iterations, `wait_us` microseconds waited.
         ///  * `pt__pause__timeout`: the convergence deadline was hit. MUST never
@@ -4718,7 +4726,7 @@ mod real {
         ///    held (the dispatcher host-alias phase; see the ABBA fixed by
         ///    hoisting the `MADV_DONTNEED` pause). `wait_us` is the budget.
         ///  * `pt__pause__end`: the pause was released and siblings resumed. `tid`.
-        fn pt__pause__begin(_: i32, _: i32, _: i32) {}
+        fn pt__pause__begin(_: i32, _: i32, _: i32, _: i32) {}
         fn pt__pause__ready(_: i32, _: i32, _: i64) {}
         fn pt__pause__timeout(_: i32, _: i64) {}
         fn pt__pause__election__timeout(_: i32, _: i64) {}
@@ -6269,8 +6277,8 @@ mod real {
         carrick_usdt::supervisor__child__exit!(|| (pid, status));
     }
 
-    pub fn pt_pause_begin(tid: i32, others_in_guest: i32, count: i32) {
-        carrick_usdt::pt__pause__begin!(|| (tid, others_in_guest, count));
+    pub fn pt_pause_begin(tid: i32, others_in_guest: i32, leases: i32, executors: i32) {
+        carrick_usdt::pt__pause__begin!(|| (tid, others_in_guest, leases, executors));
     }
 
     pub fn pt_pause_ready(tid: i32, spins: i32, wait_us: i64) {
@@ -7100,7 +7108,7 @@ mod stub {
     stub!(supervisor_child_ready(runtime_pid: i32));
     stub!(supervisor_foreground_pgrp(pgid: i32, errno: i32));
     stub!(supervisor_child_exit(pid: i32, status: i32));
-    stub!(pt_pause_begin(tid: i32, others_in_guest: i32, count: i32));
+    stub!(pt_pause_begin(tid: i32, others_in_guest: i32, leases: i32, executors: i32));
     stub!(pt_pause_ready(tid: i32, spins: i32, wait_us: i64));
     stub!(pt_pause_timeout(tid: i32, wait_us: i64));
     stub!(pt_pause_election_timeout(tid: i32, wait_us: i64));
