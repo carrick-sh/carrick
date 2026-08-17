@@ -138,7 +138,18 @@ def summarize(scope: dict[str, Any], results: list[dict[str, Any]]) -> dict[str,
             and row["docker"]["result"] == "success"
             and carrick_totals == docker_totals
             and carrick_totals["n"] > 0
+            and carrick_totals["n"] == carrick_totals["passed"]
+            and carrick_totals["failed"] == 0
+            and carrick_totals["broken"] == 0
+            and carrick_totals["skipped"] == 0
+            and docker_totals["n"] > 0
+            and docker_totals["n"] == docker_totals["passed"]
+            and docker_totals["failed"] == 0
+            and docker_totals["broken"] == 0
+            and docker_totals["skipped"] == 0
             and bool(pairs)
+            and len(pairs) == carrick_totals["n"]
+            and len(pairs) == docker_totals["n"]
             and all(pair[1:] == ("ok", "ok") for pair in pairs)
         )
         infrastructure = (
