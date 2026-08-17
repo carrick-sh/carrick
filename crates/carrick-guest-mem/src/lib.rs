@@ -133,6 +133,20 @@ impl GuestVa {
     }
 }
 
+impl From<u64> for GuestVa {
+    #[inline]
+    fn from(val: u64) -> Self {
+        GuestVa(val)
+    }
+}
+
+impl From<GuestVa> for u64 {
+    #[inline]
+    fn from(va: GuestVa) -> Self {
+        va.0
+    }
+}
+
 /// A contiguous range of guest virtual addresses `[start, start + len)`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct GuestVaRange {
@@ -528,6 +542,15 @@ pub trait GuestMemory {
         Ok(unsafe { value.assume_init() })
     }
 
+    /// Read a typed `FromBytes` struct from guest memory at `va`.
+    #[inline]
+    fn read_struct_va<T: zerocopy::FromBytes>(&self, va: GuestVa) -> Result<T, MemoryError>
+    where
+        Self: Sized,
+    {
+        self.read_struct(va.raw())
+    }
+
     /// Write a typed `IntoBytes + Immutable` struct to guest memory at `address`.
     fn write_struct<T: zerocopy::IntoBytes + zerocopy::Immutable>(
         &mut self,
@@ -538,6 +561,31 @@ pub trait GuestMemory {
         Self: Sized,
     {
         self.write_bytes(address, value.as_bytes())
+    }
+
+    /// Write a typed `IntoBytes + Immutable` struct to guest memory at `va`.
+    #[inline]
+    fn write_struct_va<T: zerocopy::IntoBytes + zerocopy::Immutable>(
+        &mut self,
+        va: GuestVa,
+        value: &T,
+    ) -> Result<(), MemoryError>
+    where
+        Self: Sized,
+    {
+        self.write_struct(va.raw(), value)
+    }
+
+    /// PERMISSION-CHECKED read from guest virtual address `va`.
+    #[inline]
+    fn read_va(&self, va: GuestVa, length: usize) -> Result<Vec<u8>, MemoryError> {
+        self.read_bytes(va.raw(), length)
+    }
+
+    /// PERMISSION-CHECKED write to guest virtual address `va`.
+    #[inline]
+    fn write_va(&mut self, va: GuestVa, bytes: &[u8]) -> Result<(), MemoryError> {
+        self.write_bytes(va.raw(), bytes)
     }
 
     /// Write `bytes` at `address` WITHOUT enforcing the guest-visible write
