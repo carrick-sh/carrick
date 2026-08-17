@@ -2958,6 +2958,36 @@ where
                                 self.release_and_park_vcpu_for_fork(engine)?;
                                 continue;
                             }
+                            // EINTR requires that a signal actually be delivered
+                            // to THIS thread. The interrupt check inside the wait
+                            // samples a PROCESS-wide pending set, so a
+                            // process-directed signal makes every parked thread a
+                            // candidate — but only one of them ends up running the
+                            // handler. If a sibling consumed it while this thread
+                            // was waking, nothing is deliverable here any more and
+                            // Linux would never have interrupted this syscall at
+                            // all: it was never chosen.
+                            //
+                            // Surfacing EINTR anyway is a spurious interrupt, and
+                            // SA_RESTART cannot repair it — the restart path only
+                            // runs when a signal IS delivered, so there is no
+                            // handler frame to rewind the PC from. libuv's
+                            // `eintr_handling` is the reduced case: a worker thread
+                            // `kill(getpid(), SIGUSR1)`s, the signal is delivered
+                            // to that worker at its own `kill` boundary, and the
+                            // main thread's blocked pipe `read` returned -EINTR
+                            // having received no signal whatsoever.
+                            //
+                            // Re-check and retry the syscall instead. This is the
+                            // same predicate the wait used, just re-sampled after
+                            // the race window it was racing with.
+                            if !kernel.dispatcher.has_deliverable_dispatch_pending_for_wait(
+                                &kernel_context,
+                                self.this_tid,
+                                sig_mask,
+                            ) {
+                                continue;
+                            }
                             break Ok(DispatchOutcome::Errno {
                                 errno: crate::linux_abi::LINUX_EINTR,
                             });
@@ -5482,11 +5512,58 @@ impl PendingSignalAction {
 }
 
 /// Linux aarch64 syscall numbers that auto-restart when interrupted by an
-/// SA_RESTART handler (the kernel's `ERESTARTSYS` set).
+/// SA_RESTART handler (the kernel's `ERESTARTSYS` set), per `signal(7)`
+/// "Interruption of system calls and library functions by signal handlers".
+///
+/// This listed only `waitid`/`wait4` for a long time, which meant EVERY other
+/// blocking call surfaced `EINTR` to a guest that had explicitly asked, via
+/// `SA_RESTART`, not to see it. libuv's `eintr_handling` is the reduced case:
+/// a thread `kill(getpid(), SIGUSR1)`s while the main thread is blocked in a
+/// synchronous `read(2)` on an empty pipe, and libuv installs its signal
+/// handlers with `SA_RESTART`, so Linux resumes the read and returns the 13
+/// bytes. Carrick returned `-EINTR` (the test reports `-4 == 13`).
+///
+/// The `signal(7)` "never restarted" list is deliberately EXCLUDED, so those
+/// keep surfacing `EINTR` as Linux does: `poll`/`ppoll`, `select`/`pselect6`,
+/// `epoll_wait`/`epoll_pwait`, `nanosleep`/`clock_nanosleep`, `io_getevents`,
+/// `msgrcv`/`msgsnd`, `semop`/`semtimedop`, and the `sigsuspend`/
+/// `rt_sigtimedwait` family.
+///
+/// Socket calls (`accept`, `connect`, the `recv`/`send` families) are also
+/// absent, and that is a KNOWN REMAINING GAP rather than a judgement that they
+/// do not restart — they do, but only when the socket carries no
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO`. This decision point sees only the syscall
+/// NUMBER, not the fd, so honouring that exclusion needs the timeout plumbed
+/// through first; restarting unconditionally would re-block a timeout socket
+/// that Linux would have failed with `EINTR`.
 pub(super) fn is_restartable_syscall(nr: u64) -> bool {
     matches!(
         nr,
-        95  // waitid
+        // Reads and writes on "slow" devices — pipes, terminals, sockets. On a
+        // regular file these never return EINTR, so listing them is harmless.
+        63  // read
+        | 64  // write
+        | 65  // readv
+        | 66  // writev
+        | 67  // pread64
+        | 68  // pwrite64
+        | 69  // preadv
+        | 70  // pwritev
+        | 286 // preadv2
+        | 287 // pwritev2
+        | 29  // ioctl (on a slow device)
+        | 56  // openat (blocks opening a FIFO)
+        // Advisory file locking: flock, and fcntl's F_SETLKW. fcntl is listed
+        // whole because the blocking lock commands are the only ones that can
+        // return EINTR.
+        | 32  // flock
+        | 25  // fcntl
+        // POSIX message queues.
+        | 182 // mq_timedsend
+        | 183 // mq_timedreceive
+        | 278 // getrandom
+        // Waits.
+        | 95  // waitid
         | 260 // wait4
     )
 }
@@ -5573,6 +5650,69 @@ mod tests {
     use super::*;
     use std::num::NonZeroU64;
     use std::time::Duration;
+
+    /// `SA_RESTART` must resume the calls `signal(7)` says it resumes, and must
+    /// NOT resume the ones it says always fail with `EINTR`.
+    ///
+    /// The set used to be just `waitid`/`wait4`, so every other blocking call
+    /// surfaced `EINTR` to a guest that had explicitly asked not to see it —
+    /// libuv's `eintr_handling` failed because a synchronous `read(2)` on a
+    /// pipe, interrupted by a `SA_RESTART` SIGUSR1, returned `-EINTR` instead
+    /// of the 13 bytes. The negative half matters just as much: restarting
+    /// `poll` or `nanosleep` would be its own divergence, silently turning a
+    /// guest's interruptible wait into an uninterruptible one.
+    #[test]
+    fn sa_restart_restarts_exactly_the_documented_syscalls() {
+        // Restarted (signal(7)): slow-device I/O, blocking open, file locks,
+        // POSIX mqueues, getrandom, waits.
+        for (nr, name) in [
+            (63u64, "read"),
+            (64, "write"),
+            (65, "readv"),
+            (66, "writev"),
+            (67, "pread64"),
+            (68, "pwrite64"),
+            (69, "preadv"),
+            (70, "pwritev"),
+            (286, "preadv2"),
+            (287, "pwritev2"),
+            (29, "ioctl"),
+            (56, "openat"),
+            (32, "flock"),
+            (25, "fcntl"),
+            (182, "mq_timedsend"),
+            (183, "mq_timedreceive"),
+            (278, "getrandom"),
+            (95, "waitid"),
+            (260, "wait4"),
+        ] {
+            assert!(
+                is_restartable_syscall(nr),
+                "{name} ({nr}) is restarted under SA_RESTART"
+            );
+        }
+
+        // NEVER restarted, regardless of SA_RESTART (signal(7)).
+        for (nr, name) in [
+            (73u64, "ppoll"),
+            (72, "pselect6"),
+            (22, "epoll_pwait"),
+            (101, "nanosleep"),
+            (115, "clock_nanosleep"),
+            (188, "msgrcv"),
+            (189, "msgsnd"),
+            (193, "semop"),
+            (192, "semtimedop"),
+            (133, "rt_sigsuspend"),
+            (137, "rt_sigtimedwait"),
+            (4, "io_getevents"),
+        ] {
+            assert!(
+                !is_restartable_syscall(nr),
+                "{name} ({nr}) always fails with EINTR, even under SA_RESTART"
+            );
+        }
+    }
 
     #[test]
     fn proc_maps_projects_linux_initial_stack_vma_not_full_rlimit_backing() {
