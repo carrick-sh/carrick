@@ -6300,6 +6300,94 @@ mod tests {
         }
     }
 
+    /// `capabilities(7)` / `user_namespaces(7)`: the capability sets and the
+    /// user-namespace view are per-process. A `fork` child gets a COPY of the
+    /// parent's, and each side's later change is invisible to the other.
+    ///
+    /// This is the fast, Docker-free guard for the property the
+    /// `capbsetisolation`/`usernsisolation` conformance probes prove
+    /// end-to-end. It is a real regression test: before the state moved onto
+    /// `Task` it lived in one process-global `Mutex` shared by every guest
+    /// process in the carrier, so the child's `capbset_drop` below would have
+    /// been observed by the parent and every sibling.
+    #[test]
+    fn fork_child_gets_its_own_capability_sets_and_user_namespace() {
+        let (kernel, root) = bootstrap(338);
+        const CAP_NET_RAW: u32 = 13;
+
+        // The parent starts from the default container set and the initial,
+        // identity-mapped user namespace.
+        assert!(root.task().caps().capbset_read(CAP_NET_RAW));
+        assert_eq!(
+            root.task().user_ns().id,
+            crate::namespace::INITIAL_USER_NS,
+            "a fresh task starts in the initial user namespace"
+        );
+
+        let published = kernel
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                "creds-ns child".to_owned(),
+                None,
+            )
+            .expect("reserve fork")
+            .prepare_reference(ThreadId::synthetic_for_tests(339))
+            .expect("prepare fork")
+            .commit()
+            .expect("commit fork");
+        let child = published.context().expect("child context").task();
+
+        // Inheritance at fork is a COPY, not a share.
+        assert_eq!(
+            child.caps(),
+            root.task().caps(),
+            "fork child inherits the parent's capability sets verbatim"
+        );
+        assert_eq!(child.user_ns().id, root.task().user_ns().id);
+
+        // The child drops a bounding capability.
+        child.with_caps(|caps| caps.capbset_drop(CAP_NET_RAW));
+        assert!(
+            !child.caps().capbset_read(CAP_NET_RAW),
+            "the child's own drop takes effect for the child"
+        );
+        assert!(
+            root.task().caps().capbset_read(CAP_NET_RAW),
+            "a child's PR_CAPBSET_DROP must not reach the parent"
+        );
+
+        // ...and then unshares a user namespace. Ordering matters: per
+        // `user_namespaces(7)` the CREATOR of a new user namespace holds a full
+        // capability set within it, so the unshare deliberately re-grants what
+        // the drop above removed. Asserting the drop first keeps the two
+        // effects from masking each other.
+        let child_ns = child.unshare_user_ns();
+        assert!(
+            child.caps().capbset_read(CAP_NET_RAW),
+            "creating a user namespace grants a full set within it"
+        );
+        assert_ne!(
+            child_ns,
+            root.task().user_ns().id,
+            "unshare(CLONE_NEWUSER) moves only the caller"
+        );
+        assert_eq!(
+            root.task().user_ns().id,
+            crate::namespace::INITIAL_USER_NS,
+            "the parent stays in the namespace it never left"
+        );
+
+        // Namespace ids are carrier-unique, so a second unsharer cannot alias
+        // the first's namespace.
+        assert_ne!(
+            root.task().unshare_user_ns(),
+            child_ns,
+            "independent unshares must allocate distinct namespace ids"
+        );
+        assert_eq!(kernel.validate_invariants(), Ok(()));
+    }
+
     #[test]
     fn operation_lifetime_reservations_allow_thread_prepare_but_serialize_publication() {
         let (kernel, root) = bootstrap(335);
