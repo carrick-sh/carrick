@@ -4500,29 +4500,6 @@ impl SyscallDispatcher {
                 (bus_start <= old_size).then_some(bus_start)
             })
             .flatten();
-            // The third shared shape: an aperture SNAPSHOT of a file, which is
-            // what a MAP_SHARED file mapping becomes when it runs past EOF and
-            // so cannot be a live alias. `ltp-mremap01` is this one — it writes
-            // a SINGLE byte to its file and then maps 0x3e8000 of it, so all but
-            // the first page is already bus-fault territory — and it grows to
-            // 0x7d0000, entirely past EOF. Same rule as the alias case: growth
-            // is reproducible in place only when every added byte is past the
-            // bus threshold, since the aperture would otherwise have to
-            // materialize file bytes it does not have.
-            let shared_file_aperture_grow = (new_size > old_size
-                && flags & LINUX_MREMAP_MAYMOVE != 0)
-                .then(|| {
-                    let alloc = shared_aperture_alloc.as_ref()?;
-                    if alloc.guest_addr != old_address.0 || alloc.live_len != old_size {
-                        return None;
-                    }
-                    let (raw_fd, file_offset) = alloc.backing.shared_file_parts()?;
-                    let file_len = host_fd_file_len(raw_fd)?;
-                    let bus_start =
-                        shared_file_bus_offset(file_len, file_offset, new_size, page_size)?;
-                    (bus_start <= old_size).then_some(bus_start)
-                })
-                .flatten();
             // Offset within the mapping at which SIGBUS starts, when the
             // mapping ALREADY ends past its file's EOF. Read off the bus records
             // the original `mmap` published rather than re-derived from a
@@ -4573,7 +4550,6 @@ impl SyscallDispatcher {
                      aperture={:?} anon_plan={shared_grow_in_place} \
                      arena_past_eof={shared_arena_grow_past_eof:?} \
                      alias_plan={shared_file_alias_grow:?} \
-                     aperture_plan={shared_file_aperture_grow:?} \
                      alias_file_extent={alias_file_extent:?} \
                      alias_regrow={alias_regrow_within_eof} path={:?}",
                     old_address.0,
@@ -4589,7 +4565,6 @@ impl SyscallDispatcher {
                 && !shared_grow_in_place
                 && shared_arena_grow_past_eof.is_none()
                 && shared_file_alias_grow.is_none()
-                && shared_file_aperture_grow.is_none()
                 && !alias_regrow_within_eof
             {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
@@ -4752,49 +4727,6 @@ impl SyscallDispatcher {
                     this.record_mmap_bus_fault_range(
                         old_address.0.saturating_add(bus_start),
                         new_size.saturating_sub(bus_start),
-                    );
-                    this.record_dynamic_mapping_with_file_offset(
-                        old_address.0,
-                        new_size,
-                        source_metadata.prot,
-                        source_metadata.sharing,
-                        source_metadata.path.clone(),
-                        source_metadata.file_page_offset,
-                    );
-                    this.mark_vma_dispatch(&mut host_alias_dispatch);
-                    return Ok(DispatchOutcome::Returned {
-                        value: old_address.0 as i64,
-                    });
-                }
-                if shared_file_aperture_grow.is_some() {
-                    // Extend the reservation so nothing else can take the VA,
-                    // but publish NO backing for it: every added byte is past
-                    // the file's end, where Linux delivers SIGBUS rather than
-                    // zeroes. The tail is left inaccessible so the guest's
-                    // access faults, and the bus record is what turns that
-                    // fault into SIGBUS instead of SIGSEGV.
-                    let claimed = this.mem.lock().shared.grow(old_address.0, new_size);
-                    let Some((claim_start, claim_len)) = claimed else {
-                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-                    };
-                    if claim_len != 0 {
-                        let Ok(claim_len_usize) = usize::try_from(claim_len) else {
-                            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-                        };
-                        memory.set_mapping_protection_and_sharing(
-                            claim_start,
-                            claim_len_usize,
-                            true,
-                            false,
-                            carrick_guest_mem::MappingSharing::Shared,
-                        );
-                        if memory.protect_range(claim_start, claim_len_usize, 0).is_err() {
-                            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-                        }
-                    }
-                    this.record_mmap_bus_fault_range(
-                        old_address.0.saturating_add(old_size),
-                        new_size.saturating_sub(old_size),
                     );
                     this.record_dynamic_mapping_with_file_offset(
                         old_address.0,

@@ -203,6 +203,15 @@ guest and produces nothing. That cost a round too.
   that is meant to fault needs no page-table work at all — reserving the VA is
   the whole job.
 
+### The aperture's SharedFile backing is dead in production
+
+Worth knowing before writing code against it: `BackingObject::SharedFile` is
+constructed ONLY in tests. The live-alias model replaced the old
+aperture-snapshot-plus-msync-writeback model, so no production path creates one
+today, and a grow plan keyed on `alloc.backing.shared_file_parts()` can never
+fire. One was written here and then deleted rather than left in as defensive
+dead code.
+
 ### Separate unfixed bug found on the way: MAP_SHARED past EOF loses writes
 
 A `MAP_SHARED` file mapping that runs PAST its file's EOF becomes an arena
