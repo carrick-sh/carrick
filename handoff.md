@@ -88,6 +88,17 @@ a6d877666 fix(runtime): report real boot time in /proc/uptime
 3fc77ed7c feat(conformance): fill one suite's docker oracle by profile
 ```
 
+Commits added later on 2026-08-17 (the memory/inventory cluster — these close
+two of the three "next clusters" listed further down):
+
+```text
+af86c4ce4 fix(runtime): reclaim stage-1 tables when the edit is already exclusive
+a6fd9e6fb refactor(runtime): drop the unreachable aperture-file mremap grow
+34765e4cd fix(runtime): grow a shared file mapping on mremap
+c64096131 fix(runtime): grow a shared anonymous mapping in place on mremap
+c08221355 docs(conformance): narrow the alias-retirement FATAL to an orphaned extent
+```
+
 ## What is complete
 
 ### Fail-closed closure surface
@@ -128,6 +139,21 @@ leftovers. Post-integration focused and full closure runs make
 `node-app-smoke` and `node-v8-smoke` exact TAP MATCH.
 
 ## Current authoritative signed checkpoint
+
+> **A NEWER closure run is in flight on the memory/inventory artifact below.**
+> Do not quote the post-libuv numbers as current once it lands; they predate
+> `ltp-mremap01`/`04` closing and the `cpython-multiprocessing_spawn` crash fix,
+> which together move well over a thousand assertion rows.
+>
+> ```text
+> HEAD                    af86c4ce4143a76d0804ec98bf68a243fd72e667
+> binary sha256           195e11b8759a3514aa69033a72992a0dc4adea362064596a91e3c0e1ad8a9dab
+> CDHash                  1a5a5840f243cd288638e564eb1dc6580a3d317c
+> hypervisor entitlement  present
+> __TEXT,__dof_carrick    present
+> ```
+>
+> Built from a clean tree at that exact HEAD with nothing newer than the binary.
 
 > **SUPERSEDED 2026-08-17.** A full closure run has been taken on the
 > post-libuv artifact — see
@@ -361,14 +387,21 @@ names.
 
 Measured, not inferred — see `docs/perf-results/2026-08-17-closure-post-libuv/`.
 
-- **`ltp-mremap01`: 1,314 rows from ONE bug, already root-caused and reduced.**
-  Carrick cannot GROW a mapping outside the mmap arena even with
-  `MREMAP_MAYMOVE` (`dispatch/mem.rs` supports resize-down for the non-arena
-  case then falls through to an unconditional ENOMEM). Reducer: mmap one page
-  `MAP_SHARED|MAP_ANONYMOUS`, `mremap` it to two pages with `MREMAP_MAYMOVE` —
-  carrick EINVAL, Linux ok; the same with `MAP_PRIVATE` passes on both. Linux
-  is free to MOVE the mapping, which is what it does. Everything else in that
-  suite (1,313 TBROK and a segfault) is cascade from this one failure.
+- **`ltp-mremap01`: 1,314 rows — FIXED (`c64096131`, `34765e4cd`).** Now
+  `TPASS`, rc=0, matching the oracle; `ltp-mremap04` also went failing -> TPASS
+  and `ltp-mremap05` 2/6 -> 3 passing (the rest is unimplemented
+  `MREMAP_FIXED`). `mremap` refused to grow ANY `MAP_SHARED` mapping; it now
+  grows shared-anonymous in place via `SharedAperture::grow`, and re-establishes
+  a live shared-FILE alias over the same descriptor at the new length (a byte
+  copy would silently unshare it).
+
+  Read `docs/perf-results/2026-08-17-closure-post-libuv/reducers/README.md`
+  before touching this area — the original entry here was WRONG about the shape
+  in a way that cost several rounds. `mremap01` is not the shared-anonymous case
+  at all, and its file is not the 1 byte its `write` calls suggest: LTP builds
+  it SPARSELY with lseek+write, so the mapping is a live alias entirely inside
+  an 8 MiB file. What settled it was extending the gated `CARRICK_FAULT_DEBUG`
+  hatch with an `mremap GROW` line, not another reducer.
 - **CPython multiprocessing + concurrent_futures, ~1,200 rows, TWO NAMED
   CRASHES.** Both were read straight out of the closure run's `.err` files —
   no new instrumentation needed, and neither is a "carrick is slow" problem:
@@ -394,13 +427,26 @@ Measured, not inferred — see `docs/perf-results/2026-08-17-closure-post-libuv/
      `cpython-multiprocessing_fork` gets 78 of 317 assertions out before it
      dies.
 
-  2. **`cpython-multiprocessing_spawn`**:
-     ```
-     carrick: FATAL: apply HVPatch alias retirement inventory:
-       mapping MappingId(73350) is not live
-     ```
-     A different bug — an alias-retirement invariant, not table exhaustion.
-     It dies at `test_error_on_stdio_flush_1` after 86 of 323 assertions.
+  2. **`cpython-multiprocessing_spawn` — FIXED (`af86c4ce4`).** It now runs all
+     397 tests with 3 of its 4 test files passing (was 88 assertions then a
+     crash), and only `test_misc` fails.
+
+     The FATAL and the `OutOfTables` above turned out to be the SAME cluster,
+     stacked. The abort was the outer symptom: a failed stage-1 install ran the
+     RETIREMENT path over an extent that had been staged but never published.
+     Underneath it was the pool leak — and the reason reclaim never ran is a
+     POPULATION mismatch, not a missing free: the engine gated reclaim on
+     `Arc::strong_count(&page_tables) > 1` (live engine HANDLES) while the
+     runtime decides exclusivity from `has_peer_guest_executor()` (threads that
+     can run guest code). `carrick_hal::stage1_exclusive` now publishes the
+     runtime's answer instead. Note the guess recorded in item 1 above — "the
+     HVPatch per-child VA mapping is a second consumer of the same pool" — was
+     NOT the cause; the ordinary `mmap(MAP_SHARED, fd)` alias path was leaking
+     because its reclaim was disabled.
+
+     Reducer: `reducers/alias-churn-fatal.py` (deterministic in ~5 s) plus
+     `reducers/alias-churn-variants.py` for the size/sharing/inode variants that
+     refuted the obvious hypotheses.
 
   3. **`cpython-multiprocessing_forkserver`** emits ZERO assertions with an
      EMPTY stderr — a third shape. Recover its transcript with `run -t` or
@@ -409,8 +455,18 @@ Measured, not inferred — see `docs/perf-results/2026-08-17-closure-post-libuv/
   These are CRASHES, so they outrank wrong answers, and one of them has a
   ready-made in-tree hypothesis. They are also the reason the cluster looks
   like a huge `docker = absent` count.
-- **`cpython-importlib` 351**, **`cpython-concurrent_futures` 239** (also a
-  fast crash at 0.62x), **`go-go_types` 574** (untriaged),
+- **`cpython-importlib` 351** and **`cpython-concurrent_futures` 239** both got
+  much DEEPER after `af86c4ce4` and changed shape, so re-triage rather than
+  trusting the descriptions above. Re-measured on that artifact:
+  `test_concurrent_futures` now runs hundreds of tests and HANGS at
+  `test_gh105829_should_not_deadlock_if_wakeup_pipe_full` (leaving a `core`
+  behind from a child that died during `test_process_pool`), and
+  `test_importlib` now reaches
+  `test_locks.Source_DeadlockAvoidanceTests.test_deadlock` and takes a GUEST
+  SIGSEGV there. That class passes 3/3 in isolation, so the crash needs the full
+  run's context — go at it with a core and `carrick-lldb` on the CARRIER, not
+  with another reducer.
+  **`go-go_types` 574** (untriaged),
   **`ltp-splice07` + `ltp-ioctl_ficlone04` 410** (LTP `tst_fd.c` fd-type
   inventory differs, shifting every ordinal).
 - **`ltp-setpriority01`: oracle FIXED, 198 rows -> 3, and the residual gap is
@@ -440,6 +496,19 @@ ratio (145.02x and 67.02x, both of which were the oracle hanging).
 
 ### Also found, recorded rather than fixed
 
+- **A `MAP_SHARED` file mapping that runs PAST its file's EOF silently loses
+  writes.** Such a mapping becomes an arena snapshot under carrick and is never
+  written back: store to offset 0, `munmap`, re-read — Docker gives the stored
+  byte, carrick gives the original. This is silent data loss, it is independent
+  of `mremap`, and no current row covers it. Reducer:
+  `docs/perf-results/2026-08-17-closure-post-libuv/reducers/mremap-eof-shape.c`
+  with `NOREMAP=1`, about a second.
+- **`mremap` gaps left deliberately, both stated in comments rather than
+  hidden:** a grow WITHOUT `MREMAP_MAYMOVE` still reports ENOMEM (matching a
+  measurement of real Linux 6.12 for both shared shapes, but Linux would
+  succeed where the space above is free), and if the runtime's host mmap fails
+  after a shared-file re-alias has already reclaimed the source, the guest loses
+  the source mapping where Linux would keep it.
 - `fchmod` on a bound AF_UNIX socket fd resolves no path and silently returns
   0, so a mode set through the fd alone is lost. No current row covers it.
 - `dispatch/time.rs`'s `RLIMIT_CPU_GENERATION` is a carrier-global static
