@@ -135,7 +135,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use std::path::{Component, Path};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // LOCK ORDERING: dispatch handlers must not hold subsystem locks while entering
 // guest-memory callbacks or blocking host waits. When multiple dispatcher
@@ -1927,7 +1927,11 @@ impl AsyncSignalWakeOwner {
         match self {
             Self::SignalPump => crate::host_signal::publish_process_signal(signum),
         }
-        #[cfg(not(feature = "platform-macos"))]
+        #[cfg(any(
+            feature = "platform-linux",
+            feature = "platform-freebsd",
+            feature = "platform-netbsd"
+        ))]
         {
             let _ = self;
             crate::timer_delivery::deliver(signum);
@@ -1939,7 +1943,11 @@ impl AsyncSignalWakeOwner {
         match self {
             Self::SignalPump => crate::host_signal::publish_pending_for(target_tid, signum),
         }
-        #[cfg(not(feature = "platform-macos"))]
+        #[cfg(any(
+            feature = "platform-linux",
+            feature = "platform-freebsd",
+            feature = "platform-netbsd"
+        ))]
         {
             let _ = self;
             crate::host_signal::publish_pending_for(target_tid, signum);
@@ -6062,27 +6070,26 @@ pub(super) fn dispatch_futex_waitv_args(
         }
     }
 
-    let start = Instant::now();
-    loop {
-        for (index, entry) in entries.iter().enumerate() {
-            match read_futex_word(memory, entry.address) {
-                Ok(word) if word != entry.value => {
-                    return DispatchOutcome::Returned {
-                        value: index as i64,
-                    };
-                }
-                Ok(_) => {}
-                Err(errno) => return DispatchOutcome::Errno { errno },
+    for (index, entry) in entries.iter().enumerate() {
+        match read_futex_word(memory, entry.address) {
+            Ok(word) if word != entry.value => {
+                return DispatchOutcome::Returned {
+                    value: index as i64,
+                };
             }
+            Ok(_) => {}
+            Err(errno) => return DispatchOutcome::Errno { errno },
         }
-        if let Some(deadline) = timeout
-            && start.elapsed() >= deadline
-        {
-            return DispatchOutcome::Errno {
-                errno: LINUX_ETIMEDOUT,
-            };
+    }
+    if let Some(timeout) = timeout {
+        DispatchOutcome::WaitOnSleep {
+            duration: timeout,
+            remaining: None,
         }
-        std::thread::sleep(Duration::from_millis(1));
+    } else {
+        DispatchOutcome::Errno {
+            errno: LINUX_ETIMEDOUT,
+        }
     }
 }
 
@@ -6871,7 +6878,11 @@ impl SyscallDispatcher {
                 (id, state)
             })
             .collect();
-        #[cfg(not(feature = "platform-macos"))]
+        #[cfg(any(
+            feature = "platform-linux",
+            feature = "platform-freebsd",
+            feature = "platform-netbsd"
+        ))]
         let states: std::collections::HashMap<_, _> =
             registry.thread_state_chars().into_iter().collect();
         let mut threads: Vec<_> = context

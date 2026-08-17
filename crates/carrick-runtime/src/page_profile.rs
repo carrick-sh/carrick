@@ -25,7 +25,14 @@ pub(crate) struct ExecutionPlan {
     pub diagnostics: Vec<String>,
 }
 
-#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
+#[cfg_attr(
+    any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ),
+    allow(dead_code)
+)]
 pub(crate) fn resolve_execution_plan(spec: &RunSpec) -> Result<ExecutionPlan, RuntimeError> {
     resolve_execution_plan_for_request_for_host(
         spec.platform,

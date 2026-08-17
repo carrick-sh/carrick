@@ -1,7 +1,7 @@
 rules:
   - id: rust-no-handrolled-abi-bytes
     languages: [rust]
-    severity: WARNING
+    severity: ERROR
     message: |
       Hand-rolled offset write into a fixed ABI buffer detected.
       Prefer a `#[repr(C, packed)]` struct deriving `IntoBytes` (zerocopy)

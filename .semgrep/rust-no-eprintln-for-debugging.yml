@@ -1,7 +1,7 @@
 rules:
   - id: rust-no-eprintln-for-debugging
     languages: [rust]
-    severity: WARNING
+    severity: ERROR
     message: |
       `eprintln!`/`println!` used as a debugging hook. Use a USDT probe
       (`crate::probes::*` or `carrick_usdt::*` via `dtrace_probes`) instead —

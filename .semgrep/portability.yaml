@@ -1,7 +1,7 @@
 rules:
   - id: prefer-carrick-portable-over-libc
     languages: [rust]
-    severity: WARNING
+    severity: ERROR
     message: >
       Use `carrick_portable::<X>` instead of `libc::<X>`. This symbol differs in
       value/type or is absent across carrick's host platforms (Darwin vs Linux),

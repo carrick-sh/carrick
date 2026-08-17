@@ -338,7 +338,10 @@ pub(super) fn host_fd_has_oob(host_fd: i32) -> bool {
     // zero-timeout drain — an EVFILT_EXCEPT event with NOTE_OOB fflags means a
     // pending urgent byte. EV_CLEAR keeps it from re-counting (irrelevant for a
     // one-shot transient kq, but harmless).
-    let add = Kevent::oob(host_fd, libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR);
+    let add = Kevent::oob(
+        host_fd,
+        carrick_portable::EV_ADD | carrick_portable::EV_ENABLE | carrick_portable::EV_CLEAR,
+    );
     if kq.apply(&[add]).is_err() {
         return false;
     }
@@ -2945,8 +2948,11 @@ mod tests {
                 use carrick_host_bsd::Kqueue;
                 use carrick_host_bsd::kqueue::{EVFILT_EXCEPT, Kevent, NOTE_OOB};
                 let kq = Kqueue::new_internal().expect("kqueue");
-                kq.apply(&[Kevent::oob(client, libc::EV_ADD | libc::EV_ENABLE)])
-                    .expect("register EVFILT_EXCEPT");
+                kq.apply(&[Kevent::oob(
+                    client,
+                    carrick_portable::EV_ADD | carrick_portable::EV_ENABLE,
+                )])
+                .expect("register EVFILT_EXCEPT");
                 let mut out = [Kevent::empty(); 1];
                 let timeout = libc::timespec {
                     tv_sec: 5,

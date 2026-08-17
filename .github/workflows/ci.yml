@@ -37,20 +37,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # The gate commands live in the justfile (single source of truth). CI
-      # installs `just` and calls the matching recipe per step, so `just ci`
-      # locally runs exactly what this job runs — no drift between the two.
-      - name: Install just
+      - name: Install just and cargo-deny
         uses: taiki-e/install-action@v2
         with:
-          tool: just
+          tool: just, cargo-deny
+
+      - name: Install Semgrep
+        run: brew install semgrep || python3 -m pip install semgrep
 
       - name: Formatting
         run: just fmt-check
 
-      # No-panic gate: unwrap/expect/panic/todo/unimplemented are denied via
-      # crate-level attributes; `-D warnings` promotes every other lint too.
       - name: Clippy (no-panic gate)
         run: just clippy
+
+      - name: Typed-domain lints (semgrep gate)
+        run: just lint-domains
+
+      - name: Dependency audit (cargo-deny gate)
+        run: just deny
+
+      - name: Support matrix drift check
+        run: just check-matrix
 
       - name: Build
         run: just check --workspace

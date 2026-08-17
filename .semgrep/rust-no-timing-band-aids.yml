@@ -1,7 +1,7 @@
 rules:
   - id: rust-no-timing-band-aids
     languages: [rust]
-    severity: WARNING
+    severity: ERROR
     message: |
       `sleep` used inside a `loop { … sleep … }` pattern that looks like
       timing-as-correctness — i.e., "wait a bit and hope the race resolves"

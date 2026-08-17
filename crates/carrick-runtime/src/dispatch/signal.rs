@@ -4539,6 +4539,7 @@ mod tests {
 
     #[test]
     fn rt_sigsuspend_releases_dispatch_before_waiting() {
+        use std::time::Instant;
         const MASK_PTR: u64 = 0x1000;
         let d = SyscallDispatcher::new();
         let context = d.capture_one_task_context().unwrap();

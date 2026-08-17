@@ -15334,9 +15334,10 @@ pub(crate) fn hvf_get_reg(
     use applevisor::prelude::*;
     let hal_r = r;
     match hal_r {
-        carrick_hal::Reg::X(n) if (n as usize) < GPR_TABLE.len() => {
-            vcpu.get_reg(GPR_TABLE[n as usize]).map_err(hvf_os_error)
-        }
+        carrick_hal::Reg::X(n) => match GPR_TABLE.get(n as usize) {
+            Some(&reg) => vcpu.get_reg(reg).map_err(hvf_os_error),
+            None => Err(carrick_hal::OsError::from_raw(libc::EINVAL)),
+        },
         carrick_hal::Reg::Sp => vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_os_error),
         carrick_hal::Reg::Pc => vcpu.get_reg(Reg::PC).map_err(hvf_os_error),
         carrick_hal::Reg::Pstate => vcpu.get_reg(Reg::CPSR).map_err(hvf_os_error),
@@ -15356,9 +15357,10 @@ pub(crate) fn hvf_set_reg(
     use applevisor::prelude::*;
     let hal_r = r;
     match hal_r {
-        carrick_hal::Reg::X(n) if (n as usize) < GPR_TABLE.len() => {
-            vcpu.set_reg(GPR_TABLE[n as usize], v).map_err(hvf_os_error)
-        }
+        carrick_hal::Reg::X(n) => match GPR_TABLE.get(n as usize) {
+            Some(&reg) => vcpu.set_reg(reg, v).map_err(hvf_os_error),
+            None => Err(carrick_hal::OsError::from_raw(libc::EINVAL)),
+        },
         carrick_hal::Reg::Sp => vcpu.set_sys_reg(SysReg::SP_EL0, v).map_err(hvf_os_error),
         carrick_hal::Reg::Pc => vcpu.set_reg(Reg::PC, v).map_err(hvf_os_error),
         carrick_hal::Reg::Pstate => vcpu.set_reg(Reg::CPSR, v).map_err(hvf_os_error),

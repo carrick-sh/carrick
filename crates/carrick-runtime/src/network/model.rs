@@ -44,13 +44,27 @@ pub(crate) struct LinuxResolverConfig {
 // `execute` arm today; the `cfg_attr(dead_code)` allowances come off when the
 // non-macOS run path renders container hosts files too (M0.8+).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
+#[cfg_attr(
+    any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ),
+    allow(dead_code)
+)]
 pub(crate) struct LinuxHostsConfig {
     pub(crate) entries: Vec<LinuxHostsEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
+#[cfg_attr(
+    any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ),
+    allow(dead_code)
+)]
 pub(crate) struct LinuxHostsEntry {
     pub(crate) addr: String,
     pub(crate) names: Vec<String>,
@@ -224,7 +238,14 @@ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packet
     }
 
     // See `LinuxHostsConfig`: macOS-arm-only consumer today.
-    #[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
+    #[cfg_attr(
+        any(
+            feature = "platform-linux",
+            feature = "platform-freebsd",
+            feature = "platform-netbsd"
+        ),
+        allow(dead_code)
+    )]
     pub(crate) fn hosts_config<I>(
         &self,
         spec: &NetworkNamespaceSpec,
@@ -327,7 +348,14 @@ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packet
     }
 
     // See `LinuxHostsConfig`: macOS-arm-only consumer today.
-    #[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
+    #[cfg_attr(
+        any(
+            feature = "platform-linux",
+            feature = "platform-freebsd",
+            feature = "platform-netbsd"
+        ),
+        allow(dead_code)
+    )]
     fn primary_ipv4_address(&self, spec: &NetworkNamespaceSpec) -> Ipv4Addr {
         self.addresses
             .iter()
@@ -344,7 +372,14 @@ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packet
     }
 
     // See `LinuxHostsConfig`: macOS-arm-only consumer today.
-    #[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
+    #[cfg_attr(
+        any(
+            feature = "platform-linux",
+            feature = "platform-freebsd",
+            feature = "platform-netbsd"
+        ),
+        allow(dead_code)
+    )]
     fn primary_gateway_v4(&self, spec: &NetworkNamespaceSpec) -> Ipv4Addr {
         self.routes
             .iter()
@@ -388,7 +423,14 @@ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packet
 
 impl LinuxHostsConfig {
     // See `LinuxHostsConfig`: macOS-arm-only consumer today.
-    #[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
+    #[cfg_attr(
+        any(
+            feature = "platform-linux",
+            feature = "platform-freebsd",
+            feature = "platform-netbsd"
+        ),
+        allow(dead_code)
+    )]
     pub(crate) fn render(&self) -> String {
         let mut out = String::new();
         for entry in &self.entries {
@@ -446,7 +488,14 @@ fn proc_net_route_hex_v4_mask(prefix_len: u8) -> String {
 }
 
 // See `LinuxHostsConfig`: macOS-arm-only consumer today.
-#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
+#[cfg_attr(
+    any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ),
+    allow(dead_code)
+)]
 fn parse_extra_host(entry: &str, host_gateway: Option<Ipv4Addr>) -> Option<(String, String)> {
     let (name, addr) = entry.split_once('=').or_else(|| entry.split_once(':'))?;
     let name = name.trim();
