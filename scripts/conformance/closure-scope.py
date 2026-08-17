@@ -174,14 +174,18 @@ def freeze_scope(
     images: dict[str, dict[str, Any]],
     *,
     source_head: str,
+    tooling_source_head: str,
     binary_path: Path,
 ) -> dict[str, Any]:
     names, ecosystem_counts, declared_images = _manifest_inventory(Path(manifest_path))
     if not re.fullmatch(r"[0-9a-f]{40,64}", source_head):
         raise ScopeError(f"source HEAD is malformed: {source_head!r}")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", tooling_source_head):
+        raise ScopeError(f"tooling source HEAD is malformed: {tooling_source_head!r}")
     return {
         "schema": SCHEMA,
         "source_head": source_head,
+        "tooling_source_head": tooling_source_head,
         "binary_sha256": _sha256(Path(binary_path)),
         "manifest_sha256": _sha256(Path(manifest_path)),
         "suite_count": len(names),
@@ -221,6 +225,7 @@ def check_scope(
         Path(manifest_path),
         images,
         source_head=source_head,
+        tooling_source_head=source_head,
         binary_path=Path(binary_path),
     )
     required = set(expected)
@@ -229,16 +234,17 @@ def check_scope(
             f"scope fields drifted (missing={sorted(required - set(scope))}, "
             f"unexpected={sorted(set(scope) - required)})"
         )
-    # source_head is provenance for the frozen binary. The scope file itself is
-    # committed after that artifact exists, so current HEAD cannot equal it by
-    # construction; live source cleanliness is checked independently below.
+    # These are provenance, not live-equality assertions. The binary may be
+    # built before report/cluster tooling is committed, and the scope record is
+    # itself committed afterward. Live content/hash checks remain exact below.
     for key, value in expected.items():
-        if key != "source_head" and scope.get(key) != value:
+        if key not in {"source_head", "tooling_source_head"} and scope.get(key) != value:
             raise ScopeError(f"scope drift in {key}")
-    if not isinstance(scope.get("source_head"), str) or not re.fullmatch(
-        r"[0-9a-f]{40,64}", scope["source_head"]
-    ):
-        raise ScopeError("recorded source_head is malformed")
+    for key in ["source_head", "tooling_source_head"]:
+        if not isinstance(scope.get(key), str) or not re.fullmatch(
+            r"[0-9a-f]{40,64}", scope[key]
+        ):
+            raise ScopeError(f"recorded {key} is malformed")
     if require_clean:
         if repo_root is None:
             raise ScopeError("repo_root is required for a clean-source check")
@@ -259,6 +265,10 @@ def main(argv: list[str] | None = None) -> int:
         "--manifest", type=Path, default=root / "scripts/conformance/suites.toml"
     )
     parser.add_argument("--binary", type=Path, default=root / "target/release/carrick")
+    parser.add_argument(
+        "--binary-source-head",
+        help="source commit that produced --binary (defaults to current HEAD)",
+    )
     args = parser.parse_args(argv)
     try:
         names, _, image_refs = _manifest_inventory(args.manifest)
@@ -267,8 +277,13 @@ def main(argv: list[str] | None = None) -> int:
         identities = resolve_images(image_refs)
         head = _git(root, "rev-parse", "HEAD")
         if args.action == "freeze":
+            binary_source_head = args.binary_source_head or head
             scope = freeze_scope(
-                args.manifest, identities, source_head=head, binary_path=args.binary
+                args.manifest,
+                identities,
+                source_head=binary_source_head,
+                tooling_source_head=head,
+                binary_path=args.binary,
             )
             args.scope.write_text(json.dumps(scope, indent=2, sort_keys=True) + "\n")
             print(f"froze {scope['suite_count']} suites in {args.scope}")

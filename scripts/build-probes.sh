@@ -58,9 +58,8 @@ if [ "$MODE" = "--closure-arm64" ]; then
     -v "$PWD/conformance-probes:/p" -w /p \
     rust:alpine sh -ec '
       rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
-      # Cargo/rustc has twice lost the package rlib while fanning 430 bins out
-      # against this bind-mounted target (`E0463` / "rlib format not found").
-      # Closure is an evidence gate, so make the strict build deterministic.
+      # Closure is an evidence gate: serialize the 430-bin build so artifact
+      # publication on the bind-mounted target is deterministic.
       set -- cargo build --release --jobs 1 --target aarch64-unknown-linux-musl
       for name in $CARRICK_CLOSURE_BINS; do
         set -- "$@" --bin "$name"
