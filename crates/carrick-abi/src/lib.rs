@@ -4992,6 +4992,40 @@ pub const LINUX_IP_DROP_MEMBERSHIP: i32 = 36;
 /// (`multiaddr, interface, sourceaddr`) and Darwin
 /// (`multiaddr, sourceaddr, interface`) — see
 /// `dispatch::net::support::rewrite_optval_for_host`.
+/// `IP_RECVERR` / `IPV6_RECVERR`: opt in to Linux's per-socket ERROR QUEUE, so
+/// an ICMP error is reported even on an UNCONNECTED datagram socket and is
+/// readable with `recvmsg(MSG_ERRQUEUE)` as a `sock_extended_err` cmsg. Darwin
+/// has neither option nor queue — see `dispatch::net::recverr`.
+pub const LINUX_IP_RECVERR: i32 = 11;
+pub const LINUX_IPV6_RECVERR: i32 = 25;
+
+/// `struct sock_extended_err` (`linux/errqueue.h`), the payload of an
+/// `IP_RECVERR`/`IPV6_RECVERR` cmsg. The offending peer's `sockaddr` follows
+/// IMMEDIATELY after this struct (`SO_EE_OFFENDER`).
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxSockExtendedErr {
+    pub ee_errno: u32,
+    pub ee_origin: u8,
+    pub ee_type: u8,
+    pub ee_code: u8,
+    pub ee_pad: u8,
+    pub ee_info: u32,
+    pub ee_data: u32,
+}
+
+/// `SO_EE_ORIGIN_ICMP` / `SO_EE_ORIGIN_ICMP6`.
+pub const LINUX_SO_EE_ORIGIN_ICMP: u8 = 2;
+pub const LINUX_SO_EE_ORIGIN_ICMP6: u8 = 3;
+/// `ICMP_DEST_UNREACH` type with `ICMP_PORT_UNREACH` code.
+pub const LINUX_ICMP_DEST_UNREACH: u8 = 3;
+pub const LINUX_ICMP_PORT_UNREACH: u8 = 3;
+/// `ICMPV6_DEST_UNREACH` type with `ICMPV6_PORT_UNREACH` code.
+pub const LINUX_ICMPV6_DEST_UNREACH: u8 = 1;
+pub const LINUX_ICMPV6_PORT_UNREACH: u8 = 4;
+
 pub const LINUX_IP_UNBLOCK_SOURCE: i32 = 37;
 pub const LINUX_IP_BLOCK_SOURCE: i32 = 38;
 pub const LINUX_IP_ADD_SOURCE_MEMBERSHIP: i32 = 39;
