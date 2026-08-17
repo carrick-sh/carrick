@@ -75,9 +75,10 @@ has exactly three rows. Every Carrick arm reached a real TAP producer:
   120,736 ms.
 - `node-v8-smoke`: TAP 13, plan `1..1`, one `not ok`; inner timeout at
   120,487 ms.
-- `node-libuv`: plan `1..332`, 301 `ok` and 31 `not ok` before the inner
-  timeout at 180,980 ms. The regression parser labels this `MATCH` only because
-  both arms failed; that label is not closure evidence.
+- `node-libuv`: declared plan `1..507`, reached assertion 332 with 301 `ok` and
+  31 `not ok` before the inner timeout at 180,980 ms. The regression parser
+  labels this `MATCH` only because both arms failed; that label is not closure
+  evidence.
 
 The exact stdout/stderr streams are the `node-*-candidate.{out,err}` files.
 All three run ids had zero scoped Carrick processes after cleanup.
