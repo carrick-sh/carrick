@@ -1,0 +1,2277 @@
+{
+  "abortdeath": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "acceptsock": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "accessx": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "accounting": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "adjtimexstate": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "alarmretval": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "aliassize": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "altstacktid": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "bigallocfree": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "bigread": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "bindunixnode": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "blockingpipewrite": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "bridge_compose_client": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_bridge_compose_pair"
+  },
+  "bridge_compose_server": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_bridge_compose_pair"
+  },
+  "bridge_loopback_isolation": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_bridge_loopback_isolation"
+  },
+  "bridge_net_identity": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_bridge_net_identity"
+  },
+  "bridge_publish_tcp": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_bridge_publish_tcp"
+  },
+  "bridge_reuse_sockopts": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_bridge_reuse_sockopts"
+  },
+  "bridge_tcp_nonblocking_refused": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_bridge_tcp_nonblocking_refused"
+  },
+  "bridge_tcp_peer": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_bridge_tcp_peer"
+  },
+  "bridge_udp_connected_unreachable": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_bridge_udp_connected_unreachable"
+  },
+  "bridge_udp_peer": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_bridge_udp_peer"
+  },
+  "bridge_udp_sendto_unreachable": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_bridge_udp_sendto_unreachable"
+  },
+  "brkheapgrow": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "bsd_signal_xlate": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "cachestatpages": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "capbsetisolation": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "childsubreaper": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "chmodfollowsymlink": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "chmodsetgid": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "clockcoherence": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "clockgetres": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "clocknanosleepcpu": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "clone3args": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "clone3exithandled": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "clone3pidfdsig": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "clone3signalflight": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "clonebasic": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "cloneexithandled": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "cloneexitsig": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "clonefilesexec": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "clonefileshare": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "clonefsumask": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "clonestack": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "closedstdio": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "cluster10errno": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "connrefused": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "coredumpbit": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "coredumpfile": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "cpucount": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "credtransition": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ctrel0": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "devnullseek": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "dirdac": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "dirfdnotdir": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "dirops": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "dirrenamecache": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "dnotify": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "dsrconstantpool": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "dupclosestdin": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epollclosenodel": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epollcluster": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epolletblockedhup": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epolletchildhup": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epolletmanyhup": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epolletpipeeof": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epollexclusive": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epollforkeventfd": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epollinmemwake": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epolloutrearm": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epolloutxthread": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epollpri": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epollpwait": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "epollstaledel": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "etchostnamefile": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "execfailsurvive": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "execfatalstatus": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "execfromthread": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "execpermitchurn": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "execpipe": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "execsig": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "execsocket": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "execthreads": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "execvenonutf8": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "execvereset": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "exitgroupmainthreads": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "exitgroupthreads": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "exitstatus127": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "expectcontinue": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fallocatebig": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "faultaddr": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fchmoddir": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fcntlgetlk": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fcntllease": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fcntllock": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fcntlofdlock": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fcntlowner": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fcntlpipesz": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fcntlstdio": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fdio": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fdstat": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fdstatus": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fexecveprobe": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fgetflcreate": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fifoepolleof": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fifoforkeof": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fifonode": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "flocklock": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "forkaltstack": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "forkcow": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "forkexecpthread": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "forkfault": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "forkfiletable": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "forkfpreclaim": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "forkfpregs": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "forkheapalloc": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "forkhighva": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "forkshared": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "forksigwalk": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "forksleepfork": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "forksnapshot": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "forksplicestage": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fsescapeguard": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fsetfl": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fsmeta": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fstatatflags": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "fsx": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "futexdeadline": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "futexextra": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "futexforkrequeue": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "futexforkwakegroups": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "futexghost": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "futexpilock": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "futexpingpong": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "futexprivatewakeexact": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "futexrealtime": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "futexrequeue": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "futexshare": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "futexsharedalias": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "futexsharedto": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "futexwaiterstates": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "futexwakecount": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "futexwakeexact": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "getrandomflags": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "getrandomvdso": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "getrandomvdsofork": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "getrandomvdsoloop": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "getsocknameval": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "host_gateway_client": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_native_host_gateway"
+  },
+  "hugepage": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "icmp": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ioctlcluster": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "iopriovhangup": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "iouring": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "iouringenterflag": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "iouringsqpoll": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "iovecedge": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ipv6recvhoplimit": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ipv6sendhoplimit": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "itimer": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "itimerprofidle": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "kernelidentity": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "keydeny": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "killchld": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "killfault": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "killgroup": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "killreap": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "killrt": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "killtarget": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "killuidperm": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "lchownsymlink": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "legacyaio": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "legacyfs": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "linkatflag": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "linkstat": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "linuxsysinfo": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "loopbacksubnet": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ltpcheckpoint": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ltpcheckpointexec": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "lutimesym": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "lxattr": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mailboxregs": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "manythreads": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mapfixed": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mapfixedfork": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "maskfork": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mcastjoingroup": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mem": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "memfdcreate": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "memmap": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mincoreedge": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mkdirsetgid": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mknoddevnode": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mlock2": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mmapcage": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mmapcluster": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mmapdevzero": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mmapexecshared": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mmapfile": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mmapfileforkwriteback": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mmapfileshare_mt": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mmapmunmap": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mmapprivfile": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mmaprecl": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mmapreuse": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mmaptrimprotect": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mmapv8align": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mmapzerofill": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mprotectexec": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mqueue": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mremapgrow": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mremapmove": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mremapsharedshrink": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mremapshrink": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "msgctlstat": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "msgoverflow": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "msyncalign": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mtforkcorrupt": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mtidlesleep": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "mtsigrelease": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "multi_network_client": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_native_multi_network_roles"
+  },
+  "multi_network_dns_client": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_native_multi_network_roles"
+  },
+  "multi_network_server": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_native_multi_network_roles"
+  },
+  "nanosleeprem": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "nativebrk": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "nativeetexecfork": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "nativex18": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "net": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "netifmcast": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "netlink_route": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "netpoll": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "nicepriority": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "nofiledefault": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "nsfsioctl": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "oappendroundtrip": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "odirectory": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "oomscoreadj": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "opathfd": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "openat2resolve": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "openat2valid": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "openbrokensymlinkcreate": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "openeloop": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "openempty": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "openexcldir": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "otmpfileforkexec": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "patherrno": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "pathnonutf8": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "pauseeintr": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "pauseinterrupt2": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "pendingunblock": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_direct_compute": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_disk_meta": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_disk_vol": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_dsr_gateway": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_dsr_indirect": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_epoll_pipe_loop": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_fork": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_fork_exec": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_fork_mmap_snapshot": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_fork_scale": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_futex_pingpong": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_large_meta": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_mmap_churn": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_net_tcp_rr": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_net_tcp_stream": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_net_xclient": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_net_xserver": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_overlay_small_updates": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_preadv_burst": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_pwritev_burst": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_shared_anon_churn": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_stdio_burst": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_trap_floor": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_wait_pipe_pingpong": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "perf_writev_burst": {
+    "class": "performance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "pidfdprocdir": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "pidnsinitreap": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "pidnsinitsig": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "pidnsorphanreap": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "pidnsroot": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "pidnswait": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "pipeextra": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "pipelargewrite": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "pipeszcrossend": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "pollevent": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "posixtimers": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ppid": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ppollsig": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ppollunblock": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "prctldumpable": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "prctlerrors": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "prctlnnp": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "preadspecial": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "preadv2flags": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "preadvwronly": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "preemptsigstorm": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "probeinit": {
+    "class": "helper",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "procconfigloop": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "procid": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "procladder": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "procladder_epollmgr": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "procladder_mixed": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "procladder_mt": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "proclife": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "procpeerdir": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "procpeermem": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "procprctlview": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "procselfdir": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "procselfpid": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "procselfstatleader": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "procsignalmask": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "procsignalmulti": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "procstat": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "procstatstate": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "procstatussig": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "protnonesyscall": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "pselecteintr": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ptraceattach": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ptraceinvaliderrno": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ptracekillcont": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ptracesequence": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ptracesigdeath": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ptracesignalstop": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ptracestop": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ptracetraceme": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ptyfionbio": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ptyfionread": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ptyforkreopen": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ptypair": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "readpasteof": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "readwronly": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "recursionguard": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "recverrqueue": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "recvmsgtrunc": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "renameexchange": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "reparenttoinit": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "rlimitnofile": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "rlimitresource": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "rlimitroundtrip": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "robustlist": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "roprotect": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "roreadwrite": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "rosharedbus": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "rtsigqueueinfo": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "rtsigqueueinfoxthread": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "rtsigtimedwaitsiginfo": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "saresethand": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "schedaffinitysibling": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "schedgetattr": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "schedparam": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "schedprio": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "schedthread": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "scmrightsfds": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "seccompenforce": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "seccompexec": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "seekholedata": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "selectnfds": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "selecttimeout": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "selfhostnameresolve": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "selfraise": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "semctlrange": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "semgetnsems": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "semtimedop": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sendfilebadf": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "setfsid": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "setgroupsroundtrip": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "setidthreadchurn": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "setpgidparentgroup": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "shmlinkat": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "shmnestedfork": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "shmrdonly": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sidecar_loopback_client": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "docker_compose_shared_network_namespace_smoke"
+  },
+  "sidecar_loopback_isolated_client": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "docker_compose_shared_network_namespace_smoke"
+  },
+  "sidecar_loopback_server": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "docker_compose_shared_network_namespace_smoke"
+  },
+  "sigactionresetinfo": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sigbadstack": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sigchld": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "siginfo": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "siglongjmpaltstack": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "signalexit": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "signalfd4": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "signalfdread": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "signals": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sigpairrace": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sigpipewrite": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sigqueueusr1": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sigreenter": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sigsuspendxthread": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sigtimedwaitintr": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sigunblockpending": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sigwaitalarm": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sigwaitblock": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sigwaitthread": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sockbufreuseport": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sockoptdomainproto": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sotimeo": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "splicenetpoll": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "splicepipe": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "spliceunixpoll": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "statfdino": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "symlinkfollow": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "symlinkmknod": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "syncfilerange": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "syscallregpreserve": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sysinfo": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sysvmsg": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sysvmsgwake": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sysvsem": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sysvsemstat": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "sysvshm": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "telemetrymap": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "termiosbits": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "termiosflow": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "tgsigqueue": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "threadbarrier": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "threadcommname": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "threadrecycle": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "threadspawn": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "threadstatstate": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "threadstatuscount": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "timeclock": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "timeextra": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "timersettimeabs": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "timeschildren": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "tmpfileatime": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "tmpfilewrite": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "traceexecstop": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "ttyencoding": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "udp_published_client": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_native_udp_service_pair"
+  },
+  "udp_published_server": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "conformance_native_udp_service_pair"
+  },
+  "udpconnectunspec": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "udplitesock": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "udpreuseaddr": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "unicodenorm": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "unlinkatbindmount": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "usernsisolation": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "usernsmap": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "usernswrite": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "vdsogtod": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "vdsosymbols": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "vforkexecthread": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "vforkpid": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "vforkvmshare": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "vmsplicepipe": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "waitexitstorm": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "waitidcputime": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "waitidspec": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "waitpgid": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "waitrestart": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "waitsiblingsigchld": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "writevpartial": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "xprocsigign": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "xsignal": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "xthreadsig": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "zerolenio": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  }
+}

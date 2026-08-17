@@ -17,7 +17,7 @@
 // production code, so allow unwrap/expect across this integration test file.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -2061,6 +2061,13 @@ fn set_gates_here(lane: &Lane, set: &ProbeSet) -> bool {
     }
 }
 
+/// Closure is deliberately narrower than the ordinary multi-platform probe
+/// campaign: both arm64 libc builds are authoritative and every divergence is
+/// gating. The ordinary GNU/report-only and x86 bring-up policies are unchanged.
+fn closure_set_gates(lane: &Lane, set: &ProbeSet) -> bool {
+    lane.label == ARM64.label && matches!(set.libc, "musl" | "gnu")
+}
+
 /// Curated allowlist of x86_64 probes permitted to GATE (fail the build red) on
 /// the amd64 lane even though the lane as a whole is report-only carrick-x86
 /// BRING-UP. A probe here gates on the native x86_64 fleet; everything else stays
@@ -2813,6 +2820,127 @@ fn probe_campaign_dir(target: &str, exec_backend: Option<&str>) -> PathBuf {
 /// under the injection transport it would fork/exec ITSELF at `/tmp/p`.
 const PROBE_HELPERS: &[&str] = &["probeinit"];
 
+#[derive(serde::Deserialize)]
+struct ProbeInventoryRow {
+    class: String,
+    runner: String,
+    excluded: bool,
+}
+
+fn all_probe_source_names() -> BTreeSet<String> {
+    let src_dir = repo_path("conformance-probes/src/bin");
+    let Ok(entries) = std::fs::read_dir(src_dir) else {
+        return BTreeSet::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+                return None;
+            }
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn closure_generic_probe_names() -> Result<BTreeSet<String>, String> {
+    let path = repo_path("conformance-probes/probe-inventory.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let inventory: BTreeMap<String, ProbeInventoryRow> = serde_json::from_str(&raw)
+        .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+    let source_names = all_probe_source_names();
+    let inventory_names = inventory.keys().cloned().collect::<BTreeSet<_>>();
+    if source_names != inventory_names {
+        return Err(format!(
+            "probe source inventory drift (missing={:?}, absent_from_disk={:?})",
+            source_names
+                .difference(&inventory_names)
+                .collect::<Vec<_>>(),
+            inventory_names
+                .difference(&source_names)
+                .collect::<Vec<_>>()
+        ));
+    }
+
+    let mut selected = BTreeSet::new();
+    for (name, row) in inventory {
+        if row.excluded {
+            return Err(format!(
+                "closure probe inventory contains an exclusion: {name}"
+            ));
+        }
+        let expected_class = if name.starts_with("perf_") {
+            "performance"
+        } else if name == "probeinit" {
+            "helper"
+        } else {
+            "conformance"
+        };
+        if row.class != expected_class {
+            return Err(format!(
+                "probe {name} is class {}, expected {expected_class}",
+                row.class
+            ));
+        }
+        if row.class == "conformance" && row.runner == "generic" {
+            selected.insert(name);
+        }
+    }
+    Ok(selected)
+}
+
+struct ClosureProbeInventory<'a> {
+    expected: &'a BTreeSet<String>,
+    binaries: &'a BTreeSet<String>,
+    oracles: &'a BTreeSet<String>,
+    skipped: &'a BTreeSet<String>,
+}
+
+fn validate_closure_probe_inventory(inventory: &ClosureProbeInventory<'_>) -> Result<(), String> {
+    let mut errors = Vec::new();
+    if inventory.binaries != inventory.expected {
+        errors.push(format!(
+            "binary inventory differs (missing={:?}, unexpected={:?})",
+            inventory
+                .expected
+                .difference(inventory.binaries)
+                .collect::<Vec<_>>(),
+            inventory
+                .binaries
+                .difference(inventory.expected)
+                .collect::<Vec<_>>()
+        ));
+    }
+    if inventory.oracles != inventory.expected {
+        errors.push(format!(
+            "oracle inventory differs (missing={:?}, unexpected={:?})",
+            inventory
+                .expected
+                .difference(inventory.oracles)
+                .collect::<Vec<_>>(),
+            inventory
+                .oracles
+                .difference(inventory.expected)
+                .collect::<Vec<_>>()
+        ));
+    }
+    if !inventory.skipped.is_empty() {
+        errors.push(format!(
+            "closure selected probes were skipped: {:?}",
+            inventory.skipped
+        ));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 /// Raw `clone(CLONE_FILES)` is blocked by Docker's default seccomp profile,
 /// and so is `unshare(CLONE_NEWUSER)`. These probes intentionally exercise
 /// those Linux contracts, so both Carrick and the Docker oracle must run them
@@ -2830,22 +2958,9 @@ fn probe_needs_unconfined(name: &str) -> bool {
 }
 
 fn probe_source_names() -> BTreeSet<String> {
-    let src_dir = repo_path("conformance-probes/src/bin");
-    let Ok(entries) = std::fs::read_dir(src_dir) else {
-        return BTreeSet::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                return None;
-            }
-            path.file_stem()
-                .and_then(|n| n.to_str())
-                .filter(|name| !PROBE_HELPERS.contains(name))
-                .map(str::to_string)
-        })
+    all_probe_source_names()
+        .into_iter()
+        .filter(|name| !PROBE_HELPERS.contains(&name.as_str()))
         .collect()
 }
 
@@ -3696,9 +3811,20 @@ fn probe_worker_count(requested: Option<&str>, available: Option<usize>) -> Resu
 fn conformance_probes() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let Some(bin) = carrick_bin() else {
-        eprintln!("SKIP conformance_probes: target/release/carrick not built");
-        return;
+    let closure_mode = match std::env::var("CARRICK_PROBE_MODE").ok().as_deref() {
+        None => false,
+        Some("closure") => true,
+        Some(value) => panic!("invalid CARRICK_PROBE_MODE={value:?}; expected `closure`"),
+    };
+    let bin = match carrick_bin() {
+        Some(bin) => bin,
+        None if closure_mode => {
+            panic!("closure probe gate requires target/release/carrick")
+        }
+        None => {
+            eprintln!("SKIP conformance_probes: target/release/carrick not built");
+            return;
+        }
     };
     // Docker reachability check (std::process side, so no bollard ping here):
     // a trivial `docker version` must succeed. Unlike before, the gate does NOT
@@ -3712,7 +3838,12 @@ fn conformance_probes() {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if !docker_available {
+    if closure_mode {
+        assert!(
+            docker_available,
+            "closure probe gate requires a reachable Docker daemon"
+        );
+    } else if !docker_available {
         eprintln!(
             "NOTE conformance_probes: Docker not reachable — diffing against the \
              committed probe-oracle cache (carrick-only). Probes with no cached \
@@ -3728,15 +3859,45 @@ fn conformance_probes() {
 
     let mut nongating_diffs: Vec<String> = Vec::new();
     let requested_exec_backend = std::env::var("CARRICK_EXEC_BACKEND").ok();
+    let requested_probe_lane = std::env::var("CARRICK_PROBE_LANE").ok();
     let requested_probe_libc = std::env::var("CARRICK_PROBE_LIBC").ok();
     let requested_probe_names = std::env::var("CARRICK_PROBE_FILTER").ok();
     let requested_probe_workers = std::env::var("CARRICK_PROBE_WORKERS").ok();
+    if closure_mode {
+        assert_eq!(
+            requested_probe_lane.as_deref(),
+            Some("arm64"),
+            "closure probe gate requires CARRICK_PROBE_LANE=arm64"
+        );
+        assert_eq!(
+            requested_exec_backend.as_deref(),
+            Some("hvpatch"),
+            "closure probe gate requires CARRICK_EXEC_BACKEND=hvpatch"
+        );
+        assert!(
+            requested_probe_libc.is_none(),
+            "closure probe gate forbids CARRICK_PROBE_LIBC"
+        );
+        assert!(
+            requested_probe_names.is_none(),
+            "closure probe gate forbids CARRICK_PROBE_FILTER"
+        );
+    }
+    let closure_expected = closure_mode.then(|| {
+        closure_generic_probe_names()
+            .unwrap_or_else(|error| panic!("invalid closure probe inventory: {error}"))
+    });
     let n_workers = probe_worker_count(
         requested_probe_workers.as_deref(),
         std::thread::available_parallelism().ok().map(|n| n.get()),
     )
     .unwrap_or_else(|error| panic!("{error}"));
-    for lane in LANES {
+    let lanes = if closure_mode {
+        std::slice::from_ref(&ARM64)
+    } else {
+        LANES
+    };
+    for lane in lanes {
         if !lane_allowed_for_backend(lane, requested_exec_backend.as_deref()) {
             eprintln!(
                 "SKIP conformance_probes[{}]: exec backend {} only supports the host-matching guest ISA",
@@ -3774,9 +3935,21 @@ fn conformance_probes() {
             // report-only SUMMARY; individual probes additionally gate via the
             // per-probe `probe_gates` allowlist below (so a curated x86 subset can
             // gate while the rest of the bring-up lane stays report-only).
-            let set_gates = set_gates_here(lane, set);
+            let set_gates = if closure_mode {
+                closure_set_gates(lane, set)
+            } else {
+                set_gates_here(lane, set)
+            };
             let dir = probe_campaign_dir(set.target, requested_exec_backend.as_deref());
             if !dir.exists() {
+                if closure_mode {
+                    panic!(
+                        "closure probe set {}:{} is not built ({})",
+                        lane.label,
+                        set.libc,
+                        dir.display()
+                    );
+                }
                 eprintln!(
                     "SKIP conformance_probes[{}:{}]: probes not built ({})",
                     lane.label,
@@ -3797,14 +3970,57 @@ fn conformance_probes() {
                         // src/bin/ only to share build-probes.sh and have no place in
                         // a differential CORRECTNESS diff (their output never matches).
                         .map(|n| {
-                            !GATE_SKIP_PROBES.contains(&n)
-                                && !n.starts_with("perf_")
-                                && probe_name_allowed(n, requested_probe_names.as_deref())
+                            if let Some(expected) = &closure_expected {
+                                // Closure's explicit inventory replaces the regression
+                                // skip list: generic conformance sources remain selected
+                                // even if GATE_SKIP_PROBES excludes them ordinarily.
+                                expected.contains(n)
+                            } else {
+                                !GATE_SKIP_PROBES.contains(&n)
+                                    && !n.starts_with("perf_")
+                                    && probe_name_allowed(n, requested_probe_names.as_deref())
+                            }
                         })
                         .unwrap_or(true)
                 })
                 .collect();
+            if let Some(expected) = &closure_expected {
+                let binaries = probes
+                    .iter()
+                    .filter_map(|path| path.file_name()?.to_str().map(str::to_string))
+                    .collect::<BTreeSet<_>>();
+                let oracles = if docker_available {
+                    expected.clone()
+                } else {
+                    expected
+                        .iter()
+                        .filter(|name| cached_probe_oracle(lane.label, set.libc, name).is_some())
+                        .cloned()
+                        .collect()
+                };
+                let skipped = BTreeSet::new();
+                validate_closure_probe_inventory(&ClosureProbeInventory {
+                    expected,
+                    binaries: &binaries,
+                    oracles: &oracles,
+                    skipped: &skipped,
+                })
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "closure probe inventory failed for {}:{}: {error}",
+                        lane.label, set.libc
+                    )
+                });
+            }
             if probes.is_empty() {
+                if closure_mode {
+                    panic!(
+                        "closure probe set {}:{} has no selected binaries in {}",
+                        lane.label,
+                        set.libc,
+                        dir.display()
+                    );
+                }
                 eprintln!(
                     "SKIP conformance_probes[{}:{}]: no probe binaries in {}",
                     lane.label,
@@ -3940,7 +4156,11 @@ fn conformance_probes() {
                 let qualified = format!("{}:{}:{name}", lane.label, set.libc);
                 // Per-probe gating: the whole set may be report-only while a
                 // curated x86 subset (X86_GATING_PROBES) still gates.
-                let gates = probe_gates(lane, set, name);
+                let gates = if closure_mode {
+                    closure_set_gates(lane, set)
+                } else {
+                    probe_gates(lane, set, name)
+                };
                 match outcome {
                     ProbeOutcome::Pass => eprintln!("PASS {qualified}"),
                     ProbeOutcome::UnexpectedPass => {
@@ -4822,6 +5042,62 @@ fn probe_gates_decision_allowlist_logic() {
         true,
         X86_GATING_PROBES.contains(&"icmp")
     ));
+}
+
+#[test]
+fn closure_gates_arm64_musl_and_gnu_and_rejects_skips() {
+    assert!(
+        ARM64
+            .probe_sets
+            .iter()
+            .all(|set| closure_set_gates(&ARM64, set))
+    );
+
+    let expected = BTreeSet::from(["alpha".to_string(), "beta".to_string()]);
+    let complete = expected.clone();
+    let empty = BTreeSet::new();
+    assert!(
+        validate_closure_probe_inventory(&ClosureProbeInventory {
+            expected: &expected,
+            binaries: &complete,
+            oracles: &complete,
+            skipped: &empty,
+        })
+        .is_ok()
+    );
+
+    let missing_binary = BTreeSet::from(["alpha".to_string()]);
+    assert!(
+        validate_closure_probe_inventory(&ClosureProbeInventory {
+            expected: &expected,
+            binaries: &missing_binary,
+            oracles: &complete,
+            skipped: &empty,
+        })
+        .is_err()
+    );
+
+    let unblessed = BTreeSet::from(["alpha".to_string()]);
+    assert!(
+        validate_closure_probe_inventory(&ClosureProbeInventory {
+            expected: &expected,
+            binaries: &complete,
+            oracles: &unblessed,
+            skipped: &empty,
+        })
+        .is_err()
+    );
+
+    let skipped = BTreeSet::from(["beta".to_string()]);
+    assert!(
+        validate_closure_probe_inventory(&ClosureProbeInventory {
+            expected: &expected,
+            binaries: &complete,
+            oracles: &complete,
+            skipped: &skipped,
+        })
+        .is_err()
+    );
 }
 
 #[test]

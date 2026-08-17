@@ -16,7 +16,7 @@
 # glibc — that is exactly how the TCGETS2 isatty gap shipped. Building both and
 # diffing each against real Linux closes that blind spot.
 #
-# `--keep-going` is intentional everywhere: a probe that does not yet compile
+# `--keep-going` is intentional in the ordinary multi-architecture build: a probe that does not yet compile
 # for a given target (the handful of aarch64-only raw-asm/raw-syscall probes
 # fail to build for x86_64) is skipped (best-effort), so one arch-specific probe
 # does not block the whole matrix. The harness only runs probes whose binary
@@ -36,6 +36,53 @@ cd "$(dirname "$0")/.."
 
 HOST_ARCH="$(uname -m)"
 MODE="${1:-default}"
+
+if [ "$MODE" = "--closure-arm64" ]; then
+  if [ "$HOST_ARCH" != "arm64" ] && [ "$HOST_ARCH" != "aarch64" ]; then
+    echo "--closure-arm64 requires an arm64 host" >&2
+    exit 2
+  fi
+
+  python3 scripts/probe-inventory.py check
+  CARRICK_CLOSURE_BINS="$(python3 scripts/probe-inventory.py selected)"
+  export CARRICK_CLOSURE_BINS
+
+  # Closure owns only the two arm64 release directories. Clearing them before
+  # either strict build prevents a prior partial or broader build from making a
+  # missing binary look present.
+  rm -rf conformance-probes/target/aarch64-unknown-linux-musl/release
+  rm -rf conformance-probes/target/aarch64-unknown-linux-gnu/release
+
+  docker run --rm --platform linux/arm64 \
+    -e CARRICK_CLOSURE_BINS \
+    -v "$PWD/conformance-probes:/p" -w /p \
+    rust:alpine sh -ec '
+      rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
+      set -- cargo build --release --target aarch64-unknown-linux-musl
+      for name in $CARRICK_CLOSURE_BINS; do
+        set -- "$@" --bin "$name"
+      done
+      "$@"
+    '
+  python3 scripts/probe-inventory.py check-binaries \
+    conformance-probes/target/aarch64-unknown-linux-musl/release arm64-musl
+
+  docker run --rm --platform linux/arm64 \
+    -e CARRICK_CLOSURE_BINS \
+    -v "$PWD/conformance-probes:/p" -w /p \
+    rust:bookworm sh -ec '
+      rustup target add aarch64-unknown-linux-gnu >/dev/null 2>&1 || true
+      set -- cargo build --release --target aarch64-unknown-linux-gnu
+      for name in $CARRICK_CLOSURE_BINS; do
+        set -- "$@" --bin "$name"
+      done
+      "$@"
+    '
+  python3 scripts/probe-inventory.py check-binaries \
+    conformance-probes/target/aarch64-unknown-linux-gnu/release arm64-gnu
+
+  exit 0
+fi
 
 if [ "$MODE" = "--native-pie" ] || [ "$MODE" = "--native-pie-musl" ]; then
   if [ "$HOST_ARCH" != "arm64" ] && [ "$HOST_ARCH" != "aarch64" ]; then
@@ -93,7 +140,7 @@ if [ "$MODE" = "--native-pie" ] || [ "$MODE" = "--native-pie-musl" ]; then
 fi
 
 if [ "$MODE" != "default" ]; then
-  echo "usage: $0 [--native-pie|--native-pie-musl]" >&2
+  echo "usage: $0 [--closure-arm64|--native-pie|--native-pie-musl]" >&2
   exit 2
 fi
 
