@@ -303,4 +303,43 @@ carrick_flags = ["--fs", "host"]
         assert!(e.iter().any(|s| s.contains("timeout_s")), "{e:?}");
         assert!(e.iter().any(|s| s.contains("n=0 trap")), "{e:?}");
     }
+
+    /// Locate the committed manifest from either the crate dir or the repo root
+    /// (cargo runs unit tests with CWD = the crate dir, but not every harness
+    /// does). Panics rather than skipping: a test that silently passes when it
+    /// cannot find its subject gates nothing.
+    pub(crate) fn committed_manifest() -> Manifest {
+        const PATH: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/conformance/suites.toml"
+        );
+        let content = std::fs::read_to_string(PATH)
+            .unwrap_or_else(|e| panic!("cannot read committed manifest {PATH}: {e}"));
+        Manifest::from_toml(&content).expect("parse committed suites.toml")
+    }
+
+    /// `node-libuv` must NOT pin `--user` on the docker side.
+    ///
+    /// The image's `nodejs-conformance` wrapper creates and chowns the libuv
+    /// fixture and then drops itself to uid/gid 1000 on its own. Starting the
+    /// container as an unprivileged user instead makes that chown fail EPERM, so
+    /// the oracle never reaches libuv and records a setup failure rather than
+    /// Linux behaviour. This asserts on the COMMITTED manifest so regeneration
+    /// (see `generate.rs`) cannot quietly restore the flag.
+    #[test]
+    fn node_libuv_manifest_does_not_pin_docker_user() {
+        let m = committed_manifest();
+        let libuv = m
+            .suite
+            .iter()
+            .find(|s| s.name == "node-libuv")
+            .expect("committed manifest declares node-libuv");
+        assert!(
+            !libuv.docker_flags.iter().any(|f| f == "--user"),
+            "node-libuv must not pin --user in docker_flags: the image wrapper drops to \
+             uid/gid 1000 itself, and starting unprivileged makes its fixture chown EPERM \
+             so the oracle measures a setup failure instead of Linux libuv: {:?}",
+            libuv.docker_flags
+        );
+    }
 }

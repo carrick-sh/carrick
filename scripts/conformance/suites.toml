@@ -77,7 +77,6 @@ tier = "full"
 weight = "heavy"
 timeout_s = 240
 carrick_flags = ["--raw", "--fs", "host"]
-docker_flags = ["--user", "65534"]
 
 [[suite.env]]
 key = "NODEJS_CONFORMANCE_IN_IMAGE"

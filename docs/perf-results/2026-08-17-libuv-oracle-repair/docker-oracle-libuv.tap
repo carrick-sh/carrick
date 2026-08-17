@@ -1,0 +1,625 @@
+1..507
+ok 1 - platform_output
+# Output from process `platform_output`:
+# uv_get_process_title: /opt/libuv-src/build/uv_run_tests_a
+# uv_cwd: /tmp/nodejs-libuv.EdAunU
+# uv_resident_set_memory: 1675264
+# uv_uptime: 5083.760000
+# uv_getrusage:
+#   user: 0 sec 0 microsec
+#   system: 0 sec 231 microsec
+#   page faults: 0
+#   maximum resident set size: 2844
+# uv_available_parallelism: 10
+# uv_cpu_info:
+#   model: unknown
+#   speed: 0
+#   times.sys: 44040
+#   times.user: 64160
+#   times.idle: 4951140
+#   times.irq: 0
+#   times.nice: 0
+#   model: unknown
+#   speed: 0
+#   times.sys: 15020
+#   times.user: 27530
+#   times.idle: 5032360
+#   times.irq: 0
+#   times.nice: 0
+#   model: unknown
+#   speed: 0
+#   times.sys: 16750
+#   times.user: 29190
+#   times.idle: 5029170
+#   times.irq: 0
+#   times.nice: 0
+#   model: unknown
+#   speed: 0
+#   times.sys: 17460
+#   times.user: 29580
+#   times.idle: 5028780
+#   times.irq: 0
+#   times.nice: 0
+#   model: unknown
+#   speed: 0
+#   times.sys: 15900
+#   times.user: 28740
+#   times.idle: 5031200
+#   times.irq: 0
+#   times.nice: 0
+#   model: unknown
+#   speed: 0
+#   times.sys: 16480
+#   times.user: 30750
+#   times.idle: 5028770
+#   times.irq: 0
+#   times.nice: 0
+#   model: unknown
+#   speed: 0
+#   times.sys: 16110
+#   times.user: 29100
+#   times.idle: 5031100
+#   times.irq: 0
+#   times.nice: 0
+#   model: unknown
+#   speed: 0
+#   times.sys: 15270
+#   times.user: 29460
+#   times.idle: 5031260
+#   times.irq: 0
+#   times.nice: 0
+#   model: unknown
+#   speed: 0
+#   times.sys: 16310
+#   times.user: 29490
+#   times.idle: 5029490
+#   times.irq: 0
+#   times.nice: 0
+#   model: unknown
+#   speed: 0
+#   times.sys: 16750
+#   times.user: 30710
+#   times.idle: 5028690
+#   times.irq: 0
+#   times.nice: 0
+# uv_interface_addresses:
+#   name: lo
+#   internal: 1
+#   physical address: 00:00:00:00:00:00
+#   address: 127.0.0.1
+#   netmask: 255.0.0.0
+#   name: eth0
+#   internal: 0
+#   physical address: be:00:fd:b1:58:6a
+#   address: 172.17.0.4
+#   netmask: 255.255.0.0
+#   name: lo
+#   internal: 1
+#   physical address: 00:00:00:00:00:00
+#   address: ::1
+#   netmask: ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+# uv_os_get_passwd:
+#   euid: 1000
+#   gid: 1000 (nodeconf)
+#     members: [ ]
+#   username: nodeconf
+#   shell: /usr/sbin/nologin
+#   home directory: /home/nodeconf
+# uv_os_getpid: 20
+# uv_os_getppid: 19
+# uv_os_uname:
+#   sysname: Linux
+#   release: 7.0.12-linuxkit
+#   version: #1 SMP PREEMPT Wed Aug 12 20:18:49 UTC 2026
+#   machine: aarch64
+# uv_getrusage_thread:
+#   user: 0 sec 0 microsec
+#   system: 0 sec 231 microsec
+#   page faults: 0
+#   maximum resident set size: 2844
+ok 2 - active
+ok 3 - async
+ok 4 - async_null_cb
+ok 5 - async_ref
+ok 6 - barrier_1
+ok 7 - barrier_2
+ok 8 - barrier_3
+ok 9 - barrier_serial_thread
+ok 10 - barrier_serial_thread_single
+ok 11 - callback_stack
+ok 12 - check_ref
+ok 13 - clock_gettime
+ok 14 - close_fd
+ok 15 - close_order
+ok 16 - closed_fd_events
+ok 17 - condvar_1
+ok 18 - condvar_2
+ok 19 - condvar_3
+ok 20 - condvar_4
+ok 21 - condvar_5
+ok 22 - connect_unspecified
+ok 23 - connection_fail
+ok 24 - connection_fail_doesnt_auto_close
+ok 25 - cwd_and_chdir
+ok 26 - default_loop_close
+ok 27 - delayed_accept
+ok 28 - dlerror
+ok 29 - eintr_handling
+ok 30 - embed
+ok 31 - emfile
+ok 32 - env_vars
+ok 33 - error_message
+ok 34 - fork_close_signal_in_child
+ok 35 - fork_fs_events_child
+ok 36 - fork_fs_events_child_dir
+ok 37 - fork_fs_events_file_parent_child
+ok 38 - fork_signal_to_child
+ok 39 - fork_signal_to_child_closed
+ok 40 - fork_socketpair
+ok 41 - fork_socketpair_started
+ok 42 - fork_threadpool_queue_work_simple
+ok 43 - fork_timer
+ok 44 - fs_access
+ok 45 - fs_access_iouring
+ok 46 - fs_async_dir
+ok 47 - fs_async_dir_iouring
+ok 48 - fs_async_sendfile
+ok 49 - fs_async_sendfile_iouring
+ok 50 - fs_async_sendfile_nodata
+ok 51 - fs_async_sendfile_nodata_iouring
+ok 52 - fs_chmod
+ok 53 - fs_chmod_iouring
+ok 54 - fs_chown
+ok 55 - fs_chown_iouring
+ok 56 - fs_copyfile
+ok 57 - fs_copyfile_iouring
+ok 58 - fs_event_close_in_callback
+ok 59 - fs_event_close_with_pending_delete_event
+ok 60 - fs_event_close_with_pending_event
+ok 61 - fs_event_getpath
+ok 62 - fs_event_immediate_close
+ok 63 - fs_event_no_callback_after_close
+ok 64 - fs_event_no_callback_on_close
+ok 65 - fs_event_ref
+ok 66 - fs_event_start_and_close
+ok 67 - fs_event_stop_in_cb
+ok 68 - fs_event_watch_delete_dir
+ok 69 - fs_event_watch_dir
+ok 70 - fs_event_watch_dir_recursive # SKIP Recursive directory watching not supported on this platform.
+ok 71 - fs_event_watch_file
+ok 72 - fs_event_watch_file_current_dir
+ok 73 - fs_event_watch_file_exact_path
+ok 74 - fs_event_watch_file_twice
+ok 75 - fs_event_watch_invalid_path
+ok 76 - fs_file_async
+ok 77 - fs_file_async_iouring
+ok 78 - fs_file_loop
+ok 79 - fs_file_loop_iouring
+ok 80 - fs_file_nametoolong
+ok 81 - fs_file_nametoolong_iouring
+ok 82 - fs_file_noent
+ok 83 - fs_file_noent_iouring
+ok 84 - fs_file_open_append
+ok 85 - fs_file_open_append_iouring
+ok 86 - fs_file_pos_after_op_with_offset
+ok 87 - fs_file_pos_after_op_with_offset_iouring
+ok 88 - fs_file_sync
+ok 89 - fs_file_sync_iouring
+ok 90 - fs_file_write_null_buffer
+ok 91 - fs_file_write_null_buffer_iouring
+ok 92 - fs_fstat
+ok 93 - fs_fstat_iouring
+ok 94 - fs_fstat_st_dev
+ok 95 - fs_fstat_st_dev_iouring
+ok 96 - fs_fstat_stdio
+ok 97 - fs_fstat_stdio_iouring
+ok 98 - fs_futime
+ok 99 - fs_futime_iouring
+ok 100 - fs_get_system_error
+ok 101 - fs_get_system_error_iouring
+ok 102 - fs_link
+ok 103 - fs_link_iouring
+ok 104 - fs_lutime
+ok 105 - fs_lutime_iouring
+ok 106 - fs_mkdtemp
+ok 107 - fs_mkdtemp_iouring
+ok 108 - fs_mkstemp
+ok 109 - fs_mkstemp_iouring
+ok 110 - fs_null_req
+ok 111 - fs_null_req_iouring
+ok 112 - fs_open_dir
+ok 113 - fs_open_dir_iouring
+ok 114 - fs_partial_read
+ok 115 - fs_partial_read_iouring
+ok 116 - fs_partial_write
+ok 117 - fs_partial_write_iouring
+ok 118 - fs_poll
+ok 119 - fs_poll_close_request
+ok 120 - fs_poll_close_request_multi_start_stop
+ok 121 - fs_poll_close_request_multi_stop_start
+ok 122 - fs_poll_close_request_stop_when_active
+ok 123 - fs_poll_getpath
+ok 124 - fs_poll_ref
+ok 125 - fs_posix_delete
+ok 126 - fs_posix_delete_iouring
+ok 127 - fs_read_bufs
+ok 128 - fs_read_bufs_iouring
+ok 129 - fs_read_dir
+ok 130 - fs_read_dir_iouring
+ok 131 - fs_read_file_eof
+ok 132 - fs_read_file_eof_iouring
+ok 133 - fs_read_write_null_arguments
+ok 134 - fs_read_write_null_arguments_iouring
+ok 135 - fs_readdir_empty_dir
+ok 136 - fs_readdir_empty_dir_iouring
+ok 137 - fs_readdir_file
+ok 138 - fs_readdir_file_iouring
+ok 139 - fs_readdir_non_empty_dir
+ok 140 - fs_readdir_non_empty_dir_iouring
+ok 141 - fs_readdir_non_existing_dir
+ok 142 - fs_readdir_non_existing_dir_iouring
+ok 143 - fs_readlink
+ok 144 - fs_readlink_iouring
+ok 145 - fs_realpath
+ok 146 - fs_realpath_iouring
+ok 147 - fs_rename_to_existing_file
+ok 148 - fs_rename_to_existing_file_iouring
+ok 149 - fs_scandir_early_exit
+ok 150 - fs_scandir_early_exit_iouring
+ok 151 - fs_scandir_empty_dir
+ok 152 - fs_scandir_empty_dir_iouring
+ok 153 - fs_scandir_file
+ok 154 - fs_scandir_file_iouring
+ok 155 - fs_scandir_non_existent_dir
+ok 156 - fs_scandir_non_existent_dir_iouring
+ok 157 - fs_stat_batch_multiple
+ok 158 - fs_stat_batch_multiple_iouring
+ok 159 - fs_stat_missing_path
+ok 160 - fs_stat_missing_path_iouring
+ok 161 - fs_statfs
+ok 162 - fs_statfs_iouring
+ok 163 - fs_symlink
+ok 164 - fs_symlink_dir
+ok 165 - fs_symlink_dir_iouring
+ok 166 - fs_symlink_iouring
+ok 167 - fs_unlink_readonly
+ok 168 - fs_unlink_readonly_iouring
+ok 169 - fs_utime
+ok 170 - fs_utime_iouring
+ok 171 - fs_utime_round
+ok 172 - fs_utime_round_iouring
+ok 173 - fs_write_alotof_bufs
+ok 174 - fs_write_alotof_bufs_iouring
+ok 175 - fs_write_alotof_bufs_with_offset
+ok 176 - fs_write_alotof_bufs_with_offset_iouring
+ok 177 - fs_write_multiple_bufs
+ok 178 - fs_write_multiple_bufs_iouring
+ok 179 - get_currentexe
+ok 180 - get_group
+ok 181 - get_loadavg
+ok 182 - get_memory
+ok 183 - get_osfhandle_valid_handle
+ok 184 - get_passwd
+ok 185 - get_passwd2
+ok 186 - getaddrinfo_basic
+ok 187 - getaddrinfo_basic_sync
+ok 188 - getaddrinfo_concurrent
+ok 189 - getaddrinfo_fail
+ok 190 - getaddrinfo_fail_sync
+ok 191 - gethostname
+ok 192 - getnameinfo_basic_ip4
+ok 193 - getnameinfo_basic_ip4_sync
+ok 194 - getnameinfo_basic_ip6
+ok 195 - getsockname_tcp
+ok 196 - getsockname_udp
+ok 197 - getters_setters
+ok 198 - gettimeofday
+ok 199 - handle_fileno
+ok 200 - handle_type_name
+ok 201 - has_ref
+ok 202 - homedir
+ok 203 - hrtime
+ok 204 - idle_check
+ok 205 - idle_ref
+ok 206 - idle_starvation
+ok 207 - idna_toascii
+ok 208 - iouring_pollhup
+ok 209 - ip4_addr
+ok 210 - ip6_addr_link_local
+ok 211 - ip6_pton
+ok 212 - ip6_sin6_len
+ok 213 - ip_name
+ok 214 - ipc_heavy_traffic_deadlock_bug
+ok 215 - ipc_listen_after_write
+ok 216 - ipc_listen_before_write
+ok 217 - ipc_send_recv_pipe
+ok 218 - ipc_send_recv_pipe_inprocess
+ok 219 - ipc_send_recv_tcp
+ok 220 - ipc_send_recv_tcp_inprocess
+ok 221 - ipc_send_zero
+ok 222 - ipc_tcp_connection
+ok 223 - kill
+ok 224 - kill_invalid_signum
+ok 225 - loop_alive
+ok 226 - loop_backend_timeout
+ok 227 - loop_close
+ok 228 - loop_configure
+ok 229 - loop_handles
+ok 230 - loop_init_oom
+ok 231 - loop_instant_close
+ok 232 - loop_stop
+ok 233 - loop_stop_before_run
+ok 234 - loop_update_time
+ok 235 - metrics_idle_time
+ok 236 - metrics_idle_time_thread
+ok 237 - metrics_idle_time_zero
+ok 238 - metrics_info_check
+ok 239 - metrics_pool_events
+ok 240 - multiple_listen
+ok 241 - not_readable_nor_writable_on_read_error
+ok 242 - not_writable_after_shutdown
+ok 243 - open_osfhandle_valid_handle
+ok 244 - pipe_bind_error_addrinuse
+ok 245 - pipe_bind_error_addrnotavail
+ok 246 - pipe_bind_error_inval
+ok 247 - pipe_bind_or_listen_error_after_close
+ok 248 - pipe_close_stdout_read_stdin
+ok 249 - pipe_connect_bad_name
+ok 250 - pipe_connect_close_multiple
+ok 251 - pipe_connect_multiple
+ok 252 - pipe_connect_on_prepare
+ok 253 - pipe_connect_to_file
+ok 254 - pipe_getsockname
+ok 255 - pipe_getsockname_abstract
+ok 256 - pipe_getsockname_autobind
+ok 257 - pipe_getsockname_blocking
+ok 258 - pipe_listen_without_bind
+ok 259 - pipe_overlong_path
+ok 260 - pipe_pending_instances
+ok 261 - pipe_ping_pong
+ok 262 - pipe_ping_pong_vec
+ok 263 - pipe_ref
+ok 264 - pipe_ref2
+ok 265 - pipe_ref3
+ok 266 - pipe_ref4
+ok 267 - pipe_sendmsg
+ok 268 - pipe_server_close
+ok 269 - pipe_set_chmod
+ok 270 - pipe_set_non_blocking
+ok 271 - poll_bad_fdtype
+ok 272 - poll_close
+ok 273 - poll_close_doesnt_corrupt_stack # SKIP Test only relevant on Windows
+ok 274 - poll_closesocket # SKIP Test only relevant on Windows
+ok 275 - poll_duplex
+ok 276 - poll_multiple_handles
+ok 277 - poll_nested_epoll
+ok 278 - poll_oob
+ok 279 - poll_unidirectional
+ok 280 - prepare_ref
+ok 281 - process_priority
+ok 282 - process_ref
+ok 283 - process_title
+ok 284 - process_title_big_argv
+ok 285 - process_title_threadsafe
+ok 286 - queue_foreach_delete
+ok 287 - random_async
+ok 288 - random_sync
+ok 289 - readable_on_eof
+ok 290 - ref
+ok 291 - req_type_name
+ok 292 - run_nowait
+ok 293 - run_once
+ok 294 - semaphore_1
+ok 295 - semaphore_2
+ok 296 - semaphore_3
+ok 297 - shutdown_close_pipe
+ok 298 - shutdown_close_tcp
+ok 299 - shutdown_eof
+ok 300 - shutdown_simultaneous
+ok 301 - shutdown_twice
+ok 302 - signal_close_loop_alive
+ok 303 - signal_multiple_loops
+ok 304 - signal_pending_on_close
+ok 305 - socket_buffer_size
+ok 306 - spawn_and_kill
+ok 307 - spawn_and_kill_with_std
+ok 308 - spawn_and_ping
+ok 309 - spawn_auto_unref
+ok 310 - spawn_closed_process_io
+ok 311 - spawn_detached
+ok 312 - spawn_empty_env
+ok 313 - spawn_exercise_sigchld_issue
+ok 314 - spawn_exit_code
+ok 315 - spawn_fails
+ok 316 - spawn_fails_check_for_waitpid_cleanup
+ok 317 - spawn_fs_open
+ok 318 - spawn_ignored_stdio
+ok 319 - spawn_inherit_streams
+ok 320 - spawn_preserve_env
+ok 321 - spawn_quoted_path # SKIP Test for Windows
+ok 322 - spawn_reads_child_path
+ok 323 - spawn_relative_path
+ok 324 - spawn_same_stdout_stderr
+ok 325 - spawn_setgid_fails
+ok 326 - spawn_setuid_fails
+ok 327 - spawn_setuid_setgid # SKIP It should be run as root user
+ok 328 - spawn_stdin
+ok 329 - spawn_stdio_greater_than_3
+ok 330 - spawn_stdout
+ok 331 - spawn_stdout_and_stderr_to_file
+ok 332 - spawn_stdout_and_stderr_to_file2
+ok 333 - spawn_stdout_and_stderr_to_file_swap
+ok 334 - spawn_stdout_to_file
+ok 335 - spawn_tcp_server
+ok 336 - stdio_emulate_iocp
+ok 337 - stdio_over_pipes
+ok 338 - strscpy
+ok 339 - strtok
+ok 340 - sys_error
+ok 341 - tcp6_local_connect_timeout
+ok 342 - tcp6_ping_pong
+ok 343 - tcp6_ping_pong_vec
+ok 344 - tcp_alloc_cb_fail
+ok 345 - tcp_bind6_error_addrinuse
+ok 346 - tcp_bind6_error_addrnotavail
+ok 347 - tcp_bind6_error_fault
+ok 348 - tcp_bind6_error_inval
+ok 349 - tcp_bind6_localhost_ok
+ok 350 - tcp_bind_error_addrinuse_connect
+ok 351 - tcp_bind_error_addrinuse_listen
+ok 352 - tcp_bind_error_addrnotavail_1
+ok 353 - tcp_bind_error_addrnotavail_2
+ok 354 - tcp_bind_error_fault
+ok 355 - tcp_bind_error_inval
+ok 356 - tcp_bind_invalid_flags
+ok 357 - tcp_bind_localhost_ok
+ok 358 - tcp_bind_or_listen_error_after_close
+ok 359 - tcp_bind_writable_flags
+ok 360 - tcp_close
+ok 361 - tcp_close_accept
+ok 362 - tcp_close_after_read_timeout
+ok 363 - tcp_close_reset_accepted
+ok 364 - tcp_close_reset_accepted_after_shutdown
+ok 365 - tcp_close_reset_accepted_after_socket_shutdown
+ok 366 - tcp_close_reset_client
+ok 367 - tcp_close_reset_client_after_shutdown
+ok 368 - tcp_close_while_connecting
+ok 369 - tcp_connect6_error_fault
+ok 370 - tcp_connect6_link_local # SKIP IPv6 link-local traffic not supported
+ok 371 - tcp_connect_error_after_write
+ok 372 - tcp_connect_error_fault
+ok 373 - tcp_connect_timeout
+ok 374 - tcp_create_early
+ok 375 - tcp_create_early_accept
+ok 376 - tcp_create_early_bad_bind
+ok 377 - tcp_create_early_bad_domain
+ok 378 - tcp_flags
+ok 379 - tcp_listen_without_bind
+ok 380 - tcp_local_connect_timeout
+ok 381 - tcp_oob
+ok 382 - tcp_open
+ok 383 - tcp_open_bound
+ok 384 - tcp_open_connected
+ok 385 - tcp_open_twice
+ok 386 - tcp_ping_pong
+ok 387 - tcp_ping_pong_vec
+ok 388 - tcp_read_stop
+ok 389 - tcp_read_stop_start
+ok 390 - tcp_ref
+ok 391 - tcp_ref2
+ok 392 - tcp_ref2b
+ok 393 - tcp_ref3
+ok 394 - tcp_ref4
+ok 395 - tcp_reuseport
+ok 396 - tcp_rst
+ok 397 - tcp_shutdown_after_write
+ok 398 - tcp_try_write
+ok 399 - tcp_try_write_error
+ok 400 - tcp_unexpected_read
+ok 401 - tcp_write_after_connect
+ok 402 - tcp_write_fail
+ok 403 - tcp_write_in_a_row
+ok 404 - tcp_write_queue_order
+ok 405 - tcp_write_ready
+ok 406 - tcp_write_to_half_open_connection
+ok 407 - tcp_writealot
+ok 408 - test_macros
+ok 409 - thread_affinity
+ok 410 - thread_create
+ok 411 - thread_detach
+ok 412 - thread_equal
+ok 413 - thread_local_storage
+ok 414 - thread_mutex
+ok 415 - thread_mutex_recursive
+ok 416 - thread_name
+ok 417 - thread_name_threadpool
+ok 418 - thread_priority
+ok 419 - thread_rwlock
+ok 420 - thread_rwlock_trylock
+ok 421 - thread_stack_size
+ok 422 - thread_stack_size_explicit
+ok 423 - threadpool_cancel_fs
+ok 424 - threadpool_cancel_fs_iouring
+ok 425 - threadpool_cancel_getaddrinfo
+ok 426 - threadpool_cancel_getnameinfo
+ok 427 - threadpool_cancel_random
+ok 428 - threadpool_cancel_single
+ok 429 - threadpool_cancel_when_busy
+ok 430 - threadpool_cancel_work
+ok 431 - threadpool_multiple_event_loops
+ok 432 - threadpool_queue_work_einval
+ok 433 - threadpool_queue_work_simple
+ok 434 - timer
+ok 435 - timer_again
+ok 436 - timer_early_check
+ok 437 - timer_from_check
+ok 438 - timer_huge_repeat
+ok 439 - timer_huge_timeout
+ok 440 - timer_init
+ok 441 - timer_is_closing
+ok 442 - timer_no_double_call_nowait
+ok 443 - timer_no_double_call_once
+ok 444 - timer_no_run_on_unref
+ok 445 - timer_null_callback
+ok 446 - timer_order
+ok 447 - timer_ref
+ok 448 - timer_ref2
+ok 449 - timer_run_once
+ok 450 - timer_start_twice
+ok 451 - timer_zero_timeout
+ok 452 - tmpdir
+ok 453 - tty # SKIP Cannot open /dev/tty as read-only: No such device or address
+ok 454 - tty_file
+ok 455 - tty_pty
+ok 456 - tty_pty_partial
+ok 457 - udp_alloc_cb_fail
+ok 458 - udp_bind
+ok 459 - udp_bind_reuseaddr
+ok 460 - udp_connect
+ok 461 - udp_connect6
+ok 462 - udp_create_early
+ok 463 - udp_create_early_bad_bind
+ok 464 - udp_create_early_bad_domain
+ok 465 - udp_dgram_too_big
+ok 466 - udp_dual_stack
+ok 467 - udp_ipv6_only
+ok 468 - udp_mmsg
+ok 469 - udp_multicast_interface
+ok 470 - udp_multicast_interface6
+ok 471 - udp_multicast_join
+ok 472 - udp_multicast_join6 # SKIP No external IPv6 interface available
+ok 473 - udp_multicast_ttl
+ok 474 - udp_no_autobind
+ok 475 - udp_open
+ok 476 - udp_open_bound
+ok 477 - udp_open_connect
+ok 478 - udp_open_twice
+ok 479 - udp_options
+ok 480 - udp_options6
+ok 481 - udp_recv_cb_close_pollerr
+ok 482 - udp_recv_in_a_row
+ok 483 - udp_recvmsg_unreachable_error
+ok 484 - udp_recvmsg_unreachable_error6
+ok 485 - udp_ref
+ok 486 - udp_ref2
+ok 487 - udp_ref3
+ok 488 - udp_reuseport
+ok 489 - udp_send_and_recv
+ok 490 - udp_send_hang_loop
+ok 491 - udp_send_immediate
+ok 492 - udp_send_pollerr_no_recv
+ok 493 - udp_send_unix
+ok 494 - udp_send_unreachable
+ok 495 - udp_sendmmsg_error
+ok 496 - udp_try_send
+ok 497 - uname
+ok 498 - unref_in_prepare_cb
+ok 499 - utf8_decode1
+ok 500 - utf8_decode1_overrun
+ok 501 - walk_handles
+ok 502 - watcher_cross_stop
+ok 503 - we_get_signal
+ok 504 - we_get_signal_one_shot
+ok 505 - we_get_signals
+ok 506 - we_get_signals_mixed
+ok 507 - wtf8
