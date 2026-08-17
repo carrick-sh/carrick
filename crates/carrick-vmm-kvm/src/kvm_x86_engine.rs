@@ -1440,18 +1440,20 @@ fn deserialize_x86_snapshot(state: &[u8]) -> Option<X86VcpuSnapshot> {
 /// vol. 1 §10.5.1): control words +0, st_space (x87) +32, xmm_space +160,
 /// mxcsr +24.
 fn kvm_fpu_to_fxsave(fpu: &kvm_bindings::kvm_fpu) -> [u8; 512] {
+    use zerocopy::IntoBytes;
     let mut fx = [0u8; 512];
-    fx[0] = (fpu.fcw & 0xFF) as u8;
-    fx[1] = (fpu.fcw >> 8) as u8;
-    fx[2] = (fpu.fsw & 0xFF) as u8;
-    fx[3] = (fpu.fsw >> 8) as u8;
-    fx[4] = fpu.ftwx;
-    fx[5] = 0; // reserved
-    fx[6] = (fpu.last_opcode & 0xFF) as u8;
-    fx[7] = (fpu.last_opcode >> 8) as u8;
-    fx[8..16].copy_from_slice(&fpu.last_ip.to_le_bytes());
-    fx[16..24].copy_from_slice(&fpu.last_dp.to_le_bytes());
-    fx[24..28].copy_from_slice(&fpu.mxcsr.to_le_bytes());
+    let header = carrick_abi::LinuxFxsaveHeader {
+        fcw: fpu.fcw,
+        fsw: fpu.fsw,
+        ftwx: fpu.ftwx,
+        _reserved1: 0,
+        last_opcode: fpu.last_opcode,
+        last_ip: fpu.last_ip,
+        last_dp: fpu.last_dp,
+        mxcsr: fpu.mxcsr,
+        mxcsr_mask: 0,
+    };
+    fx[0..32].copy_from_slice(header.as_bytes());
     // st_space: 8 × 16 bytes at +32 (KVM stores [u32; 32] = 128 bytes).
     for (i, w) in fpu.fpr.iter().enumerate() {
         let off = 32 + i * 16;

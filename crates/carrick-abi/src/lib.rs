@@ -746,6 +746,37 @@ impl LinuxTermios {
     }
 }
 
+/// Linux `struct termio` (TCGETA/TCSETA) wire format (18 bytes).
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxTermio {
+    pub c_iflag: u16,
+    pub c_oflag: u16,
+    pub c_cflag: u16,
+    pub c_lflag: u16,
+    pub c_line: u8,
+    pub c_cc: [u8; 8],
+}
+
+/// Linux x86 FXSAVE 32-byte header wire layout.
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxFxsaveHeader {
+    pub fcw: u16,
+    pub fsw: u16,
+    pub ftwx: u8,
+    pub _reserved1: u8,
+    pub last_opcode: u16,
+    pub last_ip: u64,
+    pub last_dp: u64,
+    pub mxcsr: u32,
+    pub mxcsr_mask: u32,
+}
+
 #[repr(C, packed)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,

@@ -23,7 +23,7 @@ rules:
   # (audit P1 waitid-errno; tighten in M4)
   - id: carrick-host-errno-must-translate
     languages: [rust]
-    severity: WARNING
+    severity: ERROR
     message: |
       Raw host errno flowing into a guest-visible errno. Darwin errno values
       differ from Linux for some codes; translate via the central host-errno

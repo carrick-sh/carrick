@@ -548,7 +548,7 @@ fn copy_user_xattrs(src: &Path, dst: &Path) {
         // SAFETY: csrc/cname are valid C strings; a null value pointer with
         // size 0 asks the kernel for the attribute's length.
         let vlen = unsafe {
-            libc::lgetxattr(
+            carrick_portable::lgetxattr(
                 csrc.as_ptr(),
                 cname.as_ptr(),
                 std::ptr::null_mut::<libc::c_void>(),
@@ -560,7 +560,7 @@ fn copy_user_xattrs(src: &Path, dst: &Path) {
         }
         let mut val = vec![0u8; vlen as usize];
         let got = unsafe {
-            libc::lgetxattr(
+            carrick_portable::lgetxattr(
                 csrc.as_ptr(),
                 cname.as_ptr(),
                 val.as_mut_ptr() as *mut libc::c_void,
@@ -574,7 +574,7 @@ fn copy_user_xattrs(src: &Path, dst: &Path) {
         // SAFETY: cdst/cname are valid C strings; val is a valid buffer of the
         // passed length. Best-effort — ignore the result.
         unsafe {
-            libc::lsetxattr(
+            carrick_portable::lsetxattr(
                 cdst.as_ptr(),
                 cname.as_ptr(),
                 val.as_ptr() as *const libc::c_void,
@@ -871,7 +871,7 @@ mod tests {
             let cn = std::ffi::CString::new(name).unwrap();
             // SAFETY: valid C strings + a valid value buffer of the given length.
             unsafe {
-                libc::lsetxattr(
+                carrick_portable::lsetxattr(
                     cp.as_ptr(),
                     cn.as_ptr(),
                     val.as_ptr() as *const libc::c_void,
@@ -886,7 +886,7 @@ mod tests {
             let mut buf = vec![0u8; 256];
             // SAFETY: valid C strings + a writable buffer of the given length.
             let n = unsafe {
-                libc::lgetxattr(
+                carrick_portable::lgetxattr(
                     cp.as_ptr(),
                     cn.as_ptr(),
                     buf.as_mut_ptr() as *mut libc::c_void,

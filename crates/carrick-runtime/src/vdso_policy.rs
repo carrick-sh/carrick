@@ -56,7 +56,14 @@ pub(crate) fn debug_env_flag_enabled(value: Option<&str>) -> bool {
 
 // Called only by the macOS `runtime` arm today; the non-macOS arms reach the
 // `_at` form directly until M0.8 wires the native run path on every host.
-#[cfg_attr(not(feature = "platform-macos"), allow(dead_code))]
+#[cfg_attr(
+    any(
+        feature = "platform-linux",
+        feature = "platform-freebsd",
+        feature = "platform-netbsd"
+    ),
+    allow(dead_code)
+)]
 pub(crate) fn with_optional_vdso<A: carrick_hal::GuestArch>(
     image: AddressSpace,
 ) -> Result<AddressSpace, AddressSpaceError> {

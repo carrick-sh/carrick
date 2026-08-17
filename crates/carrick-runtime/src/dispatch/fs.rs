@@ -224,19 +224,18 @@ fn host_pipe_readable_bytes(host_fd: i32) -> Result<usize, LinuxErrno> {
 }
 
 fn linux_termio_bytes(termios: &LinuxTermios) -> [u8; LINUX_TERMIO_SIZE] {
-    let c_iflag = termios.c_iflag;
-    let c_oflag = termios.c_oflag;
-    let c_cflag = termios.c_cflag;
-    let c_lflag = termios.c_lflag;
-    let c_line = termios.c_line;
-    let c_cc = termios.c_cc;
+    let mut cc = [0u8; 8];
+    cc.copy_from_slice(&termios.c_cc[..8]);
+    let termio = carrick_abi::LinuxTermio {
+        c_iflag: termios.c_iflag as u16,
+        c_oflag: termios.c_oflag as u16,
+        c_cflag: termios.c_cflag as u16,
+        c_lflag: termios.c_lflag as u16,
+        c_line: termios.c_line,
+        c_cc: cc,
+    };
     let mut out = [0u8; LINUX_TERMIO_SIZE];
-    out[0..2].copy_from_slice(&(c_iflag as u16).to_le_bytes());
-    out[2..4].copy_from_slice(&(c_oflag as u16).to_le_bytes());
-    out[4..6].copy_from_slice(&(c_cflag as u16).to_le_bytes());
-    out[6..8].copy_from_slice(&(c_lflag as u16).to_le_bytes());
-    out[8] = c_line;
-    out[9..17].copy_from_slice(&c_cc[..8]);
+    out.copy_from_slice(termio.as_bytes());
     out
 }
 

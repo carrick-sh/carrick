@@ -98,7 +98,7 @@ lint-domains:
         echo "warning: semgrep not installed — skipping typed-domain gate (brew install semgrep)" >&2
         exit 0
     fi
-    semgrep --config .semgrep/typed-domains.yml crates/ --severity ERROR --error --quiet
+    semgrep --config .semgrep/ crates/ --severity ERROR --error --quiet
 
 
 # Dependency license / bans / sources gate (matches CI). Enforces the deny.toml
