@@ -22,21 +22,26 @@ class ClosureScopeTest(unittest.TestCase):
         self.manifest = self.root / "suites.toml"
         self.binary = self.root / "carrick"
         self.binary.write_bytes(b"signed-carrick-fixture")
+        self.image_refs = [
+            f"registry.invalid/carrick-fixture:{index}" for index in range(1, 5)
+        ]
         self.images = {
-            "registry.invalid/carrick-fixture:1": {
+            image: {
                 "docker_id": "sha256:" + "1" * 64,
                 "repo_digests": [
-                    "registry.invalid/carrick-fixture@sha256:" + "2" * 64
+                    f"{image.rsplit(':', 1)[0]}@sha256:" + "2" * 64
                 ],
                 "registry_digest": "sha256:" + "3" * 64,
             }
+            for image in self.image_refs
         }
         self._write_manifest(2127)
 
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def _write_manifest(self, count):
+    def _write_manifest(self, count, image_refs=None):
+        image_refs = image_refs or self.image_refs
         rows = []
         for index in range(count):
             ecosystem = "go" if index % 2 == 0 else "ltp"
@@ -46,7 +51,7 @@ class ClosureScopeTest(unittest.TestCase):
                         "[[suite]]",
                         f'name = "suite-{index:04d}"',
                         f'ecosystem = "{ecosystem}"',
-                        'image = "registry.invalid/carrick-fixture:1"',
+                        f'image = "{image_refs[index % len(image_refs)]}"',
                     ]
                 )
             )
@@ -94,6 +99,30 @@ class ClosureScopeTest(unittest.TestCase):
                 source_head="a" * 40,
                 binary_path=self.binary,
             )
+
+    def test_scope_requires_exactly_four_distinct_declared_images(self):
+        for image_count in [3, 5]:
+            with self.subTest(image_count=image_count):
+                image_refs = [
+                    f"registry.invalid/cardinality:{index}"
+                    for index in range(image_count)
+                ]
+                images = {
+                    image: {
+                        "docker_id": "sha256:" + "1" * 64,
+                        "repo_digests": [],
+                        "registry_digest": "sha256:" + "2" * 64,
+                    }
+                    for image in image_refs
+                }
+                self._write_manifest(2127, image_refs)
+                with self.assertRaises(closure_scope.ScopeError):
+                    closure_scope.freeze_scope(
+                        self.manifest,
+                        images,
+                        source_head="a" * 40,
+                        binary_path=self.binary,
+                    )
 
 
 if __name__ == "__main__":
