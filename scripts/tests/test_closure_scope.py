@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -134,6 +135,42 @@ class ClosureScopeTest(unittest.TestCase):
                         tooling_source_head="b" * 40,
                         binary_path=self.binary,
                     )
+
+    def test_provenance_requires_an_existing_ancestor_commit(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+
+        def git(*args):
+            return subprocess.run(
+                ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+        git("init", "-q")
+        git("config", "user.name", "Closure Test")
+        git("config", "user.email", "closure@example.invalid")
+        (repo / "first").write_text("first\n", encoding="utf-8")
+        git("add", "first")
+        git("commit", "-qm", "first")
+        ancestor = git("rev-parse", "HEAD")
+        (repo / "second").write_text("second\n", encoding="utf-8")
+        git("add", "second")
+        git("commit", "-qm", "second")
+        current = git("rev-parse", "HEAD")
+
+        closure_scope._validate_provenance(repo, ancestor, current, "binary source")
+        with self.assertRaises(closure_scope.ScopeError):
+            closure_scope._validate_provenance(repo, "f" * 40, current, "binary source")
+
+        git("checkout", "-q", "--orphan", "unrelated")
+        git("rm", "-q", "-rf", ".")
+        (repo / "other").write_text("other\n", encoding="utf-8")
+        git("add", "other")
+        git("commit", "-qm", "other")
+        unrelated = git("rev-parse", "HEAD")
+        with self.assertRaises(closure_scope.ScopeError):
+            closure_scope._validate_provenance(
+                repo, ancestor, unrelated, "binary source"
+            )
 
 
 if __name__ == "__main__":

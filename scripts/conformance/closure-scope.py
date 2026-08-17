@@ -209,6 +209,31 @@ def _git(repo_root: Path, *args: str) -> str:
         raise ScopeError(f"git {' '.join(args)} failed: {error}") from error
 
 
+def _validate_provenance(
+    repo_root: Path, recorded_head: str, current_head: str, label: str
+) -> None:
+    try:
+        subprocess.run(
+            ["git", "cat-file", "-e", f"{recorded_head}^{{commit}}"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ScopeError(f"recorded {label} is not an existing commit: {recorded_head}") from error
+    try:
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", recorded_head, current_head],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ScopeError(
+            f"recorded {label} is not an ancestor of controller HEAD: {recorded_head}"
+        ) from error
+
+
 def check_scope(
     scope: dict[str, Any],
     manifest_path: Path,
@@ -245,6 +270,11 @@ def check_scope(
             r"[0-9a-f]{40,64}", scope[key]
         ):
             raise ScopeError(f"recorded {key} is malformed")
+    if repo_root is not None:
+        _validate_provenance(repo_root, scope["source_head"], source_head, "binary source")
+        _validate_provenance(
+            repo_root, scope["tooling_source_head"], source_head, "tooling source"
+        )
     if require_clean:
         if repo_root is None:
             raise ScopeError("repo_root is required for a clean-source check")
@@ -278,6 +308,8 @@ def main(argv: list[str] | None = None) -> int:
         head = _git(root, "rev-parse", "HEAD")
         if args.action == "freeze":
             binary_source_head = args.binary_source_head or head
+            _validate_provenance(root, binary_source_head, head, "binary source")
+            _validate_provenance(root, head, head, "tooling source")
             scope = freeze_scope(
                 args.manifest,
                 identities,
