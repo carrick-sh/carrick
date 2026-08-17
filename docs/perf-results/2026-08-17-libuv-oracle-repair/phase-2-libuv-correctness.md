@@ -90,7 +90,7 @@ Measured on binary `a1ee8ef2…01a7032f7`.
 
 | # | row | state |
 |---|---|---|
-| 456 | `tty_pty_partial` | **Deterministic**, and reduced: 64512 of 65536 bytes arrive, i.e. **exactly 1024 lost**, on every run. A host-only C reducer doing the same 8×8192 slave writes and master reads loses NOTHING, so the loss is Carrick's, not the pty's. A round 1024 points at a fixed-size buffer or a drop of the final partial chunk on the slave-close/EOF edge. Not yet localised in `pty_relay.rs` / the pty read path. |
+| 456 | `tty_pty_partial` | **ROOT-CAUSED, fix reverted — see below.** Deterministic, and reduced: 64512 of 65536 bytes arrive, i.e. **exactly 1024 lost**, on every run. A host-only C reducer doing the same 8×8192 slave writes and master reads loses NOTHING, so the loss is Carrick's, not the pty's. A round 1024 points at a fixed-size buffer or a drop of the final partial chunk on the slave-close/EOF edge. Not yet localised in `pty_relay.rs` / the pty read path. |
 | 483 | `udp_recvmsg_unreachable_error` | Needs `IP_RECVERR` accepted (absent from the SOL_IP gate, so `uv_udp_bind` fails before any recvmsg), then a real `MSG_ERRQUEUE`. **Feasibility is now settled — see the shadow-socket row in the Darwin facts table.** Design below. |
 | 484 | `udp_recvmsg_unreachable_error6` | same, `IPV6_RECVERR` |
 
@@ -156,6 +156,43 @@ ran. That points at the guest's `close` of the accepted fd not having reached a
 host `close` yet (a lingering `HostFdRef`, or ordering between `uv_close`'s
 callback and the actual descriptor teardown). Unproven.
 
+### `tty_pty_partial`: root cause found, first fix reverted
+
+The host-trace settles it. On a failing run, `host-pipe-io` shows **64 writes of
+1024 to the slave (65536 bytes) and only 63 reads of 1024 from the master
+(64512)** — every byte was written; exactly one pty buffer was never read. At
+the moment Carrick returns EOF, `FIONREAD` on the master is 0 and a retry read
+returns 0, so the missing chunk is not waiting anywhere: it was destroyed.
+
+Why: **Darwin discards whatever is still queued in a pty when its last slave fd
+closes.** Proven with a 20-line C program (write 1024, do not read, close the
+slave, read the master → `0`, nothing drained). Linux hands the data over and
+reports EOF afterwards. Any reader even one buffer behind therefore loses the
+tail; libuv's epoll-driven reader is exactly one 1024-byte buffer behind, which
+is why the loss is a constant 1024. A `sleep(0.5)` before the guest's
+`close(slave)` makes the row pass, and keeping the slave open makes all 65536
+arrive — both confirm the close is the destroyer.
+
+The obvious fix — on guest close of the last pty slave, rescue the master's
+queued bytes into the existing splice-pushback staging (which the pipe read path
+already drains before touching the host fd, and which the epoll/poll readiness
+paths already count) — **works for this row and was reverted**, because it
+regressed the sibling `tty_pty` into a HANG. Two things were learned and must
+inform the next attempt:
+
+1. **`FIONREAD` on a pty master reports 0 even with data queued**, so the
+   rescue cannot be sized that way; it has to read until EAGAIN.
+2. **The close path cannot look the master up through the file table.** Reading
+   `read_open_files()` from inside `close_open_file_and_free_pty` deadlocks —
+   `tty_pty` hung even in the variant where the drain immediately no-opped, so
+   the lookup itself is the problem, not the draining.
+
+So the next attempt needs the master reachable WITHOUT the file table: register
+the master's description (or its host fd plus a way to stage onto it) when the
+master is opened — e.g. alongside the pts index — and rescue through that. The
+rescue itself must read until EAGAIN under a byte cap, not until a count
+`FIONREAD` will not give.
+
 ## Ledger impact beyond libuv
 ## Ledger impact beyond libuv
 
@@ -178,6 +215,8 @@ a known host capability gap with a known bridge.
 | `struct ip_mreq_source` field order | Darwin `{ multiaddr, sourceaddr, interface }` vs Linux `{ multiaddr, interface, sourceaddr }`; option numbers 70..73 vs 37..40. |
 | `SO_REUSEPORT` distribution, 2 sockets / 10 connections | TCP `listener0=0 listener1=10`; UDP `receiver0=0 receiver1=10`. Darwin never distributes — the last binder takes everything. |
 | write to a TCP socket whose peer closed | `ECONNRESET` after ~27 four-byte writes. Darwin does the right thing here, so `tcp_try_write_error`'s EAGAIN is Carrick's, not the host's. |
+| pty: slave closes with data still queued | **Darwin DISCARDS it.** Write 1024 bytes to a slave, do not read the master, `close` the slave — the master then reads `0` (EOF) and the bytes are gone. Linux delivers them and only then reports EOF. |
+| pty: `FIONREAD` on a master with queued data | reports **0**, so it cannot be used to size a rescue read. |
 | ICMP port-unreachable on an UNCONNECTED UDP socket | Not reported at all: `SO_ERROR` stays 0, `poll` shows nothing, `recv` gives `EAGAIN`. |
 | ICMP port-unreachable on a CONNECTED UDP socket | `recv` returns `ECONNREFUSED`. |
 | **shadow-socket bridge for the above** | **Works.** A second socket bound to the SAME local `addr:port` with `SO_REUSEADDR|SO_REUSEPORT` and `connect`ed to the destination receives the `ECONNREFUSED`, while the original unconnected socket still receives from third parties normally and the shadow does not steal them. |
