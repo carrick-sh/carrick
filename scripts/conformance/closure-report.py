@@ -132,6 +132,15 @@ def summarize(scope: dict[str, Any], results: list[dict[str, Any]]) -> dict[str,
         if ratio is not None:
             ratios[name] = ratio
 
+        post_assertion_process_failure = (
+            verdict == "incomplete"
+            and row["carrick"]["result"] == "failure"
+            and row["docker"]["result"] == "success"
+            and carrick_totals == docker_totals
+            and carrick_totals["n"] > 0
+            and bool(pairs)
+            and all(pair[1:] == ("ok", "ok") for pair in pairs)
+        )
         infrastructure = (
             carrick_totals["broken"] > 0
             or docker_totals["broken"] > 0
@@ -139,6 +148,7 @@ def summarize(scope: dict[str, Any], results: list[dict[str, Any]]) -> dict[str,
             or row["docker"]["result"] != "success"
             or any("broken" in pair[1:] for pair in pairs)
             or verdict in {"carrick_crash", "timeout", "oracle_fail"}
+            or post_assertion_process_failure
         )
         if infrastructure:
             categories["infrastructure_failures"].append(name)
