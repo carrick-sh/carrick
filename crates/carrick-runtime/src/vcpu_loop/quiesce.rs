@@ -223,9 +223,15 @@ impl PtPauseBudget {
     };
 }
 
+/// `census` is recorded, not consulted: whether to pause at all is decided by
+/// the caller (`KernelState::has_peer_guest_executor`). Carrying it into
+/// `pt-pause-begin` beside `kicker.count()` keeps the two populations visible
+/// side by side, so a reader can never again mistake the lease count for the
+/// set of threads that can execute guest code.
 pub(super) fn acquire_pt_pause(
     barrier: &'static crate::fork_quiesce::PtQuiesce,
     kicker: &dyn carrick_hal::VcpuRegistry,
+    census: &crate::kernel::GuestExecutorCensus,
     tid: ThreadId,
     budget: PtPauseBudget,
 ) -> Result<PtPauseGuard, PtPauseError> {
@@ -266,6 +272,7 @@ pub(super) fn acquire_pt_pause(
         tid.raw(),
         i32::from(kicker.any_other_in_guest(tid)),
         kicker.count() as i32,
+        census.live() as i32,
     );
 
     let start = Instant::now();
@@ -308,10 +315,14 @@ where
     /// returning an RAII guard that resumes them on drop. A timeout is a typed
     /// clean failure: nothing is held on the election path and the barrier
     /// request is rolled back on the drain path, so no edit may begin either way.
-    pub(super) fn pt_pause(&self) -> Result<PtPauseGuard, PtPauseError> {
+    pub(super) fn pt_pause(
+        &self,
+        census: &crate::kernel::GuestExecutorCensus,
+    ) -> Result<PtPauseGuard, PtPauseError> {
         acquire_pt_pause(
             pt_barrier(),
             &*self.kicker,
+            census,
             self.this_tid,
             PtPauseBudget::DEFAULT,
         )
@@ -450,7 +461,14 @@ where
         crate::trap::clear_sibling_fork_mappings();
         // Stop-the-world: a multithreaded guest can fork only if every OTHER guest
         // vCPU thread is first paused at its lock-safe run-loop top.
-        let mut others = self.kicker.count().saturating_sub(1);
+        //
+        // "Other guest vCPU THREAD" is the guest-executor census, not the vCPU
+        // registry: the registry counts live LEASES, so a sibling parked in a
+        // blocking wait had already unregistered and this read 0, leaving
+        // `libc::fork` to run with the barrier down while that sibling could be
+        // woken independently. `others` is re-read from the kicker inside the
+        // drain below, which is the correct question there.
+        let mut others = kernel.guest_executors.live().saturating_sub(1);
         crate::probes::fork_quiesce(
             0,
             others as i64,
@@ -989,6 +1007,14 @@ where
                     self.futex = Arc::new(crate::thread::FutexTable::new());
                     self.platform_futex = (self.platform_futex_factory)(Arc::clone(&self.futex));
                     self.threads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+                    // Same reason as the fresh kicker: the guest-executor census
+                    // the child inherited counts PARENT vCPU loops, and
+                    // `libc::fork` replicated only the calling thread. Nothing
+                    // in the child would ever decrement them, so the child
+                    // would raise a stop-the-world barrier on every mapping
+                    // syscall for threads that do not exist — and its own fork
+                    // drain would then wait on a population it can never reach.
+                    kernel.guest_executors.reset_for_forked_child();
                     // Clear the quiesce + fork flags the child inherited (copied) from
                     // the parent so the child's single-threaded run loop runs. Also
                     // reset the inherited parked-thread COUNT: it belongs to PARENT
@@ -1172,7 +1198,21 @@ where
         let fork_total_started = Instant::now();
         let mut fork_stage_started = fork_total_started;
         let mut quiesced = false;
-        let initial_siblings = self.kicker.count().saturating_sub(1);
+        // Raise the barrier whenever this process has ANOTHER thread that can
+        // execute guest code. `kicker.count()` counts live vCPU LEASES, so
+        // every sibling parked in a futex / epoll / fd wait had already
+        // unregistered and this read 0 — and the transaction below then ran
+        // with NO BARRIER AT ALL, against siblings whose wake does not require
+        // this thread (a host fd readying, an `EVFILT_TIMER`, a cross-process
+        // shared-futex wake, or the signal pump). Their run-loop-top quiesce
+        // check passed for the same reason: nobody had set `quiescing`.
+        //
+        // The DRAIN below still keys on the kicker, which is the right question
+        // for its own purpose ("has every sibling given its vCPU up yet?") and
+        // is satisfied immediately when the siblings were already parked. What
+        // matters is that `quiescing` is now RAISED, so a sibling woken
+        // mid-transaction parks at the barrier instead of resuming into it.
+        let initial_siblings = kernel.guest_executors.live().saturating_sub(1);
         let mut quiesce_poll_iterations = 0_u64;
         if initial_siblings > 0 {
             process_barrier.set_quiescing();
@@ -1579,6 +1619,10 @@ where
                     Arc::new(KernelFrameCowAuthority {
                         kernel: Arc::clone(child_context.kernel()),
                         mm: child_mm,
+                        // The CHILD's census: an HVPatch fork child owns its
+                        // own `KernelState`, so its executor population starts
+                        // from this thread alone.
+                        guest_executors: Arc::clone(&child_kernel.guest_executors),
                         kicker: child_kicker.clone(),
                         tid: child_tid,
                     });
@@ -2035,6 +2079,9 @@ mod pt_pause_tests {
         let barrier: &'static crate::fork_quiesce::PtQuiesce =
             Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
         let registry = Arc::new(GenericVcpuRegistry::new());
+        // Recorded into `pt-pause-begin` beside the lease count; these
+        // tests exercise the DRAIN, which reads the registry.
+        let census = crate::kernel::GuestExecutorCensus::default();
         let coordinator = tid(1501);
         let sibling = tid(1502);
         let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
@@ -2056,6 +2103,7 @@ mod pt_pause_tests {
         let result = acquire_pt_pause(
             barrier,
             &*registry,
+            &census,
             coordinator,
             PtPauseBudget {
                 election: Duration::from_secs(30),
@@ -2089,6 +2137,9 @@ mod pt_pause_tests {
         let barrier: &'static crate::fork_quiesce::PtQuiesce =
             Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
         let registry = Arc::new(GenericVcpuRegistry::new());
+        // Recorded into `pt-pause-begin` beside the lease count; these
+        // tests exercise the DRAIN, which reads the registry.
+        let census = crate::kernel::GuestExecutorCensus::default();
         let waiter = tid(1521);
         let waiter_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
         registry.register(waiter, Box::new(NoopKick), &waiter_in_guest);
@@ -2100,6 +2151,7 @@ mod pt_pause_tests {
         let result = acquire_pt_pause(
             barrier,
             &*registry,
+            &census,
             waiter,
             PtPauseBudget {
                 election: Duration::from_millis(50),
@@ -2131,6 +2183,9 @@ mod pt_pause_tests {
         let barrier: &'static crate::fork_quiesce::PtQuiesce =
             Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
         let registry = Arc::new(GenericVcpuRegistry::new());
+        // Recorded into `pt-pause-begin` beside the lease count; these
+        // tests exercise the DRAIN, which reads the registry.
+        let census = crate::kernel::GuestExecutorCensus::default();
         let coordinator = tid(1511);
         let sibling = tid(1512);
         let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
@@ -2147,6 +2202,7 @@ mod pt_pause_tests {
         let guard = acquire_pt_pause(
             barrier,
             &*registry,
+            &census,
             coordinator,
             PtPauseBudget {
                 election: Duration::from_secs(30),
@@ -2184,6 +2240,9 @@ mod pt_pause_tests {
         let barrier: &'static crate::fork_quiesce::PtQuiesce =
             Box::leak(Box::new(crate::fork_quiesce::PtQuiesce::new()));
         let registry = Arc::new(GenericVcpuRegistry::new());
+        // Recorded into `pt-pause-begin` beside the lease count; these
+        // tests exercise the DRAIN, which reads the registry.
+        let census = crate::kernel::GuestExecutorCensus::default();
         let coordinator = tid(1531);
         let sibling = tid(1532);
         let coordinator_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
@@ -2203,6 +2262,7 @@ mod pt_pause_tests {
         let result = acquire_pt_pause(
             barrier,
             &*registry,
+            &census,
             coordinator,
             PtPauseBudget {
                 election: Duration::from_secs(30),

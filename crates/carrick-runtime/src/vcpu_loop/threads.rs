@@ -1206,8 +1206,8 @@ where
                 .filter(|handle| handle.thread().id() != current_host_thread)
                 .filter(|handle| !handle.is_finished())
                 .count();
-            let process_vcpu_live = kernel.process_vcpu_live();
-            if unfinished == 0 && process_vcpu_live <= 1 {
+            let guest_executors = kernel.guest_executor_count();
+            if unfinished == 0 && guest_executors <= 1 {
                 break;
             }
             if !debugger_window_announced
@@ -1233,13 +1233,13 @@ where
             }
             if std::time::Instant::now() >= deadline {
                 return Err(RuntimeError::Trap(TrapError::Hypervisor(format!(
-                    "hvpatch process thread-group teardown timed out: pid={} unfinished={} process_vcpu_live={} kicker={}",
+                    "hvpatch process thread-group teardown timed out: pid={} unfinished={} guest_executors={} kicker={}",
                     kernel
                         .hvpatch_process
                         .as_ref()
                         .map_or(0, crate::hvpatch::ProcessContext::pid),
                     unfinished,
-                    process_vcpu_live,
+                    guest_executors,
                     self.kicker.count()
                 ))));
             }
@@ -1398,18 +1398,18 @@ where
                     .filter(|handle| handle.thread().id() != current_host_thread)
                     .filter(|handle| !handle.is_finished())
                     .count();
-                if unfinished == 0 && kernel.process_vcpu_live() <= 1 {
+                if unfinished == 0 && kernel.guest_executor_count() <= 1 {
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
                     return Err(RuntimeError::Trap(TrapError::Hypervisor(format!(
-                        "hvpatch exec thread-group teardown timed out: pid={} unfinished={} process_vcpu_live={} kicker={}",
+                        "hvpatch exec thread-group teardown timed out: pid={} unfinished={} guest_executors={} kicker={}",
                         kernel
                             .hvpatch_process
                             .as_ref()
                             .map_or(0, crate::hvpatch::ProcessContext::pid),
                         unfinished,
-                        kernel.process_vcpu_live(),
+                        kernel.guest_executor_count(),
                         self.kicker.count()
                     ))));
                 }
