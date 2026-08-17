@@ -7,9 +7,9 @@ gate then ran both arm64 libc sets on the same signed Carrick binary.
 
 ## Artifact
 
-- Binary source: `52554a8d9376539464922641e7098029c88459f8`
+- Binary source: `52554a8d94b3b60924628c3323c1ef3d17966001`
 - Probe-build tooling source: `ce1ec732fc97134bf78087fd22ca83b300688a25`
-- Ledger/controller tooling source: `b21b55d504f6caa781e6d2570c9a8a822b0bb4a8`
+- Ledger/controller tooling source: `651d77a744ddb821f4b53f87abb9e926890cda34`
 - Signed Carrick SHA-256: `dca649d43b6d839dbd27b3b043bd651fc12a20640559bf2c224733890c5fb1cb`
 - CDHash: `37cbc540824e0a078e8ff529ba696b8b51f73d9e`
 - LC_UUID: `6A516A5A-27F2-3EF7-92C3-5F12046A6C8A`
