@@ -1,0 +1,14 @@
+tracepoint:syscalls:sys_enter_mmap  /comm == "mremap01"/ {
+  printf("mmap  addr=%lx len=%lx prot=%lx flags=%lx fd=%ld off=%lx\n",
+         args->addr, args->len, args->prot, args->flags, (int64)args->fd, args->off);
+}
+tracepoint:syscalls:sys_exit_mmap   /comm == "mremap01"/ { printf("mmap  -> %lx\n", args->ret); }
+tracepoint:syscalls:sys_enter_mremap /comm == "mremap01"/ {
+  printf("mremap old=%lx oldsz=%lx newsz=%lx flags=%lx new=%lx\n",
+         args->addr, args->old_len, args->new_len, args->flags, args->new_addr);
+}
+tracepoint:syscalls:sys_exit_mremap  /comm == "mremap01"/ { printf("mremap -> %lx\n", args->ret); }
+tracepoint:syscalls:sys_enter_munmap /comm == "mremap01"/ {
+  printf("munmap addr=%lx len=%lx\n", args->addr, args->len);
+}
+tracepoint:syscalls:sys_exit_munmap  /comm == "mremap01"/ { printf("munmap -> %ld\n", args->ret); }

@@ -87,3 +87,60 @@ Note the sibling crash is DIFFERENT and this reducer does not produce it:
 `map hvpatch child VA ...: OutOfTables`. A plain 800-fork storm
 (`fork` + `_exit` + `waitpid`) completes cleanly, so that one is not a simple
 fork-path table leak.
+
+
+## `mremap-grow-shapes.c` + `mremap01-oracle-shape.bt` — mremap grow
+
+`mremap-grow-shapes.c` runs six one-page grows and prints one line each, so a
+carrick run and a Docker run diff directly. Build it static (`gcc -static -O0`)
+so the same binary runs under both. Two things it will teach you the hard way if
+you change it:
+
+- **Unbuffer stdout.** The first version block-buffered, the shared-anon case
+  took a SIGBUS, and the whole transcript was discarded — it looked like the
+  program had not run at all. `setvbuf(stdout, NULL, _IONBF, 0)` is load-bearing.
+- **Do not touch the grown tail of a `MAP_SHARED|MAP_ANONYMOUS` mapping.** Real
+  Linux keeps the original tmpfs object at its original size across the grow, so
+  the new pages have no backing and the access is a genuine SIGBUS. That is
+  correct Linux behaviour, not a bug in either side, and it is why the harness
+  takes a `touch_tail` argument.
+
+Measured (real Linux 6.12, docker gcc:latest, arm64, 2026-08-17) vs carrick:
+
+| shape | Linux | carrick before | carrick after |
+|---|---|---|---|
+| priv-anon grow MAYMOVE | ok (moved) | ok | ok |
+| priv-anon grow noflag | ENOMEM | ok | ok |
+| shared-anon grow MAYMOVE | ok (moved) | **ENOMEM** | **ok** |
+| shared-anon grow noflag | ENOMEM | ENOMEM | ENOMEM |
+| shared-file grow MAYMOVE | ok (moved) | **ENOMEM** | **ENOMEM** |
+| priv-file grow MAYMOVE | ok (moved) | ok | ok |
+
+`moved` is not an ABI guarantee — Linux happens to relocate and carrick grows in
+place — so the reducer prints it for information rather than as a verdict.
+
+### `ltp-mremap01` is the shared-FILE row, not the shared-anon one
+
+Do not assume the anon fix closes it. `mremap01-oracle-shape.bt` captures the
+suite's actual syscall shape from inside the Docker oracle (the sanctioned
+method — never guest `strace`), and it is unambiguous:
+
+```
+mmap  addr=0 len=3e8000 prot=2 flags=1 fd=3 off=0     # MAP_SHARED, a FILE
+mremap old=... oldsz=3e8000 newsz=7d0000 flags=1      # MREMAP_MAYMOVE
+mremap -> ffff9fa00000                                # moved
+munmap addr=ffff9fa00000 len=7d0000
+```
+
+So mremap01 needs the shared-FILE grow, which is a different mechanism: carrick
+backs `MAP_SHARED` file mappings with a LIVE host alias of the file's page cache
+at a fresh high VA, not with aperture bytes. Growing one means re-establishing
+the alias at the larger size (re-mmapping the same fd preserves sharing exactly,
+unlike a byte copy), and the request grows PAST the file's EOF — 0x3e8000 to
+0x7d0000 — so the tail beyond EOF has to become a `bus_fault_ranges` entry, the
+same treatment `mmap` already gives an over-EOF `MAP_SHARED` file mapping.
+
+Note also that `carrick trace` was NOT able to answer this: its syscall stream
+carries the loader's mmaps and then stops at `execve-loaded`, showing nothing
+the test itself issued. Reach for the oracle-side bpftrace rather than trying to
+make the tracer follow the guest's self-re-exec.
