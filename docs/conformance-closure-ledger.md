@@ -4,8 +4,8 @@ This is generated controller state. Update it from a complete closure run; do no
 
 ## Provenance
 
-- Source HEAD: `52554a8d9376539464922641e7098029c88459f8`
-- Tooling/controller source HEAD: `b21b55d504f6caa781e6d2570c9a8a822b0bb4a8`
+- Source HEAD: `52554a8d94b3b60924628c3323c1ef3d17966001`
+- Tooling/controller source HEAD: `651d77a744ddb821f4b53f87abb9e926890cda34`
 - Signed Carrick SHA-256: `dca649d43b6d839dbd27b3b043bd651fc12a20640559bf2c224733890c5fb1cb`
 - Manifest SHA-256: `36042b91814ca767d61a6615c0023aa07773b7f5649fc65038fae6c34367d282`
 - Raw suite artifact: `target/conformance/closure-after-node-exec/results.jsonl`
