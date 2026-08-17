@@ -19,6 +19,7 @@ from typing import Any
 
 SCHEMA = "carrick-closure-scope-v1"
 CLOSURE_SUITE_COUNT = 2127
+CLOSURE_IMAGE_COUNT = 4
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -66,6 +67,11 @@ def _manifest_inventory(manifest_path: Path) -> tuple[list[str], dict[str, int],
     if len(set(names)) != len(names):
         duplicates = sorted(name for name, count in Counter(names).items() if count > 1)
         raise ScopeError(f"closure manifest contains duplicate suite names: {duplicates}")
+    if len(images) != CLOSURE_IMAGE_COUNT:
+        raise ScopeError(
+            f"closure manifest declares {len(images)} distinct images; "
+            f"expected {CLOSURE_IMAGE_COUNT}"
+        )
     return sorted(names), dict(sorted(ecosystems.items())), sorted(images)
 
 

@@ -2068,6 +2068,35 @@ fn closure_set_gates(lane: &Lane, set: &ProbeSet) -> bool {
     lane.label == ARM64.label && matches!(set.libc, "musl" | "gnu")
 }
 
+fn validate_closure_probe_host(
+    host_os: &str,
+    host_arch: &str,
+    arm64_runnable: bool,
+) -> Result<(), String> {
+    if host_os != "macos" || host_arch != "aarch64" {
+        return Err(format!(
+            "closure probe gate requires macOS/aarch64, got {host_os}/{host_arch}"
+        ));
+    }
+    if !arm64_runnable {
+        return Err("closure probe gate requires the ARM64 lane to be runnable".to_string());
+    }
+    Ok(())
+}
+
+fn validate_closure_executed_sets(executed: &BTreeSet<String>) -> Result<(), String> {
+    let required = BTreeSet::from(["musl".to_string(), "gnu".to_string()]);
+    if executed == &required {
+        Ok(())
+    } else {
+        Err(format!(
+            "closure probe sets differ (missing={:?}, unexpected={:?})",
+            required.difference(executed).collect::<Vec<_>>(),
+            executed.difference(&required).collect::<Vec<_>>()
+        ))
+    }
+}
+
 /// Curated allowlist of x86_64 probes permitted to GATE (fail the build red) on
 /// the amd64 lane even though the lane as a whole is report-only carrick-x86
 /// BRING-UP. A probe here gates on the native x86_64 fleet; everything else stays
@@ -2819,6 +2848,69 @@ fn probe_campaign_dir(target: &str, exec_backend: Option<&str>) -> PathBuf {
 /// against the oracle. `probeinit` is the direct-ELF container init shim —
 /// under the injection transport it would fork/exec ITSELF at `/tmp/p`.
 const PROBE_HELPERS: &[&str] = &["probeinit"];
+const PROBE_SOURCE_COUNT: usize = 455;
+
+/// The only topology-specific runners accepted by closure inventory parsing.
+/// Every source not listed here must use `generic`; keeping this as one mapping
+/// prevents an allowlist and a name-to-runner table from drifting separately.
+const DEDICATED_PROBE_RUNNERS: &[(&str, &str)] = &[
+    ("bridge_compose_client", "conformance_bridge_compose_pair"),
+    ("bridge_compose_server", "conformance_bridge_compose_pair"),
+    (
+        "bridge_loopback_isolation",
+        "conformance_bridge_loopback_isolation",
+    ),
+    ("bridge_net_identity", "conformance_bridge_net_identity"),
+    ("bridge_publish_tcp", "conformance_bridge_publish_tcp"),
+    ("bridge_reuse_sockopts", "conformance_bridge_reuse_sockopts"),
+    (
+        "bridge_tcp_nonblocking_refused",
+        "conformance_bridge_tcp_nonblocking_refused",
+    ),
+    ("bridge_tcp_peer", "conformance_bridge_tcp_peer"),
+    (
+        "bridge_udp_connected_unreachable",
+        "conformance_bridge_udp_connected_unreachable",
+    ),
+    ("bridge_udp_peer", "conformance_bridge_udp_peer"),
+    (
+        "bridge_udp_sendto_unreachable",
+        "conformance_bridge_udp_sendto_unreachable",
+    ),
+    ("host_gateway_client", "conformance_native_host_gateway"),
+    (
+        "multi_network_client",
+        "conformance_native_multi_network_roles",
+    ),
+    (
+        "multi_network_dns_client",
+        "conformance_native_multi_network_roles",
+    ),
+    (
+        "multi_network_server",
+        "conformance_native_multi_network_roles",
+    ),
+    (
+        "sidecar_loopback_client",
+        "docker_compose_shared_network_namespace_smoke",
+    ),
+    (
+        "sidecar_loopback_isolated_client",
+        "docker_compose_shared_network_namespace_smoke",
+    ),
+    (
+        "sidecar_loopback_server",
+        "docker_compose_shared_network_namespace_smoke",
+    ),
+    (
+        "udp_published_client",
+        "conformance_native_udp_service_pair",
+    ),
+    (
+        "udp_published_server",
+        "conformance_native_udp_service_pair",
+    ),
+];
 
 #[derive(serde::Deserialize)]
 struct ProbeInventoryRow {
@@ -2852,17 +2944,45 @@ fn closure_generic_probe_names() -> Result<BTreeSet<String>, String> {
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let inventory: BTreeMap<String, ProbeInventoryRow> = serde_json::from_str(&raw)
         .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
-    let source_names = all_probe_source_names();
+    validate_closure_probe_rows(&inventory, &all_probe_source_names())
+}
+
+fn validate_closure_probe_rows(
+    inventory: &BTreeMap<String, ProbeInventoryRow>,
+    source_names: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, String> {
     let inventory_names = inventory.keys().cloned().collect::<BTreeSet<_>>();
-    if source_names != inventory_names {
+    if source_names != &inventory_names {
         return Err(format!(
             "probe source inventory drift (missing={:?}, absent_from_disk={:?})",
             source_names
                 .difference(&inventory_names)
                 .collect::<Vec<_>>(),
-            inventory_names
-                .difference(&source_names)
-                .collect::<Vec<_>>()
+            inventory_names.difference(source_names).collect::<Vec<_>>()
+        ));
+    }
+    if source_names.len() != PROBE_SOURCE_COUNT {
+        return Err(format!(
+            "closure probe source denominator is {}, expected {PROBE_SOURCE_COUNT}",
+            source_names.len()
+        ));
+    }
+
+    let dedicated = DEDICATED_PROBE_RUNNERS
+        .iter()
+        .copied()
+        .collect::<BTreeMap<_, _>>();
+    if dedicated.len() != DEDICATED_PROBE_RUNNERS.len() {
+        return Err("closure dedicated-runner mapping contains duplicate names".to_string());
+    }
+    let missing_dedicated = dedicated
+        .keys()
+        .filter(|name| !inventory.contains_key(**name))
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing_dedicated.is_empty() {
+        return Err(format!(
+            "closure dedicated-runner sources are missing: {missing_dedicated:?}"
         ));
     }
 
@@ -2886,8 +3006,15 @@ fn closure_generic_probe_names() -> Result<BTreeSet<String>, String> {
                 row.class
             ));
         }
+        let expected_runner = dedicated.get(name.as_str()).copied().unwrap_or("generic");
+        if row.runner != expected_runner {
+            return Err(format!(
+                "probe {name} uses runner {:?}, expected {expected_runner:?}",
+                row.runner
+            ));
+        }
         if row.class == "conformance" && row.runner == "generic" {
-            selected.insert(name);
+            selected.insert(name.clone());
         }
     }
     Ok(selected)
@@ -3887,6 +4014,14 @@ fn conformance_probes() {
         closure_generic_probe_names()
             .unwrap_or_else(|error| panic!("invalid closure probe inventory: {error}"))
     });
+    if closure_mode {
+        validate_closure_probe_host(
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            lane_runnable_here(&ARM64),
+        )
+        .unwrap_or_else(|error| panic!("closure probe host validation failed: {error}"));
+    }
     let n_workers = probe_worker_count(
         requested_probe_workers.as_deref(),
         std::thread::available_parallelism().ok().map(|n| n.get()),
@@ -3897,6 +4032,7 @@ fn conformance_probes() {
     } else {
         LANES
     };
+    let mut closure_executed_sets = BTreeSet::new();
     for lane in lanes {
         if !lane_allowed_for_backend(lane, requested_exec_backend.as_deref()) {
             eprintln!(
@@ -4211,7 +4347,14 @@ fn conformance_probes() {
                     results.len()
                 );
             }
+            if closure_mode {
+                closure_executed_sets.insert(set.libc.to_string());
+            }
         }
+    }
+    if closure_mode {
+        validate_closure_executed_sets(&closure_executed_sets)
+            .unwrap_or_else(|error| panic!("closure probe execution incomplete: {error}"));
     }
     if !nongating_diffs.is_empty() {
         eprintln!(
@@ -5098,6 +5241,72 @@ fn closure_gates_arm64_musl_and_gnu_and_rejects_skips() {
         })
         .is_err()
     );
+}
+
+#[test]
+fn closure_requires_macos_arm64_runnable_host_and_both_executed_sets() {
+    assert!(validate_closure_probe_host("macos", "aarch64", true).is_ok());
+    assert!(validate_closure_probe_host("linux", "aarch64", true).is_err());
+    assert!(validate_closure_probe_host("macos", "x86_64", true).is_err());
+    assert!(validate_closure_probe_host("macos", "aarch64", false).is_err());
+
+    let both = BTreeSet::from(["musl".to_string(), "gnu".to_string()]);
+    assert!(validate_closure_executed_sets(&both).is_ok());
+    assert!(validate_closure_executed_sets(&BTreeSet::from(["musl".to_string()])).is_err());
+    assert!(validate_closure_executed_sets(&BTreeSet::new()).is_err());
+}
+
+#[test]
+fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
+    fn inventory() -> BTreeMap<String, ProbeInventoryRow> {
+        serde_json::from_str(
+            &std::fs::read_to_string(repo_path("conformance-probes/probe-inventory.json"))
+                .expect("read probe inventory"),
+        )
+        .expect("parse probe inventory")
+    }
+
+    let sources = all_probe_source_names();
+    assert_eq!(DEDICATED_PROBE_RUNNERS.len(), 20);
+    assert!(validate_closure_probe_rows(&inventory(), &sources).is_ok());
+
+    let mut typo = inventory();
+    typo.get_mut("bridge_tcp_peer")
+        .expect("dedicated row")
+        .runner = "conformance_bridge_tcp_pere".to_string();
+    assert!(validate_closure_probe_rows(&typo, &sources).is_err());
+
+    let mut unknown = inventory();
+    unknown.get_mut("abortdeath").expect("generic row").runner = "unknown_runner".to_string();
+    assert!(validate_closure_probe_rows(&unknown, &sources).is_err());
+
+    let mut missing = inventory();
+    missing
+        .get_mut("bridge_tcp_peer")
+        .expect("dedicated row")
+        .runner = "generic".to_string();
+    assert!(validate_closure_probe_rows(&missing, &sources).is_err());
+
+    let mut renamed = inventory();
+    let tcp_runner = renamed
+        .get("bridge_tcp_peer")
+        .expect("tcp row")
+        .runner
+        .clone();
+    let udp_runner = renamed
+        .get("bridge_udp_peer")
+        .expect("udp row")
+        .runner
+        .clone();
+    renamed.get_mut("bridge_tcp_peer").expect("tcp row").runner = udp_runner;
+    renamed.get_mut("bridge_udp_peer").expect("udp row").runner = tcp_runner;
+    assert!(validate_closure_probe_rows(&renamed, &sources).is_err());
+
+    let mut shrunken_inventory = inventory();
+    shrunken_inventory.remove("abortdeath");
+    let mut shrunken_sources = sources.clone();
+    shrunken_sources.remove("abortdeath");
+    assert!(validate_closure_probe_rows(&shrunken_inventory, &shrunken_sources).is_err());
 }
 
 #[test]
