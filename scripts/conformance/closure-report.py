@@ -145,6 +145,24 @@ def summarize(scope: dict[str, Any], results: list[dict[str, Any]]) -> dict[str,
 
         suite_has_assertion_gap = False
         suite_has_unexercised = False
+        zero_assertion_success = (
+            verdict == "incomplete"
+            and not pairs
+            and row["carrick"]["result"] == "success"
+            and row["docker"]["result"] == "success"
+            and all(value == 0 for value in carrick_totals.values())
+            and all(value == 0 for value in docker_totals.values())
+        )
+        if zero_assertion_success:
+            categories["unexercised"].append(
+                {
+                    "suite": name,
+                    "assertion": "<no assertions>",
+                    "carrick": "absent",
+                    "docker": "absent",
+                }
+            )
+            suite_has_unexercised = True
         for assertion, carrick_outcome, docker_outcome in pairs:
             assertion_row = {
                 "suite": name,
