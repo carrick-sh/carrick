@@ -465,7 +465,7 @@ impl SyscallDispatcher {
             // libcap-based tools see a coherent story (docs/namespaces-design.md
             // §4.4). capget data words are 32-bit halves of each 64-bit set:
             // word 0 = low 32 bits, word 1 = high 32 bits (capability_words).
-            let caps = crate::namespace::process::caps();
+            let caps = cx.kernel.task().caps();
             let words = linux_capability_data_words(header.version);
             let data = capability_words(&caps, words);
             if memory
@@ -514,31 +514,39 @@ impl SyscallDispatcher {
             // Violations are EPERM even for a fully-privileged caller (oracle:
             // debian:stable root, capset{eff=1,prm=0} -> EPERM). Valid drops
             // satisfy both rules, so dpkg/setpriv still succeed.
-            let mut caps = crate::namespace::process::caps();
             let (eff, prm, inh) = capability_set_from_words(&data);
-            if (eff & !prm) != 0 || (prm & !caps.permitted) != 0 {
+            // Validate and apply under the task's capability lock: every rule
+            // below is relative to the CURRENT set, so a read-validate-write
+            // that dropped the lock in between could lose a sibling thread's
+            // concurrent capset (all threads of a process share one set).
+            let accepted = cx.kernel.task().with_caps(|caps| {
+                if (eff & !prm) != 0 || (prm & !caps.permitted) != 0 {
+                    return false;
+                }
+                // Validate the new INHERITABLE (pI) set, the third invariant
+                // Linux enforces for every caller (capset02/capset03). A caller
+                // may only raise pI bits it is entitled to:
+                //   * WITH CAP_SETPCAP: any bit in (bounding | old_inheritable).
+                //   * WITHOUT it: only bits in (old_permitted | old_inheritable).
+                // A new pI bit outside that set is EPERM. (`caps` is still the
+                // OLD set here — it is mutated below.)
+                let setpcap_bit = 1u64 << crate::namespace::process::CAP_SETPCAP;
+                let allowed_inh = if caps.effective & setpcap_bit != 0 {
+                    caps.bounding | caps.inheritable
+                } else {
+                    caps.permitted | caps.inheritable
+                };
+                if (inh & !allowed_inh) != 0 {
+                    return false;
+                }
+                caps.effective = eff;
+                caps.permitted = prm;
+                caps.inheritable = inh;
+                true
+            });
+            if !accepted {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
-            // Validate the new INHERITABLE (pI) set, the third invariant Linux
-            // enforces for every caller (capset02/capset03). A caller may only
-            // raise pI bits it is entitled to:
-            //   * WITH CAP_SETPCAP: any bit in (bounding | old_inheritable).
-            //   * WITHOUT it: only bits in (old_permitted | old_inheritable).
-            // A new pI bit outside that set is EPERM. (`caps` is still the OLD
-            // set here — it is mutated below.)
-            let setpcap_bit = 1u64 << crate::namespace::process::CAP_SETPCAP;
-            let allowed_inh = if caps.effective & setpcap_bit != 0 {
-                caps.bounding | caps.inheritable
-            } else {
-                caps.permitted | caps.inheritable
-            };
-            if (inh & !allowed_inh) != 0 {
-                return Ok(DispatchOutcome::errno(LINUX_EPERM));
-            }
-            caps.effective = eff;
-            caps.permitted = prm;
-            caps.inheritable = inh;
-            crate::namespace::process::set_caps(caps);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 

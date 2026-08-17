@@ -230,6 +230,13 @@ pub struct SyntheticProcContext {
     /// process behind it, which is what makes `/proc/<dead-pid>/oom_score_adj`
     /// ENOENT rather than a fabricated 0.
     pub oom_score_adj: std::collections::BTreeMap<u32, i32>,
+    /// The CALLING process's capability sets and user-namespace view, snapshot
+    /// from its `Task` by the dispatcher. `/proc/self/status`'s `Cap*` lines and
+    /// `/proc/self/{uid_map,gid_map,setgroups}` render from this rather than
+    /// from a process-global cell, because under HVPatch every Linux process is
+    /// a thread of one Darwin process and a global would show every guest the
+    /// same capabilities and maps.
+    pub creds_ns: crate::namespace::process::ProcessCredsNs,
     /// Every LIVE Linux process, from the kernel graph. This is the authority
     /// for a `/proc/<peer-pid>/…` read: HVPatch peers have no host process of
     /// their own, so without it the renderer falls through to a host-derived
@@ -339,25 +346,33 @@ pub(crate) fn parse_tunable_write(path: &str, data: &[u8]) -> Result<TunableWrit
 /// "consumed" per kernel behavior), or `Err(positive_errno)` (EPERM / EINVAL)
 /// to be returned as a negative errno. The write-once, setgroups-gate, ≤5-line
 /// and unprivileged-single-id rules are enforced by [`crate::namespace::user`].
-pub(crate) fn write_userns_map(path: &str, data: &[u8]) -> Result<usize, LinuxErrno> {
+///
+/// `ns` is the CALLING process's user namespace and `privileged` its own
+/// `CAP_SETUID`/`CAP_SETGID` verdict — both supplied by the dispatcher from the
+/// caller's task. `/proc/self/uid_map` names the writer's own namespace, so
+/// resolving it from anything process-global would let one guest process
+/// rewrite another's maps.
+pub(crate) fn write_userns_map(
+    ns: &mut crate::namespace::user::UserNs,
+    privileged: bool,
+    path: &str,
+    data: &[u8],
+) -> Result<usize, LinuxErrno> {
     let text = std::str::from_utf8(data).map_err(|_| crate::namespace::user::EINVAL)?;
-    let privileged = crate::namespace::process::is_map_write_privileged();
     // The writer's outside id for the unprivileged single-id rule. carrick runs
     // the guest as a single host identity; the parent-ns euid/egid is the host
-    // identity, which for the default container is 0. We use the modeled creds
-    // via cred_ipc's published self euid is not reachable here cheaply, so use
-    // the namespace store's notion (identity ns → 0). The unprivileged path is
+    // identity, which for the default container is 0. The unprivileged path is
     // only reached after the guest unshared a userns, where the parent-ns id is
     // the pre-unshare euid; for the common rootful case `privileged` is true and
     // this value is unused.
     let euid_outside = 0;
     let egid_outside = 0;
-    crate::namespace::process::with_user_mut(|ns| match path {
+    match path {
         "/proc/self/uid_map" => ns.write_uid_map(text, privileged, euid_outside),
         "/proc/self/gid_map" => ns.write_gid_map(text, privileged, egid_outside),
         "/proc/self/setgroups" => ns.write_setgroups(text),
         _ => Err(crate::namespace::user::EINVAL),
-    })
+    }
     .map(|()| data.len())
 }
 
@@ -999,17 +1014,9 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         // identity namespace these read as `0 0 4294967295` / `allow`, matching
         // observed `docker run` (docs/namespaces-design.md §1.2, §4.3). Writable
         // — see ProcVfs::open + the write(2) handler.
-        "/proc/self/uid_map" => {
-            Some(crate::namespace::process::with_user(|ns| ns.uid_map_text()).into_bytes())
-        }
-        "/proc/self/gid_map" => {
-            Some(crate::namespace::process::with_user(|ns| ns.gid_map_text()).into_bytes())
-        }
-        "/proc/self/setgroups" => Some(
-            crate::namespace::process::with_user(|ns| ns.setgroups_text())
-                .as_bytes()
-                .to_vec(),
-        ),
+        "/proc/self/uid_map" => Some(ctx.creds_ns.user.uid_map_text().into_bytes()),
+        "/proc/self/gid_map" => Some(ctx.creds_ns.user.gid_map_text().into_bytes()),
+        "/proc/self/setgroups" => Some(ctx.creds_ns.user.setgroups_text().as_bytes().to_vec()),
         _ => {
             if path == "/proc/sys/kernel/hostname" {
                 return Some(format!("{}\n", context_guest_hostname(ctx)).into_bytes());
@@ -2163,6 +2170,7 @@ impl Default for ProcVfs {
 fn synthetic_proc_context_from_open(ctx: &OpenContext<'_>) -> SyntheticProcContext {
     SyntheticProcContext {
         oom_score_adj: ctx.oom_score_adj.cloned().unwrap_or_default(),
+        creds_ns: ctx.creds_ns.cloned().unwrap_or_default(),
         executable_path: ctx.executable_path.unwrap_or("").to_owned(),
         argv: ctx.argv.unwrap_or(&[]).to_vec(),
         task_comm: ctx.task_comm.unwrap_or("").to_owned(),
@@ -2901,7 +2909,7 @@ fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {
     // or a full set inside a freshly-created user namespace), NOT the all-zero
     // set — capability-probing tools (apt/dpkg/setpriv) refuse to proceed if
     // they think they hold nothing (docs/namespaces-design.md §4.4).
-    let cap_lines = crate::namespace::process::cap_status_lines();
+    let cap_lines = ctx.creds_ns.caps.status_lines();
     let locked_kb = locked_memory_kb(ctx);
     format!(
         "Name:\t{comm}\n\
