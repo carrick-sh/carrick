@@ -437,10 +437,29 @@ where
             // SA_RESTART: if this handler interrupted a blocking, restartable
             // syscall that returned EINTR, restart it instead of surfacing the
             // EINTR.
-            let restart_syscall = interrupted_pc.is_none()
-                && last_syscall_retval == Some(crate::linux_abi::LINUX_EINTR.guest_retval())
-                && sa_flags.contains(carrick_abi::LinuxSaFlags::RESTART)
-                && trap.last_syscall_nr().is_some_and(is_restartable_syscall);
+            let at_syscall_boundary = interrupted_pc.is_none();
+            let retval_is_eintr =
+                last_syscall_retval == Some(crate::linux_abi::LINUX_EINTR.guest_retval());
+            let handler_wants_restart = sa_flags.contains(carrick_abi::LinuxSaFlags::RESTART);
+            let syscall_restartable = trap.last_syscall_nr().is_some_and(is_restartable_syscall);
+            let restart_syscall = at_syscall_boundary
+                && retval_is_eintr
+                && handler_wants_restart
+                && syscall_restartable;
+            // Publish WHICH predicate decided. All four live in one boolean, so
+            // from outside "the guest saw EINTR under SA_RESTART" is otherwise a
+            // dead end — you cannot tell a missing syscall from the restartable
+            // set apart from a retval that was never EINTR in the first place.
+            crate::probes::signal_restart_decision(
+                tid.raw(),
+                pending,
+                trap.last_syscall_nr().map_or(-1, |nr| nr as i64),
+                last_syscall_retval.unwrap_or(0),
+                i32::from(at_syscall_boundary)
+                    | (i32::from(retval_is_eintr) << 1)
+                    | (i32::from(handler_wants_restart) << 2)
+                    | (i32::from(syscall_restartable) << 3),
+            );
             // Wire form for the sigframe build (see the synchronous-fault arm).
             let saved_sigmask = dispatcher
                 .enter_signal_handler(context, tid, pending, action)
