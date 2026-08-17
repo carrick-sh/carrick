@@ -201,6 +201,58 @@ class ClosureReportTest(unittest.TestCase):
         with self.assertRaises(closure_report.ReportError):
             closure_report.summarize(scope, malformed)
 
+    def test_post_assertion_process_failure_is_infrastructure_not_assertion_semantics(self):
+        scope = scope_2127()
+        scope["suite_names"][0] = "ltp-post-assertion"
+        results = [result(name) for name in scope["suite_names"]]
+        process_failure = result(
+            "ltp-post-assertion",
+            verdict="incomplete",
+            pairs={
+                "msgstress.c:10#1": ["ok", "ok"],
+                "msgstress.c:20#1": ["ok", "ok"],
+            },
+            ratio=20.0,
+        )
+        equal_totals = {
+            "n": 2,
+            "passed": 2,
+            "failed": 0,
+            "broken": 0,
+            "skipped": 0,
+        }
+        process_failure["carrick"] = {
+            "result": "failure",
+            "totals": dict(equal_totals),
+        }
+        process_failure["docker"] = {
+            "result": "success",
+            "totals": dict(equal_totals),
+        }
+        results[0] = process_failure
+
+        summary = closure_report.summarize(scope, results)
+
+        self.assertIn("ltp-post-assertion", summary["infrastructure_failures"])
+        self.assertFalse(
+            any(row["suite"] == "ltp-post-assertion" for row in summary["semantic_gaps"])
+        )
+        self.assertNotIn("ltp-post-assertion", summary["verified"])
+        self.assertNotIn("ltp-post-assertion", summary["pathological"])
+
+        semantic_results = list(results)
+        semantic_failure = dict(process_failure)
+        semantic_failure["pairs"] = {"msgstress.c:10#1": ["fail", "ok"]}
+        semantic_results[0] = semantic_failure
+        semantic_summary = closure_report.summarize(scope, semantic_results)
+        self.assertIn(
+            "msgstress.c:10#1",
+            [row["assertion"] for row in semantic_summary["semantic_gaps"]],
+        )
+        self.assertNotIn(
+            "ltp-post-assertion", semantic_summary["infrastructure_failures"]
+        )
+
     def test_report_rejects_unexpected_rows_and_malformed_performance(self):
         scope = scope_2127()
         complete = [result(name) for name in scope["suite_names"]]
