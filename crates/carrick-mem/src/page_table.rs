@@ -1218,6 +1218,41 @@ impl PageTableManager {
         Ok(changed)
     }
 
+    /// Spare pages still available to `alloc_table`: the free list plus the
+    /// untouched bump tail.
+    fn spare_tables_available(&self) -> u64 {
+        let tail = (self.bytes.len() as u64).saturating_sub(self.next_free) / PT_PAGE;
+        self.free_tables.len() as u64 + tail
+    }
+
+    /// Count the naturally aligned `gran` spans that `[start, end)` touches.
+    fn spans_touched(start: u64, end: u64, gran: u64) -> u64 {
+        if end <= start {
+            return 0;
+        }
+        let first = start & !(gran - 1);
+        let last = (end - 1) & !(gran - 1);
+        (last - first) / gran + 1
+    }
+
+    /// Build a VA→IPA alias translation using the COARSEST leaf the geometry
+    /// admits at every step: 1 GiB L1 blocks, then 2 MiB L2 blocks, then 4 KiB
+    /// L3 pages only at the edges.
+    ///
+    /// `mmap` establishes a VMA; it must not do work proportional to the
+    /// mapping's size. A block leaf maps a naturally aligned VA span onto an
+    /// equally aligned output, so it is expressible exactly when the VA and the
+    /// IPA are *congruent* modulo the block size — congruence, not either
+    /// address's own alignment, is what decides whether coarse leaves are
+    /// usable. (Masking an unaligned output into a block descriptor would
+    /// silently map the wrong bytes, so the choice is made per step and never
+    /// forced.)
+    ///
+    /// The build is also all-or-nothing. Running out of spare tables partway
+    /// used to leave a half-built mapping that the guest re-faults on forever —
+    /// an apparent hang rather than an error — so the table budget is checked
+    /// UP FRONT and an unsatisfiable build is refused whole, which the callers
+    /// lower to a guest `ENOMEM` the way Linux does.
     fn map_aliased_with_flags(
         &mut self,
         va: u64,
@@ -1226,45 +1261,57 @@ impl PageTableManager {
         block_flags: u64,
         page_flags: u64,
     ) -> Result<bool, PageTableError> {
+        const ONE_GIB: u64 = 1 << 30;
         const TWO_MIB: u64 = 1 << 21;
-        const FOUR_KIB: u64 = 1 << 12;
-        if va.is_multiple_of(TWO_MIB) && ipa.is_multiple_of(TWO_MIB) {
-            // Map the 2 MiB-aligned BULK as L2 block leaves (one descriptor per
-            // 2 MiB, no per-2-MiB L3 table), then the sub-2-MiB TAIL as 4 KiB
-            // pages (a single L3 table). A multi-GiB alias whose length is not a
-            // multiple of 2 MiB — e.g. CPython's `mmap` of a 2 GiB sparse file →
-            // 2 GiB + 16 KiB — otherwise fell to the page-granular loop below for
-            // the WHOLE region, allocating ~1 L3 table per 2 MiB (~1024 tables for
-            // 2 GiB). That exhausts the spare pool (OutOfTables) and leaves a
-            // half-built mapping the guest re-faults on forever (an apparent hang).
-            let blocks = len / TWO_MIB;
-            for i in 0..blocks {
-                let v = va + i * TWO_MIB;
-                let p = ipa + i * TWO_MIB;
-                let l2_off = self.descend_creating(v, 2)?;
-                let idx = indices(v);
-                self.write_desc(l2_off + idx[2] * 8, (p & PA_MASK_2MIB) | block_flags);
-            }
-            let tail_off = blocks * TWO_MIB;
-            let tail_pages = (len - tail_off).div_ceil(FOUR_KIB);
-            for j in 0..tail_pages {
-                let v = va + tail_off + j * FOUR_KIB;
-                let p = ipa + tail_off + j * FOUR_KIB;
-                let l3_off = self.descend_creating(v, 3)?;
-                let idx = indices(v);
-                self.write_desc(l3_off + idx[3] * 8, (p & PA_MASK_4KIB) | page_flags);
-            }
-            return Ok(true);
+        const L1_SPAN: u64 = 1 << 39;
+        if len == 0 {
+            return Ok(false);
         }
-        // va/ipa not 2 MiB-aligned (no caller does this for aliases today, but
-        // keep a correct fallback): page-granular throughout.
-        let pages = len.div_ceil(FOUR_KIB);
-        for i in 0..pages {
-            let v = va + i * FOUR_KIB;
-            let p = ipa + i * FOUR_KIB;
-            let l3_off = self.descend_creating(v, 3)?;
-            let idx = indices(v);
-            self.write_desc(l3_off + idx[3] * 8, (p & PA_MASK_4KIB) | page_flags);
+        let end = va.checked_add(len).ok_or(PageTableError::BadAddress)?;
+
+        // Upper-bound the new tables this build can need, so an unsatisfiable
+        // one is refused before a single descriptor is written. Coarse leaves
+        // need no table at their own level, so only the levels ABOVE the leaf
+        // count. When VA and IPA are incongruent mod 2 MiB no block leaf is
+        // expressible anywhere and the build is page-granular throughout —
+        // which is what makes the budget check load-bearing rather than
+        // theoretical.
+        let congruent = (va & (TWO_MIB - 1)) == (ipa & (TWO_MIB - 1));
+        let l1_tables = Self::spans_touched(va, end, L1_SPAN);
+        let l2_tables = Self::spans_touched(va, end, ONE_GIB);
+        let l3_tables = if congruent {
+            // Only the two unaligned edges fall to pages.
+            Self::spans_touched(va, end, TWO_MIB).min(2)
+        } else {
+            Self::spans_touched(va, end, TWO_MIB)
+        };
+        if l1_tables + l2_tables + l3_tables > self.spare_tables_available() {
+            return Err(PageTableError::OutOfTables);
+        }
+
+        let mut cursor = va;
+        while cursor < end {
+            let out = ipa + (cursor - va);
+            let remaining = end - cursor;
+            let level = if cursor.is_multiple_of(ONE_GIB)
+                && out.is_multiple_of(ONE_GIB)
+                && remaining >= ONE_GIB
+            {
+                1
+            } else if cursor.is_multiple_of(TWO_MIB)
+                && out.is_multiple_of(TWO_MIB)
+                && remaining >= TWO_MIB
+            {
+                2
+            } else {
+                3
+            };
+            let (span, mask) = Self::level_span(level);
+            let flags = if level == 3 { page_flags } else { block_flags };
+            let table_off = self.descend_creating(cursor, level)?;
+            let idx = indices(cursor);
+            self.write_desc(table_off + idx[level] * 8, (out & mask) | flags);
+            cursor += span;
         }
         Ok(true)
     }
@@ -1666,6 +1713,82 @@ mod tests {
         assert_eq!(mgr.translate(va + 0x123), None);
         assert_eq!(mgr.translate_retained_output(va + 0x123), Some(ipa + 0x123));
         assert_eq!(mgr.debug_walk(va)[3] & VALID, 0);
+    }
+
+    #[test]
+    fn multi_gib_alias_maps_with_coarse_leaves_and_a_tiny_table_budget() {
+        const ONE_GIB: u64 = 1 << 30;
+        let mut mgr = manager();
+        let (before, _, capacity) = mgr.pool_stats();
+        let va = LINUX_HIGH_VA_THRESHOLD;
+        let ipa = LINUX_ALIAS_IPA_BASE;
+        // CPython mmaps a 2 GiB sparse file, so the alias length rounds to
+        // 2 GiB + 16 KiB. A page-granular build needs ~1024 L3 tables — far
+        // more than the spare pool — while coarse leaves need a handful.
+        let len = 2 * ONE_GIB + 4 * 0x1000;
+        mgr.map_aliased(va, ipa, len, true)
+            .expect("a 2 GiB + 16 KiB alias must map");
+        let (after, _, _) = mgr.pool_stats();
+        assert!(
+            after.saturating_sub(before) <= 8,
+            "coarse leaves must keep the table budget O(1): used {} of {capacity}",
+            after.saturating_sub(before)
+        );
+        assert_eq!(mgr.translate(va), Some(ipa));
+        assert_eq!(
+            mgr.translate(va + ONE_GIB + 0x1234),
+            Some(ipa + ONE_GIB + 0x1234)
+        );
+        assert_eq!(mgr.translate(va + 2 * ONE_GIB), Some(ipa + 2 * ONE_GIB));
+        assert_eq!(mgr.translate(va + len - 1), Some(ipa + len - 1));
+    }
+
+    #[test]
+    fn a_gib_aligned_alias_span_uses_l1_block_leaves() {
+        const ONE_GIB: u64 = 1 << 30;
+        let mut mgr = manager();
+        let va = LINUX_HIGH_VA_THRESHOLD;
+        let ipa = LINUX_ALIAS_IPA_BASE;
+        mgr.map_aliased(va, ipa, ONE_GIB, true)
+            .expect("a 1 GiB alias must map");
+        let walk = mgr.debug_walk(va);
+        assert_ne!(walk[1] & VALID, 0, "L1 leaf must be valid");
+        assert_eq!(
+            walk[1] & TYPE_BITS,
+            TYPE_BLOCK,
+            "a 1 GiB-aligned span must terminate in an L1 block leaf"
+        );
+        assert_eq!(walk[2], 0, "a 1 GiB block has no L2 table beneath it");
+        assert_eq!(mgr.translate(va + ONE_GIB - 1), Some(ipa + ONE_GIB - 1));
+    }
+
+    #[test]
+    fn an_unsatisfiable_alias_build_writes_nothing() {
+        const FOUR_KIB: u64 = 1 << 12;
+        const ONE_GIB: u64 = 1 << 30;
+        let mut mgr = manager();
+        // VA and IPA incongruent mod 2 MiB: no block leaf can express this
+        // translation, so the build is page-granular and cannot fit the spare
+        // pool. It must be refused WHOLE rather than half-built — a partial
+        // mapping is one the guest re-faults on forever.
+        let va = LINUX_HIGH_VA_THRESHOLD;
+        let ipa = LINUX_ALIAS_IPA_BASE + FOUR_KIB;
+        let before = mgr.pool_stats();
+        assert_eq!(
+            mgr.map_aliased(va, ipa, ONE_GIB, true),
+            Err(PageTableError::OutOfTables)
+        );
+        assert_eq!(
+            mgr.pool_stats(),
+            before,
+            "a refused build must consume no spare tables"
+        );
+        assert_eq!(
+            mgr.translate(va),
+            None,
+            "a refused build must leave no live translation"
+        );
+        assert_eq!(mgr.translate(va + ONE_GIB / 2), None);
     }
 
     #[test]
