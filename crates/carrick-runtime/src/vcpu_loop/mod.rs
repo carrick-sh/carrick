@@ -572,11 +572,13 @@ use signal::el0_debug_signal;
 /// Linux parentage remains authoritative in `Kernel`; this table only turns
 /// the parent key selected there into the host wake objects needed to deliver
 /// the configured child-exit signal.
+#[derive(Clone)]
 struct HvpatchRuntimeEndpoint {
     kernel: Weak<KernelState>,
-    /// Exact parent task generation retained at endpoint publication. Child
-    /// exit notification must not recapture a newer registry association.
-    signal_context: crate::kernel::KernelContext,
+    /// Exact parent task generation retained at endpoint publication. Each
+    /// notification recaptures one CURRENT live thread through this binding so
+    /// exec's replacement Sighand is observed without accepting PID reuse.
+    task_binding: crate::kernel::KernelTaskBinding,
 }
 
 /// The kernel lane's [`TaskWaker`](crate::kernel::TaskWaker): the three vehicles a guest task on this
@@ -663,28 +665,31 @@ impl HvpatchRuntimeDirectory {
     }
 
     fn notify_child_exit(&self, parent: crate::kernel::TaskKey, signal: Option<i32>) {
-        let endpoints = self.endpoints.lock();
-        let Some(endpoint) = endpoints.get(&parent) else {
+        let Some(endpoint) = self.endpoints.lock().get(&parent).cloned() else {
             return;
         };
         let Some(parent_kernel) = endpoint.kernel.upgrade() else {
             return;
         };
+        let Ok(signal_snapshot) = endpoint.task_binding.capture_signal_snapshot() else {
+            return;
+        };
+        let signal_context = signal_snapshot.context();
         if let Some(signal) = signal
             && parent_kernel
                 .dispatcher
-                .child_exit_signal_needs_process_pump(&endpoint.signal_context, signal as u32)
+                .child_exit_signal_snapshot_needs_pump(&signal_snapshot, signal as u32)
         {
             parent_kernel
                 .dispatcher
-                .mark_in_process_signal_pending(&endpoint.signal_context, signal);
+                .mark_in_process_signal_pending(signal_context, signal);
         }
         // Child waitability is independent of SIGCHLD disposition. The Kernel
         // zombie is durable, but a parent can be between its initial wait query
         // and host-wait enrollment when publication occurs; always nudge every
         // wait vehicle so it rechecks the authoritative graph even when SIGCHLD
         // is ignored or blocked.
-        endpoint.signal_context.task().wake();
+        signal_context.task().wake();
     }
 }
 
@@ -1167,7 +1172,7 @@ impl KernelState {
             process.task_key(),
             HvpatchRuntimeEndpoint {
                 kernel: Arc::downgrade(self),
-                signal_context,
+                task_binding: binding,
             },
         );
     }
@@ -5837,6 +5842,130 @@ mod tests {
         assert!(directory.join_process_threads().is_err());
         assert!(completed.load(std::sync::atomic::Ordering::Acquire));
         assert!(directory.process_threads.lock().is_empty());
+    }
+
+    struct EndpointTestForkCoordinator;
+
+    impl HostForkCoordinator for EndpointTestForkCoordinator {
+        fn start_signal_pump(
+            &self,
+            _registry: &Arc<dyn VcpuRegistry>,
+            _futex: &Arc<dyn PlatformFutex>,
+        ) {
+        }
+
+        fn prepare_host_fork(&self) -> carrick_hal::PreparedHostFork {
+            carrick_hal::PreparedHostFork {
+                had_signal_pump: false,
+            }
+        }
+
+        fn restart_after_parent_fork(
+            &self,
+            _prepared: carrick_hal::PreparedHostFork,
+            _registry: &Arc<dyn VcpuRegistry>,
+            _futex: &Arc<dyn PlatformFutex>,
+            _child_exit_needs_signal_pump: bool,
+        ) {
+        }
+
+        fn restart_after_child_fork(
+            &self,
+            _prepared: carrick_hal::PreparedHostFork,
+            _registry: &Arc<dyn VcpuRegistry>,
+            _futex: &Arc<dyn PlatformFutex>,
+        ) {
+        }
+
+        fn restart_after_fork_error(
+            &self,
+            _prepared: carrick_hal::PreparedHostFork,
+            _registry: &Arc<dyn VcpuRegistry>,
+            _futex: &Arc<dyn PlatformFutex>,
+        ) {
+        }
+    }
+
+    struct EndpointTestSignalArrival;
+
+    impl carrick_hal::SignalArrival for EndpointTestSignalArrival {
+        fn wake_all_waiters(&self) {}
+    }
+
+    #[test]
+    fn hvpatch_child_exit_reads_the_post_exec_sighand_generation() {
+        let dispatcher = SyscallDispatcher::new();
+        let pre_exec = dispatcher
+            .capture_one_task_context()
+            .expect("pre-exec context");
+        let task = pre_exec.task().key();
+        let directory = HvpatchRuntimeDirectory::default();
+        let kernel = Arc::new(KernelState::new(
+            dispatcher,
+            Arc::new(EndpointTestForkCoordinator),
+            Arc::new(EndpointTestSignalArrival),
+            None,
+            None,
+            None,
+        ));
+        directory.register(
+            task,
+            HvpatchRuntimeEndpoint {
+                kernel: Arc::downgrade(&kernel),
+                task_binding: pre_exec.task_binding(),
+            },
+        );
+
+        let prepared = kernel
+            .dispatcher
+            .prepare_one_task_kernel_exec(&pre_exec)
+            .expect("prepare exec");
+        let post_exec = kernel
+            .dispatcher
+            .commit_one_task_kernel_exec(prepared)
+            .expect("commit exec");
+        let chld = crate::linux_abi::LINUX_SIGCHLD;
+        let signal = crate::kernel::LinuxSignal::for_signal_number(chld).expect("SIGCHLD");
+        let mut caught = carrick_abi::LinuxSigaction::empty();
+        caught.sa_handler = 0x4000;
+        post_exec.shared().sighand().install_action(signal, caught);
+
+        assert_eq!(pre_exec.task().key(), post_exec.task().key());
+        assert_ne!(pre_exec.revision(), post_exec.revision());
+        assert_ne!(pre_exec.thread().key(), post_exec.thread().key());
+        assert_ne!(
+            pre_exec.shared().sighand().id(),
+            post_exec.shared().sighand().id()
+        );
+        let post_exec_snapshot = pre_exec
+            .task_binding()
+            .capture_signal_snapshot()
+            .expect("post-exec signal snapshot");
+        assert_eq!(
+            post_exec_snapshot.context().revision(),
+            post_exec.revision()
+        );
+        assert_eq!(
+            post_exec_snapshot.context().thread().key(),
+            post_exec.thread().key()
+        );
+        assert_eq!(post_exec_snapshot.threads().len(), 1);
+        assert_eq!(
+            post_exec_snapshot.threads()[0].key(),
+            post_exec.thread().key()
+        );
+        assert_eq!(
+            post_exec.shared().sighand().disposition(signal),
+            crate::kernel::SignalDisposition::Caught
+        );
+        directory.notify_child_exit(task, Some(chld));
+        assert!(
+            post_exec
+                .shared()
+                .pending_signals()
+                .present()
+                .contains(chld)
+        );
     }
 
     #[test]

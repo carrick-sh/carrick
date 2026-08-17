@@ -1,0 +1,11 @@
+source_head=9f754b6ca85dd26e2ce19d1be99aed71d4ab5acf
+binary=target/release/carrick
+sha256=c1a87b072a8f64d186fcabf6d4f9a10f0ec265c19f5e4130c9f11e7e968b6a39
+cdhash=a6dc89a5237d262816815f3f04d8d7b1c030cfcd
+lc_uuid=2C67E91C-D4E9-3DB8-8430-8A4886A6D066
+codesign_identifier=carrick.tmp.257
+codesign_flags=0x2(adhoc)
+hypervisor_entitlement=true
+dof_section=__TEXT,__dof_carrick
+node_image=localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0
+node_image_digest=sha256:1ed49af83bd30401e1b275957b99a1c28f6c582ab3d987997afb5888fa302718
