@@ -818,6 +818,7 @@ fn alias_registry() -> &'static parking_lot::Mutex<Vec<AliasBacking>> {
 struct GlobalFrameHostOwner {
     _mapping: crate::host_mapping::OwnedHostMapping,
     _lease: GlobalFrameStage2Lease,
+    perms: u64,
 }
 
 // SAFETY: the mapping is process-address-space state. Its address is stable,
@@ -839,6 +840,7 @@ fn global_frame_host_owners()
 fn register_global_frame_host_owner(
     lease: GlobalFrameStage2Lease,
     mapping: crate::host_mapping::OwnedHostMapping,
+    perms: u64,
 ) -> Result<(), TrapError> {
     let key = lease.key();
     if key.1 != mapping.len() as u64 || !lease.mapped {
@@ -859,6 +861,7 @@ fn register_global_frame_host_owner(
         GlobalFrameHostOwner {
             _mapping: mapping,
             _lease: lease,
+            perms,
         },
     );
     Ok(())
@@ -3980,6 +3983,10 @@ impl GlobalFrameStage2Lease {
         self.mapped = true;
     }
 
+    fn mark_unmapped(&mut self) {
+        self.mapped = false;
+    }
+
     fn key(&self) -> (u64, u64) {
         (self.base, self.length)
     }
@@ -4293,6 +4300,99 @@ struct GlobalExecPlan {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExecStage2Install {
+    ipa: u64,
+    size: usize,
+    host: *mut u8,
+    perms: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ExecStage2Install {
+    #[cfg(test)]
+    fn key(&self) -> (u64, u64) {
+        (self.ipa, self.size as u64)
+    }
+
+    #[cfg(test)]
+    fn for_test(ipa: u64, size: usize) -> Self {
+        Self {
+            ipa,
+            size,
+            host: std::ptr::null_mut(),
+            perms: 0,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn switch_exec_stage2_transaction(
+    old: &[ExecStage2Install],
+    new: &[ExecStage2Install],
+    fail_after_maps: Option<usize>,
+    mut unmap: impl FnMut(&ExecStage2Install) -> Result<(), TrapError>,
+    mut map: impl FnMut(&ExecStage2Install) -> Result<(), TrapError>,
+) -> Result<(), TrapError> {
+    for (old_unmapped, extent) in old.iter().enumerate() {
+        if let Err(error) = unmap(extent) {
+            for restore in &old[..old_unmapped] {
+                map(restore).unwrap_or_else(|rollback| {
+                    eprintln!(
+                        "carrick: FATAL: restore HVPatch exec predecessor after unmap failure: {rollback}"
+                    );
+                    std::process::abort();
+                });
+            }
+            return Err(error);
+        }
+    }
+
+    let rollback =
+        |mapped: usize,
+         unmap: &mut dyn FnMut(&ExecStage2Install) -> Result<(), TrapError>,
+         map: &mut dyn FnMut(&ExecStage2Install) -> Result<(), TrapError>| {
+            for replacement in new[..mapped].iter().rev() {
+                unmap(replacement).unwrap_or_else(|error| {
+                    eprintln!(
+                        "carrick: FATAL: rollback HVPatch exec replacement stage-2 mapping: {error}"
+                    );
+                    std::process::abort();
+                });
+            }
+            for predecessor in old {
+                map(predecessor).unwrap_or_else(|error| {
+                    eprintln!(
+                        "carrick: FATAL: restore HVPatch exec predecessor stage-2 mapping: {error}"
+                    );
+                    std::process::abort();
+                });
+            }
+        };
+
+    for (new_mapped, extent) in new.iter().enumerate() {
+        if fail_after_maps == Some(new_mapped) {
+            rollback(new_mapped, &mut unmap, &mut map);
+            return Err(TrapError::Hypervisor(format!(
+                "injected HVPatch exec stage-2 map failure after {new_mapped} maps"
+            )));
+        }
+        if let Err(error) = map(extent) {
+            rollback(new_mapped, &mut unmap, &mut map);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn exec_stage2_fail_after_maps() -> Option<usize> {
+    std::env::var("CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn global_frame_exec_lease_order(mappings: &[GuestMapping], table_index: usize) -> Vec<usize> {
     let mut order: Vec<usize> = (0..mappings.len())
         .filter(|&index| !is_sparse_hvpatch_mmap_mapping(&mappings[index]))
@@ -4306,6 +4406,161 @@ fn global_frame_exec_lease_order(mappings: &[GuestMapping], table_index: usize) 
         )
     });
     order
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn prepare_global_exec_plan(
+    plan: &GuestMappingPlan,
+    mm_root_slot: Option<(u64, u64)>,
+) -> Result<GlobalExecPlan, TrapError> {
+    let old_root = plan.stage1_page_tables_base.ok_or_else(|| {
+        TrapError::Hypervisor("hvpatch exec image has no stage-1 tables".to_owned())
+    })?;
+    let table_index = plan
+        .mappings
+        .iter()
+        .position(|mapping| mapping.guest_start == old_root)
+        .ok_or_else(|| {
+            TrapError::Hypervisor("hvpatch exec page-table mapping absent".to_owned())
+        })?;
+    let mut global = plan.clone();
+    let mut stage2_leases = std::collections::BTreeMap::new();
+    let mut page_tables = crate::page_table::PageTableManager::new(
+        global.mappings[table_index].image.as_ref().clone(),
+        old_root,
+    );
+    const TWO_MIB: u64 = 2 * 1024 * 1024;
+    let mut order = global_frame_exec_lease_order(&global.mappings, table_index);
+    if mm_root_slot.is_none() {
+        // The root's table is allocator-owned after its first exec, unlike a
+        // child's fixed root-slot table. Preserve scarce large holes by giving
+        // the largest root mappings first choice before reserving the table.
+        order.sort_by_key(|&index| {
+            (
+                std::cmp::Reverse(global.mappings[index].mapped_size),
+                global.mappings[index].guest_start,
+                index,
+            )
+        });
+    }
+    for index in order {
+        let mapping = &mut global.mappings[index];
+        let lease = if let Some((root_slot_base, root_slot_size)) = mm_root_slot
+            && index == table_index
+        {
+            if mapping.mapped_size > root_slot_size {
+                return Err(TrapError::Hypervisor(format!(
+                    "hvpatch stage-1 root needs {} bytes, slot has {root_slot_size}",
+                    mapping.mapped_size
+                )));
+            }
+            let lease = GlobalFrameStage2Lease::fixed(root_slot_base, mapping.mapped_size);
+            if lease
+                .base
+                .checked_add(mapping.mapped_size)
+                .is_none_or(|end| end > root_slot_base.saturating_add(root_slot_size))
+            {
+                return Err(TrapError::Hypervisor(format!(
+                    "hvpatch stage-1 root mapping escapes slot 0x{root_slot_base:x}..0x{:x}",
+                    root_slot_base.saturating_add(root_slot_size)
+                )));
+            }
+            lease
+        } else {
+            let alignment =
+                if mapping.guest_start.is_multiple_of(TWO_MIB) && mapping.mapped_size >= TWO_MIB {
+                    TWO_MIB
+                } else {
+                    HVF_PAGE_SIZE
+                };
+            GlobalFrameStage2Lease::reserve(mapping.mapped_size, alignment)?
+        };
+        let ipa = lease.base;
+        mapping.ipa_start = ipa;
+        if stage2_leases
+            .insert((ipa, mapping.mapped_size), lease)
+            .is_some()
+        {
+            return Err(TrapError::Hypervisor(format!(
+                "duplicate HVPatch exec stage-2 lease IPA 0x{ipa:x} size {}",
+                mapping.mapped_size
+            )));
+        }
+    }
+    let root = global.mappings[table_index].ipa_start;
+    page_tables.rebase(root).map_err(|error| {
+        TrapError::Hypervisor(format!("rebase HVPatch exec page tables: {error:?}"))
+    })?;
+    for mapping in global
+        .mappings
+        .iter()
+        .filter(|mapping| !is_sparse_hvpatch_mmap_mapping(mapping))
+    {
+        let remap = if (crate::memory::LINUX_KERNEL_REGION_BASE
+            ..crate::memory::LINUX_KERNEL_REGION_BASE + TWO_MIB)
+            .contains(&mapping.guest_start)
+        {
+            page_tables.map_kernel_aliased(
+                mapping.guest_start,
+                mapping.ipa_start,
+                mapping.mapped_size,
+            )
+        } else {
+            page_tables.map_aliased(
+                mapping.guest_start,
+                mapping.ipa_start,
+                mapping.mapped_size,
+                mapping.perms.write,
+            )
+        };
+        remap.map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "plan global-frame HVPatch exec VA 0x{:x}: {error:?}",
+                mapping.guest_start
+            ))
+        })?;
+    }
+    page_tables
+        .set_prot_none(
+            crate::memory::LINUX_MMAP_BASE,
+            crate::memory::mmap_arena_size() as usize,
+        )
+        .map_err(|error| {
+            TrapError::Hypervisor(format!("reserve sparse HVPatch mmap arena: {error:?}"))
+        })?;
+    reapply_global_exec_readonly_spans(&mut page_tables, &global.ro_spans)?;
+    for mapping in &global.mappings {
+        let expected = (!is_sparse_hvpatch_mmap_mapping(mapping)).then_some(mapping.ipa_start);
+        if page_tables.translate(mapping.guest_start) != expected {
+            return Err(TrapError::Hypervisor(format!(
+                "hvpatch exec translation mismatch for VA 0x{:x}: expected={expected:x?}",
+                mapping.guest_start,
+            )));
+        }
+    }
+    carrick_aarch64::engine::reserve_hvpatch_process_apertures(&mut page_tables).map_err(
+        |error| {
+            TrapError::Hypervisor(format!(
+                "reserve hvpatch exec root-slot/global-frame apertures: {error:?}"
+            ))
+        },
+    )?;
+    let table_bytes = page_tables.into_bytes();
+    {
+        let table = &mut global.mappings[table_index];
+        if table.ipa_start != root || table_bytes.len() > table.mapped_size as usize {
+            return Err(TrapError::Hypervisor(
+                "hvpatch exec page-table root-slot layout mismatch".to_owned(),
+            ));
+        }
+        table.image = table_bytes.into();
+        table.payload_size = table.image.len() as u64;
+    }
+    global.stage1_page_tables_base = Some(root);
+    Ok(GlobalExecPlan {
+        plan: global,
+        stage2_leases,
+    })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4401,6 +4656,74 @@ pub struct ThreadSpec;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
+    fn exec_predecessor_stage2_installs(
+        &self,
+        extents: &std::collections::BTreeSet<(u64, usize)>,
+    ) -> Result<Vec<ExecStage2Install>, TrapError> {
+        let owners = global_frame_host_owners().lock();
+        let mut installs = Vec::with_capacity(extents.len());
+        for &(ipa, size) in extents {
+            if let Some(owner) = owners.get(&(ipa, size as u64)) {
+                installs.push(ExecStage2Install {
+                    ipa,
+                    size,
+                    host: owner._mapping.as_ptr(),
+                    perms: owner.perms,
+                });
+                continue;
+            }
+            let mapping = self
+                .mappings
+                .iter()
+                .find(|mapping| mapping.physical_ipa == ipa && mapping.physical_size == size)
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(format!(
+                        "HVPatch exec predecessor IPA 0x{ipa:x} size {size} has no live backing"
+                    ))
+                })?;
+            let offset = mapping.ipa.checked_sub(mapping.physical_ipa).ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "HVPatch exec predecessor semantic IPA 0x{:x} precedes physical IPA 0x{ipa:x}",
+                    mapping.ipa
+                ))
+            })?;
+            let offset = usize::try_from(offset).map_err(|_| TrapError::MappingTooLarge(offset))?;
+            let host = unsafe { mapping.host_addr.sub(offset) };
+            installs.push(ExecStage2Install {
+                ipa,
+                size,
+                host,
+                perms: u64::from(mapping.perms),
+            });
+        }
+        Ok(installs)
+    }
+
+    fn finish_exec_predecessor_stage2_retirement(
+        &mut self,
+        ipa: u64,
+        length: u64,
+    ) -> Result<(), TrapError> {
+        if let Some(mut owner) = global_frame_host_owners().lock().remove(&(ipa, length)) {
+            owner._lease.mark_unmapped();
+            drop(owner);
+            return Ok(());
+        }
+        if let Some(mut lease) = self.mappings.iter_mut().find_map(|mapping| {
+            (mapping
+                .stage2_lease
+                .as_ref()
+                .is_some_and(|lease| lease.key() == (ipa, length)))
+            .then(|| mapping.stage2_lease.take())
+            .flatten()
+        }) {
+            lease.mark_unmapped();
+            drop(lease);
+            return Ok(());
+        }
+        release_retired_stage2_ipa(ipa, length)
+    }
+
     fn retire_stage2_extent(&mut self, ipa: u64, length: u64) -> Result<(), TrapError> {
         if retire_global_frame_host_owner(ipa, length) {
             return Ok(());
@@ -6377,7 +6700,7 @@ impl HvfVmState {
             )));
         }
         lease.mark_mapped();
-        register_global_frame_host_owner(lease, host_mapping)?;
+        register_global_frame_host_owner(lease, host_mapping, u64::from(stage2_perms))?;
         let mut owner_rollback = GlobalFrameOwnerRollback::default();
         owner_rollback.record((physical_ipa, physical_len));
 
@@ -6809,7 +7132,7 @@ impl HvfVmState {
             )));
         }
         new_lease.mark_mapped();
-        register_global_frame_host_owner(new_lease, new_host)?;
+        register_global_frame_host_owner(new_lease, new_host, u64::from(stage2_perms))?;
         let mut owner_rollback = GlobalFrameOwnerRollback::default();
         owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE));
 
@@ -7279,7 +7602,7 @@ impl HvfVmState {
             )));
         }
         new_lease.mark_mapped();
-        register_global_frame_host_owner(new_lease, new_host)?;
+        register_global_frame_host_owner(new_lease, new_host, u64::from(stage2_perms))?;
 
         let backing = Self::private_backing_identity();
         let split = match Self::stage_cow_inventory_split(
@@ -8277,6 +8600,7 @@ impl HvfVmState {
                     TrapError::Hypervisor("HVPatch alias lost its global IPA lease".to_owned())
                 })?,
                 host_mapping,
+                u64::from(perms),
             )?;
             None
         } else {
@@ -11173,187 +11497,8 @@ impl HvfVmState {
         Ok((state, vcpu, mailbox))
     }
 
-    /// Remove every stage-2 range owned by the current guest address space
-    /// while retaining the process-wide HVF VM. The per-thread mapping list
-    /// covers the boot image; the alias registry contributes dynamic mappings
-    /// installed by any sibling. Duplicate IPA extents are unmap-once.
-    fn unmap_address_space_for_exec(
-        &mut self,
-    ) -> Result<std::collections::BTreeSet<(u64, usize)>, TrapError> {
-        // The backend inventory, not a vCPU-local mapping Vec or the global
-        // alias index, is the exact logical ownership ledger. A physical extent
-        // shared by another live mm stays installed until the last logical
-        // reference retires. The runtime holds its process-wide HVPatch topology
-        // lock across this selection, every unmap below, and stage_retirement;
-        // alias map, fork materialization, and process retirement take that same
-        // lock, so the shared reference ledger cannot change between them.
-        let extents = final_exec_physical_extents(&self.frame_inventory.lock())?;
-        for &(ipa, size) in &extents {
-            crate::probes::hvpatch_exec_stage2(
-                carrick_observability::probes::HvpatchExecStage2::new(
-                    carrick_observability::probes::HvpatchExecStage2Phase::UnmapBegin,
-                    ipa,
-                    size as u64,
-                    u64::MAX,
-                    0,
-                ),
-            );
-            let result = self.retire_stage2_extent(ipa, size as u64);
-            crate::probes::hvpatch_exec_stage2(
-                carrick_observability::probes::HvpatchExecStage2::new(
-                    carrick_observability::probes::HvpatchExecStage2Phase::UnmapEnd,
-                    ipa,
-                    size as u64,
-                    u64::MAX,
-                    if result.is_ok() { 0 } else { -1 },
-                ),
-            );
-            result?;
-        }
-        Ok(extents)
-    }
-
     fn global_frame_exec_plan(&self, plan: &GuestMappingPlan) -> Result<GlobalExecPlan, TrapError> {
-        let Some((root_slot_base, root_slot_size)) = self.mm_root_slot else {
-            return Ok(GlobalExecPlan {
-                plan: plan.clone(),
-                stage2_leases: std::collections::BTreeMap::new(),
-            });
-        };
-        let old_root = plan.stage1_page_tables_base.ok_or_else(|| {
-            TrapError::Hypervisor("hvpatch exec image has no stage-1 tables".to_owned())
-        })?;
-        let table_index = plan
-            .mappings
-            .iter()
-            .position(|mapping| mapping.guest_start == old_root)
-            .ok_or_else(|| {
-                TrapError::Hypervisor("hvpatch exec page-table mapping absent".to_owned())
-            })?;
-        let mut global = plan.clone();
-        let mut stage2_leases = std::collections::BTreeMap::new();
-        let mut page_tables = crate::page_table::PageTableManager::new(
-            global.mappings[table_index].image.as_ref().clone(),
-            old_root,
-        );
-        page_tables.rebase(root_slot_base).map_err(|error| {
-            TrapError::Hypervisor(format!("rebase hvpatch exec page tables: {error:?}"))
-        })?;
-
-        let order = global_frame_exec_lease_order(&global.mappings, table_index);
-        const TWO_MIB: u64 = 2 * 1024 * 1024;
-        for index in order {
-            let mapping = &mut global.mappings[index];
-            let lease = if index == table_index {
-                if mapping.mapped_size > root_slot_size {
-                    return Err(TrapError::Hypervisor(format!(
-                        "hvpatch stage-1 root needs {} bytes, slot has {root_slot_size}",
-                        mapping.mapped_size
-                    )));
-                }
-                GlobalFrameStage2Lease::fixed(root_slot_base, mapping.mapped_size)
-            } else {
-                let alignment = if mapping.guest_start.is_multiple_of(TWO_MIB)
-                    && mapping.mapped_size >= TWO_MIB
-                {
-                    TWO_MIB
-                } else {
-                    HVF_PAGE_SIZE
-                };
-                GlobalFrameStage2Lease::reserve(mapping.mapped_size, alignment)?
-            };
-            let ipa = lease.base;
-            if index == table_index
-                && ipa
-                    .checked_add(mapping.mapped_size)
-                    .is_none_or(|end| end > root_slot_base.saturating_add(root_slot_size))
-            {
-                return Err(TrapError::Hypervisor(format!(
-                    "hvpatch stage-1 root mapping escapes slot 0x{root_slot_base:x}..0x{:x}",
-                    root_slot_base.saturating_add(root_slot_size)
-                )));
-            }
-            mapping.ipa_start = ipa;
-            if stage2_leases
-                .insert((ipa, mapping.mapped_size), lease)
-                .is_some()
-            {
-                return Err(TrapError::Hypervisor(format!(
-                    "duplicate HVPatch exec stage-2 lease IPA 0x{ipa:x} size {}",
-                    mapping.mapped_size
-                )));
-            }
-            let remap = if (crate::memory::LINUX_KERNEL_REGION_BASE
-                ..crate::memory::LINUX_KERNEL_REGION_BASE + TWO_MIB)
-                .contains(&mapping.guest_start)
-            {
-                page_tables.map_kernel_aliased(mapping.guest_start, ipa, mapping.mapped_size)
-            } else {
-                page_tables.map_aliased(
-                    mapping.guest_start,
-                    ipa,
-                    mapping.mapped_size,
-                    mapping.perms.write,
-                )
-            };
-            remap.map_err(|error| {
-                TrapError::Hypervisor(format!(
-                    "plan global-frame HVPatch exec VA 0x{:x}: {error:?}",
-                    mapping.guest_start
-                ))
-            })?;
-        }
-        // The mmap arena is a semantic reservation, not a boot frame.  Keep
-        // its coarse stage-1 coverage invalid until an exact VMA commit gives
-        // that mm private zero backing.  No host mapping, stage-2 entry,
-        // global-frame lease, or frame-inventory identity exists for this
-        // hidden reservation.
-        page_tables
-            .set_prot_none(
-                crate::memory::LINUX_MMAP_BASE,
-                crate::memory::mmap_arena_size() as usize,
-            )
-            .map_err(|error| {
-                TrapError::Hypervisor(format!("reserve sparse HVPatch mmap arena: {error:?}"))
-            })?;
-        // The loader deliberately merges overlapping PT_LOAD regions into one
-        // writable mapping for the HVF stage-2 backing. Re-aliasing that merged
-        // region above therefore grants write at every stage-1 leaf. Restore the
-        // loader's page-granular non-writable PT_LOAD spans after the rebase;
-        // set_readonly edits attributes in place and preserves each aliased IPA.
-        reapply_global_exec_readonly_spans(&mut page_tables, &global.ro_spans)?;
-        for mapping in &global.mappings {
-            let expected = (!is_sparse_hvpatch_mmap_mapping(mapping)).then_some(mapping.ipa_start);
-            if page_tables.translate(mapping.guest_start) != expected {
-                return Err(TrapError::Hypervisor(format!(
-                    "hvpatch exec translation mismatch for VA 0x{:x}: expected={expected:x?}",
-                    mapping.guest_start,
-                )));
-            }
-        }
-        carrick_aarch64::engine::reserve_hvpatch_process_apertures(&mut page_tables).map_err(
-            |error| {
-                TrapError::Hypervisor(format!(
-                    "reserve hvpatch exec root-slot/global-frame apertures: {error:?}"
-                ))
-            },
-        )?;
-        let table_bytes = page_tables.into_bytes();
-        {
-            let table = &mut global.mappings[table_index];
-            if table.ipa_start != root_slot_base || table_bytes.len() > table.mapped_size as usize {
-                return Err(TrapError::Hypervisor(
-                    "hvpatch exec page-table root-slot layout mismatch".to_owned(),
-                ));
-            }
-            table.image = table_bytes.into();
-            table.payload_size = table.image.len() as u64;
-        }
-        global.stage1_page_tables_base = Some(root_slot_base);
-        Ok(GlobalExecPlan {
-            plan: global,
-            stage2_leases,
-        })
+        prepare_global_exec_plan(plan, self.mm_root_slot)
     }
 
     /// `execve(2)` image replacement. Ordinary VMM tears down and rebuilds the
@@ -11422,6 +11567,31 @@ impl HvfVmState {
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
         let plan = &global_plan;
+        let map_backings_started = std::time::Instant::now();
+        let mut prepared_exec_regions = Vec::new();
+        if self.persistent_vm_lifecycle {
+            for mapping in plan
+                .mappings
+                .iter()
+                .filter(|mapping| !is_sparse_hvpatch_mmap_mapping(mapping))
+            {
+                let key = (mapping.ipa_start, mapping.mapped_size);
+                let lease = stage2_leases.remove(&key).ok_or_else(|| {
+                    TrapError::Hypervisor(format!(
+                        "HVPatch exec mapping IPA 0x{:x} size {} has no owning lease",
+                        key.0, key.1
+                    ))
+                })?;
+                let region = prepare_exec_region_raw(mapping)?;
+                prepared_exec_regions.push((region, lease));
+            }
+            if !stage2_leases.is_empty() {
+                return Err(TrapError::Hypervisor(format!(
+                    "HVPatch exec left {} reserved stage-2 leases unmaterialized",
+                    stage2_leases.len()
+                )));
+            }
+        }
         let emit_replace_stage =
             |phase: carrick_observability::probes::HvpatchExecReplaceStagePhase,
              started: std::time::Instant| {
@@ -11453,9 +11623,92 @@ impl HvfVmState {
         let address_space_teardown_started = std::time::Instant::now();
         let retired_physical_extents = if self.persistent_vm_lifecycle {
             // The vCPU is stopped at the execve syscall exit and every sibling
-            // has already retired. Remove only extents whose final logical
-            // references belong to this old mm.
-            let extents = self.unmap_address_space_for_exec()?;
+            // has already retired. Build the complete predecessor/replacement
+            // edge sets before touching stage-2. The switch helper restores the
+            // exact predecessor on every ordinary failure, so backend inventory,
+            // owners and mapping rows remain unchanged until this succeeds.
+            let extents = final_exec_physical_extents(&self.frame_inventory.lock())?;
+            let predecessor = self.exec_predecessor_stage2_installs(&extents)?;
+            let replacement = plan
+                .mappings
+                .iter()
+                .filter(|mapping| !is_sparse_hvpatch_mmap_mapping(mapping))
+                .zip(prepared_exec_regions.iter())
+                .map(|(mapping, (region, _))| exec_stage2_install(mapping, region))
+                .collect::<Vec<_>>();
+            switch_exec_stage2_transaction(
+                &predecessor,
+                &replacement,
+                exec_stage2_fail_after_maps(),
+                |extent| {
+                    crate::probes::hvpatch_exec_stage2(
+                        carrick_observability::probes::HvpatchExecStage2::new(
+                            carrick_observability::probes::HvpatchExecStage2Phase::UnmapBegin,
+                            extent.ipa,
+                            extent.size as u64,
+                            u64::MAX,
+                            0,
+                        ),
+                    );
+                    let rc = unsafe { inventory_hv_vm_unmap(extent.ipa, extent.size) };
+                    crate::probes::hvpatch_exec_stage2(
+                        carrick_observability::probes::HvpatchExecStage2::new(
+                            carrick_observability::probes::HvpatchExecStage2Phase::UnmapEnd,
+                            extent.ipa,
+                            extent.size as u64,
+                            u64::MAX,
+                            if rc == 0 { 0 } else { -1 },
+                        ),
+                    );
+                    if rc == 0 {
+                        Ok(())
+                    } else {
+                        Err(TrapError::Hypervisor(format!(
+                            "unmap HVPatch exec predecessor IPA 0x{:x} size {} failed: 0x{rc:x}",
+                            extent.ipa, extent.size
+                        )))
+                    }
+                },
+                |extent| {
+                    crate::probes::hvpatch_exec_stage2(
+                        carrick_observability::probes::HvpatchExecStage2::new(
+                            carrick_observability::probes::HvpatchExecStage2Phase::MapBegin,
+                            extent.ipa,
+                            extent.size as u64,
+                            u64::MAX,
+                            0,
+                        ),
+                    );
+                    let rc = unsafe {
+                        inventory_hv_vm_map(
+                            extent.host.cast(),
+                            extent.ipa,
+                            extent.size,
+                            extent.perms,
+                        )
+                    };
+                    crate::probes::hvpatch_exec_stage2(
+                        carrick_observability::probes::HvpatchExecStage2::new(
+                            carrick_observability::probes::HvpatchExecStage2Phase::MapEnd,
+                            extent.ipa,
+                            extent.size as u64,
+                            u64::MAX,
+                            rc as i32,
+                        ),
+                    );
+                    if rc == 0 {
+                        Ok(())
+                    } else {
+                        Err(TrapError::Hypervisor(format!(
+                            "map HVPatch exec replacement IPA 0x{:x} size {} failed: 0x{rc:x}",
+                            extent.ipa, extent.size
+                        )))
+                    }
+                },
+            )?;
+            for (_, lease) in &mut prepared_exec_regions {
+                lease.mark_mapped();
+            }
             if let Some((retired, _)) = inventory_reservations.as_mut() {
                 let mut inventory = self.frame_inventory.lock();
                 if let Err(error) = Self::stage_retirement(&mut inventory, retired) {
@@ -11510,6 +11763,9 @@ impl HvfVmState {
         );
         let drop_backings_started = std::time::Instant::now();
         if self.persistent_vm_lifecycle {
+            for &(ipa, size) in &retired_physical_extents {
+                self.finish_exec_predecessor_stage2_retirement(ipa, size as u64)?;
+            }
             // Reclaim only host mappings whose exact stage-2 extents were
             // removed. A shared extent retained for another mm still points at
             // this host allocation, so preserve that backing until VM teardown.
@@ -11581,49 +11837,32 @@ impl HvfVmState {
             page_tables_started,
         );
 
-        // Apply the new mapping plan via the shared raw-mmap helper.
-        let map_backings_started = std::time::Instant::now();
-        let mut owner_rollback = GlobalFrameOwnerRollback::default();
-        for mapping in &plan.mappings {
-            if self.persistent_vm_lifecycle && is_sparse_hvpatch_mmap_mapping(mapping) {
-                continue;
+        // Stage-2 is already switched transactionally on HVPatch. Publish its
+        // host owners only after predecessor retirement can no longer roll
+        // back. Mature VMM still maps through the historical helper here.
+        if self.persistent_vm_lifecycle {
+            for (mut region, lease) in prepared_exec_regions.drain(..) {
+                let key = lease.key();
+                let host_mapping = region.host_mapping.take().unwrap_or_else(|| {
+                    eprintln!(
+                        "carrick: FATAL: HVPatch exec mapping IPA 0x{:x} has no host owner",
+                        key.0
+                    );
+                    std::process::abort();
+                });
+                register_global_frame_host_owner(lease, host_mapping, u64::from(region.perms))
+                    .unwrap_or_else(|error| {
+                        eprintln!(
+                            "carrick: FATAL: publish HVPatch exec global-frame owner: {error}"
+                        );
+                        std::process::abort();
+                    });
+                self.mappings.push(region);
             }
-            let key = (mapping.ipa_start, mapping.mapped_size);
-            let mut stage2_lease = if self.persistent_vm_lifecycle {
-                Some(stage2_leases.remove(&key).ok_or_else(|| {
-                    TrapError::Hypervisor(format!(
-                        "HVPatch exec mapping IPA 0x{:x} size {} has no owning lease",
-                        key.0, key.1
-                    ))
-                })?)
-            } else {
-                None
-            };
-            match map_region_raw(mapping, self.persistent_vm_lifecycle) {
-                Ok(mut region) if self.persistent_vm_lifecycle => {
-                    let mut lease = stage2_lease.take().ok_or_else(|| {
-                        TrapError::Hypervisor("HVPatch exec lost its stage-2 lease".to_owned())
-                    })?;
-                    lease.mark_mapped();
-                    let host_mapping = region.host_mapping.take().ok_or_else(|| {
-                        TrapError::Hypervisor(format!(
-                            "HVPatch exec mapping IPA 0x{:x} has no host owner",
-                            key.0
-                        ))
-                    })?;
-                    register_global_frame_host_owner(lease, host_mapping)?;
-                    owner_rollback.record(key);
-                    self.mappings.push(region);
-                }
-                Ok(region) => self.mappings.push(region),
-                Err(error) => return Err(error),
+        } else {
+            for mapping in &plan.mappings {
+                self.mappings.push(map_region_raw(mapping, false)?);
             }
-        }
-        if !stage2_leases.is_empty() {
-            return Err(TrapError::Hypervisor(format!(
-                "HVPatch exec left {} reserved stage-2 leases unmaterialized",
-                stage2_leases.len()
-            )));
         }
         if let Some((retired, mut replacement)) = inventory_reservations.take() {
             let mut inventory = self.frame_inventory.lock();
@@ -11745,7 +11984,6 @@ impl HvfVmState {
             );
             std::process::abort();
         });
-        owner_rollback.commit();
         emit_replace_stage(
             carrick_observability::probes::HvpatchExecReplaceStagePhase::Mailbox,
             mailbox_started,
@@ -12718,6 +12956,69 @@ fn clone_page_tables_for_child(
     let dst_ptr = dst.as_ptr();
     unsafe { std::ptr::copy_nonoverlapping(src, dst_ptr, size) };
     Ok(dst)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn prepare_exec_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> {
+    let requested_size = usize::try_from(mapping.mapped_size)
+        .map_err(|_| TrapError::MappingTooLarge(mapping.mapped_size))?;
+    let backing_started = std::time::Instant::now();
+    let (host, size, host_mapping) = map_exclusive_region(mapping, requested_size)?;
+    let elapsed_ns = backing_started
+        .elapsed()
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64;
+    crate::probes::hvpatch_exec_backing(carrick_observability::probes::HvpatchExecBacking::new(
+        if mapping.private_file_backing.is_some() {
+            carrick_observability::probes::HvpatchExecBackingPhase::PrivateFileMapped
+        } else {
+            carrick_observability::probes::HvpatchExecBackingPhase::Materialized
+        },
+        mapping.guest_start,
+        mapping.ipa_start,
+        mapping.mapped_size,
+        elapsed_ns,
+    ));
+    let end =
+        mapping
+            .guest_start
+            .checked_add(mapping.mapped_size)
+            .ok_or(TrapError::MappingOverflow {
+                guest_start: mapping.guest_start,
+                mapped_size: mapping.mapped_size,
+            })?;
+    Ok(HvfMappedRegion {
+        start: mapping.guest_start,
+        ipa: mapping.ipa_start,
+        physical_ipa: mapping.ipa_start,
+        end,
+        host_addr: host,
+        size,
+        physical_size: size,
+        perms: hvf_perms(mapping.perms),
+        memory: None,
+        host_mapping: Some(host_mapping),
+        stage2_lease: None,
+        is_dynamic_alias: false,
+        sharing: if mapping.shared {
+            GuestMappingSharing::GlobalShared
+        } else {
+            GuestMappingSharing::Private
+        },
+        guest_writable: mapping.perms.write,
+        shared_key_base: 0,
+        shared_key_offset: 0,
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn exec_stage2_install(mapping: &GuestMapping, region: &HvfMappedRegion) -> ExecStage2Install {
+    ExecStage2Install {
+        ipa: mapping.ipa_start,
+        size: region.physical_size,
+        host: region.host_addr,
+        perms: u64::from(region.perms),
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -13848,6 +14149,234 @@ mod frame_inventory_backend_tests {
         );
     }
 
+    fn root_exec_test_plan() -> GuestMappingPlan {
+        let mut data = exec_mapping_for_order(0x20_0000, 0x20_000);
+        data.perms = carrick_mem::elf::SegmentPerms {
+            read: true,
+            write: true,
+            execute: false,
+        };
+        let mut page_tables = exec_mapping_for_order(
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+            crate::memory::LINUX_PAGE_TABLES_SIZE,
+        );
+        page_tables.image = std::sync::Arc::new(crate::memory::stage1_identity_page_tables());
+        page_tables.payload_size = page_tables.image.len() as u64;
+        let sparse = exec_mapping_for_order(
+            crate::memory::LINUX_MMAP_BASE,
+            crate::memory::mmap_arena_size(),
+        );
+        GuestMappingPlan {
+            mappings: vec![data, page_tables, sparse],
+            entry: 0x20_0000,
+            initial_stack_pointer: None,
+            el0_trampoline_entry: None,
+            el1_vectors_base: None,
+            stage1_page_tables_base: Some(crate::memory::LINUX_PAGE_TABLES_BASE),
+            ro_spans: vec![carrick_mem::elf::RoSpan {
+                start: 0x20_4000,
+                len: 0x4000,
+                exec: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn root_exec_plan_owns_every_materialized_stage2_extent() {
+        let plan = root_exec_test_plan();
+        let GlobalExecPlan {
+            plan: rebuilt,
+            mut stage2_leases,
+        } = prepare_global_exec_plan(&plan, None).unwrap();
+        for mapping in rebuilt
+            .mappings
+            .iter()
+            .filter(|mapping| !is_sparse_hvpatch_mmap_mapping(mapping))
+        {
+            let key = (mapping.ipa_start, mapping.mapped_size);
+            let lease = stage2_leases
+                .remove(&key)
+                .unwrap_or_else(|| panic!("root exec mapping {key:x?} lost its stage-2 lease"));
+            assert_eq!(lease.key(), key);
+            assert!(
+                lease.release_ipa,
+                "replacement root frames are allocator-owned"
+            );
+            assert_ne!(
+                mapping.ipa_start, mapping.guest_start,
+                "root exec must not collide with identity frames retained by a child"
+            );
+        }
+        assert!(stage2_leases.is_empty());
+    }
+
+    #[test]
+    fn consecutive_root_exec_plans_reserve_disjoint_frame_generations() {
+        let plan = root_exec_test_plan();
+        let first = prepare_global_exec_plan(&plan, None).unwrap();
+        let second = prepare_global_exec_plan(&plan, None).unwrap();
+        let first_keys = first.stage2_leases.keys().copied().collect::<Vec<_>>();
+        let second_keys = second.stage2_leases.keys().copied().collect::<Vec<_>>();
+
+        assert!(
+            first_keys
+                .iter()
+                .all(|first| second_keys.iter().all(|second| first != second)),
+            "a successor root image must not reuse a frame still retained by a child or predecessor"
+        );
+    }
+
+    #[test]
+    fn root_exec_plan_does_not_collide_with_a_live_child_generation() {
+        let plan = root_exec_test_plan();
+        let child = prepare_global_exec_plan(
+            &plan,
+            Some((crate::memory::LINUX_HVPATCH_ROOT_SLOT_BASE, 2 * 1024 * 1024)),
+        )
+        .unwrap();
+        let root = prepare_global_exec_plan(&plan, None).unwrap();
+
+        assert!(root.stage2_leases.keys().all(|root_key| {
+            child
+                .stage2_leases
+                .keys()
+                .all(|child_key| root_key != child_key)
+        }));
+    }
+
+    fn assert_exec_stage2_injected_failure_restores_old(fail_after_maps: usize) {
+        let old = [
+            ExecStage2Install::for_test(0x1000, 0x1000),
+            ExecStage2Install::for_test(0x3000, 0x1000),
+        ];
+        let new = [
+            ExecStage2Install::for_test(0x9000, 0x1000),
+            ExecStage2Install::for_test(0xb000, 0x1000),
+        ];
+        let installed = std::cell::RefCell::new(
+            old.iter()
+                .map(ExecStage2Install::key)
+                .collect::<std::collections::BTreeSet<_>>(),
+        );
+        let actions = std::cell::RefCell::new(Vec::new());
+
+        let error = switch_exec_stage2_transaction(
+            &old,
+            &new,
+            Some(fail_after_maps),
+            |extent| {
+                actions.borrow_mut().push(("unmap", extent.key()));
+                if installed.borrow_mut().remove(&extent.key()) {
+                    Ok(())
+                } else {
+                    Err(TrapError::Hypervisor(format!(
+                        "unmap absent {:?}",
+                        extent.key()
+                    )))
+                }
+            },
+            |extent| {
+                actions.borrow_mut().push(("map", extent.key()));
+                if installed.borrow_mut().insert(extent.key()) {
+                    Ok(())
+                } else {
+                    Err(TrapError::Hypervisor(format!(
+                        "map duplicate {:?}",
+                        extent.key()
+                    )))
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected HVPatch exec stage-2 map failure")
+        );
+        assert_eq!(
+            *installed.borrow(),
+            old.iter().map(ExecStage2Install::key).collect(),
+            "an injected replacement failure must restore the exact predecessor stage-2 set"
+        );
+        let mut expected = old
+            .iter()
+            .map(|extent| ("unmap", extent.key()))
+            .collect::<Vec<_>>();
+        expected.extend(
+            new[..fail_after_maps]
+                .iter()
+                .map(|extent| ("map", extent.key())),
+        );
+        expected.extend(
+            new[..fail_after_maps]
+                .iter()
+                .rev()
+                .map(|extent| ("unmap", extent.key())),
+        );
+        expected.extend(old.iter().map(|extent| ("map", extent.key())));
+        assert_eq!(
+            *actions.borrow(),
+            expected,
+            "rollback must remove every published successor in reverse order before restoring every predecessor"
+        );
+    }
+
+    #[test]
+    fn exec_stage2_failure_after_teardown_restores_predecessor_exactly() {
+        assert_exec_stage2_injected_failure_restores_old(0);
+    }
+
+    #[test]
+    fn exec_stage2_failure_after_one_map_removes_successor_and_restores_predecessor() {
+        assert_exec_stage2_injected_failure_restores_old(1);
+    }
+
+    #[test]
+    fn root_exec_rebuilds_tables_with_sparse_and_hvpatch_reservations() {
+        let plan = root_exec_test_plan();
+
+        let GlobalExecPlan {
+            plan: rebuilt,
+            stage2_leases,
+        } = prepare_global_exec_plan(&plan, None).unwrap();
+        assert_eq!(
+            rebuilt.stage1_page_tables_base,
+            rebuilt
+                .mappings
+                .iter()
+                .find(|mapping| mapping.guest_start == crate::memory::LINUX_PAGE_TABLES_BASE)
+                .map(|mapping| mapping.ipa_start)
+        );
+        assert_eq!(stage2_leases.len(), 2, "the sparse arena owns no frame");
+        let table = rebuilt
+            .mappings
+            .iter()
+            .find(|mapping| mapping.guest_start == crate::memory::LINUX_PAGE_TABLES_BASE)
+            .unwrap();
+        let mut manager = crate::page_table::PageTableManager::new(
+            table.image.as_ref().clone(),
+            rebuilt.stage1_page_tables_base.unwrap(),
+        );
+        assert_eq!(
+            manager.translate(0x20_0000),
+            rebuilt
+                .mappings
+                .iter()
+                .find(|mapping| mapping.guest_start == 0x20_0000)
+                .map(|mapping| mapping.ipa_start)
+        );
+        assert_eq!(manager.translate(crate::memory::LINUX_MMAP_BASE), None);
+        assert_eq!(
+            manager.translate(crate::memory::LINUX_HVPATCH_ROOT_SLOT_BASE),
+            None
+        );
+        assert!(
+            !manager.set_readonly(0x20_4000, 0x4000, false).unwrap(),
+            "root exec must preserve the ELF read-only span"
+        );
+    }
+
     #[test]
     fn sparse_exec_omission_requires_exact_private_hidden_arena() {
         let exact = exec_mapping_for_order(
@@ -13907,6 +14436,7 @@ mod frame_inventory_backend_tests {
             _mapping: host_mapping,
             // This test exercises owner identity without installing stage-2.
             _lease: GlobalFrameStage2Lease::fixed(LIVE_IPA, LENGTH),
+            perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
         };
         assert!(
             global_frame_host_owners()
