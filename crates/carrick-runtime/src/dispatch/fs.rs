@@ -1525,9 +1525,8 @@ impl SyscallDispatcher {
     /// ioctl/fgetxattr must all fail with EBADF (LTP open13). The flag is
     /// preserved in the description's status_flags at open time.
     pub(super) fn fd_is_o_path(&self, fd: i32) -> bool {
-        self.open_file(fd).is_some_and(|of| {
-            of.description.read().status_flags() & crate::linux_abi::LINUX_O_PATH != 0
-        })
+        self.open_file(fd)
+            .is_some_and(|of| of.description.read().is_path())
     }
 
     /// Build a [`StatRecord`] from a real backing stat, applying the `mknod(2)`
@@ -4430,7 +4429,7 @@ impl SyscallDispatcher {
             return;
         };
         let desc = open_file.description.read();
-        let armed = desc.status_flags() & LINUX_O_ASYNC != 0;
+        let armed = desc.is_async();
         if !armed {
             drop(desc);
             carrick_signal_core::fasync::disarm(pipe_id);
@@ -5227,7 +5226,7 @@ impl SyscallDispatcher {
                         if !*writable {
                             return DispatchOutcome::errno(LINUX_EBADF);
                         }
-                        if base.status_flags() & LINUX_O_APPEND != 0 {
+                        if base.is_append() {
                             // Let the HOST kernel perform the append. Linux's
                             // O_APPEND seeks to end and writes as ONE atomic
                             // operation; emulating it as `lseek(SEEK_END)` then
@@ -9360,7 +9359,7 @@ impl SyscallDispatcher {
                 } => {
                     let state = Arc::clone(state);
                     let semaphore = *semaphore;
-                    let nonblocking = base.status_flags() & LINUX_O_NONBLOCK != 0;
+                    let nonblocking = base.is_nonblocking();
                     drop(open);
                     return Ok(read_eventfd(
                         memory,
@@ -9955,7 +9954,7 @@ impl SyscallDispatcher {
             // offset (pwrite04). macOS pwrite() on an O_APPEND fd returns EINVAL,
             // so seek-to-end then write() instead (matching the plain write()
             // append path).
-            let is_append = open.status_flags() & LINUX_O_APPEND != 0;
+            let is_append = open.is_append();
             // Real host file: positional write via libc::pwrite (visible
             // across fork; kernel offset untouched).
             if let OpenDescription::HostFile {
@@ -10116,7 +10115,7 @@ impl SyscallDispatcher {
             // offset, seek to EOF, then write via writev()/write() (macOS rejects
             // pwritev() on an O_APPEND fd with EINVAL), and restore the offset
             // afterward.
-            let is_append = open.status_flags() & LINUX_O_APPEND != 0;
+            let is_append = open.is_append();
             // Real host file: positional writev via libc::pwrite per iovec.
             if let OpenDescription::HostFile {
                 host_fd, writable, ..
@@ -10575,7 +10574,7 @@ impl SyscallDispatcher {
             // non-blocking behaviour when the DESTINATION fd is O_NONBLOCK,
             // exactly like write(2) on the same fd.
             let out_nonblocking = splice_flags.contains(LinuxSpliceFlags::NONBLOCK)
-                || this.fd_status_flags(out_fd.0) & LINUX_O_NONBLOCK != 0;
+                || this.fd_is_nonblocking(out_fd.0);
             // Never hand the destination more than it can take in one go. The
             // write path returns a SHORT count rather than parking (splice(2)'s
             // own contract), and bounding the SOURCE read by the same figure
@@ -10626,7 +10625,7 @@ impl SyscallDispatcher {
                 // like every other blocking-mode host read; the guest's own
                 // O_NONBLOCK on fd_in counts alongside SPLICE_F_NONBLOCK.
                 let in_nonblocking = splice_flags.contains(LinuxSpliceFlags::NONBLOCK)
-                    || this.fd_status_flags(in_fd.0) & LINUX_O_NONBLOCK != 0;
+                    || this.fd_is_nonblocking(in_fd.0);
                 let host_fd_owner = this.open_file(in_fd.0).and_then(|file| {
                     let open = file.description.read();
                     match &*open {
@@ -10919,7 +10918,7 @@ impl SyscallDispatcher {
             // SPLICE_F_NONBLOCK *or* an O_NONBLOCK pipe: vmsplice(2) blocks
             // only when both say it may.
             let nonblocking = splice_flags.contains(LinuxSpliceFlags::NONBLOCK)
-                || this.fd_status_flags(fd.0) & LINUX_O_NONBLOCK != 0;
+                || this.fd_is_nonblocking(fd.0);
 
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -11729,7 +11728,7 @@ impl SyscallDispatcher {
                             // host fd isn't opened O_APPEND, so we emulate the
                             // seek-then-write; single-writer, which covers the
                             // shell/dpkg append cases.)
-                            if base.status_flags() & LINUX_O_APPEND != 0 {
+                            if base.is_append() {
                                 unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
                             }
                             // RLIMIT_FSIZE: a write starting past the guest's
@@ -12006,7 +12005,7 @@ impl SyscallDispatcher {
                             write_kind: HostWriteKind::RegularFile,
                             pipe_state: None,
                             sigpipe_on_epipe: false,
-                            append: base.status_flags() & LINUX_O_APPEND != 0,
+                            append: base.is_append(),
                         })
                     }
                     _ => None,
@@ -12145,7 +12144,7 @@ impl SyscallDispatcher {
                                 // libc::write to the real fd advances the shared
                                 // kernel offset (visible across fork and to the
                                 // readv that follows).
-                                if base.status_flags() & LINUX_O_APPEND != 0 {
+                                if base.is_append() {
                                     unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
                                 }
                                 outcome = write_host_pipe_owned(

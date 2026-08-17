@@ -1355,17 +1355,15 @@ impl SyscallDispatcher {
         }
     }
 
-    fn pidfd_status_flags(&self, fd: i32) -> Option<u64> {
-        let open = self.open_file(fd)?;
+    #[inline]
+    fn pidfd_is_nonblocking(&self, fd: i32) -> bool {
+        let Some(open) = self.open_file(fd) else {
+            return false;
+        };
         let desc = open.description.read();
         match &*desc {
-            OpenDescription::Pidfd { base, .. } => Some(base.status_flags()),
-            OpenDescription::Directory { path, .. }
-                if self.proc_directory_pidfd_target(path).is_some() =>
-            {
-                Some(0)
-            }
-            _ => None,
+            OpenDescription::Pidfd { base, .. } => base.is_nonblocking(),
+            _ => false,
         }
     }
 
@@ -3049,11 +3047,7 @@ impl SyscallDispatcher {
                             }
                             return Ok(DispatchOutcome::Returned { value: 0 });
                         }
-                        if idtype == LINUX_P_PIDFD
-                            && this
-                                .pidfd_status_flags(id as i32)
-                                .is_some_and(|flags| flags & LINUX_O_NONBLOCK != 0)
-                        {
+                        if idtype == LINUX_P_PIDFD && this.pidfd_is_nonblocking(id as i32) {
                             return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                         }
                         let tid = Self::ctx_tid(cx);
@@ -3172,11 +3166,7 @@ impl SyscallDispatcher {
                         }
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
-                    if idtype == LINUX_P_PIDFD
-                        && this
-                            .pidfd_status_flags(id as i32)
-                            .is_some_and(|flags| flags & LINUX_O_NONBLOCK != 0)
-                    {
+                    if idtype == LINUX_P_PIDFD && this.pidfd_is_nonblocking(id as i32) {
                         return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                     }
                     let tid = Self::ctx_tid(cx);
@@ -3268,10 +3258,7 @@ impl SyscallDispatcher {
             if si_pid == 0 && !guest_nohang {
                 if idtype == LINUX_P_PIDFD
                     && let Some(host_fd) = this.host_fd_for_poll(id as i32) {
-                        if this
-                            .pidfd_status_flags(id as i32)
-                            .is_some_and(|flags| flags & LINUX_O_NONBLOCK != 0)
-                        {
+                        if this.pidfd_is_nonblocking(id as i32) {
                             return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                         }
                         return Ok(DispatchOutcome::WaitOnPollFds {

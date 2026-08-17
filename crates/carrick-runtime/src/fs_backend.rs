@@ -6169,10 +6169,11 @@ impl FsBackend for HostFsBackend {
         // Translate Linux XATTR_CREATE/XATTR_REPLACE to the macOS options
         // (same semantics, different numeric values).
         let mut opts: libc::c_int = 0;
-        if flags & crate::linux_abi::LINUX_XATTR_CREATE != 0 {
+        let xflags = carrick_abi::LinuxXattrFlags::from_bits_truncate(flags);
+        if xflags.contains(carrick_abi::LinuxXattrFlags::CREATE) {
             opts |= carrick_portable::XATTR_CREATE;
         }
-        if flags & crate::linux_abi::LINUX_XATTR_REPLACE != 0 {
+        if xflags.contains(carrick_abi::LinuxXattrFlags::REPLACE) {
             opts |= carrick_portable::XATTR_REPLACE;
         }
         if !follow {

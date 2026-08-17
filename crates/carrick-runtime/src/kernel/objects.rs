@@ -775,8 +775,9 @@ impl FileSlot {
         Arc::clone(&self.description)
     }
 
-    pub const fn close_on_exec(&self) -> bool {
-        self.fd_flags & crate::linux_abi::LINUX_FD_CLOEXEC != 0
+    pub fn close_on_exec(&self) -> bool {
+        carrick_abi::LinuxFdFlags::from_bits_truncate(self.fd_flags)
+            .contains(carrick_abi::LinuxFdFlags::CLOEXEC)
     }
 }
 

@@ -3754,7 +3754,8 @@ where
                         va.raw(),
                         len,
                         prot_none,
-                        prot & crate::linux_abi::LINUX_PROT_WRITE == 0,
+                        !carrick_abi::LinuxProtFlags::from_bits_truncate(prot)
+                            .contains(carrick_abi::LinuxProtFlags::WRITE),
                         if shared {
                             carrick_guest_mem::MappingSharing::Shared
                         } else {
@@ -4901,7 +4902,8 @@ where
                                 va.raw(),
                                 len,
                                 prot_none,
-                                prot & crate::linux_abi::LINUX_PROT_WRITE == 0,
+                                !carrick_abi::LinuxProtFlags::from_bits_truncate(prot)
+                                    .contains(carrick_abi::LinuxProtFlags::WRITE),
                                 if shared {
                                     carrick_guest_mem::MappingSharing::Shared
                                 } else {

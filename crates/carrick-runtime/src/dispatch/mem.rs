@@ -2272,8 +2272,8 @@ impl SyscallDispatcher {
             };
             let desc = open_file.description.read();
             // An O_PATH descriptor (or an O_WRONLY fd) is not open for reading.
-            if desc.status_flags() & crate::linux_abi::LINUX_O_PATH != 0
-                || desc.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+            if LinuxOpenFlags::from_bits_truncate(desc.status_flags()).contains(LinuxOpenFlags::PATH)
+                || desc.is_write_only()
             {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
@@ -2631,7 +2631,7 @@ impl SyscallDispatcher {
 
             if !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && let Some(open_file) = this.open_file(fd.0)
-                && open_file.description.read().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+                && open_file.description.read().is_write_only()
             {
                 return Ok(request.refused(
                     MmapRefusal::Spec("mmap of a write-only descriptor"),
@@ -3396,9 +3396,7 @@ impl SyscallDispatcher {
                 && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && let Some(open_file) = this.open_file(fd.0)
             {
-                mmap_read_only_shared_file = open_file.description.read().status_flags()
-                    & LINUX_O_ACCMODE
-                    == LINUX_O_RDONLY;
+                mmap_read_only_shared_file = open_file.description.read().is_read_only();
             }
             // A live MAP_SHARED, PROT_WRITE mapping of an (unsealed) memfd — its
             // backing description is recorded so F_ADD_SEALS F_SEAL_WRITE can

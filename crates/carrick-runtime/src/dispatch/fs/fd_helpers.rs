@@ -757,7 +757,7 @@ impl SyscallDispatcher {
                 writable: true,
                 ..
             } => {
-                if base.status_flags() & crate::linux_abi::LINUX_O_APPEND != 0 {
+                if base.is_append() {
                     Some(LINUX_EINVAL)
                 } else {
                     None

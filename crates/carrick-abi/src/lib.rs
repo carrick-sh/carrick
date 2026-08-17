@@ -492,6 +492,13 @@ pub const LINUX_SIG_DFL: u64 = 0;
 pub const LINUX_SIG_IGN: u64 = 1;
 
 /// `sa_flags` bit: the `sa_restorer` field is valid. When CLEAR the kernel
+/// `SA_NOCLDSTOP`: do not generate SIGCHLD when children stop.
+pub const LINUX_SA_NOCLDSTOP: u64 = 0x0000_0001;
+
+/// `SA_NOCLDWAIT`: do not transform children into zombies on exit.
+pub const LINUX_SA_NOCLDWAIT: u64 = 0x0000_0002;
+
+/// `SA_RESTORER`: caller installed an explicit restorer. Linux on AArch64
 /// IGNORES `sa_restorer` (whatever garbage it holds) and returns from the
 /// handler via the VDSO sigreturn trampoline. glibc on aarch64 never sets this
 /// — so carrick must synthesise its own trampoline unless this bit is present.
@@ -3182,6 +3189,7 @@ pub const LINUX_AT_STATX_DONT_SYNC: u64 = 0x4000;
 pub const LINUX_ELF_NOTE_OWNER: &[u8] = b"LINUX\0";
 pub const LINUX_UTIME_NOW: i64 = (1 << 30) - 1;
 pub const LINUX_UTIME_OMIT: i64 = (1 << 30) - 2;
+pub const LINUX_F_OK: u64 = 0;
 pub const LINUX_R_OK: u64 = 4;
 pub const LINUX_W_OK: u64 = 2;
 pub const LINUX_X_OK: u64 = 1;
@@ -4330,6 +4338,33 @@ bitflags! {
         const CMSG_CLOEXEC = LINUX_MSG_CMSG_CLOEXEC;
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxSaFlags: u64 {
+        const NOCLDSTOP = LINUX_SA_NOCLDSTOP;
+        const NOCLDWAIT = LINUX_SA_NOCLDWAIT;
+        const SIGINFO = LINUX_SA_SIGINFO;
+        const ONSTACK = LINUX_SA_ONSTACK;
+        const RESTART = LINUX_SA_RESTART;
+        const NODEFER = LINUX_SA_NODEFER;
+        const RESETHAND = LINUX_SA_RESETHAND;
+        const RESTORER = LINUX_SA_RESTORER;
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxXattrFlags: i32 {
+        const CREATE = LINUX_XATTR_CREATE;
+        const REPLACE = LINUX_XATTR_REPLACE;
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxIoUringEnterFlags: u32 {
+        const GETEVENTS = LINUX_IORING_ENTER_GETEVENTS;
+        const SQ_WAKEUP = LINUX_IORING_ENTER_SQ_WAKEUP;
+        const SQ_WAIT = LINUX_IORING_ENTER_SQ_WAIT;
+        const EXT_ARG = LINUX_IORING_ENTER_EXT_ARG;
+        const REGISTERED_RING = LINUX_IORING_ENTER_REGISTERED_RING;
+    }
+
     /// `wait4`/`waitid` option bits. WSTOPPED is `waitid`'s alias for
     /// WUNTRACED (same value, 2). Each syscall accepts a DIFFERENT subset —
     /// see [`LinuxWaitOptions::WAITID_SUPPORTED`] /
@@ -4511,6 +4546,7 @@ bitflags! {
     /// `access(2)` / `faccessat(2)` check mode bits.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct LinuxAccessMode: u64 {
+        const F_OK = LINUX_F_OK;
         const R_OK = LINUX_R_OK;
         const W_OK = LINUX_W_OK;
         const X_OK = LINUX_X_OK;

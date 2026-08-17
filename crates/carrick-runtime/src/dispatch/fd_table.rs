@@ -429,6 +429,45 @@ impl OpenDescriptionBase {
         self.status_flags
     }
 
+    #[inline]
+    pub(super) fn is_append(&self) -> bool {
+        carrick_abi::LinuxOpenFlags::from_bits_truncate(self.status_flags)
+            .contains(carrick_abi::LinuxOpenFlags::APPEND)
+    }
+
+    #[inline]
+    pub(super) fn is_nonblocking(&self) -> bool {
+        carrick_abi::LinuxOpenFlags::from_bits_truncate(self.status_flags)
+            .contains(carrick_abi::LinuxOpenFlags::NONBLOCK)
+    }
+
+    #[inline]
+    pub(super) fn is_async(&self) -> bool {
+        carrick_abi::LinuxOpenFlags::from_bits_truncate(self.status_flags)
+            .contains(carrick_abi::LinuxOpenFlags::ASYNC)
+    }
+
+    #[inline]
+    pub(super) fn access_mode(&self) -> u64 {
+        self.status_flags & carrick_abi::LINUX_O_ACCMODE
+    }
+
+    #[inline]
+    pub(super) fn is_write_only(&self) -> bool {
+        self.access_mode() == carrick_abi::LINUX_O_WRONLY
+    }
+
+    #[inline]
+    pub(super) fn is_read_only(&self) -> bool {
+        self.access_mode() == carrick_abi::LINUX_O_RDONLY
+    }
+
+    #[inline]
+    pub(super) fn is_path(&self) -> bool {
+        carrick_abi::LinuxOpenFlags::from_bits_truncate(self.status_flags)
+            .contains(carrick_abi::LinuxOpenFlags::PATH)
+    }
+
     /// F_GETOWN_EX returns the (type, pid); (0, 0) means no owner set.
     pub(super) fn owner(&self) -> (i32, i32) {
         (self.owner_type, self.owner_pid)
@@ -1840,6 +1879,36 @@ impl OpenDescription {
 
     pub(super) fn status_flags(&self) -> u64 {
         self.base().status_flags()
+    }
+
+    #[inline]
+    pub(super) fn is_append(&self) -> bool {
+        self.base().is_append()
+    }
+
+    #[inline]
+    pub(super) fn is_nonblocking(&self) -> bool {
+        self.base().is_nonblocking()
+    }
+
+    #[inline]
+    pub(super) fn is_async(&self) -> bool {
+        self.base().is_async()
+    }
+
+    #[inline]
+    pub(super) fn is_write_only(&self) -> bool {
+        self.base().is_write_only()
+    }
+
+    #[inline]
+    pub(super) fn is_read_only(&self) -> bool {
+        self.base().is_read_only()
+    }
+
+    #[inline]
+    pub(super) fn is_path(&self) -> bool {
+        self.base().is_path()
     }
 
     pub(super) fn set_status_flags(&mut self, next: u64) {

@@ -1516,15 +1516,12 @@ impl SyscallDispatcher {
         }
     }
 
-    /// The guest's status flags (O_NONBLOCK etc.) for `fd`. carrick keeps the
-    /// HOST fd non-blocking always and tracks the guest's intended blocking
-    /// mode here; `blocking_io` consults this to decide EAGAIN vs a lockless
-    /// wait. Bare stdio / unknown fds report 0 (blocking), the safe default.
-    pub(super) fn fd_status_flags(&self, fd: i32) -> u64 {
+    #[inline]
+    pub(super) fn fd_is_nonblocking(&self, fd: i32) -> bool {
         let Some(open_file) = self.open_file(fd) else {
-            return 0;
+            return false;
         };
-        open_file.description.read().status_flags()
+        open_file.description.read().is_nonblocking()
     }
 
     /// THE single chokepoint for blocking-mode host I/O — every recv/send/
@@ -1587,7 +1584,7 @@ impl SyscallDispatcher {
     /// carries MSG_DONTWAIT.
     pub(super) fn io_is_nonblocking(&self, fd: i32, msg_flags: i32) -> bool {
         // from_bits_retain: send/recv IGNORE unknown msg_flags bits.
-        self.fd_status_flags(fd) & LINUX_O_NONBLOCK != 0
+        self.fd_is_nonblocking(fd)
             || LinuxMsgFlags::from_bits_retain(msg_flags).contains(LinuxMsgFlags::DONTWAIT)
     }
 
@@ -2566,7 +2563,9 @@ impl SyscallDispatcher {
                 return DispatchOutcome::errno(LINUX_EBADF);
             };
             match &*open_file.description.read() {
-                open if open.status_flags() & crate::linux_abi::LINUX_O_PATH != 0 => {
+                open if carrick_abi::LinuxOpenFlags::from_bits_truncate(open.status_flags())
+                    .contains(carrick_abi::LinuxOpenFlags::PATH) =>
+                {
                     return DispatchOutcome::errno(LINUX_EBADF);
                 }
                 OpenDescription::HostSocket {

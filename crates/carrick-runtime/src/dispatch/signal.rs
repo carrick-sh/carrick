@@ -472,11 +472,12 @@ impl SyscallDispatcher {
         action: LinuxSigaction,
     ) -> SigSet {
         let thread = Self::required_signal_thread(context, tid);
+        let sa_flags = carrick_abi::LinuxSaFlags::from_bits_truncate(action.sa_flags);
         let saved = thread.update_signal_state(|state| {
             let saved = state
                 .take_armed_restore_mask()
                 .unwrap_or_else(|| state.blocked());
-            let delivered = if action.sa_flags & crate::linux_abi::LINUX_SA_NODEFER != 0 {
+            let delivered = if sa_flags.contains(carrick_abi::LinuxSaFlags::NODEFER) {
                 SigSet::EMPTY
             } else {
                 SigSet::EMPTY.with(signum)
@@ -488,8 +489,8 @@ impl SyscallDispatcher {
                     .union(SigSet::from_raw(action.sa_mask[0])),
             );
             state.set_blocked(handler_mask);
-            let on_altstack = action.sa_flags & crate::linux_abi::LINUX_SA_ONSTACK != 0
-                && state.altstack().is_some();
+            let on_altstack =
+                sa_flags.contains(carrick_abi::LinuxSaFlags::ONSTACK) && state.altstack().is_some();
             state.push_handler_frame(crate::kernel::HandlerFrameState {
                 on_altstack,
                 restore_mask: None,
@@ -497,7 +498,7 @@ impl SyscallDispatcher {
             saved
         });
         // Change the shared disposition only after releasing the thread leaf.
-        if action.sa_flags & crate::linux_abi::LINUX_SA_RESETHAND != 0 {
+        if sa_flags.contains(carrick_abi::LinuxSaFlags::RESETHAND) {
             let mut reset = action;
             reset.sa_handler = crate::linux_abi::LINUX_SIG_DFL;
             Self::install_signal_action(context, signum, reset);
@@ -1558,7 +1559,9 @@ impl SyscallDispatcher {
             };
             if fd.0 == -1 {
                 let description = OpenDescription::SignalFd {
-                    base: OpenDescriptionBase::new(flags & LINUX_O_NONBLOCK),
+                    base: OpenDescriptionBase::new(
+                        flags & carrick_abi::LinuxOpenFlags::NONBLOCK.bits(),
+                    ),
                     mask: mask_val,
                 };
                 Ok(this.install_fd(description, linux_fd_flags_from_open_flags(flags)))
