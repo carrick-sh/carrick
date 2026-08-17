@@ -1,0 +1,4 @@
+TAP version 13
+1..1
+not ok 1 - v8-smoke
+# v8-smoke ok

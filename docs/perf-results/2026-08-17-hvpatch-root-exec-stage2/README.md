@@ -60,6 +60,28 @@ Two focused topology reducers also passed on the signed candidate:
 The first covers two consecutive root execs; the second root-execs while a
 fork child is live.
 
+The final reviewed candidate is source
+`696c69d304759440ac1bc641666ade42cd1fb50b`, binary SHA-256
+`add5d9e6f02fb6054da90ccfc7060c628dd51e13fcab998d1ddc81c93f8e6549`,
+CDHash `95906949c6f13f700b083262e2c6d94670747ad5`, and LC_UUID
+`F9B5458B-6CA2-37AC-90EB-7E238495FE9C`. Exact identity is in
+`candidate-binary-identity.txt`.
+
+Its forced, one-worker focused gate selected all three Node rows, used three
+cached oracles and launched zero Docker containers. `node-three-candidate.jsonl`
+has exactly three rows. Every Carrick arm reached a real TAP producer:
+
+- `node-app-smoke`: TAP 13, plan `1..1`, one `not ok`; inner timeout at
+  120,736 ms.
+- `node-v8-smoke`: TAP 13, plan `1..1`, one `not ok`; inner timeout at
+  120,487 ms.
+- `node-libuv`: plan `1..332`, 301 `ok` and 31 `not ok` before the inner
+  timeout at 180,980 ms. The regression parser labels this `MATCH` only because
+  both arms failed; that label is not closure evidence.
+
+The exact stdout/stderr streams are the `node-*-candidate.{out,err}` files.
+All three run ids had zero scoped Carrick processes after cleanup.
+
 ## Next distinct blocker
 
 After the exec transaction fix, `node-app-smoke` reaches its real TAP producer
