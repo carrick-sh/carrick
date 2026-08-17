@@ -154,8 +154,59 @@ impl HostPid {
 /// A signal number argument (`int` in the kernel ABI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Signal(pub i32);
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub use carrick_guest_mem::GuestVa;
+
+/// Typed guest memory pointer argument with seamless conversion to/from [`GuestVa`].
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct GuestPtr(pub u64);
+
+impl GuestPtr {
+    #[inline]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn to_va(self) -> GuestVa {
+        GuestVa(self.0)
+    }
+}
+
+impl From<GuestVa> for GuestPtr {
+    #[inline]
+    fn from(va: GuestVa) -> Self {
+        Self(va.0)
+    }
+}
+
+impl From<GuestPtr> for GuestVa {
+    #[inline]
+    fn from(ptr: GuestPtr) -> Self {
+        GuestVa(ptr.0)
+    }
+}
+
+impl From<u64> for GuestPtr {
+    #[inline]
+    fn from(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+impl From<GuestPtr> for u64 {
+    #[inline]
+    fn from(ptr: GuestPtr) -> Self {
+        ptr.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestLen(pub usize);
 
@@ -180,6 +231,11 @@ impl FromGuestArg for Signal {
 impl FromGuestArg for GuestPtr {
     fn from_arg(raw: u64) -> Self {
         GuestPtr(raw)
+    }
+}
+impl FromGuestArg for GuestVa {
+    fn from_arg(raw: u64) -> Self {
+        GuestVa(raw)
     }
 }
 impl FromGuestArg for u64 {

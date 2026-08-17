@@ -220,3 +220,17 @@ rules:
     message: |
       Prefer carrick_guest_mem::GuestVaRange for address ranges instead of separate
       (start, end) or (start, len) parameters to ensure bounds safety.
+
+  # Forbid re-declaring custom GuestPtr types; use carrick_guest_mem::GuestVa.
+  - id: carrick-no-raw-guest-ptr
+    languages: [rust]
+    severity: ERROR
+    paths:
+      exclude:
+        - crates/carrick-runtime/src/dispatch/abi_args.rs
+        - crates/carrick-guest-mem/
+    patterns:
+      - pattern: "struct GuestPtr($...ANY);"
+    message: |
+      Do not define custom GuestPtr pointer wrappers. Use the canonical
+      `carrick_guest_mem::GuestVa` type across the codebase.
