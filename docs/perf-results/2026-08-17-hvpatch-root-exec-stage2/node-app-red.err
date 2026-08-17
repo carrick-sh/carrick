@@ -1,0 +1,2 @@
+2026-08-17T10:26:01.753502Z ERROR carrick_runtime::vcpu_loop::exec: execve failed after the point of no return; killing the guest process by SIGSEGV cause="replace guest image: hypervisor operation failed: HVPatch exec mapping IPA 0x100000000 size 1523712 has no owning lease"
+2026-08-17T10:26:01.753650Z ERROR carrick_runtime::vcpu_loop: terminal owner could not retire HVPatch engine address space pid=1 error=hypervisor operation failed: hvpatch process-exit ASID maintenance failed: hypervisor exited for an unexpected reason: EL0Fault during EL1 stage-1 maintenance
