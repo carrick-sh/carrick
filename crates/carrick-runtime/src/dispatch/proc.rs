@@ -1074,6 +1074,7 @@ impl SyscallDispatcher {
     /// Returns 0 on success, EFAULT/EINVAL on a bad program.
     fn install_seccomp_filter<M: GuestMemory>(
         &self,
+        task: &crate::kernel::Task,
         memory: &mut M,
         fprog_ptr: u64,
     ) -> DispatchOutcome {
@@ -1107,9 +1108,9 @@ impl SyscallDispatcher {
         };
         let no_new_privs = self.proc.lock().no_new_privs;
         if !no_new_privs
-            && !crate::namespace::process::has_effective_cap(
-                crate::namespace::process::CAP_SYS_ADMIN,
-            )
+            && !task
+                .caps()
+                .has_effective(crate::namespace::process::CAP_SYS_ADMIN)
         {
             return DispatchOutcome::errno(LINUX_EACCES);
         }
@@ -1533,7 +1534,7 @@ impl SyscallDispatcher {
             // are not differentiated in v1.
             match operation as u32 {
                 crate::seccomp::SECCOMP_SET_MODE_FILTER => {
-                    Ok(this.install_seccomp_filter(&mut *cx.memory, args.0))
+                    Ok(this.install_seccomp_filter(cx.kernel.task(), &mut *cx.memory, args.0))
                 }
                 crate::seccomp::SECCOMP_SET_MODE_STRICT => {
                     Ok(this.install_seccomp_strict(&mut *cx.memory))
@@ -1628,25 +1629,35 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                     DispatchOutcome::Returned {
-                        value: i64::from(crate::namespace::process::capbset_read(arg2 as u32)),
+                        value: i64::from(cx.kernel.task().caps().capbset_read(arg2 as u32)),
                     }
                 }
                 LINUX_PR_CAPBSET_DROP => {
                     if arg2 > 63 {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
-                    if !crate::namespace::process::has_effective_cap(
-                        crate::namespace::process::CAP_SETPCAP,
-                    ) {
+                    // Gate and drop under one lock: the drop is irreversible,
+                    // so re-reading the set between the check and the mutation
+                    // could act on a set a sibling thread has since changed.
+                    let dropped = cx.kernel.task().with_caps(|caps| {
+                        if !caps.has_effective(crate::namespace::process::CAP_SETPCAP) {
+                            return false;
+                        }
+                        caps.capbset_drop(arg2 as u32);
+                        true
+                    });
+                    if !dropped {
                         return Ok(DispatchOutcome::errno(LINUX_EPERM));
                     }
-                    crate::namespace::process::capbset_drop(arg2 as u32);
                     DispatchOutcome::Returned { value: 0 }
                 }
                 LINUX_PR_SET_SECUREBITS => {
-                    if !crate::namespace::process::has_effective_cap(
-                        crate::namespace::process::CAP_SETPCAP,
-                    ) {
+                    if !cx
+                        .kernel
+                        .task()
+                        .caps()
+                        .has_effective(crate::namespace::process::CAP_SETPCAP)
+                    {
                         return Ok(DispatchOutcome::errno(LINUX_EPERM));
                     }
                     DispatchOutcome::Returned { value: 0 }
@@ -1738,9 +1749,7 @@ impl SyscallDispatcher {
                             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                         }
                         DispatchOutcome::Returned {
-                            value: i64::from(crate::namespace::process::cap_ambient_is_set(
-                                arg3 as u32,
-                            )),
+                            value: i64::from(cx.kernel.task().caps().ambient_is_set(arg3 as u32)),
                         }
                     }
                     LINUX_PR_CAP_AMBIENT_RAISE => {
@@ -1750,7 +1759,11 @@ impl SyscallDispatcher {
                         {
                             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                         }
-                        if !crate::namespace::process::cap_ambient_raise(arg3 as u32) {
+                        if !cx
+                            .kernel
+                            .task()
+                            .with_caps(|caps| caps.ambient_raise(arg3 as u32))
+                        {
                             return Ok(DispatchOutcome::errno(LINUX_EPERM));
                         }
                         DispatchOutcome::Returned { value: 0 }
@@ -1762,14 +1775,18 @@ impl SyscallDispatcher {
                         {
                             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                         }
-                        crate::namespace::process::cap_ambient_lower(arg3 as u32);
+                        cx.kernel
+                            .task()
+                            .with_caps(|caps| caps.ambient_lower(arg3 as u32));
                         DispatchOutcome::Returned { value: 0 }
                     }
                     LINUX_PR_CAP_AMBIENT_CLEAR_ALL => {
                         if arg3 != 0 || arg4 != 0 || arg5 != 0 {
                             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                         }
-                        crate::namespace::process::cap_ambient_clear_all();
+                        cx.kernel
+                            .task()
+                            .with_caps(crate::namespace::process::CapabilitySet::ambient_clear_all);
                         DispatchOutcome::Returned { value: 0 }
                     }
                     _ => DispatchOutcome::errno(LINUX_EINVAL),
@@ -1793,7 +1810,9 @@ impl SyscallDispatcher {
                 // accepted as a no-op record (not differentiated). arg2 is the
                 // mode; arg3 is the `struct sock_fprog *` for FILTER mode.
                 LINUX_PR_SET_SECCOMP => match arg2 {
-                    LINUX_SECCOMP_MODE_FILTER => this.install_seccomp_filter(memory, arg3),
+                    LINUX_SECCOMP_MODE_FILTER => {
+                        this.install_seccomp_filter(cx.kernel.task(), memory, arg3)
+                    }
                     LINUX_SECCOMP_MODE_STRICT => this.install_seccomp_strict(memory),
                     _ => DispatchOutcome::errno(LINUX_EINVAL),
                 },
@@ -1885,17 +1904,18 @@ impl SyscallDispatcher {
         /// private instance) rather than EINVAL, so container inits that pass
         /// CLONE_NEWNS/UTS/IPC/CGROUP/NET don't break (§1.1, §6).
         fn unshare(this, cx, flags: u64) {
-            let _ = (this, cx);
+            let _ = this;
             let parsed = LinuxCloneFlags::from_bits_truncate(flags);
             if parsed.contains(LinuxCloneFlags::NEWUSER) {
-                // Allocate a fresh user ns for the caller; grant full caps in it.
-                let _id = crate::namespace::process::unshare_user_ns();
+                // Allocate a fresh user ns for the CALLING TASK; grant it full
+                // caps within that namespace. Only this process moves — a
+                // sibling guest process keeps its own namespace and maps.
+                let _id = cx.kernel.task().unshare_user_ns();
             }
-            if parsed.contains(LinuxCloneFlags::NEWPID) {
-                // Does not move the caller; the caller's next fork creates the
-                // new pid ns (consumed in the fork path — Phase 4 wiring).
-                crate::namespace::process::arm_pending_newpid();
-            }
+            // CLONE_NEWPID does not move the caller: per unshare(2) the
+            // caller's next fork would become the init of the new pid ns. That
+            // is Phase 4 and is NOT implemented — the flag is accepted and
+            // ignored, like the other namespace flags below.
             // CLONE_NEWNS / NEWUTS / NEWIPC / NEWCGROUP / NEWNET: accepted and
             // ignored. Unknown bits are likewise tolerated (truncated above).
             Ok(DispatchOutcome::Returned { value: 0 })

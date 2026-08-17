@@ -3720,6 +3720,9 @@ impl SyscallDispatcher {
         let proc_oom_score_adj = self
             .hvpatch_process()
             .map(|process| process.kernel_graph().registry().oom_score_adj_by_pid());
+        // The caller's own capabilities and user-namespace view; `/proc/self`'s
+        // `status`, `uid_map`, `gid_map` and `setgroups` render from this.
+        let proc_creds_ns = context.task().creds_ns();
         let proc_processes = Self::synthetic_proc_processes(self.hvpatch_process().as_ref());
         let proc_zombies = self.hvpatch_process().map(|process| {
             process
@@ -3769,6 +3772,7 @@ impl SyscallDispatcher {
             sig_shdpnd,
             identity: self.synthetic_proc_identity(context),
             oom_score_adj: proc_oom_score_adj.as_ref(),
+            creds_ns: Some(&proc_creds_ns),
             processes: proc_processes.as_deref(),
             threads: proc_threads.as_deref(),
             zombies: proc_zombies.as_deref(),
@@ -11809,7 +11813,17 @@ impl SyscallDispatcher {
                             // the user-namespace map writers enforce the
                             // write-once / setgroups-gate / ≤5-line rules
                             // (docs/namespaces-design.md §4.3).
-                            return Ok(match crate::vfs::proc::write_userns_map(path, &bytes) {
+                            // The map named by /proc/self/uid_map is the
+                            // CALLER's own, and the privilege verdict is read
+                            // from the caller's own capability set — both off
+                            // its task, so one guest process cannot rewrite
+                            // another's maps.
+                            let task = cx.kernel.task();
+                            let privileged = task.caps().is_map_write_privileged();
+                            let result = task.with_user_ns(|ns| {
+                                crate::vfs::proc::write_userns_map(ns, privileged, path, &bytes)
+                            });
+                            return Ok(match result {
                                 Ok(n) => DispatchOutcome::Returned { value: n as i64 },
                                 Err(errno) => DispatchOutcome::errno(errno),
                             });

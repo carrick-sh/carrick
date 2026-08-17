@@ -6938,6 +6938,10 @@ impl SyscallDispatcher {
             .as_ref()
             .map(|process| process.kernel_graph().registry().oom_score_adj_by_pid())
             .unwrap_or_default();
+        // Capabilities and the user-namespace view are the CALLER's own, read
+        // straight off its task: unlike `oom_score_adj` these render only for
+        // `/proc/self`, so there is no by-pid map to assemble.
+        let creds_ns = context.task().creds_ns();
         let processes = Self::synthetic_proc_processes(hvpatch_process.as_ref());
         let zombies = hvpatch_process.map(|process| {
             process
@@ -6987,6 +6991,7 @@ impl SyscallDispatcher {
             sig_shdpnd,
             identity: self.synthetic_proc_identity(context),
             oom_score_adj,
+            creds_ns,
             processes,
             threads: self.synthetic_proc_threads(context, None),
             zombies,

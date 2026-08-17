@@ -12,6 +12,8 @@ use carrick_hal::ThreadId;
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::linux_abi::LINUX_DEFAULT_UMASK;
+use crate::namespace::process::{CapabilitySet, ProcessCredsNs};
+use crate::namespace::user::UserNs;
 
 use super::address::MmBackend;
 use super::clone_plan::{CloneObjectMode, ClonePlan, CloneTaskMode};
@@ -2359,6 +2361,24 @@ pub struct Task {
     /// one guest's `KEYCTL_JOIN_SESSION_KEYRING` reassign every other guest's
     /// session keyring.
     keyrings: Mutex<ProcessKeyrings>,
+    /// This process's five capability sets (`capabilities(7)`) and its
+    /// user-namespace view (`user_namespaces(7)`) — the `uid_map`/`gid_map`/
+    /// `setgroups` state behind `/proc/self/*`.
+    ///
+    /// Both are per-process attributes that a `fork` child inherits as a COPY
+    /// and then owns: `PR_CAPBSET_DROP`, `capset`, `PR_CAP_AMBIENT_*` and a
+    /// `uid_map` write change only the calling process. They live on the task
+    /// for the same reason [`Task::oom_score_adj`] and [`Task::keyrings`] do —
+    /// under HVPatch every Linux process is a thread of ONE Darwin process, so
+    /// the `static` that used to hold them was a single cell shared by every
+    /// guest process at once. That made one guest's capbset drop remove the
+    /// capability from every other guest, irreversibly, and published one
+    /// guest's `uid_map` in every other guest's `/proc/self/uid_map`.
+    ///
+    /// One mutex covers both because `unshare(CLONE_NEWUSER)` must replace the
+    /// namespace and grant the full set as a single atomic step; splitting
+    /// them would let a reader observe a fresh namespace with the old caps.
+    creds_ns: Mutex<ProcessCredsNs>,
 }
 
 /// A process's keyring pointers. Serials rather than object references: the
@@ -2434,7 +2454,75 @@ impl Task {
             wake_generation: AtomicU64::new(0),
             oom_score_adj: AtomicI32::new(0),
             keyrings: Mutex::new(ProcessKeyrings::default()),
+            creds_ns: Mutex::new(ProcessCredsNs::default()),
         }
+    }
+
+    /// A snapshot of this process's capability sets and user-namespace view,
+    /// for the `/proc` render context.
+    pub fn creds_ns(&self) -> ProcessCredsNs {
+        self.creds_ns.lock().clone()
+    }
+
+    /// This process's capability sets, by value.
+    pub fn caps(&self) -> CapabilitySet {
+        self.creds_ns.lock().caps
+    }
+
+    /// Mutate this process's capability sets under the task lock, so a
+    /// read-modify-write (`capset`, `PR_CAPBSET_DROP`, `PR_CAP_AMBIENT_RAISE`)
+    /// cannot race a sibling thread of the same process. All threads of a
+    /// Linux process share one set, which is why this is task state and not
+    /// thread state.
+    pub fn with_caps<R>(&self, f: impl FnOnce(&mut CapabilitySet) -> R) -> R {
+        f(&mut self.creds_ns.lock().caps)
+    }
+
+    /// This process's user namespace, by value.
+    pub fn user_ns(&self) -> UserNs {
+        self.creds_ns.lock().user.clone()
+    }
+
+    /// Mutate this process's user-namespace view under the task lock — the
+    /// `/proc/self/{uid_map,gid_map,setgroups}` write path.
+    pub fn with_user_ns<R>(&self, f: impl FnOnce(&mut UserNs) -> R) -> R {
+        f(&mut self.creds_ns.lock().user)
+    }
+
+    /// `unshare(CLONE_NEWUSER)` (and the `clone(CLONE_NEWUSER)` child path):
+    /// place this process in a fresh user namespace parented at its current
+    /// one, and grant it a full capability set WITHIN that namespace
+    /// (`user_namespaces(7)`; design §4.1, §4.6). Returns the new id.
+    ///
+    /// Namespace replacement and the capability grant happen under one lock so
+    /// no reader sees the new namespace with the old caps.
+    pub fn unshare_user_ns(&self) -> crate::namespace::NsId {
+        let id = crate::namespace::process::alloc_ns_id();
+        let mut guard = self.creds_ns.lock();
+        let parent = guard.user.id;
+        guard.user = UserNs::fresh(id, parent);
+        guard.caps = CapabilitySet::full();
+        id
+    }
+
+    /// Copy the parent's capability sets and user-namespace view into a fresh
+    /// `fork` child.
+    ///
+    /// `capabilities(7)`: `fork` preserves all five sets verbatim — the child
+    /// starts identical to the parent and diverges only through its own later
+    /// `capset`/`PR_CAPBSET_DROP`/`PR_CAP_AMBIENT_*`. `user_namespaces(7)`: the
+    /// child is a member of the parent's user namespace, seeing the same
+    /// `uid_map`/`gid_map`. Both are COPIES, so a later change on either side
+    /// is invisible to the other.
+    ///
+    /// There is no execve counterpart: `execve` does not build a new [`Task`],
+    /// and Linux preserves the bounding, inheritable and ambient sets across an
+    /// exec of an ordinary (non-setuid, no-file-capability) binary — which is
+    /// every exec carrick models, since it implements neither file capabilities
+    /// nor the set-user-ID bit. Preserving the whole struct is therefore the
+    /// correct execve behaviour and needs no code.
+    pub fn inherit_creds_ns_from(&self, parent: &Task) {
+        *self.creds_ns.lock() = parent.creds_ns.lock().clone();
     }
 
     /// This process's keyring pointers.

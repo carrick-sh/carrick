@@ -883,13 +883,14 @@ impl SyscallDispatcher {
                 // root does not receive that capability in Docker's default
                 // bounded set, and a fresh user namespace's local full set is
                 // insufficient.
-                if rlim_max > old.rlim_max
-                    && !(crate::namespace::process::current_user_ns()
-                        == crate::namespace::INITIAL_USER_NS
-                        && crate::namespace::process::has_effective_cap(
-                            crate::namespace::process::CAP_SYS_RESOURCE,
-                        ))
-                {
+                let creds_ns_privileged = {
+                    let task = cx.kernel.task();
+                    task.user_ns().id == crate::namespace::INITIAL_USER_NS
+                        && task
+                            .caps()
+                            .has_effective(crate::namespace::process::CAP_SYS_RESOURCE)
+                };
+                if rlim_max > old.rlim_max && !creds_ns_privileged {
                     return Ok(DispatchOutcome::errno(LINUX_EPERM));
                 }
                 if resource == LINUX_RLIMIT_NOFILE {
