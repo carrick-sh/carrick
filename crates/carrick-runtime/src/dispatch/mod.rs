@@ -3393,6 +3393,15 @@ impl SyscallDispatcher {
             .shared()
             .sighand()
             .replace_actions(inherited.shared().sighand().actions());
+        // The per-process attributes Linux inherits across fork. This path
+        // bootstraps a BRAND-NEW root task, so nothing carries them implicitly;
+        // the in-process fork path calls the same helper (see
+        // `Task::inherit_fork_attributes_from`). Before these moved off
+        // process-global `static`s, `libc::fork` copied them for free and the
+        // omission here was invisible.
+        context
+            .task()
+            .inherit_fork_attributes_from(inherited.task());
         // A host fork copies only the calling thread. Preserve its blocked
         // mask, altstack and active handler-frame restoration state while
         // clearing both task- and thread-directed pending signals, exactly as
@@ -6519,7 +6528,10 @@ fn monotonic_duration() -> Duration {
     }
 }
 
-fn boottime_duration() -> Duration {
+/// The guest's `CLOCK_BOOTTIME`. Also THE authority for `/proc/uptime` field 1
+/// and `/proc/stat`'s `btime`, which Linux derives from this same clock — see
+/// `crate::vfs::proc`.
+pub(crate) fn boottime_duration() -> Duration {
     // On a Linux host the guest's CLOCK_BOOTTIME IS the host's — read it natively
     // so it shares the same (time-namespace-virtualized) epoch family as
     // monotonic_duration above; BOOTTIME = MONOTONIC + suspend, so the

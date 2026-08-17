@@ -126,12 +126,6 @@ use crate::linux_abi::{
     LINUX_PTRACE_POKEDATA, LINUX_PTRACE_POKETEXT, LINUX_PTRACE_POKEUSER,
 };
 
-/// Process I/O priority stored by `ioprio_set` and echoed by `ioprio_get`.
-/// carrick has no real I/O scheduler; default is IOPRIO_CLASS_BE(2) level 4 =
-/// (2<<13)|4, what the kernel reports for a process that never set one.
-static IOPRIO_VALUE: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new((2 << 13) | 4);
-
 /// `sizeof(struct robust_list_head)` on 64-bit Linux: three 8-byte fields
 /// (list.next, futex_offset, list_op_pending). set_robust_list requires the
 /// caller's `len` to equal this exactly; get_robust_list reports it.
@@ -2007,7 +2001,7 @@ impl SyscallDispatcher {
                 }
                 _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             }
-            IOPRIO_VALUE.store(v, std::sync::atomic::Ordering::SeqCst);
+            cx.kernel.task().set_ioprio(v);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -2022,7 +2016,7 @@ impl SyscallDispatcher {
             if !matches!(which, PROCESS | PGRP | USER) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let v = IOPRIO_VALUE.load(std::sync::atomic::Ordering::SeqCst);
+            let v = cx.kernel.task().ioprio();
             Ok(DispatchOutcome::Returned { value: v as i64 })
         }
 
