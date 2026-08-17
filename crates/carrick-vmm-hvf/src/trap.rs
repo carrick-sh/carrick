@@ -4306,10 +4306,42 @@ struct ExecStage2Install {
     size: usize,
     host: *mut u8,
     perms: u64,
+    replay_registered: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type ExecBackendExtentFingerprint = (
+    (u64, u64),
+    carrick_hal::FrameId,
+    carrick_hal::MappingId,
+    InventoryBackingIdentity,
+    u64,
+    u64,
+);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type ExecMappingFingerprint = (u64, u64, u64, usize, usize, Option<(u64, u64)>);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExecAuthorityFingerprint {
+    owners: Vec<((u64, u64), usize, u64)>,
+    backend_extents: Vec<ExecBackendExtentFingerprint>,
+    frame_references: Vec<(carrick_hal::FrameId, usize)>,
+    extent_references: Vec<((carrick_hal::FrameId, u64, u64), usize)>,
+    stage2_references: Vec<((u64, u64), usize)>,
+    mappings: Vec<ExecMappingFingerprint>,
+    allocator_leases: Vec<(u64, u64)>,
+    replay_mappings: Vec<ReplayMappingKey>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl ExecStage2Install {
+    fn replay_key(&self) -> Option<ReplayMappingKey> {
+        self.replay_registered
+            .then_some((self.ipa, self.size, self.host as usize, self.perms))
+    }
+
     #[cfg(test)]
     fn key(&self) -> (u64, u64) {
         (self.ipa, self.size as u64)
@@ -4322,6 +4354,7 @@ impl ExecStage2Install {
             size,
             host: std::ptr::null_mut(),
             perms: 0,
+            replay_registered: false,
         }
     }
 }
@@ -4656,11 +4689,87 @@ pub struct ThreadSpec;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
+    fn exec_authority_fingerprint(&self) -> ExecAuthorityFingerprint {
+        let inventory = self.frame_inventory.lock();
+        let backend_extents = inventory
+            .extents
+            .iter()
+            .map(|(&key, extent)| {
+                (
+                    key,
+                    extent.frame,
+                    extent.mapping,
+                    extent.backing,
+                    extent.stage2_base,
+                    extent.stage2_length,
+                )
+            })
+            .collect();
+        let frames = inventory.frames.lock();
+        let frame_references = frames
+            .references
+            .iter()
+            .map(|(&key, &value)| (key, value))
+            .collect();
+        let extent_references = frames
+            .extent_references
+            .iter()
+            .map(|(&key, &value)| (key, value))
+            .collect();
+        let stage2_references = frames
+            .stage2_references
+            .iter()
+            .map(|(&key, &value)| (key, value))
+            .collect();
+        drop(frames);
+        drop(inventory);
+        let owners = global_frame_host_owners()
+            .lock()
+            .iter()
+            .map(|(&key, owner)| (key, owner._mapping.as_ptr() as usize, owner.perms))
+            .collect();
+        let mappings = self
+            .mappings
+            .iter()
+            .map(|mapping| {
+                (
+                    mapping.start,
+                    mapping.ipa,
+                    mapping.physical_ipa,
+                    mapping.host_addr as usize,
+                    mapping.physical_size,
+                    mapping
+                        .stage2_lease
+                        .as_ref()
+                        .map(GlobalFrameStage2Lease::key),
+                )
+            })
+            .collect();
+        let allocator_leases = global_frame_ipa_allocator()
+            .lock()
+            .live
+            .iter()
+            .map(|(&key, &value)| (key, value))
+            .collect();
+        let replay_mappings = replay_mappings().lock().iter().copied().collect();
+        ExecAuthorityFingerprint {
+            owners,
+            backend_extents,
+            frame_references,
+            extent_references,
+            stage2_references,
+            mappings,
+            allocator_leases,
+            replay_mappings,
+        }
+    }
+
     fn exec_predecessor_stage2_installs(
         &self,
         extents: &std::collections::BTreeSet<(u64, usize)>,
     ) -> Result<Vec<ExecStage2Install>, TrapError> {
         let owners = global_frame_host_owners().lock();
+        let replay = replay_mappings().lock();
         let mut installs = Vec::with_capacity(extents.len());
         for &(ipa, size) in extents {
             if let Some(owner) = owners.get(&(ipa, size as u64)) {
@@ -4669,6 +4778,12 @@ impl HvfVmState {
                     size,
                     host: owner._mapping.as_ptr(),
                     perms: owner.perms,
+                    replay_registered: replay.contains(&(
+                        ipa,
+                        size,
+                        owner._mapping.as_ptr() as usize,
+                        owner.perms,
+                    )),
                 });
                 continue;
             }
@@ -4694,6 +4809,12 @@ impl HvfVmState {
                 size,
                 host,
                 perms: u64::from(mapping.perms),
+                replay_registered: replay.contains(&(
+                    ipa,
+                    size,
+                    host as usize,
+                    u64::from(mapping.perms),
+                )),
             });
         }
         Ok(installs)
@@ -11636,7 +11757,8 @@ impl HvfVmState {
                 .zip(prepared_exec_regions.iter())
                 .map(|(mapping, (region, _))| exec_stage2_install(mapping, region))
                 .collect::<Vec<_>>();
-            switch_exec_stage2_transaction(
+            let authority_before = self.exec_authority_fingerprint();
+            let switch_result = switch_exec_stage2_transaction(
                 &predecessor,
                 &replacement,
                 exec_stage2_fail_after_maps(),
@@ -11687,6 +11809,11 @@ impl HvfVmState {
                             extent.perms,
                         )
                     };
+                    if rc == 0
+                        && let Some(replay_key) = extent.replay_key()
+                    {
+                        replay_mappings().lock().insert(replay_key);
+                    }
                     crate::probes::hvpatch_exec_stage2(
                         carrick_observability::probes::HvpatchExecStage2::new(
                             carrick_observability::probes::HvpatchExecStage2Phase::MapEnd,
@@ -11705,7 +11832,17 @@ impl HvfVmState {
                         )))
                     }
                 },
-            )?;
+            );
+            if let Err(error) = switch_result {
+                let authority_after = self.exec_authority_fingerprint();
+                if authority_after != authority_before {
+                    eprintln!(
+                        "carrick: FATAL: HVPatch exec stage-2 rollback changed published owner/inventory/mapping/allocator authority"
+                    );
+                    std::process::abort();
+                }
+                return Err(error);
+            }
             for (_, lease) in &mut prepared_exec_regions {
                 lease.mark_mapped();
             }
@@ -11764,7 +11901,18 @@ impl HvfVmState {
         let drop_backings_started = std::time::Instant::now();
         if self.persistent_vm_lifecycle {
             for &(ipa, size) in &retired_physical_extents {
-                self.finish_exec_predecessor_stage2_retirement(ipa, size as u64)?;
+                self.finish_exec_predecessor_stage2_retirement(ipa, size as u64)
+                    .unwrap_or_else(|error| {
+                        // `stage_retirement` above has already consumed the
+                        // predecessor backend inventory. Returning through the
+                        // ordinary exec failure path would present a rollback
+                        // that can no longer exist. Fail closed at this explicit
+                        // post-switch commit boundary instead.
+                        eprintln!(
+                            "carrick: FATAL: commit HVPatch exec predecessor retirement: {error}"
+                        );
+                        std::process::abort();
+                    });
             }
             // Reclaim only host mappings whose exact stage-2 extents were
             // removed. A shared extent retained for another mm still points at
@@ -13018,6 +13166,7 @@ fn exec_stage2_install(mapping: &GuestMapping, region: &HvfMappedRegion) -> Exec
         size: region.physical_size,
         host: region.host_addr,
         perms: u64::from(region.perms),
+        replay_registered: false,
     }
 }
 
@@ -14245,6 +14394,15 @@ mod frame_inventory_backend_tests {
     }
 
     fn assert_exec_stage2_injected_failure_restores_old(fail_after_maps: usize) {
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct PublicationAuthorities {
+            owners: std::collections::BTreeSet<(u64, u64)>,
+            backend_inventory: std::collections::BTreeSet<(u64, u64)>,
+            kernel_inventory: std::collections::BTreeSet<(u64, u64)>,
+            self_mappings: std::collections::BTreeSet<(u64, u64)>,
+            allocator_leases: std::collections::BTreeSet<(u64, u64)>,
+        }
+
         let old = [
             ExecStage2Install::for_test(0x1000, 0x1000),
             ExecStage2Install::for_test(0x3000, 0x1000),
@@ -14259,6 +14417,14 @@ mod frame_inventory_backend_tests {
                 .collect::<std::collections::BTreeSet<_>>(),
         );
         let actions = std::cell::RefCell::new(Vec::new());
+        let authorities = PublicationAuthorities {
+            owners: old.iter().map(ExecStage2Install::key).collect(),
+            backend_inventory: old.iter().map(ExecStage2Install::key).collect(),
+            kernel_inventory: old.iter().map(ExecStage2Install::key).collect(),
+            self_mappings: old.iter().map(ExecStage2Install::key).collect(),
+            allocator_leases: new.iter().map(ExecStage2Install::key).collect(),
+        };
+        let authorities_before = authorities.clone();
 
         let error = switch_exec_stage2_transaction(
             &old,
@@ -14320,6 +14486,10 @@ mod frame_inventory_backend_tests {
             expected,
             "rollback must remove every published successor in reverse order before restoring every predecessor"
         );
+        assert_eq!(
+            authorities, authorities_before,
+            "an ordinary stage-2 switch failure occurs before owner, backend inventory, Kernel inventory, self.mappings, or allocator-lease publication"
+        );
     }
 
     #[test]
@@ -14330,6 +14500,53 @@ mod frame_inventory_backend_tests {
     #[test]
     fn exec_stage2_failure_after_one_map_removes_successor_and_restores_predecessor() {
         assert_exec_stage2_injected_failure_restores_old(1);
+    }
+
+    #[test]
+    fn exec_stage2_rollback_restores_predecessor_replay_registration() {
+        let mut predecessor = ExecStage2Install::for_test(0x1000, 0x1000);
+        predecessor.replay_registered = true;
+        let replacement = ExecStage2Install::for_test(0x9000, 0x1000);
+        let installed =
+            std::cell::RefCell::new(std::collections::BTreeSet::from([predecessor.key()]));
+        let replay = std::cell::RefCell::new(std::collections::BTreeSet::from([predecessor
+            .replay_key()
+            .unwrap()]));
+
+        let error = switch_exec_stage2_transaction(
+            &[predecessor],
+            &[replacement],
+            Some(0),
+            |extent| {
+                installed.borrow_mut().remove(&extent.key());
+                if let Some(key) = extent.replay_key() {
+                    replay.borrow_mut().remove(&key);
+                }
+                Ok(())
+            },
+            |extent| {
+                installed.borrow_mut().insert(extent.key());
+                if let Some(key) = extent.replay_key() {
+                    replay.borrow_mut().insert(key);
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected HVPatch exec stage-2 map failure")
+        );
+        assert_eq!(
+            *installed.borrow(),
+            std::collections::BTreeSet::from([predecessor.key()])
+        );
+        assert_eq!(
+            *replay.borrow(),
+            std::collections::BTreeSet::from([predecessor.replay_key().unwrap()])
+        );
     }
 
     #[test]
