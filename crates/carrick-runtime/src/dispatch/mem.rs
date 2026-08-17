@@ -4352,9 +4352,6 @@ impl SyscallDispatcher {
                 Ok(metadata) => metadata,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            if source_metadata.sharing == ProcMapSharing::Shared && new_size > old_size {
-                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
-            }
             let shared_aperture_alloc = this
                 .mem
                 .lock()
@@ -4381,6 +4378,40 @@ impl SyscallDispatcher {
                 // residency, VMA metadata, or the aperture free list.
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
+            // A shared mapping cannot be grown by copying it somewhere bigger:
+            // the whole point of MAP_SHARED is that every mapper of the object
+            // observes the same bytes, and a copy would silently unshare it.
+            // Linux instead keeps the backing object exactly where it is, so
+            // carrick grows the aperture allocation in place. Only a
+            // shared-aperture allocation that this request covers exactly can
+            // do that; anything else keeps the pre-existing ENOMEM.
+            //
+            // Measured against real Linux 6.12 (docker gcc:latest, arm64,
+            // 2026-08-17): `MAP_SHARED|MAP_ANONYMOUS` 1 page grown to 2 with
+            // MREMAP_MAYMOVE succeeds, and WITHOUT MREMAP_MAYMOVE it reports
+            // ENOMEM — which is why the grow below is gated on the flag.
+            //
+            // Restricted to SharedAnon: a SharedFile allocation's grown tail
+            // must show the FILE's bytes at the matching offset (measured: a
+            // 1-page MAP_SHARED window onto a 4-page file grows and the new
+            // page reads and writes the file), and the aperture's granules
+            // would come up zeroed instead. That shape still reports ENOMEM
+            // here — an honest gap, not a silent wrong answer.
+            let shared_grow_in_place = new_size > old_size
+                && flags & LINUX_MREMAP_MAYMOVE != 0
+                && matches!(
+                    shared_aperture_alloc,
+                    Some(ref alloc)
+                        if alloc.guest_addr == old_address.0
+                            && alloc.live_len == old_size
+                            && alloc.backing == crate::shared_aperture::BackingObject::SharedAnon
+                );
+            if source_metadata.sharing == ProcMapSharing::Shared
+                && new_size > old_size
+                && !shared_grow_in_place
+            {
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            }
             if !source_in_arena {
                 // The mapping is not in the mmap arena: it's a MAP_SHARED file
                 // alias (high VA) or a MAP_SHARED anonymous shared-aperture
@@ -4401,6 +4432,93 @@ impl SyscallDispatcher {
                 // probing the main stack VMA.
                 if memory.read_bytes(old_address.0, 1).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                if shared_grow_in_place {
+                    // Extend the existing aperture allocation rather than
+                    // allocating a bigger one and copying: the backing object
+                    // must keep its identity so every other mapper (a forked
+                    // child, a second mmap of the same object) still sees this
+                    // mapping's stores.
+                    let claimed = this.mem.lock().shared.grow(old_address.0, new_size);
+                    let Some((claim_start, claim_len)) = claimed else {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    };
+                    if claim_len != 0 {
+                        // The claimed granules may still hold a previous
+                        // owner's bytes, and Linux hands out zeroed pages for
+                        // anonymous shared memory. Scrub before anything can
+                        // read them. The aperture rounds to the host granule,
+                        // so this range is already host-page aligned.
+                        let Ok(claim_len_usize) = usize::try_from(claim_len) else {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                        };
+                        if memory
+                            .zero_anonymous_reuse(
+                                claim_start,
+                                claim_len_usize,
+                                carrick_guest_mem::MappingSharing::Shared,
+                            )
+                            .is_err()
+                        {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                        }
+                        if this
+                            .mem
+                            .lock()
+                            .shared
+                            .range_needs_identity_restore(claim_start, claim_len)
+                        {
+                            if memory
+                                .restore_shared_identity(claim_start, claim_len_usize)
+                                .is_err()
+                            {
+                                // The page-table edit may already be live even
+                                // when its TLB flush reports failure; recycling
+                                // this VA would publish unowned translation.
+                                std::process::abort();
+                            }
+                            if this
+                                .mem
+                                .lock()
+                                .shared
+                                .mark_identity_restored(claim_start, claim_len)
+                                .is_none()
+                            {
+                                std::process::abort();
+                            }
+                        }
+                        // The aperture is boot-mapped RW, so the grown tail
+                        // needs this mapping's protection published over it
+                        // exactly as a fresh MAP_SHARED|MAP_ANON does —
+                        // otherwise a store to a read-only mapping's new pages
+                        // silently succeeds.
+                        let prot_none = source_metadata.prot.is_empty();
+                        memory.set_mapping_protection_and_sharing(
+                            claim_start,
+                            claim_len_usize,
+                            prot_none,
+                            !prot_none && !source_metadata.prot.contains(LinuxProtFlags::WRITE),
+                            carrick_guest_mem::MappingSharing::Shared,
+                        );
+                        if memory
+                            .protect_range(claim_start, claim_len_usize, source_metadata.prot.bits())
+                            .is_err()
+                        {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                        }
+                    }
+                    this.record_dynamic_mapping_with_file_offset(
+                        old_address.0,
+                        new_size,
+                        source_metadata.prot,
+                        source_metadata.sharing,
+                        source_metadata.path.clone(),
+                        source_metadata.file_page_offset,
+                    );
+                    this.mark_vma_dispatch(&mut host_alias_dispatch);
+                    return Ok(DispatchOutcome::Returned {
+                        value: old_address.0 as i64,
+                    });
                 }
                 if new_size <= old_size {
                     let tail_start = old_address.0.saturating_add(new_size);

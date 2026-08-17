@@ -737,6 +737,62 @@ impl SharedAperture {
         Some(())
     }
 
+    /// Grow the guest-visible length of a live allocation IN PLACE, claiming
+    /// whatever additional whole granules it needs from the space immediately
+    /// above it. This is the inverse of [`shrink`](Self::shrink) and exists for
+    /// `mremap` growth: Linux keeps the mapping's backing object identity
+    /// across a grow, so carrick must extend the existing allocation rather
+    /// than allocate a fresh one and copy (a copy would silently break sharing
+    /// with every other mapper of the same object).
+    ///
+    /// Returns the interval this call newly claimed — bytes that were NOT owned
+    /// by this allocation before and may therefore still hold a previous
+    /// owner's data, so the caller must scrub them before publishing. A zero
+    /// length means the growth fit inside the reservation the allocation
+    /// already had (granule rounding usually makes a small grow free).
+    ///
+    /// `None` if there is no live allocation at `guest_addr`, if `new_live_len`
+    /// would shrink it, or if the space above is owned by another allocation or
+    /// runs past the window.
+    pub fn grow(&mut self, guest_addr: u64, new_live_len: u64) -> Option<(u64, u64)> {
+        let (reserved_len, live_len) = {
+            let alloc = self.live.iter().find(|a| a.guest_addr == guest_addr)?;
+            (alloc.len, alloc.live_len)
+        };
+        if new_live_len < live_len {
+            return None;
+        }
+        let needed = align_up_u64(new_live_len, GRANULE)?;
+        if needed <= reserved_len {
+            let alloc = self.live.iter_mut().find(|a| a.guest_addr == guest_addr)?;
+            alloc.live_len = new_live_len;
+            return Some((guest_addr.checked_add(reserved_len)?, 0));
+        }
+        let claim_start = guest_addr.checked_add(reserved_len)?;
+        let claim_len = needed.checked_sub(reserved_len)?;
+        let claim_end = claim_start.checked_add(claim_len)?;
+        if claim_end > self.window_end() {
+            return None;
+        }
+        // The claim starts exactly at this allocation's reserved end, so it can
+        // never overlap the allocation itself; any owner found here is a
+        // different live slot and the grow has to fail.
+        if self.physical_range_has_owner(claim_start, claim_len) {
+            return None;
+        }
+        // Everything below the bump pointer is either live (ruled out above) or
+        // free, so removing the interval from the free list and advancing the
+        // bump pointer claims it in both the reused and never-allocated cases.
+        interval_remove(&mut self.free, claim_start, claim_end);
+        if claim_end > self.next {
+            self.next = claim_end;
+        }
+        let alloc = self.live.iter_mut().find(|a| a.guest_addr == guest_addr)?;
+        alloc.len = needed;
+        alloc.live_len = new_live_len;
+        Some((claim_start, claim_len))
+    }
+
     /// Release any whole-granule tail beyond the allocation's current
     /// `live_len`, updating its reserved length and free accounting.
     pub fn release_tail(&mut self, guest_addr: u64) -> Option<()> {
@@ -862,6 +918,79 @@ mod tests {
         assert_eq!(a, base());
         // Second allocation is rounded up to the 16 KiB granule (0x4000).
         assert_eq!(b, base() + 0x4000);
+    }
+
+    /// A small grow is usually free: granule rounding already reserved the
+    /// space, so nothing is claimed and the caller has no bytes to scrub.
+    #[test]
+    fn grow_inside_the_rounded_reservation_claims_nothing() {
+        let mut ap = SharedAperture::new();
+        let a = ap.alloc(0x1000, BackingObject::SharedAnon).expect("alloc");
+        let (_, claimed) = ap.grow(a, 0x2000).expect("grow");
+        assert_eq!(claimed, 0, "0x2000 still fits the 16 KiB granule");
+        assert_eq!(ap.live()[0].live_len, 0x2000);
+        assert_eq!(ap.live()[0].len, GRANULE, "reservation unchanged");
+    }
+
+    /// Growing past the rounded reservation claims the granules above it and
+    /// reports them, because they may still hold a previous owner's bytes.
+    #[test]
+    fn grow_past_the_reservation_claims_and_reports_the_new_granules() {
+        let mut ap = SharedAperture::new();
+        let a = ap.alloc(0x1000, BackingObject::SharedAnon).expect("alloc");
+        let (start, claimed) = ap.grow(a, 0x5000).expect("grow");
+        assert_eq!(start, a + GRANULE);
+        assert_eq!(claimed, GRANULE, "0x5000 rounds to two granules");
+        assert_eq!(ap.live()[0].live_len, 0x5000);
+        assert_eq!(ap.live()[0].len, 2 * GRANULE);
+        // The claim must really be owned now: a fresh allocation cannot land
+        // inside it.
+        let b = ap.alloc(0x1000, BackingObject::SharedAnon).expect("alloc");
+        assert!(b >= a + 2 * GRANULE, "{b:#x} overlaps the grown allocation");
+    }
+
+    /// The space above may belong to someone else, and then the grow must fail
+    /// rather than quietly overrun a live neighbour.
+    #[test]
+    fn grow_refuses_to_overrun_a_live_neighbour() {
+        let mut ap = SharedAperture::new();
+        let a = ap.alloc(0x1000, BackingObject::SharedAnon).expect("alloc");
+        let b = ap.alloc(0x1000, BackingObject::SharedAnon).expect("alloc");
+        assert_eq!(b, a + GRANULE, "neighbour sits directly above");
+        assert!(ap.grow(a, 0x5000).is_none());
+        assert_eq!(ap.live()[0].live_len, 0x1000, "failed grow changed nothing");
+        assert_eq!(ap.live()[0].len, GRANULE);
+    }
+
+    /// A freed neighbour's granules are reusable by a grow, the same way
+    /// `alloc` reuses them.
+    #[test]
+    fn grow_reclaims_a_freed_neighbour() {
+        let mut ap = SharedAperture::new();
+        let a = ap.alloc(0x1000, BackingObject::SharedAnon).expect("alloc");
+        let b = ap.alloc(0x1000, BackingObject::SharedAnon).expect("alloc");
+        ap.free(b).expect("free");
+        let (start, claimed) = ap.grow(a, 0x5000).expect("grow");
+        assert_eq!((start, claimed), (a + GRANULE, GRANULE));
+    }
+
+    /// `grow` is the inverse of `shrink`, not a general resize: a request that
+    /// would shorten the allocation is rejected so a caller cannot silently
+    /// leak the tail's reservation through the wrong entry point.
+    #[test]
+    fn grow_rejects_a_shrink() {
+        let mut ap = SharedAperture::new();
+        let a = ap.alloc(0x4000, BackingObject::SharedAnon).expect("alloc");
+        assert!(ap.grow(a, 0x1000).is_none());
+        assert_eq!(ap.live()[0].live_len, 0x4000);
+    }
+
+    /// Growing something that is not a live allocation must fail rather than
+    /// invent one.
+    #[test]
+    fn grow_rejects_an_unknown_address() {
+        let mut ap = SharedAperture::new();
+        assert!(ap.grow(base() + 0x8000, 0x1000).is_none());
     }
 
     #[test]
