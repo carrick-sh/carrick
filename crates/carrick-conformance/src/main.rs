@@ -220,6 +220,27 @@ struct Args {
     /// capturing a finished run's docker work without re-running any container.
     #[arg(long)]
     seed_oracle: Option<PathBuf>,
+    /// Re-run DOCKER ONLY for the `--suite`/`--ecosystem` selection, under
+    /// `--oracle-fill-profile`, rewrite just those cache rows, and exit.
+    ///
+    /// A suite's docker oracle is keyed by its DECLARATION, so repairing a
+    /// declaration (e.g. removing a wrong `docker_flags` entry) mints a new key
+    /// whose row does not exist yet. The closure gate refuses suite filters —
+    /// correctly, it is the gate — and `--refresh-oracle` on a full closure run
+    /// would re-run all 2,127 oracles to capture one. This is the narrow
+    /// docker-side repair path: no carrick runs, no classification, no gate
+    /// verdict, no baseline. It is a measurement tool, not a gate, so it always
+    /// runs the container fresh and NEVER accepts an existing cached row.
+    ///
+    /// Requires an explicit selection: filling the whole surface must be a
+    /// deliberate `--refresh-oracle` run, never a side effect of this flag.
+    #[arg(long)]
+    oracle_fill: bool,
+    /// Parser profile for `--oracle-fill`: `closure` (the assertion-exact
+    /// profile the closure gate keys on) or `regression`. These are DIFFERENT
+    /// cache keys; filling the wrong one leaves the gate's row still missing.
+    #[arg(long, default_value = "closure")]
+    oracle_fill_profile: String,
 }
 
 fn main() -> ExitCode {
@@ -337,6 +358,9 @@ fn run() -> anyhow::Result<ExitCode> {
     );
     if args.closure {
         validate_closure_selection(&selected)?;
+    }
+    if args.oracle_fill {
+        return oracle_fill(&args, &selected, docker_platform);
     }
     // Transparency: a bring-up lane silently dropping not-yet-applicable
     // ecosystems could be misread as full coverage, so name what was scoped out.
@@ -963,6 +987,126 @@ fn perf_summary(carrick_ms: u64, oracle_ms: Option<u64>) -> PerfSummary {
 
 fn verdict_kind(s: &Suite) -> manifest::VerdictKind {
     s.verdict
+}
+
+/// Parse `--oracle-fill-profile` into the cache-key determinant it names.
+fn parse_oracle_fill_profile(name: &str) -> anyhow::Result<oracle::ParserProfile> {
+    match name {
+        "closure" => Ok(oracle::ParserProfile::ClosureV1),
+        "regression" => Ok(oracle::ParserProfile::Regression),
+        other => anyhow::bail!(
+            "unknown --oracle-fill-profile {other:?} (expected `closure` or `regression`)"
+        ),
+    }
+}
+
+/// `--oracle-fill`: re-run DOCKER ONLY for an explicitly named selection and
+/// rewrite just those oracle-cache rows under one parser profile.
+///
+/// Repairing a suite DECLARATION mints a new determinant key, so the gate's row
+/// for the repaired declaration does not exist. The closure gate rejects suite
+/// filters (it is the gate), and `--refresh-oracle` on a closure run would
+/// re-run all 2,127 oracles to capture one. This is the narrow docker-side
+/// repair path.
+///
+/// Fails closed: an empty selection, a docker spawn failure, a timeout, or a
+/// result the cache refuses to accept is an error, and the invalidated row is
+/// left MISSING rather than silently reverting to the superseded oracle.
+fn oracle_fill(
+    args: &Args,
+    selected: &[Suite],
+    docker_platform: crate::lane::DockerPlatform,
+) -> anyhow::Result<ExitCode> {
+    if args.closure {
+        anyhow::bail!(
+            "--oracle-fill is a docker-side repair tool, not a gate; it rejects --closure"
+        );
+    }
+    // Filling the whole surface must be a deliberate `--refresh-oracle` run,
+    // never a side effect of this flag.
+    if args.ecosystem.is_empty() && args.suite.is_empty() {
+        anyhow::bail!("--oracle-fill requires an explicit --suite/--ecosystem selection");
+    }
+    if selected.is_empty() {
+        anyhow::bail!("--oracle-fill selected no suites");
+    }
+    let profile = parse_oracle_fill_profile(&args.oracle_fill_profile)?;
+    let parser_mode = match profile {
+        oracle::ParserProfile::ClosureV1 => parsers::ParseMode::Closure,
+        oracle::ParserProfile::Regression => parsers::ParseMode::Regression,
+    };
+
+    let pid = std::process::id();
+    let mut cache = oracle::OracleCache::load(&args.oracle_cache);
+    eprintln!(
+        "oracle-fill: {} suite(s), profile={}, platform={docker_platform:?} (docker only; \
+         no carrick, no classification)",
+        selected.len(),
+        args.oracle_fill_profile,
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    for (i, suite) in selected.iter().enumerate() {
+        // Drop the existing row FIRST: a failed refresh must leave a miss, never
+        // let a later gate fall back to the superseded oracle.
+        cache.invalidate_for_profile(suite, docker_platform, profile);
+        let run_id = format!("fill-{pid}-d{i:02}");
+        let out = engine::run_docker(suite, &run_id, docker_platform);
+        let out = match out {
+            Ok(o) => o,
+            Err(e) => {
+                failures.push(format!("{}: docker spawn failed: {e:#}", suite.name));
+                continue;
+            }
+        };
+        if out.timed_out {
+            failures.push(format!(
+                "{}: docker timed out after {} s — no oracle recorded",
+                suite.name, suite.timeout_s
+            ));
+            continue;
+        }
+        let res = parsers::parse_for_mode(verdict_kind(suite), &out.raw(), parser_mode);
+        eprintln!(
+            "  [docker] {} -> {:?} n={} pass={} fail={} broken={} skip={} ({} ms)\n\
+                        raw: {} / {}",
+            suite.name,
+            res.result,
+            res.totals.n,
+            res.totals.passed,
+            res.totals.failed,
+            res.totals.broken,
+            res.totals.skipped,
+            out.elapsed_ms,
+            out.stdout_path.display(),
+            out.stderr_path.display(),
+        );
+        if !cache.insert_fresh_for_profile(
+            suite,
+            docker_platform,
+            profile,
+            res,
+            Some(out.elapsed_ms),
+            out.timed_out,
+        ) {
+            failures.push(format!(
+                "{}: cache refused the fresh oracle — row left missing",
+                suite.name
+            ));
+        }
+    }
+
+    if cache.dirty() {
+        cache.save()?;
+        eprintln!("oracle-fill: wrote {}", args.oracle_cache.display());
+    }
+    if !failures.is_empty() {
+        for f in &failures {
+            eprintln!("oracle-fill error: {f}");
+        }
+        anyhow::bail!("{} suite(s) produced no oracle row", failures.len());
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Import a completed gate's docker side into the oracle cache, reconstructing
@@ -2099,6 +2243,34 @@ fn walk_newest(dir: &Path, newest: &mut Option<std::time::SystemTime>) {
 
 #[cfg(test)]
 mod tests {
+    /// `--oracle-fill` defaults to the CLOSURE profile, and names only the two
+    /// real profiles.
+    ///
+    /// The two profiles are distinct cache keys. Filling `regression` when the
+    /// closure gate is the consumer writes a row the gate never reads and leaves
+    /// its own row missing — which is exactly how a repaired `node-libuv`
+    /// declaration was recorded as "oracle refreshed" while the closure gate
+    /// still had no oracle for it. Defaulting to `closure` makes the campaign's
+    /// profile the one you get without asking.
+    #[test]
+    fn oracle_fill_profile_defaults_to_closure_and_rejects_unknown() {
+        use super::{Args, oracle, parse_oracle_fill_profile};
+        use clap::Parser;
+
+        let args = Args::parse_from(["carrick-conformance", "--oracle-fill", "--suite", "x"]);
+        assert_eq!(args.oracle_fill_profile, "closure");
+        assert_eq!(
+            parse_oracle_fill_profile(&args.oracle_fill_profile).unwrap(),
+            oracle::ParserProfile::ClosureV1
+        );
+        assert_eq!(
+            parse_oracle_fill_profile("regression").unwrap(),
+            oracle::ParserProfile::Regression
+        );
+        assert!(parse_oracle_fill_profile("closure-v1").is_err());
+        assert!(parse_oracle_fill_profile("").is_err());
+    }
+
     /// A cheap run must never destroy an expensive one's data. This is not
     /// hypothetical: a 2-suite reproduction wiped the per-suite records of a
     /// 1175-suite full-tier run mid-triage, and only the handful of lines
