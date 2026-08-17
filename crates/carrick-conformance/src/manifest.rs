@@ -318,6 +318,34 @@ carrick_flags = ["--fs", "host"]
         Manifest::from_toml(&content).expect("parse committed suites.toml")
     }
 
+    /// `go-os` and `go-net` must keep `-t` on the docker side.
+    ///
+    /// Each contains a test that needs a controlling TERMINAL —
+    /// `TestSpliceFile/{TCP,Unix}-To-TTY` and `TestCopyFromTTY`. Without one
+    /// they HANG rather than fail or skip, the suite is killed at its budget,
+    /// and the oracle records a fraction of its assertions: 104 of `go-os`'s
+    /// 729 and 259 of `go-net`'s 449, leaving ~800 rows ledgered
+    /// `docker = absent` and never compared. Losing this flag would silently
+    /// stop measuring most of two suites, which is exactly how the `node-libuv`
+    /// oracle went unnoticed.
+    #[test]
+    fn go_tty_suites_keep_their_docker_tty() {
+        let m = committed_manifest();
+        for name in ["go-os", "go-net"] {
+            let suite = m
+                .suite
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("committed manifest declares {name}"));
+            assert!(
+                suite.docker_flags.iter().any(|f| f == "-t"),
+                "{name} must run its oracle with -t: without a controlling terminal its \
+                 TTY test hangs and the suite is truncated at the timeout, got {:?}",
+                suite.docker_flags
+            );
+        }
+    }
+
     /// `node-libuv` must NOT pin `--user` on the docker side.
     ///
     /// The image's `nodejs-conformance` wrapper creates and chowns the libuv

@@ -93,6 +93,17 @@ const LTP_CMD_OVERRIDES: &[(&str, &[&str])] = &[
 /// the generated suites.toml do NOT survive regen — this table is their home.
 /// Matched by EXACT suite name.
 const DOCKER_FLAG_OVERRIDES: &[(&str, &[&str])] = &[
+    // `go-os` and `go-net` each contain a test that requires a controlling
+    // TERMINAL — `TestSpliceFile/{TCP,Unix}-To-TTY` and `TestCopyFromTTY`. In a
+    // container without one they do not fail or skip, they HANG, and the suite
+    // is killed at its budget: the oracle recorded 104 of `go-os`'s 729
+    // assertions and 259 of `go-net`'s 449, so ~800 rows were ledgered
+    // "docker = absent" and never compared at all. With `-t` both run to
+    // completion (verified directly). Same class as the `node-libuv` oracle
+    // that never reached libuv — a container that cannot run the case the test
+    // was written for is not measuring Linux, it is measuring the container.
+    ("go-os", &["-t"]),
+    ("go-net", &["-t"]),
     ("ltp-clone301", &["--security-opt", "seccomp=unconfined"]),
     ("ltp-clone302", &["--security-opt", "seccomp=unconfined"]),
 ];

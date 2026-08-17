@@ -6529,6 +6529,7 @@ tier = "full"
 weight = "heavy"
 timeout_s = 180
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["-t"]
 workdir = "/usr/local/go/src/net"
 
 [[suite]]
@@ -6769,6 +6770,7 @@ tier = "full"
 weight = "heavy"
 timeout_s = 180
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["-t"]
 workdir = "/usr/local/go/src/os"
 
 [[suite]]
