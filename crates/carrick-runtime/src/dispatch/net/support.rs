@@ -1423,6 +1423,10 @@ pub(super) fn is_known_sockopt_optname(level: i32, optname: i32) -> bool {
                 | a::LINUX_IP_MULTICAST_LOOP
                 | a::LINUX_IP_ADD_MEMBERSHIP
                 | a::LINUX_IP_DROP_MEMBERSHIP
+                | a::LINUX_IP_UNBLOCK_SOURCE
+                | a::LINUX_IP_BLOCK_SOURCE
+                | a::LINUX_IP_ADD_SOURCE_MEMBERSHIP
+                | a::LINUX_IP_DROP_SOURCE_MEMBERSHIP
                 | a::LINUX_IP_RECVTTL
                 | a::LINUX_IP_PKTINFO
                 | a::LINUX_IP_RECVTOS
@@ -1478,6 +1482,89 @@ mod netbsd_sockopt {
     // IP_TOS=3), so there is deliberately no constant for it here.
 }
 
+/// Darwin's `struct ip_mreq_source` (`<netinet/in.h>`).
+///
+/// Same three `struct in_addr` fields as [`LinuxIpMreqSource`], in a DIFFERENT
+/// ORDER: Darwin puts the source before the interface. Modelling both layouts
+/// as named types means the conversion below reads as what it is — a field
+/// remap between two ABIs — instead of an index-arithmetic swap that the next
+/// reader has to decode and that silently rots if either layout gains a field.
+#[cfg(target_os = "macos")]
+#[repr(C, packed)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+    zerocopy::Unaligned,
+)]
+struct HostIpMreqSource {
+    multiaddr: [u8; 4],
+    sourceaddr: [u8; 4],
+    interface: [u8; 4],
+}
+
+#[cfg(target_os = "macos")]
+impl From<crate::linux_abi::LinuxIpMreqSource> for HostIpMreqSource {
+    fn from(guest: crate::linux_abi::LinuxIpMreqSource) -> Self {
+        Self {
+            multiaddr: guest.multiaddr,
+            sourceaddr: guest.sourceaddr,
+            interface: guest.interface,
+        }
+    }
+}
+
+/// Translate a setsockopt OPTVAL whose STRUCT LAYOUT differs between guest
+/// Linux and the host, in place. Returns `true` if it rewrote anything.
+///
+/// [`linux_to_host_sockopt`] translates the option *number*; this translates the
+/// bytes behind it. Today the only such struct is `ip_mreq_source`, used by the
+/// source-specific multicast options — passing the guest's bytes through
+/// unchanged would join the right group from the wrong source, on the wrong
+/// interface, with no error to show for it.
+///
+/// Non-macOS hosts (Linux and the BSDs) share Linux's field order, so this is a
+/// no-op there.
+pub(super) fn rewrite_optval_for_host(level: i32, optname: i32, optval: &mut [u8]) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use crate::linux_abi as a;
+        use zerocopy::{FromBytes, IntoBytes};
+
+        let is_source_membership = level == a::LINUX_SOL_IP
+            && matches!(
+                optname,
+                a::LINUX_IP_ADD_SOURCE_MEMBERSHIP
+                    | a::LINUX_IP_DROP_SOURCE_MEMBERSHIP
+                    | a::LINUX_IP_BLOCK_SOURCE
+                    | a::LINUX_IP_UNBLOCK_SOURCE
+            );
+        if !is_source_membership {
+            return false;
+        }
+        // A short buffer is the GUEST's bug: let it reach the host so the host
+        // answers EINVAL, rather than silently "repairing" it here.
+        let Ok(guest) = a::LinuxIpMreqSource::read_from_prefix(optval) else {
+            return false;
+        };
+        let host = HostIpMreqSource::from(guest.0);
+        let host_bytes = host.as_bytes();
+        optval[..host_bytes.len()].copy_from_slice(host_bytes);
+        true
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (level, optname, optval);
+        false
+    }
+}
+
 pub(super) fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i32)> {
     match level {
         LINUX_SOL_SOCKET => {
@@ -1520,6 +1607,13 @@ pub(super) fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i3
                 a::LINUX_IP_MULTICAST_LOOP => 11,
                 a::LINUX_IP_ADD_MEMBERSHIP => 12,
                 a::LINUX_IP_DROP_MEMBERSHIP => 13,
+                // Source-specific multicast: Darwin numbers these 70..73 where
+                // Linux uses 37..40, and its `ip_mreq_source` swaps the
+                // interface and source fields (see `rewrite_optval_for_host`).
+                a::LINUX_IP_UNBLOCK_SOURCE => 73,
+                a::LINUX_IP_BLOCK_SOURCE => 72,
+                a::LINUX_IP_ADD_SOURCE_MEMBERSHIP => 70,
+                a::LINUX_IP_DROP_SOURCE_MEMBERSHIP => 71,
                 a::LINUX_IP_RECVTTL => 24,
                 a::LINUX_IP_PKTINFO => 26,
                 a::LINUX_IP_RECVTOS => 27,
@@ -2503,6 +2597,75 @@ pub(in crate::dispatch) fn parse_host_scm_rights_fds(
 
 #[cfg(test)]
 mod tests {
+    /// `ip_mreq_source` is laid out differently by Linux and Darwin, and the
+    /// difference is invisible at the option-number level: both sides accept a
+    /// 12-byte buffer and neither reports an error, so getting it wrong joins
+    /// the right group from the WRONG source on the WRONG interface, silently.
+    ///
+    /// Linux: `multiaddr, interface, sourceaddr`.
+    /// Darwin: `multiaddr, sourceaddr, interface` (`<netinet/in.h>`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ip_mreq_source_is_remapped_to_darwin_field_order() {
+        use crate::linux_abi as a;
+
+        const MULTI: [u8; 4] = [239, 255, 0, 1];
+        const IFACE: [u8; 4] = [10, 0, 0, 7];
+        const SOURCE: [u8; 4] = [192, 168, 1, 5];
+
+        for optname in [
+            a::LINUX_IP_ADD_SOURCE_MEMBERSHIP,
+            a::LINUX_IP_DROP_SOURCE_MEMBERSHIP,
+            a::LINUX_IP_BLOCK_SOURCE,
+            a::LINUX_IP_UNBLOCK_SOURCE,
+        ] {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&MULTI);
+            buf.extend_from_slice(&IFACE);
+            buf.extend_from_slice(&SOURCE);
+            assert!(super::rewrite_optval_for_host(
+                a::LINUX_SOL_IP,
+                optname,
+                &mut buf
+            ));
+            assert_eq!(&buf[0..4], &MULTI, "group is field 0 on both");
+            assert_eq!(&buf[4..8], &SOURCE, "Darwin puts the SOURCE second");
+            assert_eq!(&buf[8..12], &IFACE, "Darwin puts the INTERFACE third");
+        }
+    }
+
+    /// Only the source-specific options carry that struct. Plain
+    /// `IP_ADD_MEMBERSHIP` takes `ip_mreq`, whose two fields are ordered the
+    /// same on both systems, and must pass through untouched — and a short
+    /// buffer is the guest's bug, to be answered EINVAL by the host rather than
+    /// silently repaired here.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plain_membership_and_short_buffers_are_left_alone() {
+        use crate::linux_abi as a;
+
+        let mut mreq = vec![239, 255, 0, 1, 0, 0, 0, 0];
+        let before = mreq.clone();
+        assert!(!super::rewrite_optval_for_host(
+            a::LINUX_SOL_IP,
+            a::LINUX_IP_ADD_MEMBERSHIP,
+            &mut mreq
+        ));
+        assert_eq!(mreq, before);
+
+        let mut short = vec![1u8; 11];
+        let before_short = short.clone();
+        assert!(!super::rewrite_optval_for_host(
+            a::LINUX_SOL_IP,
+            a::LINUX_IP_ADD_SOURCE_MEMBERSHIP,
+            &mut short
+        ));
+        assert_eq!(
+            short, before_short,
+            "a short optval must reach the host as-is"
+        );
+    }
+
     use super::*;
 
     #[test]

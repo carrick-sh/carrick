@@ -6553,28 +6553,17 @@ impl SyscallDispatcher {
                     }
                 }
             }
-            // Multicast GROUP MEMBERSHIP (join/leave, incl. source-specific) needs
-            // a multicast-capable route + SSM that carrick can't reliably provide
-            // on macOS, and the host test interface usually can't deliver it.
-            // Report ENODEV ("no such device") — libuv maps it to UV_ENODEV and
-            // the multicast tests RETURN_SKIP("No multicast support"), the honest
-            // outcome for an unsupported feature. The non-membership knobs
-            // (IP_MULTICAST_IF/TTL/LOOP) still pass through.
+            // Multicast group membership (join/leave, including source-specific)
+            // passes through to the host. It used to be answered ENODEV outright
+            // on the theory that carrick "can't reliably provide" it on macOS, so
+            // libuv's multicast tests took RETURN_SKIP("No multicast support").
+            // That was wrong: measured on this host, a Darwin AF_INET SOCK_DGRAM
+            // socket joins 239.255.0.1 with `imr_interface = INADDR_ANY`, sends
+            // to the group, receives its own datagram back, and drops the
+            // membership — all four calls succeed. The option translation to
+            // Darwin's numbers was already wired and simply unreachable.
             {
                 use crate::linux_abi as a;
-                const IP_ADD_SOURCE_MEMBERSHIP: i32 = 39;
-                const IP_DROP_SOURCE_MEMBERSHIP: i32 = 40;
-                let ip_membership = level == a::LINUX_SOL_IP
-                    && (optname == a::LINUX_IP_ADD_MEMBERSHIP
-                        || optname == a::LINUX_IP_DROP_MEMBERSHIP
-                        || optname == IP_ADD_SOURCE_MEMBERSHIP
-                        || optname == IP_DROP_SOURCE_MEMBERSHIP);
-                let ipv6_membership = level == a::LINUX_SOL_IPV6
-                    && (optname == a::LINUX_IPV6_JOIN_GROUP
-                        || optname == a::LINUX_IPV6_LEAVE_GROUP);
-                if ip_membership || ipv6_membership {
-                    return Ok(DispatchOutcome::errno(a::LINUX_ENODEV));
-                }
                 // Protocol-independent multicast source-filter API
                 // (MCAST_JOIN_GROUP=42 .. MCAST_LEAVE_SOURCE_GROUP=47, RFC 3678).
                 // Darwin has no MCAST_* optnames, so Carrick models the
@@ -6626,7 +6615,7 @@ impl SyscallDispatcher {
             if optlen != 0 && optval_addr == 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
-            let bytes = if optval_addr == 0 || optlen == 0 {
+            let mut bytes = if optval_addr == 0 || optlen == 0 {
                 Vec::new()
             } else {
                 match memory.read_bytes(optval_addr, optlen as usize) {
@@ -6636,6 +6625,10 @@ impl SyscallDispatcher {
                     }
                 }
             };
+            // Some optvals are STRUCTS whose field order differs between guest
+            // Linux and the host (today: `ip_mreq_source`). Translating only the
+            // option NUMBER would hand the host correctly-named garbage.
+            crate::dispatch::net::support::rewrite_optval_for_host(level, optname, &mut bytes);
             let rc = unsafe {
                 libc::setsockopt(
                     host_fd.get(),
