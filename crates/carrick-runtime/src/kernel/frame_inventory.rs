@@ -524,7 +524,7 @@ fn live_mapping_mut<'a>(
         });
     }
     if entry.state != MappingState::Published {
-        return Err(FrameInventoryError::NonliveMapping(mapping));
+        return Err(FrameInventoryError::MappingNotPublished(mapping));
     }
     Ok(entry)
 }
@@ -696,6 +696,13 @@ pub enum FrameInventoryError {
     },
     #[error("mapping {0:?} is not live")]
     NonliveMapping(MappingId),
+    /// The mapping EXISTS but is still `Prepared` — its publishing transaction
+    /// has not committed. Distinct from [`Self::NonliveMapping`], which means no
+    /// such mapping at all. They were one error for a long time, which made a
+    /// FATAL abort say only "is not live" and leave the reader unable to tell a
+    /// double-retire (absent) from a mid-transaction one (prepared).
+    #[error("mapping {0:?} exists but is not published")]
+    MappingNotPublished(MappingId),
     #[error("mapping {0:?} event is out of lifecycle order")]
     InvalidOrdering(MappingId),
     #[error("mapping {mapping:?} generation {actual} does not match expected {expected}")]
