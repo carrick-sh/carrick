@@ -17,6 +17,30 @@ pub mod tap;
 use crate::manifest::VerdictKind;
 use std::collections::BTreeMap;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseMode {
+    Regression,
+    Closure,
+}
+
+#[derive(Default)]
+pub(crate) struct AssertionCollector {
+    ids: BTreeMap<String, Outcome>,
+    occurrences: BTreeMap<String, usize>,
+}
+
+impl AssertionCollector {
+    pub fn push(&mut self, base: String, outcome: Outcome) {
+        let occurrence = self.occurrences.entry(base.clone()).or_default();
+        *occurrence += 1;
+        self.ids.insert(format!("{base}#{}", *occurrence), outcome);
+    }
+
+    pub fn into_ids(self) -> BTreeMap<String, Outcome> {
+        self.ids
+    }
+}
+
 /// Raw captured output from one engine run, handed to a parser.
 #[derive(Debug, Clone)]
 pub struct Raw {
@@ -107,6 +131,10 @@ pub trait VerdictParser {
 /// A `timed_out` raw short-circuits to a `None`-result empty map (the classifier
 /// turns that into a TIMEOUT/ORACLE_FAIL verdict before any per-id diff).
 pub fn parse(kind: VerdictKind, raw: &Raw) -> SuiteResult {
+    parse_for_mode(kind, raw, ParseMode::Regression)
+}
+
+pub fn parse_for_mode(kind: VerdictKind, raw: &Raw, mode: ParseMode) -> SuiteResult {
     if raw.timed_out {
         return SuiteResult {
             totals: Totals::default(),
@@ -114,12 +142,17 @@ pub fn parse(kind: VerdictKind, raw: &Raw) -> SuiteResult {
             ids: BTreeMap::new(),
         };
     }
-    match kind {
-        VerdictKind::Regrtest => regrtest::RegrtestParser.parse(raw),
-        VerdictKind::Gotest => gotest::GotestParser.parse(raw),
-        VerdictKind::Tap => tap::TapParser.parse(raw),
-        VerdictKind::Ltp => ltp::LtpParser.parse(raw),
-        VerdictKind::Shell => shell::ShellParser.parse(raw),
+    match (kind, mode) {
+        (VerdictKind::Regrtest, ParseMode::Regression) => regrtest::RegrtestParser.parse(raw),
+        (VerdictKind::Gotest, ParseMode::Regression) => gotest::GotestParser.parse(raw),
+        (VerdictKind::Tap, ParseMode::Regression) => tap::TapParser.parse(raw),
+        (VerdictKind::Ltp, ParseMode::Regression) => ltp::LtpParser.parse(raw),
+        (VerdictKind::Shell, ParseMode::Regression) => shell::ShellParser.parse(raw),
+        (VerdictKind::Regrtest, ParseMode::Closure) => regrtest::RegrtestParser.parse_closure(raw),
+        (VerdictKind::Gotest, ParseMode::Closure) => gotest::GotestParser.parse_closure(raw),
+        (VerdictKind::Tap, ParseMode::Closure) => tap::TapParser.parse_closure(raw),
+        (VerdictKind::Ltp, ParseMode::Closure) => ltp::LtpParser.parse_closure(raw),
+        (VerdictKind::Shell, ParseMode::Closure) => shell::ShellParser.parse_closure(raw),
     }
 }
 
@@ -135,4 +168,25 @@ pub(crate) fn strip_carrick_banners(s: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_mode_keeps_regression_coarse_and_makes_closure_exact() {
+        let raw = Raw {
+            stdout: "TAP version 13\n1..1\nok 1 - alpha\n".into(),
+            stderr: String::new(),
+            exit_code: 0,
+            timed_out: false,
+        };
+
+        let regression = parse(VerdictKind::Tap, &raw);
+        let closure = parse_for_mode(VerdictKind::Tap, &raw, ParseMode::Closure);
+
+        assert!(regression.ids.contains_key("suite"));
+        assert!(closure.ids.contains_key("tap:1:alpha#1"));
+    }
 }

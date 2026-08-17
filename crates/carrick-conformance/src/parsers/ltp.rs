@@ -4,17 +4,151 @@
 //!   - Tier 2 (old API): count per-line `TPASS/TFAIL/TBROK/TCONF` tokens (those
 //!     tests print NO Summary, so a summary-only verdict would false-MATCH them).
 //!
-//! The LTP verdict is count-based (the skill warns: a count MATCH is NOT proof of
-//! the same assertions — probes are the precise gate). We collapse the side to one
-//! synthetic `"summary"` id whose coarse outcome (Ok / Fail / Broken / Conf)
-//! captures the regression-relevant transition, with the exact counts kept in
-//! `Totals` for the matrix fraction.
+//! Regression mode remains count-based and collapses the side to one synthetic
+//! `"summary"` id. Closure mode instead retains source/case assertion identities,
+//! duplicate occurrences, and reconciles any framework summary against them.
 
-use super::{Outcome, Raw, SuiteOutcome, SuiteResult, Totals, VerdictParser};
+use super::{AssertionCollector, Outcome, Raw, SuiteOutcome, SuiteResult, Totals, VerdictParser};
 use regex::Regex;
 use std::collections::BTreeMap;
 
 pub struct LtpParser;
+
+impl LtpParser {
+    pub(crate) fn parse_closure(&self, raw: &Raw) -> SuiteResult {
+        if raw.exit_code == 124 || raw.exit_code == 137 {
+            return SuiteResult {
+                totals: Totals::default(),
+                result: SuiteOutcome::None,
+                ids: BTreeMap::new(),
+            };
+        }
+
+        let text = super::strip_carrick_banners(&raw.combined());
+        let (Ok(modern), Ok(old), Ok(legacy), Ok(legacy_numbered), Ok(summary_count)) = (
+            Regex::new(r"^(\S+\.c):(\d+):\s+(TPASS|TFAIL|TBROK|TCONF):"),
+            Regex::new(r"^(\S+)\s+(\d+)\s+(TPASS|TFAIL|TBROK|TCONF)\s*:"),
+            Regex::new(
+                r"^(\S+)\s+\d+\s+TINFO\s*:\s+.*?\b(?:Test case|case)\s+(\d+)\b.*?\b(PASSED|FAILED)\b",
+            ),
+            Regex::new(r"^(\S+)\s+(\d+)\s+\S+\s*:\s+.*\b(PASSED|FAILED)\b"),
+            Regex::new(r"^(passed|failed|broken|skipped)\s+(\d+)\s*$"),
+        ) else {
+            return SuiteResult::empty();
+        };
+
+        let mut assertions = AssertionCollector::default();
+        let (mut passed, mut failed, mut broken, mut skipped) = (0usize, 0usize, 0usize, 0usize);
+        let mut summary = [0usize; 4];
+        let mut summary_present = false;
+
+        for line in text.lines() {
+            if line.trim() == "Summary:" {
+                summary_present = true;
+                continue;
+            }
+            if let Some(caps) = summary_count.captures(line.trim()) {
+                let n = caps
+                    .get(2)
+                    .and_then(|value| value.as_str().parse::<usize>().ok())
+                    .unwrap_or(0);
+                match caps.get(1).map(|value| value.as_str()) {
+                    Some("passed") => summary[0] += n,
+                    Some("failed") => summary[1] += n,
+                    Some("broken") => summary[2] += n,
+                    Some("skipped") => summary[3] += n,
+                    _ => {}
+                }
+                continue;
+            }
+
+            let assertion = modern
+                .captures(line)
+                .and_then(|caps| closure_assertion(&caps, 1, 2, 3))
+                .or_else(|| {
+                    old.captures(line)
+                        .and_then(|caps| closure_assertion(&caps, 1, 2, 3))
+                })
+                .or_else(|| {
+                    legacy.captures(line).and_then(|caps| {
+                        let binary = caps.get(1)?.as_str();
+                        let case = caps.get(2)?.as_str();
+                        let outcome = match caps.get(3)?.as_str() {
+                            "PASSED" => Outcome::Ok,
+                            "FAILED" => Outcome::Fail,
+                            _ => return None,
+                        };
+                        Some((format!("ltp:{binary}:{case}"), outcome))
+                    })
+                })
+                .or_else(|| {
+                    legacy_numbered.captures(line).and_then(|caps| {
+                        let binary = caps.get(1)?.as_str();
+                        let case = caps.get(2)?.as_str();
+                        let outcome = match caps.get(3)?.as_str() {
+                            "PASSED" => Outcome::Ok,
+                            "FAILED" => Outcome::Fail,
+                            _ => return None,
+                        };
+                        Some((format!("ltp:{binary}:{case}"), outcome))
+                    })
+                });
+
+            if let Some((id, outcome)) = assertion {
+                match outcome {
+                    Outcome::Ok => passed += 1,
+                    Outcome::Fail => failed += 1,
+                    Outcome::Broken => broken += 1,
+                    Outcome::Conf => skipped += 1,
+                    _ => {}
+                }
+                assertions.push(id, outcome);
+            }
+        }
+
+        let totals = Totals {
+            n: passed + failed + broken,
+            passed,
+            failed,
+            broken,
+            skipped,
+        };
+        let ids = assertions.into_ids();
+        let summary_matches = !summary_present || summary == [passed, failed, broken, skipped];
+
+        let result = if ids.is_empty() || !summary_matches {
+            SuiteOutcome::None
+        } else if failed > 0 || broken > 0 || raw.exit_code != 0 {
+            SuiteOutcome::Failure
+        } else {
+            SuiteOutcome::Success
+        };
+
+        SuiteResult {
+            totals,
+            result,
+            ids,
+        }
+    }
+}
+
+fn closure_assertion(
+    caps: &regex::Captures<'_>,
+    binary_index: usize,
+    case_index: usize,
+    outcome_index: usize,
+) -> Option<(String, Outcome)> {
+    let binary = caps.get(binary_index)?.as_str();
+    let case = caps.get(case_index)?.as_str();
+    let outcome = match caps.get(outcome_index)?.as_str() {
+        "TPASS" => Outcome::Ok,
+        "TFAIL" => Outcome::Fail,
+        "TBROK" => Outcome::Broken,
+        "TCONF" => Outcome::Conf,
+        _ => return None,
+    };
+    Some((format!("ltp:{binary}:{case}"), outcome))
+}
 
 impl VerdictParser for LtpParser {
     fn parse(&self, raw: &Raw) -> SuiteResult {
@@ -252,5 +386,67 @@ mod tests {
             timed_out: false,
         });
         assert_eq!(r.result, SuiteOutcome::Empty);
+    }
+
+    fn closure(s: &str) -> SuiteResult {
+        LtpParser.parse_closure(&raw(s))
+    }
+
+    #[test]
+    fn closure_distinguishes_equal_counts_with_different_assertions() {
+        let c = closure(
+            "a.c:10: TPASS: a\nb.c:20: TFAIL: b\nSummary:\npassed 1\nfailed 1\nbroken 0\nskipped 0\n",
+        );
+        let d = closure(
+            "a.c:10: TFAIL: a\nb.c:20: TPASS: b\nSummary:\npassed 1\nfailed 1\nbroken 0\nskipped 0\n",
+        );
+        assert_eq!(
+            (
+                c.totals.n,
+                c.totals.passed,
+                c.totals.failed,
+                c.totals.broken,
+                c.totals.skipped,
+            ),
+            (
+                d.totals.n,
+                d.totals.passed,
+                d.totals.failed,
+                d.totals.broken,
+                d.totals.skipped,
+            )
+        );
+        assert_ne!(c.ids, d.ids);
+        assert_eq!(c.ids["ltp:a.c:10#1"], Outcome::Ok);
+    }
+
+    #[test]
+    fn closure_preserves_repeated_ltp_assertions() {
+        let result = closure("loop.c:42: TPASS: iteration\nloop.c:42: TPASS: iteration\n");
+        assert_eq!(result.ids.len(), 2);
+        assert!(result.ids.contains_key("ltp:loop.c:42#2"));
+    }
+
+    #[test]
+    fn closure_parses_old_and_legacy_numbered_assertions() {
+        let result = closure(
+            "oldbin  1  TPASS  : first\noldbin  2  TFAIL  : second\nlegacy  0  TINFO  : Test case 3: PASSED\nlegacy2  7  TINFO  : operation PASSED\n",
+        );
+        assert_eq!(result.ids["ltp:oldbin:1#1"], Outcome::Ok);
+        assert_eq!(result.ids["ltp:oldbin:2#1"], Outcome::Fail);
+        assert_eq!(result.ids["ltp:legacy:3#1"], Outcome::Ok);
+        assert_eq!(result.ids["ltp:legacy2:7#1"], Outcome::Ok);
+    }
+
+    #[test]
+    fn closure_rejects_summary_only_tbrok_tconf_and_count_mismatch() {
+        for text in [
+            "Summary:\npassed 0\nfailed 0\nbroken 1\nskipped 0\n",
+            "Summary:\npassed 0\nfailed 0\nbroken 0\nskipped 1\n",
+            "a.c:10: TPASS: a\nSummary:\npassed 2\nfailed 0\nbroken 0\nskipped 0\n",
+            "only.c:1: TINFO: setup\n",
+        ] {
+            assert_ne!(closure(text).result, SuiteOutcome::Success, "{text}");
+        }
     }
 }

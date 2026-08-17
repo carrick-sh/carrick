@@ -38,12 +38,38 @@ struct OracleKey<'a> {
     workdir: Option<&'a str>,
     /// which parser turns docker's raw output into the cached `SuiteResult`.
     verdict: VerdictKind,
+    /// Omitted for regression so its committed determinant bytes remain stable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parser_profile: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParserProfile {
+    Regression,
+    ClosureV1,
+}
+
+impl ParserProfile {
+    fn determinant(self) -> Option<&'static str> {
+        match self {
+            Self::Regression => None,
+            Self::ClosureV1 => Some("closure-v1"),
+        }
+    }
 }
 
 /// Canonical determinant key for a suite's docker oracle. Carrick-only fields
 /// (`carrick_flags`, `env_carrick`, `entrypoint.carrick`) and the per-run
 /// `--name`/run-id are deliberately excluded — they cannot change docker output.
 pub fn oracle_key(suite: &Suite, platform: crate::lane::DockerPlatform) -> String {
+    oracle_key_for_profile(suite, platform, ParserProfile::Regression)
+}
+
+pub fn oracle_key_for_profile(
+    suite: &Suite,
+    platform: crate::lane::DockerPlatform,
+    profile: ParserProfile,
+) -> String {
     let mut env: Vec<String> = Vec::new();
     for kv in suite.env.iter().chain(suite.env_docker.iter()) {
         env.push(format!("{}={}", kv.key, kv.val));
@@ -58,6 +84,7 @@ pub fn oracle_key(suite: &Suite, platform: crate::lane::DockerPlatform) -> Strin
         env,
         workdir: suite.workdir.as_deref(),
         verdict: suite.verdict,
+        parser_profile: profile.determinant(),
     };
     // These are plain owned/borrowed scalars and Vecs — serialization cannot
     // fail; the fallback only exists so a key is always produced.
@@ -124,11 +151,20 @@ impl OracleCache {
     /// comparable without a re-bless. Fail dominates on a collision, matching
     /// the parser's own merge rule.
     pub fn get(&self, suite: &Suite, platform: crate::lane::DockerPlatform) -> Option<SuiteResult> {
-        let mut result = self
-            .by_key
-            .get(&oracle_key(suite, platform))?
-            .result
-            .clone();
+        self.get_for_profile(suite, platform, ParserProfile::Regression)
+    }
+
+    pub fn get_for_profile(
+        &self,
+        suite: &Suite,
+        platform: crate::lane::DockerPlatform,
+        profile: ParserProfile,
+    ) -> Option<SuiteResult> {
+        let key = match profile {
+            ParserProfile::Regression => oracle_key(suite, platform),
+            ParserProfile::ClosureV1 => oracle_key_for_profile(suite, platform, profile),
+        };
+        let mut result = self.by_key.get(&key)?.result.clone();
         if suite.verdict == VerdictKind::Gotest {
             let mut ids: BTreeMap<String, Outcome> = BTreeMap::new();
             for (id, o) in std::mem::take(&mut result.ids) {
@@ -154,8 +190,17 @@ impl OracleCache {
         suite: &Suite,
         platform: crate::lane::DockerPlatform,
     ) -> Option<u64> {
+        self.get_elapsed_ms_for_profile(suite, platform, ParserProfile::Regression)
+    }
+
+    pub fn get_elapsed_ms_for_profile(
+        &self,
+        suite: &Suite,
+        platform: crate::lane::DockerPlatform,
+        profile: ParserProfile,
+    ) -> Option<u64> {
         self.by_key
-            .get(&oracle_key(suite, platform))
+            .get(&oracle_key_for_profile(suite, platform, profile))
             .and_then(|record| record.elapsed_ms)
     }
 
@@ -169,10 +214,27 @@ impl OracleCache {
         result: SuiteResult,
         elapsed_ms: Option<u64>,
     ) -> bool {
+        self.insert_for_profile(
+            suite,
+            platform,
+            ParserProfile::Regression,
+            result,
+            elapsed_ms,
+        )
+    }
+
+    pub fn insert_for_profile(
+        &mut self,
+        suite: &Suite,
+        platform: crate::lane::DockerPlatform,
+        profile: ParserProfile,
+        result: SuiteResult,
+        elapsed_ms: Option<u64>,
+    ) -> bool {
         if !is_cacheable(&result) {
             return false;
         }
-        let key = oracle_key(suite, platform);
+        let key = oracle_key_for_profile(suite, platform, profile);
         self.by_key.insert(
             key.clone(),
             OracleRecord {
@@ -197,14 +259,45 @@ impl OracleCache {
         elapsed_ms: Option<u64>,
         timed_out: bool,
     ) -> bool {
-        !timed_out && self.insert(suite, platform, result, elapsed_ms)
+        self.insert_fresh_for_profile(
+            suite,
+            platform,
+            ParserProfile::Regression,
+            result,
+            elapsed_ms,
+            timed_out,
+        )
+    }
+
+    pub fn insert_fresh_for_profile(
+        &mut self,
+        suite: &Suite,
+        platform: crate::lane::DockerPlatform,
+        profile: ParserProfile,
+        result: SuiteResult,
+        elapsed_ms: Option<u64>,
+        timed_out: bool,
+    ) -> bool {
+        !timed_out && self.insert_for_profile(suite, platform, profile, result, elapsed_ms)
     }
 
     /// Remove the current determinant record before a forced fresh oracle run.
     /// A failed refresh must leave a miss, never permit a later run to fall
     /// back to the superseded oracle record.
     pub fn invalidate(&mut self, suite: &Suite, platform: crate::lane::DockerPlatform) -> bool {
-        let removed = self.by_key.remove(&oracle_key(suite, platform)).is_some();
+        self.invalidate_for_profile(suite, platform, ParserProfile::Regression)
+    }
+
+    pub fn invalidate_for_profile(
+        &mut self,
+        suite: &Suite,
+        platform: crate::lane::DockerPlatform,
+        profile: ParserProfile,
+    ) -> bool {
+        let removed = self
+            .by_key
+            .remove(&oracle_key_for_profile(suite, platform, profile))
+            .is_some();
         if removed {
             self.dirty = true;
         }
@@ -440,6 +533,62 @@ mod tests {
     }
 
     #[test]
+    fn regression_profile_keeps_golden_key_bytes_and_closure_is_distinct() {
+        let s = base_suite();
+        let platform = crate::lane::DockerPlatform::LinuxArm64;
+        let legacy = oracle_key(&s, platform);
+        let regression = oracle_key_for_profile(&s, platform, ParserProfile::Regression);
+        let closure = oracle_key_for_profile(&s, platform, ParserProfile::ClosureV1);
+
+        assert_eq!(regression, legacy);
+        assert_ne!(closure, regression);
+        assert!(closure.contains(r#""parser_profile":"closure-v1""#));
+    }
+
+    #[test]
+    fn exact_closure_oracle_round_trip_is_profile_isolated() {
+        let path = std::env::temp_dir().join(format!(
+            "carrick-oracle-closure-profile-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let s = base_suite();
+        let platform = crate::lane::DockerPlatform::LinuxArm64;
+        let exact = result(
+            &[
+                ("py:m.C.test_a[1]#1", Outcome::Ok),
+                ("py:m.C.test_a[2]#1", Outcome::Ok),
+            ],
+            SuiteOutcome::Success,
+        );
+
+        let mut cache = OracleCache::load(&path);
+        assert!(cache.insert_for_profile(
+            &s,
+            platform,
+            ParserProfile::ClosureV1,
+            exact.clone(),
+            Some(7),
+        ));
+        cache.save().expect("save closure profile");
+
+        let reloaded = OracleCache::load(&path);
+        assert!(
+            reloaded.get(&s, platform).is_none(),
+            "regression lookup must not consume closure assertions"
+        );
+        let got = reloaded
+            .get_for_profile(&s, platform, ParserProfile::ClosureV1)
+            .expect("closure profile hit");
+        assert_eq!(got.ids, exact.ids);
+        assert_eq!(
+            reloaded.get_elapsed_ms_for_profile(&s, platform, ParserProfile::ClosureV1),
+            Some(7)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn parse_cache_records_counts_schema_mismatches() {
         // One valid record + blank/whitespace lines (ignored) + two non-empty
         // lines that fail to deserialize (a renamed/added determinant field, or
@@ -650,35 +799,52 @@ mod tests {
 
     #[test]
     fn timed_out_refresh_invalidates_stale_oracle_and_persists_miss() {
-        let path = std::env::temp_dir().join("carrick-oracle-timeout-refresh.jsonl");
-        let _ = std::fs::remove_file(&path);
-        let suite = base_suite();
-        let platform = crate::lane::DockerPlatform::LinuxArm64;
-        let all_pass = result(&[("t", Outcome::Ok)], SuiteOutcome::Success);
+        for (index, profile) in [ParserProfile::Regression, ParserProfile::ClosureV1]
+            .into_iter()
+            .enumerate()
+        {
+            let path = std::env::temp_dir().join(format!(
+                "carrick-oracle-timeout-refresh-{}-{index}.jsonl",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let suite = base_suite();
+            let platform = crate::lane::DockerPlatform::LinuxArm64;
+            let all_pass = result(&[("t", Outcome::Ok)], SuiteOutcome::Success);
 
-        let mut cache = OracleCache::load(&path);
-        assert!(cache.insert(&suite, platform, all_pass.clone(), Some(1)));
-        cache
-            .save()
-            .unwrap_or_else(|error| panic!("save stale oracle: {error}"));
+            let mut cache = OracleCache::load(&path);
+            assert!(cache.insert_for_profile(&suite, platform, profile, all_pass.clone(), Some(1)));
+            cache
+                .save()
+                .unwrap_or_else(|error| panic!("save stale oracle: {error}"));
 
-        let mut refresh = OracleCache::load(&path);
-        assert!(refresh.invalidate(&suite, platform));
-        assert!(
-            !refresh.insert_fresh(&suite, platform, all_pass, Some(2), true),
-            "a timed-out fresh Docker run is never cacheable"
-        );
-        assert!(refresh.dirty(), "invalidation alone must dirty the cache");
-        assert!(refresh.get(&suite, platform).is_none());
-        refresh
-            .save()
-            .unwrap_or_else(|error| panic!("save invalidated cache: {error}"));
+            let mut refresh = OracleCache::load(&path);
+            assert!(refresh.invalidate_for_profile(&suite, platform, profile));
+            assert!(
+                !refresh.insert_fresh_for_profile(
+                    &suite,
+                    platform,
+                    profile,
+                    all_pass,
+                    Some(2),
+                    true
+                ),
+                "a timed-out fresh Docker run is never cacheable"
+            );
+            assert!(refresh.dirty(), "invalidation alone must dirty the cache");
+            assert!(refresh.get_for_profile(&suite, platform, profile).is_none());
+            refresh
+                .save()
+                .unwrap_or_else(|error| panic!("save invalidated cache: {error}"));
 
-        let checkpoint = OracleCache::load(&path);
-        assert!(
-            checkpoint.get(&suite, platform).is_none(),
-            "later cache-only checkpoint must not reuse stale oracle evidence"
-        );
-        let _ = std::fs::remove_file(&path);
+            let checkpoint = OracleCache::load(&path);
+            assert!(
+                checkpoint
+                    .get_for_profile(&suite, platform, profile)
+                    .is_none(),
+                "later cache-only checkpoint must not reuse stale oracle evidence"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
