@@ -814,6 +814,7 @@ mod overlay_dispatch_tests {
                 write_sealed_shared: false,
                 read_only_shared_file: false,
                 writable_memfd: None,
+                shared_file_alias: None,
             }));
             unsafe { libc::_exit(0) };
         }
@@ -839,6 +840,7 @@ mod overlay_dispatch_tests {
             write_sealed_shared: false,
             read_only_shared_file: false,
             writable_memfd: None,
+            shared_file_alias: None,
         })
     }
 

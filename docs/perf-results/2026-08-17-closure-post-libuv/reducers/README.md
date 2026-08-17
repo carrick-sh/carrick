@@ -144,3 +144,76 @@ Note also that `carrick trace` was NOT able to answer this: its syscall stream
 carries the loader's mmaps and then stops at `execve-loaded`, showing nothing
 the test itself issued. Reach for the oracle-side bpftrace rather than trying to
 make the tracer follow the guest's self-re-exec.
+
+### Correction: mremap01's file is SPARSE, and the fix is a re-alias
+
+The syscall capture above is real but INCOMPLETE, and reading it literally sent
+this investigation down a blind alley for several rounds. It shows two
+`write(fd, ..., 1)` calls and no `ftruncate`, which reads as "a 1-byte file
+mapped 0x3e8000 long" — i.e. a mapping that is almost entirely past EOF. Two
+reproducers were built on that reading and both behaved correctly under carrick
+while the suite kept failing.
+
+What the capture omits is `lseek`. LTP builds the file SPARSELY — seek to
+`size-1`, write one byte — so the truth is:
+
+- at `mmap` time the file is already 0x3e8000 long, the mapping fits inside it,
+  and carrick maps it as a LIVE alias (`addr=0x10000000000`), not as an arena or
+  aperture snapshot;
+- the test then EXTENDS the file to 0x7d0001 the same way;
+- the `mremap` to 0x7d0000 is therefore entirely INSIDE the file.
+
+So nothing about this suite involves SIGBUS. The fix is to re-establish the live
+alias over the same descriptor at the new length — re-mmapping the same fd
+aliases the same page cache, so sharing stays exact where a byte copy would
+silently break it.
+
+**Trace file setup, not just the operation under test.** Had the first capture
+included `lseek`/`fstat`, the shape would have been unambiguous immediately.
+
+### What actually settled it: a gated diagnostic, not a reproducer
+
+Four reproducers all passed while the suite failed. What ended it was extending
+the existing `CARRICK_FAULT_DEBUG` hatch with an `mremap GROW` line reporting
+every discriminant the grow plans key on:
+
+```
+[FAULTDBG] mremap GROW addr=0x10000000000 old=0x3e8000 new=0x7d0000 flags=0x1
+  sharing=Shared in_arena=false aperture=None anon_plan=false
+  arena_past_eof=None alias_plan=None aperture_plan=None
+  alias_file_extent=Some((8192001, 0)) path=".../mremapfile"
+```
+
+`alias_file_extent=Some((8192001, 0))` is the whole answer: the file is 8 MiB,
+not 1 byte. The line is kept — it is behind an env hatch that already existed,
+and it is the instrument that answers "why did this grow refuse?" in one run.
+
+**`CARRICK_FAULT_DEBUG` is read from the HOST environment**, by the dispatcher
+in the carrick process — passing it with `-e` into the guest sets it for the
+guest and produces nothing. That cost a round too.
+
+### Two traps in this handler that present as a hang
+
+- **Do not call `mmap_fault_is_sigbus` from `mremap`.** It opens its own
+  host-alias dispatch guard and `mremap` already holds one, so the guest wedges
+  in the syscall and the run dies on its timeout with no output past the `mmap`.
+  Read `mem.bus_fault_ranges` directly instead.
+- **Do not `protect_range` arena VA above the bump pointer.** Publishing a
+  PROT_NONE mapping over never-established backing hangs the same way. A tail
+  that is meant to fault needs no page-table work at all — reserving the VA is
+  the whole job.
+
+### Separate unfixed bug found on the way: MAP_SHARED past EOF loses writes
+
+A `MAP_SHARED` file mapping that runs PAST its file's EOF becomes an arena
+snapshot under carrick, and that snapshot is never written back. Store to
+offset 0, `munmap`, re-read the file:
+
+| | byte 0 |
+|---|---|
+| Docker (real Linux) | `Z` (the store) |
+| carrick | `a` (the original) |
+
+`reducers/mremap-eof-shape.c` with `NOREMAP=1` reproduces it in about a second.
+This is a silent data-loss divergence, it is INDEPENDENT of `mremap`, and it is
+NOT fixed here.
