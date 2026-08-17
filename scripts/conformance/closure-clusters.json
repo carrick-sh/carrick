@@ -1,0 +1,11 @@
+{
+  "probes": {},
+  "schema": "carrick-closure-clusters-v1",
+  "suites": {
+    "go-net_http": "epoll-ready-queue",
+    "go-os_exec": "sibling-materialization-gate",
+    "node-app-smoke": "hvpatch-exec-stage2-lease",
+    "node-libuv": "hvpatch-exec-stage2-lease",
+    "node-v8-smoke": "hvpatch-exec-stage2-lease"
+  }
+}

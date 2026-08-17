@@ -410,11 +410,34 @@ class ClosureReportTest(unittest.TestCase):
             probe_summary,
             Path("results.jsonl"),
             Path("probes.log"),
+            {
+                "schema": "carrick-closure-clusters-v1",
+                "suites": {"ltp-red": "epoll-ready-queue"},
+                "probes": {"gnu:abortdeath": "signal-exit"},
+            },
         )
 
         self.assertIn("`red.c:7#1`", ledger)
         self.assertIn("## Probe semantic failures", ledger)
         self.assertIn("`abortdeath`", ledger)
+        self.assertIn("| epoll-ready-queue |", ledger)
+        self.assertIn("| signal-exit |", ledger)
+
+    def test_cluster_map_rejects_unknown_rows_and_malformed_names(self):
+        scope = scope_2127()
+        base = {
+            "schema": "carrick-closure-clusters-v1",
+            "suites": {},
+            "probes": {},
+        }
+        for clusters in [
+            {**base, "suites": {"not-a-suite": "known-cluster"}},
+            {**base, "probes": {"gnu:not-a-probe": "known-cluster"}},
+            {**base, "suites": {scope["suite_names"][0]: "Not Valid"}},
+        ]:
+            with self.subTest(clusters=clusters):
+                with self.assertRaises(closure_report.ReportError):
+                    closure_report.validate_clusters(clusters, scope, inventory())
 
 
 if __name__ == "__main__":
