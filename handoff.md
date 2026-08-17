@@ -261,68 +261,67 @@ argv from `--dry-run` on the suite and diff position-by-position.
 Closed, each proven red-first: `platform_output` (uptime), `thread_priority`
 (nice scope), `eintr_handling` (spurious EINTR), `pipe_set_chmod` (AF_UNIX
 owner), `udp_multicast_interface6` (ifindex 0), `udp_multicast_join` (blanket
-ENODEV), `tcp_reuseport` + `udp_reuseport` (SO_REUSEPORT distribution).
+ENODEV), `tcp_reuseport` + `udp_reuseport` (SO_REUSEPORT distribution),
+`tty_pty_partial` (Darwin destroys queued pty data at slave close), and
+`udp_recvmsg_unreachable_error` + its v6 twin (no `IP_RECVERR`, no error
+queue).
 
-**libuv is at 4 divergent positions, down from 12.** Last measured on binary
-`d52ff64a…ca1ff1ce`: 497 ok / 6 skip / 4 fail against the oracle's 499 ok /
-8 skip.
+**libuv is at 2 divergent positions, down from 12.**
 
 ### Remaining, in recommended order
 
-Down to FOUR divergent positions plus one non-deterministic row.
+**libuv is at 2 divergent positions, down from 12** — 500 ok / 6 skip / 1 fail
+against the oracle's 499 ok / 8 skip, on binary `ba4c0603…c564714d3`. Both
+remaining rows have the SAME cause, and it is not a bug in the feature either
+names.
 
-1. **`tty_pty_partial` (456) — root-caused, fix reverted.** Darwin DISCARDS
-   whatever is still queued in a pty when the last slave fd closes; Linux
-   delivers it then reports EOF. Proven with a 20-line C program, and the
-   host trace shows 64 slave writes of 1024 against only 63 master reads. The
-   rescue-into-staging fix made this row pass 5/5 but HUNG the sibling
-   `tty_pty`, so it was reverted. Two constraints for the next attempt, both
-   already paid for: `FIONREAD` on a pty master reports 0 even with data
-   queued (so size the rescue by reading until EAGAIN under a byte cap), and
-   the close path CANNOT reach the master through the file table
-   (`read_open_files()` inside `close_open_file_and_free_pty` deadlocks —
-   `tty_pty` hung even when the drain no-opped). Register the master's
-   description alongside its pts index when it is opened, and rescue through
-   that. Full detail in the phase-2 report.
-2. **`tcp_try_write_error` — non-deterministic**, 8 of 20 isolated runs fail.
-   Not currently in the divergence list because it happens to pass in most
-   full runs, which is exactly why it must be fixed before any clean final
-   pass. Genuine Heisenbug: under `carrick trace` it passed 6 of 6 (~4.7%
-   likely by chance), so use the event ring via `carrick-lldb`, NOT a tracer.
-   Known: `uv_try_write` returns EAGAIN where Linux gives EPIPE/ECONNRESET
-   after the peer closes; Darwin itself returns ECONNRESET after ~27 writes and
-   `blocking_io` really does call the host write, so the peer's host socket was
-   still open when the guest had closed it. Suspect a lingering `HostFdRef`.
-3. **UDP error queue** (`udp_recvmsg_unreachable_error` 483 and `...6` 484).
-   Design SETTLED and feasibility MEASURED — see "Settled design for the UDP
-   error queue" in the phase-2 report. Darwin will not report an ICMP error on
-   an unconnected UDP socket, but a shadow socket bound to the same local
-   addr:port with SO_REUSEADDR|SO_REUSEPORT and connected to the destination
-   will, without changing the wire packets or what the real socket receives.
-   Verified with a host-only program.
-4. **The netns asymmetry** (`tcp_connect6_link_local` 370 inversion,
+1. **Carrick's bridge networking breaks glibc's `getaddrinfo`** — fix this
+   first, because it is a crash in a shipped network mode AND it blocks the
+   other two rows:
+
+   ```
+   carrick run --network bridge ... python3 -c \
+     'import socket; socket.getaddrinfo("localhost", 80)'
+   Fatal glibc error: getaddrinfo.c:1673 (rfc3484_sort): assertion failed:
+     a1->source_addr.sin6_family == PF_INET6
+   ```
+
+   Host mode resolves fine. Already RULED OUT by measurement, so do not repeat
+   it: `getsockname` after `connect` on an `AF_INET6` UDP socket returns the
+   right family in both modes, for `::1` and for a v4-mapped
+   `::ffff:127.0.0.1`, matching the Docker oracle exactly; and bridge-mode
+   `/proc/net/if_inet6` correctly holds only `::1` on `lo`. Next suspect is the
+   synthetic netlink `RTM_GETADDR` reply glibc's `__check_pf` parses
+   (`dispatch/net/support.rs`) — note it emits `RT_SCOPE_UNIVERSE` for every
+   non-loopback address where a real `fe80::` carries `RT_SCOPE_LINK` (253).
+   The same resolution path also produced a fork-time ObjC abort
+   (`+[NSNumber initialize] … Crashing instead`) earlier in the workload.
+
+2. **The netns asymmetry** (`tcp_connect6_link_local` 370 inversion,
    `udp_multicast_join6` 472). `carrick run` defaults to `--network host` while
    `docker run` defaults to bridge, so the two sides enumerate different
-   interfaces. The bridge model is already corrected to match the oracle netns
-   (verified inside the image: only `::1/128` on `lo`), but the suite cannot be
-   switched to bridge until the blocker below is fixed.
+   interfaces — the oracle container has only `::1/128` on `lo`, while Carrick
+   in host mode truthfully surfaces the Mac's `en0` link-local, and libuv's
+   skip conditions scan for `fe80::`. The bridge model is already corrected to
+   match the oracle netns, so the fix is to give the suite
+   `--network bridge`: that changes only `carrick_flags`, which is excluded
+   from the oracle key, so the oracle stays valid. Blocked on (1).
 
-### Blocker: `--network bridge` aborts
+3. **`tcp_try_write_error` — non-deterministic**, 8 of 20 isolated runs fail.
+   NOT in the divergence list precisely because it usually passes, which is why
+   it must be fixed before any clean final pass. Genuine Heisenbug: under
+   `carrick trace` it passed 6 of 6 (~4.7% likely by chance), so use the event
+   ring via `carrick-lldb`, NOT a tracer. Known: `uv_try_write` returns EAGAIN
+   where Linux gives EPIPE/ECONNRESET after the peer closes; Darwin itself
+   returns ECONNRESET after ~27 writes and `blocking_io` really does call the
+   host write, so the peer's host socket was still open when the guest had
+   closed it. Suspect a lingering `HostFdRef`.
 
-Running the libuv workload with `--network bridge` exits 134 with zero stdout:
-
-```
-objc[...]: +[NSNumber initialize] may have been in progress in another thread
-when fork() was called. ... Crashing instead.
-```
-
-A trivial `--network bridge ... sh -c 'echo hello'` succeeds, so it is
-workload-specific, not setup. Known fork-unsafe CoreFoundation/ObjC class.
-Likely entry point is `getaddrinfo` via `to_socket_addrs` in
-`crates/carrick-runtime/src/network/dns.rs`; `scutil` in `vfs/resolvconf.rs` is
-a `posix_spawn` subprocess and is NOT the culprit. Attach the VM carrier with
-`carrick debug lldb-run` and break on `objc_initializeAfterForkError`. This is a
-crash, so it outranks a wrong answer.
+Once libuv closes, move to the next correctness cluster. Per the ledger the
+largest remaining assertion fan-out is CPython multiprocessing/process
+isolation, then Go process/epoll, then broad LTP infrastructure — but re-run
+the closure gate first, because every recorded count predates the oracle
+repair.
 
 ### Also found, recorded rather than fixed
 
