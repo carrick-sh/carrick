@@ -57,9 +57,30 @@ lands on the same `(gpa, length)` can collide with it. Relevant sites:
 `trap.rs:5189` and `:5304` (remove), `:5386` (a contains_key guard) and `:5484`
 (insert).
 
+Ordering matters here and rules out the obvious candidate: the sequence is
+shape -> reserve -> stage -> `unregister_alias` -> **apply (aborts)** ->
+`commit_inventory_lease_retirement`. The commit is the only place that removes
+`extents` entries (`trap.rs:5189`), and it runs AFTER the apply — so the stale
+extent was left behind by an EARLIER cycle, not by this one.
+
+Two structural facts worth having before the next attempt:
+
+- A COW split (`commit_cow_inventory_split`, `trap.rs:5300`) gives each
+  fragment its own `MappingId` but leaves every fragment sharing the ORIGINAL
+  `stage2_base`/`stage2_length`. So one stage-2 lease legitimately fans out to
+  many extents, and a lease retirement selects all of them at once
+  (`trap.rs:5099-5104`). Duplicate mapping ids are therefore NOT the cause.
+- `inventory.extents` and the kernel frame-inventory authority are two records
+  of the same fact, and only the alias-retirement path keeps them in step.
+
+So the leading hypothesis is that some OTHER path retires a mapping in the
+authority — a low-arena `munmap`, a fork COW retirement, an exec teardown —
+without removing the matching `extents` entry, and the alias retirement later
+trips over the orphan. Confirm by logging every authority mapping-retirement
+with its origin, then diffing that set against `extents` at the abort.
+
 So the question to answer first is: which path removes a mapping from the
-inventory WITHOUT removing its `extents` entry? Log the extent key alongside
-the mapping id at the abort and compare against the insert at `trap.rs:5484`.
+authority WITHOUT removing its `extents` entry?
 
 Note the sibling crash is DIFFERENT and this reducer does not produce it:
 `cpython-multiprocessing_fork` and `cpython-concurrent_futures` die with
