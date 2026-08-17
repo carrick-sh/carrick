@@ -496,7 +496,7 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
             Some("/usr/local/bin/nodejs-conformance"),
         )));
     }
-    let mut libuv = node_suite(mk(
+    let libuv = node_suite(mk(
         s("node-libuv"),
         Node,
         NODE_IMG,
@@ -517,7 +517,6 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
         None,
         Some("/usr/local/bin/nodejs-conformance"),
     ));
-    libuv.docker_flags = vec![s("--user"), s("65534")];
     suites.push(libuv);
 
     // ---- CPython: one suite per top-level test module ----------------------
@@ -722,6 +721,37 @@ mod tests {
             ltp_cmd("fcntl14_64"),
             vec!["/opt/ltp/testcases/bin/fcntl14_64", "-n", "200"]
         );
+    }
+
+    /// `node-libuv` must not acquire `--user` from either override table.
+    ///
+    /// It was previously hardcoded in `build()` as
+    /// `docker_flags = ["--user", "65534"]`, which made the oracle's fixture
+    /// chown fail EPERM so the docker row recorded a setup failure instead of
+    /// Linux libuv behaviour. The image wrapper drops itself to uid/gid 1000, so
+    /// the container must start privileged. `build()` shells to docker, so this
+    /// asserts on the override tables it consults (the only surviving way a
+    /// regen could put the flag back); the committed manifest is separately
+    /// guarded in `manifest::tests::node_libuv_manifest_does_not_pin_docker_user`.
+    #[test]
+    fn node_libuv_regen_does_not_pin_docker_user() {
+        assert!(
+            docker_flag_overrides("node-libuv").is_none(),
+            "node-libuv must not be given docker_flags by regen: the image wrapper drops to \
+             uid/gid 1000 itself and needs a privileged container to chown its fixture"
+        );
+        for (name, flags) in DOCKER_FLAG_OVERRIDES {
+            assert!(
+                !(name.starts_with("node") && flags.contains(&"--user")),
+                "{name} pins --user"
+            );
+        }
+        for (prefix, flags) in DOCKER_FLAG_PREFIX_OVERRIDES {
+            assert!(
+                !(prefix.starts_with("node") && flags.contains(&"--user")),
+                "{prefix} pins --user"
+            );
+        }
     }
 
     /// Guards against a repeat of the regen that silently dropped the
