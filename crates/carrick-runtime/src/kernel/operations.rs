@@ -537,6 +537,11 @@ impl ForkReservation {
         // inherited across fork (`keyrings(7)`); the thread keyring is not, and
         // the fresh leader below starts without one.
         child.inherit_keyrings_from(&self.caller_task);
+        // The five capability sets and the user-namespace view are inherited
+        // as a COPY (`capabilities(7)`, `user_namespaces(7)`): the child starts
+        // identical to the parent, and each side's later `PR_CAPBSET_DROP` /
+        // `capset` / `uid_map` write is invisible to the other.
+        child.inherit_creds_ns_from(&self.caller_task);
         let leader_tid = LinuxTid::for_task_leader(self.child_id);
         let leader = child.attach_fork_thread(
             ThreadKey {

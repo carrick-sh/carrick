@@ -1,26 +1,33 @@
-//! Process-global namespace + capability state.
+//! Per-process capability sets and user-namespace view — the *types*. The
+//! storage is [`crate::kernel::Task`].
 //!
-//! User namespace membership and the capability set are **per-process**
-//! attributes that are read from two very different places: the syscall
-//! dispatcher (`capget`/`capset`/`unshare`, `is_privileged`) and the free
-//! `/proc` synthesis functions in `vfs/proc.rs` (which have no handle to the
-//! dispatcher). A process-global store reachable from both — inherited at fork
-//! via the address-space copy, exactly like the `NICE_VALUE` static in
-//! `creds.rs` and the `cred_ipc` publish pattern — is the natural home.
+//! User-namespace membership and the five capability sets are **per-process**
+//! attributes (`capabilities(7)`, `user_namespaces(7)`): a `PR_CAPBSET_DROP`
+//! or a `uid_map` write by one process is invisible to every other process,
+//! and a `fork` child starts from a copy that diverges freely afterwards.
 //!
-//! This is the Phase 1 storage for the *current* process's user namespace.
+//! This module used to hold them in a `static OnceLock<Mutex<ProcessNs>>`,
+//! which was correct under the retired 1:1 host-process-per-guest-process
+//! backends: a guest `fork` was a host `fork`, so the address-space copy gave
+//! every guest process its own copy of the static for free. **Under HVPatch
+//! every Linux process is a thread of ONE Darwin carrier**, so that static was
+//! a single cell shared by every guest process at once — one guest's capbset
+//! drop silently removed the capability from every other guest, monotonically
+//! and irreversibly, and one guest's `unshare(CLONE_NEWUSER)` + `uid_map`
+//! write appeared in every other guest's `/proc/self/uid_map`.
+//!
+//! The state therefore lives on the task, next to [`crate::kernel::Task`]'s
+//! `oom_score_adj` and `keyrings` and for exactly the same reason. Namespace
+//! *ids* are the deliberate exception — see [`alloc_ns_id`].
+//!
 //! Cross-process sharing of namespace objects (the file-backed registry of
 //! design §4.5) and the PID-namespace hot state (the `MAP_SHARED` region of
-//! [`super::pid`]) are separate; this module only holds what a single process
-//! needs to answer "what uid_map/caps do I present?".
+//! [`super::pid`]) remain separate.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-use parking_lot::Mutex;
-
-use super::pid::PidNs;
 use super::user::UserNs;
-use super::{FIRST_DYNAMIC_NS, INITIAL_PID_NS, INITIAL_USER_NS, NsId};
+use super::{FIRST_DYNAMIC_NS, NsId};
 
 /// The Docker default bounded capability set, observed on
 /// `docker run debian:stable` (design §1.2, §4.4). carrick reports this in
@@ -96,176 +103,115 @@ impl CapabilitySet {
     }
 }
 
-/// The per-process namespace + capability state.
-struct ProcessNs {
-    /// This process's current user namespace. Starts as the identity initial ns
+/// A process's capability sets plus its user-namespace view — the pair that
+/// `unshare(CLONE_NEWUSER)` replaces together, and the pair that a `fork`
+/// child inherits as a copy.
+///
+/// The authority is one mutex on [`crate::kernel::Task`]; the `/proc`
+/// synthesis layer receives a snapshot of this on its render context, the same
+/// way it receives `oom_score_adj`.
+#[derive(Clone, Debug)]
+pub struct ProcessCredsNs {
+    /// The modeled capability set — the Docker default until a fresh user
+    /// namespace grants a full set within it.
+    pub caps: CapabilitySet,
+    /// This process's user namespace. Starts as the identity initial ns
     /// (uid 0 → host uid 0), so the common `docker run` case is unchanged.
-    user: UserNs,
-    /// This process's current PID namespace descriptor. The hot translation
-    /// lives in [`super::pid`]'s shared region; this is identity + lineage.
-    pidns: PidNs,
-    /// The modeled capability set (Docker default until a fresh userns grants
-    /// a full set).
-    caps: CapabilitySet,
-    /// `unshare(CLONE_NEWPID)` arms this; the next `fork` consumes it and makes
-    /// the child the init of a fresh pid ns (design §5.5). Phase 4.
-    pending_newpid: bool,
-    /// Monotonic allocator for namespace ids created *by this process*
-    /// (`unshare`/`clone(CLONE_NEW*)`). Starts after the initial-ns ids.
-    next_ns_id: NsId,
+    pub user: UserNs,
 }
 
-impl ProcessNs {
-    fn new() -> Self {
+impl Default for ProcessCredsNs {
+    fn default() -> Self {
         Self {
-            user: UserNs::initial(INITIAL_USER_NS),
-            pidns: PidNs::initial(INITIAL_PID_NS),
             caps: CapabilitySet::docker_default(),
-            pending_newpid: false,
-            next_ns_id: FIRST_DYNAMIC_NS,
+            user: UserNs::initial(super::INITIAL_USER_NS),
         }
     }
 }
 
-/// The process-global store. `OnceLock`-initialized on first access; the
-/// initialized value is inherited by fork descendants (address-space copy), so
-/// a child sees the parent's `current_userns`/caps at fork time and may diverge
-/// afterward — exactly the per-process semantic Linux gives.
-fn store() -> &'static Mutex<ProcessNs> {
-    static STORE: OnceLock<Mutex<ProcessNs>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(ProcessNs::new()))
+/// Bit `cap` of a 64-bit capability mask, or `None` for an out-of-range
+/// capability number. Every accessor below funnels through this so an
+/// out-of-range `prctl` argument can never shift past the width of the mask.
+fn cap_bit(cap: u32) -> Option<u64> {
+    (cap <= 63).then(|| 1u64 << cap)
 }
 
-/// Run `f` with a shared reference to the current user namespace.
-pub fn with_user<R>(f: impl FnOnce(&UserNs) -> R) -> R {
-    f(&store().lock().user)
-}
-
-/// Run `f` with a mutable reference to the current user namespace.
-pub fn with_user_mut<R>(f: impl FnOnce(&mut UserNs) -> R) -> R {
-    f(&mut store().lock().user)
-}
-
-/// The current user namespace id.
-pub fn current_user_ns() -> NsId {
-    store().lock().user.id
-}
-
-/// The current PID namespace descriptor.
-pub fn current_pid_ns() -> PidNs {
-    store().lock().pidns
-}
-
-/// Set the current PID namespace descriptor (launch placement, §5.2).
-pub fn set_current_pid_ns(ns: PidNs) {
-    store().lock().pidns = ns;
-}
-
-/// The modeled capability set.
-pub fn caps() -> CapabilitySet {
-    store().lock().caps
-}
-
-/// Replace the modeled capability set (`capset` accept-and-record, §4.4).
-pub fn set_caps(caps: CapabilitySet) {
-    store().lock().caps = caps;
-}
-
-/// The five `Cap*` lines for `/proc/[pid]/status`.
-pub fn cap_status_lines() -> String {
-    store().lock().caps.status_lines()
-}
-
-/// `prctl(PR_CAPBSET_READ, cap)` — is `cap` in the bounding set?
-pub fn capbset_read(cap: u32) -> bool {
-    if cap > 63 {
-        return false;
+impl CapabilitySet {
+    /// `prctl(PR_CAPBSET_READ, cap)` — is `cap` in the bounding set?
+    pub fn capbset_read(&self, cap: u32) -> bool {
+        cap_bit(cap).is_some_and(|bit| self.bounding & bit != 0)
     }
-    store().lock().caps.bounding & (1u64 << cap) != 0
-}
 
-/// `prctl(PR_CAPBSET_DROP, cap)` — clear `cap` from the bounding set
-/// (accept-and-record; §4.4).
-pub fn capbset_drop(cap: u32) {
-    if cap > 63 {
-        return;
+    /// `prctl(PR_CAPBSET_DROP, cap)` — clear `cap` from the bounding set
+    /// (accept-and-record; §4.4). Irreversible for this process, and per
+    /// `capabilities(7)` visible to nobody else.
+    pub fn capbset_drop(&mut self, cap: u32) {
+        if let Some(bit) = cap_bit(cap) {
+            self.bounding &= !bit;
+        }
     }
-    store().lock().caps.bounding &= !(1u64 << cap);
-}
 
-pub fn has_effective_cap(cap: u32) -> bool {
-    if cap > 63 {
-        return false;
+    /// Is `cap` in the effective set?
+    pub fn has_effective(&self, cap: u32) -> bool {
+        cap_bit(cap).is_some_and(|bit| self.effective & bit != 0)
     }
-    store().lock().caps.effective & (1u64 << cap) != 0
-}
 
-pub fn cap_ambient_is_set(cap: u32) -> bool {
-    if cap > 63 {
-        return false;
+    /// `PR_CAP_AMBIENT_IS_SET`.
+    pub fn ambient_is_set(&self, cap: u32) -> bool {
+        cap_bit(cap).is_some_and(|bit| self.ambient & bit != 0)
     }
-    store().lock().caps.ambient & (1u64 << cap) != 0
-}
 
-pub fn cap_ambient_lower(cap: u32) {
-    if cap > 63 {
-        return;
+    /// `PR_CAP_AMBIENT_LOWER`.
+    pub fn ambient_lower(&mut self, cap: u32) {
+        if let Some(bit) = cap_bit(cap) {
+            self.ambient &= !bit;
+        }
     }
-    store().lock().caps.ambient &= !(1u64 << cap);
-}
 
-pub fn cap_ambient_clear_all() {
-    store().lock().caps.ambient = 0;
-}
-
-pub fn cap_ambient_raise(cap: u32) -> bool {
-    if cap > 63 {
-        return false;
+    /// `PR_CAP_AMBIENT_CLEAR_ALL`.
+    pub fn ambient_clear_all(&mut self) {
+        self.ambient = 0;
     }
-    let bit = 1u64 << cap;
-    let mut g = store().lock();
-    if g.caps.permitted & bit == 0 || g.caps.inheritable & bit == 0 {
-        return false;
+
+    /// `PR_CAP_AMBIENT_RAISE`. Per `capabilities(7)` a capability may enter the
+    /// ambient set only while it is in BOTH the permitted and the inheritable
+    /// set; otherwise the raise fails (EPERM at the caller).
+    pub fn ambient_raise(&mut self, cap: u32) -> bool {
+        let Some(bit) = cap_bit(cap) else {
+            return false;
+        };
+        if self.permitted & bit == 0 || self.inheritable & bit == 0 {
+            return false;
+        }
+        self.ambient |= bit;
+        true
     }
-    g.caps.ambient |= bit;
-    true
+
+    /// Is this set privileged for *map-writing* purposes in its user
+    /// namespace? True if it holds `CAP_SETUID`/`CAP_SETGID` (modeled), i.e.
+    /// it is uid 0 with the default set, or it created a fresh userns (full
+    /// caps). This is the gate the `/proc/[pid]/uid_map` writer consults
+    /// (design §4.3).
+    pub fn is_map_write_privileged(&self) -> bool {
+        const CAP_SETGID: u64 = 1 << 6;
+        const CAP_SETUID: u64 = 1 << 7;
+        self.effective & (CAP_SETUID | CAP_SETGID) == (CAP_SETUID | CAP_SETGID)
+    }
 }
 
-/// Is the current process privileged for *map-writing* purposes in its current
-/// user namespace? True if it holds `CAP_SETUID`/`CAP_SETGID` (modeled), i.e.
-/// it is uid 0 with the default set, or it created a fresh userns (full caps).
-/// This is the gate the `/proc/[pid]/uid_map` writer consults (design §4.3).
-pub fn is_map_write_privileged() -> bool {
-    let c = store().lock().caps;
-    const CAP_SETGID: u64 = 1 << 6;
-    const CAP_SETUID: u64 = 1 << 7;
-    c.effective & (CAP_SETUID | CAP_SETGID) == (CAP_SETUID | CAP_SETGID)
-}
-
-/// `unshare(CLONE_NEWUSER)` (and the `clone(CLONE_NEWUSER)` child path):
-/// allocate a fresh user namespace for the caller, parented at the current one,
-/// and grant a full capability set within it (design §4.1, §4.6). Returns the
-/// new namespace id.
-pub fn unshare_user_ns() -> NsId {
-    let mut g = store().lock();
-    let parent = g.user.id;
-    let id = g.next_ns_id;
-    g.next_ns_id += 1;
-    g.user = UserNs::fresh(id, parent);
-    g.caps = CapabilitySet::full();
-    id
-}
-
-/// Arm the pending-NEWPID flag (`unshare(CLONE_NEWPID)`; consumed at the next
-/// fork — design §5.5). Phase 4.
-pub fn arm_pending_newpid() {
-    store().lock().pending_newpid = true;
-}
-
-/// Consume the pending-NEWPID flag, returning whether it was set.
-pub fn take_pending_newpid() -> bool {
-    let mut g = store().lock();
-    std::mem::take(&mut g.pending_newpid)
+/// Monotonic allocator for namespace ids, scoped to the whole VM carrier.
+///
+/// This is the deliberate exception to "per-process state lives on the task".
+/// A namespace id is an IDENTITY, not a per-process view of one: Linux exposes
+/// it as an nsfs inode number that is unique kernel-wide, and two namespaces
+/// are the same namespace exactly when their ids match. A per-task allocator
+/// would hand the same id to two processes that unshared independently,
+/// aliasing two distinct namespaces into one — the opposite of the isolation
+/// this module exists to provide. Carrier-wide monotonic allocation is what
+/// keeps ids unique, so a shared counter is correct here.
+pub fn alloc_ns_id() -> NsId {
+    static NEXT_NS_ID: AtomicU32 = AtomicU32::new(FIRST_DYNAMIC_NS);
+    NEXT_NS_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]
