@@ -642,3 +642,41 @@ exit 0
 
 The refreshed `scripts/conformance/oracle-cache.jsonl` remains the sole dirty,
 unstaged path. No runtime or target-artifact command ran.
+
+## Coordinator-owned authoritative discovery
+
+The final measurement used the frozen signed Carrick artifact directly, without
+another `just build`, because the signing wrapper relinks/resigns its release
+output and therefore changes the artifact hash. Carrick and Docker ran in
+strictly serialized phases with `--refresh-oracle`, no retries, no baseline, and
+no filter.
+
+- Suites: 2,127 unique rows (1,197 MATCH, 930 INCOMPLETE).
+- Exact assertions: 8,317 semantic gaps, 11,278 unexercised rows, 609 suites
+  with infrastructure failure evidence.
+- Valid pathologies: 6 completing MATCH suites at >=10x.
+- Liveness: 10 blocked timeouts.
+- Probes: 858/858 arm64 musl/GNU rows (842 PASS, 16 FAIL, zero skip/note/error).
+- Dedicated scenarios: all 28 invocations ran and emitted all 40 source/libc
+  rows; four rows failed.
+
+Final receipt:
+
+- Scope source: `83dcfe48067ec832375b1979241353997211e5b0`
+- Signed SHA-256: `b88db5ee72c67d2d16d52521a152aaf055a5f5e17af271c155a591e4d662a1ad`
+- CDHash: `f33b276f9101995dee613c87119d22c80d02ca6a`
+- LC_UUID: `8D032E4F-FBC0-363A-BC40-C7BF86E116EA`
+- Hypervisor entitlement: present/true
+- `__dof_carrick`: present (one load-command match)
+- Results SHA-256: `23dbc6c058304905c10f8a2cc5981220ff5b121ca04b3e65cf0571cf509c427c`
+- Probe-log SHA-256: `b02377e3badabada9976a1fea87590d2a00621960e371c738635561c32b24904`
+- Suite-log SHA-256: `7685bdf984a234767d49f45918c05101025a689817721dc8975de1b115d6a7bc`
+- Ledger SHA-256: `676f72d9563df3abcd77838e7f56d716fc6d3c78ba58fd8574f607cc67e25e7d`
+- Cleanup: zero live `carrick`/`carrick:conf-*` processes and zero `conf-*`
+  containers.
+
+Committed controller state:
+
+- `83dcfe480` records the final fresh oracle.
+- `4de017cf1` binds final scope provenance.
+- `25243f50e` records `docs/conformance-closure-ledger.md`.
