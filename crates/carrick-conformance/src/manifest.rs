@@ -346,6 +346,35 @@ carrick_flags = ["--fs", "host"]
         }
     }
 
+    /// `ltp-setpriority01` needs `CAP_SYS_NICE` on the docker side, and
+    /// `setpriority02` must NOT have it.
+    ///
+    /// `01` RAISES priority on a process it owns, which requires the
+    /// capability; without it the ORACLE fails 120 of its own assertions and
+    /// the row measures Docker's default cap policy rather than Linux. `02`
+    /// tests the EPERM/EACCES rejections and needs the capability ABSENT, which
+    /// is why this is an exact-name override and not a `ltp-setpriority` prefix.
+    #[test]
+    fn setpriority_oracle_privilege_is_split_between_01_and_02() {
+        let m = committed_manifest();
+        let flags = |name: &str| {
+            m.suite
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("committed manifest declares {name}"))
+                .docker_flags
+                .clone()
+        };
+        assert!(
+            flags("ltp-setpriority01").iter().any(|f| f == "SYS_NICE"),
+            "setpriority01's oracle needs CAP_SYS_NICE or it fails its own assertions"
+        );
+        assert!(
+            !flags("ltp-setpriority02").iter().any(|f| f == "SYS_NICE"),
+            "setpriority02 tests the privilege REJECTIONS and must not be granted it"
+        );
+    }
+
     /// `node-libuv` must NOT pin `--user` on the docker side.
     ///
     /// The image's `nodejs-conformance` wrapper creates and chowns the libuv

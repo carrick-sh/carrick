@@ -104,6 +104,14 @@ const DOCKER_FLAG_OVERRIDES: &[(&str, &[&str])] = &[
     // was written for is not measuring Linux, it is measuring the container.
     ("go-os", &["-t"]),
     ("go-net", &["-t"]),
+    // setpriority01 RAISES priority (nice -20..19) on a process it owns, which
+    // needs CAP_SYS_NICE — dropped by Docker's default cap set. Without it the
+    // ORACLE fails 120 of its own assertions; with it the suite passes 3. That
+    // is the documented under-privileged-oracle trap: granting the privilege
+    // the case implies makes the oracle measure Linux instead of the container's
+    // policy. EXACT name, not a prefix: setpriority02 tests the EPERM/EACCES
+    // rejections and needs the capability ABSENT.
+    ("ltp-setpriority01", &["--cap-add", "SYS_NICE"]),
     ("ltp-clone301", &["--security-opt", "seccomp=unconfined"]),
     ("ltp-clone302", &["--security-opt", "seccomp=unconfined"]),
 ];

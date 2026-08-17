@@ -378,11 +378,24 @@ Measured, not inferred — see `docs/perf-results/2026-08-17-closure-post-libuv/
   fast crash at 0.62x), **`go-go_types` 574** (untriaged),
   **`ltp-splice07` + `ltp-ioctl_ficlone04` 410** (LTP `tst_fd.c` fd-type
   inventory differs, shifting every ordinal).
-- **`ltp-setpriority01` 198 is an ORACLE problem**, not a carrick gap: Docker
-  fails 120 of its own assertions because `setpriority` lowering needs
-  `CAP_SYS_NICE`, which Docker's default cap set drops. Confirm with and
-  without the capability, then grant it via `docker_flags` as fanotify and
-  add_key already do. It was NOT closed by the nice/ioprio scope fix.
+- **`ltp-setpriority01`: oracle FIXED, 198 rows -> 3, and the residual gap is
+  now reduced.** The oracle was failing 120 of its own assertions because
+  raising priority needs `CAP_SYS_NICE`, which Docker's default cap set drops;
+  granted via `docker_flags` (exact name — `setpriority02` tests the
+  rejections and must NOT have it), the oracle now passes 3.
+
+  What remains is a REAL carrick gap, reduced to one line:
+  **`setpriority`/`getpriority` with `PRIO_PROCESS` and a live CHILD's pid
+  returns ESRCH**, where Linux succeeds. It is specific to that path — in the
+  same guest, for the same child pid, `kill(pid, 0)` succeeds,
+  `sched_getscheduler(pid)` succeeds, and `/proc/<pid>` exists. So the pid is
+  resolvable; only `resolve_prio_process_target` ->
+  `SyscallDispatcher::guest_process_target` -> `Kernel::live_task_process_euid`
+  fails to find it. Note the doc comment on `PrioTarget::Other` says an
+  unpublished peer should read as root, while the code does
+  `.and_then(|t| t.euid())` and turns `None` into `NotFound` — worth checking
+  first. Reducer: fork a child that blocks on a pipe, then
+  `setpriority(PRIO_PROCESS, child, 5)` from the parent.
 
 **Check the oracle first on any suite with a large `docker = absent` count.**
 Two of the three biggest "carrick gaps" this session were oracle defects
