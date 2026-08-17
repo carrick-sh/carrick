@@ -1367,3 +1367,52 @@ fn prlimit64_and_getrlimit_round_trip_per_resource() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
+
+/// The setpriority/getpriority ABI round trip for ONE process: the stored nice
+/// is reported back as the kernel's `20 - nice`.
+///
+/// This deliberately does NOT claim to test scope. A single-task case passes
+/// identically against the old runtime-global `static NICE_VALUE`, because a
+/// fresh test process starts at 0 either way — the scope invariant needs three
+/// live tasks and lives in
+/// `kernel::operations::tests::nice_is_per_process_inherited_at_fork_and_independent_thereafter`.
+#[test]
+fn setpriority_getpriority_round_trip_reports_kernel_abi_nice() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = LinearMemory::new(0x4000, Vec::new());
+    let reporter = CompatReporter::default();
+    let ctx = dispatcher.capture_one_task_context().unwrap();
+
+    // Default nice is 0 -> getpriority returns 20 - 0 = 20.
+    let out = dispatcher
+        .dispatch(
+            &ctx,
+            SyscallRequest::new(141, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(out, DispatchOutcome::Returned { value: 20 });
+
+    // Set nice to 5 -> getpriority returns 20 - 5 = 15.
+    let out = dispatcher
+        .dispatch(
+            &ctx,
+            SyscallRequest::new(140, SyscallArgs::from([0, 0, 5, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(out, DispatchOutcome::Returned { value: 0 });
+    assert_eq!(ctx.task().nice(), 5);
+
+    let out = dispatcher
+        .dispatch(
+            &ctx,
+            SyscallRequest::new(141, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(out, DispatchOutcome::Returned { value: 15 });
+}

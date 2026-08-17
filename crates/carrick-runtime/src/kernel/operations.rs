@@ -530,18 +530,10 @@ impl ForkReservation {
             Arc::clone(&child_shared),
             child_resources.credentials(),
         ));
-        // oom_score_adj is inherited across fork (proc(5)) and independent
-        // thereafter — copy the parent's value into the fresh child task.
-        child.set_oom_score_adj(self.caller_task.oom_score_adj());
-        // The session and process keyrings and the request-key default are
-        // inherited across fork (`keyrings(7)`); the thread keyring is not, and
-        // the fresh leader below starts without one.
-        child.inherit_keyrings_from(&self.caller_task);
-        // The five capability sets and the user-namespace view are inherited
-        // as a COPY (`capabilities(7)`, `user_namespaces(7)`): the child starts
-        // identical to the parent, and each side's later `PR_CAPBSET_DROP` /
-        // `capset` / `uid_map` write is invisible to the other.
-        child.inherit_creds_ns_from(&self.caller_task);
+        // oom_score_adj, nice, the inherited keyrings and the capability/userns
+        // copy — see `Task::inherit_fork_attributes_from`, which the host-fork
+        // adapter shares so the two fork paths cannot drift apart again.
+        child.inherit_fork_attributes_from(&self.caller_task);
         let leader_tid = LinuxTid::for_task_leader(self.child_id);
         let leader = child.attach_fork_thread(
             ThreadKey {
@@ -3561,6 +3553,115 @@ mod tests {
         )
         .expect("bootstrap input");
         Kernel::bootstrap_root(input).expect("kernel")
+    }
+
+    /// `nice` is inherited at fork and independent thereafter — and, crucially,
+    /// belongs to ONE Linux process rather than to the runtime.
+    ///
+    /// It used to live in a `static NICE_VALUE: AtomicI32` in
+    /// `dispatch/creds.rs`, justified by a comment claiming "a process-global
+    /// static is correct … carrick's fork creates a fresh address space". That
+    /// was true under the retired one-host-process-per-guest-process model and
+    /// is false under HVPatch, where many logical Linux processes share one
+    /// carrier: a dead child's nice leaked into every later process.
+    ///
+    /// This case needs THREE live tasks to see it. Every single-process
+    /// assertion (set 5, read back 5) passes identically against a shared cell,
+    /// which is exactly the blind spot `docs/identity-and-scope-domains.md`
+    /// describes — so a test that never creates a second task proves nothing
+    /// about scope.
+    #[test]
+    fn nice_is_per_process_inherited_at_fork_and_independent_thereafter() {
+        let (kernel, root) = bootstrap(151);
+        root.task().set_nice(7);
+
+        let fork = |tid: i32, name: &str| {
+            kernel
+                .fork_task(
+                    &root,
+                    ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                    ThreadId::synthetic_for_tests(tid),
+                    name.to_string(),
+                    None,
+                )
+                .expect("fork child")
+        };
+
+        // Child A inherits 7, then raises itself to 19 and exits.
+        let child_a = fork(9_151, "child-a");
+        assert_eq!(child_a.task.nice(), 7, "child A inherits the parent's nice");
+        child_a.task.set_nice(19);
+        kernel
+            .exit_task(
+                child_a.task.key().id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("child A exit");
+
+        // A's write must not have reached its parent...
+        assert_eq!(root.task().nice(), 7, "child A's nice must not touch root");
+
+        // ...nor an unrelated later process. A runtime-global cell reports 19.
+        let child_b = fork(9_152, "child-b");
+        assert_eq!(
+            child_b.task.nice(),
+            7,
+            "child B inherits root's nice, not the dead child A's"
+        );
+
+        // And B is independent of A's already-recorded value in both directions.
+        child_b.task.set_nice(-3);
+        assert_eq!(child_b.task.nice(), -3);
+        assert_eq!(root.task().nice(), 7, "child B's nice must not touch root");
+    }
+
+    /// I/O priority is the exact same shape as [`nice`], and had the exact same
+    /// defect: a `static IOPRIO_VALUE` in `dispatch/proc.rs` shared by every
+    /// logical Linux process in the carrier.
+    #[test]
+    fn ioprio_is_per_process_inherited_at_fork_and_independent_thereafter() {
+        let (kernel, root) = bootstrap(152);
+        assert_eq!(
+            root.task().ioprio(),
+            Task::DEFAULT_IOPRIO,
+            "a process that never called ioprio_set reports IOPRIO_CLASS_BE level 4"
+        );
+        // IOPRIO_CLASS_RT(1) level 2.
+        let rt2 = (1 << 13) | 2;
+        root.task().set_ioprio(rt2);
+
+        let fork = |tid: i32, name: &str| {
+            kernel
+                .fork_task(
+                    &root,
+                    ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                    ThreadId::synthetic_for_tests(tid),
+                    name.to_string(),
+                    None,
+                )
+                .expect("fork child")
+        };
+
+        let child_a = fork(9_251, "child-a");
+        assert_eq!(child_a.task.ioprio(), rt2, "inherited at fork");
+        // IOPRIO_CLASS_IDLE(3).
+        child_a.task.set_ioprio(3 << 13);
+        kernel
+            .exit_task(
+                child_a.task.key().id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("child A exit");
+        assert_eq!(root.task().ioprio(), rt2, "child A must not touch root");
+
+        let child_b = fork(9_252, "child-b");
+        assert_eq!(
+            child_b.task.ioprio(),
+            rt2,
+            "child B inherits root's ioprio, not the dead child A's"
+        );
     }
 
     #[test]

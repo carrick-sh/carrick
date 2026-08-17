@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -2352,6 +2352,23 @@ pub struct Task {
     /// process's file and reads it back (`tst_memutils.c:set_oom_score_adj`),
     /// which a shared cell cannot model.
     oom_score_adj: AtomicI32,
+    /// This process's nice value (`getpriority`/`setpriority`): range
+    /// [-20, 19], default 0. Inherited across fork and preserved across exec.
+    ///
+    /// Per-TASK, not a runtime `static`: under HVPatch many logical Linux
+    /// processes share one host carrier, so a global cell leaks one process's
+    /// nice into every other. (Linux's own granularity is finer still — nice is
+    /// really per-thread — see `nice()`.)
+    nice: AtomicI32,
+    /// This process's I/O priority, stored by `ioprio_set` and echoed by
+    /// `ioprio_get`. Carrick has no real I/O scheduler, so this is a faithful
+    /// value store, not a scheduling input. Default `IOPRIO_CLASS_BE(2)` level
+    /// 4 = `(2 << 13) | 4`, what Linux reports for a process that never set one.
+    ///
+    /// Per-TASK for the same reason as [`Task::nice`]: it was a runtime-global
+    /// `static IOPRIO_VALUE` in `dispatch/proc.rs`, which every logical Linux
+    /// process in the carrier shared.
+    ioprio: AtomicU32,
     /// This process's keyring pointers (`keyrings(7)`): the process keyring,
     /// the session keyring, and the `KEYCTL_SET_REQKEY_KEYRING` default.
     ///
@@ -2454,9 +2471,67 @@ impl Task {
             waker: Mutex::new(None),
             wake_generation: AtomicU64::new(0),
             oom_score_adj: AtomicI32::new(0),
+            nice: AtomicI32::new(0),
+            ioprio: AtomicU32::new(Task::DEFAULT_IOPRIO),
             keyrings: Mutex::new(ProcessKeyrings::default()),
             creds_ns: Mutex::new(ProcessCredsNs::default()),
         }
+    }
+
+    /// What Linux reports for a process that never called `ioprio_set`:
+    /// `IOPRIO_CLASS_BE` (2) at level 4, packed as `(class << 13) | level`.
+    pub const DEFAULT_IOPRIO: u32 = (2 << 13) | 4;
+
+    /// This process's packed I/O priority (`ioprio_get`).
+    pub fn ioprio(&self) -> u32 {
+        self.ioprio.load(Ordering::SeqCst)
+    }
+
+    /// Store this process's packed I/O priority (`ioprio_set`).
+    pub fn set_ioprio(&self, value: u32) {
+        self.ioprio.store(value, Ordering::SeqCst);
+    }
+
+    /// This process's nice value (default 0).
+    pub fn nice(&self) -> i32 {
+        self.nice.load(Ordering::Relaxed)
+    }
+
+    /// Set this process's nice value.
+    pub fn set_nice(&self, value: i32) {
+        self.nice.store(value, Ordering::Relaxed);
+    }
+
+    /// Copy every per-process attribute Linux inherits across `fork(2)` and
+    /// leaves independent thereafter, from `parent` into this fresh child task.
+    ///
+    /// This exists as ONE named operation because there are TWO fork paths that
+    /// mint a child `Task`, and they drifted: `ForkReservation::prepare` (the
+    /// in-process path HVPatch uses) carried all four, while the host-fork
+    /// adapter `reset_one_task_kernel_binding_for_current_process` — taken by
+    /// backends whose `supports_in_process_fork()` is false — bootstrapped a
+    /// brand-new root task and carried none of them. That difference was
+    /// invisible while these values lived in process-global `static`s, because
+    /// `libc::fork` copied the statics for free. Moving them onto `Task` makes
+    /// the omission load-bearing, so the two paths must share this one call.
+    pub fn inherit_fork_attributes_from(&self, parent: &Task) {
+        // oom_score_adj is inherited across fork and independent thereafter
+        // (`proc(5)`).
+        self.set_oom_score_adj(parent.oom_score_adj());
+        // nice is inherited across fork (`fork(2)`: "the child's nice value is
+        // the same as the parent's").
+        self.set_nice(parent.nice());
+        // I/O priority is likewise inherited across fork (`ioprio_set(2)`).
+        self.set_ioprio(parent.ioprio());
+        // The session and process keyrings and the `KEYCTL_SET_REQKEY_KEYRING`
+        // default are inherited (`keyrings(7)`); the thread keyring is not, and
+        // a fresh leader starts without one.
+        self.inherit_keyrings_from(parent);
+        // The five capability sets and the user-namespace view are inherited as
+        // a COPY (`capabilities(7)`, `user_namespaces(7)`): the child starts
+        // identical, and each side's later `PR_CAPBSET_DROP` / `capset` /
+        // `uid_map` write is invisible to the other.
+        self.inherit_creds_ns_from(parent);
     }
 
     /// A snapshot of this process's capability sets and user-namespace view,

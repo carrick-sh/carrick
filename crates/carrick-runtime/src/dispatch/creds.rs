@@ -75,13 +75,6 @@ syscall_table! {
     177 => sys_getegid,
 }
 
-/// Per-process nice value (the calling process's PRIO_PROCESS priority).
-/// Default 0. setpriority(PRIO_PROCESS, self) stores it (clamped to [-20,19])
-/// and getpriority(PRIO_PROCESS, self) reports it as the kernel-ABI `20 - nice`
-/// (glibc converts back). A process-global static is correct: nice is a
-/// per-process attribute and carrick's fork creates a fresh address space.
-static NICE_VALUE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-
 fn is_self_priority_target(who: i32) -> bool {
     // PRIO_PROCESS names the caller by 0 (self for setpriority, unlike signals)
     // or by its (ns-)pid — the process-level cases are the canonical
@@ -557,7 +550,6 @@ impl SyscallDispatcher {
         }
 
         fn setpriority(this, cx, which: u64, who: Pid, prio: u64) {
-            use std::sync::atomic::Ordering;
             let prio = prio as i32;
             // An unknown `which` class is EINVAL (setpriority02 case 0).
             if which > LINUX_PRIO_USER {
@@ -609,17 +601,17 @@ impl SyscallDispatcher {
             // CAP_SYS_NICE, so an unprivileged caller gets EACCES (setpriority02
             // cases 4 and 5). EPERM (above) is target-ownership; EACCES is the
             // privilege to raise one's own priority.
-            if clamped < NICE_VALUE.load(Ordering::Relaxed) && !euid.is_root() {
+            let current_nice = cx.kernel.task().nice();
+            if clamped < current_nice && !euid.is_root() {
                 return Ok(DispatchOutcome::errno(LINUX_EACCES));
             }
             if which == LINUX_PRIO_PROCESS {
-                NICE_VALUE.store(clamped, Ordering::Relaxed);
+                cx.kernel.task().set_nice(clamped);
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn getpriority(this, cx, which: u64, who: Pid) {
-            use std::sync::atomic::Ordering;
             if which > LINUX_PRIO_USER {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -642,7 +634,7 @@ impl SyscallDispatcher {
             // negative); glibc converts it back. Report the calling process's
             // stored nice for PRIO_PROCESS, else the default (nice 0 → 20).
             let nice = if which == LINUX_PRIO_PROCESS {
-                NICE_VALUE.load(Ordering::Relaxed)
+                cx.kernel.task().nice()
             } else {
                 0
             };
