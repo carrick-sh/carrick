@@ -328,6 +328,19 @@ conformance-probes: build
     esac
     cargo test -p carrick-cli --test conformance {{_platform_features}} -- --nocapture
 
+# Verify the frozen 2,127-suite discovery surface against the current clean
+# source tree, signed Carrick binary, manifest, and live image identities.
+conformance-closure-scope:
+    python3 scripts/conformance/closure-scope.py check scripts/conformance/closure-scope.json
+
+# Strict macOS/aarch64 proof gate: build every selected musl+GNU source and run
+# both libc sets as gating HVPatch differentials. Closure mode rejects skips,
+# missing artifacts, filters, alternate backends, and an unavailable oracle.
+conformance-probes-closure: build
+    ./scripts/build-probes.sh --closure-arm64
+    CARRICK_PROBE_MODE=closure CARRICK_PROBE_LANE=arm64 CARRICK_EXEC_BACKEND=hvpatch \
+      cargo test -p carrick-cli --test conformance conformance_probes -- --exact --nocapture
+
 # Re-sign an already-built release binary (rarely needed on its own).
 sign:
     codesign --force --sign - --entitlements scripts/entitlements.plist target/release/carrick
