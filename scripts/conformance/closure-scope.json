@@ -39,7 +39,7 @@
   },
   "manifest_sha256": "36042b91814ca767d61a6615c0023aa07773b7f5649fc65038fae6c34367d282",
   "schema": "carrick-closure-scope-v1",
-  "source_head": "52554a8d9376539464922641e7098029c88459f8",
+  "source_head": "52554a8d94b3b60924628c3323c1ef3d17966001",
   "suite_count": 2127,
   "suite_counts_by_ecosystem": {
     "cpython": 438,
@@ -2176,5 +2176,5 @@
     "node-libuv",
     "node-v8-smoke"
   ],
-  "tooling_source_head": "b21b55d504f6caa781e6d2570c9a8a822b0bb4a8"
+  "tooling_source_head": "651d77a744ddb821f4b53f87abb9e926890cda34"
 }
