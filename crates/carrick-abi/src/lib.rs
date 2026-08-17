@@ -1055,6 +1055,17 @@ pub const LINUX_IFLA_IFNAME: u16 = 3;
 pub const LINUX_IFA_ADDRESS: u16 = 1;
 pub const LINUX_IFA_LOCAL: u16 = 2;
 pub const LINUX_IFA_LABEL: u16 = 3;
+pub const LINUX_IFA_BROADCAST: u16 = 4;
+/// `IFA_CACHEINFO`: `struct ifa_cacheinfo { prefered, valid, cstamp, tstamp }`,
+/// four `u32`s. Linux emits it on every address; `INFINITY_LIFE_TIME` is `~0`.
+pub const LINUX_IFA_CACHEINFO: u16 = 6;
+/// `IFA_FLAGS`: the 32-bit flag word that supersedes `ifaddrmsg.ifa_flags`.
+pub const LINUX_IFA_FLAGS: u16 = 8;
+/// `IFA_F_PERMANENT`: a statically configured address, which is what every
+/// address in a container netns is.
+pub const LINUX_IFA_F_PERMANENT: u32 = 0x80;
+/// `INFINITY_LIFE_TIME`, the lifetime a permanent address reports.
+pub const LINUX_IFA_INFINITY_LIFE_TIME: u32 = u32::MAX;
 
 #[repr(C, packed)]
 #[derive(
