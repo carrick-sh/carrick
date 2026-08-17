@@ -1,15 +1,17 @@
 //! CPython `python3 -m test -v` (unittest verbose) parser. Lifted from
 //! `scripts/cpython-parity.py`. The per-test line is
 //! `<method> (<dotted.id>)[ [N]] ... <outcome>`; the dotted id is the key and
-//! first-occurrence wins (a later subtest line for the same id is ignored).
+//! first-occurrence wins in regression mode. Closure mode retains every
+//! occurrence and includes `[N]` subtest ordinals in the assertion identity.
 
-use super::{Outcome, Raw, SuiteOutcome, SuiteResult, Totals, VerdictParser};
+use super::{AssertionCollector, Outcome, Raw, SuiteOutcome, SuiteResult, Totals, VerdictParser};
 use regex::Regex;
 use std::collections::BTreeMap;
 
 pub struct RegrtestParser;
 
 const LINE: &str = r"^(\S+) \(([\w.]+)\)(?: \[\d+\])? \.\.\. (.*)$";
+const CLOSURE_LINE: &str = r"^(\S+) \(([\w.]+)\)(?: \[(\d+)\])? \.\.\. (.*)$";
 const RESULT: &str = r"(?m)^Result:\s*(\w+)";
 
 fn classify(rest: &str) -> Outcome {
@@ -28,6 +30,55 @@ fn classify(rest: &str) -> Outcome {
         Outcome::Skipped
     } else {
         Outcome::Other
+    }
+}
+
+impl RegrtestParser {
+    pub(crate) fn parse_closure(&self, raw: &Raw) -> SuiteResult {
+        let text = super::strip_carrick_banners(&raw.combined());
+        let (Ok(line_re), Ok(result_re)) = (Regex::new(CLOSURE_LINE), Regex::new(RESULT)) else {
+            return SuiteResult::empty();
+        };
+
+        let mut collector = AssertionCollector::default();
+        let (mut passed, mut failed, mut skipped) = (0usize, 0usize, 0usize);
+        for line in text.lines() {
+            let Some(caps) = line_re.captures(line.trim_end()) else {
+                continue;
+            };
+            let (Some(id), Some(rest)) = (caps.get(2), caps.get(4)) else {
+                continue;
+            };
+            let outcome = classify(rest.as_str());
+            match outcome {
+                Outcome::Ok => passed += 1,
+                Outcome::Fail | Outcome::Error | Outcome::Uxsuccess => failed += 1,
+                Outcome::Skipped | Outcome::Xfail => skipped += 1,
+                _ => {}
+            }
+            let ordinal = caps
+                .get(3)
+                .map_or(String::new(), |value| format!("[{}]", value.as_str()));
+            collector.push(format!("py:{}{ordinal}", id.as_str()), outcome);
+        }
+        let ids = collector.into_ids();
+        let result = match result_re.captures(&text).and_then(|caps| caps.get(1)) {
+            Some(value) if value.as_str().eq_ignore_ascii_case("SUCCESS") => SuiteOutcome::Success,
+            Some(_) => SuiteOutcome::Failure,
+            None if ids.is_empty() => SuiteOutcome::Empty,
+            None => SuiteOutcome::None,
+        };
+        SuiteResult {
+            totals: Totals {
+                n: passed + failed,
+                passed,
+                failed,
+                broken: 0,
+                skipped,
+            },
+            result,
+            ids,
+        }
     }
 }
 
@@ -134,5 +185,15 @@ Result: FAILURE";
         let out = "test_a (m.C.test_a) ... ok\ntest_a (m.C.test_a) ... FAIL\nResult: SUCCESS";
         let r = RegrtestParser.parse(&raw(out));
         assert_eq!(r.ids.get("m.C.test_a"), Some(&Outcome::Ok));
+    }
+
+    #[test]
+    fn closure_keeps_python_duplicate_subtest_ordinals() {
+        let out =
+            "test_a (m.C.test_a) [1] ... ok\ntest_a (m.C.test_a) [2] ... FAIL\nResult: FAILURE\n";
+        let result = RegrtestParser.parse_closure(&raw(out));
+        assert!(result.ids.contains_key("py:m.C.test_a[1]#1"));
+        assert!(result.ids.contains_key("py:m.C.test_a[2]#1"));
+        assert_eq!(result.ids.len(), 2);
     }
 }

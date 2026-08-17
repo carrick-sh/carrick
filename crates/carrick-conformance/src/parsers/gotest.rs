@@ -7,7 +7,7 @@
 //! mid-run crash (`SuiteOutcome::None`) so the classifier reports one
 //! root-cause verdict instead of a per-test diff storm (design §4.4).
 
-use super::{Outcome, Raw, SuiteOutcome, SuiteResult, Totals, VerdictParser};
+use super::{AssertionCollector, Outcome, Raw, SuiteOutcome, SuiteResult, Totals, VerdictParser};
 use regex::Regex;
 use std::collections::BTreeMap;
 
@@ -21,6 +21,68 @@ const CRASH_SIGNATURES: &[&str] = &[
 ];
 
 const LINE: &str = r"^\s*--- (PASS|FAIL|SKIP): (\S+)";
+
+impl GotestParser {
+    pub(crate) fn parse_closure(&self, raw: &Raw) -> SuiteResult {
+        let text = super::strip_carrick_banners(&raw.combined());
+        let recovered_expected_panic_failure = raw.exit_code == 2
+            && text.contains("panic: did not panic [recovered]")
+            && text.contains("--- FAIL:");
+        let crashed = CRASH_SIGNATURES.iter().any(|sig| text.contains(sig))
+            || (!matches!(raw.exit_code, 0 | 1) && !recovered_expected_panic_failure);
+        let Ok(re) = Regex::new(LINE) else {
+            return SuiteResult::empty();
+        };
+
+        let mut collector = AssertionCollector::default();
+        let (mut passed, mut failed, mut skipped) = (0usize, 0usize, 0usize);
+        for line in text.lines() {
+            let Some(caps) = re.captures(line) else {
+                continue;
+            };
+            let (Some(status), Some(name)) = (caps.get(1), caps.get(2)) else {
+                continue;
+            };
+            let outcome = match status.as_str() {
+                "PASS" => Outcome::Ok,
+                "FAIL" => Outcome::Fail,
+                _ => Outcome::Skipped,
+            };
+            match outcome {
+                Outcome::Ok => passed += 1,
+                Outcome::Fail => failed += 1,
+                Outcome::Skipped => skipped += 1,
+                _ => {}
+            }
+            collector.push(format!("go:{}", normalize_id(name.as_str())), outcome);
+        }
+        let ids = collector.into_ids();
+        let totals = Totals {
+            n: passed + failed,
+            passed,
+            failed,
+            broken: 0,
+            skipped,
+        };
+        let result = if crashed {
+            SuiteOutcome::None
+        } else if ids.is_empty() && text.contains("testing: warning: no tests to run") {
+            SuiteOutcome::Success
+        } else if ids.is_empty() {
+            SuiteOutcome::Empty
+        } else if failed > 0 {
+            SuiteOutcome::Failure
+        } else {
+            SuiteOutcome::Success
+        };
+
+        SuiteResult {
+            totals,
+            result,
+            ids,
+        }
+    }
+}
 
 impl VerdictParser for GotestParser {
     fn parse(&self, raw: &Raw) -> SuiteResult {
@@ -248,5 +310,23 @@ panic: did not panic [recovered]
         let r = GotestParser.parse(&out);
         assert_eq!(r.result, SuiteOutcome::Failure);
         assert_eq!(r.ids.get("TestTypeFieldReadOnly"), Some(&Outcome::Fail));
+    }
+
+    #[test]
+    fn closure_keeps_pointer_normalized_duplicate_subtests() {
+        let out = "\
+--- PASS: TestAs/As(Errorf(...),_0x6048040008) (0.00s)
+--- FAIL: TestAs/As(Errorf(...),_0x604801cb10) (0.00s)
+FAIL";
+        let result = GotestParser.parse_closure(&raw(out));
+        assert_eq!(result.ids.len(), 2);
+        assert_eq!(
+            result.ids["go:TestAs/As(Errorf(...),_0xADDR)#1"],
+            Outcome::Ok
+        );
+        assert_eq!(
+            result.ids["go:TestAs/As(Errorf(...),_0xADDR)#2"],
+            Outcome::Fail
+        );
     }
 }

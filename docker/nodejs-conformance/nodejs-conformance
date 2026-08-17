@@ -223,7 +223,11 @@ run_logged() {
   if [[ -z "$signature" ]]; then
     signature="$(head -1 "$tmp" || true)"
   fi
-  printf '%-12s %-8s rc=%s log=%s\n' "$name" "$status" "$rc" "$tmp"
+  if ! python3 "$script_dir/normalize-tap.py" "$name" "$rc" "$tmp"; then
+    rm -f "$tmp"
+    return 2
+  fi
+  rm -f "$tmp"
   append_jsonl "$name" "$effective_runner" "$line" "$status" "$rc" "$((end - start))" "$signature"
   return "$rc"
 }

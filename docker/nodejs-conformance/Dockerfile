@@ -68,11 +68,12 @@ RUN set -eux; \
     find /opt/libuv-src -type f \( -name 'uv_run_tests_a' -o -name 'run-tests' \) -perm -111 -print -quit | grep .
 
 COPY nodejs-conformance /usr/local/bin/nodejs-conformance
+COPY normalize-tap.py /usr/local/bin/normalize-tap.py
 COPY fixtures /opt/nodejs-conformance/fixtures
 
 RUN set -eux; \
     useradd --create-home --uid 1000 --user-group --shell /usr/sbin/nologin nodeconf; \
-    chmod +x /usr/local/bin/nodejs-conformance; \
+    chmod +x /usr/local/bin/nodejs-conformance /usr/local/bin/normalize-tap.py; \
     /opt/nodejs-conformance/bin/node24 --version; \
     /opt/nodejs-conformance/bin/node26 --version; \
     printf '{"node24_ref":"%s","node26_ref":"%s","libuv_ref":"%s"}\n' \

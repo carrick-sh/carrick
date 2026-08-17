@@ -433,6 +433,17 @@ fn run() -> anyhow::Result<ExitCode> {
                 .ok_or_else(|| anyhow::anyhow!("regular run requires a baseline"))?,
         )
     };
+    let (parser_mode, oracle_profile) = if args.closure {
+        (
+            parsers::ParseMode::Closure,
+            oracle::ParserProfile::ClosureV1,
+        )
+    } else {
+        (
+            parsers::ParseMode::Regression,
+            oracle::ParserProfile::Regression,
+        )
+    };
 
     let pid = std::process::id();
     let carrick_bin = args.carrick_bin.to_string_lossy().into_owned();
@@ -519,7 +530,12 @@ fn run() -> anyhow::Result<ExitCode> {
         if args.refresh_oracle {
             let invalidated = selected
                 .iter()
-                .filter(|suite| cache.invalidate(suite, docker_platform))
+                .filter(|suite| match oracle_profile {
+                    oracle::ParserProfile::Regression => cache.invalidate(suite, docker_platform),
+                    oracle::ParserProfile::ClosureV1 => {
+                        cache.invalidate_for_profile(suite, docker_platform, oracle_profile)
+                    }
+                })
                 .count();
             if invalidated > 0 {
                 eprintln!("oracle cache: invalidated {invalidated} selected record(s) for refresh");
@@ -528,11 +544,15 @@ fn run() -> anyhow::Result<ExitCode> {
         } else {
             selected
                 .iter()
-                .map(|s| {
-                    (
+                .map(|s| match oracle_profile {
+                    oracle::ParserProfile::Regression => (
                         cache.get(s, docker_platform),
                         cache.get_elapsed_ms(s, docker_platform),
-                    )
+                    ),
+                    oracle::ParserProfile::ClosureV1 => (
+                        cache.get_for_profile(s, docker_platform, oracle_profile),
+                        cache.get_elapsed_ms_for_profile(s, docker_platform, oracle_profile),
+                    ),
                 })
                 .unzip()
         };
@@ -680,14 +700,28 @@ fn run() -> anyhow::Result<ExitCode> {
         let side = match out.and_then(|r| r.ok()) {
             Some(o) => {
                 let timed_out = o.timed_out;
-                let res = parsers::parse(verdict_kind(s), &o.raw());
-                cache.insert_fresh(
-                    s,
-                    docker_platform,
-                    res.clone(),
-                    Some(o.elapsed_ms),
-                    timed_out,
-                );
+                let res = parsers::parse_for_mode(verdict_kind(s), &o.raw(), parser_mode);
+                match oracle_profile {
+                    oracle::ParserProfile::Regression => {
+                        cache.insert_fresh(
+                            s,
+                            docker_platform,
+                            res.clone(),
+                            Some(o.elapsed_ms),
+                            timed_out,
+                        );
+                    }
+                    oracle::ParserProfile::ClosureV1 => {
+                        cache.insert_fresh_for_profile(
+                            s,
+                            docker_platform,
+                            oracle_profile,
+                            res.clone(),
+                            Some(o.elapsed_ms),
+                            timed_out,
+                        );
+                    }
+                }
                 DockerSide {
                     result: res,
                     run_id: o.run_id,
@@ -865,7 +899,12 @@ fn build_report(
         ),
     };
 
-    let c_res = parsers::parse(verdict_kind(s), &c_raw);
+    let c_res = match policy {
+        ClassificationPolicy::Closure => {
+            parsers::parse_for_mode(verdict_kind(s), &c_raw, parsers::ParseMode::Closure)
+        }
+        ClassificationPolicy::Baseline(_) => parsers::parse(verdict_kind(s), &c_raw),
+    };
     let d_res = &docker.result;
     let cl = match policy {
         ClassificationPolicy::Closure => {
@@ -2101,6 +2140,55 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn closure_build_report_uses_assertion_exact_parser() {
+        let mut suite = suite("node-exact", Ecosystem::Node, Weight::Light);
+        suite.verdict = crate::manifest::VerdictKind::Tap;
+        let output = "TAP version 13\n1..1\nok 1 - alpha\n";
+        let temp = std::env::temp_dir().join(format!(
+            "carrick-conformance-closure-parser-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp).expect("create parser test directory");
+        let stdout_path = temp.join("stdout");
+        let stderr_path = temp.join("stderr");
+        std::fs::write(&stdout_path, output).expect("write stdout fixture");
+        std::fs::write(&stderr_path, "").expect("write stderr fixture");
+        let run = engine::RunOutput {
+            stdout_path,
+            stderr_path,
+            exit_code: 0,
+            timed_out: false,
+            elapsed_ms: 1,
+            run_id: "closure-parser-test".into(),
+            argv: Vec::new(),
+            timeout_evidence: None,
+        };
+        let raw = parsers::Raw {
+            stdout: output.into(),
+            stderr: String::new(),
+            exit_code: 0,
+            timed_out: false,
+        };
+        let docker = DockerSide {
+            result: parsers::parse_for_mode(
+                crate::manifest::VerdictKind::Tap,
+                &raw,
+                parsers::ParseMode::Closure,
+            ),
+            run_id: "docker-test".into(),
+            argv: Vec::new(),
+            elapsed_ms: Some(1),
+            timed_out: false,
+        };
+
+        let report = build_report(&suite, Some(&run), &docker, ClassificationPolicy::Closure);
+        assert_eq!(report.verdict, Verdict::Match);
+        assert!(!report.gating);
+
+        std::fs::remove_dir_all(temp).expect("remove parser test directory");
+    }
 
     #[test]
     fn select_dispatches_ltp_first_cpython_last() {
