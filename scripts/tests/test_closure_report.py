@@ -219,6 +219,42 @@ class ClosureReportTest(unittest.TestCase):
                         all_pass + extra + "\n", inventory()
                     )
 
+    def test_probe_log_rejects_raw_dedicated_skip_note_and_cargo_failure(self):
+        all_pass = complete_probe_log()
+        forbidden = [
+            "SKIP conformance_bridge_tcp_peer: target/release/carrick not built",
+            "NOTE conformance_bridge_publish_tcp: Docker oracle unavailable",
+            "test conformance_bridge_udp_peer ... FAILED",
+        ]
+        for raw_line in forbidden:
+            with self.subTest(raw_line=raw_line):
+                with self.assertRaises(closure_report.ReportError):
+                    closure_report.validate_probe_log(
+                        all_pass + raw_line + "\n", inventory()
+                    )
+
+    def test_probe_log_rejects_raw_generic_fail_and_error(self):
+        all_pass = complete_probe_log()
+        for raw_line in [
+            "FAIL arm64:gnu:abortdeath",
+            "ERROR arm64:musl:acceptsock (read probe failed)",
+        ]:
+            with self.subTest(raw_line=raw_line):
+                with self.assertRaises(closure_report.ReportError):
+                    closure_report.validate_probe_log(
+                        all_pass + raw_line + "\n", inventory()
+                    )
+
+    def test_probe_log_allows_canonical_rows_and_passing_cargo_noise(self):
+        log = complete_probe_log(
+            extras=["test conformance_bridge_tcp_peer ... ok"]
+        )
+
+        summary = closure_report.validate_probe_log(log, inventory())
+
+        self.assertEqual(summary["rows"], 858)
+        self.assertEqual(summary["passed"], 858)
+
     def test_ledger_renders_assertion_and_probe_red_sections(self):
         scope = scope_2127()
         scope["suite_names"][0] = "ltp-red"

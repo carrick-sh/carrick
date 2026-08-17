@@ -160,7 +160,13 @@ def run_plan(
                     "",
                     f"command runner returned a malformed result: {result!r}",
                 )
-            sys.stdout.write(result.output)
+            for line in result.output.splitlines():
+                print(f"CLOSURE_PROBE_DETAIL {libc}:{command.runner}: {line}")
+            if result.detail:
+                print(
+                    f"CLOSURE_PROBE_DETAIL {libc}:{command.runner}: "
+                    f"terminal={result.status} detail={result.detail}"
+                )
             for source in command.sources:
                 row = TerminalRow(
                     libc,

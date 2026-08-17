@@ -110,6 +110,32 @@ class ClosureProbeScenarioTest(unittest.TestCase):
         )
         self.assertEqual(calls[-1], ("musl", plan.commands[-1].runner))
 
+    def test_plan_prefixes_raw_cargo_failure_output_as_nonterminal_detail(self):
+        plan = scenarios.build_plan(self.inventory)
+
+        def fake_runner(_root, command, _libc):
+            return scenarios.CommandResult(
+                "FAIL",
+                f"test {command.runner} ... FAILED\n",
+                "synthetic failure",
+            )
+
+        output = StringIO()
+        with redirect_stdout(output):
+            scenarios.run_plan(ROOT, plan, command_runner=fake_runner)
+
+        rendered = output.getvalue()
+        self.assertNotIn("\ntest conformance_bridge_compose_pair ... FAILED\n", rendered)
+        self.assertIn(
+            "CLOSURE_PROBE_DETAIL gnu:conformance_bridge_compose_pair: "
+            "test conformance_bridge_compose_pair ... FAILED",
+            rendered,
+        )
+        self.assertIn(
+            "CLOSURE_PROBE SCENARIO FAIL arm64:gnu:bridge_compose_client",
+            rendered,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

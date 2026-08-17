@@ -220,6 +220,8 @@ STANDALONE_PROBE_STATE_RE = re.compile(
     r"^(?:PASS|FAIL|DIFF|SKIP|NOTE|ERROR|XFAIL|UNEXPECTED PASS) "
     r"(?:CLOSURE_SCENARIO )?arm64:"
 )
+RAW_DEDICATED_STATE_RE = re.compile(r"^(?:SKIP|NOTE) ([A-Za-z0-9_]+):")
+RAW_CARGO_FAILURE_RE = re.compile(r"^test ([A-Za-z0-9_]+) \.\.\. FAILED$")
 
 
 def validate_probe_log(log: str, inventory: dict[str, Any]) -> dict[str, Any]:
@@ -229,6 +231,7 @@ def validate_probe_log(log: str, inventory: dict[str, Any]) -> dict[str, Any]:
     dedicated = {
         name for name, row in inventory.items() if row.get("class") == "conformance" and row.get("runner") != "generic"
     }
+    dedicated_runners = {inventory[name].get("runner") for name in dedicated}
     if len(generic) != 409 or len(dedicated) != 20:
         raise ReportError(
             f"probe inventory denominator drifted: {len(generic)} generic, {len(dedicated)} dedicated"
@@ -259,6 +262,12 @@ def validate_probe_log(log: str, inventory: dict[str, Any]) -> dict[str, Any]:
             )
         elif terminal.startswith("CLOSURE_PROBE ") or STANDALONE_PROBE_STATE_RE.match(terminal):
             raise ReportError(f"malformed or standalone probe terminal state: {terminal}")
+        else:
+            raw_state = RAW_DEDICATED_STATE_RE.match(terminal)
+            cargo_failure = RAW_CARGO_FAILURE_RE.fullmatch(terminal)
+            runner = (raw_state or cargo_failure).group(1) if raw_state or cargo_failure else None
+            if runner in dedicated_runners:
+                raise ReportError(f"raw dedicated probe failure state is forbidden: {terminal}")
     expected = {(libc, source) for libc in PROBE_LIBCS for source in generic | dedicated}
     keys = [(row["libc"], row["source"]) for row in observed]
     duplicates = sorted(row for row, count in Counter(keys).items() if count > 1)
