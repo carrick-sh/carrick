@@ -1,0 +1,8 @@
+source_head=696c69d304759440ac1bc641666ade42cd1fb50b
+binary_sha256=add5d9e6f02fb6054da90ccfc7060c628dd51e13fcab998d1ddc81c93f8e6549
+Identifier=carrick.tmp.92329
+CDHash=95906949c6f13f700b083262e2c6d94670747ad5
+TeamIdentifier=not set
+UUID: F9B5458B-6CA2-37AC-90EB-7E238495FE9C (arm64) target/release/carrick
+entitlement=com.apple.security.hypervisor
+__dof_carrick.size=0x8c5c

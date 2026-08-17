@@ -1,0 +1,1 @@
+/usr/local/bin/nodejs-conformance: line 204:     7 Killed                  timeout -s KILL "$timeout_s" "$@" > "$tmp" 2>&1
