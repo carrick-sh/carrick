@@ -3043,6 +3043,11 @@ struct HvpatchFrameInventory {
     frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
     alias_reservation: Option<carrick_hal::FrameInventoryReservation>,
     alias_commit: Option<carrick_hal::FrameInventoryCommit<()>>,
+    /// Extents `stage_mapping` inserted for the alias transaction currently in
+    /// flight. They name MappingIds the authority does not learn about until the
+    /// commit is applied, so a CANCELLED transaction has to take them back out —
+    /// see `cancel_alias_inventory`.
+    alias_staged: Vec<((u64, u64), InventoryExtent)>,
     process_reservation: Option<carrick_hal::FrameInventoryReservation>,
     process_commit: Option<carrick_hal::FrameInventoryCommit<()>>,
     retired_reservation: Option<carrick_hal::FrameInventoryReservation>,
@@ -3315,15 +3320,42 @@ impl HvpatchFrameInventoryState {
     /// hand-off: `add_alias_with_sharing` returning early leaves the
     /// `alias_reservation` it never consumed, while a stage-1 `map_aliased`
     /// failure after a successful stage-2 install leaves the `alias_commit` it
-    /// already staged. Reservations and commits are pointer-free data with no
-    /// `Drop` side effects — dropping one only burns its candidate IDs, which
-    /// the runtime's monotonic registry never reissues — so the backend's own
-    /// stage-1/stage-2 unwind (RAII host mappings and global-frame IPA leases)
-    /// plus this discard leave no residue.
+    /// already staged.
+    ///
+    /// Dropping the reservation really is free — reservations are pointer-free
+    /// data whose only cost is burning candidate IDs the monotonic registry
+    /// never reissues. Dropping the COMMIT is NOT. By the time one exists,
+    /// `stage_mapping` has already inserted an `InventoryExtent` into
+    /// `extents`, and that extent names a MappingId the authority only learns
+    /// about when the commit is applied. Discarding the commit alone therefore
+    /// left the backend ledger holding an extent for a mapping the authority
+    /// had never seen, and the next `munmap` of that VA staged an
+    /// `UnmapMapping` for it and aborted the carrier with
+    /// `mapping MappingId(N) is not live`. So the staged extents are rolled
+    /// back here too, which is what makes this discard leave no residue.
     fn cancel_alias_inventory(&mut self) -> bool {
         let mut inventory = self.ledger.lock();
         let reservation = inventory.alias_reservation.take();
         let commit = inventory.alias_commit.take();
+        let staged = std::mem::take(&mut inventory.alias_staged);
+        tracing::trace!(
+            staged = staged.len(),
+            reservation = reservation.is_some(),
+            commit = commit.is_some(),
+            "hvpatch alias cancel"
+        );
+        if !staged.is_empty()
+            && let Err(error) = HvfVmState::rollback_unpublished_mappings(&mut inventory, &staged)
+        {
+            // The ledger and the authority have already diverged; continuing
+            // would hand a later retirement an extent naming a mapping that
+            // does not exist, which aborts anyway but much further from the
+            // cause.
+            eprintln!(
+                "carrick: FATAL: roll back cancelled HVPatch alias staging: {error} staged={staged:?}"
+            );
+            std::process::abort();
+        }
         reservation.is_some() || commit.is_some()
     }
 
@@ -5684,7 +5716,16 @@ impl HvfVmState {
     }
 
     pub(crate) fn take_alias_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
-        self.frame_inventory.lock().alias_commit.take()
+        let mut inventory = self.frame_inventory.lock();
+        // Handing the commit off makes the staged extents the authority's
+        // business, so they are no longer this transaction's to roll back.
+        tracing::trace!(
+            staged = inventory.alias_staged.len(),
+            commit = inventory.alias_commit.is_some(),
+            "hvpatch alias take"
+        );
+        inventory.alias_staged.clear();
+        inventory.alias_commit.take()
     }
 
     pub(crate) fn abandon_alias_inventory(&mut self) -> bool {
@@ -8871,7 +8912,7 @@ impl HvfVmState {
                 );
                 std::process::abort();
             });
-            if let Err(error) = Self::stage_mapping(
+            match Self::stage_mapping(
                 &mut inventory,
                 &mut reservation,
                 InventoryMappingStage {
@@ -8887,8 +8928,21 @@ impl HvfVmState {
                     stage2_lease: None,
                 },
             ) {
-                eprintln!("carrick: FATAL: stage inventory after HVPatch alias map: {error}");
-                std::process::abort();
+                Ok(extent) => {
+                    tracing::trace!(
+                        mapping = ?extent.mapping,
+                        frame = ?extent.frame,
+                        gpa = format_args!("{ipa:#x}"),
+                        "hvpatch alias stage"
+                    );
+                    inventory
+                        .alias_staged
+                        .push(((ipa, physical_size as u64), extent));
+                }
+                Err(error) => {
+                    eprintln!("carrick: FATAL: stage inventory after HVPatch alias map: {error}");
+                    std::process::abort();
+                }
             }
             inventory.alias_commit = Some(reservation.commit(()));
         }
@@ -9666,7 +9720,34 @@ impl HvfVmState {
             std::process::abort();
         }
         if let Err(error) = authority.apply(reservation.commit(())) {
-            eprintln!("carrick: FATAL: apply HVPatch alias retirement inventory: {error}");
+            // Name the retirement, not just the id that failed. This abort used
+            // to print one MappingId and nothing else, which cannot distinguish
+            // a double-retire from a mapping the authority never saw, and gives
+            // no way to tell WHICH extent named it — `inventory.extents` is
+            // keyed by `(gpa, length)`, so an extent has no lifetime tie to the
+            // mapping it names and an orphan is invisible from the id alone.
+            let inventory = self.frame_inventory.lock();
+            let retiring: std::collections::BTreeSet<_> = retirement
+                .mappings
+                .iter()
+                .map(|(_, extent)| extent.mapping)
+                .collect();
+            let naming: Vec<_> = inventory
+                .extents
+                .iter()
+                .filter(|(_, extent)| retiring.contains(&extent.mapping))
+                .map(|(&key, extent)| (key, extent.mapping, extent.frame, extent.backing))
+                .collect();
+            eprintln!(
+                "carrick: FATAL: apply HVPatch alias retirement inventory: {error}\n  \
+                 va={va:#x} len={len:#x} retiring={:?}\n  frames={:?} leases={:?}\n  \
+                 every extent naming those mappings: {naming:?}\n  \
+                 live extents={} planned_leases={planned_leases:?}",
+                retirement.mappings,
+                retirement.frames,
+                retirement.stage2_leases,
+                inventory.extents.len(),
+            );
             std::process::abort();
         }
         {
