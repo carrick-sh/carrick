@@ -643,6 +643,7 @@ where
         write_sealed_shared: false,
         read_only_shared_file: false,
         writable_memfd: None,
+        shared_file_alias: None,
     }));
     let install = transaction
         .claim()
@@ -3959,6 +3960,7 @@ fn native16k_rejects_write_exec_alias_mprotect() {
         write_sealed_shared: false,
         read_only_shared_file: false,
         writable_memfd: None,
+        shared_file_alias: None,
     });
     let registry =
         crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1160));
@@ -4161,6 +4163,7 @@ fn native16k_allows_private_alias_write_exec_for_translation_backend() {
         write_sealed_shared: false,
         read_only_shared_file: false,
         writable_memfd: None,
+        shared_file_alias: None,
     });
     let registry =
         crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1187));
@@ -5488,6 +5491,7 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
         write_sealed_shared: false,
         read_only_shared_file: false,
         writable_memfd: None,
+        shared_file_alias: None,
     });
 
     let mem = dispatcher.mem.lock();
@@ -5559,6 +5563,7 @@ fn core_file_provenance_keeps_mmap_offset_and_excludes_anonymous_exec() {
         write_sealed_shared: false,
         read_only_shared_file: false,
         writable_memfd: None,
+        shared_file_alias: None,
     });
     dispatcher.commit_host_alias_mmap(HostAliasMmapCommit {
         start: 0x7100_0000,
@@ -5573,6 +5578,7 @@ fn core_file_provenance_keeps_mmap_offset_and_excludes_anonymous_exec() {
         write_sealed_shared: false,
         read_only_shared_file: false,
         writable_memfd: None,
+        shared_file_alias: None,
     });
 
     assert_eq!(
@@ -5606,6 +5612,7 @@ fn host_alias_inventory_commits_trims_and_fork_clones_exact_ranges() {
         write_sealed_shared: false,
         read_only_shared_file: false,
         writable_memfd: None,
+        shared_file_alias: None,
     }));
     assert!(
         !parent.range_has_host_alias_backing(start, len),
@@ -5692,6 +5699,7 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
         write_sealed_shared: false,
         read_only_shared_file: false,
         writable_memfd: None,
+        shared_file_alias: None,
     }));
 
     assert_eq!(
@@ -5755,6 +5763,7 @@ fn pending_host_alias_transaction_drop_aborts_and_notifies_waiters() {
         write_sealed_shared: false,
         read_only_shared_file: false,
         writable_memfd: None,
+        shared_file_alias: None,
     }));
     let sibling = std::sync::Arc::clone(&dispatcher);
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
@@ -5799,6 +5808,7 @@ fn dropping_unconsumed_host_alias_outcome_closes_fd_and_aborts_transaction() {
         write_sealed_shared: false,
         read_only_shared_file: false,
         writable_memfd: None,
+        shared_file_alias: None,
     }));
     let mut pipe = [-1; 2];
     assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
@@ -5849,6 +5859,7 @@ fn installing_host_alias_blocks_sibling_mapping_dispatch_until_resolution() {
         write_sealed_shared: false,
         read_only_shared_file: false,
         writable_memfd: None,
+        shared_file_alias: None,
     }));
     let install = transaction
         .claim()

@@ -388,6 +388,17 @@ pub(super) struct MemState {
         crate::vfs::GuestMemoryRange,
         Arc<crate::kernel::FileDescription>,
     )>,
+    /// Live `MAP_SHARED` file aliases, paired with the open-file description
+    /// they alias. The alias itself keeps only a dup'd host fd that the runtime
+    /// closes right after mapping, so without this the file behind a mapping is
+    /// unrecoverable once the guest closes its own fd — and `mremap` needs it to
+    /// answer "where does this file end?" before it can grow the mapping (the
+    /// tail past EOF is SIGBUS, not zeroes). Same shape and lifetime rules as
+    /// `writable_memfd_maps`: trimmed by range whenever a mapping goes away.
+    shared_file_alias_maps: Vec<(
+        crate::vfs::GuestMemoryRange,
+        Arc<crate::kernel::FileDescription>,
+    )>,
     /// The exact serialized ELF auxiliary vector written to the guest stack at
     /// exec, captured from the `AddressSpace` via
     /// [`SyscallDispatcher::set_auxv_image`]. Mirrored to `/proc/self/auxv`.
@@ -441,6 +452,7 @@ impl MemState {
             read_only_shared_file_maps: Vec::new(),
             write_sealed_shared_maps: Vec::new(),
             writable_memfd_maps: Vec::new(),
+            shared_file_alias_maps: Vec::new(),
             linux_auxv_image: Vec::new(),
             core_file_mappings: Vec::new(),
         }
@@ -976,6 +988,9 @@ pub(crate) struct HostAliasMmapCommit {
     pub(super) write_sealed_shared: bool,
     pub(super) read_only_shared_file: bool,
     pub(super) writable_memfd: Option<Arc<crate::kernel::FileDescription>>,
+    /// The open-file description behind a live `MAP_SHARED` file alias, kept so
+    /// `mremap` can still find the file after the guest closes its own fd.
+    pub(super) shared_file_alias: Option<Arc<crate::kernel::FileDescription>>,
 }
 
 fn prot_to_proc_perms(prot: LinuxProtFlags) -> (bool, bool, bool) {
@@ -1167,6 +1182,7 @@ fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len: u64) {
     trim_growdown_ranges_for_range(mem, start, len);
     trim_ranges_for_range(&mut mem.bus_fault_ranges, start, len);
     trim_writable_memfd_maps_for_range(&mut mem.writable_memfd_maps, start, len);
+    trim_writable_memfd_maps_for_range(&mut mem.shared_file_alias_maps, start, len);
     trim_remap_snapshots_for_range(&mut mem.remap_snapshots, start, len);
     let Some(remove) =
         crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
@@ -1440,6 +1456,9 @@ impl SyscallDispatcher {
         if let Some(description) = commit.writable_memfd {
             mem.writable_memfd_maps.push((replacement, description));
         }
+        if let Some(description) = commit.shared_file_alias {
+            mem.shared_file_alias_maps.push((replacement, description));
+        }
         if let Some(file_page_offset) = commit.file_page_offset
             && !commit.path.is_empty()
         {
@@ -1705,6 +1724,24 @@ impl SyscallDispatcher {
         {
             locked_ranges_insert(&mut self.mem.lock().read_only_shared_file_maps, range);
         }
+    }
+
+    /// The open-file description behind the live `MAP_SHARED` alias covering
+    /// `[start, start+len)`, if that whole range is one recorded alias. Callers
+    /// use it to re-derive a fact about the FILE (notably its length) after the
+    /// guest has closed its own descriptor.
+    fn shared_file_alias_description(
+        &self,
+        start: u64,
+        len: u64,
+    ) -> Option<Arc<crate::kernel::FileDescription>> {
+        let end = start.checked_add(len)?;
+        self.mem
+            .lock()
+            .shared_file_alias_maps
+            .iter()
+            .find(|(range, _)| range.start().raw() <= start && range.end().raw() >= end)
+            .map(|(_, description)| Arc::clone(description))
     }
 
     fn range_is_read_only_shared_file(&self, start: u64, len: u64) -> bool {
@@ -2595,6 +2632,7 @@ impl SyscallDispatcher {
                         write_sealed_shared: false,
                         read_only_shared_file: false,
                         writable_memfd: None,
+                        shared_file_alias: None,
                     },
                     mapping,
                     mm,
@@ -2891,6 +2929,7 @@ impl SyscallDispatcher {
                     write_sealed_shared: false,
                     read_only_shared_file: false,
                     writable_memfd: None,
+                    shared_file_alias: None,
                 });
                 return Ok(DispatchOutcome::Returned {
                     value: requested.0 as i64,
@@ -2914,6 +2953,7 @@ impl SyscallDispatcher {
                 && !map_flags.contains(LinuxMmapFlags::FIXED)
                 && offset.is_multiple_of(hvf_page)
             {
+                let mut alias_description: Option<Arc<crate::kernel::FileDescription>> = None;
                 let dup_fd = {
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(request.refused(
@@ -2940,7 +2980,17 @@ impl SyscallDispatcher {
                                 None
                             } else {
                                 let d = unsafe { libc::dup(host_fd.raw()) };
-                                if d < 0 { None } else { Some(d) }
+                                if d < 0 {
+                                    None
+                                } else {
+                                    // Retain the description: the dup above is
+                                    // the runtime's and is closed right after
+                                    // mapping, so this is the only way a later
+                                    // `mremap` can ask where the file ends.
+                                    alias_description =
+                                        Some(std::sync::Arc::clone(&open_file.description));
+                                    Some(d)
+                                }
                             }
                         }
                         _ => None,
@@ -3038,6 +3088,7 @@ impl SyscallDispatcher {
                             write_sealed_shared: false,
                             read_only_shared_file: false,
                             writable_memfd: None,
+                            shared_file_alias: alias_description,
                         },
                     ));
                     return Ok(DispatchOutcome::MapHostAlias {
@@ -3689,6 +3740,7 @@ impl SyscallDispatcher {
                         write_sealed_shared: mmap_write_sealed_shared,
                         read_only_shared_file: mmap_read_only_shared_file,
                         writable_memfd: writable_memfd_desc,
+                        shared_file_alias: None,
                     },
                 ));
                 return Ok(DispatchOutcome::MapHostAlias {
@@ -4406,9 +4458,139 @@ impl SyscallDispatcher {
                             && alloc.live_len == old_size
                             && alloc.backing == crate::shared_aperture::BackingObject::SharedAnon
                 );
+            // File length and mapping offset behind a live MAP_SHARED alias, if
+            // this range is one. Shared by the grow plan and the diagnostic
+            // below so both report the same numbers.
+            let alias_file_extent = (|| {
+                let description = this.shared_file_alias_description(old_address.0, old_size)?;
+                let file_offset = source_metadata
+                    .file_page_offset
+                    .unwrap_or(0)
+                    .checked_mul(crate::core_dump::GUEST_PAGE as u64)?;
+                let open = description.read();
+                let file_len = match &*open {
+                    OpenDescription::HostFile { host_fd, .. } => host_fd_file_len(host_fd.raw()),
+                    _ => None,
+                }?;
+                Some((file_len, file_offset))
+            })();
+
+            // The other shared shape carrick can grow: a live MAP_SHARED file
+            // alias whose growth lands entirely PAST the file's end. Linux keeps
+            // the object and its live page-cache sharing exactly as they are and
+            // simply extends the VMA; every page from EOF on has no backing and
+            // faults SIGBUS. Carrick can reproduce that without touching the
+            // alias at all — extend the VMA and record the tail as a bus-fault
+            // range — which is strictly better than re-establishing the mapping,
+            // because the existing alias IS the shared page cache.
+            //
+            // `ltp-mremap01` is exactly this: a 0x3e8000 MAP_SHARED window onto
+            // a 0x3e8000 file, grown to 0x7d0000 with MREMAP_MAYMOVE.
+            let shared_file_alias_grow = (new_size > old_size
+                && flags & LINUX_MREMAP_MAYMOVE != 0
+                && source_metadata.sharing == ProcMapSharing::Shared
+                && shared_aperture_alloc.is_none())
+            .then(|| {
+                let (file_len, file_offset) = alias_file_extent?;
+                // Where SIGBUS starts inside the GROWN mapping. The growth is
+                // reproducible in place only when every added byte is already
+                // past that point; otherwise part of the new tail must show real
+                // file bytes, which extending the VMA alone would not deliver.
+                let bus_start = shared_file_bus_offset(file_len, file_offset, new_size, page_size)?;
+                (bus_start <= old_size).then_some(bus_start)
+            })
+            .flatten();
+            // The third shared shape: an aperture SNAPSHOT of a file, which is
+            // what a MAP_SHARED file mapping becomes when it runs past EOF and
+            // so cannot be a live alias. `ltp-mremap01` is this one — it writes
+            // a SINGLE byte to its file and then maps 0x3e8000 of it, so all but
+            // the first page is already bus-fault territory — and it grows to
+            // 0x7d0000, entirely past EOF. Same rule as the alias case: growth
+            // is reproducible in place only when every added byte is past the
+            // bus threshold, since the aperture would otherwise have to
+            // materialize file bytes it does not have.
+            let shared_file_aperture_grow = (new_size > old_size
+                && flags & LINUX_MREMAP_MAYMOVE != 0)
+                .then(|| {
+                    let alloc = shared_aperture_alloc.as_ref()?;
+                    if alloc.guest_addr != old_address.0 || alloc.live_len != old_size {
+                        return None;
+                    }
+                    let (raw_fd, file_offset) = alloc.backing.shared_file_parts()?;
+                    let file_len = host_fd_file_len(raw_fd)?;
+                    let bus_start =
+                        shared_file_bus_offset(file_len, file_offset, new_size, page_size)?;
+                    (bus_start <= old_size).then_some(bus_start)
+                })
+                .flatten();
+            // Offset within the mapping at which SIGBUS starts, when the
+            // mapping ALREADY ends past its file's EOF. Read off the bus records
+            // the original `mmap` published rather than re-derived from a
+            // descriptor: an arena snapshot keeps no fd, and the guest may well
+            // have closed its own by now.
+            //
+            // Read the records directly — `mmap_fault_is_sigbus` opens its own
+            // host-alias dispatch guard and `mremap` already holds one, so
+            // calling it here DEADLOCKED the guest (the run wedged in mremap and
+            // timed out with no output past the mmap).
+            let shared_arena_grow_past_eof = (new_size > old_size
+                && flags & LINUX_MREMAP_MAYMOVE != 0
+                && source_metadata.sharing == ProcMapSharing::Shared
+                && source_in_arena
+                && old_size != 0)
+            .then(|| {
+                let last = old_address.0.saturating_add(old_size) - 1;
+                this.mem
+                    .lock()
+                    .bus_fault_ranges
+                    .iter()
+                    .find(|&&(start, len)| {
+                        start
+                            .checked_add(len)
+                            .is_some_and(|end| last >= start && last < end)
+                    })
+                    .map(|&(start, _)| start.saturating_sub(old_address.0))
+            })
+            .flatten();
+            // Grow of a live alias whose larger extent is still wholly inside
+            // the file: re-established over the same fd below.
+            let alias_regrow_within_eof = new_size > old_size
+                && flags & LINUX_MREMAP_MAYMOVE != 0
+                && source_metadata.sharing == ProcMapSharing::Shared
+                && shared_aperture_alloc.is_none()
+                && alias_file_extent.is_some_and(|(file_len, file_offset)| {
+                    shared_file_bus_offset(file_len, file_offset, new_size, page_size).is_none()
+                });
+            if new_size > old_size && std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
+                // Which grow plan (if any) matched, and the facts each one keys
+                // on. A refused grow is otherwise indistinguishable from a dozen
+                // other ENOMEM sources in this handler, and the shapes that need
+                // one differ by backing rather than by anything the guest can
+                // see. Same hatch as the mmap BUS line above.
+                eprintln!(
+                    "[FAULTDBG] mremap GROW addr={:#x} old={old_size:#x} new={new_size:#x} \
+                     flags={flags:#x} sharing={:?} in_arena={source_in_arena} \
+                     aperture={:?} anon_plan={shared_grow_in_place} \
+                     arena_past_eof={shared_arena_grow_past_eof:?} \
+                     alias_plan={shared_file_alias_grow:?} \
+                     aperture_plan={shared_file_aperture_grow:?} \
+                     alias_file_extent={alias_file_extent:?} \
+                     alias_regrow={alias_regrow_within_eof} path={:?}",
+                    old_address.0,
+                    source_metadata.sharing,
+                    shared_aperture_alloc
+                        .as_ref()
+                        .map(|a| (a.guest_addr, a.live_len, a.len)),
+                    source_metadata.path,
+                );
+            }
             if source_metadata.sharing == ProcMapSharing::Shared
                 && new_size > old_size
                 && !shared_grow_in_place
+                && shared_arena_grow_past_eof.is_none()
+                && shared_file_alias_grow.is_none()
+                && shared_file_aperture_grow.is_none()
+                && !alias_regrow_within_eof
             {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
@@ -4432,6 +4614,200 @@ impl SyscallDispatcher {
                 // probing the main stack VMA.
                 if memory.read_bytes(old_address.0, 1).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                // Grow a live MAP_SHARED file alias whose LARGER extent is still
+                // entirely inside the file. Linux backs the added pages from the
+                // file, so carrick has to as well — and the only way to keep
+                // sharing exact is to re-establish the alias over the same fd at
+                // the new length. Re-mmapping the same descriptor aliases the
+                // same page cache, so unlike a byte copy this preserves
+                // coherence with every other mapper.
+                //
+                // `ltp-mremap01` is this shape. It builds a SPARSE file with
+                // lseek+write (which is why a naive read of its `write` calls
+                // suggests a 1-byte file), maps 0x3e8000 of it, EXTENDS the file
+                // to 0x7d0001, and then grows the mapping to 0x7d0000 — all
+                // inside EOF.
+                if let Some((file_len, file_offset)) = alias_file_extent
+                    && new_size > old_size
+                    && flags & LINUX_MREMAP_MAYMOVE != 0
+                    && source_metadata.sharing == ProcMapSharing::Shared
+                    && shared_aperture_alloc.is_none()
+                    && shared_file_bus_offset(file_len, file_offset, new_size, page_size).is_none()
+                {
+                    let Some(description) =
+                        this.shared_file_alias_description(old_address.0, old_size)
+                    else {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    };
+                    let dup_fd = {
+                        let open = description.read();
+                        match &*open {
+                            OpenDescription::HostFile { host_fd, .. } => {
+                                if host_fd_can_back_shared_alias(host_fd.raw()) {
+                                    let d = unsafe { libc::dup(host_fd.raw()) };
+                                    (d >= 0).then_some(d)
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        }
+                    };
+                    let Some(dup_fd) = dup_fd else {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    };
+                    let Some(ipa) = crate::memory::alloc_alias_ipa(new_size) else {
+                        unsafe { libc::close(dup_fd) };
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    };
+                    let va = crate::memory::LINUX_HIGH_VA_THRESHOLD
+                        + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE);
+                    // Same translation as the mmap path: PROT_EXEC is dropped
+                    // (the guest executes through its own stage-1/stage-2, and
+                    // macOS refuses MAP_SHARED|PROT_EXEC of an ordinary file).
+                    let pf = source_metadata.prot;
+                    let mut host_prot = 0;
+                    if pf.intersects(LinuxProtFlags::READ | LinuxProtFlags::EXEC) {
+                        host_prot |= libc::PROT_READ;
+                    }
+                    if pf.contains(LinuxProtFlags::WRITE) {
+                        host_prot |= libc::PROT_WRITE;
+                    }
+                    // Linux unmaps the source. Reclaim the old alias BEFORE
+                    // publishing the new one; the destination IPA is freshly
+                    // allocated and never reused, so it cannot collide with the
+                    // source, and the ordering keeps `mmap_next`-independent
+                    // alias VA bookkeeping single-valued. If the runtime's host
+                    // mmap then fails the transaction aborts and the guest has
+                    // lost the source mapping, where Linux would have kept it —
+                    // a divergence confined to that failure path.
+                    if let Ok(old_len) = usize::try_from(old_size)
+                        && old_len > 0
+                    {
+                        let _ = memory.unmap_alias_range(old_address.0, old_len);
+                        mark_range_unmapped(memory, old_address.0, old_len);
+                        this.remove_mapping_metadata(old_address.0, old_size);
+                    }
+                    let transaction =
+                        host_alias_dispatch.publish(HostAliasCommit::mmap(HostAliasMmapCommit {
+                            start: va,
+                            len: new_size,
+                            prot: pf,
+                            sharing: ProcMapSharing::Shared,
+                            path: source_metadata.path.clone(),
+                            file_page_offset: source_metadata.file_page_offset,
+                            locked: None,
+                            resident: true,
+                            bus_fault: None,
+                            write_sealed_shared: false,
+                            read_only_shared_file: false,
+                            writable_memfd: None,
+                            shared_file_alias: Some(Arc::clone(&description)),
+                        }));
+                    return Ok(DispatchOutcome::MapHostAlias {
+                        success_retval: va as i64,
+                        transaction,
+                        va: GuestVa(va),
+                        ipa: Gpa(ipa),
+                        len: new_size,
+                        payload: Vec::new(),
+                        file: Some((
+                            // SAFETY: `dup_fd` is the successful, uniquely-owned
+                            // descriptor created just above and is transferred
+                            // into the non-cloneable outcome exactly once.
+                            unsafe { HostAliasOwnedFd::from_raw_fd(dup_fd) },
+                            file_offset as libc::off_t,
+                            host_prot,
+                        )),
+                        shared: true,
+                        prot: pf.bits(),
+                        prot_none: pf.is_empty(),
+                    });
+                }
+                if let Some(bus_start) = shared_file_alias_grow {
+                    // Leave the live alias exactly as it is — it IS the shared
+                    // page cache, and re-establishing it would be both slower
+                    // and a chance to lose coherence — and give the mapping the
+                    // unbacked tail Linux gives it. The VA above the alias has
+                    // to be free, because nothing is moving.
+                    let Some(new_end) = old_address.0.checked_add(new_size) else {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    };
+                    let old_end = old_address.0.saturating_add(old_size);
+                    let tail_occupied = this
+                        .mem
+                        .lock()
+                        .dynamic_maps
+                        .iter()
+                        .any(|map| map.start < new_end && map.end > old_end);
+                    if tail_occupied {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    }
+                    // Every page from `bus_start` on is past EOF and must fault
+                    // SIGBUS, not read as zeroes. Nothing is mapped there, so
+                    // the access takes a translation fault and this record is
+                    // what turns the resulting SIGSEGV into the SIGBUS Linux
+                    // delivers.
+                    this.record_mmap_bus_fault_range(
+                        old_address.0.saturating_add(bus_start),
+                        new_size.saturating_sub(bus_start),
+                    );
+                    this.record_dynamic_mapping_with_file_offset(
+                        old_address.0,
+                        new_size,
+                        source_metadata.prot,
+                        source_metadata.sharing,
+                        source_metadata.path.clone(),
+                        source_metadata.file_page_offset,
+                    );
+                    this.mark_vma_dispatch(&mut host_alias_dispatch);
+                    return Ok(DispatchOutcome::Returned {
+                        value: old_address.0 as i64,
+                    });
+                }
+                if shared_file_aperture_grow.is_some() {
+                    // Extend the reservation so nothing else can take the VA,
+                    // but publish NO backing for it: every added byte is past
+                    // the file's end, where Linux delivers SIGBUS rather than
+                    // zeroes. The tail is left inaccessible so the guest's
+                    // access faults, and the bus record is what turns that
+                    // fault into SIGBUS instead of SIGSEGV.
+                    let claimed = this.mem.lock().shared.grow(old_address.0, new_size);
+                    let Some((claim_start, claim_len)) = claimed else {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    };
+                    if claim_len != 0 {
+                        let Ok(claim_len_usize) = usize::try_from(claim_len) else {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                        };
+                        memory.set_mapping_protection_and_sharing(
+                            claim_start,
+                            claim_len_usize,
+                            true,
+                            false,
+                            carrick_guest_mem::MappingSharing::Shared,
+                        );
+                        if memory.protect_range(claim_start, claim_len_usize, 0).is_err() {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                        }
+                    }
+                    this.record_mmap_bus_fault_range(
+                        old_address.0.saturating_add(old_size),
+                        new_size.saturating_sub(old_size),
+                    );
+                    this.record_dynamic_mapping_with_file_offset(
+                        old_address.0,
+                        new_size,
+                        source_metadata.prot,
+                        source_metadata.sharing,
+                        source_metadata.path.clone(),
+                        source_metadata.file_page_offset,
+                    );
+                    this.mark_vma_dispatch(&mut host_alias_dispatch);
+                    return Ok(DispatchOutcome::Returned {
+                        value: old_address.0 as i64,
+                    });
                 }
                 if shared_grow_in_place {
                     // Extend the existing aperture allocation rather than
@@ -4655,6 +5031,160 @@ impl SyscallDispatcher {
                 });
             }
 
+            // A MAP_SHARED file mapping that already ends past its file's EOF,
+            // living in the arena as an eager snapshot. `ltp-mremap01` is this
+            // shape. The whole growth is past EOF too — nothing to materialize,
+            // just VA to reserve and a tail that has to fault SIGBUS — so it is
+            // grown in place rather than moved and copied.
+            //
+            // "Past EOF" is read off the bus records the original mmap
+            // published rather than re-derived from a descriptor: an arena
+            // snapshot keeps no fd, and the guest may well have closed its own
+            // by now. If the mapping's LAST byte already faults SIGBUS then the
+            // file ends at or before it, so every added byte is past EOF too.
+            if let Some(bus_rel) = shared_arena_grow_past_eof {
+                let Some(new_end) = old_address.0.checked_add(new_size) else {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                };
+                let old_end = old_address.0.saturating_add(old_size);
+                let can_extend_in_place = old_end == this.mem.lock().mmap_next
+                    && range_within(old_address.0, new_size, layout.mmap_base, layout.mmap_size);
+                if !can_extend_in_place {
+                    // Something already owns the space directly above, so this
+                    // has to MOVE — which is what Linux does here too. Moving a
+                    // snapshot is a copy, but only of the bytes that exist: the
+                    // region from `bus_rel` on is past EOF and is deliberately
+                    // inaccessible, so reading it to copy it would EFAULT.
+                    let Some((new_addr, reused)) = this.next_mmap_address(
+                        0,
+                        new_size,
+                        LINUX_PROT_READ | LINUX_PROT_WRITE,
+                        0,
+                    ) else {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    };
+                    let (Ok(new_len), Ok(copy_len)) = (
+                        usize::try_from(new_size),
+                        usize::try_from(bus_rel.min(old_size)),
+                    ) else {
+                        this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    };
+                    let copied = if copy_len == 0 {
+                        Vec::new()
+                    } else {
+                        match memory.read_bytes_raw(old_address.0, copy_len) {
+                            Ok(bytes) => bytes,
+                            Err(_) => {
+                                this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
+                                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                            }
+                        }
+                    };
+                    if reused && memory.zero_backing(new_addr, new_len).is_err() {
+                        this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    }
+                    memory.set_mapping_protection_and_sharing(
+                        new_addr,
+                        new_len,
+                        false,
+                        false,
+                        proc_mapping_sharing(source_metadata.sharing),
+                    );
+                    if memory
+                        .protect_range(new_addr, new_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
+                        .is_err()
+                    {
+                        this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    }
+                    if !copied.is_empty()
+                        && memory.write_bytes_unchecked(new_addr, &copied).is_err()
+                    {
+                        this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                    let prot_none = source_metadata.prot.is_empty();
+                    memory.set_mapping_protection(
+                        new_addr,
+                        new_len,
+                        prot_none,
+                        !prot_none && !source_metadata.prot.contains(LinuxProtFlags::WRITE),
+                    );
+                    if memory
+                        .protect_range(new_addr, new_len, source_metadata.prot.bits())
+                        .is_err()
+                    {
+                        this.rollback_fresh_arena_mapping(memory, new_addr, new_size)?;
+                        return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+                    }
+                    // Re-publish the past-EOF tail at the destination exactly as
+                    // `mmap` publishes it: no access, then the bus record that
+                    // turns the resulting fault into SIGBUS.
+                    let bus_start_abs = new_addr.saturating_add(bus_rel);
+                    let bus_len = new_size.saturating_sub(bus_rel);
+                    if let Ok(bus_len_usize) = usize::try_from(bus_len)
+                        && bus_len_usize != 0
+                    {
+                        memory.set_no_access(bus_start_abs, bus_len_usize, true);
+                        let _ = memory.protect_range(bus_start_abs, bus_len_usize, 0);
+                    }
+                    this.record_mmap_bus_fault_range(bus_start_abs, bus_len);
+                    this.record_dynamic_mapping_with_file_offset(
+                        new_addr,
+                        new_size,
+                        source_metadata.prot,
+                        source_metadata.sharing,
+                        source_metadata.path.clone(),
+                        source_metadata.file_page_offset,
+                    );
+                    // Linux unmaps the source. Reclaim it exactly like munmap so
+                    // a later access faults and the VA is reusable.
+                    if let Ok(old_len) = usize::try_from(old_size)
+                        && old_len > 0
+                        && memory.unmap_range(old_address.0, old_len).is_ok()
+                    {
+                        mark_range_unmapped(memory, old_address.0, old_len);
+                        this.remove_mapping_metadata(old_address.0, old_size);
+                        let mut mem = this.mem.lock();
+                        if old_end == mem.mmap_next {
+                            mem.mmap_next = old_address.0;
+                        } else {
+                            free_regions_insert(&mut mem.free_regions, old_address.0, old_size);
+                        }
+                    }
+                    this.mark_vma_dispatch(&mut host_alias_dispatch);
+                    return Ok(DispatchOutcome::Returned {
+                        value: new_addr as i64,
+                    });
+                }
+                let grow_len_u64 = new_size - old_size;
+                // Deliberately NO page-table work: the tail is above the arena
+                // bump pointer and so has no stage-1 mapping, which is exactly
+                // the state an access has to find. Publishing a PROT_NONE
+                // mapping over it instead HUNG the guest (the backend tries to
+                // protect backing that was never established), and it would be
+                // pointless anyway — reserving the VA and recording the bus
+                // range is the whole job.
+                {
+                    let mut mem = this.mem.lock();
+                    mem.mmap_next = new_end;
+                }
+                this.record_mmap_bus_fault_range(old_end, grow_len_u64);
+                this.record_dynamic_mapping_with_file_offset(
+                    old_address.0,
+                    new_size,
+                    source_metadata.prot,
+                    source_metadata.sharing,
+                    source_metadata.path.clone(),
+                    source_metadata.file_page_offset,
+                );
+                this.mark_vma_dispatch(&mut host_alias_dispatch);
+                return Ok(DispatchOutcome::Returned {
+                    value: old_address.0 as i64,
+                });
+            }
             if old_address.0.checked_add(old_size) == Some(this.mem.lock().mmap_next) {
                 let Some(old_end) = old_address.0.checked_add(old_size) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
@@ -4968,6 +5498,7 @@ impl SyscallDispatcher {
                             write_sealed_shared: false,
                             read_only_shared_file: false,
                             writable_memfd: None,
+                            shared_file_alias: None,
                         }));
                     return Ok(DispatchOutcome::MapHostAlias {
                         // mprotect answers 0, not the address.
