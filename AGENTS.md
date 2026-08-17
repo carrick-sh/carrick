@@ -638,6 +638,24 @@ path), and lets a "landed" change never actually land.
   timeout) all reduce to "two domains shared one integer type". The rules,
   ranked audit, and staged plan live in
   [`docs/typed-interfaces-audit.md`](docs/typed-interfaces-audit.md):
+- **That migration typed SCALARS and stopped there — the four domains it does
+  NOT cover are where the HVPatch bugs live.** Populations (`kicker.count()` vs
+  `task().threads().len()` are both `usize`, and there are EIGHT such sets),
+  thread lifecycle ("alive" vs "can reach a safe point", which must be asked
+  per-purpose), address-space ownership ("which mm" is not a value, it is
+  `self`), and scope (a `static` carries no mark saying whether it describes the
+  carrier or one Linux process). All four were TRUE statements under the retired
+  one-process-per-guest model, so the code that relies on them still compiles,
+  still passes, and still explains itself in terms of a model that no longer
+  exists — three defects carry doc comments actively justifying the wrong
+  behaviour. Critically, **every instance is correct while exactly one Linux
+  process exists and wrong the instant a second appears**, and the smoke lane is
+  a single `run-elf` process where carrier pid, root task id and `getpid()`
+  coincide numerically — so the gate structurally cannot see this class, and a
+  case exercising TWO live guest processes is worth more than any number of
+  single-process cases. Evidence, the 42 audited sites, and the proposed
+  architecture:
+  [`docs/identity-and-scope-domains.md`](docs/identity-and-scope-domains.md).
   - Use the existing types; don't re-raw them: `Fd`/`HostFd` (guest vs host
     descriptors), `NsPid`/`HostPid` (translate, never wrap the wrong domain),
     `Signal`, `GuestPtr`/`GuestLen`, `SigSet`/`SigBlockMask`/`WaitSigMask`
