@@ -183,6 +183,7 @@ pub fn classify_closure(
     carrick: &SuiteResult,
     carrick_timed_out: bool,
     docker: &SuiteResult,
+    docker_timed_out: bool,
 ) -> Classification {
     let all_ok = |side: &SuiteResult| {
         side.result == SuiteOutcome::Success
@@ -190,6 +191,7 @@ pub fn classify_closure(
             && side.ids.values().all(|outcome| *outcome == Outcome::Ok)
     };
     if !carrick_timed_out
+        && !docker_timed_out
         && all_ok(carrick)
         && all_ok(docker)
         && carrick.ids == docker.ids
@@ -561,7 +563,7 @@ mod tests {
         let suite = suite(&["assertion#1"]);
         let carrick = res(&[("assertion#1", Outcome::Broken)]);
         let docker = res(&[("assertion#1", Outcome::Broken)]);
-        let got = classify_closure(&suite, &carrick, false, &docker);
+        let got = classify_closure(&suite, &carrick, false, &docker, false);
         assert_eq!(got.verdict, Verdict::Incomplete);
         assert!(got.gating);
         assert!(got.known_diffs.is_empty());
@@ -570,7 +572,7 @@ mod tests {
     #[test]
     fn closure_accepts_only_nonempty_identical_all_ok_results() {
         let side = res(&[("assertion#1", Outcome::Ok)]);
-        assert!(!classify_closure(&suite(&[]), &side, false, &side).gating);
+        assert!(!classify_closure(&suite(&[]), &side, false, &side, false).gating);
         for outcome in [
             Outcome::Fail,
             Outcome::Broken,
@@ -581,7 +583,15 @@ mod tests {
             Outcome::Other,
         ] {
             let side = res(&[("assertion#1", outcome)]);
-            assert!(classify_closure(&suite(&[]), &side, false, &side).gating);
+            assert!(classify_closure(&suite(&[]), &side, false, &side, false).gating);
         }
+    }
+
+    #[test]
+    fn closure_rejects_parseable_docker_timeout() {
+        let side = res(&[("assertion#1", Outcome::Ok)]);
+        let got = classify_closure(&suite(&[]), &side, false, &side, true);
+        assert_eq!(got.verdict, Verdict::Incomplete);
+        assert!(got.gating);
     }
 }
