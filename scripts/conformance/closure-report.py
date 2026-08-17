@@ -332,18 +332,27 @@ def validate_probe_log(log: str, inventory: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _suite_table(summary: dict[str, Any], category: str) -> str:
+def _suite_table(
+    summary: dict[str, Any], category: str, suite_clusters: dict[str, str]
+) -> str:
     names = summary[category]
     if not names:
         return "_None._\n"
     lines = ["| Suite | Mechanism cluster | Ratio |", "|---|---|---:|"]
     for name in names:
         ratio = summary["ratios"].get(name)
-        lines.append(f"| `{name}` | unclustered | {ratio:.2f}x |" if ratio is not None else f"| `{name}` | unclustered | — |")
+        cluster = suite_clusters.get(name, "unclustered")
+        lines.append(
+            f"| `{name}` | {cluster} | {ratio:.2f}x |"
+            if ratio is not None
+            else f"| `{name}` | {cluster} | — |"
+        )
     return "\n".join(lines) + "\n"
 
 
-def _assertion_table(summary: dict[str, Any], category: str) -> str:
+def _assertion_table(
+    summary: dict[str, Any], category: str, suite_clusters: dict[str, str]
+) -> str:
     rows = summary[category]
     if not rows:
         return "_None._\n"
@@ -352,28 +361,71 @@ def _assertion_table(summary: dict[str, Any], category: str) -> str:
         "|---|---|---|---|---|",
     ]
     for row in rows:
+        cluster = suite_clusters.get(row["suite"], "unclustered")
         lines.append(
             f"| `{row['suite']}` | `{row['assertion']}` | `{row['carrick']}` | "
-            f"`{row['docker']}` | unclustered |"
+            f"`{row['docker']}` | {cluster} |"
         )
     return "\n".join(lines) + "\n"
 
 
-def _probe_table(rows: list[dict[str, str]]) -> str:
+def _probe_table(rows: list[dict[str, str]], probe_clusters: dict[str, str]) -> str:
     if not rows:
         return "_None._\n"
-    lines = ["| Libc | Source | Runner | Status |", "|---|---|---|---|"]
+    lines = [
+        "| Libc | Source | Runner | Status | Mechanism cluster |",
+        "|---|---|---|---|---|",
+    ]
     for row in rows:
+        cluster = probe_clusters.get(f"{row['libc']}:{row['source']}", "unclustered")
         lines.append(
             f"| `{row['libc']}` | `{row['source']}` | `{row['runner']}` | "
-            f"`{row['status']}` |"
+            f"`{row['status']}` | {cluster} |"
         )
     return "\n".join(lines) + "\n"
+
+
+def validate_clusters(
+    clusters: Any, scope: dict[str, Any], inventory: dict[str, Any]
+) -> dict[str, dict[str, str]]:
+    if not isinstance(clusters, dict) or set(clusters) != {"schema", "suites", "probes"}:
+        raise ReportError("cluster map requires exactly schema, suites, and probes")
+    if clusters["schema"] != "carrick-closure-clusters-v1":
+        raise ReportError("cluster map schema is unsupported")
+    suites = clusters["suites"]
+    probes = clusters["probes"]
+    if not isinstance(suites, dict) or not isinstance(probes, dict):
+        raise ReportError("cluster suite/probe maps must be objects")
+    unknown_suites = sorted(set(suites) - set(scope.get("suite_names", [])))
+    expected_probes = {
+        f"{libc}:{source}"
+        for libc in PROBE_LIBCS
+        for source, row in inventory.items()
+        if row.get("class") == "conformance"
+    }
+    unknown_probes = sorted(set(probes) - expected_probes)
+    if unknown_suites or unknown_probes:
+        raise ReportError(
+            f"cluster map names unknown rows (suites={unknown_suites}, probes={unknown_probes})"
+        )
+    cluster_names = [*suites.values(), *probes.values()]
+    if not all(
+        isinstance(name, str) and re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name)
+        for name in cluster_names
+    ):
+        raise ReportError("cluster names must be nonempty lowercase kebab-case")
+    return {"suites": suites, "probes": probes}
 
 
 def render_ledger(
-    scope: dict[str, Any], summary: dict[str, Any], probes: dict[str, Any], results_path: Path, probe_path: Path
+    scope: dict[str, Any],
+    summary: dict[str, Any],
+    probes: dict[str, Any],
+    results_path: Path,
+    probe_path: Path,
+    clusters: dict[str, dict[str, str]] | None = None,
 ) -> str:
+    clusters = clusters or {"suites": {}, "probes": {}}
     images = scope.get("images", {})
     image_lines = [
         f"- `{name}`: `{row.get('registry_digest', 'unresolved')}`"
@@ -403,18 +455,24 @@ def render_ledger(
         ("Semantic assertion gaps", "semantic_gaps"),
         ("Unexercised assertions", "unexercised"),
     ]:
-        sections.extend(["", f"## {title}", "", _assertion_table(summary, key).rstrip()])
+        sections.extend(
+            ["", f"## {title}", "", _assertion_table(summary, key, clusters["suites"]).rstrip()]
+        )
     for title, key in [
         ("Suite infrastructure failures", "infrastructure_failures"),
         ("Valid completing >=10x pathology", "pathological"),
     ]:
-        sections.extend(["", f"## {title}", "", _suite_table(summary, key).rstrip()])
+        sections.extend(
+            ["", f"## {title}", "", _suite_table(summary, key, clusters["suites"]).rstrip()]
+        )
     for title, key in [
         ("Probe semantic failures", "failures"),
         ("Probe infrastructure failures", "infrastructure_failures"),
         ("Probe unexercised rows", "unexercised"),
     ]:
-        sections.extend(["", f"## {title}", "", _probe_table(probes[key]).rstrip()])
+        sections.extend(
+            ["", f"## {title}", "", _probe_table(probes[key], clusters["probes"]).rstrip()]
+        )
     sections.append("")
     return "\n".join(sections)
 
@@ -429,14 +487,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--probe-inventory", type=Path, default=root / "conformance-probes/probe-inventory.json"
     )
+    parser.add_argument(
+        "--clusters", type=Path, default=root / "scripts/conformance/closure-clusters.json"
+    )
     args = parser.parse_args(argv)
     try:
         scope = json.loads(args.scope.read_text(encoding="utf-8"))
         inventory = json.loads(args.probe_inventory.read_text(encoding="utf-8"))
+        clusters = validate_clusters(
+            json.loads(args.clusters.read_text(encoding="utf-8")), scope, inventory
+        )
         summary = summarize(scope, load_jsonl(args.results))
         probes = validate_probe_log(args.probe_log.read_text(encoding="utf-8"), inventory)
         args.output.write_text(
-            render_ledger(scope, summary, probes, args.results, args.probe_log), encoding="utf-8"
+            render_ledger(scope, summary, probes, args.results, args.probe_log, clusters),
+            encoding="utf-8",
         )
     except (OSError, json.JSONDecodeError, ReportError) as error:
         print(f"closure report error: {error}", file=sys.stderr)
