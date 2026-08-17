@@ -789,6 +789,7 @@ where
                         std::sync::Arc::new(super::KernelFrameCowAuthority {
                             kernel: std::sync::Arc::clone(committed_context.kernel()),
                             mm: committed_mm,
+                            guest_executors: std::sync::Arc::clone(&kernel.guest_executors),
                             kicker: std::sync::Arc::clone(&self.kicker),
                             tid: self.this_tid,
                         });
