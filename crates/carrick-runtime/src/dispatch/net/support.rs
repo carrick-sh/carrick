@@ -2328,6 +2328,68 @@ pub(in crate::dispatch) fn build_linux_scm_rights(fds: &[i32], cap: usize) -> (V
     (buf, truncated)
 }
 
+/// Build the GUEST (Linux-layout) `msg_control` record an `IP_RECVERR` /
+/// `IPV6_RECVERR` error-queue read returns: a `sock_extended_err` immediately
+/// followed by the offending peer's `sockaddr` (`SO_EE_OFFENDER`).
+///
+/// libuv reads exactly this — it walks the cmsgs for
+/// `(SOL_IP, IP_RECVERR)` / `(SOL_IPV6, IPV6_RECVERR)`, takes `ee_errno`, and
+/// takes the peer from `SO_EE_OFFENDER(serr)` — so the two must be adjacent in
+/// one record, not two.
+///
+/// Returns `(bytes, truncated)`; nothing is emitted if a whole record does not
+/// fit, and the caller sets `MSG_CTRUNC`.
+pub(in crate::dispatch) fn build_linux_recverr(
+    errno: i32,
+    is_ipv6: bool,
+    offender: &[u8],
+    cap: usize,
+) -> (Vec<u8>, bool) {
+    use crate::linux_abi as a;
+    const SOCK_EXTENDED_ERR_LEN: usize = 16;
+    let data_len = SOCK_EXTENDED_ERR_LEN + offender.len();
+    let cmsg_len = LINUX_CMSGHDR_LEN + data_len;
+    if cap < cmsg_len {
+        return (Vec::new(), true);
+    }
+    let (level, ty, origin, icmp_type, icmp_code) = if is_ipv6 {
+        (
+            a::LINUX_SOL_IPV6,
+            a::LINUX_IPV6_RECVERR,
+            a::LINUX_SO_EE_ORIGIN_ICMP6,
+            a::LINUX_ICMPV6_DEST_UNREACH,
+            a::LINUX_ICMPV6_PORT_UNREACH,
+        )
+    } else {
+        (
+            a::LINUX_SOL_IP,
+            a::LINUX_IP_RECVERR,
+            a::LINUX_SO_EE_ORIGIN_ICMP,
+            a::LINUX_ICMP_DEST_UNREACH,
+            a::LINUX_ICMP_PORT_UNREACH,
+        )
+    };
+    let mut buf = vec![0u8; linux_cmsg_align(cmsg_len)];
+    buf[0..8].copy_from_slice(&(cmsg_len as u64).to_ne_bytes());
+    buf[8..12].copy_from_slice(&level.to_ne_bytes());
+    buf[12..16].copy_from_slice(&ty.to_ne_bytes());
+    let serr = a::LinuxSockExtendedErr {
+        ee_errno: errno as u32,
+        ee_origin: origin,
+        ee_type: icmp_type,
+        ee_code: icmp_code,
+        ee_pad: 0,
+        ee_info: 0,
+        ee_data: 0,
+    };
+    let serr_bytes = zerocopy::IntoBytes::as_bytes(&serr);
+    let at = LINUX_CMSGHDR_LEN;
+    buf[at..at + serr_bytes.len()].copy_from_slice(serr_bytes);
+    let off_at = at + SOCK_EXTENDED_ERR_LEN;
+    buf[off_at..off_at + offender.len()].copy_from_slice(offender);
+    (buf, false)
+}
+
 /// Build a Linux `SCM_CREDENTIALS` control message carrying `struct ucred {
 /// pid, uid, gid }` (12 bytes), bounded by `cap` remaining control bytes.
 /// Returns `(bytes, truncated)`; if a full record doesn't fit, emits nothing

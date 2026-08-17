@@ -328,6 +328,7 @@ fn host_socket_addr(host_fd: i32, _family: i32, peer: bool) -> Option<std::net::
     let used = (sa_len as usize).min(sa.len());
     host_sockaddr_to_socket_addr(&sa[..used])
 }
+mod recverr;
 mod reuseport;
 mod support;
 
@@ -335,6 +336,12 @@ mod support;
 /// `dispatch`; see `reuseport::leave`.
 pub(in crate::dispatch) fn reuseport_leave(host_fd: i32) {
     reuseport::leave(host_fd);
+}
+
+/// Release any modelled Linux error queue (and its shadow socket) for
+/// `host_fd`. Called from the close path in `dispatch`; see `recverr::close`.
+pub(in crate::dispatch) fn recverr_close(host_fd: i32) {
+    recverr::close(host_fd);
 }
 
 use support::*;
@@ -970,6 +977,16 @@ impl SyscallDispatcher {
                 // connection instead of alternating. Both directions are
                 // corrected here. `is_shared` is false for every ordinary
                 // socket, which keeps them on the untouched path.
+                // A modelled Linux error queue makes the socket both readable
+                // AND in error, which is what drives libuv to run its plain read
+                // and then its MSG_ERRQUEUE read — `uv__udp_io` only calls the
+                // latter on POLLERR.
+                if recverr::is_enabled(host_fd.get()) {
+                    recverr::poll_errors(host_fd.get());
+                    if recverr::has_pending(host_fd.get()) {
+                        ready |= LINUX_EPOLLIN | LINUX_EPOLLERR;
+                    }
+                }
                 if requested_events & LINUX_EPOLLIN != 0 && reuseport::is_shared(host_fd.get()) {
                     let group_has_work = ready & LINUX_EPOLLIN != 0
                         || reuseport::siblings(host_fd.get())
@@ -1895,6 +1912,14 @@ impl SyscallDispatcher {
                     }
                     if pfd.revents & libc::POLLHUP != 0 {
                         ready |= LINUX_POLLHUP;
+                    }
+                }
+                // Same as the epoll path: a queued error-queue entry is both
+                // readable and an error condition.
+                if recverr::is_enabled(host_fd.raw()) {
+                    recverr::poll_errors(host_fd.raw());
+                    if recverr::has_pending(host_fd.raw()) {
+                        ready |= LINUX_POLLIN | LINUX_POLLERR;
                     }
                 }
                 // SO_REUSEPORT readability is a GROUP property — see the
@@ -4334,6 +4359,25 @@ impl SyscallDispatcher {
                                 )),
                             )
                         });
+                        // An error-queue socket's ICMP error lands on its
+                        // SHADOW, which the guest knows nothing about. Register
+                        // it under the SAME udata so an event there wakes this
+                        // epoll and the level recompute reports the queued
+                        // error. Without it the guest parks in epoll_wait with
+                        // an error it is never told about — the error arrives
+                        // asynchronously, after the send has already returned.
+                        if let Some(shadow) = recverr::shadow_fd(host_fd.get()) {
+                            let _ = kqueue.with_mux(|mux| {
+                                mux.register_io(
+                                    shadow,
+                                    pack_epoll_udata(fd, reg_gen),
+                                    effective,
+                                    epoll_host_trigger_mode(LinuxEpollEvents::from_bits_retain(
+                                        ev_events,
+                                    )),
+                                )
+                            });
+                        }
                         if let Err(err) = register {
                             return Ok(DispatchOutcome::errno(crate::host_to_linux_errno(
                                 err.errno,
@@ -5565,6 +5609,25 @@ impl SyscallDispatcher {
                     }
                 }
             }
+            // An error-queue socket needs host SO_REUSEPORT so its shadow can
+            // share this addr:port (see `recverr`). Linux would refuse a SECOND
+            // error-queue bind here, and Darwin no longer will once the flag is
+            // set, so Carrick enforces that itself.
+            if recverr::is_enabled(host_fd.get()) {
+                if !recverr::reserve_bind(host_fd.get(), &host_addr) {
+                    return Ok(DispatchOutcome::errno(linux_errno::EADDRINUSE));
+                }
+                let one: i32 = 1;
+                unsafe {
+                    libc::setsockopt(
+                        host_fd.get(),
+                        libc::SOL_SOCKET,
+                        libc::SO_REUSEPORT,
+                        &one as *const i32 as *const libc::c_void,
+                        std::mem::size_of::<i32>() as u32,
+                    );
+                }
+            }
             let rc = unsafe {
                 libc::bind(
                     host_fd.get(),
@@ -5605,6 +5668,13 @@ impl SyscallDispatcher {
             }
             if let Err(errno) = bind_result {
                 return Ok(DispatchOutcome::errno(errno));
+            }
+            // An error-queue socket's shadow must exist before `epoll_ctl(ADD)`
+            // registers it (see `recverr::create_shadow_at_bind`).
+            if recverr::is_enabled(host_fd.get())
+                && let Some(local) = host_sockaddr_bytes(host_fd.get())
+            {
+                recverr::create_shadow_at_bind(host_fd.get(), &local);
             }
             // SO_REUSEPORT: join this host addr:port's group. Darwin lets every
             // member bind but then delivers ALL traffic to the last binder, so
@@ -6235,10 +6305,23 @@ impl SyscallDispatcher {
             let nonblocking = this.io_is_nonblocking(fd, flags);
             let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
             let connected_send = dest_addr == 0;
+            // Resolve the error-queue shadow BEFORE entering the I/O closure:
+            // it needs this socket's own bound address, and the closure cannot
+            // borrow `this`.
+            let recverr_send_fd = match (&host_addr, recverr::is_enabled(host_fd.get())) {
+                (Some(dest), true) => host_sockaddr_bytes(host_fd.get())
+                    .and_then(|local| recverr::shadow_for_send(host_fd.get(), &local, dest)),
+                _ => None,
+            };
             let send_to = this
                 .open_file(fd)
                 .and_then(|f| f.description.read().send_timeout());
             let outcome = this.blocking_io(host_fd.get(), IoDir::Write, nonblocking, send_to, || {
+                // Re-stated locally (idempotent) so the non-blocking guarantee
+                // is visible at every send site below: both the real socket and
+                // the error-queue shadow are O_NONBLOCK, and MSG_DONTWAIT keeps
+                // that true per call.
+                let host_flags = host_flags | libc::MSG_DONTWAIT;
                 let n = match &host_addr {
                     None => unsafe {
                         libc::sendto(
@@ -6250,16 +6333,39 @@ impl SyscallDispatcher {
                             0,
                         )
                     },
-                    Some(a) => unsafe {
-                        libc::sendto(
-                            host_fd.get(),
-                            data_ptr as *const _,
-                            len,
-                            host_flags,
-                            a.as_ptr() as *const _,
-                            a.len() as u32,
-                        )
-                    },
+                    // An error-queue socket sends through its shadow (same
+                    // local addr:port, connected to this destination), so Darwin
+                    // reports the returning ICMP error — it reports nothing on
+                    // an unconnected socket. The shadow is already connected, so
+                    // the destination is implicit: Darwin answers EISCONN for a
+                    // `sendto` that names an address on a connected socket.
+                    // No shadow means send normally; losing the datagram would
+                    // be far worse than losing the error report.
+                    Some(a) => {
+                        let host_flags = host_flags | libc::MSG_DONTWAIT;
+                        match recverr_send_fd {
+                            Some(shadow) => unsafe {
+                                libc::sendto(
+                                    shadow,
+                                    data_ptr as *const _,
+                                    len,
+                                    host_flags,
+                                    std::ptr::null(),
+                                    0,
+                                )
+                            },
+                            None => unsafe {
+                                libc::sendto(
+                                    host_fd.get(),
+                                    data_ptr as *const _,
+                                    len,
+                                    host_flags,
+                                    a.as_ptr() as *const _,
+                                    a.len() as u32,
+                                )
+                            },
+                        }
+                    }
                 };
                 match n.host_syscall_errno().map(|value| value as i64) {
                     Err(LINUX_ENOTCONN) if is_stream => Err(LINUX_EPIPE),
@@ -6317,6 +6423,13 @@ impl SyscallDispatcher {
                 }
                 return Ok(DispatchOutcome::Returned { value: take as i64 });
             }
+            // An error-queue socket's ICMP error goes ONLY to the queue — that
+            // is what `IP_RECVERR` is FOR. The ordinary read must still answer
+            // EAGAIN, which libuv reports as a zero-length receive.
+            // `udp_send_unreachable` pins this: its `recv_cb` treats a NEGATIVE
+            // nread carrying no `UV_UDP_LINUX_RECVERR` flag as
+            // `ASSERT(0 && "unexpected error")`.
+            recverr::poll_errors(host_fd.get());
             if let Some(errno) = this.take_socket_pending_error(fd) {
                 return Ok(DispatchOutcome::errno(errno));
             }
@@ -6531,6 +6644,23 @@ impl SyscallDispatcher {
                         base.set_so_sndbuf(v);
                     }
                 }
+            }
+            // IP_RECVERR / IPV6_RECVERR: the guest is opting into Linux's UDP
+            // ERROR QUEUE. Darwin has neither the option nor the queue, so
+            // accept it here and model the queue ourselves — see
+            // `dispatch::net::recverr`. Forwarding it would just ENOPROTOOPT
+            // and libuv's `uv_udp_bind` fails outright on that.
+            if (level == LINUX_SOL_IP && optname == crate::linux_abi::LINUX_IP_RECVERR)
+                || (level == LINUX_SOL_IPV6 && optname == crate::linux_abi::LINUX_IPV6_RECVERR)
+            {
+                let on = optlen >= 4
+                    && memory.read_bytes(optval_addr, 4).is_ok_and(|b| {
+                        i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) != 0
+                    });
+                if on {
+                    recverr::enable(host_fd.get(), level == LINUX_SOL_IPV6);
+                }
+                return Ok(DispatchOutcome::Returned { value: 0 });
             }
             // IPV6_MULTICAST_IF: Linux accepts interface index 0, meaning
             // "clear the multicast interface and let routing choose". Darwin
@@ -7250,6 +7380,16 @@ impl SyscallDispatcher {
         let send_to = self
             .open_file(fd)
             .and_then(|f| f.description.read().send_timeout());
+        // An error-queue socket sends through its shadow so Darwin will report
+        // the returning ICMP error (it reports nothing on an unconnected
+        // socket). Same bytes and same source address on the wire. libuv's
+        // `uv_udp_send` lowers to sendmsg, not sendto, so this path needs the
+        // routing just as much as `sendto` does.
+        let recverr_send_fd = match (&host_addr, recverr::is_enabled(host_fd.get())) {
+            (Some(dest), true) => host_sockaddr_bytes(host_fd.get())
+                .and_then(|local| recverr::shadow_for_send(host_fd.get(), &local, dest)),
+            _ => None,
+        };
         let outcome = self.blocking_io(host_fd.get(), IoDir::Write, nonblocking, send_to, || {
             // Use a real sendmsg so the host control buffer (SCM_RIGHTS) is
             // delivered. A single iovec over the assembled `data` is fine —
@@ -7259,7 +7399,12 @@ impl SyscallDispatcher {
                 iov_len: data.len(),
             };
             let mut hmsg: libc::msghdr = unsafe { std::mem::zeroed() };
-            if let Some(a) = &host_addr {
+            // The shadow is already CONNECTED to this destination, and Darwin
+            // answers EISCONN for a send that names an address on a connected
+            // socket — so address it implicitly there.
+            if let Some(a) = &host_addr
+                && recverr_send_fd.is_none()
+            {
                 hmsg.msg_name = a.as_ptr() as *mut libc::c_void;
                 hmsg.msg_namelen = a.len() as libc::socklen_t;
             }
@@ -7269,10 +7414,85 @@ impl SyscallDispatcher {
                 hmsg.msg_control = host_control.as_ptr() as *mut libc::c_void;
                 hmsg.msg_controllen = host_control.len() as _;
             }
-            let n = unsafe { libc::sendmsg(host_fd.get(), &hmsg as *const _, host_flags) };
+            let send_fd = recverr_send_fd.unwrap_or_else(|| host_fd.get());
+            // Re-stated locally (idempotent): both the real socket and the
+            // error-queue shadow are O_NONBLOCK, and MSG_DONTWAIT keeps this
+            // call non-blocking regardless.
+            let host_flags = host_flags | libc::MSG_DONTWAIT;
+            let n = unsafe { libc::sendmsg(send_fd, &hmsg as *const _, host_flags) };
             n.host_syscall_errno().map(|value| value as i64)
         });
         Ok(outcome)
+    }
+
+    /// Serve one `recvmsg(MSG_ERRQUEUE)` from this socket's modelled Linux
+    /// error queue (see `dispatch::net::recverr`).
+    ///
+    /// Returns the entry as a `sock_extended_err` + `SO_EE_OFFENDER` cmsg with
+    /// `MSG_ERRQUEUE` set in the returned `msg_flags` — libuv checks that flag
+    /// before it will even look at the cmsgs. An empty queue is `EAGAIN`,
+    /// exactly as a drained Linux queue is, which is what ends libuv's
+    /// errqueue-drain loop.
+    fn recvmsg_errqueue(
+        &self,
+        fd: i32,
+        msg_addr: u64,
+        msg: &LinuxMsghdr,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let Ok((host_fd, _family)) = self.host_socket_lookup(fd) else {
+            return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+        };
+        recverr::poll_errors(host_fd.get());
+        let Some(entry) = recverr::pop(host_fd.get()) else {
+            return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+        };
+        // The offending peer, in the guest's sockaddr layout, both as msg_name
+        // and inside the cmsg (Linux puts it in both places).
+        let offender = host_to_linux_sockaddr(
+            &entry.offender,
+            if entry.is_ipv6 {
+                LINUX_AF_INET6
+            } else {
+                LINUX_AF_INET
+            },
+            true,
+        );
+        if msg.name != 0 && msg.namelen > 0 {
+            let take = offender.len().min(msg.namelen as usize);
+            if memory.write_bytes(msg.name, &offender[..take]).is_err() {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+            let _ = memory.write_bytes(
+                msg_addr + core::mem::offset_of!(LinuxMsghdr, namelen) as u64,
+                &(offender.len() as u32).to_ne_bytes(),
+            );
+        }
+        let mut linux_flags = crate::linux_abi::LINUX_MSG_ERRQUEUE;
+        let cap = if msg.control != 0 {
+            msg.controllen as usize
+        } else {
+            0
+        };
+        let (control, truncated) = build_linux_recverr(entry.errno, entry.is_ipv6, &offender, cap);
+        if truncated {
+            linux_flags |= crate::linux_abi::LINUX_MSG_CTRUNC;
+        }
+        if !control.is_empty() && memory.write_bytes(msg.control, &control).is_err() {
+            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+        }
+        let _ = memory.write_bytes(
+            msg_addr + core::mem::offset_of!(LinuxMsghdr, controllen) as u64,
+            &(control.len() as u64).to_ne_bytes(),
+        );
+        let _ = memory.write_bytes(
+            msg_addr + core::mem::offset_of!(LinuxMsghdr, flags) as u64,
+            &linux_flags.to_ne_bytes(),
+        );
+        // Linux returns the original datagram's payload here; libuv ignores it
+        // and reads only the cmsg, so report zero bytes rather than inventing
+        // a payload Carrick never captured.
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn recvmsg_inner(
@@ -7302,7 +7522,7 @@ impl SyscallDispatcher {
         // msg_namelen still surfaces EINVAL. (from_bits_retain: recvmsg IGNORES
         // other unknown flag bits.) Mirrors the recvfrom MSG_ERRQUEUE path.
         if !is_netlink && LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::ERRQUEUE) {
-            return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+            return self.recvmsg_errqueue(fd, msg_addr, &msg, memory);
         }
         // Linux caps the iovec array at UIO_MAXIOV (1024); a larger msg_iovlen is
         // EMSGSIZE, not the EINVAL that read_iovecs' length guard would raise
@@ -7424,6 +7644,11 @@ impl SyscallDispatcher {
         // IPv6 RFC 3542 ancillary cmsgs (hop-limit/tclass/pktinfo) the host
         // returned, as (linux_cmsg_type, data) — forwarded to the guest below.
         let received_ipv6_cmsgs = std::cell::RefCell::new(Vec::<(i32, Vec<u8>)>::new());
+        // See the recvfrom path: with `IP_RECVERR` the error belongs to the
+        // QUEUE, not to this read, which must still answer EAGAIN.
+        if !is_netlink {
+            recverr::poll_errors(host_fd.get());
+        }
         let guest_msg_flags = std::cell::Cell::new(0i32);
         let recvmsg_targets: Vec<i32> = std::iter::once(host_fd.get())
             .chain(reuseport::steal_targets(host_fd.get()))

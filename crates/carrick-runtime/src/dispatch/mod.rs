@@ -4569,6 +4569,7 @@ impl SyscallDispatcher {
             // no-op for a socket that never joined.
             if let OpenDescription::HostSocket { host_fd, .. } = &*open_file.description.read() {
                 crate::dispatch::net::reuseport_leave(host_fd.raw());
+                crate::dispatch::net::recverr_close(host_fd.raw());
             }
             match &*open_file.description.read() {
                 OpenDescription::HostPipe { pty, host_fd, .. } => {
