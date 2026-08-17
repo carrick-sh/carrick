@@ -64,13 +64,14 @@ impl GotestParser {
             broken: 0,
             skipped,
         };
+        let terminal_failed = text.lines().any(|line| line.trim() == "FAIL");
         let result = if crashed {
             SuiteOutcome::None
         } else if ids.is_empty() && text.contains("testing: warning: no tests to run") {
             SuiteOutcome::Success
         } else if ids.is_empty() {
             SuiteOutcome::Empty
-        } else if failed > 0 {
+        } else if failed > 0 || raw.exit_code != 0 || terminal_failed {
             SuiteOutcome::Failure
         } else {
             SuiteOutcome::Success
@@ -328,5 +329,16 @@ FAIL";
             result.ids["go:TestAs/As(Errorf(...),_0xADDR)#2"],
             Outcome::Fail
         );
+    }
+
+    #[test]
+    fn closure_rejects_terminal_fail_with_only_pass_assertions() {
+        let mut completed_failure = raw("--- PASS: TestA (0.00s)\nFAIL\n");
+        completed_failure.exit_code = 1;
+
+        let result = GotestParser.parse_closure(&completed_failure);
+
+        assert_eq!(result.ids["go:TestA#1"], Outcome::Ok);
+        assert_eq!(result.result, SuiteOutcome::Failure);
     }
 }

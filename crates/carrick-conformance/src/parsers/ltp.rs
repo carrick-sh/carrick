@@ -25,7 +25,14 @@ impl LtpParser {
         }
 
         let text = super::strip_carrick_banners(&raw.combined());
-        let (Ok(modern), Ok(old), Ok(legacy), Ok(legacy_numbered), Ok(summary_count)) = (
+        let (
+            Ok(modern),
+            Ok(old),
+            Ok(legacy),
+            Ok(legacy_numbered),
+            Ok(summary_count),
+            Ok(summary_field),
+        ) = (
             Regex::new(r"^(\S+\.c):(\d+):\s+(TPASS|TFAIL|TBROK|TCONF):"),
             Regex::new(r"^(\S+)\s+(\d+)\s+(TPASS|TFAIL|TBROK|TCONF)\s*:"),
             Regex::new(
@@ -33,32 +40,58 @@ impl LtpParser {
             ),
             Regex::new(r"^(\S+)\s+(\d+)\s+\S+\s*:\s+.*\b(PASSED|FAILED)\b"),
             Regex::new(r"^(passed|failed|broken|skipped)\s+(\d+)\s*$"),
-        ) else {
+            Regex::new(r"^(passed|failed|broken|skipped)\b"),
+        )
+        else {
             return SuiteResult::empty();
         };
 
         let mut assertions = AssertionCollector::default();
         let (mut passed, mut failed, mut broken, mut skipped) = (0usize, 0usize, 0usize, 0usize);
         let mut summary = [0usize; 4];
-        let mut summary_present = false;
+        let mut summary_fields = [0usize; 4];
+        let mut summary_headers = 0usize;
+        let mut malformed_summary_field = false;
 
         for line in text.lines() {
             if line.trim() == "Summary:" {
-                summary_present = true;
+                summary_headers += 1;
                 continue;
             }
-            if let Some(caps) = summary_count.captures(line.trim()) {
-                let n = caps
+            let trimmed = line.trim();
+            if summary_headers > 0
+                && let Some(caps) = summary_count.captures(trimmed)
+            {
+                let Some(n) = caps
                     .get(2)
                     .and_then(|value| value.as_str().parse::<usize>().ok())
-                    .unwrap_or(0);
+                else {
+                    malformed_summary_field = true;
+                    continue;
+                };
                 match caps.get(1).map(|value| value.as_str()) {
-                    Some("passed") => summary[0] += n,
-                    Some("failed") => summary[1] += n,
-                    Some("broken") => summary[2] += n,
-                    Some("skipped") => summary[3] += n,
+                    Some("passed") => {
+                        summary[0] += n;
+                        summary_fields[0] += 1;
+                    }
+                    Some("failed") => {
+                        summary[1] += n;
+                        summary_fields[1] += 1;
+                    }
+                    Some("broken") => {
+                        summary[2] += n;
+                        summary_fields[2] += 1;
+                    }
+                    Some("skipped") => {
+                        summary[3] += n;
+                        summary_fields[3] += 1;
+                    }
                     _ => {}
                 }
+                continue;
+            }
+            if summary_headers > 0 && summary_field.is_match(trimmed) {
+                malformed_summary_field = true;
                 continue;
             }
 
@@ -114,7 +147,11 @@ impl LtpParser {
             skipped,
         };
         let ids = assertions.into_ids();
-        let summary_matches = !summary_present || summary == [passed, failed, broken, skipped];
+        let summary_matches = summary_headers == 0
+            || (summary_headers == 1
+                && summary_fields == [1, 1, 1, 1]
+                && !malformed_summary_field
+                && summary == [passed, failed, broken, skipped]);
 
         let result = if ids.is_empty() || !summary_matches {
             SuiteOutcome::None
@@ -445,6 +482,18 @@ mod tests {
             "Summary:\npassed 0\nfailed 0\nbroken 0\nskipped 1\n",
             "a.c:10: TPASS: a\nSummary:\npassed 2\nfailed 0\nbroken 0\nskipped 0\n",
             "only.c:1: TINFO: setup\n",
+        ] {
+            assert_ne!(closure(text).result, SuiteOutcome::Success, "{text}");
+        }
+    }
+
+    #[test]
+    fn closure_requires_each_summary_counter_exactly_once() {
+        for text in [
+            "a.c:10: TPASS: a\nSummary:\npassed 1\nfailed 0\nbroken 0\n",
+            "a.c:10: TPASS: a\nSummary:\npassed 1\nfailed 0\nbroken 0\nskipped 0\nskipped 0\n",
+            "a.c:10: TPASS: a\nSummary:\npassed 1\nfailed 0\nbroken 0\nskipped nope\n",
+            "a.c:10: TPASS: a\nSummary:\npassed 1\nfailed 0\nbroken 0\nskipped 999999999999999999999999999999999999999\n",
         ] {
             assert_ne!(closure(text).result, SuiteOutcome::Success, "{text}");
         }
