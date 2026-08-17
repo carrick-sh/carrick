@@ -161,6 +161,46 @@ class ClosureReportTest(unittest.TestCase):
             ["mixed.c:20#1"],
         )
 
+    def test_both_success_zero_assertion_suite_is_retained_as_unexercised(self):
+        scope = scope_2127()
+        scope["suite_names"][0] = "cpython-zero"
+        results = [result(name) for name in scope["suite_names"]]
+        zero = result("cpython-zero", verdict="incomplete", ratio=20.0)
+        zero["carrick"]["totals"] = {
+            "n": 0,
+            "passed": 0,
+            "failed": 0,
+            "broken": 0,
+            "skipped": 0,
+        }
+        zero["docker"]["totals"] = dict(zero["carrick"]["totals"])
+        zero["pairs"] = {}
+        results[0] = zero
+
+        summary = closure_report.summarize(scope, results)
+
+        self.assertIn(
+            {
+                "suite": "cpython-zero",
+                "assertion": "<no assertions>",
+                "carrick": "absent",
+                "docker": "absent",
+            },
+            summary["unexercised"],
+        )
+        self.assertNotIn("cpython-zero", summary["verified"])
+        self.assertNotIn("cpython-zero", summary["pathological"])
+
+        malformed = [dict(row) for row in results]
+        malformed_zero = dict(zero)
+        malformed_zero["carrick"] = {
+            "result": "success",
+            "totals": {"n": 1, "passed": 1, "failed": 0, "broken": 0, "skipped": 0},
+        }
+        malformed[0] = malformed_zero
+        with self.assertRaises(closure_report.ReportError):
+            closure_report.summarize(scope, malformed)
+
     def test_report_rejects_unexpected_rows_and_malformed_performance(self):
         scope = scope_2127()
         complete = [result(name) for name in scope["suite_names"]]
