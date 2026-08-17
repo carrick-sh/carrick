@@ -369,11 +369,46 @@ Measured, not inferred — see `docs/perf-results/2026-08-17-closure-post-libuv/
   carrick EINVAL, Linux ok; the same with `MAP_PRIVATE` passes on both. Linux
   is free to MOVE the mapping, which is what it does. Everything else in that
   suite (1,313 TBROK and a segfault) is cascade from this one failure.
-- **CPython multiprocessing, ~946 rows, TWO distinct bugs.** `fork` and
-  `forkserver` emit ZERO assertions at 5-6x Docker's wall — a hang killed at
-  the budget, whose block-buffered stdout was discarded (AGENTS.md's crash
-  signature; recover with `run -t` or `stdbuf -o0`). `spawn` emits 88 at
-  **0.72x** — a fast crash, and the cheaper reducer. Do `spawn` first.
+- **CPython multiprocessing + concurrent_futures, ~1,200 rows, TWO NAMED
+  CRASHES.** Both were read straight out of the closure run's `.err` files —
+  no new instrumentation needed, and neither is a "carrick is slow" problem:
+
+  1. **`cpython-multiprocessing_fork` and `cpython-concurrent_futures`**:
+     ```
+     carrick: trap engine failed: hypervisor operation failed:
+       map hvpatch child VA 0x2d00020000 to global/root-slot IPA
+       0x9a00000000: OutOfTables
+     ```
+     Stage-2 page-table SPARE-POOL exhaustion in the child-mapping path
+     (`crates/carrick-vmm-hvf/src/trap.rs:11255` ->
+     `crates/carrick-mem/src/page_table.rs`). The mechanism is already
+     documented in-tree at `page_table.rs:959-963`, which names this exact
+     workload: the pool is **440 entries** and "a churning guest (CPython
+     multiprocessing maps+unmaps 400+ SemLock/Pool shm files) hits
+     OutOfTables". That comment covers freeing the per-2-MiB L3 table for
+     `mmap(MAP_SHARED, fd)` aliases; the HVPatch per-child VA mapping is a
+     second consumer of the same pool and appears not to be returning its
+     tables. Start by instrumenting `spare_tables_available()` /
+     `free_table` (`page_table.rs:317`, `:427`) across a fork storm and see
+     whether the pool actually drains or merely leaks.
+     `cpython-multiprocessing_fork` gets 78 of 317 assertions out before it
+     dies.
+
+  2. **`cpython-multiprocessing_spawn`**:
+     ```
+     carrick: FATAL: apply HVPatch alias retirement inventory:
+       mapping MappingId(73350) is not live
+     ```
+     A different bug — an alias-retirement invariant, not table exhaustion.
+     It dies at `test_error_on_stdio_flush_1` after 86 of 323 assertions.
+
+  3. **`cpython-multiprocessing_forkserver`** emits ZERO assertions with an
+     EMPTY stderr — a third shape. Recover its transcript with `run -t` or
+     `stdbuf -o0` before assuming it shares either cause.
+
+  These are CRASHES, so they outrank wrong answers, and one of them has a
+  ready-made in-tree hypothesis. They are also the reason the cluster looks
+  like a huge `docker = absent` count.
 - **`cpython-importlib` 351**, **`cpython-concurrent_futures` 239** (also a
   fast crash at 0.62x), **`go-go_types` 574** (untriaged),
   **`ltp-splice07` + `ltp-ioctl_ficlone04` 410** (LTP `tst_fd.c` fd-type
