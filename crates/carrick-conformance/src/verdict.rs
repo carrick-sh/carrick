@@ -16,6 +16,9 @@ use std::collections::{BTreeMap, HashMap};
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
     Match,
+    /// Closure mode requires identical, nonempty all-pass results from both
+    /// sides, so every other observation is a gating incomplete result.
+    Incomplete,
     Diff,
     Regression,
     New,
@@ -28,6 +31,7 @@ impl Verdict {
     pub fn as_str(self) -> &'static str {
         match self {
             Verdict::Match => "MATCH",
+            Verdict::Incomplete => "INCOMPLETE",
             Verdict::Diff => "DIFF",
             Verdict::Regression => "REGRESSION",
             Verdict::New => "NEW",
@@ -126,6 +130,78 @@ pub struct Classification {
     pub new_diffs: Vec<String>,
     pub known_diffs: Vec<String>,
     pub pairs: BTreeMap<String, [Outcome; 2]>,
+}
+
+impl Classification {
+    fn exact_match(carrick: &SuiteResult, _docker: &SuiteResult) -> Self {
+        let pairs = carrick
+            .ids
+            .iter()
+            .map(|(id, outcome)| (id.clone(), [*outcome, *outcome]))
+            .collect();
+        Self {
+            verdict: Verdict::Match,
+            gating: false,
+            new_diffs: vec![],
+            known_diffs: vec![],
+            pairs,
+        }
+    }
+
+    fn incomplete_or_diff(carrick: &SuiteResult, docker: &SuiteResult) -> Self {
+        let mut ids: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        ids.extend(carrick.ids.keys().map(String::as_str));
+        ids.extend(docker.ids.keys().map(String::as_str));
+
+        let mut pairs = BTreeMap::new();
+        let mut new_diffs = Vec::new();
+        for id in ids {
+            let carrick_outcome = carrick.ids.get(id).copied().unwrap_or(Outcome::Absent);
+            let docker_outcome = docker.ids.get(id).copied().unwrap_or(Outcome::Absent);
+            pairs.insert(id.to_string(), [carrick_outcome, docker_outcome]);
+            if carrick_outcome != docker_outcome {
+                new_diffs.push(id.to_string());
+            }
+        }
+
+        Self {
+            verdict: Verdict::Incomplete,
+            gating: true,
+            new_diffs,
+            known_diffs: vec![],
+            pairs,
+        }
+    }
+}
+
+/// Strict, baseline-free classification for a closure run. Any missing,
+/// unequal, failed, skipped, broken, crashed, timed-out, or empty observation
+/// is a gating [`Verdict::Incomplete`]; known gaps and prior results are never
+/// consulted.
+pub fn classify_closure(
+    _suite: &Suite,
+    carrick: &SuiteResult,
+    carrick_timed_out: bool,
+    docker: &SuiteResult,
+) -> Classification {
+    let all_ok = |side: &SuiteResult| {
+        side.result == SuiteOutcome::Success
+            && !side.ids.is_empty()
+            && side.ids.values().all(|outcome| *outcome == Outcome::Ok)
+    };
+    if !carrick_timed_out
+        && all_ok(carrick)
+        && all_ok(docker)
+        && carrick.ids == docker.ids
+        && carrick.totals.n == docker.totals.n
+        && carrick.totals.passed == docker.totals.passed
+        && carrick.totals.failed == docker.totals.failed
+        && carrick.totals.broken == docker.totals.broken
+        && carrick.totals.skipped == docker.totals.skipped
+    {
+        return Classification::exact_match(carrick, docker);
+    }
+    Classification::incomplete_or_diff(carrick, docker)
 }
 
 fn known_gap_match(id: &str, known_gaps: &[String]) -> bool {
@@ -478,5 +554,34 @@ mod tests {
         );
         assert_eq!(c.verdict, Verdict::OracleFail);
         assert!(!c.gating);
+    }
+
+    #[test]
+    fn closure_rejects_shared_failure_and_ignores_excuses() {
+        let suite = suite(&["assertion#1"]);
+        let carrick = res(&[("assertion#1", Outcome::Broken)]);
+        let docker = res(&[("assertion#1", Outcome::Broken)]);
+        let got = classify_closure(&suite, &carrick, false, &docker);
+        assert_eq!(got.verdict, Verdict::Incomplete);
+        assert!(got.gating);
+        assert!(got.known_diffs.is_empty());
+    }
+
+    #[test]
+    fn closure_accepts_only_nonempty_identical_all_ok_results() {
+        let side = res(&[("assertion#1", Outcome::Ok)]);
+        assert!(!classify_closure(&suite(&[]), &side, false, &side).gating);
+        for outcome in [
+            Outcome::Fail,
+            Outcome::Broken,
+            Outcome::Conf,
+            Outcome::Skipped,
+            Outcome::Xfail,
+            Outcome::Uxsuccess,
+            Outcome::Other,
+        ] {
+            let side = res(&[("assertion#1", outcome)]);
+            assert!(classify_closure(&suite(&[]), &side, false, &side).gating);
+        }
     }
 }

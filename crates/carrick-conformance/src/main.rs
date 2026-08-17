@@ -10,6 +10,7 @@
 //! Invariants: identical trailing argv to both engines; carrick‖docker never
 //! overlap (two-phase); every kill is SCOPED to one run-id (no unscoped reap).
 
+mod closure;
 mod engine;
 mod generate;
 mod images;
@@ -20,8 +21,11 @@ mod oracle;
 mod parsers;
 mod verdict;
 
+use crate::closure::{ClosurePolicy, validate_closure_reports};
 use crate::manifest::{Ecosystem, Manifest, Suite, Tier, Weight};
-use crate::verdict::{Baseline, PerfSummary, SideSummary, SuiteReport, Verdict, classify};
+use crate::verdict::{
+    Baseline, PerfSummary, SideSummary, SuiteReport, Verdict, classify, classify_closure,
+};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -56,6 +60,10 @@ struct Args {
     /// Which tier to run: `smoke` (fast gate) or `full` (everything).
     #[arg(long, default_value = "full")]
     tier: String,
+    /// Run the strict, baseline-free closure gate: full unfiltered HVF coverage
+    /// with no retries or waivers, where every selected suite must MATCH.
+    #[arg(long)]
+    closure: bool,
     /// WHERE the carrick side runs — not which backend it uses; carrick has one
     /// (HVPatch) and no lane selects it. `hvf` (the local signed binary on this
     /// mac, the default, and the owner of the shared baseline), `kvm` (carrick
@@ -225,6 +233,13 @@ fn main() -> ExitCode {
 fn run() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
 
+    if let Err(errors) = ClosurePolicy::validate_args(&args) {
+        for error in errors {
+            eprintln!("closure invocation error: {error}");
+        }
+        return Ok(ExitCode::from(2));
+    }
+
     // A scale < 1.0 (or NaN/inf) silently shrinks every carrick deadline to ~0
     // via the f64->u64 cast — refuse it up front instead.
     if !args.lima_timeout_scale.is_finite() || args.lima_timeout_scale < 1.0 {
@@ -249,7 +264,8 @@ fn run() -> anyhow::Result<ExitCode> {
         &args.lima_gateway,
         args.lima_timeout_scale,
         args.local_timeout_scale,
-    );
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
 
     if args.render_matrix {
         let reports = read_reports(&args.results_path())?;
@@ -395,9 +411,22 @@ fn run() -> anyhow::Result<ExitCode> {
         .baseline_overlay
         .clone()
         .or_else(|| lane_overlay_path(&args.baseline, &args.lane));
-    let baseline = match &overlay_path {
-        Some(p) => load_baseline(&args.baseline).with_overlay(load_baseline(p)),
-        None => load_baseline(&args.baseline),
+    let baseline = if args.closure {
+        None
+    } else {
+        Some(match &overlay_path {
+            Some(p) => load_baseline(&args.baseline).with_overlay(load_baseline(p)),
+            None => load_baseline(&args.baseline),
+        })
+    };
+    let classification = if args.closure {
+        ClassificationPolicy::Closure
+    } else {
+        ClassificationPolicy::Baseline(
+            baseline
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("regular run requires a baseline"))?,
+        )
     };
 
     let pid = std::process::id();
@@ -559,7 +588,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     elapsed_ms: cached_elapsed[i],
                 };
                 let cout = out.as_ref().ok();
-                let rep = build_report(s, cout, &docker, &baseline);
+                let rep = build_report(s, cout, &docker, classification);
                 if rep.gating {
                     let gating = phase1_gating.fetch_add(1, Ordering::SeqCst) + 1;
                     if fail_fast.should_abort(gating)
@@ -689,7 +718,7 @@ fn run() -> anyhow::Result<ExitCode> {
         .enumerate()
         .map(|(i, (s, cout))| {
             let cout = cout.as_ref().and_then(|r| r.as_ref().ok());
-            build_report(s, cout, &docker_sides[i], &baseline)
+            build_report(s, cout, &docker_sides[i], classification)
         })
         .collect();
 
@@ -721,7 +750,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 let s = &selected[i];
                 let run_id = format!("conf-{pid}-r{i:02}-a{attempt}");
                 let cout = engine::run_carrick(s, &carrick_bin, &run_id, &lane).ok();
-                let rep = build_report(s, cout.as_ref(), &docker_sides[i], &baseline);
+                let rep = build_report(s, cout.as_ref(), &docker_sides[i], classification);
                 eprintln!(
                     "  [retry] {} attempt {attempt}/{retries} -> {}{}",
                     s.name,
@@ -737,6 +766,19 @@ fn run() -> anyhow::Result<ExitCode> {
 
     write_reports(&args.results_path(), &reports)?;
     print_summary(&reports);
+
+    if args.closure {
+        match validate_closure_reports(&selected, &reports) {
+            Ok(()) => {
+                eprintln!("\nOK: closure has complete MATCH coverage");
+                return Ok(ExitCode::SUCCESS);
+            }
+            Err(error) => {
+                eprintln!("\nFAIL: closure is incomplete: {error:#}");
+                return Ok(ExitCode::from(1));
+            }
+        }
+    }
 
     let gating = reports.iter().filter(|r| r.gating).count();
 
@@ -763,11 +805,17 @@ struct DockerSide {
     elapsed_ms: Option<u64>,
 }
 
+#[derive(Clone, Copy)]
+enum ClassificationPolicy<'a> {
+    Closure,
+    Baseline(&'a Baseline),
+}
+
 fn build_report(
     s: &Suite,
     cout: Option<&engine::RunOutput>,
     docker: &DockerSide,
-    baseline: &Baseline,
+    policy: ClassificationPolicy<'_>,
 ) -> SuiteReport {
     let (c_raw, c_timed, c_runid, c_argv, c_elapsed_ms) = match cout {
         Some(o) => (
@@ -793,7 +841,10 @@ fn build_report(
 
     let c_res = parsers::parse(verdict_kind(s), &c_raw);
     let d_res = &docker.result;
-    let cl = classify(s, &c_res, c_timed, d_res, baseline);
+    let cl = match policy {
+        ClassificationPolicy::Closure => classify_closure(s, &c_res, c_timed, d_res),
+        ClassificationPolicy::Baseline(baseline) => classify(s, &c_res, c_timed, d_res, baseline),
+    };
 
     SuiteReport {
         name: s.name.clone(),
@@ -981,7 +1032,7 @@ fn timeout_blocks_bless(kind: Option<crate::engine::TimeoutKind>) -> bool {
 
 fn bless_blocks(target: BlessTarget, verdict: Verdict) -> bool {
     match verdict {
-        Verdict::Timeout | Verdict::CarrickCrash => true,
+        Verdict::Incomplete | Verdict::Timeout | Verdict::CarrickCrash => true,
         Verdict::OracleFail => matches!(target, BlessTarget::SharedBaseline),
         Verdict::Match | Verdict::Diff | Verdict::Regression | Verdict::New => false,
     }
