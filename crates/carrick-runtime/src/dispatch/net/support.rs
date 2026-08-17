@@ -75,7 +75,8 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use super::super::*;
 use crate::linux_abi::{
-    LINUX_ARPHRD_ETHER, LINUX_IFF_BROADCAST, LINUX_IFF_MULTICAST, LINUX_IFF_POINTOPOINT,
+    LINUX_ARPHRD_ETHER, LINUX_IFA_CACHEINFO, LINUX_IFA_F_PERMANENT, LINUX_IFA_FLAGS,
+    LINUX_IFA_INFINITY_LIFE_TIME, LINUX_IFF_BROADCAST, LINUX_IFF_MULTICAST, LINUX_IFF_POINTOPOINT,
     LINUX_RT_SCOPE_HOST, LINUX_RT_SCOPE_LINK, LINUX_RT_SCOPE_UNIVERSE, LINUX_RT_TABLE_MAIN,
     LINUX_RTA_DST, LINUX_RTA_GATEWAY, LINUX_RTA_OIF, LINUX_RTM_GETNEIGH, LINUX_RTM_GETROUTE,
     LINUX_RTM_NEWROUTE, LINUX_RTN_UNICAST, LINUX_RTPROT_KERNEL, LinuxRtMsg,
@@ -1210,12 +1211,23 @@ pub(super) fn build_netlink_reply_for_snapshot(
                 };
                 let index = snapshot_link_index(snapshot, &address.link_name).unwrap_or(1);
                 let mut payload = Vec::new();
+                let is_v6 = family == LINUX_AF_INET6 as u8;
                 let ifa = LinuxIfAddrMsg {
                     ifa_family: family,
                     ifa_prefixlen: address.prefix_len,
-                    ifa_flags: 0,
+                    // Every address in a container netns is statically
+                    // configured. Reporting 0 here says "not permanent", which
+                    // is not a shape Linux ever emits.
+                    ifa_flags: LINUX_IFA_F_PERMANENT as u8,
                     ifa_scope: if address.addr.is_loopback() {
                         LINUX_RT_SCOPE_HOST
+                    } else if matches!(
+                        address.addr,
+                        std::net::IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80
+                    ) {
+                        // A real `fe80::` is link-scoped; calling it universe
+                        // misleads any address-selection logic that reads scope.
+                        LINUX_RT_SCOPE_LINK
                     } else {
                         LINUX_RT_SCOPE_UNIVERSE
                     },
@@ -1223,10 +1235,29 @@ pub(super) fn build_netlink_reply_for_snapshot(
                 };
                 payload.extend_from_slice(ifa.as_bytes());
                 push_rtattr(&mut payload, LINUX_IFA_ADDRESS, &addr);
-                push_rtattr(&mut payload, LINUX_IFA_LOCAL, &addr);
-                let mut label = address.link_name.as_bytes().to_vec();
-                label.push(0);
-                push_rtattr(&mut payload, LINUX_IFA_LABEL, &label);
+                // Linux emits IFA_LOCAL and IFA_LABEL for IPv4 only; on IPv6 it
+                // emits neither. Matching the real shape matters because glibc
+                // walks these attributes to build its address-selection state.
+                if !is_v6 {
+                    push_rtattr(&mut payload, LINUX_IFA_LOCAL, &addr);
+                    let mut label = address.link_name.as_bytes().to_vec();
+                    label.push(0);
+                    push_rtattr(&mut payload, LINUX_IFA_LABEL, &label);
+                }
+                // IFA_CACHEINFO and IFA_FLAGS are on EVERY address Linux
+                // reports; glibc reads IFA_FLAGS in preference to the 8-bit
+                // header field.
+                let mut cacheinfo = Vec::with_capacity(16);
+                cacheinfo.extend_from_slice(&LINUX_IFA_INFINITY_LIFE_TIME.to_ne_bytes());
+                cacheinfo.extend_from_slice(&LINUX_IFA_INFINITY_LIFE_TIME.to_ne_bytes());
+                cacheinfo.extend_from_slice(&0u32.to_ne_bytes());
+                cacheinfo.extend_from_slice(&0u32.to_ne_bytes());
+                push_rtattr(&mut payload, LINUX_IFA_CACHEINFO, &cacheinfo);
+                push_rtattr(
+                    &mut payload,
+                    LINUX_IFA_FLAGS,
+                    &LINUX_IFA_F_PERMANENT.to_ne_bytes(),
+                );
                 push_nlmsg(&mut out, LINUX_RTM_NEWADDR, seq, pid, &payload);
             }
             push_nlmsg_done(&mut out, seq, pid);
