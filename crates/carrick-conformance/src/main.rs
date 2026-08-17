@@ -517,6 +517,13 @@ fn run() -> anyhow::Result<ExitCode> {
     let mut cache = oracle::OracleCache::load(&args.oracle_cache);
     let (cached, cached_elapsed): (Vec<Option<parsers::SuiteResult>>, Vec<Option<u64>>) =
         if args.refresh_oracle {
+            let invalidated = selected
+                .iter()
+                .filter(|suite| cache.invalidate(suite, docker_platform))
+                .count();
+            if invalidated > 0 {
+                eprintln!("oracle cache: invalidated {invalidated} selected record(s) for refresh");
+            }
             (vec![None; n], vec![None; n])
         } else {
             selected
@@ -674,7 +681,13 @@ fn run() -> anyhow::Result<ExitCode> {
             Some(o) => {
                 let timed_out = o.timed_out;
                 let res = parsers::parse(verdict_kind(s), &o.raw());
-                cache.insert(s, docker_platform, res.clone(), Some(o.elapsed_ms)); // refuses to cache a non-comparable oracle
+                cache.insert_fresh(
+                    s,
+                    docker_platform,
+                    res.clone(),
+                    Some(o.elapsed_ms),
+                    timed_out,
+                );
                 DockerSide {
                     result: res,
                     run_id: o.run_id,

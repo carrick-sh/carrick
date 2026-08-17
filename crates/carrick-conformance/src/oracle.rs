@@ -186,7 +186,32 @@ impl OracleCache {
         true
     }
 
-    /// Whether any `insert` stored a new record since load.
+    /// Cache a fresh Docker result only when the process completed before its
+    /// deadline. Buffered all-pass output from a timed-out process is not an
+    /// oracle result and must never survive into a later cache-only checkpoint.
+    pub fn insert_fresh(
+        &mut self,
+        suite: &Suite,
+        platform: crate::lane::DockerPlatform,
+        result: SuiteResult,
+        elapsed_ms: Option<u64>,
+        timed_out: bool,
+    ) -> bool {
+        !timed_out && self.insert(suite, platform, result, elapsed_ms)
+    }
+
+    /// Remove the current determinant record before a forced fresh oracle run.
+    /// A failed refresh must leave a miss, never permit a later run to fall
+    /// back to the superseded oracle record.
+    pub fn invalidate(&mut self, suite: &Suite, platform: crate::lane::DockerPlatform) -> bool {
+        let removed = self.by_key.remove(&oracle_key(suite, platform)).is_some();
+        if removed {
+            self.dirty = true;
+        }
+        removed
+    }
+
+    /// Whether any insert or invalidation mutated the cache since load.
     pub fn dirty(&self) -> bool {
         self.dirty
     }
@@ -209,7 +234,8 @@ impl OracleCache {
 }
 
 /// Only a comparable oracle (the docker side actually produced a verdict) may be
-/// cached; a crash/hang/empty must be retried.
+/// cached; a crash/hang/empty must be retried. Fresh Docker deadlines are
+/// rejected separately by [`OracleCache::insert_fresh`].
 fn is_cacheable(result: &SuiteResult) -> bool {
     matches!(result.result, SuiteOutcome::Success | SuiteOutcome::Failure)
 }
@@ -619,6 +645,40 @@ mod tests {
         assert!(!cache.insert(&s, platform, result(&[], SuiteOutcome::Empty), Some(1)));
         assert!(!cache.dirty(), "nothing stored");
         assert!(cache.get(&s, platform).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn timed_out_refresh_invalidates_stale_oracle_and_persists_miss() {
+        let path = std::env::temp_dir().join("carrick-oracle-timeout-refresh.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let suite = base_suite();
+        let platform = crate::lane::DockerPlatform::LinuxArm64;
+        let all_pass = result(&[("t", Outcome::Ok)], SuiteOutcome::Success);
+
+        let mut cache = OracleCache::load(&path);
+        assert!(cache.insert(&suite, platform, all_pass.clone(), Some(1)));
+        cache
+            .save()
+            .unwrap_or_else(|error| panic!("save stale oracle: {error}"));
+
+        let mut refresh = OracleCache::load(&path);
+        assert!(refresh.invalidate(&suite, platform));
+        assert!(
+            !refresh.insert_fresh(&suite, platform, all_pass, Some(2), true),
+            "a timed-out fresh Docker run is never cacheable"
+        );
+        assert!(refresh.dirty(), "invalidation alone must dirty the cache");
+        assert!(refresh.get(&suite, platform).is_none());
+        refresh
+            .save()
+            .unwrap_or_else(|error| panic!("save invalidated cache: {error}"));
+
+        let checkpoint = OracleCache::load(&path);
+        assert!(
+            checkpoint.get(&suite, platform).is_none(),
+            "later cache-only checkpoint must not reuse stale oracle evidence"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
