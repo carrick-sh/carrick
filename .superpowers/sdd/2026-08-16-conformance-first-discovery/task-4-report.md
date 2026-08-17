@@ -339,3 +339,115 @@ all 40 terminal source rows.
 
 No broad suite or probe measurement was run in this review. The coordinator
 still owns the authoritative 2,127-suite and 858-probe runtime discoveries.
+
+## Review round 2/5
+
+### Red-first evidence
+
+Exact synthetic raw forms were appended to an otherwise complete 858-PASS log.
+Before the independent raw-state guards, each reviewer example was silently
+accepted:
+
+```text
+FAIL: test_probe_log_rejects_raw_dedicated_skip_note_and_cargo_failure
+
+raw_line='SKIP conformance_bridge_tcp_peer: target/release/carrick not built'
+AssertionError: ReportError not raised
+
+raw_line='NOTE conformance_bridge_publish_tcp: Docker oracle unavailable'
+AssertionError: ReportError not raised
+
+raw_line='test conformance_bridge_udp_peer ... FAILED'
+AssertionError: ReportError not raised
+```
+
+Tightening the consumer exposed that the dedicated producer forwarded raw Cargo
+failure lines before its canonical terminal rows. The producer regression test
+failed red on that leak:
+
+```text
+FAIL: test_plan_prefixes_raw_cargo_failure_output_as_nonterminal_detail
+AssertionError: '\ntest conformance_bridge_compose_pair ... FAILED\n' unexpectedly found
+```
+
+### Fixes
+
+- `closure-report.py` now independently rejects raw dedicated
+  `SKIP conformance_<runner>: ...`, `NOTE conformance_<runner>: ...`, including
+  oracle-unavailable notes, and `test <dedicated-runner> ... FAILED` anywhere in
+  the log. The runner name must be one of the inventory-derived dedicated
+  scenario functions, avoiding broad matches on unrelated Cargo output.
+- Existing raw generic `FAIL arm64:<libc>:<source>` and
+  `ERROR arm64:<libc>:<source> ...` rejection is covered explicitly.
+- Canonical `CLOSURE_PROBE ...` terminal lines and benign
+  `test conformance_<runner> ... ok` Cargo noise remain accepted; a complete
+  canonical 858-PASS fixture verifies no false positive.
+- Dedicated raw stdout/stderr is retained under the non-terminal
+  `CLOSURE_PROBE_DETAIL <libc>:<runner>:` prefix. Raw Cargo `FAILED`, scenario
+  `SKIP`, and scenario `NOTE` strings therefore cannot leak as standalone
+  states from the producer, while the canonical source/libc terminal rows and
+  full diagnostics remain available.
+
+### Green verification
+
+```text
+python3 -m unittest discover -s scripts/tests -p 'test_*closure*.py'
+Ran 20 tests; OK
+
+cargo test -p carrick-cli --test conformance closure_ -- --nocapture
+5 passed; 0 failed
+
+cargo clippy -p carrick-cli --test conformance --test serve -- -D warnings
+exit 0
+
+cargo fmt --check
+exit 0
+
+python3 scripts/conformance/closure-probe-scenarios.py --check
+dedicated closure plan: 20 sources, 14 runners
+
+git diff --check
+exit 0
+```
+
+### Scope provenance refresh
+
+This round changed only Python tooling and tests, so Carrick was not rebuilt.
+After committing the code/tests cleanly, `closure-scope.json` was frozen from
+that commit. Its diff changed only `source_head`:
+
+```text
+source_head: 1befe20cddcab86b80bfb9af3ae1f5f9479977e9
+binary_sha256: 21e7d11449c23f6c6a1d254232101ae82294c4c7563f216b0d1c695924a6d0e1
+node_registry_digest: sha256:1ed49af83bd30401e1b275957b99a1c28f6c582ab3d987997afb5888fa302718
+suite_count: 2127
+```
+
+The following checks passed after the scope-data commit:
+
+```text
+git merge-base --is-ancestor "$source_head" HEAD
+exit 0
+
+git merge-base --is-ancestor \
+  9873d0af1b2de79ee8f09815ff5e2d88f0484147 "$source_head"
+exit 0
+
+python3 scripts/conformance/closure-scope.py check \
+  scripts/conformance/closure-scope.json
+closure scope checked: 2127 suites
+```
+
+Thus the recorded source commit contains review round 1's complete-red code and
+all round 2 raw-log hardening, and precedes only the scope-data/report commits.
+The signed binary and Node image identities are unchanged and verified live.
+
+### Commits and remaining concern
+
+- `1befe20cddcab86b80bfb9af3ae1f5f9479977e9`
+  `fix(conformance): reject raw closure probe states`
+- `01ab27c4325ec911607efe66b67f0f22bcffa868`
+  `test(conformance): advance closure tooling provenance`
+
+No broad measurement was run. The coordinator still owns the authoritative
+2,127-suite and 858-probe runtime discoveries.
