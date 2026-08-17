@@ -4,6 +4,8 @@ import importlib.util
 import json
 import subprocess
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -49,7 +51,10 @@ class ClosureProbeScenarioTest(unittest.TestCase):
 
     def test_postcondition_rejects_missing_duplicate_and_unexpected_rows(self):
         plan = scenarios.build_plan(self.inventory)
-        expected = scenarios.expected_rows(plan)
+        expected = [
+            scenarios.TerminalRow(row.libc, row.source, row.runner, "PASS", "")
+            for row in scenarios.expected_rows(plan)
+        ]
 
         scenarios.validate_completed(plan, expected)
         for completed in [expected[:-1], expected + [expected[0]]]:
@@ -57,11 +62,13 @@ class ClosureProbeScenarioTest(unittest.TestCase):
                 scenarios.validate_completed(plan, completed)
 
         unexpected = list(expected)
-        unexpected[-1] = scenarios.CompletedRow("musl", "not-in-inventory", "runner")
+        unexpected[-1] = scenarios.TerminalRow(
+            "musl", "not-in-inventory", "runner", "PASS", ""
+        )
         with self.assertRaises(scenarios.ScenarioError):
             scenarios.validate_completed(plan, unexpected)
 
-    def test_runner_rejects_an_oracle_unavailable_note_even_when_cargo_is_green(self):
+    def test_runner_classifies_an_oracle_unavailable_note_even_when_cargo_is_green(self):
         command = scenarios.RunnerCommand(
             "conformance_bridge_publish_tcp",
             "conformance",
@@ -78,8 +85,30 @@ class ClosureProbeScenarioTest(unittest.TestCase):
             stderr="",
         )
         with mock.patch.object(scenarios.subprocess, "run", return_value=completed):
-            with self.assertRaises(scenarios.ScenarioError):
-                scenarios._run_command(ROOT, command, "musl")
+            result = scenarios._run_command(ROOT, command, "musl")
+
+        self.assertEqual(result.status, "NOTE")
+
+    def test_plan_runs_later_functions_and_libcs_after_an_early_failure(self):
+        plan = scenarios.build_plan(self.inventory)
+        calls = []
+
+        def fake_runner(_root, command, libc):
+            calls.append((libc, command.runner))
+            status = "FAIL" if len(calls) == 1 else "PASS"
+            return scenarios.CommandResult(status, f"output-{len(calls)}", "synthetic")
+
+        with redirect_stdout(StringIO()):
+            rows = scenarios.run_plan(ROOT, plan, command_runner=fake_runner)
+
+        self.assertEqual(len(calls), 28)
+        self.assertEqual({libc for libc, _runner in calls}, {"gnu", "musl"})
+        self.assertEqual(len(rows), 40)
+        self.assertEqual(
+            sum(row.status == "FAIL" for row in rows),
+            len(plan.commands[0].sources),
+        )
+        self.assertEqual(calls[-1], ("musl", plan.commands[-1].runner))
 
 
 if __name__ == "__main__":

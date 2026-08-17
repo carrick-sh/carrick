@@ -3799,6 +3799,14 @@ enum ProbeOutcome {
     Error(String),
 }
 
+fn closure_probe_terminal_status(outcome: &ProbeOutcome) -> &'static str {
+    match outcome {
+        ProbeOutcome::Pass => "PASS",
+        ProbeOutcome::Error(_) => "ERROR",
+        ProbeOutcome::UnexpectedPass | ProbeOutcome::Fail(_) | ProbeOutcome::Xfail(_) => "FAIL",
+    }
+}
+
 /// Run one probe under carrick + Docker and classify the result. Self-contained
 /// (its own per-case run id via the selected transport), so it is safe to call
 /// from multiple worker threads concurrently.
@@ -4315,10 +4323,17 @@ fn conformance_probes() {
                 let outcome = match (enc, oracle) {
                     (Err(e), _) => (name, ProbeOutcome::Error(format!("read probe: {e}"))),
                     (Ok(_), Some(OracleSource::Unblessed)) | (Ok(_), None) => {
-                        eprintln!(
-                            "SKIP {}:{}:{name} (no cached oracle + no Docker — bless on a Docker host)",
-                            lane.label, set.libc
-                        );
+                        if closure_mode {
+                            eprintln!(
+                                "CLOSURE_PROBE GENERIC NOTE {}:{}:{name}",
+                                lane.label, set.libc
+                            );
+                        } else {
+                            eprintln!(
+                                "SKIP {}:{}:{name} (no cached oracle + no Docker — bless on a Docker host)",
+                                lane.label, set.libc
+                            );
+                        }
                         unblessed.push(format!("{}:{}:{name}", lane.label, set.libc));
                         continue;
                     }
@@ -4351,10 +4366,17 @@ fn conformance_probes() {
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("<unknown>");
-                    eprintln!(
-                        "SKIP {}:{}:{name} (timing-sensitive; needs a live Docker oracle)",
-                        lane.label, set.libc
-                    );
+                    if closure_mode {
+                        eprintln!(
+                            "CLOSURE_PROBE GENERIC NOTE {}:{}:{name}",
+                            lane.label, set.libc
+                        );
+                    } else {
+                        eprintln!(
+                            "SKIP {}:{}:{name} (timing-sensitive; needs a live Docker oracle)",
+                            lane.label, set.libc
+                        );
+                    }
                     unblessed.push(format!("{}:{}:{name}", lane.label, set.libc));
                 }
             }
@@ -4370,6 +4392,31 @@ fn conformance_probes() {
                 } else {
                     probe_gates(lane, set, name)
                 };
+                if closure_mode {
+                    eprintln!(
+                        "CLOSURE_PROBE GENERIC {} {qualified}",
+                        closure_probe_terminal_status(outcome)
+                    );
+                    match outcome {
+                        ProbeOutcome::Pass => {}
+                        ProbeOutcome::UnexpectedPass => fixed_gaps.push(qualified),
+                        ProbeOutcome::Fail(diff) => {
+                            eprintln!("CLOSURE_PROBE_DETAIL {qualified}\n{diff}");
+                            failures.push(qualified);
+                        }
+                        ProbeOutcome::Xfail(diff) => {
+                            eprintln!(
+                                "CLOSURE_PROBE_DETAIL {qualified} known-gap forbidden\n{diff}"
+                            );
+                            failures.push(qualified);
+                        }
+                        ProbeOutcome::Error(error) => {
+                            eprintln!("CLOSURE_PROBE_DETAIL {qualified} {error}");
+                            failures.push(qualified);
+                        }
+                    }
+                    continue;
+                }
                 match outcome {
                     ProbeOutcome::Pass => eprintln!("PASS {qualified}"),
                     ProbeOutcome::UnexpectedPass => {
@@ -4428,6 +4475,10 @@ fn conformance_probes() {
     if closure_mode {
         validate_closure_executed_sets(&closure_executed_sets)
             .unwrap_or_else(|error| panic!("closure probe execution incomplete: {error}"));
+        assert!(
+            unblessed.is_empty(),
+            "closure probes lacked a complete oracle: {unblessed:?}"
+        );
     }
     if !nongating_diffs.is_empty() {
         eprintln!(
@@ -5398,6 +5449,27 @@ fn closure_dedicated_scenarios_select_both_arm64_libc_artifact_sets() {
     assert_eq!(
         dedicated_probe_target(&ARM64, false, None),
         Ok("aarch64-unknown-linux-musl")
+    );
+}
+
+#[test]
+fn closure_generic_terminal_status_rejects_excuses_and_separates_errors() {
+    assert_eq!(closure_probe_terminal_status(&ProbeOutcome::Pass), "PASS");
+    assert_eq!(
+        closure_probe_terminal_status(&ProbeOutcome::Fail("diff".to_string())),
+        "FAIL"
+    );
+    assert_eq!(
+        closure_probe_terminal_status(&ProbeOutcome::Xfail("known".to_string())),
+        "FAIL"
+    );
+    assert_eq!(
+        closure_probe_terminal_status(&ProbeOutcome::UnexpectedPass),
+        "FAIL"
+    );
+    assert_eq!(
+        closure_probe_terminal_status(&ProbeOutcome::Error("read".to_string())),
+        "ERROR"
     );
 }
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import json
 import unittest
 from pathlib import Path
 
@@ -40,6 +41,31 @@ def result(name, *, verdict="match", pairs=None, skipped=0, broken=0, ratio=1.0)
             "carrick_to_oracle_ratio": ratio,
         },
     }
+
+
+def inventory():
+    return json.loads(
+        (ROOT / "conformance-probes/probe-inventory.json").read_text(encoding="utf-8")
+    )
+
+
+def complete_probe_log(overrides=None, extras=None):
+    overrides = overrides or {}
+    lines = []
+    for libc in ["gnu", "musl"]:
+        for name, row in sorted(inventory().items()):
+            if row["class"] != "conformance":
+                continue
+            status = overrides.get((libc, name), "PASS")
+            if row["runner"] == "generic":
+                lines.append(f"CLOSURE_PROBE GENERIC {status} arm64:{libc}:{name}")
+            else:
+                lines.append(
+                    f"CLOSURE_PROBE SCENARIO {status} arm64:{libc}:{name} "
+                    f"runner={row['runner']}"
+                )
+    lines.extend(extras or [])
+    return "\n".join(lines) + "\n"
 
 
 class ClosureReportTest(unittest.TestCase):
@@ -85,10 +111,55 @@ class ClosureReportTest(unittest.TestCase):
 
         summary = closure_report.summarize(scope, results)
 
-        self.assertEqual(summary["semantic_gaps"], ["ltp-futex"])
+        self.assertEqual(
+            summary["semantic_gaps"],
+            [
+                {
+                    "suite": "ltp-futex",
+                    "assertion": "futex.c:42#1",
+                    "carrick": "fail",
+                    "docker": "ok",
+                }
+            ],
+        )
         self.assertEqual(summary["infrastructure_failures"], ["ltp-tracefs"])
-        self.assertEqual(summary["unexercised"], ["ltp-cgroup"])
+        self.assertEqual(
+            summary["unexercised"],
+            [
+                {
+                    "suite": "ltp-cgroup",
+                    "assertion": "cgroup.c:1#1",
+                    "carrick": "conf",
+                    "docker": "conf",
+                }
+            ],
+        )
         self.assertEqual(summary["pathological"], ["ltp-munmap04"])
+
+    def test_suite_can_contribute_semantic_and_unexercised_assertions(self):
+        scope = scope_2127()
+        scope["suite_names"][0] = "ltp-mixed"
+        results = [result(name) for name in scope["suite_names"]]
+        results[0] = result(
+            "ltp-mixed",
+            verdict="incomplete",
+            skipped=1,
+            pairs={
+                "mixed.c:10#1": ["fail", "ok"],
+                "mixed.c:20#1": ["fail", "conf"],
+            },
+        )
+
+        summary = closure_report.summarize(scope, results)
+
+        self.assertEqual(
+            [row["assertion"] for row in summary["semantic_gaps"]],
+            ["mixed.c:10#1", "mixed.c:20#1"],
+        )
+        self.assertEqual(
+            [row["assertion"] for row in summary["unexercised"]],
+            ["mixed.c:20#1"],
+        )
 
     def test_report_rejects_unexpected_rows_and_malformed_performance(self):
         scope = scope_2127()
@@ -100,6 +171,80 @@ class ClosureReportTest(unittest.TestCase):
         malformed["perf"]["carrick_to_oracle_ratio"] = "ten"
         with self.assertRaises(closure_report.ReportError):
             closure_report.summarize(scope, complete)
+
+    def test_probe_log_retains_complete_red_terminal_rows(self):
+        overrides = {
+            ("gnu", "abortdeath"): "FAIL",
+            ("gnu", "acceptsock"): "DIFF",
+            ("musl", "accessx"): "ERROR",
+            ("musl", "accounting"): "SKIP",
+            ("gnu", "bridge_tcp_peer"): "NOTE",
+        }
+
+        summary = closure_report.validate_probe_log(
+            complete_probe_log(
+                overrides,
+                extras=["CLOSURE_PROBE_DETAIL arm64:gnu:abortdeath line mismatch"],
+            ),
+            inventory(),
+        )
+
+        self.assertEqual(summary["rows"], 858)
+        self.assertEqual(summary["passed"], 853)
+        self.assertEqual(
+            {(row["libc"], row["source"]) for row in summary["failures"]},
+            {("gnu", "abortdeath"), ("gnu", "acceptsock")},
+        )
+        self.assertEqual(
+            {(row["libc"], row["source"]) for row in summary["infrastructure_failures"]},
+            {("musl", "accessx"), ("gnu", "bridge_tcp_peer")},
+        )
+        self.assertEqual(
+            {(row["libc"], row["source"]) for row in summary["unexercised"]},
+            {("musl", "accounting"), ("gnu", "bridge_tcp_peer")},
+        )
+
+    def test_probe_log_rejects_duplicate_unknown_and_standalone_terminal_rows(self):
+        all_pass = complete_probe_log()
+        unknown = "CLOSURE_PROBE GENERIC ERROR arm64:gnu:not_in_inventory"
+        standalone = "SKIP arm64:gnu:abortdeath oracle unavailable"
+        duplicate_red = [
+            f"CLOSURE_PROBE GENERIC {status} arm64:gnu:abortdeath"
+            for status in ["FAIL", "SKIP", "NOTE"]
+        ]
+        for extra in duplicate_red + [unknown, standalone]:
+            with self.subTest(extra=extra):
+                with self.assertRaises(closure_report.ReportError):
+                    closure_report.validate_probe_log(
+                        all_pass + extra + "\n", inventory()
+                    )
+
+    def test_ledger_renders_assertion_and_probe_red_sections(self):
+        scope = scope_2127()
+        scope["suite_names"][0] = "ltp-red"
+        results = [result(name) for name in scope["suite_names"]]
+        results[0] = result(
+            "ltp-red",
+            verdict="incomplete",
+            pairs={"red.c:7#1": ["fail", "conf"]},
+            skipped=1,
+        )
+        suite_summary = closure_report.summarize(scope, results)
+        probe_summary = closure_report.validate_probe_log(
+            complete_probe_log({("gnu", "abortdeath"): "FAIL"}), inventory()
+        )
+
+        ledger = closure_report.render_ledger(
+            scope,
+            suite_summary,
+            probe_summary,
+            Path("results.jsonl"),
+            Path("probes.log"),
+        )
+
+        self.assertIn("`red.c:7#1`", ledger)
+        self.assertIn("## Probe semantic failures", ledger)
+        self.assertIn("`abortdeath`", ledger)
 
 
 if __name__ == "__main__":
