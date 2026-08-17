@@ -3912,6 +3912,18 @@ impl SyscallDispatcher {
                     })),
                     linux_fd_flags_from_open_flags(flags),
                 );
+                // Remember where this pty's MASTER lives. The slave's close
+                // path has to rescue the master's queued bytes before Darwin
+                // destroys them, and it cannot look the master up through the
+                // file table from inside the close (see
+                // `dispatch::pty_registry`).
+                if is_master {
+                    crate::dispatch::pty_registry::register_master(
+                        pts_index,
+                        host_fd,
+                        open_file.description.id(),
+                    );
+                }
                 let new_fd = match self.install_fd_at_or_above(0, open_file) {
                     Ok(fd) => fd,
                     Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
@@ -5028,6 +5040,27 @@ impl SyscallDispatcher {
             staged.remove(&description.id());
         }
         Ok(bytes)
+    }
+
+    /// Stage `bytes` on an open description named by ID rather than by guest
+    /// fd, for callers that must not touch the file table (see
+    /// `dispatch::pty_registry`).
+    pub(super) fn stage_splice_bytes_for_description(
+        &self,
+        description: crate::kernel::FileDescriptionId,
+        bytes: Vec<u8>,
+    ) {
+        if bytes.is_empty() {
+            return;
+        }
+        let files = self.captured_file_table();
+        let queue = files
+            .lock_splice_pushback()
+            .entry(description)
+            .or_insert_with(|| Arc::new(Mutex::new(SplicePushback::default())))
+            .clone();
+        queue.lock().push_back_owned(bytes);
+        self.notify_inmem_epoll();
     }
 
     pub(super) fn stage_splice_pipe_bytes_owned(&self, guest_fd: i32, bytes: Vec<u8>) {
