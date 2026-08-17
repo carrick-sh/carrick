@@ -30,6 +30,26 @@ the timeout remains a correctness failure.
 Carrick may be rearchitected wherever evidence shows that the current model or
 lowering cannot satisfy these boundaries.
 
+## Execution priority correction — conformance first
+
+The gate-integrity boundary is a prerequisite, not the product. Implement only
+the smallest closure path needed to make the first full result honest:
+
+- assertion-level LTP identities instead of count-only summaries;
+- no baseline or `known_gaps` excuses in closure mode;
+- no missing manifest rows, skipped probe sets, report-only arm64 GNU results,
+  retries, empty output, crashes, timeouts, or oracle failures accepted as
+  green; and
+- a simple frozen scope/digest record sufficient to reproduce the discovery.
+
+As soon as those properties hold, run the full 2,127-suite and arm64 musl/GNU
+probe discovery and spend the campaign on Carrick reducers, tracing, runtime
+fixes, and evidence-selected rearchitecture. General receipt frameworks,
+parser abstractions beyond observed false-green shapes, and final provenance
+polish must not delay correctness work. They remain completion requirements
+and are finished after the semantic backlog is closed, when they protect a
+result worth certifying.
+
 ## Paste-ready `/goal`
 
 > On the canonical macOS/HVF arm64 HVPatch lane, first make the conformance
