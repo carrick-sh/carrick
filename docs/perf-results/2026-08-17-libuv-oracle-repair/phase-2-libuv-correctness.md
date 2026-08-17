@@ -5,7 +5,7 @@
 **Predecessor:** `README.md` in this directory (step 1, the oracle repair)
 
 Step 1 made the `node-libuv` docker row real (507 positions: 499 pass, 0 fail,
-8 skip). This phase measured Carrick against it and closed six divergences.
+8 skip). This phase measured Carrick against it and closed EIGHT divergences, taking libuv from 12 divergent positions to 5.
 
 ## Method
 
@@ -64,61 +64,99 @@ Each carried a doc comment arguing it was correct. The comments were written
 under assumptions that had since stopped holding, which is exactly the
 `docs/identity-and-scope-domains.md` failure mode.
 
-## Remaining divergences (7) and their state
+## Divergences closed (continued)
 
-Measured on binary `6271fcb7…1628060905`.
+| # | row | was | now | root cause |
+|---|---|---|---|---|
+| 29 | `eintr_handling` | FLAKY (8/15 fail) | 20/20 pass | EINTR surfaced for a signal delivered to another thread |
+| 395 | `tcp_reuseport` | fail | pass | Darwin never distributes `SO_REUSEPORT` |
+| 488 | `udp_reuseport` | fail | pass | same |
+
+`eintr_handling` is the one worth reading twice. It looked exactly like a
+missing entry in the `SA_RESTART` restartable syscall set — that set really was
+wrong (only `waitid`/`wait4`) and really was fixed — but expanding it moved the
+failure rate not at all. The new `signal__restart__decision` probe showed why:
+in a failing run the ONLY SIGUSR1 decision was on the thread that called
+`kill(2)`, at its own syscall boundary. The blocked reader that returned
+`-EINTR` had received no signal at all. SA_RESTART could never have repaired
+that, because the restart path works by rewinding the PC behind a handler frame
+and there was no frame. An ABSENT trace line was the evidence.
+
+## Remaining divergences (5) and their state
+
+Measured on binary `a1ee8ef2…01a7032f7`.
 
 ### Real Carrick gaps
 
-| # | row | root cause | evidence |
-|---|---|---|---|
-| 395 | `tcp_reuseport` | two listeners bind `127.0.0.1:9123` with `SO_REUSEPORT`; the test needs BOTH to accept ≥1 of 10 connections (`ASSERT_GT(thread_loopN_accepted, 0)`). Not yet distinguished: Darwin not load-balancing vs a Carrick epoll/accept dispatch defect. | not started |
-| 488 | `udp_reuseport` | same shape, 10 datagrams across 2 receivers | not started |
-| 483 | `udp_recvmsg_unreachable_error` | needs `IP_RECVERR` (absent from the SOL_IP option gate), so `uv_udp_bind` fails before any recvmsg. Then needs the ICMP error delivered as (a) `ECONNREFUSED` on the next recvmsg, (b) a `MSG_ERRQUEUE` entry with a `SOL_IP`/`IP_RECVERR` cmsg carrying `sock_extended_err` + `SO_EE_OFFENDER`, (c) `EPOLLERR` on the fd, (d) `EAGAIN` on the second errqueue read. Exactly 3 `recv_cb` calls. | `MSG_ERRQUEUE` is currently hard-coded to a no-error-queue stub |
-| 484 | `udp_recvmsg_unreachable_error6` | same, `IPV6_RECVERR` | " |
-| 456 | `tty_pty_partial` | 8×8192 bytes written to a pty slave must read back as exactly 65536 on the master, ten times. NOT upstream flakiness: the "not 100% deterministic" comment says a BUGGY implementation fails ~1 in 3, which is why it loops 10× — the assertion itself is exact with no tolerance. | not started |
+| # | row | state |
+|---|---|---|
+| 456 | `tty_pty_partial` | **Deterministic**, and reduced: 64512 of 65536 bytes arrive, i.e. **exactly 1024 lost**, on every run. A host-only C reducer doing the same 8×8192 slave writes and master reads loses NOTHING, so the loss is Carrick's, not the pty's. A round 1024 points at a fixed-size buffer or a drop of the final partial chunk on the slave-close/EOF edge. Not yet localised in `pty_relay.rs` / the pty read path. |
+| 483 | `udp_recvmsg_unreachable_error` | Needs `IP_RECVERR` accepted (absent from the SOL_IP gate, so `uv_udp_bind` fails before any recvmsg), then a real `MSG_ERRQUEUE`. **Feasibility is now settled — see the shadow-socket row in the Darwin facts table.** Design below. |
+| 484 | `udp_recvmsg_unreachable_error6` | same, `IPV6_RECVERR` |
 
-### Harness-level netns asymmetry
+#### Settled design for the UDP error queue
+
+Darwin reports an ICMP port-unreachable only on a CONNECTED UDP socket; Linux
+reports it on an unconnected one precisely because `IP_RECVERR` asked. Measured
+bridge: a shadow socket bound to the SAME local `addr:port` with
+`SO_REUSEADDR|SO_REUSEPORT` and `connect`ed to the destination receives the
+`ECONNREFUSED`, while the real unconnected socket still receives from third
+parties and the shadow does not steal them.
+
+So: accept `IP_RECVERR`/`IPV6_RECVERR` and record the flag; when such a socket
+sends, route the send through a shadow connected to that destination (same
+packet on the wire, same source `addr:port`); drain the shadow's error and push
+an error-queue entry; serve `MSG_ERRQUEUE` `recvmsg` from that queue with a
+`SOL_IP`/`IP_RECVERR` cmsg carrying `sock_extended_err` + `SO_EE_OFFENDER`, set
+`MSG_ERRQUEUE` in the returned `msg_flags`, report `EPOLLERR` while the queue is
+non-empty, and answer `EAGAIN` once drained. The test wants exactly three
+`recv_cb` calls: `ECONNREFUSED` on the plain read, the errqueue entry, then
+`EAGAIN`.
+
+### Harness-level netns asymmetry (unchanged)
 
 | # | row | state |
 |---|---|---|
 | 370 | `tcp_connect6_link_local` | INVERSION: Docker skips, Carrick runs |
-| 472 | `udp_multicast_join6` | Docker skips, Carrick now fails |
+| 472 | `udp_multicast_join6` | Docker skips, Carrick fails |
 
-Both come from one cause: **`carrick run` defaults to `--network host` while
-`docker run` defaults to bridge**, so the two engines are compared with
-different network namespaces. The oracle container has only `::1/128` on `lo`;
-Carrick in host mode surfaces the Mac's `en0`, which has a link-local. libuv's
-skip conditions scan enumerated interfaces for `fe80::`, so Carrick runs what
-Linux declines.
+One cause: **`carrick run` defaults to `--network host` while `docker run`
+defaults to bridge**, so the two engines are compared with different network
+namespaces. The oracle container has only `::1/128` on `lo` (verified inside the
+image); Carrick in host mode surfaces the Mac's `en0`, which has a link-local,
+and libuv's skip conditions scan enumerated interfaces for `fe80::`.
 
-The bridge model itself has been corrected to match the oracle netns. Aligning
-the suite is blocked on a separate bug found while testing it:
+The bridge model has been corrected to match the oracle netns, but the suite
+cannot be switched to bridge yet:
 
 > **`--network bridge` aborts the libuv workload.** Exit 134, zero stdout:
 > `objc[…]: +[NSNumber initialize] may have been in progress in another thread
 > when fork() was called. … Crashing instead.` A trivial
-> `--network bridge … sh -c 'echo hello'` succeeds, so it is workload-specific.
-> This is the known fork-unsafe CoreFoundation/ObjC class; the likely entry
-> point is `getaddrinfo` via `to_socket_addrs` in `network/dns.rs`
-> (`scutil` is a `posix_spawn` subprocess and is not the culprit). Not yet
-> root-caused.
+> `--network bridge … sh -c 'echo hello'` succeeds, so it is workload-specific,
+> not setup. Known fork-unsafe CoreFoundation/ObjC class; likely entry point is
+> `getaddrinfo` via `to_socket_addrs` in `network/dns.rs` (`scutil` in
+> `vfs/resolvconf.rs` is a `posix_spawn` subprocess and is NOT the culprit).
+> Not root-caused. It is a crash, so it outranks a wrong answer.
 
-### Stability — two rows are NOT deterministic
+### Stability
 
-Four consecutive runs of the same signed binary:
+`eintr_handling` is fixed (20/20). `tcp_try_write_error` remains
+non-deterministic: **8 of 20 isolated runs fail**, and it is a genuine
+Heisenbug — under `carrick trace` it passed 6 of 6, which at a 60% base pass
+rate is ~4.7% likely by chance, so tracing really does perturb it away. The
+recommended instrument is therefore the always-on event ring via `carrick-lldb`,
+not a tracer.
 
-| # | row | run 1 | run 2 | run 3 | run 4 |
-|---|---|---|---|---|---|
-| 29 | `eintr_handling` | ok | ok | **fail** | ok |
-| 399 | `tcp_try_write_error` | ok | ok | **fail** | **fail** |
+What IS known: it fails with `uv_try_write` returning `-11` (EAGAIN) where the
+test requires `UV_EPIPE`/`UV_ECONNABORTED`/`UV_ECONNRESET` after the peer
+closes. A host-only reducer shows Darwin returns `ECONNRESET` after ~27
+four-byte writes, and `blocking_io` genuinely calls the host write, so the
+EAGAIN is real — meaning the peer's host socket was still open when the writes
+ran. That points at the guest's `close` of the accepted fd not having reached a
+host `close` yet (a lingering `HostFdRef`, or ordering between `uv_close`'s
+callback and the actual descriptor teardown). Unproven.
 
-These were invisible while the oracle was absent. They are correctness
-blockers in their own right: the goal admits no flakiness and no
-retry-recovered acceptance, so a clean final pass is impossible until they are
-deterministic. Neither has been root-caused, and neither may be dismissed as
-load — that has to be measured, not assumed.
-
+## Ledger impact beyond libuv
 ## Ledger impact beyond libuv
 
 The repaired oracle turns 507 previously-`docker = absent` rows into real

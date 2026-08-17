@@ -246,54 +246,54 @@ unchanged through every gate.
 
 ## Next cluster: finish Node libuv
 
-Step 1 (repair the Docker oracle) and most of step 2 are DONE. See
-`docs/perf-results/2026-08-17-libuv-oracle-repair/README.md` (oracle repair)
-and `phase-2-libuv-correctness.md` (the Carrick side) for full evidence,
-provenance and per-row root causes. Do not redo them.
+Step 1 (repair the Docker oracle) is DONE, and eight of the twelve divergences
+are closed. Full evidence, provenance, per-row root causes and the measured
+Darwin capability table are in
+`docs/perf-results/2026-08-17-libuv-oracle-repair/README.md` (oracle repair) and
+`phase-2-libuv-correctness.md` (the Carrick side). Do not redo them.
 
-The oracle now emits 507 positions (499 pass / 0 fail / 8 skip) and its raw TAP
-is committed at
+The oracle emits 507 positions (499 pass / 0 fail / 8 skip) and its raw TAP is
+committed at
 `docs/perf-results/2026-08-17-libuv-oracle-repair/docker-oracle-libuv.tap`, so
-the Carrick side can be diffed without re-running Docker.
+the Carrick side can be diffed WITHOUT re-running Docker. Run Carrick with the
+argv from `--dry-run` on the suite and diff position-by-position.
 
 Closed, each proven red-first: `platform_output` (uptime), `thread_priority`
-(nice scope), `pipe_set_chmod` (AF_UNIX owner), `udp_multicast_interface6`
-(ifindex 0), `udp_multicast_join` (blanket ENODEV).
+(nice scope), `eintr_handling` (spurious EINTR), `pipe_set_chmod` (AF_UNIX
+owner), `udp_multicast_interface6` (ifindex 0), `udp_multicast_join` (blanket
+ENODEV), `tcp_reuseport` + `udp_reuseport` (SO_REUSEPORT distribution).
 
 ### Remaining, in recommended order
 
-1. **Two NON-DETERMINISTIC rows — do these first.** `eintr_handling` (29) and
-   `tcp_try_write_error` (399) flip between runs of the SAME signed binary
-   (fail 1-of-4 and 2-of-4 respectively). The goal admits no flakiness and no
-   retry-recovered acceptance, so no clean final pass is possible while they
-   flip, and every later measurement is noisy until they are fixed. Do not
-   dismiss them as load without measuring.
-2. **`SO_REUSEPORT` distribution** (`tcp_reuseport` 395, `udp_reuseport` 488).
-   Two listeners on `127.0.0.1:9123`; the test requires BOTH to receive at
-   least one of 10 connections/datagrams. First distinguish "Darwin does not
-   load-balance" from "Carrick's epoll/accept dispatch hands everything to one
-   waiter" — a small host-only C program settles the first half without any
-   guest, the way the `IPV6_MULTICAST_IF` and multicast-join questions were
-   settled. Then get Linux ground truth with bpftrace inside Docker over
-   setsockopt/bind/listen/accept4/recvmsg. Never strace.
-3. **UDP error queue** (`udp_recvmsg_unreachable_error` 483 / `…6` 484). Needs
-   `IP_RECVERR`/`IPV6_RECVERR` accepted (they are absent from the SOL_IP and
-   SOL_IPV6 option gates, so `uv_udp_bind` fails before any recvmsg), then a
-   real `MSG_ERRQUEUE` carrying a `sock_extended_err` + `SO_EE_OFFENDER` cmsg,
-   `EPOLLERR` on the fd, and `EAGAIN` on the drained second read. The test
-   asserts exactly 3 `recv_cb` calls. `MSG_ERRQUEUE` is currently a stub.
-4. **`tty_pty_partial`** (456). 8x8192 bytes in, exactly 65536 out, ten times.
-   The upstream "not 100% deterministic" comment does NOT excuse this: it says a
-   BUGGY implementation fails ~1 in 3, which is why it loops 10x; the assertion
-   is exact.
-5. **The netns asymmetry** (`tcp_connect6_link_local` 370 inversion,
-   `udp_multicast_join6` 472). `carrick run` defaults to `--network host` while
+1. **`tcp_try_write_error` — non-deterministic, 8 of 20 isolated runs fail.**
+   Do this before anything that needs a clean measurement. It is a genuine
+   Heisenbug: under `carrick trace` it passed 6 of 6 (~4.7% likely by chance at
+   its base rate), so use the always-on event ring via `carrick-lldb`, NOT a
+   tracer. Known: `uv_try_write` returns EAGAIN where Linux gives EPIPE/
+   ECONNRESET after the peer closes; Darwin itself returns ECONNRESET after ~27
+   writes and `blocking_io` really does call the host write, so the peer's host
+   socket was still open. Suspect a lingering `HostFdRef` delaying the host
+   close behind the guest's `close`.
+2. **`tty_pty_partial` — deterministic and already reduced.** 64512 of 65536
+   bytes arrive, i.e. EXACTLY 1024 lost, every run. A host-only C reducer doing
+   the same 8x8192 slave writes and master reads loses nothing, so it is
+   Carrick's. A round 1024 points at a fixed-size buffer or a dropped final
+   partial chunk on the slave-close/EOF edge. Not yet localised.
+3. **UDP error queue** (`udp_recvmsg_unreachable_error` and `...6`). The design
+   is SETTLED and the feasibility measured — see "Settled design for the UDP
+   error queue" in the phase-2 report. Darwin will not report an ICMP error on
+   an unconnected UDP socket, but a shadow socket bound to the same local
+   addr:port with SO_REUSEADDR|SO_REUSEPORT and connected to the destination
+   will, without changing the wire packets or what the real socket receives.
+   That was verified with a host-only program.
+4. **The netns asymmetry** (`tcp_connect6_link_local` inversion,
+   `udp_multicast_join6`). `carrick run` defaults to `--network host` while
    `docker run` defaults to bridge, so the two sides enumerate different
-   interfaces. The bridge model has been corrected to match the oracle netns
-   (uplinks IPv4-only, `lo` keeps `::1`), but the suite cannot be switched to
-   bridge yet — see the blocker below.
+   interfaces. The bridge model is already corrected to match the oracle netns
+   (verified inside the image: only `::1/128` on `lo`), but the suite cannot be
+   switched to bridge until the blocker below is fixed.
 
-### Blocker found while testing (5): `--network bridge` aborts
+### Blocker: `--network bridge` aborts
 
 Running the libuv workload with `--network bridge` exits 134 with zero stdout:
 
@@ -303,30 +303,31 @@ when fork() was called. ... Crashing instead.
 ```
 
 A trivial `--network bridge ... sh -c 'echo hello'` succeeds, so it is
-workload-specific, not setup. This is the known fork-unsafe
-CoreFoundation/ObjC class. Likely entry point is `getaddrinfo` via
-`to_socket_addrs` in `crates/carrick-runtime/src/network/dns.rs`; `scutil` in
-`vfs/resolvconf.rs` is a `posix_spawn` subprocess and is NOT the culprit. Not
-root-caused. Attach the VM carrier (`carrick debug lldb-run`) and break on
-`objc_initializeAfterForkError`.
-
-This is a crash, so it outranks a wrong answer.
+workload-specific, not setup. Known fork-unsafe CoreFoundation/ObjC class.
+Likely entry point is `getaddrinfo` via `to_socket_addrs` in
+`crates/carrick-runtime/src/network/dns.rs`; `scutil` in `vfs/resolvconf.rs` is
+a `posix_spawn` subprocess and is NOT the culprit. Attach the VM carrier with
+`carrick debug lldb-run` and break on `objc_initializeAfterForkError`. This is a
+crash, so it outranks a wrong answer.
 
 ### Also found, recorded rather than fixed
 
 - `fchmod` on a bound AF_UNIX socket fd resolves no path and silently returns
-  0, so a mode set through the fd alone is lost. No current row covers it;
-  libuv's `uv_pipe_chmod` runs `chmod` afterwards and does not depend on it.
+  0, so a mode set through the fd alone is lost. No current row covers it.
 - `dispatch/time.rs`'s `RLIMIT_CPU_GENERATION` is a carrier-global static
   gating a per-process limit, so one guest process's `setrlimit(RLIMIT_CPU)`
   can cancel another's enforcement. Same class as the `nice`/`ioprio` statics
-  just fixed. Not measured by any current row.
-- The previous checkpoint's durable evidence is GONE: it lived in
-  `target/` inside the `.worktrees/conformance-first` worktree, which no longer
-  exists. The campaign commits themselves are on `main` (`96a23ca7d` is an
-  ancestor of HEAD), and the committed docs survived, but every raw artifact
-  the old handoff cited is unrecoverable. Evidence that matters is now
-  committed under `docs/perf-results/` instead of left in `target/`.
+  fixed this session. Not measured by any current row.
+- Socket calls are absent from the `SA_RESTART` restartable set on purpose:
+  they DO restart on Linux, but only without `SO_RCVTIMEO`/`SO_SNDTIMEO`, and
+  the decision point sees only the syscall number, not the fd. Plumb the
+  timeout before adding them.
+- The previous checkpoint's durable evidence is GONE: it lived in `target/`
+  inside the `.worktrees/conformance-first` worktree, which no longer exists.
+  The campaign commits are on `main` (`96a23ca7d` is an ancestor of HEAD) and
+  the committed docs survived, but every raw artifact the old handoff cited is
+  unrecoverable. Evidence that matters is now committed under
+  `docs/perf-results/`.
 
 ## Measurement discipline
 
