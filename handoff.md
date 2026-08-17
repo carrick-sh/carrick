@@ -263,31 +263,45 @@ Closed, each proven red-first: `platform_output` (uptime), `thread_priority`
 owner), `udp_multicast_interface6` (ifindex 0), `udp_multicast_join` (blanket
 ENODEV), `tcp_reuseport` + `udp_reuseport` (SO_REUSEPORT distribution).
 
+**libuv is at 4 divergent positions, down from 12.** Last measured on binary
+`d52ff64a…ca1ff1ce`: 497 ok / 6 skip / 4 fail against the oracle's 499 ok /
+8 skip.
+
 ### Remaining, in recommended order
 
-1. **`tcp_try_write_error` — non-deterministic, 8 of 20 isolated runs fail.**
-   Do this before anything that needs a clean measurement. It is a genuine
-   Heisenbug: under `carrick trace` it passed 6 of 6 (~4.7% likely by chance at
-   its base rate), so use the always-on event ring via `carrick-lldb`, NOT a
-   tracer. Known: `uv_try_write` returns EAGAIN where Linux gives EPIPE/
-   ECONNRESET after the peer closes; Darwin itself returns ECONNRESET after ~27
-   writes and `blocking_io` really does call the host write, so the peer's host
-   socket was still open. Suspect a lingering `HostFdRef` delaying the host
-   close behind the guest's `close`.
-2. **`tty_pty_partial` — deterministic and already reduced.** 64512 of 65536
-   bytes arrive, i.e. EXACTLY 1024 lost, every run. A host-only C reducer doing
-   the same 8x8192 slave writes and master reads loses nothing, so it is
-   Carrick's. A round 1024 points at a fixed-size buffer or a dropped final
-   partial chunk on the slave-close/EOF edge. Not yet localised.
-3. **UDP error queue** (`udp_recvmsg_unreachable_error` and `...6`). The design
-   is SETTLED and the feasibility measured — see "Settled design for the UDP
+Down to FOUR divergent positions plus one non-deterministic row.
+
+1. **`tty_pty_partial` (456) — root-caused, fix reverted.** Darwin DISCARDS
+   whatever is still queued in a pty when the last slave fd closes; Linux
+   delivers it then reports EOF. Proven with a 20-line C program, and the
+   host trace shows 64 slave writes of 1024 against only 63 master reads. The
+   rescue-into-staging fix made this row pass 5/5 but HUNG the sibling
+   `tty_pty`, so it was reverted. Two constraints for the next attempt, both
+   already paid for: `FIONREAD` on a pty master reports 0 even with data
+   queued (so size the rescue by reading until EAGAIN under a byte cap), and
+   the close path CANNOT reach the master through the file table
+   (`read_open_files()` inside `close_open_file_and_free_pty` deadlocks —
+   `tty_pty` hung even when the drain no-opped). Register the master's
+   description alongside its pts index when it is opened, and rescue through
+   that. Full detail in the phase-2 report.
+2. **`tcp_try_write_error` — non-deterministic**, 8 of 20 isolated runs fail.
+   Not currently in the divergence list because it happens to pass in most
+   full runs, which is exactly why it must be fixed before any clean final
+   pass. Genuine Heisenbug: under `carrick trace` it passed 6 of 6 (~4.7%
+   likely by chance), so use the event ring via `carrick-lldb`, NOT a tracer.
+   Known: `uv_try_write` returns EAGAIN where Linux gives EPIPE/ECONNRESET
+   after the peer closes; Darwin itself returns ECONNRESET after ~27 writes and
+   `blocking_io` really does call the host write, so the peer's host socket was
+   still open when the guest had closed it. Suspect a lingering `HostFdRef`.
+3. **UDP error queue** (`udp_recvmsg_unreachable_error` 483 and `...6` 484).
+   Design SETTLED and feasibility MEASURED — see "Settled design for the UDP
    error queue" in the phase-2 report. Darwin will not report an ICMP error on
    an unconnected UDP socket, but a shadow socket bound to the same local
    addr:port with SO_REUSEADDR|SO_REUSEPORT and connected to the destination
    will, without changing the wire packets or what the real socket receives.
-   That was verified with a host-only program.
-4. **The netns asymmetry** (`tcp_connect6_link_local` inversion,
-   `udp_multicast_join6`). `carrick run` defaults to `--network host` while
+   Verified with a host-only program.
+4. **The netns asymmetry** (`tcp_connect6_link_local` 370 inversion,
+   `udp_multicast_join6` 472). `carrick run` defaults to `--network host` while
    `docker run` defaults to bridge, so the two sides enumerate different
    interfaces. The bridge model is already corrected to match the oracle netns
    (verified inside the image: only `::1/128` on `lo`), but the suite cannot be
