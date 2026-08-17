@@ -13,7 +13,7 @@ impl TapParser {
         let text = super::strip_carrick_banners(&raw.combined());
         let (Ok(plan_re), Ok(assertion_re)) = (
             Regex::new(r"^1\.\.(\d+)\s*$"),
-            Regex::new(r"^(ok|not ok)\s+(\d+)(?:\s*-\s*)?(.*)$"),
+            Regex::new(r"^(ok|not ok)\s+(\d+)(?:\s+(?:-\s*)?(.*))?$"),
         ) else {
             return SuiteResult::empty();
         };
@@ -203,5 +203,12 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn closure_tap_rejects_garbage_attached_to_assertion_number() {
+        let result = TapParser.parse_closure(&raw(0, "1..1\nok 1garbage\n"));
+        assert_ne!(result.result, SuiteOutcome::Success);
+        assert!(result.ids.is_empty());
     }
 }
