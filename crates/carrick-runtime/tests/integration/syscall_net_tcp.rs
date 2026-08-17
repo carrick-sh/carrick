@@ -151,6 +151,98 @@ fn netlink_getsockopt_so_type_reports_guest_type_not_hardcoded_raw() {
 }
 
 #[cfg(target_os = "macos")]
+/// `IPV6_MULTICAST_IF` with interface index 0 is Linux's "clear the multicast
+/// interface, let routing choose". Darwin rejects index 0 with EINVAL and has
+/// no clear operation at all (measured on macOS 27: 0 as `u32`, 0 as `int`, and
+/// a zero-length optval all EINVAL, and the readback keeps the previous index).
+///
+/// libuv's `uv_udp_set_multicast_interface(handle, NULL)` sends exactly index 0
+/// on an IPv6 handle, so forwarding it made `udp_multicast_interface6` die on
+/// `ASSERT_OK`. Carrick answers index 0 itself and serves the readback from the
+/// guest's value.
+#[test]
+fn ipv6_multicast_if_index_zero_is_accepted_and_reads_back() {
+    const AF_INET6: u64 = 10;
+    const SOCK_DGRAM: u64 = 2;
+    const SOL_IPV6: u64 = 41;
+    const IPV6_MULTICAST_IF: u64 = 17;
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let call = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            &d.capture_one_task_context().unwrap(),
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+    let getu32 = |m: &LinearMemory, at: u64| {
+        u32::from_ne_bytes(m.read_bytes(at, 4).unwrap().try_into().unwrap())
+    };
+
+    let fd = match call(
+        &mut dispatcher,
+        &mut memory,
+        198,
+        [AF_INET6, SOCK_DGRAM, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        // A host without IPv6 cannot exercise this; nothing to assert.
+        DispatchOutcome::Errno { .. } => return,
+        o => panic!("socket(AF_INET6,SOCK_DGRAM): {o:?}"),
+    };
+
+    // Index 0 must SUCCEED, not EINVAL through to the host.
+    memory.write_bytes(0x4000, &0u32.to_ne_bytes()).unwrap();
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            208,
+            [fd, SOL_IPV6, IPV6_MULTICAST_IF, 0x4000, 4, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 },
+        "IPV6_MULTICAST_IF index 0 is Linux's 'clear'; it must not surface Darwin's EINVAL"
+    );
+    memory.write_bytes(0x4010, &4u32.to_ne_bytes()).unwrap();
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            209,
+            [fd, SOL_IPV6, IPV6_MULTICAST_IF, 0x4020, 0x4010, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(getu32(&memory, 0x4020), 0, "cleared interface reads back 0");
+
+    // A non-zero index still round-trips through the guest-visible value.
+    memory.write_bytes(0x4000, &1u32.to_ne_bytes()).unwrap();
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            208,
+            [fd, SOL_IPV6, IPV6_MULTICAST_IF, 0x4000, 4, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    memory.write_bytes(0x4010, &4u32.to_ne_bytes()).unwrap();
+    assert_eq!(
+        call(
+            &mut dispatcher,
+            &mut memory,
+            209,
+            [fd, SOL_IPV6, IPV6_MULTICAST_IF, 0x4020, 0x4010, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(getu32(&memory, 0x4020), 1);
+}
+
 #[test]
 fn so_reuseport_and_bufsize_report_guest_values_not_host_widening() {
     // M4: getsockopt(SO_REUSEPORT) must report what the guest set (default 0),
