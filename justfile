@@ -337,10 +337,20 @@ conformance-closure-scope:
 # both libc sets as gating HVPatch differentials. Closure mode rejects skips,
 # missing artifacts, filters, alternate backends, and an unavailable oracle.
 conformance-probes-closure: build
-    ./scripts/build-probes.sh --closure-arm64
+    #!/usr/bin/env bash
+    set -uo pipefail
+    ./scripts/build-probes.sh --closure-arm64 || exit $?
+    generic_status=0
     CARRICK_PROBE_MODE=closure CARRICK_PROBE_LANE=arm64 CARRICK_EXEC_BACKEND=hvpatch \
-      cargo test -p carrick-cli --test conformance conformance_probes -- --exact --nocapture
-    python3 scripts/conformance/closure-probe-scenarios.py
+      cargo test -p carrick-cli --test conformance conformance_probes -- --exact --nocapture \
+      || generic_status=$?
+    dedicated_status=0
+    python3 scripts/conformance/closure-probe-scenarios.py || dedicated_status=$?
+    if (( generic_status != 0 || dedicated_status != 0 )); then
+      printf 'closure probe phases failed: generic=%d dedicated=%d\n' \
+        "$generic_status" "$dedicated_status" >&2
+      exit 1
+    fi
 
 # Re-sign an already-built release binary (rarely needed on its own).
 sign:

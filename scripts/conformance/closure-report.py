@@ -55,18 +55,18 @@ def _totals(row: dict[str, Any], side: str) -> dict[str, int]:
     return totals
 
 
-def _pair_outcomes(row: dict[str, Any]) -> list[str]:
+def _assertion_pairs(row: dict[str, Any]) -> list[tuple[str, str, str]]:
     pairs = row.get("pairs")
     if not isinstance(pairs, dict):
         raise ReportError(f"result row {row.get('name')!r} lacks assertion pairs")
-    outcomes: list[str] = []
+    pairs_out: list[tuple[str, str, str]] = []
     for assertion, pair in pairs.items():
         if not isinstance(assertion, str) or not isinstance(pair, list) or len(pair) != 2:
             raise ReportError(f"result row {row.get('name')!r} has malformed assertion pair")
         if not all(isinstance(outcome, str) for outcome in pair):
             raise ReportError(f"result row {row.get('name')!r} has non-string outcomes")
-        outcomes.extend(pair)
-    return outcomes
+        pairs_out.append((assertion, pair[0], pair[1]))
+    return sorted(pairs_out)
 
 
 def _ratio(row: dict[str, Any]) -> float | None:
@@ -102,7 +102,7 @@ def summarize(scope: dict[str, Any], results: list[dict[str, Any]]) -> dict[str,
             f"missing={sorted(expected - actual)}, unexpected={sorted(actual - expected)})"
         )
 
-    categories: dict[str, list[str]] = {
+    categories: dict[str, Any] = {
         "semantic_gaps": [],
         "infrastructure_failures": [],
         "unexercised": [],
@@ -115,7 +115,7 @@ def summarize(scope: dict[str, Any], results: list[dict[str, Any]]) -> dict[str,
         row = by_name[name]
         carrick_totals = _totals(row, "carrick")
         docker_totals = _totals(row, "docker")
-        outcomes = _pair_outcomes(row)
+        pairs = _assertion_pairs(row)
         verdict = row.get("verdict")
         if verdict not in {
             "match",
@@ -132,29 +132,62 @@ def summarize(scope: dict[str, Any], results: list[dict[str, Any]]) -> dict[str,
         if ratio is not None:
             ratios[name] = ratio
 
-        unexercised = (
-            carrick_totals["skipped"] > 0
-            or docker_totals["skipped"] > 0
-            or any(outcome in {"skipped", "conf", "absent"} for outcome in outcomes)
-        )
         infrastructure = (
             carrick_totals["broken"] > 0
             or docker_totals["broken"] > 0
             or row["carrick"]["result"] in {"none", "empty"}
             or row["docker"]["result"] != "success"
-            or any(outcome == "broken" for outcome in outcomes)
+            or any("broken" in pair[1:] for pair in pairs)
             or verdict in {"carrick_crash", "timeout", "oracle_fail"}
         )
-        if unexercised:
-            categories["unexercised"].append(name)
-        elif infrastructure:
+        if infrastructure:
             categories["infrastructure_failures"].append(name)
-        elif verdict != "match" or any(outcome != "ok" for outcome in outcomes):
-            categories["semantic_gaps"].append(name)
-        elif ratio is not None and ratio >= PATHOLOGICAL_RATIO:
+
+        suite_has_assertion_gap = False
+        suite_has_unexercised = False
+        for assertion, carrick_outcome, docker_outcome in pairs:
+            assertion_row = {
+                "suite": name,
+                "assertion": assertion,
+                "carrick": carrick_outcome,
+                "docker": docker_outcome,
+            }
+            unexercised = {carrick_outcome, docker_outcome} & {
+                "skipped",
+                "conf",
+                "absent",
+            }
+            if unexercised:
+                categories["unexercised"].append(assertion_row)
+                suite_has_unexercised = True
+            semantic = "broken" not in {carrick_outcome, docker_outcome} and (
+                carrick_outcome != docker_outcome
+                or carrick_outcome in {"fail", "error", "xfail", "uxsuccess", "other"}
+                or docker_outcome in {"fail", "error", "xfail", "uxsuccess", "other"}
+            )
+            if semantic:
+                categories["semantic_gaps"].append(assertion_row)
+                suite_has_assertion_gap = True
+
+        valid = (
+            not infrastructure
+            and verdict == "match"
+            and bool(pairs)
+            and all(pair[1:] == ("ok", "ok") for pair in pairs)
+        )
+        if valid and ratio is not None and ratio >= PATHOLOGICAL_RATIO:
             categories["pathological"].append(name)
-        else:
+        elif valid:
             categories["verified"].append(name)
+        elif (
+            verdict != "match"
+            and not infrastructure
+            and not suite_has_assertion_gap
+            and not suite_has_unexercised
+        ):
+            raise ReportError(
+                f"result row {name!r} is non-match without an attributable assertion"
+            )
 
     categories["ratios"] = ratios
     categories["suite_count"] = len(results)
@@ -179,13 +212,17 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-GENERIC_PASS_RE = re.compile(r"^PASS arm64:(musl|gnu):([A-Za-z0-9_]+)$")
-SCENARIO_PASS_RE = re.compile(
-    r"^PASS CLOSURE_SCENARIO arm64:(musl|gnu):([A-Za-z0-9_]+) runner=([A-Za-z0-9_]+)$"
+PROBE_TERMINAL_RE = re.compile(
+    r"^CLOSURE_PROBE (GENERIC|SCENARIO) (PASS|FAIL|DIFF|SKIP|NOTE|ERROR) "
+    r"arm64:(musl|gnu):([A-Za-z0-9_]+)(?: runner=([A-Za-z0-9_]+))?$"
+)
+STANDALONE_PROBE_STATE_RE = re.compile(
+    r"^(?:PASS|FAIL|DIFF|SKIP|NOTE|ERROR|XFAIL|UNEXPECTED PASS) "
+    r"(?:CLOSURE_SCENARIO )?arm64:"
 )
 
 
-def validate_probe_log(log: str, inventory: dict[str, Any]) -> dict[str, int]:
+def validate_probe_log(log: str, inventory: dict[str, Any]) -> dict[str, Any]:
     generic = {
         name for name, row in inventory.items() if row.get("class") == "conformance" and row.get("runner") == "generic"
     }
@@ -196,34 +233,58 @@ def validate_probe_log(log: str, inventory: dict[str, Any]) -> dict[str, int]:
         raise ReportError(
             f"probe inventory denominator drifted: {len(generic)} generic, {len(dedicated)} dedicated"
         )
-    observed: list[tuple[str, str]] = []
+    observed: list[dict[str, str]] = []
     for line in log.splitlines():
-        if match := GENERIC_PASS_RE.fullmatch(line.strip()):
-            observed.append((match.group(1), match.group(2)))
-        elif match := SCENARIO_PASS_RE.fullmatch(line.strip()):
-            source = match.group(2)
-            runner = match.group(3)
-            if source not in dedicated or inventory[source].get("runner") != runner:
-                raise ReportError(f"scenario log row disagrees with inventory: {line.strip()}")
-            observed.append((match.group(1), source))
+        terminal = line.strip()
+        match = PROBE_TERMINAL_RE.fullmatch(terminal)
+        if match:
+            kind, status, libc, source, runner = match.groups()
+            if kind == "GENERIC":
+                if source not in generic or runner is not None:
+                    raise ReportError(f"generic log row disagrees with inventory: {terminal}")
+            elif (
+                source not in dedicated
+                or runner is None
+                or inventory[source].get("runner") != runner
+            ):
+                raise ReportError(f"scenario log row disagrees with inventory: {terminal}")
+            observed.append(
+                {
+                    "kind": kind.lower(),
+                    "status": status,
+                    "libc": libc,
+                    "source": source,
+                    "runner": runner or "generic",
+                }
+            )
+        elif terminal.startswith("CLOSURE_PROBE ") or STANDALONE_PROBE_STATE_RE.match(terminal):
+            raise ReportError(f"malformed or standalone probe terminal state: {terminal}")
     expected = {(libc, source) for libc in PROBE_LIBCS for source in generic | dedicated}
-    duplicates = sorted(row for row, count in Counter(observed).items() if count > 1)
-    actual = set(observed)
+    keys = [(row["libc"], row["source"]) for row in observed]
+    duplicates = sorted(row for row, count in Counter(keys).items() if count > 1)
+    actual = set(keys)
     if duplicates or actual != expected:
         raise ReportError(
             "probe log does not close both arm64 libc sets "
             f"(rows={len(observed)}, duplicates={duplicates}, "
             f"missing={sorted(expected - actual)}, unexpected={sorted(actual - expected)})"
         )
+    failures = [row for row in observed if row["status"] in {"FAIL", "DIFF"}]
+    infrastructure = [row for row in observed if row["status"] in {"ERROR", "NOTE"}]
+    unexercised = [row for row in observed if row["status"] in {"SKIP", "NOTE"}]
     return {
         "sources": len(generic | dedicated),
         "rows": len(observed),
+        "passed": sum(row["status"] == "PASS" for row in observed),
         "generic_sources": len(generic),
         "dedicated_sources": len(dedicated),
+        "failures": failures,
+        "infrastructure_failures": infrastructure,
+        "unexercised": unexercised,
     }
 
 
-def _table(summary: dict[str, Any], category: str) -> str:
+def _suite_table(summary: dict[str, Any], category: str) -> str:
     names = summary[category]
     if not names:
         return "_None._\n"
@@ -234,8 +295,36 @@ def _table(summary: dict[str, Any], category: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _assertion_table(summary: dict[str, Any], category: str) -> str:
+    rows = summary[category]
+    if not rows:
+        return "_None._\n"
+    lines = [
+        "| Suite | Assertion | Carrick | Docker | Mechanism cluster |",
+        "|---|---|---|---|---|",
+    ]
+    for row in rows:
+        lines.append(
+            f"| `{row['suite']}` | `{row['assertion']}` | `{row['carrick']}` | "
+            f"`{row['docker']}` | unclustered |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _probe_table(rows: list[dict[str, str]]) -> str:
+    if not rows:
+        return "_None._\n"
+    lines = ["| Libc | Source | Runner | Status |", "|---|---|---|---|"]
+    for row in rows:
+        lines.append(
+            f"| `{row['libc']}` | `{row['source']}` | `{row['runner']}` | "
+            f"`{row['status']}` |"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def render_ledger(
-    scope: dict[str, Any], summary: dict[str, Any], probes: dict[str, int], results_path: Path, probe_path: Path
+    scope: dict[str, Any], summary: dict[str, Any], probes: dict[str, Any], results_path: Path, probe_path: Path
 ) -> str:
     images = scope.get("images", {})
     image_lines = [
@@ -263,12 +352,21 @@ def render_ledger(
         f"- Probe rows: {probes['rows']} (arm64 musl + GNU)",
     ]
     for title, key in [
-        ("Semantic gaps", "semantic_gaps"),
-        ("Infrastructure failures", "infrastructure_failures"),
+        ("Semantic assertion gaps", "semantic_gaps"),
         ("Unexercised assertions", "unexercised"),
+    ]:
+        sections.extend(["", f"## {title}", "", _assertion_table(summary, key).rstrip()])
+    for title, key in [
+        ("Suite infrastructure failures", "infrastructure_failures"),
         ("Valid completing >=10x pathology", "pathological"),
     ]:
-        sections.extend(["", f"## {title}", "", _table(summary, key).rstrip()])
+        sections.extend(["", f"## {title}", "", _suite_table(summary, key).rstrip()])
+    for title, key in [
+        ("Probe semantic failures", "failures"),
+        ("Probe infrastructure failures", "infrastructure_failures"),
+        ("Probe unexercised rows", "unexercised"),
+    ]:
+        sections.extend(["", f"## {title}", "", _probe_table(probes[key]).rstrip()])
     sections.append("")
     return "\n".join(sections)
 

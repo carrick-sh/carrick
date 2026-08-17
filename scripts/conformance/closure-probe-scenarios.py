@@ -21,6 +21,9 @@ Source = namedtuple("Source", "name runner")
 RunnerCommand = namedtuple("RunnerCommand", "runner test_target sources")
 Plan = namedtuple("Plan", "sources commands")
 CompletedRow = namedtuple("CompletedRow", "libc source runner")
+CommandResult = namedtuple("CommandResult", "status output detail")
+TerminalRow = namedtuple("TerminalRow", "libc source runner status detail")
+TERMINAL_STATUSES = {"PASS", "FAIL", "DIFF", "SKIP", "NOTE", "ERROR"}
 
 
 class ScenarioError(RuntimeError):
@@ -70,21 +73,22 @@ def expected_rows(plan: Plan) -> list[CompletedRow]:
     )
 
 
-def validate_completed(plan: Plan, completed: list[CompletedRow]) -> None:
-    expected = expected_rows(plan)
-    duplicates = sorted(row for row, count in Counter(completed).items() if count > 1)
-    if duplicates or Counter(completed) != Counter(expected):
-        expected_set = set(expected)
-        actual_set = set(completed)
+def validate_completed(plan: Plan, completed: list[TerminalRow]) -> None:
+    expected = {(row.libc, row.source, row.runner) for row in expected_rows(plan)}
+    keys = [(row.libc, row.source, row.runner) for row in completed]
+    duplicates = sorted(row for row, count in Counter(keys).items() if count > 1)
+    actual = set(keys)
+    invalid_statuses = sorted({row.status for row in completed} - TERMINAL_STATUSES)
+    if duplicates or actual != expected or invalid_statuses:
         raise ScenarioError(
             "dedicated scenario postcondition failed "
             f"(rows={len(completed)}, duplicates={duplicates}, "
-            f"missing={sorted(expected_set - actual_set)}, "
-            f"unexpected={sorted(actual_set - expected_set)})"
+            f"missing={sorted(expected - actual)}, "
+            f"unexpected={sorted(actual - expected)}, invalid_statuses={invalid_statuses})"
         )
 
 
-def _run_command(root: Path, command: RunnerCommand, libc: str) -> str:
+def _run_command(root: Path, command: RunnerCommand, libc: str) -> CommandResult:
     env = os.environ.copy()
     env.update(
         {
@@ -108,40 +112,67 @@ def _run_command(root: Path, command: RunnerCommand, libc: str) -> str:
     ]
     if command.test_target == "serve":
         args.append("--ignored")
-    process = subprocess.run(
-        args,
-        cwd=root,
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        process = subprocess.run(
+            args,
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        return CommandResult("ERROR", "", f"cannot start cargo test: {error}")
     output = process.stdout + process.stderr
-    if process.returncode != 0:
-        raise ScenarioError(
-            f"scenario {command.runner} [{libc}] exited {process.returncode}:\n{output}"
-        )
-    if "running 1 test" not in output or f"test {command.runner} ... ok" not in output:
-        raise ScenarioError(
-            f"scenario {command.runner} [{libc}] did not execute exactly once:\n{output}"
-        )
-    if re.search(rf"\b(?:SKIP|NOTE)\s+{re.escape(command.runner)}\b", output):
-        raise ScenarioError(
-            f"scenario {command.runner} [{libc}] did not fully gate:\n{output}"
-        )
-    return output
+    if re.search(rf"\bSKIP\s+{re.escape(command.runner)}\b", output):
+        return CommandResult("SKIP", output, "scenario skipped")
+    if re.search(rf"\bNOTE\s+{re.escape(command.runner)}\b", output):
+        return CommandResult("NOTE", output, "scenario did not have a complete oracle")
+    ran_once = output.count("running 1 test") == 1
+    passed = output.count(f"test {command.runner} ... ok") == 1
+    failed = output.count(f"test {command.runner} ... FAILED") == 1
+    if process.returncode == 0 and ran_once and passed:
+        return CommandResult("PASS", output, "")
+    if process.returncode != 0 and ran_once and failed:
+        return CommandResult("FAIL", output, f"cargo test exited {process.returncode}")
+    return CommandResult(
+        "ERROR",
+        output,
+        f"cargo test exited {process.returncode} without exactly one terminal test result",
+    )
 
 
-def run_plan(root: Path, plan: Plan) -> list[CompletedRow]:
-    completed: list[CompletedRow] = []
+def run_plan(
+    root: Path,
+    plan: Plan,
+    *,
+    command_runner=_run_command,
+) -> list[TerminalRow]:
+    completed: list[TerminalRow] = []
     for libc in LIBCS:
         for command in plan.commands:
-            output = _run_command(root, command, libc)
-            sys.stdout.write(output)
+            try:
+                result = command_runner(root, command, libc)
+            except Exception as error:  # fail this command closed; continue the matrix
+                result = CommandResult("ERROR", "", f"command runner raised: {error}")
+            if not isinstance(result, CommandResult) or result.status not in TERMINAL_STATUSES:
+                result = CommandResult(
+                    "ERROR",
+                    "",
+                    f"command runner returned a malformed result: {result!r}",
+                )
+            sys.stdout.write(result.output)
             for source in command.sources:
-                row = CompletedRow(libc, source, command.runner)
+                row = TerminalRow(
+                    libc,
+                    source,
+                    command.runner,
+                    result.status,
+                    result.detail,
+                )
                 completed.append(row)
                 print(
-                    f"PASS CLOSURE_SCENARIO arm64:{libc}:{source} runner={command.runner}"
+                    f"CLOSURE_PROBE SCENARIO {result.status} "
+                    f"arm64:{libc}:{source} runner={command.runner}"
                 )
     validate_completed(plan, completed)
     return completed
@@ -162,7 +193,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"dedicated closure plan: {len(plan.sources)} sources, {len(plan.commands)} runners")
             return 0
         completed = run_plan(root, plan)
-        print(f"dedicated closure scenarios checked: {len(completed)} arm64 libc/source rows")
+        red = [row for row in completed if row.status != "PASS"]
+        print(
+            f"dedicated closure scenarios checked: {len(completed)} arm64 libc/source rows; "
+            f"{len(red)} red"
+        )
+        if red:
+            return 1
     except (OSError, json.JSONDecodeError, ScenarioError) as error:
         print(f"closure scenario error: {error}", file=sys.stderr)
         return 1
