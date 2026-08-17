@@ -62,6 +62,7 @@ class ClosureScopeTest(unittest.TestCase):
             self.manifest,
             self.images,
             source_head="a" * 40,
+            tooling_source_head="b" * 40,
             binary_path=self.binary,
         )
 
@@ -83,8 +84,16 @@ class ClosureScopeTest(unittest.TestCase):
 
     def test_scope_records_source_binary_manifest_and_image_identities(self):
         scope = self._freeze()
-        for key in ["source_head", "binary_sha256", "manifest_sha256", "images"]:
+        for key in [
+            "source_head",
+            "tooling_source_head",
+            "binary_sha256",
+            "manifest_sha256",
+            "images",
+        ]:
             self.assertIn(key, scope)
+        self.assertEqual(scope["source_head"], "a" * 40)
+        self.assertEqual(scope["tooling_source_head"], "b" * 40)
         self.assertEqual(
             scope["suite_counts_by_ecosystem"], {"go": 1064, "ltp": 1063}
         )
@@ -97,6 +106,7 @@ class ClosureScopeTest(unittest.TestCase):
                 self.manifest,
                 unresolved,
                 source_head="a" * 40,
+                tooling_source_head="b" * 40,
                 binary_path=self.binary,
             )
 
@@ -121,6 +131,7 @@ class ClosureScopeTest(unittest.TestCase):
                         self.manifest,
                         images,
                         source_head="a" * 40,
+                        tooling_source_head="b" * 40,
                         binary_path=self.binary,
                     )
 

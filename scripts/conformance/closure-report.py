@@ -439,6 +439,7 @@ def render_ledger(
         "## Provenance",
         "",
         f"- Source HEAD: `{scope.get('source_head', 'unknown')}`",
+        f"- Tooling/controller source HEAD: `{scope.get('tooling_source_head', 'unknown')}`",
         f"- Signed Carrick SHA-256: `{scope.get('binary_sha256', 'unknown')}`",
         f"- Manifest SHA-256: `{scope.get('manifest_sha256', 'unknown')}`",
         f"- Raw suite artifact: `{results_path}`",
