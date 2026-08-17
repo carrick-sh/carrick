@@ -60,7 +60,7 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use carrick_abi::{NsGid, NsUid};
 
@@ -400,14 +400,22 @@ pub(crate) fn set_single_process_oom_score_adj(value: i32) {
     OOM_SCORE_ADJ_SINGLE_PROCESS.store(value, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The instant carrick's guest "booted" (first time anything asks). Drives
-/// `/proc/uptime` and `/proc/stat`'s `btime` so they report seconds-since-boot
-/// rather than seconds-since-the-UNIX-epoch (the old bug made uptime ~56 years
-/// and btime 0). Lazily initialised; close enough to process start for any
-/// uptime/age math a guest performs.
-fn boot_instant() -> Instant {
-    static BOOT: OnceLock<Instant> = OnceLock::new();
-    *BOOT.get_or_init(Instant::now)
+/// Seconds since the guest booted, for `/proc/uptime` field 1 and (via
+/// [`boot_epoch_secs`]) `/proc/stat`'s `btime`.
+///
+/// This is `CLOCK_BOOTTIME`, because on Linux that is exactly what
+/// `/proc/uptime` field 1 reports — so it MUST be the same authority the
+/// `clock_gettime(CLOCK_BOOTTIME)` path uses, not a second one.
+///
+/// It used to be a lazily-initialised `OnceLock<Instant>` seeded on the FIRST
+/// READ, which made the first reader see `0.00`. libuv's `uv_uptime()` slurps
+/// `/proc/uptime` and asserts `uptime > 0` (`ASSERT_GT` in
+/// `test-platform-output.c`), so the very first read failed — and the
+/// `CLOCK_BOOTTIME` fallback in libuv never ran, because the slurp had
+/// *succeeded*. It also disagreed with `clock_gettime(CLOCK_BOOTTIME)`, which
+/// already reported host uptime: two sources of truth for one fact.
+fn boot_elapsed() -> Duration {
+    crate::dispatch::boottime_duration()
 }
 
 /// 16 cryptographically-random bytes (best-effort; all-zero on the rare
@@ -2631,7 +2639,7 @@ fn synthetic_proc_uptime() -> String {
     // Field 1 is seconds since (guest) boot; field 2 is cumulative idle time
     // across all CPUs (>= field 1 on a multi-CPU box). Both 2-dp floats. The
     // old code emitted epoch-seconds here, yielding a ~56-year "uptime".
-    let up = boot_instant().elapsed().as_secs_f64();
+    let up = boot_elapsed().as_secs_f64();
     let idle = up * crate::host_facts::logical_cpu_count().max(1) as f64;
     format!("{up:.2} {idle:.2}\n")
 }
@@ -2643,7 +2651,7 @@ fn boot_epoch_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    now.saturating_sub(boot_instant().elapsed().as_secs())
+    now.saturating_sub(boot_elapsed().as_secs())
 }
 
 fn synthetic_proc_meminfo() -> &'static [u8] {
@@ -3853,6 +3861,48 @@ fn per_thread_comm(tid: crate::thread::ThreadId, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/proc/uptime` field 1 must be > 0 on the FIRST read, and must agree with
+    /// `clock_gettime(CLOCK_BOOTTIME)`.
+    ///
+    /// It was a lazily-initialised `OnceLock<Instant>` seeded by the first
+    /// reader, so the first read was always `0.00`. libuv's `uv_uptime()` slurps
+    /// this file and asserts `> 0`, and because the slurp SUCCEEDS its
+    /// `CLOCK_BOOTTIME` fallback never ran — `platform_output` failed on a
+    /// hard-zero. Reading it twice would have hidden the bug, which is why this
+    /// asserts on the very first call in the process.
+    #[test]
+    fn proc_uptime_is_nonzero_on_first_read_and_tracks_boottime() {
+        let text = synthetic_proc_uptime();
+        let mut fields = text.split_whitespace();
+        let up: f64 = fields
+            .next()
+            .expect("uptime field 1")
+            .parse()
+            .expect("field 1 parses as a float");
+        let idle: f64 = fields
+            .next()
+            .expect("uptime field 2")
+            .parse()
+            .expect("field 2 parses as a float");
+        assert!(
+            up > 0.0,
+            "/proc/uptime field 1 must be > 0 on the first read, got {up}"
+        );
+        // Field 2 is cumulative idle across all CPUs, so >= field 1.
+        assert!(idle >= up, "idle {idle} must be >= uptime {up}");
+
+        // Same authority as CLOCK_BOOTTIME, not a second clock. Allow a small
+        // delta for the time between the two reads.
+        let boottime = crate::dispatch::boottime_duration().as_secs_f64();
+        assert!(
+            (boottime - up).abs() < 5.0,
+            "/proc/uptime ({up}) must track CLOCK_BOOTTIME ({boottime})"
+        );
+
+        // btime is an absolute epoch second derived from the same clock.
+        assert!(boot_epoch_secs() > 0, "btime must be a real epoch second");
+    }
 
     #[test]
     fn hvpatch_proc_uses_authoritative_linux_thread_snapshot() {
