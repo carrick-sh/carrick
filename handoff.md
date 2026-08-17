@@ -129,6 +129,19 @@ leftovers. Post-integration focused and full closure runs make
 
 ## Current authoritative signed checkpoint
 
+> **SUPERSEDED 2026-08-17.** A full closure run has been taken on the
+> post-libuv artifact — see
+> `docs/perf-results/2026-08-17-closure-post-libuv/README.md`. Current numbers:
+> **1,201 MATCH / 926 INCOMPLETE, semantic gaps 2,947 (was 4,761), unexercised
+> 5,598 (was 7,775)**, on binary
+> `5ab52d7b893f56fa8caf8abf784b39d7d33fdca4a624802a1420f5489107eb34`. Every
+> count in the section below, and in `docs/conformance-closure-ledger.md`,
+> predates the `node-libuv` and `go-os`/`go-net` oracle repairs and must not be
+> quoted. The ledger itself has NOT been regenerated (that needs a probe-phase
+> log as well).
+
+## Superseded checkpoint (pre-libuv-repair)
+
 The post-SIGCHLD checkpoint is review-approved. The full Carrick phase ran all
 2,127 rows before the 84 Docker cache-miss rows. The strict probe phase emitted
 all 858 rows. No retries, waivers, or baseline blessing were used.
@@ -344,11 +357,38 @@ names.
    failure rate, so the probe is not yet reproducing the real condition.
    Instrument the actual failing run.
 
-Once libuv closes, move to the next correctness cluster. Per the ledger the
-largest remaining assertion fan-out is CPython multiprocessing/process
-isolation, then Go process/epoll, then broad LTP infrastructure — but re-run
-the closure gate first, because every recorded count predates the oracle
-repair.
+### Next clusters, from the fresh closure run
+
+Measured, not inferred — see `docs/perf-results/2026-08-17-closure-post-libuv/`.
+
+- **`ltp-mremap01`: 1,314 rows from ONE bug, already root-caused and reduced.**
+  Carrick cannot GROW a mapping outside the mmap arena even with
+  `MREMAP_MAYMOVE` (`dispatch/mem.rs` supports resize-down for the non-arena
+  case then falls through to an unconditional ENOMEM). Reducer: mmap one page
+  `MAP_SHARED|MAP_ANONYMOUS`, `mremap` it to two pages with `MREMAP_MAYMOVE` —
+  carrick EINVAL, Linux ok; the same with `MAP_PRIVATE` passes on both. Linux
+  is free to MOVE the mapping, which is what it does. Everything else in that
+  suite (1,313 TBROK and a segfault) is cascade from this one failure.
+- **CPython multiprocessing, ~946 rows, TWO distinct bugs.** `fork` and
+  `forkserver` emit ZERO assertions at 5-6x Docker's wall — a hang killed at
+  the budget, whose block-buffered stdout was discarded (AGENTS.md's crash
+  signature; recover with `run -t` or `stdbuf -o0`). `spawn` emits 88 at
+  **0.72x** — a fast crash, and the cheaper reducer. Do `spawn` first.
+- **`cpython-importlib` 351**, **`cpython-concurrent_futures` 239** (also a
+  fast crash at 0.62x), **`go-go_types` 574** (untriaged),
+  **`ltp-splice07` + `ltp-ioctl_ficlone04` 410** (LTP `tst_fd.c` fd-type
+  inventory differs, shifting every ordinal).
+- **`ltp-setpriority01` 198 is an ORACLE problem**, not a carrick gap: Docker
+  fails 120 of its own assertions because `setpriority` lowering needs
+  `CAP_SYS_NICE`, which Docker's default cap set drops. Confirm with and
+  without the capability, then grant it via `docker_flags` as fanotify and
+  add_key already do. It was NOT closed by the nice/ioprio scope fix.
+
+**Check the oracle first on any suite with a large `docker = absent` count.**
+Two of the three biggest "carrick gaps" this session were oracle defects
+(`node-libuv`'s `--user 65534`, `go-os`/`go-net`'s missing `-t`). Both looked
+identical from the ledger: a huge absent count plus an implausible performance
+ratio (145.02x and 67.02x, both of which were the oracle hanging).
 
 ### Also found, recorded rather than fixed
 
