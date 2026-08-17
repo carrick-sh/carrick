@@ -286,16 +286,25 @@ names.
      a1->source_addr.sin6_family == PF_INET6
    ```
 
-   Host mode resolves fine. Already RULED OUT by measurement, so do not repeat
-   it: `getsockname` after `connect` on an `AF_INET6` UDP socket returns the
-   right family in both modes, for `::1` and for a v4-mapped
-   `::ffff:127.0.0.1`, matching the Docker oracle exactly; and bridge-mode
-   `/proc/net/if_inet6` correctly holds only `::1` on `lo`. Next suspect is the
-   synthetic netlink `RTM_GETADDR` reply glibc's `__check_pf` parses
-   (`dispatch/net/support.rs`) — note it emits `RT_SCOPE_UNIVERSE` for every
-   non-loopback address where a real `fe80::` carries `RT_SCOPE_LINK` (253).
-   The same resolution path also produced a fork-time ObjC abort
-   (`+[NSNumber initialize] … Crashing instead`) earlier in the workload.
+   Host mode resolves fine. The same resolution path also produced a fork-time
+   ObjC abort (`+[NSNumber initialize] … Crashing instead`) earlier in the
+   workload. It is PRE-EXISTING — it reproduces on the network model from
+   before this campaign touched it.
+
+   Already RULED OUT by measurement, so do not repeat any of it:
+   - `getsockname` after `connect` on an `AF_INET6` UDP socket returns the
+     right family in both modes, for `::1` and for a v4-mapped
+     `::ffff:127.0.0.1`, matching the Docker oracle exactly;
+   - bridge-mode `/proc/net/if_inet6` correctly holds only `::1` on `lo`;
+   - the synthetic netlink `RTM_GETADDR` reply, which really did differ and
+     has since been corrected to match the oracle's shape byte for byte —
+     the crash survives it.
+
+   What still correlates: bridge mode has NO non-loopback IPv6 address while
+   host mode does. Docker's netns is in the same position and does not crash.
+   Every cheap differential hypothesis is now exhausted, so the next step is to
+   observe the actual syscall sequence glibc makes in each mode — `carrick
+   trace` on the Carrick side, bpftrace inside Docker for ground truth.
 
 2. **The netns asymmetry** (`tcp_connect6_link_local` 370 inversion,
    `udp_multicast_join6` 472). `carrick run` defaults to `--network host` while
