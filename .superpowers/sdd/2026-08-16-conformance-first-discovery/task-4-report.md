@@ -574,3 +574,71 @@ exit 0
 
 The pre-existing modified `scripts/conformance/oracle-cache.jsonl` remains the
 sole unstaged path. No broad measurement or target-artifact operation occurred.
+
+## Runtime fix round 5/5
+
+The final reviewer round tightened the post-assertion/process-failure exception
+without running guests or Docker and without touching target artifacts or the
+dirty oracle cache.
+
+### Red-first evidence
+
+Three exact near-miss fixtures were added before changing production. The
+previous round's condition incorrectly accepted all three as infrastructure:
+
+```text
+FAIL: test_post_assertion_exception_rejects_inconsistent_totals_and_cardinality
+
+case='partial-pass-total'
+n=2 passed=1 pairs=1
+AssertionError: ReportError not raised
+
+case='failed-total-with-ok-pair'
+n=1 passed=0 failed=1 pairs=1
+AssertionError: ReportError not raised
+
+case='assertion-cardinality-mismatch'
+n=3 passed=3 pairs=1
+AssertionError: ReportError not raised
+```
+
+### Exact consistency fix
+
+The suite-level post-assertion exception now requires all of the following:
+
+- verdict `incomplete`;
+- Carrick `failure` and Docker `success`;
+- both totals nonzero and identical;
+- for both sides, `n == passed` and `failed == broken == skipped == 0`;
+- nonempty assertion pairs with `len(pairs) == n` on both sides;
+- every pair exactly `ok/ok`.
+
+The existing two-assertion all-pass fixture representing the real
+`ltp-msgstress01`/`ltp-shmget04` shape remains an infrastructure failure. The
+three inconsistent shapes now continue to the unattributable guard and raise,
+and the `fail/ok` fixture remains assertion-level semantic evidence.
+
+### Green verification
+
+```text
+python3 -m unittest discover -s scripts/tests -p 'test_*closure*.py'
+Ran 23 tests; OK
+
+python3 -m py_compile scripts/conformance/closure-report.py \
+  scripts/tests/test_closure_report.py
+exit 0
+
+cargo fmt --check
+exit 0
+
+git diff --check
+exit 0
+```
+
+### Commit and retained external state
+
+- `70d1684b7434977d30cbe5ab9746e6e84439c4a6`
+  `fix(conformance): tighten post-assertion evidence`
+
+The refreshed `scripts/conformance/oracle-cache.jsonl` remains the sole dirty,
+unstaged path. No runtime or target-artifact command ran.
