@@ -443,8 +443,16 @@ pub fn last_sender_for(signum: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_test() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn pending_bit_basics() {
+        let _lock = lock_test();
         assert_eq!(pending_bit(1), Some(1));
         assert_eq!(pending_bit(64), Some(1 << 63));
         assert_eq!(pending_bit(0), None);
@@ -453,6 +461,7 @@ mod tests {
 
     #[test]
     fn publish_take_thread_pending() {
+        let _lock = lock_test();
         forget_thread(4242);
         publish_pending_for(4242, 9);
         publish_pending_for(4242, 17);
@@ -469,6 +478,7 @@ mod tests {
 
     #[test]
     fn proc_pending_is_process_global() {
+        let _lock = lock_test();
         clear_proc_pending();
         publish_process_signal(15);
         assert!(has_process_pending());
@@ -486,6 +496,7 @@ mod tests {
     /// re-arm is platform GLUE, unit-tested at its own layer.)
     #[test]
     fn supervisor_fork_neutral_clears_empty_all_state() {
+        let _lock = lock_test();
         let tid = 0x5757_i32;
         // Seed each neutral store.
         publish_pending_for(tid, 10); // thread-pending (SIGUSR1)
@@ -521,6 +532,7 @@ mod tests {
     /// would strand the re-published signal).
     #[test]
     fn tid_hint_fast_path_never_hides_published_signal() {
+        let _lock = lock_test();
         let tid = 0x7a11_i32;
         let colliding = tid + 64; // same hint bit
         forget_thread(tid);
@@ -561,6 +573,7 @@ mod tests {
     /// lock-free fast path). Bounded, deterministic outcome.
     #[test]
     fn tid_hint_concurrent_publish_take_loses_nothing() {
+        let _lock = lock_test();
         let tid = 0x7b22_i32;
         forget_thread(tid);
         const ROUNDS: usize = 2000;
