@@ -2755,44 +2755,6 @@ fn probe_vm_slot_budget(
     }
 }
 
-/// vCPU budget for sibling guest threads.
-///
-/// Hypervisor.framework caps the number of vCPUs that may exist CONCURRENTLY in
-/// a VM (`hv_vm_get_max_vcpu_count`, 64 on this class of host). Carrick also
-/// should not ask the bounded M:N scheduler to run more HVF vCPU handles than
-/// there are physical host cores: extra runnable guest threads should queue in
-/// the scheduler, not oversubscribe HVF and turn conformance into host-kernel
-/// contention.
-///
-/// Linux has no such cap: those 100 threads just run. To preserve that observable
-/// behavior we DON'T fail clone; instead the bounded scheduler parks excess
-/// guest threads until a vCPU slot frees. The guest thread is created eagerly
-/// (clone succeeds, matching Linux); it simply may not get scheduled onto a real
-/// vCPU until the live count drops below budget. Threads that decouple through a
-/// queue (producers exit → free slots → queued consumers admitted) therefore
-/// complete instead of deadlocking.
-///
-/// The shared M:N scheduler caps runnable sibling threads inside one process.
-/// A separate admission permit caps one-vCPU HVF VMs across a fork tree: otherwise
-/// every fork child receives a fresh process-local scheduler and a plain LTP fork
-/// storm can create hundreds of live VMs until HVF returns `HV_NO_RESOURCES`.
-/// That global creation permit is sized from the measured system-wide vCPU
-/// ceiling (`GLOBAL_VCPU_CEILING`, 120 — a soft margin under the ~126 the host
-/// sustains), NOT `hvf_cap_budget()`/`hv_vm_get_max_vcpu_count` (which is the
-/// PER-VM max, 64, and was the wrong number the old cap of 12 was clamped from).
-/// Its ONLY job is bounding concurrent VM/vCPU CREATION in a fork storm's
-/// pre-block window; guest EXECUTION is already bounded by the per-process M:N
-/// scheduler and the Darwin kernel time-slicing host cores. The TRUE hard limit
-/// is discovered at runtime by `HV_NO_RESOURCES` and absorbed with park+retry
-/// (`create_with_no_resources_backpressure` / `park_for_slot`).
-/// Initial VM creation, plain fork rebuilds, and shared-wait resumes all pass
-/// through this same creation gate.
-///
-/// Vfork rebuilds deliberately bypass that global permit. The vfork parent waits
-/// inside the fork handler itself until the child execs/exits, so admitting that
-/// parent and child through the same cross-process slots can self-deadlock. Execve
-/// rebuilds also bypass for the same vfork-child progress reason.
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn virtual_machine_with_private_signals_blocked(
     config: applevisor::vm::VirtualMachineConfig,

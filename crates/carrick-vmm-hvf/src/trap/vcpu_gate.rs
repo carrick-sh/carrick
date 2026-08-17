@@ -1,3 +1,20 @@
+//! # vCPU Gate & Admission
+//!
+//! Hypervisor.framework caps the number of vCPUs that may exist CONCURRENTLY in
+//! a VM (`hv_vm_get_max_vcpu_count`, 64 on this class of host). Carrick also
+//! should not ask the bounded M:N scheduler to run more HVF vCPU handles than
+//! there are physical host cores: extra runnable guest threads should queue in
+//! the scheduler, not oversubscribe HVF and turn conformance into host-kernel
+//! contention.
+//!
+//! Linux has no such cap: those 100 threads just run. To preserve that observable
+//! behavior we DON'T fail clone; instead the bounded scheduler parks excess
+//! guest threads until a vCPU slot frees. The guest thread is created eagerly
+//! (clone succeeds, matching Linux); it simply may not get scheduled onto a real
+//! vCPU until the live count drops below budget. Threads that decouple through a
+//! queue (producers exit → free slots → queued consumers admitted) therefore
+//! complete instead of deadlocking.
+
 use std::sync::{Condvar, Mutex, OnceLock};
 
 /// Slots we keep in reserve below the raw HVF cap so a multithreaded fork can
