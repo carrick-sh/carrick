@@ -289,6 +289,33 @@ fn socket_addr_to_linux_sockaddr(addr: std::net::SocketAddr) -> Option<Vec<u8>> 
     }
 }
 
+/// The RAW `sockaddr` bytes `getsockname(2)` reports for `host_fd`.
+///
+/// Unlike [`host_socket_addr`] this does no family-specific parsing, so it can
+/// key a table (see `reuseport`) for any address family — including ones
+/// Carrick does not otherwise model, which must never collide with ones it
+/// does.
+/// Whether `host_fd` has something to read RIGHT NOW, without consuming it.
+/// Used to ask whether a reuseport sibling is holding the group's work.
+fn host_fd_has_pending_input(host_fd: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: host_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    unsafe { libc::poll(&mut pfd as *mut _, 1, 0) > 0 && pfd.revents & libc::POLLIN != 0 }
+}
+
+fn host_sockaddr_bytes(host_fd: i32) -> Option<Vec<u8>> {
+    let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
+    let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
+    let rc =
+        unsafe { libc::getsockname(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _) };
+    rc.host_syscall_errno().ok()?;
+    let used = (sa_len as usize).min(sa.len());
+    (used > 0).then(|| sa[..used].to_vec())
+}
+
 fn host_socket_addr(host_fd: i32, _family: i32, peer: bool) -> Option<std::net::SocketAddr> {
     let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
     let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
@@ -301,7 +328,15 @@ fn host_socket_addr(host_fd: i32, _family: i32, peer: bool) -> Option<std::net::
     let used = (sa_len as usize).min(sa.len());
     host_sockaddr_to_socket_addr(&sa[..used])
 }
+mod reuseport;
 mod support;
+
+/// Drop `host_fd` from any `SO_REUSEPORT` group. Called from the close path in
+/// `dispatch`; see `reuseport::leave`.
+pub(in crate::dispatch) fn reuseport_leave(host_fd: i32) {
+    reuseport::leave(host_fd);
+}
+
 use support::*;
 pub(super) use support::{drain_netlink_queue, set_host_nonblocking};
 
@@ -925,6 +960,25 @@ impl SyscallDispatcher {
                     }
                     if pfd.revents & libc::POLLERR != 0 {
                         ready |= LINUX_EPOLLERR;
+                    }
+                }
+                // SO_REUSEPORT readability is a GROUP property. Darwin parks
+                // all incoming work on the last binder, so a member's own host
+                // socket is usually quiet while the group has plenty; and the
+                // member whose turn it is not must stay quiet even when its own
+                // socket does hold something, or two workers race for one
+                // connection instead of alternating. Both directions are
+                // corrected here. `is_shared` is false for every ordinary
+                // socket, which keeps them on the untouched path.
+                if requested_events & LINUX_EPOLLIN != 0 && reuseport::is_shared(host_fd.get()) {
+                    let group_has_work = ready & LINUX_EPOLLIN != 0
+                        || reuseport::siblings(host_fd.get())
+                            .into_iter()
+                            .any(host_fd_has_pending_input);
+                    if group_has_work && reuseport::is_turn(host_fd.get()) {
+                        ready |= LINUX_EPOLLIN;
+                    } else {
+                        ready &= !LINUX_EPOLLIN;
                     }
                 }
                 // macOS `poll(2)` does NOT surface TCP urgent/out-of-band data
@@ -1843,6 +1897,20 @@ impl SyscallDispatcher {
                         ready |= LINUX_POLLHUP;
                     }
                 }
+                // SO_REUSEPORT readability is a GROUP property — see the
+                // matching block in `epoll_ready_events`. No-op for any socket
+                // that is not in a multi-member group.
+                if requested_events & LINUX_POLLIN != 0 && reuseport::is_shared(host_fd.raw()) {
+                    let group_has_work = ready & LINUX_POLLIN != 0
+                        || reuseport::siblings(host_fd.raw())
+                            .into_iter()
+                            .any(host_fd_has_pending_input);
+                    if group_has_work && reuseport::is_turn(host_fd.raw()) {
+                        ready |= LINUX_POLLIN;
+                    } else {
+                        ready &= !LINUX_POLLIN;
+                    }
+                }
             }
             OpenDescription::Netlink { recv_queue, .. } => {
                 // A netlink socket is "readable" once a dump response has
@@ -2589,24 +2657,45 @@ impl SyscallDispatcher {
         let nonblocking = self.io_is_nonblocking(fd, 0);
         // accept(2) has no SO_*TIMEO bound on Linux — no per-fd timeout.
         let accepted_source = std::cell::RefCell::new(None::<Vec<u8>>);
+        // SO_REUSEPORT: Darwin parks EVERY incoming connection on the last
+        // socket that bound the addr:port, so this member's own host socket is
+        // very likely empty even when the group has work. Try it first (the
+        // common, ungrouped case costs nothing), then take from the sibling
+        // holding it. `siblings` is empty unless this fd is in a group with
+        // more than one member, so an ordinary listener never leaves the
+        // original path.
+        let accept_targets: Vec<i32> = std::iter::once(host_fd)
+            .chain(reuseport::steal_targets(host_fd))
+            .collect();
         let outcome = self.blocking_io(host_fd, IoDir::Read, nonblocking, None, || {
-            let mut sa_storage = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
-            let mut sa_len: libc::socklen_t = sa_storage.len() as libc::socklen_t;
-            let new_host = unsafe {
-                libc::accept(
-                    host_fd,
-                    sa_storage.as_mut_ptr() as *mut _,
-                    &mut sa_len as *mut _,
-                )
-            };
-            let new_host = new_host.host_syscall_errno()?;
-            if addr_addr != 0 && addrlen_addr != 0 {
-                let used = (sa_len as usize).min(sa_storage.len());
-                accepted_source
-                    .borrow_mut()
-                    .replace(sa_storage[..used].to_vec());
+            let mut last = Err(LINUX_EAGAIN);
+            for target in accept_targets {
+                let mut sa_storage = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
+                let mut sa_len: libc::socklen_t = sa_storage.len() as libc::socklen_t;
+                let new_host = unsafe {
+                    libc::accept(
+                        target,
+                        sa_storage.as_mut_ptr() as *mut _,
+                        &mut sa_len as *mut _,
+                    )
+                };
+                match new_host.host_syscall_errno() {
+                    Ok(new_host) => {
+                        if addr_addr != 0 && addrlen_addr != 0 {
+                            let used = (sa_len as usize).min(sa_storage.len());
+                            accepted_source
+                                .borrow_mut()
+                                .replace(sa_storage[..used].to_vec());
+                        }
+                        return Ok(new_host as i64);
+                    }
+                    // Only an empty queue is worth trying the next member for.
+                    // Any other errno is this accept's real answer.
+                    Err(e) if e == LINUX_EAGAIN => last = Err(e),
+                    Err(e) => return Err(e),
+                }
             }
-            Ok(new_host as i64)
+            last
         });
         let new_host = match outcome {
             DispatchOutcome::Returned { value } => value as i32,
@@ -2614,6 +2703,9 @@ impl SyscallDispatcher {
             // accept on readiness.
             other => return other,
         };
+        // This member took the group's turn; hand it to the next one so two
+        // symmetric workers alternate strictly rather than racing.
+        reuseport::advance_turn(host_fd);
         crate::event_ring::rec(crate::event_ring::ACCEPT, host_fd, new_host, 0);
         let accepted_source = accepted_source.into_inner();
         let accept_protocol = (family == libc::AF_INET && type_ == libc::SOCK_STREAM)
@@ -5514,6 +5606,17 @@ impl SyscallDispatcher {
             if let Err(errno) = bind_result {
                 return Ok(DispatchOutcome::errno(errno));
             }
+            // SO_REUSEPORT: join this host addr:port's group. Darwin lets every
+            // member bind but then delivers ALL traffic to the last binder, so
+            // Carrick has to distribute — see `reuseport`. Keyed on the address
+            // the HOST actually bound (read back, not the requested one, which
+            // may carry port 0 or have been rewritten above).
+            if this.socket_reuseport(fd)
+                && let Some(socket_type) = this.socket_guest_type(fd)
+                && let Some(bound) = host_sockaddr_bytes(host_fd.get())
+            {
+                reuseport::join(reuseport::GroupKey::new(socket_type, bound), host_fd.get());
+            }
             if let Some((guest_local, protocol)) = rewritten_bind
                 && let Some(host_local) = host_socket_addr(host_fd.get(), family, false)
             {
@@ -6256,6 +6359,9 @@ impl SyscallDispatcher {
                 .and_then(|f| f.description.read().recv_timeout());
             let recv_protocol = this.socket_port_protocol(fd);
             let received_source = std::cell::RefCell::new(None::<Vec<u8>>);
+            let recv_targets: Vec<i32> = std::iter::once(host_fd.get())
+                .chain(reuseport::steal_targets(host_fd.get()))
+                .collect();
             let outcome = this.blocking_io(host_fd.get(), IoDir::Read, nonblocking, recv_to, || {
                 let host_write_ranges = [(buf_addr, len)];
                 let host_write = zero_copy.then(|| {
@@ -6263,34 +6369,66 @@ impl SyscallDispatcher {
                 });
                 let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
                 let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
-                let (n, used_addr) = if src_addr == 0 {
-                    (
+                let used_addr = src_addr != 0;
+                // SO_REUSEPORT: Darwin delivers every datagram to the last
+                // socket that bound the addr:port, so take from the sibling
+                // holding the group's work when this member's own socket is
+                // empty. `recv_targets` is just this fd unless it is in a
+                // multi-member group.
+                let mut n = -1isize;
+                let mut last_errno = None;
+                // Re-stated locally (idempotent) so the non-blocking guarantee
+                // is visible at BOTH recvfrom call sites below rather than only
+                // at the outer binding — the host fd is O_NONBLOCK and this
+                // runs inside `blocking_io`, and MSG_DONTWAIT keeps that true
+                // per call.
+                let host_flags = host_flags | libc::MSG_DONTWAIT;
+                for target in &recv_targets {
+                    sa_len = sa.len() as libc::socklen_t;
+                    let attempt = if used_addr {
                         unsafe {
                             libc::recvfrom(
-                                host_fd.get(),
-                                dst_ptr as *mut _,
-                                len,
-                                host_flags,
-                                std::ptr::null_mut(),
-                                std::ptr::null_mut(),
-                            )
-                        },
-                        false,
-                    )
-                } else {
-                    (
-                        unsafe {
-                            libc::recvfrom(
-                                host_fd.get(),
+                                *target,
                                 dst_ptr as *mut _,
                                 len,
                                 host_flags,
                                 sa.as_mut_ptr() as *mut _,
                                 &mut sa_len as *mut _,
                             )
-                        },
-                        true,
-                    )
+                        }
+                    } else {
+                        unsafe {
+                            libc::recvfrom(
+                                *target,
+                                dst_ptr as *mut _,
+                                len,
+                                host_flags,
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                            )
+                        }
+                    };
+                    match attempt.host_syscall_errno() {
+                        Ok(_) => {
+                            n = attempt;
+                            last_errno = None;
+                            break;
+                        }
+                        // Only an empty socket is worth trying the next member
+                        // for; any other errno is this recv's real answer.
+                        Err(e) if e == LINUX_EAGAIN => last_errno = Some(e),
+                        Err(e) => {
+                            last_errno = Some(e);
+                            break;
+                        }
+                    }
+                }
+                let n = match last_errno {
+                    Some(e) => {
+                        drop(host_write);
+                        return Err(e);
+                    }
+                    None => n,
                 };
                 // Close the odd-generation bracket before interpreting any
                 // result or touching `memory` again. Drop also runs on unwind.
@@ -6309,6 +6447,10 @@ impl SyscallDispatcher {
                 }
                 Ok(n as i64)
             });
+            if matches!(outcome, DispatchOutcome::Returned { .. }) {
+                // This member took the group's turn; hand it to the next.
+                reuseport::advance_turn(host_fd.get());
+            }
             if matches!(outcome, DispatchOutcome::Returned { .. })
                 && src_addr != 0
                 && src_len_addr != 0
@@ -7283,6 +7425,9 @@ impl SyscallDispatcher {
         // returned, as (linux_cmsg_type, data) — forwarded to the guest below.
         let received_ipv6_cmsgs = std::cell::RefCell::new(Vec::<(i32, Vec<u8>)>::new());
         let guest_msg_flags = std::cell::Cell::new(0i32);
+        let recvmsg_targets: Vec<i32> = std::iter::once(host_fd.get())
+            .chain(reuseport::steal_targets(host_fd.get()))
+            .collect();
         let outcome = self.blocking_io(host_fd.get(), IoDir::Read, nonblocking, recv_to, || {
             // A retry must not leak fds from a prior partial attempt.
             for stale in received_host_fds.borrow_mut().drain(..) {
@@ -7321,7 +7466,39 @@ impl SyscallDispatcher {
             // host_flags carries MSG_DONTWAIT and this runs inside blocking_io
             // (host_fd is O_NONBLOCK; EAGAIN -> WaitOnFds with the dispatcher lock
             // released), so this recvmsg never blocks under the lock.
-            let n = unsafe { libc::recvmsg(host_fd.get(), &mut hmsg as *mut _, host_flags) };
+            // SO_REUSEPORT: Darwin delivers every datagram to the last socket
+            // that bound the addr:port, so take from the sibling holding the
+            // group's work when this member's own socket is empty. Without
+            // this the member whose TURN it is can never drain the group and
+            // the readiness gate silences the others — a deadlock, not just a
+            // skew. `recvmsg_targets` is just this fd unless it is in a
+            // multi-member group.
+            let mut n = -1isize;
+            let mut last_errno = None;
+            for target in &recvmsg_targets {
+                if msg.name != 0 {
+                    hmsg.msg_namelen = sa.len() as libc::socklen_t;
+                }
+                if want_control {
+                    hmsg.msg_controllen = hcontrol.len() as _;
+                }
+                let attempt = unsafe { libc::recvmsg(*target, &mut hmsg as *mut _, host_flags) };
+                match attempt.host_syscall_errno() {
+                    Ok(_) => {
+                        n = attempt;
+                        last_errno = None;
+                        break;
+                    }
+                    Err(e) if e == LINUX_EAGAIN => last_errno = Some(e),
+                    Err(e) => {
+                        last_errno = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = last_errno {
+                return Err(e);
+            }
             let n = n.host_syscall_errno()?;
             // Stash any received fds (host-layout cmsg) for installation after
             // the closure returns; the guest-facing rewrite happens below.
@@ -7381,6 +7558,10 @@ impl SyscallDispatcher {
         // (Linux-layout) control buffer + the controllen/flags fields. Done
         // OUTSIDE the I/O closure so it happens exactly once on success.
         let host_fds: Vec<i32> = received_host_fds.borrow_mut().drain(..).collect();
+        if matches!(outcome, DispatchOutcome::Returned { value } if value >= 0) {
+            // This member took the group's turn; hand it to the next.
+            reuseport::advance_turn(host_fd.get());
+        }
         if matches!(outcome, DispatchOutcome::Returned { value } if value >= 0) {
             // from_bits_retain: recvmsg IGNORES unknown msg_flags bits.
             let cloexec =

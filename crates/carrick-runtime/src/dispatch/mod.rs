@@ -4563,6 +4563,13 @@ impl SyscallDispatcher {
                 .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
                 .is_none()
         {
+            // A reuseport membership must never outlive its socket: host fds
+            // are REUSED, so a stale entry would hand a later unrelated
+            // socket's traffic to this group. Removal is by host fd and is a
+            // no-op for a socket that never joined.
+            if let OpenDescription::HostSocket { host_fd, .. } = &*open_file.description.read() {
+                crate::dispatch::net::reuseport_leave(host_fd.raw());
+            }
             match &*open_file.description.read() {
                 OpenDescription::HostPipe { pty, host_fd, .. } => {
                     fifo_host_fd = Some(host_fd.raw());
