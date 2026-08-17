@@ -93,18 +93,28 @@ impl LinuxNetworkModel {
                     name: format!("eth{idx}"),
                     loopback: false,
                     has_ipv4: true,
-                    // Docker attaches a link-local IPv6 (fe80::/64) to every veth
-                    // even in an IPv4-only bridge, so a guest enumerating IPv6
-                    // interfaces (getifaddrs AF_INET6, /proc/net/if_inet6,
-                    // /proc/net/igmp6) sees eth0 — keep netlink and procfs
-                    // correlated on the same name.
-                    has_ipv6: true,
+                    // NO IPv6 on an uplink. This used to fabricate a link-local
+                    // `fe80::1/64`, justified by "Docker attaches a link-local
+                    // IPv6 to every veth even in an IPv4-only bridge". That is
+                    // false for the conformance oracle, and measurably so: the
+                    // container's `/proc/net/if_inet6` holds exactly one row,
+                    // `::1/128` on `lo`, because Docker's default bridge leaves
+                    // IPv6 disabled in the netns.
+                    //
+                    // The fabrication was guest-visible and wrong in both
+                    // directions. libuv's `tcp_connect6_link_local` skips on
+                    // Linux precisely because no enumerated interface carries an
+                    // `fe80::` address; carrick advertised one, so the guest ran
+                    // a test real Linux declines — an inversion, which is just as
+                    // much a parity failure as a missing pass. It also carried
+                    // `udp_multicast_join6` past the same interface check.
+                    has_ipv6: false,
                 }),
         );
 
-        // Loopback carries ::1/128; each uplink carries a link-local fe80::1/64
-        // (matches /proc/net/if_inet6's per-interface row). Enumerating IPv6
-        // interfaces must find at least one UP AF_INET6 iface.
+        // Loopback carries ::1/128 and the uplinks carry IPv4 only — the exact
+        // address set the Docker oracle's netns has (see the `has_ipv6: false`
+        // comment above).
         let mut addresses = vec![
             LinuxNetworkAddress {
                 addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -117,25 +127,13 @@ impl LinuxNetworkModel {
                 link_name: "lo".to_string(),
             },
         ];
-        addresses.extend(
-            attachments
-                .iter()
-                .enumerate()
-                .flat_map(|(idx, attachment)| {
-                    [
-                        LinuxNetworkAddress {
-                            addr: IpAddr::V4(attachment.ipv4),
-                            prefix_len: 24,
-                            link_name: format!("eth{idx}"),
-                        },
-                        LinuxNetworkAddress {
-                            addr: IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
-                            prefix_len: 64,
-                            link_name: format!("eth{idx}"),
-                        },
-                    ]
-                }),
-        );
+        addresses.extend(attachments.iter().enumerate().map(|(idx, attachment)| {
+            LinuxNetworkAddress {
+                addr: IpAddr::V4(attachment.ipv4),
+                prefix_len: 24,
+                link_name: format!("eth{idx}"),
+            }
+        }));
 
         let primary_gateway = attachments
             .first()
@@ -537,9 +535,22 @@ mod tests {
                     name: "eth0".to_string(),
                     loopback: false,
                     has_ipv4: true,
-                    has_ipv6: true,
+                    // IPv4 ONLY. Measured against the conformance oracle
+                    // container: its `/proc/net/if_inet6` has exactly one row,
+                    // `::1/128` on `lo`. Docker's default bridge leaves IPv6
+                    // disabled in the netns, so a veth carries no `fe80::`.
+                    has_ipv6: false,
                 },
             ]
+        );
+        // And no IPv6 address is attributed to the uplink.
+        assert!(
+            !model
+                .addresses
+                .iter()
+                .any(|addr| addr.link_name == "eth0" && addr.addr.is_ipv6()),
+            "an uplink must carry no IPv6 address: {:?}",
+            model.addresses
         );
         assert!(model.addresses.iter().any(|addr| addr
             == &LinuxNetworkAddress {
