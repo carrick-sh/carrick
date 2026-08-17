@@ -227,3 +227,115 @@ Concern: the first two are the authoritative broad runtime measurements and
 must remain serialized and coordinator-owned. Until they produce 2,127 suite
 rows and 858 probe rows, there is no honest live backlog or mechanism-cluster
 ranking to report.
+
+## Review round 1/5
+
+### Red-first evidence
+
+The assertion-level/non-exclusive report tests failed against the preparatory
+implementation because it returned suite names and selected one category by
+precedence:
+
+```text
+FAIL: test_report_separates_semantic_infrastructure_unexercised_and_pathological_rows
+Lists differ: ['ltp-futex'] != [{'suite': 'ltp-futex', 'assertion': 'futex.c:42#1', ...}]
+
+FAIL: test_suite_can_contribute_semantic_and_unexercised_assertions
+Lists differ: [] != ['mixed.c:10#1', 'mixed.c:20#1']
+```
+
+The complete-red probe-log tests failed because canonical red terminal rows
+were not recognized and therefore appeared as 858 missing rows:
+
+```text
+ERROR: test_probe_log_retains_complete_red_terminal_rows
+ReportError: probe log does not close both arm64 libc sets (rows=0, ...)
+```
+
+The dedicated continuation tests failed before terminal-result collection
+existed:
+
+```text
+AttributeError: module 'closure_probe_scenarios' has no attribute 'TerminalRow'
+TypeError: run_plan() got an unexpected keyword argument 'command_runner'
+ScenarioError: scenario conformance_bridge_publish_tcp [musl] did not fully gate
+```
+
+The generic terminal-policy test also failed on the missing Rust mapping:
+
+```text
+error[E0425]: cannot find function `closure_probe_terminal_status` in this scope
+error: could not compile `carrick-cli` (test "conformance") due to 5 previous errors
+```
+
+### Fixes
+
+- Suite summarization is assertion-level and non-exclusive. Each semantic
+  divergence records suite, assertion identity, Carrick outcome, and Docker
+  outcome. Every `skipped`/`conf`/`absent` assertion is independently recorded
+  as unexercised, so one assertion and one suite may appear in both sections.
+  Infrastructure remains a suite-level category. Ledger tables now render the
+  assertion identities rather than suite-only precedence.
+- Generic closure output now emits one canonical terminal line per selected
+  source/libc row: `CLOSURE_PROBE GENERIC PASS|FAIL|NOTE|ERROR ...`. Known-gap
+  `XFAIL` and unexpected pass both lower to closure `FAIL`; closure no longer
+  accepts a missing oracle as an excuse.
+- Dedicated execution returns a terminal result instead of raising on the first
+  red scenario. All 14 functions run under GNU and musl, exceptions and malformed
+  Cargo results lower to `ERROR`, and each grouped source receives exactly one of
+  40 canonical `CLOSURE_PROBE SCENARIO ...` rows. The script exits nonzero only
+  after the complete 28-invocation matrix finishes.
+- The `just conformance-probes-closure` shell captures generic and dedicated
+  statuses independently, always runs the dedicated phase after a red generic
+  phase, and exits nonzero only after both phases finish.
+- The report parser requires exactly one canonical terminal row for all 858
+  expected keys. Red rows count as complete evidence. Unknown, duplicate,
+  malformed, extra, and standalone terminal states fail closed. A complete
+  858-PASS log plus an extra canonical `FAIL`, `SKIP`, or `NOTE` is explicitly
+  tested and rejected.
+- Ledger rendering has explicit probe semantic-failure, infrastructure-failure,
+  and unexercised sections. `NOTE`/oracle-unavailable is retained in both the
+  infrastructure and unexercised views.
+
+### Green verification
+
+```text
+python3 -m unittest discover -s scripts/tests -p 'test_*closure*.py'
+Ran 16 tests; OK
+
+cargo test -p carrick-cli --test conformance closure_ -- --nocapture
+5 passed; 0 failed
+
+cargo clippy -p carrick-cli --test conformance --test serve -- -D warnings
+exit 0
+
+cargo fmt --check
+exit 0
+
+python3 scripts/conformance/closure-probe-scenarios.py --check
+dedicated closure plan: 20 sources, 14 runners
+
+python3 -m py_compile scripts/conformance/closure-report.py \
+  scripts/conformance/closure-probe-scenarios.py \
+  scripts/tests/test_closure_report.py \
+  scripts/tests/test_closure_probe_scenarios.py
+exit 0
+
+just --dry-run conformance-probes-closure
+generic_status and dedicated_status are captured; both phases precede final exit
+
+git diff --check
+exit 0
+```
+
+The synthetic runner test made the first GNU scenario fail and proved all 28
+function/libc calls still occurred, including the final musl function, producing
+all 40 terminal source rows.
+
+### Commit and remaining concern
+
+- `9873d0af1b2de79ee8f09815ff5e2d88f0484147`
+  `fix(conformance): retain complete red closure evidence`
+
+No broad suite or probe measurement was run in this review. The coordinator
+still owns the authoritative 2,127-suite and 858-probe runtime discoveries.
