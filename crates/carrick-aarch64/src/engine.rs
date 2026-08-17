@@ -366,11 +366,19 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         // reference to the freed page. So coalesce is safe iff the edit is
         // EXCLUSIVE. The single-vCPU case is provably exclusive here, so re-enable
         // coalescing then (the OutOfTables→ENOMEM-under-churn fix for a
-        // single-threaded guest). The multi-vCPU case stays conservative
-        // (unsafe_to_coalesce = true): the generic loop's Pause-Modify-Resume pauses
-        // siblings + `tlbi vmalle1is`-broadcasts around every threaded stage-1 editor
-        // (vcpu_loop.rs pt_pause), but the engine cannot read that barrier from this
-        // crate, so it keeps the conservative flag rather than assume the PMR is held.
+        // single-threaded guest). The multi-vCPU case is exclusive too WHEN the
+        // caller holds the stage-1 barrier: the generic loop's Pause-Modify-Resume
+        // pauses siblings + `tlbi vmalle1is`-broadcasts around every threaded
+        // stage-1 editor (vcpu_loop.rs pt_pause, taken pre-dispatch for
+        // mmap/munmap/mremap/mprotect). This used to ASSUME the PMR was not held,
+        // because the engine had no way to read it from this crate — so a
+        // multi-vCPU guest reclaimed nothing, leaked one stage-1 table per
+        // `mmap(MAP_SHARED, fd)`, and exhausted the 440-page pool after a few
+        // hundred map/unmap cycles ("stage-1 page-table pool exhausted", the
+        // OutOfTables crash behind CPython multiprocessing's SemLock/Pool churn).
+        // The marker now lives in `carrick_hal::pt_pause`, which both the runtime
+        // and this crate can see, so the barrier is READ rather than assumed
+        // away. Absent the pause the conservative flag still applies.
         //
         // Measure the count BEFORE the local `pt` clone below — the clone adds a
         // reference, so `strong_count(&pt)` is 2 for a SOLE vCPU and `> 1` is
@@ -378,7 +386,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         // table pool under single-threaded mmap churn (CPython multiprocessing's
         // 400+ SemLock map/unmap cycles exhausted it: "stage-1 page-table pool
         // exhausted"). `strong_count(&self.page_tables)` == the live engine count.
-        let unsafe_to_coalesce = Arc::strong_count(&self.page_tables) > 1;
+        let unsafe_to_coalesce = Arc::strong_count(&self.page_tables) > 1
+            && !carrick_hal::stage1_exclusive::current_thread_edits_exclusively();
         let pt = Arc::clone(&self.page_tables);
         let mut guard = pt.lock();
         if guard.is_none() {
@@ -410,15 +419,29 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             )));
         }
         mgr.set_multi_vcpu(unsafe_to_coalesce);
-        let changed = edit(mgr).map_err(|e| match e {
-            PageTableError::OutOfTables => {
-                MemoryError::HostMap("stage-1 page-table pool exhausted".to_string())
+        let changed = match edit(mgr) {
+            Ok(changed) => changed,
+            Err(PageTableError::OutOfTables) => {
+                // Report the pool's own numbers. "Exhausted" alone cannot
+                // distinguish a genuinely huge address space from the reclaim
+                // leak, and `in_use` rising monotonically toward `capacity`
+                // while `free` stays at 0 IS the leak's signature.
+                let (in_use, free, capacity) = mgr.pool_stats();
+                let engines = Arc::strong_count(&self.page_tables);
+                let pmr = carrick_hal::stage1_exclusive::current_thread_edits_exclusively();
+                return Err(MemoryError::HostMap(format!(
+                    "stage-1 page-table pool exhausted \
+                     (in_use={in_use} free={free} capacity={capacity} \
+                     reclaim_disabled={unsafe_to_coalesce} engines={engines} pmr={pmr})"
+                )));
             }
-            PageTableError::BadAddress => MemoryError::OutOfBounds {
-                address: 0,
-                length: 0,
-            },
-        })?;
+            Err(PageTableError::BadAddress) => {
+                return Err(MemoryError::OutOfBounds {
+                    address: 0,
+                    length: 0,
+                });
+            }
+        };
         if changed {
             // SAFETY: `host` backs the live page-table region for the whole process
             // lifetime; the manager writes only 8-byte-aligned descriptor slots
@@ -1527,6 +1550,27 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
             );
         }
         if let Err(error) = page_table_result {
+            // Roll the alias inventory staging back BEFORE tearing the mapping
+            // down. `add_alias_with_sharing` has already staged an extent that
+            // names a freshly claimed MappingId, and the authority does not
+            // learn about that mapping until the commit is applied — which has
+            // not happened yet, and now never will.
+            //
+            // `unmap_alias_range` is the RETIREMENT path: it walks the extents
+            // covering this VA's stage-2 lease and stages an `UnmapMapping` for
+            // each. Run in this order it would pick up the extent staged
+            // moments ago and ask the authority to retire a mapping it has
+            // never seen, aborting the whole carrier with
+            // `mapping MappingId(N) is not live` — every Linux process
+            // multiplexed into it, for one process's failed mmap. Discarding
+            // the staging first leaves the retirement with nothing to retire,
+            // which it handles by simply unregistering the alias.
+            //
+            // Reproduced by `reducers/alias-churn-fatal.py`: a few hundred
+            // MAP_SHARED map/unmap cycles reach a stage-1 failure and abort
+            // deterministically. It is also the crash that killed
+            // `cpython-multiprocessing_spawn`.
+            self.vm.abandon_alias_inventory();
             let cleanup_len = usize::try_from(len).unwrap_or_else(|_| std::process::abort());
             if self.unmap_alias_range(va.raw(), cleanup_len).is_err() {
                 std::process::abort();

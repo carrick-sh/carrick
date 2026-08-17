@@ -79,8 +79,60 @@ without removing the matching `extents` entry, and the alias retirement later
 trips over the orphan. Confirm by logging every authority mapping-retirement
 with its origin, then diffing that set against `extents` at the abort.
 
-So the question to answer first is: which path removes a mapping from the
-authority WITHOUT removing its `extents` entry?
+**RESOLVED.** The answer was neither of the leading hypotheses. Two distinct
+bugs sat on top of each other, and the abort was only the outer one.
+
+Inode recycling was refuted cheaply first: a variant that keeps every temp file
+OPEN (so the host never reuses an inode, and every mapping gets a distinct
+`SharedFile { device, inode, .. }` backing identity) aborts at the SAME
+`MappingId`. Varying the mapping size 4 KiB -> 16 KiB also aborts at the same
+id, while a `MAP_PRIVATE` variant completes cleanly — so the trigger was
+count-driven and MAP_SHARED-specific, not data-driven.
+
+What settled it was reading the inventory's own `tracing` output
+(`RUST_LOG=carrick_runtime::kernel::frame_inventory=trace`) alongside two new
+trace points at the ends of the alias transaction. Every healthy cycle reads
+`stage(N) -> take -> prepare(N) -> unmap(N)`. The failing one reads
+`stage(N) -> unmap(N)` — no `take`, no `prepare`. So the extent had been staged
+into the backend ledger while the authority never learned the mapping existed.
+
+1. **The abort.** `map_host_alias_with_sharing` stages the extent, then installs
+   the stage-1 mapping. When that install FAILS its cleanup called
+   `unmap_alias_range` — the RETIREMENT path — which walks the extents covering
+   the VA's stage-2 lease and stages an `UnmapMapping` for each. It therefore
+   picked up the extent staged moments earlier and asked the authority to retire
+   a mapping it had never seen, aborting the whole carrier for one process's
+   failed mmap. Fixed by discarding the staging BEFORE the teardown.
+
+2. **Why the install failed at all:** `stage-1 page-table pool exhausted
+   (in_use=438 free=0 capacity=440 reclaim_disabled=true engines=3 pmr=false)`.
+   That is a page-table leak, one table per `mmap(MAP_SHARED, fd)`, and the
+   reclaim that should prevent it was disabled by a POPULATION mismatch — see
+   below.
+
+### The populations bug behind the leak
+
+Reclaiming an emptied stage-1 sub-table is only safe when the edit is exclusive,
+so the engine gated it on `Arc::strong_count(&page_tables) > 1`. That counts
+live engine HANDLES. The runtime, meanwhile, decides whether to take the
+Pause-Modify-Resume barrier from `has_peer_guest_executor()` — threads that can
+execute guest code, parked siblings included.
+
+Those two populations disagree, and the diagnostic above shows exactly how:
+`engines=3` with `pmr=false`. Three live engine handles, no peer able to execute
+guest code. The runtime correctly skipped the pause because the edit was already
+exclusive; the engine read its own proxy, concluded "shared", and never
+reclaimed. This is the `docs/identity-and-scope-domains.md` populations hazard
+in the wild — two `usize`s that mean different things.
+
+The fix publishes the runtime's answer instead of approximating it:
+`carrick_hal::stage1_exclusive` is a thread-local marker the runtime raises for
+any stage-1-editing syscall (both because it holds the pause AND because there
+is no peer to be exclusive against), and the engine reads it.
+
+Result: the 1,200-cycle reducer completes, 5,000 cycles complete, and
+`cpython-multiprocessing_spawn` goes from an 88-assertion crash to running all
+397 tests with 3 of its 4 test files passing.
 
 Note the sibling crash is DIFFERENT and this reducer does not produce it:
 `cpython-multiprocessing_fork` and `cpython-concurrent_futures` die with

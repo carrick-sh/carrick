@@ -114,6 +114,16 @@ fn syscall_takes_pre_dispatch_pt_pause(number: u64, arg2: u64, multi_vcpu: bool)
     if !multi_vcpu {
         return false;
     }
+    syscall_edits_stage1(number, arg2)
+}
+
+/// Whether this syscall edits stage-1 descriptors at all, independent of how
+/// many threads exist. Split out from the pause predicate because the two
+/// answers are used for different things: a peer executor decides whether a
+/// PAUSE is needed, while editing stage-1 at all decides whether this thread
+/// should claim stage-1 EXCLUSIVITY for the dispatch — which it holds either
+/// way, since with no peer executor there is nobody to be exclusive against.
+fn syscall_edits_stage1(number: u64, arg2: u64) -> bool {
     match number {
         // munmap, mremap, mmap, mprotect: they edit the stage-1 descriptors.
         215 | 216 | 222 | 226 => true,
@@ -2743,6 +2753,13 @@ where
         // `epoll_wait` is absent from the kicker and present here, and it is
         // exactly the thread a lease-keyed predicate let walk a half-edited
         // descriptor tree.
+        // Claim stage-1 exclusivity for the whole dispatch of any syscall that
+        // edits stage-1 descriptors. Both arms below are exclusive, for
+        // different reasons, and the backend page-table manager needs to know
+        // that so it can reclaim the spare sub-tables an alias teardown empties
+        // (`carrick_hal::stage1_exclusive` documents what leaks when it cannot).
+        let _stage1_exclusive = syscall_edits_stage1(frame.number.raw(), frame.args[2])
+            .then(quiesce::Stage1Exclusive::claim);
         let _pt_pause = if syscall_takes_pre_dispatch_pt_pause(
             frame.number.raw(),
             frame.args[2],
@@ -2758,6 +2775,8 @@ where
                 }
             }
         } else {
+            // No peer can execute guest code, which is exactly why no pause is
+            // needed — and equally why the edit is exclusive.
             None
         };
         let mut signal_wait_deadline = None;
@@ -6187,6 +6206,33 @@ mod tests {
         assert!(!should_destroy_departing_vcpu(true, false));
         assert!(!should_destroy_departing_vcpu(false, true));
         assert!(should_destroy_departing_vcpu(false, false));
+    }
+
+    /// Editing stage-1 and NEEDING A PAUSE are different questions, and the
+    /// page-table manager keys table reclaim on the first. A sole guest
+    /// executor takes no pause precisely because it is already exclusive, so if
+    /// exclusivity were derived from pause ownership it would read as "shared"
+    /// there — which is the shape that leaked one stage-1 table per
+    /// `mmap(MAP_SHARED, fd)` until the pool hit `OutOfTables`.
+    #[test]
+    fn stage1_editors_are_claimed_regardless_of_peers() {
+        let dontneed = carrick_abi::LINUX_MADV_DONTNEED;
+        for editor in [215u64, 216, 222, 226] {
+            assert!(
+                syscall_edits_stage1(editor, 0),
+                "{editor} edits stage-1 whether or not a peer exists"
+            );
+        }
+        assert!(syscall_edits_stage1(233, dontneed));
+        assert!(!syscall_edits_stage1(233, 0), "only MADV_DONTNEED");
+        assert!(!syscall_edits_stage1(63, 0), "read edits no descriptors");
+        // The pause predicate is the same set, narrowed by the peer population.
+        for editor in [215u64, 216, 222, 226] {
+            assert_eq!(
+                syscall_takes_pre_dispatch_pt_pause(editor, 0, true),
+                syscall_edits_stage1(editor, 0)
+            );
+        }
     }
 
     /// The pre-dispatch page-table pause exists to keep ONE global lock order

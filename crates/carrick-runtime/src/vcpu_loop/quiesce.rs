@@ -6,17 +6,40 @@
 
 use super::*;
 
-thread_local! {
-    /// Page-table pause ownership is thread-local because the coordinator is
-    /// the vCPU service thread. Backends can re-enter the authority while a
-    /// mapping syscall already owns the outer Pause-Modify-Resume transaction
-    /// (for example, zero_backing COW during same-VA mmap reuse). Such a nested
-    /// acquisition must borrow the outer pause, never park behind itself.
-    static PT_PAUSE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+/// Page-table pause ownership is thread-local because the coordinator is the
+/// vCPU service thread. Backends can re-enter the authority while a mapping
+/// syscall already owns the outer Pause-Modify-Resume transaction (for example,
+/// `zero_backing` COW during same-VA mmap reuse). Such a nested acquisition
+/// must borrow the outer pause, never park behind itself.
+///
+/// The marker itself lives in `carrick_hal::stage1_exclusive` rather than here
+/// because the ENGINE crates need to read it — they sit below this one — to
+/// know that a stage-1 edit is exclusive and its spare sub-tables can be
+/// reclaimed. Note the marker is BROADER than pause ownership: a sole guest
+/// executor also edits exclusively, without any pause being taken.
+pub(super) fn current_thread_holds_pt_pause() -> bool {
+    carrick_hal::stage1_exclusive::current_thread_edits_exclusively()
 }
 
-pub(super) fn current_thread_holds_pt_pause() -> bool {
-    PT_PAUSE_DEPTH.with(|depth| depth.get() != 0)
+/// Holds this thread's stage-1 exclusivity claim for a mapping syscall's whole
+/// dispatch. Separate from [`PtPauseGuard`] because exclusivity has two
+/// sources: the pause (which raises the same marker, so the two nest harmlessly
+/// when both apply) and simply having no peer that can execute guest code.
+pub(super) struct Stage1Exclusive {
+    _private: (),
+}
+
+impl Stage1Exclusive {
+    pub(super) fn claim() -> Self {
+        carrick_hal::stage1_exclusive::enter();
+        Self { _private: () }
+    }
+}
+
+impl Drop for Stage1Exclusive {
+    fn drop(&mut self) {
+        carrick_hal::stage1_exclusive::exit();
+    }
 }
 
 pub(super) struct PtPauseGuard {
@@ -25,20 +48,14 @@ pub(super) struct PtPauseGuard {
 
 impl PtPauseGuard {
     fn new(inner: crate::fork_quiesce::PtPauseGuard) -> Self {
-        PT_PAUSE_DEPTH.with(|depth| {
-            depth.set(depth.get().saturating_add(1));
-        });
+        carrick_hal::stage1_exclusive::enter();
         Self { _inner: inner }
     }
 }
 
 impl Drop for PtPauseGuard {
     fn drop(&mut self) {
-        PT_PAUSE_DEPTH.with(|depth| {
-            let current = depth.get();
-            debug_assert!(current != 0, "page-table pause ownership underflow");
-            depth.set(current.saturating_sub(1));
-        });
+        carrick_hal::stage1_exclusive::exit();
         // `_inner` drops next and resumes sibling vCPUs only after the local
         // ownership marker has been cleared.
     }
