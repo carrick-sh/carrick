@@ -4514,6 +4514,19 @@ mod real {
         /// Pair with `signal-publish` to see a signal published for tid X but never
         /// drained by X (the routing/tid-mismatch and blocked-thread cases).
         fn signal__deliver(_: i32, _: i32) {}
+        /// Fires at every `SA_RESTART` restart DECISION, whether or not the
+        /// syscall is restarted. `tid`, `signum`, `syscall_nr` (-1 if the trap
+        /// carried none), `retval` (the interrupted syscall's return), and
+        /// `predicates`, a bitmask of the four conditions that must ALL hold:
+        /// bit0 at-syscall-boundary, bit1 retval-is-EINTR, bit2 SA_RESTART set
+        /// in the handler's flags, bit3 syscall is in the restartable set.
+        /// `predicates == 0b1111` means the syscall was restarted.
+        ///
+        /// Without this, "the guest saw EINTR under SA_RESTART" is a dead end:
+        /// the four predicates live in one boolean expression and the failing
+        /// one is invisible from outside. libuv's `eintr_handling` cost a full
+        /// investigation cycle to that.
+        fn signal__restart__decision(_: i32, _: i32, _: i64, _: i64, _: i32) {}
         /// Fires when `execve_into` has finished swapping the engine to
         /// the new image. `path`, `entry`, `initial_sp`, `mapping_count`
         /// let dtrace operators verify the new process layout.
@@ -6669,6 +6682,17 @@ mod real {
         carrick_usdt::signal__deliver!(|| (tid, pending));
     }
 
+    /// An SA_RESTART restart decision was made. See `signal__restart__decision`.
+    pub fn signal_restart_decision(
+        tid: i32,
+        signum: i32,
+        syscall_nr: i64,
+        retval: i64,
+        predicates: i32,
+    ) {
+        carrick_usdt::signal__restart__decision!(|| (tid, signum, syscall_nr, retval, predicates));
+    }
+
     pub fn register_dtrace_probes() -> Result<(), super::ProbeRegistrationError> {
         // Install the compat reporter's per-event probe hook so every recorded
         // CompatEvent fires its DTrace probe. compat lives in the neutral
@@ -7128,6 +7152,7 @@ mod stub {
     stub!(hv_vm_map_alias(va: u64, ipa: u64, size: u64, rc: i32, forked: i32));
     stub!(signal_publish(target_tid: i32, signum: i32, kind: i32));
     stub!(signal_deliver(tid: i32, pending: i32));
+    stub!(signal_restart_decision(tid: i32, signum: i32, syscall_nr: i64, retval: i64, predicates: i32));
     stub!(fire(event: &crate::compat::CompatEvent));
 
     // Native-x86 (DSR) run-loop probes — no-op mirror of `real`'s, so the shared
