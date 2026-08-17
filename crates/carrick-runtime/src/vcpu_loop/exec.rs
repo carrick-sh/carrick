@@ -50,6 +50,21 @@ fn apply_exec_inventory<E>(
     apply(replacement_mm, replacement)
 }
 
+#[derive(Default)]
+struct ExecBackendPublicationGate {
+    engine_replaced: bool,
+}
+
+impl ExecBackendPublicationGate {
+    fn record_engine_replaced(&mut self) {
+        self.engine_replaced = true;
+    }
+
+    fn take_after_replace<T>(&self, take: impl FnOnce() -> Option<T>) -> Option<T> {
+        self.engine_replaced.then(take).flatten()
+    }
+}
+
 enum RuntimePreparedExec {
     Hvpatch(crate::hvpatch::PreparedProcessExec),
     Other(crate::kernel::PreparedExec),
@@ -181,7 +196,7 @@ fn verify_published_exec_image<E: ThreadedEngine>(
 #[cfg(test)]
 mod exec_image_verification_tests {
     use super::{
-        HvpatchExecInventoryFailureInjection, apply_exec_inventory,
+        ExecBackendPublicationGate, HvpatchExecInventoryFailureInjection, apply_exec_inventory,
         exec_regions_to_verify_with_mappings, first_byte_mismatch,
         parse_hvpatch_exec_inventory_failure_injection, should_update_host_process_title,
     };
@@ -317,6 +332,30 @@ mod exec_image_verification_tests {
 
         assert_eq!(routed, [old_mm, replacement_mm]);
         drop(prepared);
+    }
+
+    #[test]
+    fn exec_inventory_cannot_be_taken_before_engine_replacement_succeeds() {
+        let mut gate = ExecBackendPublicationGate::default();
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            gate.take_after_replace(|| {
+                calls.set(calls.get() + 1);
+                Some(7)
+            }),
+            None
+        );
+        assert_eq!(calls.get(), 0);
+
+        gate.record_engine_replaced();
+        assert_eq!(
+            gate.take_after_replace(|| {
+                calls.set(calls.get() + 1);
+                Some(7)
+            }),
+            Some(7)
+        );
+        assert_eq!(calls.get(), 1);
     }
 }
 
@@ -681,6 +720,7 @@ where
                     topology_lock_started,
                 );
                 let engine_replace_started = std::time::Instant::now();
+                let mut backend_publication_gate = ExecBackendPublicationGate::default();
                 if let Err(error) = engine.execve_into(&img) {
                     return Self::exec_failed_past_no_return(
                         kernel,
@@ -689,12 +729,14 @@ where
                     )
                     .map(Some);
                 }
+                backend_publication_gate.record_engine_replaced();
                 // `execve_into` has released every stage-2/frame lock. Topology
                 // serialization must also be released before runtime takes its
                 // frame-inventory authority lock.
                 drop(_hvpatch_topology);
                 if let Some(process) = kernel.hvpatch_process.as_ref() {
-                    let Some((retired_commit, replacement_commit)) = engine.take_exec_inventory()
+                    let Some((retired_commit, replacement_commit)) = backend_publication_gate
+                        .take_after_replace(|| engine.take_exec_inventory())
                     else {
                         return Self::exec_failed_past_no_return(
                             kernel,

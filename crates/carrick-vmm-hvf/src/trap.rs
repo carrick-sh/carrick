@@ -4310,29 +4310,104 @@ struct ExecStage2Install {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-type ExecBackendExtentFingerprint = (
-    (u64, u64),
-    carrick_hal::FrameId,
-    carrick_hal::MappingId,
-    InventoryBackingIdentity,
-    u64,
-    u64,
-);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExecLeaseFingerprint {
+    base: u64,
+    length: u64,
+    mapped: bool,
+    active: bool,
+    release_ipa: bool,
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-type ExecMappingFingerprint = (u64, u64, u64, usize, usize, Option<(u64, u64)>);
+impl From<&GlobalFrameStage2Lease> for ExecLeaseFingerprint {
+    fn from(lease: &GlobalFrameStage2Lease) -> Self {
+        Self {
+            base: lease.base,
+            length: lease.length,
+            mapped: lease.mapped,
+            active: lease.active,
+            release_ipa: lease.release_ipa,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExecOwnerFingerprint {
+    key: (u64, u64),
+    host: usize,
+    host_len: usize,
+    perms: u64,
+    lease: ExecLeaseFingerprint,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExecBackendExtentFingerprint {
+    key: (u64, u64),
+    frame: carrick_hal::FrameId,
+    mapping: carrick_hal::MappingId,
+    backing: InventoryBackingIdentity,
+    stage2_base: u64,
+    stage2_length: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExecMappingFingerprint {
+    start: u64,
+    ipa: u64,
+    physical_ipa: u64,
+    end: u64,
+    host: usize,
+    size: usize,
+    physical_size: usize,
+    perms: u64,
+    has_memory: bool,
+    host_owner: Option<(usize, usize)>,
+    stage2_lease: Option<ExecLeaseFingerprint>,
+    is_dynamic_alias: bool,
+    sharing: GuestMappingSharing,
+    guest_writable: bool,
+    shared_key_base: u64,
+    shared_key_offset: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExecAllocatorFingerprint {
+    next: u64,
+    free: Vec<(u64, u64)>,
+    live: Vec<(u64, u64)>,
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExecAuthorityFingerprint {
-    owners: Vec<((u64, u64), usize, u64)>,
+    owners: Vec<ExecOwnerFingerprint>,
+    inventory_initialized: bool,
     backend_extents: Vec<ExecBackendExtentFingerprint>,
     frame_references: Vec<(carrick_hal::FrameId, usize)>,
     extent_references: Vec<((carrick_hal::FrameId, u64, u64), usize)>,
     stage2_references: Vec<((u64, u64), usize)>,
     mappings: Vec<ExecMappingFingerprint>,
-    allocator_leases: Vec<(u64, u64)>,
+    allocator: ExecAllocatorFingerprint,
     replay_mappings: Vec<ReplayMappingKey>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn verify_exec_authority_rollback(
+    before: &ExecAuthorityFingerprint,
+    after: &ExecAuthorityFingerprint,
+) -> Result<(), TrapError> {
+    if before == after {
+        Ok(())
+    } else {
+        Err(TrapError::Hypervisor(
+            "HVPatch exec stage-2 rollback changed published authority".to_owned(),
+        ))
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4694,17 +4769,16 @@ impl HvfVmState {
         let backend_extents = inventory
             .extents
             .iter()
-            .map(|(&key, extent)| {
-                (
-                    key,
-                    extent.frame,
-                    extent.mapping,
-                    extent.backing,
-                    extent.stage2_base,
-                    extent.stage2_length,
-                )
+            .map(|(&key, extent)| ExecBackendExtentFingerprint {
+                key,
+                frame: extent.frame,
+                mapping: extent.mapping,
+                backing: extent.backing,
+                stage2_base: extent.stage2_base,
+                stage2_length: extent.stage2_length,
             })
             .collect();
+        let inventory_initialized = inventory.initialized;
         let frames = inventory.frames.lock();
         let frame_references = frames
             .references
@@ -4726,40 +4800,59 @@ impl HvfVmState {
         let owners = global_frame_host_owners()
             .lock()
             .iter()
-            .map(|(&key, owner)| (key, owner._mapping.as_ptr() as usize, owner.perms))
+            .map(|(&key, owner)| ExecOwnerFingerprint {
+                key,
+                host: owner._mapping.as_ptr() as usize,
+                host_len: owner._mapping.len(),
+                perms: owner.perms,
+                lease: (&owner._lease).into(),
+            })
             .collect();
         let mappings = self
             .mappings
             .iter()
-            .map(|mapping| {
-                (
-                    mapping.start,
-                    mapping.ipa,
-                    mapping.physical_ipa,
-                    mapping.host_addr as usize,
-                    mapping.physical_size,
-                    mapping
-                        .stage2_lease
-                        .as_ref()
-                        .map(GlobalFrameStage2Lease::key),
-                )
+            .map(|mapping| ExecMappingFingerprint {
+                start: mapping.start,
+                ipa: mapping.ipa,
+                physical_ipa: mapping.physical_ipa,
+                end: mapping.end,
+                host: mapping.host_addr as usize,
+                size: mapping.size,
+                physical_size: mapping.physical_size,
+                perms: u64::from(mapping.perms),
+                has_memory: mapping.memory.is_some(),
+                host_owner: mapping
+                    .host_mapping
+                    .as_ref()
+                    .map(|owner| (owner.as_ptr() as usize, owner.len())),
+                stage2_lease: mapping.stage2_lease.as_ref().map(Into::into),
+                is_dynamic_alias: mapping.is_dynamic_alias,
+                sharing: mapping.sharing,
+                guest_writable: mapping.guest_writable,
+                shared_key_base: mapping.shared_key_base,
+                shared_key_offset: mapping.shared_key_offset,
             })
             .collect();
-        let allocator_leases = global_frame_ipa_allocator()
-            .lock()
-            .live
-            .iter()
-            .map(|(&key, &value)| (key, value))
-            .collect();
+        let allocator = global_frame_ipa_allocator().lock();
+        let allocator = ExecAllocatorFingerprint {
+            next: allocator.next,
+            free: allocator.free.clone(),
+            live: allocator
+                .live
+                .iter()
+                .map(|(&key, &value)| (key, value))
+                .collect(),
+        };
         let replay_mappings = replay_mappings().lock().iter().copied().collect();
         ExecAuthorityFingerprint {
             owners,
+            inventory_initialized,
             backend_extents,
             frame_references,
             extent_references,
             stage2_references,
             mappings,
-            allocator_leases,
+            allocator,
             replay_mappings,
         }
     }
@@ -11835,10 +11928,10 @@ impl HvfVmState {
             );
             if let Err(error) = switch_result {
                 let authority_after = self.exec_authority_fingerprint();
-                if authority_after != authority_before {
-                    eprintln!(
-                        "carrick: FATAL: HVPatch exec stage-2 rollback changed published owner/inventory/mapping/allocator authority"
-                    );
+                if let Err(rollback_error) =
+                    verify_exec_authority_rollback(&authority_before, &authority_after)
+                {
+                    eprintln!("carrick: FATAL: {rollback_error}");
                     std::process::abort();
                 }
                 return Err(error);
@@ -14393,16 +14486,96 @@ mod frame_inventory_backend_tests {
         }));
     }
 
-    fn assert_exec_stage2_injected_failure_restores_old(fail_after_maps: usize) {
-        #[derive(Clone, Debug, Eq, PartialEq)]
-        struct PublicationAuthorities {
-            owners: std::collections::BTreeSet<(u64, u64)>,
-            backend_inventory: std::collections::BTreeSet<(u64, u64)>,
-            kernel_inventory: std::collections::BTreeSet<(u64, u64)>,
-            self_mappings: std::collections::BTreeSet<(u64, u64)>,
-            allocator_leases: std::collections::BTreeSet<(u64, u64)>,
+    fn exec_authority_fingerprint_fixture() -> ExecAuthorityFingerprint {
+        let frame = carrick_hal::FrameId::from_kernel_allocation(id(201));
+        let mapping = carrick_hal::MappingId::from_kernel_allocation(id(202));
+        let lease = ExecLeaseFingerprint {
+            base: 0x9000,
+            length: 0x1000,
+            mapped: true,
+            active: true,
+            release_ipa: true,
+        };
+        ExecAuthorityFingerprint {
+            owners: vec![ExecOwnerFingerprint {
+                key: (0x9000, 0x1000),
+                host: 0x100_0000,
+                host_len: 0x1000,
+                perms: 7,
+                lease,
+            }],
+            inventory_initialized: true,
+            backend_extents: vec![ExecBackendExtentFingerprint {
+                key: (0x9000, 0x1000),
+                frame,
+                mapping,
+                backing: InventoryBackingIdentity::Private(1),
+                stage2_base: 0x9000,
+                stage2_length: 0x1000,
+            }],
+            frame_references: vec![(frame, 1)],
+            extent_references: vec![((frame, 0x9000, 0x1000), 1)],
+            stage2_references: vec![((0x9000, 0x1000), 1)],
+            mappings: vec![ExecMappingFingerprint {
+                start: 0x4000,
+                ipa: 0x9000,
+                physical_ipa: 0x9000,
+                end: 0x5000,
+                host: 0x100_0000,
+                size: 0x1000,
+                physical_size: 0x1000,
+                perms: 7,
+                has_memory: false,
+                host_owner: None,
+                stage2_lease: Some(lease),
+                is_dynamic_alias: false,
+                sharing: GuestMappingSharing::Private,
+                guest_writable: true,
+                shared_key_base: 0,
+                shared_key_offset: 0,
+            }],
+            allocator: ExecAllocatorFingerprint {
+                next: 0xa000,
+                free: vec![(0xb000, 0x1000)],
+                live: vec![(0x9000, 0x1000)],
+            },
+            replay_mappings: vec![(0x9000, 0x1000, 0x100_0000, 7)],
         }
+    }
 
+    #[test]
+    fn exec_authority_rollback_rejects_drift_in_every_published_component() {
+        let before = exec_authority_fingerprint_fixture();
+        let assert_drift = |mut after: ExecAuthorityFingerprint,
+                            mutate: fn(&mut ExecAuthorityFingerprint)| {
+            mutate(&mut after);
+            assert!(verify_exec_authority_rollback(&before, &after).is_err());
+        };
+
+        assert_drift(before.clone(), |after| after.owners[0].perms ^= 1);
+        assert_drift(before.clone(), |after| after.inventory_initialized = false);
+        assert_drift(before.clone(), |after| {
+            after.backend_extents[0].stage2_base += 0x1000
+        });
+        assert_drift(before.clone(), |after| after.frame_references[0].1 += 1);
+        assert_drift(before.clone(), |after| after.extent_references[0].1 += 1);
+        assert_drift(before.clone(), |after| after.stage2_references[0].1 += 1);
+        assert_drift(before.clone(), |after| {
+            after.mappings[0].guest_writable = false
+        });
+        assert_drift(before.clone(), |after| after.allocator.next += 0x1000);
+        assert_drift(before.clone(), |after| {
+            after.allocator.free.push((0xc000, 0x1000))
+        });
+        assert_drift(before.clone(), |after| {
+            after.allocator.live.push((0xd000, 0x1000))
+        });
+        assert_drift(before.clone(), |after| {
+            after.replay_mappings.push((0xe000, 0x1000, 0x200_0000, 7))
+        });
+    }
+
+    fn assert_exec_stage2_injected_failure_restores_old(fail_after_maps: usize) {
         let old = [
             ExecStage2Install::for_test(0x1000, 0x1000),
             ExecStage2Install::for_test(0x3000, 0x1000),
@@ -14417,14 +14590,6 @@ mod frame_inventory_backend_tests {
                 .collect::<std::collections::BTreeSet<_>>(),
         );
         let actions = std::cell::RefCell::new(Vec::new());
-        let authorities = PublicationAuthorities {
-            owners: old.iter().map(ExecStage2Install::key).collect(),
-            backend_inventory: old.iter().map(ExecStage2Install::key).collect(),
-            kernel_inventory: old.iter().map(ExecStage2Install::key).collect(),
-            self_mappings: old.iter().map(ExecStage2Install::key).collect(),
-            allocator_leases: new.iter().map(ExecStage2Install::key).collect(),
-        };
-        let authorities_before = authorities.clone();
 
         let error = switch_exec_stage2_transaction(
             &old,
@@ -14485,10 +14650,6 @@ mod frame_inventory_backend_tests {
             *actions.borrow(),
             expected,
             "rollback must remove every published successor in reverse order before restoring every predecessor"
-        );
-        assert_eq!(
-            authorities, authorities_before,
-            "an ordinary stage-2 switch failure occurs before owner, backend inventory, Kernel inventory, self.mappings, or allocator-lease publication"
         );
     }
 
