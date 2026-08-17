@@ -10,19 +10,15 @@ use support::*;
 
 use carrick_runtime::linux_abi::LINUX_EACCES;
 
-/// Serializes the capability tests. `capget`/`capset` both read/mutate the
-/// process-global modeled capability set (`namespace::process::caps()`), which
-/// is shared across the whole test binary and is NOT reset between tests.
-/// Holding this lock for each test's body keeps them from interleaving (capset's
-/// record would otherwise race capget's read in the parallel harness).
-static CAPS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Establish a deterministic baseline: the Docker-default modeled cap set a
-/// fresh carrick process starts with. Call under `CAPS_TEST_LOCK`.
-fn reset_modeled_caps_to_docker_default() {
-    use carrick_runtime::namespace::process::{CapabilitySet, set_caps};
-    set_caps(CapabilitySet::docker_default());
-}
+// The capability tests below used to need a `CAPS_TEST_LOCK` plus a
+// reset-to-Docker-default helper, because `capget`/`capset` read and mutated
+// ONE process-global set shared by the whole test binary. The set is now per
+// task (`Task::caps`), and each `SyscallDispatcher::new()` brings its own
+// kernel binding and root task, so every test starts from a fresh
+// Docker-default set and cannot observe another test's `capset`. The isolation
+// the lock was emulating is now a property of the runtime, and these tests are
+// a standing check of it: if the state ever regresses to a global, they go red
+// under the parallel harness instead of passing by serialization.
 
 #[test]
 fn process_identity_syscalls_return_bootstrap_ids() {
@@ -57,9 +53,6 @@ fn process_identity_syscalls_return_bootstrap_ids() {
 
 #[test]
 fn capget_writes_docker_default_capability_sets() {
-    let _guard = CAPS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    reset_modeled_caps_to_docker_default();
-
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     write_capability_header(&mut memory, 0x4000, LINUX_CAPABILITY_VERSION_3, 0);
     let reporter = CompatReporter::default();
@@ -88,9 +81,6 @@ fn capget_writes_docker_default_capability_sets() {
 
 #[test]
 fn capset_accepts_empty_sets_and_rejects_nonempty_sets() {
-    let _guard = CAPS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    reset_modeled_caps_to_docker_default();
-
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     write_capability_header(&mut memory, 0x4000, LINUX_CAPABILITY_VERSION_3, 0);
     write_capability_data(&mut memory, 0x4080, [(0, 0, 0), (0, 0, 0)]);

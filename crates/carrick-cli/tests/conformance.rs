@@ -2813,10 +2813,17 @@ fn probe_campaign_dir(target: &str, exec_backend: Option<&str>) -> PathBuf {
 /// under the injection transport it would fork/exec ITSELF at `/tmp/p`.
 const PROBE_HELPERS: &[&str] = &["probeinit"];
 
-/// Raw `clone(CLONE_FILES)` is blocked by Docker's default seccomp profile.
-/// These probes intentionally exercise that Linux contract, so both Carrick
-/// and the Docker oracle must run them without the container policy.
-const UNCONFINED_PROBES: &[&str] = &["clonefileshare", "clonefilesexec"];
+/// Raw `clone(CLONE_FILES)` is blocked by Docker's default seccomp profile,
+/// and so is `unshare(CLONE_NEWUSER)`. These probes intentionally exercise
+/// those Linux contracts, so both Carrick and the Docker oracle must run them
+/// without the container policy.
+///
+/// Confirmed by running `usernsisolation` under `docker run` both ways: with
+/// the default profile the oracle returns EPERM from `unshare` and never
+/// reaches the assertion, so the row would measure the seccomp profile rather
+/// than `user_namespaces(7)`. Granting the privilege the probe's own subject
+/// implies is what makes the oracle measure Linux, not carrick.
+const UNCONFINED_PROBES: &[&str] = &["clonefileshare", "clonefilesexec", "usernsisolation"];
 
 fn probe_needs_unconfined(name: &str) -> bool {
     UNCONFINED_PROBES.contains(&name)

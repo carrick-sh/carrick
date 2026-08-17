@@ -326,6 +326,10 @@ pub struct OpenContext<'a> {
     /// [`SyntheticProcContext::oom_score_adj`]. `None` on a lane with no kernel
     /// graph, where one Linux process is one host process.
     pub oom_score_adj: Option<&'a std::collections::BTreeMap<u32, i32>>,
+    /// The calling process's capability sets and user-namespace view — see
+    /// [`SyntheticProcContext::creds_ns`]. `None` only in tests that build a
+    /// bare context; the dispatcher always supplies the caller's task state.
+    pub creds_ns: Option<&'a crate::namespace::process::ProcessCredsNs>,
     /// Every live Linux process from the kernel graph — see
     /// [`SyntheticProcContext::processes`]. `None` on a lane with no kernel
     /// graph, where one Linux process is one host process.
