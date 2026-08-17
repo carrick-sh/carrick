@@ -4,6 +4,10 @@ use crate::Args;
 use crate::manifest::Suite;
 use crate::verdict::{SuiteReport, Verdict};
 
+/// The campaign-frozen full HVF manifest denominator. A changed manifest must
+/// be deliberately re-scoped rather than silently becoming a closure target.
+pub const CLOSURE_SUITE_COUNT: usize = 2_127;
+
 /// Invocation and result requirements for a no-excuse closure run.
 pub struct ClosurePolicy;
 
@@ -58,9 +62,33 @@ impl ClosurePolicy {
     }
 }
 
+/// Reject an empty, drifted, or duplicate closure selection before any run can
+/// take the ordinary empty-selection success path.
+pub fn validate_closure_selection(selected: &[Suite]) -> anyhow::Result<()> {
+    let names: std::collections::BTreeSet<&str> =
+        selected.iter().map(|suite| suite.name.as_str()).collect();
+    let mut details = Vec::new();
+    if names.len() != CLOSURE_SUITE_COUNT {
+        details.push(format!(
+            "expected exactly {CLOSURE_SUITE_COUNT} unique selected suite names, got {}",
+            names.len()
+        ));
+    }
+    if selected.len() != names.len() {
+        details.push("duplicate selected suite names".to_string());
+    }
+    if details.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("closure selection is invalid ({})", details.join("; "));
+    }
+}
+
 /// Ensure a closure run accounted for exactly its selected inventory and no
 /// report lets a non-MATCH observation escape the final non-zero status.
 pub fn validate_closure_reports(selected: &[Suite], reports: &[SuiteReport]) -> anyhow::Result<()> {
+    validate_closure_selection(selected)?;
+
     let expected: std::collections::BTreeSet<&str> =
         selected.iter().map(|suite| suite.name.as_str()).collect();
     let actual: std::collections::BTreeSet<&str> =
@@ -68,10 +96,19 @@ pub fn validate_closure_reports(selected: &[Suite], reports: &[SuiteReport]) -> 
     let missing: Vec<&str> = expected.difference(&actual).copied().collect();
     let unexpected: Vec<&str> = actual.difference(&expected).copied().collect();
     let duplicate_reports = reports.len() != actual.len();
-    let duplicate_selected = selected.len() != expected.len();
 
-    if !missing.is_empty() || !unexpected.is_empty() || duplicate_reports || duplicate_selected {
+    if actual.len() != CLOSURE_SUITE_COUNT
+        || !missing.is_empty()
+        || !unexpected.is_empty()
+        || duplicate_reports
+    {
         let mut details = Vec::new();
+        if actual.len() != CLOSURE_SUITE_COUNT {
+            details.push(format!(
+                "expected exactly {CLOSURE_SUITE_COUNT} unique report names, got {}",
+                actual.len()
+            ));
+        }
         if !missing.is_empty() {
             details.push(format!("missing: {}", missing.join(", ")));
         }
@@ -80,9 +117,6 @@ pub fn validate_closure_reports(selected: &[Suite], reports: &[SuiteReport]) -> 
         }
         if duplicate_reports {
             details.push("duplicate report names".to_string());
-        }
-        if duplicate_selected {
-            details.push("duplicate selected suite names".to_string());
         }
         anyhow::bail!(
             "closure report inventory differs from the selected manifest ({})",
@@ -107,7 +141,9 @@ pub fn validate_closure_reports(selected: &[Suite], reports: &[SuiteReport]) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{ClosurePolicy, validate_closure_reports};
+    use super::{
+        CLOSURE_SUITE_COUNT, ClosurePolicy, validate_closure_reports, validate_closure_selection,
+    };
     use crate::Args;
     use crate::manifest::{Ecosystem, Suite, Tier, VerdictKind, Weight};
     use crate::parsers::{SuiteOutcome, Totals};
@@ -179,6 +215,19 @@ mod tests {
         }
     }
 
+    fn full_inventory() -> Vec<Suite> {
+        (0..CLOSURE_SUITE_COUNT)
+            .map(|index| suite_named(&format!("suite-{index}")))
+            .collect()
+    }
+
+    fn matching_reports(selected: &[Suite]) -> Vec<SuiteReport> {
+        selected
+            .iter()
+            .map(|suite| report_named(&suite.name, Verdict::Match))
+            .collect()
+    }
+
     #[test]
     fn closure_requires_the_complete_hvf_run() {
         let mut args = ArgsFixture::closure();
@@ -196,10 +245,114 @@ mod tests {
     }
 
     #[test]
-    fn closure_report_inventory_must_equal_manifest() {
-        let selected = vec![suite_named("a"), suite_named("b")];
-        let reports = vec![report_named("a", Verdict::Match)];
+    fn closure_allows_fresh_oracle_discovery_and_frozen_cache_checkpoints() {
+        let fresh = Args::try_parse_from([
+            "carrick-conformance",
+            "--closure",
+            "--lane",
+            "hvf",
+            "--tier",
+            "full",
+            "--force",
+            "--refresh-oracle",
+        ])
+        .unwrap_or_else(|error| panic!("fresh closure invocation did not parse: {error}"));
+        assert!(ClosurePolicy::validate_args(&fresh).is_ok());
+
+        let cached = Args::try_parse_from([
+            "carrick-conformance",
+            "--closure",
+            "--lane",
+            "hvf",
+            "--tier",
+            "full",
+            "--force",
+            "--require-cached-oracle",
+        ])
+        .unwrap_or_else(|error| panic!("cached closure invocation did not parse: {error}"));
+        assert!(ClosurePolicy::validate_args(&cached).is_ok());
+    }
+
+    #[test]
+    fn closure_report_inventory_requires_exact_2127_unique_names() {
+        let selected = full_inventory();
+        let reports = matching_reports(&selected);
+        assert!(validate_closure_reports(&selected, &reports).is_ok());
+    }
+
+    #[test]
+    fn closure_rejects_manifest_relative_inventory() {
+        let mut selected = full_inventory();
+        selected.pop();
+        let reports = matching_reports(&selected);
         let error = validate_closure_reports(&selected, &reports).unwrap_err();
-        assert!(error.to_string().contains("missing: b"));
+        assert!(
+            error
+                .to_string()
+                .contains("2127 unique selected suite names")
+        );
+    }
+
+    #[test]
+    fn closure_rejects_zero_selected_suite_names() {
+        let error = validate_closure_selection(&[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("2127 unique selected suite names")
+        );
+        assert!(error.to_string().contains("got 0"));
+    }
+
+    #[test]
+    fn closure_rejects_duplicate_selected_suite_names() {
+        let mut selected = full_inventory();
+        selected[CLOSURE_SUITE_COUNT - 1].name = selected[0].name.clone();
+        let reports = matching_reports(&selected);
+        let error = validate_closure_reports(&selected, &reports).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("2127 unique selected suite names")
+        );
+    }
+
+    #[test]
+    fn closure_rejects_duplicate_report_names() {
+        let selected = full_inventory();
+        let mut reports = matching_reports(&selected);
+        reports.push(report_named("suite-0", Verdict::Match));
+        let error = validate_closure_reports(&selected, &reports).unwrap_err();
+        assert!(error.to_string().contains("duplicate report names"));
+    }
+
+    #[test]
+    fn closure_rejects_unexpected_report_names() {
+        let selected = full_inventory();
+        let mut reports = matching_reports(&selected);
+        reports.push(report_named("unexpected", Verdict::Match));
+        let error = validate_closure_reports(&selected, &reports).unwrap_err();
+        assert!(error.to_string().contains("unexpected: unexpected"));
+    }
+
+    #[test]
+    fn closure_rejects_non_match_reports() {
+        let selected = full_inventory();
+        let mut reports = matching_reports(&selected);
+        reports[0].verdict = Verdict::Incomplete;
+        let error = validate_closure_reports(&selected, &reports).unwrap_err();
+        assert!(error.to_string().contains("suite-0 (INCOMPLETE)"));
+    }
+
+    #[test]
+    fn closure_report_inventory_names_missing_selected_suite() {
+        let selected = full_inventory();
+        let reports: Vec<SuiteReport> = selected
+            .iter()
+            .skip(1)
+            .map(|suite| report_named(&suite.name, Verdict::Match))
+            .collect();
+        let error = validate_closure_reports(&selected, &reports).unwrap_err();
+        assert!(error.to_string().contains("missing: suite-0"));
     }
 }

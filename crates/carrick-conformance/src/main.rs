@@ -21,7 +21,7 @@ mod oracle;
 mod parsers;
 mod verdict;
 
-use crate::closure::{ClosurePolicy, validate_closure_reports};
+use crate::closure::{ClosurePolicy, validate_closure_reports, validate_closure_selection};
 use crate::manifest::{Ecosystem, Manifest, Suite, Tier, Weight};
 use crate::verdict::{
     Baseline, PerfSummary, SideSummary, SuiteReport, Verdict, classify, classify_closure,
@@ -61,7 +61,9 @@ struct Args {
     #[arg(long, default_value = "full")]
     tier: String,
     /// Run the strict, baseline-free closure gate: full unfiltered HVF coverage
-    /// with no retries or waivers, where every selected suite must MATCH.
+    /// with no retries or waivers, where every selected suite must MATCH. The
+    /// first authoritative discovery may add `--refresh-oracle`; later closure
+    /// checkpoints may add `--require-cached-oracle` against its frozen cache.
     #[arg(long)]
     closure: bool,
     /// WHERE the carrick side runs — not which backend it uses; carrick has one
@@ -333,6 +335,9 @@ fn run() -> anyhow::Result<ExitCode> {
         &args.suite,
         skip_key,
     );
+    if args.closure {
+        validate_closure_selection(&selected)?;
+    }
     // Transparency: a bring-up lane silently dropping not-yet-applicable
     // ecosystems could be misread as full coverage, so name what was scoped out.
     // Only on an unfiltered run — an explicit --ecosystem/--suite already ran it.
@@ -586,6 +591,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     run_id: "<cached>".to_string(),
                     argv: engine::docker_dry_run(s, "<cached>", docker_platform),
                     elapsed_ms: cached_elapsed[i],
+                    timed_out: false,
                 };
                 let cout = out.as_ref().ok();
                 let rep = build_report(s, cout, &docker, classification);
@@ -666,6 +672,7 @@ fn run() -> anyhow::Result<ExitCode> {
         let s = &selected[i];
         let side = match out.and_then(|r| r.ok()) {
             Some(o) => {
+                let timed_out = o.timed_out;
                 let res = parsers::parse(verdict_kind(s), &o.raw());
                 cache.insert(s, docker_platform, res.clone(), Some(o.elapsed_ms)); // refuses to cache a non-comparable oracle
                 DockerSide {
@@ -673,6 +680,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     run_id: o.run_id,
                     argv: o.argv,
                     elapsed_ms: Some(o.elapsed_ms),
+                    timed_out,
                 }
             }
             None => DockerSide {
@@ -680,6 +688,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 run_id: String::new(),
                 argv: engine::docker_dry_run(s, "spawn-failed", docker_platform),
                 elapsed_ms: None,
+                timed_out: false,
             },
         };
         fresh.insert(i, side);
@@ -705,6 +714,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 run_id: "<cached>".to_string(),
                 argv: engine::docker_dry_run(s, "<cached>", docker_platform),
                 elapsed_ms: cached_elapsed[i],
+                timed_out: false,
             },
             None => fresh.remove(&i).ok_or_else(|| {
                 anyhow::anyhow!("every non-cached suite has a fresh docker side (suite {i})")
@@ -803,6 +813,9 @@ struct DockerSide {
     run_id: String,
     argv: Vec<String>,
     elapsed_ms: Option<u64>,
+    /// A fresh Docker deadline is an oracle failure even if buffered output
+    /// happened to parse as all-pass; cached oracle results are never timed out.
+    timed_out: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -842,7 +855,9 @@ fn build_report(
     let c_res = parsers::parse(verdict_kind(s), &c_raw);
     let d_res = &docker.result;
     let cl = match policy {
-        ClassificationPolicy::Closure => classify_closure(s, &c_res, c_timed, d_res),
+        ClassificationPolicy::Closure => {
+            classify_closure(s, &c_res, c_timed, d_res, docker.timed_out)
+        }
         ClassificationPolicy::Baseline(baseline) => classify(s, &c_res, c_timed, d_res, baseline),
     };
 
