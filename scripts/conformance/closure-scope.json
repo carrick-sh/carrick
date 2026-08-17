@@ -39,7 +39,7 @@
   },
   "manifest_sha256": "36042b91814ca767d61a6615c0023aa07773b7f5649fc65038fae6c34367d282",
   "schema": "carrick-closure-scope-v1",
-  "source_head": "83dcfe48067ec832375b1979241353997211e5b0",
+  "source_head": "6882ea1285cb677577dbac3bd34f8618adaf28d2",
   "suite_count": 2127,
   "suite_counts_by_ecosystem": {
     "cpython": 438,
