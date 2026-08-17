@@ -1,5 +1,5 @@
 {
-  "binary_sha256": "809f10dd3f4bdcdc61eb5e6af2ee43ce1a2a65b9d06fe53f35a49f6a85d2bf5f",
+  "binary_sha256": "21e7d11449c23f6c6a1d254232101ae82294c4c7563f216b0d1c695924a6d0e1",
   "declared_image_refs": [
     "localhost:5005/carrick-go-conformance:1.24",
     "localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0",
@@ -39,7 +39,7 @@
   },
   "manifest_sha256": "36042b91814ca767d61a6615c0023aa07773b7f5649fc65038fae6c34367d282",
   "schema": "carrick-closure-scope-v1",
-  "source_head": "8164f767fe584696e383a401b5784677a19c19c2",
+  "source_head": "d4526fed56bfb34aed22316a65a942f33f3d8655",
   "suite_count": 2127,
   "suite_counts_by_ecosystem": {
     "cpython": 438,
