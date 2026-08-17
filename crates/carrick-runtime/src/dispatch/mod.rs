@@ -693,6 +693,7 @@ macro_rules! syscall_table {
 }
 
 mod abi_args;
+mod pty_registry;
 #[macro_use]
 mod creds;
 mod epoll_shim;
@@ -4571,6 +4572,20 @@ impl SyscallDispatcher {
                 crate::dispatch::net::reuseport_leave(host_fd.raw());
                 crate::dispatch::net::recverr_close(host_fd.raw());
             }
+            // A pty SLAVE is about to close. Darwin DESTROYS whatever is still
+            // queued in the pty when the last slave fd goes away; Linux hands it
+            // over and only then reports EOF. Rescue it onto the master's
+            // staging queue, which the pipe read path already drains before it
+            // touches the host fd and the readiness paths already count.
+            let closing_slave = match &*open_file.description.read() {
+                OpenDescription::HostPipe {
+                    pty: Some(role), ..
+                } if !role.is_master => Some(role.index),
+                _ => None,
+            };
+            if let Some(index) = closing_slave {
+                self.rescue_pty_master_before_slave_close(index);
+            }
             match &*open_file.description.read() {
                 OpenDescription::HostPipe { pty, host_fd, .. } => {
                     fifo_host_fd = Some(host_fd.raw());
@@ -4609,6 +4624,7 @@ impl SyscallDispatcher {
             self.fs.fanotify_registry.prune_dead_groups();
         }
         if let Some(index) = pty_master_index {
+            crate::dispatch::pty_registry::unregister_master(index);
             self.pty_table()
                 .lock()
                 .free_if_owner(index, std::process::id());
@@ -4750,6 +4766,46 @@ impl SyscallDispatcher {
     /// Shared pseudo-terminal table. Also held by the `/dev` (ptmx) and
     /// `/dev/pts` mounts — all three see the same Arc. Used by the ioctl
     /// (TIOCSPTLCK) and close (free-on-master-close) handlers.
+    /// Move whatever is still queued in pty `index` onto the MASTER's staging
+    /// queue, before the closing slave lets Darwin destroy it.
+    ///
+    /// Measured on macOS 27: write 1024 bytes to a pty slave, do not read the
+    /// master, `close` the slave — the master then reads `0` and the bytes are
+    /// gone. Linux delivers them first. Any reader even one buffer behind
+    /// therefore loses the tail, which is exactly what libuv's
+    /// `tty_pty_partial` sees: 64 slave writes of 1024 against 63 master reads,
+    /// a constant 1024 bytes short of the 65536 it requires.
+    ///
+    /// Two constraints, both learned by getting them wrong:
+    ///
+    /// * the master is found through `dispatch::pty_registry`, NOT the file
+    ///   table — reading the file table from inside this close path hangs
+    ///   (`tty_pty` hung even when the rescue itself did nothing);
+    /// * the amount is discovered by reading until EAGAIN under a byte cap, NOT
+    ///   by `FIONREAD`, which reports 0 on a pty master even with data queued.
+    fn rescue_pty_master_before_slave_close(&self, index: u32) {
+        // Bounded so a still-live writer on the other end cannot keep this
+        // draining — under the dispatcher lock — for as long as it produces.
+        const CAP: usize = 256 * 1024;
+        let Some((master_host_fd, description)) = crate::dispatch::pty_registry::master(index)
+        else {
+            return;
+        };
+        let mut rescued = Vec::new();
+        let mut buf = [0u8; 8192];
+        while rescued.len() < CAP {
+            // BLOCKING-IO-OK: a pty master is adopted O_NONBLOCK.
+            let n = unsafe { libc::read(master_host_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            rescued.extend_from_slice(&buf[..n as usize]);
+        }
+        if !rescued.is_empty() {
+            self.stage_splice_bytes_for_description(description, rescued);
+        }
+    }
+
     pub(super) fn pty_table(&self) -> &std::sync::Arc<parking_lot::Mutex<crate::vfs::PtyTable>> {
         &self.fs.pty_table
     }
