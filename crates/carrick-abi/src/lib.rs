@@ -895,6 +895,29 @@ pub struct LinuxFdPair {
     pub write_fd: i32,
 }
 
+/// Guest-Linux `struct ip_mreq_source`, the optval of the source-specific
+/// multicast options ([`LINUX_IP_ADD_SOURCE_MEMBERSHIP`] and friends).
+///
+/// The field ORDER is the ABI here, and it is NOT universal: Linux orders it
+/// `multiaddr, interface, sourceaddr` while Darwin orders it
+/// `multiaddr, sourceaddr, interface`. This type exists so that difference is
+/// carried by named fields with a typed conversion instead of an untyped byte
+/// swap — the same reason the rest of this crate models wire layouts rather
+/// than indexing into buffers.
+///
+/// All three are `struct in_addr` in NETWORK byte order, so they are held as
+/// raw octets: there is no host-endian value here to convert, and calling one
+/// a `u32` would invite exactly that mistake.
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxIpMreqSource {
+    pub multiaddr: [u8; 4],
+    pub interface: [u8; 4],
+    pub sourceaddr: [u8; 4],
+}
+
 // ----- Netlink (AF_NETLINK / NETLINK_ROUTE) ABI ---------------------------
 //
 // macOS has no AF_NETLINK, so carrick synthesises just enough of the
@@ -4964,6 +4987,15 @@ pub const LINUX_IP_MULTICAST_TTL: i32 = 33;
 pub const LINUX_IP_MULTICAST_LOOP: i32 = 34;
 pub const LINUX_IP_ADD_MEMBERSHIP: i32 = 35;
 pub const LINUX_IP_DROP_MEMBERSHIP: i32 = 36;
+/// The source-specific multicast options (RFC 3376). These take a
+/// `struct ip_mreq_source`, whose FIELD ORDER differs between Linux
+/// (`multiaddr, interface, sourceaddr`) and Darwin
+/// (`multiaddr, sourceaddr, interface`) — see
+/// `dispatch::net::support::rewrite_optval_for_host`.
+pub const LINUX_IP_UNBLOCK_SOURCE: i32 = 37;
+pub const LINUX_IP_BLOCK_SOURCE: i32 = 38;
+pub const LINUX_IP_ADD_SOURCE_MEMBERSHIP: i32 = 39;
+pub const LINUX_IP_DROP_SOURCE_MEMBERSHIP: i32 = 40;
 
 pub const LINUX_IPV6_ADDRFORM: i32 = 1;
 pub const LINUX_IPV6_UNICAST_HOPS: i32 = 16;
