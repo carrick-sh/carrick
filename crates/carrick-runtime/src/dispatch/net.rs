@@ -6378,6 +6378,36 @@ impl SyscallDispatcher {
                     }
                 }
             }
+            // IPV6_MULTICAST_IF: Linux accepts interface index 0, meaning
+            // "clear the multicast interface and let routing choose". Darwin
+            // rejects 0 with EINVAL (measured on macOS 27: 0 as u32, 0 as int,
+            // and a zero-length optval all EINVAL). libuv's
+            // `uv_udp_set_multicast_interface(handle, NULL)` sends exactly that
+            // — `sin6_scope_id = 0` — so the host call failed and
+            // `udp_multicast_interface6` died on `ASSERT_OK`.
+            //
+            // Record the guest's intent and DON'T forward index 0. A fresh
+            // socket has no multicast interface set, so "clear" on it is a true
+            // no-op and this is exact. Darwin cannot undo a previously-set
+            // non-zero index (there is no clear operation at all), so in that
+            // one case the guest sees its 0 while the host keeps the old index.
+            // A non-zero index still passes through to the host below.
+            if level == LINUX_SOL_IPV6
+                && optname == crate::linux_abi::LINUX_IPV6_MULTICAST_IF
+                && optlen >= 4
+                && let Ok(b) = memory.read_bytes(optval_addr, 4)
+            {
+                let index = u32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+                if let Some(open_file) = this.open_file(fd)
+                    && let OpenDescription::HostSocket { base, .. } =
+                        &mut *open_file.description.write()
+                {
+                    base.set_ipv6_multicast_if(index);
+                }
+                if index == 0 {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+            }
             // SO_PASSCRED: store + accept. macOS has no equivalent (it would
             // ENOPROTOOPT through the host), and recvmsg synthesizes the
             // SCM_CREDENTIALS ancillary message from LOCAL_PEERCRED when it's
@@ -6736,6 +6766,31 @@ impl SyscallDispatcher {
                     }
                 };
                 return write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes());
+            }
+            // IPV6_MULTICAST_IF: report the guest-set index. The set side keeps
+            // this carrick-side because Linux's index-0 "clear" has no Darwin
+            // encoding (see the setsockopt comment), so the host would answer
+            // with a stale non-zero index after the guest cleared it. Never set
+            // reads back as 0, which is Linux's default.
+            if level == LINUX_SOL_IPV6
+                && optname == crate::linux_abi::LINUX_IPV6_MULTICAST_IF
+                && let Some(open_file) = this.open_file(fd)
+            {
+                let index = {
+                    let open = open_file.description.read();
+                    match &*open {
+                        OpenDescription::HostSocket { base, .. } => base.ipv6_multicast_if(),
+                        _ => None,
+                    }
+                };
+                if let Some(index) = index {
+                    return write_sockopt_value(
+                        memory,
+                        optval_addr,
+                        optlen_addr,
+                        &index.to_ne_bytes(),
+                    );
+                }
             }
             // SO_RCVTIMEO/SO_SNDTIMEO readback: the set side stores these per
             // open-file-description and bypasses the (dead) host fd, so the

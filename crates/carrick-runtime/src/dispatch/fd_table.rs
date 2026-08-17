@@ -331,6 +331,16 @@ pub(super) struct OpenDescriptionBase {
     /// SO_PASSCRED: when set, recvmsg attaches an SCM_CREDENTIALS ancillary
     /// message with the peer's `struct ucred`. (audit M2)
     so_passcred: bool,
+    /// Guest-set `IPV6_MULTICAST_IF` interface index; `None` = never set.
+    ///
+    /// Linux accepts index **0**, meaning "clear the multicast interface, let
+    /// routing choose". Darwin has no encoding for that: index 0 is `EINVAL`,
+    /// and once a non-zero index is set there is no way to unset it (measured
+    /// on macOS 27 — `0` as `u32`, `0` as `int`, and a zero-length optval all
+    /// return `EINVAL`, and the readback keeps the previous index). So the
+    /// guest's intent is tracked here and reported by `getsockopt`, and a
+    /// requested index of 0 is not forwarded to the host.
+    ipv6_multicast_if: Option<u32>,
     /// True after a successful `listen(2)`. Darwin's EVFILT_READ `data` for a
     /// listening socket is the pending-connection count, so an EPOLLET filter
     /// must remain armed to observe that count growing after a redundant
@@ -376,6 +386,7 @@ impl OpenDescriptionBase {
             fd_refs: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             so_reuseaddr: false,
             so_reuseport: false,
+            ipv6_multicast_if: None,
             so_rcvbuf: None,
             so_sndbuf: None,
             so_passcred: false,
@@ -547,6 +558,16 @@ impl OpenDescriptionBase {
     pub(super) fn so_passcred(&self) -> bool {
         self.so_passcred
     }
+    /// Guest-set `IPV6_MULTICAST_IF` index (`None` = never set). See the field
+    /// comment: Linux's index-0 "clear" has no Darwin equivalent, so the guest's
+    /// value is served from here rather than from the host socket.
+    pub(super) fn ipv6_multicast_if(&self) -> Option<u32> {
+        self.ipv6_multicast_if
+    }
+    pub(super) fn set_ipv6_multicast_if(&mut self, index: u32) {
+        self.ipv6_multicast_if = Some(index);
+    }
+
     pub(super) fn set_so_passcred(&mut self, on: bool) {
         self.so_passcred = on;
     }
