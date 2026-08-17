@@ -4,10 +4,6 @@
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
-**Active worktree:** `/Volumes/CaseSensitive/carrick/.worktrees/conformance-first`
-
-**Active branch:** `codex/conformance-first`
-
 This file is the live controller for the next session. It supersedes the old
 native/Tier-D handoff that previously occupied this path. Do not resume the
 retired native campaign or restart the completed closure-harness work.
@@ -36,21 +32,10 @@ denominator, add an excuse, accept a retry, or start final performance work.
 ## Resume here
 
 ```sh
-cd /Volumes/CaseSensitive/carrick/.worktrees/conformance-first
-git status --short --branch
 git log -6 --oneline
 python3 scripts/conformance/closure-scope.py check \
   scripts/conformance/closure-scope.json
 ```
-
-Expected before new edits:
-
-- branch `codex/conformance-first`;
-- this handoff commit is the tip and the worktree is clean;
-- `main` is `4365c1d7bc9dbcc4c320729712bd980eac472c06`;
-- the campaign branch was 53 commits ahead of `main` before this handoff commit
-  and has no commits on the `main` side;
-- scope check reports exactly 2,127 suites.
 
 Read these next:
 
@@ -79,14 +64,29 @@ abcc37282 docs(conformance): freeze post-sigchld artifact
 651d77a74 test(conformance): validate provenance ancestry
 ```
 
-Earlier reviewed root-exec transaction commits are already integrated in this
-branch. Do not re-merge `codex/node-exec-stage2-lease` or
-`codex/node-worker-teardown`. The latter contained superseded intermediate
-signal behavior; only its reviewed final cumulative diff was squashed into
-`3ef2bf7a8`.
+Earlier reviewed root-exec transaction commits are already integrated. Do not
+re-merge `codex/node-exec-stage2-lease` or `codex/node-worker-teardown`. The
+latter contained superseded intermediate signal behavior; only its reviewed
+final cumulative diff was squashed into `3ef2bf7a8`.
 
-No push or merge to `main` has been performed. Keep the campaign isolated until
-the real correctness and performance goal is complete.
+**The campaign now lives on `main`, not on a worktree branch.** `96a23ca7d` is
+an ancestor of `main`'s HEAD, and the `.worktrees/conformance-first` worktree no
+longer exists. `codex/conformance-first` still exists as a branch but is not
+where work happens. Nothing has been pushed.
+
+Commits added on 2026-08-17 after the checkpoint above (oracle repair and the
+first libuv correctness cluster):
+
+```text
+3656a4692 fix(runtime): stop fabricating a link-local IPv6 on bridge uplinks
+f894506e2 fix(runtime): pass IPv4 multicast membership through to the host
+e479f238d fix(runtime): stamp the creator as owner of a bound AF_UNIX socket
+5b2992981 fix(runtime): accept IPV6_MULTICAST_IF index 0 as Linux's clear
+a6d877666 fix(runtime): report real boot time in /proc/uptime
+2e4e37496 fix(runtime): scope nice and ioprio to the Linux process
+60a415773 fix(conformance): stop pinning --user on the node-libuv oracle
+3fc77ed7c feat(conformance): fill one suite's docker oracle by profile
+```
 
 ## What is complete
 
@@ -187,7 +187,13 @@ The six valid `>=10x` rows are:
 - `ltp-timerfd_settime02` 32.50x
 
 Do not treat the libuv 145.02x ratio as performance evidence: its cached Docker
-row is an invalid setup failure.
+row was an invalid setup failure. That row has since been REPAIRED (see
+`docs/perf-results/2026-08-17-libuv-oracle-repair/`); the docker side now runs
+in 45.5 s and carrick in ~58 s, so the real ratio is near 1.3x. The counts in
+this section, and in `docs/conformance-closure-ledger.md`, still describe the
+PRE-repair state: 507 libuv positions were ledgered `docker = absent`
+(unexercised) and are now real comparisons. Re-run the closure gate before
+quoting any of these numbers again.
 
 Timeout identity rotated under the eight-worker discovery run. Cleared:
 `cpython-compileall`, `cpython-concurrent_futures`, and
@@ -198,8 +204,14 @@ attributing them; do not accept retry-recovered results.
 
 ## Durable evidence
 
-All ignored runtime artifacts remain in this worktree. Do not rebuild before
-inspecting them.
+**The artifacts listed below are GONE.** They lived in `target/` inside the
+`.worktrees/conformance-first` worktree, which no longer exists; only the
+committed docs survived. The hashes are kept as a record of what the checkpoint
+claimed, not as something you can inspect. Do not plan work that depends on
+re-reading them — re-measure instead.
+
+Evidence produced from 2026-08-17 onward is committed under
+`docs/perf-results/` rather than left in `target/`, precisely because of this.
 
 ```text
 target/conformance/closure-after-sigchld/results.jsonl
@@ -232,93 +244,89 @@ probe commands exited nonzero because 14 real semantic gaps remain. Scoped
 Carrick cleanup and `conf-*` Docker cleanup were zero. The binary hash remained
 unchanged through every gate.
 
-## Next cluster: repair and close Node libuv
+## Next cluster: finish Node libuv
 
-The existing `2026-08-17-libuv-child-lifecycle.md` plan is stale after the
-SIGCHLD fix. Do not run its old `spawn_exit_code` LLDB campaign: the prior
-child-exit blocker cleared and both `spawn_exercise_sigchld_issue` and
-`spawn_exit_code` pass. Of the 30 spawn positions, 28 pass; `spawn_quoted_path`
-and `spawn_setuid_setgid` remain skipped, with the latter still requiring a
-privilege-correct comparison. Revise the plan before implementation.
+Step 1 (repair the Docker oracle) and most of step 2 are DONE. See
+`docs/perf-results/2026-08-17-libuv-oracle-repair/README.md` (oracle repair)
+and `phase-2-libuv-correctness.md` (the Carrick side) for full evidence,
+provenance and per-row root causes. Do not redo them.
 
-### 1. Repair the Docker oracle first
+The oracle now emits 507 positions (499 pass / 0 fail / 8 skip) and its raw TAP
+is committed at
+`docs/perf-results/2026-08-17-libuv-oracle-repair/docker-oracle-libuv.tap`, so
+the Carrick side can be diffed without re-running Docker.
 
-The Docker row does not reach libuv:
+Closed, each proven red-first: `platform_output` (uptime), `thread_priority`
+(nice scope), `pipe_set_chmod` (AF_UNIX owner), `udp_multicast_interface6`
+(ifindex 0), `udp_multicast_join` (blanket ENODEV).
 
-- `scripts/conformance/suites.toml:80` adds `--user 65534`;
-- `crates/carrick-conformance/src/generate.rs:520` regenerates it;
-- `docker/nodejs-conformance/nodejs-conformance:245-267` must create/copy and
-  chown the fixture, then call `setgid(1000)` and `setuid(1000)`.
+### Remaining, in recommended order
 
-The raw cached oracle is chown/setgid EPERM, not Linux libuv behavior. Remove
-the `--user 65534` flags from both manifest and generator and add a
-generator/manifest regression test so regeneration cannot restore them. The
-wrapper still drops the actual test to uid/gid 1000. No image rebuild is
-needed. The OracleKey changes, so run only the corrected node-libuv Docker row
-in a serialized Docker-only phase and preserve proof that TAP begins after the
-drop. Do not refresh all 2,127 oracles for this change.
+1. **Two NON-DETERMINISTIC rows — do these first.** `eintr_handling` (29) and
+   `tcp_try_write_error` (399) flip between runs of the SAME signed binary
+   (fail 1-of-4 and 2-of-4 respectively). The goal admits no flakiness and no
+   retry-recovered acceptance, so no clean final pass is possible while they
+   flip, and every later measurement is noisy until they are fixed. Do not
+   dismiss them as load without measuring.
+2. **`SO_REUSEPORT` distribution** (`tcp_reuseport` 395, `udp_reuseport` 488).
+   Two listeners on `127.0.0.1:9123`; the test requires BOTH to receive at
+   least one of 10 connections/datagrams. First distinguish "Darwin does not
+   load-balance" from "Carrick's epoll/accept dispatch hands everything to one
+   waiter" — a small host-only C program settles the first half without any
+   guest, the way the `IPV6_MULTICAST_IF` and multicast-join questions were
+   settled. Then get Linux ground truth with bpftrace inside Docker over
+   setsockopt/bind/listen/accept4/recvmsg. Never strace.
+3. **UDP error queue** (`udp_recvmsg_unreachable_error` 483 / `…6` 484). Needs
+   `IP_RECVERR`/`IPV6_RECVERR` accepted (they are absent from the SOL_IP and
+   SOL_IPV6 option gates, so `uv_udp_bind` fails before any recvmsg), then a
+   real `MSG_ERRQUEUE` carrying a `sock_extended_err` + `SO_EE_OFFENDER` cmsg,
+   `EPOLLERR` on the fd, and `EAGAIN` on the drained second read. The test
+   asserts exactly 3 `recv_cb` calls. `MSG_ERRQUEUE` is currently a stub.
+4. **`tty_pty_partial`** (456). 8x8192 bytes in, exactly 65536 out, ten times.
+   The upstream "not 100% deterministic" comment does NOT excuse this: it says a
+   BUGGY implementation fails ~1 in 3, which is why it loops 10x; the assertion
+   is exact.
+5. **The netns asymmetry** (`tcp_connect6_link_local` 370 inversion,
+   `udp_multicast_join6` 472). `carrick run` defaults to `--network host` while
+   `docker run` defaults to bridge, so the two sides enumerate different
+   interfaces. The bridge model has been corrected to match the oracle netns
+   (uplinks IPv4-only, `lo` keeps `::1`), but the suite cannot be switched to
+   bridge yet — see the blocker below.
 
-### 2. Classify against the repaired 507-position oracle
+### Blocker found while testing (5): `--network bridge` aborts
 
-Current Carrick failures:
+Running the libuv workload with `--network bridge` exits 134 with zero stdout:
 
-- `platform_output`: `uv_uptime()` is zero. `host_uptime_secs` silently falls
-  back to zero when Darwin `KERN_BOOTTIME` fails or has the wrong shape.
-- `tcp_reuseport` and `udp_reuseport`: both listeners bind, but all traffic
-  lands on one listener. Existing probe coverage checks bind/readback, not
-  Linux load distribution.
-- `thread_priority`: high-confidence process-scope bug. `NICE_VALUE` is a
-  carrier-global static even though HVPatch logical processes share the
-  carrier. An earlier libuv test leaves nice at 19; a later logical process
-  setting self to 4 receives EACCES.
-- `tty_pty_partial`: exact 1,024-byte loss after a 65,536-byte write. The
-  upstream test is labeled nondeterministic; sample corrected Docker and
-  Carrick at least three times before filing a mechanism.
-- `udp_multicast_interface6`: default/null IPv6 interface setup returns EINVAL.
-- `udp_recvmsg_unreachable_error` v4/v6: Carrick has no Linux UDP error queue;
-  MSG_ERRQUEUE is hard-coded EAGAIN and IPv6 RECVERR is not modeled.
+```
+objc[...]: +[NSNumber initialize] may have been in progress in another thread
+when fork() was called. ... Crashing instead.
+```
 
-Nine skips remain. Some are expected Windows/platform or headless-TTY skips;
-`pipe_set_chmod`, multicast joins, and `spawn_setuid_setgid` are not acceptable
-coverage conclusions until compared with the repaired oracle and, where
-needed, given a privilege-correct sublane.
+A trivial `--network bridge ... sh -c 'echo hello'` succeeds, so it is
+workload-specific, not setup. This is the known fork-unsafe
+CoreFoundation/ObjC class. Likely entry point is `getaddrinfo` via
+`to_socket_addrs` in `crates/carrick-runtime/src/network/dns.rs`; `scutil` in
+`vfs/resolvconf.rs` is a `posix_spawn` subprocess and is NOT the culprit. Not
+root-caused. Attach the VM carrier (`carrick debug lldb-run`) and break on
+`objc_initializeAfterForkError`.
 
-### 3. Recommended implementation order
+This is a crash, so it outranks a wrong answer.
 
-1. Repair and refresh only the libuv oracle.
-2. Add a red `nice_process_isolation` probe: logical child A sets nice 19 and
-   exits; logical child B sets nice 4 and must succeed/read back 4. Move nice
-   authority into Task/process state, not another global or host-PID shim.
-3. Add a bounded `reuseport_distribution` probe covering TCP and UDP with many
-   distinct source sockets. Require both listeners to receive traffic.
-4. Prove Linux ground truth for reuseport inside Docker with bpftrace over
-   setsockopt/bind/listen/accept4/recvmsg. Do not use strace.
-5. Trace the red Carrick reducer with bounded `carrick trace` plus the existing
-   epoll/accept events. If tracing perturbs or wedges it, use
-   `carrick debug lldb-run`, the VM carrier core, event ring, and `bt all`.
-6. Implement only after distinguishing Darwin host distribution from a Carrick
-   epoll/waiter dispatch defect.
-7. Then reduce UDP RECVERR, uptime, multicast, and PTY residuals in that order.
+### Also found, recorded rather than fixed
 
-The cheapest high-confidence first fix is nice-state isolation. The largest
-visible libuv failure fan-out is reuseport distribution (two of eight current
-failures). After each fix, re-run the deterministic reducer, the exact libuv
-row against the repaired oracle, focused tests, full `just ci`, then let the
-coordinator run the next broad closure checkpoint.
-
-## Other live backlog after libuv
-
-- Isolate the three newly timed-out rows and `ltp-waitpid13` three times on the
-  frozen artifact before attributing a regression.
-- The 14 probe failures are listed exactly at the end of
-  `docs/conformance-closure-ledger.md`. They include `ioctlcluster`, `mqueue`,
-  `oomscoreadj`, GNU `aliassize`, GNU `childsubreaper`, GNU `coredumpfile`, GNU
-  `termiosbits`, and the two dedicated bridge failures under both libcs.
-- The largest remaining assertion fan-out is CPython multiprocessing/process
-  isolation, followed by Go process/epoll clusters and broad LTP
-  infrastructure. Use the generated ledger rather than the stale baseline.
-- Valid `>=10x` rows are correctness work, but correctness parity remains the
-  ordered first gate. Do not optimize elapsed ratios for incomplete rows.
+- `fchmod` on a bound AF_UNIX socket fd resolves no path and silently returns
+  0, so a mode set through the fd alone is lost. No current row covers it;
+  libuv's `uv_pipe_chmod` runs `chmod` afterwards and does not depend on it.
+- `dispatch/time.rs`'s `RLIMIT_CPU_GENERATION` is a carrier-global static
+  gating a per-process limit, so one guest process's `setrlimit(RLIMIT_CPU)`
+  can cancel another's enforcement. Same class as the `nice`/`ioprio` statics
+  just fixed. Not measured by any current row.
+- The previous checkpoint's durable evidence is GONE: it lived in
+  `target/` inside the `.worktrees/conformance-first` worktree, which no longer
+  exists. The campaign commits themselves are on `main` (`96a23ca7d` is an
+  ancestor of HEAD), and the committed docs survived, but every raw artifact
+  the old handoff cited is unrecoverable. Evidence that matters is now
+  committed under `docs/perf-results/` instead of left in `target/`.
 
 ## Measurement discipline
 
