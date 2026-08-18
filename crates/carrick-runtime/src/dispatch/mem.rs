@@ -474,9 +474,6 @@ struct ResidentFaultRange {
     prot: LinuxProtFlags,
 }
 
-/// Insert `[addr, addr+len)` into `regions` (sorted by start), coalescing any
-/// adjacent or overlapping ranges. `len` must be > 0.
-
 /// Debug: log any `mmap_next` LOWERING that crosses `CARRICK_FORK_DEBUG_VA`.
 /// The bump allocator's invariant is "everything at/above `mmap_next` is
 /// unallocated"; a lowering that crosses a LIVE mapping breaks it and the next
@@ -497,6 +494,8 @@ fn debug_mmap_next_lowering(old: u64, new: u64) {
     }
 }
 
+/// Insert `[addr, addr+len)` into `regions` (sorted by start), coalescing any
+/// adjacent or overlapping ranges. `len` must be > 0.
 fn free_regions_insert(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
     // Free-list audit: CARRICK_FORK_DEBUG_VA=<hex> logs any insert covering
     // that VA, with the caller — the final provenance hook in the forkserver

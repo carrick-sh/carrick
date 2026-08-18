@@ -600,3 +600,44 @@ Raw logs preserved in the scratchpad (`fd*.err`, `gd*.err`, `ld.err`,
 deep in a threading test), and `cpython-concurrent_futures` (178, left a
 `core` behind) are all plausibly this one family — a context-dependent child
 SIGSEGV. Confirming or splitting that attribution is worth ~1,100 rows.
+
+
+## THE FIX (landed): exclusive-claim authentication for maintenance writes
+
+`frame_cow_write_route` gains a fourth discriminant: a `BackingMaintenance`
+write whose retained stage-1 output LACKS AN EXCLUSIVE CLAIM routes to
+`MaterializeRetired` — a fresh private zeroed granule, transactionally
+repointed — instead of writing Direct through the frame. A claim is lacking
+when:
+
+- this mm's inventory holds NO extent covering the IPA (a stale retained leaf
+  that survived its mapping's retirement — the forkserver worker's exact
+  shape: 606 own extents, none covering the IPA, writing straight into the
+  server's frame), or
+- an extent exists with a `Private` backing whose frame the shared backend
+  registry counts more than one reference on (fork-COW sharing).
+
+`SharedAnon`/`SharedFile` backings are exempt — MAP_SHARED means every mapper
+must keep seeing the same bytes, and the first version of this fix privatized
+a shared semaphore page and hung multiprocessing's Barrier. Deliberate sharing
+is not a lost claim.
+
+Two earlier fix attempts did NOT move the bug and are kept only as adjacent
+hardening: dropping `zero_guest_backing`'s unscoped VA fallback, and the
+`retained_frame_is_shared` refcount-only test (defeated by the missing-extent
+case).
+
+Verified on the signed binary:
+
+| check | before | after |
+|---|---|---|
+| the 2.5 s pair | FAILED 3/3, child SIGSEGV | OK 5/5 |
+| `test_multiprocessing_fork.test_misc` | 1 ERROR | SUCCESS |
+| `test_multiprocessing_spawn` | 3/4 files | **SUCCESS 4/4** |
+| `test_multiprocessing_forkserver` | 0 assertions (hang) | **SUCCESS 4/4** |
+| `test_multiprocessing_fork.test_processes` | never completed | completes; 1 isolated ERROR |
+| churn reducers, `ltp-mremap01`, `go-net_http` 53 s | — | all unchanged-green |
+
+Remaining, now ISOLATED and deterministic: `WithProcessesTestPicklingConnections
+.test_pickling` fails standalone under carrick (recv EOF), passes under Docker —
+an fd-passing (SCM_RIGHTS pickled-connection) gap, nothing to do with memory.

@@ -3840,9 +3840,18 @@ fn frame_cow_write_route(
     intent: carrick_aarch64::vmm::FrameCowWriteIntent,
     armed: bool,
     retained_output_has_no_physical_source: bool,
+    retained_output_source_is_shared: bool,
 ) -> FrameCowWriteRoute {
+    // A maintenance write whose retained output names a frame OTHER mms still
+    // reference must MATERIALIZE a private replacement, exactly like the
+    // no-source case — never write through. The armed-set cannot make this
+    // call: it is derived at fork from alias rows and is known-omissive
+    // (`mtforkcorrupt`), and an unarmed Direct write through a shared frame
+    // zeroed one process's live memory during another's mmap reuse (the
+    // CPython forkserver interned-dict corruption). The frame inventory's
+    // reference count is the authority that actually knows who shares.
     if intent == carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance
-        && retained_output_has_no_physical_source
+        && (retained_output_has_no_physical_source || retained_output_source_is_shared)
     {
         FrameCowWriteRoute::MaterializeRetired
     } else if armed {
@@ -6705,6 +6714,60 @@ impl HvfVmState {
         self.cow_identity = Some(identity);
     }
 
+    /// Whether the frame backing `ipa` is referenced by MORE than one extent in
+    /// the shared backend registry — i.e., some other mm (a fork parent or
+    /// child) still lives on it. The registry `Arc` is shared across every
+    /// engine in the carrier and its counts drive retirement, so it is the
+    /// authority for "shared", where the per-engine armed-set is only a
+    /// derived (and known-omissive) approximation.
+    /// Whether this mm may write DIRECTLY through the frame its retained
+    /// stage-1 output names. Two ways to lose that right:
+    ///
+    /// - This mm's inventory holds NO extent covering the IPA at all: the leaf
+    ///   is stale — it survived a retirement/replacement of the mapping it
+    ///   belonged to — and whatever lives behind that IPA now belongs to
+    ///   someone else. The forkserver worker's scrub had exactly this shape
+    ///   (606 own extents, none covering the retained IPA) and its Direct
+    ///   write zeroed the SERVER's live interned-dict granule.
+    /// - An extent exists but the backend registry counts more than one
+    ///   reference on its frame: a fork peer still lives on it, and a direct
+    ///   write would be visible through the other mm.
+    ///
+    /// In both cases the maintenance write must MATERIALIZE a private zeroed
+    /// replacement instead. The registry `Arc` is shared carrier-wide and its
+    /// counts drive retirement, so it is the authority; the per-engine
+    /// armed-set is a derived, known-omissive approximation
+    /// (`mtforkcorrupt`).
+    fn retained_output_lacks_exclusive_claim(&self, ipa: u64) -> bool {
+        let inventory = self.frame_inventory.lock();
+        let extent = inventory
+            .extents
+            .iter()
+            .find(|(key, _)| key.0 <= ipa && ipa < key.0.saturating_add(key.1))
+            .map(|(_, extent)| *extent);
+        let Some(extent) = extent else {
+            return true;
+        };
+        // DELIBERATE sharing is not a lost claim. A `SharedAnon`/`SharedFile`
+        // backing is MAP_SHARED semantics: every mapper must keep seeing the
+        // same bytes, and materializing a private replacement under it breaks
+        // exactly what the guest asked for (measured: multiprocessing's
+        // Barrier hung when a shared semaphore page was privatized here).
+        // Only a PRIVATE backing observed by more than one mm is fork-COW
+        // sharing that a maintenance write must not write through.
+        if !matches!(extent.backing, InventoryBackingIdentity::Private(_)) {
+            return false;
+        }
+        inventory
+            .frames
+            .lock()
+            .references
+            .get(&extent.frame)
+            .copied()
+            .unwrap_or(0)
+            > 1
+    }
+
     fn physical_cow_source(&self, semantic_va: u64, ipa: u64) -> Option<(*mut u8, u64)> {
         let physical_ipa = align_down(ipa, CowArmedRanges::COMPOUND_SIZE);
         let physical_end = physical_ipa.checked_add(CowArmedRanges::COMPOUND_SIZE)?;
@@ -7282,7 +7345,9 @@ impl HvfVmState {
         let Some(retained_ipa) = retained_ipa else {
             return Ok(None);
         };
-        if self.physical_cow_source(page_va, retained_ipa).is_some() {
+        if self.physical_cow_source(page_va, retained_ipa).is_some()
+            && !self.retained_output_lacks_exclusive_claim(retained_ipa)
+        {
             return Ok(None);
         }
         if !self.protections.range_unmapped(page_va, 1) {
@@ -7315,7 +7380,14 @@ impl HvfVmState {
         let Some(retained_ipa) = retained_ipa else {
             return Ok(None);
         };
-        if self.physical_cow_source(page_va, retained_ipa).is_some() {
+        if self.physical_cow_source(page_va, retained_ipa).is_some()
+            && !self.retained_output_lacks_exclusive_claim(retained_ipa)
+        {
+            // A live PRIVATE source means a sibling repaired the leaf; nothing
+            // to materialize. A live SHARED source is the case this exists
+            // for: the mm must get its own zeroed replacement rather than
+            // writing through (corruption) or reading through (disclosure)
+            // the other mm's frame.
             return Ok(None);
         }
 
@@ -7353,9 +7425,10 @@ impl HvfVmState {
                 .lock()
                 .as_ref()
                 .and_then(|manager| manager.translate_retained_output(probe));
-            let needs_materialization = retained
-                .is_some_and(|ipa| self.physical_cow_source(probe, ipa).is_none())
-                && self.protections.range_unmapped(probe, 1);
+            let needs_materialization = retained.is_some_and(|ipa| {
+                self.physical_cow_source(probe, ipa).is_none()
+                    || self.retained_output_lacks_exclusive_claim(ipa)
+            }) && self.protections.range_unmapped(probe, 1);
             if !needs_materialization {
                 span_end = probe;
                 break;
@@ -8231,19 +8304,47 @@ impl HvfVmState {
         let mut current = start;
         while current < end {
             let armed = self.cow_armed.lock().span_for(current).is_some();
-            let retained_output_has_no_physical_source = if intent
-                == carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance
-                && self.persistent_vm_lifecycle
+            let (retained_output_has_no_physical_source, retained_output_source_is_shared) =
+                if intent == carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance
+                    && self.persistent_vm_lifecycle
+                {
+                    match self
+                        .page_tables
+                        .lock()
+                        .as_ref()
+                        .and_then(|manager| manager.translate_retained_output(current))
+                    {
+                        Some(ipa) => {
+                            let no_source = self.physical_cow_source(current, ipa).is_none();
+                            let shared =
+                                !no_source && self.retained_output_lacks_exclusive_claim(ipa);
+                            (no_source, shared)
+                        }
+                        None => (false, false),
+                    }
+                } else {
+                    (false, false)
+                };
+            let route = frame_cow_write_route(
+                intent,
+                armed,
+                retained_output_has_no_physical_source,
+                retained_output_source_is_shared,
+            );
+            if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
+                .ok()
+                .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+                && current <= debug_va
+                && debug_va < end.min(current.saturating_add(CowArmedRanges::COMPOUND_SIZE))
             {
-                self.page_tables
-                    .lock()
-                    .as_ref()
-                    .and_then(|manager| manager.translate_retained_output(current))
-                    .is_some_and(|ipa| self.physical_cow_source(current, ipa).is_none())
-            } else {
-                false
-            };
-            match frame_cow_write_route(intent, armed, retained_output_has_no_physical_source) {
+                eprintln!(
+                    "[ROUTEDBG pid={:?}] va={current:#x} intent={intent:?} armed={armed} \
+                     no_source={retained_output_has_no_physical_source} \
+                     shared={retained_output_source_is_shared} route={route:?}",
+                    self.cow_identity.map(|identity| identity.linux_pid),
+                );
+            }
+            match route {
                 FrameCowWriteRoute::MaterializeRetired => {
                     if let Some(materialized_end) =
                         self.materialize_retired_reuse(current, end, flush_stage1)?
@@ -15479,19 +15580,33 @@ mod frame_inventory_backend_tests {
         use carrick_aarch64::vmm::FrameCowWriteIntent;
 
         assert_eq!(
-            frame_cow_write_route(FrameCowWriteIntent::BackingMaintenance, true, true),
+            frame_cow_write_route(FrameCowWriteIntent::BackingMaintenance, true, true, false),
             FrameCowWriteRoute::MaterializeRetired,
             "same-VA reuse must not COW an IPA after its exact stage-2 lease retired",
         );
         assert_eq!(
-            frame_cow_write_route(FrameCowWriteIntent::BackingMaintenance, true, false),
+            frame_cow_write_route(FrameCowWriteIntent::BackingMaintenance, true, false, false),
             FrameCowWriteRoute::CopyOnWrite,
             "a still-live fork-shared physical source remains an ordinary COW",
         );
         assert_eq!(
-            frame_cow_write_route(FrameCowWriteIntent::GuestVisible, true, true),
+            frame_cow_write_route(FrameCowWriteIntent::GuestVisible, true, true, false),
             FrameCowWriteRoute::CopyOnWrite,
             "guest faults never use the pre-publication backing-maintenance route",
+        );
+        // The corruption shape: an UNARMED maintenance write whose retained
+        // output names a frame other mms still reference must materialize a
+        // private replacement — never write Direct through the shared frame
+        // (the CPython forkserver interned-dict zeroing).
+        assert_eq!(
+            frame_cow_write_route(FrameCowWriteIntent::BackingMaintenance, false, false, true),
+            FrameCowWriteRoute::MaterializeRetired,
+            "an unarmed maintenance write must not go direct through a shared frame",
+        );
+        assert_eq!(
+            frame_cow_write_route(FrameCowWriteIntent::BackingMaintenance, false, false, false),
+            FrameCowWriteRoute::Direct,
+            "an unshared retained frame is this mm's own; direct scrub is correct",
         );
 
         let va = 0x0600_000a_9000;
