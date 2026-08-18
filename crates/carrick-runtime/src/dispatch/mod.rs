@@ -19,9 +19,10 @@
 //! taking `&mut SyscallCtx<M>` and returning `Result<DispatchOutcome,
 //! DispatchError>` — so a `number → handler` mapping is just a `match` returning
 //! one [`SyscallHandler`] fn pointer. Each per-domain module (`fs`, `net`,
-//! `mem`, `proc`, `signal`, `time`, `creds`, `sysv`) owns its OWN routing table
-//! via the `syscall_table!` macro, which emits a `dispatch_<area>(number) ->
-//! Option<SyscallHandler<M>>`. `resolve_handler` chains those eight tables;
+//! `mem`, `proc`, `signal`, `time`, `creds`, `sysv`, `mqueue`, `perf`) owns its
+//! OWN routing table via the `syscall_table!` macro, which emits a
+//! `dispatch_<area>(number) -> Option<SyscallHandler<M>>`. `resolve_handler`
+//! chains those per-module tables;
 //! `dispatch_normalized` (builds a [`SyscallCtx`] and invokes the resolved
 //! handler) and `dispatch_normalized_known` (the membership test the threaded
 //! path uses) both go through it, so they cannot drift. There is NO central
@@ -715,6 +716,7 @@ mod mem;
 #[macro_use]
 mod net;
 #[macro_use]
+mod perf;
 mod proc;
 mod proctitle;
 mod resources;
@@ -3173,6 +3175,7 @@ fn resolve_handler<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
         .or_else(|| sysv::dispatch_sysv(number))
         .or_else(|| mqueue::dispatch_mqueue(number))
         .or_else(|| bpf::dispatch_bpf(number))
+        .or_else(|| perf::dispatch_perf(number))
 }
 
 /// True once the kernel lane's first process has bound. On that lane a Linux

@@ -4220,6 +4220,110 @@ pub const LINUX_NS_GET_PARENT: u64 = 0xb702;
 pub const LINUX_NS_GET_NSTYPE: u64 = 0xb703;
 pub const LINUX_NS_GET_OWNER_UID: u64 = 0xb704;
 
+// ── perf_event_open(2) ABI ──────────────────────────────────────────────────
+// Derived clean-room from perf_event_open(2) (man-pages) and differential runs
+// against the native arm64 Docker oracle (errno shapes: E2BIG size-versioning,
+// ENOENT for unavailable generic events, ENOSPC for short counter reads).
+
+/// `perf_event_attr.type` selectors (the man page's PERF_TYPE_* ordinals).
+pub const LINUX_PERF_TYPE_HARDWARE: u32 = 0;
+pub const LINUX_PERF_TYPE_SOFTWARE: u32 = 1;
+
+/// `PERF_TYPE_SOFTWARE` config ordinals carrick can honestly back.
+pub const LINUX_PERF_COUNT_SW_CPU_CLOCK: u64 = 0;
+pub const LINUX_PERF_COUNT_SW_TASK_CLOCK: u64 = 1;
+pub const LINUX_PERF_COUNT_SW_DUMMY: u64 = 9;
+
+/// First published `perf_event_attr` size (`PERF_ATTR_SIZE_VER0`); a smaller
+/// non-zero `attr.size` is E2BIG. `attr.size == 0` is read as VER0.
+pub const LINUX_PERF_ATTR_SIZE_VER0: u32 = 64;
+/// The `perf_event_attr` size carrick knows (through the VER8 `sig_data`
+/// field). A larger guest struct is accepted iff the tail beyond this is
+/// all-zero, else E2BIG with this value written back into `attr.size` —
+/// the man page's forward/backward size-versioning contract.
+pub const LINUX_PERF_ATTR_SIZE_SUPPORTED: u32 = 136;
+
+// perf_event ioctls: `'$'` (0x24) type byte in the `_IO*` encodings.
+pub const LINUX_PERF_EVENT_IOC_ENABLE: u64 = 0x2400;
+pub const LINUX_PERF_EVENT_IOC_DISABLE: u64 = 0x2401;
+pub const LINUX_PERF_EVENT_IOC_REFRESH: u64 = 0x2402;
+pub const LINUX_PERF_EVENT_IOC_RESET: u64 = 0x2403;
+pub const LINUX_PERF_EVENT_IOC_PERIOD: u64 = 0x4008_2404;
+pub const LINUX_PERF_EVENT_IOC_SET_OUTPUT: u64 = 0x2405;
+pub const LINUX_PERF_EVENT_IOC_SET_FILTER: u64 = 0x4008_2406;
+pub const LINUX_PERF_EVENT_IOC_ID: u64 = 0x8008_2407;
+pub const LINUX_PERF_EVENT_IOC_SET_BPF: u64 = 0x4004_2408;
+pub const LINUX_PERF_EVENT_IOC_PAUSE_OUTPUT: u64 = 0x4004_2409;
+/// `PERF_IOC_FLAG_GROUP`: apply an enable/disable/reset to the whole group.
+pub const LINUX_PERF_IOC_FLAG_GROUP: u64 = 1;
+
+bitflags! {
+    /// `perf_event_open(2)` `flags` argument bits. Unknown bits are EINVAL.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PerfEventOpenFlags: u64 {
+        const FD_NO_GROUP = 1 << 0;
+        const FD_OUTPUT = 1 << 1;
+        const PID_CGROUP = 1 << 2;
+        const FD_CLOEXEC = 1 << 3;
+    }
+
+    /// `perf_event_attr.read_format` bits. Unknown bits are EINVAL.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PerfEventReadFormat: u64 {
+        const TOTAL_TIME_ENABLED = 1 << 0;
+        const TOTAL_TIME_RUNNING = 1 << 1;
+        const ID = 1 << 2;
+        const GROUP = 1 << 3;
+        const LOST = 1 << 4;
+    }
+
+    /// The `perf_event_attr` packed flag word (the bitfield starting at
+    /// `disabled`), bit numbers in the man page's field order. Bits above
+    /// `SIGTRAP` are reserved (`__reserved_1`) and are EINVAL when set.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PerfEventAttrFlags: u64 {
+        const DISABLED = 1 << 0;
+        const INHERIT = 1 << 1;
+        const PINNED = 1 << 2;
+        const EXCLUSIVE = 1 << 3;
+        const EXCLUDE_USER = 1 << 4;
+        const EXCLUDE_KERNEL = 1 << 5;
+        const EXCLUDE_HV = 1 << 6;
+        const EXCLUDE_IDLE = 1 << 7;
+        const MMAP = 1 << 8;
+        const COMM = 1 << 9;
+        const FREQ = 1 << 10;
+        const INHERIT_STAT = 1 << 11;
+        const ENABLE_ON_EXEC = 1 << 12;
+        const TASK = 1 << 13;
+        const WATERMARK = 1 << 14;
+        // `precise_ip` is a 2-bit field.
+        const PRECISE_IP_LO = 1 << 15;
+        const PRECISE_IP_HI = 1 << 16;
+        const MMAP_DATA = 1 << 17;
+        const SAMPLE_ID_ALL = 1 << 18;
+        const EXCLUDE_HOST = 1 << 19;
+        const EXCLUDE_GUEST = 1 << 20;
+        const EXCLUDE_CALLCHAIN_KERNEL = 1 << 21;
+        const EXCLUDE_CALLCHAIN_USER = 1 << 22;
+        const MMAP2 = 1 << 23;
+        const COMM_EXEC = 1 << 24;
+        const USE_CLOCKID = 1 << 25;
+        const CONTEXT_SWITCH = 1 << 26;
+        const WRITE_BACKWARD = 1 << 27;
+        const NAMESPACES = 1 << 28;
+        const KSYMBOL = 1 << 29;
+        const BPF_EVENT = 1 << 30;
+        const AUX_OUTPUT = 1 << 31;
+        const CGROUP = 1 << 32;
+        const TEXT_POKE = 1 << 33;
+        const BUILD_ID = 1 << 34;
+        const INHERIT_THREAD = 1 << 35;
+        const REMOVE_ON_EXEC = 1 << 36;
+        const SIGTRAP = 1 << 37;
+    }
+}
+
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct LinuxOpenFlags: u64 {

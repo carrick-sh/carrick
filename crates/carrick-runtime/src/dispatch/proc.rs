@@ -246,7 +246,7 @@ fn sched_priority_for(policy: i32, max: bool) -> DispatchOutcome {
 /// the host pid as the guest process pid, plus `LINUX_BOOTSTRAP_PID` (the stable
 /// guest-init alias used elsewhere); threaded dispatch also carries the current
 /// guest tid.
-fn sched_pid_is_self<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
+pub(super) fn sched_pid_is_self<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
     // 0 and the caller's own thread tid are self for sched_*; the process-level
     // self cases (host pid, bootstrap, ns-pid) are the canonical
     // NsPid::names_self (which the old body lacked the ns-pid arm of).
@@ -258,7 +258,10 @@ fn sched_pid_is_self<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
 }
 
 /// True when `pid` names a live sibling thread in this Carrick guest process.
-fn sched_pid_is_live_guest_thread<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
+pub(super) fn sched_pid_is_live_guest_thread<M: GuestMemory>(
+    cx: &SyscallCtx<'_, M>,
+    pid: u64,
+) -> bool {
     if pid == 0 || pid > i32::MAX as u64 {
         return false;
     }
@@ -272,7 +275,7 @@ fn sched_pid_is_live_guest_thread<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u
 /// Classification of a sched_*/priority `pid` argument relative to the caller,
 /// resolved against carrick's guest process model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SchedTarget {
+pub(super) enum SchedTarget {
     /// 0, the caller's own pid/alias, or one of its live sibling thread tids —
     /// operate on the calling process.
     SelfProc,
@@ -304,7 +307,7 @@ enum SchedTarget {
 /// against the host would spuriously match an unrelated host process/kthread
 /// sharing the numeric value (over-inclusive), and a valid sibling's ns-pid
 /// would never be recognised as a peer guest (under-inclusive).
-fn resolve_sched_target<M: GuestMemory>(
+pub(super) fn resolve_sched_target<M: GuestMemory>(
     this: &SyscallDispatcher,
     cx: &SyscallCtx<'_, M>,
     pid: u64,

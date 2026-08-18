@@ -131,6 +131,22 @@ const DOCKER_FLAG_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[
     ("ltp-add_key", &["--security-opt", "seccomp=unconfined"]),
     ("ltp-request_key", &["--security-opt", "seccomp=unconfined"]),
     ("ltp-keyctl", &["--security-opt", "seccomp=unconfined"]),
+    // perf_event_open: Docker's default seccomp EPERMs the syscall outright
+    // and the container lacks CAP_PERFMON/CAP_SYS_ADMIN for perf_event_paranoid,
+    // so the confined oracle never measures perf semantics at all. Unconfine +
+    // SYS_ADMIN so the oracle answers honestly (TCONF ENOENT for hardware
+    // events inside its VM, TPASS for software clock events) — the surface
+    // carrick's dispatch::perf implements. Verified with/without the caps
+    // 2026-08-18 per the under-privileged-oracle procedure in AGENTS.md.
+    (
+        "ltp-perf_event_open",
+        &[
+            "--security-opt",
+            "seccomp=unconfined",
+            "--cap-add",
+            "SYS_ADMIN",
+        ],
+    ),
     // pidfd_getfd additionally needs CAP_SYS_PTRACE to reach into the target
     // process's fd table.
     (
@@ -254,6 +270,14 @@ const KNOWN_GAP_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[("ltp-pidfd_getfd", &["
 /// `fanotify_init`/`fanotify_mark` were implemented: 02/04/08/11/12 now match
 /// the oracle TPASS-for-TPASS and the remaining rows match on their own, so
 /// they are genuinely gated and a regression in them fails the gate.
+///
+/// The three perf_event_open rows carry NO known_gap: with the privileged
+/// oracle they all MATCH assertion-for-assertion on the HVPatch lane (01:
+/// 5x TCONF ENOENT + 2x TPASS; 02: TCONF ENOENT; 03: TCONF intel_pt), so they
+/// are genuinely gated. An earlier revision of this branch marked 02
+/// report-only for a `bench_work` DSR crash on the legacy native lane; that
+/// lane has since been retired, and 02 was re-verified line-exact against the
+/// oracle on HVPatch (2026-08-18).
 const KNOWN_GAP_EXACT_OVERRIDES: &[(&str, &[&str])] = &[
     ("ltp-acct01", &["summary"]),
     ("ltp-bind06", &["summary"]),

@@ -6881,6 +6881,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::PerfEvent { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
@@ -8045,6 +8046,14 @@ impl SyscallDispatcher {
                 });
             }
 
+            // ── perf_event ioctls ───────────────────────────────────────────────────
+            // PERF_EVENT_IOC_* drive the counter behind a perf event fd (see
+            // `dispatch::perf`); unknown requests on a perf fd report unhandled
+            // and answer ENOTTY like every other fd kind.
+            if let Some(state) = this.perf_event_state(fd.0) {
+                return Ok(this.perf_event_ioctl(cx, fd.0, &state, ioctl_request, arg));
+            }
+
             Ok(match ioctl_request {
                 LINUX_TIOCGWINSZ if fd_is_tty(&this.captured_file_table().read_open_files(), fd.0) => {
                     // Prefer the live host window size when stdin/stdout/stderr
@@ -9204,6 +9213,9 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                // A perf event fd is an unseekable stream (verified ESPIPE
+                // against the Docker oracle).
+                | OpenDescription::PerfEvent { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
@@ -9256,6 +9268,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::PerfEvent { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
@@ -9547,6 +9560,13 @@ impl SyscallDispatcher {
                     // signalfd_siginfo records (empty → EAGAIN, like inotify).
                     return Ok(this.read_signalfd(cx.kernel, memory, address, length, mask, tid));
                 }
+                OpenDescription::PerfEvent { state, .. } => {
+                    let state = Arc::clone(state);
+                    drop(open);
+                    // Report the counter in the attr.read_format layout; a
+                    // short buffer is ENOSPC. Reads never drain the value.
+                    return Ok(this.read_perf_event(memory, address, length, &state));
+                }
                 OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
                 | OpenDescription::Mqueue { .. }
@@ -9753,6 +9773,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::PerfEvent { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
@@ -9838,6 +9859,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::PerfEvent { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
@@ -9995,6 +10017,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::PerfEvent { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
@@ -10155,6 +10178,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::PerfEvent { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
@@ -10308,6 +10332,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::PerfEvent { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
@@ -12012,6 +12037,11 @@ impl SyscallDispatcher {
                                     }
                                 }
                             });
+                        }
+                        // write(2) on a perf event fd is EINVAL (verified
+                        // against the Docker oracle), not EBADF.
+                        OpenDescription::PerfEvent { .. } => {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                         }
                         _ => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                     }
