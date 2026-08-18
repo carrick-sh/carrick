@@ -3499,19 +3499,23 @@ pub fn linux_auxv_from_load_plan_with_vdso(
     auxv.push(LinuxAuxvEntry::new(LINUX_AT_EGID, 0));
     auxv.push(LinuxAuxvEntry::new(LINUX_AT_SECURE, 0));
     auxv.push(LinuxAuxvEntry::new(LINUX_AT_CLKTCK, 100));
-    // Minimal AArch64 HWCAP — enough for glibc to decide it can use the
-    // "modern" optimized routines. Backends may remove features that their
-    // execution boundary cannot preserve before serializing the stack.
-    let hwcap = crate::linux_abi::LinuxAarch64Hwcap::FP
-        | crate::linux_abi::LinuxAarch64Hwcap::ASIMD
-        | crate::linux_abi::LinuxAarch64Hwcap::AES
-        | crate::linux_abi::LinuxAarch64Hwcap::PMULL
-        | crate::linux_abi::LinuxAarch64Hwcap::SHA1
-        | crate::linux_abi::LinuxAarch64Hwcap::SHA2
-        | crate::linux_abi::LinuxAarch64Hwcap::CRC32
-        | crate::linux_abi::LinuxAarch64Hwcap::ATOMICS;
+    // AArch64 HWCAP/HWCAP2 matching the native arm64 Docker oracle's exact
+    // words (0xefb3ffff / 0x326181 read via getauxval in the oracle) minus
+    // the three control-flow features carrick cannot yet honor — PACA/PACG
+    // (EL1 pointer-auth key management) and BTI (PROT_BTI guarded pages).
+    // The instructions behind every advertised bit execute natively on the
+    // same physical cores the oracle ran on; under-advertising made feature-
+    // gated code paths silently untestable (go crypto/sha512's Armv8.2 rows
+    // were skip-absent because SHA512 was missing). Backends may remove
+    // features that their execution boundary cannot preserve before
+    // serializing the stack.
+    let hwcap = crate::linux_abi::LinuxAarch64Hwcap::all()
+        - crate::linux_abi::LinuxAarch64Hwcap::PACA
+        - crate::linux_abi::LinuxAarch64Hwcap::PACG;
+    let hwcap2 =
+        crate::linux_abi::LinuxAarch64Hwcap2::all() - crate::linux_abi::LinuxAarch64Hwcap2::BTI;
     auxv.push(LinuxAuxvEntry::new(LINUX_AT_HWCAP, hwcap.bits()));
-    auxv.push(LinuxAuxvEntry::new(LINUX_AT_HWCAP2, 0));
+    auxv.push(LinuxAuxvEntry::new(LINUX_AT_HWCAP2, hwcap2.bits()));
     if include_vdso {
         // Point the guest at carrick's vDSO so libc/Go resolve
         // __kernel_clock_gettime and read the clock in userspace (CNTVCT_EL0)
