@@ -142,6 +142,7 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         | 271
         | 277
         | 278
+        | 280
         | 293
         | 424
         | 434
