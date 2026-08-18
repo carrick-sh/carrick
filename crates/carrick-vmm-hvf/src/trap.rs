@@ -6010,6 +6010,27 @@ impl HvfVmState {
         self.page_tables = page_tables;
     }
 
+    /// Tell `manager` whether THIS thread's edit is exclusive, before an
+    /// HVPatch mapping publication that locks `self.page_tables` directly.
+    ///
+    /// `Aarch64EngineCore::pt_edit_locked` pushes the same answer for every
+    /// edit that goes through the engine, but the HVPatch publications below
+    /// take the lock themselves and would otherwise allocate spare sub-tables
+    /// under whatever marker the PREVIOUS editor happened to leave behind.
+    /// The marker gates `alloc_table`'s last-resort reclaim sweep, so a stale
+    /// `false` turns a recoverable pool into `OutOfTables` -> guest `ENOMEM`:
+    /// cpython `concurrent_futures` raised `MemoryError` out of a 16 KiB
+    /// anonymous `mmap` whose own syscall dispatch DID hold exclusivity.
+    ///
+    /// Only exclusivity is refreshed. `multi_vcpu` gates the EAGER coalescing
+    /// scan, which is a throughput decision this path must not silently flip
+    /// (enabling it cost `go-net_http` 50 s -> over 200 s).
+    fn refresh_stage1_exclusivity(manager: &mut crate::page_table::PageTableManager) {
+        manager.set_stage1_exclusive(
+            carrick_hal::stage1_exclusive::current_thread_edits_exclusively(),
+        );
+    }
+
     /// Complete pre-transaction image of `manager`, taken into the recycled
     /// buffer when one is available.
     ///
@@ -7157,6 +7178,7 @@ impl HvfVmState {
                 TrapError::Hypervisor("sparse HVPatch mmap page tables are absent".to_owned())
             })?;
             rollback_page_tables = Some(Self::rollback_pre_image(&mut rollback_scratch, manager));
+            Self::refresh_stage1_exclusivity(manager);
             let aligned_start = align_up(start, TWO_MIB)?.min(end);
             if start < aligned_start {
                 manager
@@ -7609,6 +7631,7 @@ impl HvfVmState {
                 TrapError::Hypervisor("HVPatch retained reuse page tables are absent".to_owned())
             })?;
             rollback_page_tables = Some(Self::rollback_pre_image(&mut rollback_scratch, manager));
+            Self::refresh_stage1_exclusivity(manager);
             manager
                 .repoint_preserving_attributes(page_va, new_ipa, span_len as u64)
                 .map_err(|error| {
@@ -8122,6 +8145,7 @@ impl HvfVmState {
             // complete pre-edit image: a cloned manager's dirty list alone is
             // not a rollback log, because `sync_to_host` drains the NEW edits.
             rollback_page_tables = Some(Self::rollback_pre_image(&mut rollback_scratch, manager));
+            Self::refresh_stage1_exclusivity(manager);
             if span.kernel_only {
                 manager
                     .map_kernel_aliased(span.va, new_ipa, span.len as u64)
@@ -11710,8 +11734,16 @@ impl HvfVmState {
                 )
             };
             mapped.map_err(|error| {
+                // Name the pool's own numbers, exactly as `pt_edit_locked` does
+                // for the syscall path. "OutOfTables" alone cannot distinguish a
+                // legitimately huge address space from a pool the child clone was
+                // refused permission to sweep.
+                let (in_use, free, capacity) = page_tables.pool_stats();
+                let (multi_vcpu, exclusive, reclaim_pending) = page_tables.coalesce_policy();
                 TrapError::Hypervisor(format!(
-                    "map hvpatch child VA 0x{:x} to global/root-slot IPA 0x{ipa:x}: {error:?}",
+                    "map hvpatch child VA 0x{:x} to global/root-slot IPA 0x{ipa:x}: {error:?} \
+                     (in_use={in_use} free={free} capacity={capacity} multi_vcpu={multi_vcpu} \
+                     exclusive={exclusive} reclaim_pending={reclaim_pending})",
                     mapping.start
                 ))
             })?;
