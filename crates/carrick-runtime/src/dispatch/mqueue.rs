@@ -226,24 +226,29 @@ fn ensure_dir() {
     let _ = std::fs::set_permissions(MQ_DIR, std::fs::Permissions::from_mode(0o1777));
 }
 
-/// Validate a guest mqueue name and map it to a backing-file path. The name must
-/// start with `/`, contain no other `/`, be non-empty after the slash, and be at
-/// most `NAME_MAX` chars (mq_overview(7)). Returns `Err(errno)` otherwise.
+/// Validate a guest mqueue name and map it to a backing-file path.
+///
+/// The mq_open(2) SYSCALL receives the queue name with the leading '/'
+/// already stripped by the C library (glibc/musl validate the leading slash
+/// in the mq_open(3) wrapper, then pass name+1 to the syscall — the kernel
+/// keys the mqueue fs on the bare entry name). The kernel then treats the
+/// name as a single directory entry: verified live on Ubuntu 6.8 arm64,
+/// a name containing ANY '/' (a raw syscall passing the unstripped
+/// "/name" included) or naming "."/".." is EACCES, an empty name is
+/// ENOENT, and an over-long one is ENAMETOOLONG. carrick previously
+/// tolerated one leading '/' — the mqueue probe's raw "/name" open
+/// succeeded here and failed on every real kernel.
 fn name_to_path(name: &str) -> Result<PathBuf, LinuxErrno> {
-    // The mq_open(2) SYSCALL receives the queue name with the leading '/' already
-    // stripped by the C library (glibc/musl validate the leading slash in the
-    // mq_open(3) wrapper, then pass name+1 to the syscall — the kernel keys the
-    // mqueue fs on the bare entry name). A raw syscall may still include the '/'.
-    // Accept an optional single leading '/', then require one non-empty component
-    // with no embedded '/'.
-    let rest = name.strip_prefix('/').unwrap_or(name);
-    if rest.is_empty() || rest.contains('/') {
-        return Err(LINUX_EINVAL);
+    if name.is_empty() {
+        return Err(crate::linux_abi::LINUX_ENOENT);
     }
-    if rest.len() > NAME_MAX {
+    if name.contains('/') || name == "." || name == ".." {
+        return Err(crate::linux_abi::LINUX_EACCES);
+    }
+    if name.len() > NAME_MAX {
         return Err(crate::linux_abi::LINUX_ENAMETOOLONG);
     }
-    Ok(PathBuf::from(MQ_DIR).join(rest))
+    Ok(PathBuf::from(MQ_DIR).join(name))
 }
 
 fn object_path_from_stat(st: &libc::stat) -> PathBuf {

@@ -96,16 +96,14 @@ const GATE_SKIP_PROBES: &[&str] = &[
     // reducer (run it alongside other guests to reproduce); NOT a gate signal
     // until the underlying contention bug is fixed. See project memory.
     "manythreads",
-    // mqueue: exercises the full POSIX message-queue family (mq_open/mq_timedsend/
-    // mq_timedreceive/mq_getsetattr/mq_unlink), which carrick emulates correctly
-    // on a host-file backing (see carrick-runtime dispatch/mqueue.rs). Reason (2)
-    // above — the ORACLE is the limited side: Docker Desktop's LinuxKit kernel
-    // refuses mq_open(O_CREAT) with EACCES even under --privileged and --ipc=host
-    // (the mqueue fs is mounted rw, but creation is blocked at the VM-kernel
-    // level), so carrick's correct success can never MATCH the oracle's EACCES.
-    // Kept as a reducer; gate it against a native-Linux oracle (the kvm/bhyve
-    // lanes), where mq_open actually works.
-    "mqueue",
+    // mqueue: RE-GATED. The old entry here blamed the LinuxKit oracle for
+    // refusing mq_open(O_CREAT) with EACCES — that read was WRONG: the probe
+    // passed a "/name" to the RAW syscall, and the kernel-level mq_open
+    // treats any '/' in its (already-stripped-by-libc) name argument as
+    // EACCES on every real kernel (verified live on Ubuntu 6.8 arm64 and on
+    // LinuxKit). carrick was the deviant side, accepting the leading slash.
+    // Both the runtime and the probe now use kernel name semantics, so the
+    // Docker oracle gates it normally.
     // bridge_tcp_peer must run under `--net bridge`; the generic probe runner
     // uses the default host network. Covered by conformance_bridge_tcp_peer.
     "bridge_tcp_peer",

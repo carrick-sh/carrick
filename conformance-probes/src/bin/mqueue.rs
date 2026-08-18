@@ -8,11 +8,14 @@
 //! Deterministic only: booleans, byte counts, errno names, and rendered
 //! single-line content. No fd numbers, addresses, pids, or timestamps.
 //!
-//! NOTE: this probe is in `GATE_SKIP_PROBES` (see crates/carrick-cli/tests/
-//! conformance.rs). The macOS Docker oracle (Docker Desktop / LinuxKit) cannot
-//! create a POSIX message queue at all — `mq_open(O_CREAT)` returns EACCES even
-//! under `--privileged`/`--ipc=host` — so carrick's correct success can never
-//! MATCH it. Gate this against a native-Linux oracle (the kvm/bhyve lanes).
+//! NOTE on names: the mq_open(2) SYSCALL takes the queue name with the
+//! leading '/' already stripped (glibc/musl validate it in the wrapper and
+//! pass name+1). The kernel treats the argument as one directory entry:
+//! ANY '/' in it — a raw syscall passing an unstripped "/name" included —
+//! is EACCES, "" is ENOENT (verified live on Ubuntu 6.8 arm64 AND the
+//! LinuxKit Docker oracle; the earlier claim that LinuxKit "cannot create
+//! mqueues" mis-read exactly this EACCES). This probe therefore drives the
+//! raw syscalls with BARE names and asserts the slash rejections explicitly.
 
 use std::ffi::CString;
 
@@ -32,9 +35,28 @@ const MSGSIZE: i64 = 64;
 const MAXMSG: i64 = 10;
 
 fn main() {
-    let name = "/carrick_mq_probe";
+    let name = "carrick_mq_probe";
     // Start from a clean slate (ignore ENOENT).
     mq_unlink(name);
+
+    // 0. Kernel-level name rules: any '/' in the raw syscall name is EACCES
+    //    (the leading slash belongs to the C-library interface, not the
+    //    syscall), and an empty name is ENOENT.
+    let slashed = mq_open("/carrick_mq_probe", libc::O_CREAT | libc::O_RDWR, 0o600, None);
+    println!(
+        "mq_open_leading_slash_eacces={}",
+        slashed < 0 && errno() == libc::EACCES
+    );
+    let nested = mq_open("a/b", libc::O_CREAT | libc::O_RDWR, 0o600, None);
+    println!(
+        "mq_open_embedded_slash_eacces={}",
+        nested < 0 && errno() == libc::EACCES
+    );
+    let empty = mq_open("", libc::O_CREAT | libc::O_RDWR, 0o600, None);
+    println!(
+        "mq_open_empty_enoent={}",
+        empty < 0 && errno() == libc::ENOENT
+    );
 
     let attr = MqAttr {
         mq_maxmsg: MAXMSG,
