@@ -1131,6 +1131,22 @@ pub(super) enum OpenDescription {
         base: OpenDescriptionBase,
         mask: carrick_abi::SigSet,
     },
+    /// A new-mount-API filesystem context (`fsopen(2)`/`fspick(2)`). An
+    /// anon-inode fd carrying the staged configuration a subsequent
+    /// `fsconfig(2)` manipulates. Linux reachability note: every entry point of
+    /// the family is CAP_SYS_ADMIN-gated exactly like the Docker oracle's
+    /// default seccomp/cap profile, so a default-caps guest only ever sees
+    /// EPERM; this object is reachable once a guest holds CAP_SYS_ADMIN (e.g.
+    /// after `unshare(CLONE_NEWUSER)` grants a full in-namespace set). The
+    /// state is `Arc`-shared so `dup(2)` clones operate on the SAME context,
+    /// as on Linux. Superblock creation itself (`FSCONFIG_CMD_CREATE` /
+    /// `CMD_RECONFIGURE`) is deferred (EOPNOTSUPP) — carrick's VFS cannot
+    /// instantiate or reconfigure superblocks, and fabricating success would
+    /// leak into `fsmount`/`move_mount` guest-visible state.
+    FsContext {
+        base: OpenDescriptionBase,
+        state: Arc<Mutex<super::mount_api::FsContextState>>,
+    },
     // In-memory pipe ends. Currently `pipe2(2)` routes through `HostPipe`
     // (real macOS kernel pipe) so these are not constructed today, but the
     // full read/write/poll machinery (`PipeState`, `read_pipe`, `write_pipe`)
@@ -1394,6 +1410,7 @@ impl OpenDescription {
             Self::Inotify { .. } => "inotify",
             Self::Fanotify { .. } => "fanotify",
             Self::SignalFd { .. } => "signalfd",
+            Self::FsContext { .. } => "fscontext",
             Self::PipeReader { .. } => "pipe_reader",
             Self::PipeWriter { .. } => "pipe_writer",
             Self::HostPipe { .. } => "host_pipe",
@@ -1445,6 +1462,7 @@ impl OpenDescription {
             OpenDescription::Inotify { .. } => "anon_inode:[inotify]".to_owned(),
             OpenDescription::Fanotify { .. } => "anon_inode:[fanotify]".to_owned(),
             OpenDescription::SignalFd { .. } => "anon_inode:[signalfd]".to_owned(),
+            OpenDescription::FsContext { .. } => "anon_inode:[fscontext]".to_owned(),
             OpenDescription::Mqueue { .. } => "anon_inode:[mqueue]".to_owned(),
             // Linux spells the bpf anon-inode labels WITHOUT brackets.
             OpenDescription::BpfMap { .. } => "anon_inode:bpf-map".to_owned(),
@@ -1515,6 +1533,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::Mqueue { .. } => Kind::Mqueue,
             OpenDescription::BpfMap { .. } => Kind::BpfMap,
             OpenDescription::BpfProg { .. } => Kind::BpfProg,
+            OpenDescription::FsContext { .. } => Kind::FsContext,
         };
         let status_flags = (!matches!(&*description, OpenDescription::Closed { .. }))
             .then(|| description.base().status_flags());
@@ -1869,6 +1888,7 @@ impl OpenDescription {
             | OpenDescription::Inotify { base, .. }
             | OpenDescription::Fanotify { base, .. }
             | OpenDescription::SignalFd { base, .. }
+            | OpenDescription::FsContext { base, .. }
             | OpenDescription::Netlink { base, .. }
             | OpenDescription::Mqueue { base, .. }
             | OpenDescription::BpfMap { base, .. }
@@ -1897,6 +1917,7 @@ impl OpenDescription {
             | OpenDescription::Inotify { base, .. }
             | OpenDescription::Fanotify { base, .. }
             | OpenDescription::SignalFd { base, .. }
+            | OpenDescription::FsContext { base, .. }
             | OpenDescription::Netlink { base, .. }
             | OpenDescription::Mqueue { base, .. }
             | OpenDescription::BpfMap { base, .. }
@@ -2072,6 +2093,9 @@ impl OpenDescription {
             }
             OpenDescription::SignalFd { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic("anon_inode:[signalfd]", 0, 0o600))
+            }
+            OpenDescription::FsContext { .. } => {
+                OpenStatSource::Record(StatRecord::synthetic("anon_inode:[fscontext]", 0, 0o600))
             }
             OpenDescription::Mqueue { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic("anon_inode:[mqueue]", 0, 0o600))
