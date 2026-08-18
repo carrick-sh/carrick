@@ -1249,6 +1249,25 @@ pub(super) enum OpenDescription {
     /// so `mq_unlink` can remove the public name while existing descriptors keep
     /// working; ordinary `read`/`write` on the fd are EINVAL/EBADF (Linux rejects
     /// them on a mqd too).
+    /// A live eBPF map (`bpf(2)` `BPF_MAP_CREATE`): an anonymous-inode fd
+    /// whose object lives in [`crate::dispatch::bpf::BpfMap`]. Shared by
+    /// `Arc`, so `dup` and an in-carrier `fork` see one map, as Linux shares
+    /// the kernel object behind the fd. Ordinary `read`/`write`/`lseek` on
+    /// the fd are `EINVAL`, like any anon-inode fd.
+    BpfMap {
+        base: OpenDescriptionBase,
+        map: Arc<crate::dispatch::bpf::BpfMap>,
+    },
+    /// A loaded eBPF program (`bpf(2)` `BPF_PROG_LOAD`): metadata only —
+    /// carrick validates the instruction stream structurally and never
+    /// executes it (see `dispatch/bpf.rs` module docs). The fd supports the
+    /// lifecycle surface (`dup`/`close`/fstat/proc links); attachment
+    /// surfaces reject it.
+    BpfProg {
+        base: OpenDescriptionBase,
+        #[allow(dead_code)]
+        prog: Arc<crate::dispatch::bpf::BpfProg>,
+    },
     Mqueue {
         base: OpenDescriptionBase,
         /// OWNING handle (see [`HostFdRef`]) to the real host fd of the backing
@@ -1382,6 +1401,8 @@ impl OpenDescription {
             Self::HostFile { .. } => "host_file",
             Self::Netlink { .. } => "netlink",
             Self::Mqueue { .. } => "mqueue",
+            Self::BpfMap { .. } => "bpf_map",
+            Self::BpfProg { .. } => "bpf_prog",
         }
     }
 
@@ -1425,6 +1446,9 @@ impl OpenDescription {
             OpenDescription::Fanotify { .. } => "anon_inode:[fanotify]".to_owned(),
             OpenDescription::SignalFd { .. } => "anon_inode:[signalfd]".to_owned(),
             OpenDescription::Mqueue { .. } => "anon_inode:[mqueue]".to_owned(),
+            // Linux spells the bpf anon-inode labels WITHOUT brackets.
+            OpenDescription::BpfMap { .. } => "anon_inode:bpf-map".to_owned(),
+            OpenDescription::BpfProg { .. } => "anon_inode:bpf-prog".to_owned(),
             // A pty slave readlinks to its /dev/pts/N node (ttyname(3)); the
             // master has no /dev path, so report a stable anon label.
             OpenDescription::HostPipe {
@@ -1489,6 +1513,8 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::SignalFd { .. } => Kind::SignalFd,
             OpenDescription::Netlink { .. } => Kind::Netlink,
             OpenDescription::Mqueue { .. } => Kind::Mqueue,
+            OpenDescription::BpfMap { .. } => Kind::BpfMap,
+            OpenDescription::BpfProg { .. } => Kind::BpfProg,
         };
         let status_flags = (!matches!(&*description, OpenDescription::Closed { .. }))
             .then(|| description.base().status_flags());
@@ -1844,7 +1870,9 @@ impl OpenDescription {
             | OpenDescription::Fanotify { base, .. }
             | OpenDescription::SignalFd { base, .. }
             | OpenDescription::Netlink { base, .. }
-            | OpenDescription::Mqueue { base, .. } => base,
+            | OpenDescription::Mqueue { base, .. }
+            | OpenDescription::BpfMap { base, .. }
+            | OpenDescription::BpfProg { base, .. } => base,
         }
     }
 
@@ -1870,7 +1898,9 @@ impl OpenDescription {
             | OpenDescription::Fanotify { base, .. }
             | OpenDescription::SignalFd { base, .. }
             | OpenDescription::Netlink { base, .. }
-            | OpenDescription::Mqueue { base, .. } => base,
+            | OpenDescription::Mqueue { base, .. }
+            | OpenDescription::BpfMap { base, .. }
+            | OpenDescription::BpfProg { base, .. } => base,
         }
     }
 
@@ -2045,6 +2075,12 @@ impl OpenDescription {
             }
             OpenDescription::Mqueue { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic("anon_inode:[mqueue]", 0, 0o600))
+            }
+            OpenDescription::BpfMap { .. } => {
+                OpenStatSource::Record(StatRecord::synthetic("anon_inode:bpf-map", 0, 0o600))
+            }
+            OpenDescription::BpfProg { .. } => {
+                OpenStatSource::Record(StatRecord::synthetic("anon_inode:bpf-prog", 0, 0o600))
             }
             OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic(

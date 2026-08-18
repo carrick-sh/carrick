@@ -1113,6 +1113,8 @@ fn backing_kind_name(backing: &FileDescriptionBackingSnapshot) -> &'static str {
         Kind::SignalFd => "signalfd",
         Kind::Netlink => "netlink",
         Kind::Mqueue => "mqueue",
+        Kind::BpfMap => "bpf-map",
+        Kind::BpfProg => "bpf-prog",
         Kind::IoUring => "io-uring",
     }
 }

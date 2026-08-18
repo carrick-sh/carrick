@@ -193,6 +193,8 @@ impl SyscallDispatcher {
             | OpenDescription::HostSocket { .. }
             | OpenDescription::SignalFd { .. }
             | OpenDescription::Mqueue { .. }
+            | OpenDescription::BpfMap { .. }
+            | OpenDescription::BpfProg { .. }
             | OpenDescription::Netlink { .. } => Ok(Err(LINUX_EINVAL)),
         }
     }
@@ -250,6 +252,8 @@ impl SyscallDispatcher {
             | OpenDescription::HostSocket { .. }
             | OpenDescription::SignalFd { .. }
             | OpenDescription::Mqueue { .. }
+            | OpenDescription::BpfMap { .. }
+            | OpenDescription::BpfProg { .. }
             | OpenDescription::Netlink { .. } => return Err(LINUX_EINVAL),
         };
         Ok(bytes)
