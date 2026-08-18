@@ -1794,6 +1794,9 @@ impl SyscallDispatcher {
             // signalfd readiness would track pending masked signals; delivery is
             // a tracked follow-up, so there is no in-memory readiness here.
             OpenDescription::SignalFd { .. } => {}
+            // An fs context fd carries no readiness events in carrick (its
+            // read channel — the fsconfig error log — is unimplemented).
+            OpenDescription::FsContext { .. } => {}
             OpenDescription::PipeReader { pipe, .. } => {
                 if requested_events & LINUX_POLLIN != 0 {
                     let pipe = pipe.lock();

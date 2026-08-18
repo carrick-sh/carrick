@@ -26,8 +26,8 @@ Each row carries a `SupportLevel`, which maps to the **Quality** column below:
 | `Planned` | **Stub** | Recognized by name but routes to `ENOSYS` today. Only two: `execveat` (#281) and `clone3` (#435) — the latter is partially wired for the clone/fork modes carrick supports (`compat_note_for_aarch64`). |
 | `Deferred` | **Not implemented** | `ENOSYS`, surfaced by its real name (e.g. `io_uring_register`, `userfaultfd`) so the compat report shows `userfaultfd`, not `unknown 282`. |
 
-**~216 syscalls are actively emulated** (`BringUp`), 2 are `Planned` stubs, and
-the remaining 121 table rows are `Deferred`. Counts are from the table itself
+**232 syscalls are actively emulated** (`BringUp`), 2 are `Planned` stubs, and
+the remaining 105 table rows are `Deferred`. Counts are from the table itself
 (`rg 'SupportLevel::BringUp' crates/carrick-abi/src/syscall.rs | wc -l`).
 
 > [!NOTE]
@@ -93,6 +93,7 @@ cap-std with `--fs host`). Each open file is an `OpenDescription` behind an
 | `sendfile`, `copy_file_range`, `splice` | 71,285,76 | Emulated (Full→Partial) | Darwin `sendfile(2)`; host read/write copy | `sendfile` access-mode validated; `splice`/`tee`/`vmsplice` pass through to the host syscalls on Linux (exact pipe semantics), and return `ENOSYS` on macOS, which has no such syscalls. |
 | `utimensat`, `inotify_init1`/`add_watch`/`rm_watch`, `ioctl` | 88,26–28,29 | Emulated (Partial) | host `utimensat`; host fd ioctls | `ioctl` covers the terminal/`FIONREAD`/sizing set workloads use, not the full ioctl surface. |
 | `memfd_create`, `cachestat`, `sync_file_range` | 279,451,84 | Stub/Deferred | — | `memfd_create` (#279) and `cachestat` (#451) are `Deferred` in the table; the conformance probes exercise emulated paths added later — treat the table's `SupportLevel` as authoritative for the report. |
+| new-mount API: `open_tree`, `move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr` | 428–433,442 | Emulated (Partial) | fd-object staging (`FsContext`) + `O_PATH` lowering for `open_tree` | The whole family is CAP_SYS_ADMIN-gated exactly like the Docker default profile (default-caps guest → EPERM before argument validation, matching the oracle and LTP `tst_fd`). With the cap: oracle-exact argument validation/ordering, `fsconfig` staging state machine; superblock creation/reconfiguration and mount moves are honestly deferred (`EOPNOTSUPP`) — see `dispatch/mount_api.rs`. |
 
 | `fanotify_init`, `fanotify_mark` | 262,263 | Partial | dispatch-seam event synthesis (`crates/carrick-runtime/src/fanotify.rs`) | `FAN_CLASS_NOTIF` groups only. Events are synthesized from the guest's own syscalls on the same seam inotify uses, NOT from host vnode watches — a `EVFILT_VNODE`/FSEvents observer cannot report which guest process acted, the mark's mask, the ignore mask, or child-vs-self. See the per-flag table below. |
 
@@ -124,9 +125,8 @@ delivery the case would exercise IS implemented and unit-tested
 only the tracefs half is missing.
 
 **Deferred in this category:** `mount`/`umount2`/`pivot_root`/`chroot`,
-`quotactl`, `name_to_handle_at`/`open_by_handle_at`, the new-mount API
-(`open_tree`, `move_mount`, `fsopen`/`fsconfig`/`fsmount`/`fspick`,
-`mount_setattr`, `statmount`/`listmount`),
+`quotactl`, `name_to_handle_at`/`open_by_handle_at`,
+`statmount`/`listmount` (ENOSYS — also ENOSYS on the LinuxKit oracle kernel),
 and the `*_time64` fs variants (`utimensat_time64`, `pselect6_time64`,
 `ppoll_time64`). The 32-bit-time variants are unreachable from a 64-bit aarch64
 guest.

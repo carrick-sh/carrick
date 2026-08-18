@@ -1116,6 +1116,7 @@ fn backing_kind_name(backing: &FileDescriptionBackingSnapshot) -> &'static str {
         Kind::BpfMap => "bpf-map",
         Kind::BpfProg => "bpf-prog",
         Kind::IoUring => "io-uring",
+        Kind::FsContext => "fscontext",
     }
 }
 

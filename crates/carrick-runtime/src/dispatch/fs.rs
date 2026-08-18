@@ -1907,7 +1907,7 @@ impl SyscallDispatcher {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn open_at_path_string(
+    pub(super) fn open_at_path_string(
         &self,
         context: &crate::kernel::KernelContext,
         registry: Option<&crate::thread::ThreadRegistry>,
@@ -5787,7 +5787,7 @@ impl SyscallDispatcher {
         Ok(effective_path)
     }
 
-    fn openat2_anchor_for_dirfd(&self, dirfd: u64) -> Result<String, LinuxErrno> {
+    pub(super) fn openat2_anchor_for_dirfd(&self, dirfd: u64) -> Result<String, LinuxErrno> {
         let dirfd = (dirfd as i32) as i64 as u64;
         if dirfd == LINUX_AT_FDCWD {
             return Ok(self.cwd());
@@ -6870,6 +6870,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::FsContext { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
@@ -9193,6 +9194,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::FsContext { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
@@ -9245,6 +9247,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::FsContext { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
@@ -9524,6 +9527,12 @@ impl SyscallDispatcher {
                     // signalfd_siginfo records (empty → EAGAIN, like inotify).
                     return Ok(this.read_signalfd(cx.kernel, memory, address, length, mask, tid));
                 }
+                // read() on an fs context (the kernel's fsconfig error-log
+                // channel) is unimplemented — EINVAL, documented in
+                // `dispatch/mount_api.rs`.
+                OpenDescription::FsContext { .. } => {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
                 OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
                 | OpenDescription::Mqueue { .. }
@@ -9726,6 +9735,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::FsContext { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
@@ -9807,6 +9817,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::FsContext { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
@@ -9960,6 +9971,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::FsContext { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
@@ -10116,6 +10128,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::FsContext { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
@@ -10265,6 +10278,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::FsContext { .. }
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
@@ -11534,6 +11548,7 @@ impl SyscallDispatcher {
                     | OpenDescription::Inotify { .. }
                     | OpenDescription::Fanotify { .. }
                     | OpenDescription::SignalFd { .. }
+                | OpenDescription::FsContext { .. }
                     | OpenDescription::Mqueue { .. }
                     | OpenDescription::BpfMap { .. }
                     | OpenDescription::BpfProg { .. }
