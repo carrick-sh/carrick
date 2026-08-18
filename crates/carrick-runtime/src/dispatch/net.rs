@@ -2237,6 +2237,9 @@ impl SyscallDispatcher {
     }
 
     fn set_socket_error_after_send(&self, fd: i32, errno: carrick_abi::LinuxErrno) {
+        if std::env::var_os("CARRICK_NET_DEBUG").is_some() {
+            eprintln!("NETDBG set_error_after_send fd={fd} errno={}", errno.get());
+        }
         if let Some(open_file) = self.open_file(fd)
             && let OpenDescription::HostSocket { base, .. } = &mut *open_file.description.write()
         {
@@ -2293,6 +2296,9 @@ impl SyscallDispatcher {
     }
 
     fn queue_socket_error_after_send(&self, fd: i32) {
+        if std::env::var_os("CARRICK_NET_DEBUG").is_some() {
+            eprintln!("NETDBG queue_error_after_send fd={fd}");
+        }
         if let Some(open_file) = self.open_file(fd)
             && let OpenDescription::HostSocket { base, .. } = &mut *open_file.description.write()
             && let Some(errno) = base.socket_error_after_send()
@@ -5873,8 +5879,15 @@ impl SyscallDispatcher {
                             rewritten_connect = Some((requested, host, protocol));
                         }
                     }
-                    Ok(ConnectTarget::Unchanged) => {}
+                    Ok(ConnectTarget::Unchanged) => {
+                        if std::env::var_os("CARRICK_NET_DEBUG").is_some() {
+                            eprintln!("NETDBG connect resolve UNCHANGED fd={fd} req={requested:?} proto={protocol:?}");
+                        }
+                    }
                     Ok(ConnectTarget::Denied(errno)) => {
+                        if std::env::var_os("CARRICK_NET_DEBUG").is_some() {
+                            eprintln!("NETDBG connect resolve DENIED fd={fd} errno={} proto={protocol:?} gt={:?}", errno.get(), this.socket_guest_type(fd));
+                        }
                         if errno == carrick_abi::LINUX_ECONNREFUSED
                             && protocol == PortProtocol::Tcp
                             && this.socket_guest_type(fd) == Some(LINUX_SOCK_STREAM)
@@ -6200,6 +6213,19 @@ impl SyscallDispatcher {
 
         fn sendto(this, cx, fd: Fd, buf: GuestPtr, len: u64, flags: u64, dest_addr: GuestPtr, addrlen: u64) {
 
+            if std::env::var_os("CARRICK_NET_DEBUG").is_some() {
+                let kind = this
+                    .open_file(fd.0)
+                    .map(|of| {
+                        let guard = of.description.read();
+                        guard.reexec_kind_name().to_string()
+                    })
+                    .unwrap_or_else(|| "<none>".to_string());
+                eprintln!(
+                    "NETDBG sendto enter pid={} fd={} len={} dest_addr={:#x} kind={kind}",
+                    std::process::id(), fd.0, len, dest_addr.0
+                );
+            }
             let memory = &*cx.memory;
             let fd = fd.0;
             let buf_addr = buf.0;
@@ -6291,6 +6317,16 @@ impl SyscallDispatcher {
                             && protocol == PortProtocol::Udp
                             && this.socket_guest_type(fd) == Some(LINUX_SOCK_DGRAM) =>
                     {
+                        // The datagram is dropped (nothing listens on the
+                        // bridge-local target), but Linux still reports the
+                        // send as successful. For a CONNECTED socket the
+                        // asynchronous ICMP unreachable must then surface as
+                        // POLLERR + recv ECONNREFUSED — arm the pending error
+                        // exactly like a delivered ICMP would (the connect
+                        // path already staged error_after_send).
+                        if dest_addr == 0 {
+                            this.queue_socket_error_after_send(fd);
+                        }
                         return Ok(DispatchOutcome::Returned { value: len as i64 });
                     }
                     Ok(ConnectTarget::Denied(errno)) => return Ok(DispatchOutcome::errno(errno)),
@@ -6316,6 +6352,9 @@ impl SyscallDispatcher {
             let send_to = this
                 .open_file(fd)
                 .and_then(|f| f.description.read().send_timeout());
+            if std::env::var_os("CARRICK_NET_DEBUG").is_some() {
+                eprintln!("NETDBG sendto pre-io fd={fd} nonblocking={nonblocking}");
+            }
             let outcome = this.blocking_io(host_fd.get(), IoDir::Write, nonblocking, send_to, || {
                 // Re-stated locally (idempotent) so the non-blocking guarantee
                 // is visible at every send site below: both the real socket and
@@ -6372,6 +6411,9 @@ impl SyscallDispatcher {
                     other => other,
                 }
             });
+            if std::env::var_os("CARRICK_NET_DEBUG").is_some() {
+                eprintln!("NETDBG sendto outcome fd={fd} connected_send={connected_send} outcome={outcome:?}");
+            }
             if connected_send && matches!(outcome, DispatchOutcome::Returned { value } if value >= 0) {
                 this.queue_socket_error_after_send(fd);
             }
