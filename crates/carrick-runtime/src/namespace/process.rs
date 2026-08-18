@@ -52,6 +52,7 @@ pub const CAP_SYS_ADMIN: u32 = 21;
 pub const CAP_SYS_NICE: u32 = 23;
 pub const CAP_MKNOD: u32 = 27;
 pub const CAP_MAC_OVERRIDE: u32 = 32;
+pub const CAP_WAKE_ALARM: u32 = 35;
 
 /// The file-related capabilities `fsuid` transitions raise and lower in the
 /// EFFECTIVE set (capabilities(7), "Effect of user ID changes" rule 3).
@@ -89,6 +90,7 @@ pub fn capability_by_name(name: &str) -> Option<u32> {
         "SYS_RESOURCE" => CAP_SYS_RESOURCE,
         "MKNOD" => CAP_MKNOD,
         "MAC_OVERRIDE" => CAP_MAC_OVERRIDE,
+        "WAKE_ALARM" => CAP_WAKE_ALARM,
         _ => return None,
     })
 }
