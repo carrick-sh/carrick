@@ -939,6 +939,31 @@ ratio (145.02x and 67.02x, both of which were the oracle hanging).
   unrecoverable. Evidence that matters is now committed under
   `docs/perf-results/`.
 
+## Oracle cache: a self-inflicted loss, and the rule that prevents it
+
+**2026-08-18: I destroyed the closure-v3 oracle cache and cost the campaign a
+full Docker refresh.** The working tree carried a modified
+`scripts/conformance/oracle-cache.jsonl` — the legitimate post-gate re-bless
+that the `closure-v3-second` run had just written. While switching branches I
+ran `git checkout -- scripts/conformance/oracle-cache.jsonl` to "clean" the
+tree, which discarded it. It was never committed, so it is unrecoverable.
+
+The committed cache is therefore stale against the current declaration in two
+independent ways, and `--require-cached-oracle` correctly refuses all 2,127
+suites (`no cached oracle for platform LinuxArm64`):
+
+- its arm64 rows carry `parser_profile: "closure-v1"`, not the current v3, and
+- their `cmd` is the DIRECT exec (`/opt/ltp/testcases/bin/abort01`) rather than
+  the `/bin/sh -c` form the harness now issues.
+
+AGENTS.md already says this: the post-gate rewrite "is a legitimate re-bless —
+commit it ... Only `git checkout` it away when the rewrite is spurious (a box
+missing/with wrong images)." The rewrite was not spurious; this box has the
+images. **Never `git checkout` `oracle-cache.jsonl`. Commit it, or stash the
+question by committing on a branch.** Recovery is a full `--refresh-oracle`
+Docker pass over the whole surface, which is what is running now — and its
+rewritten cache MUST be committed when it lands.
+
 ## Measurement discipline
 
 - Always build guest-running Carrick with `just build`; a plain Cargo build is
