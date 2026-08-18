@@ -94,6 +94,16 @@ pub enum SuiteOutcome {
     None,
     /// produced nothing comparable at all
     Empty,
+    /// The run hit its deadline. Any ids alongside this outcome are what it
+    /// emitted BEFORE the deadline — real observations, but NOT the complete
+    /// inventory, so the suite can never be read as a pass.
+    ///
+    /// Distinct from [`Self::None`], which used to cover this case by
+    /// discarding the transcript entirely. That destroyed the evidence of how
+    /// far the run actually got and made the classifier charge the suite's WHOLE
+    /// oracle inventory as unexercised — roughly 1,900 phantom rows across 85
+    /// suites in the 2026-08-17 closure.
+    Truncated,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -128,20 +138,33 @@ pub trait VerdictParser {
 }
 
 /// Dispatch a [`Raw`] to the parser named by the manifest's `verdict` field.
-/// A `timed_out` raw short-circuits to a `None`-result empty map (the classifier
-/// turns that into a TIMEOUT/ORACLE_FAIL verdict before any per-id diff).
+/// A `timed_out` raw is still PARSED — see [`parse_for_mode`].
 pub fn parse(kind: VerdictKind, raw: &Raw) -> SuiteResult {
     parse_for_mode(kind, raw, ParseMode::Regression)
 }
 
 pub fn parse_for_mode(kind: VerdictKind, raw: &Raw, mode: ParseMode) -> SuiteResult {
+    let parsed = parse_transcript(kind, raw, mode);
     if raw.timed_out {
+        // Parse the transcript we DO have, then stamp it `Truncated`. This used
+        // to discard the transcript and return an empty map, which was wrong
+        // twice over: it threw away the rows the run genuinely produced (so
+        // triage could not see where it died — the "no output means died before
+        // flushing, never did not run" trap), and it left the classifier to
+        // union the id sets and mint an `[Absent, Ok]` pair for every oracle row,
+        // charging the suite its ENTIRE inventory as unexercised.
+        //
+        // The suite is still a gating failure; a deadline is never a pass. What
+        // changes is only that the accounting is now truthful.
         return SuiteResult {
-            totals: Totals::default(),
-            result: SuiteOutcome::None,
-            ids: BTreeMap::new(),
+            result: SuiteOutcome::Truncated,
+            ..parsed
         };
     }
+    parsed
+}
+
+fn parse_transcript(kind: VerdictKind, raw: &Raw, mode: ParseMode) -> SuiteResult {
     match (kind, mode) {
         (VerdictKind::Regrtest, ParseMode::Regression) => regrtest::RegrtestParser.parse(raw),
         (VerdictKind::Gotest, ParseMode::Regression) => gotest::GotestParser.parse(raw),
