@@ -99,7 +99,7 @@ impl SyscallDispatcher {
             .map(|md| vfs_md_to_rootfs_md(path, &md))
     }
 
-    pub(super) fn canonicalize_following(&self, path: &str) -> Result<String, LinuxErrno> {
+    pub(crate) fn canonicalize_following(&self, path: &str) -> Result<String, LinuxErrno> {
         let mut cur = path.to_string();
         for _ in 0..40 {
             let md = self.layered_lstat(&cur)?;

@@ -1224,6 +1224,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "overlaysymlink": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "patherrno": {
     "class": "conformance",
     "excluded": false,
