@@ -11286,12 +11286,20 @@ impl SyscallDispatcher {
         }
 
         fn fanotify_init(this, cx, flags: u64, event_f_flags: u64) {
-            // fanotify_init(2) requires CAP_SYS_ADMIN. Carrick has no capability
-            // model finer than the credential snapshot, so gate on effective
-            // root — the same answer Linux gives an unprivileged caller, and
-            // NOT a fabricated success that would let a non-root guest believe
-            // it is monitoring a filesystem it cannot.
-            if !this.cred_snapshot().euid.is_root() {
+            // fanotify_init(2) requires CAP_SYS_ADMIN — the CAPABILITY, not
+            // euid 0. This used to gate on effective root with a comment
+            // saying carrick had no finer model; it does now
+            // (`has_effective_capability`), and the distinction is
+            // guest-visible: Docker's default set drops CAP_SYS_ADMIN, so the
+            // oracle answers EPERM for container root BOTH confined and
+            // unconfined (i.e. it is a kernel check, not the seccomp profile),
+            // while carrick handed root a working group fd. That extra fd type
+            // is one of the pairings `splice07`/`ioctl_ficlone04` run and the
+            // oracle skips.
+            if !super::creds::has_effective_capability(
+                cx.kernel,
+                crate::namespace::process::CAP_SYS_ADMIN,
+            ) {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             if flags & !LinuxFanotifyInitFlags::KNOWN_MASK != 0 {
@@ -11366,6 +11374,19 @@ impl SyscallDispatcher {
         }
 
         fn fanotify_mark(this, cx, fanotify_fd: Fd, flags: u64, mask: u64, dirfd: Fd, pathname: GuestPtr) {
+            // Flag validation precedes the fd lookup: the oracle answers
+            // EINVAL for `fanotify_mark(-1, 0, 0, -1, NULL)` — a bad fd AND
+            // a flagless command — both confined and unconfined, while
+            // carrick answered EBADF by looking the fd up first.
+            if flags & !LinuxFanotifyMarkFlags::KNOWN_MASK != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let mark_flags = LinuxFanotifyMarkFlags::from_bits_retain(flags);
+            // Exactly one of ADD / REMOVE / FLUSH, and at most one object type.
+            let (Some(command), Some(mark_type)) = (mark_flags.command(), mark_flags.mark_type())
+            else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
             let Some(group) = this.fanotify_group(fanotify_fd.0) else {
                 // A live fd that is not a fanotify group is EINVAL, not EBADF
                 // (fanotify_mark(2): "fanotify_fd was not an fanotify file
@@ -11375,15 +11396,6 @@ impl SyscallDispatcher {
                 } else {
                     LINUX_EBADF
                 }));
-            };
-            if flags & !LinuxFanotifyMarkFlags::KNOWN_MASK != 0 {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            let mark_flags = LinuxFanotifyMarkFlags::from_bits_retain(flags);
-            // Exactly one of ADD / REMOVE / FLUSH, and at most one object type.
-            let (Some(command), Some(mark_type)) = (mark_flags.command(), mark_flags.mark_type())
-            else {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             // FAN_MARK_FLUSH ignores `mask` AND `pathname` entirely — it drops
             // every mark of one class from this group. Resolving the path here

@@ -60,6 +60,26 @@
 //! entry-by-entry with the same evidence bar (Docker's profile JSON is NOT
 //! copied wholesale).
 //!
+//! # `io_uring` family provenance (differential, 2026-08-18)
+//!
+//! Docker's default profile denies all three `io_uring` entry points.
+//! Observed on `localhost:5050/cpython-test:3.12.13`, linux/arm64, same caps:
+//!
+//! | call | default profile | `seccomp=unconfined` |
+//! |---|---|---|
+//! | `io_uring_setup(1, NULL)` | EPERM | EFAULT |
+//! | `io_uring_enter(-1, …)` | EPERM | EBADF |
+//! | `io_uring_register(-1, …)` | EPERM | EINVAL |
+//!
+//! Every unconfined answer is a kernel argument check, so the confined EPERM
+//! is the profile. carrick implements io_uring, so without this entry a
+//! default guest creates ring fds the oracle cannot — which is exactly what
+//! made `splice07`/`ioctl_ficlone04` run fd-type pairings the oracle skips.
+//!
+//! Note `fanotify_init` is deliberately NOT in this table: it answers EPERM
+//! *unconfined too* (a genuine CAP_SYS_ADMIN check), so it belongs in the
+//! handler, not in the launch-policy model.
+//!
 //! # `clone3(2)` entry provenance (differential, 2026-08-18)
 //!
 //! Docker's default profile answers `clone3` with **ENOSYS** rather than
@@ -120,6 +140,9 @@ const SYS_PERF_EVENT_OPEN: u64 = 241;
 const SYS_BPF: u64 = 280;
 const SYS_UNSHARE: u64 = 97;
 const SYS_CLONE3: u64 = 435;
+const SYS_IO_URING_SETUP: u64 = 425;
+const SYS_IO_URING_ENTER: u64 = 426;
+const SYS_IO_URING_REGISTER: u64 = 427;
 const SYS_SETNS: u64 = 268;
 
 /// Identity syscalls the EL1 fast-path shim may answer without a dispatch
@@ -165,6 +188,10 @@ impl ContainerPolicy {
             // `clone3`: denied with ENOSYS (not EPERM) so a guest libc takes
             // its documented `clone` fallback, exactly as it does in Docker.
             (SYS_CLONE3, LINUX_ENOSYS),
+            // The whole `io_uring` family (see the provenance note above).
+            (SYS_IO_URING_SETUP, LINUX_EPERM),
+            (SYS_IO_URING_ENTER, LINUX_EPERM),
+            (SYS_IO_URING_REGISTER, LINUX_EPERM),
         ])
     }
 

@@ -689,6 +689,11 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
     // assertions when the container cannot tune it.
     ("/proc/sys/vm/nr_hugepages", Sysctl::Static(b"0\n")),
     ("/proc/sys/vm/swappiness", Sysctl::Static(b"60\n")),
+    // LTP's tst_sys_conf probes this before the fanotify dirty-cache tests
+    // (fanotify10/23); absent, they TCONF "Path not found" where the oracle
+    // TCONFs "Path is not writable". 100 is the kernel default and the value
+    // the oracle reports.
+    ("/proc/sys/vm/vfs_cache_pressure", Sysctl::Static(b"100\n")),
     // fs.* — file-max/nr_open match NOFILE_HARD (the RLIMIT_NOFILE ceiling
     // carrick enforces). file-nr is exactly THREE tab-separated ints.
     ("/proc/sys/fs/file-max", Sysctl::Static(b"1048576\n")),
