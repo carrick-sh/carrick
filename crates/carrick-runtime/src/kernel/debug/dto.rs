@@ -1117,6 +1117,7 @@ fn backing_kind_name(backing: &FileDescriptionBackingSnapshot) -> &'static str {
         Kind::BpfProg => "bpf-prog",
         Kind::PerfEvent => "perf-event",
         Kind::IoUring => "io-uring",
+        Kind::FsContext => "fscontext",
     }
 }
 

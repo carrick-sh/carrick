@@ -26,8 +26,8 @@ Each row carries a `SupportLevel`, which maps to the **Quality** column below:
 | `Planned` | **Stub** | Recognized by name but routes to `ENOSYS` today. Only two: `execveat` (#281) and `clone3` (#435) — the latter is partially wired for the clone/fork modes carrick supports (`compat_note_for_aarch64`). |
 | `Deferred` | **Not implemented** | `ENOSYS`, surfaced by its real name (e.g. `io_uring_register`, `process_madvise`) so the compat report shows `process_madvise`, not `unknown 440`. |
 
-**234 syscalls are actively emulated** (`BringUp`), 2 are `Planned` stubs, and
-the remaining 103 table rows are `Deferred`. Counts are from the table itself
+**242 syscalls are actively emulated** (`BringUp`), 2 are `Planned` stubs, and
+the remaining 95 table rows are `Deferred`. Counts are from the table itself
 (`rg 'SupportLevel::BringUp' crates/carrick-abi/src/syscall.rs | wc -l`).
 
 > [!NOTE]
@@ -126,9 +126,8 @@ delivery the case would exercise IS implemented and unit-tested
 only the tracefs half is missing.
 
 **Deferred in this category:** `mount`/`umount2`/`pivot_root`/`chroot`,
-`quotactl`, `name_to_handle_at`/`open_by_handle_at`, the new-mount API
-(`open_tree`, `move_mount`, `fsopen`/`fsconfig`/`fsmount`/`fspick`,
-`mount_setattr`, `statmount`/`listmount`),
+`quotactl`, `name_to_handle_at`/`open_by_handle_at`,
+`statmount`/`listmount` (ENOSYS — also ENOSYS on the LinuxKit oracle kernel),
 and the `*_time64` fs variants (`utimensat_time64`, `pselect6_time64`,
 `ppoll_time64`). The 32-bit-time variants are unreachable from a 64-bit aarch64
 guest.

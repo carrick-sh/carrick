@@ -3584,7 +3584,10 @@ fn synthetic_proc_mounts() -> &'static [u8] {
     b"overlay / overlay ro,relatime 0 0\n"
 }
 
-fn synthetic_proc_filesystems() -> &'static [u8] {
+/// The `/proc/filesystems` the guest sees. `pub(crate)` so the new-mount-API
+/// dispatch (`fsopen`'s ENODEV list) can pin itself to this exact list — the
+/// two surfaces answering "which filesystems exist" must never drift apart.
+pub(crate) fn synthetic_proc_filesystems() -> &'static [u8] {
     b"nodev\ttmpfs\n\
 nodev\tproc\n\
 nodev\tsysfs\n\

@@ -1798,6 +1798,9 @@ impl SyscallDispatcher {
             // overflow-sample delivery, and carrick refuses sampling events at
             // open (see dispatch::perf module docs).
             OpenDescription::PerfEvent { .. } => {}
+            // An fs context fd carries no readiness events in carrick (its
+            // read channel — the fsconfig error log — is unimplemented).
+            OpenDescription::FsContext { .. } => {}
             OpenDescription::PipeReader { pipe, .. } => {
                 if requested_events & LINUX_POLLIN != 0 {
                     let pipe = pipe.lock();

@@ -39,7 +39,7 @@ The legacy 1:1 host-process-per-guest-process execution backends (legacy `vmm`
 and `native`) have been retired in favor of the consolidated HVPatch kernel.
 
 **Status — experimental, not production-ready.** Be honest in code, comments,
-docs, and commit messages: syscall coverage is partial (234 emulated, 103
+docs, and commit messages: syscall coverage is partial (242 emulated, 95
 deferred on the aarch64 table — count them with
 `grep -c 'SupportLevel::BringUp' crates/carrick-abi/src/syscall.rs` — several
 only partial; see [`docs/syscalls-emulation-map.md`](docs/syscalls-emulation-map.md)),
