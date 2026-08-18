@@ -4922,7 +4922,7 @@ impl SyscallDispatcher {
         reporter: &CompatReporter,
     ) -> Option<DispatchOutcome> {
         let policy = self.container_policy.as_ref()?;
-        let errno = policy.denied_errno(request.number.raw())?;
+        let errno = policy.denied_errno_for_args(request.number.raw(), request.args.0[0])?;
         let name = lookup_aarch64(request.number.raw()).map_or("unknown", |syscall| syscall.name);
         reporter.record(CompatEvent::partial_syscall(
             request.number.raw(),
