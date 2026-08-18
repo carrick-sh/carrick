@@ -188,12 +188,59 @@ bitflags! {
     pub struct LinuxAarch64Hwcap: u64 {
         const FP = 1 << 0;
         const ASIMD = 1 << 1;
+        const EVTSTRM = 1 << 2;
         const AES = 1 << 3;
         const PMULL = 1 << 4;
         const SHA1 = 1 << 5;
         const SHA2 = 1 << 6;
         const CRC32 = 1 << 7;
         const ATOMICS = 1 << 8;
+        const FPHP = 1 << 9;
+        const ASIMDHP = 1 << 10;
+        const CPUID = 1 << 11;
+        const ASIMDRDM = 1 << 12;
+        const JSCVT = 1 << 13;
+        const FCMA = 1 << 14;
+        const LRCPC = 1 << 15;
+        const DCPOP = 1 << 16;
+        const SHA3 = 1 << 17;
+        const ASIMDDP = 1 << 20;
+        const SHA512 = 1 << 21;
+        const ASIMDFHM = 1 << 23;
+        const DIT = 1 << 24;
+        const USCAT = 1 << 25;
+        const ILRCPC = 1 << 26;
+        const FLAGM = 1 << 27;
+        const SB = 1 << 29;
+        /// Pointer-auth address keys. NOT advertised: enabling it makes
+        /// guests emit non-hint PAC instructions that need EL1 key
+        /// management carrick does not provide yet.
+        const PACA = 1 << 30;
+        /// Pointer-auth generic key — withheld with [`Self::PACA`].
+        const PACG = 1 << 31;
+    }
+}
+
+bitflags! {
+    /// AArch64 Linux `AT_HWCAP2` feature bits published to the guest. Bit
+    /// positions derived from the live oracle: the kernel prints
+    /// `/proc/cpuinfo` Features in ascending bit order across HWCAP then
+    /// HWCAP2, so pairing Docker's feature string with its raw
+    /// `getauxval(AT_HWCAP2)` word (0x326181 on the native arm64 oracle)
+    /// names each set bit exactly.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxAarch64Hwcap2: u64 {
+        const DCPODP = 1 << 0;
+        const FLAGM2 = 1 << 7;
+        const FRINT = 1 << 8;
+        const I8MM = 1 << 13;
+        const BF16 = 1 << 14;
+        /// Branch Target Identification. NOT advertised: honoring it needs
+        /// PROT_BTI mappings and guarded-page bits in carrick's stage-1
+        /// tables.
+        const BTI = 1 << 17;
+        const AFP = 1 << 20;
+        const RPRES = 1 << 21;
     }
 }
 

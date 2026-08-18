@@ -2596,7 +2596,7 @@ fn synthetic_proc_cpuinfo(arch: GuestReportedArch) -> Vec<u8> {
                 out.push_str(&format!(
                     "processor\t: {cpu}\n\
 BogoMIPS\t: 48.00\n\
-Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp\n\
+Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512 asimdfhm dit uscat ilrcpc flagm sb dcpodp flagm2 frint i8mm bf16 afp rpres\n\
 CPU implementer\t: 0x61\n\
 CPU architecture: 8\n\
 CPU variant\t: 0x0\n\
