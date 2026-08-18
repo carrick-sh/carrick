@@ -95,6 +95,25 @@ three publication pre-images plus the fork-time parent pre-image are taken into
 recycled buffers via a hand-written `Clone::clone_from`. No snapshot was
 weakened — each is still the complete pre-transaction image.
 
+`7f58d0595`. The fork-time parent pre-image is now built only when the fork
+copies the mm. `CLONE_VM`/vfork leave `fork_cow_ranges()` empty, never arm the
+parent, and never reach the block that consumes the pre-image, so that copy was
+pure waste on the path glibc's `posix_spawn` takes — i.e. on every cpython
+`subprocess` and forkserver child.
+
+Same-instrument receipts from `hvpatch-phase4-fork-process-spec-stages.d` on the
+final signed binary, `ParentPageTablesClone` `units` (bytes of table image the
+stage copies):
+
+| workload | forks | units | images per fork |
+| --- | ---: | ---: | ---: |
+| `posix_spawn("/bin/true")` loop | 41 | 75,235,328 | 1 |
+| `fork`/`_exit`/`waitpid` loop | 101 | 368,836,608 | 2 |
+
+and on that plain-fork capture the per-stage elapsed moved
+`ParentPageTablesClone` 425 -> 291 us, `BackendSpecFinalize` 242 -> 4.35 us (the
+deleted dead clone), whole process-spec 1,314 -> 883 us per fork.
+
 ## Result
 
 Reducer, `gcc:13`, dynamically linked, untraced, two reps per side, load ~8-9.
@@ -142,11 +161,29 @@ perf pass.
 ## What this does NOT fix
 
 `cpython-multiprocessing_main_handling` is unmoved: 18.8 / 21.1 s guest-reported
-before, 19.8 / 17.5 s after, against a 3.4 s native arm64 Docker oracle (~5x).
-The suite runs 39 `runpy` cases that each start a fresh interpreter, so it is
-exec/startup bound rather than fork bound. The fork lever is aimed at
-`multiprocessing_fork` / `forkserver` / `concurrent_futures`, and
-`main_handling` needs the exec path measured separately.
+on unmodified main, 17.5 / 19.8 / 20.4 s across three runs of the changed
+builds, against a 3.4 s native arm64 Docker oracle (~5-6x). The suite runs 39
+`runpy` cases that each start a fresh interpreter, so it is exec/startup bound
+rather than fork bound. The fork lever is aimed at `multiprocessing_fork` /
+`forkserver` / `concurrent_futures`; `main_handling` needs the exec path
+measured separately.
+
+## A pre-existing regression found on the way, NOT from this work
+
+`just conformance-quick` on the changed build is 22 MATCH and one gating
+REGRESSION: `cpython-threading` 191/193 against a 193/193 oracle, failing
+`test_main_thread_after_fork` and `test_2_join_in_forked_process`. The blessed
+baseline records this suite as 193/193 MATCH, so it is a real regression against
+the bless.
+
+It is not from this work. Reduced to its inner subprocess — fork from a Python
+process and let the child run to exit — it reproduces **19 times in 20** on the
+changed binary and **19 times in 20 on unmodified `44744a166`**, with the same
+signature: `free(): invalid pointer` / `Fatal Python error: Aborted` in the
+forked child during garbage collection, child exit code -6. That is guest heap
+state diverging across fork, and it wants its own investigation. The reducer is
+a 20-iteration loop over the exact snippet from
+`test_threading.ThreadTests.test_main_thread_after_fork`.
 
 ## Reproducing
 
