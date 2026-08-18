@@ -494,8 +494,20 @@ Measured, not inferred — see `docs/perf-results/2026-08-17-closure-post-libuv/
 
   **`ltp-splice07` + `ltp-ioctl_ficlone04` 410** (LTP `tst_fd.c` fd-type
   inventory differs, shifting every ordinal).
-- **`ltp-setpriority01`: oracle FIXED, 198 rows -> 3, and the residual gap is
-  now reduced.** The oracle was failing 120 of its own assertions because
+- **`ltp-setpriority01`: CLOSED.** 3 TPASS / 0 TFAIL, rc=0, matching the
+  repaired oracle; setpriority02, getpriority01/02 and nice01-04 all still
+  green (nice05's 2-row gap is pre-existing and unrelated). Three stacked
+  fixes: `resolve_prio_process_target`'s stale ESRCH refusals (nice is
+  per-`Task` since `2e4e37496`, so a peer's nice IS serviceable through the
+  kernel graph), `getpriority` reading the CALLER's nice for a peer target,
+  and — the part the first fix attempt missed — PRIO_PGRP/PRIO_USER no-opping
+  entirely. LTP sweeps all three classes; the TFAIL storm after the
+  PRIO_PROCESS TPASS was the group/user sweeps. Selection is per POSIX
+  (effective uid), `who == 0` denotes the caller's REAL uid per the man page;
+  both class reads return the members' minimum nice.
+
+  The original entry below is retained for its oracle-repair history:
+  oracle FIXED, 198 rows -> 3. The oracle was failing 120 of its own assertions because
   raising priority needs `CAP_SYS_NICE`, which Docker's default cap set drops;
   granted via `docker_flags` (exact name — `setpriority02` tests the
   rejections and must NOT have it), the oracle now passes 3.
