@@ -534,6 +534,12 @@ fn timer_create_rejects_thread_cpu_sigev_thread_id() {
     let mut sev = [0u8; 64];
     sev[8..12].copy_from_slice(&LINUX_SIGPROF.to_le_bytes());
     sev[12..16].copy_from_slice(&LINUX_SIGEV_THREAD_ID.to_le_bytes());
+    // `_sigev_un._tid` must name a thread: the kernel answers EINVAL for an
+    // unset one, verified against the oracle with a raw-syscall probe over
+    // sigev_notify 0..4 (notify=4 with `_tid` left zero -> EINVAL). This test
+    // used to leave it zero and expect success, which was carrick being more
+    // lenient than Linux.
+    sev[16..20].copy_from_slice(&1_i32.to_le_bytes());
     memory.write_bytes(0x4000, &sev).unwrap();
 
     assert_eq!(
@@ -566,6 +572,28 @@ fn timer_create_rejects_thread_cpu_sigev_thread_id() {
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
+    );
+
+    // SIGEV_THREAD_ID with an unset `_tid` is EINVAL even for a clock carrick
+    // supports — the kernel's own rule, not a carrick limitation.
+    let mut unset_tid = sev;
+    unset_tid[16..20].copy_from_slice(&0_i32.to_le_bytes());
+    memory.write_bytes(0x4040, &unset_tid).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(
+                    107,
+                    SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 0x4040, 0x4088, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL
+        }
     );
     let id = u64::from_le_bytes(memory.read_bytes(0x4080, 8).unwrap().try_into().unwrap());
     assert_eq!(

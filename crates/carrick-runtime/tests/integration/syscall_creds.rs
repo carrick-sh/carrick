@@ -940,8 +940,13 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
         DispatchOutcome::Returned { value: 15 }
     );
 
-    // setpriority returns EACCES, not EPERM, when the target exists but an
-    // unprivileged caller tries to lower its nice value (raise priority).
+    // setpriority returns EACCES, not EPERM, when the target exists but a
+    // caller without CAP_SYS_NICE tries to lower its nice value (raise
+    // priority). The previous statement left this task at nice 15, so
+    // requesting nice 0 IS a raise — and the modeled Docker-default set does
+    // not grant CAP_SYS_NICE. This expectation used to be `Returned{0}` under
+    // the euid==0 model, which is what let carrick succeed where the oracle
+    // EPERMs (LTP nice01/nice05).
     assert_eq!(
         dispatcher
             .dispatch(
@@ -951,7 +956,9 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(13)
+        }
     );
     assert_eq!(
         dispatcher
