@@ -477,6 +477,21 @@ struct ResidentFaultRange {
 /// Insert `[addr, addr+len)` into `regions` (sorted by start), coalescing any
 /// adjacent or overlapping ranges. `len` must be > 0.
 fn free_regions_insert(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
+    // Free-list audit: CARRICK_FORK_DEBUG_VA=<hex> logs any insert covering
+    // that VA, with the caller — the final provenance hook in the forkserver
+    // zeroed-granule chain (an insert overlapping a live mapping is the seed
+    // corruption every later grant faithfully amplifies).
+    if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
+        .ok()
+        .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+        && addr <= debug_va
+        && debug_va < addr.saturating_add(len)
+    {
+        eprintln!(
+            "[FREEDBG] free_regions_insert {addr:#x}+{len:#x}\n{}",
+            std::backtrace::Backtrace::force_capture(),
+        );
+    }
     let mut new_start = addr;
     let mut new_end = addr.saturating_add(len);
     let mut out: Vec<(u64, u64)> = Vec::with_capacity(regions.len() + 1);
@@ -1176,6 +1191,21 @@ fn trim_growdown_ranges_for_range(mem: &mut MemState, start: u64, len: u64) {
 }
 
 fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len: u64) {
+    // Ledger audit: CARRICK_FORK_DEBUG_VA=<hex> logs any metadata removal
+    // covering that VA, with the caller — the hook that named the path
+    // deleting a LIVE mapping's ledger entry (the forkserver zeroed-granule
+    // corruption: the free list then honestly resold the range).
+    if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
+        .ok()
+        .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+        && start <= debug_va
+        && debug_va < start.saturating_add(len)
+    {
+        eprintln!(
+            "[LEDGERDBG] remove_mapping_metadata {start:#x}+{len:#x}\n{}",
+            std::backtrace::Backtrace::force_capture(),
+        );
+    }
     trim_dynamic_maps_for_range(&mut mem.dynamic_maps, start, len);
     trim_core_file_mappings_for_range(&mut mem.core_file_mappings, start, len);
     trim_live_boot_regions_for_range(mem, start, len);
@@ -2078,6 +2108,69 @@ impl SyscallDispatcher {
     }
 
     pub(in crate::dispatch) fn next_mmap_address(
+        &self,
+        requested: u64,
+        length: u64,
+        prot: u64,
+        flags: u64,
+    ) -> Option<(u64, bool)> {
+        let granted = self.next_mmap_address_inner(requested, length, prot, flags);
+        // Grant audit: CARRICK_MMAP_GRANT_DEBUG=1 logs any non-FIXED grant that
+        // overlaps a LIVE dynamic mapping, with the allocator state and caller.
+        // A double-grant here scrubbed a live CPython interned-dict granule to
+        // zeros (the forkserver SIGSEGV cluster); this names the guilty path in
+        // one run instead of a day of ledger archaeology.
+        if flags & LINUX_MAP_FIXED == 0
+            && std::env::var_os("CARRICK_MMAP_GRANT_DEBUG").is_some()
+            && let Some((address, _)) = granted
+        {
+            let mem = self.mem.lock();
+            let overlaps: Vec<_> = mem
+                .dynamic_maps
+                .iter()
+                .filter(|map| map.start < address.saturating_add(length) && map.end > address)
+                .map(|map| (map.start, map.end))
+                .collect();
+            if !overlaps.is_empty() {
+                eprintln!(
+                    "[GRANTDBG] non-fixed grant {address:#x}+{length:#x} OVERLAPS live {overlaps:x?}\n  \
+                     mmap_next={:#x} free_regions={:x?}\n{}",
+                    mem.mmap_next,
+                    mem.free_regions,
+                    std::backtrace::Backtrace::force_capture(),
+                );
+            }
+            // Even without a ledger overlap, a grant covering the debug VA is
+            // the event under investigation — dump the ledger's view of the
+            // neighbourhood so a MISSING dynamic_maps entry is visible too.
+            if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
+                .ok()
+                .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+                && address <= debug_va
+                && debug_va < address.saturating_add(length)
+            {
+                let near: Vec<_> = mem
+                    .dynamic_maps
+                    .iter()
+                    .filter(|map| {
+                        map.end > address.saturating_sub(0x200000)
+                            && map.start < address.saturating_add(length + 0x200000)
+                    })
+                    .map(|map| (map.start, map.end))
+                    .collect();
+                eprintln!(
+                    "[GRANTDBG] grant {address:#x}+{length:#x} covers debug VA; dynamic_maps near: \
+                     {near:x?}\n  mmap_next={:#x} free_regions={:x?}\n{}",
+                    mem.mmap_next,
+                    mem.free_regions,
+                    std::backtrace::Backtrace::force_capture(),
+                );
+            }
+        }
+        granted
+    }
+
+    fn next_mmap_address_inner(
         &self,
         requested: u64,
         length: u64,
