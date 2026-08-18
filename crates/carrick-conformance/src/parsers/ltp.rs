@@ -33,8 +33,8 @@ impl LtpParser {
             Ok(summary_count),
             Ok(summary_field),
         ) = (
-            Regex::new(r"^(\S+\.c):(\d+):\s+(TPASS|TFAIL|TBROK|TCONF):"),
-            Regex::new(r"^(\S+)\s+(\d+)\s+(TPASS|TFAIL|TBROK|TCONF)\s*:"),
+            Regex::new(r"^(\S+\.c):(\d+):\s+(TPASS|TFAIL|TBROK|TCONF):\s*(.*)$"),
+            Regex::new(r"^(\S+)\s+(\d+)\s+(TPASS|TFAIL|TBROK|TCONF)\s*:\s*(.*)$"),
             Regex::new(
                 r"^(\S+)\s+\d+\s+TINFO\s*:\s+.*?\b(?:Test case|case)\s+(\d+)\b.*?\b(PASSED|FAILED)\b",
             ),
@@ -184,7 +184,67 @@ fn closure_assertion(
         "TCONF" => Outcome::Conf,
         _ => return None,
     };
-    Some((format!("ltp:{binary}:{case}"), outcome))
+    let descriptor = caps
+        .get(outcome_index + 1)
+        .map(|message| descriptor_slug(message.as_str()))
+        .unwrap_or_default();
+    let id = if descriptor.is_empty() {
+        format!("ltp:{binary}:{case}")
+    } else {
+        format!("ltp:{binary}:{case}:{descriptor}")
+    };
+    Some((id, outcome))
+}
+
+/// Reduce a tst_res message to the stable DESCRIPTOR the closure id keys on.
+///
+/// tst_fd-family suites emit one assertion per fd type from the SAME
+/// file:line; keying those rows positionally shifts every later ordinal
+/// whenever one side's fd inventory differs, so unrelated fd types get
+/// compared against each other (splice07/ioctl_ficlone04). The line text
+/// itself names the fd type, so the id carries it — with the parts that
+/// legitimately vary stripped:
+///
+/// - the outcome detail after the LAST " : " (a TPASS "… : EINVAL (22)"
+///   and a divergent TFAIL "… : SUCCESS" must share one id so the pair
+///   compares as semantic, not as two unexercised absences);
+/// - digit runs (pids, sizes, timings) normalize to `N`;
+/// - whitespace collapses to `_`, and the slug is length-bounded.
+fn descriptor_slug(message: &str) -> String {
+    let descriptor = match message.rsplit_once(" : ") {
+        Some((head, _detail)) => head,
+        None => message,
+    };
+    let mut slug = String::with_capacity(descriptor.len().min(64));
+    let mut last_was_sep = true;
+    let mut last_was_digit = false;
+    for ch in descriptor.chars() {
+        if slug.len() >= 64 {
+            break;
+        }
+        if ch.is_ascii_digit() {
+            if !last_was_digit {
+                slug.push('N');
+            }
+            last_was_digit = true;
+            last_was_sep = false;
+            continue;
+        }
+        last_was_digit = false;
+        if ch.is_whitespace() {
+            if !last_was_sep {
+                slug.push('_');
+            }
+            last_was_sep = true;
+        } else {
+            slug.push(ch);
+            last_was_sep = false;
+        }
+    }
+    while slug.ends_with('_') {
+        slug.pop();
+    }
+    slug
 }
 
 impl VerdictParser for LtpParser {
@@ -305,6 +365,84 @@ impl VerdictParser for LtpParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// tst_fd-family suites emit ONE assertion per fd type from the SAME
+    /// file:line. A positional (`#occurrence`) key shifts every later ordinal
+    /// when one side's fd inventory differs, comparing unrelated fd types
+    /// against each other (splice07/ioctl_ficlone04, ~194 rows). The closure
+    /// id must therefore carry the per-line descriptor text so a missing fd
+    /// type surfaces as exactly ONE unexercised pair while every shared fd
+    /// type still pairs by identity.
+    #[test]
+    fn closure_ids_key_on_descriptor_not_ordinal() {
+        let oracle = concat!(
+            "splice07.c:56: TPASS: splice() on file -> pipe : EINVAL (22)\n",
+            "splice07.c:56: TPASS: splice() on file -> unix socket : EINVAL (22)\n",
+            "splice07.c:56: TPASS: splice() on file -> fanotify : EINVAL (22)\n",
+        );
+        // carrick lacks fanotify in the inventory but diverges on unix socket.
+        let carrick = concat!(
+            "splice07.c:56: TPASS: splice() on file -> pipe : EINVAL (22)\n",
+            "splice07.c:56: TFAIL: splice() on file -> unix socket : SUCCESS\n",
+        );
+        let o = LtpParser.parse_closure(&raw(oracle));
+        let c = LtpParser.parse_closure(&raw(carrick));
+        // The shared descriptors pair by identity...
+        let pipe_id = o
+            .ids
+            .keys()
+            .find(|k| k.contains("pipe"))
+            .expect("pipe id present")
+            .clone();
+        assert_eq!(o.ids.get(&pipe_id), Some(&Outcome::Ok));
+        assert_eq!(c.ids.get(&pipe_id), Some(&Outcome::Ok), "{c:?}");
+        // ...including the DIVERGENT one: same id, different outcome — the
+        // outcome tail after the last " : " must not participate in the key.
+        let sock_id = o
+            .ids
+            .keys()
+            .find(|k| k.contains("unix_socket") || k.contains("unix socket"))
+            .expect("unix socket id present")
+            .clone();
+        assert_eq!(o.ids.get(&sock_id), Some(&Outcome::Ok));
+        assert_eq!(c.ids.get(&sock_id), Some(&Outcome::Fail), "{c:?}");
+        // The missing fd type is absent from carrick under its OWN id; no
+        // other id shifted.
+        let fan_id = o
+            .ids
+            .keys()
+            .find(|k| k.contains("fanotify"))
+            .expect("fanotify id present")
+            .clone();
+        assert!(!c.ids.contains_key(&fan_id));
+        assert_eq!(o.ids.len(), 3);
+        assert_eq!(c.ids.len(), 2);
+    }
+
+    /// Variable data (pids, sizes, timings) in the descriptor must not split
+    /// ids between the oracle and carrick runs: digit runs normalize.
+    #[test]
+    fn closure_ids_normalize_digit_runs() {
+        let a = LtpParser.parse_closure(&raw(
+            "kill02.c:100: TPASS: signal sent to pid 4711 : arrived
+",
+        ));
+        let b = LtpParser.parse_closure(&raw("kill02.c:100: TPASS: signal sent to pid 9 : arrived
+"));
+        assert_eq!(
+            a.ids.keys().collect::<Vec<_>>(),
+            b.ids.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Identical descriptor lines still disambiguate ordinally.
+    #[test]
+    fn closure_ids_keep_occurrence_for_true_duplicates() {
+        let r = LtpParser.parse_closure(&raw("loop.c:10: TPASS: iteration ok
+loop.c:10: TPASS: iteration ok
+"));
+        assert_eq!(r.ids.len(), 2);
+    }
 
     fn raw(s: &str) -> Raw {
         Raw {
@@ -454,14 +592,14 @@ mod tests {
             )
         );
         assert_ne!(c.ids, d.ids);
-        assert_eq!(c.ids["ltp:a.c:10#1"], Outcome::Ok);
+        assert_eq!(c.ids["ltp:a.c:10:a#1"], Outcome::Ok);
     }
 
     #[test]
     fn closure_preserves_repeated_ltp_assertions() {
         let result = closure("loop.c:42: TPASS: iteration\nloop.c:42: TPASS: iteration\n");
         assert_eq!(result.ids.len(), 2);
-        assert!(result.ids.contains_key("ltp:loop.c:42#2"));
+        assert!(result.ids.contains_key("ltp:loop.c:42:iteration#2"));
     }
 
     #[test]
@@ -469,8 +607,8 @@ mod tests {
         let result = closure(
             "oldbin  1  TPASS  : first\noldbin  2  TFAIL  : second\nlegacy  0  TINFO  : Test case 3: PASSED\nlegacy2  7  TINFO  : operation PASSED\n",
         );
-        assert_eq!(result.ids["ltp:oldbin:1#1"], Outcome::Ok);
-        assert_eq!(result.ids["ltp:oldbin:2#1"], Outcome::Fail);
+        assert_eq!(result.ids["ltp:oldbin:1:first#1"], Outcome::Ok);
+        assert_eq!(result.ids["ltp:oldbin:2:second#1"], Outcome::Fail);
         assert_eq!(result.ids["ltp:legacy:3#1"], Outcome::Ok);
         assert_eq!(result.ids["ltp:legacy2:7#1"], Outcome::Ok);
     }
