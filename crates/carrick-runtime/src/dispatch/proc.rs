@@ -1898,18 +1898,50 @@ impl SyscallDispatcher {
         fn unshare(this, cx, flags: u64) {
             let _ = this;
             let parsed = LinuxCloneFlags::from_bits_truncate(flags);
+            // Every namespace flag EXCEPT CLONE_NEWUSER requires
+            // CAP_SYS_ADMIN (unshare(2)); CLONE_NEWUSER deliberately needs
+            // none, which is how an unprivileged guest bootstraps a namespace
+            // in which it holds a full set. Verified against the oracle with
+            // the seccomp profile OFF and the default caps: unshare(NEWUTS)
+            // is EPERM there while unshare(CLONE_FILES) succeeds, so this is
+            // a kernel capability check, not Docker's launch policy (which
+            // this handler must not model — see `container_policy`).
+            let privileged_namespaces = parsed
+                & (LinuxCloneFlags::NEWNS
+                    | LinuxCloneFlags::NEWUTS
+                    | LinuxCloneFlags::NEWIPC
+                    | LinuxCloneFlags::NEWNET
+                    | LinuxCloneFlags::NEWPID
+                    | LinuxCloneFlags::NEWCGROUP);
+            if !privileged_namespaces.is_empty()
+                && !super::creds::has_effective_capability(
+                    cx.kernel,
+                    crate::namespace::process::CAP_SYS_ADMIN,
+                )
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
             if parsed.contains(LinuxCloneFlags::NEWUSER) {
                 // Allocate a fresh user ns for the CALLING TASK; grant it full
                 // caps within that namespace. Only this process moves — a
                 // sibling guest process keeps its own namespace and maps.
                 let _id = cx.kernel.task().unshare_user_ns();
             }
-            // CLONE_NEWPID does not move the caller: per unshare(2) the
-            // caller's next fork would become the init of the new pid ns. That
-            // is Phase 4 and is NOT implemented — the flag is accepted and
-            // ignored, like the other namespace flags below.
-            // CLONE_NEWNS / NEWUTS / NEWIPC / NEWCGROUP / NEWNET: accepted and
-            // ignored. Unknown bits are likewise tolerated (truncated above).
+            // A privileged caller asking for a namespace carrick does not
+            // model gets the answer a kernel built without that namespace
+            // option gives — EINVAL — rather than a silent success that
+            // leaves the guest believing it was unshared (CPython's
+            // test_unshare_setns treats EINVAL as "not configured" and skips;
+            // the previous accept-and-ignore made it report
+            // "os.unshare failed" instead). CLONE_NEWPID is included: per
+            // unshare(2) it only affects the caller's future children, which
+            // carrick does not model either.
+            if !privileged_namespaces.is_empty() {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            // The non-namespace flags (CLONE_FILES / FS / SIGHAND / SYSVSEM)
+            // need no capability and are accepted. Unknown bits are tolerated
+            // (truncated above).
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -4050,11 +4082,28 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
 
+            // Creating a child in a NEW namespace needs CAP_SYS_ADMIN for
+            // every namespace type except CLONE_NEWUSER (clone(2),
+            // capabilities(7)) — and carrick models neither the mount, ipc,
+            // net, cgroup nor pid namespaces for a clone child, so an
+            // unprivileged guest must get the same EPERM Linux gives rather
+            // than a child silently sharing the caller's namespaces. LTP
+            // clone11 pins this: "clone(CLONE_NEWIPC) should fail with EPERM".
+            // CLONE_NEWUSER stays EPERM here for a different, pre-existing
+            // reason (a clone-created user namespace is unmodelled), and
+            // CLONE_NEWPID likewise.
+            let ns_flags = LinuxCloneFlags::NEWUSER
+                | LinuxCloneFlags::NEWPID
+                | LinuxCloneFlags::NEWNS
+                | LinuxCloneFlags::NEWUTS
+                | LinuxCloneFlags::NEWIPC
+                | LinuxCloneFlags::NEWNET
+                | LinuxCloneFlags::NEWCGROUP;
+            if flags & ns_flags.bits() != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
             if is_thread_clone(flags) {
                 return Ok(clone_thread_outcome(flags, stack, parent_tid.0, tls, child_tid.0));
-            }
-            if flags & (LinuxCloneFlags::NEWUSER | LinuxCloneFlags::NEWPID).bits() != 0 {
-                return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
 
             let pidfd_out = if flags & LinuxCloneFlags::PIDFD.bits() != 0 {

@@ -850,9 +850,13 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
 
     // setpriority: an out-of-range prio is CLAMPED, not rejected (Linux
     // set_user_nice clamps to [-20,19]; EINVAL is reserved for a bad `which`).
-    // prio=-21 clamps to -20; as full-capability root (euid 0) lowering nice
-    // succeeds -> 0. (Docker oracle returns EPERM only because it drops
-    // CAP_SYS_NICE; carrick models unrestricted root.)
+    // prio=-21 clamps to -20, which RAISES priority — and raising needs
+    // CAP_SYS_NICE, which the modeled Docker-default capability set does not
+    // grant (bit 23 clear), so the answer is EACCES. This expectation used to
+    // be `Returned{0}` with a comment claiming "carrick models unrestricted
+    // root"; that was the euid==0 model, and it made carrick succeed where the
+    // Docker oracle EPERMs (LTP nice01/nice05). The privilege is the
+    // capability, not the uid.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -865,7 +869,9 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
+        DispatchOutcome::Errno {
+            errno: LinuxErrno::new(13)
+        }
     );
     assert_eq!(
         dispatcher
