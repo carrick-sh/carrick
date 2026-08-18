@@ -101,14 +101,42 @@ re-sampled immediately rather than filed as regressions:
   outstanding** — this artifact changes page-table teardown, so carrick cannot be
   ruled out as the cause until the base revision is sampled the same way.
 
-## Performance — not yet the phase, but recorded
+## CORRECTION — two of the outliers were a regression in THIS artifact
 
-The run emitted a `carrick/oracle >= 10x` outlier list. Do NOT read these as
-performance numbers yet: per AGENTS.md a suite sitting on its timeout reports as
-spectacularly slow, and several of these are hangs rather than slow paths
-(`cpython-tarfile` at 132x / 463 s and `go-net_http` at 126x / 540 s are both
-suites that do not complete). The honest reading is that they are CORRECTNESS
-blockers first.
+The paragraph originally here dismissed the `>= 10x` outlier list as
+pre-existing hangs and moved on. That was wrong, and it is the most important
+thing on this page.
+
+`go-net_http` and `go-syscall` did not "not complete". They completed fine on
+the previous artifact and were broken BY `af86c4ce4`:
+
+| suite | post-libuv | this run |
+|---|---|---|
+| `go-net_http` | success, 1,316 rows, **56.8 s** | **timeout, 0 rows, 540.5 s** |
+| `go-syscall` | 38 rows, **43.4 s** | **timeout, 0 rows, 180.8 s** |
+
+Bisected, two samples per point: `c08221355` 50 s, `a6fd9e6fb` 51 s,
+`af86c4ce4` does not finish in 250 s. Cause and fix are in `10c62b8cb` —
+exclusivity was allowed to re-enable EAGER table reclamation, whose
+512-descriptor scans run on every `apply`. Fixed by moving reclamation to the
+paths that would otherwise return `OutOfTables`.
+
+**So the 1,388 `go-net_http` rows and 58 `go-syscall` rows counted as
+`unexercised` in the table above are this regression, not a pre-existing gap.**
+The −1,542 headline is therefore an UNDERSTATEMENT: it nets a real ~−1,542
+improvement against ~+1,446 rows of self-inflicted loss. The next closure on a
+post-`10c62b8cb` artifact is the one to quote.
+
+The general lesson is the one AGENTS.md already states and this page failed to
+apply: a suite sitting on its timeout reports as spectacularly slow, so a ratio
+is never evidence on its own — but "it's a known hang" is not a free pass
+either. Diff the outlier list against the previous run before explaining it
+away.
+
+## Performance — not yet the phase
+
+Remaining `>= 10x` rows still should not be read as performance numbers while
+the suite does not complete.
 
 `per-suite-ledger.jsonl` in this directory carries name, ecosystem, verdict,
 agree/semantic/unexercised counts and the perf ratio for all 2,127 suites, so the
