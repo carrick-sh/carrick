@@ -71,6 +71,61 @@ oscillates between runs (`aliassize`/`coredumpfile`/`termiosbits`/
 rules before touching code). The 4 dedicated reds persist both runs:
 `bridge_publish_tcp` + `bridge_udp_connected_unreachable`, gnu+musl.
 
+**UPDATE (2026-08-18, artifact post-`3e994635b`): every red row above is
+CLOSED.** Six fixes, each red-first against a live reproduction and verified
+line-exact vs the oracle on both libcs:
+
+- `childsubreaper`: probe race — its pipe helpers did not retry EINTR
+  (12/18 -> 0/18 under load after the fix, earlier commit).
+- Dedicated `bridge_publish_tcp` (+ its scenario sibling): carrick ABORTED
+  on exit AFTER probe success — fork-inherited `PublishedTcpProxy`
+  JoinHandles joined a parent-only pthread (ESRCH panic in Drop). Fixed by
+  owner-pid-guarded joins (`c6748f058`). The CLI abort hook now honors
+  RUST_BACKTRACE (same commit) — that is how the join site was found.
+- `bridge_udp_connected_unreachable`: connected-UDP send to an unused
+  bridge port returned synthetic success WITHOUT arming the staged
+  ECONNREFUSED (the sendto-path Denied arm early-returned above the queue
+  step), so poll/recv never saw the error (`6b0680a88`).
+- `aliassize`(gnu): NOT load-flaky — deterministic guest SIGSEGV every run
+  (the "standalone pass" evidence came from a CARRICK_PROBE_FILTER value
+  that matched nothing: the filter is comma-separated EXACT names, and a
+  pipe-separated value silently selects zero probes and the non-closure
+  gate SKIPs with rc=0). Root cause: carrick loaded the PIE image at
+  4 GiB and ld.so at 512 GiB — addresses Linux leaves FREE — so the
+  probe's MAP_FIXEDs clobbered its own text/ld.so. PIE base -> 544 GiB,
+  interp -> 560 GiB, arena ceiling + identity-image mprotect window
+  re-anchored (`0283ef7dc`).
+- `termiosbits`(gnu): Linux's pty driver never stores CS5-CS7; glibc's
+  tcsetattr verifies via readback and reports EINVAL itself (musl does
+  not verify — hence the gnu-only diff). carrick now coerces CSIZE->CS8
+  in the pty TCSETS path and lets the guest libc produce the per-libc
+  result (`fab59805d`).
+- `coredumpfile`(gnu): thread PCs agree with Linux (oracle core's
+  NT_PRSTATUS extracted and compared) — the divergence was WHICH PAGES the
+  core contains: Linux omits executable file-backed contents (text
+  PT_LOADs with filesz=0). carrick's core capture now does the same
+  (`080dc272e`; known in-line-documented approximation: merged image VMAs
+  drop their data portion too).
+- `mqueue`(both): the GATE_SKIP_PROBES "LinuxKit cannot create mqueues"
+  claim was FALSE — kernel-level mq_open treats any '/' in its name as
+  EACCES (glibc strips the leading slash pre-syscall; verified live on
+  real Ubuntu 6.8 arm64 via lima AND on LinuxKit). carrick was the deviant
+  side accepting "/name". Kernel-exact name validation + probe re-written
+  to bare names + un-skipped; full mq family now line-exact vs Docker on
+  both libcs (`3e994635b`).
+
+Load-flaky rows seen ONCE under gate parallelism and 3/3 green standalone,
+all output-interleaving or timing shaped: `vforkexecthread`(musl, line
+ORDER), `sysvsem`(gnu, sleeper count 4 vs 5), `bsd_signal_xlate`(gnu),
+`futexforkwakegroups`(musl, line order), `cloneexithandled`. If these keep
+rotating, the systematic fix is probe-side determinism (single-writer
+output), not runtime chases. Also seen once: `carrick-native-darwin`
+`dynamic_x18_publication_is_veneered…` failed in one full `just test` then
+passed 3/3 exact and a full rerun — pre-existing JIT flake, not addressed.
+
+A full `just conformance-probes-closure` was launched on this artifact; read
+its result before claiming the probe phase green.
+
 ## Resume here
 
 ```sh
