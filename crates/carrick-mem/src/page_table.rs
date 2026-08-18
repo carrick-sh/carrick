@@ -141,6 +141,59 @@ pub fn walk_descriptors(bytes: &[u8], base: u64, va: u64) -> [u64; 4] {
     out
 }
 
+/// Diagnostic: the same walk as [`walk_descriptors`], reading the LIVE host
+/// backing in place instead of a copy of it.
+///
+/// [`walk_descriptors`] needs an owned `&[u8]` of the whole region, so a caller
+/// holding only a host pointer had to copy `LINUX_PAGE_TABLES_SIZE` (1.75 MiB)
+/// to read four 8-byte descriptors. On the frame-COW fault path that copy is
+/// per fault, which made a diagnostic probe the most expensive thing in the
+/// handler. This reads the eight bytes it actually needs.
+///
+/// Descriptors are read as acquire loads, matching
+/// [`PageTableManager::debug_walk_host`], so a walk concurrent with a sibling's
+/// break-before-make publication observes a whole descriptor rather than a
+/// torn one. Deliberately independent of any [`PageTableManager`]: the point of
+/// a live walk is to compare hardware-visible bytes against the software model,
+/// so it must not consult the model to find them.
+///
+/// # Safety
+/// `host` must point at a live mapping of at least `len` bytes whose byte
+/// offset 0 is the PA `base`, and must stay mapped for the call.
+pub unsafe fn walk_descriptors_host(host: *const u8, len: usize, base: u64, va: u64) -> [u64; 4] {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    let idx = indices(va);
+    let mut out = [0u64; 4];
+    let mut table_off: usize = 0; // L0 table at byte offset 0
+    for level in 0..4 {
+        let off = table_off + idx[level] * 8;
+        if off + 8 > len {
+            break;
+        }
+        // SAFETY: `off + 8 <= len` was just checked, every descriptor offset is
+        // 8-byte aligned (table offsets are page-aligned, indices scale by 8),
+        // and the caller guarantees the mapping covers `len` bytes.
+        let desc = unsafe {
+            let slot = host.add(off).cast::<AtomicU64>();
+            (*slot).load(Ordering::Acquire)
+        };
+        out[level] = desc;
+        if desc & VALID == 0 {
+            break; // invalid descriptor: walk stops here
+        }
+        if level == 3 || desc & TYPE_BITS != TYPE_TABLE_OR_PAGE {
+            break; // L3 page, or an L1/L2 block descriptor: leaf reached
+        }
+        let child_pa = desc & PA_MASK_TABLE;
+        let Some(child_off) = child_pa.checked_sub(base) else {
+            break;
+        };
+        table_off = child_off as usize;
+    }
+    out
+}
+
 /// Reconstruct the spare-pool bump cursor from an existing table image: one
 /// past the LAST non-zero spare page. The pristine boot image has an all-zero
 /// spare tail (cursor = `SPARE_START_OFFSET`, the historical constant), but the
@@ -168,7 +221,16 @@ fn discover_next_free_spare(bytes: &[u8]) -> u64 {
 /// private copy of the page-table backing) but MUST inherit the parent's
 /// `next_free`/`free_tables` — a fresh manager would reset the bump cursor and
 /// re-hand-out table pages already live in the copied backing, corrupting it.
-#[derive(Clone)]
+///
+/// `Clone` is implemented by hand ONLY to give `clone_from` an allocation-reusing
+/// body; `clone` itself is the field-wise copy `#[derive(Clone)]` would have
+/// produced. The 1.75 MiB `LINUX_PAGE_TABLES_SIZE` image is large enough that
+/// the system allocator serves it from a fresh `mmap`, so every snapshot costs a
+/// host `mmap`, a zero-fill fault per 16 KiB page, and a `munmap`/`madvise` on
+/// drop. The frame-COW handler takes such a snapshot on EVERY fault as its
+/// rollback pre-image, so reusing one buffer removes that host-VM churn from the
+/// COW path without weakening the snapshot (it is still the complete
+/// pre-transaction image).
 pub struct PageTableManager {
     bytes: Vec<u8>,
     /// PA mapped at byte offset 0 (`LINUX_PAGE_TABLES_BASE`).
@@ -202,6 +264,36 @@ pub struct PageTableManager {
     /// break-before-make ordering that keeps a concurrent sibling walk safe
     /// without quiescing.
     dirty: Vec<(usize, bool)>,
+}
+
+impl Clone for PageTableManager {
+    fn clone(&self) -> Self {
+        Self {
+            bytes: self.bytes.clone(),
+            base: self.base,
+            next_free: self.next_free,
+            free_tables: self.free_tables.clone(),
+            multi_vcpu: self.multi_vcpu,
+            stage1_exclusive: self.stage1_exclusive,
+            reclaim_pending: self.reclaim_pending,
+            dirty: self.dirty.clone(),
+        }
+    }
+
+    /// Overwrite `self` with `source`, reusing `self`'s buffers. Every field is
+    /// copied, so the result is indistinguishable from `clone()`; only the
+    /// allocations differ. `Vec::clone_from` keeps the destination's capacity,
+    /// which is the entire point on the 1.75 MiB table image.
+    fn clone_from(&mut self, source: &Self) {
+        self.bytes.clone_from(&source.bytes);
+        self.base = source.base;
+        self.next_free = source.next_free;
+        self.free_tables.clone_from(&source.free_tables);
+        self.multi_vcpu = source.multi_vcpu;
+        self.stage1_exclusive = source.stage1_exclusive;
+        self.reclaim_pending = source.reclaim_pending;
+        self.dirty.clone_from(&source.dirty);
+    }
 }
 
 impl PageTableManager {
