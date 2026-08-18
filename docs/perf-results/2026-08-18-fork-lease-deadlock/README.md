@@ -107,12 +107,76 @@ their leases while blocked, so the pool never saturates. A discriminating
 reducer needs genuinely parallel guest threads (Go, not CPython). Kept because
 the negative result is the useful part.
 
+## Second defect, found after the first: the admission budget itself
+
+The fork fix above did not close `go-os_exec`, so the clone side was traced
+properly rather than guessed at. Three hypotheses were killed by measurement
+before the real one, and each is recorded so it is not retried:
+
+1. *Parent holds its slot while its child queues.* Moving the parent's reclaim
+   ahead of the spawn (its own comment says that is the intent) changed
+   nothing: 4/4 still aborted.
+2. *Blocking waits keep their leases and never re-evaluate.* Forcing
+   `should_keep_vcpu_for_blocking_wait` to always release changed nothing:
+   3/3 still aborted. Held leases were not the cause.
+3. *Scheduler unfairness alone.* Making admission FIFO changed nothing on its
+   own: 4/4 still aborted.
+
+Temporary markers in the child materializer gave the actual funnel: **23 clone
+children passed the HVF vCPU gate, only 17 ever got a scheduler slot**, and the
+6 that never did are exactly the tids whose parents' start gate expired into
+`std::process::abort()`. The shipped hatch `CARRICK_HVF_VCPU_RECLAIM=0` — which
+removes the bound by admitting one live HVF vCPU per guest thread — passed the
+same test in **under a second, 2/2**. That localized the defect to the bound
+itself, not to reclaim, the guest, or the futex layer.
+
+The bound is one line: `budget_from_limits` clamped the pool to the host's
+**physical core count** (10) against an HVF ceiling of **63**. carrick binds one
+vCPU per guest thread, so that number is how many guest threads may be
+simultaneously admitted — a correctness quantity that was being set by a
+throughput heuristic. Above it, slots are held by threads that only release
+once some other thread progresses, and the thread that would progress is the
+one queued for a slot.
+
+Budgeting by the hypervisor ceiling instead:
+
+| fixture | baseline | fixed |
+|---|---|---|
+| `TestConcurrentExec` | 4/4 abort at 10 s | **4/4 PASS in <1 s** |
+| full `os_exec` suite | `none`, 30 assertions | **86 assertions, all PASS — exactly the oracle's 86** |
+| `net_http` N=1 | 51 s | 53 s, 0 gate timeouts (unchanged) |
+
+Two supporting changes landed with it: admission is now FIFO (`release` used to
+push an id and `notify_one`, letting any running thread barge, and
+`acquire_preferring` barged by design), and a clone child now waits for its slot
+in 250 ms slices rather than 10 ms — every `acquire_timeout` call takes a *fresh*
+place in line, so a child re-entering the queue every few milliseconds sent
+itself to the back forever.
+
+Reclaim still matters above the ceiling: guests do exceed it (CPython
+`test_queue.test_many_threads` spawns 100 threads). This raises the bound, it
+does not remove it.
+
+### Still not closed
+
+- `os_exec` hit a second, unrelated intermittent hang at
+  `TestWaitInterrupt/SIGQUIT` in one trial of two, so the suite is not yet
+  reliably green.
+- `net_http` at N=4 is now dominated by the pre-existing `TestSOCKS5Proxy`
+  wedge: 2 of 4 guests ran to completion and a third reached the last test,
+  while the fourth sat in the documented SOCKS5 stall. The N=4 wall figure is
+  therefore not a clean measure of admission any more — which is progress, but
+  means that fixture needs the SOCKS5 bug fixed before it can be re-quoted.
+
 ## Open, ranked
 
-1. The clone materialization gate (`threads.rs:1019`) — the live blocker for
-   `go-os_exec`, and the likely shared cause with `cpython-multiprocessing_fork`
-   / `forkserver` (600 s timeouts) and `cpython-threading`.
-2. Per-process vCPU budget is a per-process view of a host-global resource:
+1. Re-measure `cpython-multiprocessing_fork` / `forkserver` (600 s timeouts),
+   `cpython-threading` and `cpython-asyncio` against the raised budget — they
+   share the admission mechanism that `go-os_exec` was starving on, and are
+   2,455 diverging rows between them.
+2. `TestWaitInterrupt/SIGQUIT` and `TestSOCKS5Proxy`, the two intermittent
+   hangs now visible underneath the admission bug.
+3. Per-process vCPU budget is a per-process view of a host-global resource:
    every carrick process independently sizes to the whole machine, so four
    guests admit 4x the host's cores. The code already knows the resource is
    host-global ("a slot freed by a DIFFERENT process's teardown can't reach
