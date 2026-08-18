@@ -192,6 +192,7 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
             | OpenDescription::SignalFd { .. }
+            | OpenDescription::PerfEvent { .. }
             | OpenDescription::Mqueue { .. }
             | OpenDescription::BpfMap { .. }
             | OpenDescription::BpfProg { .. }
@@ -251,6 +252,7 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
             | OpenDescription::SignalFd { .. }
+            | OpenDescription::PerfEvent { .. }
             | OpenDescription::Mqueue { .. }
             | OpenDescription::BpfMap { .. }
             | OpenDescription::BpfProg { .. }

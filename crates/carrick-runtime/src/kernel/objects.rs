@@ -428,6 +428,7 @@ pub enum FileDescriptionBackingKind {
     Mqueue,
     BpfMap,
     BpfProg,
+    PerfEvent,
     IoUring,
 }
 
