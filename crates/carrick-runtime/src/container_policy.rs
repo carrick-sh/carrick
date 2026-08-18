@@ -48,6 +48,14 @@
 //!   for a genuinely-absent key — proving the EPERM is Docker's launch-time
 //!   policy, not a kernel permission check.
 //!
+//! `perf_event_open` (2026-08-18, same method, LTP arm64 image): default
+//! profile answers EPERM for every event type (LTP perf_event_open01 TFAILs
+//! "EPERM ... failed unexpectedly" on its FIRST case); unconfined, the same
+//! call reaches the kernel and answers honestly (ENOENT for hardware events
+//! inside the VM, working fds for software events). The EPERM is Docker's
+//! launch policy, so it belongs HERE — the dispatch handler keeps its honest
+//! implementation when the layer is off.
+//!
 //! The table is deliberately minimal: model only what is verified, extend
 //! entry-by-entry with the same evidence bar (Docker's profile JSON is NOT
 //! copied wholesale).
@@ -79,6 +87,7 @@ use carrick_abi::LINUX_EPERM;
 const SYS_ADD_KEY: u64 = 217;
 const SYS_REQUEST_KEY: u64 = 218;
 const SYS_KEYCTL: u64 = 219;
+const SYS_PERF_EVENT_OPEN: u64 = 241;
 const SYS_BPF: u64 = 280;
 
 /// Identity syscalls the EL1 fast-path shim may answer without a dispatch
@@ -109,6 +118,10 @@ impl ContainerPolicy {
             (SYS_ADD_KEY, LINUX_EPERM),
             (SYS_REQUEST_KEY, LINUX_EPERM),
             (SYS_KEYCTL, LINUX_EPERM),
+            // perf_event_open: EPERM under Docker's default profile; honest
+            // handler behavior when unconfined (observed 2026-08-18, module
+            // docs).
+            (SYS_PERF_EVENT_OPEN, LINUX_EPERM),
             // bpf(2): EPERM under Docker's default profile (gated on
             // CAP_SYS_ADMIN, which the default cap set lacks); succeeds
             // unprivileged when unconfined (observed 2026-08-18, module docs).
@@ -143,9 +156,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn docker_default_model_denies_keyring_family_and_bpf_with_eperm() {
+    fn docker_default_model_denies_keyring_family_perf_and_bpf_with_eperm() {
         let policy = ContainerPolicy::docker_default_model();
-        for nr in [SYS_ADD_KEY, SYS_REQUEST_KEY, SYS_KEYCTL, SYS_BPF] {
+        for nr in [
+            SYS_ADD_KEY,
+            SYS_REQUEST_KEY,
+            SYS_KEYCTL,
+            SYS_PERF_EVENT_OPEN,
+            SYS_BPF,
+        ] {
             assert_eq!(
                 policy.denied_errno(nr),
                 Some(LINUX_EPERM),

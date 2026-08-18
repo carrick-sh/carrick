@@ -1246,4 +1246,27 @@ mod tests {
         let (value, _, _) = orphan.snapshot(orphan.ledger());
         assert_eq!(value, 0, "a reaped counter reports its frozen value");
     }
+    #[test]
+    fn confined_policy_denies_perf_event_open_with_eperm() {
+        // Under the Docker default-profile model the syscall is EPERM at the
+        // dispatch seam — the handler's honest behavior is unconfined-only,
+        // mirroring the bare `docker run` oracle (perf_event_open01's TFAIL
+        // "EPERM ... failed unexpectedly").
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.apply_seccomp_policy(carrick_spec::SeccompPolicy::ContainerDefault);
+        let mut memory = memory();
+        let attr = attr_bytes(
+            LINUX_PERF_TYPE_SOFTWARE,
+            128,
+            0,
+            0,
+            0,
+            DISABLED_EXCLUDES,
+            128,
+        );
+        assert_eq!(
+            open_event(&mut dispatcher, &mut memory, &attr, 0, -1, -1, 0),
+            DispatchOutcome::Errno { errno: LINUX_EPERM }
+        );
+    }
 }
