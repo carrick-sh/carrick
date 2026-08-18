@@ -184,6 +184,17 @@ pub struct PageTableManager {
     /// break-before-make structural change that is unsafe without an all-vCPU
     /// TLB flush HVF can't give one vCPU).
     multi_vcpu: bool,
+    /// Whether THIS thread's stage-1 edits are exclusive (see
+    /// `carrick_hal::stage1_exclusive`). Distinct from `multi_vcpu`, which asks
+    /// whether EAGER coalescing is worth doing; this asks only whether freeing a
+    /// table for REUSE is safe. Only the on-demand sweep in `alloc_table`
+    /// consults it.
+    stage1_exclusive: bool,
+    /// Set when a teardown invalidated descriptors, so a sub-table MIGHT now be
+    /// empty; cleared by the reclaim sweep. Without it the sweep re-walks the
+    /// table graph on every allocation once the pool sits near its limit, which
+    /// starves the vCPU badly enough to trip the sibling start gate.
+    reclaim_pending: bool,
     /// Byte offsets edited since the last sync, in write order, tagged
     /// `is_table_pointer`. The host sync replays them as aligned atomic stores,
     /// writing a table descriptor (which exposes a sub-table to the guest's
@@ -202,6 +213,8 @@ impl PageTableManager {
             next_free,
             free_tables: Vec::new(),
             multi_vcpu: false,
+            stage1_exclusive: false,
+            reclaim_pending: false,
             dirty: Vec::new(),
         }
     }
@@ -300,6 +313,15 @@ impl PageTableManager {
 
     /// Tell the manager whether sibling vCPUs are live (set per-edit from the
     /// process-wide live-vCPU count). Gates coalescing.
+    /// Record whether this thread's stage-1 edits are exclusive. Gates ONLY the
+    /// last-resort reclaim sweep, never the eager paths — making exclusivity
+    /// enable eager coalescing took `go-net_http` from 50 s to over 200 s,
+    /// because a busy guest holds most of the pool legitimately and the scan
+    /// then runs constantly while finding almost nothing.
+    pub fn set_stage1_exclusive(&mut self, exclusive: bool) {
+        self.stage1_exclusive = exclusive;
+    }
+
     pub fn set_multi_vcpu(&mut self, multi: bool) {
         self.multi_vcpu = multi;
     }
@@ -598,6 +620,19 @@ impl PageTableManager {
         }
         let off = self.next_free;
         if off + PT_PAGE > self.bytes.len() as u64 {
+            // Last resort before failing: sweep the live table structure for
+            // sub-tables an earlier teardown left ALL-INVALID and take them
+            // back. Deliberately done HERE and nowhere else. Reclaiming eagerly
+            // on every edit is what a busy guest cannot afford — it holds most
+            // of the pool legitimately, so the scan runs constantly and finds
+            // almost nothing (`go-net_http`: 50 s -> over 200 s). Paying it once,
+            // on the path that would otherwise return `OutOfTables`, costs
+            // nothing in the common case and still keeps a churning guest alive.
+            if self.reclaim_all_invalid_tables()
+                && let Some(pa) = self.free_tables.pop()
+            {
+                return Ok(pa);
+            }
             return Err(PageTableError::OutOfTables);
         }
         self.next_free += PT_PAGE;
@@ -942,6 +977,9 @@ impl PageTableManager {
 
     /// Mark `[va, va+len)` invalid (faults on any access → SEGV_MAPERR).
     pub fn set_prot_none(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
+        // A teardown is the only thing that can empty a sub-table, so this is
+        // where the reclaim sweep becomes worth re-running.
+        self.reclaim_pending = true;
         self.apply(va, len, PtOp::Invalidate)
     }
 
@@ -985,6 +1023,66 @@ impl PageTableManager {
         while block < end {
             freed |= self.reclaim_invalid_block(block);
             block += 1 << 21;
+        }
+        freed
+    }
+
+    /// Walk the LIVE table structure and free every spare sub-table that is
+    /// all-invalid, clearing the parent entry that pointed at it. The dual of
+    /// `reclaim_invalid_tables`, but driven by the table graph rather than by a
+    /// VA range, so a caller that has no range in hand (`alloc_table`) can still
+    /// recover the pool.
+    ///
+    /// Bounded by the number of LIVE tables, not by the address space: at most
+    /// `capacity` tables, each a 512-descriptor scan. That is trivial as a
+    /// one-shot and unaffordable per edit, which is exactly why it lives here.
+    ///
+    /// EXCLUSIVITY IS REQUIRED. Freeing a table only makes it reusable, and
+    /// handing a page back out while a sibling vCPU may hold a stale cached walk
+    /// reaching it is the same break-before-make hazard that gates the eager
+    /// paths. Under `stage1_exclusive` there is no such sibling. Returns whether
+    /// anything was freed.
+    fn reclaim_all_invalid_tables(&mut self) -> bool {
+        if !self.stage1_exclusive || !self.reclaim_pending {
+            return false;
+        }
+        // One sweep per teardown epoch. Re-walking with nothing newly
+        // invalidated cannot find anything the last walk missed.
+        self.reclaim_pending = false;
+        let mut freed = false;
+        for l0 in 0..512usize {
+            let Some(l1_pa) = self.child_table_pa(l0 * 8) else {
+                continue;
+            };
+            let Ok(l1_off) = self.pa_to_off(l1_pa) else {
+                continue;
+            };
+            for l1 in 0..512usize {
+                let l1_entry = l1_off + l1 * 8;
+                let Some(l2_pa) = self.child_table_pa(l1_entry) else {
+                    continue;
+                };
+                let Ok(l2_off) = self.pa_to_off(l2_pa) else {
+                    continue;
+                };
+                for l2 in 0..512usize {
+                    let l2_entry = l2_off + l2 * 8;
+                    if let Some(l3_pa) = self.child_table_pa(l2_entry)
+                        && self.is_spare_table(l3_pa)
+                        && let Ok(l3_off) = self.pa_to_off(l3_pa)
+                        && self.table_all_invalid(l3_off)
+                    {
+                        self.write_desc(l2_entry, 0);
+                        self.free_table(l3_pa);
+                        freed = true;
+                    }
+                }
+                if self.is_spare_table(l2_pa) && self.table_all_invalid(l2_off) {
+                    self.write_desc(l1_entry, 0);
+                    self.free_table(l2_pa);
+                    freed = true;
+                }
+            }
         }
         freed
     }
@@ -1285,8 +1383,15 @@ impl PageTableManager {
         } else {
             Self::spans_touched(va, end, TWO_MIB)
         };
-        if l1_tables + l2_tables + l3_tables > self.spare_tables_available() {
-            return Err(PageTableError::OutOfTables);
+        let needed = l1_tables + l2_tables + l3_tables;
+        if needed > self.spare_tables_available() {
+            // The budget is checked UP FRONT (see above), so this path returns
+            // before `alloc_table` is ever called and its last-resort sweep
+            // would never run. Take the same one-shot reclaim here, then re-ask.
+            self.reclaim_all_invalid_tables();
+            if needed > self.spare_tables_available() {
+                return Err(PageTableError::OutOfTables);
+            }
         }
 
         let mut cursor = va;
@@ -2066,6 +2171,73 @@ mod tests {
         assert_eq!(mgr.set_prot_none(LINUX_MMAP_BASE, 1 << 30), Ok(true));
         assert!(!mgr.is_valid(LINUX_MMAP_BASE));
         assert!(!mgr.is_valid(LINUX_MMAP_BASE + (1 << 30) - 0x1000));
+    }
+
+    /// The last-resort sweep is what keeps a churning guest off `OutOfTables`
+    /// once eager reclaim is (correctly) declined for a multi-vCPU guest: a
+    /// sub-table left ALL-INVALID by a teardown is taken back and its parent
+    /// entry cleared.
+    #[test]
+    fn last_resort_sweep_reclaims_an_emptied_subtable() {
+        let mut mgr = manager();
+        mgr.set_multi_vcpu(true); // eager reclaim declined, as in a busy guest
+        mgr.set_stage1_exclusive(true);
+        let block = LINUX_MMAP_BASE + 0x60_0000;
+        // Split the 2 MiB block, then tear the WHOLE block down so the L3 that
+        // the split created is left with 512 invalid descriptors. Invalidating
+        // one page only would leave 511 valid and nothing to reclaim.
+        mgr.set_prot_none(block, 0x1000).expect("split");
+        mgr.set_prot_none(block, 1 << 21)
+            .expect("tear the block down");
+        assert!(
+            mgr.free_tables.is_empty(),
+            "eager reclaim must NOT have run for a multi-vCPU guest"
+        );
+        assert!(mgr.reclaim_all_invalid_tables(), "sweep should free the L3");
+        assert!(!mgr.free_tables.is_empty(), "the emptied table came back");
+    }
+
+    /// Freeing a table only makes it REUSABLE, so without exclusivity a sibling
+    /// could still hold a stale cached walk reaching it. The sweep must decline.
+    #[test]
+    fn last_resort_sweep_declines_without_exclusivity() {
+        let mut mgr = manager();
+        mgr.set_multi_vcpu(true);
+        mgr.set_stage1_exclusive(false);
+        let block = LINUX_MMAP_BASE + 0x60_0000;
+        mgr.set_prot_none(block, 0x1000).expect("split");
+        mgr.set_prot_none(block, 1 << 21)
+            .expect("tear the block down");
+        assert!(!mgr.reclaim_all_invalid_tables());
+        assert!(mgr.free_tables.is_empty(), "nothing may be reclaimed");
+    }
+
+    /// The sweep walks the table graph, which is far too expensive to repeat per
+    /// allocation — doing so starved the vCPU badly enough to trip the sibling
+    /// materialization start gate. It may run only once per teardown epoch.
+    #[test]
+    fn last_resort_sweep_runs_once_per_teardown() {
+        let mut mgr = manager();
+        mgr.set_multi_vcpu(true);
+        mgr.set_stage1_exclusive(true);
+        let block = LINUX_MMAP_BASE + 0x60_0000;
+        mgr.set_prot_none(block, 0x1000).expect("split");
+        mgr.set_prot_none(block, 1 << 21)
+            .expect("tear the block down");
+        assert!(
+            mgr.reclaim_all_invalid_tables(),
+            "first sweep does the work"
+        );
+        assert!(
+            !mgr.reclaim_all_invalid_tables(),
+            "a second sweep with no new teardown must decline"
+        );
+        // A fresh teardown re-arms it.
+        let other = LINUX_MMAP_BASE + 0x80_0000;
+        mgr.set_prot_none(other, 0x1000).expect("split");
+        mgr.set_prot_none(other, 1 << 21)
+            .expect("tear the block down");
+        assert!(mgr.reclaim_all_invalid_tables(), "new teardown re-arms");
     }
 
     #[test]

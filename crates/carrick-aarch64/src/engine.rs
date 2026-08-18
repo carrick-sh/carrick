@@ -366,19 +366,16 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         // reference to the freed page. So coalesce is safe iff the edit is
         // EXCLUSIVE. The single-vCPU case is provably exclusive here, so re-enable
         // coalescing then (the OutOfTables→ENOMEM-under-churn fix for a
-        // single-threaded guest). The multi-vCPU case is exclusive too WHEN the
-        // caller holds the stage-1 barrier: the generic loop's Pause-Modify-Resume
-        // pauses siblings + `tlbi vmalle1is`-broadcasts around every threaded
-        // stage-1 editor (vcpu_loop.rs pt_pause, taken pre-dispatch for
-        // mmap/munmap/mremap/mprotect). This used to ASSUME the PMR was not held,
-        // because the engine had no way to read it from this crate — so a
-        // multi-vCPU guest reclaimed nothing, leaked one stage-1 table per
-        // `mmap(MAP_SHARED, fd)`, and exhausted the 440-page pool after a few
-        // hundred map/unmap cycles ("stage-1 page-table pool exhausted", the
-        // OutOfTables crash behind CPython multiprocessing's SemLock/Pool churn).
-        // The marker now lives in `carrick_hal::pt_pause`, which both the runtime
-        // and this crate can see, so the barrier is READ rather than assumed
-        // away. Absent the pause the conservative flag still applies.
+        // single-threaded guest). The multi-vCPU case stays conservative HERE,
+        // and deliberately so: safety is not the only question. Eager coalescing
+        // asks whether the scan is WORTH it, and a busy multi-vCPU guest holds
+        // most of the 440-table pool legitimately, so the 512-descriptor scans
+        // run on every edit and reclaim almost nothing — measured at
+        // `go-net_http` 50 s -> over 200 s when exclusivity was allowed to relax
+        // this flag. Whether freeing a table for REUSE is safe is the separate
+        // question `stage1_exclusive` answers, and it gates only the last-resort
+        // sweep in `alloc_table`, which is what actually keeps a churning guest
+        // off OutOfTables.
         //
         // Measure the count BEFORE the local `pt` clone below — the clone adds a
         // reference, so `strong_count(&pt)` is 2 for a SOLE vCPU and `> 1` is
@@ -386,8 +383,15 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         // table pool under single-threaded mmap churn (CPython multiprocessing's
         // 400+ SemLock map/unmap cycles exhausted it: "stage-1 page-table pool
         // exhausted"). `strong_count(&self.page_tables)` == the live engine count.
-        let unsafe_to_coalesce = Arc::strong_count(&self.page_tables) > 1
-            && !carrick_hal::stage1_exclusive::current_thread_edits_exclusively();
+        let unsafe_to_coalesce = Arc::strong_count(&self.page_tables) > 1;
+        // Exclusivity is passed separately and deliberately does NOT relax
+        // `unsafe_to_coalesce`. Letting it enable EAGER coalescing/reclaim took
+        // `go-net_http` from 50 s to over 200 s: a busy guest legitimately holds
+        // most of the 440-table pool, so the 512-descriptor scans ran on every
+        // edit and reclaimed almost nothing. Exclusivity gates only the
+        // last-resort sweep inside `alloc_table`, which is what actually keeps a
+        // churning guest off `OutOfTables`.
+        let stage1_exclusive = carrick_hal::stage1_exclusive::current_thread_edits_exclusively();
         let pt = Arc::clone(&self.page_tables);
         let mut guard = pt.lock();
         if guard.is_none() {
@@ -419,6 +423,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             )));
         }
         mgr.set_multi_vcpu(unsafe_to_coalesce);
+        mgr.set_stage1_exclusive(stage1_exclusive);
         let changed = match edit(mgr) {
             Ok(changed) => changed,
             Err(PageTableError::OutOfTables) => {
@@ -428,7 +433,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 // while `free` stays at 0 IS the leak's signature.
                 let (in_use, free, capacity) = mgr.pool_stats();
                 let engines = Arc::strong_count(&self.page_tables);
-                let pmr = carrick_hal::stage1_exclusive::current_thread_edits_exclusively();
+                let pmr = stage1_exclusive;
                 return Err(MemoryError::HostMap(format!(
                     "stage-1 page-table pool exhausted \
                      (in_use={in_use} free={free} capacity={capacity} \
