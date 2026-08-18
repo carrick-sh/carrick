@@ -939,6 +939,86 @@ ratio (145.02x and 67.02x, both of which were the oracle hanging).
   unrecoverable. Evidence that matters is now committed under
   `docs/perf-results/`.
 
+## Static attribution of six suite clusters (2026-08-18, read-only agents)
+
+Analysis only — none of these is fixed yet, and each names the live experiment
+that would settle it. Two framing corrections first: there is no `ltp-kcmp`
+suite (it is `kcmp01/02/03`), and `ltp-ioctl_pidfd01` does emit one row (a
+TCONF), it does not emit zero.
+
+**`ltp-writev07` (16 rows) — real bug, cheap. FIX STAGED, NOT YET BUILT.**
+Linux `writev` is not all-or-nothing: it copies segments in order, stops at the
+first unreadable one, and returns the bytes already transferred. EFAULT is
+correct only when NOTHING moved. `gather_bounded_iovec_bytes`
+(`dispatch/fs.rs:285`) aborted the whole call, so carrick returned EFAULT where
+the oracle returns 64. The in-memory loop was worse: it returned EFAULT *after*
+writing bytes to the file, both losing the count and lying about the write.
+Staged in the working tree; `pwritev`'s `prepare_pwritev_payloads`
+(`fs.rs:349`) has the identical shape and is deliberately NOT yet touched.
+
+**`ltp-setns01` (26 rows) — real bug, and an instance of the identity-domain
+class.** The whole `/proc/<pid>/ns` family resolves liveness through
+`proc_live_pid` -> the HOST process table (`vfs/proc.rs:1156`), but under
+HVPatch a peer Linux process is a thread of one Darwin process and has no host
+pid, so every numeric-pid ns path is ENOENT and setup TCONFs at
+`setns01.c:153`. `/proc/self/ns` works only because `"self"` short-circuits at
+`:1157` — **which is why the existing `nsfsioctl` probe, which only ever uses
+`/proc/self/ns/<type>`, cannot see this gap.** The ctx-aware authority already
+exists (`graph_process`, `:1821`) and was already applied to `/proc`,
+`/proc/<pid>`, `/proc/<pid>/task` — the `ns` subtree was simply left behind.
+Corroborated by `setns02`, whose "kconfig disabled" TCONF is really the same
+numeric-pid inaccessibility (the config keys ARE present, `proc.rs:3651`).
+Fix is carrick-side only. **Do NOT add `--cap-add SYS_ADMIN` here:** it would
+lift the policy deny and, with `setns` still `Deferred` and handler-less, turn
+all 25 rows into ENOSYS diffs.
+
+**`ltp-kcmp01/02/03` (25 rows) — policy row.** Docker's default seccomp gates
+`kcmp` behind CAP_SYS_PTRACE and returns EPERM; carrick has no handler for 272
+so it falls through to ENOSYS and LTP turns that into TCONF. Fix is a
+capability-conditional deny entry in `container_policy.rs` (the same shape as
+`SYS_SETNS`/`SYS_BPF`), not a handler. Settle first with the module's own
+evidence bar: run `kcmp01` under `--security-opt seccomp=unconfined` at default
+caps. If it succeeds there the deny-table home is right; if it still EPERMs the
+gate is a kernel/Yama check and belongs handler-side.
+
+**`ltp-ioctl_pidfd01` — blocked on an oracle contradiction, do not fix yet.**
+`PIDFD_GET_INFO` is unimplemented (no arm anywhere; `grep` is empty). But the
+committed cache records the ORACLE also TCONFing at the same line, while the
+fresh run shows it answering fully — which implies a Docker/LinuxKit kernel
+upgrade (`PIDFD_INFO_EXIT` needs >= 6.15). Settle with
+`docker run --rm localhost:5050/ltp:arm64 uname -r` before writing code.
+Separately: carrick's `clone`/`clone3` does NOT enforce CAP_SYS_ADMIN for
+`CLONE_NEW*` the way its own `unshare` handler does, which is what lets
+`setns02` run past the point where the oracle EPERMs.
+
+**`ltp-process_vm_readv03` (33 rows) — known unimplemented, real subsystem.**
+`process_vm_rw` hard-returns EFAULT for any cross-process transfer
+(`dispatch/proc.rs:4581`); its own doc comment names this suite. Needs a
+foreign-mm stage-1 walker, an IPA read/write pair promoted out of
+`carrick-vmm-hvf` (`trap.rs:941` has the read half), and `prot` bits published
+on `VmaSummary` (`kernel/address.rs:65`, currently just start/end). Closes
+`process_vm_readv02`/`writev02` too. Note the transaction rule: reading a peer
+mm's stage-1 pages needs a revision-validated read, not a naive walk.
+
+**`ltp-lseek11` (16 rows) — NOT a carrick translation bug.** The
+SEEK_DATA/SEEK_HOLE constant swap is correct (macOS 3/4 is Linux 4/3). carrick
+TCONFs because APFS answers the hole query as "one entire data region"; `man 2
+lseek` documents exactly that and points at `fpathconf(_PC_MIN_HOLE_SIZE)`.
+Real fix is to answer from APFS extents (`fcntl F_LOG2PHYS_EXT`) instead of
+delegating `lseek`. Found alongside it, independently real:
+**`fallocate(FALLOC_FL_PUNCH_HOLE)` is a silent no-op returning 0** on both
+backends, and macOS has the primitive (`fcntl F_PUNCHHOLE`) which carrick never
+calls — guests cannot create holes at all.
+
+**Harness bug worth its own measured pass:** `carrick_flags_for`
+(`carrick-conformance/src/generate.rs:311`) mirrors `--cap-add` onto the carrick
+side but SILENTLY DROPS `--security-opt seccomp=unconfined`. Every suite whose
+override unconfines the oracle — the `add_key`/`request_key`/`keyctl`,
+`perf_event_open`, `pidfd_getfd`, `setrlimit`, `fanotify` and `clone301/302`
+families — therefore runs docker unconfined against carrick confined. That is
+the known unequal-privilege bug class, live in the harness today. One-line fix,
+but it moves ~30 suites at once, so it needs its own measured pass.
+
 ## Oracle cache: a self-inflicted loss, and the rule that prevents it
 
 **2026-08-18: I destroyed the closure-v3 oracle cache and cost the campaign a
