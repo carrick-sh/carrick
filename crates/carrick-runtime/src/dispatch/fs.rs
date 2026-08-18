@@ -122,6 +122,7 @@ syscall_table! {
     451 => cachestat,
     276 => renameat2,
     279 => memfd_create,
+    447 => memfd_secret,
     285 => copy_file_range,
     // preadv2/pwritev2: positional vectored I/O plus a RWF_* flags arg. The
     // flags are advisory for our backing — RWF_HIPRI (high-priority hint),
@@ -1533,6 +1534,16 @@ impl SyscallDispatcher {
     pub(super) fn fd_is_o_path(&self, fd: i32) -> bool {
         self.open_file(fd)
             .is_some_and(|of| of.description.read().is_path())
+    }
+
+    /// True iff `fd` is a `memfd_secret(2)` description. Secret memory has no
+    /// file read/write methods, so the read/write/pread/readv/… family and
+    /// splice/sendfile/copy_file_range all fail EINVAL on it — the only data
+    /// path is a MAP_SHARED mapping. (memfdsecret probe; LTP splice07's
+    /// "memfd secret" rows.)
+    pub(super) fn fd_is_secretmem(&self, fd: i32) -> bool {
+        self.open_file(fd)
+            .is_some_and(|of| of.description.read().is_secretmem())
     }
 
     /// Build a [`StatRecord`] from a real backing stat, applying the `mknod(2)`
@@ -9279,6 +9290,10 @@ impl SyscallDispatcher {
             if this.io_uring_description(fd.0).is_some() {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            // memfd_secret: no file read method → EINVAL (memfdsecret probe).
+            if this.fd_is_secretmem(fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let address = buf.0;
             let length =
                 usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
@@ -9376,6 +9391,14 @@ impl SyscallDispatcher {
                     );
                     if crate::vfs::proc::is_proc_self_mem_path(path, self_pid) {
                         let va = *offset as u64;
+                        // Secret memory (memfd_secret mappings) is invisible
+                        // to the kernel's view of the process: a read that
+                        // touches a live secretmem mapping fails EIO
+                        // (memfdsecret probe `procmem_hidden`).
+                        if length > 0 && this.range_touches_secretmem(va, length as u64) {
+                            drop(open);
+                            return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EIO));
+                        }
                         match memory.read_bytes(va, length) {
                             Ok(bytes) => {
                                 let read_len = bytes.len();
@@ -9575,6 +9598,10 @@ impl SyscallDispatcher {
         fn readv(this, cx, fd: Fd, iov: GuestPtr, vlen: u64) {
 
             let fd: Fd = fd;
+            // memfd_secret: no file read method → EINVAL (memfdsecret probe).
+            if this.fd_is_secretmem(fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let iov = iov.0;
             let iovcnt =
                 usize::try_from(vlen).map_err(|_| DispatchError::LengthTooLarge(vlen))?;
@@ -9746,6 +9773,10 @@ impl SyscallDispatcher {
             if this.fd_is_o_path(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
+            // memfd_secret: no file read method → EINVAL (memfdsecret probe).
+            if this.fd_is_secretmem(fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let buffer = buf.0;
             let length =
                 usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
@@ -9829,6 +9860,10 @@ impl SyscallDispatcher {
         fn preadv(this, cx, fd: Fd, iov: GuestPtr, vlen: u64, pos_l: u64, pos_h: u64, rwf: u64) {
 
             let fd: Fd = fd;
+            // memfd_secret: no file read method → EINVAL (memfdsecret probe).
+            if this.fd_is_secretmem(fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let iov = iov.0;
             let iovcnt =
                 usize::try_from(vlen).map_err(|_| DispatchError::LengthTooLarge(vlen))?;
@@ -9982,6 +10017,10 @@ impl SyscallDispatcher {
             if this.fd_is_o_path(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
+            // memfd_secret: no file write method → EINVAL (memfdsecret probe).
+            if this.fd_is_secretmem(fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let address = buf.0;
             let length =
                 usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
@@ -10132,6 +10171,10 @@ impl SyscallDispatcher {
         fn pwritev(this, cx, fd: Fd, iov: GuestPtr, vlen: u64, pos_l: u64, pos_h: u64, rwf: u64) {
 
             let fd: Fd = fd;
+            // memfd_secret: no file write method → EINVAL (memfdsecret probe).
+            if this.fd_is_secretmem(fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let iov = iov.0;
             let iovcnt =
                 usize::try_from(vlen).map_err(|_| DispatchError::LengthTooLarge(vlen))?;
@@ -10301,6 +10344,12 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
 
+            // memfd_secret cannot be a sendfile endpoint (no file read/write
+            // methods) → EINVAL (memfd_secret(2)).
+            if this.fd_is_secretmem(in_fd.0) || this.fd_is_secretmem(out_fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+
             let mut offset = this.sendfile_offset(in_fd.0, offset_address, memory)??;
 
             // Darwin-native fast path: a regular file -> socket uses macOS
@@ -10434,6 +10483,12 @@ impl SyscallDispatcher {
             let count = requested.min(8 * 1024 * 1024);
             if count == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+
+            // memfd_secret cannot be a copy_file_range endpoint (no file
+            // read/write methods) → EINVAL (memfd_secret(2)).
+            if this.fd_is_secretmem(in_fd.0) || this.fd_is_secretmem(out_fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
 
             let in_offset = this.sendfile_offset(in_fd.0, off_in_addr, memory)??;
@@ -10628,6 +10683,13 @@ impl SyscallDispatcher {
             if this.io_uring_description(in_fd.0).is_some()
                 || this.io_uring_description(out_fd.0).is_some()
             {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            // memfd_secret cannot be a splice endpoint (secretmem has no
+            // splice_read/splice_write): EINVAL even when the other end IS a
+            // genuine pipe. Ordered after the EBADF/no-pipe checks so the
+            // splice07 "memfd secret" rows keep Linux's error precedence.
+            if this.fd_is_secretmem(in_fd.0) || this.fd_is_secretmem(out_fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if count == 0 {
@@ -11630,6 +11692,10 @@ impl SyscallDispatcher {
             if this.io_uring_description(fd).is_some() {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            // memfd_secret: no file write method → EINVAL (memfdsecret probe).
+            if this.fd_is_secretmem(fd) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let address = buf.0;
             let length =
                 usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
@@ -11993,6 +12059,10 @@ impl SyscallDispatcher {
         fn writev(this, cx, fd: Fd, iov: GuestPtr, vlen: u64) {
 
             let fd = fd.0;
+            // memfd_secret: no file write method → EINVAL (memfdsecret probe).
+            if this.fd_is_secretmem(fd) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let iov = iov.0;
             let iovcnt =
                 usize::try_from(vlen).map_err(|_| DispatchError::LengthTooLarge(vlen))?;
@@ -13270,6 +13340,56 @@ impl SyscallDispatcher {
                 writable: true,
             };
             let fd_flags = if memfd_flags.contains(LinuxMemfdFlags::CLOEXEC) {
+                LINUX_FD_CLOEXEC
+            } else {
+                0
+            };
+            Ok(this.install_fd(description, fd_flags))
+        }
+
+        fn memfd_secret(this, cx, flags: u64) {
+            // memfd_secret(2): an anonymous RAM-backed file whose pages the
+            // kernel itself cannot address (removed from the direct map), so
+            // the contents are reachable ONLY through the caller's own
+            // MAP_SHARED mapping. Carrick models the guest-visible ABI: an
+            // O_RDWR anonymous File description marked `secretmem`, which
+            //   - rejects read(2)/write(2)-family I/O and splice with EINVAL
+            //     (secretmem has no file read/write methods),
+            //   - rejects MAP_PRIVATE mmap with EINVAL (mem.rs),
+            //   - hides its mapped pages from `/proc/<pid>/mem` (EIO), and
+            //   - supports ftruncate/fstat sizing like a memfd.
+            // What carrick does NOT model: the host-kernel direct-map removal
+            // itself (the pages live in ordinary guest RAM) and the implicit
+            // mlock/RLIMIT_MEMLOCK accounting.
+            //
+            // The only accepted flag is close-on-exec, and the ABI takes the
+            // O_CLOEXEC bit — NOT the FD_CLOEXEC value the man page's flag
+            // name suggests. Probed differentially (`memfdsecret` probe):
+            // memfd_secret(FD_CLOEXEC=1) → EINVAL; memfd_secret(O_CLOEXEC) →
+            // fd with FD_CLOEXEC set.
+            let _ = &cx;
+            if flags & !LINUX_O_CLOEXEC != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let path = "/secretmem".to_string();
+            // No sealing support: seals stay None (F_GET_SEALS/F_ADD_SEALS →
+            // EINVAL), unlike memfd_create.
+            let mut base = OpenDescriptionBase::new(LINUX_O_RDWR);
+            base.set_secretmem(true);
+            let description = OpenDescription::File {
+                metadata: RootFsMetadata {
+                    path: Path::new(&path).to_path_buf(),
+                    kind: RootFsEntryKind::File,
+                    mode: 0o777,
+                    size: 0,
+                },
+                path,
+                contents: FileContents::dense(Vec::new()),
+                offset: 0,
+                base,
+                writable: true,
+            };
+            let fd_flags = if flags & LINUX_O_CLOEXEC != 0 {
                 LINUX_FD_CLOEXEC
             } else {
                 0

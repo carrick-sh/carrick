@@ -813,6 +813,7 @@ mod overlay_dispatch_tests {
                 bus_fault: None,
                 write_sealed_shared: false,
                 read_only_shared_file: false,
+                secretmem: false,
                 writable_memfd: None,
                 shared_file_alias: None,
             }));
@@ -839,6 +840,7 @@ mod overlay_dispatch_tests {
             bus_fault: None,
             write_sealed_shared: false,
             read_only_shared_file: false,
+            secretmem: false,
             writable_memfd: None,
             shared_file_alias: None,
         })
