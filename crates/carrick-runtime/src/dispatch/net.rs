@@ -1794,6 +1794,10 @@ impl SyscallDispatcher {
             // signalfd readiness would track pending masked signals; delivery is
             // a tracked follow-up, so there is no in-memory readiness here.
             OpenDescription::SignalFd { .. } => {}
+            // A counting perf event fd never becomes readable: readability is
+            // overflow-sample delivery, and carrick refuses sampling events at
+            // open (see dispatch::perf module docs).
+            OpenDescription::PerfEvent { .. } => {}
             OpenDescription::PipeReader { pipe, .. } => {
                 if requested_events & LINUX_POLLIN != 0 {
                     let pipe = pipe.lock();
