@@ -50,6 +50,27 @@ the 858/898 rows. Attributed so far:
 The post-SIGCHLD checkpoint had all 858 green, so several of these are LIKELY
 regressions from this session's memory work — but "likely" is not attribution.
 
+**UPDATE (later, artifact post-`f0d1c2…/probe fixes`):** 13 gaps -> 8 after
+three fixes, each verified green on both libcs via the filtered harness
+(`CARRICK_PROBE_FILTER`):
+
+- `nicepriority`: probe reordered privilege-free (was an under-privileged
+  ORACLE, not a carrick gap).
+- `ioctlcluster`: guest-reachable RUNTIME ABORT — `struct termio` 17-vs-18
+  byte pad panic on any TCGETA. Fixed.
+- `oomscoreadj`: phantom `/proc/<dead-pid>/oom_score_adj` under access(F_OK) —
+  non-Live records in the oom map + `ProcVfs::lookup` probing existence with a
+  DEFAULT context whose empty map trips the single-process fallback. Fixed.
+
+The remaining 8 generic rows are LOAD-COUPLED: all pass in the filtered
+(lighter) harness; under the closure gate's parallelism `mqueue` and
+`childsubreaper` fail on BOTH libcs in BOTH runs (reliable-under-load — debug
+these first, with the gate's concurrency reproduced), while the gnu-only set
+oscillates between runs (`aliassize`/`coredumpfile`/`termiosbits`/
+`vforkexecthread`/`cloneexithandled` — classify per the load-sensitivity
+rules before touching code). The 4 dedicated reds persist both runs:
+`bridge_publish_tcp` + `bridge_udp_connected_unreachable`, gnu+musl.
+
 ## Resume here
 
 ```sh
