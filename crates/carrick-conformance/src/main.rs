@@ -460,7 +460,7 @@ fn run() -> anyhow::Result<ExitCode> {
     let (parser_mode, oracle_profile) = if args.closure {
         (
             parsers::ParseMode::Closure,
-            oracle::ParserProfile::ClosureV2,
+            oracle::ParserProfile::ClosureV3,
         )
     } else {
         (
@@ -556,7 +556,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 .iter()
                 .filter(|suite| match oracle_profile {
                     oracle::ParserProfile::Regression => cache.invalidate(suite, docker_platform),
-                    oracle::ParserProfile::ClosureV2 => {
+                    oracle::ParserProfile::ClosureV3 => {
                         cache.invalidate_for_profile(suite, docker_platform, oracle_profile)
                     }
                 })
@@ -573,7 +573,7 @@ fn run() -> anyhow::Result<ExitCode> {
                         cache.get(s, docker_platform),
                         cache.get_elapsed_ms(s, docker_platform),
                     ),
-                    oracle::ParserProfile::ClosureV2 => (
+                    oracle::ParserProfile::ClosureV3 => (
                         cache.get_for_profile(s, docker_platform, oracle_profile),
                         cache.get_elapsed_ms_for_profile(s, docker_platform, oracle_profile),
                     ),
@@ -735,7 +735,7 @@ fn run() -> anyhow::Result<ExitCode> {
                             timed_out,
                         );
                     }
-                    oracle::ParserProfile::ClosureV2 => {
+                    oracle::ParserProfile::ClosureV3 => {
                         cache.insert_fresh_for_profile(
                             s,
                             docker_platform,
@@ -992,7 +992,7 @@ fn verdict_kind(s: &Suite) -> manifest::VerdictKind {
 /// Parse `--oracle-fill-profile` into the cache-key determinant it names.
 fn parse_oracle_fill_profile(name: &str) -> anyhow::Result<oracle::ParserProfile> {
     match name {
-        "closure" => Ok(oracle::ParserProfile::ClosureV2),
+        "closure" => Ok(oracle::ParserProfile::ClosureV3),
         "regression" => Ok(oracle::ParserProfile::Regression),
         other => anyhow::bail!(
             "unknown --oracle-fill-profile {other:?} (expected `closure` or `regression`)"
@@ -1032,7 +1032,7 @@ fn oracle_fill(
     }
     let profile = parse_oracle_fill_profile(&args.oracle_fill_profile)?;
     let parser_mode = match profile {
-        oracle::ParserProfile::ClosureV2 => parsers::ParseMode::Closure,
+        oracle::ParserProfile::ClosureV3 => parsers::ParseMode::Closure,
         oracle::ParserProfile::Regression => parsers::ParseMode::Regression,
     };
 
@@ -2261,13 +2261,13 @@ mod tests {
         assert_eq!(args.oracle_fill_profile, "closure");
         assert_eq!(
             parse_oracle_fill_profile(&args.oracle_fill_profile).unwrap(),
-            oracle::ParserProfile::ClosureV2
+            oracle::ParserProfile::ClosureV3
         );
         assert_eq!(
             parse_oracle_fill_profile("regression").unwrap(),
             oracle::ParserProfile::Regression
         );
-        assert!(parse_oracle_fill_profile("closure-v2").is_err());
+        assert!(parse_oracle_fill_profile("closure-v3").is_err());
         assert!(parse_oracle_fill_profile("").is_err());
     }
 

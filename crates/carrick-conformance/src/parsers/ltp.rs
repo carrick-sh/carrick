@@ -33,7 +33,7 @@ impl LtpParser {
             Ok(summary_count),
             Ok(summary_field),
         ) = (
-            Regex::new(r"^(\S+\.c):(\d+):\s+(TPASS|TFAIL|TBROK|TCONF):\s*(.*)$"),
+            Regex::new(r"^(\S+\.[ch]):(\d+):\s+(TPASS|TFAIL|TBROK|TCONF):\s*(.*)$"),
             Regex::new(r"^(\S+)\s+(\d+)\s+(TPASS|TFAIL|TBROK|TCONF)\s*:\s*(.*)$"),
             Regex::new(
                 r"^(\S+)\s+\d+\s+TINFO\s*:\s+.*?\b(?:Test case|case)\s+(\d+)\b.*?\b(PASSED|FAILED)\b",
@@ -175,7 +175,11 @@ fn closure_assertion(
     case_index: usize,
     outcome_index: usize,
 ) -> Option<(String, Outcome)> {
+    // Header assertions can print a full build path
+    // (`/src/…/../utils/compat_tst_16.h:153:`); reduce to the basename so
+    // carrick and oracle rows key identically regardless of build layout.
     let binary = caps.get(binary_index)?.as_str();
+    let binary = binary.rsplit('/').next().unwrap_or(binary);
     let case = caps.get(case_index)?.as_str();
     let outcome = match caps.get(outcome_index)?.as_str() {
         "TPASS" => Outcome::Ok,
@@ -433,6 +437,43 @@ mod tests {
             a.ids.keys().collect::<Vec<_>>(),
             b.ids.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// LTP asserts from HEADERS too — `select_var.h:30: TCONF: …` and the
+    /// full-path `/src/…/compat_tst_16.h:153: TCONF: …` shape every `_16`
+    /// compat suite prints. The `.c`-only regex dropped those rows, so the
+    /// counted totals disagreed with the Summary block and ~50 suites
+    /// (chown01_16 family, select01-04, clock_settime…) parsed to None on
+    /// BOTH sides. Path prefixes reduce to the basename so both sides key
+    /// identically regardless of build paths.
+    #[test]
+    fn closure_parses_header_assertions_and_basenames_paths() {
+        let r = LtpParser.parse_closure(&raw(concat!(
+            "/src/testcases/kernel/syscalls/chown/../utils/compat_tst_16.h:153: TCONF: 16-bit version of chown() is not supported on your platform
+",
+            "select_var.h:30: TCONF: syscall(-1) __NR_select not supported on your arch
+",
+            "Summary:
+",
+            "passed   0
+",
+            "failed   0
+",
+            "broken   0
+",
+            "skipped  2
+",
+        )));
+        assert_eq!(r.totals.skipped, 2, "{:?}", r.ids);
+        assert!(
+            r.ids
+                .keys()
+                .any(|k| k.starts_with("ltp:compat_tst_16.h:153:")),
+            "path prefix must reduce to the basename: {:?}",
+            r.ids
+        );
+        assert!(r.ids.keys().any(|k| k.starts_with("ltp:select_var.h:30:")));
+        assert_ne!(r.result, SuiteOutcome::None, "summary must reconcile");
     }
 
     /// Identical descriptor lines still disambiguate ordinally.
