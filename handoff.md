@@ -337,10 +337,38 @@ alone livelocks (the coordinator re-stops the world every retry; 199% CPU, no
 progress), and reserving before the barrier deadlocks outright (every forker
 holds one slot while asking for a second).
 
-**This does not close `go-os_exec`.** Its abort is the *clone* materialization
-gate (`threads.rs:1019`), a different site: 1 of 3 trials improved to 38 passes,
-2 of 3 still abort. That gate is the next target and is the likely shared cause
-with `cpython-multiprocessing_fork`/`forkserver` (600 s) and `cpython-threading`.
+**Second and bigger root cause, found by tracing the clone side rather than
+guessing: the admission budget was set by the wrong quantity.**
+`budget_from_limits` clamped the M:N vCPU pool to the host's PHYSICAL CORE
+COUNT (10) against an HVF ceiling of 63. carrick binds one vCPU per guest
+thread, so that number is how many guest threads may be simultaneously
+admitted — a correctness quantity that a throughput heuristic was setting.
+Above it, slots are held by threads that only release once some other thread
+progresses, and the thread that would progress is the one queued for a slot.
+
+Measured funnel: 23 clone children passed the HVF vCPU gate, only 17 ever got a
+scheduler slot, and the 6 that never did are exactly the tids whose parents'
+start gate expired into `std::process::abort()`. The shipped hatch
+`CARRICK_HVF_VCPU_RECLAIM=0` passed the same test in under a second, which
+localized the defect to the bound and not to reclaim, the guest or the futex
+layer. Now budgeted by the hypervisor ceiling; admission is also FIFO, and a
+clone child waits in 250 ms slices (a 10 ms slice re-entered the queue at the
+BACK every retry and starved forever).
+
+**Results, serial, quiet host:** `go-os_exec` `none`/30 -> **86 of 86, exactly
+the oracle**; `cpython-threading` 300 s timeout at 141/193 -> **SUCCESS in 26 s**.
+
+**Three hypotheses measurement KILLED first — do not retry them:** moving the
+parent's reclaim ahead of the spawn (no change, 4/4 abort); forcing every
+blocking wait to release its lease (no change, 3/3 abort); FIFO fairness alone
+(no change, 4/4 abort).
+
+**Still open in this cluster:** `cpython-multiprocessing_fork`/`forkserver`
+(526 rows) are NOT admission — both still time out, now stalling at
+`WithProcessesTestPoolWorkerLifetime.test_pool_worker_lifetime` after 86 tests.
+`cpython-asyncio` (1,872 rows) has not been re-measured against the raised
+budget yet. Two intermittent hangs are now visible underneath:
+`TestWaitInterrupt/SIGQUIT` (cost 1 of 2 os_exec trials) and `TestSOCKS5Proxy`.
 
 **Fixture traps learned here:** `go-net_http` wedges intermittently at
 `TestSOCKS5Proxy` even at N=1 on unmodified binaries, so one timing is a coin
