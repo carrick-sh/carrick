@@ -2819,7 +2819,18 @@ impl HostFsBackend {
                     ImmutableHostFileOpen::Served {
                         file: std::fs::File::from(fd),
                         metadata: RootFsMetadata {
-                            path: normalized,
+                            // GUEST-ABSOLUTE, not the sandbox-relative form
+                            // `normalize` produces (it drops `RootDir`). This
+                            // metadata becomes an `OpenDescription::HostFile`,
+                            // whose `path` IS the guest path the fd was opened
+                            // at — `open_path()` serves it to `execveat`
+                            // AT_EMPTY_PATH (fexecve) and to `fchown`/`futimens`
+                            // path resolution. Every sibling producer of a
+                            // served `HostFile` stores the absolute path; this
+                            // lane storing `usr/local/bin/python3.12` made
+                            // `fexecve` re-resolve against the caller's cwd, so
+                            // it only worked while the cwd was `/`.
+                            path: Path::new("/").join(&normalized),
                             kind: RootFsEntryKind::File,
                             mode,
                             size: stat.st_size as usize,

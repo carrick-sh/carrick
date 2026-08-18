@@ -100,6 +100,38 @@ pub enum OpenDispatchResult {
     NotFoundCreate,
 }
 
+impl OpenDispatchResult {
+    /// Re-anchor the served metadata on the GUEST-ABSOLUTE path this open
+    /// resolved to.
+    ///
+    /// The backends speak a sandbox-RELATIVE path domain (`fs_backend::
+    /// normalize` drops `Component::RootDir` so the name can be handed to a
+    /// cap-std/`openat` walk), and several arms below hand a backend
+    /// `RootFsMetadata` straight through. But the dispatcher turns this
+    /// metadata into a guest-visible `OpenDescription`, whose `metadata.path`
+    /// IS the guest path the fd was opened at: `OpenDescription::open_path`
+    /// serves it to `execveat(AT_EMPTY_PATH)` (glibc `fexecve`), and `fchown`/
+    /// `futimens` re-resolve it. A relative path there is silently re-resolved
+    /// against the caller's cwd, so `fexecve` of an image-layer binary only
+    /// worked while the cwd happened to be `/` — CPython
+    /// `test_posix.test_fexecve` chdirs to the executable's directory first and
+    /// got ENOENT.
+    ///
+    /// Converting once here, at the single boundary where a backend result
+    /// becomes a guest-facing one, is what keeps the two domains from mixing;
+    /// no individual arm can leak the relative form.
+    fn anchor_metadata_at(&mut self, guest_path: &str) {
+        let metadata = match self {
+            Self::File { metadata, .. }
+            | Self::RootFsBackedFile { metadata, .. }
+            | Self::HostFile { metadata, .. }
+            | Self::Directory { metadata, .. } => metadata,
+            Self::NotFoundCreate => return,
+        };
+        metadata.path = std::path::Path::new(guest_path).to_path_buf();
+    }
+}
+
 impl RootFsVfs {
     pub fn new() -> Self {
         Self {
@@ -256,6 +288,27 @@ impl RootFsVfs {
     /// reads only; this method covers the writable + directory
     /// cases that don't fit neatly into the trait surface yet.
     pub fn open_for_dispatch(
+        &self,
+        path: &str,
+        want_create: bool,
+        want_excl: bool,
+        want_trunc: bool,
+        writable_request: bool,
+    ) -> Result<OpenDispatchResult, LinuxErrno> {
+        let mut result = self.open_for_dispatch_inner(
+            path,
+            want_create,
+            want_excl,
+            want_trunc,
+            writable_request,
+        )?;
+        // Cross from the backends' sandbox-relative path domain into the
+        // guest-absolute one exactly once — see `anchor_metadata_at`.
+        result.anchor_metadata_at(path);
+        Ok(result)
+    }
+
+    fn open_for_dispatch_inner(
         &self,
         path: &str,
         want_create: bool,
@@ -1343,6 +1396,14 @@ mod tests {
         assert_eq!(bytes, b"lower-cache");
         assert_eq!(metadata.kind, RootFsEntryKind::File);
         assert_eq!(metadata.size, 11);
+        assert_eq!(
+            metadata.path,
+            std::path::Path::new("/usr/lib/cache"),
+            "a served HostFile's metadata path is the GUEST-ABSOLUTE path the fd \
+             was opened at (OpenDescription::open_path feeds it to execveat \
+             AT_EMPTY_PATH); the sandbox-relative `normalize` form made fexecve \
+             re-resolve against the caller's cwd"
+        );
         let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
         assert_ne!(flags, -1);
         assert_eq!(

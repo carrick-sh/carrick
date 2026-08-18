@@ -1759,12 +1759,22 @@ impl SyscallDispatcher {
             }
             return Ok(self.stat_record_with_device(&path, &real));
         }
-        if follow
-            && let Some(link) = self.fs.rootfs_vfs.overlay.real_stat(&path, false)
-            && link.kind == RootFsEntryKind::Symlink
-        {
-            return Err(LINUX_ENOENT);
-        }
+        // The overlay could not follow `path` itself. If `path` is a symlink,
+        // note that BEFORE re-resolving, but do NOT conclude it dangles yet:
+        // `overlay.real_stat(.., follow)` follows only inside the writable
+        // UPPER, so a link whose target lives solely in the immutable image
+        // layers is invisible to it. Concluding "dangling" here made `stat()`
+        // ENOENT for EVERY guest-created symlink into image content — while
+        // `open()` through the same link worked, because open takes the layered
+        // path. CPython `test_posix.test_posix_spawnp` is exactly that shape: it
+        // symlinks a temp-dir program at `sys.executable` and then spawns it.
+        let path_is_symlink = follow
+            && self
+                .fs
+                .rootfs_vfs
+                .overlay
+                .real_stat(&path, false)
+                .is_some_and(|link| link.kind == RootFsEntryKind::Symlink);
 
         let path = if follow {
             self.canonicalize_following(&path).unwrap_or(path)
@@ -1773,6 +1783,20 @@ impl SyscallDispatcher {
         };
         if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
             return Ok(self.stat_record_with_device(&path, &real));
+        }
+        // Dangling only if resolution never got PAST the link: on success
+        // `canonicalize_following` hands back a non-symlink, so a still-symlink
+        // `path` here means the chain ended at a target no layer has. Testing
+        // the resolved path (not the overlay's follow-stat) is the whole point —
+        // the mount and layered lookups below are what answer for a target in
+        // the immutable image layers, and short-circuiting before them is what
+        // made every guest-created link into image content ENOENT.
+        if path_is_symlink
+            && self
+                .layered_lstat(&path)
+                .is_ok_and(|md| md.kind == RootFsEntryKind::Symlink)
+        {
+            return Err(LINUX_ENOENT);
         }
 
         use crate::vfs::Vfs as _;
@@ -14084,11 +14108,34 @@ impl SyscallDispatcher {
                 }
                 return Ok(this.write_statx_real_with_device(memory, statxbuf, &path, &real));
             }
-            // DANGLING SYMLINK: following statx of a symlink whose target does
-            // not exist is ENOENT on Linux (mirrors the newfstatat path above).
-            if follow
-                && let Some(link) = this.fs.rootfs_vfs.overlay.real_stat(&path, false)
-                && link.kind == RootFsEntryKind::Symlink
+            // The overlay could not follow `path`. Note whether it IS a symlink,
+            // then re-resolve through the LAYERED view before concluding it
+            // dangles — `overlay.real_stat(.., follow)` follows only inside the
+            // writable UPPER, so a link into the immutable image layers is
+            // invisible to it. Mirrors `path_stat_record`; glibc lowers `stat()`
+            // to `statx`, so this twin is the one CPython actually hits.
+            let path_is_symlink = follow
+                && this
+                    .fs
+                    .rootfs_vfs
+                    .overlay
+                    .real_stat(&path, false)
+                    .is_some_and(|link| link.kind == RootFsEntryKind::Symlink);
+            let path = if follow {
+                this.canonicalize_following(&path).unwrap_or(path)
+            } else {
+                path
+            };
+            if let Some(real) = this.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
+                return Ok(this.write_statx_real_with_device(memory, statxbuf, &path, &real));
+            }
+            // DANGLING SYMLINK: resolution never got past the link (a resolved
+            // path is never a symlink), so no layer has its target — ENOENT.
+            // See the twin in `path_stat_record`.
+            if path_is_symlink
+                && this
+                    .layered_lstat(&path)
+                    .is_ok_and(|md| md.kind == RootFsEntryKind::Symlink)
             {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
             }

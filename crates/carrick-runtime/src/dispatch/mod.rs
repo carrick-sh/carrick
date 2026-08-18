@@ -4342,6 +4342,29 @@ impl SyscallDispatcher {
     /// alone would miss). Returns None if the path isn't a readable
     /// file in either layer.
     pub fn read_exec_file(&self, path: &str) -> Option<Vec<u8>> {
+        self.read_exec_file_at(path).or_else(|| {
+            let resolved = self.exec_symlink_resolved(path)?;
+            self.read_exec_file_at(&resolved)
+        })
+    }
+
+    /// Follow `path`'s trailing symlink chain through the LAYERED view, for the
+    /// exec readers below.
+    ///
+    /// Each backend follows symlinks only WITHIN itself, so a link in the
+    /// writable upper pointing at an executable that lives in the immutable
+    /// image layers resolves in neither: the upper cannot see the target and
+    /// the lower does not have the link. `execve(2)` has no `O_NOFOLLOW`, so
+    /// such a link must be followed — CPython `test_posix.test_posix_spawnp`
+    /// symlinks its temp-dir program name at `sys.executable` and spawns it,
+    /// and carrick reported ENOENT. `None` when nothing moved, so the caller
+    /// does not repeat an identical lookup.
+    fn exec_symlink_resolved(&self, path: &str) -> Option<String> {
+        let resolved = self.canonicalize_following(path).ok()?;
+        (resolved != path).then_some(resolved)
+    }
+
+    fn read_exec_file_at(&self, path: &str) -> Option<Vec<u8>> {
         match self.fs.rootfs_vfs.overlay.lookup_kind(path) {
             Some(crate::fs_backend::OverlayEntryKind::File) => {
                 // An owned upper entry shadows the lower even when it is not a
@@ -4438,6 +4461,13 @@ impl SyscallDispatcher {
     /// multi-MB tool binary per probe (twice per exec, before the loader's
     /// own read) on the cold `go build`.
     pub fn read_exec_file_head(&self, path: &str, max: usize) -> Option<Vec<u8>> {
+        self.read_exec_file_head_at(path, max).or_else(|| {
+            let resolved = self.exec_symlink_resolved(path)?;
+            self.read_exec_file_head_at(&resolved, max)
+        })
+    }
+
+    fn read_exec_file_head_at(&self, path: &str, max: usize) -> Option<Vec<u8>> {
         match self.fs.rootfs_vfs.overlay.lookup_kind(path) {
             Some(crate::fs_backend::OverlayEntryKind::File) => {
                 return self.fs.rootfs_vfs.overlay.file_head(path, max);
