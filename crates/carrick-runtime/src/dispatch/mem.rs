@@ -476,6 +476,27 @@ struct ResidentFaultRange {
 
 /// Insert `[addr, addr+len)` into `regions` (sorted by start), coalescing any
 /// adjacent or overlapping ranges. `len` must be > 0.
+
+/// Debug: log any `mmap_next` LOWERING that crosses `CARRICK_FORK_DEBUG_VA`.
+/// The bump allocator's invariant is "everything at/above `mmap_next` is
+/// unallocated"; a lowering that crosses a LIVE mapping breaks it and the next
+/// bump grant then hands out (and scrubs) memory the guest still owns — the
+/// forkserver zeroed-granule corruption. `new` may come from the free-region
+/// merge loop, so call this AFTER the final value is computed.
+fn debug_mmap_next_lowering(old: u64, new: u64) {
+    if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
+        .ok()
+        .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+        && new <= debug_va
+        && debug_va < old
+    {
+        eprintln!(
+            "[BUMPDBG] mmap_next lowered {old:#x} -> {new:#x} (crosses debug VA)\n{}",
+            std::backtrace::Backtrace::force_capture(),
+        );
+    }
+}
+
 fn free_regions_insert(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
     // Free-list audit: CARRICK_FORK_DEBUG_VA=<hex> logs any insert covering
     // that VA, with the caller — the final provenance hook in the forkserver
@@ -488,7 +509,8 @@ fn free_regions_insert(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
         && debug_va < addr.saturating_add(len)
     {
         eprintln!(
-            "[FREEDBG] free_regions_insert {addr:#x}+{len:#x}\n{}",
+            "[FREEDBG tid={:?}] free_regions_insert {addr:#x}+{len:#x}\n{}",
+            std::thread::current().id(),
             std::backtrace::Backtrace::force_capture(),
         );
     }
@@ -1202,7 +1224,8 @@ fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len: u64) {
         && debug_va < start.saturating_add(len)
     {
         eprintln!(
-            "[LEDGERDBG] remove_mapping_metadata {start:#x}+{len:#x}\n{}",
+            "[LEDGERDBG tid={:?}] remove_mapping_metadata {start:#x}+{len:#x}\n{}",
+            std::thread::current().id(),
             std::backtrace::Backtrace::force_capture(),
         );
     }
@@ -2133,8 +2156,9 @@ impl SyscallDispatcher {
                 .collect();
             if !overlaps.is_empty() {
                 eprintln!(
-                    "[GRANTDBG] non-fixed grant {address:#x}+{length:#x} OVERLAPS live {overlaps:x?}\n  \
+                    "[GRANTDBG pid={}] non-fixed grant {address:#x}+{length:#x} OVERLAPS live {overlaps:x?}\n  \
                      mmap_next={:#x} free_regions={:x?}\n{}",
+                    self.identity_pid(),
                     mem.mmap_next,
                     mem.free_regions,
                     std::backtrace::Backtrace::force_capture(),
@@ -2159,8 +2183,9 @@ impl SyscallDispatcher {
                     .map(|map| (map.start, map.end))
                     .collect();
                 eprintln!(
-                    "[GRANTDBG] grant {address:#x}+{length:#x} covers debug VA; dynamic_maps near: \
+                    "[GRANTDBG pid={}] grant {address:#x}+{length:#x} covers debug VA; dynamic_maps near: \
                      {near:x?}\n  mmap_next={:#x} free_regions={:x?}\n{}",
+                    self.identity_pid(),
                     mem.mmap_next,
                     mem.free_regions,
                     std::backtrace::Backtrace::force_capture(),
@@ -4195,6 +4220,7 @@ impl SyscallDispatcher {
                 std::process::abort();
             }
             if address.0.checked_add(aligned_len) == Some(mem.mmap_next) {
+                let lowered_from = mem.mmap_next;
                 mem.mmap_next = address.0;
                 while let Some(pos) = mem
                     .free_regions
@@ -4204,6 +4230,7 @@ impl SyscallDispatcher {
                     let (s, _l) = mem.free_regions.remove(pos);
                     mem.mmap_next = s;
                 }
+                debug_mmap_next_lowering(lowered_from, mem.mmap_next);
             } else {
                 free_regions_insert(&mut mem.free_regions, address.0, aligned_len);
             }
@@ -5027,6 +5054,7 @@ impl SyscallDispatcher {
                     this.remove_mapping_metadata(tail_start, tail_len);
                     let mut mem = this.mem.lock();
                     if tail_end == mem.mmap_next {
+                        let lowered_from = mem.mmap_next;
                         mem.mmap_next = tail_start;
                         while let Some(pos) = mem
                             .free_regions
@@ -5036,6 +5064,7 @@ impl SyscallDispatcher {
                             let (s, _l) = mem.free_regions.remove(pos);
                             mem.mmap_next = s;
                         }
+                        debug_mmap_next_lowering(lowered_from, mem.mmap_next);
                     } else {
                         free_regions_insert(&mut mem.free_regions, tail_start, tail_len);
                     }
@@ -5174,7 +5203,9 @@ impl SyscallDispatcher {
                         this.remove_mapping_metadata(old_address.0, old_size);
                         let mut mem = this.mem.lock();
                         if old_end == mem.mmap_next {
+                            let lowered_from = mem.mmap_next;
                             mem.mmap_next = old_address.0;
+                            debug_mmap_next_lowering(lowered_from, mem.mmap_next);
                         } else {
                             free_regions_insert(&mut mem.free_regions, old_address.0, old_size);
                         }
@@ -5381,6 +5412,7 @@ impl SyscallDispatcher {
                     this.remove_mapping_metadata(old_address.0, old_size);
                     let mut mem = this.mem.lock();
                     if old_address.0.checked_add(old_size) == Some(mem.mmap_next) {
+                        let lowered_from = mem.mmap_next;
                         mem.mmap_next = old_address.0;
                         while let Some(pos) = mem
                             .free_regions
@@ -5390,6 +5422,7 @@ impl SyscallDispatcher {
                             let (s, _l) = mem.free_regions.remove(pos);
                             mem.mmap_next = s;
                         }
+                        debug_mmap_next_lowering(lowered_from, mem.mmap_next);
                     } else {
                         free_regions_insert(&mut mem.free_regions, old_address.0, old_size);
                     }
@@ -6163,7 +6196,9 @@ impl SyscallDispatcher {
         mark_range_unmapped(memory, address, len_usize);
         let mut mem = self.mem.lock();
         if address.checked_add(len) == Some(mem.mmap_next) {
+            let lowered_from = mem.mmap_next;
             mem.mmap_next = address;
+            debug_mmap_next_lowering(lowered_from, mem.mmap_next);
         } else {
             free_regions_insert(&mut mem.free_regions, address, len);
         }
