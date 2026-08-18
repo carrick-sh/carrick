@@ -29,6 +29,27 @@ artifact.
 The goal is still active. Do not mark it complete, bless a baseline, weaken the
 denominator, add an excuse, accept a retry, or start final performance work.
 
+## Probe phase state (2026-08-18, artifact post-`dacc0c3e9`)
+
+`just conformance-probes-closure` FAILS: 13 generic gaps + 4 dedicated red of
+the 858/898 rows. Attributed so far:
+
+- `nicepriority` (gnu+musl): the ORACLE was under-privileged — the probe's
+  isolation leg needed a 19->7 nice DECREASE, which needs CAP_SYS_NICE, which
+  Docker drops even for root. The probe is now reordered so nice only ever
+  increases (privilege-free, `a0cdbd75e`); rerun should clear both rows.
+- UNATTRIBUTED, next in queue — each needs sampling against the
+  pre-session artifact before being filed as regression vs pre-existing:
+  `childsubreaper`(musl), `ioctlcluster`(both), `mqueue`(both),
+  `oomscoreadj`(both; carrick keeps `/proc/<dead-pid>/oom_score_adj` present
+  where Linux removes it), `aliassize`(gnu), `coredumpfile`(gnu),
+  `termiosbits`(gnu — historically a glibc-only diff, previously fixed),
+  `vforkexecthread`(gnu); dedicated: `bridge_publish_tcp`(both),
+  `bridge_udp_connected_unreachable`(both).
+
+The post-SIGCHLD checkpoint had all 858 green, so several of these are LIKELY
+regressions from this session's memory work — but "likely" is not attribution.
+
 ## Resume here
 
 ```sh
