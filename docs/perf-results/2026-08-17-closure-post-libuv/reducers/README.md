@@ -358,11 +358,30 @@ inherit cwd from the forkserver server, so `cd` before starting anything.
 - `carrick debug core` validates it: pid 6, signal 11, fault_address 0x18,
   pc `0x6000179108`.
 - NT_FILE places the PC in `usr/local/lib/libpython3.12.so.1.0` at file offset
-  `0x169108` — **`PyType_GenericAlloc+0x18`**, i.e. `ldr x1,[x0,#0x18]` with
-  x0 = the `type` argument = NULL, reading `tp_basicsize`. (An earlier
-  libc attribution in this file was WRONG — it joined a PC against another
-  process's mapping base. NT_FILE from the core is the only trustworthy join.)
-- **Refuted: the zeroed-library-page hypothesis.** PyUnicode_Type, PyDict_Type,
+  `0x169108`. **Symbolizing that took three attempts, and the first two were
+  wrong in instructive ways.** (1) A libc attribution joined the PC against
+  another process's mapping base — NT_FILE from the core is the only
+  trustworthy join. (2) `PyType_GenericAlloc+0x18` came from symbolizing
+  against the WRONG image's libpython: the layer cache holds THREE
+  `libpython3.12.so.1.0` copies, and a glob-and-head-1 picked python:3.12-slim's.
+  Pick the file by matching sampled text pages against the core
+  (`e1aefb8a…`, the 28 MB unstripped cpython-test build, matches 5/5).
+  Symbolized wrongly, the same bytes even "disassembled" into a plausible
+  story — a page-content match is the only proof of file identity.
+- Against the RIGHT file: guest text is PRISTINE (0 of 0x47a pages differ),
+  and the crash is **`unicodekeys_lookup_unicode+0x68`** — CPython's
+  unicode-key dict probe reading `me_key->hash` (`ldr x1,[x0,#0x18]`; 0x18 is
+  the hash field of PyASCIIObject) with **`me_key == NULL`**. A NULL me_key
+  reached through a VALID index-table slot breaks a dict invariant: the keys
+  object's INDEX page says the entry is live, its ENTRIES page reads NULL.
+  `x22=0x3fff` (a 16K-slot table) on an interning path makes the corrupted
+  object almost certainly the INTERNED-STRINGS dict — which both crash paths
+  share (marshal interns every unmarshalled name; GC walks dicts).
+- Sharpened hypothesis, still unproven: ONE heap page of the interned dict's
+  keys object reads stale/zeroed in the forkserver child while its neighbors
+  read fine — a per-page fork-inheritance inconsistency, not text, not
+  file-backed data, not library bss.
+- **Refuted along the way: the zeroed-library-page hypothesis.** PyUnicode_Type, PyDict_Type,
   PyLong_Type, PyType_Type, PyBaseObject_Type read INTACT from the core
   (immortal refcounts, ob_type all pointing at PyType_Type), and the crash
   registers even hold valid pointers to two of them beside x0=0. libpython's
