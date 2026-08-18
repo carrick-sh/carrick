@@ -301,6 +301,17 @@ fn host_to_linux_termios(d: &libc::termios) -> LinuxTermios {
     }
 }
 
+/// Coerce a guest-supplied termios the way Linux's pty driver does before it
+/// is stored: the character size is forced to CS8 (a pty has no UART; Linux
+/// keeps every other bit as given but never stores CS5-CS7). Guest glibc's
+/// `tcsetattr` verifies the result via TCGETS and reports EINVAL itself when
+/// the stored CSIZE differs from the requested one — carrick only has to make
+/// the readback honest (the `termiosbits` probe pins `set1_ok=false` under
+/// glibc and `=true` under musl, which does not verify).
+pub fn coerce_pty_termios(linux: &mut LinuxTermios) {
+    linux.c_cflag = (linux.c_cflag & !LINUX_CSIZE) | LINUX_CS8;
+}
+
 /// Push a Linux termios down to the host fd via `tcsetattr`. Returns
 /// `true` on success.
 pub fn set_host_termios(fd: i32, linux: &LinuxTermios) -> bool {
