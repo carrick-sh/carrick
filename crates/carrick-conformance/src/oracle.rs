@@ -46,14 +46,14 @@ struct OracleKey<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParserProfile {
     Regression,
-    ClosureV1,
+    ClosureV2,
 }
 
 impl ParserProfile {
     fn determinant(self) -> Option<&'static str> {
         match self {
             Self::Regression => None,
-            Self::ClosureV1 => Some("closure-v1"),
+            Self::ClosureV2 => Some("closure-v2"),
         }
     }
 }
@@ -162,7 +162,7 @@ impl OracleCache {
     ) -> Option<SuiteResult> {
         let key = match profile {
             ParserProfile::Regression => oracle_key(suite, platform),
-            ParserProfile::ClosureV1 => oracle_key_for_profile(suite, platform, profile),
+            ParserProfile::ClosureV2 => oracle_key_for_profile(suite, platform, profile),
         };
         let mut result = self.by_key.get(&key)?.result.clone();
         if suite.verdict == VerdictKind::Gotest {
@@ -538,11 +538,11 @@ mod tests {
         let platform = crate::lane::DockerPlatform::LinuxArm64;
         let legacy = oracle_key(&s, platform);
         let regression = oracle_key_for_profile(&s, platform, ParserProfile::Regression);
-        let closure = oracle_key_for_profile(&s, platform, ParserProfile::ClosureV1);
+        let closure = oracle_key_for_profile(&s, platform, ParserProfile::ClosureV2);
 
         assert_eq!(regression, legacy);
         assert_ne!(closure, regression);
-        assert!(closure.contains(r#""parser_profile":"closure-v1""#));
+        assert!(closure.contains(r#""parser_profile":"closure-v2""#));
     }
 
     #[test]
@@ -566,7 +566,7 @@ mod tests {
         assert!(cache.insert_for_profile(
             &s,
             platform,
-            ParserProfile::ClosureV1,
+            ParserProfile::ClosureV2,
             exact.clone(),
             Some(7),
         ));
@@ -578,11 +578,11 @@ mod tests {
             "regression lookup must not consume closure assertions"
         );
         let got = reloaded
-            .get_for_profile(&s, platform, ParserProfile::ClosureV1)
+            .get_for_profile(&s, platform, ParserProfile::ClosureV2)
             .expect("closure profile hit");
         assert_eq!(got.ids, exact.ids);
         assert_eq!(
-            reloaded.get_elapsed_ms_for_profile(&s, platform, ParserProfile::ClosureV1),
+            reloaded.get_elapsed_ms_for_profile(&s, platform, ParserProfile::ClosureV2),
             Some(7)
         );
         let _ = std::fs::remove_file(&path);
@@ -799,7 +799,7 @@ mod tests {
 
     #[test]
     fn timed_out_refresh_invalidates_stale_oracle_and_persists_miss() {
-        for (index, profile) in [ParserProfile::Regression, ParserProfile::ClosureV1]
+        for (index, profile) in [ParserProfile::Regression, ParserProfile::ClosureV2]
             .into_iter()
             .enumerate()
         {
