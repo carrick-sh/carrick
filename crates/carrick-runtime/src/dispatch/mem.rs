@@ -6311,13 +6311,14 @@ fn range_within(address: u64, length: u64, base: u64, size: u64) -> bool {
 /// host-side-only tracking would leave the guest's own stores enforcing the OLD
 /// protection.
 fn mprotect_range_in_identity_image(address: u64, length: u64, layout: MemoryLayout) -> bool {
+    use crate::elf::LINUX_PIE_DEFAULT_BASE as IMAGE;
     use crate::memory::{
-        LINUX_INTERPRETER_BASE as INTERP, LINUX_KERNEL_REGION_BASE as KERNEL,
-        LINUX_NULL_GUARD_END as GUARD_END, LINUX_SHARED_FILE_BASE as SHARED,
+        LINUX_KERNEL_REGION_BASE as KERNEL, LINUX_NULL_GUARD_END as GUARD_END,
+        LINUX_SHARED_FILE_BASE as SHARED,
     };
     range_within(address, length, GUARD_END, KERNEL - GUARD_END)
         || range_within(address, length, layout.heap_base, layout.heap_size)
-        || range_within(address, length, INTERP, SHARED - INTERP)
+        || range_within(address, length, IMAGE, SHARED - IMAGE)
         || range_within(
             address,
             length,

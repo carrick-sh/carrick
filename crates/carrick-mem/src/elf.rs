@@ -9,10 +9,19 @@ use goblin::elf::program_header::{PF_R, PF_W, PF_X, PT_LOAD};
 use serde::Serialize;
 use thiserror::Error;
 
-/// Default load base for ET_DYN (PIE) main executables. Picked so it lives
-/// well above page zero and well below `LINUX_MMAP_BASE` / `LINUX_HEAP_BASE`,
-/// while still being page-aligned for HVF stage-2 mappings.
-pub const LINUX_PIE_DEFAULT_BASE: u64 = 0x1_0000_0000;
+/// Default load base for ET_DYN (PIE) main executables. Linux places an
+/// ET_DYN image high (`ELF_ET_DYN_BASE = 2/3 * TASK_SIZE`), leaving the low
+/// gigabytes FREE for the program's own fixed mappings. The old 4 GiB base
+/// violated that: a glibc binary that `MAP_FIXED`s at 0x1_0000_0000 (the
+/// `aliassize` probe pins this) clobbered its own image and SIGSEGV'd where
+/// Linux succeeds. The Linux-proportional 2/3 point of the 1 TiB guest task
+/// size (~683 GiB) is unavailable — it falls inside the HVPatch global-frame
+/// IPA arena (620..1016 GiB) — so the base sits in the free identity window
+/// below the interpreter image (`LINUX_INTERPRETER_BASE`, 560 GiB) and the
+/// shared aperture (`LINUX_SHARED_FILE_BASE`, 576 GiB), 2 MiB-aligned for
+/// stage-1 block mappings. The exact value is guest-observable only through
+/// /proc/*/maps; the freed low region is what conformance measures.
+pub const LINUX_PIE_DEFAULT_BASE: u64 = 0x88_0000_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
