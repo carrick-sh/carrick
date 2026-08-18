@@ -2105,6 +2105,17 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 }
                 None => page_tables.clone(),
             });
+        // Taken AFTER the parent's rollback pre-image so that image stays a
+        // faithful copy of the parent. From here the manager is the CHILD's
+        // offline graph: no TTBR names it, no host backing has been synced from
+        // it, and this thread is its only owner until `materialize_process`
+        // publishes it. Say so rather than inheriting the parent's per-syscall
+        // exclusivity marker, which describes the parent's last mapping call
+        // and nothing about this image. Left inherited, the child's own
+        // `map_aliased` publication is refused `alloc_table`'s last-resort
+        // reclaim sweep and fails `OutOfTables` with reclaimable tables still
+        // in the graph.
+        page_tables.declare_offline_private_image();
         let parent_armed_snapshot = self.vm.frame_cow_arm_snapshot();
         // The child's own editable graph, plus the parent's rollback pre-image
         // when this fork copies the mm.

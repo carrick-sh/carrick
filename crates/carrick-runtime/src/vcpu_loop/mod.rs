@@ -185,8 +185,19 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         // whenever another thread could reach guest code before the copy
         // completes — a parked sibling included. Keying this on the kicker's
         // lease count skipped the pause for exactly that sibling.
-        if !self.guest_executors.has_peer_executor() || quiesce::current_thread_holds_pt_pause() {
+        if quiesce::current_thread_holds_pt_pause() {
+            // An outer transaction already owns the exclusivity marker; a
+            // nested claim would only deepen it for no one's benefit.
             return Ok(Box::new(()));
+        }
+        if !self.guest_executors.has_peer_executor() {
+            // No peer can execute guest code, which is exactly why no pause is
+            // needed — and equally why this edit is EXCLUSIVE. Say so for the
+            // duration of the copy, the same way `service_threaded_syscall`
+            // does for a mapping syscall that skips the pause: the COW
+            // publication edits stage-1 and its spare sub-tables are only
+            // reclaimable while the marker is up.
+            return Ok(Box::new(quiesce::Stage1Exclusive::claim()));
         }
         // The LAZY, cross-thread acquisition — the A-then-P half of the ABBA
         // above, and the one a caller can reach while already holding the
