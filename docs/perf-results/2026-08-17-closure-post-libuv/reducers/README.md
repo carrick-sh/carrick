@@ -278,3 +278,69 @@ offset 0, `munmap`, re-read the file:
 `reducers/mremap-eof-shape.c` with `NOREMAP=1` reproduces it in about a second.
 This is a silent data-loss divergence, it is INDEPENDENT of `mremap`, and it is
 NOT fixed here.
+
+
+## The multiprocessing fork/forkserver SIGSEGV — reduced, NOT yet fixed
+
+The former 300 s hang is gone (post-`10c62b8cb` the suite completes test files),
+leaving two separate defects:
+
+1. **`test_manager` takes 3m32s** — unmeasured, probably a pathological-ratio
+   correctness signal of its own.
+2. **A deterministic child SIGSEGV**, reduced to a 2.5 s two-test pair:
+
+```
+python3 -m unittest test.test_multiprocessing_fork.test_misc.TestStartMethod.test_context \
+                    test.test_multiprocessing_fork.test_misc.TestStartMethod.test_set_get
+```
+
+carrick: `test_set_get` ERRORs with EOFError and
+`Dangling processes: {<Process ... exitcode=-SIGSEGV>}`. Docker: OK. Either
+test alone passes on carrick — the pair is required, and it is 2/2
+deterministic.
+
+### The fault signature (from `CARRICK_FAULT_DEBUG=1`, host env)
+
+Two crashes, IDENTICAL machine state, different Python paths:
+
+```
+esr=0x92000007 elr=0x6000179108 far=0x18 x0=0x0 insn=ldr x1,[x0,#0x18]
+```
+
+With `PYTHONFAULTHANDLER=1` passed into the guest (it propagates into
+forkserver children via the environment where `-X faulthandler` does not):
+
+- crash 1: a forkserver-forked child inside `_compile_bytecode` (marshal)
+  while importing `logging` from `spawn.prepare` (`forkserver.py:315
+  _serve_one`);
+- crash 2: `Garbage-collecting / <no Python frame>`.
+
+Same PC, same NULL+0x18 load, one crash in marshal and one in GC: some earlier
+load returned 0 from memory that should have held a pointer. That is the shape
+of a stale or zeroed page in a FORKED child (HVPatch frame-COW territory), but
+that attribution is a HYPOTHESIS — the label "COW bug" has been wrong in this
+project before, and nothing here yet ties the zero to a specific page
+transition.
+
+### Dead ends already paid for (do not repeat)
+
+- Five standalone replicas of the pair's shape — plain contexts, simplex pipes,
+  `set_start_method(force=True)`, preload changes, repeated children from one
+  server — ALL pass under carrick. The unittest environment itself is a
+  necessary ingredient; stop trying to remove it.
+- `carrick trace --profile hvpatch-frame-cow` on the reducer returns an EMPTY
+  capture (`receipt needs exactly one header and summary, got {}`). Zero events
+  means the probes did not fire on this shape, not that no COW happened; the
+  validator correctly refuses it. Do not cite it either way.
+- A guest `ulimit -c unlimited` produced no core file in the mounted cwd.
+  Whether carrick's guest core-dump path covers a forked CHILD's SIGSEGV is
+  unverified; `carrick debug lldb-run` / attaching the carrier is the
+  documented next instrument.
+
+### Why this cluster is worth the next cycle
+
+`cpython-multiprocessing_forkserver` (366 unexercised rows),
+`cpython-multiprocessing_fork` (227), `cpython-importlib` (349, guest SIGSEGV
+deep in a threading test), and `cpython-concurrent_futures` (178, left a
+`core` behind) are all plausibly this one family — a context-dependent child
+SIGSEGV. Confirming or splitting that attribution is worth ~1,100 rows.

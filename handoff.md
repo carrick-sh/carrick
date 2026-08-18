@@ -406,6 +406,14 @@ Measured, not inferred — see `docs/perf-results/2026-08-17-closure-post-libuv/
   CRASHES.** Both were read straight out of the closure run's `.err` files —
   no new instrumentation needed, and neither is a "carrick is slow" problem:
 
+  0. **UPDATE 2026-08-18: the fork/forkserver HANG is gone** (post-`10c62b8cb`
+     the suite completes test files) and the remainder is reduced to a 2.5 s
+     deterministic two-test reducer for a CHILD SIGSEGV — see
+     `docs/perf-results/2026-08-17-closure-post-libuv/reducers/README.md`
+     ("multiprocessing fork/forkserver SIGSEGV"), which also records the exact
+     fault signature, the PYTHONFAULTHANDLER technique, and three dead ends
+     already paid for. `test_manager` at 3m32s is a separate, unmeasured item.
+     The entry below is the pre-fix state, kept for history.
   1. **`cpython-multiprocessing_fork` and `cpython-concurrent_futures`**:
      ```
      carrick: trap engine failed: hypervisor operation failed:
