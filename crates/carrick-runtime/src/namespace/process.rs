@@ -41,6 +41,7 @@ pub const DOCKER_DEFAULT_CAPS: u64 = 0x0000_0000_a804_25fb;
 pub const CAP_LAST_CAP: u32 = 40;
 pub const CAP_SETPCAP: u32 = 8;
 pub const CAP_SYS_ADMIN: u32 = 21;
+pub const CAP_SYS_NICE: u32 = 23;
 pub const CAP_SYS_RESOURCE: u32 = 24;
 
 /// A full capability set over the modeled range — what the creator of a fresh
