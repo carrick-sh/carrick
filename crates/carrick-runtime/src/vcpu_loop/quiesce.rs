@@ -126,6 +126,29 @@ impl Drop for ReservedProcessVcpuLease {
     }
 }
 
+/// How long the process-fork coordinator may wait for its child's vCPU slot
+/// once it holds the fork barrier.
+///
+/// It MUST be bounded, and it must only ever be entered after
+/// [`carrick_hal::VcpuScheduler::has_spare_capacity`] says a slot exists.
+/// Waiting here unbounded is hold-and-wait against our own supply: the barrier
+/// parks every other guest thread, and those siblings are the only threads that
+/// can release capacity. Measured 2026-08-18 on the canonical host: four
+/// concurrent `go-net_http` guests took 1017 s against 51 s for one, with the
+/// coordinator parked in `Condvar::wait` inside this reservation while its
+/// siblings sat in `park_if_fork_quiescing`.
+///
+/// Two shapes that do NOT work, both measured before this one: bounding the
+/// wait alone still re-stops the world on every retry (livelock, 199% CPU and
+/// no progress at four guests), and reserving before the barrier makes every
+/// competing forker hold one slot while asking for a second, which deadlocks
+/// outright once as many threads fork as the pool has slots.
+const PROCESS_FORK_VCPU_RESERVE: Duration = Duration::from_millis(50);
+
+/// How long a fork attempt waits when the vCPU pool has no spare slot at all.
+/// Purely a spin brake on the caller's retry loop.
+const PROCESS_FORK_VCPU_BACKOFF: Duration = Duration::from_millis(1);
+
 /// Admit an HVPatch fork child to the same bounded vCPU pool as a clone-thread
 /// sibling before entering the topology transaction. HVPatch keeps every Linux
 /// process in one host process and one HVF VM, so process leaders consume the
@@ -135,11 +158,13 @@ impl Drop for ReservedProcessVcpuLease {
 fn reserve_hvpatch_process_vcpu_lease(
     scheduler: &'static dyn carrick_hal::VcpuScheduler,
     tid: ThreadId,
-) -> ReservedProcessVcpuLease {
-    ReservedProcessVcpuLease {
-        scheduler,
-        lease: Some(scheduler.acquire(tid.raw() as u64)),
-    }
+) -> Option<ReservedProcessVcpuLease> {
+    scheduler
+        .acquire_timeout(tid.raw() as u64, None, PROCESS_FORK_VCPU_RESERVE)
+        .map(|lease| ReservedProcessVcpuLease {
+            scheduler,
+            lease: Some(lease),
+        })
 }
 
 /// Try to become the one process-fork coordinator and reserve its child's
@@ -151,10 +176,27 @@ fn try_begin_hvpatch_process_fork(
     scheduler: &'static dyn carrick_hal::VcpuScheduler,
     tid: ThreadId,
 ) -> Option<ReservedProcessVcpuLease> {
+    // Never stop the world without capacity already in sight. Winning the
+    // barrier parks every other guest thread, and those siblings are the only
+    // threads that can hand a slot back -- so waiting for one from behind the
+    // barrier is hold-and-wait against our own supply.
+    if !scheduler.has_spare_capacity() {
+        // Back off instead of returning straight into the caller's retry loop:
+        // with no slot to reserve there is nothing to stop the world for, and
+        // an instant retry turns the loop into a spin.
+        std::thread::sleep(PROCESS_FORK_VCPU_BACKOFF);
+        return None;
+    }
     if !barrier.try_begin_fork() {
         return None;
     }
-    Some(reserve_hvpatch_process_vcpu_lease(scheduler, tid))
+    // Capacity was spare a moment ago, so this is expected to be immediate; the
+    // bound only covers a sibling that took the slot in between.
+    let Some(reserved) = reserve_hvpatch_process_vcpu_lease(scheduler, tid) else {
+        barrier.end_fork();
+        return None;
+    };
+    Some(reserved)
 }
 
 enum ProcessForkStart<'a> {
@@ -2002,14 +2044,60 @@ mod pt_pause_tests {
             rx.recv_timeout(Duration::from_millis(20)).is_err(),
             "a fork child must not materialize beyond the bounded vCPU pool"
         );
-        scheduler.release(first, carrick_hal::Yield::Exited);
-        let second = rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("released capacity admits the queued fork child");
-        drop(second);
+        // The wait is BOUNDED: an exhausted pool gives the attempt back rather
+        // than parking forever, which is what keeps the coordinator from
+        // hold-and-wait against the siblings its barrier parked.
+        assert!(
+            rx.recv_timeout(PROCESS_FORK_VCPU_RESERVE * 4)
+                .expect("the bounded reservation must return")
+                .is_none(),
+            "an exhausted pool must surrender the attempt, not block on it"
+        );
         waiter.join().unwrap();
+        scheduler.release(first, carrick_hal::Yield::Exited);
+        let second = reserve_hvpatch_process_vcpu_lease(scheduler, tid(1604));
+        assert!(second.is_some(), "released capacity admits a fork child");
+        drop(second);
         let third = scheduler.acquire(1603);
         scheduler.release(third, carrick_hal::Yield::Exited);
+    }
+
+    /// The barrier stops every other guest thread, and those siblings are the
+    /// only threads that can release a vCPU slot. So a fork attempt that cannot
+    /// get capacity must leave the barrier CLOSED-free: if it stopped the world
+    /// first and waited afterwards, it would be waiting on its own supply. Live
+    /// shape this guards (2026-08-18): the coordinator parked in
+    /// `Condvar::wait` inside the reservation while its siblings sat in
+    /// `park_if_fork_quiescing`.
+    #[test]
+    fn an_exhausted_pool_never_leaves_the_fork_barrier_begun() {
+        use carrick_hal::VcpuScheduler;
+
+        let barrier: &'static crate::fork_quiesce::QuiesceBarrier =
+            Box::leak(Box::new(crate::fork_quiesce::QuiesceBarrier::new()));
+        let scheduler: &'static carrick_hal::vcpu_sched::HostCondvarScheduler = Box::leak(
+            Box::new(carrick_hal::vcpu_sched::HostCondvarScheduler::new(1)),
+        );
+        let occupied = scheduler.acquire(1_621);
+
+        assert!(
+            try_begin_hvpatch_process_fork(barrier, scheduler, tid(1_622)).is_none(),
+            "no capacity, so no fork may start"
+        );
+        assert!(
+            !barrier.is_quiescing(),
+            "a fork that could not reserve capacity must not have stopped the world"
+        );
+
+        scheduler.release(occupied, carrick_hal::Yield::Exited);
+        let started = try_begin_hvpatch_process_fork(barrier, scheduler, tid(1_623))
+            .expect("spare capacity admits the coordinator");
+        assert!(
+            !barrier.try_begin_fork(),
+            "the admitted coordinator holds the fork token"
+        );
+        drop(started);
+        barrier.end_fork();
     }
 
     #[test]
