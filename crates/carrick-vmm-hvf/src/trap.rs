@@ -8323,9 +8323,20 @@ impl HvfVmState {
                         .and_then(|manager| manager.translate_retained_output(current))
                     {
                         Some(ipa) => {
-                            let no_source = self.physical_cow_source(current, ipa).is_none();
-                            let shared =
-                                !no_source && self.retained_output_lacks_exclusive_claim(ipa);
+                            // The retired-reuse materializer serves UNMAPPED
+                            // VAs whose leaf retained a dead output. A LIVE VA
+                            // in that state (a brk-heap page whose fork-COW
+                            // lease retired underneath it) is not its case —
+                            // the materializer refuses it by design, and
+                            // routing it there turned every brk SHRINK over
+                            // such a page into a refusal (ltp-brk02). A live
+                            // VA's scrub resolves through its live backing.
+                            let unmapped = self.protections.range_unmapped(current, 1);
+                            let no_source =
+                                unmapped && self.physical_cow_source(current, ipa).is_none();
+                            let shared = unmapped
+                                && !no_source
+                                && self.retained_output_lacks_exclusive_claim(ipa);
                             (no_source, shared)
                         }
                         None => (false, false),

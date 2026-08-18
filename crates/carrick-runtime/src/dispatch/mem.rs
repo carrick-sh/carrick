@@ -2510,8 +2510,14 @@ impl SyscallDispatcher {
                         });
                     };
                     if clear_len != 0
-                        && cx.memory.zero_backing(clear_start, clear_len).is_err()
+                        && let Err(error) = cx.memory.zero_backing(clear_start, clear_len)
                     {
+                        if std::env::var_os("CARRICK_FORK_DEBUG_VA").is_some() {
+                            eprintln!(
+                                "[BRKDBG] shrink {current:#x} -> {requested:#x} REFUSED: \
+                                 zero_backing({clear_start:#x}, {clear_len:#x}) = {error:?}"
+                            );
+                        }
                         return Ok(DispatchOutcome::Returned {
                             value: current as i64,
                         });
