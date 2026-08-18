@@ -4719,6 +4719,18 @@ where
                     let woke = state
                         .platform_futex
                         .shared_wake(location, waiter_key, count);
+                    if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
+                        let addr = location.wait_addr().raw();
+                        let current = unsafe {
+                            (*(addr as *const std::sync::atomic::AtomicU32))
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                        };
+                        eprintln!(
+                            "SIGDBG shared_wake tid={} key={:#x} addr={addr:#x} current={current} req={count} woke={woke}",
+                            state.this_tid.raw(),
+                            waiter_key
+                        );
+                    }
                     last_syscall_retval = Some(state.complete_returned(&mut engine, woke.max(0))?);
                 }
                 DispatchOutcome::SharedFutexRequeue {

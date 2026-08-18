@@ -80,8 +80,15 @@ impl SharedFutexSyscall for HvfShared {
         val: u32,
         slice_ns: i64,
     ) -> SharedWaitStep {
-        let _ = waiter_key;
         let host_addr = location.wait_addr().raw();
+        // A waker that ran while we were BETWEEN slices logically dequeued us
+        // (count -> credit) but its os_sync wake found nobody parked. When the
+        // waker never changes the word (pure wake/wait protocols: LTP
+        // tst_checkpoint), the value re-check below can never recover it —
+        // claim the pending credit before re-parking.
+        if carrick_host::ulock::has_wake_credit(waiter_key) {
+            return SharedWaitStep::Woken;
+        }
         // Re-validate the shared word at the TOP of every slice before re-parking.
         // A macOS os_sync wake can be LOST: `os_sync_wake_by_address` fires before
         // the waiter is parked (the cross-process wake-before-park race), and
