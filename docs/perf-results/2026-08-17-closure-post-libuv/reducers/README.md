@@ -462,12 +462,37 @@ one physical range — and the third instance this campaign (engine-handle
 count vs guest-executor population; `(gpa,len)` extents vs `MappingId`; now
 `(base,len)` leases vs physical range).
 
-Six simplified probes (committed beside this file) all PASS — the trigger
-needs a partial munmap inside a grown sparse extent with a surviving sibling
-mapping, which none of them reproduce. Fix direction: either grow the owner in
-place (never re-register one base at a new length — the `SharedAperture::grow`
-precedent), or make ownership range-aware so no retire drops bytes any live
-lease still covers.
+### FINAL: the writer is the mmap-reuse scrub over a DOUBLE-ALLOCATED range
+
+A third hook (`zero_guest_backing` logging any scrub covering the debug VA)
+ended it. Three scrubs cover the granule, all from guest `mmap` reuse:
+
+```
+before fork#1:  zero va=0x6000fd1000 len=0x100000   (1 MiB grant)
+before fork#1:  zero va=0x60010c1000 len=0x31000    (the dict chunk's grant)
+BETWEEN forks:  zero va=0x6000fd1000 len=0x100000   (the SAME 1 MiB again)
+```
+
+`[0x6000fd1000, +0x100000)` ends at `0x60010d1000` — overlapping the LIVE dict
+mapping `[0x60010c1000, 0x60010f4000)` by four granules. The dispatcher's
+arena allocator granted a reused range that overlaps a live mapping, and
+`zero_anonymous_reuse` faithfully scrubbed the grant — including the dict's
+granule. Every HVPatch-side hypothesis along the way (fork COW, lease
+refcounts, owner generations) was WRONG; the stage-2 lease-keying observations
+earlier in this file are real hygiene issues but not this bug. The defect is a
+guest-VA double allocation in `dispatch/mem.rs` (`next_mmap_address` /
+`free_regions` bookkeeping): the same freed region was handed out twice with
+overlap.
+
+Note the overlap also explains the survivor pattern in the core: entries below
+the hole live in pages the guest rewrote after the scrub; the hole granule was
+never rewritten.
+
+Next: instrument grant-time (log any reused grant overlapping a live
+`dynamic_map` with the free-list state), reduce which munmap/mremap path
+double-inserted the region, then fix that bookkeeping. The three env-gated
+hooks (`CARRICK_FORK_DEBUG_VA` on forks and scrubs, `CARRICK_FORK_DEBUG_IPA`
+on owner register/retire) stay in-tree.
 
 The proving core is preserved at `/tmp/core` (20 MB; regenerate with the
 recipe above if lost).

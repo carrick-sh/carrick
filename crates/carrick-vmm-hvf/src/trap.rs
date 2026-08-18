@@ -9364,6 +9364,20 @@ impl HvfVmState {
         length: usize,
     ) -> Result<(), MemoryError> {
         let address = strip_pointer_tag(address);
+        // Scrub debug: CARRICK_FORK_DEBUG_VA=<hex> logs any zeroing whose range
+        // covers that VA, with the caller — the instrument that named the agent
+        // zeroing a live dict granule during the forkserver corruption hunt.
+        if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
+            .ok()
+            .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+            && address <= debug_va
+            && debug_va < address.saturating_add(length as u64)
+        {
+            eprintln!(
+                "[FORKDBG] zero_guest_backing va={address:#x} len={length:#x}\n{}",
+                std::backtrace::Backtrace::force_capture(),
+            );
+        }
         let mut cleared = 0usize;
         while cleared < length {
             let (chunk_va, chunk_len) = Self::guest_copy_chunk(address, cleared, length)?;
