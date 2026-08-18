@@ -15,6 +15,12 @@ const ECOSYSTEMS: [(&str, &str); 4] = [
 /// One side's headline cell: a `<passed>/<n>` fraction when there are per-test
 /// counts, else the suite status word (§9).
 fn cell(s: &SideSummary) -> String {
+    // A truncated run reports FIRST, and keeps its partial counts visible. It
+    // has real rows, so the `n > 0` branch below would render it as an ordinary
+    // fraction and hide the fact that the inventory is incomplete.
+    if s.result == SuiteOutcome::Truncated {
+        return format!("TIMEOUT@{}/{}", s.totals.passed, s.totals.n);
+    }
     if s.totals.n > 0 {
         format!("{}/{}", s.totals.passed, s.totals.n)
     } else {
@@ -23,6 +29,7 @@ fn cell(s: &SideSummary) -> String {
             SuiteOutcome::Failure => "FAILURE".to_string(),
             SuiteOutcome::None => "CRASH".to_string(),
             SuiteOutcome::Empty => "EMPTY".to_string(),
+            SuiteOutcome::Truncated => "TIMEOUT".to_string(),
         }
     }
 }

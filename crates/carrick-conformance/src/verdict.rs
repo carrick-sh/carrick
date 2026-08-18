@@ -227,7 +227,13 @@ pub fn classify(
     let base = baseline_entry.filter(|p| !p.is_empty());
 
     // 1. Oracle short-circuit: a hung/broken oracle never counts against carrick.
-    if docker.result == SuiteOutcome::None || docker.result == SuiteOutcome::Empty {
+    // `Truncated` belongs here too: a timed-out oracle produces it rather than
+    // `None` now that a deadline no longer discards the transcript, and a hung
+    // oracle must still never count against carrick.
+    if docker.result == SuiteOutcome::None
+        || docker.result == SuiteOutcome::Empty
+        || docker.result == SuiteOutcome::Truncated
+    {
         return Classification {
             verdict: Verdict::OracleFail,
             gating: false,
@@ -496,6 +502,67 @@ mod tests {
         );
         assert_eq!(c.verdict, Verdict::Diff);
         assert!(!c.gating);
+    }
+
+    /// A timed-out run keeps the rows it DID emit. Discarding them made the
+    /// classifier union the id sets and mint an `[Absent, Ok]` pair for every
+    /// oracle row, charging the suite its whole inventory as unexercised —
+    /// roughly 1,900 phantom rows across 85 suites in the 2026-08-17 closure.
+    #[test]
+    fn closure_charges_a_timeout_only_for_rows_it_did_not_reach() {
+        let mut truncated = res(&[("a", Outcome::Ok), ("b", Outcome::Ok)]);
+        truncated.result = SuiteOutcome::Truncated;
+        let oracle = res(&[
+            ("a", Outcome::Ok),
+            ("b", Outcome::Ok),
+            ("c", Outcome::Ok),
+            ("d", Outcome::Ok),
+        ]);
+        let c = classify_closure(&suite(&[]), &truncated, true, &oracle, false);
+        assert_eq!(c.verdict, Verdict::Incomplete, "a deadline is never a pass");
+        assert!(c.gating);
+        let absent = c.pairs.values().filter(|p| p[0] == Outcome::Absent).count();
+        assert_eq!(absent, 2, "only the two rows it never reached: c and d");
+        assert_eq!(
+            c.pairs["a"],
+            [Outcome::Ok, Outcome::Ok],
+            "reached rows kept"
+        );
+    }
+
+    /// A truncated run must never reach the exact-match fast path, even if every
+    /// row it managed to emit agrees with the oracle.
+    #[test]
+    fn a_truncated_run_is_never_a_match() {
+        let mut truncated = res(&[("a", Outcome::Ok)]);
+        truncated.result = SuiteOutcome::Truncated;
+        let c = classify_closure(
+            &suite(&[]),
+            &truncated,
+            true,
+            &res(&[("a", Outcome::Ok)]),
+            false,
+        );
+        assert_eq!(c.verdict, Verdict::Incomplete);
+    }
+
+    /// A hung ORACLE still never counts against carrick. It produces
+    /// `Truncated` now rather than `None`, so the short-circuit has to know
+    /// about it or a slow oracle starts reading as a carrick failure.
+    #[test]
+    fn a_truncated_oracle_is_still_an_oracle_failure() {
+        let mut oracle = res(&[("a", Outcome::Ok)]);
+        oracle.result = SuiteOutcome::Truncated;
+        let combined = Baseline::from_jsonl("").with_overlay(Baseline::from_jsonl(""));
+        let c = classify(
+            &suite(&[]),
+            &res(&[("a", Outcome::Ok)]),
+            false,
+            &oracle,
+            &combined,
+        );
+        assert_eq!(c.verdict, Verdict::OracleFail);
+        assert!(!c.gating, "a broken oracle must not gate carrick");
     }
 
     #[test]
