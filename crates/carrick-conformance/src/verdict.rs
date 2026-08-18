@@ -185,6 +185,7 @@ pub fn classify_closure(
     docker: &SuiteResult,
     docker_timed_out: bool,
 ) -> Classification {
+    let carrick = &align_descriptor_residue(carrick, docker);
     let all_ok = |side: &SuiteResult| {
         side.result == SuiteOutcome::Success
             && !side.ids.is_empty()
@@ -204,6 +205,67 @@ pub fn classify_closure(
         return Classification::exact_match(carrick, docker);
     }
     Classification::incomplete_or_diff(carrick, docker)
+}
+
+/// Rewrite carrick-only assertion ids onto docker-only ids that share the same
+/// `ltp:<file>:<line>` anchor, in sorted order, so run-variable descriptor
+/// text (ASLR'd pointers, mkstemp suffixes — `chroot02`'s `/tmp/LTP_chrXXXXXX`,
+/// `getrusage01`'s `0xffff…` argument) pairs the way the positional scheme
+/// always paired it, while ids that DO match exactly (the deterministic
+/// fd-type descriptors the scheme exists for) keep identity pairing. A group
+/// with more ids on one side leaves the surplus absent — a missing tst_fd
+/// inventory entry stays exactly one unexercised pair and shifts nothing.
+/// Pairing within a group is by sorted id on both sides; when outcomes within
+/// a group differ AND the text varies per run this can mis-pair — the same
+/// ambiguity the purely positional scheme had, now confined to the residue.
+fn align_descriptor_residue(carrick: &SuiteResult, docker: &SuiteResult) -> SuiteResult {
+    let anchor = |id: &str| -> Option<String> {
+        // `ltp:<file>:<line>:<descriptor>#<occ>` -> `ltp:<file>:<line>`.
+        let rest = id.strip_prefix("ltp:")?;
+        let (file, tail) = rest.split_once(':')?;
+        // Descriptor-less ids (`ltp:file:line#N`) have nothing to align.
+        let (line, tail) = tail.split_once(':')?;
+        if line.is_empty() || !line.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let _ = tail;
+        Some(format!("ltp:{file}:{line}"))
+    };
+    let mut docker_only: BTreeMap<String, Vec<&String>> = BTreeMap::new();
+    for id in docker
+        .ids
+        .keys()
+        .filter(|id| !carrick.ids.contains_key(*id))
+    {
+        if let Some(anchor) = anchor(id) {
+            docker_only.entry(anchor).or_default().push(id);
+        }
+    }
+    let mut renamed: BTreeMap<String, Outcome> = BTreeMap::new();
+    for (id, outcome) in &carrick.ids {
+        if docker.ids.contains_key(id) {
+            renamed.insert(id.clone(), *outcome);
+            continue;
+        }
+        let target = anchor(id)
+            .and_then(|anchor| docker_only.get_mut(&anchor))
+            .and_then(|ids| {
+                if ids.is_empty() {
+                    None
+                } else {
+                    Some(ids.remove(0))
+                }
+            });
+        match target {
+            Some(docker_id) => renamed.insert(docker_id.clone(), *outcome),
+            None => renamed.insert(id.clone(), *outcome),
+        };
+    }
+    SuiteResult {
+        totals: carrick.totals.clone(),
+        result: carrick.result,
+        ids: renamed,
+    }
 }
 
 fn known_gap_match(id: &str, known_gaps: &[String]) -> bool {
@@ -320,6 +382,119 @@ pub fn classify(
 
 #[cfg(test)]
 mod tests {
+
+    mod residue_alignment {
+        use super::super::*;
+
+        fn suite(ids: &[(&str, Outcome)]) -> SuiteResult {
+            let map: BTreeMap<String, Outcome> =
+                ids.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+            let ok = map.values().filter(|o| **o == Outcome::Ok).count();
+            SuiteResult {
+                totals: Totals {
+                    n: map.len(),
+                    passed: ok,
+                    failed: map.len() - ok,
+                    broken: 0,
+                    skipped: 0,
+                },
+                result: if map.values().all(|o| *o == Outcome::Ok) {
+                    SuiteOutcome::Success
+                } else {
+                    SuiteOutcome::Failure
+                },
+                ids: map,
+            }
+        }
+
+        fn s() -> Suite {
+            super::suite(&[])
+        }
+
+        /// Run-variable descriptor text (mkstemp suffixes, ASLR'd pointers)
+        /// must pair positionally within its file:line anchor and MATCH.
+        #[test]
+        fn variable_text_pairs_within_anchor() {
+            let carrick = suite(&[
+                (
+                    "ltp:chroot02.c:28:chroot(/tmp/LTP_chrAAAAAA)_passed#1",
+                    Outcome::Ok,
+                ),
+                (
+                    "ltp:chroot02.c:28:chroot(/tmp/LTP_chrBBBBBB)_passed#1",
+                    Outcome::Ok,
+                ),
+            ]);
+            let docker = suite(&[
+                (
+                    "ltp:chroot02.c:28:chroot(/tmp/LTP_chrCCCCCC)_passed#1",
+                    Outcome::Ok,
+                ),
+                (
+                    "ltp:chroot02.c:28:chroot(/tmp/LTP_chrDDDDDD)_passed#1",
+                    Outcome::Ok,
+                ),
+            ]);
+            let got = classify_closure(&s(), &carrick, false, &docker, false);
+            assert_eq!(got.verdict, Verdict::Match, "{:?}", got.pairs);
+        }
+
+        /// A genuinely missing assertion (tst_fd inventory gap) must stay one
+        /// absent pair and shift nothing else.
+        #[test]
+        fn missing_inventory_entry_stays_absent() {
+            let carrick = suite(&[("ltp:splice07.c:56:on_pipe#1", Outcome::Ok)]);
+            let docker = suite(&[
+                ("ltp:splice07.c:56:on_pipe#1", Outcome::Ok),
+                ("ltp:splice07.c:56:on_fanotify#1", Outcome::Ok),
+            ]);
+            let got = classify_closure(&s(), &carrick, false, &docker, false);
+            assert_eq!(got.verdict, Verdict::Incomplete);
+            assert_eq!(
+                got.pairs["ltp:splice07.c:56:on_pipe#1"],
+                [Outcome::Ok, Outcome::Ok]
+            );
+            assert_eq!(
+                got.pairs["ltp:splice07.c:56:on_fanotify#1"],
+                [Outcome::Absent, Outcome::Ok]
+            );
+        }
+
+        /// Exact-id matches keep identity pairing even when a residue exists
+        /// at the same anchor: a divergent OUTCOME on a shared descriptor
+        /// must stay a semantic pair, not be re-paired away.
+        #[test]
+        fn exact_ids_keep_identity_pairing() {
+            let carrick = suite(&[
+                ("ltp:splice07.c:56:on_pipe#1", Outcome::Fail),
+                ("ltp:splice07.c:56:on_0xAAAA#1", Outcome::Ok),
+            ]);
+            let docker = suite(&[
+                ("ltp:splice07.c:56:on_pipe#1", Outcome::Ok),
+                ("ltp:splice07.c:56:on_0xBBBB#1", Outcome::Ok),
+            ]);
+            let got = classify_closure(&s(), &carrick, false, &docker, false);
+            assert_eq!(
+                got.pairs["ltp:splice07.c:56:on_pipe#1"],
+                [Outcome::Fail, Outcome::Ok]
+            );
+            assert_eq!(
+                got.pairs["ltp:splice07.c:56:on_0xBBBB#1"],
+                [Outcome::Ok, Outcome::Ok]
+            );
+        }
+
+        /// Non-LTP ids never align: a go test name only pairs by identity.
+        #[test]
+        fn non_ltp_ids_do_not_align() {
+            let carrick = suite(&[("go:TestOne#1", Outcome::Ok)]);
+            let docker = suite(&[("go:TestTwo#1", Outcome::Ok)]);
+            let got = classify_closure(&s(), &carrick, false, &docker, false);
+            assert_eq!(got.verdict, Verdict::Incomplete);
+            assert_eq!(got.pairs["go:TestOne#1"], [Outcome::Ok, Outcome::Absent]);
+            assert_eq!(got.pairs["go:TestTwo#1"], [Outcome::Absent, Outcome::Ok]);
+        }
+    }
     use super::*;
     use crate::manifest::{Ecosystem, Suite, Tier, VerdictKind, Weight};
 
