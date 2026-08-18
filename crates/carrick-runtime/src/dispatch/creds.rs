@@ -582,14 +582,34 @@ impl SyscallDispatcher {
                     {
                         return Ok(DispatchOutcome::errno(LINUX_EPERM));
                     }
-                    // Another guest process the caller MAY affect (privileged or
-                    // same owner), or no such process. carrick tracks nice only
-                    // for the CALLING process, so it cannot service a cross-
-                    // process set: report ESRCH rather than a bogus success that
-                    // the paired getpriority() readback (which also cannot see a
-                    // peer's nice) would contradict — LTP setpriority01 then fails
-                    // every sub-case uniformly, matching the container oracle.
-                    PrioTarget::Other { .. } | PrioTarget::NotFound => {
+                    // Another guest process the caller MAY affect (privileged
+                    // or same owner). This used to return ESRCH behind a comment
+                    // saying carrick tracked nice only for the calling process —
+                    // true when it was written, and false since `2e4e37496`
+                    // moved nice onto the `Task` (`kernel/objects.rs`). The
+                    // kernel graph can now name the target, so service it.
+                    PrioTarget::Other { .. } => {
+                        let Some(process) = this.hvpatch_process() else {
+                            // A lane with no kernel graph cannot name a peer's
+                            // nice, so it still cannot service the set.
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                        };
+                        let registry = process.kernel_graph().registry();
+                        let Some(target_nice) = registry.task_nice(who.0) else {
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                        };
+                        // The raise rule is the same as for self, but measured
+                        // against the TARGET's current nice — that is the value
+                        // Linux compares.
+                        if clamped < target_nice && !euid.is_root() {
+                            return Ok(DispatchOutcome::errno(LINUX_EACCES));
+                        }
+                        if !registry.set_task_nice(who.0, clamped) {
+                            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                        }
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    PrioTarget::NotFound => {
                         return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                     }
                 }
@@ -627,16 +647,32 @@ impl SyscallDispatcher {
                     t.registry
                         .is_live(crate::thread::ThreadId::from_guest_supplied_tid(who.0))
                 });
-            if which == LINUX_PRIO_PROCESS && !is_self_priority_target(who.0) && !sibling {
-                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-            }
-            // Kernel ABI: getpriority returns `20 - nice` (so the value is never
-            // negative); glibc converts it back. Report the calling process's
-            // stored nice for PRIO_PROCESS, else the default (nice 0 → 20).
-            let nice = if which == LINUX_PRIO_PROCESS {
-                cx.kernel.task().nice()
+            // A PRIO_PROCESS target that is neither self nor a sibling thread
+            // is a PEER process. It used to be refused ESRCH outright; the
+            // kernel graph can name it, so read ITS nice. Only a pid the graph
+            // does not know is ESRCH.
+            let peer_nice = if which == LINUX_PRIO_PROCESS
+                && !is_self_priority_target(who.0)
+                && !sibling
+            {
+                let found = this
+                    .hvpatch_process()
+                    .and_then(|process| process.kernel_graph().registry().task_nice(who.0));
+                #[allow(clippy::manual_let_else)]
+                match found {
+                    Some(nice) => Some(nice),
+                    None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
+                }
             } else {
-                0
+                None
+            };
+            // Kernel ABI: getpriority returns `20 - nice` (so the value is never
+            // negative); glibc converts it back. Report the target's stored nice
+            // for PRIO_PROCESS, else the default (nice 0 → 20).
+            let nice = match (which == LINUX_PRIO_PROCESS, peer_nice) {
+                (true, Some(peer)) => peer,
+                (true, None) => cx.kernel.task().nice(),
+                (false, _) => 0,
             };
             Ok(DispatchOutcome::Returned {
                 value: (20 - nice) as i64,

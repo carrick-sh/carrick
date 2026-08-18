@@ -466,7 +466,32 @@ Measured, not inferred — see `docs/perf-results/2026-08-17-closure-post-libuv/
   SIGSEGV there. That class passes 3/3 in isolation, so the crash needs the full
   run's context — go at it with a core and `carrick-lldb` on the CARRIER, not
   with another reducer.
-  **`go-go_types` 574** (untriaged),
+  **`go-go_types`** closed itself (574 unexercised -> 0, `success 571/571`) once
+  the stage-1 pool stopped exhausting; confirm rather than assume.
+  **`ltp-splice07` + `ltp-ioctl_ficlone04` ~209 rows** — the cause is NOT a
+  missing syscall. `AssertionCollector::push`
+  (`crates/carrick-conformance/src/parsers/mod.rs`) keys every LTP assertion by
+  POSITIONAL occurrence (`file.c:line#N`), so one extra or missing fd type in
+  carrick's `tst_fd` inventory shifts every later ordinal and compares
+  unrelated rows against each other (`accept03.c:46` #13-#15 line fanotify up
+  against inotify). That both inflates the count and MASKS genuine per-fd-type
+  divergences. Every LTP line already carries the fd type verbatim
+  (`splice07.c:56: TPASS: splice() on file -> unix socket : EINVAL (22)`), so
+  the fix is to key on that text. Do NOT "fix" it by implementing
+  `memfd_secret`: a verifier ran the analyst's own model forward and it makes
+  the cluster WORSE (96 -> 120), because divergence scales with the
+  inventory-size delta.
+
+  **Cost that is not obvious and must be planned for: this needs a full oracle
+  re-bless.** `scripts/conformance/oracle-cache.jsonl` stores per-assertion
+  `ids`, and the cache KEY does not include the id scheme. Changing the scheme
+  would leave every cached LTP oracle holding old-style ids while fresh carrick
+  runs emit new-style ones — every row Absent on one side, a false-divergence
+  storm rather than a clean miss. So the change must add an id-scheme
+  determinant to `OracleKey` (the `docker_platform` precedent in AGENTS.md) so
+  the whole cache invalidates and refills in one deliberate `--refresh-oracle`
+  pass. Give it its own cycle; do not fold it into another change.
+
   **`ltp-splice07` + `ltp-ioctl_ficlone04` 410** (LTP `tst_fd.c` fd-type
   inventory differs, shifting every ordinal).
 - **`ltp-setpriority01`: oracle FIXED, 198 rows -> 3, and the residual gap is

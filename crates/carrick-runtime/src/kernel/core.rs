@@ -1144,6 +1144,39 @@ impl Registry {
         }
     }
 
+    /// The nice value of live process `pid`. `None` means no such live process,
+    /// which the caller lowers to ESRCH.
+    ///
+    /// `getpriority(PRIO_PROCESS, peer)` needs the TARGET's value; it used to
+    /// report the CALLER's, which is only right when the target IS the caller.
+    pub(crate) fn task_nice(&self, pid: i32) -> Option<i32> {
+        self.state
+            .read()
+            .tasks
+            .iter()
+            .find(|(id, _)| id.raw() == pid)
+            .map(|(_, record)| record.task.nice())
+    }
+
+    /// Apply a nice value to live process `pid`. `false` means no such live
+    /// process. Companion to [`Self::task_nice`]; nice is per-`Task`, so a
+    /// cross-process `setpriority` is serviceable from the kernel graph.
+    pub(crate) fn set_task_nice(&self, pid: i32, nice: i32) -> bool {
+        let state = self.state.read();
+        match state
+            .tasks
+            .iter()
+            .find(|(id, _)| id.raw() == pid)
+            .map(|(_, record)| Arc::clone(&record.task))
+        {
+            Some(task) => {
+                task.set_nice(nice);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn process_group(&self, id: ProcessGroupId) -> Option<Arc<ProcessGroup>> {
         self.state
             .read()
