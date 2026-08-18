@@ -1585,6 +1585,65 @@ mod tests {
         PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE)
     }
 
+    /// The in-place walk exists so the frame-COW fault path can stop copying
+    /// the whole 1.75 MiB table image to read four descriptors. It is only
+    /// worth anything if it reports EXACTLY what the copying walk reported, so
+    /// pin the two against each other over a mapped VA (a real four-level
+    /// walk), an unmapped VA (the walk stops early and leaves zeros), and a
+    /// truncated region (the length bound stops the walk instead of reading
+    /// past the mapping).
+    #[test]
+    fn host_walk_matches_the_copying_walk() {
+        let mut mgr = manager();
+        let va = LINUX_HEAP_BASE;
+        mgr.map_private_aliased(va, LINUX_ALIAS_IPA_BASE, 0x4000, true)
+            .expect("map a private alias to force a full four-level walk");
+        let bytes = mgr.as_bytes().to_vec();
+        let base = mgr.base();
+
+        for probe in [va, va + 0x1000, LINUX_MMAP_BASE, LINUX_SHARED_FILE_BASE] {
+            let copied = walk_descriptors(&bytes, base, probe);
+            // SAFETY: `bytes` is a live allocation of `bytes.len()` whose byte
+            // offset 0 is the PA `base`.
+            let live = unsafe { walk_descriptors_host(bytes.as_ptr(), bytes.len(), base, probe) };
+            assert_eq!(copied, live, "walk diverged at VA {probe:#x}");
+        }
+
+        // A short region must bound both walks identically rather than reading
+        // past the caller's mapping.
+        let short = 8;
+        let copied = walk_descriptors(&bytes[..short], base, va);
+        // SAFETY: only the first `short` bytes are read, well inside `bytes`.
+        let live = unsafe { walk_descriptors_host(bytes.as_ptr(), short, base, va) };
+        assert_eq!(copied, live, "bounded walks diverged");
+    }
+
+    /// `clone_from` is hand-written so the frame-COW rollback pre-image can
+    /// reuse one buffer instead of asking the allocator for 1.75 MiB per fault.
+    /// It has to stay indistinguishable from `clone`, including the allocator
+    /// cursor and free list that a fresh manager would reset.
+    #[test]
+    fn clone_from_reproduces_clone_and_keeps_the_buffer() {
+        let mut source = manager();
+        source
+            .map_private_aliased(LINUX_HEAP_BASE, LINUX_ALIAS_IPA_BASE, 0x4000, true)
+            .expect("split a block so the source has allocator state to carry");
+
+        let mut recycled = manager();
+        let capacity_before = recycled.as_bytes().len();
+        recycled.clone_from(&source);
+
+        let fresh = source.clone();
+        assert_eq!(recycled.as_bytes(), fresh.as_bytes());
+        assert_eq!(recycled.base(), fresh.base());
+        assert_eq!(recycled.pool_stats(), fresh.pool_stats());
+        assert_eq!(
+            recycled.as_bytes().len(),
+            capacity_before,
+            "both managers cover the same region, so no reallocation is needed"
+        );
+    }
+
     #[test]
     fn indices_decompose_va() {
         let i = indices(LINUX_MMAP_BASE); // 0x60_0000_0000
