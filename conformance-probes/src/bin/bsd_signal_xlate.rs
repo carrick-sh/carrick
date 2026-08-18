@@ -39,7 +39,21 @@ unsafe fn install(signum: i32, handler: extern "C" fn(i32)) -> bool {
 
 fn child_main(ready_fd: i32) -> ! {
     unsafe {
-        let installed = install(SIGSTKFLT, on_stkflt)
+        // Block the three probe signals BEFORE reporting ready: from here on
+        // they can only be delivered inside `sigsuspend`, which closes the
+        // classic pause() lost-wakeup race (a signal landing between the
+        // counter check and pause() would otherwise strand the child until
+        // the alarm kills it — observed as a load-flaky child_exited_zero
+        // divergence under the closure gate's parallelism).
+        let mut block: libc::sigset_t = core::mem::zeroed();
+        libc::sigemptyset(&mut block);
+        libc::sigaddset(&mut block, SIGSTKFLT);
+        libc::sigaddset(&mut block, SIGPWR);
+        libc::sigaddset(&mut block, SIGIO_LINUX);
+        let blocked = libc::sigprocmask(libc::SIG_BLOCK, &block, core::ptr::null_mut()) == 0;
+
+        let installed = blocked
+            && install(SIGSTKFLT, on_stkflt)
             && install(SIGPWR, on_pwr)
             && install(SIGIO_LINUX, on_io);
         let byte = [installed as u8];
@@ -49,12 +63,14 @@ fn child_main(ready_fd: i32) -> ! {
             libc::_exit(2);
         }
 
+        let mut wait_mask: libc::sigset_t = core::mem::zeroed();
+        libc::sigemptyset(&mut wait_mask);
         libc::alarm(5);
         while GOT_STKFLT.load(Ordering::SeqCst) == 0
             || GOT_PWR.load(Ordering::SeqCst) == 0
             || GOT_IO.load(Ordering::SeqCst) == 0
         {
-            libc::pause();
+            libc::sigsuspend(&wait_mask);
         }
         libc::_exit(0);
     }
