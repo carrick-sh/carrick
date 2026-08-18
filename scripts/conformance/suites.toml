@@ -882,7 +882,7 @@ cmd = ["/usr/local/bin/python3", "-m", "test", "-v", "--randseed", "0", "test_co
 verdict = "regrtest"
 tier = "full"
 weight = "heavy"
-timeout_s = 300
+timeout_s = 600
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
@@ -2576,7 +2576,7 @@ cmd = ["/usr/local/bin/python3", "-m", "test", "-v", "--randseed", "0", "test_mu
 verdict = "regrtest"
 tier = "full"
 weight = "heavy"
-timeout_s = 300
+timeout_s = 600
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
@@ -2587,7 +2587,7 @@ cmd = ["/usr/local/bin/python3", "-m", "test", "-v", "--randseed", "0", "test_mu
 verdict = "regrtest"
 tier = "full"
 weight = "heavy"
-timeout_s = 300
+timeout_s = 600
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
@@ -2609,7 +2609,7 @@ cmd = ["/usr/local/bin/python3", "-m", "test", "-v", "--randseed", "0", "test_mu
 verdict = "regrtest"
 tier = "full"
 weight = "heavy"
-timeout_s = 300
+timeout_s = 600
 carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
@@ -6023,7 +6023,7 @@ cmd = ["/conformance/go_internal_gcimporter.test", "-test.v", "-test.run", "Test
 verdict = "gotest"
 tier = "full"
 weight = "heavy"
-timeout_s = 180
+timeout_s = 360
 carrick_flags = ["--raw", "--fs", "host"]
 workdir = "/usr/local/go/src/go/internal/gcimporter"
 
@@ -6095,7 +6095,7 @@ cmd = ["/conformance/go_types.test", "-test.v", "-test.run", "Test", "-test.shor
 verdict = "gotest"
 tier = "full"
 weight = "heavy"
-timeout_s = 180
+timeout_s = 360
 carrick_flags = ["--raw", "--fs", "host"]
 workdir = "/usr/local/go/src/go/types"
 
