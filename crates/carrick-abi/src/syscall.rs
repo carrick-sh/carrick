@@ -108,15 +108,17 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         | 276
         | 285
         | 291
+        | 279
         | 436
         | 437
         | 439
+        | 447
         | 452 => SyscallHandler::Filesystem,
         19..=22 | 72 | 73 | 198..=212 | 242 | 243 | 269 => SyscallHandler::Network,
         85..=87 | 101..=103 | 112..=115 | 153 | 165 | 169..=171 | 179 | 261 | 266 => {
             SyscallHandler::Time
         }
-        213..=216 | 222 | 223 | 226..=233 | 283 | 284 | 425 | 426 => SyscallHandler::Memory,
+        213..=216 | 222 | 223 | 226..=233 | 282..=284 | 425 | 426 => SyscallHandler::Memory,
         90 | 91 | 140 | 141 | 143..=152 | 158 | 159 | 166 | 174..=177 => {
             SyscallHandler::Credentials
         }
@@ -155,6 +157,12 @@ pub const fn compat_note_for_aarch64(number: u64) -> Option<&'static str> {
     match number {
         14..=16 => Some("xattr removal is reported as unsupported for bring-up compatibility"),
         281 => Some("execveat remains planned and currently routes to unimplemented ENOSYS"),
+        282 => Some(
+            "container policy only: EPERM without CAP_SYS_PTRACE (Docker-default caps), ENOSYS with it — no userfaultfd emulation",
+        ),
+        447 => Some(
+            "guest-visible ABI (fd, MAP_SHARED-only mmap, EINVAL file I/O, /proc mem hiding); host direct-map removal and mlock accounting are not modeled",
+        ),
         435 => Some("clone3 is partially handled for the clone/fork modes Carrick supports"),
         _ => None,
     }
@@ -447,10 +455,10 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(276, "renameat2", "fs", SupportLevel::BringUp),
     syscall(277, "seccomp", "process", SupportLevel::BringUp),
     syscall(278, "getrandom", "random", SupportLevel::BringUp),
-    syscall(279, "memfd_create", "fs", SupportLevel::Deferred),
+    syscall(279, "memfd_create", "fs", SupportLevel::BringUp),
     syscall(280, "bpf", "process", SupportLevel::BringUp),
     syscall(281, "execveat", "process", SupportLevel::Planned),
-    syscall(282, "userfaultfd", "mm", SupportLevel::Deferred),
+    syscall(282, "userfaultfd", "mm", SupportLevel::BringUp),
     syscall(283, "membarrier", "process", SupportLevel::BringUp),
     syscall(284, "mlock2", "mm", SupportLevel::BringUp),
     syscall(285, "copy_file_range", "fs", SupportLevel::BringUp),
@@ -531,7 +539,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
         "process",
         SupportLevel::Deferred,
     ),
-    syscall(447, "memfd_secret", "mm", SupportLevel::Deferred),
+    syscall(447, "memfd_secret", "mm", SupportLevel::BringUp),
     syscall(448, "process_mrelease", "process", SupportLevel::Deferred),
     syscall(449, "futex_waitv", "process", SupportLevel::Deferred),
     syscall(450, "set_mempolicy_home_node", "mm", SupportLevel::Deferred),

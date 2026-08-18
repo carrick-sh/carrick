@@ -24,17 +24,17 @@ Each row carries a `SupportLevel`, which maps to the **Quality** column below:
 |---|---|---|
 | `BringUp` | **Emulated** (Full or Partial) | Routed to a real handler. *Full* = ABI-complete for the cases workloads hit; *Partial* = the common path works, edges/flags are stubbed or deferred (judged here from the handler + `compat_note`). |
 | `Planned` | **Stub** | Recognized by name but routes to `ENOSYS` today. Only two: `execveat` (#281) and `clone3` (#435) — the latter is partially wired for the clone/fork modes carrick supports (`compat_note_for_aarch64`). |
-| `Deferred` | **Not implemented** | `ENOSYS`, surfaced by its real name (e.g. `io_uring_register`, `userfaultfd`) so the compat report shows `userfaultfd`, not `unknown 282`. |
+| `Deferred` | **Not implemented** | `ENOSYS`, surfaced by its real name (e.g. `io_uring_register`, `process_madvise`) so the compat report shows `process_madvise`, not `unknown 440`. |
 
-**~216 syscalls are actively emulated** (`BringUp`), 2 are `Planned` stubs, and
-the remaining 121 table rows are `Deferred`. Counts are from the table itself
+**234 syscalls are actively emulated** (`BringUp`), 2 are `Planned` stubs, and
+the remaining 103 table rows are `Deferred`. Counts are from the table itself
 (`rg 'SupportLevel::BringUp' crates/carrick-abi/src/syscall.rs | wc -l`).
 
 > [!NOTE]
 > "Deferred → ENOSYS" is deliberate and load-bearing: glibc/musl and most
 > runtimes treat an `ENOSYS` from an optional syscall as "feature absent" and
 > fall back. Returning `ENOSYS` by *name* (rather than crashing on an unknown
-> trap) is what lets `userfaultfd`, `io_uring_register`, `landlock_*`, the
+> trap) is what lets `io_uring_register`, `landlock_*`, the
 > `*_time64` variants, etc. degrade gracefully.
 
 ## Host backing at a glance
@@ -92,7 +92,9 @@ cap-std with `--fs host`). Each open file is an `OpenDescription` behind an
 | `fsync`, `fdatasync`, `sync`, `syncfs`, `sync_file_range`, `fadvise64`, `flock` | 82,83,81,267,84,223,32 | Emulated (Full) | host flush/advise; `flock` is real host advisory locking | `sync_file_range` validates flags/range then best-effort host flush; `flock` cross-fd/cross-process conflicts are real. |
 | `sendfile`, `copy_file_range`, `splice` | 71,285,76 | Emulated (Full→Partial) | Darwin `sendfile(2)`; host read/write copy | `sendfile` access-mode validated; `splice`/`tee`/`vmsplice` pass through to the host syscalls on Linux (exact pipe semantics), and return `ENOSYS` on macOS, which has no such syscalls. |
 | `utimensat`, `inotify_init1`/`add_watch`/`rm_watch`, `ioctl` | 88,26–28,29 | Emulated (Partial) | host `utimensat`; host fd ioctls | `ioctl` covers the terminal/`FIONREAD`/sizing set workloads use, not the full ioctl surface. |
-| `memfd_create`, `cachestat`, `sync_file_range` | 279,451,84 | Stub/Deferred | — | `memfd_create` (#279) and `cachestat` (#451) are `Deferred` in the table; the conformance probes exercise emulated paths added later — treat the table's `SupportLevel` as authoritative for the report. |
+| `memfd_create` | 279 | Emulated (Partial) | unlinked in-memory File (same shape as `O_TMPFILE`) | MFD flag validation, name bounds, sealing (`F_ADD_SEALS`/`F_GET_SEALS`, shared-map `EBUSY`), `/proc/self/fd` reopen. |
+| `memfd_secret` | 447 | Emulated (Partial) | anonymous in-memory File marked `secretmem` | Guest-visible ABI probed against the oracle (`memfdsecret` probe): `O_CLOEXEC`-only flag word, read/write(2)/splice/sendfile → `EINVAL`, `MAP_SHARED`-only mmap, mapped pages hidden from `/proc/<pid>/mem` (EIO). Host direct-map removal and implicit-mlock accounting are NOT modeled. |
+| `cachestat` | 451 | Stub/Deferred | — | `cachestat` (#451) exercises an emulated path added after the table row was set — treat the table's `SupportLevel` as authoritative for the report. |
 
 | `fanotify_init`, `fanotify_mark` | 262,263 | Partial | dispatch-seam event synthesis (`crates/carrick-runtime/src/fanotify.rs`) | `FAN_CLASS_NOTIF` groups only. Events are synthesized from the guest's own syscalls on the same seam inotify uses, NOT from host vnode watches — a `EVFILT_VNODE`/FSEvents observer cannot report which guest process acted, the mark's mask, the ignore mask, or child-vs-self. See the per-flag table below. |
 
@@ -146,9 +148,11 @@ from a bump arena (`mmap_next`), with lazy zero-fill of pristine pages
 | `madvise`, `mincore`, `msync`, `mlock`/`munlock`/`mlockall`/`munlockall` | 233,232,227,228–231 | Emulated (Partial) | advisory / host `msync` / no-op locks | `MADV_HUGEPAGE`/`NOHUGEPAGE` return 0 (advisory, never an error). |
 | `fadvise64` | 223 | Emulated (Partial) | host `posix_fadvise` | Out-of-range advice → EINVAL; pipe → ESPIPE. |
 
+| `userfaultfd` | 282 | Emulated (Policy) | container-policy denial | Matches the Docker oracle's seccomp gate: `EPERM` without `CAP_SYS_PTRACE` (the Docker-default capability set), honest `ENOSYS` with it — carrick's kernel does not implement userfaultfd and `/proc/config.gz` says `# CONFIG_USERFAULTFD is not set`, exactly like the oracle's LinuxKit kernel (LTP userfaultfd01–06 TCONF identically on both sides). |
+
 **Deferred:** `swapon`/`swapoff`, `mbind`/`get_mempolicy`/`set_mempolicy`/
-`migrate_pages`/`move_pages`/`set_mempolicy_home_node` (NUMA), `userfaultfd`,
-`mlock2`, `pkey_*`, `remap_file_pages`, `process_madvise`, `memfd_secret`,
+`migrate_pages`/`move_pages`/`set_mempolicy_home_node` (NUMA),
+`mlock2`, `pkey_*`, `remap_file_pages`, `process_madvise`,
 `map_shadow_stack`, `mseal`.
 
 ## Process & thread lifecycle

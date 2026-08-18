@@ -47,6 +47,7 @@ pub const CAP_FSETID: u32 = 4;
 pub const CAP_SETPCAP: u32 = 8;
 pub const CAP_LINUX_IMMUTABLE: u32 = 9;
 pub const CAP_NET_RAW: u32 = 13;
+pub const CAP_SYS_PTRACE: u32 = 19;
 pub const CAP_SYS_ADMIN: u32 = 21;
 pub const CAP_SYS_NICE: u32 = 23;
 pub const CAP_MKNOD: u32 = 27;
@@ -278,6 +279,16 @@ mod tests {
     #[test]
     fn docker_default_excludes_sys_resource() {
         let bit = 1u64 << CAP_SYS_RESOURCE;
+        assert_eq!(CapabilitySet::docker_default().effective & bit, 0);
+        assert_ne!(CapabilitySet::full().effective & bit, 0);
+    }
+
+    #[test]
+    fn docker_default_excludes_sys_ptrace() {
+        // userfaultfd(2)'s container-policy EPERM depends on the default set
+        // LACKING CAP_SYS_PTRACE (the oracle's Docker seccomp gate; LTP
+        // userfaultfd01/02/06 TCONF).
+        let bit = 1u64 << CAP_SYS_PTRACE;
         assert_eq!(CapabilitySet::docker_default().effective & bit, 0);
         assert_ne!(CapabilitySet::full().effective & bit, 0);
     }

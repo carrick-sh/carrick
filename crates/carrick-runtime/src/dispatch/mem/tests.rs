@@ -642,6 +642,7 @@ where
         bus_fault: None,
         write_sealed_shared: false,
         read_only_shared_file: false,
+        secretmem: false,
         writable_memfd: None,
         shared_file_alias: None,
     }));
@@ -3959,6 +3960,7 @@ fn native16k_rejects_write_exec_alias_mprotect() {
         bus_fault: None,
         write_sealed_shared: false,
         read_only_shared_file: false,
+        secretmem: false,
         writable_memfd: None,
         shared_file_alias: None,
     });
@@ -4162,6 +4164,7 @@ fn native16k_allows_private_alias_write_exec_for_translation_backend() {
         bus_fault: None,
         write_sealed_shared: false,
         read_only_shared_file: false,
+        secretmem: false,
         writable_memfd: None,
         shared_file_alias: None,
     });
@@ -4905,6 +4908,55 @@ fn trim_dynamic_maps_preserves_sorted_order_without_full_resort() {
 }
 
 #[test]
+fn secretmem_range_registry_records_queries_and_splits() {
+    let dispatcher = SyscallDispatcher::new();
+    let base = LINUX_MMAP_BASE;
+    let page = LINUX_PAGE_SIZE;
+
+    // Nothing recorded -> nothing touches.
+    assert!(!dispatcher.range_touches_secretmem(base, page));
+
+    dispatcher.record_secretmem_map(base, 4 * page);
+    // Inside, at both edges, and spanning the start from below.
+    assert!(dispatcher.range_touches_secretmem(base, 1));
+    assert!(dispatcher.range_touches_secretmem(base + 4 * page - 1, 1));
+    assert!(dispatcher.range_touches_secretmem(base - page, 2 * page));
+    // Adjacent-but-outside on both sides.
+    assert!(!dispatcher.range_touches_secretmem(base - page, page));
+    assert!(!dispatcher.range_touches_secretmem(base + 4 * page, page));
+
+    // A partial munmap splits the range: the middle stops matching, the
+    // outer halves keep matching.
+    dispatcher.remove_secretmem_map(base + page, page);
+    assert!(dispatcher.range_touches_secretmem(base, page));
+    assert!(!dispatcher.range_touches_secretmem(base + page, page));
+    assert!(dispatcher.range_touches_secretmem(base + 2 * page, 2 * page));
+
+    // Removing the rest clears the registry.
+    dispatcher.remove_secretmem_map(base, 4 * page);
+    assert!(!dispatcher.range_touches_secretmem(base, 4 * page));
+}
+
+/// The shared mmap-teardown path (`munmap`, and SysV `shmdt`) must retire
+/// secretmem ranges along with every other range classification, so a later
+/// mapping at the same VA is not spuriously hidden from `/proc/<pid>/mem`.
+#[test]
+fn secretmem_range_is_retired_by_mapping_metadata_removal() {
+    let dispatcher = SyscallDispatcher::new();
+    let base = LINUX_MMAP_BASE;
+    let page = LINUX_PAGE_SIZE;
+
+    dispatcher.record_secretmem_map(base, 2 * page);
+    assert!(dispatcher.range_touches_secretmem(base, 2 * page));
+
+    dispatcher.remove_mapping_metadata(base, 2 * page);
+    assert!(
+        !dispatcher.range_touches_secretmem(base, 2 * page),
+        "remove_mapping_metadata must retire the secretmem classification"
+    );
+}
+
+#[test]
 fn mincore_onfault_lock_is_not_resident_until_page_is_touched() {
     let dispatcher = SyscallDispatcher::new();
     let base = LINUX_MMAP_BASE;
@@ -5490,6 +5542,7 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
         bus_fault: None,
         write_sealed_shared: false,
         read_only_shared_file: false,
+        secretmem: false,
         writable_memfd: None,
         shared_file_alias: None,
     });
@@ -5562,6 +5615,7 @@ fn core_file_provenance_keeps_mmap_offset_and_excludes_anonymous_exec() {
         bus_fault: None,
         write_sealed_shared: false,
         read_only_shared_file: false,
+        secretmem: false,
         writable_memfd: None,
         shared_file_alias: None,
     });
@@ -5577,6 +5631,7 @@ fn core_file_provenance_keeps_mmap_offset_and_excludes_anonymous_exec() {
         bus_fault: None,
         write_sealed_shared: false,
         read_only_shared_file: false,
+        secretmem: false,
         writable_memfd: None,
         shared_file_alias: None,
     });
@@ -5611,6 +5666,7 @@ fn host_alias_inventory_commits_trims_and_fork_clones_exact_ranges() {
         bus_fault: None,
         write_sealed_shared: false,
         read_only_shared_file: false,
+        secretmem: false,
         writable_memfd: None,
         shared_file_alias: None,
     }));
@@ -5698,6 +5754,7 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
         bus_fault: None,
         write_sealed_shared: false,
         read_only_shared_file: false,
+        secretmem: false,
         writable_memfd: None,
         shared_file_alias: None,
     }));
@@ -5762,6 +5819,7 @@ fn pending_host_alias_transaction_drop_aborts_and_notifies_waiters() {
         bus_fault: None,
         write_sealed_shared: false,
         read_only_shared_file: false,
+        secretmem: false,
         writable_memfd: None,
         shared_file_alias: None,
     }));
@@ -5807,6 +5865,7 @@ fn dropping_unconsumed_host_alias_outcome_closes_fd_and_aborts_transaction() {
         bus_fault: None,
         write_sealed_shared: false,
         read_only_shared_file: false,
+        secretmem: false,
         writable_memfd: None,
         shared_file_alias: None,
     }));
@@ -5858,6 +5917,7 @@ fn installing_host_alias_blocks_sibling_mapping_dispatch_until_resolution() {
         bus_fault: None,
         write_sealed_shared: false,
         read_only_shared_file: false,
+        secretmem: false,
         writable_memfd: None,
         shared_file_alias: None,
     }));

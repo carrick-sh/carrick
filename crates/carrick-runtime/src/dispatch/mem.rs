@@ -79,6 +79,7 @@ syscall_table! {
     426 => io_uring_enter,
     427 => io_uring_register,
     283 => sys_membarrier,
+    282 => userfaultfd,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -399,6 +400,11 @@ pub(super) struct MemState {
         crate::vfs::GuestMemoryRange,
         Arc<crate::kernel::FileDescription>,
     )>,
+    /// VA ranges of live MAP_SHARED mappings backed by a `memfd_secret(2)` fd.
+    /// Secret memory is hidden from the kernel's own view of the process, so
+    /// `/proc/<pid>/mem` reads that touch one of these ranges fail EIO
+    /// (memfdsecret probe `procmem_hidden`).
+    secretmem_maps: Vec<crate::vfs::GuestMemoryRange>,
     /// The exact serialized ELF auxiliary vector written to the guest stack at
     /// exec, captured from the `AddressSpace` via
     /// [`SyscallDispatcher::set_auxv_image`]. Mirrored to `/proc/self/auxv`.
@@ -453,6 +459,7 @@ impl MemState {
             write_sealed_shared_maps: Vec::new(),
             writable_memfd_maps: Vec::new(),
             shared_file_alias_maps: Vec::new(),
+            secretmem_maps: Vec::new(),
             linux_auxv_image: Vec::new(),
             core_file_mappings: Vec::new(),
         }
@@ -1023,6 +1030,9 @@ pub(crate) struct HostAliasMmapCommit {
     pub(super) bus_fault: Option<(u64, u64)>,
     pub(super) write_sealed_shared: bool,
     pub(super) read_only_shared_file: bool,
+    /// The mapping is backed by a `memfd_secret(2)` fd: its pages are
+    /// hidden from `/proc/<pid>/mem` (memfdsecret probe `procmem_hidden`).
+    pub(super) secretmem: bool,
     pub(super) writable_memfd: Option<Arc<crate::kernel::FileDescription>>,
     /// The open-file description behind a live `MAP_SHARED` file alias, kept so
     /// `mremap` can still find the file after the guest closes its own fd.
@@ -1246,6 +1256,7 @@ fn remove_mapping_metadata_locked(mem: &mut MemState, start: u64, len: u64) {
     locked_ranges_remove(&mut mem.resident_tracked_ranges, remove);
     remove_fault_range(&mut mem.resident_fault_ranges, remove);
     locked_ranges_remove(&mut mem.write_sealed_shared_maps, remove);
+    locked_ranges_remove(&mut mem.secretmem_maps, remove);
     locked_ranges_remove(&mut mem.read_only_shared_file_maps, remove);
     locked_ranges_remove(&mut mem.host_alias_backed_ranges, remove);
     locked_ranges_remove(&mut mem.alias_vma_ranges, remove);
@@ -1504,6 +1515,9 @@ impl SyscallDispatcher {
         }
         if commit.read_only_shared_file {
             locked_ranges_insert(&mut mem.read_only_shared_file_maps, replacement);
+        }
+        if commit.secretmem {
+            locked_ranges_insert(&mut mem.secretmem_maps, replacement);
         }
         if let Some(description) = commit.writable_memfd {
             mem.writable_memfd_maps.push((replacement, description));
@@ -1810,6 +1824,34 @@ impl SyscallDispatcher {
             .write_sealed_shared_maps
             .iter()
             .any(|r| ranges_overlap(start, len, r.start().raw(), r.end().raw()))
+    }
+
+    fn record_secretmem_map(&self, start: u64, len: u64) {
+        if let Some(range) =
+            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+        {
+            self.mem.lock().secretmem_maps.push(range);
+        }
+    }
+
+    /// True iff `[start, start+len)` touches a live secretmem mapping — used
+    /// by the `/proc/<pid>/mem` read path to fail with EIO (the kernel cannot
+    /// GUP secret pages; memfdsecret probe `procmem_hidden`).
+    pub(in crate::dispatch) fn range_touches_secretmem(&self, start: u64, len: u64) -> bool {
+        self.mem
+            .lock()
+            .secretmem_maps
+            .iter()
+            .any(|r| ranges_overlap(start, len, r.start().raw(), r.end().raw()))
+    }
+
+    #[cfg(test)]
+    fn remove_secretmem_map(&self, start: u64, len: u64) {
+        if let Some(range) =
+            crate::vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(start.saturating_add(len)))
+        {
+            locked_ranges_remove(&mut self.mem.lock().secretmem_maps, range);
+        }
     }
 
     fn record_writable_memfd_map(
@@ -2754,6 +2796,7 @@ impl SyscallDispatcher {
                         bus_fault: None,
                         write_sealed_shared: false,
                         read_only_shared_file: false,
+                        secretmem: false,
                         writable_memfd: None,
                         shared_file_alias: None,
                     },
@@ -2821,6 +2864,22 @@ impl SyscallDispatcher {
                 return Ok(request.refused(
                     MmapRefusal::Spec("shared writable mapping of a write-sealed memfd"),
                     LINUX_EPERM,
+                ));
+            }
+
+            // memfd_secret mappings must be MAP_SHARED: secretmem rejects a
+            // MAP_PRIVATE mmap with EINVAL (memfdsecret probe
+            // `mmap_private_errno=22`). Classified here, ahead of every
+            // private/file-backed lowering decision, so no path can materialize
+            // a private view of secret memory.
+            let secretmem_backed = !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                && this
+                    .open_file(fd.0)
+                    .is_some_and(|open_file| open_file.description.read().is_secretmem());
+            if secretmem_backed && map_sharing == MmapSharing::Private {
+                return Ok(request.refused(
+                    MmapRefusal::Spec("MAP_PRIVATE mapping of a memfd_secret fd"),
+                    LINUX_EINVAL,
                 ));
             }
 
@@ -3051,6 +3110,7 @@ impl SyscallDispatcher {
                     bus_fault,
                     write_sealed_shared: false,
                     read_only_shared_file: false,
+                    secretmem: false,
                     writable_memfd: None,
                     shared_file_alias: None,
                 });
@@ -3210,6 +3270,7 @@ impl SyscallDispatcher {
                             bus_fault: None,
                             write_sealed_shared: false,
                             read_only_shared_file: false,
+                            secretmem: false,
                             writable_memfd: None,
                             shared_file_alias: alias_description,
                         },
@@ -3862,6 +3923,7 @@ impl SyscallDispatcher {
                         bus_fault,
                         write_sealed_shared: mmap_write_sealed_shared,
                         read_only_shared_file: mmap_read_only_shared_file,
+                        secretmem: secretmem_backed,
                         writable_memfd: writable_memfd_desc,
                         shared_file_alias: None,
                     },
@@ -4038,6 +4100,9 @@ impl SyscallDispatcher {
             }
             if mmap_read_only_shared_file {
                 this.record_read_only_shared_file_map(address, length);
+            }
+            if secretmem_backed {
+                this.record_secretmem_map(address, length);
             }
             if let Some(description) = writable_memfd_desc {
                 this.record_writable_memfd_map(address, length, description);
@@ -4802,6 +4867,7 @@ impl SyscallDispatcher {
                             bus_fault: None,
                             write_sealed_shared: false,
                             read_only_shared_file: false,
+                            secretmem: false,
                             writable_memfd: None,
                             shared_file_alias: Some(Arc::clone(&description)),
                         }));
@@ -5560,6 +5626,7 @@ impl SyscallDispatcher {
                             bus_fault: None,
                             write_sealed_shared: false,
                             read_only_shared_file: false,
+                            secretmem: false,
                             writable_memfd: None,
                             shared_file_alias: None,
                         }));
@@ -5850,6 +5917,35 @@ impl SyscallDispatcher {
 
         fn sys_membarrier(this, cx, command: u64, flags: u64) {
             Ok(this.membarrier(command, flags))
+        }
+
+        fn userfaultfd(this, cx, _flags: u64) {
+            // Container POLICY, not kernel emulation. The differential oracle
+            // (native arm64 Docker) denies userfaultfd(2) in its default
+            // seccomp profile unless the caller holds CAP_SYS_PTRACE, and the
+            // deny fires on the syscall NUMBER alone — before flag validation,
+            // so UFFD_USER_MODE_ONLY and even invalid flag bits all yield
+            // EPERM (uffdpolicy probe; LTP userfaultfd01/02/06 TCONF with
+            // "userfaultfd() requires CAP_SYS_PTRACE ... EPERM"). Carrick's
+            // guest runs with the same Docker-default capability set, which
+            // lacks CAP_SYS_PTRACE → EPERM.
+            //
+            // WITH the capability the call would reach the kernel, and
+            // carrick's kernel does not implement userfaultfd — exactly what
+            // the synthetic /proc/config.gz declares ("# CONFIG_USERFAULTFD
+            // is not set", the same answer the oracle's LinuxKit kernel
+            // gives) — so that path is an honest ENOSYS, not a fake fd.
+            let _ = &this;
+            // Per-TASK capability check (`has_effective_capability`), never a
+            // process-global one: the carrier hosts many Linux tasks, and a
+            // post-setuid task holds nothing at all.
+            if !super::creds::has_effective_capability(
+                cx.kernel,
+                crate::namespace::process::CAP_SYS_PTRACE,
+            ) {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
+            Ok(DispatchOutcome::errno(LINUX_ENOSYS))
         }
 
         // io_uring (WS-H4-B1). setup allocates the rings in the guest arena and

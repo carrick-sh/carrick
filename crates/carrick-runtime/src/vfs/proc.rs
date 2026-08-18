@@ -3619,6 +3619,7 @@ CONFIG_CGROUPS=y\n\
 CONFIG_PROC_FS=y\n\
 CONFIG_SYSFS=y\n\
 CONFIG_TMPFS=y\n\
+CONFIG_SECRETMEM=y\n\
 CONFIG_OVERLAY_FS=y\n\
 CONFIG_UNIX=y\n\
 CONFIG_INET=y\n\
@@ -3630,7 +3631,8 @@ CONFIG_IPC_NS=y\n\
 CONFIG_PID_NS=y\n\
 CONFIG_NET_NS=y\n\
 CONFIG_TIME_NS=y\n\
-CONFIG_USER_NS=y\n"
+CONFIG_USER_NS=y\n\
+# CONFIG_USERFAULTFD is not set\n"
             );
             let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
             let _ = enc.write_all(body.as_bytes());
