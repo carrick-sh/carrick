@@ -1763,6 +1763,14 @@ impl SyscallDispatcher {
             if crate::vfs::proc::synthetic_dir_entries(&path, &proc_ctx).is_some() {
                 return Ok(StatRecord::synthetic(&path, 0, LINUX_S_IFDIR | 0o555));
             }
+            // A peer's ns magic symlink, for the same reason.
+            if let Some(size) = crate::vfs::proc::proc_ns_link_size_with_context(&path, &proc_ctx) {
+                return Ok(StatRecord::synthetic(
+                    &path,
+                    size as usize,
+                    LINUX_S_IFLNK | 0o777,
+                ));
+            }
         }
         if let Some(contents) = crate::vfs::sys::synthetic_file(&path) {
             return Ok(StatRecord::synthetic(
@@ -2194,7 +2202,22 @@ impl SyscallDispatcher {
         // not read(2) by the ioctl_ns tests); its recorded `path` is what the
         // NS_GET_* ioctl handler keys on. O_RDONLY|O_CLOEXEC are covered by
         // install_proc_synthetic_bytes / OpenDescriptionBase.
-        if proc_ns_link(&path).is_some() {
+        // The context-free recogniser resolves the pid through the HOST process
+        // table, which under HVPatch describes the carrier — so a live PEER's
+        // `/proc/<pid>/ns/<type>` looked absent (LTP `setns01` TCONFs at
+        // `setns01.c:153` for exactly this). Fall back to the kernel task graph,
+        // but only for paths that actually look like ns links: building the
+        // synthetic proc context snapshots the address space and is far too
+        // expensive to pay on every open.
+        if proc_ns_link(&path).is_some()
+            || (path.starts_with("/proc/")
+                && path.contains("/ns/")
+                && crate::vfs::proc::proc_ns_link_type_with_context(
+                    &path,
+                    &self.synthetic_proc_context(context),
+                )
+                .is_some())
+        {
             return Ok(self.install_proc_synthetic_bytes(&path, Vec::new(), flags));
         }
 
@@ -12758,7 +12781,21 @@ impl SyscallDispatcher {
                 this.resolve_at_path(dirfd, &path)?
             };
 
-            let target = if let Some(kind) = proc_self_magic_link(&path) {
+            // A PEER's `/proc/<pid>/ns/<type>`: the context-free resolver in the
+            // Vfs asks the host process table, which cannot see a Linux process
+            // that is a thread of this carrier. Guarded on the path shape
+            // because assembling the proc context is expensive.
+            let peer_ns_target = (path.starts_with("/proc/") && path.contains("/ns/"))
+                .then(|| {
+                    crate::vfs::proc::proc_ns_link_target_with_context(
+                        &path,
+                        &this.synthetic_proc_context(cx.kernel),
+                    )
+                })
+                .flatten();
+            let target = if let Some(t) = peer_ns_target {
+                t
+            } else if let Some(kind) = proc_self_magic_link(&path) {
                 match kind {
                     // /proc/self/exe is the REAL running binary. If the entrypoint
                     // was a symlink (e.g. /usr/bin/readlink -> /bin/busybox), resolve
