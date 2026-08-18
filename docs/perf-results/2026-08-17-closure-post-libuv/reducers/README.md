@@ -528,8 +528,45 @@ analysed entirely within itself: establish which mapping the crash VA belongs
 to IN THAT RUN (FORKDBG prints the covering mapping), then read the
 LEDGER/FREE/GRANT/scrub events for those exact ranges in that same log.
 
+### RESOLVED (mechanism): a cross-process scrub through an unscoped VA fallback
+
+Adding PROCESS IDENTITY to every hook dissolved the "double allocation"
+entirely: the interleaved grants belong to FIVE different guest processes
+(pids 2, 5, 6, 7, 9) legitimately reusing the same NUMERIC arena VAs in their
+own address spaces. Every grant, munmap, free-list insert and scrub is
+per-process correct. The corruption is that **pid 9's scrub of its own fresh
+1 MiB grant zeroes pid 6's (the forkserver server's) physical frame**.
+
+The guilty resolution chain, in `zero_guest_backing`'s fallback:
+
+- `mapping_for_range` (trap.rs) resolves a VA in three branches. The stage-1
+  IPA-keyed branches authenticate through the caller's own translation; the
+  VA-keyed alias fallback filters by `alias_matches_process_scope`; but the
+  bare `self.mappings` VA fallback — `mapping.contains_range(address, length)
+  && region_is_live(mapping)` — has NO scope or stage-1 authentication.
+- A fork child's engine state inherits the parent's mapping rows, several as
+  `ForkMappingHost::Borrowed(parent_host_addr)`. For the scrub's chunks the
+  caller's stage-1 is INVALID by construction (a reused range is scrubbed
+  before its stage-1 is re-validated), so `stage1_ipa` is None and resolution
+  falls through to exactly that unscoped fallback — matching a stale inherited
+  row for the numerically-identical VA and handing back the ANCESTOR'S host
+  pointer. `write_bytes(…, 0, …)` then zeroes another process's memory.
+
+This is the identity/scope-domains class, fourth instance this campaign, and
+the precise shape AGENTS.md's HVPatch memory rule warns about: "never feed one
+domain back into a lookup for another: authenticate through the live stage-1
+translation and the exact current owner generation."
+
+Fix directions (next cycle, red-first against the 2.5 s pair):
+1. A write-capable resolution (`zero_guest_backing`, and any other
+   write-through-host path) must NEVER use the unscoped VA fallback — no
+   stage-1-authenticated output means no write target, period.
+2. Audit why inherited borrowed rows survive in the child engine post-exec
+   (the root-exec transaction was supposed to rebuild this state), and purge
+   them.
+
 Raw logs preserved in the scratchpad (`fd*.err`, `gd*.err`, `ld.err`,
-`fr.err`); the proving core at `/tmp/core`.
+`fr.err`, `id.err` — the pid-tagged run); the proving core at `/tmp/core`.
 
 ### Why this cluster is worth the next cycle
 

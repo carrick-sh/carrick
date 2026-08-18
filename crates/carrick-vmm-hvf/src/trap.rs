@@ -9374,7 +9374,8 @@ impl HvfVmState {
             && debug_va < address.saturating_add(length as u64)
         {
             eprintln!(
-                "[FORKDBG] zero_guest_backing va={address:#x} len={length:#x}\n{}",
+                "[FORKDBG pid={:?}] zero_guest_backing va={address:#x} len={length:#x}\n{}",
+                self.cow_identity.map(|identity| identity.linux_pid),
                 std::backtrace::Backtrace::force_capture(),
             );
         }
