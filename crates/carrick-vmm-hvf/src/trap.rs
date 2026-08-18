@@ -6739,6 +6739,14 @@ impl HvfVmState {
     /// armed-set is a derived, known-omissive approximation
     /// (`mtforkcorrupt`).
     fn retained_output_lacks_exclusive_claim(&self, ipa: u64) -> bool {
+        // Only REUSABLE global-frame IPAs carry claims at all. Boot and
+        // identity regions (the heap, the low arena's fixed backing, page
+        // tables) are per-mm by construction and never enter the extent map;
+        // treating their absence as a lost claim routed every brk-heap scrub
+        // into materialization and broke `ltp-brk02`/`ltp-tgkill01` outright.
+        if !is_reusable_global_frame_extent(ipa, 1) {
+            return false;
+        }
         let inventory = self.frame_inventory.lock();
         let extent = inventory
             .extents
@@ -9530,13 +9538,36 @@ impl HvfVmState {
             // this mm's own backing.
             let live_ipa = self.translate_va(chunk_va);
             let ipa = live_ipa.or(retained_ipa);
-            let target = ipa.and_then(|ipa| {
-                self.mapping_for_live_ipa_range(chunk_va, ipa, chunk_len)
-                    .and_then(|mapping| {
-                        let offset = usize::try_from(ipa.checked_sub(mapping.ipa)?).ok()?;
-                        Some(unsafe { mapping.host_addr.add(offset) })
-                    })
-            });
+            let target = ipa
+                .and_then(|ipa| {
+                    self.mapping_for_live_ipa_range(chunk_va, ipa, chunk_len)
+                        .and_then(|mapping| {
+                            let offset = usize::try_from(ipa.checked_sub(mapping.ipa)?).ok()?;
+                            Some(unsafe { mapping.host_addr.add(offset) })
+                        })
+                })
+                .or_else(|| {
+                    // VA fallback, restricted to NON-reusable backing. Boot and
+                    // identity regions (the brk heap above all) are per-mm by
+                    // construction and sometimes reachable only by VA here;
+                    // skipping them left stale bytes where `ltp-brk02` demands
+                    // zeros. Reusable global-frame results stay excluded — a
+                    // VA-only join over carrier-inherited rows is exactly the
+                    // cross-process write this function must never make.
+                    self.mapping_for_range_mut(chunk_va, chunk_len)
+                        .and_then(|mapping| {
+                            // The view carries only the semantic IPA; that is
+                            // sufficient here — reusable-frame mappings' semantic
+                            // IPAs live inside the global-frame arena, identity
+                            // and boot mappings' do not.
+                            if is_reusable_global_frame_extent(mapping.ipa, 1) {
+                                return None;
+                            }
+                            let offset =
+                                usize::try_from(chunk_va.checked_sub(mapping.start)?).ok()?;
+                            Some(unsafe { mapping.host_addr.add(offset) })
+                        })
+                });
             if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
                 .ok()
                 .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
