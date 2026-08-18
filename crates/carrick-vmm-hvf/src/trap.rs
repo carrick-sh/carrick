@@ -11396,6 +11396,79 @@ impl HvfVmState {
                     .and_then(ThreadMappingDesc::from_alias)
             })
             .collect();
+        // Fork-union audit: `CARRICK_FORK_DEBUG_VA=<hex guest VA>` reports every
+        // LOCAL mapping row covering that VA and whether the alias index kept
+        // it. The `[FORKDBG] mapping` block further down only prints rows that
+        // already SURVIVED this filter, so a row dropped here — the child then
+        // inherits a writable stage-1 leaf onto the parent's frame with nothing
+        // arming COW — was previously invisible.
+        if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
+            .ok()
+            .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+        {
+            let window_lo = debug_va.saturating_sub(0x20_0000);
+            let window_hi = debug_va.saturating_add(0x20_0000);
+            for alias in aliases.iter().filter(|alias| {
+                alias.start < window_hi && alias.start.saturating_add(alias.size as u64) > window_lo
+            }) {
+                eprintln!(
+                    "[UNIONDBG pid={:?}] alias [{:#x}+{:#x}) ipa={:#x} host={:#x} \
+                     phys=({:#x}+{:#x}) scope={:?} in_scope={} sharing={:?} writable={} \
+                     covers_va={}",
+                    self.cow_identity.map(|identity| identity.linux_pid),
+                    alias.start,
+                    alias.size,
+                    alias.ipa,
+                    alias.host_addr,
+                    alias.physical_ipa,
+                    alias.physical_size,
+                    alias.ownership_scope,
+                    alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot),
+                    alias.sharing,
+                    alias.guest_writable,
+                    alias.start <= debug_va
+                        && debug_va < alias.start.saturating_add(alias.size as u64),
+                );
+            }
+            for mapping in self
+                .mappings
+                .iter()
+                .filter(|mapping| mapping.start < window_hi && mapping.end > window_lo)
+            {
+                let kept = mapping_is_current_for_process_fork_indexed(mapping, &alias_index);
+                eprintln!(
+                    "[UNIONDBG pid={:?}] local row [{:#x},{:#x}) ipa={:#x} host={:p} \
+                     size={:#x} sem={:#x} dyn={} sharing={:?} guest_writable={} kept={} \
+                     covers_va={}",
+                    self.cow_identity.map(|identity| identity.linux_pid),
+                    mapping.start,
+                    mapping.end,
+                    mapping.ipa,
+                    mapping.host_addr,
+                    mapping.size,
+                    semantic_extent_size(mapping.start, mapping.end),
+                    mapping.is_dynamic_alias,
+                    mapping.sharing,
+                    mapping.guest_writable,
+                    kept,
+                    mapping.start <= debug_va && debug_va < mapping.end,
+                );
+            }
+            let armed = self.fork_cow_ranges();
+            let covering: Vec<_> = armed
+                .iter()
+                .filter(|range| {
+                    range.va <= debug_va && debug_va < range.va.saturating_add(range.len as u64)
+                })
+                .map(|range| (range.va, range.len))
+                .collect();
+            eprintln!(
+                "[UNIONDBG pid={:?}] fork_cow_ranges covering {debug_va:#x}: {covering:x?} \
+                 (total {} ranges)",
+                self.cow_identity.map(|identity| identity.linux_pid),
+                armed.len(),
+            );
+        }
         let local_regions = source_mappings.len() as u64;
         // A structural boot mapping can physically contain a narrower semantic
         // alias at the same IPA (the private-overlay aperture is the canonical

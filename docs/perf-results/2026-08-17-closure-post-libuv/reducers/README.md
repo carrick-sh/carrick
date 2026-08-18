@@ -641,3 +641,119 @@ Verified on the signed binary:
 Remaining, now ISOLATED and deterministic: `WithProcessesTestPicklingConnections
 .test_pickling` fails standalone under carrick (recv EOF), passes under Docker —
 an fd-passing (SCM_RIGHTS pickled-connection) gap, nothing to do with memory.
+
+
+## `cpython-fork-shutdown-parent-segv.py` — the fork union DROPS a live row
+
+The `cpython-threading` gating regression (191/193 against a blessed 193/193)
+is a SECOND, independent instance of "the child's writes land in the parent's
+heap", and it is NOT the exclusive-claim case fixed above. Reducer beside this
+file; it is 100% deterministic (iteration 0 passes, every later one fails)
+while Docker is 8/8 clean.
+
+**It is not a regression inside HVPatch.** The blessed baseline predates the
+backend: `45e5d1984` (2026-08-15) retired the legacy 1:1 VMM/native backends,
+and a bisect good-point at 2026-08-02 was measuring the NATIVE/DSR lane (it
+fails with `DSR could not read guest instruction`, not the payload). Do not
+read "regression against bless" here as "someone broke it recently".
+
+### What is actually corrupt (proven from two cores, not inferred)
+
+Take a core of the forking PARENT at `os.abort()` immediately after `waitpid`,
+in two configurations that differ ONLY in what the child does — `os._exit(0)`
+(parent survives) versus a full interpreter shutdown (parent later SIGSEGVs).
+Pin `PYTHONHASHSEED=0` and drop `-I`, or hash randomisation makes the two cores
+differ in ~260 KB of ordinary allocator noise and hides the signal (that cost a
+round).
+
+A symbol-free audit of CPython's GC doubly-linked lists — for every 16-byte
+aligned pair that looks like a `PyGC_Head`, confirm the forward edge
+`next(n)->prev == n` and then check `prev(n)->next == n` — separates them
+cleanly:
+
+| core | confirmed list edges | broken nodes |
+|---|---|---|
+| child `_exit` (healthy) | 11,747 | 1 (benign, present in both) |
+| child full shutdown | 11,675 | **25** |
+
+**24 of the 25 broken nodes have their `prev` inside ONE 16 KiB granule**
+(`0x6000ca8000`), and the crash's own object sits in it. Inside that granule
+the first word of live objects has been replaced by a pymalloc free-list link
+while the `ob_type` word beside it is untouched — i.e. the granule holds blocks
+that were FREED by the child, in a parent that still considers them live. The
+guest then faults in `_PyObject_GC_UNTRACK` on `str x3,[x2]` with
+`_gc_prev == 0` (`esr=0x92000047`, `far=0x0`, `insn=0xf9000043`).
+
+Note the granule is NOT zeroed — the previous hunt's signature. Scanning for
+blanked granules finds nothing here, which is why the GC-list invariant audit,
+not a zero census, is the instrument for this one.
+
+### ROOT CAUSE: `mapping_is_current_for_process_fork_indexed` fails OPEN
+
+Extend the fork hooks with a union audit (`[UNIONDBG]`, gated on the existing
+`CARRICK_FORK_DEBUG_VA`) that prints every LOCAL `self.mappings` row near the
+debug VA together with the alias-registry rows and the resulting
+`fork_cow_ranges`. The existing `[FORKDBG] mapping` block only prints rows that
+already SURVIVED the union filter, so the drop was structurally invisible.
+
+At the fork, for the corrupted VA:
+
+```
+[UNIONDBG pid=Some(5)] local row [0x6000c7d000,0x6000cae000) ipa=0x9d1567d000
+    host=0x10da7d000 size=0x31000 sem=0x31000 dyn=true sharing=Private
+    guest_writable=true kept=false covers_va=true
+[UNIONDBG pid=Some(5)] fork_cow_ranges covering 0x6000ca8120: [] (total 28 ranges)
+```
+
+A live, private, **guest-writable** row covering the granule is `kept=false`,
+and nothing in `fork_cow_ranges` covers it. Neither mm is armed read-only, the
+child's cloned stage-1 keeps a WRITABLE leaf onto the parent's frame, no COW
+fault ever happens, and the child's ordinary stores go into the parent.
+
+Why the row is rejected: `mapping_is_current_for_process_fork_indexed` requires
+an EXACT `(start, ipa, host_addr, semantic_size)` match in the process alias
+index. A partial `munmap` SPLITS the registry entry
+(`unregister_alias_entries`, `trap.rs:1309`) but does NOT split the engine's
+local row — `unregister_process_alias` only drops a local row when the WHOLE
+stage-2 lease retires (`trap.rs:10065`). The registry in this run holds only
+`[0x6000c80000+0x21000)` (a `.so` segment) where the row spans `0x31000`.
+
+The workload shape that produces it is the dynamic loader's
+reserve-then-trim: `mmap(0x31000)` → map the `_opcode` segments over part of it
+→ `munmap` the 0xd000 tail. The arena allocator then LOWERS `mmap_next` back
+over that tail (`[BUMPDBG] mmap_next lowered 0x6000cae000 -> 0x6000ca1000`) and
+the next 1 MiB pymalloc arena reuses it — served by the stale row, with no
+fresh alias publication, so fork cannot see it.
+
+This is the identity/scope-domains class again: two records of one fact (the
+engine row and the alias publication) drifting, with a LIVENESS question
+answered by an IDENTITY test.
+
+### Two fix attempts that did NOT work (do not repeat)
+
+1. **Keep the row if `translate_va(mapping.start)` lands in its physical
+   extent.** No effect: the row's FIRST page is itself unmapped (the registry
+   fragment starts 0x3000 in), so the test says "dead" for a row that is very
+   much alive in the middle.
+2. **Arm the per-granule live sub-ranges of a rejected row.** This does stop
+   the silent corruption, but replaces it with a hard failure —
+   `HVPatch COW VA 0x6000ca4000 IPA 0x9c0caa4000 has no matching 16 KiB
+   physical backing` — because `physical_cow_source` resolves the COW source
+   through the alias registry, and the whole point is that there is no
+   publication for that VA. Arming without republishing is not a fix.
+
+So the fix has to restore the invariant, not patch the consumer: either trim /
+split the engine's local rows in step with `unregister_alias_entries`, or make
+an arena reuse that lands inside a stale row materialize and PUBLISH fresh
+backing instead of silently inheriting the row's. Only the diagnostic is
+landed here.
+
+### `cpython-importlib` is the same SIGNATURE but not (yet) the same bug
+
+`cpython-importlib` also dies with a NULL where a live pointer belongs —
+`_PyEval_EvalFrameDefault+0x7a4`, `ldr x0,[x24]; ldr x1,[x0]`, `x0=0`,
+`esr=0x92000007`, `last_syscall=98` (futex) — but in a MULTI-THREADED lock
+test (`test_importlib/test_locks.py`) with no fork in the picture, and only in
+the full suite (`python3 -m unittest test.test_importlib.test_locks` alone is
+28/28 OK). Treat it as the same class, not the same root cause, until a fork or
+a dropped row is actually shown in its capture.
