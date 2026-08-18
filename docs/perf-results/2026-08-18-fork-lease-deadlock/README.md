@@ -157,6 +157,23 @@ Reclaim still matters above the ceiling: guests do exceed it (CPython
 `test_queue.test_many_threads` spawns 100 threads). This raises the bound, it
 does not remove it.
 
+### What the raised budget did to the rest of the cluster
+
+Re-measured serially on a quiet host, same signed artifact:
+
+| suite | baseline | after |
+|---|---|---|
+| `go-os_exec` | `none`, 30 assertions | **86/86, matches the oracle exactly** |
+| `cpython-threading` | 300 s timeout, 141 of 193 | **26 s, `Result: SUCCESS`, 208 tests** |
+| `cpython-multiprocessing_fork` | 600 s timeout, 69 of 317 | still times out (620 s) |
+| `cpython-multiprocessing_forkserver` | 600 s timeout, 140 of 323 | still times out (621 s) |
+
+So the admission bound was the whole story for `os_exec` and `threading`, and
+is NOT the story for the multiprocessing pair: those now stall at
+`WithProcessesTestPoolWorkerLifetime.test_pool_worker_lifetime` after 86 tests,
+which is a Pool worker-recycle wait, not an admission starve. They keep their
+own root cause and their own entry in the queue below.
+
 ### Still not closed
 
 - `os_exec` hit a second, unrelated intermittent hang at
@@ -170,10 +187,10 @@ does not remove it.
 
 ## Open, ranked
 
-1. Re-measure `cpython-multiprocessing_fork` / `forkserver` (600 s timeouts),
-   `cpython-threading` and `cpython-asyncio` against the raised budget — they
-   share the admission mechanism that `go-os_exec` was starving on, and are
-   2,455 diverging rows between them.
+1. `cpython-multiprocessing_fork` / `forkserver` (526 rows): NOT admission.
+   Both now stall at `test_pool_worker_lifetime`, a Pool worker-recycle wait.
+   Reduce that test directly. `cpython-asyncio` (1,872 rows) is still to be
+   re-measured against the raised budget.
 2. `TestWaitInterrupt/SIGQUIT` and `TestSOCKS5Proxy`, the two intermittent
    hangs now visible underneath the admission bug.
 3. Per-process vCPU budget is a per-process view of a host-global resource:
