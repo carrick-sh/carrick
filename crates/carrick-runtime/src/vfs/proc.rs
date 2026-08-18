@@ -2256,7 +2256,28 @@ impl Vfs for ProcVfs {
                 mtime_nanos: 0,
             });
         }
-        if synthetic_file(path, &SyntheticProcContext::default()).is_some() {
+        // Context-free existence only for files whose existence is
+        // context-free. A NUMERIC-pid per-process file (oom_score_adj and its
+        // family) exists iff that pid names a LIVE process, which this
+        // default-context probe cannot know: its empty oom map trips the
+        // single-process fallback and fabricates the file for ANY digits —
+        // `access("/proc/<reaped-pid>/oom_score_adj", F_OK)` answered true
+        // (probe `oomscoreadj`, `dead_pid_file_absent=false`) while the
+        // ctx-aware open of the same path correctly ENOENTed. Liveness-scoped
+        // paths are answered ONLY by the dispatcher-side ctx-aware pass
+        // (`synthetic_access`/`is_synthetic_virtual_file`), which runs before
+        // this mount lookup; reaching HERE with such a path means that pass
+        // already said "no live process".
+        let liveness_scoped = proc_tunable_name(path).is_some_and(|(_, pid)| pid.is_some())
+            || path
+                .strip_prefix("/proc/")
+                .and_then(|rest| rest.split_once('/'))
+                .is_some_and(|(pid, rest)| {
+                    !pid.is_empty()
+                        && pid.bytes().all(|b| b.is_ascii_digit())
+                        && matches!(rest, "oom_score" | "oom_adj" | "oom_score_adj")
+                });
+        if !liveness_scoped && synthetic_file(path, &SyntheticProcContext::default()).is_some() {
             return Ok(Metadata {
                 kind: EntryKind::File,
                 mode: 0o444,

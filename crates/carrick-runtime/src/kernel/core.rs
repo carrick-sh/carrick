@@ -1114,10 +1114,16 @@ impl Registry {
     /// lookup because the synthetic-`/proc` context is assembled before the
     /// requested pid is known; the live-task count is small.
     pub(crate) fn oom_score_adj_by_pid(&self) -> BTreeMap<u32, i32> {
+        // LIVE tasks only. The `/proc` renderer's contract is "a pid absent
+        // from this map has no live process behind it" — that absence is what
+        // makes `/proc/<dead-pid>/oom_score_adj` ENOENT. Including a lingering
+        // zombie/dead record fabricated the file for a reaped pid (probe
+        // `oomscoreadj`, `dead_pid_file_absent=false`).
         self.state
             .read()
             .tasks
             .iter()
+            .filter(|(_, record)| record.task.lifecycle() == TaskLifecycle::Live)
             .map(|(id, record)| (id.raw() as u32, record.task.oom_score_adj()))
             .collect()
     }
