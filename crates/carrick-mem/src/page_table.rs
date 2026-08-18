@@ -418,6 +418,24 @@ impl PageTableManager {
         self.multi_vcpu = multi;
     }
 
+    /// Declare this image an OFFLINE PRIVATE copy: sole owner, no hardware
+    /// walker can reach it, so freeing a spare sub-table for reuse cannot race
+    /// a stale cached walk.
+    ///
+    /// `clone()` copies `stage1_exclusive` because the field describes the
+    /// EDITOR, and for a live manager the editor is the calling vCPU thread. An
+    /// offline fork copy has no such editor — the inherited value describes the
+    /// PARENT's last mapping syscall, which says nothing about this image. Left
+    /// inherited it reads `false` whenever the parent's last stage-1 edit was
+    /// not an exclusive one, and `alloc_table`'s last-resort sweep is then
+    /// refused while the child is publishing its own mappings: `cpython`
+    /// `concurrent_futures` reached `OutOfTables` at `in_use=438 free=0
+    /// capacity=440 exclusive=false reclaim_pending=true` — a pool with
+    /// reclaimable tables and no permission to reclaim them.
+    pub fn declare_offline_private_image(&mut self) {
+        self.stage1_exclusive = true;
+    }
+
     /// True iff `pa` is a runtime-allocated spare sub-table (never a boot table
     /// — the boot L0/L1/L2/L3 hold the null guard and kernel hole and must
     /// never be coalesced/freed).
@@ -546,6 +564,16 @@ impl PageTableManager {
         let free = self.free_tables.len() as u64;
         let capacity = (self.bytes.len() as u64 - SPARE_START_OFFSET) / PT_PAGE;
         ((bumped - free) as u32, free as u32, capacity as u32)
+    }
+
+    /// The three policy bits that decide whether an exhausted pool can recover:
+    /// `(multi_vcpu, stage1_exclusive, reclaim_pending)`. `alloc_table`'s
+    /// last-resort sweep runs only with `stage1_exclusive && reclaim_pending`,
+    /// so an `OutOfTables` carrying `stage1_exclusive=false` was refused the
+    /// sweep rather than genuinely out of reclaimable tables.
+    #[must_use]
+    pub fn coalesce_policy(&self) -> (bool, bool, bool) {
+        (self.multi_vcpu, self.stage1_exclusive, self.reclaim_pending)
     }
 
     /// Read-only descriptor walk for `va`, for `carrick trace` diagnostics:
@@ -2389,6 +2417,77 @@ mod tests {
         mgr.set_prot_none(other, 1 << 21)
             .expect("tear the block down");
         assert!(mgr.reclaim_all_invalid_tables(), "new teardown re-arms");
+    }
+
+    /// A fork copy inherits `stage1_exclusive` verbatim, but the field
+    /// describes the EDITOR and an offline copy has none — the inherited value
+    /// is the PARENT's last mapping syscall. When that syscall was not an
+    /// exclusive edit, the copy carries `false`, `alloc_table`'s last-resort
+    /// sweep is refused, and the child's own mapping publication dies
+    /// `OutOfTables` with reclaimable tables still in the graph. Observed live
+    /// as `cpython-concurrent_futures` failing
+    /// `map hvpatch child VA 0x2d00020000 ... OutOfTables (in_use=438 free=0
+    /// capacity=440 multi_vcpu=true exclusive=false reclaim_pending=true)`.
+    #[test]
+    fn offline_fork_copy_sweeps_where_the_inherited_marker_refused() {
+        let mut parent = manager();
+        // A busy guest: eager coalescing correctly declined...
+        parent.set_multi_vcpu(true);
+        // ...and the parent's last stage-1 edit was not an exclusive one.
+        parent.set_stage1_exclusive(false);
+
+        // Churn the pool the way CPython's SemLock/Pool map+unmap cycles do:
+        // split each 2 MiB block to 4 KiB granularity, then tear the whole
+        // block down so its L3 is left ALL-INVALID. Nothing is reclaimed, so
+        // the bump cursor walks to the end of the pool. Every block stays
+        // inside the first 1 GiB, so only one L1->L2 split happens.
+        let mut block = LINUX_MMAP_BASE;
+        let mut exhausted = false;
+        for _ in 0..1024 {
+            match parent.set_prot_none(block, 0x1000) {
+                Ok(_) => {}
+                Err(PageTableError::OutOfTables) => {
+                    exhausted = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected split failure: {other:?}"),
+            }
+            parent
+                .set_prot_none(block, 1 << 21)
+                .expect("tear the block down");
+            block += 1 << 21;
+        }
+        assert!(exhausted, "the churn must exhaust the spare pool");
+        let (in_use, free, capacity) = parent.pool_stats();
+        assert_eq!(free, 0, "a refused sweep reclaims nothing");
+        assert_eq!(in_use, capacity, "the pool is at its limit");
+        assert_eq!(
+            parent.coalesce_policy(),
+            (true, false, true),
+            "and it is refused with a teardown still pending"
+        );
+
+        // `alloc_table` failed before writing anything, so both copies below
+        // start from the same intact graph.
+        let mut inherited = parent.clone();
+        assert_eq!(
+            inherited.set_prot_none(block, 0x1000),
+            Err(PageTableError::OutOfTables),
+            "the inherited marker keeps refusing the sweep"
+        );
+
+        let mut offline = parent.clone();
+        offline.declare_offline_private_image();
+        assert_eq!(
+            offline.set_prot_none(block, 0x1000),
+            Ok(true),
+            "an offline private copy may sweep and recover the pool"
+        );
+        assert_eq!(
+            offline.pool_stats().2,
+            capacity,
+            "recovery reuses the pool, it does not grow it"
+        );
     }
 
     #[test]
