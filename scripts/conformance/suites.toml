@@ -16820,6 +16820,7 @@ tier = "full"
 weight = "light"
 timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
 name = "ltp-perf_event_open02"
@@ -16831,6 +16832,7 @@ tier = "full"
 weight = "light"
 timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
 name = "ltp-perf_event_open03"
@@ -16842,6 +16844,7 @@ tier = "full"
 weight = "light"
 timeout_s = 40
 carrick_flags = ["--raw", "--fs", "host"]
+docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
 name = "ltp-personality01"
