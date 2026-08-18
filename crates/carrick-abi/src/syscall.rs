@@ -108,9 +108,11 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         | 276
         | 285
         | 291
+        | 428..=433
         | 436
         | 437
         | 439
+        | 442
         | 452 => SyscallHandler::Filesystem,
         19..=22 | 72 | 73 | 198..=212 | 242 | 243 | 269 => SyscallHandler::Network,
         85..=87 | 101..=103 | 112..=115 | 153 | 165 | 169..=171 | 179 | 261 | 266 => {
