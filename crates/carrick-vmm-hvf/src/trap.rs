@@ -849,6 +849,20 @@ fn register_global_frame_host_owner(
             mapping.len()
         )));
     }
+    if let Some(debug_ipa) = std::env::var("CARRICK_FORK_DEBUG_IPA")
+        .ok()
+        .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+        && key.0 <= debug_ipa
+        && debug_ipa < key.0.saturating_add(key.1)
+    {
+        eprintln!(
+            "[FORKDBG] register_global_frame_host_owner ipa={:#x} len={:#x} host={:p}\n{}",
+            key.0,
+            key.1,
+            mapping.as_ptr(),
+            std::backtrace::Backtrace::force_capture(),
+        );
+    }
     let mut owners = global_frame_host_owners().lock();
     if owners.contains_key(&key) {
         return Err(TrapError::Hypervisor(format!(
@@ -869,6 +883,22 @@ fn register_global_frame_host_owner(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn retire_global_frame_host_owner(ipa: u64, length: u64) -> bool {
+    // Lifecycle debug: CARRICK_FORK_DEBUG_IPA=<hex> logs every owner
+    // retirement overlapping that IPA, with the caller. Retiring an owner
+    // drops its OwnedHostMapping — macOS can recycle the host VA immediately —
+    // so a retire while a live process still references the frame is the
+    // scrubbed-shared-granule bug's trigger shape.
+    if let Some(debug_ipa) = std::env::var("CARRICK_FORK_DEBUG_IPA")
+        .ok()
+        .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+        && ipa <= debug_ipa
+        && debug_ipa < ipa.saturating_add(length)
+    {
+        eprintln!(
+            "[FORKDBG] retire_global_frame_host_owner ipa={ipa:#x} len={length:#x}\n{}",
+            std::backtrace::Backtrace::force_capture(),
+        );
+    }
     let owner = global_frame_host_owners().lock().remove(&(ipa, length));
     let retired = owner.is_some();
     drop(owner);
@@ -11164,6 +11194,87 @@ impl HvfVmState {
                     | ForkMappingDisposition::SharedFrameReadOnly
             ) {
                 let inherited = inherited_fork_inventory_extents(mapping, &parent_inventory);
+                // Fork lineage debug: CARRICK_FORK_DEBUG_VA=<hex guest VA>
+                // prints, for the mapping covering that VA, every inherited
+                // extent and — crucially — a mapping DROPPED for having none.
+                // Added while hunting a deterministic zeroed 16 KiB granule in
+                // a forkserver worker; the drop below is silent by design and
+                // was otherwise unobservable.
+                if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
+                    .ok()
+                    .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+                    && mapping.start <= debug_va
+                    && debug_va < mapping.end
+                {
+                    eprintln!(
+                        "[FORKDBG] mapping [{:#x},{:#x}) ipa={:#x} phys_ipa={:#x} size={:#x} \
+                         sharing={:?} dyn={} extents={}",
+                        mapping.start,
+                        mapping.end,
+                        mapping.ipa,
+                        mapping.physical_ipa,
+                        mapping.size,
+                        mapping.sharing,
+                        mapping.is_dynamic_alias,
+                        inherited.len(),
+                    );
+                    for ((gpa, length), extent) in &inherited {
+                        eprintln!(
+                            "[FORKDBG]   extent gpa={gpa:#x}+{length:#x} mapping={:?} frame={:?} \
+                             backing={:?} lease=({:#x},{:#x})",
+                            extent.mapping,
+                            extent.frame,
+                            extent.backing,
+                            extent.stage2_base,
+                            extent.stage2_length,
+                        );
+                    }
+                    if inherited.is_empty() {
+                        eprintln!(
+                            "[FORKDBG]   DROPPED: no inventory extents; child will have NO backing here"
+                        );
+                    }
+                    // Peek the PARENT frame's bytes for the debug granule: if
+                    // they are already zero here, the parent reads its data
+                    // through some OTHER backing than the frame the child will
+                    // inherit — the divergence predates the fork.
+                    let frame_offset =
+                        (debug_va - mapping.start) + (mapping.ipa - mapping.physical_ipa);
+                    let peek = mapping
+                        .physical_host_addr
+                        .wrapping_add(frame_offset as usize);
+                    // SAFETY: debug-only read inside the mapping's live host
+                    // backing, bounds-checked against physical_size just below.
+                    if (frame_offset as usize) + 16 <= mapping.physical_size {
+                        let bytes = unsafe { std::slice::from_raw_parts(peek.cast_const(), 16) };
+                        eprintln!(
+                            "[FORKDBG]   parent frame bytes @host+{frame_offset:#x}: {bytes:02x?}"
+                        );
+                    }
+                    // The decisive comparison: where does the PARENT's live
+                    // stage-1 actually point for this VA, versus where the
+                    // inventory says the frame is? A mismatch proves the
+                    // divergence the child will inherit.
+                    let expected_ipa = mapping.physical_ipa + frame_offset;
+                    let walk = self
+                        .page_tables
+                        .lock()
+                        .as_ref()
+                        .map(|manager| manager.debug_walk(debug_va));
+                    if let Some(w) = walk {
+                        let leaf_pa = w[3] & 0x0000_FFFF_FFFF_F000;
+                        eprintln!(
+                            "[FORKDBG]   parent stage-1 leaf for {debug_va:#x}: {:#x} -> pa {leaf_pa:#x} \
+                             (inventory expects {expected_ipa:#x}) {}",
+                            w[3],
+                            if leaf_pa == expected_ipa & !0xfff {
+                                "AGREES"
+                            } else {
+                                "DIVERGED"
+                            },
+                        );
+                    }
+                }
                 // A coarse per-vCPU host-owner row may outlive its exact
                 // per-mm mapping coverage after every compound in that stage-2
                 // lease was repointed. It is no longer a fork source.
