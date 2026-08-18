@@ -5375,6 +5375,20 @@ impl SyscallDispatcher {
             if family == LINUX_AF_NETLINK {
                 return Ok(this.netlink_socket(type_, protocol));
             }
+            // A packet-crafting socket needs CAP_NET_RAW (socket(2),
+            // capabilities(7)). Docker's default set grants it, so container
+            // root keeps working; a guest that has setuid'd away from root
+            // has lost every capability and must get EPERM — LTP socket01
+            // pins exactly that row ("raw open as non-root").
+            let base_type = type_ & !LinuxSocketTypeFlags::SUPPORTED_MASK;
+            if base_type == LINUX_SOCK_RAW
+                && !super::creds::has_effective_capability(
+                    cx.kernel,
+                    crate::namespace::process::CAP_NET_RAW,
+                )
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
             Ok(this.host_socket_install(family, type_, protocol))
 
         }
