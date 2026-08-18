@@ -7758,7 +7758,9 @@ impl SyscallDispatcher {
                                 let mut padded = [0u8; core::mem::size_of::<LinuxTermios>()];
                                 padded[..want].copy_from_slice(&bytes);
                                 match LinuxTermios::read_from_bytes(&padded) {
-                                    Ok(t) => {
+                                    Ok(mut t) => {
+                                        // Linux's pty driver never stores CS5-CS7.
+                                        crate::host_tty::coerce_pty_termios(&mut t);
                                         let _ = crate::host_tty::with_sigttou_blocked(
                                             block_ttou,
                                             || crate::host_tty::set_host_termios(host_fd, &t),
