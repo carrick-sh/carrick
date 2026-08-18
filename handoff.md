@@ -123,8 +123,51 @@ output), not runtime chases. Also seen once: `carrick-native-darwin`
 `dynamic_x18_publication_is_veneered…` failed in one full `just test` then
 passed 3/3 exact and a full rerun — pre-existing JIT flake, not addressed.
 
-A full `just conformance-probes-closure` was launched on this artifact; read
-its result before claiming the probe phase green.
+A full `just conformance-probes-closure` on the fixed artifact came back
+857/858 with 0 dedicated reds; the one generic red (gnu bsd_signal_xlate)
+was a probe-side pause() lost-wakeup race, fixed in `5c523aaee` (sigsuspend
+idiom). The probe phase has no known deterministic reds left.
+
+## Suite-phase state (2026-08-18 early AM, artifact post-`d961da061`)
+
+Five closure runs this cycle. Key structural changes, in order:
+
+- **ClosureV2 id scheme** (`dcb25c2dd` + `801ab86df`): LTP closure ids key on
+  descriptor text (fd types!) with positional residue alignment for
+  run-variable text. splice07/ioctl_ficlone04 now show HONEST per-fd-type
+  rows ("splice() on file -> io_uring" absent = a real missing fd type).
+  Oracle cache refilled once under the closure-v2 determinant (~40 min for
+  BOTH phases live — docker phase is cheap; the carrick-vs-docker
+  serialization cost model in earlier plans was far too pessimistic).
+- **Lost shared-futex wakes fixed** (`9c613aa6e` + fence `0d91ccf1f`): a wake
+  landing between a waiter's 20 ms ulock slices was unrecoverable when the
+  waker never changes the word (LTP tst_checkpoint). Credits are claimed
+  under an enroll-sequence fence (late enrollees never steal older wakes —
+  the peek variant without the fence regressed 10 checkpoint suites in run 3
+  before being caught by the run tally and bisected). rt_tgsigqueueinfo01
+  12/20 -> 0/10.
+- **Fork cost de-quadraticized** (`f1fc82c04` + `309c6a694`): fork was O(live
+  processes) — 35 ms/fork at 1000 live (alias-registry linear scans per
+  mapping). Indexed: 1.7 ms at 1000; 1000 forks 7.3 s -> 1.2 s.
+- **Closure parity = outcome equality** (`d961da061`): the old all-Ok rule
+  made ~600 perfect-agreement suites (oracle-matched skips/TCONFs and
+  oracle-side failures reproduced row-for-row) permanently INCOMPLETE.
+  MATCH now requires parsed-result equality + exact id equality + totals
+  equality. Preview on run-4 data: **1,810 MATCH / 181 real non-match**
+  (was 1,208 under all-Ok). Run 5 (in flight at handoff time) is the
+  authoritative first tally under this predicate.
+
+The remaining ~181-suite work queue (ranked, `$SCRATCHPAD/workqueue.txt`):
+cpython-asyncio (2,475 rows, carrick result none — crash/no-output),
+cpython-importlib (350, guest SIGSEGV), cpython-concurrent_futures (175,
+truncated under load), cpython-posix (150), splice07+ficlone04 (194, real
+missing fd types: io_uring/fanotify inventory), futex_cmp_requeue01 (57,
+1000-waiter herd: ~200 wakes lost in requeue chain — needs exact waiter
+accounting to replace the heuristic counter slot), go-os_exec (57, none),
+go-crypto_sha512 (30, TestGolden/Armv8.2 — SHA-512 ISA feature rows),
+cpython-socket (42), and a ~150-suite LTP tail mostly totals-ne.
+
+## Resume here
 
 ## Resume here
 
