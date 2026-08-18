@@ -109,9 +109,11 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         | 285
         | 291
         | 279
+        | 428..=433
         | 436
         | 437
         | 439
+        | 442
         | 447
         | 452 => SyscallHandler::Filesystem,
         19..=22 | 72 | 73 | 198..=212 | 242 | 243 | 269 => SyscallHandler::Network,
@@ -142,6 +144,7 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         | 271
         | 277
         | 278
+        | 280
         | 293
         | 424
         | 434
@@ -510,12 +513,12 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(425, "io_uring_setup", "io", SupportLevel::BringUp),
     syscall(426, "io_uring_enter", "io", SupportLevel::BringUp),
     syscall(427, "io_uring_register", "io", SupportLevel::Deferred),
-    syscall(428, "open_tree", "fs", SupportLevel::Deferred),
-    syscall(429, "move_mount", "fs", SupportLevel::Deferred),
-    syscall(430, "fsopen", "fs", SupportLevel::Deferred),
-    syscall(431, "fsconfig", "fs", SupportLevel::Deferred),
-    syscall(432, "fsmount", "fs", SupportLevel::Deferred),
-    syscall(433, "fspick", "fs", SupportLevel::Deferred),
+    syscall(428, "open_tree", "fs", SupportLevel::BringUp),
+    syscall(429, "move_mount", "fs", SupportLevel::BringUp),
+    syscall(430, "fsopen", "fs", SupportLevel::BringUp),
+    syscall(431, "fsconfig", "fs", SupportLevel::BringUp),
+    syscall(432, "fsmount", "fs", SupportLevel::BringUp),
+    syscall(433, "fspick", "fs", SupportLevel::BringUp),
     syscall(434, "pidfd_open", "process", SupportLevel::BringUp),
     syscall(435, "clone3", "process", SupportLevel::Planned),
     syscall(436, "close_range", "fs", SupportLevel::BringUp),
@@ -524,7 +527,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(439, "faccessat2", "fs", SupportLevel::BringUp),
     syscall(440, "process_madvise", "mm", SupportLevel::Deferred),
     syscall(441, "epoll_pwait2", "net", SupportLevel::Deferred),
-    syscall(442, "mount_setattr", "fs", SupportLevel::Deferred),
+    syscall(442, "mount_setattr", "fs", SupportLevel::BringUp),
     syscall(443, "quotactl_fd", "fs", SupportLevel::Deferred),
     syscall(
         444,

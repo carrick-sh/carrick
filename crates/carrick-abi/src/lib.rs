@@ -3269,6 +3269,121 @@ pub const LINUX_AT_STATX_FORCE_SYNC: u64 = 0x2000;
 pub const LINUX_AT_STATX_DONT_SYNC: u64 = 0x4000;
 /// Owner name of Linux-specific ELF notes, including AArch64 `NT_ARM_TLS`.
 pub const LINUX_ELF_NOTE_OWNER: &[u8] = b"LINUX\0";
+/// `open_tree(2)`/`mount_setattr(2)` "apply to the whole subtree" flag
+/// (shares the AT_* numbering space with the statx sync bits above).
+pub const LINUX_AT_RECURSIVE: u64 = 0x8000;
+
+// --- New mount API (fsopen/fsconfig/fsmount/fspick/move_mount/open_tree,
+// mount_setattr) — constants from the respective man pages. ---
+
+/// `fsopen(2)` flags: only close-on-exec is defined.
+pub const LINUX_FSOPEN_CLOEXEC: u64 = 0x1;
+
+/// `fsmount(2)` flags: only close-on-exec is defined.
+pub const LINUX_FSMOUNT_CLOEXEC: u64 = 0x1;
+
+/// `fspick(2)` flags.
+pub const LINUX_FSPICK_CLOEXEC: u64 = 0x1;
+pub const LINUX_FSPICK_SYMLINK_NOFOLLOW: u64 = 0x2;
+pub const LINUX_FSPICK_NO_AUTOMOUNT: u64 = 0x4;
+pub const LINUX_FSPICK_EMPTY_PATH: u64 = 0x8;
+/// Every valid `fspick(2)` flag; anything else is EINVAL.
+pub const LINUX_FSPICK_VALID_FLAGS: u64 = LINUX_FSPICK_CLOEXEC
+    | LINUX_FSPICK_SYMLINK_NOFOLLOW
+    | LINUX_FSPICK_NO_AUTOMOUNT
+    | LINUX_FSPICK_EMPTY_PATH;
+
+/// `open_tree(2)` flags: OPEN_TREE_* plus a subset of the AT_* space.
+pub const LINUX_OPEN_TREE_CLONE: u64 = 0x1;
+/// OPEN_TREE_CLOEXEC is defined as O_CLOEXEC (open_tree(2)).
+pub const LINUX_OPEN_TREE_CLOEXEC: u64 = 0o2000000;
+/// Every valid `open_tree(2)` flag; anything else is EINVAL.
+pub const LINUX_OPEN_TREE_VALID_FLAGS: u64 = LINUX_OPEN_TREE_CLONE
+    | LINUX_OPEN_TREE_CLOEXEC
+    | LINUX_AT_EMPTY_PATH
+    | LINUX_AT_NO_AUTOMOUNT
+    | LINUX_AT_RECURSIVE
+    | LINUX_AT_SYMLINK_NOFOLLOW;
+
+/// `move_mount(2)` flags.
+pub const LINUX_MOVE_MOUNT_F_SYMLINKS: u64 = 0x1;
+pub const LINUX_MOVE_MOUNT_F_AUTOMOUNTS: u64 = 0x2;
+pub const LINUX_MOVE_MOUNT_F_EMPTY_PATH: u64 = 0x4;
+pub const LINUX_MOVE_MOUNT_T_SYMLINKS: u64 = 0x10;
+pub const LINUX_MOVE_MOUNT_T_AUTOMOUNTS: u64 = 0x20;
+pub const LINUX_MOVE_MOUNT_T_EMPTY_PATH: u64 = 0x40;
+pub const LINUX_MOVE_MOUNT_SET_GROUP: u64 = 0x100;
+pub const LINUX_MOVE_MOUNT_BENEATH: u64 = 0x200;
+/// Every valid `move_mount(2)` flag; anything else is EINVAL.
+pub const LINUX_MOVE_MOUNT_VALID_FLAGS: u64 = LINUX_MOVE_MOUNT_F_SYMLINKS
+    | LINUX_MOVE_MOUNT_F_AUTOMOUNTS
+    | LINUX_MOVE_MOUNT_F_EMPTY_PATH
+    | LINUX_MOVE_MOUNT_T_SYMLINKS
+    | LINUX_MOVE_MOUNT_T_AUTOMOUNTS
+    | LINUX_MOVE_MOUNT_T_EMPTY_PATH
+    | LINUX_MOVE_MOUNT_SET_GROUP
+    | LINUX_MOVE_MOUNT_BENEATH;
+
+/// `mount_setattr(2)` / `fsmount(2)` MOUNT_ATTR_* attribute bits.
+pub const LINUX_MOUNT_ATTR_RDONLY: u64 = 0x1;
+pub const LINUX_MOUNT_ATTR_NOSUID: u64 = 0x2;
+pub const LINUX_MOUNT_ATTR_NODEV: u64 = 0x4;
+pub const LINUX_MOUNT_ATTR_NOEXEC: u64 = 0x8;
+/// Mask over the three atime modes (RELATIME=0 is the all-clear value).
+pub const LINUX_MOUNT_ATTR_ATIME_MASK: u64 = 0x70;
+pub const LINUX_MOUNT_ATTR_NOATIME: u64 = 0x10;
+pub const LINUX_MOUNT_ATTR_STRICTATIME: u64 = 0x20;
+pub const LINUX_MOUNT_ATTR_NODIRATIME: u64 = 0x80;
+pub const LINUX_MOUNT_ATTR_IDMAP: u64 = 0x100000;
+pub const LINUX_MOUNT_ATTR_NOSYMFOLLOW: u64 = 0x200000;
+/// Attribute bits `fsmount(2)` accepts in `attr_flags` (no IDMAP there —
+/// oracle: `fsmount(-1, 0, MOUNT_ATTR_IDMAP)` is EINVAL before the fd check).
+pub const LINUX_FSMOUNT_VALID_ATTRS: u64 = LINUX_MOUNT_ATTR_RDONLY
+    | LINUX_MOUNT_ATTR_NOSUID
+    | LINUX_MOUNT_ATTR_NODEV
+    | LINUX_MOUNT_ATTR_NOEXEC
+    | LINUX_MOUNT_ATTR_ATIME_MASK
+    | LINUX_MOUNT_ATTR_NODIRATIME
+    | LINUX_MOUNT_ATTR_NOSYMFOLLOW;
+/// Attribute bits `mount_setattr(2)` accepts (adds IDMAP).
+pub const LINUX_MOUNT_SETATTR_VALID_ATTRS: u64 = LINUX_FSMOUNT_VALID_ATTRS | LINUX_MOUNT_ATTR_IDMAP;
+/// `sizeof(struct mount_attr)` v0 (MOUNT_ATTR_SIZE_VER0, mount_setattr(2)).
+pub const LINUX_MOUNT_ATTR_SIZE_VER0: u64 = 32;
+
+/// `fsconfig(2)` commands (ordinal enum per the typed-domain rules — never
+/// hand-numbered match arms). `from_raw` is total over the kernel's known
+/// range; an unknown raw command is the caller's EOPNOTSUPP case (oracle:
+/// `fsconfig(fd, 100, …)` is EOPNOTSUPP even on a non-fscontext or closed fd).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum FsconfigCmd {
+    SetFlag = 0,
+    SetString = 1,
+    SetBinary = 2,
+    SetPath = 3,
+    SetPathEmpty = 4,
+    SetFd = 5,
+    CmdCreate = 6,
+    CmdReconfigure = 7,
+    CmdCreateExcl = 8,
+}
+
+impl FsconfigCmd {
+    pub fn from_raw(raw: u64) -> Option<Self> {
+        Some(match raw {
+            0 => Self::SetFlag,
+            1 => Self::SetString,
+            2 => Self::SetBinary,
+            3 => Self::SetPath,
+            4 => Self::SetPathEmpty,
+            5 => Self::SetFd,
+            6 => Self::CmdCreate,
+            7 => Self::CmdReconfigure,
+            8 => Self::CmdCreateExcl,
+            _ => return None,
+        })
+    }
+}
 pub const LINUX_UTIME_NOW: i64 = (1 << 30) - 1;
 pub const LINUX_UTIME_OMIT: i64 = (1 << 30) - 2;
 pub const LINUX_F_OK: u64 = 0;

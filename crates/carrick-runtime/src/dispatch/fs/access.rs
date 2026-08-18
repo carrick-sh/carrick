@@ -443,6 +443,7 @@ impl SyscallDispatcher {
             | OpenDescription::HostSocket { .. }
             | OpenDescription::SignalFd { .. }
             | OpenDescription::PerfEvent { .. }
+            | OpenDescription::FsContext { .. }
             | OpenDescription::Mqueue { .. }
             | OpenDescription::BpfMap { .. }
             | OpenDescription::BpfProg { .. }

@@ -723,6 +723,7 @@ mod resources;
 #[macro_use]
 mod signal;
 mod bpf;
+mod mount_api;
 mod mqueue;
 mod sysv;
 #[macro_use]
@@ -3176,6 +3177,7 @@ fn resolve_handler<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
         .or_else(|| mqueue::dispatch_mqueue(number))
         .or_else(|| bpf::dispatch_bpf(number))
         .or_else(|| perf::dispatch_perf(number))
+        .or_else(|| mount_api::dispatch_mount_api(number))
 }
 
 /// True once the kernel lane's first process has bound. On that lane a Linux

@@ -430,6 +430,8 @@ pub enum FileDescriptionBackingKind {
     BpfProg,
     PerfEvent,
     IoUring,
+    /// A new-mount-API filesystem context (`fsopen(2)`/`fspick(2)`).
+    FsContext,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
