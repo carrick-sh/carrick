@@ -27,6 +27,16 @@ fn read_exact_fd(fd: libc::c_int, buf: &mut [u8]) -> bool {
     let mut off = 0;
     while off < buf.len() {
         let rc = unsafe { libc::read(fd, buf[off..].as_mut_ptr() as *mut _, buf.len() - off) };
+        if rc < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
+            // The probe's own SIGCHLD handler has no SA_RESTART, and the
+            // orphan's exit races the parent's blocked pipe read: the death
+            // signal can interrupt the read BEFORE its 4 bytes arrive. That is
+            // a scheduling race on real Linux too — treating EINTR as failure
+            // made the probe verdict depend on signal timing (observed ~1/3
+            // red under 6-way load with the orphan's write demonstrably
+            // completing). A correctness probe must not encode a race.
+            continue;
+        }
         if rc <= 0 {
             return false;
         }
@@ -39,6 +49,9 @@ fn write_all_fd(fd: libc::c_int, buf: &[u8]) -> bool {
     let mut off = 0;
     while off < buf.len() {
         let rc = unsafe { libc::write(fd, buf[off..].as_ptr() as *const _, buf.len() - off) };
+        if rc < 0 && unsafe { *libc::__errno_location() } == libc::EINTR {
+            continue; // see read_exact_fd — same SIGCHLD race
+        }
         if rc <= 0 {
             return false;
         }
