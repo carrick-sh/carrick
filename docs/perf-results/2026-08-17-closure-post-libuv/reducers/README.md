@@ -488,14 +488,48 @@ Note the overlap also explains the survivor pattern in the core: entries below
 the hole live in pages the guest rewrote after the scrub; the hole granule was
 never rewritten.
 
-Next: instrument grant-time (log any reused grant overlapping a live
-`dynamic_map` with the free-list state), reduce which munmap/mremap path
-double-inserted the region, then fix that bookkeeping. The three env-gated
-hooks (`CARRICK_FORK_DEBUG_VA` on forks and scrubs, `CARRICK_FORK_DEBUG_IPA`
-on owner register/retire) stay in-tree.
+### Provenance instrumentation is COMPLETE; final reduction is one run away
 
-The proving core is preserved at `/tmp/core` (20 MB; regenerate with the
-recipe above if lost).
+Five env-gated hooks now cover every layer, all keyed on
+`CARRICK_FORK_DEBUG_VA` (plus `CARRICK_FORK_DEBUG_IPA` and
+`CARRICK_MMAP_GRANT_DEBUG=1`):
+
+| hook | layer |
+|---|---|
+| fork spec build | mapping + extents + parent frame BYTES + live stage-1 leaf |
+| owner register/retire | global-frame host-owner lifecycle, with backtraces |
+| `zero_guest_backing` | every scrub covering the VA, with backtraces |
+| `next_mmap_address` | overlapping grants; ledger neighbourhood on covering grants |
+| `remove_mapping_metadata` / `free_regions_insert` | ledger removals and free-list inserts, with backtraces |
+
+What single-run captures established so far:
+
+- The grant audit found NO non-FIXED grant overlapping a live `dynamic_maps`
+  entry — yet the killer scrub covers memory the trap-side registry still
+  shows as a live 0x33000 mapping at both forks. The DISPATCHER ledger and the
+  TRAP-side alias rows disagree about what is alive: the guest munmap'd a
+  0x33000 mapping (LEDGERDBG line), the dispatcher trimmed its ledger and
+  free-listed the range, but the trap-side row `[0x60010c1000,0x60010f4000)`
+  persists across both forks. The corruption sits in that divergence: scrubs
+  resolve host bytes through trap-side rows, grants through the dispatcher
+  ledger.
+- One run's full chain (`fr.err`): guest munmap 0xf000 -> free insert; 1 MiB
+  scrub-grant; guest munmap 0x33000 -> free insert; 0x31000 scrub-grant (the
+  live array); guest munmap 0xf000 AGAIN over the head of that grant; the
+  killer 1 MiB re-grant whose scrub covers the granule.
+
+**WARNING for the next session — a mistake to not repeat: do not
+cross-reference addresses BETWEEN runs.** The debug VA `0x60010cc000` came
+from the original core; each run's leases and chunk layout shift (observed
+0x174000 / 0xf4000 / 0x1a4000 / 0x154000 for "the same" lease), so the same VA
+plays different roles run to run. Two log analyses in this file's history
+conflated layers this way. The closing move is ONE run with ALL hooks enabled,
+analysed entirely within itself: establish which mapping the crash VA belongs
+to IN THAT RUN (FORKDBG prints the covering mapping), then read the
+LEDGER/FREE/GRANT/scrub events for those exact ranges in that same log.
+
+Raw logs preserved in the scratchpad (`fd*.err`, `gd*.err`, `ld.err`,
+`fr.err`); the proving core at `/tmp/core`.
 
 ### Why this cluster is worth the next cycle
 
