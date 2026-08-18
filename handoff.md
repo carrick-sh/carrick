@@ -406,6 +406,19 @@ Measured, not inferred — see `docs/perf-results/2026-08-17-closure-post-libuv/
   CRASHES.** Both were read straight out of the closure run's `.err` files —
   no new instrumentation needed, and neither is a "carrick is slow" problem:
 
+  -1. **UPDATE 2026-08-18 (later): the ENTIRE multiprocessing crash family is
+     FIXED** (`1e970696e` — maintenance writes now authenticate an exclusive
+     frame claim; full root-cause narrative and every wrong turn in
+     `docs/perf-results/2026-08-17-closure-post-libuv/reducers/README.md`).
+     Measured on the signed binary: `test_multiprocessing_spawn` SUCCESS 4/4,
+     `test_multiprocessing_forkserver` SUCCESS 4/4 (from ZERO assertions),
+     `test_concurrent_futures` SUCCESS 8/8, fork's `test_misc` SUCCESS and
+     `test_processes` completing with ONE isolated deterministic error left:
+     `WithProcessesTestPicklingConnections.test_pickling` (recv EOF standalone
+     under carrick, OK under Docker — an fd-passing/pickled-connection gap,
+     nothing to do with memory; the next reducer target).
+     `cpython-importlib` did NOT move — its deep-run SIGSEGV is a different
+     bug. Every entry below this point is historical.
   0. **UPDATE 2026-08-18: the fork/forkserver HANG is gone** (post-`10c62b8cb`
      the suite completes test files) and the remainder is reduced to a 2.5 s
      deterministic two-test reducer for a CHILD SIGSEGV — see
