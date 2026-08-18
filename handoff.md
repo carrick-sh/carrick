@@ -307,7 +307,54 @@ no-peer arm. That is sound only if `has_peer_executor()` is the exact
 guest-executor census — the population-domain trap. Tests and the reducer
 are green; a wrong answer there would free a table a walker can still reach.
 
-## Resume here
+## Session 2026-08-18 (third): load sensitivity is architectural
+
+Full report: `docs/perf-results/2026-08-18-fork-lease-deadlock/README.md`.
+
+**The five "regressions" from `closure-v3-second` are not regressions.** None is
+caused by the merged code. `cpython-asyncio` (1,872 rows) passes 2,572 tests
+standalone; `ltp-mq_timedsend01` passes 34/34; `go-net_http` completes in 28-54 s
+standalone against its 540 s truncation. Only `ltp-nice05` is a real gap — carrick
+emits an extra `nice05.c:37` TBROK the oracle does not (oracle: one TBROK at
+line 42, confirmed live). Do not re-attribute these to the merge.
+
+**But do not file the other four as noise.** Three fail only under gate load, and
+a suite that passes alone and crashes at eight workers is a race that only opens
+under contention. Measured, quiet host, `go-net_http`: N=1 51 s, N=2 75 s,
+**N=4 1017 s (20x)** — a serialization collapse, not starvation, with the
+carriers at 0.0-0.6% CPU (so NOT a macOS-kernel load problem).
+
+**Root cause found and fixed (one of them).** `try_begin_hvpatch_process_fork`
+won the quiesce barrier and only then called the unbounded `scheduler.acquire()`
+for its child's slot — while the siblings that barrier parks are the only
+threads that can release one. Live `bt all` on an unmodified binary caught the
+coordinator in `Condvar::wait` inside `reserve_hvpatch_process_vcpu_lease` with
+8 siblings in `park_if_fork_quiescing`. Now gated on `has_spare_capacity()`
+before the barrier, then a bounded reservation.
+
+**Two fix shapes that measured WORSE — do not retry them:** bounding the wait
+alone livelocks (the coordinator re-stops the world every retry; 199% CPU, no
+progress), and reserving before the barrier deadlocks outright (every forker
+holds one slot while asking for a second).
+
+**This does not close `go-os_exec`.** Its abort is the *clone* materialization
+gate (`threads.rs:1019`), a different site: 1 of 3 trials improved to 38 passes,
+2 of 3 still abort. That gate is the next target and is the likely shared cause
+with `cpython-multiprocessing_fork`/`forkserver` (600 s) and `cpython-threading`.
+
+**Fixture traps learned here:** `go-net_http` wedges intermittently at
+`TestSOCKS5Proxy` even at N=1 on unmodified binaries, so one timing is a coin
+flip. A CPython threads+fork reducer does NOT discriminate (the GIL makes its
+threads release leases); a discriminating one needs Go. And `timeout` kills the
+wrapper, not the guest — several "hangs" were the wrapper dying while the guest
+ran on.
+
+**Where the mass actually is** (2,127 rows, 152 non-match): LTP 132 suites but
+only 726 diverging rows (a long tail); CPython 14 suites / 2,887 rows. The
+concurrency cluster — asyncio 1,872, net_http 665, multiprocessing_fork 298,
+forkserver 228, futex_cmp_requeue01 155, threading 57, os_exec 57 — is
+**3,332 of 4,357 diverging rows (76%)**. Fixing the clone/fork admission
+architecture is the single highest-leverage move left on correctness.
 
 ## Resume here
 
