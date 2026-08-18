@@ -145,6 +145,7 @@ const SYS_IO_URING_SETUP: u64 = 425;
 const SYS_IO_URING_ENTER: u64 = 426;
 const SYS_IO_URING_REGISTER: u64 = 427;
 const SYS_SETNS: u64 = 268;
+const SYS_KCMP: u64 = 272;
 
 /// Identity syscalls the EL1 fast-path shim may answer without a dispatch
 /// (getpid/getppid/getuid/geteuid/getgid/getegid/gettid). A policy that denied
@@ -179,6 +180,11 @@ impl ContainerPolicy {
     /// oracle allows and the two sides ran at different privilege.
     pub(crate) fn docker_model_with_capabilities(granted: u64) -> Self {
         let mut policy = Self::docker_default_model();
+        let sys_ptrace = 1_u64 << crate::namespace::process::CAP_SYS_PTRACE;
+        if granted & sys_ptrace != 0 {
+            // The profile gates `kcmp` on CAP_SYS_PTRACE, not CAP_SYS_ADMIN.
+            policy.deny.retain(|(nr, _)| !matches!(*nr, SYS_KCMP));
+        }
         let sys_admin = 1_u64 << crate::namespace::process::CAP_SYS_ADMIN;
         if granted & sys_admin != 0 {
             policy.deny.retain(|(nr, _)| {
@@ -215,6 +221,17 @@ impl ContainerPolicy {
             // container holds CAP_SYS_ADMIN (see the provenance note above).
             (SYS_UNSHARE, LINUX_EPERM),
             (SYS_SETNS, LINUX_EPERM),
+            // `kcmp`: the default profile gates it behind CAP_SYS_PTRACE, which
+            // the default cap set lacks. Nothing in the KERNEL refuses it --
+            // comparing a process against ITSELF needs no privilege -- so the
+            // EPERM is purely the profile. Measured 2026-08-18 on the canonical
+            // oracle: `kcmp01` under the default profile gives
+            // `kcmp01.c:77 TFAIL kcmp() failed unexpectedly: EPERM`, and the
+            // same image with `--security-opt seccomp=unconfined` at the SAME
+            // caps gives `kcmp01.c:88 TPASS kcmp() returned the expected
+            // value`. carrick had no handler for 272, so it answered ENOSYS and
+            // LTP turned that into a TCONF instead of the oracle's failure.
+            (SYS_KCMP, LINUX_EPERM),
             // `clone3`: denied with ENOSYS (not EPERM) so a guest libc takes
             // its documented `clone` fallback, exactly as it does in Docker.
             (SYS_CLONE3, LINUX_ENOSYS),
