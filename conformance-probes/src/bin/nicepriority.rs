@@ -19,6 +19,15 @@ use conformance_probes::errno;
 
 fn main() {
     unsafe {
+        // Every leg below only ever INCREASES nice (lowers priority), which is
+        // allowed without CAP_SYS_NICE. That ordering is load-bearing: Docker's
+        // default cap set drops CAP_SYS_NICE even for root, so any leg that
+        // needed a nice DECREASE would fail EACCES on the ORACLE while
+        // succeeding under carrick's full-cap guest root, and the probe would
+        // read as a carrick DIFF (the under-privileged-oracle trap, AGENTS.md;
+        // exactly what happened when the clamp leg ran before the isolation
+        // legs and left the parent at 19 with 7 unreachable).
+
         // set nice 2 → getpriority reports 2.
         let s2 = libc::setpriority(libc::PRIO_PROCESS, 0, 2);
         println!("set_nice_2_ok={}", s2 == 0);
@@ -26,23 +35,6 @@ fn main() {
         println!(
             "get_nice_is_2={}",
             libc::getpriority(libc::PRIO_PROCESS, 0) == 2 && errno() == 0
-        );
-
-        // nice 50 is out of range → Linux CLAMPS to 19 and succeeds (no EINVAL).
-        let s50 = libc::setpriority(libc::PRIO_PROCESS, 0, 50);
-        println!("set_nice_50_ok={}", s50 == 0);
-        *libc::__errno_location() = 0;
-        println!(
-            "get_nice_clamped_19={}",
-            libc::getpriority(libc::PRIO_PROCESS, 0) == 19 && errno() == 0
-        );
-
-        // getpriority with an invalid `which` → EINVAL.
-        *libc::__errno_location() = 0;
-        let bad = libc::getpriority(99, 0);
-        println!(
-            "getpriority_bad_which_einval={}",
-            bad == -1 && errno() == libc::EINVAL
         );
 
         // ---- nice is PER-PROCESS state, not one value shared by every guest
@@ -56,21 +48,17 @@ fn main() {
         // an unrelated later child.
         //
         // The discriminator has to be a READ, not a privilege gate: this probe
-        // runs as root (see the header), so the EACCES arm that guards lowering
-        // one's own nice is unreachable and cannot distinguish the two models.
-        // Both values below are therefore PRINTED, so the line-exact diff
-        // compares the numbers Linux actually produces rather than a boolean
-        // that a shared cell can satisfy by accident.
-        //
-        // Drop the parent to 7 first: the clamp leg above left it at 19, which
-        // is also the value child A writes, and equal values cannot tell a
-        // leaked cell from correct inheritance.
+        // cannot rely on EACCES arms (see the cap note above), so both values
+        // below are PRINTED and the line-exact diff compares the numbers Linux
+        // actually produces rather than a boolean a shared cell can satisfy by
+        // accident. 7 (parent) versus 19 (child A) keeps the two models
+        // distinguishable.
         libc::setpriority(libc::PRIO_PROCESS, 0, 7);
         let parent_nice = libc::getpriority(libc::PRIO_PROCESS, 0);
         println!("isolation_parent_nice={parent_nice}");
 
-        // Child A raises itself to 19 (a raise is allowed unprivileged) and
-        // exits. Under a per-process model that write dies with it.
+        // Child A raises itself to 19 (nice increase, unprivileged) and exits.
+        // Under a per-process model that write dies with it.
         let pid_a = libc::fork();
         if pid_a == 0 {
             libc::setpriority(libc::PRIO_PROCESS, 0, 19);
@@ -103,6 +91,25 @@ fn main() {
             // broken probe, not a passing one.
             println!("isolation_child_b_nice=unreaped");
         }
+
+        // nice 50 is out of range → Linux CLAMPS to 19 and succeeds (no
+        // EINVAL). 7 → 19 is still an increase, so this stays privilege-free —
+        // which is why the clamp leg runs LAST.
+        let s50 = libc::setpriority(libc::PRIO_PROCESS, 0, 50);
+        println!("set_nice_50_ok={}", s50 == 0);
+        *libc::__errno_location() = 0;
+        println!(
+            "get_nice_clamped_19={}",
+            libc::getpriority(libc::PRIO_PROCESS, 0) == 19 && errno() == 0
+        );
+
+        // getpriority with an invalid `which` → EINVAL.
+        *libc::__errno_location() = 0;
+        let bad = libc::getpriority(99, 0);
+        println!(
+            "getpriority_bad_which_einval={}",
+            bad == -1 && errno() == libc::EINVAL
+        );
 
         let _ = errno;
     }
