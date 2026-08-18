@@ -1196,19 +1196,48 @@ fn missing_process_aliases(
 /// owners as well as lookup rows, so a retired row may remain in `mappings`
 /// after munmap; only an exact live-registry publication makes it semantic.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn mapping_is_current_for_process_fork(
-    mapping: &HvfMappedRegion,
+/// Exact-identity key of one process-scoped alias publication: the four
+/// fields `mapping_is_current_for_process_fork` matches. Fork-path callers
+/// walk EVERY mapping and previously linear-scanned the alias registry per
+/// mapping — O(mappings x aliases) per fork, the dominant term of the
+/// fork-cost-grows-with-live-count pathology (35 ms/fork at 1000 live
+/// processes; futex_cmp_requeue01's 1000-waiter phase starves on it). The
+/// index makes one pass over the registry and answers each mapping in O(1).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type ProcessAliasKey = (u64, u64, usize, usize);
+
+/// One-pass index of the process-scoped alias publications, keyed by
+/// [`ProcessAliasKey`]. First occurrence wins, mirroring the linear scans'
+/// `.find` semantics this replaces.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn process_alias_index(
     aliases: &[AliasBacking],
     mm_root_slot: Option<(u64, u64)>,
+) -> std::collections::HashMap<ProcessAliasKey, AliasBacking> {
+    let mut index = std::collections::HashMap::with_capacity(aliases.len());
+    for alias in aliases {
+        if alias_matches_process_scope(alias.ownership_scope, mm_root_slot) {
+            index
+                .entry((alias.start, alias.ipa, alias.host_addr, alias.size))
+                .or_insert(*alias);
+        }
+    }
+    index
+}
+
+/// Index-backed [`mapping_is_current_for_process_fork`].
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mapping_is_current_for_process_fork_indexed(
+    mapping: &HvfMappedRegion,
+    index: &std::collections::HashMap<ProcessAliasKey, AliasBacking>,
 ) -> bool {
     !mapping.is_dynamic_alias
-        || aliases.iter().any(|alias| {
-            alias_matches_process_scope(alias.ownership_scope, mm_root_slot)
-                && alias.start == mapping.start
-                && alias.ipa == mapping.ipa
-                && alias.host_addr == mapping.host_addr as usize
-                && alias.size == semantic_extent_size(mapping.start, mapping.end)
-        })
+        || index.contains_key(&(
+            mapping.start,
+            mapping.ipa,
+            mapping.host_addr as usize,
+            semantic_extent_size(mapping.start, mapping.end),
+        ))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1217,11 +1246,11 @@ fn current_dynamic_alias_ipas(
     aliases: &[AliasBacking],
     mm_root_slot: Option<(u64, u64)>,
 ) -> std::collections::HashSet<u64> {
+    let index = process_alias_index(aliases, mm_root_slot);
     mappings
         .iter()
         .filter(|mapping| {
-            mapping.is_dynamic_alias
-                && mapping_is_current_for_process_fork(mapping, aliases, mm_root_slot)
+            mapping.is_dynamic_alias && mapping_is_current_for_process_fork_indexed(mapping, &index)
         })
         .map(|mapping| mapping.ipa)
         .collect()
@@ -6509,6 +6538,7 @@ impl HvfVmState {
     /// installed by sibling vCPUs and filters retired lifetime-owner rows.
     pub(crate) fn fork_cow_ranges(&self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
         let aliases = alias_registry().lock().clone();
+        let alias_index = process_alias_index(&aliases, self.mm_root_slot);
         let mut ranges: Vec<_> = self
             .mappings
             .iter()
@@ -6519,7 +6549,7 @@ impl HvfVmState {
                         mapping.start,
                         semantic_extent_size(mapping.start, mapping.end),
                     )
-                    && mapping_is_current_for_process_fork(mapping, &aliases, self.mm_root_slot)
+                    && mapping_is_current_for_process_fork_indexed(mapping, &alias_index)
             })
             .map(|mapping| carrick_aarch64::vmm::ForkCowRange {
                 va: mapping.start,
@@ -10667,12 +10697,11 @@ impl HvfVmState {
 
         let phase_start = std::time::Instant::now();
         let aliases = alias_registry().lock().clone();
+        let alias_index = process_alias_index(&aliases, self.mm_root_slot);
         let mapping_descs: Vec<ForkMappingDesc> = self
             .mappings
             .iter()
-            .filter(|mapping| {
-                mapping_is_current_for_process_fork(mapping, &aliases, self.mm_root_slot)
-            })
+            .filter(|mapping| mapping_is_current_for_process_fork_indexed(mapping, &alias_index))
             .map(|m| ForkMappingDesc {
                 start: m.start,
                 ipa: m.ipa,
@@ -11292,6 +11321,7 @@ impl HvfVmState {
             })?;
         let mut cursor = request.root_slot_base;
         let aliases = alias_registry().lock().clone();
+        let alias_index = process_alias_index(&aliases, self.mm_root_slot);
         let mut source_mappings: Vec<ThreadMappingDesc> = self
             .mappings
             .iter()
@@ -11299,15 +11329,13 @@ impl HvfVmState {
                 if !mapping.is_dynamic_alias {
                     return Some(ThreadMappingDesc::from_region(mapping));
                 }
-                aliases
-                    .iter()
-                    .find(|alias| {
-                        alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot)
-                            && alias.start == mapping.start
-                            && alias.ipa == mapping.ipa
-                            && alias.host_addr == mapping.host_addr as usize
-                            && alias.size == semantic_extent_size(mapping.start, mapping.end)
-                    })
+                alias_index
+                    .get(&(
+                        mapping.start,
+                        mapping.ipa,
+                        mapping.host_addr as usize,
+                        semantic_extent_size(mapping.start, mapping.end),
+                    ))
                     .copied()
                     .and_then(ThreadMappingDesc::from_alias)
             })
@@ -16620,7 +16648,22 @@ mod tag_strip_tests {
         HVF_PAGE_SIZE, HvfMappedRegion, InventoryBackingIdentity, ThreadMappingDesc,
         alias_is_owned_by_process, alias_matches_process_scope, alias_registry,
         current_dynamic_alias_ipas, forget_replay_extent, inherited_fork_inventory_extents,
-        lookup_shared_alias, mapping_is_current_for_process_fork, missing_process_aliases,
+        lookup_shared_alias, mapping_is_current_for_process_fork_indexed, missing_process_aliases,
+        process_alias_index,
+    };
+    /// Test adapter preserving the retired linear signature over the index.
+    fn mapping_is_current_for_process_fork_test(
+        mapping: &HvfMappedRegion,
+        aliases: &[AliasBacking],
+        mm_root_slot: Option<(u64, u64)>,
+    ) -> bool {
+        mapping_is_current_for_process_fork_indexed(
+            mapping,
+            &process_alias_index(aliases, mm_root_slot),
+        )
+    }
+    #[allow(unused_imports)]
+    use super::{
         next_vdso_rng_generation, reapply_global_exec_readonly_spans,
         rebind_inherited_alias_to_process, register_shared_alias,
         retained_private_reuse_alias_fragment, retired_alias_disarm_spans, strip_pointer_tag,
@@ -17537,20 +17580,20 @@ mod tag_strip_tests {
         };
 
         assert!(
-            !mapping_is_current_for_process_fork(
+            !mapping_is_current_for_process_fork_test(
                 &mapping(retired_ipa, 0x2000, true),
                 &[live_alias],
                 Some(root_slot),
             ),
             "a retained stage-2 lifetime owner is not a live child mapping"
         );
-        assert!(mapping_is_current_for_process_fork(
+        assert!(mapping_is_current_for_process_fork_test(
             &mapping(live_ipa, 0x3000, true),
             &[live_alias],
             Some(root_slot),
         ));
         assert!(
-            mapping_is_current_for_process_fork(
+            mapping_is_current_for_process_fork_test(
                 &mapping(root_slot.0, 0x4000, false),
                 &[],
                 Some(root_slot),
