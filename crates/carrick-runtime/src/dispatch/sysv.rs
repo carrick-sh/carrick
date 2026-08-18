@@ -2462,6 +2462,7 @@ impl SyscallDispatcher {
                     bus_fault: None,
                     write_sealed_shared: false,
                     read_only_shared_file: false,
+                    secretmem: false,
                     writable_memfd: None,
                     shared_file_alias: None,
                 },
@@ -5007,6 +5008,7 @@ mod ipc_set_tests {
             bus_fault: Some((addr, len)),
             write_sealed_shared: true,
             read_only_shared_file: false,
+            secretmem: false,
             writable_memfd: Some(writable_memfd),
             shared_file_alias: None,
         });
@@ -5050,6 +5052,7 @@ mod ipc_set_tests {
             bus_fault: None,
             write_sealed_shared: false,
             read_only_shared_file: false,
+            secretmem: false,
             writable_memfd: None,
             shared_file_alias: None,
         });
@@ -5143,6 +5146,7 @@ mod ipc_set_tests {
                 bus_fault: None,
                 write_sealed_shared: false,
                 read_only_shared_file: false,
+                secretmem: false,
                 writable_memfd: None,
                 shared_file_alias: None,
             },
