@@ -461,6 +461,25 @@ impl SyscallDispatcher {
         /// sigev_notify (4) | _sigev_un (48) = 64 bytes total.
         fn timer_create(this, cx, clock_id: u64, sevp: GuestPtr, id_out: GuestPtr) {
             let memory = &mut *cx.memory;
+            // The two ALARM clocks wake a suspended system, which Linux gates
+            // on CAP_WAKE_ALARM — and Docker's default set drops it, so the
+            // oracle answers EPERM for `timer_create(CLOCK_BOOTTIME_ALARM)`
+            // and `CLOCK_REALTIME_ALARM` (LTP timer_settime01/02,
+            // timer_create01). carrick answered EINVAL, which sent those
+            // suites down their "clock unsupported" TCONF path instead of the
+            // oracle's failure path. Checked BEFORE the supported-clock test:
+            // the capability answer does not depend on whether carrick can
+            // service the clock.
+            if matches!(
+                clock_id,
+                crate::linux_abi::LINUX_CLOCK_REALTIME_ALARM
+                    | crate::linux_abi::LINUX_CLOCK_BOOTTIME_ALARM
+            ) && !super::creds::has_effective_capability(
+                cx.kernel,
+                crate::namespace::process::CAP_WAKE_ALARM,
+            ) {
+                return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EPERM));
+            }
             // Validate the clock — we only support the same set as clock_gettime.
             if linux_clock_duration(clock_id).is_none() {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -482,30 +501,45 @@ impl SyscallDispatcher {
                     // settime/gettime/delete bookkeeping.
                     signum = 0;
                 } else if notify == LINUX_SIGEV_SIGNAL
+                    || notify == LINUX_SIGEV_THREAD
                     || notify == LINUX_SIGEV_THREAD_ID
                 {
-                    // SIGEV_THREAD_ID is the kernel's "deliver to a specific
-                    // tid via _sigev_un.tid" variant — glibc compiles
-                    // SIGEV_THREAD down to SIGEV_THREAD_ID + an internal helper
-                    // thread. Carrick does not yet have per-guest-thread CPU
-                    // timer accounting; accepting CLOCK_THREAD_CPUTIME_ID here
-                    // would turn Go's per-M profiler timers into wall-clock
-                    // process SIGPROF streams. Report unsupported so runtimes
-                    // use their process-timer fallback instead.
-                    if notify == LINUX_SIGEV_THREAD_ID
-                        && clock_id == LINUX_CLOCK_THREAD_CPUTIME_ID
-                    {
-                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    // SIGEV_THREAD (2) and SIGEV_THREAD_ID (4) both reach
+                    // the kernel and are NOT interchangeable — verified
+                    // against the oracle with a raw-syscall probe over
+                    // sigev_notify 0..4 (`timer_create(CLOCK_REALTIME, …)`):
+                    //   notify 0/1/2 -> 0, notify 3 -> EINVAL,
+                    //   notify 4 with an unset `_tid` -> EINVAL.
+                    // carrick had the last two INVERTED: it rejected
+                    // SIGEV_THREAD outright ("the kernel never sees it —
+                    // glibc rewrites it", which the probe refutes) and
+                    // accepted SIGEV_THREAD_ID without looking at the tid.
+                    // LTP timer_create01 drives the raw syscall, so the
+                    // inversion cost every SIGEV_THREAD row in that suite.
+                    if notify == LINUX_SIGEV_THREAD_ID {
+                        // The target must name a live thread of this process.
+                        let tid = memory
+                            .read_bytes(sevp.0 + 16, 4)
+                            .ok()
+                            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            .unwrap_or(0);
+                        if tid <= 0 {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        // Carrick has no per-guest-thread CPU timer
+                        // accounting; accepting CLOCK_THREAD_CPUTIME_ID here
+                        // would turn Go's per-M profiler timers into
+                        // wall-clock process SIGPROF streams. Report
+                        // unsupported so runtimes take their process-timer
+                        // fallback.
+                        if clock_id == LINUX_CLOCK_THREAD_CPUTIME_ID {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
                     }
                     if !(1..=64).contains(&signo) {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                     signum = signo;
-                } else if notify == LINUX_SIGEV_THREAD {
-                    // SIGEV_THREAD: never seen by the kernel on real Linux
-                    // (glibc swaps it for SIGEV_THREAD_ID). A raw syscall
-                    // passing it gets EINVAL.
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 } else {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
