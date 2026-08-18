@@ -557,13 +557,38 @@ the precise shape AGENTS.md's HVPatch memory rule warns about: "never feed one
 domain back into a lookup for another: authenticate through the live stage-1
 translation and the exact current owner generation."
 
-Fix directions (next cycle, red-first against the 2.5 s pair):
-1. A write-capable resolution (`zero_guest_backing`, and any other
-   write-through-host path) must NEVER use the unscoped VA fallback — no
-   stage-1-authenticated output means no write target, period.
-2. Audit why inherited borrowed rows survive in the child engine post-exec
-   (the root-exec transaction was supposed to rebuild this state), and purge
-   them.
+**CORRECTION — the unscoped-fallback attribution above was WRONG, and the fix
+built on it did not move the bug.** Chunk-level SCRUBDBG logging with the
+server's frame pointer printed beside it settled the true mechanism:
+
+```
+server frame granule host = 0x17a798000 + 0xcc000 = 0x17a864000
+[SCRUBDBG pid=7] chunk va=0x60010cc000 live_ipa=None
+                 retained_ipa=0x9e2bacc000 target=0x17a864000   ← THE SAME POINTER
+```
+
+pid 7 (a fork child) resolves its OWN retained stage-1 output — a leaf cloned
+at fork that legitimately names the COW-SHARED frame — and the resolution is
+fully authenticated (VA-consistent, owner live). The write is wrong not
+because the lookup crossed processes but because **the write went through a
+still-shared frame without a copy-on-write break**: `ensure_frame_cow_write`
+routed `Direct` because the child's `cow_armed` span set did not cover the
+range. The armed-set is derived at fork from alias rows and can omit ranges
+(the in-tree `mtforkcorrupt` comment describes the same class); the FRAME
+INVENTORY, which knows the frame is referenced by more than one mm, is the
+authority that should have decided "shared". Populations, fifth instance.
+
+The scrub also cannot simply SKIP such a chunk: leaving the shared frame
+un-scrubbed lets the reusing child READ the other process's bytes through the
+reused VA — a cross-process disclosure instead of a corruption. The correct
+operation is a REPOINT: materialize a fresh zeroed granule for this mm
+(update the retained leaf's output and split the inventory extent), leaving
+the shared frame untouched — the same transactional shape as
+`materialize_retired_reuse`/`perform_frame_cow`.
+
+The stage-1-authentication tightening of `zero_guest_backing` (dropping the
+unscoped VA fallback) is KEPT — it closes a real adjacent hole — it just is
+not this bug's fix.
 
 Raw logs preserved in the scratchpad (`fd*.err`, `gd*.err`, `ld.err`,
 `fr.err`, `id.err` — the pid-tagged run); the proving core at `/tmp/core`.
