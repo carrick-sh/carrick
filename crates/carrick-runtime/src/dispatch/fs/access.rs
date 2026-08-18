@@ -443,6 +443,8 @@ impl SyscallDispatcher {
             | OpenDescription::HostSocket { .. }
             | OpenDescription::SignalFd { .. }
             | OpenDescription::Mqueue { .. }
+            | OpenDescription::BpfMap { .. }
+            | OpenDescription::BpfProg { .. }
             | OpenDescription::Netlink { .. } => synthetic_readonly_access(mode),
         }
     }

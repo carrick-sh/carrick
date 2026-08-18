@@ -448,7 +448,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(277, "seccomp", "process", SupportLevel::BringUp),
     syscall(278, "getrandom", "random", SupportLevel::BringUp),
     syscall(279, "memfd_create", "fs", SupportLevel::Deferred),
-    syscall(280, "bpf", "process", SupportLevel::Deferred),
+    syscall(280, "bpf", "process", SupportLevel::BringUp),
     syscall(281, "execveat", "process", SupportLevel::Planned),
     syscall(282, "userfaultfd", "mm", SupportLevel::Deferred),
     syscall(283, "membarrier", "process", SupportLevel::BringUp),
