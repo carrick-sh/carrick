@@ -9407,30 +9407,54 @@ impl HvfVmState {
                     self.mm_root_slot,
                 )
             });
-            let target = retained_ipa
-                .and_then(|ipa| {
-                    self.mapping_for_live_ipa_range(chunk_va, ipa, chunk_len)
-                        .and_then(|mapping| {
-                            let offset = usize::try_from(ipa.checked_sub(mapping.ipa)?).ok()?;
-                            Some(unsafe { mapping.host_addr.add(offset) })
-                        })
-                })
-                .or_else(|| {
-                    self.mapping_for_range_mut(chunk_va, chunk_len)
-                        .and_then(|mapping| {
-                            let offset =
-                                usize::try_from(chunk_va.checked_sub(mapping.start)?).ok()?;
-                            Some(unsafe { mapping.host_addr.add(offset) })
-                        })
-                });
-            let Some(target) = target else {
-                return Err(MemoryError::OutOfBounds { address, length });
-            };
-            unsafe {
-                core::ptr::write_bytes(target, 0u8, chunk_len);
+            // WRITE TARGETS ARE STAGE-1-AUTHENTICATED, PERIOD. This used to
+            // fall back to `mapping_for_range_mut` — a VA-keyed search over
+            // carrier-inherited rows with no scope filter — when the caller's
+            // own translation had nothing. A fork child's engine inherits
+            // Borrowed rows pointing at the ANCESTOR's host memory for
+            // numerically identical VAs, and a reused range is scrubbed
+            // exactly while its stage-1 is invalid, so that fallback resolved
+            // another process's frame and zeroed it: one 16 KiB granule of the
+            // forkserver server's live interned-strings dict, read back as
+            // NULL me_keys by every worker (the CPython multiprocessing
+            // SIGSEGV cluster).
+            //
+            // The scrub's purpose is to keep STALE BYTES from being observed
+            // through THIS VA. If neither the live walk nor the retained
+            // invalid-leaf output names an IPA, the guest has no translation
+            // here and cannot observe anything — there is nothing to scrub,
+            // and skipping is the correct amount of writing. With an IPA in
+            // hand, `mapping_for_live_ipa_range` demands VA/IPA consistency
+            // plus a live authenticated owner, so the write can only land in
+            // this mm's own backing.
+            let live_ipa = self.translate_va(chunk_va);
+            let ipa = live_ipa.or(retained_ipa);
+            let target = ipa.and_then(|ipa| {
+                self.mapping_for_live_ipa_range(chunk_va, ipa, chunk_len)
+                    .and_then(|mapping| {
+                        let offset = usize::try_from(ipa.checked_sub(mapping.ipa)?).ok()?;
+                        Some(unsafe { mapping.host_addr.add(offset) })
+                    })
+            });
+            if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
+                .ok()
+                .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+                && chunk_va <= debug_va
+                && debug_va < chunk_va.saturating_add(chunk_len as u64)
+            {
+                eprintln!(
+                    "[SCRUBDBG pid={:?}] chunk va={chunk_va:#x}+{chunk_len:#x} live_ipa={live_ipa:x?} \
+                     retained_ipa={retained_ipa:x?} target={target:?}",
+                    self.cow_identity.map(|identity| identity.linux_pid),
+                );
             }
-            if let Some(fragment) = retained_fragment {
-                register_shared_alias(fragment);
+            if let Some(target) = target {
+                unsafe {
+                    core::ptr::write_bytes(target, 0u8, chunk_len);
+                }
+                if let Some(fragment) = retained_fragment {
+                    register_shared_alias(fragment);
+                }
             }
             cleared += chunk_len;
         }
@@ -11223,7 +11247,7 @@ impl HvfVmState {
                 {
                     eprintln!(
                         "[FORKDBG] mapping [{:#x},{:#x}) ipa={:#x} phys_ipa={:#x} size={:#x} \
-                         sharing={:?} dyn={} extents={}",
+                         sharing={:?} dyn={} extents={} phys_host={:p}",
                         mapping.start,
                         mapping.end,
                         mapping.ipa,
@@ -11232,6 +11256,7 @@ impl HvfVmState {
                         mapping.sharing,
                         mapping.is_dynamic_alias,
                         inherited.len(),
+                        mapping.physical_host_addr,
                     );
                     for ((gpa, length), extent) in &inherited {
                         eprintln!(
