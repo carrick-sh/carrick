@@ -54,8 +54,31 @@ pub(crate) fn hvf_cap_budget() -> usize {
     (cap - RESERVE).max(1) as usize
 }
 
+/// The M:N admission budget is the HYPERVISOR's ceiling, not the host's core
+/// count.
+///
+/// Clamping to physical cores treated a correctness-critical admission
+/// resource as a throughput knob. carrick binds one vCPU per guest thread, so
+/// the budget is the number of guest threads that may be simultaneously
+/// admitted -- and a guest whose runnable threads exceed it can deadlock:
+/// slots end up held by threads that only release when some other thread makes
+/// progress, and the thread that would make it is the one queued for a slot.
+/// Oversubscribing vCPUs to cores is what a host scheduler is for; refusing to
+/// admit them is what wedges a guest.
+///
+/// Measured 2026-08-18 on `go-os_exec` `TestConcurrentExec`, canonical host
+/// (10 physical cores, HVF ceiling 63): with the clamp, 23 clone children pass
+/// the vCPU gate, only 17 ever get a scheduler slot, and the 6 that do not make
+/// their parents' 10 s start gate expire into `std::process::abort()` -- 4 runs
+/// out of 4. `CARRICK_HVF_VCPU_RECLAIM=0`, which admits one live HVF vCPU per
+/// guest thread and so removes the bound entirely, passes the same test in
+/// under a second.
+///
+/// Reclaim still matters above this ceiling: HVF caps concurrent vCPUs, and
+/// guests do exceed it (CPython `test_queue.test_many_threads` spawns 100).
 pub(crate) fn budget_from_limits(hvf_budget: usize, physical_cores: usize) -> usize {
-    hvf_budget.max(1).min(physical_cores.max(1))
+    let _ = physical_cores;
+    hvf_budget.max(1)
 }
 
 /// A vCPU was destroyed; wake any thread parked on the gate condvar.

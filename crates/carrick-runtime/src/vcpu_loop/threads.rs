@@ -80,6 +80,12 @@ fn futex_wait_is_interrupted(
         || !registry.is_live(tid)
 }
 
+/// How long a clone child waits per attempt for its vCPU slot. Long enough
+/// that a FIFO place is actually held rather than surrendered and retaken at
+/// the back of the queue; short enough to notice `exit_group` cancellation
+/// promptly.
+const CLONE_CHILD_SLOT_WAIT_SLICE: Duration = Duration::from_millis(250);
+
 fn acquire_vcpu_lease_while_live<A, R>(
     registry: &ThreadRegistry,
     tid: ThreadId,
@@ -716,6 +722,19 @@ where
                 .map(crate::hvpatch::ProcessContext::pid),
             tid,
         );
+        // Reclaim this caller's vCPU BEFORE spawning, not after. The child
+        // materializer starts queueing for a slot the instant the host thread
+        // runs, so releasing afterwards leaves a window in which the parent
+        // still owns a slot while its own child competes for one -- and with
+        // several parents cloning at once that window is the whole deadlock:
+        // every parent holds a slot, every child waits for one, and the
+        // parent's `ready` gate expires into `std::process::abort()`.
+        //
+        // Keep the caller reclaimed through publication/start: the child
+        // materializer holds the topology lock until `start_tx`, so resuming the
+        // parent first would exchange the slot deadlock for a topology deadlock.
+        let parent_reclaim =
+            self.park_vcpu_for_blocking_wait(engine, crate::thread::VcpuParkClass::ReleaseSafe);
         let handle = std::thread::Builder::new()
             .name(host_thread_name)
             .spawn(move || {
@@ -757,10 +776,21 @@ where
                         let _ = ready_tx.send(Err(SiblingStartFailure::Cancelled));
                         return;
                     }
+                    // Wait in long slices, not short ones. Admission is FIFO,
+                    // and every `acquire_timeout` call takes a FRESH place in
+                    // line -- so a child that re-enters the queue every few
+                    // milliseconds keeps sending itself to the back and can
+                    // starve indefinitely behind threads that wait properly.
+                    // Measured 2026-08-18 on `TestConcurrentExec` with a 10 ms
+                    // slice: 23 children passed the HVF vCPU gate, only 17 ever
+                    // got a scheduler slot, and the 6 that never did are exactly
+                    // the ones whose parents' start gate expired into
+                    // `std::process::abort()`. The slice only bounds how quickly
+                    // cancellation is noticed, and the parent's gate is 10 s.
                     if let Some(lease) = carrick_hal::vcpu_sched::global().acquire_timeout(
                         tid.raw() as u64,
                         None,
-                        Duration::from_millis(10),
+                        CLONE_CHILD_SLOT_WAIT_SLICE,
                     ) {
                         break lease;
                     }
@@ -987,14 +1017,6 @@ where
                 return Err(error);
             }
         };
-        // Thread creation is a blocking wait for another scheduler consumer.
-        // Reclaim this caller's vCPU before waiting so a full M:N budget cannot
-        // deadlock with every parent holding a slot while its child waits for
-        // one. Keep the caller reclaimed through publication/start: the child
-        // materializer holds the topology lock until `start_tx`, so resuming the
-        // parent first would exchange the slot deadlock for a topology deadlock.
-        let parent_reclaim =
-            self.park_vcpu_for_blocking_wait(engine, crate::thread::VcpuParkClass::ReleaseSafe);
         // Classified 2026-08-13: this is a real deadlock/lost wakeup, NOT a time
         // assumption, so the bound is a backstop and must not be "fixed" by
         // raising it. Measured on the cold go-build fixture: a successful run

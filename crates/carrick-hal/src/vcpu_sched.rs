@@ -3,6 +3,7 @@
 //! reclaim-on-block. The default impl leans on a host Mutex+Condvar (generalizing
 //! the HVF `vcpu_gate`) and the host thread scheduler for the M.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
@@ -111,7 +112,25 @@ struct PoolState {
     free: Vec<SlotId>,
     /// Per-id generation; bumped on each grant, zeroed when free.
     generations: Vec<u64>,
+    /// Arrival-ordered tickets of threads waiting for a slot.
+    ///
+    /// Admission is FIFO because without it the pool starves newcomers
+    /// outright. `release` used to push an id and `notify_one`, so any thread
+    /// already running could barge in and take it before the woken waiter
+    /// reacquired the mutex -- and `acquire_preferring` barges BY DESIGN,
+    /// re-taking a blocking thread's own id ahead of everyone. Incumbents
+    /// therefore recycled their slots among themselves indefinitely while a
+    /// freshly cloned sibling (which has no `preferred` id to prefer) never
+    /// won one. Measured 2026-08-18 on `go-os_exec` `TestConcurrentExec`:
+    /// budget 10, 26 admits and 76 reclaims in a single 10 s run -- slots
+    /// circulating briskly -- yet linux tids 25, 26 and 28 never got one and
+    /// the parent's `ready` gate expired into `std::process::abort()`.
+    queue: VecDeque<Ticket>,
+    /// Next ticket to hand out.
+    next_ticket: Ticket,
 }
+
+type Ticket = u64;
 
 /// Default scheduler: an N-slot free-list behind a host Mutex+Condvar.
 pub struct HostCondvarScheduler {
@@ -132,6 +151,8 @@ impl HostCondvarScheduler {
                 // rev() so pop() yields 0,1,2,... — stable, low ids first.
                 free: (0..n as SlotId).rev().collect(),
                 generations: vec![0; n],
+                queue: VecDeque::new(),
+                next_ticket: 0,
             }),
             cv: Condvar::new(),
             grant_gen: AtomicU64::new(1),
@@ -140,14 +161,58 @@ impl HostCondvarScheduler {
     }
 }
 
+impl HostCondvarScheduler {
+    /// Take a slot only from the FRONT of the arrival queue, preferring the
+    /// caller's own id when it is still free. Returns `None` if the caller is
+    /// not at the head or nothing is free.
+    fn try_take_at_head(
+        &self,
+        st: &mut PoolState,
+        ticket: Ticket,
+        preferred: Option<SlotId>,
+    ) -> Option<SlotLease> {
+        if st.queue.front() != Some(&ticket) {
+            return None;
+        }
+        let slot = match preferred.and_then(|p| st.free.iter().position(|&s| s == p)) {
+            // Reusing the caller's OWN just-released id keeps its vCPU clean and
+            // avoids a re-bind. Safe to keep now that it only applies at the
+            // head: it is an ordering preference among free ids, not a way past
+            // the threads that arrived first.
+            Some(pos) => st.free.remove(pos),
+            None => st.free.pop()?,
+        };
+        st.queue.pop_front();
+        let generation = self.grant_gen.fetch_add(1, Ordering::SeqCst);
+        st.generations[slot as usize] = generation;
+        Some(SlotLease { slot, generation })
+    }
+
+    fn enqueue(&self, st: &mut PoolState) -> Ticket {
+        let ticket = st.next_ticket;
+        st.next_ticket = st.next_ticket.wrapping_add(1);
+        st.queue.push_back(ticket);
+        ticket
+    }
+
+    /// Leave the queue without a slot. The next thread in line may now be at the
+    /// head with a slot already free, so it has to be woken.
+    fn abandon(&self, st: &mut PoolState, ticket: Ticket) {
+        if let Some(pos) = st.queue.iter().position(|&t| t == ticket) {
+            st.queue.remove(pos);
+        }
+    }
+}
+
 impl VcpuScheduler for HostCondvarScheduler {
     fn acquire(&self, _tid: u64) -> SlotLease {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let ticket = self.enqueue(&mut st);
         loop {
-            if let Some(slot) = st.free.pop() {
-                let generation = self.grant_gen.fetch_add(1, Ordering::SeqCst);
-                st.generations[slot as usize] = generation;
-                return SlotLease { slot, generation };
+            if let Some(lease) = self.try_take_at_head(&mut st, ticket, None) {
+                drop(st);
+                self.cv.notify_all();
+                return lease;
             }
             // 50ms backstop like HVF's gate — never miss a release wakeup.
             self.blocked.fetch_add(1, Ordering::SeqCst);
@@ -165,31 +230,21 @@ impl VcpuScheduler for HostCondvarScheduler {
     }
 
     fn has_spare_capacity(&self) -> bool {
-        !self
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .free
-            .is_empty()
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Free ids already spoken for by queued waiters are not spare: reporting
+        // them would send a fork coordinator into the barrier for a slot it is
+        // going to lose.
+        st.free.len() > st.queue.len()
     }
 
     fn acquire_preferring(&self, _tid: u64, preferred: SlotId) -> SlotLease {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let ticket = self.enqueue(&mut st);
         loop {
-            // Reuse the thread's OWN just-released slot if it is still free.
-            if let Some(pos) = st.free.iter().position(|&s| s == preferred) {
-                st.free.remove(pos);
-                let generation = self.grant_gen.fetch_add(1, Ordering::SeqCst);
-                st.generations[preferred as usize] = generation;
-                return SlotLease {
-                    slot: preferred,
-                    generation,
-                };
-            }
-            if let Some(slot) = st.free.pop() {
-                let generation = self.grant_gen.fetch_add(1, Ordering::SeqCst);
-                st.generations[slot as usize] = generation;
-                return SlotLease { slot, generation };
+            if let Some(lease) = self.try_take_at_head(&mut st, ticket, Some(preferred)) {
+                drop(st);
+                self.cv.notify_all();
+                return lease;
             }
             self.blocked.fetch_add(1, Ordering::SeqCst);
             let (g, _) = self
@@ -209,26 +264,19 @@ impl VcpuScheduler for HostCondvarScheduler {
     ) -> Option<SlotLease> {
         let deadline = std::time::Instant::now() + timeout;
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let ticket = self.enqueue(&mut st);
         loop {
-            // Reuse the thread's OWN just-released slot if it is still free.
-            if let Some(p) = preferred
-                && let Some(pos) = st.free.iter().position(|&s| s == p)
-            {
-                st.free.remove(pos);
-                let generation = self.grant_gen.fetch_add(1, Ordering::SeqCst);
-                st.generations[p as usize] = generation;
-                return Some(SlotLease {
-                    slot: p,
-                    generation,
-                });
-            }
-            if let Some(slot) = st.free.pop() {
-                let generation = self.grant_gen.fetch_add(1, Ordering::SeqCst);
-                st.generations[slot as usize] = generation;
-                return Some(SlotLease { slot, generation });
+            if let Some(lease) = self.try_take_at_head(&mut st, ticket, preferred) {
+                drop(st);
+                self.cv.notify_all();
+                return Some(lease);
             }
             let now = std::time::Instant::now();
             if now >= deadline {
+                // Give the place up so the thread behind us can reach the head.
+                self.abandon(&mut st, ticket);
+                drop(st);
+                self.cv.notify_all();
                 return None;
             }
             // Count as a waiter (has_waiters drives siblings' reclaim-on-block
@@ -254,7 +302,9 @@ impl VcpuScheduler for HostCondvarScheduler {
             st.free.push(lease.slot);
         }
         drop(st);
-        self.cv.notify_one();
+        // notify_all, not notify_one: only the thread at the head of the queue
+        // may take this id, and notify_one could wake anyone else.
+        self.cv.notify_all();
     }
 
     fn budget(&self) -> usize {
@@ -266,6 +316,7 @@ impl VcpuScheduler for HostCondvarScheduler {
         // Fresh full pool: every id free, every grant invalidated. The caller
         // re-acquires the child's main slot (0) afterward.
         st.free = (0..self.budget as SlotId).rev().collect();
+        st.queue.clear();
         st.generations.iter_mut().for_each(|g| *g = 0);
     }
 }
