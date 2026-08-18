@@ -399,5 +399,11 @@ fn install_guest_abort_banner() {
              {msg}\n  at {loc}\n\
              \x1b[1;31m=================================================\x1b[0m\n"
         );
+        // Honor RUST_BACKTRACE like the default hook would: a one-line banner
+        // with no trace has cost real investigations a full reproduce-under-
+        // debugger cycle (the bridge-probe shutdown join panic among them).
+        if std::env::var_os("RUST_BACKTRACE").is_some_and(|v| v != "0") {
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
     }));
 }

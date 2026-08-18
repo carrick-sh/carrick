@@ -108,12 +108,19 @@ struct ListenerReservation {
 struct PublishedTcpProxy {
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
+    /// Host pid that spawned the proxy thread. A raw run forks host processes
+    /// (carrier/supervisor), and the child inherits this struct while the
+    /// pthread only exists in the parent; joining there aborts the whole run
+    /// with ESRCH during shutdown. Drop only joins in the owning process.
+    owner: u32,
 }
 
 #[derive(Debug)]
 struct PublishedUdpProxy {
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
+    /// See [`PublishedTcpProxy::owner`].
+    owner: u32,
 }
 
 /// Where a published-UDP relay publishes the transient endpoint that lets the
@@ -284,7 +291,11 @@ impl Drop for PublishedTcpProxy {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            // A fork-inherited handle names a pthread that exists only in the
+            // owning process; joining it here returns ESRCH and std panics.
+            if std::process::id() == self.owner {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -293,7 +304,9 @@ impl Drop for PublishedUdpProxy {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            if std::process::id() == self.owner {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -893,6 +906,7 @@ impl SocketNamespaceProvider {
             .push(PublishedTcpProxy {
                 stop,
                 handle: Some(handle),
+                owner: std::process::id(),
             });
         Ok(())
     }
@@ -977,6 +991,7 @@ impl SocketNamespaceProvider {
             .push(PublishedUdpProxy {
                 stop,
                 handle: Some(handle),
+                owner: std::process::id(),
             });
         Ok(())
     }
@@ -4777,6 +4792,7 @@ mod tests {
             .push(PublishedTcpProxy {
                 stop: Arc::new(AtomicBool::new(false)),
                 handle: Some(handle),
+                owner: std::process::id(),
             });
         locked_rx
             .recv_timeout(Duration::from_secs(1))
