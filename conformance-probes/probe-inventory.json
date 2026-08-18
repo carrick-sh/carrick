@@ -944,6 +944,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "memfdsecret": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "memmap": {
     "class": "conformance",
     "excluded": false,
@@ -1150,6 +1155,11 @@
     "runner": "generic"
   },
   "netpoll": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "newmountapi": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
@@ -2165,6 +2175,11 @@
     "runner": "generic"
   },
   "udpreuseaddr": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "uffdpolicy": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"

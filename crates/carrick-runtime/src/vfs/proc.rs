@@ -2040,6 +2040,105 @@ fn proc_pid_dir_entries_with_context(
     }
 }
 
+/// Whether the pid component of a `/proc/<pid>…` path names a process that
+/// exists, asked of the kernel task graph FIRST and the host process table only
+/// as the no-graph fallback.
+///
+/// This is the same authority [`graph_process`] provides, exposed as a bare
+/// predicate for the subtrees that only need "does this process exist" and not
+/// the process record itself.
+pub(crate) fn proc_pid_component_is_live(component: &str, ctx: &SyntheticProcContext) -> bool {
+    graph_process(component, ctx).is_some() || proc_live_pid(component).is_some()
+}
+
+/// The `/proc/<pid>/ns` component pair of a path, if it has one.
+fn proc_ns_path_parts(path: &str) -> Option<(&str, &str)> {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let rest = path.strip_prefix("/proc/")?;
+    let (component, leaf) = rest.split_once('/')?;
+    (!component.is_empty()).then_some((component, leaf))
+}
+
+/// Context-aware `/proc/<pid>/ns` listing.
+///
+/// The whole ns family used to resolve liveness through [`proc_live_pid`], i.e.
+/// the HOST process table. Under HVPatch a peer Linux process is a thread of one
+/// Darwin process and owns no host pid, so every numeric-pid ns path answered
+/// ENOENT while `/proc/self/ns` worked (the `self` alias short-circuits ahead of
+/// the lookup). LTP `setns01` reads `/proc/<pid>/ns/<type>` by number and
+/// TCONF'd at `setns01.c:153` "no ns types/proc entries"; `setns02` reported the
+/// same thing as a bogus kconfig failure.
+///
+/// The graph-backed authority was already threaded into `/proc`, `/proc/<pid>`
+/// and `/proc/<pid>/task` — the `ns` subtree was simply left behind. Note the
+/// bug is invisible with a single guest process, since pid 1 IS the caller;
+/// it needs a live peer, which is exactly the identity-domain shape
+/// `docs/identity-and-scope-domains.md` describes.
+fn proc_ns_dir_entries_with_context(path: &str, ctx: &SyntheticProcContext) -> Option<Vec<DirEnt>> {
+    let (component, leaf) = proc_ns_path_parts(path)?;
+    if leaf != "ns" || !proc_pid_component_is_live(component, ctx) {
+        return None;
+    }
+    let mut entries = vec![
+        DirEnt {
+            name: ".".to_string(),
+            kind: EntryKind::Directory,
+        },
+        DirEnt {
+            name: "..".to_string(),
+            kind: EntryKind::Directory,
+        },
+    ];
+    entries.extend(PROC_NS_TYPES.iter().map(|(name, _)| DirEnt {
+        name: (*name).to_string(),
+        kind: EntryKind::Symlink,
+    }));
+    Some(entries)
+}
+
+/// Context-aware `<type>:[<inode>]` readlink target for `/proc/<pid>/ns/<type>`,
+/// resolving the pid through the kernel task graph. The context-free
+/// [`proc_ns_link_target`] stays for the callers that have no context.
+pub(crate) fn proc_ns_link_target_with_context(
+    path: &str,
+    ctx: &SyntheticProcContext,
+) -> Option<String> {
+    let (component, leaf) = proc_ns_path_parts(path)?;
+    let ns_type = leaf.strip_prefix("ns/")?;
+    if !proc_pid_component_is_live(component, ctx) {
+        return None;
+    }
+    PROC_NS_TYPES
+        .iter()
+        .find(|(name, _)| *name == ns_type)
+        .map(|(name, ino)| format!("{name}:[{ino}]"))
+}
+
+/// Context-aware readlink-target LENGTH for `/proc/<pid>/ns/<type>` — the
+/// `st_size` an lstat reports for the magic symlink. The context-free
+/// [`proc_magic_symlink_size`] cannot see a peer.
+pub(crate) fn proc_ns_link_size_with_context(
+    path: &str,
+    ctx: &SyntheticProcContext,
+) -> Option<u64> {
+    proc_ns_link_target_with_context(path, ctx).map(|t| t.len() as u64)
+}
+
+/// Context-aware `/proc/<pid>/ns/<type>` recogniser: the namespace `<type>` when
+/// the pid names a live process. Mirrors the dispatcher's `proc_ns_link`, which
+/// can only consult the host process table.
+pub(crate) fn proc_ns_link_type_with_context<'a>(
+    path: &'a str,
+    ctx: &SyntheticProcContext,
+) -> Option<&'a str> {
+    let (component, leaf) = proc_ns_path_parts(path)?;
+    let ns_type = leaf.strip_prefix("ns/")?;
+    if !proc_pid_component_is_live(component, ctx) {
+        return None;
+    }
+    ns_type_inode(ns_type).map(|_| ns_type)
+}
+
 /// Every synthetic `/proc` DIRECTORY whose existence only the kernel task graph
 /// can settle: `/proc`, `/proc/<pid>` and `/proc/<pid>/task`.
 ///
@@ -2056,6 +2155,7 @@ pub(crate) fn synthetic_dir_entries(path: &str, ctx: &SyntheticProcContext) -> O
     proc_task_dir_entries_with_context(path, ctx)
         .or_else(|| proc_task_tid_dir_entries_with_context(path, ctx))
         .or_else(|| proc_pid_dir_entries_with_context(path, ctx))
+        .or_else(|| proc_ns_dir_entries_with_context(path, ctx))
 }
 
 /// The `/proc` top-level listing: `.`/`..`, the self aliases, every synthetic

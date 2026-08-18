@@ -470,6 +470,12 @@ impl SyscallDispatcher {
             // writable (LTP `tgkill03` probes `R_OK`).
             return Some(synthetic_readonly_access_with_errno(mode, LINUX_EACCES));
         }
+        // A PEER's `/proc/<pid>/ns/<type>` magic symlink, same reason: the
+        // context-free recogniser resolves the pid against the host process
+        // table and cannot see a process that is a thread of this carrier.
+        if crate::vfs::proc::proc_ns_link_target_with_context(path, &proc_ctx).is_some() {
+            return Some(synthetic_readonly_access_with_errno(mode, LINUX_EACCES));
+        }
         None
     }
 }

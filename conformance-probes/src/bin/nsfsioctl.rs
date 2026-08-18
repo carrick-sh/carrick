@@ -4,6 +4,14 @@
 //! models exactly ONE initial namespace per type, so the answers are synthetic
 //! but must be STABLE and consistent with Linux.
 //!
+//! Section (e) covers a live PEER process rather than `self`. That distinction
+//! is load-bearing: every other check here uses `/proc/self/ns/<type>`, and the
+//! `self` alias short-circuits ahead of the pid lookup — so a runtime that
+//! resolves `/proc/<pid>` against the HOST process table (which under HVPatch
+//! describes the one carrier every Linux process is a thread of) passes all of
+//! them while every numeric-pid ns path is ENOENT. That is exactly the shape
+//! LTP `setns01` tripped over, and it was structurally unprobed until (e).
+//!
 //! The conformance harness runs this identical static binary under carrick and
 //! real Linux and diffs line by line. Deterministic only: booleans, named
 //! CLONE_NEW* flag constants, errno values, and a uid — NEVER a raw inode
@@ -161,6 +169,102 @@ fn main() {
             unsafe { libc::close(fd) };
         }
     }
+
+    // (e) A live PEER's ns links, by NUMERIC pid. Same namespace, so every
+    // answer must equal self's. Only booleans are printed — never the peer pid.
+    peer_ns_checks();
+}
+
+/// Fork a child that parks, then inspect `/proc/<child>/ns/<type>` from the
+/// parent by numeric pid: access, lstat-is-symlink, readlink target, and open.
+/// Prints only booleans so the line set is host-stable.
+fn peer_ns_checks() {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+        println!("peer_ns_setup_ok=false");
+        return;
+    }
+    let (rd, wr) = (fds[0], fds[1]);
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        println!("peer_ns_setup_ok=false");
+        return;
+    }
+    if child == 0 {
+        unsafe { libc::close(wr) };
+        // Park until the parent closes the pipe, then exit.
+        let mut b = [0u8; 1];
+        while unsafe { libc::read(rd, b.as_mut_ptr() as *mut libc::c_void, 1) } < 0 {
+            if errno() != libc::EINTR {
+                break;
+            }
+        }
+        unsafe { libc::_exit(0) };
+    }
+    unsafe { libc::close(rd) };
+    println!("peer_ns_setup_ok=true");
+
+    for ns in ["uts", "ipc", "net", "pid", "mnt", "user"] {
+        let peer = format!("/proc/{child}/ns/{ns}");
+        let c = match CString::new(peer.clone()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let acc = unsafe { libc::access(c.as_ptr(), libc::F_OK) };
+        println!("peer_{ns}_access_ok={}", acc == 0);
+
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let lst = unsafe { libc::lstat(c.as_ptr(), &mut st as *mut libc::stat) };
+        let is_link = lst == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK;
+        println!("peer_{ns}_lstat_is_symlink={is_link}");
+
+        // The peer shares our namespaces, so its readlink target must be
+        // byte-identical to ours. Comparing the two avoids printing an inode.
+        println!(
+            "peer_{ns}_readlink_matches_self={}",
+            readlink_of(&peer) == readlink_of(&format!("/proc/self/ns/{ns}"))
+                && readlink_of(&peer).is_some()
+        );
+
+        let fd = open(&peer, libc::O_RDONLY);
+        println!("peer_{ns}_open_ok={}", fd >= 0);
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    // Release the child and reap it so the probe leaves nothing behind.
+    unsafe { libc::close(wr) };
+    let mut status: libc::c_int = 0;
+    unsafe { libc::waitpid(child, &mut status as *mut libc::c_int, 0) };
+
+    // A REAPED pid must stop resolving — the liveness gate has to be real and
+    // not "any numeric component is a process".
+    let gone = format!("/proc/{child}/ns/uts");
+    if let Ok(c) = CString::new(gone) {
+        println!(
+            "reaped_peer_ns_absent={}",
+            unsafe { libc::access(c.as_ptr(), libc::F_OK) } != 0
+        );
+    }
+}
+
+/// readlink(2) as an owned String, or None on error.
+fn readlink_of(path: &str) -> Option<String> {
+    let c = CString::new(path).ok()?;
+    let mut buf = [0u8; 256];
+    let n = unsafe {
+        libc::readlink(
+            c.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len() - 1,
+        )
+    };
+    if n <= 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
 }
 
 /// Open /proc/self/ns/<ns> O_RDONLY, returning the raw fd (or -1).
