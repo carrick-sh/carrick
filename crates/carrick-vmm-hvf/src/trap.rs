@@ -3581,6 +3581,18 @@ pub(crate) struct HvfVmState {
     pending_fork_frame_receipts: Vec<PendingForkFrameReceipt>,
     /// Child aliases withheld until fresh-vCPU register restoration succeeds.
     pending_process_aliases: Vec<AliasBacking>,
+    /// Recycled buffer for the frame-COW rollback pre-image.
+    ///
+    /// `perform_frame_cow` snapshots the whole stage-1 manager before it edits,
+    /// so a failed publication can restore the exact pre-transaction image. That
+    /// snapshot is unchanged; only its allocation is reused. A fresh
+    /// `PageTableManager::clone()` costs an `mmap` of 1.75 MiB, a zero-fill
+    /// fault per page as the copy touches it, and a `munmap`/`madvise` on drop
+    /// — measured at ~6 COW faults per guest fork+wait round trip, which put
+    /// that whole host-VM churn on the COW path. Taken for the duration of one
+    /// COW and returned on success; a rollback consumes it (it becomes the live
+    /// manager) and the next COW allocates one again.
+    cow_rollback_scratch: Option<crate::page_table::PageTableManager>,
 }
 
 /// Thread/process exit must LEAK the per-thread host backings, never `munmap`
@@ -4384,7 +4396,12 @@ pub struct ProcessSpec {
     mappings: Vec<ProcessMappingDesc>,
     inventory_mappings: Vec<ProcessInventoryDesc>,
     protections: std::sync::Arc<MemoryProtections>,
-    page_tables: std::sync::Arc<parking_lot::Mutex<Option<crate::page_table::PageTableManager>>>,
+    // No `page_tables`: the child's stage-1 graph reaches the backend through
+    // `bind_stage1_page_tables`, which the shared engine calls with the SAME
+    // manager it puts in its own process spec, immediately after
+    // `from_process_spec` returns. Carrying a second copy here meant cloning
+    // the whole 1.75 MiB `LINUX_PAGE_TABLES_SIZE` image once per fork only to
+    // overwrite it unread a few instructions later.
     mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
     syscall_transport: HvfSyscallTransport,
     persistent_vm_lifecycle: bool,
@@ -5993,6 +6010,25 @@ impl HvfVmState {
         self.page_tables = page_tables;
     }
 
+    /// Complete pre-transaction image of `manager`, taken into the recycled
+    /// buffer when one is available.
+    ///
+    /// This is byte-for-byte what `manager.clone()` produced before; the only
+    /// change is that a returned buffer is refilled in place instead of asking
+    /// the allocator for another 1.75 MiB region. See `cow_rollback_scratch`.
+    fn rollback_pre_image(
+        scratch: &mut Option<crate::page_table::PageTableManager>,
+        manager: &crate::page_table::PageTableManager,
+    ) -> crate::page_table::PageTableManager {
+        match scratch.take() {
+            Some(mut reused) => {
+                reused.clone_from(manager);
+                reused
+            }
+            None => manager.clone(),
+        }
+    }
+
     pub(crate) fn retire_process_mappings(&mut self) -> Result<(), TrapError> {
         // Mature VMM processes own a private VM and retain the historical
         // teardown path; only the persistent single-VM HVPatch lane publishes
@@ -6114,6 +6150,7 @@ impl HvfVmState {
             cow_deferred_publications: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             pending_fork_frame_receipts: Vec::new(),
             pending_process_aliases: Vec::new(),
+            cow_rollback_scratch: None,
         };
         state.seed_readonly_spans_from_plan(plan);
 
@@ -7110,13 +7147,16 @@ impl HvfVmState {
             )?
         };
         let inventory_entry = ((physical_ipa, physical_len), inventory_mapping);
+        // Fill the recycled pre-image buffer rather than allocating a fresh
+        // 1.75 MiB one per transaction (see `cow_rollback_scratch`).
+        let mut rollback_scratch = self.cow_rollback_scratch.take();
         let mut rollback_page_tables = None;
         let publication = (|| {
             let mut page_tables = self.page_tables.lock();
             let manager = page_tables.as_mut().ok_or_else(|| {
                 TrapError::Hypervisor("sparse HVPatch mmap page tables are absent".to_owned())
             })?;
-            rollback_page_tables = Some(manager.clone());
+            rollback_page_tables = Some(Self::rollback_pre_image(&mut rollback_scratch, manager));
             let aligned_start = align_up(start, TWO_MIB)?.min(end);
             if start < aligned_start {
                 manager
@@ -7206,6 +7246,9 @@ impl HvfVmState {
             )?;
             return Err(error);
         }
+        // Publication succeeded: nothing needs the pre-image any more, so hand
+        // its buffer back to the recycler for the next transaction.
+        self.cow_rollback_scratch = rollback_page_tables.take().or(rollback_scratch);
         if let Err(error) = flush_stage1() {
             eprintln!("carrick: FATAL: sparse HVPatch mmap TLBI failed: {error}");
             std::process::abort();
@@ -7556,13 +7599,16 @@ impl HvfVmState {
             inventory_mapping,
         );
 
+        // Fill the recycled pre-image buffer rather than allocating a fresh
+        // 1.75 MiB one per transaction (see `cow_rollback_scratch`).
+        let mut rollback_scratch = self.cow_rollback_scratch.take();
         let mut rollback_page_tables = None;
         let publication = (|| {
             let mut page_tables = self.page_tables.lock();
             let manager = page_tables.as_mut().ok_or_else(|| {
                 TrapError::Hypervisor("HVPatch retained reuse page tables are absent".to_owned())
             })?;
-            rollback_page_tables = Some(manager.clone());
+            rollback_page_tables = Some(Self::rollback_pre_image(&mut rollback_scratch, manager));
             manager
                 .repoint_preserving_attributes(page_va, new_ipa, span_len as u64)
                 .map_err(|error| {
@@ -7628,6 +7674,9 @@ impl HvfVmState {
             )?;
             return Err(error);
         }
+        // Publication succeeded: nothing needs the pre-image any more, so hand
+        // its buffer back to the recycler for the next transaction.
+        self.cow_rollback_scratch = rollback_page_tables.take().or(rollback_scratch);
         if let Err(error) = flush_stage1() {
             eprintln!("carrick: FATAL: retained reuse stage-1 TLBI failed: {error}");
             std::process::abort();
@@ -8052,6 +8101,9 @@ impl HvfVmState {
             crate::probes::hvpatch_frame_cow(event);
         };
         emit_cow(carrick_observability::probes::HvpatchFrameCowPhase::Stage2Mapped);
+        // Fill the recycled pre-image buffer rather than allocating a fresh
+        // 1.75 MiB one per transaction (see `cow_rollback_scratch`).
+        let mut rollback_scratch = self.cow_rollback_scratch.take();
         let mut rollback_page_tables = None;
         let mut preserved_denied_receipt = None;
         let page_table_result = (|| {
@@ -8069,7 +8121,7 @@ impl HvfVmState {
             // written to both the manager shadow and live backing.  Preserve a
             // complete pre-edit image: a cloned manager's dirty list alone is
             // not a rollback log, because `sync_to_host` drains the NEW edits.
-            rollback_page_tables = Some(manager.clone());
+            rollback_page_tables = Some(Self::rollback_pre_image(&mut rollback_scratch, manager));
             if span.kernel_only {
                 manager
                     .map_kernel_aliased(span.va, new_ipa, span.len as u64)
@@ -8177,6 +8229,9 @@ impl HvfVmState {
             let _ = retire_global_frame_host_owner(new_physical_ipa, CowArmedRanges::COMPOUND_SIZE);
             return Err(error);
         }
+        // Publication succeeded: nothing needs the pre-image any more, so hand
+        // its buffer back to the recycler for the next transaction.
+        self.cow_rollback_scratch = rollback_page_tables.take().or(rollback_scratch);
         if let Err(error) = flush_stage1() {
             eprintln!("carrick: FATAL: HVPatch COW stage-1 TLBI failed: {error}");
             std::process::abort();
@@ -11269,6 +11324,7 @@ impl HvfVmState {
             cow_deferred_publications,
             pending_fork_frame_receipts: Vec::new(),
             pending_process_aliases: Vec::new(),
+            cow_rollback_scratch: None,
         };
 
         for mapping in mappings {
@@ -11897,7 +11953,6 @@ impl HvfVmState {
             mappings,
             inventory_mappings,
             protections,
-            page_tables: std::sync::Arc::new(parking_lot::Mutex::new(Some(page_tables.clone()))),
             mailbox_slots: std::sync::Arc::clone(&self.mailbox_slots),
             syscall_transport: self.syscall_transport,
             persistent_vm_lifecycle: self.persistent_vm_lifecycle,
@@ -11905,10 +11960,14 @@ impl HvfVmState {
             frame_inventory,
             cow_armed: std::sync::Arc::new(parking_lot::Mutex::new(child_cow_armed)),
         };
+        // Zero bytes: this stage no longer copies the page-table image (see the
+        // `ProcessSpec` field comment). Reporting the old
+        // `LINUX_PAGE_TABLES_SIZE` here would keep claiming a copy that the
+        // stage does not make.
         emit_stage(
             HvpatchForkProcessSpecStagePhase::BackendSpecFinalize,
             stage_started,
-            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE,
+            0,
         );
         Ok(spec)
     }
@@ -12025,7 +12084,10 @@ impl HvfVmState {
             is_forked_child: false,
             forked_no_exec: false,
             protections: spec.protections,
-            page_tables: spec.page_tables,
+            // Empty until the shared engine's `bind_stage1_page_tables` installs
+            // the child's real manager, exactly as `new_with_plan` does for a
+            // fresh VM. Nothing between here and that bind reads it.
+            page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             mailbox_slots: spec.mailbox_slots,
             syscall_transport: spec.syscall_transport,
             last_syscall_nr: None,
@@ -12043,6 +12105,7 @@ impl HvfVmState {
             cow_deferred_publications: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             pending_fork_frame_receipts: Vec::new(),
             pending_process_aliases: aliases_to_publish,
+            cow_rollback_scratch: None,
         };
         let mailbox = match state.allocate_mailbox_for_vcpu(&vcpu) {
             Ok(mailbox) => mailbox,
