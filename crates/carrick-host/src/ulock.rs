@@ -82,6 +82,15 @@ mod imp {
         /// latency (unbounded under load; probe futexforkrequeue counted 431
         /// "waiters" on a queue holding 200).
         wake_credits: AtomicU32,
+        /// Monotonic count of wake batches that have logically dequeued
+        /// waiters here (`note_logical_dequeues`). A waiter snapshots it at
+        /// enroll; a slice-boundary credit claim is valid only when the slot
+        /// sequence has ADVANCED past that snapshot - i.e. the credit's wake
+        /// happened after this waiter began waiting. Without the fence a
+        /// late-arriving waiter claimed a credit minted for an earlier one
+        /// (fork04's second checkpoint phase stole the first phase's missed
+        /// wake and the waker's retry loop spun to TBROK).
+        wake_seq: AtomicU64,
         /// Waiters that left the wait WOKEN without a waker's credit — the
         /// slice loop's value re-check or an os_sync at-entry mismatch. On
         /// Linux they would still be queued until a FUTEX_WAKE dequeued and
@@ -434,26 +443,38 @@ mod imp {
         waiter_table().is_some()
     }
 
-    pub fn waiter_enter(host_addr: usize) {
-        if let Some(slot) = waiter_slot(host_addr) {
-            slot.count.fetch_add(1, Ordering::AcqRel);
+    /// Enroll a waiter and return the slot's wake-sequence snapshot; a later
+    /// [`try_claim_wake_credit`] must pass it back so only wakes issued AFTER
+    /// enrollment are claimable.
+    pub fn waiter_enter(host_addr: usize) -> u64 {
+        match waiter_slot(host_addr) {
+            Some(slot) => {
+                let seq = slot.wake_seq.load(Ordering::Acquire);
+                slot.count.fetch_add(1, Ordering::AcqRel);
+                seq
+            }
+            None => 0,
         }
     }
 
-    /// True when a waker has logically dequeued a waiter here
-    /// (`note_logical_dequeues`) whose credit no exit has settled yet. The
-    /// sliced wait loop polls this at each slice boundary: a physical os_sync
-    /// wake that fired while the waiter was BETWEEN slices is otherwise
-    /// unrecoverable when the waker legally never changes the futex word
-    /// (LTP's tst_checkpoint protocol — rt_tgsigqueueinfo01 slept its full
-    /// 10 s deadline against a wake_counted that had already reported the
-    /// waiter woken). Peek only: the woken exit's `settle_waiter_exit`
-    /// consumes the credit through its normal path. Two same-slot waiters
-    /// racing one credit can both observe it and produce one spurious woken
-    /// return — the loser settles as a self-wake, the bounded transient the
-    /// slot machinery already self-repairs.
-    pub fn has_wake_credit(waiter_key: usize) -> bool {
-        waiter_slot(waiter_key).is_some_and(|slot| slot.wake_credits.load(Ordering::Acquire) > 0)
+    /// Atomically claim ONE pending wake credit at this slot — a waker that
+    /// ran while the waiter was BETWEEN wait slices logically dequeued it
+    /// (`note_logical_dequeues`: count -> wake_credits) and its physical
+    /// os_sync wake found nobody parked. When the waker legally never changes
+    /// the futex word (LTP's tst_checkpoint protocol), the slice loop's value
+    /// re-check can never recover the wake: rt_tgsigqueueinfo01 slept its
+    /// full 10 s checkpoint deadline against a wake_counted that had already
+    /// reported the waiter woken. The sliced wait claims at each slice
+    /// boundary; a successful claim IS the woken waiter's ledger settlement
+    /// (the waker consumed our count unit, we consume its credit), so the
+    /// claimer must SKIP its exit-side `waiter_exit` settle. Claim — not
+    /// peek: an earlier peek-only variant woke EVERY between-slices waiter
+    /// whenever any credit existed, and the herd of spurious FUTEX_WAIT
+    /// returns broke checkpoint pairing across fork04/fcntl15/tgkill02.
+    pub fn try_claim_wake_credit(waiter_key: usize, enroll_seq: u64) -> bool {
+        waiter_slot(waiter_key).is_some_and(|slot| {
+            slot.wake_seq.load(Ordering::Acquire) > enroll_seq && consume_one(&slot.wake_credits)
+        })
     }
 
     /// An exiting waiter settles ONE accounting unit, with the LOOKUP ORDER
@@ -516,6 +537,7 @@ mod imp {
         }
         if n > 0 {
             slot.wake_credits.fetch_add(n, Ordering::AcqRel);
+            slot.wake_seq.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -907,8 +929,10 @@ mod imp {
             "shared futex waiter transport is Darwin-only",
         ))
     }
-    pub fn waiter_enter(_host_addr: usize) {}
-    pub fn has_wake_credit(_waiter_key: usize) -> bool {
+    pub fn waiter_enter(_host_addr: usize) -> u64 {
+        0
+    }
+    pub fn try_claim_wake_credit(_waiter_key: usize, _enroll_seq: u64) -> bool {
         false
     }
     pub fn waiter_exit(_host_addr: usize, _woken: bool) {}
@@ -923,7 +947,7 @@ mod imp {
     }
 }
 
-pub use imp::has_wake_credit;
+pub use imp::try_claim_wake_credit;
 pub use imp::{
     WaiterTableReexecAuthority, init_waiter_table_from_reexec, preinit_waiter_table,
     requeue_counted, requeued_waiter_complete, requeued_waiter_enter, requeued_waiter_exit,
@@ -933,24 +957,35 @@ pub use imp::{
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod tests {
-    /// A wake that lands while the waiter is BETWEEN wait slices leaves a
-    /// claimable credit the slice loop can poll; the woken exit settles it.
+    /// A wake that lands while the waiter is BETWEEN wait slices leaves
+    /// exactly one claimable credit; the claim settles the ledger (the
+    /// claimer skips its exit settle), and a second claim finds nothing.
     #[test]
-    fn between_slice_wake_leaves_claimable_credit() {
+    fn between_slice_wake_leaves_one_claimable_credit() {
         let key = 0xC0FF_EE00_0001_usize;
-        super::waiter_enter(key);
-        assert!(!super::has_wake_credit(key), "no credit before any wake");
+        let enroll = super::waiter_enter(key);
+        assert!(
+            !super::try_claim_wake_credit(key, enroll),
+            "no credit before any wake"
+        );
         let woke = super::wake_counted(key, key, 1);
         assert_eq!(woke, 1, "logical dequeue counts the enrolled waiter");
+        // A waiter that enrolls AFTER the wake must not steal the credit
+        // (fork04's second checkpoint phase vs the first phase's wake).
+        let late = super::waiter_enter(key);
         assert!(
-            super::has_wake_credit(key),
-            "missed physical wake must stay claimable"
+            !super::try_claim_wake_credit(key, late),
+            "a post-wake enrollee owns no earlier credit"
         );
-        super::waiter_exit(key, true);
         assert!(
-            !super::has_wake_credit(key),
-            "woken exit settles the credit"
+            super::try_claim_wake_credit(key, enroll),
+            "the pre-wake enrollee claims exactly once"
         );
+        assert!(
+            !super::try_claim_wake_credit(key, enroll),
+            "one credit never wakes a second waiter"
+        );
+        super::waiter_exit(key, false);
     }
 
     use super::{wait, wake};

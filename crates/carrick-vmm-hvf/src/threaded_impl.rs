@@ -30,6 +30,17 @@ const SHARED_FUTEX_MAX_SLICE_US: u32 = 20_000;
 /// `__ulock`, carrying the carrick-trace probes the module deliberately keeps.
 pub struct HvfShared;
 
+std::thread_local! {
+    /// Set when this thread's in-flight shared wait claimed a wake credit at
+    /// a slice boundary (`try_claim_wake_credit`): the claim IS the ledger
+    /// settlement, so `wait_end` must skip `waiter_exit`. Cleared at
+    /// `wait_start`; `wait_end` takes-and-clears.
+    static CLAIMED_WAKE_CREDIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The slot wake-sequence snapshot captured at this thread's `wait_start`
+    /// enrollment — the claim fence: only wakes issued after it are ours.
+    static ENROLL_WAKE_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl SharedFutexSyscall for HvfShared {
     /// Pre-wait peek: read the current shared word so carrick-trace can see it
     /// before any wait commences (once, at the top of `shared_wait`).
@@ -40,7 +51,9 @@ impl SharedFutexSyscall for HvfShared {
     }
 
     fn wait_start(&self, waiter_key: usize) {
-        carrick_host::ulock::waiter_enter(waiter_key);
+        CLAIMED_WAKE_CREDIT.with(|claimed| claimed.set(false));
+        let enroll_seq = carrick_host::ulock::waiter_enter(waiter_key);
+        ENROLL_WAKE_SEQ.with(|seq| seq.set(enroll_seq));
     }
 
     fn wait_start_requeued(&self, waiter_key: usize) -> bool {
@@ -48,6 +61,12 @@ impl SharedFutexSyscall for HvfShared {
     }
 
     fn wait_end(&self, waiter_key: usize, woken: bool) {
+        // A slice-boundary credit claim already settled this wait's ledger
+        // (see `try_claim_wake_credit`); settling again would consume a
+        // peer's credit or mint a phantom self-wake.
+        if CLAIMED_WAKE_CREDIT.with(std::cell::Cell::take) {
+            return;
+        }
         carrick_host::ulock::waiter_exit(waiter_key, woken);
     }
 
@@ -85,8 +104,15 @@ impl SharedFutexSyscall for HvfShared {
         // (count -> credit) but its os_sync wake found nobody parked. When the
         // waker never changes the word (pure wake/wait protocols: LTP
         // tst_checkpoint), the value re-check below can never recover it —
-        // claim the pending credit before re-parking.
-        if carrick_host::ulock::has_wake_credit(waiter_key) {
+        // CLAIM one pending credit before re-parking. The claim settles this
+        // wait's ledger; `wait_end` skips its exit settle (thread-local flag,
+        // cleared at `wait_start`). Exactly one waiter wins per credit — a
+        // peek here woke the whole herd and broke checkpoint pairing.
+        if carrick_host::ulock::try_claim_wake_credit(
+            waiter_key,
+            ENROLL_WAKE_SEQ.with(std::cell::Cell::get),
+        ) {
+            CLAIMED_WAKE_CREDIT.with(|claimed| claimed.set(true));
             return SharedWaitStep::Woken;
         }
         // Re-validate the shared word at the TOP of every slice before re-parking.
