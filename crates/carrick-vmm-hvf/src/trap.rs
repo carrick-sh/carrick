@@ -14408,9 +14408,11 @@ mod vm_create_admission_tests {
 
     #[test]
     fn mn_budget_uses_physical_cores_but_never_exceeds_hvf_cap() {
-        assert_eq!(vcpu_gate::budget_from_limits(60, 10), 10);
+        // The hypervisor ceiling is the budget; the host's core count is not a
+        // correctness bound on how many guest threads may be admitted.
+        assert_eq!(vcpu_gate::budget_from_limits(60, 10), 60);
         assert_eq!(vcpu_gate::budget_from_limits(6, 10), 6);
-        assert_eq!(vcpu_gate::budget_from_limits(60, 0), 1);
+        assert_eq!(vcpu_gate::budget_from_limits(60, 0), 60);
         assert_eq!(vcpu_gate::budget_from_limits(0, 10), 1);
     }
 
