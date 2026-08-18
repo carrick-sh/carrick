@@ -166,6 +166,32 @@ pub(crate) struct ContainerPolicy {
 impl ContainerPolicy {
     /// The carrick model of Docker's default seccomp profile. Entries carry
     /// their differential evidence in the module docs; keep the two in sync.
+    /// The default model, minus the entries Docker's profile gates on a
+    /// capability the container was granted with `--cap-add`. Docker's
+    /// profile is capability-CONDITIONAL: `--cap-add SYS_ADMIN` re-enables
+    /// `bpf`, `unshare`, `setns`, the `io_uring` family and the new mount
+    /// API, which is exactly how the conformance oracle runs the suites that
+    /// pass `--cap-add SYS_ADMIN`. Without this, carrick denied syscalls the
+    /// oracle allows and the two sides ran at different privilege.
+    pub(crate) fn docker_model_with_capabilities(granted: u64) -> Self {
+        let mut policy = Self::docker_default_model();
+        let sys_admin = 1_u64 << crate::namespace::process::CAP_SYS_ADMIN;
+        if granted & sys_admin != 0 {
+            policy.deny.retain(|(nr, _)| {
+                !matches!(
+                    *nr,
+                    SYS_BPF
+                        | SYS_UNSHARE
+                        | SYS_SETNS
+                        | SYS_IO_URING_SETUP
+                        | SYS_IO_URING_ENTER
+                        | SYS_IO_URING_REGISTER
+                )
+            });
+        }
+        policy
+    }
+
     pub(crate) fn docker_default_model() -> Self {
         Self::from_entries(vec![
             // Keyring syscalls: EPERM under Docker's default profile, succeed

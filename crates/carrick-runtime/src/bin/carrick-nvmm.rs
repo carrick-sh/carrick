@@ -58,6 +58,7 @@ fn main() {
             let mut argv = vec![entrypoint.clone()];
             argv.extend(rest);
             let spec = carrick_spec::RunSpec {
+                cap_add: Vec::new(),
                 executable: entrypoint,
                 argv,
                 envp: vec![

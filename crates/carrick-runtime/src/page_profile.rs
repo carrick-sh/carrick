@@ -131,6 +131,7 @@ mod tests {
         page: NativePageProfileRequest,
     ) -> RunSpec {
         RunSpec {
+            cap_add: Vec::new(),
             executable: "/bin/sh".to_string(),
             argv: vec!["/bin/sh".to_string()],
             envp: Vec::new(),

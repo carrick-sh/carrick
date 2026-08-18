@@ -441,6 +441,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 stop_timeout: None,
                 publish: vec![],
                 security_opt: vec![],
+                cap_add: vec![],
                 pid: carrick_spec::PidMode::Private,
                 detach: false,
                 forward_env: vec![],
@@ -577,7 +578,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 &security_opt,
             )
             .map_err(anyhow::Error::msg)?;
-            dispatcher.apply_seccomp_policy(seccomp_policy);
+            dispatcher.apply_launch_privileges(seccomp_policy, &[]);
             install_fs_backend(&mut dispatcher, fs)?;
             // Bind-mount host paths into the guest. `--fs host` is a sandboxed
             // scratch (NOT the real host FS), so this is the only way to expose a
@@ -869,6 +870,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             stop_timeout,
             publish,
             security_opt,
+            cap_add,
             pid,
             detach,
             forward_env,
@@ -945,6 +947,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 stop_signal,
                 stop_timeout,
                 security_opts: security_opt,
+                cap_add,
             };
 
             // Stand up the fork-shared alias-IPA counter NOW, in the root process,
@@ -1142,6 +1145,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             stop_signal,
             stop_timeout,
             security_opt,
+            cap_add,
             pull,
             command,
         } => {
@@ -1197,6 +1201,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 stop_signal,
                 stop_timeout,
                 security_opts: security_opt,
+                cap_add,
             };
             crate::lifecycle::create(req, store.clone(), name)?;
         }

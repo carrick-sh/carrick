@@ -65,6 +65,48 @@ pub const FS_CAPABILITIES: u64 = (1 << CAP_CHOWN)
     | (1 << CAP_MAC_OVERRIDE);
 pub const CAP_SYS_RESOURCE: u32 = 24;
 
+/// Resolve a docker `--cap-add` name (no `CAP_` prefix, case-insensitive) to
+/// its capability number. Only the capabilities carrick actually models are
+/// listed; an unknown name yields `None` so the caller can refuse loudly
+/// rather than silently granting nothing.
+pub fn capability_by_name(name: &str) -> Option<u32> {
+    let name = name
+        .trim()
+        .trim_start_matches("CAP_")
+        .trim_start_matches("cap_");
+    Some(match name.to_ascii_uppercase().as_str() {
+        "CHOWN" => CAP_CHOWN,
+        "DAC_OVERRIDE" => CAP_DAC_OVERRIDE,
+        "DAC_READ_SEARCH" => CAP_DAC_READ_SEARCH,
+        "FOWNER" => CAP_FOWNER,
+        "FSETID" => CAP_FSETID,
+        "SETPCAP" => CAP_SETPCAP,
+        "LINUX_IMMUTABLE" => CAP_LINUX_IMMUTABLE,
+        "NET_RAW" => CAP_NET_RAW,
+        "SYS_ADMIN" => CAP_SYS_ADMIN,
+        "SYS_PTRACE" => CAP_SYS_PTRACE,
+        "SYS_NICE" => CAP_SYS_NICE,
+        "SYS_RESOURCE" => CAP_SYS_RESOURCE,
+        "MKNOD" => CAP_MKNOD,
+        "MAC_OVERRIDE" => CAP_MAC_OVERRIDE,
+        _ => return None,
+    })
+}
+
+/// The bit mask for a set of docker `--cap-add` names, plus the names that
+/// were not recognised.
+pub fn capability_mask_for_names(names: &[String]) -> (u64, Vec<String>) {
+    let mut mask = 0_u64;
+    let mut unknown = Vec::new();
+    for name in names {
+        match capability_by_name(name) {
+            Some(cap) => mask |= 1_u64 << cap,
+            None => unknown.push(name.clone()),
+        }
+    }
+    (mask, unknown)
+}
+
 /// A full capability set over the modeled range — what the creator of a fresh
 /// user namespace holds within it (design §4.1, §4.4).
 pub const FULL_CAPS: u64 = if CAP_LAST_CAP >= 63 {
@@ -90,11 +132,15 @@ impl CapabilitySet {
     /// The default container set (effective=permitted=bounding = Docker
     /// default; inheritable/ambient empty), matching observed `docker run`.
     pub fn docker_default() -> Self {
+        // `--cap-add` raises the effective/permitted/bounding sets exactly as
+        // docker does; the grant is a launch-time constant (see
+        // `grant_launch_capabilities`).
+        let caps = DOCKER_DEFAULT_CAPS | launch_granted_capabilities();
         Self {
-            effective: DOCKER_DEFAULT_CAPS,
-            permitted: DOCKER_DEFAULT_CAPS,
+            effective: caps,
+            permitted: caps,
             inheritable: 0,
-            bounding: DOCKER_DEFAULT_CAPS,
+            bounding: caps,
             ambient: 0,
         }
     }
@@ -140,6 +186,22 @@ pub struct ProcessCredsNs {
     /// This process's user namespace. Starts as the identity initial ns
     /// (uid 0 → host uid 0), so the common `docker run` case is unchanged.
     pub user: UserNs,
+}
+
+/// Capabilities granted at launch by `--cap-add`, ORed into the container
+/// default set every process starts from. A launch-time constant: written
+/// once before the guest boots and read-only thereafter, exactly like the
+/// container syscall policy it travels with.
+static LAUNCH_GRANTED_CAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record the launch-time `--cap-add` grant. Called once, before boot.
+pub fn grant_launch_capabilities(mask: u64) {
+    LAUNCH_GRANTED_CAPS.store(mask, std::sync::atomic::Ordering::Release);
+}
+
+/// The launch-time grant, for the container default set.
+pub fn launch_granted_capabilities() -> u64 {
+    LAUNCH_GRANTED_CAPS.load(std::sync::atomic::Ordering::Acquire)
 }
 
 impl Default for ProcessCredsNs {

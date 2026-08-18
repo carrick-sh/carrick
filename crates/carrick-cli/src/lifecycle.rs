@@ -223,6 +223,7 @@ fn build_created_state(
             stop_signal,
             stop_timeout: req.stop_timeout,
             security_opts: req.security_opts.clone(),
+            cap_add: req.cap_add.clone(),
         },
     }
 }
@@ -405,6 +406,7 @@ fn rebuild_request_from_state(state: &ContainerState) -> carrick_engine::CliRunR
         stop_signal: None,
         stop_timeout: None,
         security_opts: c.security_opts.clone(),
+        cap_add: c.cap_add.clone(),
     }
 }
 
@@ -1207,6 +1209,7 @@ pub(crate) fn exec(
         // docker exec runs under the container's seccomp profile: reuse the
         // container's persisted security options.
         security_opts: state.config.security_opts.clone(),
+        cap_add: state.config.cap_add.clone(),
     };
 
     let engine = carrick_engine::Engine::new(store);
@@ -1799,6 +1802,7 @@ mod tests {
             api_auto_remove: false,
             labels: std::collections::HashMap::new(),
             config: RunConfig {
+                cap_add: Vec::new(),
                 platform: Some("linux/arm64".into()),
                 env: vec!["A=1".into()],
                 workdir: Some("/w".into()),

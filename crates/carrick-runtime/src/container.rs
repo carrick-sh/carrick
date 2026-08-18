@@ -175,6 +175,11 @@ pub struct RunConfig {
     /// was created with (empty = docker's default profile model).
     #[serde(default)]
     pub security_opts: Vec<String>,
+    /// Docker-compatible `--cap-add` grants, preserved across
+    /// start/restart/exec exactly like `security_opts` (docker keeps the
+    /// container's capability set for its whole lifetime).
+    #[serde(default)]
+    pub cap_add: Vec<String>,
 }
 
 fn default_max_traps() -> usize {
@@ -238,6 +243,7 @@ impl Default for RunConfig {
             stop_signal: None,
             stop_timeout: None,
             security_opts: Vec::new(),
+            cap_add: Vec::new(),
         }
     }
 }
