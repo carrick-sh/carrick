@@ -235,7 +235,13 @@ fn linux_termio_bytes(termios: &LinuxTermios) -> [u8; LINUX_TERMIO_SIZE] {
         c_cc: cc,
     };
     let mut out = [0u8; LINUX_TERMIO_SIZE];
-    out.copy_from_slice(termio.as_bytes());
+    // `struct termio` is 17 bytes of fields PADDED to sizeof 18 (its u16
+    // members give it alignment 2). The packed Rust mirror serializes the 17
+    // real bytes; the trailing pad stays zero. Copying into the full array
+    // panicked the runtime on length mismatch — a guest-reachable abort via
+    // any TCGETA (probe `ioctlcluster`).
+    let bytes = termio.as_bytes();
+    out[..bytes.len()].copy_from_slice(bytes);
     out
 }
 
