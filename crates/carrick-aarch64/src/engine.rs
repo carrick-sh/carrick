@@ -136,6 +136,17 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// window of an in-process fork. Runtime commits it only after the child is
     /// materialized; a recoverable failure restores both authorities.
     pending_process_fork: Option<ParentForkCowRollback>,
+
+    /// Recycled buffer for the fork-time parent page-table pre-image.
+    ///
+    /// Every in-process fork snapshots the parent's stage-1 manager so a failed
+    /// child materialization can restore it byte-for-byte. That snapshot is
+    /// unchanged; only its allocation is reused. The image is
+    /// `LINUX_PAGE_TABLES_SIZE` (1.75 MiB), which the system allocator serves
+    /// from a fresh `mmap`, so a per-fork `clone()` costs an `mmap`, a zero-fill
+    /// fault per page as the copy touches it, and a `munmap`/`madvise` on drop.
+    /// A successful commit hands the buffer back here instead of freeing it.
+    pt_snapshot_scratch: Option<PageTableManager>,
 }
 
 /// Bootstrap the live stage-1 editor only when persistent exec left it absent.
@@ -182,6 +193,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             reclaim_snapshot: None,
             fork_arena_high_water: u64::MAX,
             pending_process_fork: None,
+            pt_snapshot_scratch: None,
         }
     }
 
@@ -293,6 +305,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             reclaim_snapshot: None,
             fork_arena_high_water: u64::MAX,
             pending_process_fork: None,
+            pt_snapshot_scratch: None,
         }
     }
 
@@ -1895,14 +1908,22 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
         let ttbr = self.vcpu.get_sys_reg(SysReg::Ttbr0).ok()?;
         let root = ttbr & TTBR_ROOT_MASK;
-        let bytes = self
-            .vm
-            .read_gpa(root, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize)
-            .ok()?;
-        Some((
-            ttbr,
-            carrick_mem::page_table::walk_descriptors(&bytes, root, far),
-        ))
+        let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
+        // Walk the live backing in place. This runs on EVERY frame-COW fault
+        // (`resolve_frame_cow_fault`), and reading the region through
+        // `read_gpa` allocated and memcpy'd all 1.75 MiB of it to extract four
+        // descriptors — measured at ~6 COW faults per guest fork+wait round
+        // trip, so ~10 MiB of copying plus an mmap/munmap/madvise triple per
+        // cycle for a diagnostic probe. It still reads the HARDWARE-visible
+        // bytes rather than the software model, which is the whole point of
+        // this walk.
+        let host = self.vm.host_ptr(root, size)?;
+        // SAFETY: `host_ptr` resolved a complete live mapping of `size` bytes
+        // whose byte offset 0 is the PA `root`, and this frame holds the engine
+        // borrow for the duration of the walk.
+        Some((ttbr, unsafe {
+            carrick_mem::page_table::walk_descriptors_host(host.cast_const(), size, root, far)
+        }))
     }
 
     fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {
@@ -2069,12 +2090,29 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let mut page_tables = self.page_tables.lock().clone().ok_or_else(|| {
             TrapError::Hypervisor("hvpatch parent page tables are absent".to_owned())
         })?;
-        let parent_page_tables_snapshot = page_tables.clone();
+        // Complete pre-transaction image, taken into the recycled buffer when a
+        // previous fork returned one (see `pt_snapshot_scratch`).
+        //
+        // Only an mm-copying fork arms the parent read-only and therefore has
+        // anything to roll back: with no COW ranges the parent's graph is never
+        // edited, and the snapshot below was pure copying. `CLONE_VM` and vfork
+        // take that path, and cpython's forkserver and `subprocess` lean on it.
+        let parent_page_tables_snapshot =
+            (!cow_ranges.is_empty()).then(|| match self.pt_snapshot_scratch.take() {
+                Some(mut reused) => {
+                    reused.clone_from(&page_tables);
+                    reused
+                }
+                None => page_tables.clone(),
+            });
         let parent_armed_snapshot = self.vm.frame_cow_arm_snapshot();
+        // The child's own editable graph, plus the parent's rollback pre-image
+        // when this fork copies the mm.
         emit_stage(
             HvpatchForkProcessSpecStagePhase::ParentPageTablesClone,
             stage_started,
-            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE,
+            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE
+                * (1 + u64::from(parent_page_tables_snapshot.is_some())),
         );
 
         // Prepare the child's independent stage-1 graph read-only while it is
@@ -2138,6 +2176,16 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             // or its fail-closed descriptor authentication fails. Armed-range
             // metadata is installed only after publication succeeds, so every
             // pre-commit error leaves both authorities at their prior state.
+            //
+            // The pre-image is taken under exactly this condition above, so a
+            // missing one means the two predicates have drifted apart; refuse
+            // rather than arm the parent with no way back.
+            let Some(parent_page_tables_snapshot) = parent_page_tables_snapshot else {
+                return Err(TrapError::Hypervisor(
+                    "hvpatch fork would arm parent COW ranges without a rollback pre-image"
+                        .to_owned(),
+                ));
+            };
             let publish_parent = (|| -> Result<(), TrapError> {
                 self.pt_edit_and_flush(|manager| {
                     let mut changed = false;
@@ -2270,7 +2318,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     }
 
     fn commit_process_fork(&mut self) -> Result<(), TrapError> {
-        self.pending_process_fork = None;
+        // The child is materialized, so the parent pre-image is dead. Keep its
+        // buffer for the next fork rather than returning 1.75 MiB to the
+        // allocator only to ask for it again (see `pt_snapshot_scratch`).
+        self.pt_snapshot_scratch = self
+            .pending_process_fork
+            .take()
+            .map(|rollback| rollback.page_tables);
         Ok(())
     }
 
