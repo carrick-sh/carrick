@@ -293,6 +293,31 @@ impl FrameInventoryAuthority {
         snapshot_state(&self.state.lock(), Some(mm))
     }
 
+    /// O(1) point query: does `mapping` exist, PUBLISHED, in `mm`, bound to
+    /// exactly this (frame, gpa, length)? The COW-fault authority asks this
+    /// once per resolved fault; answering it with `snapshot_for_mm` allocated
+    /// row vectors for the WHOLE inventory under the global mutex, which made
+    /// each fork-storm COW fault O(live inventory) — fork cost climbed
+    /// linearly with live-process count (1.1 ms at 100 live -> 35 ms at
+    /// 1000; LTP futex_cmp_requeue01's 1000-waiter phase starved on it).
+    pub fn mapping_is_live_exact(
+        &self,
+        mm: MmId,
+        mapping: MappingId,
+        frame: FrameId,
+        gpa: Gpa,
+        length: FrameLength,
+    ) -> bool {
+        let state = self.state.lock();
+        state.mappings.get(&mapping).is_some_and(|entry| {
+            entry.state == MappingState::Published
+                && entry.mm == mm
+                && entry.frame == frame
+                && entry.gpa == gpa
+                && entry.length == length
+        })
+    }
+
     pub(crate) fn snapshot_until(&self, deadline: Instant) -> Option<FrameInventorySnapshot> {
         self.state
             .try_lock_until(deadline)

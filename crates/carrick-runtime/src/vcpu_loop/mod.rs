@@ -242,15 +242,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         Ok(self
             .kernel
             .frame_inventory()
-            .snapshot_for_mm(self.mm)
-            .mappings
-            .iter()
-            .any(|row| {
-                row.mapping == mapping
-                    && row.frame == frame
-                    && row.gpa == gpa
-                    && row.length == length
-            }))
+            .mapping_is_live_exact(self.mm, mapping, frame, gpa, length))
     }
 }
 
