@@ -26,8 +26,8 @@ Each row carries a `SupportLevel`, which maps to the **Quality** column below:
 | `Planned` | **Stub** | Recognized by name but routes to `ENOSYS` today. Only two: `execveat` (#281) and `clone3` (#435) — the latter is partially wired for the clone/fork modes carrick supports (`compat_note_for_aarch64`). |
 | `Deferred` | **Not implemented** | `ENOSYS`, surfaced by its real name (e.g. `io_uring_register`, `userfaultfd`) so the compat report shows `userfaultfd`, not `unknown 282`. |
 
-**232 syscalls are actively emulated** (`BringUp`), 2 are `Planned` stubs, and
-the remaining 105 table rows are `Deferred`. Counts are from the table itself
+**238 syscalls are actively emulated** (`BringUp`), 2 are `Planned` stubs, and
+the remaining 99 table rows are `Deferred`. Counts are from the table itself
 (`rg 'SupportLevel::BringUp' crates/carrick-abi/src/syscall.rs | wc -l`).
 
 > [!NOTE]
