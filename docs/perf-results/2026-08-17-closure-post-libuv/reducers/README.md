@@ -419,12 +419,58 @@ AND Docker — the corruption needs more of the real topology):
 - `mremap-grow-fork-probe.py` — glibc realloc chain (mremap-grow shape, which
   the real workload's own FAULTDBG shows firing), dirty, fork, verify. Clean.
 
-Next lever: DETERMINISM. The corrupt VA is stable run-to-run, so instrument the
-HVPatch fork frame-copy path for VA `0x60010cc000` specifically (RUST_LOG on
-the COW/frame lineage, or a targeted FAULTDBG-class hook) and watch which
-lineage decision hands the worker a zero frame while the server holds data.
-The core that proves all of this is preserved at `/tmp/core` (20 MB; regenerate
-with the recipe above if lost).
+### ROOT CAUSE (found via CARRICK_FORK_DEBUG_VA / CARRICK_FORK_DEBUG_IPA)
+
+Two env-gated hooks (kept in-tree) settled it: `CARRICK_FORK_DEBUG_VA=<hex>`
+prints, at each fork, the covering mapping, its inventory extents, the parent
+frame's BYTES at that offset, and the parent's live stage-1 leaf;
+`CARRICK_FORK_DEBUG_IPA=<hex>` prints every global-frame host-owner
+register/retire overlapping that IPA, with backtraces.
+
+What they showed, in order:
+
+1. At fork #1 the parent frame holds live data at the granule; at fork #2 the
+   SAME frame offset reads zero — with the parent's stage-1 leaf still
+   read-only, still pointing at the SAME physical address, and AGREEING with
+   the inventory. The parent never wrote the granule between forks; the
+   physical backing changed under it.
+2. The owner lifecycle names the killer:
+   - guest mmap -> `materialize_sparse_mmap_extent` registers host owner
+     `(0x9e2bc00000, 0x1a4000)` — the region the dict lives in;
+   - guest **munmap of PART of the region** -> `unregister_process_alias` ->
+     `retire_stage2_extent` retires the WHOLE owner, dropping the
+     `OwnedHostMapping` while live sibling mappings (the dict) still point
+     into it;
+   - a later guest mmap re-materializes `(0x9e2bc00000, 0x154000)` — fresh
+     ZEROED host memory under the parent's still-mapped VAs.
+3. The parent's own dict extent carries a THIRD length for the same base
+   (`(0x9e2bc00000, 0xf4000)`).
+
+So the defect: **sparse-materialized stage-2 regions re-register one base IPA
+at different lengths as they grow, and every refcount — `stage2_references`,
+the host-owner registry, `final_exec_physical_extents`'s
+`references == local` gate — keys on the exact `(base, length)` tuple.
+Overlapping leases with independent refcounts are blind to each other, so a
+partial munmap (or a process exit) retires host backing that other live
+mappings still reference through a different key.** Granules rewritten after
+the re-registration re-materialize; a granule written before and never after
+silently becomes zeros. Fork is not the bug — it merely copies the loss into a
+child that then reads it.
+
+This is the `docs/identity-and-scope-domains.md` class again — two keys for
+one physical range — and the third instance this campaign (engine-handle
+count vs guest-executor population; `(gpa,len)` extents vs `MappingId`; now
+`(base,len)` leases vs physical range).
+
+Six simplified probes (committed beside this file) all PASS — the trigger
+needs a partial munmap inside a grown sparse extent with a surviving sibling
+mapping, which none of them reproduce. Fix direction: either grow the owner in
+place (never re-register one base at a new length — the `SharedAperture::grow`
+precedent), or make ownership range-aware so no retire drops bytes any live
+lease still covers.
+
+The proving core is preserved at `/tmp/core` (20 MB; regenerate with the
+recipe above if lost).
 
 ### Why this cluster is worth the next cycle
 
