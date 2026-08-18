@@ -282,10 +282,21 @@ fn fd_is_random_device(this: &SyscallDispatcher, fd: i32) -> bool {
     })
 }
 
+/// The readable PREFIX of a gather list, plus whether the walk stopped on an
+/// unreadable segment.
+///
+/// `writev` is not all-or-nothing on Linux: the kernel copies segments in order
+/// and stops at the first one it cannot read, returning the bytes it already
+/// transferred. Only a fault with ZERO bytes transferred is `EFAULT`.
+struct GatheredIovecBytes {
+    bytes: Vec<u8>,
+    faulted: bool,
+}
+
 fn gather_bounded_iovec_bytes(
     memory: &impl GuestMemory,
     iovecs: &[LinuxIovec],
-) -> Result<Option<Vec<u8>>, LinuxErrno> {
+) -> Result<Option<GatheredIovecBytes>, LinuxErrno> {
     let mut total = 0usize;
     for iovec in iovecs {
         let len = usize::try_from(iovec.iov_len).map_err(|_| LINUX_EINVAL)?;
@@ -296,17 +307,26 @@ fn gather_bounded_iovec_bytes(
     }
 
     let mut bytes = Vec::with_capacity(total);
+    let mut faulted = false;
     for iovec in iovecs {
         let len = usize::try_from(iovec.iov_len).map_err(|_| LINUX_EINVAL)?;
+        // A zero-length segment is never dereferenced, so a `{NULL, 0}` entry
+        // must be skipped rather than faulted.
         if len == 0 {
             continue;
         }
-        let chunk = memory
-            .read_bytes(iovec.iov_base, len)
-            .map_err(|_| LINUX_EFAULT)?;
+        // Stop at the first unreadable segment and keep what came before it.
+        // Returning EFAULT for the whole call discards a transfer Linux would
+        // have performed (LTP `writev07` writes 4x64 bytes with the SECOND
+        // iovec on a PROT_NONE page and requires the return value 64, the file
+        // content, and the advanced offset).
+        let Ok(chunk) = memory.read_bytes(iovec.iov_base, len) else {
+            faulted = true;
+            break;
+        };
         bytes.extend_from_slice(&chunk);
     }
-    Ok(Some(bytes))
+    Ok(Some(GatheredIovecBytes { bytes, faulted }))
 }
 
 enum PwritevPayloads {
@@ -11347,13 +11367,19 @@ impl SyscallDispatcher {
                     if room == Some(0) {
                         return Ok(this.splice_output_would_block(fd.0, nonblocking));
                     }
-                    let bytes = match gather_bounded_iovec_bytes(memory, &iovecs) {
-                        Ok(Some(bytes)) => bytes,
+                    let (bytes, faulted) = match gather_bounded_iovec_bytes(memory, &iovecs) {
+                        Ok(Some(gathered)) => (gathered.bytes, gathered.faulted),
                         Ok(None) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     };
                     if bytes.is_empty() {
-                        return Ok(DispatchOutcome::Returned { value: 0 });
+                        // Same partial-transfer rule as `writev`: EFAULT only
+                        // when the emptiness is a fault, not a zero-length list.
+                        return if faulted {
+                            Ok(DispatchOutcome::errno(LINUX_EFAULT))
+                        } else {
+                            Ok(DispatchOutcome::Returned { value: 0 })
+                        };
                     }
                     let bytes = &bytes[..room.map_or(bytes.len(), |room| bytes.len().min(room))];
                     Ok(this.splice_write_out(fd.0, 0, bytes, memory, tid, nonblocking))
@@ -12422,10 +12448,18 @@ impl SyscallDispatcher {
             };
 
             if let Some(target) = host_target
-                && let Some(bytes) = gather_bounded_iovec_bytes(memory, &iovecs)?
+                && let Some(GatheredIovecBytes { bytes, faulted }) =
+                    gather_bounded_iovec_bytes(memory, &iovecs)?
             {
                 if bytes.is_empty() {
-                    return Ok(DispatchOutcome::Returned { value: 0 });
+                    // Nothing transferable: EFAULT only if the emptiness came
+                    // from an unreadable segment. An all-zero-length list is a
+                    // legitimate 0-byte write.
+                    return if faulted {
+                        Ok(DispatchOutcome::errno(LINUX_EFAULT))
+                    } else {
+                        Ok(DispatchOutcome::Returned { value: 0 })
+                    };
                 }
                 if target.append {
                     unsafe { libc::lseek(target.host_fd, 0, libc::SEEK_END) };
@@ -12463,6 +12497,14 @@ impl SyscallDispatcher {
                 let bytes = match memory.read_bytes(iov_base, iov_len) {
                     Ok(bytes) => bytes,
                     Err(_) => {
+                        // Bytes already written are already visible in the
+                        // file, so reporting EFAULT here would both lose the
+                        // count Linux returns AND leave the guest believing
+                        // nothing was written. Report the short count instead;
+                        // EFAULT is correct only when nothing moved.
+                        if total > 0 {
+                            break;
+                        }
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                 };
