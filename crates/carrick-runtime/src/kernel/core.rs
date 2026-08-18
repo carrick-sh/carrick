@@ -1177,6 +1177,54 @@ impl Registry {
         }
     }
 
+    /// Every LIVE task in process group `pgid`, paired with its process euid so
+    /// the caller can apply setpriority(2)'s ownership rule per member. Empty
+    /// means no such group (or none of its members are live) — ESRCH.
+    pub(crate) fn process_group_prio_targets(
+        &self,
+        pgid: ProcessGroupId,
+    ) -> Vec<(Arc<Task>, carrick_abi::NsUid)> {
+        self.state
+            .read()
+            .tasks
+            .values()
+            .filter(|record| {
+                record.task.lifecycle() == TaskLifecycle::Live
+                    && record.task.process_group() == pgid
+            })
+            .map(|record| {
+                (
+                    Arc::clone(&record.task),
+                    record.task.process_credentials().euid(),
+                )
+            })
+            .collect()
+    }
+
+    /// Every LIVE task whose process euid is `uid`, for PRIO_USER. The euid in
+    /// the pair is redundant (it equals `uid`) but keeps one shape with
+    /// [`Self::process_group_prio_targets`] so the dispatch arm is shared.
+    pub(crate) fn user_prio_targets(
+        &self,
+        uid: carrick_abi::NsUid,
+    ) -> Vec<(Arc<Task>, carrick_abi::NsUid)> {
+        self.state
+            .read()
+            .tasks
+            .values()
+            .filter(|record| {
+                record.task.lifecycle() == TaskLifecycle::Live
+                    && record.task.process_credentials().euid() == uid
+            })
+            .map(|record| {
+                (
+                    Arc::clone(&record.task),
+                    record.task.process_credentials().euid(),
+                )
+            })
+            .collect()
+    }
+
     pub fn process_group(&self, id: ProcessGroupId) -> Option<Arc<ProcessGroup>> {
         self.state
             .read()

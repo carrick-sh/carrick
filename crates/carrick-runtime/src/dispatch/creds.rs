@@ -615,6 +615,67 @@ impl SyscallDispatcher {
                 }
             }
 
+            // PRIO_PGRP / PRIO_USER: Linux applies the set to EVERY member of
+            // the class and succeeds if at least one process was affected
+            // (setpriority(2): ESRCH when the class named no process, EPERM
+            // when processes were found but none could be affected, EACCES for
+            // an unprivileged raise). The kernel graph can enumerate both
+            // classes, so service them; before this the whole sweep no-opped
+            // and returned 0, and LTP setpriority01's PGRP/USER readbacks then
+            // failed all 80 sub-cases.
+            //
+            // Selection is by process EFFECTIVE uid per POSIX ("all processes
+            // with an effective user ID equal to who"); `who == 0` denotes the
+            // caller's REAL uid, per the man page. Clean-room: derived from
+            // POSIX + man-pages and the Docker oracle, not kernel source.
+            if (which == LINUX_PRIO_PGRP || which == LINUX_PRIO_USER)
+                && let Some(process) = this.hvpatch_process()
+            {
+                let registry = process.kernel_graph().registry();
+                let targets = if which == LINUX_PRIO_PGRP {
+                    let pgid = if who.0 == 0 {
+                        cx.kernel.task().process_group()
+                    } else {
+                        match crate::kernel::TaskId::from_abi_positive(who.0) {
+                            Ok(leader) => crate::kernel::ProcessGroupId::from_leader(leader),
+                            Err(_) => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
+                        }
+                    };
+                    registry.process_group_prio_targets(pgid)
+                } else {
+                    let uid = if who.0 == 0 {
+                        this.cred_snapshot().ruid
+                    } else {
+                        carrick_abi::NsUid::new(who.0 as u32)
+                    };
+                    registry.user_prio_targets(uid)
+                };
+                if targets.is_empty() {
+                    return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                }
+                let mut affected = 0usize;
+                let mut raise_refused = 0usize;
+                for (task, target_euid) in targets {
+                    if !euid.is_root() && euid != target_euid {
+                        continue; // ownership rule; counts toward EPERM
+                    }
+                    if clamped < task.nice() && !euid.is_root() {
+                        raise_refused += 1;
+                        continue;
+                    }
+                    task.set_nice(clamped);
+                    affected += 1;
+                }
+                if affected > 0 {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                return Ok(DispatchOutcome::errno(if raise_refused > 0 {
+                    LINUX_EACCES
+                } else {
+                    LINUX_EPERM
+                }));
+            }
+
             // Nice-lowering rule for the CALLER — PRIO_PROCESS on self, or
             // PRIO_PGRP/PRIO_USER with who==0 (the caller's own group/user):
             // raising priority (a nice BELOW the current value) needs
@@ -666,13 +727,47 @@ impl SyscallDispatcher {
             } else {
                 None
             };
+            // PRIO_PGRP / PRIO_USER report the HIGHEST priority (lowest nice)
+            // among the class's members. Same selection rules as setpriority
+            // above; a lane without a kernel graph keeps the legacy default.
+            let class_nice = if which != LINUX_PRIO_PROCESS
+                && let Some(process) = this.hvpatch_process()
+            {
+                let registry = process.kernel_graph().registry();
+                let targets = if which == LINUX_PRIO_PGRP {
+                    let pgid = if who.0 == 0 {
+                        cx.kernel.task().process_group()
+                    } else {
+                        match crate::kernel::TaskId::from_abi_positive(who.0) {
+                            Ok(leader) => crate::kernel::ProcessGroupId::from_leader(leader),
+                            Err(_) => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
+                        }
+                    };
+                    registry.process_group_prio_targets(pgid)
+                } else {
+                    let uid = if who.0 == 0 {
+                        this.cred_snapshot().ruid
+                    } else {
+                        carrick_abi::NsUid::new(who.0 as u32)
+                    };
+                    registry.user_prio_targets(uid)
+                };
+                let Some(min) = targets.iter().map(|(task, _)| task.nice()).min() else {
+                    return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                };
+                Some(min)
+            } else {
+                None
+            };
             // Kernel ABI: getpriority returns `20 - nice` (so the value is never
             // negative); glibc converts it back. Report the target's stored nice
-            // for PRIO_PROCESS, else the default (nice 0 → 20).
-            let nice = match (which == LINUX_PRIO_PROCESS, peer_nice) {
-                (true, Some(peer)) => peer,
-                (true, None) => cx.kernel.task().nice(),
-                (false, _) => 0,
+            // for PRIO_PROCESS, the class minimum for PGRP/USER, else the
+            // legacy default (nice 0 → 20).
+            let nice = match (which == LINUX_PRIO_PROCESS, peer_nice, class_nice) {
+                (true, Some(peer), _) => peer,
+                (true, None, _) => cx.kernel.task().nice(),
+                (false, _, Some(min)) => min,
+                (false, _, None) => 0,
             };
             Ok(DispatchOutcome::Returned {
                 value: (20 - nice) as i64,
