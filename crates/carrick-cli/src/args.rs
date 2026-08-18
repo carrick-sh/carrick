@@ -497,6 +497,15 @@ pub(crate) enum Commands {
         /// `seccomp=builtin`. Custom profile files are not supported.
         #[arg(long = "security-opt", value_name = "OPTION")]
         security_opt: Vec<String>,
+        /// Docker-compatible `--cap-add`: grant a capability beyond the
+        /// container default set, by its `capabilities(7)` name without the
+        /// `CAP_` prefix (`SYS_ADMIN`, `SYS_PTRACE`, `SYS_NICE`, ...).
+        /// Repeatable. Docker's default bounding set drops most capabilities
+        /// AND its seccomp profile is capability-conditional, so this both
+        /// raises the modeled set and lifts the launch-time denials that
+        /// capability gates.
+        #[arg(long = "cap-add", value_name = "CAPABILITY")]
+        cap_add: Vec<String>,
         /// `KEY=VAL` env vars to set in this process before the guest starts.
         /// Carries `CARRICK_*` tunables across `sudo`'s env_reset without needing
         /// SETENV in sudoers (CLI args survive sudo where env vars don't). Same
@@ -592,6 +601,9 @@ pub(crate) enum Commands {
         /// Docker-compatible security options (see `run --security-opt`).
         #[arg(long = "security-opt", value_name = "OPTION")]
         security_opt: Vec<String>,
+        /// Docker-compatible `--cap-add` (see `run --cap-add`).
+        #[arg(long = "cap-add", value_name = "CAPABILITY")]
+        cap_add: Vec<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },

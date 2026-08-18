@@ -301,6 +301,29 @@ const KNOWN_GAP_EXACT_OVERRIDES: &[(&str, &[&str])] = &[
     ("ltp-semget05", &["summary"]),
 ];
 
+/// carrick's launch flags for a suite. The base is `--raw --fs host`; on top
+/// of that, any capability the ORACLE is granted via `--cap-add` in
+/// `docker_flag_overrides` is mirrored onto the carrick side, so the two
+/// sides run at the SAME privilege. Without this the oracle ran e.g. the
+/// fanotify suites holding CAP_SYS_ADMIN while carrick modelled the bare
+/// Docker default set and answered EPERM — a harness asymmetry that reads as
+/// a carrick gap.
+fn carrick_flags_for(name: &str) -> Vec<String> {
+    let mut flags = vec!["--raw".to_string(), "--fs".to_string(), "host".to_string()];
+    if let Some(docker) = docker_flag_overrides(name) {
+        let mut it = docker.iter();
+        while let Some(flag) = it.next() {
+            if flag == "--cap-add"
+                && let Some(cap) = it.next()
+            {
+                flags.push("--cap-add".to_string());
+                flags.push(cap.clone());
+            }
+        }
+    }
+    flags
+}
+
 fn docker_flag_overrides(name: &str) -> Option<Vec<String>> {
     if OVERRIDE_EXCLUSIONS.contains(&name) {
         return None;
@@ -447,6 +470,7 @@ fn mk(
     workdir: Option<String>,
     entrypoint: Option<&str>,
 ) -> Suite {
+    let flags = carrick_flags_for(&name);
     Suite {
         name,
         ecosystem: eco,
@@ -457,7 +481,7 @@ fn mk(
         weight,
         timeout_s,
         known_gaps: Vec::new(),
-        carrick_flags: vec!["--raw".into(), "--fs".into(), "host".into()],
+        carrick_flags: flags,
         docker_flags: Vec::new(),
         bind_mounts: Vec::new(),
         env: Vec::new(),

@@ -149,6 +149,10 @@ pub struct CliRunRequest {
     /// ([`SeccompPolicy::ContainerDefault`], docker's own default); persisted
     /// in the container's `RunConfig` so start/restart/exec keep the policy.
     pub security_opts: Vec<String>,
+    /// Docker-compatible `--cap-add` names (no `CAP_` prefix). Persisted with
+    /// the container's `RunConfig` so start/restart/exec keep the grant, the
+    /// same lifetime rule as `security_opts`.
+    pub cap_add: Vec<String>,
 }
 
 /// Resolve docker-syntax `--security-opt` values (last-wins) onto a
@@ -434,6 +438,7 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
         resolve_seccomp_policy(SeccompPolicy::ContainerDefault, &req.security_opts)?;
 
     Ok(RunSpec {
+        cap_add: req.cap_add.clone(),
         executable,
         argv,
         envp,
@@ -572,6 +577,7 @@ mod tests {
 
     fn base_req(user: Option<&str>) -> CliRunRequest {
         CliRunRequest {
+            cap_add: Vec::new(),
             image_ref: "alpine".to_string(),
             platform: None,
             args: vec!["/bin/ls".to_string()],
@@ -824,6 +830,7 @@ mod tests {
             None,
         );
         let req = CliRunRequest {
+            cap_add: Vec::new(),
             image_ref: "alpine".to_string(),
             platform: None,
             args: vec![],
@@ -875,6 +882,7 @@ mod tests {
             None,
         );
         let req = CliRunRequest {
+            cap_add: Vec::new(),
             image_ref: "alpine".to_string(),
             platform: None,
             args: vec!["/bin/ls".to_string()],
@@ -925,6 +933,7 @@ mod tests {
             None,
         );
         let req = CliRunRequest {
+            cap_add: Vec::new(),
             image_ref: "alpine".to_string(),
             platform: None,
             args: vec![],
@@ -975,6 +984,7 @@ mod tests {
             None,
         );
         let req = CliRunRequest {
+            cap_add: Vec::new(),
             image_ref: "alpine".to_string(),
             platform: None,
             args: vec!["/bin/ls".to_string()],
@@ -1034,6 +1044,7 @@ mod tests {
     fn test_merge_workdir() {
         let image = make_test_image(None, None, vec![], Some(Utf8PathBuf::from("/image/app")));
         let req = CliRunRequest {
+            cap_add: Vec::new(),
             image_ref: "alpine".to_string(),
             platform: None,
             args: vec!["/bin/ls".to_string()],
@@ -1082,6 +1093,7 @@ mod tests {
         let mk = |img_wd: Option<&str>, wd: Option<&str>| {
             let image = make_test_image(None, None, vec![], img_wd.map(Utf8PathBuf::from));
             let req = CliRunRequest {
+                cap_add: Vec::new(),
                 image_ref: "alpine".to_string(),
                 platform: None,
                 args: vec!["/bin/ls".to_string()],

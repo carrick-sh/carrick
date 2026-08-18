@@ -4849,10 +4849,32 @@ impl SyscallDispatcher {
     /// boots — the field is then read-only and inherited across guest
     /// fork/execve like a Linux seccomp filter. `Unconfined` clears it.
     pub fn apply_seccomp_policy(&mut self, policy: carrick_spec::SeccompPolicy) {
+        self.apply_launch_privileges(policy, &[]);
+    }
+
+    /// Apply the launch-time policy AND the container's `--cap-add` grants
+    /// together, because Docker's profile is capability-conditional: the same
+    /// `--cap-add SYS_ADMIN` that raises the capability set also lifts the
+    /// profile's denial of `bpf`/`unshare`/`setns`/`io_uring`. Applying one
+    /// without the other is what left carrick running at a DIFFERENT
+    /// privilege from the oracle on the 48 suites that grant capabilities.
+    /// Must be called before the guest boots.
+    pub fn apply_launch_privileges(
+        &mut self,
+        policy: carrick_spec::SeccompPolicy,
+        cap_add: &[String],
+    ) {
+        let (granted, unknown) = crate::namespace::process::capability_mask_for_names(cap_add);
+        for name in &unknown {
+            tracing::warn!(capability = %name, "ignoring unknown --cap-add name");
+        }
+        if granted != 0 {
+            crate::namespace::process::grant_launch_capabilities(granted);
+        }
         self.container_policy = match policy {
-            carrick_spec::SeccompPolicy::ContainerDefault => {
-                Some(crate::container_policy::ContainerPolicy::docker_default_model())
-            }
+            carrick_spec::SeccompPolicy::ContainerDefault => Some(
+                crate::container_policy::ContainerPolicy::docker_model_with_capabilities(granted),
+            ),
             carrick_spec::SeccompPolicy::Unconfined => None,
         };
     }

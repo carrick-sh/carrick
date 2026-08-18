@@ -885,6 +885,15 @@ pub struct RunSpec {
     /// asks for `unconfined`.
     #[serde(default)]
     pub seccomp_policy: SeccompPolicy,
+    /// Capabilities granted beyond the Docker default set (`--cap-add`), by
+    /// their `capabilities(7)` names WITHOUT the `CAP_` prefix, exactly as
+    /// docker spells them (`SYS_ADMIN`, `SYS_PTRACE`, ...). Docker's default
+    /// bounding set drops most of these, and its seccomp profile is
+    /// capability-CONDITIONAL — granting `SYS_ADMIN` re-enables the syscalls
+    /// the profile otherwise denies — so this one field drives both the
+    /// modeled capability set and the launch-time deny table.
+    #[serde(default)]
+    pub cap_add: Vec<String>,
 }
 
 #[cfg(test)]
