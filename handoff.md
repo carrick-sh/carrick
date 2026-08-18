@@ -939,6 +939,74 @@ ratio (145.02x and 67.02x, both of which were the oracle hanging).
   unrecoverable. Evidence that matters is now committed under
   `docs/perf-results/`.
 
+## Closure v4 re-baseline + this round's fixes (2026-08-18)
+
+**Artifact** `bb485077f77e2e80…` (source `e2c2c78c2`, CDHash
+`371ea6264f9f9ef1…`, LC_UUID `B84EFA13-43A7-3B3F-8251-4E287BAB4270`,
+hypervisor entitlement present, `__dof_carrick` present).
+
+**closure-v4: 1,984 MATCH / 143 non-match of 2,127; diverging rows 4,357 ->
+2,148 (-51%).** Twelve suites flipped, essentially all of them the concurrency
+cluster the vCPU-admission fix unblocked: `cpython-asyncio` (1,872 rows,
+2,521/2,521 both sides), `go-net_http` (665, 1,316/1,316),
+`cpython-multiprocessing_fork` (317/317), `go-os_exec`, `cpython-threading`,
+`go-go_internal_srcimporter`, plus `ltp-gettimeofday02`, `kill10`,
+`mq_timedsend01`, `nice05`, `sendmsg02`, `sysctl03`.
+
+`ltp-nice05` was NOT a real gap — the earlier "extra TBROK" reading came from
+the stale cache invoking the oracle by direct exec instead of `/bin/sh -c`.
+Three apparent regressions: `ltp-pselect01`/`pselect01_64` are ORACLE-side
+timing flakes (docker failed, carrick passed), and `ltp-bind05` is a genuine
+row to attribute (EADDRINUSE; suspect the shared host network under gate
+concurrency, since carrick has no net namespace yet).
+
+**Landed after that baseline** (each red-first, each gated):
+`writev07` partial-transfer (16 rows), `setns01`+`setns02` via the
+`/proc/<pid>/ns` graph authority (26+ rows), `kcmp01/02/03` policy row (25
+rows). Net expected: **137 non-match, ~2,079 rows.**
+
+### The next three are 69% of what is left
+
+1. **`ltp-futex_cmp_requeue01` — 884 rows, 42% of the remainder.** The test
+   scales waiters 10 -> 100 -> 1000. Carrick is correct at 10 and 100
+   (`children woken, futex0: 0, futex1: 7, spurious wakeups: 0` matches) and
+   collapses at 1000: 881 x `futex_cmp_requeue01.c:69 process N wasn't woken
+   up: ETIMEDOUT`, 63-75 s, ending in `Test killed! (timeout?)` against the
+   oracle's 7/7 in 1 s. The first ~235 waiters DO wake, so this is throughput,
+   not a dropped requeue. Ranking it as a correctness blocker is right per
+   AGENTS.md (74x on a completing row). `CARRICK_HVF_VCPU_RECLAIM=0` finishes
+   in 1 s but breaks at the 100-waiter test, so neither setting carries 1000 —
+   the M:N park/unpark cost per waiter is the thing to attack.
+2. **`cpython-importlib` — 349 rows.** REDUCED to a 1-second, ~50%
+   reproducible case:
+   `python3 -m test --randseed 0 test_importlib.test_locks` gives
+   `Fatal Python error: Segmentation fault` in
+   `Source_DeadlockAvoidanceTests.test_deadlock/test_no_deadlock`, with the
+   threads in `threading.notify_all` -> `Condition._release`. **Not the
+   admission path**: 3/6 crashes with reclaim ON and 3/6 with
+   `CARRICK_HVF_VCPU_RECLAIM=0`, so it is independent of the vCPU bound. No
+   guest core is written even with `ulimit -c unlimited` (Python's faulthandler
+   catches the SIGSEGV first), so the next step is carrick-side fault
+   reporting or `carrick debug lldb-run` on the carrier rather than a core.
+3. **`cpython-multiprocessing_forkserver` — 203 rows**, still truncating.
+
+### Refuted while checking (do not re-file)
+
+The static pass claimed `carrick_flags_for` drops
+`--security-opt seccomp=unconfined`, leaving ~30 suites at unequal privilege.
+**That is wrong.** `carrick-conformance/src/engine.rs:250` already mirrors it
+and matches both docker spellings, and the recorded argv for `ltp-add_key01/02`
+shows `--security-opt seccomp=unconfined` on BOTH sides. The `add_key` gap is a
+real carrick one: it registers only the `keyring` and `user` key types, so the
+eight types `add_key02` probes (`asymmetric`, `big_key`, `cifs.idmap`,
+`cifs.spnego`, `logon`, `pkcs7_test`, `rxrpc`, `rxrpc_s`) answer ENODEV before
+the payload copy and LTP skips them where the oracle reports EFAULT.
+
+`futex_halt_poll_nonzero_delays_parking_until_window_expires`
+(`carrick-thread`) is a TIME-ASSUMPTION test: it asserts `!observed_park`, so
+it fails when the host is loaded and passes 3/3 quiet. Seen failing once during
+a concurrent probe build; not a code defect.
+
 ## Static attribution of six suite clusters (2026-08-18, read-only agents)
 
 Analysis only — none of these is fixed yet, and each names the live experiment
