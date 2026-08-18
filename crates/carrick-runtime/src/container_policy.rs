@@ -52,6 +52,35 @@
 //! entry-by-entry with the same evidence bar (Docker's profile JSON is NOT
 //! copied wholesale).
 //!
+//! # `clone3(2)` entry provenance (differential, 2026-08-18)
+//!
+//! Docker's default profile answers `clone3` with **ENOSYS** rather than
+//! EPERM — deliberately, so a guest libc falls back to `clone` instead of
+//! failing. Observed on `localhost:5050/cpython-test:3.12.13`, linux/arm64,
+//! same caps: default profile `clone3(NULL, 0)` -> ENOSYS;
+//! `--security-opt seccomp=unconfined` -> EINVAL (the kernel validating the
+//! NULL args). carrick answered EINVAL, i.e. it behaved like an unconfined
+//! host and ran clone3 paths the oracle never reaches (LTP clone301 TCONFs
+//! on the oracle for exactly this reason).
+//!
+//! # `unshare(2)`/`setns(2)` entry provenance (differential, 2026-08-18)
+//!
+//! Docker's default profile denies both unless the container holds
+//! `CAP_SYS_ADMIN`. Observed on `localhost:5050/cpython-test:3.12.13`,
+//! linux/arm64, IDENTICAL default caps on both sides:
+//!
+//! * default profile: `unshare(CLONE_NEWUTS)` EPERM, `unshare(CLONE_FILES)`
+//!   EPERM, `setns(-1, 0)` EPERM;
+//! * `--security-opt seccomp=unconfined`: `unshare(CLONE_FILES)` SUCCEEDS,
+//!   `setns(-1, 0)` fails EBADF (the kernel validates the fd), while
+//!   `unshare(CLONE_NEWUTS)` still fails EPERM.
+//!
+//! The first two flips prove the confined EPERM is the launch-time profile,
+//! not a kernel check — the deny-before-validation shape this table models.
+//! The third is a genuine kernel capability check, so the `unshare` HANDLER
+//! enforces `CAP_SYS_ADMIN` for namespace flags independently of this layer
+//! (the keyring ruling's two-sided separation).
+//!
 //! # `bpf(2)` entry provenance (differential, 2026-08-18)
 //!
 //! Docker's default profile allows `bpf` only when the container holds
@@ -71,7 +100,7 @@
 //! entry.
 
 use crate::linux_abi::LinuxErrno;
-use carrick_abi::LINUX_EPERM;
+use carrick_abi::{LINUX_ENOSYS, LINUX_EPERM};
 
 /// Canonical (asm-generic/aarch64) syscall numbers for the deny table. The
 /// dispatcher normalizes x86_64 guests onto canonical numbers before dispatch,
@@ -80,6 +109,9 @@ const SYS_ADD_KEY: u64 = 217;
 const SYS_REQUEST_KEY: u64 = 218;
 const SYS_KEYCTL: u64 = 219;
 const SYS_BPF: u64 = 280;
+const SYS_UNSHARE: u64 = 97;
+const SYS_CLONE3: u64 = 435;
+const SYS_SETNS: u64 = 268;
 
 /// Identity syscalls the EL1 fast-path shim may answer without a dispatch
 /// (getpid/getppid/getuid/geteuid/getgid/getegid/gettid). A policy that denied
@@ -113,6 +145,13 @@ impl ContainerPolicy {
             // CAP_SYS_ADMIN, which the default cap set lacks); succeeds
             // unprivileged when unconfined (observed 2026-08-18, module docs).
             (SYS_BPF, LINUX_EPERM),
+            // `unshare`/`setns`: denied by the default profile unless the
+            // container holds CAP_SYS_ADMIN (see the provenance note above).
+            (SYS_UNSHARE, LINUX_EPERM),
+            (SYS_SETNS, LINUX_EPERM),
+            // `clone3`: denied with ENOSYS (not EPERM) so a guest libc takes
+            // its documented `clone` fallback, exactly as it does in Docker.
+            (SYS_CLONE3, LINUX_ENOSYS),
         ])
     }
 
@@ -159,10 +198,11 @@ mod tests {
         let policy = ContainerPolicy::docker_default_model();
         // Neighbors and common syscalls must pass through untouched — the
         // model is a targeted deny table, not a broad filter.
-        for nr in [
-            0, 63, 64, 93, 172, 216, 220, // …clone
-            435,
-        ] {
+        // NB: 435 (clone3) IS denied now (ENOSYS, matching Docker's profile —
+        // see the clone3 provenance note), so it moved out of this list; 220
+        // (clone) stays here because Docker denies only its namespace-flag
+        // shapes, which this nr-keyed table does not express.
+        for nr in [0, 63, 64, 93, 172, 216, 220] {
             assert_eq!(
                 policy.denied_errno(nr),
                 None,

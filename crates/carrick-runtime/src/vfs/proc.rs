@@ -3624,10 +3624,12 @@ CONFIG_UNIX=y\n\
 CONFIG_INET=y\n\
 CONFIG_IPV6=y\n\
 CONFIG_NET=y\n\
+CONFIG_NAMESPACES=y\n\
 CONFIG_UTS_NS=y\n\
 CONFIG_IPC_NS=y\n\
 CONFIG_PID_NS=y\n\
 CONFIG_NET_NS=y\n\
+CONFIG_TIME_NS=y\n\
 CONFIG_USER_NS=y\n"
             );
             let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
