@@ -613,6 +613,21 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
         "/proc/sys/kernel/sem",
         Sysctl::Static(b"32000\t1024000000\t500\t32000\n"),
     ),
+    // perf_event_open(2) support marker: the man page's documented way to
+    // detect perf support is this file's EXISTENCE (LTP perf_event_open01/02
+    // TCONF without it). Value 2 = "unprivileged: user-space measurements
+    // only", matching the Docker arm64 oracle; carrick's guest root passes the
+    // paranoid gate the way root-with-CAP_PERFMON does on Linux.
+    (
+        "/proc/sys/kernel/perf_event_paranoid",
+        Sysctl::Static(b"2\n"),
+    ),
+    // Default sampling-rate ceiling (matches the oracle). carrick refuses
+    // sampling events, but tools read the knob before deciding a rate.
+    (
+        "/proc/sys/kernel/perf_event_max_sample_rate",
+        Sysctl::Static(b"100000\n"),
+    ),
     // Kernel taint flags: 0 = untainted. The LTP tst_test framework reads this at
     // setup/teardown for tests with `.taint_check` to detect kernel warnings/oopses;
     // a missing file made every such test TBROK in setup (tst_taint.c ENOENT).

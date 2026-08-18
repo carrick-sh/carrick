@@ -1147,6 +1147,16 @@ pub(super) enum OpenDescription {
         base: OpenDescriptionBase,
         mask: carrick_abi::SigSet,
     },
+    /// A `perf_event_open(2)` counter (see [`super::perf`]). Like the other
+    /// anonymous-inode fds it is neither seekable (`lseek` → ESPIPE) nor
+    /// writable (EINVAL); `read(2)` reports the counter in the
+    /// `attr.read_format` layout and the `PERF_EVENT_IOC_*` ioctls drive it.
+    /// The `Arc` keeps `dup(2)`d fds on one shared counter, matching the
+    /// kernel's description-owned event object.
+    PerfEvent {
+        base: OpenDescriptionBase,
+        state: Arc<super::perf::PerfEventState>,
+    },
     // In-memory pipe ends. Currently `pipe2(2)` routes through `HostPipe`
     // (real macOS kernel pipe) so these are not constructed today, but the
     // full read/write/poll machinery (`PipeState`, `read_pipe`, `write_pipe`)
@@ -1410,6 +1420,7 @@ impl OpenDescription {
             Self::Inotify { .. } => "inotify",
             Self::Fanotify { .. } => "fanotify",
             Self::SignalFd { .. } => "signalfd",
+            Self::PerfEvent { .. } => "perf_event",
             Self::PipeReader { .. } => "pipe_reader",
             Self::PipeWriter { .. } => "pipe_writer",
             Self::HostPipe { .. } => "host_pipe",
@@ -1461,6 +1472,7 @@ impl OpenDescription {
             OpenDescription::Inotify { .. } => "anon_inode:[inotify]".to_owned(),
             OpenDescription::Fanotify { .. } => "anon_inode:[fanotify]".to_owned(),
             OpenDescription::SignalFd { .. } => "anon_inode:[signalfd]".to_owned(),
+            OpenDescription::PerfEvent { .. } => "anon_inode:[perf_event]".to_owned(),
             OpenDescription::Mqueue { .. } => "anon_inode:[mqueue]".to_owned(),
             // Linux spells the bpf anon-inode labels WITHOUT brackets.
             OpenDescription::BpfMap { .. } => "anon_inode:bpf-map".to_owned(),
@@ -1531,6 +1543,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::Mqueue { .. } => Kind::Mqueue,
             OpenDescription::BpfMap { .. } => Kind::BpfMap,
             OpenDescription::BpfProg { .. } => Kind::BpfProg,
+            OpenDescription::PerfEvent { .. } => Kind::PerfEvent,
         };
         let status_flags = (!matches!(&*description, OpenDescription::Closed { .. }))
             .then(|| description.base().status_flags());
@@ -1885,6 +1898,7 @@ impl OpenDescription {
             | OpenDescription::Inotify { base, .. }
             | OpenDescription::Fanotify { base, .. }
             | OpenDescription::SignalFd { base, .. }
+            | OpenDescription::PerfEvent { base, .. }
             | OpenDescription::Netlink { base, .. }
             | OpenDescription::Mqueue { base, .. }
             | OpenDescription::BpfMap { base, .. }
@@ -1913,6 +1927,7 @@ impl OpenDescription {
             | OpenDescription::Inotify { base, .. }
             | OpenDescription::Fanotify { base, .. }
             | OpenDescription::SignalFd { base, .. }
+            | OpenDescription::PerfEvent { base, .. }
             | OpenDescription::Netlink { base, .. }
             | OpenDescription::Mqueue { base, .. }
             | OpenDescription::BpfMap { base, .. }
@@ -2096,6 +2111,9 @@ impl OpenDescription {
             }
             OpenDescription::SignalFd { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic("anon_inode:[signalfd]", 0, 0o600))
+            }
+            OpenDescription::PerfEvent { .. } => {
+                OpenStatSource::Record(StatRecord::synthetic("anon_inode:[perf_event]", 0, 0o600))
             }
             OpenDescription::Mqueue { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic("anon_inode:[mqueue]", 0, 0o600))

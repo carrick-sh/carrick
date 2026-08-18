@@ -433,7 +433,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(238, "migrate_pages", "mm", SupportLevel::Deferred),
     syscall(239, "move_pages", "mm", SupportLevel::Deferred),
     syscall(240, "rt_tgsigqueueinfo", "signal", SupportLevel::Deferred),
-    syscall(241, "perf_event_open", "process", SupportLevel::Deferred),
+    syscall(241, "perf_event_open", "process", SupportLevel::BringUp),
     syscall(242, "accept4", "net", SupportLevel::BringUp),
     syscall(243, "recvmmsg", "net", SupportLevel::BringUp),
     syscall(260, "wait4", "process", SupportLevel::BringUp),
