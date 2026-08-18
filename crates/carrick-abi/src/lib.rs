@@ -131,6 +131,7 @@ pub use syscall_x86_64::SyscallRemap;
 // special selector) that only stay separated if they are separate types. The
 // rendered docs live in the module itself (`keyring.rs`), so the intra-doc
 // links there resolve in that module's own scope.
+pub mod bpf;
 pub mod keyring;
 
 pub const LINUX_S_IFMT: u32 = 0o170000;

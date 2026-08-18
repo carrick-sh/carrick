@@ -6871,6 +6871,8 @@ impl SyscallDispatcher {
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::Mqueue { .. }
+                | OpenDescription::BpfMap { .. }
+                | OpenDescription::BpfProg { .. }
                 | OpenDescription::Netlink { .. } => DispatchOutcome::errno(LINUX_ENOTDIR),
             })
 
@@ -9192,6 +9194,8 @@ impl SyscallDispatcher {
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::Mqueue { .. }
+                | OpenDescription::BpfMap { .. }
+                | OpenDescription::BpfProg { .. }
                 | OpenDescription::Netlink { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
                 }
@@ -9242,6 +9246,8 @@ impl SyscallDispatcher {
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::Mqueue { .. }
+                | OpenDescription::BpfMap { .. }
+                | OpenDescription::BpfProg { .. }
                 | OpenDescription::Netlink { .. } => {}
             }
             // A rewind of a trusted directory drops the materialized snapshot
@@ -9521,6 +9527,8 @@ impl SyscallDispatcher {
                 OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
                 | OpenDescription::Mqueue { .. }
+                | OpenDescription::BpfMap { .. }
+                | OpenDescription::BpfProg { .. }
                 | OpenDescription::PipeWriter { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
@@ -9719,6 +9727,8 @@ impl SyscallDispatcher {
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::Mqueue { .. }
+                | OpenDescription::BpfMap { .. }
+                | OpenDescription::BpfProg { .. }
                 | OpenDescription::Netlink { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
@@ -9798,6 +9808,8 @@ impl SyscallDispatcher {
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::Mqueue { .. }
+                | OpenDescription::BpfMap { .. }
+                | OpenDescription::BpfProg { .. }
                 | OpenDescription::Netlink { .. } => {
                     // Positional read on a non-seekable fd (pipe/socket/anon) is
                     // ESPIPE on Linux; a directory is EISDIR (above). pread02.
@@ -9949,6 +9961,8 @@ impl SyscallDispatcher {
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::Mqueue { .. }
+                | OpenDescription::BpfMap { .. }
+                | OpenDescription::BpfProg { .. }
                 | OpenDescription::Netlink { .. } => {
                     // Positional read on a non-seekable fd → ESPIPE; directory →
                     // EISDIR (above). preadv02.
@@ -10103,6 +10117,8 @@ impl SyscallDispatcher {
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::Mqueue { .. }
+                | OpenDescription::BpfMap { .. }
+                | OpenDescription::BpfProg { .. }
                 | OpenDescription::Netlink { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
@@ -10250,6 +10266,8 @@ impl SyscallDispatcher {
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::Mqueue { .. }
+                | OpenDescription::BpfMap { .. }
+                | OpenDescription::BpfProg { .. }
                 | OpenDescription::Netlink { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
@@ -11517,6 +11535,8 @@ impl SyscallDispatcher {
                     | OpenDescription::Fanotify { .. }
                     | OpenDescription::SignalFd { .. }
                     | OpenDescription::Mqueue { .. }
+                    | OpenDescription::BpfMap { .. }
+                    | OpenDescription::BpfProg { .. }
                     | OpenDescription::Netlink { .. }
             );
             if is_special {

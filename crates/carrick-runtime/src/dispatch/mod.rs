@@ -720,6 +720,7 @@ mod proctitle;
 mod resources;
 #[macro_use]
 mod signal;
+mod bpf;
 mod mqueue;
 mod sysv;
 #[macro_use]
@@ -3171,6 +3172,7 @@ fn resolve_handler<M: GuestMemory>(number: u64) -> Option<SyscallHandler<M>> {
         .or_else(|| creds::dispatch_creds(number))
         .or_else(|| sysv::dispatch_sysv(number))
         .or_else(|| mqueue::dispatch_mqueue(number))
+        .or_else(|| bpf::dispatch_bpf(number))
 }
 
 /// True once the kernel lane's first process has bound. On that lane a Linux

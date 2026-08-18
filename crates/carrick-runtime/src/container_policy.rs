@@ -51,6 +51,24 @@
 //! The table is deliberately minimal: model only what is verified, extend
 //! entry-by-entry with the same evidence bar (Docker's profile JSON is NOT
 //! copied wholesale).
+//!
+//! # `bpf(2)` entry provenance (differential, 2026-08-18)
+//!
+//! Docker's default profile allows `bpf` only when the container holds
+//! `CAP_SYS_ADMIN`; the default cap set does not, so under plain `docker run`
+//! every `bpf()` call answers EPERM. Observed on the native arm64 LTP oracle
+//! image (`localhost:5050/ltp:arm64`, linuxkit 7.0.12):
+//!
+//! * default profile: all eight LTP bpf suites TCONF at their first
+//!   `BPF_MAP_CREATE` with EPERM (`bpf_common.c:40`);
+//! * `--security-opt seccomp=unconfined`, SAME default caps: all eight run
+//!   their full assertion bodies (bpf_map01 7/7 TPASS, …) — and the oracle
+//!   kernel reports `unprivileged_bpf_disabled=0` — proving the EPERM is
+//!   Docker's launch-time policy, not a kernel capability check.
+//!
+//! Per the 2026-07-10 ruling above, `crate::dispatch::bpf` therefore
+//! implements real map/prog-load semantics and never learns about this
+//! entry.
 
 use crate::linux_abi::LinuxErrno;
 use carrick_abi::LINUX_EPERM;
@@ -61,6 +79,7 @@ use carrick_abi::LINUX_EPERM;
 const SYS_ADD_KEY: u64 = 217;
 const SYS_REQUEST_KEY: u64 = 218;
 const SYS_KEYCTL: u64 = 219;
+const SYS_BPF: u64 = 280;
 
 /// Identity syscalls the EL1 fast-path shim may answer without a dispatch
 /// (getpid/getppid/getuid/geteuid/getgid/getegid/gettid). A policy that denied
@@ -90,6 +109,10 @@ impl ContainerPolicy {
             (SYS_ADD_KEY, LINUX_EPERM),
             (SYS_REQUEST_KEY, LINUX_EPERM),
             (SYS_KEYCTL, LINUX_EPERM),
+            // bpf(2): EPERM under Docker's default profile (gated on
+            // CAP_SYS_ADMIN, which the default cap set lacks); succeeds
+            // unprivileged when unconfined (observed 2026-08-18, module docs).
+            (SYS_BPF, LINUX_EPERM),
         ])
     }
 
@@ -120,9 +143,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn docker_default_model_denies_keyring_family_with_eperm() {
+    fn docker_default_model_denies_keyring_family_and_bpf_with_eperm() {
         let policy = ContainerPolicy::docker_default_model();
-        for nr in [SYS_ADD_KEY, SYS_REQUEST_KEY, SYS_KEYCTL] {
+        for nr in [SYS_ADD_KEY, SYS_REQUEST_KEY, SYS_KEYCTL, SYS_BPF] {
             assert_eq!(
                 policy.denied_errno(nr),
                 Some(LINUX_EPERM),

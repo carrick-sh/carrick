@@ -1948,6 +1948,16 @@ impl SyscallDispatcher {
                     ready |= LINUX_POLLOUT;
                 }
             }
+            // A bpf map/prog fd implements no poll operation; Linux's poll
+            // core then reports the default mask (readable + writable).
+            OpenDescription::BpfMap { .. } | OpenDescription::BpfProg { .. } => {
+                if requested_events & LINUX_POLLIN != 0 {
+                    ready |= LINUX_POLLIN;
+                }
+                if requested_events & LINUX_POLLOUT != 0 {
+                    ready |= LINUX_POLLOUT;
+                }
+            }
             // A POSIX message queue is readable iff it holds at least one
             // message and writable iff it has room — read the backing file's
             // header (under its OFD lock) to decide. (mq_overview(7)/poll(2).)

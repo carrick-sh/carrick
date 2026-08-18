@@ -426,6 +426,8 @@ pub enum FileDescriptionBackingKind {
     SignalFd,
     Netlink,
     Mqueue,
+    BpfMap,
+    BpfProg,
     IoUring,
 }
 
