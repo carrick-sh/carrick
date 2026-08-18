@@ -337,6 +337,46 @@ transition.
   unverified; `carrick debug lldb-run` / attaching the carrier is the
   documented next instrument.
 
+### Core-based debugging DOES work — the earlier "no core" was retrieval error
+
+`ulimit -c unlimited` in the guest works today; the earlier attempt looked in
+the wrong place. `publish_core_atomic` (`dispatch/mod.rs`) writes `<cwd>/core`
+through the OVERLAY backend, so a bind-mounted cwd is bypassed and `--rm`
+discards the overlay. The working recipe:
+
+```sh
+carrick run --rm --raw --fs host -v host-dir:/out IMAGE /bin/sh -c \
+  'cd /tmp && ulimit -c unlimited && <crashing thing>; cp /tmp/core /out/'
+```
+
+crash in an OVERLAY cwd, then copy the core out inside the same guest run.
+Note the guard: no core if `!dumpable || rlimit_core == 0`, and children
+inherit cwd from the forkserver server, so `cd` before starting anything.
+
+### What the core says (child SIGSEGV, 20 MB core in hand)
+
+- `carrick debug core` validates it: pid 6, signal 11, fault_address 0x18,
+  pc `0x6000179108`.
+- NT_FILE places the PC in `usr/local/lib/libpython3.12.so.1.0` at file offset
+  `0x169108` — **`PyType_GenericAlloc+0x18`**, i.e. `ldr x1,[x0,#0x18]` with
+  x0 = the `type` argument = NULL, reading `tp_basicsize`. (An earlier
+  libc attribution in this file was WRONG — it joined a PC against another
+  process's mapping base. NT_FILE from the core is the only trustworthy join.)
+- **Refuted: the zeroed-library-page hypothesis.** PyUnicode_Type, PyDict_Type,
+  PyLong_Type, PyType_Type, PyBaseObject_Type read INTACT from the core
+  (immortal refcounts, ob_type all pointing at PyType_Type), and the crash
+  registers even hold valid pointers to two of them beside x0=0. libpython's
+  data pages are fine in the child; whatever read as NULL lives in ANONYMOUS
+  (heap) memory.
+- The fp-walk backtrace symbolized against dynamic symbols is approximate
+  (static functions dominate at these offsets) and the crashing frame's x30
+  does not line up with a call instruction — likely a tail-call chain; do not
+  build on those frame names.
+
+Next session's opening move: from the core, identify WHICH heap object carried
+the NULL (the dict-internals registers x21/x22 hold the operands) and compare
+that page's content against the still-running parent's view of the same page.
+
 ### Why this cluster is worth the next cycle
 
 `cpython-multiprocessing_forkserver` (366 unexercised rows),
