@@ -486,6 +486,18 @@ where
             let publish_wait_enrolled = || {
                 self.publish_thread_run_state(crate::run_state::RunState::Blocked, 'S');
             };
+            if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
+                let addr = location.wait_addr().raw();
+                let current = unsafe {
+                    (*(addr as *const std::sync::atomic::AtomicU32))
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                };
+                eprintln!(
+                    "SIGDBG shared_wait enter tid={} key={:#x} addr={addr:#x} expect={value} current={current}",
+                    self.this_tid.raw(),
+                    waiter_key
+                );
+            }
             let retval = self.platform_futex.shared_wait(
                 location,
                 waiter_key,
@@ -494,6 +506,17 @@ where
                 &interrupted,
                 &publish_wait_enrolled,
             );
+            if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
+                let addr = location.wait_addr().raw();
+                let current = unsafe {
+                    (*(addr as *const std::sync::atomic::AtomicU32))
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                };
+                eprintln!(
+                    "SIGDBG shared_wait exit tid={} retval={retval} addr={addr:#x} current={current}",
+                    self.this_tid.raw()
+                );
+            }
             self.publish_thread_run_state(crate::run_state::RunState::Running, 'R');
             if thread_should_finish_for_exec_replacement(&self.registry, self.this_tid) {
                 return Ok(SharedWordWaitRaw::ExecReplacedThread);

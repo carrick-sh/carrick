@@ -1447,6 +1447,14 @@ impl Kernel {
         } else {
             None
         };
+        if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
+            eprintln!(
+                "SIGDBG post sig={} task={:?} thread={:?}",
+                signal.raw(),
+                task.key(),
+                target.thread.as_ref().map(|_| "tid-directed")
+            );
+        }
         task.wake();
         if let Some(parent) = parent {
             parent.wake();

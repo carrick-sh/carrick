@@ -440,6 +440,22 @@ mod imp {
         }
     }
 
+    /// True when a waker has logically dequeued a waiter here
+    /// (`note_logical_dequeues`) whose credit no exit has settled yet. The
+    /// sliced wait loop polls this at each slice boundary: a physical os_sync
+    /// wake that fired while the waiter was BETWEEN slices is otherwise
+    /// unrecoverable when the waker legally never changes the futex word
+    /// (LTP's tst_checkpoint protocol — rt_tgsigqueueinfo01 slept its full
+    /// 10 s deadline against a wake_counted that had already reported the
+    /// waiter woken). Peek only: the woken exit's `settle_waiter_exit`
+    /// consumes the credit through its normal path. Two same-slot waiters
+    /// racing one credit can both observe it and produce one spurious woken
+    /// return — the loser settles as a self-wake, the bounded transient the
+    /// slot machinery already self-repairs.
+    pub fn has_wake_credit(waiter_key: usize) -> bool {
+        waiter_slot(waiter_key).is_some_and(|slot| slot.wake_credits.load(Ordering::Acquire) > 0)
+    }
+
     /// An exiting waiter settles ONE accounting unit, with the LOOKUP ORDER
     /// keyed by how the wait ended:
     ///
@@ -892,6 +908,9 @@ mod imp {
         ))
     }
     pub fn waiter_enter(_host_addr: usize) {}
+    pub fn has_wake_credit(_waiter_key: usize) -> bool {
+        false
+    }
     pub fn waiter_exit(_host_addr: usize, _woken: bool) {}
     pub fn requeued_waiter_enter(_host_addr: usize) -> bool {
         false
@@ -904,6 +923,7 @@ mod imp {
     }
 }
 
+pub use imp::has_wake_credit;
 pub use imp::{
     WaiterTableReexecAuthority, init_waiter_table_from_reexec, preinit_waiter_table,
     requeue_counted, requeued_waiter_complete, requeued_waiter_enter, requeued_waiter_exit,
@@ -913,6 +933,26 @@ pub use imp::{
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod tests {
+    /// A wake that lands while the waiter is BETWEEN wait slices leaves a
+    /// claimable credit the slice loop can poll; the woken exit settles it.
+    #[test]
+    fn between_slice_wake_leaves_claimable_credit() {
+        let key = 0xC0FF_EE00_0001_usize;
+        super::waiter_enter(key);
+        assert!(!super::has_wake_credit(key), "no credit before any wake");
+        let woke = super::wake_counted(key, key, 1);
+        assert_eq!(woke, 1, "logical dequeue counts the enrolled waiter");
+        assert!(
+            super::has_wake_credit(key),
+            "missed physical wake must stay claimable"
+        );
+        super::waiter_exit(key, true);
+        assert!(
+            !super::has_wake_credit(key),
+            "woken exit settles the credit"
+        );
+    }
+
     use super::{wait, wake};
     use std::sync::atomic::AtomicU32;
 
