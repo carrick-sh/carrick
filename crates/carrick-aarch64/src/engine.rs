@@ -2092,20 +2092,27 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         })?;
         // Complete pre-transaction image, taken into the recycled buffer when a
         // previous fork returned one (see `pt_snapshot_scratch`).
-        let parent_page_tables_snapshot = match self.pt_snapshot_scratch.take() {
-            Some(mut reused) => {
-                reused.clone_from(&page_tables);
-                reused
-            }
-            None => page_tables.clone(),
-        };
+        //
+        // Only an mm-copying fork arms the parent read-only and therefore has
+        // anything to roll back: with no COW ranges the parent's graph is never
+        // edited, and the snapshot below was pure copying. `CLONE_VM` and vfork
+        // take that path, and cpython's forkserver and `subprocess` lean on it.
+        let parent_page_tables_snapshot =
+            (!cow_ranges.is_empty()).then(|| match self.pt_snapshot_scratch.take() {
+                Some(mut reused) => {
+                    reused.clone_from(&page_tables);
+                    reused
+                }
+                None => page_tables.clone(),
+            });
         let parent_armed_snapshot = self.vm.frame_cow_arm_snapshot();
-        // Two full images: the child's own editable graph and the parent's
-        // rollback pre-image.
+        // The child's own editable graph, plus the parent's rollback pre-image
+        // when this fork copies the mm.
         emit_stage(
             HvpatchForkProcessSpecStagePhase::ParentPageTablesClone,
             stage_started,
-            2 * carrick_mem::memory::LINUX_PAGE_TABLES_SIZE,
+            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE
+                * (1 + u64::from(parent_page_tables_snapshot.is_some())),
         );
 
         // Prepare the child's independent stage-1 graph read-only while it is
@@ -2169,6 +2176,16 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             // or its fail-closed descriptor authentication fails. Armed-range
             // metadata is installed only after publication succeeds, so every
             // pre-commit error leaves both authorities at their prior state.
+            //
+            // The pre-image is taken under exactly this condition above, so a
+            // missing one means the two predicates have drifted apart; refuse
+            // rather than arm the parent with no way back.
+            let Some(parent_page_tables_snapshot) = parent_page_tables_snapshot else {
+                return Err(TrapError::Hypervisor(
+                    "hvpatch fork would arm parent COW ranges without a rollback pre-image"
+                        .to_owned(),
+                ));
+            };
             let publish_parent = (|| -> Result<(), TrapError> {
                 self.pt_edit_and_flush(|manager| {
                     let mut changed = false;
