@@ -370,6 +370,13 @@ pub(super) struct OpenDescriptionBase {
     /// on the open-file description so a dup'd fd shares it, matching the kernel's
     /// per-inode seal set for the common dup path.
     seals: Option<u32>,
+    /// True for a `memfd_secret(2)` description. Secret memory has no file
+    /// read/write methods (read(2)/write(2)/pread/readv/… → EINVAL, and it can
+    /// never be a splice/sendfile endpoint), must be mapped MAP_SHARED (a
+    /// MAP_PRIVATE mmap → EINVAL), and its mapped pages are hidden from
+    /// `/proc/<pid>/mem`. Lives on the open-file description so a dup'd fd
+    /// shares it, matching the kernel's per-inode secretmem state.
+    secretmem: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -403,6 +410,7 @@ impl OpenDescriptionBase {
             pipe_capacity: crate::linux_abi::LINUX_PIPE_BUF_SIZE,
             pipe_capacity_shared: None,
             seals: None,
+            secretmem: false,
         }
     }
 
@@ -412,6 +420,14 @@ impl OpenDescriptionBase {
 
     pub(super) fn set_seals(&mut self, seals: Option<u32>) {
         self.seals = seals;
+    }
+
+    pub(super) fn secretmem(&self) -> bool {
+        self.secretmem
+    }
+
+    pub(super) fn set_secretmem(&mut self, secretmem: bool) {
+        self.secretmem = secretmem;
     }
 
     /// Route pipe capacity through a cell shared with the pipe's other end.
@@ -1960,6 +1976,14 @@ impl OpenDescription {
     #[inline]
     pub(super) fn is_path(&self) -> bool {
         self.base().is_path()
+    }
+
+    /// True for a `memfd_secret(2)` description: no file read/write methods
+    /// (the read/write/splice family is EINVAL), MAP_SHARED-only mmap, and
+    /// mapped pages hidden from `/proc/<pid>/mem`.
+    #[inline]
+    pub(super) fn is_secretmem(&self) -> bool {
+        self.base().secretmem()
     }
 
     pub(super) fn set_status_flags(&mut self, next: u64) {
