@@ -9926,6 +9926,91 @@ impl HvfVmState {
         self.protections.set_no_access(address, len, no_access);
     }
 
+    /// Mirror a partial `munmap`'s registry split onto this engine's LOCAL
+    /// mapping rows.
+    ///
+    /// `unregister_alias_entries` splits an overlapped registry entry into its
+    /// surviving head/tail fragments, but the engine's own row kept the
+    /// ORIGINAL extent. `mapping_is_current_for_process_fork_indexed` then
+    /// matched that row against the registry index by exact identity
+    /// `(start, ipa, host_addr, semantic size)` — and a fragment never equals
+    /// the whole — so fork DROPPED the row from its COW ranges. The child's
+    /// cloned stage-1 kept a WRITABLE leaf onto the parent's frame, no COW
+    /// fault ever fired, and the child's frees scribbled pymalloc free-list
+    /// links over the parent's live objects (`cpython-threading`'s
+    /// `free(): invalid pointer`, reducer
+    /// `docs/perf-results/2026-08-17-closure-post-libuv/reducers/cpython-fork-shutdown-parent-segv.py`).
+    /// An identity test was standing in for a liveness question; keeping the
+    /// two representations in step restores the invariant at its source
+    /// instead of teaching the consumer to guess.
+    ///
+    /// Ownership: `HvfMappedRegion` owns its backing handles and is not
+    /// `Clone`, so the surviving HEAD keeps them and a tail fragment carries
+    /// `None`. Both fragments retain the same `physical_ipa`/`physical_size`,
+    /// which is what stage-2 retirement keys on, so they are still retired
+    /// together. A row the unmap covers ENTIRELY is left untouched: the
+    /// registry drops such an entry outright, and excluding a dead row from
+    /// fork is correct.
+    fn split_local_rows_for_unmap(&mut self, va: u64, len: usize) {
+        let Some(end) = va.checked_add(len as u64) else {
+            return;
+        };
+        let mut tails: Vec<HvfMappedRegion> = Vec::new();
+        for row in &mut self.mappings {
+            if !row.is_dynamic_alias {
+                continue;
+            }
+            let row_size = semantic_extent_size(row.start, row.end);
+            let Some(row_end) = row.start.checked_add(row_size as u64) else {
+                continue;
+            };
+            if row_end <= va || row.start >= end {
+                continue;
+            }
+            let head_survives = row.start < va;
+            let tail_survives = row_end > end;
+            if !head_survives && !tail_survives {
+                continue;
+            }
+            if tail_survives {
+                let delta = end.saturating_sub(row.start);
+                tails.push(HvfMappedRegion {
+                    start: end,
+                    end: row.end,
+                    ipa: row.ipa.saturating_add(delta),
+                    physical_ipa: row.physical_ipa,
+                    physical_size: row.physical_size,
+                    host_addr: row.host_addr.wrapping_add(delta as usize),
+                    size: usize::try_from(row_end.saturating_sub(end)).unwrap_or_default(),
+                    perms: row.perms,
+                    memory: None,
+                    host_mapping: None,
+                    stage2_lease: None,
+                    is_dynamic_alias: true,
+                    sharing: row.sharing,
+                    guest_writable: row.guest_writable,
+                    shared_key_base: row.shared_key_base,
+                    shared_key_offset: row.shared_key_offset.saturating_add(delta),
+                });
+            }
+            if head_survives {
+                row.end = va;
+                row.size = usize::try_from(va.saturating_sub(row.start)).unwrap_or_default();
+            } else {
+                // Only the tail survives: advance this row onto it and let the
+                // pushed fragment be dropped below.
+                let delta = end.saturating_sub(row.start);
+                row.ipa = row.ipa.saturating_add(delta);
+                row.host_addr = row.host_addr.wrapping_add(delta as usize);
+                row.shared_key_offset = row.shared_key_offset.saturating_add(delta);
+                row.start = end;
+                row.size = usize::try_from(row_end.saturating_sub(end)).unwrap_or_default();
+                tails.pop();
+            }
+        }
+        self.mappings.append(&mut tails);
+    }
+
     pub(crate) fn unregister_process_alias(
         &mut self,
         va: u64,
@@ -9939,6 +10024,7 @@ impl HvfVmState {
                 kernel_only: false,
             });
             let _ = unregister_alias(va, len, self.mm_root_slot);
+            self.split_local_rows_for_unmap(va, len);
             return Ok(());
         }
         let authority = self.cow_authority.as_ref().ok_or_else(|| {
@@ -9977,6 +10063,9 @@ impl HvfVmState {
         if planned_leases.is_empty() {
             let actual = unregister_alias(va, len, self.mm_root_slot);
             debug_assert!(actual.is_empty());
+            // Keep this engine's rows in step with the split the registry just
+            // took (see `split_local_rows_for_unmap`).
+            self.split_local_rows_for_unmap(va, len);
             // A partial Linux unmap can remove the last semantic projection of
             // one 4 KiB page while another fragment still retains the same
             // 16 KiB HVPatch frame. Keep the compound armed: low-arena mmap

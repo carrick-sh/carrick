@@ -145,6 +145,11 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         | 277
         | 278
         | 280
+        // perf_event_open: the counters live in `dispatch::perf`, which the
+        // Process handler owns. Flipping 241 to BringUp without listing it
+        // here left it Unimplemented in the manifest — the same gap bpf(280)
+        // had, caught by `bringup_manifest_entries_have_a_handler_owner`.
+        | 241
         | 293
         | 424
         | 434
