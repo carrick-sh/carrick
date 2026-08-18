@@ -706,7 +706,12 @@ impl SyscallDispatcher {
         fn sysinfo(this, cx, info_ptr: GuestPtr) {
             let memory = &mut *cx.memory;
             let info = LinuxSysinfo {
-                uptime: host_uptime_secs(),
+                // Same authority as /proc/uptime and CLOCK_BOOTTIME — Linux
+                // computes sysinfo.uptime from the boottime clock, and
+                // sysinfo01 cross-checks the two sources within seconds. The
+                // old host KERN_BOOTTIME wall-delta ran ~5 s skewed from
+                // CLOCK_BOOTTIME (sleep accounting), failing that band.
+                uptime: crate::dispatch::boottime_duration().as_secs() as i64,
                 loads: [0; 3],
                 totalram: 16 * 1024 * 1024 * 1024,
                 freeram: 16 * 1024 * 1024 * 1024,
@@ -1157,35 +1162,6 @@ fn rlimit_for_resource(resource: u64) -> LinuxRlimit {
         }
         _ => LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY),
     }
-}
-
-fn host_uptime_secs() -> i64 {
-    #[cfg(target_os = "macos")]
-    {
-        let mut boot = libc::timeval {
-            tv_sec: 0,
-            tv_usec: 0,
-        };
-        let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
-        let mut len = core::mem::size_of::<libc::timeval>();
-        let rc = unsafe {
-            libc::sysctl(
-                mib.as_mut_ptr(),
-                mib.len() as libc::c_uint,
-                &mut boot as *mut _ as *mut libc::c_void,
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if rc == 0
-            && boot.tv_sec > 0
-            && let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH)
-        {
-            return now.as_secs().saturating_sub(boot.tv_sec as u64) as i64;
-        }
-    }
-    0
 }
 
 /// Convert a Linux `timeval` to a `Duration` (saturating; negative components,
