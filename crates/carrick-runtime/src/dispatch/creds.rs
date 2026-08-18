@@ -679,11 +679,21 @@ impl SyscallDispatcher {
             // Nice-lowering rule for the CALLER — PRIO_PROCESS on self, or
             // PRIO_PGRP/PRIO_USER with who==0 (the caller's own group/user):
             // raising priority (a nice BELOW the current value) needs
-            // CAP_SYS_NICE, so an unprivileged caller gets EACCES (setpriority02
-            // cases 4 and 5). EPERM (above) is target-ownership; EACCES is the
-            // privilege to raise one's own priority.
+            // CAP_SYS_NICE, so a caller without it gets EACCES (setpriority02
+            // cases 4 and 5). The privilege is the CAPABILITY, not euid==0:
+            // Docker's default bounding set drops CAP_SYS_NICE even for root
+            // (the same under-privilege the nicepriority probe and the
+            // repaired setpriority01 oracle document), so the container-root
+            // guest must fail exactly as the oracle does — nice01's oracle
+            // EPERMs its whole negative-increment ladder while carrick's
+            // euid-gated check let root through. EPERM (above) is
+            // target-ownership; EACCES is the raise privilege (glibc's
+            // nice(3) wrapper surfaces it as EPERM to the caller).
             let current_nice = cx.kernel.task().nice();
-            if clamped < current_nice && !euid.is_root() {
+            let cap_sys_nice =
+                1_u64 << crate::namespace::process::CAP_SYS_NICE;
+            let may_raise = cx.kernel.task().caps().effective & cap_sys_nice != 0;
+            if clamped < current_nice && !may_raise {
                 return Ok(DispatchOutcome::errno(LINUX_EACCES));
             }
             if which == LINUX_PRIO_PROCESS {
