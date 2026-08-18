@@ -235,6 +235,78 @@ A `--closure --force --refresh-oracle` run on `35a4337ed` was launched at
 handoff time; its tally is the first authoritative measurement under
 closure-v3 + outcome-equality.
 
+## Session 2026-08-18 (second half): six lanes + two memory-subsystem bugs
+
+Baseline for this section: the first authoritative closure under the
+corrected rules (outcome-equality + closure-v3 ids) was **1,960 MATCH /
+167 INCOMPLETE**, 2,858 diverging rows, on artifact `069f26e27`.
+
+**Root causes fixed since (each with a red-first reducer):**
+
+- **Forked child wrote through to the PARENT's live heap.** A partial
+  `munmap` splits the alias-registry entry into head/tail fragments, but the
+  engine's local mapping row kept the original extent;
+  `mapping_is_current_for_process_fork_indexed` matched rows by EXACT
+  identity, a fragment never equals the whole, so fork dropped a live range
+  from its COW ranges and the child inherited a writable leaf onto the
+  parent's frame. An IDENTITY test standing in for a LIVENESS question.
+  Fixed by splitting the engine's rows in step with the registry (the head
+  keeps the ownership handles; both fragments keep `physical_*`, which is
+  what retirement keys on). Reducer 7/8 BAD -> 0/8;
+  `test_threading` 208 tests SUCCESS.
+- **The "slow" suites were HANGS.** `alloc_table`'s last-resort reclaim
+  sweep was being REFUSED, not exhausted: `stage1_exclusive` is a cached
+  marker describing the EDITOR, three HVPatch publications lock the page
+  tables directly and the fork path edits an offline clone, so all four ran
+  under whatever the previous editor left. 403 diverging rows recovered;
+  `concurrent_futures` and `multiprocessing_spawn` now MATCH (1.51x/1.68x).
+  NOTE: the blessed baseline predates the HVPatch default, so it is NOT a
+  valid "carrick used to do this" reference for those rows.
+- **cpython-posix closed (149 rows)**: a rootfs-relative path stored in a
+  field contracted to hold a guest-absolute one (so `fexecve` of an image
+  binary worked only when cwd was `/`), and `stat`/`statx`/exec resolution
+  failing through ANY guest-created symlink into the immutable image layer.
+- **`--cap-add`**: 48 suites grant the ORACLE capabilities; carrick had no
+  equivalent, so the two sides ran at different privilege. carrick now takes
+  docker's flag, the grant lifts the profile denials it gates, and the
+  generator mirrors every oracle `--cap-add` onto the carrick side.
+- Smaller: splice(2) precedence (splice07 LINE-EXACT), FICLONE filesystem
+  model (252 -> 33 diverging), ALARM clocks needing CAP_WAKE_ALARM, the
+  SIGEV_THREAD/SIGEV_THREAD_ID inversion, docker's personality filter vs
+  arm64's 32-bit refusal, io_uring denied like docker, fanotify gated on
+  the capability, `/proc/sys/vm/vfs_cache_pressure`.
+
+**Open, ranked, with attribution already done:**
+
+1. `cpython-importlib` (350 rows) — NULL where a live pointer belongs
+   (`_PyEval_EvalFrameDefault+0x7a4`, `x0=0`, last_syscall futex) in a
+   MULTI-THREADED lock test with no fork involved, and only in the full
+   suite. Same signature family as the fork bug, different root cause.
+   Method note: pin `PYTHONHASHSEED=0` and drop `-I` before comparing
+   cores, or hash randomisation buries the signal.
+2. `multiprocessing_fork` still times out (10.8x) — a cross-process LOST
+   WAKE in the Manager path: a guest process re-enters a timed-out futex
+   wait forever at the same guest PC, and its sibling face is
+   `UnpicklingError: invalid load key` on a manager connection.
+3. `go_types` — a lost CHILD-EXIT wake: `wait4(-1)` parks, the child's
+   exit publication completes after it, no `phase=ready` follows.
+4. `go-os_exec` (57) — SIGABRT at `TestConcurrentExec`, the documented
+   HVPatch M:N clone-admission deadlock (`threads.rs:998`).
+5. `futex_cmp_requeue01` (155) — the 1000-waiter herd; needs exact
+   per-waiter accounting to replace the heuristic counter slot.
+6. LTP tail (~115 suites): kcmp (25, oracle EPERMs where carrick
+   ENOSYSes — a policy row), setns01 (26), process_vm_readv03 (33),
+   ioctl_pidfd family (carrick emits NO rows), add_key02, writev07,
+   lseek11, madvise10, mmap04, memfd_create04, and the timing-shaped
+   select02/epoll_pwait03.
+7. `ioctl_ficlone04`'s last 33 rows, all involving the guest's `/dev/zero`,
+   which never reaches the FICLONE arm.
+
+**Risk to watch:** the exclusivity fix claims `Stage1Exclusive` on the
+no-peer arm. That is sound only if `has_peer_executor()` is the exact
+guest-executor census — the population-domain trap. Tests and the reducer
+are green; a wrong answer there would free a table a walker can still reach.
+
 ## Resume here
 
 ## Resume here
