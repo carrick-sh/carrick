@@ -364,12 +364,19 @@ pub const LINUX_MMAP_BASE: u64 = 0x60_0000_0000; // 384 GiB
 // below the interpreter base (512 GiB) and within the L1A page tables. Munmap'd
 // anonymous/private arena ranges are tracked in the dispatcher and reused.
 pub const LINUX_MMAP_SIZE: u64 = 32 * 1024 * 1024 * 1024;
-pub const LINUX_INTERPRETER_BASE: u64 = 0x80_0000_0000; // 512 GiB
+/// ELF interpreter (ld.so) load base. Above the PIE main-image base
+/// (`crate::elf::LINUX_PIE_DEFAULT_BASE`, 544 GiB) — Linux also loads the
+/// interpreter above the main image — and below the shared aperture
+/// (576 GiB). The historical 512 GiB base sat where a Linux guest expects
+/// FREE address space: a glibc binary that `MAP_FIXED`s at 0x80_0000_0000
+/// (the `aliassize` probe's `hi512g` leg) clobbered ld.so's first pages and
+/// SIGSEGV'd in `_dl_fini` at exit where Linux succeeds.
+pub const LINUX_INTERPRETER_BASE: u64 = 0x8C_0000_0000; // 560 GiB
 
-/// Largest the mmap arena may grow to before colliding with the interpreter
-/// base — the whole VA gap between `LINUX_MMAP_BASE` and `LINUX_INTERPRETER_BASE`
-/// (128 GiB), which the boot identity-map page tables already cover.
-pub const LINUX_MMAP_SIZE_MAX: u64 = LINUX_INTERPRETER_BASE - LINUX_MMAP_BASE;
+/// Largest the mmap arena may grow to before colliding with the PIE
+/// main-image base (544 GiB) — the whole VA gap above `LINUX_MMAP_BASE`
+/// (160 GiB).
+pub const LINUX_MMAP_SIZE_MAX: u64 = crate::elf::LINUX_PIE_DEFAULT_BASE - LINUX_MMAP_BASE;
 
 /// Resolve the arena size (bytes) from a requested GiB count, clamped to
 /// `[LINUX_MMAP_SIZE, LINUX_MMAP_SIZE_MAX]` — never below the 32 GiB Go-multithread
@@ -3518,7 +3525,7 @@ mod arena_size_tests {
         assert_eq!(resolve_arena_size(Some(1000)), LINUX_MMAP_SIZE_MAX);
         assert_eq!(resolve_arena_size(Some(u64::MAX)), LINUX_MMAP_SIZE_MAX);
         // The arena never collides with the interpreter base.
-        const { assert!(LINUX_MMAP_BASE + LINUX_MMAP_SIZE_MAX <= LINUX_INTERPRETER_BASE) };
+        const { assert!(LINUX_MMAP_BASE + LINUX_MMAP_SIZE_MAX <= crate::elf::LINUX_PIE_DEFAULT_BASE) };
     }
 }
 
