@@ -1512,6 +1512,17 @@ impl SyscallDispatcher {
 impl SyscallDispatcher {
     define_syscall! {
         fn personality(this, cx, requested: u64) {
+            // PER_LINUX32 (0x8) and PER_LINUX32_3GB (0x20008) name a 32-bit
+            // execution domain aarch64 has no support for, so the kernel
+            // answers EINVAL — verified against the oracle BOTH confined and
+            // unconfined, i.e. a kernel check rather than Docker's profile
+            // (which whitelists those two values). carrick accepted every
+            // persona and reported success.
+            const PER_LINUX32: u64 = 0x0008;
+            const PER_LINUX32_3GB: u64 = 0x2_0008;
+            if matches!(requested, PER_LINUX32 | PER_LINUX32_3GB) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let mut proc = this.proc.lock();
             let previous = proc.personality;
             if requested != LINUX_PERSONALITY_QUERY {

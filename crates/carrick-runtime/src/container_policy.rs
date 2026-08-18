@@ -140,6 +140,7 @@ const SYS_PERF_EVENT_OPEN: u64 = 241;
 const SYS_BPF: u64 = 280;
 const SYS_UNSHARE: u64 = 97;
 const SYS_CLONE3: u64 = 435;
+const SYS_PERSONALITY: u64 = 92;
 const SYS_IO_URING_SETUP: u64 = 425;
 const SYS_IO_URING_ENTER: u64 = 426;
 const SYS_IO_URING_REGISTER: u64 = 427;
@@ -161,6 +162,9 @@ pub(crate) struct ContainerPolicy {
     /// Sorted by syscall number (binary-searchable; the table is tiny today
     /// but the invariant keeps growth cheap).
     deny: Vec<(u64, LinuxErrno)>,
+    /// True for the docker-default model (as opposed to a hand-built table in
+    /// a unit test), which is what gates the argument-conditional rules.
+    models_docker_default: bool,
 }
 
 impl ContainerPolicy {
@@ -219,16 +223,54 @@ impl ContainerPolicy {
             (SYS_IO_URING_ENTER, LINUX_EPERM),
             (SYS_IO_URING_REGISTER, LINUX_EPERM),
         ])
+        .into_docker_default()
     }
 
     fn from_entries(mut deny: Vec<(u64, LinuxErrno)>) -> Self {
         deny.sort_by_key(|(nr, _)| *nr);
         deny.dedup_by_key(|(nr, _)| *nr);
-        Self { deny }
+        Self {
+            deny,
+            models_docker_default: false,
+        }
     }
 
     /// The errno this policy denies `canonical_nr` with, or `None` when the
     /// syscall passes through to its handler untouched.
+    /// Personas Docker's default profile permits; every other value is
+    /// EPERM'd by the filter before the kernel sees it. Differentially
+    /// verified (same image, same caps): 0x800000 / 0x1 / 0x4 are EPERM under
+    /// the default profile and SUCCEED under `seccomp=unconfined`, while
+    /// 0x8 / 0x20008 are EINVAL under BOTH (an arm64 kernel check, modelled
+    /// in the handler instead).
+    const PERSONALITY_ALLOWED: [u64; 5] = [0x0, 0x8, 0x2_0000, 0x2_0008, 0xffff_ffff];
+
+    /// Argument-conditional denials. `personality(2)` is the only one carrick
+    /// models: Docker's profile filters it on its ARGUMENT, which the
+    /// `nr -> errno` table above cannot express.
+    /// Mark this table as the docker-default model (consuming self), enabling the
+    /// argument-conditional rules (see `denied_errno_for_args`).
+    fn into_docker_default(mut self) -> Self {
+        self.models_docker_default = true;
+        self
+    }
+
+    pub(crate) fn denied_errno_for_args(
+        &self,
+        canonical_nr: u64,
+        first_arg: u64,
+    ) -> Option<LinuxErrno> {
+        if let Some(errno) = self.denied_errno(canonical_nr) {
+            return Some(errno);
+        }
+        if canonical_nr == SYS_PERSONALITY && self.models_docker_default {
+            if !Self::PERSONALITY_ALLOWED.contains(&first_arg) {
+                return Some(LINUX_EPERM);
+            }
+        }
+        None
+    }
+
     pub(crate) fn denied_errno(&self, canonical_nr: u64) -> Option<LinuxErrno> {
         self.deny
             .binary_search_by_key(&canonical_nr, |(nr, _)| *nr)
