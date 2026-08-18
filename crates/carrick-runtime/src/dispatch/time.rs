@@ -741,6 +741,7 @@ impl SyscallDispatcher {
             // of them at once — it reported a shell that had burned the whole
             // build's CPU and children that had burned none.
             let (user_us, system_us) = task_self_cpu_us();
+            let system_us = system_us.saturating_add(el1_counted_system_us(memory));
             let (child_user_us, child_system_us) = task_children_cpu_us();
             let to_ticks = |us: u64| (us as i64).saturating_mul(LINUX_CLK_TCK) / 1_000_000;
             let tms = LinuxTms {
@@ -790,7 +791,7 @@ impl SyscallDispatcher {
                 }
                 _ => rusage_from(
                     self_user_us,
-                    self_system_us,
+                    self_system_us.saturating_add(el1_counted_system_us(memory)),
                     host.maxrss_bytes,
                     host.majflt,
                 ),
@@ -1222,6 +1223,21 @@ fn timeval_from_duration(d: std::time::Duration) -> crate::linux_abi::LinuxTimev
 /// own CPU clock — so a task blocked in `wait4` accrues neither, exactly as on
 /// Linux. Both come from the kernel's task objects, never from a host
 /// per-process counter, which under HVPatch would describe every guest at once.
+/// SYSTEM µs owed to syscalls the EL1 shim serviced entirely in-guest (no VM
+/// exit, so `Thread::charge_system_ns` never saw them): the identity page's
+/// serviced-syscall counter x the nominal per-syscall kernel cost. Read live
+/// for RUSAGE_SELF/`times`; `sys_exit` folds-and-zeroes it into the thread
+/// ledger so the zombie snapshot and RUSAGE_CHILDREN carry it after exit.
+fn el1_counted_system_us(memory: &impl GuestMemory) -> u64 {
+    let counter_addr =
+        crate::memory::LINUX_IDENTITY_PAGE_BASE + crate::memory::IDENTITY_OFF_SHIM_SYSCALLS;
+    let Ok(bytes) = memory.read_bytes(counter_addr, 8) else {
+        return 0;
+    };
+    let count = u64::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0; 8]));
+    count.saturating_mul(crate::memory::EL1_SHIM_SYSCALL_NOMINAL_NS) / 1_000
+}
+
 fn task_self_cpu_us() -> (u64, u64) {
     super::resources::with_active_context(|context| {
         let task = context.task();
