@@ -392,9 +392,39 @@ inherit cwd from the forkserver server, so `cd` before starting anything.
   does not line up with a call instruction — likely a tail-call chain; do not
   build on those frame names.
 
-Next session's opening move: from the core, identify WHICH heap object carried
-the NULL (the dict-internals registers x21/x22 hold the operands) and compare
-that page's content against the still-running parent's view of the same page.
+### PROVEN from the core: one 16 KiB granule of the interned dict is ZEROED
+
+Register decoding against the disassembly (x20 = dict entries base, x19 = probe
+index, x22 = mask) identified the dict — its entry[0] has `me_key == me_value`,
+the interning signature — and a full audit of its 10,167 entries found the
+smoking gun:
+
+```
+dk@0x60010c1010  log2_size=14 kind=unicode  nentries=10167
+NULL me_key run: entries 765..1788  =  VA [0x60010cc000, 0x60010d0000)
+```
+
+**Exactly one 16 KiB host granule, page-aligned at both ends, 1,024 consecutive
+zeroed entries in the MIDDLE of the array**, with the crash's probe index
+inside it. Entries before and after read fine; the handful of scattered
+single-entry NULLs elsewhere are ordinary dict deletions. This is no longer a
+hypothesis: carrick loses the content of one anonymous 16 KiB page across the
+fork that creates the worker, deterministically.
+
+Two negative probes (both committed beside this file, both pass under carrick
+AND Docker — the corruption needs more of the real topology):
+
+- `double-fork-page-probe.py` — fork, child dirties 8 MiB anon, child forks,
+  grandchild verifies. Clean.
+- `mremap-grow-fork-probe.py` — glibc realloc chain (mremap-grow shape, which
+  the real workload's own FAULTDBG shows firing), dirty, fork, verify. Clean.
+
+Next lever: DETERMINISM. The corrupt VA is stable run-to-run, so instrument the
+HVPatch fork frame-copy path for VA `0x60010cc000` specifically (RUST_LOG on
+the COW/frame lineage, or a targeted FAULTDBG-class hook) and watch which
+lineage decision hands the worker a zero frame while the server holds data.
+The core that proves all of this is preserved at `/tmp/core` (20 MB; regenerate
+with the recipe above if lost).
 
 ### Why this cluster is worth the next cycle
 
