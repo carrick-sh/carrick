@@ -167,6 +167,74 @@ accounting to replace the heuristic counter slot), go-os_exec (57, none),
 go-crypto_sha512 (30, TestGolden/Armv8.2 — SHA-512 ISA feature rows),
 cpython-socket (42), and a ~150-suite LTP tail mostly totals-ne.
 
+## Session 2026-08-18 (late): five bring-up lanes integrated
+
+Artifact `35a4337ed`. Everything below is MERGED to main and gated
+(`just test`, clippy green on the integrated tree).
+
+**Integrated agent lanes** (each rebased onto main and re-verified by its
+author before merge — a first attempt merged them from stale bases and had
+to be abandoned; always have the agent rebase):
+
+- **bpf(2)**: maps + structurally-validated prog load; all 8 ltp-bpf_*
+  suites row-exact. The oracle's EPERM is Docker's seccomp, proven by an
+  unconfined flip.
+- **userfaultfd + memfd_secret**: policy denial (the oracle TCONFs all six
+  suites — its LinuxKit kernel has no CONFIG_USERFAULTFD) plus real
+  secretmem fds; all six userfaultfd suites line-match.
+- **perf_event_open(2)**: software counters off the per-thread CPU ledger,
+  read_format wire layout, ioctls; all three suites line-exact.
+- **new mount API** (fsopen/fsconfig/fsmount/fspick/move_mount/open_tree):
+  CAP_SYS_ADMIN-gated exactly like the oracle; 14/16 suites line-exact.
+- **fork+exit round-trip cost**: attributed to TWO whole-image copies of the
+  1.75 MiB page-table region per COW fault (diagnostic walk + rollback
+  pre-image). Removed/recycled them: fork+wait 5.62 -> 1.34 ms at
+  threads=0 (Docker 0.17), 8.81 -> 3.39 at threads=16. Durable D scripts
+  under `scripts/dtrace/`. NOTE the agent's own caution: load moved 4->45
+  during its session, so only paired same-session numbers are citable.
+
+**Coordinator work this session**: oracle-parity HWCAP/HWCAP2 (carrick was
+advertising 8 feature bits against the oracle's 30+, so feature-gated guest
+code silently skipped hardware paths); Linux uid-transition capability
+rules + CAP_NET_RAW/CAP_SYS_NICE/CAP_SYS_ADMIN gating (a guest that
+setuid'd away from root kept every capability); namespace semantics
+(unshare/setns/clone3 denied as Docker denies them, clone's namespace
+flags gated, /proc/config.gz gaining CONFIG_NAMESPACES + CONFIG_TIME_NS);
+io_uring denied like Docker and fanotify_init gated on the capability —
+which is what stopped carrick creating fd types the oracle cannot, the
+dominant term in the tst_fd matrix suites; splice(2) and FICLONE error
+precedence modelled from the oracle's 17x17 matrices (splice07 now
+LINE-EXACT; ioctl_ficlone04 252 -> 33 diverging rows).
+
+**Method notes worth keeping**
+- The Docker oracle MUST be invoked the way the harness does
+  (`docker run … /bin/sh -c '<binary>'`). A direct exec makes the test
+  PID 1 and misfires LTP's heartbeat, producing bogus "Main test process
+  might have exit!" transcripts. This invalidated several comparisons this
+  session — including a reported "carrick stdio bug" that does not exist.
+- The closure predicate is now OUTCOME EQUALITY (parity, not all-pass):
+  ~600 suites in perfect agreement with the oracle (matched skips, matched
+  oracle-side failures) were previously INCOMPLETE forever.
+- LTP asserts from `.h` headers too; the `.c`-only regex silently dropped
+  those rows and made ~50 suites parse to None on BOTH sides.
+
+**Open, ranked** (from the run-6 ledger, before this session's fixes):
+cpython multiprocessing_fork/forkserver/concurrent_futures/main_handling
+(734 rows, all TRUNCATED under gate load — the fork work above targets
+this; main_handling is exec/startup bound, not fork bound, and needs the
+exec path measured separately), futex_cmp_requeue01 (154, the 1000-waiter
+herd), cpython-importlib (146, guest SIGSEGV), cpython-posix (150 rows =
+3 real failures: fexecve, posix_spawnp PATH search, unshare/setns — the
+last is now fixed), go-os_exec (57, result none), cpython-socket (42),
+ioctl_ficlone04 (33, all /dev/zero), setns01/02, cpython-threading
+(flagged by the fork agent as a gating regression vs the blessed
+baseline: `free(): invalid pointer` in a forked child, reproduces on
+unmodified main).
+
+A `--closure --force --refresh-oracle` run on `35a4337ed` was launched at
+handoff time; its tally is the first authoritative measurement under
+closure-v3 + outcome-equality.
+
 ## Resume here
 
 ## Resume here
