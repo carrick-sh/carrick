@@ -186,15 +186,23 @@ pub fn classify_closure(
     docker_timed_out: bool,
 ) -> Classification {
     let carrick = &align_descriptor_residue(carrick, docker);
-    let all_ok = |side: &SuiteResult| {
-        side.result == SuiteOutcome::Success
-            && !side.ids.is_empty()
-            && side.ids.values().all(|outcome| *outcome == Outcome::Ok)
-    };
+    // Parity is OUTCOME EQUALITY, not all-pass: a test the ORACLE itself
+    // skips (env-dependent cpython/go skips, LTP TCONF) or fails
+    // (privilege-dependent LTP rows) is exact parity when carrick reproduces
+    // it row for row — the earlier all-Ok requirement barred ~600
+    // perfect-agreement suites from MATCH forever (multiprocessing_spawn at
+    // 323/323 + 47 matched skips; 390 identically-failing LTP suites), which
+    // no amount of carrick work could close. Only PARSED outcomes compare:
+    // Truncated/Empty/None never match, however equal — a deadline or empty
+    // capture is never a pass. Timeouts, one-sided skips, and result-kind
+    // divergence all remain INCOMPLETE.
+    let comparable =
+        |side: &SuiteResult| matches!(side.result, SuiteOutcome::Success | SuiteOutcome::Failure);
     if !carrick_timed_out
         && !docker_timed_out
-        && all_ok(carrick)
-        && all_ok(docker)
+        && comparable(carrick)
+        && comparable(docker)
+        && carrick.result == docker.result
         && carrick.ids == docker.ids
         && carrick.totals.n == docker.totals.n
         && carrick.totals.passed == docker.totals.passed
@@ -382,6 +390,92 @@ pub fn classify(
 
 #[cfg(test)]
 mod tests {
+
+    mod closure_outcome_equality {
+        use super::super::*;
+
+        fn result(ids: &[(&str, Outcome)], outcome: SuiteOutcome) -> SuiteResult {
+            let map: BTreeMap<String, Outcome> =
+                ids.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+            let passed = map.values().filter(|o| **o == Outcome::Ok).count();
+            let failed = map.values().filter(|o| **o == Outcome::Fail).count();
+            let skipped = map.values().filter(|o| **o == Outcome::Conf).count();
+            SuiteResult {
+                totals: Totals {
+                    n: passed + failed,
+                    passed,
+                    failed,
+                    broken: 0,
+                    skipped,
+                },
+                result: outcome,
+                ids: map,
+            }
+        }
+
+        fn s() -> Suite {
+            super::suite(&[])
+        }
+
+        /// A test the ORACLE ITSELF skips (env-dependent cpython/go skips,
+        /// LTP TCONF) is parity when carrick skips it identically — the old
+        /// all-Ok requirement barred ~200 perfect-agreement suites
+        /// (multiprocessing_spawn at 323/323 + 47 matched skips) from MATCH
+        /// forever, which no amount of carrick work could close.
+        #[test]
+        fn matched_skips_are_parity() {
+            let side = result(
+                &[("a#1", Outcome::Ok), ("b#1", Outcome::Conf)],
+                SuiteOutcome::Success,
+            );
+            let got = classify_closure(&s(), &side, false, &side.clone(), false);
+            assert_eq!(got.verdict, Verdict::Match);
+        }
+
+        /// A suite Docker itself FAILS (privilege-dependent LTP rows) is
+        /// parity when carrick fails identically, row for row.
+        #[test]
+        fn matched_failures_are_parity() {
+            let side = result(
+                &[("a#1", Outcome::Ok), ("b#1", Outcome::Fail)],
+                SuiteOutcome::Failure,
+            );
+            let got = classify_closure(&s(), &side, false, &side.clone(), false);
+            assert_eq!(got.verdict, Verdict::Match);
+        }
+
+        /// Result-kind divergence is never parity, even with equal ids.
+        #[test]
+        fn result_kind_divergence_is_incomplete() {
+            let a = result(&[("a#1", Outcome::Ok)], SuiteOutcome::Success);
+            let b = result(&[("a#1", Outcome::Ok)], SuiteOutcome::Failure);
+            let got = classify_closure(&s(), &a, false, &b, false);
+            assert_eq!(got.verdict, Verdict::Incomplete);
+        }
+
+        /// Truncated/empty/none observations never MATCH, however equal.
+        #[test]
+        fn non_parsed_outcomes_never_match() {
+            for outcome in [
+                SuiteOutcome::Truncated,
+                SuiteOutcome::Empty,
+                SuiteOutcome::None,
+            ] {
+                let side = result(&[("a#1", Outcome::Ok)], outcome);
+                let got = classify_closure(&s(), &side, false, &side.clone(), false);
+                assert_eq!(got.verdict, Verdict::Incomplete, "{outcome:?}");
+            }
+        }
+
+        /// A skip present ONLY on carrick's side stays a divergence.
+        #[test]
+        fn one_sided_skip_stays_incomplete() {
+            let a = result(&[("a#1", Outcome::Conf)], SuiteOutcome::Success);
+            let b = result(&[("a#1", Outcome::Ok)], SuiteOutcome::Success);
+            let got = classify_closure(&s(), &a, false, &b, false);
+            assert_eq!(got.verdict, Verdict::Incomplete);
+        }
+    }
 
     mod residue_alignment {
         use super::super::*;
@@ -800,21 +894,26 @@ mod tests {
         assert!(!c.gating);
     }
 
+    /// Known-gap excuses never reach closure classification: identical rows
+    /// match on EQUALITY (parity is outcome equality, see
+    /// `closure_outcome_equality`), never via the excuse list, and a
+    /// divergent row is gating regardless of any excuse entry.
     #[test]
-    fn closure_rejects_shared_failure_and_ignores_excuses() {
+    fn closure_ignores_excuses_entirely() {
         let suite = suite(&["assertion#1"]);
         let carrick = res(&[("assertion#1", Outcome::Broken)]);
-        let docker = res(&[("assertion#1", Outcome::Broken)]);
+        let docker = res(&[("assertion#1", Outcome::Ok)]);
         let got = classify_closure(&suite, &carrick, false, &docker, false);
         assert_eq!(got.verdict, Verdict::Incomplete);
         assert!(got.gating);
-        assert!(got.known_diffs.is_empty());
+        assert!(got.known_diffs.is_empty(), "no excuse channel in closure");
     }
 
+    /// Row-outcome DIVERGENCE always gates, for every outcome kind: parity
+    /// is equality, and nothing but equality passes.
     #[test]
-    fn closure_accepts_only_nonempty_identical_all_ok_results() {
-        let side = res(&[("assertion#1", Outcome::Ok)]);
-        assert!(!classify_closure(&suite(&[]), &side, false, &side, false).gating);
+    fn closure_gates_every_divergent_outcome_kind() {
+        let docker = res(&[("assertion#1", Outcome::Ok)]);
         for outcome in [
             Outcome::Fail,
             Outcome::Broken,
@@ -823,9 +922,13 @@ mod tests {
             Outcome::Xfail,
             Outcome::Uxsuccess,
             Outcome::Other,
+            Outcome::Absent,
         ] {
-            let side = res(&[("assertion#1", outcome)]);
-            assert!(classify_closure(&suite(&[]), &side, false, &side, false).gating);
+            let carrick = res(&[("assertion#1", outcome)]);
+            assert!(
+                classify_closure(&suite(&[]), &carrick, false, &docker, false).gating,
+                "{outcome:?} vs Ok must gate"
+            );
         }
     }
 
