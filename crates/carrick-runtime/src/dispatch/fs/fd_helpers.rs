@@ -764,7 +764,41 @@ impl SyscallDispatcher {
                 }
             }
             OpenDescription::HostFile { .. } | OpenDescription::File { .. } => Some(LINUX_EBADF),
-            _ => Some(LINUX_EINVAL),
+            // Everything else: splice(2) distinguishes "this fd cannot be
+            // written at all" from "this pairing cannot splice". EBADF is the
+            // answer whenever fd_out is not open for writing ("do not have
+            // proper read-write mode"); EINVAL is for a writable destination
+            // that still cannot be a splice target (neither end a pipe, an
+            // unsupported filesystem...). Verified against the oracle's
+            // splice07 matrix, which splits exactly on write mode: O_PATH
+            // file, directory, /dev/zero, /proc/self/maps, a pipe READ end and
+            // an inotify fd are EBADF, while eventfd/signalfd/timerfd/epoll/
+            // pidfd/memfd/sockets — all opened read-write — are EINVAL.
+            // carrick answered EINVAL for the whole tail.
+            // Anonymous inodes Linux creates READ-WRITE: a splice into them is
+            // a bad PAIRING (EINVAL), not a bad descriptor.
+            OpenDescription::Epoll { .. }
+            | OpenDescription::EventFd { .. }
+            | OpenDescription::SignalFd { .. }
+            | OpenDescription::TimerFd { .. }
+            | OpenDescription::Pidfd { .. }
+            | OpenDescription::Mqueue { .. }
+            | OpenDescription::BpfMap { .. }
+            | OpenDescription::BpfProg { .. }
+            | OpenDescription::PerfEvent { .. }
+            | OpenDescription::FsContext { .. } => Some(LINUX_EINVAL),
+            // Inotify/fanotify groups are read-only descriptions, so they are
+            // "not open for writing" — EBADF, like a directory or an O_PATH
+            // fd. carrick's own base flags cannot decide this for the anon
+            // inodes above (they are all created O_RDONLY here while Linux
+            // opens them O_RDWR), which is why the split is spelled out
+            // rather than derived from `is_read_only`.
+            OpenDescription::Inotify { .. } | OpenDescription::Fanotify { .. } => Some(LINUX_EBADF),
+            other => Some(if other.is_read_only() {
+                LINUX_EBADF
+            } else {
+                LINUX_EINVAL
+            }),
         }
     }
 }
