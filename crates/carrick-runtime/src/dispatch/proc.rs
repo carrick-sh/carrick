@@ -4286,6 +4286,27 @@ impl SyscallDispatcher {
             {
                 return Ok(DispatchOutcome::ThreadExit { code });
             }
+            // Process exit: fold the EL1 shim's serviced-syscall counter into
+            // the task's SYSTEM ledger so the zombie snapshot (and therefore
+            // the reaper's RUSAGE_CHILDREN) carries the kernel time Linux
+            // would have charged for those syscalls. Live getrusage/times
+            // readers add the counter directly, so it is zeroed here to keep
+            // the two accountings disjoint. A signal-killed process skips
+            // this fold (its counter dies unread) — a bounded undercount.
+            let counter_addr = crate::memory::LINUX_IDENTITY_PAGE_BASE
+                + crate::memory::IDENTITY_OFF_SHIM_SYSCALLS;
+            if let Ok(bytes) = cx.memory.read_bytes(counter_addr, 8) {
+                let count = u64::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0; 8]));
+                if count != 0 {
+                    let _ = cx.memory.write_bytes(counter_addr, &0_u64.to_le_bytes());
+                    super::resources::with_active_context(|context| {
+                        context.thread().charge_system_ns(
+                            count
+                                .saturating_mul(crate::memory::EL1_SHIM_SYSCALL_NOMINAL_NS),
+                        );
+                    });
+                }
+            }
             Ok(DispatchOutcome::Exit { code })
         }
 

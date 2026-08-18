@@ -1527,6 +1527,15 @@ fn stamp_identity_values<M: GuestMemory>(
     ] {
         memory.write_bytes(base + off, &val.to_le_bytes())?;
     }
+    // A fresh stamp starts a fresh serviced-syscall ledger: a forked child
+    // COWs its parent's identity page and must not inherit the parent's
+    // counter (Linux children start rusage at zero), and an exec'd image
+    // keeps its task ledger but not the page. (The exec re-stamp drops any
+    // pre-exec counted-but-unfolded syscalls — a µs-scale undercount.)
+    memory.write_bytes(
+        base + crate::memory::IDENTITY_OFF_SHIM_SYSCALLS,
+        &0_u64.to_le_bytes(),
+    )?;
     Ok(())
 }
 
