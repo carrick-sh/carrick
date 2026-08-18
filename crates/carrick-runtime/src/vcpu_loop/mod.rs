@@ -2129,6 +2129,26 @@ where
                     region_bytes.push(Vec::new());
                     continue;
                 }
+                // Linux's default coredump filter omits the CONTENTS of
+                // executable file-backed mappings (program/library text): the
+                // oracle core lists them as PT_LOAD with p_filesz = 0 while
+                // still dumping readable data/RELRO file mappings in full.
+                // The `coredumpfile` probe pins this — its in-core instruction
+                // lookup at the thread PCs must FAIL exactly as it does
+                // against a Linux core. Overlap (not containment) match: the
+                // loader's image VMA runs past the file extent (bss tail).
+                // Known approximation: carrick's main/interp images are one
+                // merged VMA (text+data+bss), so their DATA drops out of the
+                // core alongside the text where Linux, with split VMAs, keeps
+                // it; no conformance row observes that today.
+                let file_backed = process
+                    .file_mappings
+                    .iter()
+                    .any(|fm| fm.start < map.end && map.start < fm.end);
+                if file_backed && map.execute {
+                    region_bytes.push(Vec::new());
+                    continue;
+                }
                 if std::env::var_os("CARRICK_CORE_FAILPOINT")
                     .is_some_and(|value| value == "memory-read")
                 {
