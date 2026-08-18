@@ -1345,6 +1345,32 @@ struct RenameAtRequest {
     target_tid: Option<crate::thread::ThreadId>,
 }
 
+/// The filesystem an fd's inode lives on, as far as `FICLONE`'s error
+/// precedence can tell them apart. Derived from the oracle's
+/// `ioctl_ficlone04` matrix (every pairing of 17 fd types), not from headers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FicloneFs {
+    /// The container rootfs: regular files and directories.
+    Root {
+        is_dir: bool,
+    },
+    /// devtmpfs (`/dev/zero` and friends).
+    Dev,
+    /// procfs.
+    Proc,
+    /// pipefs (both ends).
+    Pipe,
+    /// sockfs (unix and inet).
+    Sock,
+    /// anon_inodefs: epoll, eventfd, signalfd, timerfd, inotify.
+    AnonInode,
+    /// Filesystems whose files ARE regular but whose driver has no clone
+    /// operation, so a same-fs pairing is EOPNOTSUPP rather than EINVAL:
+    /// tmpfs-backed `memfd`, `secretmem`, and pidfs.
+    Unclonable(u8),
+    Other,
+}
+
 impl SyscallDispatcher {
     fn record_fd_open_path(&self, fd: i32, path: String) {
         #[cfg(test)]
@@ -4178,6 +4204,139 @@ impl SyscallDispatcher {
     /// splice(2) must reject it with EBADF: an `O_PATH` descriptor, a
     /// write-only regular file, or the write end of a one-way pipe (splice03's
     /// write-only case, splice07's `O_PATH`/pipe-write-end sources).
+    /// True when the FICLONE destination cannot be written (a read-only
+    /// description such as a procfs file), which Linux reports as EBADF.
+    fn ficlone_dest_unwritable(&self, fd: i32) -> bool {
+        self.open_file(fd)
+            .is_some_and(|of| of.description.read().is_read_only())
+    }
+
+    /// The filesystem class `FICLONE` error precedence keys on — see
+    /// [`FicloneFs`].
+    fn ficlone_fs(&self, fd: i32) -> FicloneFs {
+        let Some(open_file) = self.open_file(fd) else {
+            return FicloneFs::Other;
+        };
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::Directory { .. } => FicloneFs::Root { is_dir: true },
+            OpenDescription::Epoll { .. }
+            | OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
+            | OpenDescription::SignalFd { .. }
+            | OpenDescription::Inotify { .. }
+            | OpenDescription::Fanotify { .. } => FicloneFs::AnonInode,
+            OpenDescription::Pidfd { .. } => FicloneFs::Unclonable(0),
+            OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
+                FicloneFs::Pipe
+            }
+            OpenDescription::HostPipe { pty: None, .. } => FicloneFs::Pipe,
+            OpenDescription::HostSocket { .. } => FicloneFs::Sock,
+            // Path-keyed classes cover File, SyntheticFile AND HostFile: the
+            // guest's /dev/zero is a HostFile, so keying off the variant alone
+            // put a character device on the rootfs and turned a devfs->pipefs
+            // pairing into a same-fs one.
+            OpenDescription::File { base, .. } | OpenDescription::SyntheticFile { base, .. } => {
+                let path = open.open_path().unwrap_or_default();
+                if base.secretmem() {
+                    FicloneFs::Unclonable(1)
+                } else if path.starts_with("/dev/") {
+                    FicloneFs::Dev
+                } else if path.starts_with("/proc/") {
+                    FicloneFs::Proc
+                } else if path.starts_with("/memfd:") || path.starts_with("memfd:") {
+                    FicloneFs::Unclonable(2)
+                } else {
+                    FicloneFs::Root { is_dir: false }
+                }
+            }
+            // A host-backed fd may carry no recorded path (the guest's
+            // /dev/zero is one), so classify by the host inode's TYPE: a
+            // character device lives on devtmpfs, a fifo on pipefs, a socket
+            // on sockfs. Keying on the path alone put /dev/zero on the rootfs
+            // and turned devfs<->pipefs pairings into same-fs ones.
+            OpenDescription::HostFile { host_fd, .. } => {
+                let path = open.open_path().unwrap_or_default();
+                if path.starts_with("/dev/") {
+                    FicloneFs::Dev
+                } else if path.starts_with("/proc/") {
+                    FicloneFs::Proc
+                } else {
+                    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                    // SAFETY: host_fd is a live descriptor owned by this
+                    // description; fstat only writes the stat buffer.
+                    if unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0 {
+                        match st.st_mode & libc::S_IFMT {
+                            libc::S_IFCHR => FicloneFs::Dev,
+                            libc::S_IFIFO => FicloneFs::Pipe,
+                            libc::S_IFSOCK => FicloneFs::Sock,
+                            libc::S_IFDIR => FicloneFs::Root { is_dir: true },
+                            _ => FicloneFs::Root { is_dir: false },
+                        }
+                    } else {
+                        FicloneFs::Root { is_dir: false }
+                    }
+                }
+            }
+            _ => FicloneFs::Other,
+        }
+    }
+
+    /// `FICLONE`'s errno for a (source, destination) pair, in the precedence
+    /// the oracle's matrix exhibits: cross-filesystem EXDEV first (a directory
+    /// cloned to `/dev/zero` is EXDEV, not EISDIR), then EISDIR for a same-fs
+    /// pairing involving a directory, then EBADF for a same-fs destination
+    /// that cannot be written (`/proc/self/maps` onto itself), then
+    /// EOPNOTSUPP for a filesystem whose driver simply lacks the operation
+    /// (memfd, secretmem, pidfs), else EINVAL. carrick answered EOPNOTSUPP for
+    /// every pairing.
+    ///
+    /// Two regular rootfs files land on EXDEV because the oracle reports EXDEV
+    /// for its own `file -> file` case: LTP builds its two instances on
+    /// different mounts, and carrick's rootfs cannot distinguish them either.
+    fn ficlone_errno(&self, src_fd: i32, dst_fd: i32) -> LinuxErrno {
+        let src = self.ficlone_fs(src_fd);
+        let dst = self.ficlone_fs(dst_fd);
+        if std::env::var_os("CARRICK_FICLONE_DEBUG").is_some() {
+            let name = |fd: i32| {
+                self.open_file(fd)
+                    .map(|of| {
+                        let g = of.description.read();
+                        format!("{}:{}", g.reexec_kind_name(), g.open_path().unwrap_or("-"))
+                    })
+                    .unwrap_or_else(|| "<none>".into())
+            };
+            eprintln!(
+                "FICLONEDBG src={:?}({}) dst={:?}({})",
+                src,
+                name(src_fd),
+                dst,
+                name(dst_fd)
+            );
+        }
+        let same_fs = match (src, dst) {
+            (FicloneFs::Root { .. }, FicloneFs::Root { .. }) => true,
+            _ => src == dst,
+        };
+        if !same_fs {
+            return carrick_abi::LINUX_EXDEV;
+        }
+        if let (FicloneFs::Root { is_dir: a }, FicloneFs::Root { is_dir: b }) = (src, dst) {
+            if a || b {
+                return LINUX_EISDIR;
+            }
+            // Distinct mounts — see the note above.
+            return carrick_abi::LINUX_EXDEV;
+        }
+        if self.ficlone_dest_unwritable(dst_fd) {
+            return LINUX_EBADF;
+        }
+        match src {
+            FicloneFs::Unclonable(_) => LINUX_EOPNOTSUPP,
+            _ => LINUX_EINVAL,
+        }
+    }
+
     fn splice_source_not_readable(&self, fd: i32) -> bool {
         if self.fd_is_o_path(fd) {
             return true;
@@ -8122,10 +8281,29 @@ impl SyscallDispatcher {
                         Ok(src_fd) => src_fd,
                         Err(_) => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                     };
+                    if std::env::var_os("CARRICK_FICLONE_DEBUG").is_some() {
+                        eprintln!(
+                            "FICLONEDBG enter dst_fd={} src_fd={} dst_valid={} src_valid={} src_opath={} dst_opath={}",
+                            fd.0,
+                            src_fd,
+                            this.fd_is_valid(fd.0),
+                            this.fd_is_valid(src_fd),
+                            this.fd_is_o_path(src_fd),
+                            this.fd_is_o_path(fd.0)
+                        );
+                    }
+                    // Both descriptors must carry a usable mode: an O_PATH fd
+                    // on EITHER side, or a destination not open for writing
+                    // (procfs files are read-only), is EBADF ahead of every
+                    // type/filesystem rule — the oracle's matrix answers EBADF
+                    // for all 34 such pairings.
                     if !this.fd_is_valid(src_fd) || this.fd_is_o_path(src_fd) {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     }
-                    DispatchOutcome::errno(LINUX_EOPNOTSUPP)
+                    if this.fd_is_o_path(fd.0) {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    }
+                    DispatchOutcome::errno(this.ficlone_errno(src_fd, fd.0))
                 }
                 LINUX_TCSETS
                 | LINUX_TCSETSW
@@ -10702,6 +10880,19 @@ impl SyscallDispatcher {
             // is EBADF, decided ahead of the pipe-vs-pipe routing (splice03's
             // write-only fd_in, splice07's O_PATH / pipe-write-end sources).
             if this.splice_source_not_readable(in_fd.0) {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            // fd_out must be open for WRITING, and Linux decides that before
+            // the one-end-must-be-a-pipe rule: the oracle's splice07 matrix
+            // answers EBADF for every non-writable destination (O_PATH file,
+            // directory, /dev/zero, /proc/self/maps, a pipe READ end, an
+            // inotify fd) and EINVAL only for writable-but-unspliceable ones
+            // (eventfd/signalfd/timerfd/epoll/pidfd/memfd/sockets/regular
+            // file). carrick reached the pipe rule first and answered EINVAL
+            // for the whole tail.
+            if let Some(errno) = this.splice_output_errno(out_fd.0)
+                && errno == LINUX_EBADF
+            {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
             // splice(2) requires at least ONE end to be a genuine pipe; a
