@@ -39,9 +39,29 @@ pub const DOCKER_DEFAULT_CAPS: u64 = 0x0000_0000_a804_25fb;
 /// `capabilities(7)`; mirrors `LINUX_CAP_LAST_CAP`). A full set is all bits
 /// `0..=CAP_LAST_CAP`.
 pub const CAP_LAST_CAP: u32 = 40;
+pub const CAP_CHOWN: u32 = 0;
+pub const CAP_DAC_OVERRIDE: u32 = 1;
+pub const CAP_DAC_READ_SEARCH: u32 = 2;
+pub const CAP_FOWNER: u32 = 3;
+pub const CAP_FSETID: u32 = 4;
 pub const CAP_SETPCAP: u32 = 8;
+pub const CAP_LINUX_IMMUTABLE: u32 = 9;
+pub const CAP_NET_RAW: u32 = 13;
 pub const CAP_SYS_ADMIN: u32 = 21;
 pub const CAP_SYS_NICE: u32 = 23;
+pub const CAP_MKNOD: u32 = 27;
+pub const CAP_MAC_OVERRIDE: u32 = 32;
+
+/// The file-related capabilities `fsuid` transitions raise and lower in the
+/// EFFECTIVE set (capabilities(7), "Effect of user ID changes" rule 3).
+pub const FS_CAPABILITIES: u64 = (1 << CAP_CHOWN)
+    | (1 << CAP_DAC_OVERRIDE)
+    | (1 << CAP_DAC_READ_SEARCH)
+    | (1 << CAP_FOWNER)
+    | (1 << CAP_FSETID)
+    | (1 << CAP_LINUX_IMMUTABLE)
+    | (1 << CAP_MKNOD)
+    | (1 << CAP_MAC_OVERRIDE);
 pub const CAP_SYS_RESOURCE: u32 = 24;
 
 /// A full capability set over the modeled range — what the creator of a fresh

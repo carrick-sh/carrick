@@ -287,8 +287,23 @@ impl SyscallDispatcher {
         kernel: &crate::kernel::KernelContext,
         update: impl FnOnce(&mut crate::kernel::Credentials),
     ) -> Result<Arc<crate::kernel::Credentials>, LinuxErrno> {
+        // Snapshot the uid identity BEFORE the update: a uid transition
+        // rewrites the capability sets (capabilities(7)), and this is the one
+        // path every set*uid/set*gid/setfsuid handler funnels through, so the
+        // rules cannot be forgotten by a future caller.
+        let before = {
+            let credentials = kernel.resources().credentials();
+            UidIdentity::of(&credentials)
+        };
         match kernel.kernel().update_credentials(kernel, update) {
-            Ok(updated) => Ok(updated.resources().credentials()),
+            Ok(updated) => {
+                let credentials = updated.resources().credentials();
+                let after = UidIdentity::of(&credentials);
+                if before != after {
+                    apply_uid_transition_capabilities(kernel, before, after);
+                }
+                Ok(credentials)
+            }
             Err(
                 crate::kernel::KernelOperationError::StaleContext
                 | crate::kernel::KernelOperationError::ParentExited
@@ -690,9 +705,8 @@ impl SyscallDispatcher {
             // target-ownership; EACCES is the raise privilege (glibc's
             // nice(3) wrapper surfaces it as EPERM to the caller).
             let current_nice = cx.kernel.task().nice();
-            let cap_sys_nice =
-                1_u64 << crate::namespace::process::CAP_SYS_NICE;
-            let may_raise = cx.kernel.task().caps().effective & cap_sys_nice != 0;
+            let may_raise =
+                has_effective_capability(cx.kernel, crate::namespace::process::CAP_SYS_NICE);
             if clamped < current_nice && !may_raise {
                 return Ok(DispatchOutcome::errno(LINUX_EACCES));
             }
@@ -1400,4 +1414,86 @@ mod identity_snapshot_tests {
             .unwrap();
         assert!(matches!(outcome, DispatchOutcome::Returned { value: 0 }));
     }
+}
+
+/// The four uids whose transitions Linux keys capability changes on
+/// (capabilities(7), "Effect of user ID changes on capabilities").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct UidIdentity {
+    ruid: u32,
+    euid: u32,
+    suid: u32,
+    fsuid: u32,
+}
+
+impl UidIdentity {
+    fn of(credentials: &crate::kernel::Credentials) -> Self {
+        Self {
+            ruid: credentials.ruid.raw(),
+            euid: credentials.euid.raw(),
+            suid: credentials.suid.raw(),
+            fsuid: credentials.fsuid.raw(),
+        }
+    }
+
+    /// True when at least one of the three set-user-IDs is root — the
+    /// condition rule 2 watches for losing.
+    fn holds_root(self) -> bool {
+        self.ruid == 0 || self.euid == 0 || self.suid == 0
+    }
+}
+
+/// Apply Linux's capability consequences of a uid transition
+/// (capabilities(7), "Effect of user ID changes on capabilities"):
+///
+///  1. euid 0 -> nonzero: clear the EFFECTIVE set.
+///  2. some set-user-ID was 0 and now none is: clear PERMITTED, EFFECTIVE
+///     and AMBIENT (this is the one LTP `socket01` depends on — it setuids
+///     to a normal user and then expects `socket(AF_INET, SOCK_RAW)` to be
+///     EPERM, which only happens once CAP_NET_RAW is gone).
+///  3. fsuid 0 -> nonzero: drop the file capabilities from EFFECTIVE;
+///     nonzero -> 0: raise them again, bounded by PERMITTED.
+///  4. euid nonzero -> 0: copy PERMITTED into EFFECTIVE.
+///
+/// Not modeled: the `SECBIT_KEEP_CAPS` / `SECBIT_NO_SETUID_FIXUP` securebits
+/// that suppress rules 1-3, and file capabilities on exec. carrick has no
+/// securebits surface yet, so a guest cannot ask for the suppressed
+/// behaviour and cannot observe its absence.
+fn apply_uid_transition_capabilities(
+    kernel: &crate::kernel::KernelContext,
+    before: UidIdentity,
+    after: UidIdentity,
+) {
+    use crate::namespace::process::FS_CAPABILITIES;
+
+    kernel.task().with_caps(|caps| {
+        if before.holds_root() && !after.holds_root() {
+            caps.permitted = 0;
+            caps.effective = 0;
+            caps.ambient = 0;
+            return;
+        }
+        if before.euid == 0 && after.euid != 0 {
+            caps.effective = 0;
+        }
+        if before.euid != 0 && after.euid == 0 {
+            caps.effective = caps.permitted;
+        }
+        if before.fsuid == 0 && after.fsuid != 0 {
+            caps.effective &= !FS_CAPABILITIES;
+        } else if before.fsuid != 0 && after.fsuid == 0 {
+            caps.effective |= caps.permitted & FS_CAPABILITIES;
+        }
+    });
+}
+
+/// Does the calling task hold `capability` in its EFFECTIVE set? The single
+/// spelling every privilege check uses, so "privileged" never silently means
+/// `euid == 0` again (the Docker default set drops CAP_SYS_NICE and a
+/// post-`setuid` guest holds nothing at all).
+pub(super) fn has_effective_capability(
+    kernel: &crate::kernel::KernelContext,
+    capability: u32,
+) -> bool {
+    kernel.task().caps().effective & (1_u64 << capability) != 0
 }
