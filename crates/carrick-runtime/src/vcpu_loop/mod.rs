@@ -4804,6 +4804,12 @@ where
                             (state.this_tid.raw(), errno.get())
                         }
                     };
+                    crate::event_ring::rec(
+                        crate::event_ring::CLONESPAWN,
+                        state.this_tid.raw(),
+                        completed_tid,
+                        completed_errno,
+                    );
                     crate::probes::mn_clone_outcome(
                         completed_tid,
                         carrick_observability::probes::HvpatchCloneThreadPhase::Completed,
