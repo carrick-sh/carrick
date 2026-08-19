@@ -779,6 +779,10 @@ struct AliasBacking {
     inventory_backing: InventoryBackingIdentity,
     shared_key_base: u64,
     shared_key_offset: u64,
+    /// Which incarnation of the global-frame lease this row was published
+    /// against — see [`GlobalFrameHostOwner::generation`]. Without it a row that
+    /// outlives its lease silently re-authenticates against the next one.
+    owner_generation: u64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -819,6 +823,43 @@ struct GlobalFrameHostOwner {
     _mapping: crate::host_mapping::OwnedHostMapping,
     _lease: GlobalFrameStage2Lease,
     perms: u64,
+    /// Which incarnation of this `(IPA, length)` lease this is.
+    ///
+    /// The host-pointer check alone is NOT an identity. Retiring an owner
+    /// `munmap`s its host buffer and returns the IPA to the allocator, and both
+    /// come straight back: measured on the canonical host, a
+    /// `map_shared_anon`/`munmap` cycle returns the SAME host VA 499 of 499
+    /// times, with ONE distinct address
+    /// (`docs/perf-results/2026-08-19-global-frame-lease-identity/`). So a stale
+    /// per-thread row naming the old triple re-authenticates against the NEW
+    /// owner and the anonymous-reuse scrub zeroes a live granule — confirmed to
+    /// be the `cpython-importlib` SIGSEGV (5/8 crashes, 0/14 once the identity
+    /// cannot recur).
+    generation: u64,
+}
+
+/// Monotonic source for [`GlobalFrameHostOwner::generation`]. Never reused, so a
+/// retired lease's incarnation can never be mistaken for a live one. Starts at
+/// 1, leaving 0 free as "no generation known".
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static GLOBAL_FRAME_OWNER_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn next_global_frame_owner_generation() -> u64 {
+    GLOBAL_FRAME_OWNER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The live owner generation for `(ipa, length)`, or 0 when unowned.
+///
+/// Rows stamp this at publication, which always happens while the lease is
+/// live, so a row records the incarnation it was actually published against.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn global_frame_host_owner_generation(ipa: u64, length: u64) -> u64 {
+    global_frame_host_owners()
+        .lock()
+        .get(&(ipa, length))
+        .map_or(0, |owner| owner.generation)
 }
 
 // SAFETY: the mapping is process-address-space state. Its address is stable,
@@ -876,6 +917,7 @@ fn register_global_frame_host_owner(
             _mapping: mapping,
             _lease: lease,
             perms,
+            generation: next_global_frame_owner_generation(),
         },
     );
     Ok(())
@@ -915,13 +957,29 @@ fn retire_global_frame_host_owner(ipa: u64, length: u64) -> bool {
 /// scrub the unrelated allocation. The `(IPA, length, host pointer)` triple is
 /// the owning lease identity and therefore the only safe HVPatch predicate.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn global_frame_host_owner_matches(ipa: u64, length: u64, host_addr: usize) -> bool {
-    let owner_host_addr = global_frame_host_owners()
+fn global_frame_host_owner_matches(
+    ipa: u64,
+    length: u64,
+    host_addr: usize,
+    generation: u64,
+) -> bool {
+    let (owner_host_addr, owner_generation) = global_frame_host_owners()
         .lock()
         .get(&(ipa, length))
-        .map(|owner| owner._mapping.as_ptr() as usize)
-        .unwrap_or(0);
-    let matches = owner_host_addr != 0 && owner_host_addr == host_addr;
+        .map_or((0, 0), |owner| {
+            (owner._mapping.as_ptr() as usize, owner.generation)
+        });
+    // The GENERATION is what turns this into an identity. Without it the triple
+    // re-authenticates against a DIFFERENT incarnation of the same recycled
+    // `(IPA, length, host VA)`, which is measured to happen every single time.
+    // A row stamped with 0 was published without a live global-frame owner for
+    // its extent (the mailbox and other early mappings are like this), so it
+    // keeps the historical pointer-only behaviour — tightening those to "no
+    // match" unmapped the syscall mailbox and killed the guest outright. Where a
+    // row DOES carry an incarnation, that incarnation must be the live one.
+    let matches = owner_host_addr != 0
+        && owner_host_addr == host_addr
+        && (generation == 0 || owner_generation == generation);
     if !matches {
         crate::probes::hvpatch_global_frame_owner_miss(
             ipa,
@@ -988,6 +1046,7 @@ fn global_frame_region_owner_matches(mapping: &HvfMappedRegion) -> bool {
         mapping.physical_ipa,
         mapping.physical_size as u64,
         physical_host_addr,
+        mapping.owner_generation,
     )
 }
 
@@ -1402,6 +1461,10 @@ fn retained_private_reuse_alias_fragment(
         inventory_backing: source.inventory_backing,
         shared_key_base: 0,
         shared_key_offset: 0,
+        owner_generation: global_frame_host_owner_generation(
+            source.physical_ipa,
+            source.physical_size as u64,
+        ),
     })
 }
 
@@ -3654,6 +3717,9 @@ pub(crate) struct HvfMappedRegion {
     /// base precedes that projection. Lifetime decisions must use this tuple.
     physical_ipa: u64,
     physical_size: usize,
+    /// Which incarnation of the global-frame lease this row was published
+    /// against — see [`GlobalFrameHostOwner::generation`].
+    owner_generation: u64,
     /// Host VA of the buffer backing this guest-physical mapping. We
     /// record this explicitly so the fork(2) path can re-issue
     /// `hv_vm_map` in the child against the same (COW'd) host pages
@@ -4205,6 +4271,10 @@ impl ThreadMappingDesc {
             guest_writable: self.guest_writable,
             shared_key_base: self.shared_key_base,
             shared_key_offset: self.shared_key_offset,
+            owner_generation: global_frame_host_owner_generation(
+                self.physical_ipa,
+                self.physical_size as u64,
+            ),
         }
     }
 }
@@ -6742,6 +6812,10 @@ impl HvfVmState {
             inventory_backing,
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: global_frame_host_owner_generation(
+                physical_ipa,
+                physical_size as u64,
+            ),
         });
         Ok(())
     }
@@ -6890,6 +6964,7 @@ impl HvfVmState {
                         alias.physical_ipa,
                         alias.physical_size as u64,
                         alias.physical_host_addr,
+                        alias.owner_generation,
                     )
                 } else {
                     alias_backing_is_live(alias.physical_host_addr)
@@ -7040,6 +7115,7 @@ impl HvfVmState {
                         alias.physical_ipa,
                         alias.physical_size as u64,
                         alias.physical_host_addr,
+                        alias.owner_generation,
                     )
             })
             .map(|alias| alias.start.saturating_add(alias.size as u64));
@@ -7071,6 +7147,7 @@ impl HvfVmState {
                         alias.physical_ipa,
                         alias.physical_size as u64,
                         alias.physical_host_addr,
+                        alias.owner_generation,
                     )
             })
             .map(|alias| alias.start)
@@ -7316,6 +7393,10 @@ impl HvfVmState {
             inventory_backing: Self::private_backing_identity(),
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: global_frame_host_owner_generation(
+                physical_ipa,
+                physical_size as u64,
+            ),
         });
         self.mappings.push(HvfMappedRegion {
             start,
@@ -7334,6 +7415,10 @@ impl HvfVmState {
             guest_writable: true,
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: global_frame_host_owner_generation(
+                physical_ipa,
+                physical_size as u64,
+            ),
         });
         self.supersede_cow_receipts("sparse-mmap-extent", start, semantic_len as u64);
         self.cow_deferred_publications
@@ -7747,6 +7832,10 @@ impl HvfVmState {
             inventory_backing: backing,
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: global_frame_host_owner_generation(
+                new_physical_ipa,
+                CowArmedRanges::COMPOUND_SIZE as usize as u64,
+            ),
         });
         self.mappings.push(HvfMappedRegion {
             start: page_va,
@@ -7765,6 +7854,10 @@ impl HvfVmState {
             guest_writable: true,
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: global_frame_host_owner_generation(
+                new_physical_ipa,
+                CowArmedRanges::COMPOUND_SIZE as usize as u64,
+            ),
         });
         self.supersede_cow_receipts("retained-reuse", page_va, span_len as u64);
         let mut pending = self.cow_deferred_publications.lock();
@@ -8356,6 +8449,10 @@ impl HvfVmState {
             inventory_backing: backing,
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: global_frame_host_owner_generation(
+                new_physical_ipa,
+                CowArmedRanges::COMPOUND_SIZE as usize as u64,
+            ),
         };
         register_shared_alias(alias);
         self.mappings.push(HvfMappedRegion {
@@ -8375,6 +8472,10 @@ impl HvfVmState {
             guest_writable: true,
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: global_frame_host_owner_generation(
+                new_physical_ipa,
+                CowArmedRanges::COMPOUND_SIZE as usize as u64,
+            ),
         });
         self.cow_armed.lock().disarm(span);
         Ok(true)
@@ -9144,6 +9245,7 @@ impl HvfVmState {
             inventory_backing,
             shared_key_base,
             shared_key_offset,
+            owner_generation: global_frame_host_owner_generation(ipa, physical_size as u64),
         });
         self.mappings.push(HvfMappedRegion {
             start: va,
@@ -9162,6 +9264,7 @@ impl HvfVmState {
             guest_writable: alias_guest_writable,
             shared_key_base,
             shared_key_offset,
+            owner_generation: global_frame_host_owner_generation(ipa, physical_size as u64),
         });
         if self.persistent_vm_lifecycle {
             let mut inventory = self.frame_inventory.lock();
@@ -10015,6 +10118,10 @@ impl HvfVmState {
                     guest_writable: row.guest_writable,
                     shared_key_base: row.shared_key_base,
                     shared_key_offset: row.shared_key_offset.saturating_add(delta),
+                    owner_generation: global_frame_host_owner_generation(
+                        row.physical_ipa,
+                        row.physical_size as u64,
+                    ),
                 });
             }
             if head_survives {
@@ -10217,6 +10324,7 @@ impl HvfVmState {
                     alias.physical_ipa,
                     alias.physical_size as u64,
                     alias.physical_host_addr,
+                    alias.owner_generation,
                 )
         };
         // First honor the exact output address in the authoritative stage-1
@@ -10443,6 +10551,7 @@ impl HvfVmState {
                             alias.physical_ipa,
                             alias.physical_size as u64,
                             alias.physical_host_addr,
+                            alias.owner_generation,
                         ))
             })
             .map(MappingView::from_alias)
@@ -11196,6 +11305,10 @@ impl HvfVmState {
                 sharing: desc.sharing,
                 shared_key_base: desc.shared_key_base,
                 shared_key_offset: desc.shared_key_offset,
+                owner_generation: global_frame_host_owner_generation(
+                    desc.physical_ipa,
+                    desc.physical_size as u64,
+                ),
             });
         }
         crate::probes::fork_rebuild(role, 1, desc_count, local_maps, elapsed_us(local_map_start));
@@ -11294,6 +11407,10 @@ impl HvfVmState {
                     sharing: sm.sharing,
                     shared_key_base: sm.shared_key_base,
                     shared_key_offset: sm.shared_key_offset,
+                    owner_generation: global_frame_host_owner_generation(
+                        sm.physical_ipa,
+                        sm.physical_size as u64,
+                    ),
                 });
             }
             crate::probes::fork_rebuild(
@@ -12232,6 +12349,10 @@ impl HvfVmState {
                     inventory_backing: mapping.inventory_backing,
                     shared_key_base: mapping.shared_key_base,
                     shared_key_offset: mapping.shared_key_offset,
+                    owner_generation: global_frame_host_owner_generation(
+                        mapping.physical_ipa,
+                        mapping.physical_size as u64,
+                    ),
                 };
                 aliases_to_publish.push(if mapping.sharing.uses_global_ipa() {
                     alias
@@ -12256,6 +12377,10 @@ impl HvfVmState {
                 sharing: mapping.sharing,
                 shared_key_base: mapping.shared_key_base,
                 shared_key_offset: mapping.shared_key_offset,
+                owner_generation: global_frame_host_owner_generation(
+                    mapping.physical_ipa,
+                    mapping.physical_size as u64,
+                ),
             });
         }
         let mut process_reservation = spec
@@ -13909,6 +14034,7 @@ fn prepare_exec_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, Tr
         guest_writable: mapping.perms.write,
         shared_key_base: 0,
         shared_key_offset: 0,
+        owner_generation: global_frame_host_owner_generation(mapping.ipa_start, size as u64),
     })
 }
 
@@ -14031,6 +14157,7 @@ fn map_region_raw(
         guest_writable: mapping.perms.write,
         shared_key_base: 0,
         shared_key_offset: 0,
+        owner_generation: global_frame_host_owner_generation(mapping.ipa_start, size as u64),
     })
 }
 
@@ -15477,6 +15604,7 @@ mod frame_inventory_backend_tests {
             // This test exercises owner identity without installing stage-2.
             _lease: GlobalFrameStage2Lease::fixed(LIVE_IPA, LENGTH),
             perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+            generation: next_global_frame_owner_generation(),
         };
         assert!(
             global_frame_host_owners()
@@ -15489,9 +15617,13 @@ mod frame_inventory_backend_tests {
             alias_backing_is_live(host_addr),
             "the superseded mapped-address predicate must admit this live host VA"
         );
-        assert!(global_frame_host_owner_matches(LIVE_IPA, LENGTH, host_addr));
+        let generation = global_frame_host_owner_generation(LIVE_IPA, LENGTH);
+        assert_ne!(generation, 0, "a registered owner carries an incarnation");
+        assert!(global_frame_host_owner_matches(
+            LIVE_IPA, LENGTH, host_addr, generation
+        ));
         assert!(
-            !global_frame_host_owner_matches(RETIRED_IPA, LENGTH, host_addr),
+            !global_frame_host_owner_matches(RETIRED_IPA, LENGTH, host_addr, generation),
             "a live host VA owned by another IPA must not resurrect a retired lease"
         );
 
@@ -15501,8 +15633,43 @@ mod frame_inventory_backend_tests {
             .unwrap();
         drop(owner);
         assert!(!global_frame_host_owner_matches(
-            LIVE_IPA, LENGTH, host_addr
+            LIVE_IPA, LENGTH, host_addr, generation
         ));
+
+        // The point of the incarnation: re-registering the SAME (ipa, length)
+        // on the SAME recycled host VA must NOT re-authenticate the stale row.
+        // Darwin hands that VA straight back — measured 499/499 — so without
+        // this the row silently passes and the reuse scrub zeroes a live
+        // granule.
+        let remap = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            LENGTH as usize,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .unwrap();
+        let reused_addr = remap.as_ptr() as usize;
+        let successor = GlobalFrameHostOwner {
+            _mapping: remap,
+            _lease: GlobalFrameStage2Lease::fixed(LIVE_IPA, LENGTH),
+            perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+            generation: next_global_frame_owner_generation(),
+        };
+        let successor_generation = successor.generation;
+        global_frame_host_owners()
+            .lock()
+            .insert((LIVE_IPA, LENGTH), successor);
+        assert_ne!(successor_generation, generation);
+        assert!(
+            !global_frame_host_owner_matches(LIVE_IPA, LENGTH, reused_addr, generation),
+            "a stale row must not authenticate against a NEW incarnation of the \
+             same (ipa, length, host VA)"
+        );
+        assert!(
+            global_frame_host_owner_matches(LIVE_IPA, LENGTH, reused_addr, successor_generation),
+            "the successor's own rows still authenticate"
+        );
+        global_frame_host_owners()
+            .lock()
+            .remove(&(LIVE_IPA, LENGTH));
     }
 
     #[test]
@@ -15534,6 +15701,7 @@ mod frame_inventory_backend_tests {
             guest_writable: true,
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: 0,
         };
 
         assert!(global_frame_region_owner_matches(&mapping));
@@ -16112,6 +16280,7 @@ mod alias_remap_limiter_tests {
             inventory_backing: InventoryBackingIdentity::Private(1),
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: 0,
         };
         let key = replay_mapping_key(backing);
         replay_mappings().lock().insert(key);
@@ -16153,6 +16322,7 @@ mod alias_remap_limiter_tests {
             inventory_backing: InventoryBackingIdentity::Private(2),
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: 0,
         };
         let replacement = AliasBacking {
             host_addr: 0x5678_0000,
@@ -16405,6 +16575,7 @@ mod thread_sibling_tests {
             guest_writable: true,
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: 0,
         }
     }
 
@@ -17260,6 +17431,7 @@ mod tag_strip_tests {
             inventory_backing: InventoryBackingIdentity::SharedAnon(41),
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: 0,
         };
         assert_eq!(
             missing_process_aliases(
@@ -17342,6 +17514,7 @@ mod tag_strip_tests {
                 inventory_backing: InventoryBackingIdentity::SharedAnon(42),
                 shared_key_base: 0,
                 shared_key_offset: 0,
+                owner_generation: 0,
             },
             child_root_slot,
         );
@@ -17434,6 +17607,7 @@ mod tag_strip_tests {
             },
             shared_key_base: 7,
             shared_key_offset: 0x8000,
+            owner_generation: 0,
         };
         let retained = std::collections::BTreeSet::new();
         assert!(
@@ -17552,6 +17726,7 @@ mod tag_strip_tests {
             inventory_backing: InventoryBackingIdentity::Private(46),
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: 0,
         };
         let mut registry = vec![prefix];
 
@@ -17601,6 +17776,7 @@ mod tag_strip_tests {
             inventory_backing: InventoryBackingIdentity::SharedAnon(44),
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: 0,
         };
         register_shared_alias(alias);
         unregister_alias(va, 0x4000, None);
@@ -17666,6 +17842,7 @@ mod tag_strip_tests {
             inventory_backing: InventoryBackingIdentity::SharedAnon(45),
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: 0,
         };
         register_shared_alias(alias);
         unregister_alias(va + 0x8000, 0x4000, None);
@@ -17740,6 +17917,7 @@ mod tag_strip_tests {
             guest_writable: true,
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: 0,
         };
         let desc = ThreadMappingDesc::from_region(&region);
         assert_eq!(desc.size, guest_size, "thread/fork semantics stay exact");
@@ -17762,6 +17940,7 @@ mod tag_strip_tests {
             inventory_backing: InventoryBackingIdentity::SharedAnon(46),
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: 0,
         };
         register_shared_alias(alias);
 
@@ -17821,6 +18000,7 @@ mod tag_strip_tests {
             guest_writable: true,
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: 0,
         };
         let live_alias = AliasBacking {
             start: va,
@@ -17840,6 +18020,7 @@ mod tag_strip_tests {
             inventory_backing: InventoryBackingIdentity::SharedAnon(43),
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: 0,
         };
 
         assert!(
@@ -17908,6 +18089,7 @@ mod tag_strip_tests {
             inventory_backing: InventoryBackingIdentity::Private(ipa),
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: 0,
         };
         let local_ipas = std::collections::HashSet::from([local_ipa]);
         let local_scope = AliasOwnershipScope::MmRootSlot {
@@ -17954,6 +18136,7 @@ mod tag_strip_tests {
             guest_writable: true,
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: 0,
         };
         let live_fragment = AliasBacking {
             start: va + 0x2000,
@@ -17973,6 +18156,7 @@ mod tag_strip_tests {
             inventory_backing: InventoryBackingIdentity::Private(44),
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: 0,
         };
         let aliases = [live_fragment];
 
