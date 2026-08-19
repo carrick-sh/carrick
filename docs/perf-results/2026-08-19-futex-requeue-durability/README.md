@@ -5,9 +5,14 @@ gate (the other two seen on 2026-08-19, `futexforkwakegroups` and `ptyfionread`,
 did not reproduce on a second sample and are load-coupled). Same cluster as
 `ltp-futex_cmp_requeue01` (122 rows).
 
-**Status: root-caused, NOT fixed. The attempted fix was measured WORSE and has
-been reverted.** This report exists so the next attempt starts from the
-measurements rather than repeating them.
+**Status: FIXED in `f730625fb`.** The first attempt was measured worse and
+reverted (`05e83fee0`); the analysis below is what made the second attempt work,
+so it is kept in full — including the wrong turn, because the wrong turn is what
+identified the missing foundation.
+
+Result: `futexforkrequeue` matches Linux exactly on three consecutive runs (800 /
+500 / 200, zero timeouts, 1000/1000 woken), and **the probe gate went GREEN** —
+zero failures, down from three.
 
 ## The divergence
 
@@ -132,3 +137,57 @@ instrument that settled it was a temporary `CARRICK_FUTEX_REQUEUE_DEBUG` block i
 `FutexTable::requeue` reporting enrolled/woken/requeued/break-reason plus the
 spurious-re-park and broadcast counters — reconstruct it from the numbers above
 rather than guessing at a different one.
+
+
+---
+
+# RESOLUTION
+
+The blocked-on list above was right about what was missing, and the fix follows
+it in order.
+
+## Durable wakes came first
+
+`FutexBucket` now tracks LOGICAL enrollment — held for the whole wait, not just
+while parked — alongside wake CREDITS. A wake that cannot find an enrolled waiter
+parked leaves a credit and counts it as released; the waiter claims that credit
+instead of re-parking.
+
+The load-bearing detail is WHERE: both the deposit and the claim happen under the
+parking-lot bucket lock. `unpark_filter`'s callback runs before the bucket is
+unlocked (parking_lot 0.9.12, `parking_lot.rs:1074` vs the unlock at `:1084`), and
+a waiter claims inside its own park validate closure, which holds the same lock.
+An earlier version checked credits at the top of the wait loop instead and still
+lost the wake — the deposit landed between the check and the park. Atomicity with
+the *decision to park* is the whole point.
+
+Measured alone, before any requeue change: the final `FUTEX_WAKE` of 700 parked
+waiters went from **8 to 700**, with zero timeouts. The wake accounting was
+independently, badly wrong; that is what durable wakes fixed.
+
+## Then the requeue, then the latch
+
+With wakes durable, the two-pass requeue (mark in FIFO order, then relink without
+waking) gave 800 / 500 / 199 with no timeouts — the same design that produced
+hundreds of timeouts before the foundation existed. Adding the enqueue latch then
+took the remainder wake from 199 to exactly 200.
+
+That ordering is the lesson. All three changes were tried before in isolation and
+each made the probe WORSE; they are not three fixes but one, and the foundation
+has to be laid first.
+
+## Not done here
+
+Signal notification is still a carrier-wide BROADCAST (~179k unparks in this one
+probe). Durable wakes make it correct, not cheap. Making it targeted remains a
+real performance lever — `notify_signal_pending_for(tid)` exists and ~30 callers
+use the broadcast form — and each caller has to be shown to know its target,
+because a missed wake is a hang.
+
+## Gate integrity, separately
+
+`futexforkwakegroups` was failing on line ORDER, not values: the parent printed
+`fork_ok` concurrently with the child's `grandchild_fork_ok`, and the gate
+compares line by line. Both orderings are legal on Linux, so the race was in the
+probe; the parent now prints after waiting. This is why that probe read as
+"load-coupled" — it was a coin flip, not a runtime property.
