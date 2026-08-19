@@ -153,6 +153,28 @@ pub const LINUX_SCHED_BATCH: i32 = 3;
 pub const LINUX_SCHED_IDLE: i32 = 5;
 pub const LINUX_SCHED_DEADLINE: i32 = 6;
 
+/// The round-robin quantum carrick publishes in
+/// `/proc/sys/kernel/sched_rr_timeslice_ms`, in milliseconds — Linux's default.
+pub const LINUX_SCHED_RR_TIMESLICE_MS: u64 = 100;
+
+/// What `sched_rr_get_interval(2)` reports for a SCHED_OTHER task.
+///
+/// A `LinuxTimespec` rather than a bare nanosecond integer: a scheduling
+/// interval crossing into a guest `struct timespec` as a loose `i64` is the
+/// poll int-vs-timespec timeout shape that motivated the typed-domain
+/// migration, and the value is written straight to guest memory.
+///
+/// It is NOT the RR quantum above and it is NOT zero: Linux answers a non-RR
+/// task with its CFS/EEVDF base slice, and the native-arm64 Docker oracle
+/// returns `tv_sec = 0, tv_nsec = 2000000` while its `sched_rr_timeslice_ms`
+/// leaf reads 100. `sched_rr_get_interval01` asserts those two AGREE and so
+/// fails on real Linux too — reproducing that disagreement is what makes
+/// carrick match the oracle.
+///
+/// carrick reports SCHED_OTHER for every task (`sched_getscheduler`), so this
+/// is the only branch reachable today.
+pub const LINUX_SCHED_OTHER_SLICE: LinuxTimespec = LinuxTimespec::new(0, 2_000_000);
+
 pub const LINUX_DT_FIFO: u8 = 1;
 pub const LINUX_DT_CHR: u8 = 2;
 pub const LINUX_DT_DIR: u8 = 4;
@@ -1422,6 +1444,19 @@ impl LinuxTimezone {
 pub const CARRICK_HOSTNAME: &str = "carrick";
 pub const CARRICK_DOMAINNAME: &str = "localdomain";
 
+/// The guest kernel release and version strings. SAME single-source rule as the
+/// hostname above, for the same reason: `uname(2)`,
+/// `/proc/sys/kernel/osrelease`, `/proc/sys/kernel/version` and `/proc/version`
+/// are all cross-checked against each other by `newuname01`, and they had
+/// drifted — `uname` said `6.12.0-carrick` / `#1 Carrick` while the procfs
+/// leaves said `6.6.0-carrick` / `#1 SMP PREEMPT_DYNAMIC`.
+///
+/// The release is also LTP's `.min_kver` gate (`tst_kvercmp`), so raising it
+/// un-TCONFs whole tests: change it only together with the feature work that
+/// earns the new floor.
+pub const CARRICK_KERNEL_RELEASE: &str = "6.12.0-carrick";
+pub const CARRICK_KERNEL_VERSION: &str = "#1 SMP PREEMPT_DYNAMIC";
+
 #[repr(C, packed)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
@@ -1447,8 +1482,8 @@ impl LinuxUtsname {
         };
         write_linux_c_field(&mut utsname.sysname, b"Linux");
         write_linux_c_field(&mut utsname.nodename, CARRICK_HOSTNAME.as_bytes());
-        write_linux_c_field(&mut utsname.release, b"6.12.0-carrick");
-        write_linux_c_field(&mut utsname.version, b"#1 Carrick");
+        write_linux_c_field(&mut utsname.release, CARRICK_KERNEL_RELEASE.as_bytes());
+        write_linux_c_field(&mut utsname.version, CARRICK_KERNEL_VERSION.as_bytes());
         write_linux_c_field(&mut utsname.machine, b"aarch64");
         write_linux_c_field(&mut utsname.domainname, CARRICK_DOMAINNAME.as_bytes());
         utsname

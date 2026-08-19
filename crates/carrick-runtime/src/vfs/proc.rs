@@ -460,6 +460,22 @@ fn sysctl_hostname() -> Vec<u8> {
     format!("{}\n", crate::execute::guest_hostname()).into_bytes()
 }
 
+/// `/proc/sys/kernel/osrelease`, `version` and `domainname` all render from the
+/// same constants `uname(2)` uses. `newuname01` compares the syscall against
+/// these three leaves field by field, so a second literal here is a guaranteed
+/// TFAIL — which is exactly what it was before.
+fn sysctl_osrelease() -> Vec<u8> {
+    format!("{}\n", carrick_abi::CARRICK_KERNEL_RELEASE).into_bytes()
+}
+
+fn sysctl_kernel_version() -> Vec<u8> {
+    format!("{}\n", carrick_abi::CARRICK_KERNEL_VERSION).into_bytes()
+}
+
+fn sysctl_domainname() -> Vec<u8> {
+    format!("{}\n", carrick_abi::CARRICK_DOMAINNAME).into_bytes()
+}
+
 #[derive(Clone, Copy)]
 struct KernelThreadLimit(u64);
 
@@ -568,16 +584,26 @@ enum Sysctl {
 /// so directory enumeration can never disagree with what `open()` will serve.
 /// Values match the Docker linux/arm64 oracle (proc_sys_*(5)); where carrick
 /// owns the real behaviour (overcommit, fd/pipe ceilings) they reflect that.
+/// The `sched_rr_timeslice_ms` leaf body, rendered from the shared constant so
+/// the file and `sched_rr_get_interval(2)` can never drift apart — LTP
+/// `sched_rr_get_interval01` reads both and compares them.
+const SCHED_RR_TIMESLICE_MS_LEAF: &[u8] = match carrick_abi::LINUX_SCHED_RR_TIMESLICE_MS {
+    100 => b"100\n",
+    // A new value needs its rendering added here; a silent mismatch between the
+    // leaf and the syscall is exactly what this constant exists to prevent.
+    _ => panic!("LINUX_SCHED_RR_TIMESLICE_MS has no rendered sysctl leaf"),
+};
+
 const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
     // kernel.*
     ("/proc/sys/kernel/ostype", Sysctl::Static(b"Linux\n")),
     (
         "/proc/sys/kernel/osrelease",
-        Sysctl::Static(b"6.6.0-carrick\n"),
+        Sysctl::Dynamic(sysctl_osrelease),
     ),
     (
         "/proc/sys/kernel/version",
-        Sysctl::Static(b"#1 SMP PREEMPT_DYNAMIC\n"),
+        Sysctl::Dynamic(sysctl_kernel_version),
     ),
     // Context-free fallback; synthetic_file handles this path first when a live
     // SyntheticProcContext supplies a per-container hostname.
@@ -651,6 +677,42 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
     ("/proc/sys/kernel/keys/gc_delay", Sysctl::Static(b"300\n")),
     ("/proc/sys/kernel/keys/maxkeys", Sysctl::Static(b"200\n")),
     ("/proc/sys/kernel/keys/maxbytes", Sysctl::Static(b"20000\n")),
+    // The root quota pair, same argument as the three above: `keyctl02` saves
+    // and restores them through `tst_sys_conf`, so their ABSENCE made it TBROK
+    // on a read the oracle answers.
+    (
+        "/proc/sys/kernel/keys/root_maxkeys",
+        Sysctl::Static(b"1000000\n"),
+    ),
+    (
+        "/proc/sys/kernel/keys/root_maxbytes",
+        Sysctl::Static(b"25000000\n"),
+    ),
+    // `syslog11` saves this through tst_sys_conf; without the leaf it reports
+    // "Path not found: ENOENT" where the oracle reports the read-only EROFS the
+    // writability gate below already produces. Linux's default console/message
+    // loglevel quad.
+    ("/proc/sys/kernel/printk", Sysctl::Static(b"4\t4\t1\t7\n")),
+    // `newuname01` cross-checks uname(2) against these leaves, and TBROKs on a
+    // missing one. Docker leaves the domain name unset, which reads as the
+    // literal "(none)".
+    (
+        "/proc/sys/kernel/domainname",
+        Sysctl::Dynamic(sysctl_domainname),
+    ),
+    // The SCHED_RR quantum, in milliseconds. `sched_rr_get_interval01` reads
+    // this leaf and compares it against what the syscall reports, so the two
+    // must agree: see `LINUX_SCHED_RR_TIMESLICE_MS`.
+    (
+        "/proc/sys/kernel/sched_rr_timeslice_ms",
+        Sysctl::Static(SCHED_RR_TIMESLICE_MS_LEAF),
+    ),
+    // `fcntl33`/`fcntl33_64` save and restore the lease break timeout.
+    ("/proc/sys/fs/lease-break-time", Sysctl::Static(b"45\n")),
+    // `clone09` saves this per-interface leaf; carrick has no net namespace, so
+    // it is declared for the loopback device only, which is what the oracle's
+    // container has.
+    ("/proc/sys/net/ipv4/conf/lo/tag", Sysctl::Static(b"0\n")),
     // Host-powered process/thread ceiling. This is intentionally not used to
     // tune SysV IPC workloads; queue throughput belongs to the SysV service.
     (
@@ -2768,8 +2830,15 @@ power management:\n\
     out.into_bytes()
 }
 
-fn synthetic_proc_version() -> &'static [u8] {
-    b"Linux version 6.6.0-carrick (carrick@bootstrap) (rustc) #1 SMP PREEMPT_DYNAMIC\n"
+/// `/proc/version`, built from the same release/version constants as `uname(2)`
+/// and the `/proc/sys/kernel/*` leaves.
+fn synthetic_proc_version() -> Vec<u8> {
+    format!(
+        "Linux version {} (carrick@bootstrap) (rustc) {}\n",
+        carrick_abi::CARRICK_KERNEL_RELEASE,
+        carrick_abi::CARRICK_KERNEL_VERSION,
+    )
+    .into_bytes()
 }
 
 fn synthetic_proc_loadavg() -> &'static [u8] {

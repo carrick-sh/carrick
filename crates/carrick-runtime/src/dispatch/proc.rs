@@ -2280,22 +2280,33 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        /// `sched_rr_get_interval(pid, &timespec)`: write the round-robin
-        /// quantum into `*timespec`. SCHED_OTHER tasks aren't on a RR
-        /// schedule; Linux returns {0, 0} (and 0). We mirror that.
+        /// `sched_rr_get_interval(pid, &timespec)`: write the scheduling quantum
+        /// into `*timespec`.
+        ///
+        /// The old body returned `{0, 0}` under a comment claiming that is what
+        /// Linux does for a SCHED_OTHER task. The Docker oracle disproves it:
+        /// it reports `tv_nsec = 2000000` for exactly that case, and LTP scores
+        /// a zero quantum as "Invalid time quantum 0s 0ns". See
+        /// `LINUX_SCHED_OTHER_SLICE`.
         fn sched_rr_get_interval(this, cx, pid: u64, address: GuestPtr) {
+            // A negative pid is EINVAL and outranks the existence probe, the
+            // same ordering `sched_getscheduler` above already implements.
+            if (pid as i32) < 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             if !sched_pid_exists(this, cx, pid) {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
-            if address.0 == 0 {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
             let memory = &mut *cx.memory;
-            // struct timespec on aarch64: i64 tv_sec, i64 tv_nsec.
-            let mut buf = [0u8; 16];
-            buf[0..8].copy_from_slice(&0i64.to_le_bytes());
-            buf[8..16].copy_from_slice(&0i64.to_le_bytes());
-            memory.write_bytes(address.0, &buf)?;
+            // An unwritable destination — NULL included — faults, as the
+            // oracle's `sched_rr_get_interval(0, <bad>) : EFAULT` row shows.
+            if address.0 == 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+            memory.write_bytes(
+                address.0,
+                zerocopy::IntoBytes::as_bytes(&carrick_abi::LINUX_SCHED_OTHER_SLICE),
+            )?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 

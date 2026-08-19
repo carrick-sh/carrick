@@ -94,9 +94,18 @@ clippy *ARGS:
 lint-domains:
     #!/usr/bin/env bash
     set -euo pipefail
+    # FAIL CLOSED. Every rule in .semgrep/ encodes a bug shape this codebase
+    # actually shipped, so "the tool is missing" is not a pass — it is the gate
+    # not running. This recipe used to `exit 0` with a warning, which made
+    # `just ci` report green on any box without semgrep while gating nothing:
+    # the same green-that-gated-nothing shape AGENTS.md already records for the
+    # probe gate (run from the wrong cwd it SKIPped every lane and reported ok
+    # in 0.04s). CI installs semgrep explicitly, so this cannot be a surprise
+    # there either.
     if ! command -v semgrep >/dev/null 2>&1; then
-        echo "warning: semgrep not installed — skipping typed-domain gate (brew install semgrep)" >&2
-        exit 0
+        echo "error: semgrep is not installed, so the typed-domain gate cannot run." >&2
+        echo "       Install it (brew install semgrep, or python3 -m pip install semgrep)." >&2
+        exit 1
     fi
     semgrep --config .semgrep/ crates/ --severity ERROR --error --quiet
 
