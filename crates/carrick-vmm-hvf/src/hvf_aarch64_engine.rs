@@ -1034,6 +1034,7 @@ fn zeroed_snapshot() -> Aarch64VcpuSnapshot {
         vbar: 0,
         cpacr: 0,
         tpidr_el0: 0,
+        contextidr_el1: 0,
         tpidrro_el0: 0,
         tpidr_el1: 0,
         actlr_el1: 0,

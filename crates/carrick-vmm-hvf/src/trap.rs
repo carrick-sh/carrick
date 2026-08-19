@@ -13066,6 +13066,9 @@ impl HvfInner {
                 tpidr_el0: vcpu.get_sys_reg(SysReg::TPIDR_EL0).map_err(hvf_error)?,
                 tpidrro_el0: vcpu.get_sys_reg(SysReg::TPIDRRO_EL0).map_err(hvf_error)?,
                 tpidr_el1: vcpu.get_sys_reg(SysReg::TPIDR_EL1).map_err(hvf_error)?,
+                contextidr_el1: vcpu
+                    .get_sys_reg(SysReg::CONTEXTIDR_EL1)
+                    .map_err(hvf_error)?,
                 actlr_el1: vcpu.get_sys_reg(SysReg::ACTLR_EL1).map_err(hvf_error)?,
                 vregs,
                 fpsr,
@@ -13116,12 +13119,20 @@ impl HvfInner {
             .map_err(hvf_error)?;
         vcpu.set_sys_reg(SysReg::TPIDR_EL0, snap.core.tpidr_el0)
             .map_err(hvf_error)?;
-        // TPIDRRO_EL0 (guest-readable thread ptr) + TPIDR_EL1 (carrick's fast-gettid
-        // tid stamp) are zeroed by hv_vcpu_create, so a rebuilt vCPU (fork/clone or
-        // a destroy/recreate reclaim) must restore both.
+        // TPIDRRO_EL0 (guest-readable thread ptr), TPIDR_EL1 (the shim's x16
+        // scratch) and CONTEXTIDR_EL1 (carrick's fast-`gettid` tid stamp) are all
+        // zeroed by hv_vcpu_create, so a rebuilt vCPU (fork/clone or a
+        // destroy/recreate reclaim) must restore each. CONTEXTIDR_EL1 is the one
+        // that is guest-VISIBLE through `gettid`: miss it and the EL1 handler
+        // reads 0 and degrades to a host round trip for the rest of the thread's
+        // life. (The tid lived in TPIDR_EL1 before it was moved here to free that
+        // register as the scratch; restoring only TPIDR_EL1 preserved a value that
+        // means nothing across a park and dropped the one that does.)
         vcpu.set_sys_reg(SysReg::TPIDRRO_EL0, snap.core.tpidrro_el0)
             .map_err(hvf_error)?;
         vcpu.set_sys_reg(SysReg::TPIDR_EL1, snap.core.tpidr_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::CONTEXTIDR_EL1, snap.core.contextidr_el1)
             .map_err(hvf_error)?;
         // Apply SCTLR last so the MMU enable lands with the new tables.
         vcpu.set_sys_reg(SysReg::SCTLR_EL1, snap.core.sctlr)
@@ -13199,6 +13210,11 @@ impl HvfInner {
             .map_err(hvf_error)?;
         vcpu.set_sys_reg(SysReg::TPIDR_EL0, snap.core.tpidr_el0)
             .map_err(hvf_error)?;
+        // CONTEXTIDR_EL1 is deliberately LEFT ZERO here: a new thread must not
+        // inherit the parent's tid stamp. Zero is the fail-safe — the EL1
+        // `gettid` handler's degrade branch traps to the host and returns the
+        // correct tid — whereas a stale parent tid would be returned silently
+        // and WRONG if the caller's re-stamp ever failed to run.
         // SP_EL1 was already set to this sibling's mailbox by materialization.
         // The trampoline does not touch it before `eret` enters EL0.
         // Enable the MMU last, identically to the parent.

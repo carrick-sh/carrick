@@ -152,6 +152,13 @@ pub struct Aarch64VcpuSnapshot {
     /// backs the syscall-frame `saved_x9` stash; the snapshot carries it so a
     /// reclaim/fork round-trips that too.)
     pub tpidr_el1: u64,
+    /// CONTEXTIDR_EL1 — the guest-visible tid that HVF's EL1 `gettid` fast path
+    /// returns without a VM exit. `hv_vcpu_create` zeroes it, and an HVF reclaim
+    /// DESTROYS and recreates the vCPU, so a rebuilt vCPU that does not restore
+    /// this reads 0 and sends every later `gettid` down the handler's degrade
+    /// branch to the host — silently, since the host still returns the correct
+    /// tid, so only the cost changes. KVM does not use it (left 0).
+    pub contextidr_el1: u64,
     /// ACTLR_EL1 — incl. EnTSO (Rosetta `prctl(PR_SET_MEM_MODEL, TSO)`). Restored
     /// across fork/clone/reclaim so a rebuilt vCPU keeps hardware x86 TSO. KVM has
     /// no such bit (left 0).
