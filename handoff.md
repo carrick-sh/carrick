@@ -939,6 +939,58 @@ ratio (145.02x and 67.02x, both of which were the oracle hanging).
   unrecoverable. Evidence that matters is now committed under
   `docs/perf-results/`.
 
+## Session 2026-08-18 (fourth): the futex left the host OS
+
+**Directive from the owner, stated twice and standing:** the runtime is all too
+expensive; drop host-OS requirements where the carrier model makes them
+obsolete, and FINISH THE SINGLE-PROCESS WORK — no more host forking. The futex
+was the first subsystem through that door (`a1bd418d8`).
+
+**What changed:** `MAP_SHARED` guest futexes now rendezvous on ONE
+carrier-wide in-process `FutexTable` (word-validated parking, real
+`unpark_requeue` for FUTEX_CMP_REQUEUE, exact wake counts). The entire
+`SharedFutexSyscall` shim layer is DELETED — HVF's `os_sync`/ulock shim with
+its 20 ms slices, wake credits and requeue tokens, and the KVM/bhyve/NVMM
+shims. The DSR native lanes keep `FutexTableNativeFutex` (they really do run
+separate host processes).
+
+**Three hard-won facts encoded in the code — do not relearn them:**
+1. The per-process `FutexTable` generation model CANNOT serve shared futexes:
+   `wake` bumps the generation every call, releasing prepared-but-unparked
+   waiters while counting only unparked threads. LTP `tst_checkpoint` retries
+   FUTEX_WAKE until the cumulative COUNT arrives, so the waker spun to
+   ETIMEDOUT while every waiter thought it was woken. Shared waits validate
+   the actual word under the bucket lock (`wait_while_word_equals`).
+2. Thread-directed signals must reach the CARRIER table.
+   `HvpatchTaskWaker::wake_task` and `notify_current_futex_signal_pending`
+   poked only the per-process table; a tgkill target parked in a checkpoint
+   never noticed its signal and the sender stalled 10 s. Caught by a
+   timestamped trace: the sender's first wake landed the same millisecond the
+   waiters timed out.
+3. `tgkill01`'s ESRCH TFAIL was DOWNSTREAM of the checkpoint stall (threads
+   TBROK and exit, then main tgkills the dead) — chasing ESRCH first would
+   have been a wrong turn.
+
+**Verified:** tgkill01/02/03, futex_wait/wake/bitset/cmp_requeue families,
+kill10, fork04, wait401, waitpid01 (146/146), go-os_exec (PASS 1 s),
+cpython-threading (SUCCESS 20 s) — all at oracle results on the rewritten
+artifact.
+
+**Follow-ups, in order:**
+1. **Single-process completion (owner directive):** find and retire every
+   remaining host-fork arm (`quiesce.rs` still has a `libc::fork` child path
+   around `:1066`; `reset_for_fork` in vcpu_sched exists for it). When that
+   lands, per-process futex tables can collapse into the carrier table
+   entirely.
+2. `runtime.rs`'s single-threaded `shared_futex_wait` still drives the ulock
+   side-table (now its only consumer). Route it through the carrier table and
+   delete the rest of `ulock.rs`'s waiter machinery.
+3. `futex_cmp_requeue01` tests 0-4 are exact; the 1000-waiter case stays
+   blocked on FORK FAN-OUT throughput (~880 rows) — it needs (1), not futex
+   work.
+4. KVM/bhyve/NVMM compile but need their real-hardware gates re-run; if one
+   still host-forks, finish (1) there rather than resurrecting the shim.
+
 ## Closure v4 re-baseline + this round's fixes (2026-08-18)
 
 **Artifact** `bb485077f77e2e80…` (source `e2c2c78c2`, CDHash
