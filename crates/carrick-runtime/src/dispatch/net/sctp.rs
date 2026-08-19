@@ -72,26 +72,73 @@ fn endpoints(host_fd: i32) -> Option<(Vec<u8>, Vec<u8>)> {
     Some((name(host_fd, false)?, name(host_fd, true)?))
 }
 
-/// Record that the guest wrote one `len`-byte message on this SCTP socket.
+/// Publish the boundary for a message the guest is ABOUT to write.
 ///
-/// A partial write does NOT end a message: SCTP's boundary is where the sender
-/// finished, so a short write extends the message in flight rather than closing
-/// it. `len` is the count actually accepted by the host.
-pub(super) fn record_sent(host_fd: i32, len: usize, complete: bool) {
+/// Must run BEFORE the host send. The peer is another socket in the same carrier,
+/// so the bytes become readable the instant the host call returns — publishing
+/// afterwards lets a waiting receiver read them first, find no boundary, and
+/// report no `MSG_EOR`. CPython drives these sends from a separate thread, which
+/// is why its SCTP rows failed 7-13 at a time while the single-threaded reducer
+/// always passed.
+pub(super) fn begin_send(host_fd: i32, len: usize) -> Option<PendingSend> {
     if len == 0 {
-        return;
+        return None;
     }
-    let Some(key) = endpoints(host_fd) else {
-        return;
+    let key = match endpoints(host_fd) {
+        Some(key) => key,
+        None => {
+            if std::env::var_os("CARRICK_SCTP_DEBUG").is_some() {
+                eprintln!("SCTPDBG begin_send fd={host_fd} len={len} NO ENDPOINTS");
+            }
+            return None;
+        }
     };
-    let Ok(mut streams) = STREAMS.lock() else {
-        return;
-    };
-    let stream = streams.entry(key).or_default();
-    if complete || stream.messages.is_empty() {
-        stream.messages.push_back(len);
-    } else if let Some(last) = stream.messages.back_mut() {
-        *last += len;
+    if std::env::var_os("CARRICK_SCTP_DEBUG").is_some() {
+        eprintln!(
+            "SCTPDBG begin_send fd={host_fd} len={len} key=({},{})",
+            hex(&key.0),
+            hex(&key.1)
+        );
+    }
+    let mut streams = STREAMS.lock().ok()?;
+    streams
+        .entry(key.clone())
+        .or_default()
+        .messages
+        .push_back(len);
+    Some(PendingSend { key, len })
+}
+
+/// A boundary published ahead of its send, waiting to be confirmed.
+pub(super) struct PendingSend {
+    key: StreamKey,
+    len: usize,
+}
+
+impl PendingSend {
+    /// Settle the published boundary against what the host actually accepted.
+    ///
+    /// `None` (the send failed) retracts it. A SHORT write shrinks it to the
+    /// bytes that made it: SCTP's boundary is where the sender finished, so the
+    /// guest's retry continues the message and publishes the rest.
+    pub(super) fn settle(self, sent: Option<usize>) {
+        let Ok(mut streams) = STREAMS.lock() else {
+            return;
+        };
+        let Some(stream) = streams.get_mut(&self.key) else {
+            return;
+        };
+        match sent {
+            Some(sent) if sent >= self.len => {}
+            Some(sent) if sent > 0 => {
+                if let Some(last) = stream.messages.back_mut() {
+                    *last = sent;
+                }
+            }
+            _ => {
+                stream.messages.pop_back();
+            }
+        }
     }
 }
 
@@ -131,12 +178,33 @@ pub(super) fn complete_read(host_fd: i32, got: usize, peek: bool) -> bool {
     let Ok(mut streams) = STREAMS.lock() else {
         return false;
     };
+    let debug = std::env::var_os("CARRICK_SCTP_DEBUG").is_some();
+    if debug {
+        eprintln!(
+            "SCTPDBG complete_read fd={host_fd} lookup=({},{})",
+            hex(&peer),
+            hex(&local)
+        );
+    }
     let Some(stream) = streams.get_mut(&(peer, local)) else {
+        if debug {
+            eprintln!("SCTPDBG complete_read fd={host_fd} got={got} NO STREAM");
+        }
         return false;
     };
     let Some(&len) = stream.messages.front() else {
+        if debug {
+            eprintln!("SCTPDBG complete_read fd={host_fd} got={got} NO MESSAGE queued");
+        }
         return false;
     };
+    if debug {
+        eprintln!(
+            "SCTPDBG complete_read fd={host_fd} got={got} peek={peek} front={len} consumed={} queued={}",
+            stream.consumed,
+            stream.messages.len()
+        );
+    }
     let remaining = len.saturating_sub(stream.consumed);
     let ends_message = got >= remaining;
     if !peek {
@@ -150,8 +218,19 @@ pub(super) fn complete_read(host_fd: i32, got: usize, peek: bool) -> bool {
     ends_message
 }
 
-/// Drop a closed socket's stream so a recycled address pair cannot inherit
-/// boundaries from a previous connection.
+/// Drop what a closing socket can no longer be responsible for.
+///
+/// Deliberately NOT both directions. Closing the SENDER does not discard bytes
+/// already queued — Linux still delivers them, and the receiver still needs their
+/// boundaries. Wiping the send direction here made the receiver report `NO
+/// STREAM` and lose `MSG_EOR` whenever the peer closed first, which is exactly
+/// what CPython's SCTP tests do: 7-13 rows failed per run, varying with the
+/// thread interleaving, while a single-threaded reducer always passed.
+///
+/// So: the RECEIVE direction goes (nobody will read it now), and the SEND
+/// direction goes only once drained. The leftover is not a leak — the peer's own
+/// close removes it, because this socket's send direction is that socket's
+/// receive direction.
 pub(super) fn forget(host_fd: i32) {
     let Some((local, peer)) = endpoints(host_fd) else {
         return;
@@ -159,8 +238,13 @@ pub(super) fn forget(host_fd: i32) {
     let Ok(mut streams) = STREAMS.lock() else {
         return;
     };
-    streams.remove(&(local.clone(), peer.clone()));
-    streams.remove(&(peer, local));
+    streams.remove(&(peer.clone(), local.clone()));
+    if streams
+        .get(&(local.clone(), peer.clone()))
+        .is_some_and(|stream| stream.messages.is_empty())
+    {
+        streams.remove(&(local, peer));
+    }
 }
 
 #[cfg(test)]
@@ -200,4 +284,9 @@ mod tests {
         stream.consumed = 0;
         assert_eq!(stream.messages.len(), 1, "the queued message survives");
     }
+}
+
+/// Hex for debug output only.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

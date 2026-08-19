@@ -114,3 +114,49 @@ tests).
 `SOCK_SEQPACKET` SCTP remains EPROTONOSUPPORT and is still an open gap: it is
 multi-streamed as well as message-oriented, and this design carries boundaries
 but not stream ids. No currently-failing row needs it.
+
+
+---
+
+# CORRECTION — the first closure claim was premature
+
+`d41139cb6` reported `cpython-socket` closed, "verified on two consecutive runs".
+Those two runs were LUCK. Re-measured, that same binary fails **8-13 SCTP rows,
+varying run to run** — all `MsgFlag: 0 != MSG_EOR: 128`. Two samples was not
+enough evidence for a suite whose implementation had a race in it, and the
+single-threaded reducer passed every time while the threaded CPython tests did
+not, which should have been the warning.
+
+Attribution was done properly the second time: checking out that commit's own
+`net.rs`/`sctp.rs` and rebuilding reproduced 8/9/11, proving the later work had
+not caused it.
+
+## The actual defect
+
+`forget()` dropped BOTH directions of a connection when either socket closed.
+Closing the SENDER does not discard bytes already queued — Linux still delivers
+them, and the receiver still needs their boundaries. CPython's SCTP tests send
+from a separate thread and close, so the receiver kept finding `NO STREAM` and
+reporting no `MSG_EOR`. A gated `CARRICK_SCTP_DEBUG` trace showed it directly:
+the publish key and the lookup key were byte-identical, and the entry was simply
+gone.
+
+    SCTPDBG begin_send   fd=164 len=28 key=(1002d20c7f...,1002d20b7f...)
+    SCTPDBG complete_read fd=166 lookup=(1002d20c7f...,1002d20b7f...)
+    SCTPDBG complete_read fd=166 got=28 NO STREAM
+
+Two wrong theories were tested and discarded first — that publication happened
+after the send (moved it before; no change), and that the keys disagreed (they
+were identical). The trace ended the guessing.
+
+`forget()` now drops the RECEIVE direction unconditionally (nobody will read it)
+and the SEND direction only once drained. The leftover is not a leak: the peer's
+own close removes it, since one socket's send direction is the other's receive
+direction.
+
+## Result
+
+    test_socket: run=732 skipped=75 Result: SUCCESS   x6 consecutive runs
+
+Six samples this time, not two. The EOR table still matches the oracle exactly,
+and `just ci` is green (3,913 tests).
