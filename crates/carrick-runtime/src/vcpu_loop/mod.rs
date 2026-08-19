@@ -5261,6 +5261,14 @@ where
             state.kicker.unregister(state.this_tid);
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 3);
             crate::run_state::clear_guest_tid(state.this_tid.raw());
+            // The process record too, when the thread-group LEADER exits: under
+            // HVPatch nothing outside the guest lifecycle can release it (see
+            // `clear_guest_process`).
+            if let Some(task_pid) = state.hvpatch_task_pid
+                && state.linux_tid.raw() == task_pid
+            {
+                crate::run_state::clear_guest_process(task_pid);
+            }
             crate::host_signal::forget_thread(state.this_tid.raw());
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 4);
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 5);
@@ -5552,6 +5560,14 @@ where
             state.kicker.unregister(state.this_tid);
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 3);
             crate::run_state::clear_guest_tid(state.this_tid.raw());
+            // The process record too, when the thread-group LEADER exits: under
+            // HVPatch nothing outside the guest lifecycle can release it (see
+            // `clear_guest_process`).
+            if let Some(task_pid) = state.hvpatch_task_pid
+                && state.linux_tid.raw() == task_pid
+            {
+                crate::run_state::clear_guest_process(task_pid);
+            }
             crate::host_signal::forget_thread(state.this_tid.raw());
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 4);
             trace_hvpatch_thread_teardown(&kernel, state.this_tid, 5);

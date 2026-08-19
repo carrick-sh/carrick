@@ -864,6 +864,26 @@ impl NsSharedRegion {
             if record.run_state.load(Ordering::Acquire) & RUN_STATE_KIND_TID != 0 {
                 continue;
             }
+            // ...and under HVPatch the same is true of PROCESS entries. A Linux
+            // process is a task in the carrier with no host process of its own,
+            // so `host_pid` here is a GUEST pid: `kill(pid, 0)` names an
+            // unrelated host process or none at all, answers ESRCH, and this
+            // sweep then released the record of a LIVE guest process. That is
+            // how a parked guest came to read `R` forever in
+            // `/proc/<pid>/stat` — its published `Blocked` was swept moments
+            // after it landed, so the renderer fell back to the host/ns
+            // derivation (989 diverging rows on `ltp-futex_cmp_requeue01`
+            // alone, since LTP's `TST_PROCESS_STATE_WAIT` polls that character
+            // with no timeout).
+            //
+            // These records are released at guest task exit instead
+            // (`run_state::clear_guest_process`), which is the only authority
+            // that knows a carrier task is finished.
+            if record.flags.load(Ordering::Acquire) & carrick_kernel::process::FLAG_OWNER_GUEST_TASK
+                != 0
+            {
+                continue;
+            }
             let generation = record.generation.load(Ordering::Acquire);
             if generation == 0 {
                 continue;
