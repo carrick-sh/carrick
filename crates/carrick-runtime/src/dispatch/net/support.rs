@@ -746,6 +746,7 @@ struct HostIface {
 }
 
 /// One host interface address (IPv4 or IPv6), in Linux-shaped terms.
+#[derive(Debug)]
 struct HostAddr {
     index: u32,
     name: String,
@@ -1009,10 +1010,39 @@ fn linux_guest_interfaces(
     let mut out_addrs = Vec::new();
     for mut addr in addrs {
         if addr.name == "lo0" || addr.name == "lo" {
+            // Loopback carries `127.0.0.1/8` and `::1/128` only. macOS `lo0` also
+            // has `fe80::1%lo0`, which a Linux loopback does not, and libuv's
+            // `tcp_connect6_link_local` skips precisely on "is there ANY fe80::
+            // address" — so passing it through made the guest RUN a test real
+            // Linux declines. `LinuxNetworkModel` already gives loopback exactly
+            // `::1/128` for the same reason.
+            if addr.family == LINUX_AF_INET6 as u8
+                && addr.addr.first().copied() == Some(0xfe)
+                && addr.addr.get(1).copied().is_some_and(|b| b & 0xc0 == 0x80)
+            {
+                continue;
+            }
             addr.name = "lo".to_owned();
             addr.index = 1;
             out_addrs.push(addr);
         } else if eth_host_name.as_deref() == Some(addr.name.as_str()) {
+            // The uplink carries IPv4 only. Passing the HOST's IPv6 addresses
+            // through made the guest advertise an external IPv6 interface it
+            // cannot actually use: carrick answers an IPv6 multicast join on it
+            // with EADDRNOTAVAIL, and the addresses are the Mac's, not the
+            // guest's. `LinuxNetworkModel` already refuses to fabricate one for
+            // the same reason ("NO IPv6 on an uplink"); this is the host-mode
+            // path, which is the mode the conformance surface runs in, so that
+            // decision never reached the guest.
+            //
+            // It is wrong in both directions, which is why it shows up as two
+            // libuv positions: `udp_multicast_join6` RAN and failed where Linux
+            // skips ("No external IPv6 interface available"), and
+            // `tcp_connect6_link_local` likewise ran where Linux skips — an
+            // inversion is as much a parity failure as a missing pass.
+            if addr.family == LINUX_AF_INET6 as u8 {
+                continue;
+            }
             addr.name = "eth0".to_owned();
             addr.index = 2;
             out_addrs.push(addr);
@@ -3437,6 +3467,25 @@ mod tests {
                 prefixlen: 64,
                 scope: LINUX_RT_SCOPE_LINK,
             },
+            // A real uplink carries IPv4; the fixture was IPv6-only, which made
+            // it indistinguishable from an uplink contributing no address at all.
+            HostAddr {
+                index: 13,
+                name: "en0".to_owned(),
+                family: LINUX_AF_INET as u8,
+                addr: vec![192, 168, 1, 20],
+                prefixlen: 24,
+                scope: LINUX_RT_SCOPE_UNIVERSE,
+            },
+            // macOS loopback also carries `fe80::1%lo0`; a Linux one does not.
+            HostAddr {
+                index: 10,
+                name: "lo0".to_owned(),
+                family: LINUX_AF_INET6 as u8,
+                addr: vec![0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                prefixlen: 64,
+                scope: LINUX_RT_SCOPE_LINK,
+            },
         ];
 
         let (ifaces, addrs) = linux_guest_interfaces(ifaces, addrs);
@@ -3447,6 +3496,30 @@ mod tests {
         let addr_names: Vec<_> = addrs.iter().map(|addr| addr.name.as_str()).collect();
         assert_eq!(addr_names, ["lo", "eth0"]);
         assert!(addrs.iter().all(|addr| addr.index == 1 || addr.index == 2));
+
+        // The guest's address set is the one a Docker container has: loopback
+        // gets `::1` and IPv4, the uplink gets IPv4 ONLY, and no interface
+        // carries an `fe80::`. libuv's `tcp_connect6_link_local` and
+        // `udp_multicast_join6` both skip on exactly "is there any fe80::
+        // address", so forwarding one made the guest RUN tests Linux declines.
+        assert!(
+            !addrs.iter().any(|addr| addr.family == LINUX_AF_INET6 as u8
+                && addr.addr.first().copied() == Some(0xfe)
+                && addr.addr.get(1).copied().is_some_and(|b| b & 0xc0 == 0x80)),
+            "no fe80:: address may reach the guest: {addrs:?}"
+        );
+        assert!(
+            !addrs
+                .iter()
+                .any(|addr| addr.name == "eth0" && addr.family == LINUX_AF_INET6 as u8),
+            "the uplink carries IPv4 only: {addrs:?}"
+        );
+        assert!(
+            addrs
+                .iter()
+                .any(|addr| addr.name == "lo" && addr.family == LINUX_AF_INET6 as u8),
+            "loopback keeps ::1: {addrs:?}"
+        );
     }
 
     #[test]

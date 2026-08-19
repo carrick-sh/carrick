@@ -1432,7 +1432,21 @@ fn host_linux_interfaces() -> Vec<(u32, String, bool, bool)> {
             }
         } else if name.starts_with("en") && !have_eth {
             have_eth = true;
-            out.push((2, "eth0".to_owned(), v4, v6));
+            // NO IPv6 on the uplink, even in host mode, and for the same reason
+            // `LinuxNetworkModel` gives none: what would be emitted is not the
+            // host's real address but a FABRICATED `fe80::…:1`
+            // (`synthetic_proc_net_if_inet6`), and carrick cannot service an IPv6
+            // multicast join on it — libuv's `udp_multicast_join6` gets
+            // EADDRNOTAVAIL where the oracle skips.
+            //
+            // Inheriting the host's `v6` here made the fabrication guest-visible
+            // in host mode only, which is the mode the conformance surface runs
+            // in, so the model's fix never applied where it mattered. It is wrong
+            // in both directions: libuv's `can_ipv6_external()` and
+            // `tcp_connect6_link_local` both key off "does any enumerated
+            // interface carry an fe80:: address", and Linux answers no.
+            let _ = v6;
+            out.push((2, "eth0".to_owned(), v4, false));
         }
     }
     if !out.iter().any(|(_, n, _, _)| n == "lo") {
