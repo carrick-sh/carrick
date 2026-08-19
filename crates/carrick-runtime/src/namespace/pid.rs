@@ -879,9 +879,22 @@ impl NsSharedRegion {
             // These records are released at guest task exit instead
             // (`run_state::clear_guest_process`), which is the only authority
             // that knows a carrier task is finished.
-            if record.flags.load(Ordering::Acquire) & carrick_kernel::process::FLAG_OWNER_GUEST_TASK
-                != 0
-            {
+            //
+            // Skipping such a record OUTRIGHT was the first attempt and was
+            // wrong in the other direction: this sweep is also the namespace
+            // subsystem's reclamation path, and `run_state::claim_record`
+            // stamps the owner flag onto ADOPTED member records, so dead
+            // members would stop being reclaimed altogether.
+            //
+            // A guest-task record needs a different liveness AUTHORITY, not a
+            // different verdict, and the guest's own lifecycle maintains one:
+            // `run_state::clear_guest_process` zeroes the run-state word when
+            // the task leader exits. A live word means alive; a cleared word
+            // means gone and the record is reclaimable exactly as before.
+            let owner_is_guest_task = record.flags.load(Ordering::Acquire)
+                & carrick_kernel::process::FLAG_OWNER_GUEST_TASK
+                != 0;
+            if owner_is_guest_task && record.run_state.load(Ordering::Acquire) != 0 {
                 continue;
             }
             let generation = record.generation.load(Ordering::Acquire);

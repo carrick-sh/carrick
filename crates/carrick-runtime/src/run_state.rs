@@ -294,9 +294,29 @@ pub fn clear_guest_process(pid: i32) {
         return;
     }
     let section = processes();
-    if let Some(r) = find_record(section, pid, false) {
-        section.release(r);
-    }
+    let Some(r) = find_record(section, pid, false) else {
+        return;
+    };
+    // Clear ONLY the run-state word, never the record.
+    //
+    // This `ProcessSection` is SHARED with the PID-namespace member table —
+    // `namespace/pid.rs` takes `&KernelArena::init_global().layout().processes`,
+    // the same object `processes()` returns — and `claim_record` will happily
+    // ADOPT an existing member record for its run-state word. Releasing the slot
+    // therefore zeroes `host_pid`, the generation and the whole body out from
+    // under the namespace subsystem, which owns `ns_pid`, `parent_host_pid`,
+    // `pgid`/`sid`/`ctty` and the MEMBER_* flags.
+    //
+    // Measured: releasing the record regressed `ltp-mq_notify01` from 7/7 to a
+    // `waitpid` EINTR plus "Main test process might have exit!", reproducing
+    // standalone on a quiet host. Clearing the word restores 7/7.
+    //
+    // Zeroing the word is all this owes: `published()` skips a record whose
+    // `unpack` yields no pid, so a dead process stops answering
+    // `/proc/<pid>/stat`. Slot reclamation belongs to whoever claimed it.
+    section.records[r.index]
+        .run_state
+        .store(0, Ordering::Release);
 }
 
 fn cached_record(
