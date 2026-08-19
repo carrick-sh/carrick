@@ -1109,6 +1109,10 @@ impl FutexTable {
         // waiter is between parks still reaches it (as a credit) instead of being
         // lost. Released on every return path.
         let enrollment = FutexEnrollment::new(bucket);
+        // A previous wait by this tid may have ended (timeout, interrupt) with a
+        // redirect still pending. It belongs to that wait, not this one — carrying
+        // it forward would queue us on a futex this call never named.
+        let _ = self.take_requeue_redirect(tid);
 
         loop {
             let bucket = enrollment.bucket();
@@ -1180,21 +1184,20 @@ impl FutexTable {
                 )
             };
 
-            // A pending requeue OUTRANKS the token: the requeuer moved us to
-            // uaddr2, and a wake racing it targeted a queue we have already left,
-            // which Linux would not have delivered to us either.
-            if let Some(destination) = self.take_requeue_redirect(tid) {
-                if registered.get() {
-                    bucket.waiters.fetch_sub(1, Ordering::AcqRel);
-                }
-                enrollment.move_to(self.bucket(destination));
-                continue;
-            }
-
             match park_result {
                 ParkResult::Unparked(token) => {
                     if registered.get() {
                         bucket.waiters.fetch_sub(1, Ordering::AcqRel);
+                    }
+                    // A pending requeue updates WHERE we are queued. It must not
+                    // consume the token: the relink leaves the redirect unclaimed
+                    // until something unparks us, and that something is usually
+                    // the very `FUTEX_WAKE` on uaddr2 we are waiting for. Treating
+                    // the redirect as outranking the token ate exactly those wakes
+                    // (`futex_cmp_requeue01`: 1,550 assertions, "waiters were not
+                    // woken up normally"). So move, then honour the token.
+                    if let Some(destination) = self.take_requeue_redirect(tid) {
+                        enrollment.move_to(self.bucket(destination));
                     }
                     match token.0 {
                         FUTEX_WAKE_TOKEN => return FutexWaitOutcome::Woken,
