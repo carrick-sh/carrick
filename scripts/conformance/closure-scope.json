@@ -1,5 +1,5 @@
 {
-  "binary_sha256": "0f62483797456fb4230ca44ef5b21af48249b6b9b6236e6608772f44e780aa82",
+  "binary_sha256": "670f5be0715156c2491d0e6404f865374f4cecf6dd92d327d4ca4215daf9e366",
   "declared_image_refs": [
     "localhost:5005/carrick-go-conformance:1.24",
     "localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0",
@@ -39,7 +39,7 @@
   },
   "manifest_sha256": "2fea3cf79644c0033292fb9a3a9194f85f4ed194532aaa52182c08925618db90",
   "schema": "carrick-closure-scope-v1",
-  "source_head": "26b06b0a55e88b2f03718bc03b5b50960c057919",
+  "source_head": "2cf018d33c9e1ac63354f9d237a800b6efb5335c",
   "suite_count": 2127,
   "suite_counts_by_ecosystem": {
     "cpython": 438,
@@ -2176,5 +2176,5 @@
     "node-libuv",
     "node-v8-smoke"
   ],
-  "tooling_source_head": "26b06b0a55e88b2f03718bc03b5b50960c057919"
+  "tooling_source_head": "2cf018d33c9e1ac63354f9d237a800b6efb5335c"
 }
