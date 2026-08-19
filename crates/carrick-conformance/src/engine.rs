@@ -478,6 +478,9 @@ fn run_one(
     // when nothing escaped, so always running it after the wait is safe.
     if matches!(engine, Engine::Carrick) {
         kill_scoped(pid, run_id, engine, cleanup.as_ref());
+        if (128..=159).contains(&exit_code) {
+            maybe_append_crash_core_summary(&stderr_path, pid, &argv);
+        }
     }
 
     Ok(RunOutput {
@@ -490,6 +493,43 @@ fn run_one(
         argv,
         timeout_evidence,
     })
+}
+
+fn maybe_append_crash_core_summary(stderr_path: &Path, pid: i32, argv: &[String]) {
+    use std::io::Write;
+    let candidate_paths = [
+        PathBuf::from("core"),
+        PathBuf::from(format!("core.{pid}")),
+        PathBuf::from("/tmp/coredumpfile/core"),
+        PathBuf::from("/tmp/core"),
+    ];
+    for path in &candidate_paths {
+        if path.exists() {
+            if let Ok(file_len) = std::fs::metadata(path).map(|m| m.len())
+                && file_len > 0
+                && let Some(carrick_bin) = argv.first()
+            {
+                if let Ok(output) = Command::new(carrick_bin)
+                    .args(["debug", "core", &path.to_string_lossy()])
+                    .output()
+                {
+                    if output.status.success() {
+                        if let Ok(mut err_file) =
+                            std::fs::OpenOptions::new().append(true).open(stderr_path)
+                        {
+                            let _ = writeln!(
+                                err_file,
+                                "\n[carrick-conformance] Crash core summary from {}:\n{}",
+                                path.display(),
+                                String::from_utf8_lossy(&output.stdout)
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn elapsed_ms(duration: Duration) -> u64 {
