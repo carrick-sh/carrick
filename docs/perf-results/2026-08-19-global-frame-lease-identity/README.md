@@ -1,8 +1,8 @@
 # The global-frame lease identity has no generation, and Darwin recycles it 100% of the time
 
 **Date:** 2026-08-19
-**Status:** root cause CANDIDATE for `cpython-importlib` (147 rows) — precondition
-measured and confirmed; the crash link itself is NOT yet proven.
+**Status:** root cause **CONFIRMED** for `cpython-importlib` — precondition
+measured, and the crash link established by a single-variable diagnostic.
 
 ## The predicate
 
@@ -74,11 +74,31 @@ is why a thread-churning test is the workload that finds it, and why a zeroed
 chunk yields `ldr x0,[x24]; ldr x1,[x0]` with `fault_address: 0`, the recorded
 `cpython-importlib` signature.
 
-## What is NOT established
+## The crash link, measured
 
-That this is *the* `cpython-importlib` crash. The precondition is confirmed and
-the path is traceable line by line, but the link to that specific SIGSEGV is
-inference. Two experiments settle it, neither needing a fix first:
+`retire_global_frame_host_owner` drops the owner, which `munmap`s the host
+buffer AND — because `GlobalFrameStage2Lease::Drop` is what calls
+`release_global_frame_ipa` — returns the IPA to the allocator. Replacing that
+`drop(owner)` with `std::mem::forget(owner)` therefore stops BOTH halves of the
+`(IPA, length, host VA)` identity from recurring, in one edit, and changes
+nothing else.
+
+Reducer: `python3 -m unittest test.test_importlib.test_locks`, ~1 s, exit 139 on
+the SIGSEGV. Both arms sampled in the same session on the same quiet host,
+because the verdict is load-probabilistic:
+
+| arm | crashes |
+|---|---|
+| HEAD | **5 / 8** |
+| `mem::forget` the retiring owner | **0 / 14** |
+
+That is the mechanism, not a correlation: the only thing the diagnostic changes
+is whether the lease identity can recur.
+
+The `mem::forget` is a DIAGNOSTIC and was reverted — it leaks 16 KiB per
+retirement. The fix is the generation below.
+
+## What is still NOT established
 
 1. Arm `scripts/dtrace/hvpatch-global-frame-stage2-inventory.d` (`dtrace -Z`,
    `carrick*:::` — the carrier is a child, and per that script's header zero
