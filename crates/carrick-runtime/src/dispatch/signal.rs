@@ -1172,12 +1172,20 @@ impl SyscallDispatcher {
             kernel.task_keys_for_broadcast(caller.key().id)
         } else {
             // pid == 0 is the caller's own group; pid < -1 names `-pid`.
+            //
+            // `checked_neg`, because `-i32::MIN` is not representable: a guest
+            // calling `kill(i32::MIN, sig)` used to panic here, and a panic in a
+            // syscall handler is FATAL — one unprivileged call took the whole
+            // guest down (LTP kill03). No process group can bear that id, so the
+            // overflow lowers to the same ESRCH an unknown group gets.
             let group = if pid == 0 {
                 caller.process_group()
             } else {
-                match crate::kernel::ProcessGroupId::from_abi_positive(-pid) {
+                match pid.checked_neg().ok_or(()).and_then(|p| {
+                    crate::kernel::ProcessGroupId::from_abi_positive(p).map_err(|_| ())
+                }) {
                     Ok(group) => group,
-                    Err(_) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
+                    Err(()) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
                 }
             };
             kernel.task_keys_in_process_group(group)

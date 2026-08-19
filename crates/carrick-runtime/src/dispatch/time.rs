@@ -572,8 +572,13 @@ impl SyscallDispatcher {
             if flags & !LINUX_TIMER_ABSTIME != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            // A NULL `new_value` is EINVAL, not EFAULT: Linux rejects the absent
+            // argument before it ever tries to copy one in, so only a non-NULL
+            // but unreadable pointer is a fault (that case is `read_itimerspec`
+            // below). Conflating them cost `timer_settime02` six assertions,
+            // one per clock.
             if new_ptr.0 == 0 {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let spec = read_itimerspec(memory, new_ptr.0)?;
             // Validate the timespec (EINVAL on tv_nsec>=1e9 or negative) via the
