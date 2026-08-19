@@ -62,8 +62,26 @@ and must NOT be quoted as a ratio.
 
 ### Root causes found this session
 
-- **`ltp-futex_cmp_requeue01` is NOT futex, NOT admission, and NOT fork
-  fan-out.** All three readings previously in this file are wrong. One
+- **`ltp-futex_cmp_requeue01` — CLOSED (`9b882d29b`). 7/7, exactly the oracle,
+  1000-waiter cases included; wall 90 s truncated -> 13.5 s.** The root cause
+  was `NsSharedRegion::sweep_dead_owner_records`, a leak backstop that proves
+  "owner is gone" with `kill(host_pid, 0) == ESRCH`. Under HVPatch a run-state
+  record's `host_pid` holds a GUEST pid, which names no host process, so the
+  sweep released the records of LIVE guest processes moments after they
+  published `Blocked` — and `/proc/<pid>/stat` then rendered `R` for a parked
+  process forever, which `TST_PROCESS_STATE_WAIT(pid,'S',0)` polls with no
+  timeout. Two things worth keeping: the domain mark had to go on the RECORD
+  (`ProcessFlags::OWNER_GUEST_TASK`), because the supervisor runs in its own
+  host process over shared memory where a carrier-set static reads false (an
+  `hvpatch_lane_active()` guard measured NO change); and the records are now
+  released at guest task exit (`run_state::clear_guest_process`) so they cannot
+  leak instead. `CARRICK_RUNSTATE_DEBUG=1` is the instrument that found it.
+  **This is an LTP-wide idiom, so expect movement well beyond this suite —
+  re-measure before ranking anything else.**
+  The historical analysis below is retained for its refuted hypotheses:
+
+- **[HISTORICAL] `ltp-futex_cmp_requeue01` is NOT futex, NOT admission, and NOT
+  fork fan-out.** All three readings previously in this file are wrong. One
   `FUTEX_WAKE` reaps the whole "stuck" cohort in ~150 ms, so the children were
   parked correctly the entire time; what breaks is that `/proc/<pid>/stat`
   reports `R` for a parked process. A settled one-second pass reads
@@ -78,8 +96,18 @@ and must NOT be quoted as a ratio.
   its lease unconditionally (identical numbers).
   Separately measured, still open: fork costs 8-25 ms/child against Docker's
   flat 0.12 ms and grows with live parked children.
-- **`process_vm_readv`/`writev` read and write the WRONG address space** since
-  `96cd97bf6` — a regression from this campaign's own work. `readv02` expects
+- **`process_vm_readv`/`writev` — made honest (`94d74706d`), still
+  unimplemented.** The cross-process transfer never existed: `ForeignMmAccess`
+  authenticates the peer and answers `is_range_mapped`, then the arm called
+  `process_vm_copy_self`, which copies within the CALLER's address space. It
+  now returns EFAULT rather than reporting success and moving the wrong bytes;
+  the pid/flag/euid/VMA validation is kept and `process_vm01` stays 25/0. This
+  gives up ~16 rows that were passing on the RETURN VALUE while the data was
+  wrong — i.e. false matches, which the goal requires zero of. To finish it:
+  `MmBackend` exposes only `snapshot`/`revision`/`vma_revision`, so it needs a
+  revision-validated foreign read/write pair over the peer's
+  `Stage1Root`/`Asid` (the read half is inside `carrick-vmm-hvf`), plus `prot`
+  on `VmaSummary`. Original defect, for context: `readv02` expects
   `"test"` and receives `IG_DNOTIFY=y` (kconfig text from the CALLER's mm);
   `writev02` reports 100000 bytes written with 100000 differences at the
   target. The previous blanket EFAULT was an honest refusal. Fix the owner
