@@ -85,3 +85,72 @@ A single guest process makes host and guest answers coincide, which is why the
 smoke lane cannot see any of it. **A case exercising TWO live guest processes is
 worth more than any number of single-process cases** — the same conclusion
 `docs/identity-and-scope-domains.md` reaches from the other direction.
+
+
+---
+
+# Which SYSCALLS must never reach Darwin
+
+The boundary above is a principle; this is the list it implies. Of the 337
+syscalls on the aarch64 table, four groups are ones where **the host has no
+correct answer to give**, because the entire question is about guest state:
+
+| group | rows | why the host cannot answer |
+|---|---:|---|
+| `process` | 83 | pid/ppid/pgid/sid, fork/clone/wait/exit, rlimits, capabilities, ptrace, seccomp, namespaces — all kernel-graph state; a host pid is the CARRIER's and is identical for every guest process |
+| `ipc` | 22 | SysV and POSIX message queues/semaphores/shm are carrick's own tables and namespaces |
+| `signal` | 14 | dispositions, masks, pending sets and delivery BETWEEN guest processes |
+| `sched` | 14 | affinity, priority and policy as the guest sees them (`sched_yield` is the one real exception — that is CPU) |
+| **total** | **133 (39%)** | |
+
+The rest legitimately reach the host, because the host owns the thing being asked
+about: `fs` (103) real files, `mm` (31) real mappings, `net` (23) real wire, `io`
+(10) real I/O, and `time` (28) which is mixed — the clock SOURCE is hardware,
+while timers and their expiry are guest bookkeeping.
+
+## What is actually there today
+
+Host `libc` calls inside the guest-authority dispatch modules:
+
+| module | host calls |
+|---|---:|
+| `sysv.rs` | 64 |
+| `proc.rs` | 32 |
+| `mqueue.rs` | 22 |
+| `signal.rs` | 7 |
+| `creds.rs` | 1 |
+
+Most of the `sysv`/`mqueue` count is LEGITIMATE and must stay: those subsystems
+keep their segments in real files, so `open`/`close`/`pread`/`pwrite`/`ftruncate`/
+`fstat` there are backing-store I/O, which is exactly what the host is for.
+
+What does not belong, by name:
+
+| call | uses | what it answers wrongly |
+|---|---:|---|
+| `libc::getpgrp` | 6 | the CARRIER's process group, not the guest's |
+| `libc::kill` | 5 | delivers a guest signal to a host pid |
+| `libc::wait4` | 5 | reaps host children; guest `fork` creates none |
+| `libc::waitid` | 5 | same |
+| `libc::getppid` | 4 | the carrier's parent |
+| `libc::getpid` | 4 | the carrier |
+
+## Make it mechanical, not aspirational
+
+The table already carries `SupportLevel` and `SyscallHandler` (which SUBSYSTEM
+serves it). It carries no `Authority` — WHOSE state the answer is — which is why
+this class keeps recurring silently. The fix that stops it recurring:
+
+1. Add `Authority { Guest, Host, Hybrid }` to `Syscall`, derived per row rather
+   than hand-numbered, following the typed-domain rules already in force.
+2. Extend the `just lint-domains` semgrep gate so a `Guest`-authority syscall's
+   dispatch path may not call host identity/process primitives
+   (`std::process::id`, `libc::get{pid,ppid,pgrp,sid,uid,gid}`, `libc::kill`,
+   `libc::wait*`, `libc::getrlimit`). The gate already blocks shipped bug shapes
+   this exact way; this is one more shape.
+3. `Hybrid` rows (SysV shm, mqueue, timers) declare that they touch the host for
+   BACKING only, so the lint allows I/O primitives there and still blocks identity
+   ones.
+
+That converts "we should service this ourselves" from a habit into a build
+failure, which is the only form that survives.
