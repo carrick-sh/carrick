@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-17
+**Updated:** 2026-08-19
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -29,7 +29,98 @@ artifact.
 The goal is still active. Do not mark it complete, bless a baseline, weaken the
 denominator, add an excuse, accept a retry, or start final performance work.
 
-## CURRENT STATE — session 2026-08-18 (sixth). Read this section first.
+## CURRENT STATE — session 2026-08-19 (seventh). Read this section first.
+
+**The probe gate is GREEN for the first time: 0 failures, was 3.** Three fixes
+landed this session, each red-first and each with `just ci` green.
+
+### 1. The EL1 `gettid` fast path was silently dead (`70837dda6`)
+
+HVF reclaim DESTROYS and recreates a vCPU, and `Aarch64VcpuSnapshot` had no
+`contextidr_el1` field — which is where carrick stamps the guest tid the EL1
+`gettid` handler returns without a VM exit. A rebuilt vCPU read 0 there and took
+the handler's fail-safe branch to the host FOR THE REST OF THE THREAD'S LIFE.
+
+Trigger is THREAD CREATION, and the degrade is permanent: baseline 124 ns, after
+`fork` 124 ns, after `fork`+`exec` 128 ns, after a 400 ms blocking wait 234 ns,
+after one thread create+join **1,656 ns**. Every threaded workload paid it. It hid
+because the degrade path returns the CORRECT tid — only the cost changes.
+
+The restore list did carry `TPIDR_EL1`, under a comment calling it "carrick's
+fast-gettid tid stamp". It WAS, until the tid moved to `CONTEXTIDR_EL1` to free
+that register as the shim scratch. So the code preserved a scratch whose value
+means nothing across a park and dropped the one that holds the tid, with a
+comment explaining why that was right — the exact failure mode
+`docs/identity-and-scope-domains.md` names. Result: 1,559 ns -> 136 ns (11.5x).
+
+`bf2119ed5` is RETRACTED: it blamed a trapping `CONTEXTIDR_EL1` read. That
+register does not trap. The check that broke the tie was the cheapest available
+and had not been run — the SAME reducer against both arms, which showed 1,571 ns
+and 147 ns from the SAME binary.
+
+### 2. `FUTEX_WAKE` could be lost outright (`f730625fb`) — likely the biggest one
+
+`notify_signal_pending` unparks every waiter carrier-wide so each can re-check its
+interrupt predicate. Between that unpark and the re-park the waiter is queued
+NOWHERE, and a wake landing in that window reached nobody and was DROPPED; the
+waiter then slept to its timeout. Linux has no such window.
+
+Consequences, all measured on `futexforkrequeue`:
+
+- `FUTEX_WAKE` of 700 parked waiters returned **8**. With durable wakes alone it
+  returns **700**. The wake accounting was independently, badly wrong.
+- `FUTEX_CMP_REQUEUE` returned 300 (woken only) where Linux returns 800, and the
+  destination queue was EMPTY, because a relinked waiter re-parks on the key it
+  computes from its OWN address. Measured: 154 signal-token re-parks against 154
+  requeued waiters.
+- Carrick re-ran the futex-word comparison on every re-park, so a waiter could
+  release ITSELF on a word store — which MASKED the lost wakes.
+
+Fixed together, foundation first: logical enrollment + wake credits (deposited and
+claimed under the same parking-lot bucket lock), then a two-pass requeue, then the
+enqueue latch. Each had been tried in isolation and each made things WORSE; the
+ordering is the finding
+(`docs/perf-results/2026-08-19-futex-requeue-durability`). `futexforkrequeue` now
+matches Linux exactly three runs running: 800 / 500 / 200, zero timeouts.
+
+**A lost futex wake is a HANG**, so several open clusters are plausible
+beneficiaries — the `multiprocessing_forkserver` wedge (a manager thread that
+"never reaches the queue"), `futex_cmp_requeue01`, and the cpython/go truncations.
+Do not assume; `closure-v8` is the measurement.
+
+### 3. Gate integrity: a probe with racy output order
+
+`futexforkwakegroups` failed on line ORDER, not values — the parent printed
+`fork_ok` concurrently with the child's `grandchild_fork_ok`, and the gate compares
+line by line. Both orderings are legal on Linux, so the race was in the probe. It
+is why that probe read as "load-coupled": a coin flip, not a runtime property.
+Worth checking the other intermittents for the same shape before calling them
+load-coupled.
+
+### In flight
+
+`closure-v8` on the frozen artifact (source `8c7731a20`, binary
+`96ef9311074c7e23c3d50dd4b7276ded10ce8ea8efb64b6d5e21ea4817efad1d`, CDHash
+`ccd1a9d4250caed18757b2d0475aa5af122fffc4`, entitlement + `__dof_carrick`
+present, scope re-frozen and checked at 2,127 suites). Compare against
+closure-v7's 2,000 MATCH / 127 non-match / 1,120 diverging rows.
+
+### Next, after `closure-v8` reports
+
+1. Re-rank the remainder from v8 — the futex fix may have moved whole clusters.
+2. **Targeted signal notification.** The broadcast form fired ~179k unparks in ONE
+   probe. `notify_signal_pending_for(tid)` exists; ~30 callers use the broadcast.
+   Now a performance lever rather than a correctness one, but each caller must be
+   shown to know its target: a missed wake is a hang.
+3. The per-syscall floor is unchanged and still ranks: `getppid`/`getuid`/
+   `geteuid` ~1,850 ns, `clock_gettime` ~2,192 ns, against `getpid`/`gettid`
+   ~135 ns. Credentials are per-THREAD and cannot go on the per-MM identity page
+   (its layout comment says so); they need a per-thread slot the shim can read
+   without trapping.
+
+---
+
+## PREVIOUS STATE — session 2026-08-18 (sixth).
 
 **Authoritative measurement: `closure-v5`, 1,986 MATCH / 141 INCOMPLETE of
 2,127, 2,038 diverging assertion rows.** Full-surface `--closure --force` on a
