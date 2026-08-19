@@ -162,6 +162,8 @@ pub const ARWRITE: u8 = 40;
 /// numbers are recycled heavily within one build, so correlate by adjacency in
 /// the ring rather than by fd number alone.
 pub const ARMAGIC: u8 = 41;
+/// Thread or process clone spawn outcome. `a` is parent PID, `b` child TID, `c` errno (0 = success).
+pub const CLONESPAWN: u8 = 42;
 
 const HVPWAIT_ID_MASK: u32 = 0x00ff_ffff;
 
@@ -797,6 +799,7 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
         ),
         FDOWNER => format!("FDOWNER pid={a} tid={b} gfd={c}"),
         FDREF => format!("FDREF    pid={a} gfd={b} refs_before={c}"),
+        CLONESPAWN => format!("CLONESPAWN parent_pid={a} child_tid={b} errno={c}"),
         _ => String::new(),
     }
 }

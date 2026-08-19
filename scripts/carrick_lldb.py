@@ -546,6 +546,9 @@ _EVENTRING_KINDS = {
     ),
     38: ("FDOWNER", lambda a, b, c: f"pid={a} tid={b} gfd={c}"),
     39: ("FDREF", lambda a, b, c: f"pid={a} gfd={b} refs_before={c}"),
+    40: ("ARWRITE", lambda a, b, c: f"hfd={a} off={b} n={c}"),
+    41: ("ARMAGIC", lambda a, b, c: f"hfd={a} off={b} n={c}"),
+    42: ("CLONESPAWN", lambda a, b, c: f"parent_pid={a} child_tid={b} errno={c}"),
 }
 
 
