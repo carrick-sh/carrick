@@ -1,11 +1,11 @@
 //! The `PlatformFutex` implementations.
 //!
-//! [`FutexTableFutex`] serves every VMM lane (HVF, KVM, bhyve, NVMM). Under the
+//! `FutexTableFutex` serves every VMM lane (HVF, KVM, bhyve, NVMM). Under the
 //! unified HVPatch kernel each of those lanes runs EVERY Linux process as a
 //! thread of one carrier, so both the private and the `MAP_SHARED` guest futex
 //! are intra-process rendezvous: the private path parks on the per-process
 //! [`crate::thread::FutexTable`], the shared path on the carrier-wide
-//! [`carrier_shared_futex_table`]. No host futex primitive is involved.
+//! `carrier_shared_futex_table`. No host futex primitive is involved.
 //!
 //! This replaces the per-host `SharedFutexSyscall` shim (macOS
 //! `os_sync_wait_on_address`, Linux bare `SYS_futex`, FreeBSD `_umtx_op`),
@@ -15,7 +15,7 @@
 //! the fork-shared waiter side-table, logical/physical wake reconciliation,
 //! requeue tokens, and the 20 ms interrupt-polling slices.
 //!
-//! [`FutexTableNativeFutex`] remains for the DSR native lanes, which DO run
+//! `FutexTableNativeFutex` remains for the DSR native lanes, which DO run
 //! guest processes as separate host processes and therefore still need a real
 //! cross-process kernel primitive.
 
@@ -176,12 +176,12 @@ impl PlatformFutex for FutexTableFutex {
 }
 
 /// The cross-process futex a NATIVE (DSR) lane owns end-to-end, as opposed to
-/// the one-kernel-slice [`SharedFutexSyscall`] the VMM lanes plug into
-/// [`shared_wait_sliced`].
+/// the one-kernel-slice `SharedFutexSyscall` the VMM lanes plug into
+/// `shared_wait_sliced`.
 ///
 /// The two are NOT interchangeable, and the difference is not stylistic. A
 /// `SharedFutexSyscall` hands the shared loop ONE ≤20 ms wait slice and lets
-/// [`FutexTableFutex`] own the deadline, the interrupt re-check and the
+/// `FutexTableFutex` own the deadline, the interrupt re-check and the
 /// requeue continuation. A native lane's futex module instead owns the WHOLE
 /// `FUTEX_WAIT` — it parks once with the guest's full relative timeout and
 /// returns the Linux retval directly — because the work it does around the

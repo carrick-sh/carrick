@@ -374,7 +374,7 @@ fn prepare_pwritev_payloads(
         };
         staged_iovecs.push(bytes);
     }
-    if staged_iovecs.iter().all(|b| b.is_empty()) && faulted {
+    if faulted {
         return Err(LINUX_EFAULT);
     }
     Ok(PwritevPayloads::Staged(staged_iovecs))
