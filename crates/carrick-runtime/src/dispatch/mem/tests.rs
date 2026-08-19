@@ -4447,6 +4447,60 @@ fn free_regions_coalesce_adjacent() {
 }
 
 #[test]
+fn lowering_the_cursor_drops_free_regions_left_above_it() {
+    // The superset-munmap shape: an interior hole exists, then a munmap that
+    // ends at the cursor lowers it PAST that hole. The absorb loop only takes
+    // regions contiguous below, so the hole would survive above the cursor —
+    // and the free list would then hand out a VA the bump path also hands out.
+    let mut next = 0x4000;
+    let mut regions = vec![(0x1000_u64, 0x1000_u64)]; // [0x1000,0x2000)
+    lower_mmap_next(&mut next, &mut regions, 0x0);
+    assert_eq!(next, 0x0);
+    assert!(
+        regions.is_empty(),
+        "a region above the lowered cursor must not survive: {regions:x?}"
+    );
+}
+
+#[test]
+fn lowering_the_cursor_truncates_a_region_that_straddles_it() {
+    let mut next = 0x4000;
+    let mut regions = vec![(0x1000_u64, 0x2000_u64)]; // [0x1000,0x3000)
+    lower_mmap_next(&mut next, &mut regions, 0x2000);
+    assert_eq!(next, 0x2000);
+    assert_eq!(
+        regions,
+        vec![(0x1000, 0x1000)],
+        "only the part below survives"
+    );
+}
+
+#[test]
+fn lowering_the_cursor_still_absorbs_regions_contiguous_below() {
+    let mut next = 0x4000;
+    let mut regions = vec![(0x1000_u64, 0x1000_u64), (0x2000_u64, 0x1000_u64)];
+    lower_mmap_next(&mut next, &mut regions, 0x3000);
+    assert_eq!(next, 0x1000, "both contiguous regions fold into the cursor");
+    assert!(regions.is_empty());
+}
+
+#[test]
+fn removing_a_fixed_range_splits_the_region_it_lands_inside() {
+    // MAP_FIXED inside the arena allocates VA the free list may still hold.
+    let mut regions = vec![(0x1000_u64, 0x4000_u64)]; // [0x1000,0x5000)
+    free_regions_remove_range(&mut regions, 0x2000, 0x1000);
+    assert_eq!(regions, vec![(0x1000, 0x1000), (0x3000, 0x2000)]);
+
+    let mut exact = vec![(0x1000_u64, 0x1000_u64)];
+    free_regions_remove_range(&mut exact, 0x1000, 0x1000);
+    assert!(exact.is_empty());
+
+    let mut untouched = vec![(0x1000_u64, 0x1000_u64)];
+    free_regions_remove_range(&mut untouched, 0x9000, 0x1000);
+    assert_eq!(untouched, vec![(0x1000, 0x1000)]);
+}
+
+#[test]
 fn guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges() {
     let dispatcher = SyscallDispatcher::new();
     let layout = dispatcher.mem.lock().layout;
