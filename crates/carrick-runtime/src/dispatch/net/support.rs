@@ -527,7 +527,14 @@ pub(super) fn canonical_socket_errno(
             // ICMP, etc. on a stream socket are EPROTONOSUPPORT (macOS: the less
             // specific EPROTOTYPE).
             LINUX_SOCK_STREAM => {
-                if protocol != 0 && protocol != LINUX_SOL_TCP {
+                // SCTP is accepted here because LINUX accepts it: a guest asking
+                // for `AF_INET/SOCK_STREAM/IPPROTO_SCTP` gets a socket on Linux,
+                // and rejecting it made CPython's `test_socket` SKIP 42 tests the
+                // oracle RUNS (`RecvmsgSCTPStreamTest`, `RecvmsgIntoSCTPStreamTest`,
+                // `SendmsgSCTPStreamTest` — the generic sendmsg/recvmsg mixins,
+                // not SCTP protocol specifics). The EPROTONOSUPPORT was carrick's
+                // own, not the host's.
+                if !matches!(protocol, 0 | LINUX_SOL_TCP | LINUX_IPPROTO_SCTP) {
                     return Some(crate::linux_abi::LINUX_EPROTONOSUPPORT);
                 }
             }

@@ -2032,7 +2032,18 @@ impl SyscallDispatcher {
         // whole UDPLITE suite (native-macOS python skips it — IPPROTO_UDPLITE
         // undefined there); pass-through socket() returned EPROTONOSUPPORT and
         // ERRORed every UDPLITE test at setUp.
-        let host_protocol = if protocol == LINUX_IPPROTO_UDPLITE
+        // macOS has no SCTP either. A guest SCTP SOCK_STREAM is a reliable,
+        // ordered byte stream to ONE peer, which is what a TCP socket already
+        // provides — the same substitution UDPLITE gets below, and the same shape
+        // as backing a guest AF_UNIX SEQPACKET with a host SOCK_STREAM. The guest
+        // protocol is recorded unchanged in the OpenDescription, so `SO_PROTOCOL`
+        // still reports SCTP.
+        //
+        // Deliberately NOT extended to SOCK_SEQPACKET: that is message-oriented
+        // and multi-streamed, and TCP cannot reconstruct its boundaries. It stays
+        // EPROTONOSUPPORT rather than pretending.
+        let host_protocol = if protocol == LINUX_IPPROTO_SCTP && base_type == LINUX_SOCK_STREAM
+            || protocol == LINUX_IPPROTO_UDPLITE
             || cfg!(carrick_bsd)
                 && matches!(family, LINUX_AF_INET | LINUX_AF_INET6)
                 && base_type == LINUX_SOCK_RAW

@@ -5276,6 +5276,10 @@ pub const LINUX_SOL_UDP: i32 = 17; // IPPROTO_UDP
 /// carrick backs it with a plain UDP socket (only the checksum-coverage
 /// sockopts differ, accepted as no-ops).
 pub const LINUX_IPPROTO_UDPLITE: i32 = 136;
+/// `IPPROTO_SCTP`. Linux accepts it on `SOCK_STREAM`/`SOCK_SEQPACKET`; macOS has
+/// no SCTP at all, so carrick backs a stream association with a plain TCP socket
+/// (the same shape as `IPPROTO_UDPLITE` over UDP).
+pub const LINUX_IPPROTO_SCTP: i32 = 132;
 pub const LINUX_SOL_IPV6: i32 = 41; // IPPROTO_IPV6
 /// Linux protocol number for ICMP (`IPPROTO_ICMP`), used by the raw-ICMP
 /// socket emulation (ping-style `SOCK_DGRAM`/`SOCK_RAW` with this protocol).
