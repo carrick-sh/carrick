@@ -87,3 +87,99 @@ the three things to attack, in that order of evidence.
 Note the traced walls (8.21 / 20.44 ms) are perturbed by eleven USDT firings per
 fork; the untraced ladder (7.93 / 25.29 ms) remains the gate figure, and only
 same-instrument growth ratios from this capture are citable.
+
+---
+
+# Follow-up: the cost is mostly NOT in fork
+
+The phase ledger above says the named phases cover **98% of the fork handler**,
+while the handler is only ~26% of guest-observed fork wall. So three quarters of
+the cost is outside the fork implementation entirely, and tuning `ChildReady`
+would address ~15% of the bill.
+
+## Decomposition: syscall vs everything around it
+
+`reducers/fork-decompose.py`, 200 forks, children `_exit` immediately. Docker
+and carrick run serially.
+
+| | Docker | carrick | ratio |
+|---|---:|---:|---:|
+| `os.fork` (CPython bookkeeping included) | 0.152 ms | 7.986 ms | **52.5x** |
+| `libc.fork` (raw syscall) | 0.093 ms | 2.758 ms | **29.7x** |
+| bookkeeping delta | 0.059 ms | **5.228 ms** | **89x** |
+
+CPython's `PyOS_BeforeFork`/`AfterFork` — import lock, threading reinit, atfork
+handlers — are just MORE GUEST SYSCALLS. On Linux they are noise. Under carrick
+they cost nearly twice what the fork itself costs. **The per-syscall floor, not
+fork, is what makes the observed operation 52x.**
+
+Note the fixture difference against the ladder above: children that `_exit`
+immediately give 2.76 ms/fork, while children that stay PARKED give 7.9-25.3
+ms/fork. Live population is a large multiplier on top of the floor, which is
+what `ChildReady` and `ProcessSpec` measure.
+
+## The floor, and the fast path that already beats Linux
+
+`reducers/syscall-floor.py`, 20,000 raw `syscall()` calls each:
+
+| syscall | Docker | carrick | ratio |
+|---|---:|---:|---:|
+| `getpid` | 238 ns | **137 ns** | **0.58x** |
+| `gettid` | 240 ns | 1,526 ns | 6.4x |
+| `clock_gettime` | 321 ns | 2,086 ns | 6.5x |
+
+**carrick answers `getpid` faster than native Linux.** The ~1.5 us floor is
+therefore not architectural — the same process, on the same path, demonstrates
+137 ns. Two trivial integer-returning syscalls differ by **11x within carrick
+itself**.
+
+The reason is exact. `container_policy::IDENTITY_FAST_PATH_SYSCALLS` gates seven
+syscalls as safe for the EL1 identity shim — 172 `getpid`, 173 `getppid`,
+174 `getuid`, 175 `geteuid`, 176 `getgid`, 177 `getegid`, 178 `gettid` — but the
+shim's dispatch table has exactly one entry:
+
+```rust
+pub const IDENTITY_SYSCALLS: &[(u16, u64)] = &[(172, IDENTITY_OFF_PID)];
+```
+
+and `stamp_identity_values` writes only the pid and the enable flag. The other
+six are gated as fast-path-safe and then take the full trap.
+
+### What extending it costs, honestly
+
+The page is 16 KiB with three fields used, so space is not the constraint;
+INVALIDATION is. Each addition carries a distinct obligation:
+
+- `getppid` — re-stamp on re-parenting (subreaper adoption, parent death).
+- `getuid`/`geteuid`/`getgid`/`getegid` — re-stamp on every credential
+  mutation (`setuid` family, `execve` with setuid bits, capability changes).
+  Carrick already tracks these per `Task`; the stamp has to hang off the same
+  authority or it will go stale, and a stale credential answer is a security
+  bug, not a performance one.
+- `gettid` — the hard one and the reason it is absent. The identity page is
+  per-MM, and the tid is per-THREAD, so a single page cannot carry it. It needs
+  a per-thread slot the shim can index without a trap.
+
+So the cheap, safe subset is the four credential syscalls plus `getppid`,
+provided the re-stamp hangs off the existing credential/parent authority rather
+than a second copy.
+
+## Caveat on these numbers
+
+The floor benchmark calls `syscall()` directly, bypassing the vDSO. That is a
+fair carrick-vs-Docker comparison of the SYSCALL path — both sides measured the
+same way — but real programs reach `clock_gettime` through libc and the vDSO, so
+the 6.5x there is not what a normal workload pays. `getpid`/`gettid` have no
+vDSO entry on aarch64 Linux, so those two are what programs actually pay.
+
+## Where this leaves the fork question
+
+Ranked by evidence:
+
+1. **The per-syscall floor** — 6.4x on every trapping syscall, multiplied by
+   every workload. The identity shim proves the floor can be ~137 ns; six of the
+   seven syscalls it is allowed to answer are not wired up.
+2. **Live-population scaling** — `ChildReady` 12.3x and `ProcessSpec` 3.5x from
+   32 to 256 live children, on top of the floor.
+3. **The raw fork syscall** — 2.76 ms against 0.093 ms with children that exit
+   immediately, i.e. 30x before any population effect.
