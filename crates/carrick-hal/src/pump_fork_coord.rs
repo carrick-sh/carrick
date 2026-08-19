@@ -224,8 +224,8 @@ mod tests {
         fn shared_wait(
             &self,
             _location: SharedFutexLocation,
-            _k: usize,
             _v: u32,
+            _tid: crate::ThreadId,
             _to: Option<Duration>,
             _i: &dyn Fn() -> bool,
             _wait_enrolled: &dyn Fn(),

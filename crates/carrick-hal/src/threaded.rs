@@ -461,11 +461,17 @@ pub trait PlatformFutex: Send + Sync {
         interrupted: &dyn Fn() -> bool,
     ) -> FutexOutcome;
     fn private_wake(&self, addr: u64, n: u32) -> u32;
+    /// Wait on a `MAP_SHARED` guest futex.
+    ///
+    /// `tid` is load-bearing: the waiter parks under that thread's park token so
+    /// a THREAD-directed signal (`tgkill`) can wake exactly this waiter. The
+    /// previous cross-process implementation could not be targeted that way and
+    /// had to poll its interrupt predicate on a 20 ms slice instead.
     fn shared_wait(
         &self,
         location: SharedFutexLocation,
-        waiter_key: usize,
         val: u32,
+        tid: ThreadId,
         timeout: Option<Duration>,
         interrupted: &dyn Fn() -> bool,
         wait_enrolled: &dyn Fn(),

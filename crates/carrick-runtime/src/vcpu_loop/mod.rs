@@ -625,6 +625,13 @@ impl std::fmt::Debug for HvpatchTaskWaker {
 impl crate::kernel::TaskWaker for HvpatchTaskWaker {
     fn wake_task(&self) {
         self.futex.notify_signal_pending();
+        // Shared (`MAP_SHARED`) futex waiters park in the CARRIER-wide table,
+        // not this process's — a wake that only pokes `self.futex` leaves a
+        // shared waiter asleep until its timeout. Concretely: `tgkill` posts
+        // the signal and comes through here; before this line, a target parked
+        // in `tst_checkpoint_wait` never noticed the pending signal and the
+        // sender's delivery handshake stalled its full 10 s (`tgkill01`).
+        carrick_thread::platform_futex::carrier_shared_futex_table().notify_signal_pending();
         self.signal_arrival.wake_all_waiters();
         self.kicker.kick_all();
     }

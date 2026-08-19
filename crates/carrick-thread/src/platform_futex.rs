@@ -1,155 +1,59 @@
-//! One `PlatformFutex` implementation, parameterized over the host's shared-page
-//! futex syscall.
+//! The `PlatformFutex` implementations.
 //!
-//! Every backend's `PlatformFutex` impl (HVF, KVM, bhyve, NVMM) was the same
-//! shape: the PRIVATE (process-anonymous) path is verbatim delegation to the
-//! shared parking-lot [`crate::thread::FutexTable`], and only the SHARED (`MAP_SHARED`,
-//! cross-process) path differs — by exactly one kernel call:
+//! [`FutexTableFutex`] serves every VMM lane (HVF, KVM, bhyve, NVMM). Under the
+//! unified HVPatch kernel each of those lanes runs EVERY Linux process as a
+//! thread of one carrier, so both the private and the `MAP_SHARED` guest futex
+//! are intra-process rendezvous: the private path parks on the per-process
+//! [`crate::thread::FutexTable`], the shared path on the carrier-wide
+//! [`carrier_shared_futex_table`]. No host futex primitive is involved.
 //!
-//!   * macOS  → `os_sync_wait_on_address` / `os_sync_wake_by_address` (`__ulock`)
-//!   * FreeBSD → `_umtx_op`
-//!   * Linux  → bare `SYS_futex` (no `FUTEX_PRIVATE_FLAG`)
-//!   * NetBSD → `__futex`  (a future arm)
-//!   * illumos → `lwp_park` (a future arm)
+//! This replaces the per-host `SharedFutexSyscall` shim (macOS
+//! `os_sync_wait_on_address`, Linux bare `SYS_futex`, FreeBSD `_umtx_op`),
+//! whose own rationale — "carrick forks each guest process as a real macOS
+//! process" — described the retired 1:1 execution model. Everything that shim
+//! needed to paper over a host primitive went with it: physical-page keying,
+//! the fork-shared waiter side-table, logical/physical wake reconciliation,
+//! requeue tokens, and the 20 ms interrupt-polling slices.
 //!
-//! So the whole impl is hoisted here ONCE over [`crate::platform_futex::FutexTableFutex`], and each
-//! host plugs in only its best shared-page primitive behind the tiny
-//! [`crate::platform_futex::SharedFutexSyscall`] shim — NOT a lowest-common-denominator. The shared
-//! deadline/slice/interrupt loop is [`carrick_hal::shared_wait_sliced`]; the
-//! per-host residue is a ~15-line `SharedFutexSyscall` impl.
-//!
-//! HVF deliberately keeps its own `HvfFutex` (it layers carrick-trace probes
-//! into the wait path); that is a per-host extra, not a divergence the shim must
-//! model. KVM and bhyve use `FutexTableFutex` directly.
+//! [`FutexTableNativeFutex`] remains for the DSR native lanes, which DO run
+//! guest processes as separate host processes and therefore still need a real
+//! cross-process kernel primitive.
 
-use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Duration;
 
-use carrick_hal::{
-    FutexOutcome, HostVa, PlatformFutex, SharedFutexLocation, SharedWaitStep, ThreadId,
-    shared_wait_sliced,
-};
+use carrick_hal::{FutexOutcome, PlatformFutex, SharedFutexLocation, ThreadId};
 
 use crate::thread::{FutexTable, FutexWaitOutcome};
 
-/// The single per-host divergence the generic [`FutexTableFutex`] needs: the
-/// host's `MAP_SHARED` (cross-process) futex kernel calls. The deadline/slice/
-/// interrupt control around `wait_one_slice` lives in
-/// [`carrick_hal::shared_wait_sliced`]; the host supplies only the one kernel
-/// wait slice (classified into a [`SharedWaitStep`]) and the wake.
-pub trait SharedFutexSyscall: Send + Sync {
-    /// One ≤20 ms cross-process wait slice on the shared-page word at
-    /// `host_addr`. Return [`SharedWaitStep::Woken`] for a wake or an
-    /// at-entry value mismatch (the guest re-checks), [`SharedWaitStep::Retry`]
-    /// for a slice timeout / signal nudge (the loop re-checks the deadline +
-    /// interrupt), or [`SharedWaitStep::Error`] for any other terminal `-errno`
-    /// (in the value space the guest expects).
-    fn wait_one_slice(
-        &self,
-        location: SharedFutexLocation,
-        waiter_key: usize,
-        val: u32,
-        slice_ns: i64,
-    ) -> SharedWaitStep;
-
-    /// Wake up to `n` waiters on the shared-page word at `location`. Returns the
-    /// count woken (>=0) or `-errno`.
-    fn wake(&self, location: SharedFutexLocation, waiter_key: usize, n: u32) -> i64;
-
-    /// Optional once-before-wait hook (default no-op), run once at the top of
-    /// [`FutexTableFutex::shared_wait`] before the slice loop. A host can use it
-    /// for a pre-wait observability peek at the shared word (HVF emits a
-    /// carrick-trace `futex_route` probe here, which is why it previously kept its
-    /// own `PlatformFutex` copy — this hook lets it fold onto the shared one).
-    fn pre_wait(&self, _location: SharedFutexLocation, _val: u32) {}
-
-    /// Optional logical-wait lifetime hooks. Hosts whose wake primitive does not
-    /// return a waiter count can use these to track the full guest FUTEX_WAIT
-    /// lifetime rather than a single host wait slice.
-    fn wait_start(&self, _waiter_key: usize) {}
-    fn wait_start_requeued(&self, waiter_key: usize) -> bool {
-        self.wait_start(waiter_key);
-        false
-    }
-    /// `woken` is the guest-visible outcome of the wait being closed (`true`
-    /// for FUTEX_WAIT returning 0 — a wake or the slice loop's value
-    /// re-check; `false` for ETIMEDOUT/EINTR). Side-table hosts use it to
-    /// keep a self-woken waiter claimable by the next wake's count (Linux
-    /// keeps such a waiter queued until a FUTEX_WAKE dequeues it).
-    fn wait_end(&self, _waiter_key: usize, _woken: bool) {}
-    fn wait_end_requeued(
-        &self,
-        _location: SharedFutexLocation,
-        waiter_key: usize,
-        _value: u32,
-    ) -> bool {
-        self.wait_end(waiter_key, false);
-        true
-    }
-    fn try_complete_requeued(&self, _waiter_key: usize) -> bool {
-        false
-    }
-    fn take_requeue(&self, _waiter_key: usize) -> Option<(usize, usize, u32)> {
-        None
-    }
-    fn requeue(
-        &self,
-        _from: SharedFutexLocation,
-        _from_key: usize,
-        _to: SharedFutexLocation,
-        _to_key: usize,
-        _wake: u32,
-        _requeue: u32,
-    ) -> (u32, u32) {
-        (0, 0)
-    }
-}
-
-/// Classify one cross-process futex wait slice's raw host return into a
-/// [`SharedWaitStep`] (the Linux `FUTEX_WAIT` errno ABI guard from
-/// [`carrick_hal::classify_wait_slice`]) AND record the silent fold when a
-/// non-`{ETIMEDOUT,EINTR}` host errno is swallowed into a spurious wake.
-///
-/// This is the ONE seam every host shim (HVF `os_sync`, KVM `SYS_futex`, bhyve
-/// `_umtx_op`, NVMM futex) routes its raw kernel result through, so the guard AND
-/// its observability are single-sourced: the `futex-unexpected-errno` USDT probe
-/// fires on every backend, not just HVF. `host_etimedout`/`host_eintr` are passed
-/// in because the numeric errno values differ per host OS.
-#[inline]
-pub fn classify_observed_wait_slice(
-    raw: i64,
-    host_addr: usize,
-    host_etimedout: i32,
-    host_eintr: i32,
-) -> SharedWaitStep {
-    let step = carrick_hal::classify_wait_slice(raw, host_etimedout, host_eintr);
-    // A wake is `raw >= 0`; the only way `raw < 0` yields `Woken` is the
-    // unexpected-errno guard folding a non-Linux-futex errno into a spurious wake.
-    if raw < 0 && matches!(step, SharedWaitStep::Woken) {
-        carrick_observability::probes::futex_unexpected_errno(host_addr as u64, (-raw) as i32);
-    }
-    step
-}
-
-/// The one `PlatformFutex` impl: a process-private [`FutexTable`] (the private
-/// path, byte-identical across every backend) paired with a host
-/// [`SharedFutexSyscall`] (the shared, cross-process path). Replaces the
-/// per-backend `KvmFutex`/`BhyveFutex` copies.
-pub struct FutexTableFutex<S: SharedFutexSyscall> {
+/// The one VMM-lane `PlatformFutex`: a process-private [`FutexTable`] for the
+/// private path, the carrier-wide table for the shared path.
+pub struct FutexTableFutex {
     table: Arc<FutexTable>,
-    shared: S,
 }
 
-impl<S: SharedFutexSyscall> FutexTableFutex<S> {
-    /// Pair a process-private table with the host's shared-page syscall shim.
-    pub fn new(table: Arc<FutexTable>, shared: S) -> Self {
+impl FutexTableFutex {
+    /// Wrap the process-private table (installed as the CURRENT table for
+    /// helper-thread signal wakes, exactly as before).
+    pub fn new(table: Arc<FutexTable>) -> Self {
         crate::thread::set_current_futex_table(&table);
-        Self { table, shared }
+        Self { table }
     }
 }
 
-impl<S: SharedFutexSyscall> PlatformFutex for FutexTableFutex<S> {
+/// THE carrier-wide wait queue for `MAP_SHARED` guest futexes.
+///
+/// One per carrier, deliberately NOT per guest process: HVPatch multiplexes
+/// every Linux process into one carrier, and `fork` hands the child a fresh
+/// per-process [`FutexTable`]. A shared futex must rendezvous ACROSS guest
+/// processes, so it cannot live in a table that fork replaces — parent and
+/// child would park in different tables and never meet.
+pub fn carrier_shared_futex_table() -> &'static Arc<FutexTable> {
+    static TABLE: std::sync::OnceLock<Arc<FutexTable>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| Arc::new(FutexTable::new()))
+}
+
+impl PlatformFutex for FutexTableFutex {
     /// Park the calling thread on a private (anonymous) futex. The value-equality
     /// check already ran in the dispatcher before it returned `FutexWait`, so we
     /// do NOT re-check — `prepare_wait` captures the generation, then
@@ -181,86 +85,74 @@ impl<S: SharedFutexSyscall> PlatformFutex for FutexTableFutex<S> {
     /// Wait on a `MAP_SHARED` (cross-process) futex. The deadline/slice/interrupt
     /// loop is shared; only the single kernel wait slice + its host-errno
     /// classification is the host's (`SharedFutexSyscall::wait_one_slice`).
+    /// Wait on a `MAP_SHARED` guest futex — in-process, no host primitive.
+    ///
+    /// Under the HVPatch kernel every Linux process is a THREAD of one carrier
+    /// sharing one address space, so a "cross-process" guest futex is an
+    /// ordinary intra-process rendezvous. `waiter_key` is already the
+    /// carrier-stable identity of the futex word, so all guest processes
+    /// naming the same word hash to the same bucket of one carrier-wide table.
+    ///
+    /// This replaces a Darwin `os_sync_wait_on_address` path whose own header
+    /// justified itself with "carrick forks each guest process as a real macOS
+    /// process" — a premise HVPatch retired. Everything that path needed to
+    /// paper over a host primitive is gone with it: the physical-page keying,
+    /// the shared waiter side-table, the logical/physical wake reconciliation,
+    /// the requeue tokens, and above all the 20 ms slicing (a host wait cannot
+    /// be interrupted by our kick, so every shared waiter had to re-check its
+    /// interrupt predicate 50x a second — 50k host wakeups/s at a thousand
+    /// waiters, inside ONE process).
     fn shared_wait(
         &self,
         location: SharedFutexLocation,
-        waiter_key: usize,
         value: u32,
+        tid: ThreadId,
         timeout: Option<Duration>,
         interrupted: &dyn Fn() -> bool,
         wait_enrolled: &dyn Fn(),
     ) -> i64 {
-        let mut location = location;
-        let mut waiter_key = waiter_key;
-        let mut value = value;
-        let mut current_requeued = false;
-        loop {
-            self.shared.pre_wait(location, value);
-            let already_woken = if current_requeued {
-                self.shared.wait_start_requeued(waiter_key)
-            } else {
-                self.shared.wait_start(waiter_key);
-                false
-            };
-            wait_enrolled();
-            if already_woken {
-                return 0;
-            }
-            let completed_requeued = Cell::new(false);
-            let ret = shared_wait_sliced(timeout, interrupted, &|slice_ns| {
-                if current_requeued && self.shared.try_complete_requeued(waiter_key) {
-                    completed_requeued.set(true);
-                    return SharedWaitStep::Woken;
-                }
-                self.shared
-                    .wait_one_slice(location, waiter_key, value, slice_ns)
-            });
-            if current_requeued {
-                if completed_requeued.get() {
-                    return 0;
-                }
-                let complete = self.shared.wait_end_requeued(location, waiter_key, value);
-                if complete {
-                    return 0;
-                }
-                if ret == 0 {
-                    continue;
-                }
-                return ret;
-            }
-            self.shared.wait_end(waiter_key, ret == 0);
-            if ret != 0 {
-                return ret;
-            }
-            let Some((next_host, next_key, next_value)) = self.shared.take_requeue(waiter_key)
-            else {
-                return ret;
-            };
-            location = SharedFutexLocation::Direct {
-                word: HostVa(next_host),
-                waiter_key: next_key,
-            };
-            waiter_key = next_key;
-            value = next_value;
-            current_requeued = true;
+        let table = carrier_shared_futex_table();
+        let waiter_key = location.waiter_key();
+        // SAFETY: the futex word is a live, 4-byte-aligned host word for as
+        // long as the guest mapping naming it is alive; the wait does not
+        // outlive the syscall that named it.
+        let word = location.wait_addr().raw() as *const std::sync::atomic::AtomicU32;
+        // Enrolled = reachable by kicks. The value check and the park are made
+        // atomic against wakes by the word validation inside the park itself,
+        // so enrollment order carries no lost-wake risk here.
+        wait_enrolled();
+        match unsafe {
+            table.wait_while_word_equals(waiter_key as u64, word, value, timeout, tid, interrupted)
+        } {
+            FutexWaitOutcome::Woken => 0,
+            FutexWaitOutcome::TimedOut => carrick_abi::LINUX_ETIMEDOUT.guest_retval(),
+            FutexWaitOutcome::Interrupted => carrick_abi::LINUX_EINTR.guest_retval(),
         }
     }
 
-    fn shared_wake(&self, location: SharedFutexLocation, waiter_key: usize, n: u32) -> i64 {
-        self.shared.wake(location, waiter_key, n)
+    fn shared_wake(&self, _location: SharedFutexLocation, waiter_key: usize, n: u32) -> i64 {
+        // The return is Linux's contract: exactly the number of parked waiters
+        // released. `FutexTable::wake` reports `unparked_threads`, and shared
+        // waiters park word-validated (never generation-validated), so a wake
+        // that unparks nobody genuinely woke nobody.
+        i64::from(carrier_shared_futex_table().wake(waiter_key as u64, n))
     }
 
+    /// `FUTEX_CMP_REQUEUE` on a shared futex: a real queue relink
+    /// (`parking_lot_core::unpark_requeue`), the same primitive the private
+    /// path uses. The host-primitive path could not relink a queue it did not
+    /// own, so it emulated requeue by waking the whole batch and handing each
+    /// woken waiter a token telling it whether to re-park on the destination.
     fn shared_requeue(
         &self,
-        from: SharedFutexLocation,
+        _from: SharedFutexLocation,
         from_key: usize,
-        to: SharedFutexLocation,
+        _to: SharedFutexLocation,
         to_key: usize,
         wake: u32,
         requeue: u32,
     ) -> (u32, u32) {
-        self.shared
-            .requeue(from, from_key, to, to_key, wake, requeue)
+        carrier_shared_futex_table().requeue(from_key as u64, to_key as u64, wake, requeue)
     }
 
     fn requeue(&self, from: u64, to: u64, wake: u32, requeue: u32) -> (u32, u32) {
@@ -270,11 +162,16 @@ impl<S: SharedFutexSyscall> PlatformFutex for FutexTableFutex<S> {
     #[inline]
     fn notify_signal_pending(&self) {
         self.table.notify_signal_pending();
+        // Shared waiters park in the carrier-wide table, not the per-process
+        // one — a signal that only poked `self.table` would leave a shared
+        // waiter asleep until its timeout.
+        carrier_shared_futex_table().notify_signal_pending();
     }
 
     #[inline]
     fn notify_signal_pending_for(&self, tid: ThreadId) {
         self.table.notify_signal_pending_for(tid);
+        carrier_shared_futex_table().notify_signal_pending_for(tid);
     }
 }
 
@@ -402,13 +299,18 @@ impl<S: NativeSharedFutex> PlatformFutex for FutexTableNativeFutex<S> {
     fn shared_wait(
         &self,
         location: SharedFutexLocation,
-        waiter_key: usize,
         value: u32,
+        // The DSR native lane still runs guest processes as real host
+        // processes, so its shared futex genuinely crosses address spaces and
+        // cannot use the carrier-wide in-process queue (or a park token that
+        // only names a thread of THIS process).
+        _tid: ThreadId,
         timeout: Option<Duration>,
         interrupted: &dyn Fn() -> bool,
         wait_enrolled: &dyn Fn(),
     ) -> i64 {
         wait_enrolled();
+        let waiter_key = location.waiter_key();
         self.shared.shared_wait(
             location.wait_addr().raw(),
             waiter_key,
@@ -463,102 +365,88 @@ mod tests {
     use carrick_hal::HostVa;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct RecordingShared;
-
-    impl SharedFutexSyscall for RecordingShared {
-        fn wait_one_slice(
-            &self,
-            location: SharedFutexLocation,
-            _waiter_key: usize,
-            _val: u32,
-            _slice_ns: i64,
-        ) -> SharedWaitStep {
-            assert_eq!(location.wait_addr(), HostVa(0x1000));
-            assert_eq!(location.waiter_count_addr(), None);
-            SharedWaitStep::Woken
-        }
-
-        fn wake(&self, location: SharedFutexLocation, _waiter_key: usize, n: u32) -> i64 {
-            assert_eq!(location.wait_addr(), HostVa(0x1000));
-            assert_eq!(location.waiter_count_addr(), None);
-            i64::from(n)
-        }
-    }
-
+    /// A shared guest futex rendezvous is now entirely in-process: one waiter
+    /// parks on the carrier-wide table and a wake on the SAME `waiter_key`
+    /// releases it, with no host primitive involved.
     #[test]
-    fn direct_shared_futex_location_does_not_expose_waiter_counter() {
+    fn shared_futex_rendezvous_is_in_process() {
         let _guard = crate::thread::current_futex_table_test_guard();
-        let futex = FutexTableFutex::new(Arc::new(FutexTable::default()), RecordingShared);
+        let word = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(7)));
+        let addr = std::ptr::from_ref(word) as usize;
         let location = SharedFutexLocation::Direct {
-            word: HostVa(0x1000),
-            waiter_key: 0x1000,
+            word: HostVa(addr),
+            waiter_key: addr,
+        };
+        let futex = Arc::new(FutexTableFutex::new(Arc::new(FutexTable::default())));
+
+        let waiter = {
+            let futex = Arc::clone(&futex);
+            std::thread::spawn(move || {
+                futex.shared_wait(location, 7, test_tid(), None, &|| false, &|| {})
+            })
         };
 
+        // Wait until the waiter is actually PARKED before waking. Waking early
+        // is not a lost wake — it advances the bucket generation, so the waiter
+        // returns without parking — but then the wake reports 0 and this test
+        // would be asserting the wrong thing.
+        while carrier_shared_futex_table().waiter_count(addr as u64) == 0 {
+            std::thread::yield_now();
+        }
+        // The wake is keyed on `waiter_key`, which is what makes two guest
+        // PROCESSES meet on one word.
         assert_eq!(
-            futex.shared_wait(location, 0x2000, 7, None, &|| false, &|| {}),
-            0
+            futex.shared_wake(location, addr, 1),
+            1,
+            "the wake must report the waiter it released"
         );
-        assert_eq!(futex.shared_wake(location, 0x2000, 3), 3);
+        assert_eq!(waiter.join().unwrap(), 0, "a woken FUTEX_WAIT returns 0");
     }
 
-    struct OrderedShared {
-        state: Arc<AtomicUsize>,
-    }
-
-    impl SharedFutexSyscall for OrderedShared {
-        fn wait_start(&self, _waiter_key: usize) {
-            assert_eq!(
-                self.state.swap(1, Ordering::SeqCst),
-                0,
-                "wait_start must run first"
-            );
-        }
-
-        fn wait_one_slice(
-            &self,
-            _location: SharedFutexLocation,
-            _waiter_key: usize,
-            _val: u32,
-            _slice_ns: i64,
-        ) -> SharedWaitStep {
-            assert_eq!(
-                self.state.load(Ordering::SeqCst),
-                2,
-                "wait_enrolled callback must run before the first wait slice"
-            );
-            SharedWaitStep::Woken
-        }
-
-        fn wake(&self, _location: SharedFutexLocation, _waiter_key: usize, _n: u32) -> i64 {
-            0
-        }
+    /// The value re-check happens AFTER enrollment, so a word that already
+    /// moved returns 0 without parking rather than sleeping to its deadline.
+    #[test]
+    fn shared_wait_returns_zero_when_the_word_already_moved() {
+        let _guard = crate::thread::current_futex_table_test_guard();
+        let word = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(9)));
+        let addr = std::ptr::from_ref(word) as usize;
+        let location = SharedFutexLocation::Direct {
+            word: HostVa(addr),
+            waiter_key: addr,
+        };
+        let futex = FutexTableFutex::new(Arc::new(FutexTable::default()));
+        assert_eq!(
+            futex.shared_wait(location, 7, test_tid(), None, &|| false, &|| {}),
+            0,
+            "word is 9, the wait expected 7: no park, immediate re-check"
+        );
     }
 
     #[test]
     fn shared_wait_publishes_after_waiter_enrollment() {
         let _guard = crate::thread::current_futex_table_test_guard();
         let state = Arc::new(AtomicUsize::new(0));
-        let futex = FutexTableFutex::new(
-            Arc::new(FutexTable::default()),
-            OrderedShared {
-                state: Arc::clone(&state),
-            },
-        );
+        let word = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(9)));
+        let addr = std::ptr::from_ref(word) as usize;
         let location = SharedFutexLocation::Direct {
-            word: HostVa(0x1000),
-            waiter_key: 0x1000,
+            word: HostVa(addr),
+            waiter_key: addr,
         };
+        let futex = FutexTableFutex::new(Arc::new(FutexTable::default()));
         let mark_enrolled = || {
-            assert_eq!(
-                state.swap(2, Ordering::SeqCst),
-                1,
-                "wait_enrolled must run after wait_start"
-            );
+            state.store(1, Ordering::SeqCst);
         };
 
+        // The word (9) already differs from the wait value (7), so this returns
+        // without parking — but enrollment must still have happened first.
         assert_eq!(
-            futex.shared_wait(location, 0x2000, 7, None, &|| false, &mark_enrolled),
+            futex.shared_wait(location, 7, test_tid(), None, &|| false, &mark_enrolled),
             0
+        );
+        assert_eq!(
+            state.load(Ordering::SeqCst),
+            1,
+            "wait_enrolled must run before the value re-check and the park"
         );
     }
 
@@ -645,9 +533,9 @@ mod tests {
         let timeout = Some(Duration::from_millis(1234));
         assert_eq!(
             futex.shared_wait(
-                native_location(0x1000, 0x1000),
-                0x2000,
+                native_location(0x1000, 0x2000),
                 7,
+                test_tid(),
                 timeout,
                 &|| false,
                 &|| {}
@@ -661,6 +549,12 @@ mod tests {
             "one whole wait: host word, the EXPLICIT waiter key, value, and the \
              guest's full timeout — not a slice"
         );
+    }
+
+    /// A synthetic thread id for the futex tests: the park token only has to be
+    /// stable within the test, never to name a live guest thread.
+    fn test_tid() -> ThreadId {
+        ThreadId::synthetic_for_tests(4242)
     }
 
     /// `wait_enrolled` must fire BEFORE the park, or a kick racing the park has
@@ -678,8 +572,8 @@ mod tests {
         };
         futex.shared_wait(
             native_location(0x1000, 0x1000),
-            0x1000,
             7,
+            test_tid(),
             None,
             &|| false,
             &enroll,
@@ -702,8 +596,8 @@ mod tests {
         assert_eq!(
             futex.shared_wait(
                 native_location(0x1000, 0x1000),
-                0x1000,
                 7,
+                test_tid(),
                 None,
                 &|| true,
                 &|| {}
