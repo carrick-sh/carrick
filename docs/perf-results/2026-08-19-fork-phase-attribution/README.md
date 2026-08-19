@@ -175,12 +175,26 @@ benchmark runs as a forked child of `/bin/sh` or directly as pid 1, so the
 per-vCPU stamp is not simply being lost across fork.
 
 The handler degrades deliberately when `CONTEXTIDR_EL1` reads 0 (`cbz`, since a
-tid is never 0) and traps normally. So the question to settle is whether
-`CONTEXTIDR_EL1` actually persists: `set_sys_reg` may not stick across
-`hv_vcpu_run`, or may be reset when the M:N scheduler destroys and recreates a
-vCPU. **Read the `IDENTITY_OFF_SHIM_SYSCALLS` counter across a `gettid` loop —
-it counts syscalls serviced ENTIRELY at EL1, so it settles this in one run
-without new instrumentation.**
+tid is never 0) and traps normally.
+
+Two things have since been checked, and both narrow it:
+
+- **The stamp itself works.** `CARRICK_TIDSTAMP_DEBUG=1` reads the sysreg back
+  immediately after writing it: `set CONTEXTIDR_EL1=1 -> readback=Ok(1)`. So
+  `set_sys_reg` is not silently failing, and the degrade must happen LATER — on
+  a trap round-trip, a resume path that restores a sysreg snapshot without
+  CONTEXTIDR, or the M:N scheduler destroying and recreating the vCPU (which
+  re-stamps only via `stamp_guest_tid` at loop start).
+- **The `IDENTITY_OFF_SHIM_SYSCALLS` counter does NOT settle it**, contrary to
+  what an earlier draft of this file said. The handler increments the counter
+  BEFORE the `CONTEXTIDR` read — its own comment notes the degrade path "still
+  traps to the host AFTER counting" — so the counter cannot distinguish a hit
+  from a degrade. It can only distinguish "handler reached" from "cmp/enabled
+  check failed", which is still worth one run.
+
+The remaining question is therefore whether CONTEXTIDR_EL1 survives a trap and
+resume, and the cheap way to ask it is a read-back at the top of the run loop
+rather than at the stamp.
 
 This is worth more than the raw 11x it represents: a designed, emitted,
 unit-tested fast path that silently degrades is exactly the shape that stays
