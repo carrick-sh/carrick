@@ -303,9 +303,18 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         // preserves x16 while checking ESR_EL1. Written via the applevisor
         // `SysReg` directly: the neutral `carrick_hal::SysReg` has no
         // CONTEXTIDR_EL1 variant (it is an HVF-private fast-path detail).
-        self.inner
+        let result = self
+            .inner
             .set_sys_reg(SysReg::CONTEXTIDR_EL1, tid)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))
+            .map_err(|e| TrapError::Hypervisor(e.to_string()));
+        if std::env::var_os("CARRICK_TIDSTAMP_DEBUG").is_some() {
+            let back = self.inner.get_sys_reg(SysReg::CONTEXTIDR_EL1);
+            eprintln!(
+                "[TIDSTAMP] set CONTEXTIDR_EL1={tid} -> readback={back:?} set_ok={}",
+                result.is_ok()
+            );
+        }
+        result
     }
 
     fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
