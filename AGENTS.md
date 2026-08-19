@@ -627,6 +627,17 @@ path), and lets a "landed" change never actually land.
   in-file `mod tests` and integration suites are compiled by clippy and never
   run by `just test`/`just test-integration`).
 
+- **Ask Darwin only for what Darwin owns.** Carrick has its own kernel now, so
+  the host is the authority for real I/O and real hardware — files, sockets,
+  memory, the time source, the CPU — and for nothing else. Identity (pid/tid/
+  uid/gid/capabilities), process relationships, resource limits, the network
+  NAMESPACE view, and signal delivery between guest processes are guest state and
+  must be answered from the kernel graph keyed by the exact task. Delegating one
+  of those does not return an approximate answer, it returns the HOST'S answer:
+  `SCM_CREDENTIALS` handed guests the Mac user's uid/gid, the interface list
+  handed them the Mac's `en0` IPv6, and guest DNS through host `getaddrinfo`
+  dragged in fork-unsafe ObjC that aborted every forked child. Standing audit and
+  the ranked fix list: [`docs/host-facility-boundary.md`](docs/host-facility-boundary.md).
 - **NEVER read Linux kernel or other GPL source when implementing carrick.**
   Clean-room only: derive ABIs from man-pages/specs and the differential Docker
   oracle (`bpftrace`/observe behaviour, diff verdicts). This is
