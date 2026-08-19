@@ -2431,8 +2431,24 @@ impl SyscallDispatcher {
     /// Peer `(pid, uid, gid)` for an AF_UNIX `host_fd`, from LOCAL_PEERCRED +
     /// LOCAL_PEERPID (best-effort; 0 where unavailable). Used to synthesize the
     /// SCM_CREDENTIALS ancillary message for SO_PASSCRED. (audit M2)
-    fn peer_ucred(&self, host_fd: i32) -> (u32, u32, u32) {
-        carrick_portable::peer_ucred(host_fd)
+    /// The `ucred` an `SO_PASSCRED` receiver sees, in GUEST terms.
+    ///
+    /// Never `carrick_portable::peer_ucred(host_fd)`. That reads the HOST's
+    /// credentials and leaked them straight into the guest: measured against the
+    /// Docker oracle, a socketpair peer reported `pid=97396 uid=501 gid=20` — the
+    /// macOS pid and the Mac user's uid/gid — where Linux reports the guest's own
+    /// `pid=1 uid=0 gid=0`. Under HVPatch a host pid is the CARRIER's, identical
+    /// for every guest process, so it could never have been a valid answer either
+    /// (`identity_pid`'s own doc names that trap).
+    ///
+    /// The peer of a `socketpair` — the shape `SO_PASSCRED` receivers
+    /// overwhelmingly use, and the one Go's `TestSCMCredentials` exercises — is
+    /// the same guest process. A cross-process AF_UNIX peer would need the
+    /// endpoint registry to carry the connector's identity; until it does, this
+    /// still answers in the guest's domain rather than leaking the host's.
+    fn peer_ucred(&self, _host_fd: i32) -> (u32, u32, u32) {
+        let creds = self.cred_snapshot();
+        (self.identity_pid(), creds.euid.raw(), creds.egid.raw())
     }
 
     /// The GUEST-requested socket type for `fd` (e.g. SOCK_SEQPACKET), which can
@@ -7783,6 +7799,25 @@ impl SyscallDispatcher {
         let is_sctp_stream = self.socket_guest_protocol(fd) == Some(LINUX_IPPROTO_SCTP);
         let sctp_peek = flags & LinuxMsgFlags::PEEK.bits() != 0;
         let sctp_eor = std::cell::Cell::new(false);
+        // macOS reports MSG_TRUNC for a ZERO-length datagram read into a
+        // zero-length buffer, where nothing is truncated and Linux reports none;
+        // the genuinely-truncated case agrees on both. Telling them apart needs to
+        // know whether the datagram carried payload, and `FIONREAD` cannot say —
+        // on macOS it answers 16 for an EMPTY unix datagram and 17 for a one-byte
+        // one, i.e. it includes per-datagram accounting overhead, and subtracting
+        // a hardcoded 16 would be exactly the sort of magic offset that rots.
+        //
+        // So read into a ONE-byte scratch and look at what comes back. Linux
+        // CONSUMES a datagram read into a zero-length buffer either way, so
+        // consuming it here matches, and "did any byte arrive" answers it
+        // directly. Restricted to datagram-shaped sockets — on a stream, a byte
+        // the guest did not ask for must stay queued.
+        let datagram_shaped = matches!(
+            self.socket_guest_type(fd),
+            Some(t) if t == libc::SOCK_DGRAM || t == libc::SOCK_SEQPACKET
+        );
+        let zero_len_datagram_read = total == 0 && datagram_shaped && !is_netlink;
+        let scratch_saw_payload = std::cell::Cell::new(false);
         let recvmsg_targets: Vec<i32> = std::iter::once(host_fd.get())
             .chain(reuseport::steal_targets(host_fd.get()))
             .collect();
@@ -7796,7 +7831,7 @@ impl SyscallDispatcher {
             } else {
                 total
             };
-            let mut buf = vec![0u8; capped];
+            let mut buf = vec![0u8; if zero_len_datagram_read { 1 } else { capped }];
             let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
             // A host control buffer sized to hold the guest's requested
             // controllen (SCM_RIGHTS fd array). CMSG_SPACE for that many fds is
@@ -7914,6 +7949,14 @@ impl SyscallDispatcher {
             }
             // Remember the host msg_flags; the guest controllen + final flags
             // (incl. a possible MSG_CTRUNC) are written after fd install below.
+            let n = if zero_len_datagram_read {
+                // The guest asked for no bytes; anything the scratch caught only
+                // tells us the datagram was non-empty.
+                scratch_saw_payload.set(n > 0);
+                0
+            } else {
+                n
+            };
             guest_msg_flags.set(host_to_linux_msg_flags(hmsg.msg_flags));
             if is_sctp_stream {
                 sctp_eor.set(sctp::complete_read(host_fd.get(), n as usize, sctp_peek));
@@ -7957,6 +8000,22 @@ impl SyscallDispatcher {
             // as MSG_EOR. The TCP backing cannot say so on its own.
             if sctp_eor.get() {
                 linux_flags |= LinuxMsgFlags::EOR.bits();
+            }
+            // MSG_TRUNC reports a truncated ATOMIC record, so Linux sets it only
+            // on datagram/seqpacket sockets — a stream has no record to truncate
+            // and simply leaves the rest queued. macOS sets it on a stream too
+            // when the data does not fit.
+            if self.socket_guest_type(fd) == Some(libc::SOCK_STREAM) {
+                linux_flags &= !LinuxMsgFlags::TRUNC.bits();
+            }
+            // A zero-length read of a datagram truncates it only if it carried
+            // payload; the scratch read above answers that directly.
+            if zero_len_datagram_read {
+                if scratch_saw_payload.get() {
+                    linux_flags |= LinuxMsgFlags::TRUNC.bits();
+                } else {
+                    linux_flags &= !LinuxMsgFlags::TRUNC.bits();
+                }
             }
             let mut written_controllen = 0u64;
             if want_control {
