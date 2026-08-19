@@ -1858,8 +1858,34 @@ impl MsgQueueWaitToken {
     }
 }
 
-fn wake_msg_queue_waiters(path: &Path) {
+/// Wake everything blocked on this queue.
+///
+/// TWO wakes, because the waiter's park and this word live in different worlds.
+///
+/// The word bump is what a waiter re-validates, and it propagates on its own:
+/// the wait word is a `MAP_SHARED` file mapping, so every thread's mapping sees
+/// the same physical page even though `MSG_QUEUE_WAIT_WORD_CACHE` is
+/// thread-local and hands each thread a different host VA.
+///
+/// The WAKE does not propagate that way. A blocked `msgrcv`/`msgsnd` parks via
+/// `DispatchOutcome::WaitOnSharedWord`, which since `a1bd418d8` lands in the
+/// carrier-wide in-process `FutexTable` keyed on `waiter_key` — the queue id.
+/// The Darwin `os_sync_wait_on_address` path it replaced keyed on the PHYSICAL
+/// PAGE, which is exactly what made a host `shared_word::wake` from another
+/// thread's mapping reach the waiter. That keying is gone, so the host wake now
+/// signals a primitive nobody waits on, and the waiter sleeps until its own
+/// timeout.
+///
+/// Measured: the `sysvmsgwake` probe's `rmid_wakes_receiver` leg printed
+/// `Alarm clock` — its own 20 s alarm — under both libcs, where Linux prints
+/// `rmid_wakes_receiver=true`. It is also the mechanism behind `ltp-msgsnd06`
+/// hanging.
+///
+/// The host wake is kept for the DSR native lanes, which really do run separate
+/// host processes and still rendezvous on the physical page.
+fn wake_msg_queue_waiters(path: &Path, id: MsgQueueId) {
     let _ = with_cached_msg_queue_wait_word(path, MsgQueueWaitWord::wake_all);
+    carrick_thread::platform_futex::carrier_shared_futex_table().wake(id.raw() as u64, u32::MAX);
 }
 
 fn with_shm_nattch_file<R>(
@@ -3163,7 +3189,7 @@ fn msg_queue_try_send(
         return Ok(false);
     }
     lock.append_message(&queue, head, file_size, msg_type, payload, operator)?;
-    wake_msg_queue_waiters(&path);
+    wake_msg_queue_waiters(&path, id);
     Ok(true)
 }
 
@@ -3254,7 +3280,7 @@ fn msg_queue_receive<M: GuestMemory>(
                 head_message.payload.len(),
                 operator,
             )?;
-            wake_msg_queue_waiters(&path);
+            wake_msg_queue_waiters(&path, id);
         }
         return Ok(Some(copy_len));
     }
@@ -3294,7 +3320,7 @@ fn msg_queue_receive<M: GuestMemory>(
         queue.rtime = unix_now_secs();
         queue.lrpid = operator;
         lock.write_queue(&queue)?;
-        wake_msg_queue_waiters(&path);
+        wake_msg_queue_waiters(&path, id);
     }
     Ok(Some(copy_len))
 }
@@ -3437,7 +3463,7 @@ fn sysv_msgctl<M: GuestMemory>(
                     return Err(LINUX_EPERM);
                 }
             }
-            wake_msg_queue_waiters(&path);
+            wake_msg_queue_waiters(&path, msqid);
             remove_cached_msg_queue_wait_word(&path);
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(msg_queue_wait_path(&path));
