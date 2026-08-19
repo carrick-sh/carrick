@@ -2919,7 +2919,17 @@ fn probe_campaign_dir(target: &str, exec_backend: Option<&str>) -> PathBuf {
 /// against the oracle. `probeinit` is the direct-ELF container init shim —
 /// under the injection transport it would fork/exec ITSELF at `/tmp/p`.
 const PROBE_HELPERS: &[&str] = &["probeinit"];
-const PROBE_SOURCE_COUNT: usize = 455;
+/// Every probe source on disk, counted independently of
+/// `probe-inventory.json` so the two cannot drift together. Bump this ONLY
+/// alongside a deliberate probe addition, naming it.
+///
+/// 455 -> 459 on 2026-08-19 for four probes that earlier work added with
+/// inventory rows but without this second guard, which left the closure probe
+/// gate unable to run at all: `memfdsecret` and `uffdpolicy` (`51f0697ea`),
+/// `newmountapi` (`b6217325e`), and `overlaysymlink` (`4fb68d5fa`). The gating
+/// row count therefore moves from 858 to 866 — 433 conformance sources under
+/// arm64 musl AND GNU.
+const PROBE_SOURCE_COUNT: usize = 459;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
