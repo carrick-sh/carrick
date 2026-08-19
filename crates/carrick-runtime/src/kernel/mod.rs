@@ -13,6 +13,7 @@ pub mod foreign_mm;
 pub mod frame_inventory;
 pub mod guest_execution;
 pub mod ids;
+pub mod mm_transaction;
 pub mod objects;
 pub mod operations;
 pub mod registry;
@@ -32,6 +33,7 @@ pub use crash_capture::{
     CrashQuorumPoll, CrashRegisterFile, CrashRegisterVote,
 };
 pub use foreign_mm::ForeignMmAccess;
+pub use mm_transaction::{MmTransaction, StagedMmOp};
 
 pub use core::{
     Kernel, KernelContext, KernelError, KernelTaskBinding, Registry, RegistryInvariantError,
