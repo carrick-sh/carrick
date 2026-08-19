@@ -433,6 +433,7 @@ fn run_one(
         .stderr(Stdio::from(err_file))
         .process_group(0); // own group, so we can kill the whole guest tree
 
+    throttle_under_extreme_load();
     let start = Instant::now();
     let deadline = Duration::from_secs(timeout_s);
     let mut child = cmd.spawn()?;
@@ -528,6 +529,18 @@ fn maybe_append_crash_core_summary(stderr_path: &Path, pid: i32, argv: &[String]
                     }
                 }
             }
+        }
+    }
+}
+
+fn throttle_under_extreme_load() {
+    let Ok(ncpu) = std::thread::available_parallelism().map(|n| n.get()) else {
+        return;
+    };
+    if let Some(load) = loadavg_1m() {
+        if load >= 2.0 * ncpu as f64 {
+            // Box is severely oversubscribed; pause briefly to let bursty sibling tasks clear.
+            std::thread::sleep(Duration::from_millis(150));
         }
     }
 }
