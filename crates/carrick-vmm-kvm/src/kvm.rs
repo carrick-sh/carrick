@@ -1795,6 +1795,7 @@ impl KvmVcpu {
             // total (the shared engine already received these as zero pre-collapse).
             tpidrro_el0: 0,
             tpidr_el1: 0,
+            contextidr_el1: 0,
             actlr_el1: 0,
             // Real FP/SIMD capture via the inherent accessors (Phase 4).
             vregs: {

@@ -330,3 +330,111 @@ Ranked by evidence:
    32 to 256 live children, on top of the floor.
 3. **The raw fork syscall** — 2.76 ms against 0.093 ms with children that exit
    immediately, i.e. 30x before any population effect.
+
+---
+
+# CORRECTION — the trapping-sysreg root cause above is WRONG
+
+The section "root-cause gettid's slow fast path to a trapping sysreg read"
+(`bf2119ed5`) is retracted. `CONTEXTIDR_EL1` reads do **not** trap. The real
+cause is a lost register, and the reasoning error is worth keeping.
+
+## What actually happens
+
+`gettid`'s EL1 handler ends with `mrs x0, CONTEXTIDR_EL1; cbz x0, <trap>; eret`.
+The `cbz` is a fail-safe: an unstamped (0) tid traps to the host rather than
+returning a wrong answer. That fail-safe was firing on essentially every real
+workload, because **`CONTEXTIDR_EL1` is not carried across a vCPU rebuild.**
+
+HVF reclaim DESTROYS and recreates the vCPU, so `restore_vcpu_into` restores
+guest state field by field from `Aarch64VcpuSnapshot`. That snapshot had no
+`contextidr_el1` field. The restore code did carry `TPIDR_EL1`, under this
+comment:
+
+    // TPIDRRO_EL0 (guest-readable thread ptr) + TPIDR_EL1 (carrick's fast-gettid
+    // tid stamp) are zeroed by hv_vcpu_create, so a rebuilt vCPU ... must restore both.
+
+`TPIDR_EL1` **was** the tid stamp. It was later moved to `CONTEXTIDR_EL1` to free
+`TPIDR_EL1` as the shim's x16 scratch, and the restore list was never updated. So
+the code faithfully preserved a scratch register whose value means nothing across
+a park, and dropped the register that actually holds the tid — with a comment
+explaining why it was right to do so. That is the third instance of the
+documented failure mode in `docs/identity-and-scope-domains.md`: *a doc comment
+actively justifying the wrong behaviour.*
+
+## The trigger, and why it hid
+
+| event | gettid after |
+|---|---|
+| baseline | 124 ns |
+| `fork` + child exits | 124 ns |
+| `fork` + child `exec` | 128 ns |
+| blocking wait 400 ms | 234 ns |
+| **thread create + join** | **1,656 ns — permanent** |
+| `subprocess.run` | 1,431 ns |
+
+Thread creation is the trigger, and the degrade is permanent for the life of the
+thread. Every threaded workload — Node, Go, CPython thread pools, and anything
+calling `ctypes.util.find_library`, which shells out — paid a full host round
+trip for `gettid` from its first thread onward.
+
+It hid because **the degrade path returns the correct tid**. Only the cost
+changes, so every correctness probe passes. It also corrupted system-time
+accounting in a way the code already half-predicted: the shim counter increments
+BEFORE the fail-safe check, so a degraded `gettid` is charged the 75 ns nominal
+AND its real dispatch time. The comment calls that "a µs-scale over-approximation
+on a path whose whole point is to stay correct, not fast" — but that path was the
+COMMON path for every threaded process, not a rare one.
+
+## The reasoning error
+
+Two measurements agreed and were both explained by a wrong theory:
+
+1. The shim counter showed `gettid` charged 75.0 ns/call, identical to `getpid`
+   — read as "the handler is EL1-served end to end." It is not. The counter
+   increments before the fail-safe, so it cannot distinguish "completed at EL1"
+   from "counted, then trapped." I had written that caveat into the emitter
+   comment myself and still drew the stronger conclusion from it.
+2. Swapping the sysreg for `ESR_EL1` made it fast — read as "the sysreg class
+   traps." It actually made it fast because `ESR_EL1` is non-zero, so the
+   fail-safe stopped firing.
+
+The check that broke it was the cheapest one available and was never run: **the
+same reducer against both arms.** `syscall-floor.py` reported 1,571 ns and
+`gettid-ab.py` reported 147 ns from the *same binary*, which is what forced the
+question "what does one script do that the other does not" — the answer being
+`ctypes.util.find_library`, which spawns a subprocess. Comparing two numbers
+produced by two different harnesses is not a measurement.
+
+## Fix
+
+`contextidr_el1` is now a field of `Aarch64VcpuSnapshot`, saved and restored
+alongside `tpidr_el0`, and the stale comment is corrected. The new-thread path
+(`restore_vcpu_thread_start_into`) deliberately leaves it ZERO rather than
+inheriting the parent's stamp: zero is the fail-safe, and a stale parent tid
+would be returned silently and wrong if the caller's re-stamp ever regressed.
+
+`snapshot_serialization_roundtrips` claimed in its doc comment to round-trip
+"every field bit-exact" while asserting 9 of 21. It now asserts all of them —
+this bug class is exactly what a spot-check test misses.
+
+## Result
+
+| syscall | before | after |
+|---|---|---|
+| `getpid` | 134 ns | 134 ns |
+| `gettid` | 1,559–1,571 ns | **136 ns** (11.5x) |
+| `getppid` | 1,850 ns | 1,850 ns |
+
+Per-thread identity verified: threads 0/1/2 report tids 2/3/4 matching
+`threading.get_native_id()`, at ~130 ns, and the main thread keeps tid 1 across
+sibling churn.
+
+Reducers: `gettid-trigger2.py` (pins the trigger), `gettid-thread-identity.py`
+(per-thread correctness + cost), `gettid-reclaim-degrade.py`,
+`gettid-fork-degrade.py` (both refuted hypotheses, kept — they bound where the
+bug is NOT).
+
+**The floor claim in "Where this leaves the fork question" stands unchanged.**
+`getppid`/`getuid`/`geteuid` are still ~1,850 ns and still unwired; this fix
+repairs the one fast path that already existed and was silently dead.

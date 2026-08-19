@@ -2606,6 +2606,7 @@ fn zeroed_snapshot() -> Aarch64VcpuSnapshot {
         tpidr_el0: 0,
         tpidrro_el0: 0,
         tpidr_el1: 0,
+        contextidr_el1: 0,
         actlr_el1: 0,
         vregs: [0; 32],
         fpsr: 0,
@@ -2639,6 +2640,7 @@ fn serialize_snapshot(s: &Aarch64VcpuSnapshot) -> Vec<u8> {
         s.tpidr_el0,
         s.tpidrro_el0,
         s.tpidr_el1,
+        s.contextidr_el1,
         s.actlr_el1,
     ] {
         buf.extend_from_slice(&v.to_le_bytes());
@@ -2653,7 +2655,7 @@ fn serialize_snapshot(s: &Aarch64VcpuSnapshot) -> Vec<u8> {
 
 fn deserialize_snapshot(state: &[u8]) -> Option<Aarch64VcpuSnapshot> {
     const GPR_BYTES: usize = 31 * 8;
-    const SPECIAL_BYTES: usize = 17 * 8;
+    const SPECIAL_BYTES: usize = 18 * 8;
     const VREG_BYTES: usize = 32 * 16;
     const TOTAL: usize = GPR_BYTES + SPECIAL_BYTES + VREG_BYTES + 8;
     if state.len() < TOTAL {
@@ -2688,6 +2690,7 @@ fn deserialize_snapshot(state: &[u8]) -> Option<Aarch64VcpuSnapshot> {
     let tpidr_el0 = next();
     let tpidrro_el0 = next();
     let tpidr_el1 = next();
+    let contextidr_el1 = next();
     let actlr_el1 = next();
     let mut vregs = [0u128; 32];
     for (i, v) in vregs.iter_mut().enumerate() {
@@ -2719,6 +2722,7 @@ fn deserialize_snapshot(state: &[u8]) -> Option<Aarch64VcpuSnapshot> {
         tpidr_el0,
         tpidrro_el0,
         tpidr_el1,
+        contextidr_el1,
         actlr_el1,
         vregs,
         fpsr,
@@ -2757,6 +2761,7 @@ mod tests {
             tpidr_el0: 0x1234,
             tpidrro_el0: 0x5678,
             tpidr_el1: 0x9abc,
+            contextidr_el1: 0xd00d,
             actlr_el1: 0x2,
             vregs: [0x9; 32],
             fpsr: 0x11,
@@ -2856,12 +2861,29 @@ mod tests {
         let s = sample();
         let bytes = serialize_snapshot(&s);
         let back = deserialize_snapshot(&bytes).expect("round-trip");
+        // EVERY field, not a spot check: this snapshot is what a
+        // destroy/recreate reclaim restores a vCPU from, so a field that is
+        // silently dropped becomes guest-visible state that vanishes across a
+        // park. `contextidr_el1` is here because exactly that happened to it.
         assert_eq!(back.gprs, s.gprs);
         assert_eq!(back.pc, s.pc);
+        assert_eq!(back.pstate, s.pstate);
+        assert_eq!(back.sp_el0, s.sp_el0);
+        assert_eq!(back.sp_el1, s.sp_el1);
+        assert_eq!(back.elr_el1, s.elr_el1);
         assert_eq!(back.spsr_el1, s.spsr_el1);
         assert_eq!(back.ttbr0, s.ttbr0);
+        assert_eq!(back.ttbr1, s.ttbr1);
+        assert_eq!(back.tcr, s.tcr);
+        assert_eq!(back.sctlr, s.sctlr);
+        assert_eq!(back.mair, s.mair);
+        assert_eq!(back.vbar, s.vbar);
         assert_eq!(back.cpacr, s.cpacr);
         assert_eq!(back.tpidr_el0, s.tpidr_el0);
+        assert_eq!(back.tpidrro_el0, s.tpidrro_el0);
+        assert_eq!(back.tpidr_el1, s.tpidr_el1);
+        assert_eq!(back.contextidr_el1, s.contextidr_el1);
+        assert_eq!(back.actlr_el1, s.actlr_el1);
         assert_eq!(back.vregs, s.vregs);
         assert_eq!(back.fpsr, s.fpsr);
         assert_eq!(back.fpcr, s.fpcr);
