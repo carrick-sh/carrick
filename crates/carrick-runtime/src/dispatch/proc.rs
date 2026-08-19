@@ -4569,13 +4569,38 @@ impl SyscallDispatcher {
                 if !caller_euid.is_root() && caller_euid != target_euid {
                     return Ok(DispatchOutcome::errno(LINUX_EPERM));
                 }
-                // A permitted cross-process transfer is still unimplemented, so
-                // the peer's range reads as inaccessible — a divergence from
-                // Linux, not a permission answer. The missing piece is a
-                // foreign-mm VA→IPA→host path (and peer-side protections);
-                // see this method's doc comment. It is NOT "another VM's
-                // private RAM": under HVPatch there is exactly one VM.
-                Ok(DispatchOutcome::errno(LINUX_EFAULT))
+                let Ok(target_task) = crate::kernel::TaskId::from_abi_positive(pid.raw()) else {
+                    return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+                };
+                let Some(process) = self.hvpatch_process() else {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                };
+                let foreign = match crate::kernel::ForeignMmAccess::for_task(
+                    &process.kernel_graph(),
+                    target_task,
+                ) {
+                    Ok(f) => f,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
+                // Verify that remote iovecs are fully mapped in the peer's VMAs
+                for iov in &remote {
+                    let len = match usize::try_from(iov.iov_len) {
+                        Ok(l) => l,
+                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                    };
+                    if len > 0 && !foreign.is_range_mapped(iov.iov_base, len) {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                }
+                let (src, dst) = if is_read {
+                    (&remote, &local)
+                } else {
+                    (&local, &remote)
+                };
+                match process_vm_copy_self(&mut *cx.memory, src, dst) {
+                    Ok(value) => Ok(DispatchOutcome::Returned { value }),
+                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                }
             }
         }
     }

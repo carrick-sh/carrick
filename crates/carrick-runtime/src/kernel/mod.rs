@@ -9,6 +9,7 @@ pub mod core;
 pub mod crash_capture;
 pub mod debug;
 pub mod exec;
+pub mod foreign_mm;
 pub mod frame_inventory;
 pub mod guest_execution;
 pub mod ids;
@@ -30,6 +31,7 @@ pub use crash_capture::{
     CrashCaptureAuthority, CrashCaptureGeneration, CrashGenerationExhausted, CrashQuorum,
     CrashQuorumPoll, CrashRegisterFile, CrashRegisterVote,
 };
+pub use foreign_mm::ForeignMmAccess;
 
 pub use core::{
     Kernel, KernelContext, KernelError, KernelTaskBinding, Registry, RegistryInvariantError,
