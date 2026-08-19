@@ -147,6 +147,45 @@ deadline and the requeue truthfully reports 0. It also explains the puzzle that
 opened this investigation — test 3 passing and test 4 failing at the SAME 100
 waiters is just whether the scan sampled inside the `S` window.
 
+### Root cause, complete
+
+`grep -n "RunState::Blocked" crates/carrick-runtime/src` finds exactly TWO
+non-test publishers, and both are futex paths (`vcpu_loop/threads.rs:286` for
+the private wait, `:493` for the shared one). Meanwhile `vcpu_loop/mod.rs:4220`
+publishes `Running`/`R` at the TOP OF EVERY RUN-LOOP ITERATION, before
+`engine.next_syscall()`.
+
+So a guest that blocks in anything other than a futex — `read` on a pipe,
+`nanosleep`, `poll`, `wait4` — leaves the last `Running` standing for the whole
+park, and `/proc/<pid>/stat` reports `R`. That is precisely what the four-kind
+probe measures.
+
+The loop-top comment says otherwise:
+
+> A genuine guest-blocking wait re-publishes `Blocked` below for the duration
+> of the park (see `block_guard`).
+
+**There is no `block_guard`.** `grep` finds the identifier only inside that
+comment. It is a doc comment describing a mechanism that was never built — the
+same "comment actively justifying the wrong behaviour" pattern
+`docs/identity-and-scope-domains.md` documents.
+
+Why the futex case still reads `R`: the two futex sites do publish `Blocked`,
+but `/proc` never sees it, because `published_stat_char` returns `None` and the
+render falls through to the host/ns derivation. The comm proves which branch
+ran — the published-state branch renders the READER's own comm, and what we
+observe is the fork-time placeholder `(hvpatch-child-of-2)` instead of the
+inherited `(python3)`.
+
+### Fix shape
+
+A guest-blocking dispatch needs a real block guard: publish `Blocked` before
+parking and restore the prior state on resume, around EVERY blocking wait
+rather than in two hand-placed futex sites — an RAII guard on the dispatch
+path, so a new blocking syscall cannot silently omit it. The forked child's
+`/proc` render must then resolve the child's own published record rather than
+falling back to the fork-time seed.
+
 ### Where to look next
 
 `shared_wait` publishes `Blocked`/`S` at enrollment, and the vCPU loop publishes
