@@ -2170,12 +2170,15 @@ impl SyscallDispatcher {
     }
 
     pub(crate) fn sysv_after_fork_child(&self) {
-        let mut state = self.sysv.lock();
-        SysvIpcService::after_fork_child();
         // `self` is already the CHILD's dispatcher clone, so `identity_pid()`
         // is the child's own Linux pid — the value Linux records in `shm_lpid`
-        // for the attachments the child inherited.
+        // for the attachments the child inherited. Resolved BEFORE the sysv
+        // lock: identity takes the proc lock, and proc-then-sysv is the order
+        // the /proc renderers use (see `cleanup_sysv_shm_attachments_on_
+        // process_exit` for the deadlock this prevents).
         let lpid = self.identity_pid() as i32;
+        let mut state = self.sysv.lock();
+        SysvIpcService::after_fork_child();
         let ids = state.attachments.values().copied().collect::<Vec<_>>();
         for shmid in ids {
             if let Some(seg) = state.segments.get_mut(&shmid) {
@@ -2269,8 +2272,16 @@ impl SyscallDispatcher {
     }
 
     fn cleanup_sysv_shm_attachments_on_process_exit(&self) {
-        let mut state = self.sysv.lock();
+        // Lock ORDER: `identity_pid()` takes the proc lock, and the /proc
+        // renderers (`synthetic_proc_context` -> `/proc/sysvipc/shm`) take
+        // proc THEN sysv — so taking sysv first here and proc second is the
+        // ABBA half of a real deadlock. Observed live (multiprocessing
+        // forkserver, shared_memory tests): an exiting leader held sysv here
+        // wanting proc, while a sibling's `newfstatat("/proc/...")` held proc
+        // wanting sysv, and a third thread wedged behind them delivering
+        // SIGTERM. Resolve identity BEFORE touching the sysv lock.
         let lpid = self.identity_pid() as i32;
+        let mut state = self.sysv.lock();
         let ids = state
             .attachments
             .drain()
