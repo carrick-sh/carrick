@@ -4603,15 +4603,33 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                 }
-                let (src, dst) = if is_read {
-                    (&remote, &local)
-                } else {
-                    (&local, &remote)
-                };
-                match process_vm_copy_self(&mut *cx.memory, src, dst) {
-                    Ok(value) => Ok(DispatchOutcome::Returned { value }),
-                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
-                }
+                // The TRANSFER across address spaces is not implemented, and
+                // must not pretend otherwise. `ForeignMmAccess` authenticates
+                // the peer and answers `is_range_mapped` from its VMAs, but it
+                // carries no read/write capability — so the only copier
+                // available here is `process_vm_copy_self`, which moves bytes
+                // WITHIN THE CALLER's address space at the peer's virtual
+                // addresses. Calling it reported success and moved the wrong
+                // memory: `process_vm_readv02` asked for "test" and received
+                // `IG_DNOTIFY=y` — kconfig text out of the CALLER's own mm —
+                // and `process_vm_writev02` returned 100000 while the target
+                // found 100000 differences.
+                //
+                // A lying success is worse than an honest error, so the
+                // unimplemented direction answers EFAULT (what this syscall did
+                // before the foreign-mm work began) until the real transfer
+                // exists. Everything above stays: pid and flag validation, the
+                // `ptrace_may_access` euid check, and the peer-VMA range check
+                // are all correct and are what a real transfer will build on.
+                //
+                // What it needs: a foreign stage-1 walker plus an IPA
+                // read/write pair promoted out of `carrick-vmm-hvf`, and `prot`
+                // bits on `VmaSummary` so a write can be refused on a read-only
+                // peer mapping. Per the transaction rule, reading a peer mm's
+                // stage-1 pages needs a revision-validated read, not a naive
+                // walk.
+                let _ = (&local, &remote, is_read);
+                Ok(DispatchOutcome::errno(LINUX_EFAULT))
             }
         }
     }

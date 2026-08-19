@@ -2326,7 +2326,6 @@ impl SyscallDispatcher {
 
     fn record_rewritten_connect_addresses(
         &self,
-        fd: i32,
         family: i32,
         host_fd: i32,
         guest_peer: std::net::SocketAddr,
@@ -2366,7 +2365,6 @@ impl SyscallDispatcher {
 
     fn prepare_rewritten_connect_source(
         &self,
-        fd: i32,
         family: i32,
         host_fd: i32,
         guest_peer: std::net::SocketAddr,
@@ -2402,9 +2400,7 @@ impl SyscallDispatcher {
                 rc.host_syscall_errno()?;
             }
         }
-        self.record_rewritten_connect_addresses(
-            fd, family, host_fd, guest_peer, host_peer, protocol,
-        );
+        self.record_rewritten_connect_addresses(family, host_fd, guest_peer, host_peer, protocol);
         Ok(())
     }
 
@@ -5874,7 +5870,6 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
                 this.record_rewritten_connect_addresses(
-                    fd,
                     family,
                     host_fd.get(),
                     requested,
@@ -6010,7 +6005,6 @@ impl SyscallDispatcher {
             set_host_nonblocking(host_fd.get());
             if let Some((guest_peer, host_peer, protocol)) = rewritten_connect {
                 if let Err(errno) = this.prepare_rewritten_connect_source(
-                    fd,
                     family,
                     host_fd.get(),
                     guest_peer,
@@ -6053,7 +6047,6 @@ impl SyscallDispatcher {
                     && let Some((guest_peer, host_peer, protocol)) = rewritten_connect
                 {
                     this.record_rewritten_connect_addresses(
-                        fd,
                         family,
                         host_fd.get(),
                         guest_peer,
@@ -6083,7 +6076,6 @@ impl SyscallDispatcher {
                         && let Some((guest_peer, host_peer, protocol)) = rewritten_connect
                     {
                         this.record_rewritten_connect_addresses(
-                            fd,
                             family,
                             host_fd.get(),
                             guest_peer,
@@ -6098,7 +6090,6 @@ impl SyscallDispatcher {
             if e == LINUX_EINPROGRESS || e == LINUX_EALREADY || e == LINUX_EAGAIN {
                 if let Some((guest_peer, host_peer, protocol)) = rewritten_connect {
                     this.record_rewritten_connect_addresses(
-                        fd,
                         family,
                         host_fd.get(),
                         guest_peer,
