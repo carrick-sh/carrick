@@ -506,8 +506,11 @@ where
             }
             let retval = self.platform_futex.shared_wait(
                 location,
-                waiter_key,
                 value,
+                // Park under THIS thread's token so a thread-directed signal
+                // can wake exactly this shared waiter, instead of the old
+                // path's 20 ms interrupt polling.
+                self.this_tid,
                 timeout,
                 &interrupted,
                 &publish_wait_enrolled,

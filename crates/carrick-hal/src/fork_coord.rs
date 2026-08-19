@@ -164,8 +164,8 @@ mod tests {
         fn shared_wait(
             &self,
             _location: SharedFutexLocation,
-            _waiter_key: usize,
             _value: u32,
+            _tid: ThreadId,
             _timeout: Option<Duration>,
             _interrupted: &dyn Fn() -> bool,
             _wait_enrolled: &dyn Fn(),

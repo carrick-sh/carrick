@@ -230,6 +230,9 @@ pub fn notify_current_futex_signal_pending() {
     if let Some(table) = CURRENT_FUTEX_TABLE.lock().as_ref().and_then(Weak::upgrade) {
         table.notify_signal_pending();
     }
+    // Shared futex waiters live in the carrier-wide table, which is never the
+    // CURRENT (per-process) table — a timer-thread signal must reach them too.
+    crate::platform_futex::carrier_shared_futex_table().notify_signal_pending();
 }
 
 /// `tid`'s prctl/pthread-set name from the current process's registry, if set.
@@ -923,6 +926,114 @@ impl FutexTable {
                     if bucket.generation.load(Ordering::Acquire) != wait.generation {
                         return FutexWaitOutcome::Woken;
                     }
+                }
+                ParkResult::TimedOut => return FutexWaitOutcome::TimedOut,
+            }
+        }
+    }
+
+    /// Park while `*word == val`, with EXACT wake accounting — the shared-futex
+    /// wait.
+    ///
+    /// Deliberately NOT the generation model. `wake` advances the bucket
+    /// generation on every call, releasing every prepared-but-unparked waiter
+    /// while reporting only the threads it actually unparked. Private guest
+    /// futexes tolerate that (the guest re-checks and re-waits), but Linux
+    /// `FUTEX_WAKE` returns the number of waiters WOKEN and LTP's
+    /// `tst_checkpoint` depends on the sum of those returns reaching its waiter
+    /// count: its waker retries `FUTEX_WAKE` until the cumulative count arrives.
+    /// Under the generation model each retry silently flushed the not-yet-parked
+    /// waiters and counted nobody — the waker spun to ETIMEDOUT while every
+    /// waiter believed it had been woken (`tgkill01`, and every checkpoint user
+    /// after the shared path moved in-process).
+    ///
+    /// Instead the park validates the actual futex word under the parking-lot
+    /// bucket lock: a wake-with-word-change is observed there (no park, the
+    /// guest re-checks), and a pure wake (word unchanged, the checkpoint shape)
+    /// releases and counts exactly the threads that are parked — Linux's own
+    /// contract, which is precisely why checkpoint wakers retry.
+    ///
+    /// # Safety
+    /// `word` must point to a live, 4-byte-aligned host word that outlives the
+    /// wait (the guest mapping backing it is alive for the wait's duration).
+    pub unsafe fn wait_while_word_equals(
+        &self,
+        addr: u64,
+        word: *const std::sync::atomic::AtomicU32,
+        val: u32,
+        timeout: Option<std::time::Duration>,
+        tid: ThreadId,
+        interrupted: &dyn Fn() -> bool,
+    ) -> FutexWaitOutcome {
+        use std::cell::Cell;
+        use std::time::Instant;
+
+        let park_token = ParkToken(usize::try_from(tid.raw()).unwrap_or(0));
+        let bucket = self.bucket(addr);
+        let key = Self::bucket_key(&bucket);
+        let deadline = timeout.map(|duration| Instant::now() + duration);
+        // SAFETY: caller guarantees `word` outlives the wait.
+        let word = unsafe { &*word };
+
+        loop {
+            if word.load(Ordering::SeqCst) != val {
+                return FutexWaitOutcome::Woken;
+            }
+            if interrupted() {
+                return FutexWaitOutcome::Interrupted;
+            }
+            if let Some(deadline) = deadline
+                && Instant::now() >= deadline
+            {
+                return FutexWaitOutcome::TimedOut;
+            }
+
+            let registered = Cell::new(false);
+            let park_result = unsafe {
+                parking_lot_core::park(
+                    key,
+                    || {
+                        // Runs under the parking-lot bucket lock, which the
+                        // waker also takes: a word change followed by a wake
+                        // cannot slip between this check and the park. Reading
+                        // a foreign word here is safe for the same reason the
+                        // wait itself is. Like the generation path, the FULL
+                        // interrupt predicate must not run here (SignalState
+                        // lock inversion); signal publishers unpark with
+                        // FUTEX_SIGNAL_TOKEN, which the match below routes to
+                        // `interrupted()` outside the lock.
+                        if word.load(Ordering::SeqCst) != val {
+                            return false;
+                        }
+                        registered.set(true);
+                        bucket.waiters.fetch_add(1, Ordering::AcqRel);
+                        true
+                    },
+                    || {},
+                    |_, _| {
+                        bucket.waiters.fetch_sub(1, Ordering::AcqRel);
+                    },
+                    park_token,
+                    deadline,
+                )
+            };
+
+            match park_result {
+                ParkResult::Unparked(token) => {
+                    if registered.get() {
+                        bucket.waiters.fetch_sub(1, Ordering::AcqRel);
+                    }
+                    match token.0 {
+                        FUTEX_WAKE_TOKEN => return FutexWaitOutcome::Woken,
+                        FUTEX_SIGNAL_TOKEN if interrupted() => {
+                            return FutexWaitOutcome::Interrupted;
+                        }
+                        _ => {}
+                    }
+                }
+                ParkResult::Invalid => {
+                    // The word moved under the bucket lock; the guest re-checks.
+                    return FutexWaitOutcome::Woken;
                 }
                 ParkResult::TimedOut => return FutexWaitOutcome::TimedOut,
             }
