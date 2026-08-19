@@ -673,6 +673,15 @@ struct FutexBucket {
     /// already dropped it while it is still, in Linux terms, on the queue. A wake
     /// that trusted `waiters` alone would report — and deliver — nothing.
     enrolled: AtomicUsize,
+    /// Waiters a `FUTEX_CMP_REQUEUE` has marked for THIS futex but which have not
+    /// adopted it yet.
+    ///
+    /// A marked waiter is relinked into this futex's parking_lot queue while its
+    /// own enrollment still sits on the SOURCE. If a signal broadcast catches it
+    /// in that gap it is parked nowhere, invisible to the source (not parked) and
+    /// to this futex (not enrolled) — and a wake here would be lost exactly as it
+    /// was before wake credits existed. Counting it as a claimant closes that gap.
+    pending_redirects: AtomicUsize,
     /// Wakes owed to waiters that were enrolled but in flight when a wake ran.
     ///
     /// Linux keeps the waiter on the queue and hands it the wake directly. Carrick
@@ -688,6 +697,7 @@ impl FutexBucket {
             generation: AtomicU64::new(0),
             waiters: AtomicUsize::new(0),
             enrolled: AtomicUsize::new(0),
+            pending_redirects: AtomicUsize::new(0),
             credits: AtomicU32::new(0),
         }
     }
@@ -853,6 +863,15 @@ pub struct FutexTable {
     /// So a requeue also INFORMS the waiter, which then moves its own key and its
     /// enrollment. Waiter state and parking_lot state cannot disagree.
     requeue_redirects: ParkingMutex<HashMap<u64, u64>>,
+    /// Outstanding entries in `requeue_redirects`.
+    ///
+    /// Every unpark has to ask whether it was requeued, and taking the map's
+    /// mutex to answer "no" put a carrier-wide lock in the path of every wake —
+    /// with a signal broadcast unparking every waiter, that is ~179k acquisitions
+    /// of ONE mutex per storm, which pushed `cpython-multiprocessing_fork` from
+    /// completing in 420 s to timing out at 600 s. Requeues are rare; this makes
+    /// the common answer a single relaxed load.
+    outstanding_redirects: AtomicUsize,
 }
 
 impl FutexTable {
@@ -861,6 +880,7 @@ impl FutexTable {
             shards: Box::new(std::array::from_fn(|_| ParkingMutex::new(HashMap::new()))),
             interrupt_generation: AtomicU64::new(0),
             requeue_redirects: ParkingMutex::new(HashMap::new()),
+            outstanding_redirects: AtomicUsize::new(0),
         }
     }
 
@@ -1295,9 +1315,10 @@ impl FutexTable {
                         // waiter so it can re-check its predicate. On Linux they
                         // would still be queued and this wake would reach them, so
                         // leave a credit and count it as released.
-                        let enrolled = u32::try_from(bucket.enrolled.load(Ordering::Acquire))
-                            .unwrap_or(u32::MAX);
-                        owed = bucket.owe_wakes(n - unparked, enrolled.saturating_sub(unparked));
+                        let claimants = bucket.enrolled.load(Ordering::Acquire)
+                            + bucket.pending_redirects.load(Ordering::Acquire);
+                        let claimants = u32::try_from(claimants).unwrap_or(u32::MAX);
+                        owed = bucket.owe_wakes(n - unparked, claimants.saturating_sub(unparked));
                     }
                     UnparkToken(FUTEX_WAKE_TOKEN)
                 },
@@ -1358,8 +1379,18 @@ impl FutexTable {
                         to_mark -= 1;
                         marked += 1;
                         // Published while the bucket lock is held, so the waiter
-                        // cannot run and miss it.
-                        self.requeue_redirects.lock().insert(token.0 as u64, to);
+                        // cannot run and miss it. The destination counts it as a
+                        // claimant immediately, so a wake there reaches it even
+                        // while its own enrollment still says the source.
+                        if self
+                            .requeue_redirects
+                            .lock()
+                            .insert(token.0 as u64, to)
+                            .is_none()
+                        {
+                            self.outstanding_redirects.fetch_add(1, Ordering::AcqRel);
+                            to_bucket.pending_redirects.fetch_add(1, Ordering::AcqRel);
+                        }
                         return FilterOp::Skip;
                     }
                     FilterOp::Stop
@@ -1400,13 +1431,21 @@ impl FutexTable {
     /// parking-lot bucket lock and then this mutex, so holding this across a
     /// `park()` would invert that order.
     fn take_requeue_redirect(&self, tid: ThreadId) -> Option<u64> {
-        let mut redirects = self.requeue_redirects.lock();
-        if redirects.is_empty() {
+        // Requeues are rare and every unpark asks this question, so answer the
+        // common "no" without touching the mutex at all.
+        if self.outstanding_redirects.load(Ordering::Acquire) == 0 {
             return None;
         }
+        let mut redirects = self.requeue_redirects.lock();
         // Same encoding the park uses for its ParkToken.
         let token = usize::try_from(tid.raw()).unwrap_or(0);
-        redirects.remove(&(token as u64))
+        let destination = redirects.remove(&(token as u64))?;
+        drop(redirects);
+        self.outstanding_redirects.fetch_sub(1, Ordering::AcqRel);
+        self.bucket(destination)
+            .pending_redirects
+            .fetch_sub(1, Ordering::AcqRel);
+        Some(destination)
     }
 
     #[cfg(test)]
