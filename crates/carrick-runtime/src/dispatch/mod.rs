@@ -4611,6 +4611,10 @@ impl SyscallDispatcher {
             if let OpenDescription::HostSocket { host_fd, .. } = &*open_file.description.read() {
                 crate::dispatch::net::reuseport_leave(host_fd.raw());
                 crate::dispatch::net::recverr_close(host_fd.raw());
+                // Drop this connection's SCTP message boundaries while the fd is
+                // still open — they are keyed by address pair, and a recycled
+                // pair must not inherit a dead connection's boundaries.
+                crate::dispatch::net::sctp_forget(host_fd.raw());
                 // Same rule, same reason: a recorded guest-visible address must
                 // not outlive its socket either. It used to, and a reused fd
                 // inherited the dead socket's address — glibc's `rfc3484_sort`

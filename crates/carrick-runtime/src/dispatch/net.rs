@@ -329,6 +329,12 @@ fn host_socket_addr(host_fd: i32, _family: i32, peer: bool) -> Option<std::net::
     host_sockaddr_to_socket_addr(&sa[..used])
 }
 mod recverr;
+mod sctp;
+
+/// Drop a closed socket's SCTP message boundaries (see [`sctp`]).
+pub(crate) fn sctp_forget(host_fd: i32) {
+    sctp::forget(host_fd);
+}
 mod reuseport;
 mod support;
 
@@ -6388,6 +6394,8 @@ impl SyscallDispatcher {
             // for stream sockets so datagram ENOTCONN (a real Linux errno) is
             // untouched. (sendto01 "not connected TCP")
             let is_stream = this.socket_guest_type(fd) == Some(libc::SOCK_STREAM);
+            let is_sctp_stream =
+                is_stream && this.socket_guest_protocol(fd) == Some(LINUX_IPPROTO_SCTP);
             let nonblocking = this.io_is_nonblocking(fd, flags);
             let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
             let connected_send = dest_addr == 0;
@@ -6456,10 +6464,21 @@ impl SyscallDispatcher {
                         }
                     }
                 };
-                match n.host_syscall_errno().map(|value| value as i64) {
+                let result = match n.host_syscall_errno().map(|value| value as i64) {
                     Err(LINUX_ENOTCONN) if is_stream => Err(LINUX_EPIPE),
                     other => other,
+                };
+                // SCTP preserves message boundaries; the TCP backing does not,
+                // so record where this message ended for the receiver's MSG_EOR.
+                // `send`/`sendto` is the path CPython's socket.send() takes —
+                // hooking only `sendmsg` recorded nothing at all.
+                if is_sctp_stream
+                    && let Ok(sent) = result
+                    && sent > 0
+                {
+                    sctp::record_sent(host_fd.get(), sent as usize, sent as usize == len);
                 }
+                result
             });
             if std::env::var_os("CARRICK_NET_DEBUG").is_some() {
                 eprintln!("NETDBG sendto outcome fd={fd} connected_send={connected_send} outcome={outcome:?}");
@@ -7469,6 +7488,11 @@ impl SyscallDispatcher {
         }
         let nonblocking = self.io_is_nonblocking(fd, flags);
         let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
+        // A guest SCTP stream is backed by TCP, which carries no message
+        // boundaries; record where each message ends so the receiver can report
+        // MSG_EOR the way Linux does.
+        let is_sctp_stream = self.socket_guest_protocol(fd) == Some(LINUX_IPPROTO_SCTP);
+        let payload_len = data.len();
         let send_to = self
             .open_file(fd)
             .and_then(|f| f.description.read().send_timeout());
@@ -7512,7 +7536,17 @@ impl SyscallDispatcher {
             // call non-blocking regardless.
             let host_flags = host_flags | libc::MSG_DONTWAIT;
             let n = unsafe { libc::sendmsg(send_fd, &hmsg as *const _, host_flags) };
-            n.host_syscall_errno().map(|value| value as i64)
+            let result = n.host_syscall_errno().map(|value| value as i64);
+            // SCTP preserves message boundaries; its TCP backing does not, so
+            // record where this message ended for the receiver's MSG_EOR.
+            if is_sctp_stream
+                && let Ok(sent) = result
+                && sent > 0
+            {
+                let complete = sent as usize == payload_len;
+                sctp::record_sent(send_fd, sent as usize, complete);
+            }
+            result
         });
         Ok(outcome)
     }
@@ -7742,6 +7776,13 @@ impl SyscallDispatcher {
             recverr::poll_errors(host_fd.get());
         }
         let guest_msg_flags = std::cell::Cell::new(0i32);
+        // SCTP never merges two messages into one recvmsg and reports MSG_EOR
+        // when a read consumes the END of one. Its TCP backing has neither
+        // property, so cap the read at the current boundary and answer EOR from
+        // the recorded one.
+        let is_sctp_stream = self.socket_guest_protocol(fd) == Some(LINUX_IPPROTO_SCTP);
+        let sctp_peek = flags & LinuxMsgFlags::PEEK.bits() != 0;
+        let sctp_eor = std::cell::Cell::new(false);
         let recvmsg_targets: Vec<i32> = std::iter::once(host_fd.get())
             .chain(reuseport::steal_targets(host_fd.get()))
             .collect();
@@ -7750,7 +7791,12 @@ impl SyscallDispatcher {
             for stale in received_host_fds.borrow_mut().drain(..) {
                 unsafe { libc::close(stale) };
             }
-            let mut buf = vec![0u8; total];
+            let capped = if is_sctp_stream {
+                sctp::read_limit(host_fd.get(), total)
+            } else {
+                total
+            };
+            let mut buf = vec![0u8; capped];
             let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
             // A host control buffer sized to hold the guest's requested
             // controllen (SCM_RIGHTS fd array). CMSG_SPACE for that many fds is
@@ -7869,6 +7915,9 @@ impl SyscallDispatcher {
             // Remember the host msg_flags; the guest controllen + final flags
             // (incl. a possible MSG_CTRUNC) are written after fd install below.
             guest_msg_flags.set(host_to_linux_msg_flags(hmsg.msg_flags));
+            if is_sctp_stream {
+                sctp_eor.set(sctp::complete_read(host_fd.get(), n as usize, sctp_peek));
+            }
             Ok(n as i64)
         });
         // Install any received fds as fresh guest fds, then write the guest
@@ -7903,6 +7952,11 @@ impl SyscallDispatcher {
             // installed fd; only the echo was missing.
             if LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::CMSG_CLOEXEC) {
                 linux_flags |= LinuxMsgFlags::CMSG_CLOEXEC.bits();
+            }
+            // SCTP: this read consumed the end of a message, which Linux reports
+            // as MSG_EOR. The TCP backing cannot say so on its own.
+            if sctp_eor.get() {
+                linux_flags |= LinuxMsgFlags::EOR.bits();
             }
             let mut written_controllen = 0u64;
             if want_control {
