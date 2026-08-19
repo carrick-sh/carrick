@@ -18,6 +18,17 @@ bitflags! {
         const ORPHANED = 1 << 1;
         const DEAD = 1 << 2;
         const ADOPTED = 1 << 3;
+        /// The owner is a CARRIER TASK, not a host process.
+        ///
+        /// Under HVPatch every Linux process is a task inside one Darwin
+        /// process, so this record's `host_pid` field holds a GUEST pid. Any
+        /// host-pid liveness probe against it (`kill(pid, 0)`) is meaningless:
+        /// it names an unrelated host process or none at all. The flag lives on
+        /// the RECORD rather than in a per-process static because the arena is
+        /// shared memory and the namespace supervisor — which runs in its own
+        /// host process, where a carrier-set static reads false — is exactly
+        /// the reader that must honor it.
+        const OWNER_GUEST_TASK = 1 << 4;
     }
 }
 
@@ -25,6 +36,7 @@ pub const FLAG_ALIVE: u32 = ProcessFlags::ALIVE.bits();
 pub const FLAG_ORPHANED: u32 = ProcessFlags::ORPHANED.bits();
 pub const FLAG_DEAD: u32 = ProcessFlags::DEAD.bits();
 pub const FLAG_ADOPTED: u32 = ProcessFlags::ADOPTED.bits();
+pub const FLAG_OWNER_GUEST_TASK: u32 = ProcessFlags::OWNER_GUEST_TASK.bits();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -239,6 +251,15 @@ impl ProcessSection {
 
     pub fn release(&self, r: ProcessRecordRef) {
         if let Some(record) = self.record_for_ref(r) {
+            if std::env::var_os("CARRICK_RUNSTATE_DEBUG").is_some() {
+                eprintln!(
+                    "[RUNSTATE] release idx={} host_pid={} gen={}\n{}",
+                    r.index,
+                    record.host_pid.load(Ordering::Acquire),
+                    record.generation.load(Ordering::Acquire),
+                    std::backtrace::Backtrace::force_capture(),
+                );
+            }
             record.clear_body_for_claim();
             record.generation.store(0, Ordering::Release);
             record.host_pid.store(0, Ordering::Release);

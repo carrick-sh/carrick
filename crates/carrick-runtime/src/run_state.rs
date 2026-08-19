@@ -217,7 +217,11 @@ fn publish_for(pid: u32, state: RunState) {
 /// here distinguish "never published" from "published under the wrong pid".
 fn debug_run_state(site: &str, id: i32, tid: i32, state: RunState) {
     if std::env::var_os("CARRICK_RUNSTATE_DEBUG").is_some() {
-        eprintln!("[RUNSTATE] {site} id={id} tid={tid} state={state:?}");
+        eprintln!(
+            "[RUNSTATE] {site} id={id} tid={tid} state={state:?} section={:p} hostpid={}",
+            processes(),
+            std::process::id(),
+        );
     }
 }
 
@@ -270,6 +274,31 @@ pub fn clear_guest_tid(tid: i32) {
     }
 }
 
+/// Release the PROCESS record for an exiting guest process.
+///
+/// Under HVPatch a Linux process is a task in the carrier, not a host process,
+/// so nothing outside the guest's own lifecycle can tell that its record is
+/// finished with. The namespace supervisor's leak backstop cannot: it answers
+/// "is the owner gone?" with `kill(host_pid, 0)`, and these records are keyed
+/// by GUEST pid — a value that names no host process, so the probe returns
+/// ESRCH and the sweep released the records of LIVE guest processes. Task exit
+/// is therefore the only correct release point.
+///
+/// Clears ONLY the process-kind slot, never a `KIND_TID` entry that happens to
+/// share the low-32 value, mirroring [`clear_guest_tid`].
+pub fn clear_guest_process(pid: i32) {
+    let Ok(pid) = u32::try_from(pid) else {
+        return;
+    };
+    if pid == 0 {
+        return;
+    }
+    let section = processes();
+    if let Some(r) = find_record(section, pid, false) {
+        section.release(r);
+    }
+}
+
 fn cached_record(
     section: &ProcessSection,
     packed_ref: u64,
@@ -312,11 +341,23 @@ fn find_record(section: &ProcessSection, id: u32, want_tid: bool) -> Option<Proc
     None
 }
 
+/// Stamp whose lifetime owns this record, so a reader in ANOTHER host process
+/// (the namespace supervisor) can tell that its `host_pid` is a guest pid and
+/// that host liveness says nothing about it.
+fn mark_owner_domain(record: &carrick_kernel::process::ProcessRecord) {
+    if crate::dispatch::hvpatch_lane_active() {
+        record.flags.fetch_or(
+            carrick_kernel::process::FLAG_OWNER_GUEST_TASK,
+            Ordering::AcqRel,
+        );
+    }
+}
+
 fn claim_record(section: &ProcessSection, id: u32, want: u64, want_tid: bool) -> ProcessRecordRef {
     if let Some(r) = find_record(section, id, want_tid) {
-        section.records[r.index]
-            .run_state
-            .store(want, Ordering::Release);
+        let record = &section.records[r.index];
+        record.run_state.store(want, Ordering::Release);
+        mark_owner_domain(record);
         return r;
     }
 
@@ -344,6 +385,7 @@ fn claim_record(section: &ProcessSection, id: u32, want: u64, want_tid: bool) ->
             let ours = raw == 0 || (raw & KIND_TID == 0 && (raw & PID_MASK) as u32 == id);
             if ours {
                 record.run_state.store(want, Ordering::Release);
+                mark_owner_domain(record);
                 return ProcessRecordRef {
                     index,
                     generation: ProcessGeneration::new(generation),
@@ -355,6 +397,7 @@ fn claim_record(section: &ProcessSection, id: u32, want: u64, want_tid: bool) ->
     let generation = KernelArena::global().allocate_generation();
     match section.claim(Some(HostPid::new(id)), generation, |record| {
         record.run_state.store(want, Ordering::Relaxed);
+        mark_owner_domain(record);
     }) {
         Ok(r) => r,
         Err(err) => abort_on_arena_error(err),
@@ -477,6 +520,9 @@ pub fn published(pid: u32) -> Option<RunState> {
         {
             if raw & KIND_TID == 0 {
                 if st != RunState::Booting {
+                    if std::env::var_os("CARRICK_RUNSTATE_DEBUG").is_some() {
+                        eprintln!("[RUNSTATE] published({pid}) -> {st:?} (process record)");
+                    }
                     return Some(st); // a live process state is authoritative
                 }
                 booting_hit = Some(st); // possibly a stale seed; prefer a live entry
@@ -486,8 +532,29 @@ pub fn published(pid: u32) -> Option<RunState> {
         }
     }
     let answer = booting_hit.or(tid_hit);
-    if std::env::var_os("CARRICK_RUNSTATE_DEBUG").is_some() {
-        eprintln!("[RUNSTATE] published({pid}) -> {answer:?}");
+    if answer.is_none() && std::env::var_os("CARRICK_RUNSTATE_DEBUG").is_some() {
+        // A miss is the interesting case: dump every record that carries this
+        // id so the disagreement between what was written and what is readable
+        // is visible, rather than inferred.
+        let mut seen = 0usize;
+        for (index, record) in section.records.iter().enumerate() {
+            let hp = record.host_pid.load(Ordering::Acquire);
+            if hp != pid {
+                continue;
+            }
+            seen += 1;
+            eprintln!(
+                "[RUNSTATE]   miss({pid}) idx={index} host_pid={hp} gen={} raw={:#x} unpack={:?}",
+                record.generation.load(Ordering::Acquire),
+                record.run_state.load(Ordering::Acquire),
+                unpack(record.run_state.load(Ordering::Acquire)),
+            );
+        }
+        eprintln!(
+            "[RUNSTATE] published({pid}) -> None, records_with_id={seen} section={:p} hostpid={}",
+            section,
+            std::process::id(),
+        );
     }
     answer
 }
