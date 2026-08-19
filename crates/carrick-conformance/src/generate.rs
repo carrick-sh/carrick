@@ -318,6 +318,17 @@ fn carrick_flags_for(name: &str) -> Vec<String> {
             {
                 flags.push("--cap-add".to_string());
                 flags.push(cap.clone());
+            } else if flag == "--security-opt"
+                && let Some(opt) = it.next()
+            {
+                flags.push("--security-opt".to_string());
+                flags.push(opt.clone());
+            } else if flag.starts_with("--security-opt=") {
+                flags.push("--security-opt".to_string());
+                flags.push(flag.trim_start_matches("--security-opt=").to_string());
+            } else if flag.starts_with("--cap-add=") {
+                flags.push("--cap-add".to_string());
+                flags.push(flag.trim_start_matches("--cap-add=").to_string());
             }
         }
     }
