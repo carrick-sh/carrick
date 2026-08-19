@@ -5,7 +5,6 @@ use super::address::VmaSummary;
 use super::core::Kernel;
 use super::ids::TaskId;
 use carrick_abi::{LINUX_EFAULT, LINUX_ESRCH, LinuxErrno};
-use std::sync::Arc;
 
 /// A validated reference to another process's address space.
 #[derive(Clone, Debug)]
@@ -16,7 +15,7 @@ pub struct ForeignMmAccess {
 
 impl ForeignMmAccess {
     /// Authenticates and creates a foreign MM access handle for `target_pid`.
-    pub fn for_task(kernel: &Arc<Kernel>, target_pid: TaskId) -> Result<Self, LinuxErrno> {
+    pub fn for_task(kernel: &Kernel, target_pid: TaskId) -> Result<Self, LinuxErrno> {
         let task = kernel.registry().task(target_pid).ok_or(LINUX_ESRCH)?;
         let mm = task.shared().mm();
         let backend = mm.backend().ok_or(LINUX_EFAULT)?;

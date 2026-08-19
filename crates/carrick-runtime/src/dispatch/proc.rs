@@ -4576,7 +4576,7 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 };
                 let foreign = match crate::kernel::ForeignMmAccess::for_task(
-                    &process.kernel_graph(),
+                    process.kernel_graph().as_ref(),
                     target_task,
                 ) {
                     Ok(f) => f,
