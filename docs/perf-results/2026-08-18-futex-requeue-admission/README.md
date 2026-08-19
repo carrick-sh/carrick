@@ -98,16 +98,79 @@ process is a thread of one carrier. LTP issues ≥N of these reads over N
 processes, so the readiness barrier alone is Θ(N²) allocations under two global
 locks.
 
+## Measured, and it overturns the diagnosis above
+
+The reducer was built to separate the two pre-requeue phases. It did — and then
+refuted the mechanism this report opened with.
+
+`reducers/shared-futex-fork-ladder.py`, carrick vs the native-arm64 Docker
+oracle, run serially on signed binaries:
+
+| n | Docker fork/child | carrick fork/child | carrick scan |
+|---|---|---|---|
+| 32 | 0.12 ms | 7.93 ms | 10 ms |
+| 64 | 0.12 ms | 9.87 ms | **20 s (bound hit)** |
+| 128 | 0.11 ms | 14.97 ms | **20 s** |
+| 256 | 0.13 ms | **25.29 ms** | **20 s** |
+
+### The vCPU-lease hypothesis is REFUTED
+
+Forcing the shared-futex park to reclaim its lease unconditionally — the change
+proposed above, matching the private path — produced **identical numbers**: the
+same stuck pids (36 / 100 / 228) and the same per-child fork cost. It was
+reverted rather than shipped; a speculative no-op is not worth the risk.
+
+### What is actually happening
+
+`wake_to_reap_ms` is the discriminator. When the scan gives up on a "stuck"
+child, one `FUTEX_WAKE` releases the **entire cohort** and every child is reaped
+in ~150 ms — the same as a healthy round. **The children were parked correctly
+the whole time.** Nothing was starved for admission, and the futex layer is
+fine.
+
+The defect is that `/proc/<pid>/stat` reports `R` for a process that is parked.
+A settled one-second pass makes it unambiguous:
+
+```
+settled_states={'R': 64} non_S_indices=[0, 1, 2, ...] non_S_count=64
+```
+
+**All 64 children read `R`, in every round.** Rounds only looked healthy because
+a scan that polls immediately catches the brief window after
+`publish_wait_enrolled` publishes `S`; add a one-second settle and every child
+has reverted to `R`.
+
+That is the whole 989-row cluster. LTP will not requeue until every child reads
+`S` (`TST_PROCESS_STATE_WAIT(pid,'S',0)`, 1 ms poll, no timeout), so it waits
+forever on a state that gets retracted; the children then hit their own 5 s
+deadline and the requeue truthfully reports 0. It also explains the puzzle that
+opened this investigation — test 3 passing and test 4 failing at the SAME 100
+waiters is just whether the scan sampled inside the `S` window.
+
+### Where to look next
+
+`shared_wait` publishes `Blocked`/`S` at enrollment, and the vCPU loop publishes
+`Running`/`R` when a thread resumes guest code at the run-loop top. A parked
+waiter whose vCPU is reclaimed and later re-acquired therefore republishes `R`
+without ever leaving the futex. The run state a parked shared-futex waiter
+publishes is not stable, and stability is exactly what the guest-visible
+contract requires.
+
+This is an M:N-layer defect, not a futex or admission one. The fork cost above
+— 8-25 ms per child against Docker's flat 0.12 ms, growing with the number of
+live parked children — is a separate, real problem in the same layer and is NOT
+explained by the publication bug.
+
 ## Reducer
 
-`reducers/shared-futex-fork-ladder.c` reproduces the two pre-requeue phases at
-n = 32/64/128/256 and prints `fork_ms` and `scan_ms` separately. It issues **no
-requeue at all**, so a collapse cannot be futex semantics. RED is a `fork_ms`
-knee near the vCPU budget and/or a super-linear `scan_ms`; Docker is the
-control.
+`reducers/shared-futex-fork-ladder.py` reproduces the two pre-requeue phases and
+issues **no requeue at all**, so a collapse cannot be futex semantics. It reports
+`fork_ms`, a settled state histogram, `scan_ms`, and `wake_to_reap_ms`. The
+histogram and the wake latency are the two readings that matter; `stuck_state`
+alone is misleading, because a scan that samples early sees the transient `S`.
 
 ## Status
 
-Mechanism attributed and verified in source; **not yet fixed and not yet
-measured** — the reducer has not been run, because an authoritative closure
-measurement owned the host. Run it red-first before changing either site.
+Root cause localized and measured; **not yet fixed**. The lease change is
+reverted. Next: make a parked waiter's published run state stable across vCPU
+reclaim/re-acquire, then re-run this ladder and `ltp-futex_cmp_requeue01`.
