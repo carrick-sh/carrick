@@ -960,23 +960,38 @@ Caught live by `bt all` (three threads of one guest wedged, SIGTERM delivery
 stuck behind them). Identity is now resolved BEFORE the sysv lock in both
 sites that had the shape. Forkserver went 44 -> 182+ tests.
 
-**3. The remaining forkserver wedge is a PIPE-READINESS loss, not futex —
-ATTRIBUTED, NOT FIXED.** With per-op futex logging, the wedge at
-`WithManagerTestPool.test_apply` reduces to exactly this event sequence: three
-pool workers park on the inqueue semaphore (same file-keyed waiter_key from
-THREE different host VAs — the key derivation is correct); ONE `sem_post`
-arrives; exactly ONE worker wakes (`woke=1`, Linux-exact); that worker then
-blocks FOREVER in `Kqueue::wait` reading the task pipe — the task bytes
-written BEFORE the sem_post never become readable. Everything else idles.
-So: futex layer exact; the loss is fd/readiness — the epoll/kqueue
-fd-recycle class (guest pids reach ~1,600 by this point, so fd churn is
-heavy). Repro: `python3 -m test -v --randseed 0
-test_multiprocessing_forkserver` wedges at test_apply in ~3 min with
-everything at 0% CPU; the class passes standalone, so the recycled-fd
-history is required. Next instrument: trace the queue pipe's write fd and
-the reader's kevent registration across the preceding worker generations
-(`scripts/dtrace/epoll-*.d`, or the event ring via carrick-lldb, which holds
-fork/socket/epoll history with nothing pre-armed).
+**3. The remaining forkserver wedge: the task never reaches the queue —
+ATTRIBUTED TWO LEVELS DOWN, NOT FIXED.** Event-level futex logging plus live
+fd introspection on the wedged carrier (`WithManagerTestPool.test_apply`,
+deterministic with `--randseed 0` at ~182 tests):
+
+- The futex layer is EXACT: three pool workers park on the queue rlock with
+  the same file-keyed `waiter_key` from three different host VAs; one post
+  wakes exactly one.
+- The pipe-readiness hypothesis is REFUTED: the woken worker's kqueue waits
+  for POLLIN on host fd 305; `lldb expr ::ioctl(305, FIONREAD)` on the wedged
+  carrier returns **0 — the pipe is EMPTY**. One worker holding the read lock
+  and blocking on an empty task pipe is a pool's NORMAL idle state.
+- So the task bytes were NEVER WRITTEN. `apply()` is a remote call
+  (main -> manager over a unix socket); the manager process shows a SINGLE
+  thread parked in poll — its per-connection handler thread (which would run
+  `pool.apply` and write the task into the inqueue pipe) is absent. Meanwhile
+  main sits in a repeating TIMED-OUT private-futex loop (the ring shows the
+  same `FUTEXWAIT addr=0x40002d3d00` -> timed-out cycle), i.e. Python-level
+  timeout polling, not a socket read.
+- Next question, precisely: did the manager's connection-handler THREAD fail
+  to spawn (clone failing/starving at ~1,600 accumulated guest pids?) or exit
+  early (connection torn)? Instrument: `carrick trace` on the suite's final
+  minute filtered to clone/accept/read on the manager pid, or add the
+  thread-spawn outcome to the event ring.
+
+**Diagnostic debt found on the way (file separately):** the live kernel-debug
+snapshot (`carrick debug hvpatch-kernel --run-id ...`) refuses with
+"kernel snapshot invariant violated: mapping frame/mm/length join is missing"
+on this wedged carrier — even with `--table` selections that exclude mappings.
+Either a real torn mapping join in the live graph (worth chasing in its own
+right) or a validator bug; both matter, and it blocked fd-table introspection
+here (worked around via lsof + lldb expr).
 
 ## Session 2026-08-18 (fourth): the futex left the host OS
 
