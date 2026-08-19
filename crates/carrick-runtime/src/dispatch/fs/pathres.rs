@@ -5,6 +5,42 @@
 use super::*;
 use crate::linux_abi::LinuxErrno;
 
+/// Recursion budget shared by `canonicalize_following` and the symlink-aware
+/// `..` walk it calls.
+///
+/// The two are mutually recursive: expanding a symlink whose target contains
+/// `..` needs a symlink-aware walk, and that walk canonicalizes each symlink
+/// intermediate it meets. A cycle like `a -> b/..`, `b -> a/..` would otherwise
+/// recurse until the stack died — and LTP's ELOOP cases stack ~43 links on
+/// purpose (`stat03`, `lstat02`, `truncate03`). Past Linux's MAXSYMLINKS the
+/// answer is ELOOP, which is also what Linux reports.
+const DOTDOT_RESOLVE_MAX_DEPTH: u32 = 40;
+
+thread_local! {
+    static DOTDOT_RESOLVE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct DotdotDepthGuard;
+
+impl DotdotDepthGuard {
+    /// Enter one level, or `None` once the budget is spent.
+    fn enter() -> Option<Self> {
+        DOTDOT_RESOLVE_DEPTH.with(|depth| {
+            if depth.get() >= DOTDOT_RESOLVE_MAX_DEPTH {
+                return None;
+            }
+            depth.set(depth.get() + 1);
+            Some(Self)
+        })
+    }
+}
+
+impl Drop for DotdotDepthGuard {
+    fn drop(&mut self) {
+        DOTDOT_RESOLVE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
 impl SyscallDispatcher {
     /// Layered "is this a directory?" probe used by mkdirat / openat
     /// (O_CREAT) parent-existence checks. The synthetic /proc and
@@ -99,6 +135,31 @@ impl SyscallDispatcher {
             .map(|md| vfs_md_to_rootfs_md(path, &md))
     }
 
+    /// Join a relative symlink TARGET onto the directory holding the link.
+    ///
+    /// A `..` inside the target must be applied AFTER resolving what precedes
+    /// it: for `parent -> current/..` with `current -> .`, Linux resolves
+    /// `current` to the directory holding it and then climbs, landing in that
+    /// directory's PARENT. `join_rootfs_path` collapses `..` LEXICALLY, cancelling
+    /// it against `current` and landing back where it started — which sent
+    /// CPython's `test_tarfile.test_parent_symlink` extraction to
+    /// `outerdir/dest/evil` where Linux writes `outerdir/evil`. (The same
+    /// lexical-collapse bug is already called out at the `..` guard in
+    /// `resolve_at_path`, but that guard only fires when the INPUT path contains
+    /// `..`; here it is inside the link's target.)
+    ///
+    /// Targets without `..` keep the cheap lexical join, which is almost all of
+    /// them.
+    fn join_symlink_target(&self, parent: &str, target: &str) -> Result<String, LinuxErrno> {
+        if !target.split('/').any(|c| c == "..") {
+            return Ok(join_rootfs_path(parent, target));
+        }
+        match DotdotDepthGuard::enter() {
+            Some(_guard) => self.resolve_dotdot_symlink_aware(parent, target),
+            None => Err(crate::linux_abi::LINUX_ELOOP),
+        }
+    }
+
     pub(crate) fn canonicalize_following(&self, path: &str) -> Result<String, LinuxErrno> {
         let mut cur = path.to_string();
         for _ in 0..40 {
@@ -116,7 +177,7 @@ impl SyscallDispatcher {
                     .parent()
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "/".to_string());
-                join_rootfs_path(&parent, &target)
+                self.join_symlink_target(&parent, &target)?
             };
         }
         Err(crate::linux_abi::LINUX_ELOOP)
@@ -156,7 +217,7 @@ impl SyscallDispatcher {
                     .parent()
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "/".to_string());
-                join_rootfs_path(&parent, &target)
+                self.join_symlink_target(&parent, &target)?
             };
         }
         Err(crate::linux_abi::LINUX_ELOOP)
