@@ -297,8 +297,11 @@ fn shim_engine_or_skip(image: &AddressSpace) -> Option<HvfTrapEngine> {
         // ONE VM per process, so run these two tests in SEPARATE processes
         // (`--exact`) to exercise both — a shared `cargo test` run lets only the
         // first create a VM; the second skips.
-        Err(_) => {
-            eprintln!("[hvf-shim-test] SKIP: HVF engine unavailable");
+        Err(error) => {
+            // Say WHY. A skip that cannot explain itself is indistinguishable
+            // from a pass, and this suite skipped silently for long enough that
+            // the `gettid` EL1 fast path regressed unnoticed.
+            eprintln!("[hvf-shim-test] SKIP: HVF engine unavailable: {error}");
             None
         }
     }

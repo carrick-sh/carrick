@@ -192,9 +192,46 @@ Two things have since been checked, and both narrow it:
   from a degrade. It can only distinguish "handler reached" from "cmp/enabled
   check failed", which is still worth one run.
 
-The remaining question is therefore whether CONTEXTIDR_EL1 survives a trap and
-resume, and the cheap way to ask it is a read-back at the top of the run loop
-rather than at the stamp.
+**CONTEXTIDR_EL1 survives.** A read-back after every `hv_vcpu_run`
+(`CARRICK_TIDSTAMP_DEBUG=1`) reports `after run: CONTEXTIDR_EL1=Ok(1)` for the
+whole workload. So the sysreg is set, persists across traps, and the shim is
+installed (getpid is 128 ns, impossible for a trapping syscall). The handler
+still does not return the tid.
+
+## The reason it was never caught: the EL1 shim test suite is vacuous
+
+`crates/carrick-runtime/tests/trap_hvf.rs` contains exactly the right test —
+`el1_shim_services_gettid_from_tpidr_el1` asserts the FIRST host-visible trap is
+`exit_group` (94), not `gettid` (178), which is a direct behavioural check that
+the fast path fired. It has never run.
+
+    test el1_shim_services_gettid_from_tpidr_el1 ... ok
+    12 tests ... finished in 0.00s
+
+Twelve tests in 0.00 s is the silent-skip signature. `shim_engine_or_skip`
+returns `None` when the engine cannot be built and the test `return`s, reporting
+`ok`. Worse, it discarded the error (`Err(_)`), so the skip could not say why.
+
+Two layers, found by making it talk:
+
+1. The skip reason is **not** a missing hypervisor entitlement, which is what
+   the comment guesses. Signing the test binary changes nothing. It is
+   `AArch64 syscall mailbox slot 0 at 0x2d001e8000 is not mapped` — the fixture
+   never calls `with_syscall_mailbox_arena()`.
+2. Adding the arena gets the engine built and the guest executing, and the test
+   then fails on a second fixture gap: `syscall HVC arrived without a published
+   mailbox request`. So the fixture also needs the mailbox request protocol,
+   not just the mapping.
+
+That second failure does NOT yet discriminate — an HVC arrived, but the harness
+cannot say whether it was the `gettid` or the trailing `exit_group`. Finishing
+the fixture is the task that turns the production benchmark into a real
+regression test.
+
+Shipped from this: the skip now prints its error. The fixture change is NOT
+shipped, because a red test in `just ci` would block everyone before the harness
+work is done. The suite is still vacuous — that is now recorded rather than
+hidden, which is the point.
 
 This is worth more than the raw 11x it represents: a designed, emitted,
 unit-tested fast path that silently degrades is exactly the shape that stays
