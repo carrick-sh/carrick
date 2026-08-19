@@ -134,6 +134,36 @@ fn syscall_edits_stage1(number: u64, arg2: u64) -> bool {
     }
 }
 
+/// Restores the guest-visible `Running` state when a guest-blocking wait ends.
+///
+/// Deliberately owns no borrow of the run state: the blocking arms it wraps
+/// need `&mut self` for `complete_errno`/`complete_returned`, so a guard
+/// holding `&self` could not coexist with them. It carries the identity it
+/// publishes under instead, which is fixed for the life of the thread.
+struct GuestBlockedGuard {
+    task_pid: Option<i32>,
+    linux_tid: i32,
+    this_tid: ThreadId,
+}
+
+impl GuestBlockedGuard {
+    fn publish(&self, state: crate::run_state::RunState, stat: char) {
+        if let Some(task_pid) = self.task_pid {
+            crate::run_state::publish_task_thread(task_pid, self.linux_tid, state);
+        } else {
+            crate::run_state::publish(state);
+            crate::run_state::publish_guest_tid(self.this_tid.raw(), state);
+        }
+        crate::thread::set_current_thread_state(self.this_tid, stat);
+    }
+}
+
+impl Drop for GuestBlockedGuard {
+    fn drop(&mut self) {
+        self.publish(crate::run_state::RunState::Running, 'R');
+    }
+}
+
 fn should_keep_vcpu_for_blocking_wait(
     force_reclaim: bool,
     has_spare_capacity: bool,
@@ -1823,6 +1853,35 @@ where
         }
     }
 
+    /// Mark this thread's guest as BLOCKED for as long as the guard lives, and
+    /// restore `Running` when it drops.
+    ///
+    /// The run-loop top publishes `Running` on EVERY iteration, so a guest that
+    /// blocks keeps reading `R` unless the blocking site says otherwise. That
+    /// used to be hand-written at each site, and it was missing from most of
+    /// them: `grep RunState::Blocked` found exactly two non-test publishers in
+    /// the whole runtime, both futex paths, so `read` on a pipe, `nanosleep`,
+    /// `poll` and `wait4` all reported `R` while genuinely parked. Measured
+    /// against the Docker oracle, all four read `S` there and `R` here.
+    ///
+    /// That is not cosmetic. LTP's `TST_PROCESS_STATE_WAIT(pid,'S',0)` polls
+    /// this character every 1 ms with NO timeout, so a parent waiting for a
+    /// child to sleep waits forever — the mechanism behind
+    /// `ltp-futex_cmp_requeue01`'s 989 diverging rows.
+    ///
+    /// The run-loop comment claimed a `block_guard` already did this "for the
+    /// duration of the park". No such thing existed; the identifier appeared
+    /// only in that comment. This is it, made RAII so a blocking site cannot
+    /// return early or `?` out and silently leave the guest marked runnable.
+    fn enter_guest_blocked(&self) -> GuestBlockedGuard {
+        self.publish_thread_run_state(crate::run_state::RunState::Blocked, 'S');
+        GuestBlockedGuard {
+            task_pid: self.hvpatch_task_pid,
+            linux_tid: self.linux_tid.raw(),
+            this_tid: self.this_tid,
+        }
+    }
+
     /// Publish both process-visible and per-thread state at the points that
     /// already maintain the thread registry on mature lanes.
     fn publish_thread_run_state(&self, state: crate::run_state::RunState, stat: char) {
@@ -2889,8 +2948,9 @@ where
             }
             match outcome {
                 DispatchOutcome::BlockingHostWrite(mut write) => {
+                    // Guest-visible: this thread is parked. See `enter_guest_blocked`.
+                    let _guest_blocked = self.enter_guest_blocked();
                     self.waiter.ensure_full();
-                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     loop {
                         if self.fork_is_quiescing() {
                             self.release_and_park_vcpu_for_fork(engine)?;
@@ -2948,7 +3008,8 @@ where
                     }
                 }
                 DispatchOutcome::BlockingRecordLock(lock) => {
-                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
+                    // Guest-visible: this thread is parked. See `enter_guest_blocked`.
+                    let _guest_blocked = self.enter_guest_blocked();
                     // FdBacked (conservative): the record-lock wake is a host
                     // blocking fcntl, unproven under a released VM.
                     let reclaim = self.park_vcpu_for_blocking_wait(
@@ -2965,8 +3026,9 @@ where
                     on_timeout,
                     sig_mask,
                 } => {
+                    // Guest-visible: this thread is parked. See `enter_guest_blocked`.
+                    let _guest_blocked = self.enter_guest_blocked();
                     self.waiter.ensure_full();
-                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     // A NON-EMPTY fd set is fd-backed (kqueue readiness wake —
                     // vetoes whole-VM release; attribution cluster B); an
                     // EMPTY set (pure signal/timeout wait, e.g. ppoll(NULL))
@@ -3061,8 +3123,9 @@ where
                     sig_mask,
                     clear_on_timeout,
                 } => {
+                    // Guest-visible: this thread is parked. See `enter_guest_blocked`.
+                    let _guest_blocked = self.enter_guest_blocked();
                     self.waiter.ensure_full();
-                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     // fd-class rule: see the WaitOnFds arm.
                     let park_class = if fds.is_empty() {
                         crate::thread::VcpuParkClass::ReleaseSafe
@@ -3127,6 +3190,8 @@ where
                     on_timeout,
                     sig_mask,
                 } => {
+                    // Guest-visible: this thread is parked. See `enter_guest_blocked`.
+                    let _guest_blocked = self.enter_guest_blocked();
                     self.waiter.ensure_full();
                     let timeout = match timeout {
                         Some(duration) => {
@@ -3143,7 +3208,6 @@ where
                             None
                         }
                     };
-                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     // fd-class rule: see the WaitOnFds arm. An empty poll set
                     // (ppoll(NULL) — pure signal/timeout wait, e.g.
                     // procladder_mt's pause() sibling) is release-safe.
@@ -3202,8 +3266,9 @@ where
                     }
                 }
                 DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
+                    // Guest-visible: this thread is parked. See `enter_guest_blocked`.
+                    let _guest_blocked = self.enter_guest_blocked();
                     self.waiter.ensure_full();
-                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     // FdBacked (conservative): the wake is kqueue
                     // EVFILT_PROC readiness — same kqueue-wake family as the
                     // un-root-caused fd gap (attribution cluster B).
@@ -3247,8 +3312,9 @@ where
                     }
                 }
                 DispatchOutcome::WaitOnProcState { sig_mask, .. } => {
+                    // Guest-visible: this thread is parked. See `enter_guest_blocked`.
+                    let _guest_blocked = self.enter_guest_blocked();
                     self.waiter.ensure_full();
-                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     let reclaim = self.park_vcpu_for_blocking_wait(
                         engine,
                         crate::thread::VcpuParkClass::FdBacked,
@@ -3285,8 +3351,9 @@ where
                     }
                 }
                 DispatchOutcome::WaitOnHvpatchChild { target, sig_mask } => {
+                    // Guest-visible: this thread is parked. See `enter_guest_blocked`.
+                    let _guest_blocked = self.enter_guest_blocked();
                     self.waiter.ensure_full();
-                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     if hvpatch_child_wait_trace
                         .as_ref()
                         .is_none_or(|(traced_target, _)| *traced_target != target)
@@ -3377,6 +3444,8 @@ where
                     block_mask,
                     timeout,
                 } => {
+                    // Guest-visible: this thread is parked. See `enter_guest_blocked`.
+                    let _guest_blocked = self.enter_guest_blocked();
                     let slice = match signal_wait_slice(&mut signal_wait_deadline, timeout) {
                         Some(slice) => slice,
                         None => {
@@ -3386,7 +3455,6 @@ where
                         }
                     };
                     self.waiter.ensure_full();
-                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     // Park for reclaim-eligible waits, judged by the GUEST's
                     // overall timeout (None = indefinite sigwait), not the
                     // 50 ms service slice — otherwise signal-wait threads hold
@@ -3570,6 +3638,8 @@ where
                     duration,
                     remaining,
                 } => {
+                    // Guest-visible: this thread is parked. See `enter_guest_blocked`.
+                    let _guest_blocked = self.enter_guest_blocked();
                     // The fix for the multithreaded-fork deadlock: sleep via the
                     // waiter (NOT a blocking host nanosleep in the dispatcher) so
                     // a sleeping sibling reaches here, observes the fork-quiesce,
@@ -3597,7 +3667,6 @@ where
                         ));
                     }
                     self.waiter.ensure_full();
-                    self.publish_process_run_state(crate::run_state::RunState::Blocked);
                     // Xsignals live in a fork-shared ring, not an fd. Bound the
                     // sleep wait at the same internal slice as `io_wait` so each
                     // slice services dispatcher-owned pending state.
