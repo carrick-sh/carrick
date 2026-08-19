@@ -198,7 +198,54 @@ whole workload. So the sysreg is set, persists across traps, and the shim is
 installed (getpid is 128 ns, impossible for a trapping syscall). The handler
 still does not return the tid.
 
-## The reason it was never caught: the EL1 shim test suite is vacuous
+## Root cause: the fast path's own sysreg read traps to EL2
+
+`reducers/shim-reached.py` settles it. The handler increments
+`IDENTITY_OFF_SHIM_SYSCALLS` BEFORE reading CONTEXTIDR, and carrick converts that
+counter into `ru_stime` at 75 ns per count, so `getrusage` reports whether the
+handler ran:
+
+| syscall | charged system time |
+|---|---|
+| `getpid` | **75.1 ns/call** — exactly `EL1_SHIM_SYSCALL_NOMINAL_NS` |
+| `gettid` | **75.0 ns/call** — identical |
+| `getppid` | 179.7 ns/call — real dispatch, never counted |
+
+So `gettid` IS serviced at EL1: the handler is reached, counted, and charged NO
+dispatch time, meaning it never reaches the host. My earlier reading — "gettid
+traps" — was wrong, and the wall-clock number alone could not have told the
+difference.
+
+It is EL1-served and still costs 1,395 ns. The two handlers are otherwise the
+same shape (~14 instructions, both do `MRS x16, TPIDR_EL1`), and `TPIDR_EL1`
+access is provably cheap because every syscall performs it and `getpid` totals
+128 ns. The single-variable difference is:
+
+    getpid:  ldr w0, [x0, #IDENTITY_OFF_PID]      ; ordinary memory read
+    gettid:  mrs x0, CONTEXTIDR_EL1               ; VM-control sysreg read
+
+**CONTEXTIDR_EL1 is architecturally a virtual-memory control register**, and
+reads of that class trap to EL2 when `HCR_EL2.TRVM` is set. carrick never
+configures `HCR_EL2` — HVF owns EL2 — so the guest cannot read it back, and this
+is inference rather than a direct measurement of the bit. But it is a
+single-variable difference between two otherwise-identical, individually-timed
+handlers, and it accounts for the whole ~1,270 ns gap.
+
+**The fix is to hold the per-vCPU tid in a register whose EL1 read does not
+trap.** Note the stale comment on `set_guest_thread_id` still says "HVF stamps
+TPIDR_EL1" — the tid apparently used to live there and was moved to
+CONTEXTIDR_EL1 to free TPIDR_EL1 as the x16 scratch. That move is what cost the
+fast path its speed, and the naive swap-back does not work: the dispatcher WRITES
+the scratch (`MSR TPIDR_EL1, x16`) on every syscall, and a write to a VM-control
+register traps under `HCR_EL2.TVM` for the same reason. The scratch and the tid
+both need non-trapping homes.
+
+The cheap confirmation, before designing that: point the gettid handler at
+`TPIDR_EL1` and stamp the tid there, breaking the x16 scratch deliberately. If
+the cost drops to ~128 ns, the trap is confirmed and the design question is only
+where the scratch goes.
+
+## Why it was never caught: the EL1 shim test suite is vacuous
 
 `crates/carrick-runtime/tests/trap_hvf.rs` contains exactly the right test —
 `el1_shim_services_gettid_from_tpidr_el1` asserts the FIRST host-visible trap is
