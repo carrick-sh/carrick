@@ -939,6 +939,45 @@ ratio (145.02x and 67.02x, both of which were the oracle hanging).
   unrecoverable. Evidence that matters is now committed under
   `docs/perf-results/`.
 
+## Session 2026-08-18 (fifth): WNOHANG, the sysv ABBA, and the pipe residue
+
+Three defects out of the forkserver grind, two fixed, one attributed:
+
+**1. `waitpid(WNOHANG)` could block — FIXED (`51e800332`).** The kernel-graph
+child-wait helpers ignored `nohang` and parked on `wait_for_reservation_change`
+(unbounded condvar inside dispatch, invisible to fork-quiesce kicks) whenever a
+reservation was mid-flight — typically the waiting process's OWN fork. That is
+CPython `Pool._join_exited_workers`'s exact shape. TaskBusy now reports
+StillRunning; blocking waits re-poll via the vcpu loop's bounded park;
+`exit_thread`'s retry deliberately still blocks. **Result:
+`cpython-multiprocessing_fork` CLOSED** (600 s timeout at 69 tests ->
+`Result: SUCCESS`, 395 tests, 228 s).
+
+**2. sysv/proc ABBA deadlock — FIXED (`e80513490`).** An exiting leader took
+the sysv lock then called `identity_pid()` (proc lock) while a sibling's
+`newfstatat("/proc/...")` held proc wanting sysv for `/proc/sysvipc/shm`.
+Caught live by `bt all` (three threads of one guest wedged, SIGTERM delivery
+stuck behind them). Identity is now resolved BEFORE the sysv lock in both
+sites that had the shape. Forkserver went 44 -> 182+ tests.
+
+**3. The remaining forkserver wedge is a PIPE-READINESS loss, not futex —
+ATTRIBUTED, NOT FIXED.** With per-op futex logging, the wedge at
+`WithManagerTestPool.test_apply` reduces to exactly this event sequence: three
+pool workers park on the inqueue semaphore (same file-keyed waiter_key from
+THREE different host VAs — the key derivation is correct); ONE `sem_post`
+arrives; exactly ONE worker wakes (`woke=1`, Linux-exact); that worker then
+blocks FOREVER in `Kqueue::wait` reading the task pipe — the task bytes
+written BEFORE the sem_post never become readable. Everything else idles.
+So: futex layer exact; the loss is fd/readiness — the epoll/kqueue
+fd-recycle class (guest pids reach ~1,600 by this point, so fd churn is
+heavy). Repro: `python3 -m test -v --randseed 0
+test_multiprocessing_forkserver` wedges at test_apply in ~3 min with
+everything at 0% CPU; the class passes standalone, so the recycled-fd
+history is required. Next instrument: trace the queue pipe's write fd and
+the reader's kevent registration across the preceding worker generations
+(`scripts/dtrace/epoll-*.d`, or the event ring via carrick-lldb, which holds
+fork/socket/epoll history with nothing pre-armed).
+
 ## Session 2026-08-18 (fourth): the futex left the host OS
 
 **Directive from the owner, stated twice and standing:** the runtime is all too
