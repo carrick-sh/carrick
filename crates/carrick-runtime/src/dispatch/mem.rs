@@ -501,6 +501,87 @@ fn debug_mmap_next_lowering(old: u64, new: u64) {
     }
 }
 
+/// Lower the bump cursor to `new_next`, restoring BOTH halves of the invariant
+/// stated on `mmap_next`: everything at/above the cursor is unallocated, AND no
+/// `free_regions` entry describes memory at/above it.
+///
+/// Only the first half was ever maintained. The absorb loop reclaims regions
+/// CONTIGUOUS BELOW the new cursor, but a lowering can jump PAST an interior
+/// hole — a superset `munmap` over a range that already had one — and that hole
+/// then sits recorded above the cursor. From there the two hand-out paths
+/// disagree: the free-list first fit returns the stale region, and the bump
+/// path, which never consults `free_regions`, climbs over the same VA and
+/// returns it a SECOND time. The second hand-out is below `mmap_writable_high`,
+/// so it is flagged `stale` and its anonymous-reuse scrub memsets the first
+/// grant's LIVE mapping to zero.
+///
+/// Reproduced in about a second with no threads and no fork by
+/// `docs/perf-results/2026-08-18-mmap-double-grant/reducers/arena-double-grant.py`:
+/// carrick returned `alias=True zeroed_of_first=131072` where Docker returned
+/// `alias=False zeroed_of_first=0`.
+///
+/// Dropping an entry at/above the cursor loses nothing — by the invariant that
+/// memory is already unallocated, and the bump path will hand it out again.
+fn lower_mmap_next(mmap_next: &mut u64, free_regions: &mut Vec<(u64, u64)>, new_next: u64) {
+    let lowered_from = *mmap_next;
+    *mmap_next = new_next;
+    // Absorb anything contiguous BELOW the new cursor, repeatedly: each
+    // absorbed region can expose another one below it.
+    while let Some(pos) = free_regions
+        .iter()
+        .position(|&(s, l)| s.checked_add(l) == Some(*mmap_next))
+    {
+        let (s, _l) = free_regions.remove(pos);
+        *mmap_next = s;
+    }
+    let cursor = *mmap_next;
+    free_regions.retain_mut(|(start, len)| {
+        let end = start.saturating_add(*len);
+        if *start >= cursor {
+            false
+        } else if end > cursor {
+            // Straddles the cursor: keep only the part that is still below it.
+            *len = cursor - *start;
+            true
+        } else {
+            true
+        }
+    });
+    debug_assert!(
+        free_regions
+            .iter()
+            .all(|&(s, l)| s.saturating_add(l) <= cursor),
+        "free region at/above mmap_next {cursor:#x} after lowering from {lowered_from:#x}",
+    );
+    debug_mmap_next_lowering(lowered_from, cursor);
+}
+
+/// Remove `[addr, addr+len)` from the free list, splitting any entry it only
+/// partially covers.
+///
+/// A `MAP_FIXED` allocation inside the arena consumes VA that the free list may
+/// still be holding; leaving it listed lets the first fit hand the same address
+/// out underneath the live fixed mapping — the same double grant
+/// [`lower_mmap_next`] describes, reached from the other direction.
+fn free_regions_remove_range(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
+    let end = addr.saturating_add(len);
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(regions.len() + 1);
+    for &(s, l) in regions.iter() {
+        let e = s.saturating_add(l);
+        if e <= addr || s >= end {
+            out.push((s, l));
+            continue;
+        }
+        if s < addr {
+            out.push((s, addr - s));
+        }
+        if e > end {
+            out.push((end, e - end));
+        }
+    }
+    *regions = out;
+}
+
 /// Insert `[addr, addr+len)` into `regions` (sorted by start), coalescing any
 /// adjacent or overlapping ranges. `len` must be > 0.
 fn free_regions_insert(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
@@ -2266,12 +2347,34 @@ impl SyscallDispatcher {
             // itself — not the plain bump that inherits its pages afterwards.
             // Raising it here is cheap and keeps the invariant whole: every way
             // a range becomes writable raises the watermark.
-            if prot & LINUX_PROT_WRITE != 0
-                && range_within(requested, length, layout.mmap_base, layout.mmap_size)
+            if range_within(requested, length, layout.mmap_base, layout.mmap_size)
                 && let Some(end) = requested.checked_add(length)
             {
                 let mut mem = self.mem.lock();
-                mem.mmap_writable_high = mem.mmap_writable_high.max(end);
+                if prot & LINUX_PROT_WRITE != 0 {
+                    mem.mmap_writable_high = mem.mmap_writable_high.max(end);
+                }
+                // A `MAP_FIXED` inside the arena ALLOCATES arena VA, so both
+                // hand-out paths have to be told. Neither was: the free list
+                // could still be holding this range, and the bump cursor stayed
+                // below it and later climbed straight over it — handing the same
+                // address out a second time and scrubbing the live mapping to
+                // zero. See `lower_mmap_next` for the full mechanism and the
+                // one-second reducer.
+                free_regions_remove_range(&mut mem.free_regions, requested, length);
+                if end > mem.mmap_next {
+                    // Skipping ahead would strand `[mmap_next, requested)`
+                    // forever, so hand it to the free list rather than lose it.
+                    let gap_start = mem.mmap_next;
+                    if requested > gap_start {
+                        free_regions_insert(
+                            &mut mem.free_regions,
+                            gap_start,
+                            requested - gap_start,
+                        );
+                    }
+                    mem.mmap_next = end;
+                }
             }
             return Some((requested, false));
         }
@@ -4290,17 +4393,8 @@ impl SyscallDispatcher {
                 std::process::abort();
             }
             if address.0.checked_add(aligned_len) == Some(mem.mmap_next) {
-                let lowered_from = mem.mmap_next;
-                mem.mmap_next = address.0;
-                while let Some(pos) = mem
-                    .free_regions
-                    .iter()
-                    .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
-                {
-                    let (s, _l) = mem.free_regions.remove(pos);
-                    mem.mmap_next = s;
-                }
-                debug_mmap_next_lowering(lowered_from, mem.mmap_next);
+                let mem = &mut *mem;
+                lower_mmap_next(&mut mem.mmap_next, &mut mem.free_regions, address.0);
             } else {
                 free_regions_insert(&mut mem.free_regions, address.0, aligned_len);
             }
@@ -5125,17 +5219,8 @@ impl SyscallDispatcher {
                     this.remove_mapping_metadata(tail_start, tail_len);
                     let mut mem = this.mem.lock();
                     if tail_end == mem.mmap_next {
-                        let lowered_from = mem.mmap_next;
-                        mem.mmap_next = tail_start;
-                        while let Some(pos) = mem
-                            .free_regions
-                            .iter()
-                            .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
-                        {
-                            let (s, _l) = mem.free_regions.remove(pos);
-                            mem.mmap_next = s;
-                        }
-                        debug_mmap_next_lowering(lowered_from, mem.mmap_next);
+                        let mem = &mut *mem;
+                        lower_mmap_next(&mut mem.mmap_next, &mut mem.free_regions, tail_start);
                     } else {
                         free_regions_insert(&mut mem.free_regions, tail_start, tail_len);
                     }
@@ -5274,9 +5359,12 @@ impl SyscallDispatcher {
                         this.remove_mapping_metadata(old_address.0, old_size);
                         let mut mem = this.mem.lock();
                         if old_end == mem.mmap_next {
-                            let lowered_from = mem.mmap_next;
-                            mem.mmap_next = old_address.0;
-                            debug_mmap_next_lowering(lowered_from, mem.mmap_next);
+                            let mem = &mut *mem;
+                            lower_mmap_next(
+                                &mut mem.mmap_next,
+                                &mut mem.free_regions,
+                                old_address.0,
+                            );
                         } else {
                             free_regions_insert(&mut mem.free_regions, old_address.0, old_size);
                         }
@@ -5483,17 +5571,12 @@ impl SyscallDispatcher {
                     this.remove_mapping_metadata(old_address.0, old_size);
                     let mut mem = this.mem.lock();
                     if old_address.0.checked_add(old_size) == Some(mem.mmap_next) {
-                        let lowered_from = mem.mmap_next;
-                        mem.mmap_next = old_address.0;
-                        while let Some(pos) = mem
-                            .free_regions
-                            .iter()
-                            .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
-                        {
-                            let (s, _l) = mem.free_regions.remove(pos);
-                            mem.mmap_next = s;
-                        }
-                        debug_mmap_next_lowering(lowered_from, mem.mmap_next);
+                        let mem = &mut *mem;
+                        lower_mmap_next(
+                            &mut mem.mmap_next,
+                            &mut mem.free_regions,
+                            old_address.0,
+                        );
                     } else {
                         free_regions_insert(&mut mem.free_regions, old_address.0, old_size);
                     }
@@ -6297,9 +6380,8 @@ impl SyscallDispatcher {
         mark_range_unmapped(memory, address, len_usize);
         let mut mem = self.mem.lock();
         if address.checked_add(len) == Some(mem.mmap_next) {
-            let lowered_from = mem.mmap_next;
-            mem.mmap_next = address;
-            debug_mmap_next_lowering(lowered_from, mem.mmap_next);
+            let mem = &mut *mem;
+            lower_mmap_next(&mut mem.mmap_next, &mut mem.free_regions, address);
         } else {
             free_regions_insert(&mut mem.free_regions, address, len);
         }
