@@ -84,6 +84,42 @@ impl NetworkForkGuard<'_> {
     }
 }
 
+/// Identifies ONE socket in the address registry.
+///
+/// It is the **host** fd, deliberately, and it is a newtype so the domain
+/// cannot be confused again. The registry used to be keyed by the guest fd
+/// NUMBER, which is wrong in three independent ways: a guest fd number is
+/// meaningful only inside one Linux process (and under HVPatch every process
+/// shares this one registry), `dup`/`dup2` give one socket several numbers, and
+/// — decisively — nothing purged an entry on `close`, so a number handed back
+/// out by the kernel inherited the dead socket's address.
+///
+/// glibc's `rfc3484_sort` does exactly that: it closes an `AF_INET` probe
+/// socket and immediately opens an `AF_INET6` one, which lands on the same fd
+/// number and was handed the dead socket's `sockaddr_in`. `getaddrinfo` then
+/// aborted the guest with
+/// `assertion failed: a1->source_addr.sin6_family == PF_INET6`.
+///
+/// The host fd is the identity the socket's teardown already keys on
+/// (`reuseport_leave`/`recverr_close` beside it), it is shared by `dup`ed fds
+/// exactly as the address should be, and it is unique while the socket lives.
+/// Host fds ARE reused after close, which is precisely why
+/// [`NetworkProvider::forget_socket_addresses`] must run when the last
+/// reference goes away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SocketKey(i32);
+
+impl SocketKey {
+    /// The ONLY constructor: name the domain at the call site.
+    pub fn for_host_fd(host_fd: i32) -> Self {
+        Self(host_fd)
+    }
+
+    pub fn raw(self) -> i32 {
+        self.0
+    }
+}
+
 pub trait NetworkProvider: Send + Sync {
     fn capabilities(&self) -> NetworkCapabilities;
     /// Nonblocking provider fork exclusion. Returning `None` means the caller
@@ -114,7 +150,7 @@ pub trait NetworkProvider: Send + Sync {
     fn record_socket_addresses(
         &self,
         _namespace_id: Option<&NetworkNamespaceId>,
-        _guest_fd: i32,
+        _socket: SocketKey,
         _guest_local: Option<GuestSocketAddr>,
         _host_local: Option<HostSocketAddr>,
         _guest_peer: Option<GuestSocketAddr>,
@@ -122,12 +158,22 @@ pub trait NetworkProvider: Send + Sync {
     ) -> Result<(), String> {
         Ok(())
     }
-    fn guest_visible_local_addr(&self, _guest_fd: i32) -> Result<Option<GuestSocketAddr>, String> {
+    fn guest_visible_local_addr(
+        &self,
+        _socket: SocketKey,
+    ) -> Result<Option<GuestSocketAddr>, String> {
         Ok(None)
     }
-    fn guest_visible_peer_addr(&self, _guest_fd: i32) -> Result<Option<GuestSocketAddr>, String> {
+    fn guest_visible_peer_addr(
+        &self,
+        _socket: SocketKey,
+    ) -> Result<Option<GuestSocketAddr>, String> {
         Ok(None)
     }
+    /// Drop `socket`'s recorded addresses. MUST be called when the last
+    /// reference to the socket goes away, because host fds are reused: an entry
+    /// that outlives its socket is handed to whatever opens next.
+    fn forget_socket_addresses(&self, _socket: SocketKey) {}
     fn translate_recv_addr(
         &self,
         _host_addr: HostSocketAddr,
