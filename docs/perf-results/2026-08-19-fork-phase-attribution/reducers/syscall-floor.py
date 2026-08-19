@@ -35,7 +35,14 @@ def bench(label, call):
     print(f"{label:16s} {N} calls in {d*1000:8.1f} ms = {d*1e9/N:8.0f} ns/call", flush=True)
 
 
+SYS_getppid, SYS_getuid, SYS_geteuid = 173, 174, 175
 ts = Ts()
+# getpid is the only entry in IDENTITY_SYSCALLS; gettid has its own designed
+# CONTEXTIDR_EL1 fast path; getppid/getuid/geteuid are gated as fast-path-safe
+# but have no handler, so they are the "definitely traps" control group.
 bench("getpid", lambda: libc.syscall(SYS_getpid))
 bench("gettid", lambda: libc.syscall(SYS_gettid))
+bench("getppid", lambda: libc.syscall(SYS_getppid))
+bench("getuid", lambda: libc.syscall(SYS_getuid))
+bench("geteuid", lambda: libc.syscall(SYS_geteuid))
 bench("clock_gettime", lambda: libc.syscall(SYS_clock_gettime, 1, ctypes.byref(ts)))

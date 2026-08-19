@@ -145,7 +145,49 @@ pub const IDENTITY_SYSCALLS: &[(u16, u64)] = &[(172, IDENTITY_OFF_PID)];
 and `stamp_identity_values` writes only the pid and the enable flag. The other
 six are gated as fast-path-safe and then take the full trap.
 
-### What extending it costs, honestly
+### `gettid` has a fast path that never fires
+
+Correcting my own first reading: `gettid` is NOT missing a fast path. It has a
+dedicated one — the EL1 vector reads `CONTEXTIDR_EL1`, which
+`Aarch64Vcpu::stamp_guest_thread_id` writes per vCPU
+(`hvf_aarch64_engine.rs:299`), with the handler emitted at `memory.rs:3015` and
+its opcodes asserted by unit tests at `memory.rs:5053-5132`.
+
+It does not fire. Measured against a control group that definitely traps —
+`getppid`, `getuid` and `geteuid` are gated fast-path-safe but have no handler
+at all:
+
+| syscall | ns/call | serviced |
+|---|---:|---|
+| `getpid` | 125-137 | EL1, identity page |
+| `gettid` | 1,395-1,426 | **traps** |
+| `getppid` | 1,697-1,699 | traps (no handler) |
+| `getuid` | 1,677-1,691 | traps (no handler) |
+| `geteuid` | 1,681-1,696 | traps (no handler) |
+| `clock_gettime` | 1,986-1,994 | traps |
+
+`gettid` sits with the trapping group, not with `getpid`. It is ~16% below the
+control group, which is consistent with exiting the `cmp` chain earlier rather
+than with being serviced at EL1.
+
+Not a fork-inheritance problem: the numbers above are identical whether the
+benchmark runs as a forked child of `/bin/sh` or directly as pid 1, so the
+per-vCPU stamp is not simply being lost across fork.
+
+The handler degrades deliberately when `CONTEXTIDR_EL1` reads 0 (`cbz`, since a
+tid is never 0) and traps normally. So the question to settle is whether
+`CONTEXTIDR_EL1` actually persists: `set_sys_reg` may not stick across
+`hv_vcpu_run`, or may be reset when the M:N scheduler destroys and recreates a
+vCPU. **Read the `IDENTITY_OFF_SHIM_SYSCALLS` counter across a `gettid` loop —
+it counts syscalls serviced ENTIRELY at EL1, so it settles this in one run
+without new instrumentation.**
+
+This is worth more than the raw 11x it represents: a designed, emitted,
+unit-tested fast path that silently degrades is exactly the shape that stays
+broken, because every test that checks the RESULT still passes — the trap path
+returns the same tid.
+
+### What extending the identity page costs, honestly
 
 The page is 16 KiB with three fields used, so space is not the constraint;
 INVALIDATION is. Each addition carries a distinct obligation:
@@ -160,9 +202,16 @@ INVALIDATION is. Each addition carries a distinct obligation:
   per-MM, and the tid is per-THREAD, so a single page cannot carry it. It needs
   a per-thread slot the shim can index without a trap.
 
-So the cheap, safe subset is the four credential syscalls plus `getppid`,
-provided the re-stamp hangs off the existing credential/parent authority rather
-than a second copy.
+**And the credential subset is not available at all.** The page layout comment
+is explicit that credentials are deliberately absent: "Linux credentials may
+diverge per thread, while this page is shared by every vCPU in the process",
+and `IDENTITY_SYSCALLS`' own comment says "Per-thread credentials must trap
+through the captured KernelContext dispatch path." Putting `getuid`/`geteuid`/
+`getgid`/`getegid` on this page would be WRONG, not merely risky — I had
+planned to do exactly that before reading the layout.
+
+That leaves `getppid` as the only page-eligible addition, and the real win is
+repairing the `gettid` path that already exists.
 
 ## Caveat on these numbers
 
