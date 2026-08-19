@@ -266,9 +266,15 @@ fn main() {
         return;
     }
 
-    println!("fork_ok=true");
+    // Print only AFTER the child subtree has exited. The parent and the child
+    // both write to stdout, so printing here before the wait races the child's
+    // own lines and the gate — which compares output LINE BY LINE — sees the two
+    // orderings as a divergence even though every value matches. Both orderings
+    // are legal on Linux (nothing orders a parent against its child after fork),
+    // so the race was in the probe, not in either runtime.
     let mut status = 0;
     let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
     let exit_ok = waited == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    println!("fork_ok=true");
     println!("child_exit_ok={exit_ok}");
 }

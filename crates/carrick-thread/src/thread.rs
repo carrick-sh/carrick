@@ -63,7 +63,7 @@
 //!     generation check).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex as ParkingMutex;
@@ -662,7 +662,24 @@ fn futex_park_validation_active_for_tests() -> bool {
 
 struct FutexBucket {
     generation: AtomicU64,
+    /// Waiters currently PARKED in parking_lot on this futex.
     waiters: AtomicUsize,
+    /// Waiters logically inside `FUTEX_WAIT` on this futex, whether or not they
+    /// are parked at this instant.
+    ///
+    /// The two differ exactly in the window that loses wakes. A signal broadcast
+    /// unparks every waiter so each can re-check its interrupt predicate; between
+    /// that unpark and the re-park a waiter is queued NOWHERE, so `waiters` has
+    /// already dropped it while it is still, in Linux terms, on the queue. A wake
+    /// that trusted `waiters` alone would report — and deliver — nothing.
+    enrolled: AtomicUsize,
+    /// Wakes owed to waiters that were enrolled but in flight when a wake ran.
+    ///
+    /// Linux keeps the waiter on the queue and hands it the wake directly. Carrick
+    /// cannot, so the wake leaves a credit the waiter claims instead of re-parking.
+    /// Reset when the last waiter leaves, so a credit can never outlive the waiters
+    /// it was meant for.
+    credits: AtomicU32,
 }
 
 impl FutexBucket {
@@ -670,6 +687,107 @@ impl FutexBucket {
         Self {
             generation: AtomicU64::new(0),
             waiters: AtomicUsize::new(0),
+            enrolled: AtomicUsize::new(0),
+            credits: AtomicU32::new(0),
+        }
+    }
+
+    /// Claim one owed wake, if any. Only a waiter that has actually enqueued may
+    /// claim: a wake that ran before this waiter ever queued must not reach it,
+    /// which is what Linux does by simply not finding it on the queue.
+    fn claim_wake_credit(&self) -> bool {
+        self.credits
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |credits| {
+                credits.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    /// Owe `want` wakes to in-flight waiters, capped so the total owed never
+    /// exceeds the waiters that could still claim them. Returns how many were
+    /// actually owed, which the caller reports as released — Linux would have
+    /// delivered them.
+    fn owe_wakes(&self, want: u32, claimants: u32) -> u32 {
+        let mut owed = self.credits.load(Ordering::Acquire);
+        loop {
+            let room = claimants.saturating_sub(owed);
+            let add = want.min(room);
+            if add == 0 {
+                return 0;
+            }
+            match self.credits.compare_exchange_weak(
+                owed,
+                owed + add,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return add,
+                Err(observed) => owed = observed,
+            }
+        }
+    }
+}
+
+/// A waiter's LOGICAL enrollment on the futex it is CURRENTLY queued on.
+///
+/// Enrollment is taken inside the park's validate closure, under the parking-lot
+/// bucket lock, so a wake taking that same lock can never decide the waiter does
+/// not exist. It is held across every re-park, follows the waiter when a
+/// `FUTEX_CMP_REQUEUE` moves it, and is released however the wait returns.
+struct FutexEnrollment {
+    bucket: std::cell::RefCell<Arc<FutexBucket>>,
+    enrolled: std::cell::Cell<bool>,
+}
+
+impl FutexEnrollment {
+    fn new(bucket: Arc<FutexBucket>) -> Self {
+        Self {
+            bucket: std::cell::RefCell::new(bucket),
+            enrolled: std::cell::Cell::new(false),
+        }
+    }
+
+    fn bucket(&self) -> Arc<FutexBucket> {
+        self.bucket.borrow().clone()
+    }
+
+    fn is_enrolled(&self) -> bool {
+        self.enrolled.get()
+    }
+
+    /// Take enrollment on the current futex. Idempotent: a waiter enrolls once
+    /// and stays enrolled across every re-park.
+    fn enroll(&self) {
+        if !self.enrolled.get() {
+            self.enrolled.set(true);
+            self.bucket.borrow().enrolled.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Follow a `FUTEX_CMP_REQUEUE` to `destination`. The destination is joined
+    /// BEFORE the source is left, so there is no instant at which the waiter is
+    /// enrolled nowhere and a wake on either futex could miss it.
+    fn move_to(&self, destination: Arc<FutexBucket>) {
+        if self.enrolled.get() {
+            destination.enrolled.fetch_add(1, Ordering::AcqRel);
+            self.release(&self.bucket.borrow().clone());
+        }
+        *self.bucket.borrow_mut() = destination;
+    }
+
+    fn release(&self, bucket: &Arc<FutexBucket>) {
+        if bucket.enrolled.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Last waiter out: an unclaimed credit belonged to waiters that are
+            // now gone and must never release a future one.
+            bucket.credits.store(0, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for FutexEnrollment {
+    fn drop(&mut self) {
+        if self.enrolled.get() {
+            self.release(&self.bucket.borrow().clone());
         }
     }
 }
@@ -722,6 +840,19 @@ pub struct FutexTable {
     #[allow(clippy::type_complexity)]
     shards: Box<[ParkingMutex<HashMap<u64, Arc<FutexBucket>>>; FUTEX_SHARDS]>,
     interrupt_generation: AtomicU64,
+    /// `FUTEX_CMP_REQUEUE` destinations, keyed by the waiter's tid.
+    ///
+    /// A requeue must be DURABLE: Linux moves the waiter to `uaddr2`'s queue and
+    /// only a wake on `uaddr2` releases it. Carrick's waiters re-park themselves
+    /// in a loop (they must, to re-check `interrupted()` when a signal broadcast
+    /// pokes them) and a self-re-parking waiter recomputes its key from its OWN
+    /// address — so a relink done silently inside parking_lot is undone by the
+    /// very next spurious unpark. Measured before this existed: 154 signal-token
+    /// re-parks against 154 requeued waiters, destination queue EMPTY.
+    ///
+    /// So a requeue also INFORMS the waiter, which then moves its own key and its
+    /// enrollment. Waiter state and parking_lot state cannot disagree.
+    requeue_redirects: ParkingMutex<HashMap<u64, u64>>,
 }
 
 impl FutexTable {
@@ -729,6 +860,7 @@ impl FutexTable {
         Self {
             shards: Box::new(std::array::from_fn(|_| ParkingMutex::new(HashMap::new()))),
             interrupt_generation: AtomicU64::new(0),
+            requeue_redirects: ParkingMutex::new(HashMap::new()),
         }
     }
 
@@ -970,13 +1102,31 @@ impl FutexTable {
 
         let park_token = ParkToken(usize::try_from(tid.raw()).unwrap_or(0));
         let bucket = self.bucket(addr);
-        let key = Self::bucket_key(&bucket);
         let deadline = timeout.map(|duration| Instant::now() + duration);
         // SAFETY: caller guarantees `word` outlives the wait.
         let word = unsafe { &*word };
+        // Logical enrollment, held across every re-park: a wake landing while this
+        // waiter is between parks still reaches it (as a credit) instead of being
+        // lost. Released on every return path.
+        let enrollment = FutexEnrollment::new(bucket);
 
         loop {
-            if word.load(Ordering::SeqCst) != val {
+            let bucket = enrollment.bucket();
+            let key = Self::bucket_key(&bucket);
+            // A wake that arrived while we were in flight left a credit rather
+            // than an unpark. Claim it before re-parking, or it IS a lost wake.
+            if enrollment.is_enrolled() && bucket.claim_wake_credit() {
+                return FutexWaitOutcome::Woken;
+            }
+            // The futex word gates ENQUEUEING only. Linux compares `*uaddr` to
+            // `val` once, under the bucket lock, and from then on the waiter is
+            // on the queue: a later store to the word does NOT release it, only
+            // a wake, a signal or the timeout does. Carrick re-parks itself in a
+            // loop, so without this latch every re-park re-ran the comparison and
+            // let a waiter release ITSELF on a word it should no longer read —
+            // which is why `FUTEX_WAKE` under-reported (the probe stores
+            // `*uaddr = 1` before waking, and waiters had already left).
+            if !enrollment.is_enrolled() && word.load(Ordering::SeqCst) != val {
                 return FutexWaitOutcome::Woken;
             }
             if interrupted() {
@@ -993,6 +1143,14 @@ impl FutexTable {
                 parking_lot_core::park(
                     key,
                     || {
+                        // A wake that could not find us parked left a credit
+                        // instead. Claim it HERE, under the bucket lock the waker
+                        // also holds, so the claim and the decision to park are
+                        // one step — checking before this point loses a credit
+                        // deposited in between, and the wake with it.
+                        if enrollment.is_enrolled() && bucket.claim_wake_credit() {
+                            return false;
+                        }
                         // Runs under the parking-lot bucket lock, which the
                         // waker also takes: a word change followed by a wake
                         // cannot slip between this check and the park. Reading
@@ -1002,10 +1160,14 @@ impl FutexTable {
                         // lock inversion); signal publishers unpark with
                         // FUTEX_SIGNAL_TOKEN, which the match below routes to
                         // `interrupted()` outside the lock.
-                        if word.load(Ordering::SeqCst) != val {
+                        if !enrollment.is_enrolled() && word.load(Ordering::SeqCst) != val {
                             return false;
                         }
                         registered.set(true);
+                        // Publish logical enrollment HERE, under the bucket lock:
+                        // once taken it persists across every re-park, so a wake
+                        // can always see this waiter even while it is in flight.
+                        enrollment.enroll();
                         bucket.waiters.fetch_add(1, Ordering::AcqRel);
                         true
                     },
@@ -1017,6 +1179,17 @@ impl FutexTable {
                     deadline,
                 )
             };
+
+            // A pending requeue OUTRANKS the token: the requeuer moved us to
+            // uaddr2, and a wake racing it targeted a queue we have already left,
+            // which Linux would not have delivered to us either.
+            if let Some(destination) = self.take_requeue_redirect(tid) {
+                if registered.get() {
+                    bucket.waiters.fetch_sub(1, Ordering::AcqRel);
+                }
+                enrollment.move_to(self.bucket(destination));
+                continue;
+            }
 
             match park_result {
                 ParkResult::Unparked(token) => {
@@ -1095,6 +1268,7 @@ impl FutexTable {
         bucket.generation.fetch_add(1, Ordering::AcqRel);
         let key = Self::bucket_key(&bucket);
         let mut remaining = n as usize;
+        let mut owed = 0u32;
         let result = unsafe {
             parking_lot_core::unpark_filter(
                 key,
@@ -1106,10 +1280,27 @@ impl FutexTable {
                         FilterOp::Unpark
                     }
                 },
-                |_| UnparkToken(FUTEX_WAKE_TOKEN),
+                |result| {
+                    // Runs with the parking-lot bucket lock STILL HELD, which is
+                    // the only place this decision is safe: a waiter claims its
+                    // credit inside its own park validate under the same lock, so
+                    // "not parked right now" and "owed a wake" cannot interleave.
+                    let unparked = result.unparked_threads as u32;
+                    if unparked < n {
+                        // Waiters enrolled but not parked at this instant are in
+                        // flight between parks — a signal broadcast unparks every
+                        // waiter so it can re-check its predicate. On Linux they
+                        // would still be queued and this wake would reach them, so
+                        // leave a credit and count it as released.
+                        let enrolled = u32::try_from(bucket.enrolled.load(Ordering::Acquire))
+                            .unwrap_or(u32::MAX);
+                        owed = bucket.owe_wakes(n - unparked, enrolled.saturating_sub(unparked));
+                    }
+                    UnparkToken(FUTEX_WAKE_TOKEN)
+                },
             )
         };
-        result.unparked_threads as u32
+        result.unparked_threads as u32 + owed
     }
 
     /// `FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE` core: wake up to `nr_wake` waiters
@@ -1133,98 +1324,86 @@ impl FutexTable {
     /// caller is responsible for rejecting a negative `nr_requeue` (the kernel
     /// returns EINVAL) before calling this.
     pub fn requeue(&self, from: u64, to: u64, nr_wake: u32, nr_requeue: u32) -> (u32, u32) {
-        // glibc/musl request "all" via INT_MAX; anything at/above this cap is
-        // treated as unbounded so it takes the single-pass fast path rather
-        // than an INT_MAX-iteration RequeueOne loop.
-        const REQUEUE_ALL: u32 = i32::MAX as u32;
         let from_bucket = self.bucket(from);
         let to_bucket = self.bucket(to);
         let key_from = Self::bucket_key(&from_bucket);
         let key_to = Self::bucket_key(&to_bucket);
 
-        // Waking advances the source generation so the woken threads observe a
-        // change; requeued threads are reached by a token unpark on `to`.
+        // Waking advances the source generation so woken threads observe a
+        // change; requeued threads are carried by their redirect instead.
         if nr_wake > 0 {
             from_bucket.generation.fetch_add(1, Ordering::AcqRel);
         }
 
-        let mut woken: u32 = 0;
-        let mut requeued: u32 = 0;
+        // Pass 1, in FIFO order under the bucket lock: wake the first `nr_wake`,
+        // then MARK the next `nr_requeue` with their destination and leave them
+        // parked (`Skip`). Marking is what makes the move durable — a signal
+        // broadcast that later unparks one of them would otherwise send it back
+        // to the key it computes from its own address.
+        let mut to_wake = nr_wake;
+        let mut to_mark = nr_requeue;
+        let mut marked = 0u32;
+        let result = unsafe {
+            parking_lot_core::unpark_filter(
+                key_from,
+                |token| {
+                    if to_wake > 0 {
+                        to_wake -= 1;
+                        return FilterOp::Unpark;
+                    }
+                    if to_mark > 0 {
+                        to_mark -= 1;
+                        marked += 1;
+                        // Published while the bucket lock is held, so the waiter
+                        // cannot run and miss it.
+                        self.requeue_redirects.lock().insert(token.0 as u64, to);
+                        return FilterOp::Skip;
+                    }
+                    FilterOp::Stop
+                },
+                |_| UnparkToken(FUTEX_WAKE_TOKEN),
+            )
+        };
+        let woken = result.unparked_threads as u32;
 
-        // Fast path: requeue-all (nr_requeue saturated). One unpark_requeue
-        // call wakes ≤1 and moves the rest. For nr_wake >= 2 we first wake the
-        // extra (nr_wake - 1) via the normal filter, since unpark_requeue only
-        // wakes one.
-        if nr_requeue >= REQUEUE_ALL {
-            if nr_wake >= 2 {
-                woken += self.wake_no_genbump(&from_bucket, nr_wake - 1);
-            }
-            let op = if nr_wake >= 1 {
-                RequeueOp::UnparkOneRequeueRest
-            } else {
-                RequeueOp::RequeueAll
-            };
-            let res: UnparkResult = unsafe {
-                parking_lot_core::unpark_requeue(
-                    key_from,
-                    key_to,
-                    || op,
-                    |_op, _res| UnparkToken(FUTEX_WAKE_TOKEN),
-                )
-            };
-            woken += res.unparked_threads as u32;
-            requeued += res.requeued_threads as u32;
-            return (woken, requeued);
-        }
-
-        // Bounded path: wake nr_wake, then requeue exactly up to nr_requeue.
-        if nr_wake > 0 {
-            woken += self.wake_no_genbump(&from_bucket, nr_wake);
-        }
-        while requeued < nr_requeue {
+        // Pass 2: relink the marked waiters onto `to` WITHOUT waking them, so no
+        // window exists in which a requeued waiter is parked nowhere and a
+        // concurrent wake on `to` misses it. A marked waiter that a broadcast
+        // reaches first moves itself via its redirect instead; either way it
+        // lands on `to`, which is why the count returned is the MARKED count.
+        let mut relinked = 0u32;
+        while relinked < marked {
             let res: UnparkResult = unsafe {
                 parking_lot_core::unpark_requeue(
                     key_from,
                     key_to,
                     || RequeueOp::RequeueOne,
-                    |_op, _res| UnparkToken(FUTEX_WAKE_TOKEN),
+                    |_, _| UnparkToken(FUTEX_WAKE_TOKEN),
                 )
             };
             if res.requeued_threads == 0 {
-                break; // source queue drained
-            }
-            requeued += res.requeued_threads as u32;
-            if !res.have_more_threads {
                 break;
             }
+            relinked += res.requeued_threads as u32;
+            // `have_more_threads` is deliberately NOT consulted: it was observed
+            // reporting "none left" with ~900 waiters still enrolled.
         }
-        (woken, requeued)
+        (woken, marked)
     }
 
-    /// Unpark up to `n` waiters on an already-resolved bucket WITHOUT bumping
-    /// its generation (the caller bumped it once up front). Used by `requeue`
-    /// to wake the `nr_wake` portion.
-    fn wake_no_genbump(&self, bucket: &Arc<FutexBucket>, n: u32) -> u32 {
-        if n == 0 {
-            return 0;
+    /// Consume `tid`'s pending `FUTEX_CMP_REQUEUE` destination, if any.
+    ///
+    /// The guard is dropped before the caller re-parks: a requeuer holds the
+    /// parking-lot bucket lock and then this mutex, so holding this across a
+    /// `park()` would invert that order.
+    fn take_requeue_redirect(&self, tid: ThreadId) -> Option<u64> {
+        let mut redirects = self.requeue_redirects.lock();
+        if redirects.is_empty() {
+            return None;
         }
-        let key = Self::bucket_key(bucket);
-        let mut remaining = n as usize;
-        let result = unsafe {
-            parking_lot_core::unpark_filter(
-                key,
-                |_| {
-                    if remaining == 0 {
-                        FilterOp::Stop
-                    } else {
-                        remaining -= 1;
-                        FilterOp::Unpark
-                    }
-                },
-                |_| UnparkToken(FUTEX_WAKE_TOKEN),
-            )
-        };
-        result.unparked_threads as u32
+        // Same encoding the park uses for its ParkToken.
+        let token = usize::try_from(tid.raw()).unwrap_or(0);
+        redirects.remove(&(token as u64))
     }
 
     #[cfg(test)]
@@ -1917,6 +2096,79 @@ mod tests {
         match sibling.join() {
             Ok(outcome) => assert_eq!(outcome, FutexWaitOutcome::Woken),
             Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+}
+
+#[cfg(test)]
+mod wake_durability_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+    use std::time::Duration;
+
+    /// A `FUTEX_WAKE` must reach a waiter even when a signal broadcast has just
+    /// unparked it.
+    ///
+    /// `notify_signal_pending` unparks every waiter so each can re-check its
+    /// interrupt predicate. Between that unpark and the waiter re-parking it is
+    /// queued NOWHERE, and a wake landing in that window is lost outright: the
+    /// waiter then sleeps to its timeout. Linux has no such window — its waiter
+    /// never leaves the queue until something releases it — so a lost wake here
+    /// is a real divergence, and the one blocking `FUTEX_CMP_REQUEUE`
+    /// (`docs/perf-results/2026-08-19-futex-requeue-durability`).
+    ///
+    /// Written to be fast when green and slow only when red: a lost wake shows
+    /// up as the waiter burning its full timeout, never as a flake on a loaded
+    /// host, so this is not a time-assumption test.
+    #[test]
+    fn wake_is_not_lost_when_a_signal_broadcast_races_it() {
+        const ROUNDS: usize = 64;
+        let table = Arc::new(FutexTable::new());
+        let word = Arc::new(AtomicU32::new(0));
+        let addr = 0x4000_1000u64;
+
+        for round in 0..ROUNDS {
+            let waiter_table = Arc::clone(&table);
+            let waiter_word = Arc::clone(&word);
+            let started = Arc::new(std::sync::Barrier::new(2));
+            let waiter_started = Arc::clone(&started);
+            let waiter = std::thread::spawn(move || {
+                waiter_started.wait();
+                // SAFETY: `waiter_word` outlives the wait (held by this closure).
+                unsafe {
+                    waiter_table.wait_while_word_equals(
+                        addr,
+                        waiter_word.as_ref() as *const AtomicU32,
+                        0,
+                        Some(Duration::from_secs(10)),
+                        ThreadId::from_guest_supplied_tid(1),
+                        &|| false,
+                    )
+                }
+            });
+
+            started.wait();
+            // Let the waiter reach its park, then reproduce the window: poke
+            // every waiter (as a signal broadcast does) and wake immediately,
+            // while this one is still on its way back to the queue.
+            while table.waiter_count(addr) == 0 {
+                std::thread::yield_now();
+            }
+            table.notify_signal_pending();
+            let woken = table.wake(addr, 1);
+
+            let outcome = waiter.join().expect("waiter thread");
+            assert_eq!(
+                outcome,
+                FutexWaitOutcome::Woken,
+                "round {round}: wake was lost while the waiter was in flight \
+                 (wake reported {woken} released)"
+            );
+            assert_eq!(
+                woken, 1,
+                "round {round}: wake must report the waiter it released"
+            );
         }
     }
 }
