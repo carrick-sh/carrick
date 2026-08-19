@@ -723,6 +723,7 @@ mod resources;
 #[macro_use]
 mod signal;
 mod bpf;
+pub(crate) mod lock_order;
 mod mount_api;
 mod mqueue;
 mod sysv;
