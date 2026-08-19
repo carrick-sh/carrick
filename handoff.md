@@ -125,6 +125,33 @@ and must NOT be quoted as a ratio.
   box and commit the rewrite. `futex_wait05` is the counter-example (all four
   cached rows agree) and stays a real carrick gap.
 
+### Queued, attributed, not yet fixed (verified in source 2026-08-19)
+
+- **`madvise(MADV_DONTNEED)` under-zeroes a partial page.** `dispatch/mem.rs`
+  page-rounds `end` for the mapping check but passes the RAW `length` to
+  `zero_backing`, so `madvise(p, 1, MADV_DONTNEED)` zeroes 1 byte where Linux
+  zeroes 4096. Red-first against the oracle before fixing.
+- **Arena VA stranding on the hint path.** The non-`MAP_FIXED` arena-hint arm
+  (`mem.rs:2382`) accepts a hint at/above `mmap_next` and advances the cursor
+  WITHOUT handing the skipped `[old mmap_next, requested)` gap to the free
+  list — the same stranding the `MAP_FIXED` arm was just fixed to avoid
+  (`153b7f20c`). Not a double-grant (the invariant still holds), just leaked VA.
+- **Spurious guest `ENOMEM`.** `mmap`/`munmap`/`mprotect`/`mremap` return ENOMEM
+  when the 500 ms pt-pause drain times out (`quiesce.rs:281`,
+  `vcpu_loop/mod.rs:2868`). Linux has no such failure mode; under many threads
+  this surfaces in CPython as a spurious `MemoryError`.
+- **Dead branch:** `global_frame_region_owner_matches`'s `locally_owned` arm
+  (`trap.rs:977`) is unreachable under `persistent_vm_lifecycle`, because
+  `add_alias_with_sharing` forces `host_mapping: None` and `stage2_lease: None`.
+  It reads as a live fast path and is not one.
+- **`cpython-importlib` (147 rows) has a measured candidate root cause** — see
+  `docs/perf-results/2026-08-19-global-frame-lease-identity/`. The
+  `(IPA, length, host pointer)` lease identity carries no generation and Darwin
+  recycles the host VA 499/499 with ONE distinct address, so a stale per-thread
+  mapping row re-authenticates and the reuse scrub can zero a live 16 KiB
+  granule. The crash LINK is inference, not fact; two settling experiments are
+  written down there.
+
 ### Landed this session
 
 - `mmap` arena **double grant** — `mmap(NULL)` returned an already-live VA and
