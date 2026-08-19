@@ -16939,8 +16939,11 @@ mod tag_strip_tests {
         assert_ne!(parent, child);
     }
 
+    static EXEC_PAYLOAD_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn guest_mapping_plan_shares_address_space_payload() {
+        let _env_guard = EXEC_PAYLOAD_ENV_LOCK.lock();
         let perms = carrick_mem::elf::SegmentPerms {
             read: true,
             write: false,
@@ -17012,6 +17015,7 @@ mod tag_strip_tests {
 
     #[test]
     fn guest_mapping_plan_payload_sharing_hatch_restores_deep_copy() {
+        let _env_guard = EXEC_PAYLOAD_ENV_LOCK.lock();
         let prior = std::env::var_os("CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD");
         // SAFETY: no other test reads or writes this diagnostic-only variable.
         unsafe { std::env::set_var("CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD", "0") };
