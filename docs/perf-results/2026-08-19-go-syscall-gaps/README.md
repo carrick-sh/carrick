@@ -56,3 +56,53 @@ Next step, in order:
 
 A `prlimit` applied to ANOTHER process is not observed by that process's Go
 runtime cache. Not investigated further.
+
+---
+
+# Post-change verification (24-suite matched comparison)
+
+Same 24 suites, 8 workers, cached oracles, before and after the DNS + interface
+changes:
+
+| | match | diverging rows |
+|---|---:|---:|
+| before | 15 | 50 |
+| after | **17** | **46** |
+
+| suite | before | after |
+|---|---|---|
+| `cpython-importlib` | timeout 300 s | **match**, 68.5 s |
+| `ltp-shmctl05` | timeout | **match** |
+| `go-syscall` | 3 rows | **2 rows** |
+| `cpython-multiprocessing_fork` | 3 rows, 280 s | timeout, 600 s |
+
+`multiprocessing_fork` is the campaign's most load-flaky suite and has now read
+420 s / 600 s / 600 s / 280 s / 600 s across five runs of comparable scope. Not
+attributed to this change, and not dismissed either — it needs its own controlled
+measurement.
+
+## `node-libuv` — what the closure ledger actually says
+
+The 24-suite runs report `n=0` assertions for libuv on BOTH sides. That is an
+artifact of the measurement mode, not a harness defect: `TapParser` parses TAP
+positions only in CLOSURE mode, and `--closure` rejects suite filters, so a
+filtered run falls back to the coarse exit-code verdict.
+
+`closure-v10` has the real ledger — 507 pairs, 4 diverging:
+
+| position | carrick | docker | status |
+|---|---|---|---|
+| 370 `tcp_connect6_link_local` | ok | skipped | **closed** — both skip now |
+| 472 `udp_multicast_join6` | fail | skipped | **closed** — both skip now |
+| 395 `tcp_reuseport` | ok | **fail** | ORACLE-side flake; carrick passed |
+| 399 `tcp_try_write_error` | fail | ok | known non-deterministic (8/20) |
+
+Two of the four are closed by the IPv6 change, verified as a 0-line TAP diff
+against a freshly-taken oracle. `tcp_reuseport` is worth noting carefully: the
+goal names "SO_REUSEPORT distribution" as a libuv gap, but in this run the ORACLE
+failed it and carrick passed — the inversion trap `AGENTS.md` warns about, where a
+divergence is read as a carrick gap when the oracle is the side that broke.
+
+Under gate load libuv shows a different single failure (`ipc_tcp_connection`),
+which standalone runs pass. libuv has residual load-coupled positions; the two
+STRUCTURAL divergences are gone.
