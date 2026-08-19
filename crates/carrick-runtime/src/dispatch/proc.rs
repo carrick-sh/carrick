@@ -3048,7 +3048,6 @@ impl SyscallDispatcher {
                         ),
                     (None, None) => process.wait_child_with_job_control(
                         target,
-                        true,
                         nowait,
                         include_stopped,
                         include_continued,
@@ -3448,14 +3447,12 @@ impl SyscallDispatcher {
                 let waited = match pid.0 {
                     -1 => process.wait_child_with_job_control(
                         None,
-                        true,
                         false,
                         include_stopped,
                         include_continued,
                     ),
                     value if value > 0 => process.wait_child_with_job_control(
                         Some(value),
-                        true,
                         false,
                         include_stopped,
                         include_continued,
