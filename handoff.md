@@ -116,10 +116,34 @@ and must NOT be quoted as a ratio.
 ### Node libuv sequence — remaining
 
 1. **DONE this session** — bridge `getaddrinfo` abort fixed.
-2. Give `node-libuv` `--network bridge` to close `tcp_connect6_link_local`
-   (370) and `udp_multicast_join6` (472). Only `carrick_flags` changes, which
-   is excluded from the oracle key, so the cached oracle stays valid. Was
-   blocked on (1); now unblocked.
+2. **BLOCKED, and the prescribed fix is refuted by measurement.** The plan was
+   to give `node-libuv` `--network bridge` (only `carrick_flags` changes, and
+   that is genuinely excluded from `OracleKey`, so the cached oracle stays
+   valid). Measured on the fixed binary:
+
+   - `--fs host` (today's declaration): **507 TAP positions, 506 ok, 1 not ok,
+     6 skip.** Exactly TWO positions differ from the committed oracle TAP, and
+     both are the netns asymmetry: position 370 `tcp_connect6_link_local` —
+     oracle `ok # SKIP`, carrick `ok` — and position 472
+     `udp_multicast_join6` — oracle `ok # SKIP`, carrick **`not ok`**. The
+     oracle skips both because its container has only `::1`; carrick in host
+     mode truthfully surfaces the Mac's `en0` link-local, so libuv's `fe80::`
+     skip conditions never fire.
+   - `--network bridge`: **aborts before emitting a single TAP line**, exit
+     134, with the fork-unsafe ObjC error this file already records as a
+     sibling symptom:
+     `objc[...]: +[NSNumber initialize] may have been in progress in another
+     thread when fork() was called ... Crashing instead.`
+
+   So bridge trades one failing position for a total abort. **Fix the
+   fork-time ObjC abort in bridge mode first** — it is a real defect in a
+   shipped network mode, and it is the only thing standing between libuv and
+   an exact match. Note the abort is NOT the `getaddrinfo` registry bug fixed
+   in (1); that one is verified gone. Grep found no host-side
+   `getaddrinfo`/`res_init`/`SCDynamicStore` call in the network path, so the
+   ObjC initialization is being pulled in somewhere else on a host thread —
+   find it with `carrick trace` or a core, per
+   `project_fork_unsafe_corefoundation`.
 3. `tcp_try_write_error` — non-deterministic, 8 of 20 isolated runs fail. It is
    a libuv LOOP-ORDERING divergence, not a write bug. Use the event ring via
    `carrick-lldb`, NOT a tracer (it passes 6/6 under `carrick trace`).
