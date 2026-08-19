@@ -7884,6 +7884,15 @@ impl SyscallDispatcher {
                 }
             }
             let mut linux_flags = guest_msg_flags.get();
+            // MSG_CMSG_CLOEXEC has no macOS equivalent, so the host never reports
+            // it and the translated flags come back without it. Linux ECHOES the
+            // caller's request in msg_flags — Go's `TestSCMCredentials` asserts
+            // exactly that, and the Docker oracle returns 0x40000000 where carrick
+            // returned 0x0. The close-on-exec itself was already applied to the
+            // installed fd; only the echo was missing.
+            if LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::CMSG_CLOEXEC) {
+                linux_flags |= LinuxMsgFlags::CMSG_CLOEXEC.bits();
+            }
             let mut written_controllen = 0u64;
             if want_control {
                 let (mut scm, scm_trunc) =

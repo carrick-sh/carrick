@@ -13323,10 +13323,30 @@ impl SyscallDispatcher {
         fn fchmodat2(this, cx, dirfd: u64, pathname: GuestPtr, mode: u64, flags: u64) {
 
             // fchmodat2 (nr 452) carries a REAL flags argument: only
-            // AT_SYMLINK_NOFOLLOW is valid (fchmodat2_02 passes -1 → EINVAL). On
-            // the disk-authoritative host backend the flag itself stays advisory.
+            // AT_SYMLINK_NOFOLLOW is valid (fchmodat2_02 passes -1 → EINVAL).
             if flags & !LINUX_AT_SYMLINK_NOFOLLOW != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0 {
+                // Linux cannot change a SYMLINK's mode — no filesystem it ships
+                // implements it — so `fchmodat2(..., AT_SYMLINK_NOFOLLOW)` on a
+                // symlink is EOPNOTSUPP. On anything else the flag is a no-op,
+                // because there is no link to avoid following. Treating the flag
+                // as purely advisory instead silently chmod'd the link's TARGET,
+                // which is the one thing the caller asked not to happen (Go's
+                // `TestFchmodat`, measured against the Docker oracle:
+                // `fchmodat2(symlink, AT_SYMLINK_NOFOLLOW)` = -1/EOPNOTSUPP there
+                // and 0 here).
+                let path = read_guest_c_string(&*cx.memory, pathname.0)?;
+                if !path.is_empty() {
+                    let resolved = this.resolve_at_path(dirfd, &path)?;
+                    if this
+                        .layered_lstat(&resolved)
+                        .is_ok_and(|md| md.kind == RootFsEntryKind::Symlink)
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+                    }
+                }
             }
             this.chmod_at(cx.kernel, dirfd, pathname.0, mode, &*cx.memory)
 
