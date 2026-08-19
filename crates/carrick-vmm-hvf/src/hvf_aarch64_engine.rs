@@ -318,7 +318,16 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
     }
 
     fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
-        HvfInner::run_to_exit(&mut self.inner, &mut self.mailbox)
+        let exit = HvfInner::run_to_exit(&mut self.inner, &mut self.mailbox);
+        if std::env::var_os("CARRICK_TIDSTAMP_DEBUG").is_some() {
+            use applevisor::prelude::SysReg;
+            // Does the tid stamp SURVIVE a run/trap round trip? The stamp itself
+            // reads back fine immediately after `set_sys_reg`, so if the EL1
+            // `gettid` fast path is degrading, this is where it would show.
+            let back = self.inner.get_sys_reg(SysReg::CONTEXTIDR_EL1);
+            eprintln!("[TIDSTAMP] after run: CONTEXTIDR_EL1={back:?}");
+        }
+        exit
     }
 
     fn kick(&self) -> Result<(), TrapError> {
