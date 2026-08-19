@@ -1,4 +1,4 @@
-# SCTP: 42 skipped tests now run, 21 of them pass
+# SCTP: `cpython-socket` closed — 42 diverging rows to ZERO
 
 `cpython-socket` was the largest single genuine gap — 42 diverging rows, every
 one of them `('skipped','ok')`, every one SCTP.
@@ -75,5 +75,42 @@ backing does not carry.
    precedent. Framing the payload instead would also work but changes the bytes on
    the wire and makes partial nonblocking sends much harder to keep atomic.
 
-Option 2 is the one to build. It is a data-path change scoped strictly to sockets
-whose guest protocol is SCTP, so the blast radius is contained.
+Option 2 is the one built.
+
+## Real boundaries, tracked out of band
+
+`dispatch/net/sctp.rs` keeps, per connection, the lengths of the messages the
+sender has written and how far the receiver has consumed into the first one. The
+connection is keyed by its address PAIR, which the two ends see reversed, so a
+sender's `(local, peer)` is the receiver's `(peer, local)`.
+
+Two properties fall out, and both are things the drained-buffer shortcut gets
+wrong:
+
+- a `recvmsg` is capped at the current message's remainder, so it can never
+  merge two messages the way its TCP backing would;
+- `MSG_EOR` is reported when a read consumes that remainder — including under
+  `MSG_PEEK`, which reports the same answer without consuming.
+
+The data path stays byte-identical to TCP: nothing is framed onto the wire, so a
+partial non-blocking send needs no special atomicity. A short write EXTENDS the
+message in flight rather than ending it, which is SCTP's rule — the boundary is
+where the sender finished. Boundaries are dropped at close while the fd is still
+open, so a recycled address pair cannot inherit a dead connection's state.
+
+Hooking `sendmsg` alone recorded NOTHING: CPython's `socket.send()` lowers to
+`sendto`, so both paths carry the hook.
+
+## Result
+
+carrick reproduces the oracle's EOR table exactly, all five rows, and
+
+    test_socket: run=732 skipped=75  Result: SUCCESS   (two consecutive runs)
+
+against the oracle's 657 comparable + 75 skipped. **42 diverging rows -> 0**, with
+zero failures and the skip count identical to Linux. `just ci` green (3,913
+tests).
+
+`SOCK_SEQPACKET` SCTP remains EPROTONOSUPPORT and is still an open gap: it is
+multi-streamed as well as message-oriented, and this design carries boundaries
+but not stream ids. No currently-failing row needs it.
