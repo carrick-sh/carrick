@@ -505,30 +505,24 @@ fn maybe_append_crash_core_summary(stderr_path: &Path, pid: i32, argv: &[String]
         PathBuf::from("/tmp/core"),
     ];
     for path in &candidate_paths {
-        if path.exists() {
-            if let Ok(file_len) = std::fs::metadata(path).map(|m| m.len())
-                && file_len > 0
-                && let Some(carrick_bin) = argv.first()
-            {
-                if let Ok(output) = Command::new(carrick_bin)
-                    .args(["debug", "core", &path.to_string_lossy()])
-                    .output()
-                {
-                    if output.status.success() {
-                        if let Ok(mut err_file) =
-                            std::fs::OpenOptions::new().append(true).open(stderr_path)
-                        {
-                            let _ = writeln!(
-                                err_file,
-                                "\n[carrick-conformance] Crash core summary from {}:\n{}",
-                                path.display(),
-                                String::from_utf8_lossy(&output.stdout)
-                            );
-                        }
-                        break;
-                    }
-                }
+        if path.exists()
+            && let Ok(file_len) = std::fs::metadata(path).map(|m| m.len())
+            && file_len > 0
+            && let Some(carrick_bin) = argv.first()
+            && let Ok(output) = Command::new(carrick_bin)
+                .args(["debug", "core", &path.to_string_lossy()])
+                .output()
+            && output.status.success()
+        {
+            if let Ok(mut err_file) = std::fs::OpenOptions::new().append(true).open(stderr_path) {
+                let _ = writeln!(
+                    err_file,
+                    "\n[carrick-conformance] Crash core summary from {}:\n{}",
+                    path.display(),
+                    String::from_utf8_lossy(&output.stdout)
+                );
             }
+            break;
         }
     }
 }
@@ -537,11 +531,11 @@ fn throttle_under_extreme_load() {
     let Ok(ncpu) = std::thread::available_parallelism().map(|n| n.get()) else {
         return;
     };
-    if let Some(load) = loadavg_1m() {
-        if load >= 2.0 * ncpu as f64 {
-            // Box is severely oversubscribed; pause briefly to let bursty sibling tasks clear.
-            std::thread::sleep(Duration::from_millis(150));
-        }
+    if let Some(load) = loadavg_1m()
+        && load >= 2.0 * ncpu as f64
+    {
+        // Box is severely oversubscribed; pause briefly to let bursty sibling tasks clear.
+        std::thread::sleep(Duration::from_millis(150));
     }
 }
 
