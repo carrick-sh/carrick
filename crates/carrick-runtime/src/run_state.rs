@@ -175,6 +175,7 @@ static MY_SLOT: AtomicU64 = AtomicU64::new(REF_NONE);
 /// A single atomic store publishes pid+state atomically.
 pub fn publish(state: RunState) {
     let pid = std::process::id();
+    debug_run_state("publish(carrier-pid)", pid as i32, pid as i32, state);
     if pid == 0 {
         return;
     }
@@ -210,7 +211,18 @@ fn publish_for(pid: u32, state: RunState) {
 /// process-local [`publish`] cache cannot distinguish fork children. The Linux
 /// task leader owns the process-keyed slot; non-leader threads use the disjoint
 /// TID-keyed slots used by cross-process `/proc/<tid>` reads.
+/// Diagnostic: which identity a publish actually lands under. Gated, because
+/// the answer decided a wrong root cause once already — the forked-child
+/// `/proc` render falls back to the host/ns derivation, and only the ids used
+/// here distinguish "never published" from "published under the wrong pid".
+fn debug_run_state(site: &str, id: i32, tid: i32, state: RunState) {
+    if std::env::var_os("CARRICK_RUNSTATE_DEBUG").is_some() {
+        eprintln!("[RUNSTATE] {site} id={id} tid={tid} state={state:?}");
+    }
+}
+
 pub fn publish_task_thread(task_pid: i32, tid: i32, state: RunState) {
+    debug_run_state("publish_task_thread", task_pid, tid, state);
     let (Ok(task_pid), Ok(tid)) = (u32::try_from(task_pid), u32::try_from(tid)) else {
         return;
     };
@@ -447,6 +459,7 @@ pub fn published(pid: u32) -> Option<RunState> {
     if pid == 0 {
         return None;
     }
+
     let section = processes();
     let mut tid_hit = None;
     let mut booting_hit = None;
@@ -472,7 +485,11 @@ pub fn published(pid: u32) -> Option<RunState> {
             }
         }
     }
-    booting_hit.or(tid_hit)
+    let answer = booting_hit.or(tid_hit);
+    if std::env::var_os("CARRICK_RUNSTATE_DEBUG").is_some() {
+        eprintln!("[RUNSTATE] published({pid}) -> {answer:?}");
+    }
+    answer
 }
 
 /// The Linux `/proc/<pid>/stat` state char for `pid`, preferring the published
