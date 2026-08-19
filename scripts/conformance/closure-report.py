@@ -45,7 +45,13 @@ def _totals(row: dict[str, Any], side: str) -> dict[str, int]:
         totals = row[side]["totals"]
     except (KeyError, TypeError) as error:
         raise ReportError(f"result row {row.get('name')!r} lacks {side} totals") from error
-    if result not in {"success", "failure", "none", "empty"}:
+    # Must track `SuiteOutcome` in carrick-conformance. `truncated` was added
+    # there (a run that hit its deadline, keeping the ids it emitted BEFORE the
+    # deadline instead of discarding the transcript) and this list was not
+    # updated, so any closure run containing a truncated suite could not be
+    # reported at all. Every consumer below tests `== "success"`, so a truncated
+    # suite is correctly never read as a pass.
+    if result not in {"success", "failure", "none", "empty", "truncated"}:
         raise ReportError(f"result row {row.get('name')!r} has invalid {side} result {result!r}")
     required = {"n", "passed", "failed", "broken", "skipped"}
     if not isinstance(totals, dict) or set(totals) != required:
@@ -155,7 +161,11 @@ def summarize(scope: dict[str, Any], results: list[dict[str, Any]]) -> dict[str,
         infrastructure = (
             carrick_totals["broken"] > 0
             or docker_totals["broken"] > 0
-            or row["carrick"]["result"] in {"none", "empty"}
+            # `truncated` = the run hit its deadline. It keeps the ids emitted
+            # BEFORE the deadline, so it can have all-matching pairs and still be
+            # a non-match — a TIMEOUT, which is a blocker in its own right and
+            # belongs here beside `none`/`empty` rather than looking unattributable.
+            or row["carrick"]["result"] in {"none", "empty", "truncated"}
             or row["docker"]["result"] != "success"
             or any("broken" in pair[1:] for pair in pairs)
             or verdict in {"carrick_crash", "timeout", "oracle_fail"}
