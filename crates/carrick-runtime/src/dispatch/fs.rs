@@ -359,18 +359,23 @@ fn prepare_pwritev_payloads(
     }
 
     let mut staged_iovecs = Vec::with_capacity(iovecs.len());
+    let mut faulted = false;
     for iovec in iovecs {
         let iov_len = usize::try_from(iovec.iov_len).map_err(|_| LINUX_EINVAL)?;
         // A zero-length iovec segment is permitted and must NOT fault, even
         // with a NULL/invalid base.
-        let bytes = if iov_len == 0 {
-            Vec::new()
-        } else {
-            memory
-                .read_bytes(iovec.iov_base, iov_len)
-                .map_err(|_| LINUX_EFAULT)?
+        if iov_len == 0 {
+            staged_iovecs.push(Vec::new());
+            continue;
+        }
+        let Ok(bytes) = memory.read_bytes(iovec.iov_base, iov_len) else {
+            faulted = true;
+            break;
         };
         staged_iovecs.push(bytes);
+    }
+    if staged_iovecs.iter().all(|b| b.is_empty()) && faulted {
+        return Err(LINUX_EFAULT);
     }
     Ok(PwritevPayloads::Staged(staged_iovecs))
 }
