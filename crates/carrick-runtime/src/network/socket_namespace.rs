@@ -33,7 +33,7 @@ pub struct SocketNamespaceProvider {
     namespaces: Mutex<HashMap<NetworkNamespaceId, NetworkNamespaceSpec>>,
     namespace_leases: Mutex<HashMap<NetworkNamespaceId, NetworkLeaseId>>,
     lease_specs: Mutex<HashMap<NetworkLeaseId, NetworkNamespaceSpec>>,
-    socket_addrs: Mutex<HashMap<i32, SocketAddressState>>,
+    socket_addrs: Mutex<HashMap<super::SocketKey, SocketAddressState>>,
     fork_tracked_fds: Arc<Mutex<HashSet<RawFd>>>,
     published_tcp: Mutex<HashMap<NetworkLeaseId, Vec<PublishedTcpProxy>>>,
     published_udp: Mutex<HashMap<NetworkLeaseId, Vec<PublishedUdpProxy>>>,
@@ -638,7 +638,7 @@ impl SocketNamespaceProvider {
     pub fn record_socket_addresses(
         &self,
         namespace_id: Option<&NetworkNamespaceId>,
-        guest_fd: i32,
+        socket: super::SocketKey,
         guest_local: Option<GuestSocketAddr>,
         host_local: Option<HostSocketAddr>,
         guest_peer: Option<GuestSocketAddr>,
@@ -653,7 +653,7 @@ impl SocketNamespaceProvider {
             .lock()
             .map_err(|_| "socket address registry lock poisoned".to_string())?;
         socket_addrs.insert(
-            guest_fd,
+            socket,
             SocketAddressState {
                 lease_id,
                 guest_local,
@@ -752,24 +752,34 @@ impl SocketNamespaceProvider {
 
     pub fn guest_visible_local_addr(
         &self,
-        guest_fd: i32,
+        socket: super::SocketKey,
     ) -> Result<Option<GuestSocketAddr>, String> {
         let socket_addrs = self
             .socket_addrs
             .lock()
             .map_err(|_| "socket address registry lock poisoned".to_string())?;
-        Ok(socket_addrs.get(&guest_fd).and_then(|s| s.guest_local))
+        Ok(socket_addrs.get(&socket).and_then(|s| s.guest_local))
     }
 
     pub fn guest_visible_peer_addr(
         &self,
-        guest_fd: i32,
+        socket: super::SocketKey,
     ) -> Result<Option<GuestSocketAddr>, String> {
         let socket_addrs = self
             .socket_addrs
             .lock()
             .map_err(|_| "socket address registry lock poisoned".to_string())?;
-        Ok(socket_addrs.get(&guest_fd).and_then(|s| s.guest_peer))
+        Ok(socket_addrs.get(&socket).and_then(|s| s.guest_peer))
+    }
+
+    /// Drop one socket's recorded addresses at teardown. Host fds are reused,
+    /// so an entry that outlives its socket is handed to whatever opens next —
+    /// which is exactly how a closed `AF_INET` probe socket's address reached
+    /// the `AF_INET6` socket glibc opened onto the same fd.
+    pub fn forget_socket_addresses(&self, socket: super::SocketKey) {
+        if let Ok(mut socket_addrs) = self.socket_addrs.lock() {
+            socket_addrs.remove(&socket);
+        }
     }
 
     pub fn translate_host_source(
@@ -2459,7 +2469,7 @@ impl NetworkProvider for SocketNamespaceProvider {
     fn record_socket_addresses(
         &self,
         namespace_id: Option<&NetworkNamespaceId>,
-        guest_fd: i32,
+        socket: super::SocketKey,
         guest_local: Option<GuestSocketAddr>,
         host_local: Option<HostSocketAddr>,
         guest_peer: Option<GuestSocketAddr>,
@@ -2467,7 +2477,7 @@ impl NetworkProvider for SocketNamespaceProvider {
     ) -> Result<(), String> {
         self.record_socket_addresses(
             namespace_id,
-            guest_fd,
+            socket,
             guest_local,
             host_local,
             guest_peer,
@@ -2475,12 +2485,22 @@ impl NetworkProvider for SocketNamespaceProvider {
         )
     }
 
-    fn guest_visible_local_addr(&self, guest_fd: i32) -> Result<Option<GuestSocketAddr>, String> {
-        self.guest_visible_local_addr(guest_fd)
+    fn guest_visible_local_addr(
+        &self,
+        socket: super::SocketKey,
+    ) -> Result<Option<GuestSocketAddr>, String> {
+        self.guest_visible_local_addr(socket)
     }
 
-    fn guest_visible_peer_addr(&self, guest_fd: i32) -> Result<Option<GuestSocketAddr>, String> {
-        self.guest_visible_peer_addr(guest_fd)
+    fn guest_visible_peer_addr(
+        &self,
+        socket: super::SocketKey,
+    ) -> Result<Option<GuestSocketAddr>, String> {
+        self.guest_visible_peer_addr(socket)
+    }
+
+    fn forget_socket_addresses(&self, socket: super::SocketKey) {
+        self.forget_socket_addresses(socket);
     }
 
     fn translate_recv_addr(
@@ -3240,7 +3260,7 @@ mod tests {
         provider
             .record_socket_addresses(
                 web_spec.namespace_id.as_ref(),
-                7,
+                crate::network::SocketKey::for_host_fd(7),
                 Some(guest_listener),
                 Some(host(SocketAddr::new(
                     IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -3380,7 +3400,7 @@ mod tests {
         provider
             .record_socket_addresses(
                 web_spec.namespace_id.as_ref(),
-                7,
+                crate::network::SocketKey::for_host_fd(7),
                 Some(guest(SocketAddr::new(
                     IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                     8080,
@@ -3425,7 +3445,7 @@ mod tests {
         provider
             .record_socket_addresses(
                 spec.namespace_id.as_ref(),
-                7,
+                crate::network::SocketKey::for_host_fd(7),
                 Some(guest(guest_addr)),
                 Some(host(host_addr)),
                 None,
@@ -3459,7 +3479,7 @@ mod tests {
         provider
             .record_socket_addresses(
                 owner.namespace_id.as_ref(),
-                7,
+                crate::network::SocketKey::for_host_fd(7),
                 Some(guest(guest_addr)),
                 Some(host(host_addr)),
                 None,
@@ -3477,6 +3497,64 @@ mod tests {
         );
     }
 
+    /// A recorded address must not outlive its socket. Host fds are REUSED, so
+    /// an entry left behind is handed to whatever opens next — which is exactly
+    /// how a closed `AF_INET` probe socket's `sockaddr_in` reached the
+    /// `AF_INET6` socket glibc opened onto the same descriptor, aborting the
+    /// guest inside `getaddrinfo`'s `rfc3484_sort`.
+    #[test]
+    fn a_closed_socket_leaves_no_address_for_the_fd_that_reuses_it() {
+        let provider = SocketNamespaceProvider::new();
+        let key = crate::network::SocketKey::for_host_fd(7);
+        let guest_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5432);
+        let host_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50033);
+        provider
+            .record_socket_addresses(
+                None,
+                key,
+                Some(guest(guest_addr)),
+                Some(host(host_addr)),
+                Some(guest(guest_addr)),
+                PortProtocol::Udp,
+            )
+            .expect("record");
+        assert_eq!(
+            provider.guest_visible_local_addr(key).expect("read"),
+            Some(guest(guest_addr))
+        );
+
+        provider.forget_socket_addresses(key);
+
+        assert_eq!(
+            provider.guest_visible_local_addr(key).expect("read"),
+            None,
+            "the next socket on this host fd must not inherit an address"
+        );
+        assert_eq!(
+            provider.guest_visible_peer_addr(key).expect("read"),
+            None,
+            "nor a peer"
+        );
+    }
+
+    /// Two live sockets are distinct records: the key is the host fd, so one
+    /// socket's address can never answer for another's.
+    #[test]
+    fn distinct_host_fds_do_not_share_a_recorded_address() {
+        let provider = SocketNamespaceProvider::new();
+        let a = crate::network::SocketKey::for_host_fd(7);
+        let b = crate::network::SocketKey::for_host_fd(8);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5432);
+        provider
+            .record_socket_addresses(None, a, Some(guest(addr)), None, None, PortProtocol::Udp)
+            .expect("record");
+        assert_eq!(
+            provider.guest_visible_local_addr(a).expect("read"),
+            Some(guest(addr))
+        );
+        assert_eq!(provider.guest_visible_local_addr(b).expect("read"), None);
+    }
+
     #[test]
     fn records_guest_visible_local_address_for_rewritten_bind() {
         let provider = SocketNamespaceProvider::new();
@@ -3485,14 +3563,16 @@ mod tests {
         provider
             .record_socket_addresses(
                 None,
-                7,
+                crate::network::SocketKey::for_host_fd(7),
                 Some(guest(guest_addr)),
                 Some(host(host_addr)),
                 None,
                 PortProtocol::Tcp,
             )
             .expect("record");
-        let visible = provider.guest_visible_local_addr(7).expect("visible addr");
+        let visible = provider
+            .guest_visible_local_addr(crate::network::SocketKey::for_host_fd(7))
+            .expect("visible addr");
         assert_eq!(visible, Some(guest(guest_addr)));
     }
 
@@ -4287,7 +4367,7 @@ mod tests {
         provider
             .record_socket_addresses(
                 first.namespace_id.as_ref(),
-                10,
+                crate::network::SocketKey::for_host_fd(10),
                 Some(guest(SocketAddr::new(IpAddr::V4(first.ipv4), 49152))),
                 Some(host(SocketAddr::new(
                     IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -4309,7 +4389,7 @@ mod tests {
         provider
             .record_socket_addresses(
                 second.namespace_id.as_ref(),
-                11,
+                crate::network::SocketKey::for_host_fd(11),
                 Some(second_guest_addr),
                 Some(host(target_addr)),
                 None,
@@ -4330,13 +4410,13 @@ mod tests {
 
         assert_eq!(
             provider
-                .guest_visible_local_addr(10)
+                .guest_visible_local_addr(crate::network::SocketKey::for_host_fd(10))
                 .expect("first socket state"),
             None
         );
         assert_eq!(
             provider
-                .guest_visible_local_addr(11)
+                .guest_visible_local_addr(crate::network::SocketKey::for_host_fd(11))
                 .expect("second socket state"),
             Some(second_guest_addr)
         );
@@ -4703,7 +4783,7 @@ mod tests {
         writer
             .record_socket_addresses(
                 client_spec.namespace_id.as_ref(),
-                10,
+                crate::network::SocketKey::for_host_fd(10),
                 Some(guest_source),
                 Some(host_source),
                 None,
@@ -4933,7 +5013,7 @@ mod tests {
         writer
             .record_socket_addresses(
                 client_spec.namespace_id.as_ref(),
-                10,
+                crate::network::SocketKey::for_host_fd(10),
                 Some(guest_source),
                 Some(host_source),
                 None,

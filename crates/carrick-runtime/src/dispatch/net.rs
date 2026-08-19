@@ -2337,7 +2337,7 @@ impl SyscallDispatcher {
         let guest_local = self
             .network
             .provider
-            .guest_visible_local_addr(fd)
+            .guest_visible_local_addr(crate::network::SocketKey::for_host_fd(host_fd))
             .ok()
             .flatten()
             .or_else(|| {
@@ -2356,7 +2356,7 @@ impl SyscallDispatcher {
             });
         let _ = self.network.provider.record_socket_addresses(
             self.network.spec.namespace_id.as_ref(),
-            fd,
+            crate::network::SocketKey::for_host_fd(host_fd),
             guest_local,
             host_local.map(HostSocketAddr).or(Some(host_peer)),
             Some(GuestSocketAddr(guest_peer)),
@@ -2378,7 +2378,7 @@ impl SyscallDispatcher {
             && self
                 .network
                 .provider
-                .guest_visible_local_addr(fd)
+                .guest_visible_local_addr(crate::network::SocketKey::for_host_fd(host_fd))
                 .ok()
                 .flatten()
                 .is_none()
@@ -2655,9 +2655,10 @@ impl SyscallDispatcher {
     }
 
     fn connected_guest_peer_addr(&self, fd: i32) -> Option<std::net::SocketAddr> {
+        let (host_fd, _family) = self.host_socket_lookup(fd).ok()?;
         self.network
             .provider
-            .guest_visible_peer_addr(fd)
+            .guest_visible_peer_addr(crate::network::SocketKey::for_host_fd(host_fd.get()))
             .ok()
             .flatten()
             .map(|addr| addr.0)
@@ -2761,7 +2762,7 @@ impl SyscallDispatcher {
         let listener_guest_local = self
             .network
             .provider
-            .guest_visible_local_addr(fd)
+            .guest_visible_local_addr(crate::network::SocketKey::for_host_fd(host_fd))
             .ok()
             .flatten();
         let accepted_host_source = host_socket_addr(new_host, family, true).or_else(|| {
@@ -2870,13 +2871,13 @@ impl SyscallDispatcher {
             let guest_local = self
                 .network
                 .provider
-                .guest_visible_local_addr(fd)
+                .guest_visible_local_addr(crate::network::SocketKey::for_host_fd(host_fd))
                 .ok()
                 .flatten();
             let host_local = host_socket_addr(new_host, family, false);
             let _ = self.network.provider.record_socket_addresses(
                 self.network.spec.namespace_id.as_ref(),
-                linux_fd,
+                crate::network::SocketKey::for_host_fd(new_host),
                 guest_local,
                 host_local.map(HostSocketAddr),
                 guest_peer,
@@ -5734,7 +5735,7 @@ impl SyscallDispatcher {
                 };
                 let _ = this.network.provider.record_socket_addresses(
                     this.network.spec.namespace_id.as_ref(),
-                    fd,
+                    crate::network::SocketKey::for_host_fd(host_fd.get()),
                     Some(GuestSocketAddr(guest_local)),
                     Some(HostSocketAddr(host_local)),
                     None,
@@ -5798,7 +5799,14 @@ impl SyscallDispatcher {
                 && let Some(host_local) = host_socket_addr(host_fd.get(), libc::AF_INET, false)
                 && let Err(errno) = this.network.provider.prepare_listen(
                     this.network.spec.namespace_id.as_ref(),
-                    this.network.provider.guest_visible_local_addr(fd.0).ok().flatten(),
+                    this
+                        .network
+                        .provider
+                        .guest_visible_local_addr(crate::network::SocketKey::for_host_fd(
+                            host_fd.get(),
+                        ))
+                        .ok()
+                        .flatten(),
                     Some(HostSocketAddr(host_local)),
                     protocol,
                     this.socket_reuseport(fd.0),
@@ -6155,7 +6163,10 @@ impl SyscallDispatcher {
             {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if let Ok(Some(guest_local)) = this.network.provider.guest_visible_local_addr(fd)
+            if let Ok(Some(guest_local)) = this
+                .network
+                .provider
+                .guest_visible_local_addr(crate::network::SocketKey::for_host_fd(host_fd.get()))
                 && let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_local.0)
             {
                 if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
@@ -6188,7 +6199,10 @@ impl SyscallDispatcher {
             let (host_fd, family) = this.host_socket_lookup(fd)?;
             if cfg!(carrick_bsd)
                 && this.socket_guest_type(fd) == Some(LINUX_SOCK_RAW)
-                && let Ok(Some(guest_peer)) = this.network.provider.guest_visible_peer_addr(fd)
+                && let Ok(Some(guest_peer)) = this
+                    .network
+                    .provider
+                    .guest_visible_peer_addr(crate::network::SocketKey::for_host_fd(host_fd.get()))
             {
                 if addr_addr == 0 || addrlen_addr == 0 {
                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
@@ -6225,7 +6239,10 @@ impl SyscallDispatcher {
             {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if let Ok(Some(guest_peer)) = this.network.provider.guest_visible_peer_addr(fd)
+            if let Ok(Some(guest_peer)) = this
+                .network
+                .provider
+                .guest_visible_peer_addr(crate::network::SocketKey::for_host_fd(host_fd.get()))
                 && let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_peer.0)
             {
                 if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {

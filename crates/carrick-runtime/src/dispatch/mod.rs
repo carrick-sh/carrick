@@ -4610,6 +4610,15 @@ impl SyscallDispatcher {
             if let OpenDescription::HostSocket { host_fd, .. } = &*open_file.description.read() {
                 crate::dispatch::net::reuseport_leave(host_fd.raw());
                 crate::dispatch::net::recverr_close(host_fd.raw());
+                // Same rule, same reason: a recorded guest-visible address must
+                // not outlive its socket either. It used to, and a reused fd
+                // inherited the dead socket's address — glibc's `rfc3484_sort`
+                // closes an AF_INET probe socket and immediately opens an
+                // AF_INET6 one onto the same number, got the v4 sockaddr back
+                // from `getsockname`, and aborted the guest.
+                self.network
+                    .provider
+                    .forget_socket_addresses(crate::network::SocketKey::for_host_fd(host_fd.raw()));
             }
             // A pty SLAVE is about to close. Darwin DESTROYS whatever is still
             // queued in the pty when the last slave fd goes away; Linux hands it
