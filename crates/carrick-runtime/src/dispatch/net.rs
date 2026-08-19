@@ -6435,6 +6435,13 @@ impl SyscallDispatcher {
                 // the error-queue shadow are O_NONBLOCK, and MSG_DONTWAIT keeps
                 // that true per call.
                 let host_flags = host_flags | libc::MSG_DONTWAIT;
+                // Publish the SCTP boundary BEFORE the host send: the peer can
+                // read the bytes the instant it returns.
+                let pending_sctp = if is_sctp_stream {
+                    sctp::begin_send(host_fd.get(), len)
+                } else {
+                    None
+                };
                 let n = match &host_addr {
                     None => unsafe {
                         libc::sendto(
@@ -6484,15 +6491,8 @@ impl SyscallDispatcher {
                     Err(LINUX_ENOTCONN) if is_stream => Err(LINUX_EPIPE),
                     other => other,
                 };
-                // SCTP preserves message boundaries; the TCP backing does not,
-                // so record where this message ended for the receiver's MSG_EOR.
-                // `send`/`sendto` is the path CPython's socket.send() takes —
-                // hooking only `sendmsg` recorded nothing at all.
-                if is_sctp_stream
-                    && let Ok(sent) = result
-                    && sent > 0
-                {
-                    sctp::record_sent(host_fd.get(), sent as usize, sent as usize == len);
+                if let Some(pending) = pending_sctp {
+                    pending.settle(result.ok().map(|sent| sent.max(0) as usize));
                 }
                 result
             });
@@ -7551,16 +7551,15 @@ impl SyscallDispatcher {
             // error-queue shadow are O_NONBLOCK, and MSG_DONTWAIT keeps this
             // call non-blocking regardless.
             let host_flags = host_flags | libc::MSG_DONTWAIT;
+            let pending_sctp = if is_sctp_stream {
+                sctp::begin_send(send_fd, payload_len)
+            } else {
+                None
+            };
             let n = unsafe { libc::sendmsg(send_fd, &hmsg as *const _, host_flags) };
             let result = n.host_syscall_errno().map(|value| value as i64);
-            // SCTP preserves message boundaries; its TCP backing does not, so
-            // record where this message ended for the receiver's MSG_EOR.
-            if is_sctp_stream
-                && let Ok(sent) = result
-                && sent > 0
-            {
-                let complete = sent as usize == payload_len;
-                sctp::record_sent(send_fd, sent as usize, complete);
+            if let Some(pending) = pending_sctp {
+                pending.settle(result.ok().map(|sent| sent.max(0) as usize));
             }
             result
         });
