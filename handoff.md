@@ -29,6 +29,114 @@ artifact.
 The goal is still active. Do not mark it complete, bless a baseline, weaken the
 denominator, add an excuse, accept a retry, or start final performance work.
 
+## CURRENT STATE — session 2026-08-18 (sixth). Read this section first.
+
+**Authoritative measurement: `closure-v5`, 1,986 MATCH / 141 INCOMPLETE of
+2,127, 2,038 diverging assertion rows.** Full-surface `--closure --force` on a
+frozen signed artifact (source `575c9288d`, binary
+`c6e35353d915389714cdc5c5a60827eab822bdbfea444b79a67b83b205b9fb01`, CDHash
+`5ba76e5055d1b86fbd5bff82af230a22c3f0b4a6`, LC_UUID
+`8A340FEC-EE19-30E4-8A4E-836D8F3504E1`, entitlement + `__dof_carrick` present),
+after `RUST_TEST_THREADS=1 just ci` exited 0. 2,113 of 2,127 oracles came from
+the committed cache; 14 ran live. Results: `target/conformance/closure-v5/`.
+
+That supersedes the closure-v4 tally (1,984 / 143, 2,148 rows) and every
+ranking below it.
+
+### Ranked remainder (top of `closure-v5`)
+
+| rows | share | suite | shape |
+|---:|---:|---|---|
+| 989 | 48.5% | `ltp-futex_cmp_requeue01` | run-state publication, see below |
+| 200 | 58.3% | `cpython-multiprocessing_forkserver` | truncated, 10.3x |
+| 147 | 65.6% | `cpython-importlib` | guest SIGSEGV, still open |
+| 55 | 68.3% | `go-go_types` | truncated |
+| 41 | 70.3% | `cpython-socket` | — |
+| 33 | 71.9% | `go-os_exec` | truncated, 221.9x under gate load |
+| 32 | 73.5% | `ltp-process_vm_readv03` | WRONG address space, below |
+
+`>=10x` completing rows to treat as correctness blockers: `go-crypto` 32.9x,
+`go-go_build` 28.3x, `go-crypto_internal_fips140deps` 17.2x,
+`go-go_doc_comment` 15.5x. Everything else in the outlier list is a truncation
+and must NOT be quoted as a ratio.
+
+### Root causes found this session
+
+- **`ltp-futex_cmp_requeue01` is NOT futex, NOT admission, and NOT fork
+  fan-out.** All three readings previously in this file are wrong. One
+  `FUTEX_WAKE` reaps the whole "stuck" cohort in ~150 ms, so the children were
+  parked correctly the entire time; what breaks is that `/proc/<pid>/stat`
+  reports `R` for a parked process. A settled one-second pass reads
+  `settled_states={'R': 64}` — every child, every round. LTP will not requeue
+  until each child reads `S` (no timeout), so it waits on a state that gets
+  retracted. `shared_wait` publishes `S` at enrollment and the vCPU loop
+  republishes `R` when a thread resumes at the run-loop top, so a parked waiter
+  whose vCPU is reclaimed and re-acquired reverts. **This is the M:N layer, and
+  it is the single highest-leverage item left.** Evidence + ladder reducer:
+  `docs/perf-results/2026-08-18-futex-requeue-admission/`.
+  Refuted and reverted, do NOT retry: forcing the shared-futex park to reclaim
+  its lease unconditionally (identical numbers).
+  Separately measured, still open: fork costs 8-25 ms/child against Docker's
+  flat 0.12 ms and grows with live parked children.
+- **`process_vm_readv`/`writev` read and write the WRONG address space** since
+  `96cd97bf6` — a regression from this campaign's own work. `readv02` expects
+  `"test"` and receives `IG_DNOTIFY=y` (kconfig text from the CALLER's mm);
+  `writev02` reports 100000 bytes written with 100000 differences at the
+  target. The previous blanket EFAULT was an honest refusal. Fix the owner
+  keying or restore the refusal.
+- **The crash-core extractor fabricates evidence.** It reads `/tmp/core` with
+  no check that the core belongs to the run, so identical summaries
+  (`pid: 6, comm: "python3"`) are attached to `mmap04`, `kill03` and
+  `setrlimit06` — and `kill03` died on a Rust panic with its own banner. Fix
+  before trusting any appended core.
+- **42 rows are ORACLE load artifacts, not carrick gaps.** `select02`,
+  `epoll_pwait03`, `epoll_wait02`, `pselect01`, `pselect01_64` each have BOTH
+  passing and failing arm64 rows in the committed cache for one declaration,
+  differing only in `parser_profile` — a parser determinant that cannot
+  manufacture a TFAIL. Re-measure those five with `--oracle-fill` on a quiet
+  box and commit the rewrite. `futex_wait05` is the counter-example (all four
+  cached rows agree) and stays a real carrick gap.
+
+### Landed this session
+
+- `mmap` arena **double grant** — `mmap(NULL)` returned an already-live VA and
+  the reuse scrub memset it to zero. Red-first reducer, Docker-verified.
+- `kill(i32::MIN, sig)` **aborted the whole guest** (unchecked negate in the
+  syscall-129 handler).
+- The bridge-mode **`getaddrinfo` abort**: the socket address registry was
+  keyed by a bare guest fd NUMBER that nothing purged on close, so a reused fd
+  inherited the dead socket's address. Now keyed by a typed `SocketKey`
+  (host fd) and purged at last close. **This unblocks the last two libuv rows.**
+- Eleven LTP suites: `timer_settime02`, `sched_rr_get_interval01/02/03`,
+  `newuname01`, `fcntl33`, `fcntl33_64`, `keyctl02`, `syslog11`, `clone09`,
+  `kill03`.
+- `just lint-domains` now **fails closed** (it exited 0 when semgrep was
+  absent, so `just ci` reported green while gating nothing).
+
+### Node libuv sequence — remaining
+
+1. **DONE this session** — bridge `getaddrinfo` abort fixed.
+2. Give `node-libuv` `--network bridge` to close `tcp_connect6_link_local`
+   (370) and `udp_multicast_join6` (472). Only `carrick_flags` changes, which
+   is excluded from the oracle key, so the cached oracle stays valid. Was
+   blocked on (1); now unblocked.
+3. `tcp_try_write_error` — non-deterministic, 8 of 20 isolated runs fail. It is
+   a libuv LOOP-ORDERING divergence, not a write bug. Use the event ring via
+   `carrick-lldb`, NOT a tracer (it passes 6/6 under `carrick trace`).
+
+### Do not redo
+
+- Do not re-derive the libuv rows listed as closed further down this file.
+- Do not retry the shared-futex lease reclaim (measured identical, reverted).
+- Do not validate `memfd_create(MFD_HUGETLB)`'s size field alone: it makes
+  `memfd_create04` WORSE, because LTP builds its expectation from the
+  `/sys/kernel/mm/hugepages` listing. Advertising the oracle's four hstates is
+  the other half, and it is blocked on a real gap — synthetic sysfs
+  DIRECTORIES are not enumerable in the guest at all (`/sys/.../cpu/online`
+  reads fine while `ls /sys/kernel/mm` ENOENTs). The pair must land together.
+
+---
+
 ## Probe phase state (2026-08-18, artifact post-`dacc0c3e9`)
 
 `just conformance-probes-closure` FAILS: 13 generic gaps + 4 dedicated red of
