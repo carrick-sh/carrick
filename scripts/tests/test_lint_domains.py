@@ -26,6 +26,7 @@ class LintDomainsTest(unittest.TestCase):
             "  'argv': sys.argv[1:],\n"
             "  'ssl': os.environ.get('SSL_CERT_FILE'),\n"
             "  'log': os.environ.get('SEMGREP_LOG_FILE'),\n"
+            "  'log_contents': pathlib.Path(os.environ['SEMGREP_LOG_FILE']).read_text(),\n"
             "  'metrics': os.environ.get('SEMGREP_SEND_METRICS'),\n"
             "  'version_check': os.environ.get('SEMGREP_ENABLE_VERSION_CHECK'),\n"
             "  'otel': os.environ.get('OTEL_SDK_DISABLED'),\n"
@@ -52,6 +53,8 @@ class LintDomainsTest(unittest.TestCase):
         )
         if log_file is not None:
             env["SEMGREP_LOG_FILE"] = str(log_file)
+        else:
+            env.pop("SEMGREP_LOG_FILE", None)
         return subprocess.run(
             [str(SCRIPT)], cwd=ROOT, env=env, text=True, capture_output=True
         )
@@ -76,6 +79,14 @@ class LintDomainsTest(unittest.TestCase):
             self.run_launcher("7", self.root / "semgrep.log").returncode, 7
         )
 
+    def test_launcher_does_not_truncate_explicit_log_before_semgrep_runs(self):
+        log_file = self.root / "semgrep.log"
+        log_file.write_text("sentinel log content\n", encoding="utf-8")
+        result = self.run_launcher(log_file=log_file)
+        self.assertEqual(result.returncode, 0)
+        capture = json.loads(self.capture.read_text(encoding="utf-8"))
+        self.assertEqual(capture["log_contents"], "sentinel log content\n")
+
     def test_launcher_rejects_unwritable_log_path_before_running_semgrep(self):
         log_file = self.root / "missing-parent" / "semgrep.log"
         result = self.run_launcher(log_file=log_file)
@@ -84,9 +95,19 @@ class LintDomainsTest(unittest.TestCase):
         self.assertFalse(self.capture.exists())
 
     def test_launcher_removes_default_temporary_log_directory(self):
-        result = self.run_launcher()
+        inherited_log_file = self.root / "inherited.log"
+        previous_log_file = os.environ.get("SEMGREP_LOG_FILE")
+        os.environ["SEMGREP_LOG_FILE"] = str(inherited_log_file)
+        try:
+            result = self.run_launcher()
+        finally:
+            if previous_log_file is None:
+                os.environ.pop("SEMGREP_LOG_FILE", None)
+            else:
+                os.environ["SEMGREP_LOG_FILE"] = previous_log_file
         self.assertEqual(result.returncode, 0)
         capture = json.loads(self.capture.read_text(encoding="utf-8"))
+        self.assertNotEqual(capture["log"], str(inherited_log_file))
         self.assertFalse(Path(capture["log"]).parent.exists())
 
 
