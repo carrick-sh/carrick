@@ -1339,85 +1339,47 @@ fn reportable_status_flags(raw: u64) -> u64 {
     raw & !CREATION_ONLY
 }
 
-/// One host interface with an IPv4 address: `(name, flags_host, sin_addr_be)`
+/// One interface with an IPv4 address: `(name, flags_host, sin_addr_be)`
 /// where `flags_host` is the host's raw `ifa_flags` and `sin_addr_be` is the
-/// 4-byte network-order IPv4 address. Built from `getifaddrs(3)`, which every
-/// supported host provides. SIOCGIFCONF reports Carrick's Linux-facing
-/// interface view, not Darwin's raw names.
+/// 4-byte network-order IPv4 address. Built from the runtime's LinuxNetworkModel.
 struct HostInet4Iface {
     name: String,
     flags_host: u32,
     addr_be: [u8; 4],
 }
 
-/// Enumerate host interfaces that have an IPv4 address, in `getifaddrs` order.
-/// Used to service the `SIOCGIFCONF`/`SIOCGIFFLAGS`/`SIOCGIFADDR` family — we
-/// normalize names to the same guest-visible `lo`/`eth0` namespace as rtnetlink
-/// and `/proc/net`.
-fn host_inet4_interfaces() -> Vec<HostInet4Iface> {
-    let mut out: Vec<HostInet4Iface> = Vec::new();
-    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs allocates a list we free with freeifaddrs below.
-    if unsafe { libc::getifaddrs(&mut head) } != 0 || head.is_null() {
-        return out;
-    }
-    let mut cur = head;
-    while !cur.is_null() {
-        // SAFETY: cur is a non-null node in the getifaddrs list.
-        let ifa = unsafe { &*cur };
-        cur = ifa.ifa_next;
-        if ifa.ifa_name.is_null() || ifa.ifa_addr.is_null() {
-            continue;
-        }
-        // SAFETY: ifa_addr is non-null; sa_family is the first field.
-        if unsafe { (*ifa.ifa_addr).sa_family } as i32 != libc::AF_INET {
-            continue;
-        }
-        // SAFETY: an AF_INET ifa_addr is a sockaddr_in.
-        let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
-        let addr_be = sin.sin_addr.s_addr.to_ne_bytes();
-        // SAFETY: ifa_name is a non-null NUL-terminated C string.
-        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
-            .to_string_lossy()
-            .into_owned();
+fn inet4_interfaces_from_model(
+    model: &crate::network::model::LinuxNetworkModel,
+) -> Vec<HostInet4Iface> {
+    let mut out = Vec::new();
+    for link in &model.links {
+        let addr_be = model
+            .addresses
+            .iter()
+            .find_map(|a| {
+                if a.link_name == link.name
+                    && let std::net::IpAddr::V4(v4) = a.addr
+                {
+                    Some(v4.octets())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(if link.loopback {
+                [127, 0, 0, 1]
+            } else {
+                [0, 0, 0, 0]
+            });
+        let flags_host = if link.loopback {
+            libc::IFF_LOOPBACK | libc::IFF_UP | libc::IFF_RUNNING
+        } else {
+            libc::IFF_UP | libc::IFF_RUNNING | libc::IFF_BROADCAST | libc::IFF_MULTICAST
+        } as u32;
         out.push(HostInet4Iface {
-            name,
-            flags_host: ifa.ifa_flags,
+            name: link.name.clone(),
+            flags_host,
             addr_be,
         });
-    }
-    // SAFETY: free the list getifaddrs allocated.
-    unsafe { libc::freeifaddrs(head) };
-    linux_guest_inet4_interfaces(out)
-}
-
-fn linux_guest_inet4_interfaces(ifaces: Vec<HostInet4Iface>) -> Vec<HostInet4Iface> {
-    let eth_host_name = ifaces
-        .iter()
-        .map(|iface| iface.name.as_str())
-        .filter(|name| name.starts_with("en"))
-        .min()
-        .map(str::to_owned);
-
-    let mut out = Vec::new();
-    let mut have_lo = false;
-    let mut have_eth = false;
-    for mut iface in ifaces {
-        if iface.name == "lo0" || iface.name == "lo" {
-            if have_lo {
-                continue;
-            }
-            have_lo = true;
-            iface.name = "lo".to_owned();
-            out.push(iface);
-        } else if eth_host_name.as_deref() == Some(iface.name.as_str()) {
-            if have_eth {
-                continue;
-            }
-            have_eth = true;
-            iface.name = "eth0".to_owned();
-            out.push(iface);
-        }
     }
     out
 }
@@ -8759,7 +8721,7 @@ impl SyscallDispatcher {
                         };
                         let ifc_len = conf.ifc_len.max(0) as usize;
                         let ifc_buf = conf.ifc_buf;
-                        let ifaces = host_inet4_interfaces();
+                        let ifaces = inet4_interfaces_from_model(&this.network.model);
                         // Linux convention: a NULL ifc_buf is a size query that
                         // reports the bytes required without writing entries.
                         let cap = if ifc_buf == 0 {
@@ -8807,7 +8769,7 @@ impl SyscallDispatcher {
                             .position(|b| *b == 0)
                             .unwrap_or(name_bytes.len());
                         let name = String::from_utf8_lossy(&name_bytes[..end]).into_owned();
-                        let ifaces = host_inet4_interfaces();
+                        let ifaces = inet4_interfaces_from_model(&this.network.model);
                         let Some(iface) = ifaces.iter().find(|i| i.name == name) else {
                             return Ok(DispatchOutcome::errno(LINUX_ENODEV));
                         };

@@ -2551,11 +2551,7 @@ impl SyscallDispatcher {
                 return DispatchOutcome::errno(LINUX_ENOTSOCK);
             };
             let dest_pid = if *pid != 0 { *pid } else { std::process::id() };
-            if self.network.spec.mode == carrick_spec::NetworkMode::Bridge {
-                build_netlink_reply_for_snapshot(request, dest_pid, &self.network.model)
-            } else {
-                build_netlink_reply(request, dest_pid)
-            }
+            build_netlink_reply_for_snapshot(request, dest_pid, &self.network.model)
         };
         if let OpenDescription::Netlink { recv_queue, .. } = &mut *open_file.description.write() {
             recv_queue.extend(reply);
