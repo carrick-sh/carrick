@@ -169,7 +169,7 @@ impl IdRegistry {
     }
 
     #[cfg(test)]
-    pub(super) fn set_next_for_tests(&self, raw: i32) {
+    pub(crate) fn set_next_for_tests(&self, raw: i32) {
         let mut state = self.state.lock();
         assert!((state.first..=state.last).contains(&raw));
         state.next = raw;

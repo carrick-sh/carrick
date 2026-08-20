@@ -54,16 +54,68 @@ pub struct MqueueMessage {
     pub payload: Vec<u8>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
+pub enum MqueueNotifyTarget<KernelResource = (), HostResource = ()> {
+    /// One exact Carrick-kernel task generation. A numeric guest pid is never
+    /// allowed to escape this variant into a host pid-taking syscall.
+    Kernel(crate::kernel::TaskKey, KernelResource),
+    /// Legacy one-host-process-per-guest-process delivery. The pid is a host
+    /// pid by construction and retains the established xsig/kill fallback.
+    Host(libc::pid_t, HostResource),
+}
+
+impl<KernelResource, HostResource> MqueueNotifyTarget<KernelResource, HostResource> {
+    fn same_owner<OtherKernel, OtherHost>(
+        &self,
+        other: &MqueueNotifyTarget<OtherKernel, OtherHost>,
+    ) -> bool {
+        match (self, other) {
+            (Self::Kernel(left, _), MqueueNotifyTarget::Kernel(right, _)) => left == right,
+            (Self::Host(left, _), MqueueNotifyTarget::Host(right, _)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct RetainedNetlinkDescription {
+    description: Arc<crate::kernel::FileDescription>,
+}
+
+impl RetainedNetlinkDescription {
+    fn new(description: Arc<crate::kernel::FileDescription>) -> Self {
+        description.retain_fd_ref();
+        Self { description }
+    }
+
+    fn enqueue(&self, bytes: &[u8]) -> Result<(), LinuxErrno> {
+        let mut open = self.description.write();
+        let OpenDescription::Netlink { recv_queue, .. } = &mut *open else {
+            return Err(LINUX_EBADF);
+        };
+        recv_queue.extend(bytes);
+        Ok(())
+    }
+}
+
+impl Drop for RetainedNetlinkDescription {
+    fn drop(&mut self) {
+        self.description.release_fd_ref();
+    }
+}
+
+#[derive(Debug)]
 pub enum MqueueNotify {
     Signal {
-        pid: i32,
+        target: MqueueNotifyTarget,
         signo: i32,
         value: i64,
     },
     Thread {
-        pid: i32,
-        netlink_fd: i32,
+        /// The route and the resource it is allowed to use are one value, so a
+        /// kernel TaskKey cannot accidentally be paired with a host fd (or a
+        /// host pid with a retained kernel description).
+        target: MqueueNotifyTarget<RetainedNetlinkDescription, i32>,
         data: [u8; NOTIFY_DATA_SIZE],
     },
 }
@@ -125,6 +177,36 @@ struct MqDescription {
 }
 
 impl SyscallDispatcher {
+    fn mqueue_notify_target(&self, context: &crate::kernel::KernelContext) -> MqueueNotifyTarget {
+        if self.hvpatch_process().is_some() {
+            MqueueNotifyTarget::Kernel(context.task().key(), ())
+        } else {
+            MqueueNotifyTarget::Host(std::process::id() as libc::pid_t, ())
+        }
+    }
+
+    fn retain_netlink_description(
+        &self,
+        fd: i32,
+    ) -> Result<RetainedNetlinkDescription, LinuxErrno> {
+        if fd < 0 {
+            return Err(LINUX_EBADF);
+        }
+        let files = self.captured_file_table();
+        let open_files = files.read_open_files();
+        let description = open_files
+            .get(&fd)
+            .map(crate::kernel::FileSlot::description)
+            .ok_or(LINUX_EBADF)?;
+        if !matches!(&*description.read(), OpenDescription::Netlink { .. }) {
+            return Err(LINUX_EBADF);
+        }
+        // Retain while the fd-table read lock still prevents a concurrent
+        // close from dropping the last functional reference and closing the
+        // backing between validation and acquisition.
+        Ok(RetainedNetlinkDescription::new(description))
+    }
+
     fn mq_description(&self, fd: i32) -> Result<MqDescription, LinuxErrno> {
         let open_file = self.open_file(fd).ok_or(LINUX_EBADF)?;
         let open = open_file.description.read();
@@ -384,10 +466,7 @@ impl SyscallDispatcher {
         /// mq_notify(mqd, sevp). Register (NULL → unregister) a one-shot
         /// notification for the empty→non-empty transition.
         fn mq_notify(this, cx, mqd: u64, sevp: GuestPtr) {
-            let caller_pid = this
-                .hvpatch_process()
-                .map(|_| cx.kernel.task().key().id.raw())
-                .unwrap_or_else(|| std::process::id() as i32);
+            let caller = this.mqueue_notify_target(cx.kernel);
 
             if sevp.0 == 0 {
                 let mq = match this.mq_description(mqd as i32) {
@@ -396,18 +475,14 @@ impl SyscallDispatcher {
                 };
                 let mut state = mq.queue.state.lock();
                 let delivery = match state.notify.take() {
-                    Some(MqueueNotify::Signal { pid, .. }) if pid == caller_pid => None,
+                    Some(MqueueNotify::Signal { target, .. })
+                        if target.same_owner(&caller) => None,
                     Some(MqueueNotify::Thread {
-                        pid,
-                        netlink_fd,
+                        target,
                         mut data,
-                    }) if pid == caller_pid => {
+                    }) if target.same_owner(&caller) => {
                         data[NOTIFY_DATA_SIZE - 1] = MQ_NOTIFY_EVENT_REMOVED as u8;
-                        Some(MqueueNotify::Thread {
-                            pid,
-                            netlink_fd,
-                            data,
-                        })
+                        Some(MqueueNotify::Thread { target, data })
                     }
                     other => {
                         state.notify = other;
@@ -436,16 +511,27 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                     Some(MqueueNotify::Signal {
-                        pid: caller_pid,
+                        target: caller,
                         signo: s,
                         value: sigev_value as i64,
                     })
                 }
                 crate::linux_abi::LINUX_SIGEV_THREAD => {
                     let fd = sev.sigev_signo;
-                    if fd < 0 || !this.fd_is_netlink(fd) {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    }
+                    let target = match caller {
+                        MqueueNotifyTarget::Kernel(task, ()) => {
+                            match this.retain_netlink_description(fd) {
+                                Ok(description) => MqueueNotifyTarget::Kernel(task, description),
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            }
+                        }
+                        MqueueNotifyTarget::Host(pid, ()) => {
+                            if fd < 0 || !this.fd_is_netlink(fd) {
+                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                            }
+                            MqueueNotifyTarget::Host(pid, fd)
+                        }
+                    };
                     let bytes = match cx.memory.read_bytes(sigev_value, NOTIFY_DATA_SIZE) {
                         Ok(bytes) => bytes,
                         Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
@@ -453,11 +539,7 @@ impl SyscallDispatcher {
                     let mut data = [0u8; NOTIFY_DATA_SIZE];
                     data.copy_from_slice(&bytes);
                     data[NOTIFY_DATA_SIZE - 1] = MQ_NOTIFY_EVENT_MSG as u8;
-                    Some(MqueueNotify::Thread {
-                        pid: caller_pid,
-                        netlink_fd: fd,
-                        data,
-                    })
+                    Some(MqueueNotify::Thread { target, data })
                 }
                 _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             };
@@ -532,49 +614,72 @@ fn deliver_notify(
     delivery: MqueueNotify,
 ) {
     match delivery {
-        MqueueNotify::Signal { pid, signo, value } => {
-            let info = crate::linux_abi::LinuxSiginfo::message_queue(
-                signo,
-                this.identity_pid() as i32,
-                this.cred_snapshot().ruid.raw(),
-                value,
-            );
-            let local_pid = this
-                .hvpatch_process()
-                .map(|_| context.task().key().id.raw())
-                .unwrap_or_else(|| std::process::id() as i32);
-            if pid == local_pid {
-                this.record_pending_siginfo(context, tid, signo, info);
-                this.mark_signal_pending(context, tid, signo);
-                crate::host_signal::raise_for_self(signo);
-            } else if crate::host_signal::xsig_enqueue(
-                pid,
-                signo,
-                crate::linux_abi::LINUX_SI_MESGQ,
-                this.identity_pid() as i32,
-                this.cred_snapshot().ruid.raw(),
-                value,
-                0,
-            ) {
-                crate::host_signal::xsig_nudge(pid);
-            } else {
-                let host_signo = crate::host_signal::linux_to_host_signum(signo);
-                unsafe { libc::kill(pid, host_signo) };
+        MqueueNotify::Signal {
+            target,
+            signo,
+            value,
+        } => match target {
+            MqueueNotifyTarget::Kernel(target, ()) => {
+                let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signo) else {
+                    return;
+                };
+                let info = crate::linux_abi::LinuxSiginfo::message_queue(
+                    signo,
+                    context.task().key().id.raw(),
+                    context.resources().credentials().ruid().raw(),
+                    value,
+                );
+                let _ = context
+                    .kernel()
+                    .post_signal_to_task_key(target, signal, Some(info));
             }
-        }
-        MqueueNotify::Thread {
-            pid,
-            netlink_fd,
-            data,
-        } => {
-            let local_pid = this
-                .hvpatch_process()
-                .map(|_| context.task().key().id.raw())
-                .unwrap_or_else(|| std::process::id() as i32);
-            if pid == local_pid {
-                let _ = this.enqueue_netlink_message(netlink_fd, &data);
+            MqueueNotifyTarget::Host(pid, ()) => {
+                let info = crate::linux_abi::LinuxSiginfo::message_queue(
+                    signo,
+                    this.identity_pid() as i32,
+                    this.cred_snapshot().ruid.raw(),
+                    value,
+                );
+                let local_pid = this
+                    .hvpatch_process()
+                    .map(|_| context.task().key().id.raw())
+                    .unwrap_or_else(|| std::process::id() as i32);
+                if pid == local_pid {
+                    this.record_pending_siginfo(context, tid, signo, info);
+                    this.mark_signal_pending(context, tid, signo);
+                    crate::host_signal::raise_for_self(signo);
+                } else if crate::host_signal::xsig_enqueue(
+                    pid,
+                    signo,
+                    crate::linux_abi::LINUX_SI_MESGQ,
+                    this.identity_pid() as i32,
+                    this.cred_snapshot().ruid.raw(),
+                    value,
+                    0,
+                ) {
+                    crate::host_signal::xsig_nudge(pid);
+                } else {
+                    let host_signo = crate::host_signal::linux_to_host_signum(signo);
+                    unsafe { libc::kill(pid, host_signo) };
+                }
             }
-        }
+        },
+        MqueueNotify::Thread { target, data } => match target {
+            MqueueNotifyTarget::Kernel(target, description) => {
+                let _ = context
+                    .kernel()
+                    .publish_task_event_and_wake(target, || description.enqueue(&data).is_ok());
+            }
+            MqueueNotifyTarget::Host(pid, netlink_fd) => {
+                let local_pid = this
+                    .hvpatch_process()
+                    .map(|_| context.task().key().id.raw())
+                    .unwrap_or_else(|| std::process::id() as i32);
+                if pid == local_pid {
+                    let _ = this.enqueue_netlink_message(netlink_fd, &data);
+                }
+            }
+        },
     }
 }
 
@@ -616,6 +721,240 @@ fn deadline_expired(deadline: Option<(i64, i64)>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn dispatch_call(
+        dispatcher: &SyscallDispatcher,
+        context: &crate::kernel::KernelContext,
+        memory: &mut LinearMemory,
+        number: u64,
+        args: [u64; 6],
+    ) -> DispatchOutcome {
+        dispatcher
+            .dispatch_normalized(
+                context,
+                SyscallRequest::new(number, SyscallArgs::from(args)),
+                memory,
+                &CompatReporter::default(),
+                None,
+            )
+            .expect("mqueue test syscall must be routed")
+            .expect("mqueue test syscall must dispatch")
+    }
+
+    fn returned_fd(outcome: DispatchOutcome) -> i32 {
+        match outcome {
+            DispatchOutcome::Returned { value } => i32::try_from(value).expect("fd fits i32"),
+            other => panic!("expected fd, got {other:?}"),
+        }
+    }
+
+    fn open_test_queue(
+        dispatcher: &SyscallDispatcher,
+        context: &crate::kernel::KernelContext,
+        memory: &mut LinearMemory,
+        name_address: u64,
+        name: &[u8],
+    ) -> i32 {
+        memory.write_bytes(name_address, name).unwrap();
+        returned_fd(dispatch_call(
+            dispatcher,
+            context,
+            memory,
+            180,
+            [
+                name_address,
+                LINUX_O_RDWR | LINUX_O_CREAT | LINUX_O_EXCL,
+                0o600,
+                0,
+                0,
+                0,
+            ],
+        ))
+    }
+
+    fn open_test_netlink(
+        dispatcher: &SyscallDispatcher,
+        context: &crate::kernel::KernelContext,
+        memory: &mut LinearMemory,
+    ) -> i32 {
+        returned_fd(dispatch_call(
+            dispatcher,
+            context,
+            memory,
+            198,
+            [LINUX_AF_NETLINK as u64, LINUX_SOCK_DGRAM as u64, 0, 0, 0, 0],
+        ))
+    }
+
+    fn register_thread_notification(
+        dispatcher: &SyscallDispatcher,
+        context: &crate::kernel::KernelContext,
+        memory: &mut LinearMemory,
+        mqd: i32,
+        netlink_fd: i32,
+        data: [u8; NOTIFY_DATA_SIZE],
+    ) {
+        use zerocopy::IntoBytes as _;
+
+        let data_address = 0x1200;
+        let sigevent_address = 0x1100;
+        memory.write_bytes(data_address, &data).unwrap();
+        let sigevent = crate::linux_abi::LinuxSigevent {
+            sigev_value: data_address,
+            sigev_signo: netlink_fd,
+            sigev_notify: crate::linux_abi::LINUX_SIGEV_THREAD,
+            _sigev_un: [0; 48],
+        };
+        memory
+            .write_bytes(sigevent_address, sigevent.as_bytes())
+            .unwrap();
+        assert_eq!(
+            dispatch_call(
+                dispatcher,
+                context,
+                memory,
+                184,
+                [mqd as u64, sigevent_address, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+    }
+
+    fn register_signal_notification(
+        dispatcher: &SyscallDispatcher,
+        context: &crate::kernel::KernelContext,
+        memory: &mut LinearMemory,
+        mqd: i32,
+        signo: i32,
+        value: i64,
+        sigevent_address: u64,
+    ) {
+        use zerocopy::IntoBytes as _;
+
+        let sigevent = crate::linux_abi::LinuxSigevent {
+            sigev_value: value as u64,
+            sigev_signo: signo,
+            sigev_notify: crate::linux_abi::LINUX_SIGEV_SIGNAL,
+            _sigev_un: [0; 48],
+        };
+        memory
+            .write_bytes(sigevent_address, sigevent.as_bytes())
+            .unwrap();
+        assert_eq!(
+            dispatch_call(
+                dispatcher,
+                context,
+                memory,
+                184,
+                [mqd as u64, sigevent_address, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+    }
+
+    fn send_test_message(
+        dispatcher: &SyscallDispatcher,
+        context: &crate::kernel::KernelContext,
+        memory: &mut LinearMemory,
+        mqd: i32,
+        message_address: u64,
+    ) {
+        memory.write_bytes(message_address, b"x").unwrap();
+        assert_eq!(
+            dispatch_call(
+                dispatcher,
+                context,
+                memory,
+                182,
+                [mqd as u64, message_address, 1, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+    }
+
+    fn fork_test_task(
+        parent: &crate::kernel::KernelContext,
+        registry_id: i32,
+        name: &str,
+    ) -> crate::kernel::KernelContext {
+        parent
+            .kernel()
+            .reserve_fork(
+                parent,
+                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+                    .unwrap(),
+                name.to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_reference(crate::thread::ThreadId::synthetic_for_tests(registry_id))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0
+    }
+
+    fn file_description(
+        dispatcher: &SyscallDispatcher,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+    ) -> Arc<crate::kernel::FileDescription> {
+        super::super::resources::with_captured_resources(context, || {
+            dispatcher.open_file(fd).expect("open file").description()
+        })
+    }
+
+    fn netlink_bytes(
+        dispatcher: &SyscallDispatcher,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+    ) -> Vec<u8> {
+        super::super::resources::with_captured_resources(context, || {
+            let open_file = dispatcher.open_file(fd).expect("netlink fd");
+            let open = open_file.description.read();
+            let OpenDescription::Netlink { recv_queue, .. } = &*open else {
+                panic!("fd {fd} is not netlink");
+            };
+            recv_queue.iter().copied().collect()
+        })
+    }
+
+    #[derive(Debug)]
+    struct SignalObservingWaker {
+        wakes: AtomicUsize,
+        pending: Arc<crate::kernel::TaskPendingSignals>,
+        pending_when_woken: AtomicUsize,
+    }
+
+    impl crate::kernel::TaskWaker for SignalObservingWaker {
+        fn wake_task(&self) {
+            self.pending_when_woken
+                .store(self.pending.pending_count(), Ordering::SeqCst);
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct NetlinkObservingWaker {
+        wakes: AtomicUsize,
+        description: Arc<crate::kernel::FileDescription>,
+        bytes_when_woken: AtomicUsize,
+    }
+
+    impl crate::kernel::TaskWaker for NetlinkObservingWaker {
+        fn wake_task(&self) {
+            let open = self.description.read();
+            let queued = match &*open {
+                OpenDescription::Netlink { recv_queue, .. } => recv_queue.len(),
+                _ => 0,
+            };
+            self.bytes_when_woken.store(queued, Ordering::SeqCst);
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn validate_names() {
@@ -663,6 +1002,311 @@ mod tests {
         assert_eq!(state.messages.remove(0).payload, b"prio10_second");
         assert_eq!(state.messages.remove(0).payload, b"prio5_first");
         assert!(state.messages.is_empty());
+    }
+
+    /// Characterize the non-HVPatch route before changing its target type. A
+    /// local unregister still publishes glibc's REMOVED record through the
+    /// caller's CURRENT fd number, exactly as the historical host path did.
+    #[test]
+    fn host_thread_unregister_route_is_unchanged() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x5000]);
+        let mqd = open_test_queue(&dispatcher, &context, &mut memory, 0x1000, b"host_notify\0");
+        let netlink_fd = open_test_netlink(&dispatcher, &context, &mut memory);
+        let data = [0x5au8; NOTIFY_DATA_SIZE];
+        register_thread_notification(&dispatcher, &context, &mut memory, mqd, netlink_fd, data);
+
+        assert_eq!(
+            dispatch_call(
+                &dispatcher,
+                &context,
+                &mut memory,
+                184,
+                [mqd as u64, 0, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        let mut expected = data;
+        expected[NOTIFY_DATA_SIZE - 1] = MQ_NOTIFY_EVENT_REMOVED as u8;
+        assert_eq!(netlink_bytes(&dispatcher, &context, netlink_fd), expected);
+
+        register_signal_notification(&dispatcher, &context, &mut memory, mqd, 34, 0x1234, 0x1300);
+        let mq = dispatcher.mq_description(mqd).unwrap();
+        let state = mq.queue.state.lock();
+        assert!(matches!(
+            &state.notify,
+            Some(MqueueNotify::Signal {
+                target: MqueueNotifyTarget::Host(pid, ()),
+                ..
+            }) if *pid == std::process::id() as libc::pid_t
+        ));
+    }
+
+    #[test]
+    fn hvpatch_cross_task_signal_targets_exact_registrant_with_sender_identity() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_001);
+        dispatcher.bind_hvpatch_process(process);
+        let registrant = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
+        let mqd = open_test_queue(
+            &dispatcher,
+            &registrant,
+            &mut memory,
+            0x1000,
+            b"kernel_signal\0",
+        );
+        let signo = 34;
+        let value = 0x1234_5678_90ab_cdefu64 as i64;
+        register_signal_notification(
+            &dispatcher,
+            &registrant,
+            &mut memory,
+            mqd,
+            signo,
+            value,
+            0x1100,
+        );
+        let sender = fork_test_task(&registrant, 82_001, "mq sender");
+        let sender = sender
+            .kernel()
+            .update_credentials(&sender, |credentials| {
+                credentials.set_uid_triple(
+                    carrick_abi::NsUid::new(1_234),
+                    carrick_abi::NsUid::new(1_234),
+                    carrick_abi::NsUid::new(1_234),
+                );
+            })
+            .unwrap();
+
+        let target_waker = Arc::new(SignalObservingWaker {
+            wakes: AtomicUsize::new(0),
+            pending: registrant.shared().pending_signals(),
+            pending_when_woken: AtomicUsize::new(0),
+        });
+        let sender_waker = Arc::new(SignalObservingWaker {
+            wakes: AtomicUsize::new(0),
+            pending: sender.shared().pending_signals(),
+            pending_when_woken: AtomicUsize::new(0),
+        });
+        registrant
+            .task()
+            .set_waker(Arc::clone(&target_waker) as Arc<dyn crate::kernel::TaskWaker>);
+        sender
+            .task()
+            .set_waker(Arc::clone(&sender_waker) as Arc<dyn crate::kernel::TaskWaker>);
+
+        send_test_message(&dispatcher, &sender, &mut memory, mqd, 0x1200);
+
+        let entries = registrant.shared().pending_signals().snapshot_entries();
+        assert_eq!(entries.len(), 1);
+        let pending = entries[0];
+        assert_eq!(pending.signal.raw(), signo);
+        let info = pending.siginfo.expect("SI_MESGQ payload");
+        let info_signo = info.si_signo;
+        let info_code = info.si_code;
+        let info_sender = info.si_addr as u32 as i32;
+        let info_uid = (info.si_addr >> 32) as u32;
+        let info_value = i64::from_le_bytes(info._pad[0..8].try_into().unwrap());
+        assert_eq!(info_signo, signo);
+        assert_eq!(info_code, crate::linux_abi::LINUX_SI_MESGQ);
+        assert_eq!(info_sender, sender.task().key().id.raw());
+        assert_eq!(info_uid, 1_234);
+        assert_eq!(info_value, value);
+        assert!(
+            sender
+                .shared()
+                .pending_signals()
+                .snapshot_entries()
+                .is_empty()
+        );
+        assert_eq!(target_waker.wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(target_waker.pending_when_woken.load(Ordering::SeqCst), 1);
+        assert_eq!(sender_waker.wakes.load(Ordering::SeqCst), 0);
+
+        let mq = dispatcher.mq_description(mqd).unwrap();
+        let state = mq.queue.state.lock();
+        assert!(state.notify.is_none(), "notification is one-shot");
+    }
+
+    #[test]
+    fn hvpatch_thread_notification_keeps_registrants_exact_netlink_description() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_002);
+        dispatcher.bind_hvpatch_process(process);
+        let registrant = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x7000]);
+        let mqd = open_test_queue(
+            &dispatcher,
+            &registrant,
+            &mut memory,
+            0x1000,
+            b"kernel_thread\0",
+        );
+        let netlink_fd = open_test_netlink(&dispatcher, &registrant, &mut memory);
+        let mut data = [0u8; NOTIFY_DATA_SIZE];
+        for (index, byte) in data.iter_mut().enumerate() {
+            *byte = u8::try_from(index).unwrap();
+        }
+        register_thread_notification(&dispatcher, &registrant, &mut memory, mqd, netlink_fd, data);
+
+        let sender = fork_test_task(&registrant, 82_002, "mq thread sender");
+        assert_eq!(
+            dispatch_call(
+                &dispatcher,
+                &sender,
+                &mut memory,
+                57,
+                [netlink_fd as u64, 0, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        let replacement = open_test_netlink(&dispatcher, &sender, &mut memory);
+        assert_eq!(replacement, netlink_fd, "child must recycle the fd number");
+
+        let registrant_description = file_description(&dispatcher, &registrant, netlink_fd);
+        let target_waker = Arc::new(NetlinkObservingWaker {
+            wakes: AtomicUsize::new(0),
+            description: Arc::clone(&registrant_description),
+            bytes_when_woken: AtomicUsize::new(0),
+        });
+        let sender_waker = Arc::new(SignalObservingWaker {
+            wakes: AtomicUsize::new(0),
+            pending: sender.shared().pending_signals(),
+            pending_when_woken: AtomicUsize::new(0),
+        });
+        registrant
+            .task()
+            .set_waker(Arc::clone(&target_waker) as Arc<dyn crate::kernel::TaskWaker>);
+        sender
+            .task()
+            .set_waker(Arc::clone(&sender_waker) as Arc<dyn crate::kernel::TaskWaker>);
+
+        send_test_message(&dispatcher, &sender, &mut memory, mqd, 0x1300);
+
+        data[NOTIFY_DATA_SIZE - 1] = MQ_NOTIFY_EVENT_MSG as u8;
+        assert_eq!(netlink_bytes(&dispatcher, &registrant, netlink_fd), data);
+        assert!(
+            netlink_bytes(&dispatcher, &sender, replacement).is_empty(),
+            "the sender's recycled fd must not receive the registrant's event",
+        );
+        assert_eq!(target_waker.wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            target_waker.bytes_when_woken.load(Ordering::SeqCst),
+            NOTIFY_DATA_SIZE,
+            "the record must be published before the exact target wakes",
+        );
+        assert_eq!(sender_waker.wakes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn hvpatch_unregister_and_delivery_never_follow_reused_pid() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_003);
+        dispatcher.bind_hvpatch_process(process);
+        let root = dispatcher.capture_one_task_context().unwrap();
+        let root_binding = root.task_binding();
+        let root_tid = root.thread().key().tid;
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
+        let mqd = open_test_queue(
+            &dispatcher,
+            &root,
+            &mut memory,
+            0x1000,
+            b"kernel_generation\0",
+        );
+        let registrant = fork_test_task(&root, 82_003, "old mq registrant");
+        let old_key = registrant.task().key();
+        register_signal_notification(
+            &dispatcher,
+            &registrant,
+            &mut memory,
+            mqd,
+            34,
+            0x55aa,
+            0x1100,
+        );
+        {
+            let mq = super::super::resources::with_captured_resources(&root, || {
+                dispatcher.mq_description(mqd).unwrap()
+            });
+            let state = mq.queue.state.lock();
+            assert!(matches!(
+                &state.notify,
+                Some(MqueueNotify::Signal {
+                    target: MqueueNotifyTarget::Kernel(target, ()),
+                    ..
+                }) if *target == old_key
+            ));
+        }
+
+        root.kernel()
+            .exit_task_key_eventually(
+                old_key,
+                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+            )
+            .unwrap();
+        drop(registrant);
+        assert!(matches!(
+            root.kernel().wait_child(
+                root.task().key().id,
+                Some(old_key.id),
+                crate::kernel::WaitMode::Consume,
+            ),
+            Ok(crate::kernel::WaitOutcome::Exited(_))
+        ));
+        root.kernel().sweep_retired_threads();
+        root.kernel().ids().set_next_for_tests(old_key.id.raw());
+        let fresh_root = root_binding.capture(root_tid).unwrap();
+        let replacement = fork_test_task(&fresh_root, 82_004, "replacement mq task");
+        assert_eq!(replacement.task().key().id, old_key.id);
+        assert_ne!(replacement.task().key(), old_key);
+
+        assert_eq!(
+            dispatch_call(
+                &dispatcher,
+                &replacement,
+                &mut memory,
+                184,
+                [mqd as u64, 0, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        {
+            let mq = super::super::resources::with_captured_resources(&fresh_root, || {
+                dispatcher.mq_description(mqd).unwrap()
+            });
+            let state = mq.queue.state.lock();
+            assert!(
+                matches!(
+                    &state.notify,
+                    Some(MqueueNotify::Signal {
+                        target: MqueueNotifyTarget::Kernel(target, ()),
+                        ..
+                    }) if *target == old_key
+                ),
+                "the reused pid does not own the old generation's registration"
+            );
+        }
+
+        let replacement_waker = Arc::new(SignalObservingWaker {
+            wakes: AtomicUsize::new(0),
+            pending: replacement.shared().pending_signals(),
+            pending_when_woken: AtomicUsize::new(0),
+        });
+        replacement
+            .task()
+            .set_waker(Arc::clone(&replacement_waker) as Arc<dyn crate::kernel::TaskWaker>);
+        send_test_message(&dispatcher, &fresh_root, &mut memory, mqd, 0x1200);
+        assert!(
+            replacement
+                .shared()
+                .pending_signals()
+                .snapshot_entries()
+                .is_empty()
+        );
+        assert_eq!(replacement_waker.wakes.load(Ordering::SeqCst), 0);
     }
 
     #[test]
