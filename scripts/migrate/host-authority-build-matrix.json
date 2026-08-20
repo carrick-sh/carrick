@@ -19,47 +19,56 @@
     {
       "id": "macos-cli-default",
       "host": "macos",
-      "command": ["cargo", "clippy", "-p", "carrick-cli", "--bin", "carrick", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
+      "host_triple": "aarch64-apple-darwin",
+      "command": ["cargo", "clippy", "-p", "carrick-cli", "--target", "aarch64-apple-darwin", "--bin", "carrick", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
     },
     {
       "id": "macos-runtime-default",
       "host": "macos",
-      "command": ["cargo", "clippy", "-p", "carrick-runtime", "--lib", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
+      "host_triple": "aarch64-apple-darwin",
+      "command": ["cargo", "clippy", "-p", "carrick-runtime", "--target", "aarch64-apple-darwin", "--lib", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
     },
     {
       "id": "macos-hvf-default",
       "host": "macos",
-      "command": ["cargo", "clippy", "-p", "carrick-vmm-hvf", "--lib", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
+      "host_triple": "aarch64-apple-darwin",
+      "command": ["cargo", "clippy", "-p", "carrick-vmm-hvf", "--target", "aarch64-apple-darwin", "--lib", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
     },
     {
       "id": "linux-cli",
       "host": "linux",
-      "command": ["cargo", "clippy", "-p", "carrick-cli", "--no-default-features", "--features", "syscall-shim,platform-linux", "--bin", "carrick", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
+      "host_triple": "x86_64-unknown-linux-gnu",
+      "command": ["cargo", "clippy", "-p", "carrick-cli", "--no-default-features", "--features", "syscall-shim,platform-linux", "--target", "x86_64-unknown-linux-gnu", "--bin", "carrick", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
     },
     {
       "id": "linux-runtime",
       "host": "linux",
-      "command": ["cargo", "clippy", "-p", "carrick-runtime", "--no-default-features", "--features", "syscall-shim,platform-linux", "--lib", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
+      "host_triple": "x86_64-unknown-linux-gnu",
+      "command": ["cargo", "clippy", "-p", "carrick-runtime", "--no-default-features", "--features", "syscall-shim,platform-linux", "--target", "x86_64-unknown-linux-gnu", "--lib", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
     },
     {
       "id": "freebsd-cli",
       "host": "freebsd",
-      "command": ["cargo", "clippy", "-p", "carrick-cli", "--no-default-features", "--features", "platform-freebsd", "--bin", "carrick", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
+      "host_triple": "x86_64-unknown-freebsd",
+      "command": ["cargo", "clippy", "-p", "carrick-cli", "--no-default-features", "--features", "platform-freebsd", "--target", "x86_64-unknown-freebsd", "--bin", "carrick", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
     },
     {
       "id": "freebsd-runtime",
       "host": "freebsd",
-      "command": ["cargo", "clippy", "-p", "carrick-runtime", "--no-default-features", "--features", "platform-freebsd", "--lib", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
+      "host_triple": "x86_64-unknown-freebsd",
+      "command": ["cargo", "clippy", "-p", "carrick-runtime", "--no-default-features", "--features", "platform-freebsd", "--target", "x86_64-unknown-freebsd", "--lib", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
     },
     {
       "id": "netbsd-cli",
       "host": "netbsd",
-      "command": ["cargo", "clippy", "-p", "carrick-cli", "--no-default-features", "--features", "platform-netbsd", "--bin", "carrick", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
+      "host_triple": "x86_64-unknown-netbsd",
+      "command": ["cargo", "clippy", "-p", "carrick-cli", "--no-default-features", "--features", "platform-netbsd", "--target", "x86_64-unknown-netbsd", "--bin", "carrick", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
     },
     {
       "id": "netbsd-runtime",
       "host": "netbsd",
-      "command": ["cargo", "clippy", "-p", "carrick-runtime", "--no-default-features", "--features", "platform-netbsd", "--lib", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
+      "host_triple": "x86_64-unknown-netbsd",
+      "command": ["cargo", "clippy", "-p", "carrick-runtime", "--no-default-features", "--features", "platform-netbsd", "--target", "x86_64-unknown-netbsd", "--lib", "--message-format=json", "--", "--force-warn", "clippy::disallowed_methods"]
     }
   ]
 }

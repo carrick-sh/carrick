@@ -16,6 +16,7 @@ import platform
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
@@ -31,6 +32,12 @@ CATALOG_ID = re.compile(r"HA-CATALOG-[A-Z0-9]+(?:-[A-Z0-9]+)*")
 CATALOG_TOKEN = re.compile(r"HA-CATALOG-[^:\s]+")
 REVIEW_ID = re.compile(r"HA-([0-9]{6})")
 CATALOG_REASON = re.compile(r"^(HA-CATALOG-[A-Z0-9]+(?:-[A-Z0-9]+)*):")
+HOST_TRIPLES = {
+    "macos": "aarch64-apple-darwin",
+    "linux": "x86_64-unknown-linux-gnu",
+    "freebsd": "x86_64-unknown-freebsd",
+    "netbsd": "x86_64-unknown-netbsd",
+}
 
 ROOT = Path(__file__).resolve().parents[2]
 MATRIX_PATH = ROOT / "scripts" / "migrate" / "host-authority-build-matrix.json"
@@ -86,6 +93,7 @@ class Profile(NamedTuple):
 
     id: str
     host: str
+    host_triple: str
     command: tuple[str, ...]
 
 
@@ -106,6 +114,8 @@ def _expected_profile_commands() -> dict[str, tuple[str, ...]]:
             "clippy",
             "-p",
             "carrick-cli",
+            "--target",
+            HOST_TRIPLES["macos"],
             "--bin",
             "carrick",
             "--message-format=json",
@@ -118,6 +128,8 @@ def _expected_profile_commands() -> dict[str, tuple[str, ...]]:
             "clippy",
             "-p",
             "carrick-runtime",
+            "--target",
+            HOST_TRIPLES["macos"],
             "--lib",
             "--message-format=json",
             "--",
@@ -129,6 +141,8 @@ def _expected_profile_commands() -> dict[str, tuple[str, ...]]:
             "clippy",
             "-p",
             "carrick-vmm-hvf",
+            "--target",
+            HOST_TRIPLES["macos"],
             "--lib",
             "--message-format=json",
             "--",
@@ -153,6 +167,8 @@ def _expected_profile_commands() -> dict[str, tuple[str, ...]]:
                 "--no-default-features",
                 "--features",
                 features,
+                "--target",
+                HOST_TRIPLES[host],
                 *target_args,
                 "--message-format=json",
                 "--",
@@ -225,11 +241,13 @@ def load_matrix(path: Path) -> Matrix:
         if not isinstance(raw_profile, dict) or set(raw_profile) != {
             "id",
             "host",
+            "host_triple",
             "command",
         }:
             raise InventoryError(f"invalid matrix profile {index} schema")
         profile_id = raw_profile.get("id")
         host = raw_profile.get("host")
+        host_triple = raw_profile.get("host_triple")
         command = raw_profile.get("command")
         if not isinstance(profile_id, str) or not profile_id:
             raise InventoryError(f"invalid matrix profile ID at row {index}")
@@ -237,6 +255,10 @@ def load_matrix(path: Path) -> Matrix:
             raise InventoryError(f"duplicate matrix profile ID: {profile_id}")
         if not isinstance(host, str) or not host:
             raise InventoryError(f"invalid host for matrix profile {profile_id}")
+        if not isinstance(host_triple, str) or not host_triple:
+            raise InventoryError(
+                f"invalid host triple for matrix profile {profile_id}"
+            )
         if not isinstance(command, list) or not command or not all(
             isinstance(argument, str) and argument for argument in command
         ):
@@ -257,11 +279,17 @@ def load_matrix(path: Path) -> Matrix:
             raise InventoryError(
                 f"matrix profile {profile_id} has wrong host {host!r}"
             )
+        if host_triple != HOST_TRIPLES[host]:
+            raise InventoryError(
+                f"matrix profile {profile_id} has wrong host triple {host_triple!r}"
+            )
         if tuple(command) != expected_command:
             raise InventoryError(
                 f"matrix profile {profile_id} does not compile its exact product target"
             )
-        profiles[profile_id] = Profile(profile_id, host, tuple(command))
+        profiles[profile_id] = Profile(
+            profile_id, host, host_triple, tuple(command)
+        )
 
     if set(profiles) != set(required_raw):
         missing = sorted(set(required_raw) - set(profiles))
@@ -294,16 +322,33 @@ def current_host_id() -> str:
         raise InventoryError(f"unsupported host for authority census: {host}") from error
 
 
+def _sanitized_build_environment(
+    *, target_dir: Path | None = None
+) -> dict[str, str]:
+    """Construct the minimal tool environment without ambient build controls."""
+    home = Path.home()
+    environment = {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "CARGO_HOME": os.environ.get("CARGO_HOME", str(home / ".cargo")),
+        "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(home / ".rustup")),
+    }
+    if target_dir is not None:
+        environment["CARGO_TARGET_DIR"] = str(target_dir)
+    return environment
+
+
 def select_profiles(
     matrix: Matrix,
     selector: str | None,
     current_host: str | None = None,
-) -> list[Profile]:
+) -> list[str]:
     """Select a nonempty current-host subset, preserving matrix order."""
     host = current_host or current_host_id()
     if selector is None:
         selected = [
-            profile for profile in matrix.profiles.values() if profile.host == host
+            profile.id
+            for profile in matrix.profiles.values()
+            if profile.host == host
         ]
     else:
         patterns = [pattern.strip() for pattern in selector.split(",")]
@@ -324,10 +369,14 @@ def select_profiles(
                         f"profile selection contains duplicate ID: {profile_id}"
                     )
                 matched_ids.append(profile_id)
-        selected = [matrix.profiles[profile_id] for profile_id in matched_ids]
+        selected = matched_ids
     if not selected:
         raise InventoryError(f"no authority census profile is available on {host}")
-    unavailable = [profile.id for profile in selected if profile.host != host]
+    unavailable = [
+        profile_id
+        for profile_id in selected
+        if matrix.profiles[profile_id].host != host
+    ]
     if unavailable:
         raise InventoryError(
             f"profiles unavailable on current host {host}: {sorted(unavailable)}"
@@ -361,29 +410,86 @@ def _command_failure(label: str, result: subprocess.CompletedProcess[str]) -> No
     )
 
 
+def _rustc_verbose_identity(
+    identity: str, required_release: str
+) -> tuple[str, str]:
+    lines = identity.splitlines()
+    if not lines:
+        raise InventoryError("rustc identity output is empty")
+    first = lines[0].split()
+    if len(first) < 2 or first[0] != "rustc" or first[1] != required_release:
+        actual = first[1] if len(first) >= 2 else "<missing>"
+        raise InventoryError(
+            f"rustc release mismatch: required {required_release!r}, got {actual!r}"
+        )
+    fields: dict[str, str] = {}
+    for line in lines[1:]:
+        key, separator, value = line.partition(":")
+        if not separator:
+            continue
+        normalized_key = key.strip()
+        if normalized_key in fields:
+            raise InventoryError(
+                f"rustc identity contains duplicate {normalized_key!r} field"
+            )
+        fields[normalized_key] = value.strip()
+    release = fields.get("release")
+    host_triple = fields.get("host")
+    if release != required_release:
+        raise InventoryError(
+            f"rustc release mismatch: required {required_release!r}, got {release!r}"
+        )
+    if not host_triple:
+        raise InventoryError("rustc verbose identity has no host triple")
+    return identity, host_triple
+
+
+def _clippy_identity(identity: str, required_release: str) -> str:
+    first = identity.splitlines()[0].split() if identity.splitlines() else []
+    if len(first) < 2 or first[0] != "clippy" or first[1] != required_release:
+        actual = first[1] if len(first) >= 2 else "<missing>"
+        raise InventoryError(
+            f"clippy release mismatch: required {required_release!r}, got {actual!r}"
+        )
+    return identity
+
+
 def verify_toolchain(
     matrix: Matrix,
     runner: Any = subprocess.run,
     root: Path = ROOT,
+    required_host_triple: str | None = None,
 ) -> dict[str, str]:
     """Verify and return the exact pinned compiler identities for the receipt."""
-    identities: dict[str, str] = {}
-    checks = (
-        ("rustc", ["rustc", "-V"], matrix.rustc_release),
-        ("clippy", ["cargo", "clippy", "-V"], matrix.clippy_release),
-    )
-    for label, command, release in checks:
-        result = _completed_text(command, runner=runner, cwd=Path(root))
+    outputs: dict[str, str] = {}
+    for label, command in (
+        ("rustc", ["rustc", "-Vv"]),
+        ("clippy", ["cargo", "clippy", "-V"]),
+    ):
+        result = _completed_text(
+            command,
+            runner=runner,
+            cwd=Path(root),
+            env=_sanitized_build_environment(),
+        )
         if result.returncode != 0:
             _command_failure(f"{label} identity check", result)
         identity = result.stdout.strip() if isinstance(result.stdout, str) else ""
-        prefix = f"{label} {release}"
-        if not identity.startswith(prefix):
-            raise InventoryError(
-                f"{label} identity mismatch: required {prefix!r}, got {identity!r}"
-            )
-        identities[label] = identity
-    return identities
+        outputs[label] = identity
+    rustc_identity, host_triple = _rustc_verbose_identity(
+        outputs["rustc"], matrix.rustc_release
+    )
+    clippy_identity = _clippy_identity(outputs["clippy"], matrix.clippy_release)
+    if required_host_triple is not None and host_triple != required_host_triple:
+        raise InventoryError(
+            "rustc host triple mismatch: "
+            f"required {required_host_triple!r}, got {host_triple!r}"
+        )
+    return {
+        "rustc": rustc_identity,
+        "clippy": clippy_identity,
+        "host_triple": host_triple,
+    }
 
 
 def run_profile(
@@ -399,9 +505,10 @@ def run_profile(
         raise InventoryError(
             f"profile {profile.id} is unavailable on current host {host}"
         )
-    environment = os.environ.copy()
-    environment["CARGO_TARGET_DIR"] = str(
-        Path(root) / "target" / "host-authority-census" / profile.id
+    environment = _sanitized_build_environment(
+        target_dir=(
+            Path(root) / "target" / "host-authority-census" / profile.id
+        )
     )
     result = _completed_text(
         profile.command,
@@ -1113,7 +1220,7 @@ def load_inventory(path: Path) -> list[dict[str, object]]:
 
 def run_census(
     matrix: Matrix,
-    profiles: Sequence[Profile],
+    profile_ids: Sequence[str],
     operation_catalog: Mapping[str, str],
     runner: Any = subprocess.run,
     *,
@@ -1121,17 +1228,29 @@ def run_census(
     current_host: str | None = None,
 ) -> dict[str, object]:
     """Run a selected local subset and return pure normalized receipt data."""
-    selected = list(profiles)
-    if not selected:
+    selected_ids = list(profile_ids)
+    if not selected_ids:
         raise InventoryError("executed profile subset must be nonempty")
-    selected_ids = [profile.id for profile in selected]
+    if not all(isinstance(profile_id, str) for profile_id in selected_ids):
+        raise InventoryError("executed profiles must be checked matrix profile IDs")
     if len(selected_ids) != len(set(selected_ids)):
         raise InventoryError("executed profile subset contains duplicate IDs")
     unknown = sorted(set(selected_ids) - set(matrix.required_profiles))
     if unknown:
         raise InventoryError(f"executed profile subset contains unknown IDs: {unknown}")
+    selected = [matrix.profiles[profile_id] for profile_id in selected_ids]
     catalog = _validate_operation_catalog(operation_catalog)
-    identities = verify_toolchain(matrix, runner=runner, root=Path(root))
+    required_triples = {profile.host_triple for profile in selected}
+    if len(required_triples) != 1:
+        raise InventoryError(
+            f"executed profiles span multiple host triples: {sorted(required_triples)}"
+        )
+    identities = verify_toolchain(
+        matrix,
+        runner=runner,
+        root=Path(root),
+        required_host_triple=next(iter(required_triples)),
+    )
     batches = []
     for profile in selected:
         messages = run_profile(
@@ -1199,8 +1318,14 @@ def candidate_document(
                 "candidate row contains an unexecuted profile: "
                 f"{sorted(row_profiles - executed)}"
             )
-    if not isinstance(toolchain, Mapping) or set(toolchain) != {"rustc", "clippy"}:
-        raise InventoryError("candidate requires pinned rustc and Clippy identities")
+    if not isinstance(toolchain, Mapping) or set(toolchain) != {
+        "rustc",
+        "clippy",
+        "host_triple",
+    }:
+        raise InventoryError(
+            "candidate requires pinned rustc, Clippy, and host-triple identities"
+        )
     if not all(isinstance(value, str) and value for value in toolchain.values()):
         raise InventoryError("candidate tool identities must be nonempty strings")
     complete = executed == required
@@ -1218,6 +1343,53 @@ def candidate_document(
         "pending_profiles": sorted(required - executed),
         "rows": rows,
     }
+
+
+def _candidate_path(
+    requested: Path, canonical_inventory: Path
+) -> Path:
+    candidate = requested.expanduser().resolve(strict=False)
+    canonical = canonical_inventory.expanduser().resolve(strict=False)
+    if candidate == canonical:
+        raise InventoryError(
+            "refresh candidate path resolves to the canonical inventory"
+        )
+    if requested.exists() and canonical_inventory.exists():
+        try:
+            aliases_canonical = requested.samefile(canonical_inventory)
+        except OSError as error:
+            raise InventoryError(
+                f"cannot authenticate refresh candidate path: {error}"
+            ) from error
+        if aliases_canonical:
+            raise InventoryError(
+                "refresh candidate path aliases the canonical inventory"
+            )
+    return candidate
+
+
+def _write_candidate_atomically(path: Path, document: Mapping[str, object]) -> None:
+    """Publish a candidate in one same-directory rename."""
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            json.dump(document, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    except BaseException:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def _argument_parser() -> argparse.ArgumentParser:
@@ -1276,6 +1448,12 @@ def main(
         checked_matrix = matrix or load_matrix(
             Path(root) / MATRIX_PATH.relative_to(ROOT)
         )
+        canonical_inventory = Path(root) / INVENTORY_PATH.relative_to(ROOT)
+        candidate_path = (
+            _candidate_path(arguments.refresh_candidate, canonical_inventory)
+            if arguments.refresh_candidate is not None
+            else None
+        )
         catalog = (
             dict(operation_catalog)
             if operation_catalog is not None
@@ -1307,7 +1485,7 @@ def main(
         assert isinstance(executed, list)
         assert isinstance(pending, list)
         assert isinstance(identities, Mapping)
-        if arguments.refresh_candidate is not None:
+        if candidate_path is not None:
             document = candidate_document(
                 rows,
                 reviews,
@@ -1315,10 +1493,12 @@ def main(
                 checked_matrix.required_profiles,
                 identities,
             )
-            arguments.refresh_candidate.write_text(
-                json.dumps(document, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            try:
+                _write_candidate_atomically(candidate_path, document)
+            except OSError as error:
+                raise InventoryError(
+                    f"cannot publish refresh candidate atomically: {error}"
+                ) from error
             if document["complete"] is not True:
                 print(
                     "error: wrote an explicitly partial, non-authoritative "
@@ -1327,7 +1507,7 @@ def main(
                 )
                 return 1
             print(
-                f"wrote complete refresh candidate: {arguments.refresh_candidate}"
+                f"wrote complete refresh candidate: {candidate_path}"
             )
             return 0
         validate(rows, reviews, executed, checked_matrix.required_profiles)

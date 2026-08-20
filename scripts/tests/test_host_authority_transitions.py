@@ -6,10 +6,12 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -43,12 +45,21 @@ REQUIRED_PROFILES = [
     "netbsd-runtime",
 ]
 
+HOST_TRIPLES = {
+    "macos": "aarch64-apple-darwin",
+    "linux": "x86_64-unknown-linux-gnu",
+    "freebsd": "x86_64-unknown-freebsd",
+    "netbsd": "x86_64-unknown-netbsd",
+}
+
 EXPECTED_COMMANDS = {
     "macos-cli-default": [
         "cargo",
         "clippy",
         "-p",
         "carrick-cli",
+        "--target",
+        HOST_TRIPLES["macos"],
         "--bin",
         "carrick",
         "--message-format=json",
@@ -61,6 +72,8 @@ EXPECTED_COMMANDS = {
         "clippy",
         "-p",
         "carrick-runtime",
+        "--target",
+        HOST_TRIPLES["macos"],
         "--lib",
         "--message-format=json",
         "--",
@@ -72,12 +85,29 @@ EXPECTED_COMMANDS = {
         "clippy",
         "-p",
         "carrick-vmm-hvf",
+        "--target",
+        HOST_TRIPLES["macos"],
         "--lib",
         "--message-format=json",
         "--",
         "--force-warn",
         "clippy::disallowed_methods",
     ],
+}
+
+AMBIENT_BUILD_AUTHORITY = {
+    "CARGO_BUILD_TARGET": "attacker-target",
+    "RUSTFLAGS": "--cfg attacker",
+    "CARGO_ENCODED_RUSTFLAGS": "--cfg\x1fattacker",
+    "RUSTC": "/tmp/attacker-rustc",
+    "RUSTC_WRAPPER": "/tmp/attacker-wrapper",
+    "RUSTC_WORKSPACE_WRAPPER": "/tmp/attacker-workspace-wrapper",
+    "CARGO_BUILD_RUSTC": "/tmp/attacker-build-rustc",
+    "CARGO_BUILD_RUSTC_WRAPPER": "/tmp/attacker-build-wrapper",
+    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER": "/tmp/attacker-build-workspace-wrapper",
+    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "--cfg target_override",
+    "CARGO_PROFILE_DEV_LTO": "true",
+    "CARGO_CONFIG": "/tmp/attacker-config.toml",
 }
 
 for host, features in (
@@ -97,6 +127,8 @@ for host, features in (
             "--no-default-features",
             "--features",
             features,
+            "--target",
+            HOST_TRIPLES[host],
             *target_args,
             "--message-format=json",
             "--",
@@ -849,13 +881,21 @@ class FakeRunner:
         )
         self.cargo_returncode = 0
         self.cargo_stderr = ""
-        self.rustc_version = "rustc 1.96.0 (abcdef 2026-08-01)\n"
+        self.rustc_version = (
+            "rustc 1.96.0 (abcdef 2026-08-01)\n"
+            "binary: rustc\n"
+            "commit-hash: abcdef\n"
+            "commit-date: 2026-08-01\n"
+            "host: aarch64-apple-darwin\n"
+            "release: 1.96.0\n"
+            "LLVM version: 21.1.0\n"
+        )
         self.clippy_version = "clippy 0.1.96 (abcdef 2026-08-01)\n"
 
     def __call__(self, argv, **kwargs):
         argv = list(argv)
         self.calls.append((argv, kwargs))
-        if argv == ["rustc", "-V"]:
+        if argv == ["rustc", "-Vv"]:
             return subprocess.CompletedProcess(argv, 0, self.rustc_version, "")
         if argv == ["cargo", "clippy", "-V"]:
             return subprocess.CompletedProcess(argv, 0, self.clippy_version, "")
@@ -893,6 +933,7 @@ class MatrixOrchestrationTest(unittest.TestCase):
                 {
                     "id": profile_id,
                     "host": profile_id.split("-", 1)[0],
+                    "host_triple": HOST_TRIPLES[profile_id.split("-", 1)[0]],
                     "command": list(EXPECTED_COMMANDS[profile_id]),
                 }
                 for profile_id in REQUIRED_PROFILES
@@ -905,6 +946,16 @@ class MatrixOrchestrationTest(unittest.TestCase):
         self.assertEqual(list(matrix.profiles), REQUIRED_PROFILES)
         self.assertEqual(matrix.rustc_release, "1.96.0")
         self.assertEqual(matrix.clippy_release, "0.1.96")
+        self.assertEqual(
+            {
+                profile_id: profile.host_triple
+                for profile_id, profile in matrix.profiles.items()
+            },
+            {
+                profile_id: HOST_TRIPLES[profile_id.split("-", 1)[0]]
+                for profile_id in REQUIRED_PROFILES
+            },
+        )
         self.assertEqual(
             {profile_id: list(profile.command) for profile_id, profile in matrix.profiles.items()},
             EXPECTED_COMMANDS,
@@ -963,6 +1014,28 @@ class MatrixOrchestrationTest(unittest.TestCase):
             str(ROOT / "target" / "host-authority-census" / profile.id),
         )
 
+    def test_every_runner_environment_removes_ambient_build_authority(self):
+        matrix = self.load()
+        profile = matrix.profiles["macos-hvf-default"]
+        runner = FakeRunner()
+        with mock.patch.dict(os.environ, AMBIENT_BUILD_AUTHORITY, clear=False):
+            self.host_authority.verify_toolchain(matrix, runner=runner)
+            self.host_authority.run_profile(
+                profile, runner=runner, root=ROOT, current_host="macos"
+            )
+        for argv, kwargs in runner.calls:
+            with self.subTest(argv=argv):
+                environment = kwargs["env"]
+                self.assertIn("PATH", environment)
+                self.assertIn("CARGO_HOME", environment)
+                for variable in AMBIENT_BUILD_AUTHORITY:
+                    self.assertNotIn(variable, environment)
+        profile_environment = runner.calls[-1][1]["env"]
+        self.assertEqual(
+            profile_environment["CARGO_TARGET_DIR"],
+            str(ROOT / "target" / "host-authority-census" / profile.id),
+        )
+
     def test_run_profile_preserves_stderr_on_compile_failure(self):
         profile = self.load().profiles["macos-hvf-default"]
         runner = FakeRunner()
@@ -1005,13 +1078,14 @@ class MatrixOrchestrationTest(unittest.TestCase):
         self.assertEqual(
             identities,
             {
-                "rustc": "rustc 1.96.0 (abcdef 2026-08-01)",
+                "rustc": runner.rustc_version.strip(),
                 "clippy": "clippy 0.1.96 (abcdef 2026-08-01)",
+                "host_triple": "aarch64-apple-darwin",
             },
         )
         self.assertEqual(
             [call[0] for call in runner.calls],
-            [["rustc", "-V"], ["cargo", "clippy", "-V"]],
+            [["rustc", "-Vv"], ["cargo", "clippy", "-V"]],
         )
         mismatch = FakeRunner()
         mismatch.clippy_version = "clippy 0.1.95 (stale)\n"
@@ -1020,20 +1094,42 @@ class MatrixOrchestrationTest(unittest.TestCase):
         ):
             self.host_authority.verify_toolchain(matrix, runner=mismatch)
 
+    def test_tool_release_tokens_and_rustc_host_must_match_exactly(self):
+        matrix = self.load()
+        cases = []
+        for version in ("0.1.960", "0.1.96-nightly", "0.1.96.1"):
+            runner = FakeRunner()
+            runner.clippy_version = f"clippy {version} (attacker)\n"
+            cases.append((f"clippy {version}", runner))
+        for version in ("1.96.00", "1.96.0-nightly", "1.96.0.1"):
+            runner = FakeRunner()
+            runner.rustc_version = runner.rustc_version.replace(
+                "release: 1.96.0", f"release: {version}"
+            )
+            cases.append((f"rustc {version}", runner))
+        wrong_host = FakeRunner()
+        wrong_host.rustc_version = wrong_host.rustc_version.replace(
+            "host: aarch64-apple-darwin", "host: x86_64-apple-darwin"
+        )
+        cases.append(("wrong host", wrong_host))
+        for label, runner in cases:
+            with self.subTest(label=label):
+                with self.assertRaises(self.host_authority.InventoryError):
+                    self.host_authority.verify_toolchain(
+                        matrix,
+                        runner=runner,
+                        required_host_triple="aarch64-apple-darwin",
+                    )
+
     def test_profile_selection_is_nonempty_local_and_supports_globs(self):
         matrix = self.load()
         expected = REQUIRED_PROFILES[:3]
         self.assertEqual(
-            [profile.id for profile in self.host_authority.select_profiles(matrix, None, "macos")],
+            self.host_authority.select_profiles(matrix, None, "macos"),
             expected,
         )
         self.assertEqual(
-            [
-                profile.id
-                for profile in self.host_authority.select_profiles(
-                    matrix, "macos-*", "macos"
-                )
-            ],
+            self.host_authority.select_profiles(matrix, "macos-*", "macos"),
             expected,
         )
         for selector in ("", "does-not-exist"):
@@ -1071,11 +1167,67 @@ class MatrixOrchestrationTest(unittest.TestCase):
         self.assertEqual(
             [call[0] for call in runner.calls[:3]],
             [
-                ["rustc", "-V"],
+                ["rustc", "-Vv"],
                 ["cargo", "clippy", "-V"],
                 EXPECTED_COMMANDS["macos-hvf-default"],
             ],
         )
+
+    def test_census_rejects_rustc_host_before_profile_execution(self):
+        matrix = self.load()
+        runner = FakeRunner(json.dumps(diagnostic()) + "\n")
+        runner.rustc_version = runner.rustc_version.replace(
+            "host: aarch64-apple-darwin", "host: x86_64-apple-darwin"
+        )
+        selected = self.host_authority.select_profiles(
+            matrix, "macos-hvf-default", "macos"
+        )
+        with self.assertRaisesRegex(
+            self.host_authority.InventoryError, "host triple mismatch"
+        ):
+            self.host_authority.run_census(
+                matrix,
+                selected,
+                FIXTURE_CATALOG,
+                runner=runner,
+                root=ROOT,
+                current_host="macos",
+            )
+        self.assertEqual(len(runner.calls), 2)
+
+    def test_census_resolves_profile_ids_from_the_checked_matrix(self):
+        matrix = self.load()
+        forged = self.host_authority.Profile(
+            "macos-hvf-default",
+            "macos",
+            "aarch64-apple-darwin",
+            (
+                "cargo",
+                "clippy",
+                "-p",
+                "attacker-package",
+                "--target",
+                "aarch64-apple-darwin",
+                "--lib",
+                "--message-format=json",
+                "--",
+                "--force-warn",
+                "clippy::disallowed_methods",
+            ),
+        )
+        runner = FakeRunner(json.dumps(diagnostic()) + "\n")
+        with self.assertRaisesRegex(
+            self.host_authority.InventoryError, "profile IDs"
+        ):
+            self.host_authority.run_census(
+                matrix,
+                [forged],
+                FIXTURE_CATALOG,
+                runner=runner,
+                root=ROOT,
+                current_host="macos",
+            )
+        self.assertEqual(runner.calls, [])
 
     def test_partial_candidate_is_unreviewed_marked_partial_and_nonzero(self):
         matrix = self.load()
@@ -1114,6 +1266,63 @@ class MatrixOrchestrationTest(unittest.TestCase):
         self.assertNotEqual(document["rows"][0]["review_id"], "HA-999999")
         self.assertIn("partial", stderr.getvalue())
 
+    def test_candidate_path_cannot_equal_or_alias_canonical_inventory(self):
+        matrix = self.load()
+        for alias_kind in ("direct", "symlink", "hardlink"):
+            with self.subTest(alias_kind=alias_kind), tempfile.TemporaryDirectory() as directory:
+                temporary_root = Path(directory)
+                inventory = (
+                    temporary_root
+                    / "scripts"
+                    / "migrate"
+                    / "host-authority-transition-inventory.json"
+                )
+                inventory.parent.mkdir(parents=True)
+                inventory.write_text("canonical sentinel\n", encoding="utf-8")
+                if alias_kind == "direct":
+                    candidate = inventory
+                else:
+                    candidate = temporary_root / f"{alias_kind}-candidate.json"
+                    if alias_kind == "symlink":
+                        candidate.symlink_to(inventory)
+                    else:
+                        os.link(inventory, candidate)
+                runner = FakeRunner()
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    result = self.host_authority.main(
+                        ["--refresh-candidate", str(candidate)],
+                        runner=runner,
+                        matrix=matrix,
+                        operation_catalog=FIXTURE_CATALOG,
+                        expected=[],
+                        current_host="macos",
+                        root=temporary_root,
+                    )
+                self.assertEqual(result, 2)
+                self.assertEqual(
+                    inventory.read_text(encoding="utf-8"), "canonical sentinel\n"
+                )
+                self.assertEqual(runner.calls, [])
+                self.assertIn("canonical inventory", stderr.getvalue())
+
+    def test_atomic_candidate_write_leaves_existing_file_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.json"
+            candidate.write_text("existing candidate\n", encoding="utf-8")
+            with mock.patch.object(
+                self.host_authority.os,
+                "replace",
+                side_effect=OSError("injected replace failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "injected replace failure"):
+                    self.host_authority._write_candidate_atomically(
+                        candidate, {"schema": 1}
+                    )
+            self.assertEqual(
+                candidate.read_text(encoding="utf-8"), "existing candidate\n"
+            )
+
     def test_complete_candidate_requires_every_required_profile(self):
         matrix = self.load()
         all_profiles = sorted(REQUIRED_PROFILES)
@@ -1124,7 +1333,11 @@ class MatrixOrchestrationTest(unittest.TestCase):
             expected,
             all_profiles,
             REQUIRED_PROFILES,
-            {"rustc": "rustc pinned", "clippy": "clippy pinned"},
+            {
+                "rustc": "rustc pinned",
+                "clippy": "clippy pinned",
+                "host_triple": "aarch64-apple-darwin",
+            },
         )
         self.assertTrue(complete["complete"])
         self.assertEqual(complete["rows"], expected)
@@ -1133,7 +1346,11 @@ class MatrixOrchestrationTest(unittest.TestCase):
             expected,
             ["macos-hvf-default"],
             REQUIRED_PROFILES,
-            {"rustc": "rustc pinned", "clippy": "clippy pinned"},
+            {
+                "rustc": "rustc pinned",
+                "clippy": "clippy pinned",
+                "host_triple": "aarch64-apple-darwin",
+            },
         )
         self.assertFalse(partial["complete"])
         self.assertTrue(
