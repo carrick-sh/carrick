@@ -7,11 +7,13 @@ drift-gated, and honestly measurable, then freeze a fresh signed Phase 0
 conformance baseline without claiming the broader campaign is complete.
 
 **Architecture:** Keep Phase 0 structural and observational.
-`carrick-abi` will spell authority on every syscall row; a deterministic offline
-lint runner plus a reviewed source-transition inventory will prevent new ambient
-host authority from entering guest-facing paths. The existing fail-closed
-closure harness will then measure the exact current tree and create the evidence
-input for the typed-capability and lifecycle plans.
+`carrick-abi` spells authority on every syscall row. A deterministic offline
+escape-hatch lint and a compiler-resolved, independently receipted review
+inventory drift-gate the three executed macOS product profiles. Human review
+supplies semantic classification; six non-local profiles remain pending, and
+173 locally forbidden rows remain debt. The existing fail-closed closure
+harness will measure the exact current tree and create evidence input for the
+Phase 1 typed-capability and lifecycle plans.
 
 **Tech Stack:** Rust 2024, Bash, Python 3 `unittest`, Semgrep 1.166+, Just,
 Docker Desktop, Hypervisor.framework, Carrick's closure harness, arm64
@@ -51,18 +53,27 @@ musl/GNU conformance probes.
   explicit CA bundle and writable log.
 - `scripts/tests/test_lint_domains.py` — launcher contracts using a fake
   Semgrep binary.
-- `scripts/migrate/check-host-authority-transitions.py` — generate and validate
-  the reviewed guest-facing host-transition inventory.
-- `scripts/migrate/host-authority-transition-inventory.json` — checked callsite
-  baseline with one required classification and rationale per transition.
-- `scripts/tests/test_host_authority_transitions.py` — inventory drift,
-  classification, and regeneration contracts.
+- `scripts/migrate/check-host-authority-transitions.py` — execute the pinned
+  compiler matrix, normalize diagnostics, and validate checked receipts and
+  reviews without parsing Rust source.
+- `scripts/migrate/host-authority-transition-inventory.json` — checked
+  compiler-resolved callsite inventory with structured evidence and human
+  classification.
+- `scripts/migrate/host-authority-macos-capture.json` — independent binding of
+  the local compiler diagnostics and exact profile memberships.
+- `.semgrep/host-authority-escape-hatches.yml` — narrow deny rules for raw
+  syscall, dynamic lookup, assembly, and watched local FFI declarations.
+- `scripts/tests/test_host_authority_transitions.py` — compiler receipt,
+  inventory drift, classification, and matrix contracts.
+- `scripts/tests/test_host_authority_escape_hatches.py` — real temporary-file
+  Semgrep contracts, including false-positive and exact-boundary cases.
 - `docs/perf-results/2026-08-19-authority-phase0/README.md` — exact signed
   checkpoint, authority counts, current closure result, and explicit blockers.
 
 ### Modified files
 
-- `justfile:89-110` — call the deterministic launcher and inventory checker.
+- `justfile:89-110` — call the deterministic launcher and the real read-only
+  compiler census `--check`.
 - `crates/carrick-abi/src/syscall.rs:47-168,268-654` — pass an explicit
   `Authority` to every `syscall(...)` row and remove the catch-all classifier.
 - `crates/carrick-runtime/tests/integration/syscall_table.rs:260-320` — prove
@@ -250,194 +261,48 @@ git commit -m "build: make typed-domain lint deterministic offline"
 
 ---
 
-### Task 2: Freeze and classify guest-facing host transitions
+### Task 2: Freeze and classify guest-facing host transitions — superseded
 
-**Files:**
-- Create: `scripts/migrate/check-host-authority-transitions.py`
-- Create: `scripts/migrate/host-authority-transition-inventory.json`
-- Create: `scripts/tests/test_host_authority_transitions.py`
-- Modify: `justfile:94-110`
+The lexical Rust parser originally specified here was rejected at breaker. Do
+not recreate or execute it. The authoritative replacement is:
 
-**Interfaces:**
-- Consumes: production Rust beneath
-  `crates/carrick-runtime/src/{dispatch,vfs,namespace}` and
-  `crates/carrick-vmm-hvf/src`.
-- Produces: `generate(root: Path) -> list[dict[str, object]]`,
-  `validate(actual, expected) -> None`, CLI `--write`, and a checked JSON file.
-  Every row has `file`, `line`, `kind`, `text`, `classification`, and
-  `rationale`.
+- design:
+  `docs/superpowers/specs/2026-08-20-compiler-resolved-host-authority-census-design.md`;
+- implementation plan:
+  `docs/superpowers/plans/2026-08-20-compiler-resolved-host-authority-census.md`.
 
-- [ ] **Step 1: Write red-first inventory tests**
+Commits `31fb071f6` through `d13bb4cc3` remain rejected evidence: their
+failures demonstrated that a lexical scanner could miss valid cfg siblings,
+aliases, function values, standalone-target reachability, and omitted watched
+operations. They are not Phase 0 closure.
 
-Create `scripts/tests/test_host_authority_transitions.py`:
+The replacement boundary keeps these facts separate:
 
-```python
-#!/usr/bin/env python3
+1. Pinned Clippy diagnostics establish the resolved callsite census only for
+   product profiles actually executed. The local macOS gate executes the CLI,
+   runtime, and HVF profiles.
+2. An independent checked compiler-capture receipt binds the catalog,
+   diagnostics, and exact profile memberships. Structured review validation
+   detects drift and malformed evidence; human review supplies semantic truth.
+3. The current local inventory contains 682 rows, including 173
+   `forbidden_semantic` rows. Those rows are known debt, not accepted authority
+   or completed fixes.
+4. Linux, FreeBSD, and NetBSD CLI/runtime profiles remain pending. A passing
+   three-profile local check is explicitly partial, not cross-platform
+   completeness.
+5. Narrow Semgrep rules deny unmistakable catalog escape hatches outside exact
+   reviewed boundary modules. Phase 1 must still introduce the typed
+   host-capability facade and deny raw host APIs outside it.
 
-import importlib.util
-import tempfile
-import unittest
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[2]
-MODULE = ROOT / "scripts" / "migrate" / "check-host-authority-transitions.py"
-SPEC = importlib.util.spec_from_file_location("host_authority", MODULE)
-host_authority = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-SPEC.loader.exec_module(host_authority)
-
-
-class HostAuthorityInventoryTest(unittest.TestCase):
-    def fixture(self, body: str) -> Path:
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        root = Path(temp.name)
-        path = root / "crates/carrick-runtime/src/dispatch/proc.rs"
-        path.parent.mkdir(parents=True)
-        path.write_text(body, encoding="utf-8")
-        return root
-
-    def test_detects_semantic_host_process_calls(self):
-        rows = host_authority.generate(
-            self.fixture("fn bad(pid: i32) { unsafe { libc::kill(pid, 0); } }\n")
-        )
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["kind"], "host_process_control")
-
-    def test_rejects_unreviewed_or_empty_rationale(self):
-        rows = host_authority.generate(
-            self.fixture("fn bad() { let _ = std::process::id(); }\n")
-        )
-        expected = [{**rows[0], "classification": "unreviewed", "rationale": ""}]
-        with self.assertRaises(host_authority.InventoryError):
-            host_authority.validate(rows, expected)
-
-    def test_accepts_an_exact_reviewed_inventory_and_rejects_drift(self):
-        root = self.fixture("fn carrier() { std::thread::yield_now(); }\n")
-        rows = host_authority.generate(root)
-        expected = [
-            {
-                **rows[0],
-                "classification": "declared_substrate",
-                "rationale": "host CPU yielding is carrier execution, not guest identity",
-            }
-        ]
-        host_authority.validate(rows, expected)
-        path = root / "crates/carrick-runtime/src/dispatch/proc.rs"
-        path.write_text(path.read_text() + "fn id() { let _ = std::process::id(); }\n")
-        with self.assertRaises(host_authority.InventoryError):
-            host_authority.validate(host_authority.generate(root), expected)
-
-
-if __name__ == "__main__":
-    unittest.main()
-```
-
-- [ ] **Step 2: Run the test and verify the checker is absent**
+The normal gate is read-only:
 
 ```bash
-python3 scripts/tests/test_host_authority_transitions.py
+./scripts/lint-domains.sh
+python3 scripts/migrate/check-host-authority-transitions.py --check
 ```
 
-Expected: import failure because the checker does not exist.
-
-- [ ] **Step 3: Implement the scanner and validator**
-
-Implement the checker with these exact categories and classifications:
-
-```python
-PATTERNS = {
-    "host_identity": re.compile(
-        r"\b(?:std::process::id|libc::(?:getpid|getppid|getpgrp|getsid|"
-        r"getuid|geteuid|getgid|getegid|getgroups|getrlimit|setrlimit))\s*\("
-    ),
-    "host_process_control": re.compile(
-        r"\blibc::(?:fork|wait4|waitid|kill|killpg|pthread_kill)\s*\("
-    ),
-    "host_namespace_view": re.compile(
-        r"\blibc::(?:getifaddrs|gethostname|getaddrinfo)\s*\("
-    ),
-    "ambient_filesystem": re.compile(
-        r"\b(?:std::fs::|std::fs\b|File::open\s*\(|OpenOptions::new\s*\()"
-    ),
-    "ambient_network": re.compile(r"\bstd::net::"),
-    "carrier_substrate": re.compile(
-        r"\b(?:std::thread::(?:spawn|sleep|yield_now)|"
-        r"std::thread::Builder::new|hv_vcpus_exit)\b"
-    ),
-}
-
-CLASSIFICATIONS = {
-    "forbidden_semantic",
-    "declared_substrate",
-    "declared_backing",
-    "legacy_unreachable",
-}
-```
-
-`generate(root)` scans the declared roots, ignores Rust line/block comments,
-files below `tests/`, and brace-balanced `#[cfg(test)] mod ... { ... }` bodies,
-emits one row per `(file, line, kind)`, and sorts by those fields. `validate`
-requires exact source-row equality after stripping `classification` and
-`rationale`, rejects classifications outside `CLASSIFICATIONS`, rejects an
-empty rationale, and rejects every `unreviewed` row.
-
-`--write` preserves classification/rationale for unchanged
-`(file, kind, text)` keys and emits new rows as `unreviewed` with an empty
-rationale. The normal no-argument form exits 1 on drift or invalid review state.
-Follow `scripts/migrate/check-k1-file-authority-inventory.py` for CLI and JSON
-format conventions.
-
-- [ ] **Step 4: Verify the checker contracts**
-
-```bash
-python3 scripts/tests/test_host_authority_transitions.py
-```
-
-Expected: PASS.
-
-- [ ] **Step 5: Generate and review the real inventory**
-
-```bash
-python3 scripts/migrate/check-host-authority-transitions.py --write
-```
-
-Edit the generated JSON with these non-overlapping rules:
-
-- `forbidden_semantic`: a guest answer or target is derived from a host PID,
-  UID/GID, process group/session, namespace view, signal, wait, or liveness
-  operation.
-- `declared_substrate`: the host call only schedules, parks, wakes, or exits an
-  authenticated Carrick carrier/vCPU and cannot accept a guest ID.
-- `declared_backing`: the call accesses already-authorized real file bytes,
-  wire data, pages, or clock/CPU hardware and does not decide guest metadata.
-- `legacy_unreachable`: code is unreachable from HVPatch and names the exact
-  compile/runtime discriminator in its rationale. These rows are migration
-  debt, not completion waivers.
-
-Every rationale must name the concrete authority and why a guest-controlled
-value cannot widen it. Re-run the checker; expected exit 0 with no unreviewed
-rows.
-
-- [ ] **Step 6: Put the inventory in the local gate**
-
-Append to the `lint-domains` recipe:
-
-```just
-    python3 scripts/migrate/check-host-authority-transitions.py
-```
-
-Run `just lint-domains`; expected: Semgrep and the inventory checker both run
-and exit 0.
-
-- [ ] **Step 7: Commit the reviewed inventory**
-
-```bash
-git add scripts/migrate/check-host-authority-transitions.py \
-  scripts/migrate/host-authority-transition-inventory.json \
-  scripts/tests/test_host_authority_transitions.py justfile
-git commit -m "test: freeze guest-facing host authority transitions"
-```
+A compiler census, independent receipt, and reviewed classification are all
+required. None alone proves semantic containment.
 
 ---
 

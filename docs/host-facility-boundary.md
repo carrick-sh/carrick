@@ -55,29 +55,36 @@ It gives the HOST'S answer, which is a different universe:
 The pattern is identical each time, and so is the fix: answer from the kernel
 graph, keyed by the exact task.
 
-## Standing audit (2026-08-19)
+## Compiler-resolved local census (2026-08-20)
 
-Counts are non-test uses in guest-facing paths (`dispatch/`, `vfs/`,
-`namespace/`). Presence is not automatically a bug — some name real host
-resources — but each is a place to ask "whose truth is this?".
+Pinned Clippy diagnostics establish the configured callsite census for the
+product profiles that actually execute. The current macOS check executes
+`macos-cli-default`, `macos-runtime-default`, and `macos-hvf-default`. An
+independent checked compiler-capture receipt binds those diagnostics to the
+catalog and exact profile memberships; the reviewed inventory contains 682
+local rows:
 
-| call | uses | verdict |
+| classification | rows | meaning |
 |---|---:|---|
-| `std::process::id()` | 92 | mostly guest questions; `signal.rs` still carries comments saying "getpid() exposes the host pid", which described the RETIRED one-process-per-guest model |
-| `getifaddrs` | 20 | guest netns view built from the host's interface list — replace with `NetNs` reads |
-| `libc::kill(pid, 0)` | 8 | FIXED under HVPatch — answered by kernel graph; legacy fallbacks unreached |
-| `libc::getpgrp` / `getsid` | 12 | FIXED under HVPatch — answered by kernel graph `ProcessIdentity` |
-| `peer_ucred` | 4 | FIXED — now `identity_pid` + `cred_snapshot` |
-| `libc::getrlimit(RLIMIT_NPROC)` in `vfs/proc.rs` | 1 | `/proc/…/limits` synthesised from the HOST's limits |
-| `gethostname` | 1 | UTS namespace is guest state |
-| `libc::getrlimit/setrlimit(RLIMIT_NOFILE)` in `time.rs` | 2 | LEGITIMATE — carrick really does open host fds and must size its own budget |
-| `sysconf` | 3 | check per call: CPU count is hardware, most else is not |
+| `forbidden_semantic` | 173 | known semantic host-authority debt; classification does not fix or waive it |
+| `declared_backing` | 318 | reviewed access to a named backing object or real host I/O |
+| `declared_substrate` | 191 | reviewed operation on an authenticated carrier resource |
 
-Ranked first, because it closes a known row and shares its root cause with the
-`docs/identity-and-scope-domains.md` audit: **give rlimits a kernel-graph home
-keyed by `TaskId`**, the way credentials already have. That fixes
-`TestPrlimitFileLimit` (`prlimit` on another process), `/proc/…/limits`, and
-removes two host calls at once. (DONE in `Task::rlimits`).
+The validator proves that checked evidence has the required shape and that the
+executed-profile callsite set has not drifted. Human source review supplies the
+semantic classification; neither compiler diagnostics, the receipt, nor JSON
+schema validation proves that a rationale is true.
+
+The Linux, FreeBSD, and NetBSD CLI/runtime profiles are still pending. A green
+local check is deliberately reported as partial and is not cross-platform
+completeness. The rejected lexical-scanner commits were breaker evidence, not
+closure; the compiler-resolved successor plan replaces them.
+
+The narrow Semgrep companion gate catches unmistakable catalog escapes such as
+raw `libc::syscall`, `dlopen`/`dlsym`, inline assembly, and local declarations
+of watched host APIs outside exact reviewed boundary modules. It does not turn
+an enumerated catalog into a capability boundary. Phase 1 must still introduce
+the typed host-capability facade and deny raw host APIs outside that facade.
 
 ## The test that catches this class
 
@@ -108,9 +115,12 @@ about: `fs` (103) real files, `mm` (31) real mappings, `net` (23) real wire, `io
 (10) real I/O, and `time` (28) which is mixed — the clock SOURCE is hardware,
 while timers and their expiry are guest bookkeeping.
 
-## What is actually there today
+## Historical guest-dispatch spot count (2026-08-19)
 
-Host `libc` calls inside the guest-authority dispatch modules:
+This lexical count predates the compiler-resolved census above. It remains
+useful as investigation history, but it is neither current callsite authority
+nor closure evidence. Host `libc` calls then seen inside guest-authority
+dispatch modules were:
 
 | module | host calls |
 |---|---:|
@@ -142,12 +152,20 @@ What does not belong, by name:
 The table now carries `Authority { Guest, Host, Hybrid }` alongside
 `SupportLevel` and `SyscallHandler` in `carrick_abi::syscall::Syscall`:
 
-1. `Authority { Guest, Host, Hybrid }` is defined in `carrick_abi::syscall` and
-   derived per syscall row in `AARCH64_SYSCALLS` via `authority_for_aarch64`.
-2. The `just lint-domains` semgrep gate enforces that `Guest`-authority syscall
-   dispatch paths do not call host identity/process primitives.
-3. `Hybrid` rows (SysV shm, mqueue, timers) declare that they touch the host for
-   BACKING only, allowing I/O primitives there while blocking identity ones.
+1. Every syscall row spells `Authority::{Guest, Host, Hybrid}` explicitly; no
+   catch-all classifier supplies missing authority.
+2. `just lint-domains` runs the deterministic Semgrep gate and the real
+   compiler census `--check`. On macOS that is the exact three-profile local
+   census above, with all six non-local profiles reported pending.
+3. The checked catalog and independent compiler receipt bind the executed
+   callsite set. Structured review validation detects drift and malformed
+   evidence; human review, not the validator, establishes semantic truth.
+4. The 173 `forbidden_semantic` rows are frozen debt, not accepted authority or
+   completed fixes. Classifying a row never makes its behavior correct.
+5. Escape-hatch lint prevents new unmistakable bypass syntax outside exact
+   reviewed modules, but only the Phase 1 typed capability facade can make raw
+   host-authority access structurally unavailable elsewhere.
 
-That converts "we should service this ourselves" from a habit into a build
-failure, which is the only form that survives.
+Phase 0 therefore makes the current local boundary explicit and drift-gated.
+It does not prove cross-platform census completeness, semantic containment, or
+the absence of raw host operations outside a future typed facade.
