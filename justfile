@@ -89,25 +89,10 @@ clippy *ARGS:
 # Typed-domain semgrep gate: blocks the bug SHAPES the newtypes exist to kill
 # (raw wait-set complements, bit=signum masks, host pids in NsPid, hand-numbered
 # private syscall numbers, function-local LINUX_* consts, inline errno
-# negation). Skips with a warning if semgrep is not installed (brew install
-# semgrep) so contributors without it are not blocked locally; CI should have it.
+# negation). The launcher fails closed while giving Semgrep a deterministic
+# offline environment and an explicit writable log path.
 lint-domains:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # FAIL CLOSED. Every rule in .semgrep/ encodes a bug shape this codebase
-    # actually shipped, so "the tool is missing" is not a pass — it is the gate
-    # not running. This recipe used to `exit 0` with a warning, which made
-    # `just ci` report green on any box without semgrep while gating nothing:
-    # the same green-that-gated-nothing shape AGENTS.md already records for the
-    # probe gate (run from the wrong cwd it SKIPped every lane and reported ok
-    # in 0.04s). CI installs semgrep explicitly, so this cannot be a surprise
-    # there either.
-    if ! command -v semgrep >/dev/null 2>&1; then
-        echo "error: semgrep is not installed, so the typed-domain gate cannot run." >&2
-        echo "       Install it (brew install semgrep, or python3 -m pip install semgrep)." >&2
-        exit 1
-    fi
-    semgrep --config .semgrep/ crates/ --severity ERROR --error --quiet
+    ./scripts/lint-domains.sh
 
 
 # Dependency license / bans / sources gate (matches CI). Enforces the deny.toml
