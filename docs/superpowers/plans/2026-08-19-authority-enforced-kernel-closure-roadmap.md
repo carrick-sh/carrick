@@ -57,4 +57,3 @@ At each phase boundary:
 - Phase 0 plan: ready for execution.
 - Phases 1-7: deliberately not expanded into implementation steps until their
   required predecessor evidence exists.
-
