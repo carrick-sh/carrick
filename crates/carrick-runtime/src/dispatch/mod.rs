@@ -2292,6 +2292,8 @@ pub struct SyscallDispatcher {
     /// SysV shared-memory registry (per-process; host-file-backed so forked
     /// guests share segments by inode through `/tmp/carrick-shm/`).
     sysv: Mutex<sysv::SysvShmState>,
+    /// POSIX message queue registry (in-memory, fork-coherent).
+    pub(crate) mqueue: Arc<mqueue::MqueueRegistry>,
     /// Active network namespace provider lease for this run. Host mode uses a
     /// no-op provider; bridge mode carries the socket namespace provider.
     network: std::sync::Arc<crate::network::RuntimeNetwork>,
@@ -3629,6 +3631,7 @@ impl SyscallDispatcher {
             seccomp: self.seccomp.fork_clone(),
             container_policy: self.container_policy.clone(),
             sysv: Mutex::new(self.sysv.lock().fork_clone()),
+            mqueue: Arc::clone(&self.mqueue),
             network: Arc::clone(&self.network),
             page_geometry: self.page_geometry,
             execution_backend: self.execution_backend,
@@ -3744,6 +3747,7 @@ impl SyscallDispatcher {
             // and unit tests keep today's handler-honest behavior.
             container_policy: None,
             sysv: Mutex::new(sysv::SysvShmState::new()),
+            mqueue: Arc::new(mqueue::MqueueRegistry::default()),
             network: std::sync::Arc::new(crate::network::RuntimeNetwork::host_default()),
             page_geometry: crate::page_profile::PageGeometry {
                 host_page_size: crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
