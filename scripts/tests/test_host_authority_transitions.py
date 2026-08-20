@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-"""Tests for the checked guest-facing host-transition inventory."""
+"""Tests for compiler-resolved host-authority diagnostic reviews."""
 
+import copy
 import importlib.util
-import json
-import tempfile
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "scripts" / "migrate" / "check-host-authority-transitions.py"
+MESSAGES = (
+    ROOT
+    / "scripts"
+    / "tests"
+    / "fixtures"
+    / "host-authority-census"
+    / "messages.jsonl"
+)
 
 
 def load_host_authority():
@@ -23,666 +30,563 @@ def load_host_authority():
     return host_authority
 
 
-class HostAuthorityInventoryTest(unittest.TestCase):
-    def fixture(self, body: str) -> Path:
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        root = Path(temp.name)
-        path = root / "crates/carrick-runtime/src/dispatch/proc.rs"
-        path.parent.mkdir(parents=True)
-        path.write_text(body, encoding="utf-8")
-        return root
+def source(
+    file: str = "crates/example/src/lib.rs",
+    line: int = 10,
+    column: int = 5,
+    *,
+    byte_start: int = 100,
+    byte_end: int = 120,
+    line_end: int | None = None,
+    column_end: int | None = None,
+):
+    return {
+        "file": file,
+        "byte_start": byte_start,
+        "byte_end": byte_end,
+        "line": line,
+        "column": column,
+        "line_start": line,
+        "line_end": line if line_end is None else line_end,
+        "column_start": column,
+        "column_end": column + 10 if column_end is None else column_end,
+    }
 
-    def write_source(self, root: Path, relative: str, body: str) -> Path:
-        path = root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(body, encoding="utf-8")
-        return path
 
-    def test_detects_semantic_host_process_calls(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture("fn bad(pid: i32) { unsafe { libc::kill(pid, 0); } }\n")
-        )
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["kind"], "host_process_control")
+def compiler_span(
+    file_name: str,
+    line: int,
+    column: int,
+    *,
+    byte_start: int,
+    byte_end: int,
+    line_end: int | None = None,
+    column_end: int | None = None,
+    primary: bool = False,
+    expansion: dict[str, object] | None = None,
+):
+    return {
+        "file_name": file_name,
+        "byte_start": byte_start,
+        "byte_end": byte_end,
+        "line_start": line,
+        "line_end": line if line_end is None else line_end,
+        "column_start": column,
+        "column_end": column + 10 if column_end is None else column_end,
+        "is_primary": primary,
+        "expansion": expansion,
+    }
 
-    def test_scans_the_complete_runtime_source_tree(self):
-        host_authority = load_host_authority()
-        root = self.fixture("")
-        self.write_source(
-            root,
-            "crates/carrick-runtime/src/network/dns.rs",
-            "fn dns() { let _ = std::net::UdpSocket::bind(\"127.0.0.1:0\"); }\n",
+
+def actual_row(
+    *,
+    operation: str = "std::process::id",
+    location: dict[str, object] | None = None,
+    expansion: dict[str, object] | None = None,
+    profiles: list[str] | None = None,
+    catalog_id: str | None = None,
+):
+    return {
+        "catalog_id": catalog_id,
+        "operation": operation,
+        "source": location or source(),
+        "expansion": expansion,
+        "profiles": profiles or ["macos-hvf-default"],
+    }
+
+
+def reviewed_row(
+    *,
+    review_id: str = "HA-000001",
+    operation: str = "std::process::id",
+    location: dict[str, object] | None = None,
+    expansion: dict[str, object] | None = None,
+    profiles: list[str] | None = None,
+    catalog_id: str | None = None,
+    classification: str = "forbidden_semantic",
+    evidence: dict[str, object] | None = None,
+    rationale: str = (
+        "The carrier PID would otherwise answer guest getpid semantics."
+    ),
+):
+    if evidence is None:
+        evidence = {
+            "authority": "guest_answer",
+            "resource": "guest-visible process identity",
+        }
+    return {
+        "review_id": review_id,
+        **actual_row(
+            operation=operation,
+            location=location,
+            expansion=expansion,
+            profiles=profiles,
+            catalog_id=catalog_id,
+        ),
+        "classification": classification,
+        "evidence": evidence,
+        "rationale": rationale,
+    }
+
+
+def diagnostic(
+    operation: str = "std::process::id",
+    *,
+    file_name: str = "ROOT/crates/example/src/lib.rs",
+    line: int = 10,
+    column: int = 5,
+    primary: bool = True,
+    expansion: dict[str, object] | None = None,
+    children: list[dict[str, object]] | None = None,
+):
+    return {
+        "reason": "compiler-message",
+        "message": {
+            "code": {"code": "clippy::disallowed_methods", "explanation": None},
+            "message": f"use of a disallowed method `{operation}`",
+            "spans": [
+                compiler_span(
+                    file_name,
+                    line,
+                    column,
+                    byte_start=100,
+                    byte_end=120,
+                    primary=primary,
+                    expansion=expansion,
+                )
+            ],
+            "children": children or [],
+        },
+    }
+
+
+class DiagnosticNormalizationTest(unittest.TestCase):
+    def setUp(self):
+        self.host_authority = load_host_authority()
+
+    def normalize(self, messages):
+        return self.host_authority.normalize_messages(
+            messages, "macos-hvf-default", ROOT
         )
-        self.write_source(
-            root,
-            "crates/carrick-runtime/src/fs_backend.rs",
-            "fn bytes() { let _ = std::fs::read(\"/authorized\"); }\n",
-        )
-        self.write_source(
-            root,
-            "crates/carrick-runtime/src/new_guest_surface.rs",
-            "fn identity() { let _ = std::process::id(); }\n",
-        )
-        rows = host_authority.generate(root)
+
+    def test_recorded_messages_normalize_all_resolved_operations(self):
+        lines = MESSAGES.read_text(encoding="utf-8").splitlines()
+        rows = self.normalize(lines)
+        self.assertEqual(len(rows), 7)
         self.assertEqual(
-            [(row["file"], row["kind"]) for row in rows],
+            [row["operation"] for row in rows],
             [
-                (
-                    "crates/carrick-runtime/src/fs_backend.rs",
-                    "ambient_filesystem",
-                ),
-                (
-                    "crates/carrick-runtime/src/network/dns.rs",
-                    "ambient_network",
-                ),
-                (
-                    "crates/carrick-runtime/src/new_guest_surface.rs",
-                    "host_identity",
-                ),
+                "libc::waitpid",
+                "std::fs::metadata",
+                "std::fs::read",
+                "std::process::id",
+                "std::process::id",
+                "std::process::id",
+                "std::thread::yield_now",
             ],
         )
-
-    def test_rejects_unreviewed_or_empty_rationale(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture("fn bad() { let _ = std::process::id(); }\n")
+        row = next(
+            row
+            for row in rows
+            if row["operation"] == "std::process::id"
+            and row["source"]["line"] == 11
         )
-        expected = [{**rows[0], "classification": "unreviewed", "rationale": ""}]
-        with self.assertRaises(host_authority.InventoryError):
-            host_authority.validate(rows, expected)
-
-    def test_requires_structured_authority_evidence(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture("fn carrier() { std::thread::yield_now(); }\n")
+        self.assertIsNone(row["catalog_id"])
+        self.assertEqual(row["operation"], "std::process::id")
+        self.assertEqual(row["profiles"], ["macos-hvf-default"])
+        self.assertEqual(
+            row["source"],
+            source(
+                "scripts/tests/fixtures/host-authority-census/src/lib.rs",
+                11,
+                5,
+                byte_start=193,
+                byte_end=209,
+                column_end=21,
+            ),
         )
-        generic = [
-            {
-                **rows[0],
-                "classification": "declared_substrate",
-                "rationale": "host CPU yielding is carrier execution",
-            }
-        ]
-        with self.assertRaises(host_authority.InventoryError):
-            host_authority.validate(rows, generic)
-        concrete = [
-            {
-                **rows[0],
-                "classification": "declared_substrate",
-                "evidence": {
-                    "authority": "authenticated_carrier",
-                    "resource": "current vCPU worker host thread",
-                },
-                "rationale": (
-                    "The call yields the current vCPU worker host thread without "
-                    "accepting a process identifier."
-                ),
-            }
-        ]
-        host_authority.validate(rows, concrete)
+        self.assertIn("line", row["source"])
+        self.assertIn("column", row["source"])
+        self.assertIsNone(row["expansion"])
 
-    def test_rejects_generic_or_disjunctive_review_claims(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture("fn carrier() { std::thread::yield_now(); }\n")
-        )
-        for resource, rationale in (
-            (
-                "carrier resource",
-                "The call yields the current worker thread.",
-            ),
-            (
-                "current timer OR current worker",
-                "The call schedules the selected helper.",
-            ),
-            (
-                "current vCPU worker host thread",
-                "The call schedules a timer Versus a worker.",
-            ),
-        ):
-            expected = [
-                {
-                    **rows[0],
-                    "classification": "declared_substrate",
-                    "evidence": {
-                        "authority": "authenticated_carrier",
-                        "resource": resource,
-                    },
-                    "rationale": rationale,
-                }
+    def test_recorded_messages_are_path_independent_and_ignore_non_clippy_rows(self):
+        raw = MESSAGES.read_text(encoding="utf-8")
+        self.assertNotIn(str(ROOT), raw)
+        self.assertNotIn("/Volumes/", raw)
+        self.assertEqual(len(raw.splitlines()), 10)
+        self.assertEqual(len(self.normalize(raw.splitlines())), 7)
+
+    def test_accepts_cargo_json_objects_and_extracts_optional_catalog_reason(self):
+        row = self.normalize(
+            [
+                diagnostic(
+                    children=[
+                        {
+                            "level": "note",
+                            "message": (
+                                "HA-CATALOG-PROCESS-ID: host process identity "
+                                "requires reviewed authority"
+                            ),
+                        }
+                    ]
+                )
             ]
-            with self.subTest(resource=resource, rationale=rationale):
-                with self.assertRaises(host_authority.InventoryError):
-                    host_authority.validate(rows, expected)
+        )[0]
+        self.assertEqual(row["catalog_id"], "HA-CATALOG-PROCESS-ID")
 
-    def test_rejects_empty_and_prefix_only_structured_claims(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture("fn carrier() { std::thread::yield_now(); }\n")
-        )
-        for resource, rationale in (
-            ("", "The call yields the current worker thread."),
-            ("authenticated carrier:", "The call yields the current worker thread."),
-            ("current vCPU worker host thread", "guest answer:"),
-        ):
-            expected = [
-                {
-                    **rows[0],
-                    "classification": "declared_substrate",
-                    "evidence": {
-                        "authority": "authenticated_carrier",
-                        "resource": resource,
-                    },
-                    "rationale": rationale,
-                }
-            ]
-            with self.subTest(resource=resource, rationale=rationale):
-                with self.assertRaises(host_authority.InventoryError):
-                    host_authority.validate(rows, expected)
-
-    def test_legacy_rejects_runtime_and_unrecognized_compile_claims(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture("fn current() { let _ = std::process::id(); }\n")
-        )
-        for evidence, rationale in (
-            (
-                {
-                    "authority": "compile_time_exclusion",
-                    "resource": "no active dispatch context",
-                    "exclusion": {"kind": "runtime_context"},
-                },
-                "No active dispatch context reaches this fallback.",
-            ),
-            (
-                {
-                    "authority": "compile_time_exclusion",
-                    "resource": "claimed cfg(test) proc module",
-                    "exclusion": {
-                        "kind": "cfg_path_module",
-                        "declaration_file": "crates/carrick-runtime/src/dispatch/mod.rs",
-                        "module": "proc",
-                        "predicate": "test",
-                    },
-                },
-                "The production proc source is claimed to be test-only.",
-            ),
-        ):
-            expected = [
-                {
-                    **rows[0],
-                    "classification": "legacy_unreachable",
-                    "evidence": evidence,
-                    "rationale": rationale,
-                }
-            ]
-            with self.subTest(evidence=evidence):
-                with self.assertRaises(host_authority.InventoryError):
-                    host_authority.validate(rows, expected)
-
-    def test_detects_qualified_and_multiline_aliased_filesystem_operations(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture(
-                "use std::fs::{\n"
-                "    File as HostFile,\n"
-                "    OpenOptions,\n"
-                "    metadata as host_metadata,\n"
-                "};\n"
-                "struct Types { qualified: std::fs::File, imported: HostFile }\n"
-                "fn qualified() {\n"
-                "    let _: Option<std::fs::File> = None;\n"
-                "    let _ = std::fs::File::open(\"/tmp/qualified\");\n"
-                "}\n"
-                "fn imported() {\n"
-                "    let _: Option<HostFile> = None;\n"
-                "    let _ = HostFile::open(\"/tmp/imported\");\n"
-                "    let _ = OpenOptions::new();\n"
-                "    let _ = host_metadata(\"/tmp/imported\");\n"
-                "}\n"
-            )
-        )
-        self.assertEqual([(row["line"], row["kind"]) for row in rows], [
-            (9, "ambient_filesystem"),
-            (13, "ambient_filesystem"),
-            (14, "ambient_filesystem"),
-            (15, "ambient_filesystem"),
-        ])
-        self.assertEqual(
-            [row.get("operations") for row in rows],
-            [
-                ["std::fs::File::open"],
-                ["std::fs::File::open"],
-                ["std::fs::OpenOptions::new"],
-                ["std::fs::metadata"],
-            ],
-        )
-
-    def test_detects_multiline_aliased_network_socket_operations(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture(
-                "use std::net::{\n"
-                "    TcpStream as Stream,\n"
-                "    TcpListener,\n"
-                "    UdpSocket as Datagram,\n"
-                "};\n"
-                "struct Types { address: std::net::SocketAddr, stream: Stream }\n"
-                "fn sockets() {\n"
-                "    let _ = Stream::connect(\"127.0.0.1:1\");\n"
-                "    let _ = TcpListener::bind(\"127.0.0.1:2\");\n"
-                "    let _ = Datagram::bind(\"127.0.0.1:3\");\n"
-                "}\n"
-            )
-        )
-        self.assertEqual([(row["line"], row["kind"]) for row in rows], [
-            (8, "ambient_network"),
-            (9, "ambient_network"),
-            (10, "ambient_network"),
-        ])
-        self.assertEqual(
-            [row.get("operations") for row in rows],
-            [
-                ["std::net::TcpStream::connect"],
-                ["std::net::TcpListener::bind"],
-                ["std::net::UdpSocket::bind"],
-            ],
-        )
-
-    def test_cfg_test_import_cannot_replace_the_production_binding(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture(
-                "#[cfg(not(test))]\n"
-                "use std::fs::File as Selected;\n"
-                "#[cfg(test)]\n"
-                "use std::net::TcpStream as Selected;\n"
-                "fn production() { let _ = Selected::open(\"/tmp/x\"); }\n"
-            )
-        )
-        self.assertEqual(
-            [(row["line"], row["kind"], row["operations"]) for row in rows],
-            [(5, "ambient_filesystem", ["std::fs::File::open"])],
-        )
-
-    def test_detects_a_bare_glob_inside_a_braced_use_tree(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture(
-                "use std::fs::{*};\n"
-                "fn imported() { let _ = read(\"/tmp/x\"); }\n"
-            )
-        )
-        self.assertEqual(
-            [(row["line"], row["kind"], row["operations"]) for row in rows],
-            [(2, "ambient_filesystem", ["std::fs::read"])],
-        )
-
-    def test_resolves_self_qualified_import_alias_chains(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture(
-                "use std::fs::File as HostFile;\n"
-                "use self::HostFile as LocalFile;\n"
-                "fn imported() { let _ = LocalFile::open(\"/tmp/x\"); }\n"
-            )
-        )
-        self.assertEqual(
-            [(row["line"], row["kind"], row["operations"]) for row in rows],
-            [(3, "ambient_filesystem", ["std::fs::File::open"])],
-        )
-
-    def test_local_value_binding_shadows_an_imported_function(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture(
-                "use std::fs::read as load;\n"
-                "fn before() { let _ = load(\"/tmp/x\"); }\n"
-                "fn shadowed() { let load = || Vec::<u8>::new(); let _ = load(); }\n"
-            )
-        )
-        self.assertEqual(
-            [(row["line"], row["kind"], row["operations"]) for row in rows],
-            [(2, "ambient_filesystem", ["std::fs::read"])],
-        )
-
-    def test_detects_grouped_watched_callees(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture(
-                "use std::fs::read as load;\n"
-                "fn qualified() { let _ = (std::fs::read)(\"/tmp/x\"); }\n"
-                "fn imported() { let _ = ((load))(\"/tmp/y\"); }\n"
-            )
-        )
-        self.assertEqual(
-            [(row["line"], row["kind"], row["operations"]) for row in rows],
-            [
-                (2, "ambient_filesystem", ["std::fs::read"]),
-                (3, "ambient_filesystem", ["std::fs::read"]),
-            ],
-        )
-
-    def test_block_local_import_alias_expires_at_its_closing_brace(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture(
-                "fn scoped() {\n"
-                "    {\n"
-                "        use std::net::TcpStream as ScopedStream;\n"
-                "        let _ = ScopedStream::connect(\"127.0.0.1:1\");\n"
-                "    }\n"
-                "}\n"
-                "fn outside() {\n"
-                "    let _ = ScopedStream::connect(\"127.0.0.1:2\");\n"
-                "}\n"
-            )
-        )
-        self.assertEqual(
-            [(row["line"], row["kind"]) for row in rows],
-            [(4, "ambient_network")],
-        )
-
-    def test_inventory_contains_calls_not_imports_or_type_mentions(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture(
-                "use applevisor_sys::{hv_vcpu_t, hv_vcpus_exit};\n"
-                "use std::fs::{File as HostFile, OpenOptions};\n"
-                "use std::net::TcpStream as Stream;\n"
-                "use std::thread::{spawn, JoinHandle};\n"
-                "type Stop = unsafe fn(*const hv_vcpu_t, u32);\n"
-                "struct Types { file: HostFile, options: OpenOptions, stream: Stream }\n"
-                "fn takes(_: JoinHandle<()>, _: Stop) {}\n"
-            )
-        )
-        self.assertEqual(rows, [])
-
-    def test_accepts_an_exact_reviewed_inventory_and_rejects_drift(self):
-        host_authority = load_host_authority()
-        root = self.fixture("fn carrier() { std::thread::yield_now(); }\n")
-        rows = host_authority.generate(root)
-        expected = [
-            {
-                **rows[0],
-                "classification": "declared_substrate",
-                "evidence": {
-                    "authority": "authenticated_carrier",
-                    "resource": "current vCPU worker host thread",
-                },
-                "rationale": (
-                    "The call yields the current vCPU worker host thread without "
-                    "accepting a process identifier."
+    def test_normalizes_outermost_workspace_macro_callsite(self):
+        expansion = {
+            "span": {
+                **compiler_span(
+                    "ROOT/crates/example/src/local_macro.rs",
+                    20,
+                    7,
+                    byte_start=200,
+                    byte_end=220,
                 ),
+                "expansion": {
+                    "span": compiler_span(
+                        "ROOT/crates/example/src/caller.rs",
+                        30,
+                        9,
+                        byte_start=300,
+                        byte_end=330,
+                    )
+                },
             }
-        ]
-        host_authority.validate(rows, expected)
-        path = root / "crates/carrick-runtime/src/dispatch/proc.rs"
-        path.write_text(path.read_text() + "fn id() { let _ = std::process::id(); }\n")
-        with self.assertRaises(host_authority.InventoryError):
-            host_authority.validate(host_authority.generate(root), expected)
-
-    def test_operation_retarget_does_not_preserve_stale_review(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture("fn open() { let _ = std::fs::File::open(\"/tmp/x\"); }\n")
+        }
+        row = self.normalize([diagnostic(expansion=expansion)])[0]
+        self.assertEqual(row["source"], source())
+        self.assertEqual(
+            row["expansion"],
+            source(
+                "crates/example/src/caller.rs",
+                30,
+                9,
+                byte_start=300,
+                byte_end=330,
+            ),
         )
-        reviewed = [
-            {
-                **rows[0],
-                "classification": "declared_backing",
-                "evidence": {
+
+    def test_rejects_missing_malformed_and_reversed_span_coordinates(self):
+        cases = {}
+        missing = diagnostic()
+        del missing["message"]["spans"][0]["byte_end"]
+        cases["missing"] = missing
+        reversed_bytes = diagnostic()
+        reversed_bytes["message"]["spans"][0]["byte_end"] = 99
+        cases["reversed bytes"] = reversed_bytes
+        reversed_columns = diagnostic()
+        reversed_columns["message"]["spans"][0]["column_end"] = 4
+        cases["reversed columns"] = reversed_columns
+        malformed = diagnostic()
+        malformed["message"]["spans"][0]["line_end"] = "10"
+        cases["malformed"] = malformed
+        malformed_expansion = diagnostic(
+            expansion={
+                "span": compiler_span(
+                    "ROOT/crates/example/src/caller.rs",
+                    30,
+                    9,
+                    byte_start=300,
+                    byte_end=330,
+                )
+            }
+        )
+        del malformed_expansion["message"]["spans"][0]["expansion"]["span"][
+            "column_end"
+        ]
+        cases["missing expansion coordinate"] = malformed_expansion
+        for label, message in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    self.host_authority.InventoryError, "span"
+                ):
+                    self.normalize([message])
+
+    def test_rejects_unknown_clippy_operation_message(self):
+        message = diagnostic()
+        message["message"]["message"] = "disallowed host operation changed shape"
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "operation"):
+            self.normalize([message])
+
+    def test_rejects_missing_primary_span(self):
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "primary span"):
+            self.normalize([diagnostic(primary=False)])
+
+    def test_rejects_duplicate_primary_spans(self):
+        message = diagnostic()
+        message["message"]["spans"].append(
+            copy.deepcopy(message["message"]["spans"][0])
+        )
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "primary span"):
+            self.normalize([message])
+
+    def test_rejects_paths_outside_workspace_root(self):
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "outside root"):
+            self.normalize([diagnostic(file_name="/private/tmp/outside.rs")])
+
+    def test_rejects_malformed_json(self):
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "malformed JSON"):
+            self.normalize(["{"])
+
+    def test_rejects_duplicate_diagnostic_identity(self):
+        message = diagnostic()
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "duplicate"):
+            self.normalize([message, copy.deepcopy(message)])
+
+    def test_rejects_conflicting_catalog_reason_children(self):
+        message = diagnostic(
+            children=[
+                {"level": "note", "message": "HA-CATALOG-PROCESS-ID: first"},
+                {"level": "note", "message": "HA-CATALOG-OTHER-ID: second"},
+            ]
+        )
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "catalog"):
+            self.normalize([message])
+
+
+class ProfileMergeTest(unittest.TestCase):
+    def setUp(self):
+        self.host_authority = load_host_authority()
+
+    def test_merges_profiles_only_for_exact_diagnostic_identity(self):
+        first = actual_row(profiles=["macos-hvf-default"])
+        second = actual_row(profiles=["macos-runtime-default"])
+        other = actual_row(
+            operation="libc::waitpid",
+            location=source(line=20),
+            profiles=["macos-runtime-default"],
+        )
+        self.assertEqual(
+            self.host_authority.merge_profiles([[first], [second, other]]),
+            [
+                other,
+                actual_row(
+                    profiles=["macos-hvf-default", "macos-runtime-default"]
+                ),
+            ],
+        )
+
+    def test_rejects_duplicate_identity_in_one_profile(self):
+        row = actual_row()
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "duplicate"):
+            self.host_authority.merge_profiles([[row, copy.deepcopy(row)]])
+
+    def test_rejects_catalog_disagreement_for_same_identity(self):
+        first = actual_row(
+            catalog_id="HA-CATALOG-PROCESS-ID", profiles=["macos-hvf-default"]
+        )
+        second = actual_row(
+            catalog_id="HA-CATALOG-OTHER", profiles=["macos-runtime-default"]
+        )
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "catalog"):
+            self.host_authority.merge_profiles([[first], [second]])
+
+
+class ReviewValidationTest(unittest.TestCase):
+    def setUp(self):
+        self.host_authority = load_host_authority()
+        self.executed = ["macos-hvf-default"]
+        self.required = ["macos-hvf-default"]
+
+    def validate(self, actual, expected):
+        self.host_authority.validate(actual, expected, self.executed, self.required)
+
+    def test_accepts_exact_review_shape(self):
+        self.validate([actual_row()], [reviewed_row()])
+
+    def test_partial_check_compares_only_executed_profile_membership(self):
+        expected = reviewed_row(profiles=["linux-runtime", "macos-hvf-default"])
+        self.validate([actual_row()], [expected])
+
+    def test_rejects_missing_executed_profile(self):
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "profile"):
+            self.host_authority.validate(
+                [actual_row()],
+                [reviewed_row()],
+                ["macos-hvf-default"],
+                ["macos-hvf-default", "macos-runtime-default"],
+            )
+
+    def test_rejects_new_removed_and_retargeted_rows(self):
+        cases = {
+            "new": (
+                [
+                    actual_row(),
+                    actual_row(operation="libc::waitpid", location=source(line=20)),
+                ],
+                [reviewed_row()],
+            ),
+            "removed": ([], [reviewed_row()]),
+            "retargeted": ([actual_row(location=source(line=11))], [reviewed_row()]),
+        }
+        for label, (actual, expected) in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    self.host_authority.InventoryError, "inventory drift"
+                ):
+                    self.validate(actual, expected)
+
+    def test_rejects_review_id_collision_across_operations(self):
+        first_actual = actual_row()
+        second_actual = actual_row(
+            operation="libc::waitpid", location=source(line=20)
+        )
+        first_review = reviewed_row()
+        second_review = reviewed_row(
+            review_id="HA-000001",
+            operation="libc::waitpid",
+            location=source(line=20),
+        )
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "review ID"):
+            self.validate(
+                [first_actual, second_actual], [first_review, second_review]
+            )
+
+    def test_rejects_legacy_unreachable_for_compiled_product_row(self):
+        row = reviewed_row(
+            classification="legacy_unreachable",
+            evidence={
+                "authority": "compile_time_exclusion",
+                "resource": "claimed compile-time exclusion",
+            },
+        )
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "legacy"):
+            self.validate([actual_row()], [row])
+
+    def test_rejects_empty_extra_generic_and_schema_mismatched_evidence(self):
+        cases = {
+            "empty": {},
+            "extra": {
+                "authority": "guest_answer",
+                "resource": "guest-visible process identity",
+                "claim": "extra",
+            },
+            "generic": {"authority": "guest_answer", "resource": "guest answer"},
+            "schema-mismatch": {
+                "authority": "authenticated_carrier",
+                "resource": "current vCPU worker host thread",
+            },
+        }
+        for label, evidence in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    self.host_authority.InventoryError, "evidence"
+                ):
+                    self.validate([actual_row()], [reviewed_row(evidence=evidence)])
+
+    def test_rejects_empty_rationale(self):
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "rationale"):
+            self.validate([actual_row()], [reviewed_row(rationale="")])
+
+    def test_accepts_each_nonlegacy_evidence_schema(self):
+        cases = [
+            (
+                "forbidden_semantic",
+                {"authority": "host_target", "resource": "selected host child PID"},
+            ),
+            (
+                "declared_backing",
+                {
                     "authority": "authorized_backing",
-                    "resource": "selected file beneath configured root",
+                    "resource": "validated rootfs directory entry",
                 },
-                "rationale": (
-                    "The call opens the selected file beneath the configured root."
-                ),
-            }
-        ]
-        retargeted = [{**rows[0], "operations": ["std::fs::metadata"]}]
-        rewritten = host_authority.reviewed_rows(retargeted, reviewed)
-        self.assertEqual(rewritten[0]["classification"], "unreviewed")
-        self.assertEqual(rewritten[0]["evidence"], {})
-        self.assertEqual(rewritten[0]["rationale"], "")
-
-    def test_duplicate_review_identity_is_rejected_as_ambiguous(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture("fn open() { let _ = std::fs::File::open(\"/tmp/x\"); }\n")
-        )
-        reviewed = {
-            **rows[0],
-            "classification": "declared_backing",
-            "evidence": {
-                "authority": "authorized_backing",
-                "resource": "selected file beneath configured root",
-            },
-            "rationale": (
-                "The call opens the selected file beneath the configured root."
-            ),
-        }
-        with self.assertRaises(host_authority.InventoryError):
-            host_authority.reviewed_rows(rows, [reviewed, reviewed])
-
-    def test_recognizes_real_cfg_path_and_standalone_target_exclusions(self):
-        host_authority = load_host_authority()
-        root = self.fixture("")
-        self.write_source(
-            root,
-            "crates/carrick-runtime/src/dispatch/fs.rs",
-            "#[cfg(test)]\n#[path = \"fs/tests.rs\"]\nmod tests;\n",
-        )
-        self.write_source(
-            root,
-            "crates/carrick-runtime/src/dispatch/fs/tests.rs",
-            "fn test_only() { let _ = std::process::id(); }\n",
-        )
-        self.write_source(
-            root,
-            "crates/carrick-vmm-hvf/Cargo.toml",
-            "[package]\nname = \"fixture-hvf\"\nversion = \"0.0.0\"\n",
-        )
-        self.write_source(
-            root,
-            "crates/carrick-vmm-hvf/src/bin/demo_probe.rs",
-            "fn main() { std::thread::yield_now(); }\n",
-        )
-        rows = host_authority.generate(root)
-        by_file = {row["file"]: row for row in rows}
-        self.assertEqual(
-            by_file[
-                "crates/carrick-runtime/src/dispatch/fs/tests.rs"
-            ].get("product_exclusion"),
-            {
-                "kind": "cfg_path_module",
-                "declaration_file": "crates/carrick-runtime/src/dispatch/fs.rs",
-                "module": "tests",
-                "predicate": "test",
-            },
-        )
-        self.assertEqual(
-            by_file[
-                "crates/carrick-vmm-hvf/src/bin/demo_probe.rs"
-            ].get("product_exclusion"),
-            {
-                "kind": "standalone_cargo_target",
-                "manifest": "crates/carrick-vmm-hvf/Cargo.toml",
-                "targets": ["demo_probe"],
-            },
-        )
-        for file, authority, resource in (
-            (
-                "crates/carrick-runtime/src/dispatch/fs/tests.rs",
-                "compile_time_exclusion",
-                "cfg(test) path module fs/tests.rs",
             ),
             (
-                "crates/carrick-vmm-hvf/src/bin/demo_probe.rs",
-                "standalone_target_exclusion",
-                "standalone Cargo target demo_probe",
-            ),
-        ):
-            row = by_file[file]
-            reviewed = {
-                **row,
-                "classification": "legacy_unreachable",
-                "evidence": {
-                    "authority": authority,
-                    "resource": resource,
-                    "exclusion": row["product_exclusion"],
-                },
-                "rationale": "The recognized build boundary excludes this source from the product.",
-            }
-            host_authority.validate([row], [reviewed])
-            mismatched = {
-                **reviewed,
-                "evidence": {
-                    **reviewed["evidence"],
-                    "exclusion": {"kind": "runtime_context"},
-                },
-            }
-            with self.assertRaises(host_authority.InventoryError):
-                host_authority.validate([row], [mismatched])
-
-    def test_unchanged_write_is_byte_identical(self):
-        host_authority = load_host_authority()
-        root = self.fixture("fn carrier() { std::thread::yield_now(); }\n")
-        rows = host_authority.generate(root)
-        reviewed = [
-            {
-                **rows[0],
-                "classification": "declared_substrate",
-                "evidence": {
+                "declared_substrate",
+                {
                     "authority": "authenticated_carrier",
                     "resource": "current vCPU worker host thread",
                 },
-                "rationale": "The call yields only the current worker thread.",
-            }
+            ),
         ]
-        inventory = root / "inventory.json"
-        before = json.dumps(reviewed, indent=2) + "\n"
-        inventory.write_text(before, encoding="utf-8")
-        original_root = host_authority.ROOT
-        original_inventory = host_authority.INVENTORY
-        host_authority.ROOT = root
-        host_authority.INVENTORY = inventory
-        try:
-            self.assertEqual(host_authority.main(["--write"]), 0)
-        finally:
-            host_authority.ROOT = original_root
-            host_authority.INVENTORY = original_inventory
-        self.assertEqual(inventory.read_text(encoding="utf-8"), before)
+        for classification, evidence in cases:
+            with self.subTest(classification=classification):
+                self.validate(
+                    [actual_row()],
+                    [
+                        reviewed_row(
+                            classification=classification,
+                            evidence=evidence,
+                            rationale="This call acts on the one named resource.",
+                        )
+                    ],
+                )
 
-    def test_valid_structured_authority_evidence_does_not_need_a_prose_prefix(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture("fn carrier() { std::thread::yield_now(); }\n")
+
+class RefreshTest(unittest.TestCase):
+    def setUp(self):
+        self.host_authority = load_host_authority()
+
+    def test_new_row_refreshes_unreviewed_with_next_monotonic_id(self):
+        old = reviewed_row(review_id="HA-000007")
+        new = actual_row(operation="libc::waitpid", location=source(line=20))
+        refreshed = self.host_authority.refresh([actual_row(), new], [old], True)
+        self.assertEqual(refreshed[1], old)
+        self.assertEqual(
+            refreshed[0],
+            reviewed_row(
+                review_id="HA-000008",
+                operation="libc::waitpid",
+                location=source(line=20),
+                classification="unreviewed",
+                evidence={},
+                rationale="",
+            ),
         )
-        expected = [
-            {
-                **rows[0],
-                "classification": "declared_substrate",
-                "evidence": {
-                    "authority": "authenticated_carrier",
-                    "resource": "current vCPU worker host thread",
-                },
-                "rationale": "The call yields only that worker thread.",
-            }
+
+    def test_same_identity_preserves_review_and_updates_profiles(self):
+        old = reviewed_row(profiles=["macos-hvf-default"])
+        actual = actual_row(profiles=["linux-runtime", "macos-hvf-default"])
+        refreshed = self.host_authority.refresh([actual], [old], True)
+        self.assertEqual(
+            refreshed,
+            [{**old, "profiles": ["linux-runtime", "macos-hvf-default"]}],
+        )
+
+    def test_same_start_changed_end_span_does_not_inherit_review(self):
+        changed_end = actual_row(location=source(byte_end=121))
+        row = self.host_authority.refresh(
+            [changed_end], [reviewed_row(review_id="HA-000003")], True
+        )[0]
+        self.assertEqual(row["source"]["byte_start"], 100)
+        self.assertEqual(row["source"]["line_start"], 10)
+        self.assertEqual(row["source"]["column_start"], 5)
+        self.assertEqual(row["source"]["byte_end"], 121)
+        self.assertEqual(row["review_id"], "HA-000004")
+        self.assertEqual(row["classification"], "unreviewed")
+
+    def test_changed_operation_source_or_expansion_never_inherits_review(self):
+        changed = [
+            actual_row(operation="libc::waitpid"),
+            actual_row(location=source(line=11)),
+            actual_row(
+                expansion=source(
+                    "crates/example/src/macro.rs",
+                    30,
+                    9,
+                    byte_start=300,
+                    byte_end=330,
+                )
+            ),
         ]
-        host_authority.validate(rows, expected)
+        for actual in changed:
+            with self.subTest(actual=actual):
+                row = self.host_authority.refresh(
+                    [actual], [reviewed_row(review_id="HA-000003")], True
+                )[0]
+                self.assertEqual(row["review_id"], "HA-000004")
+                self.assertEqual(row["classification"], "unreviewed")
+                self.assertEqual(row["evidence"], {})
+                self.assertEqual(row["rationale"], "")
 
-    def test_guest_wait_readiness_rows_are_forbidden_semantic(self):
-        inventory = json.loads(
-            (
-                ROOT
-                / "scripts/migrate/host-authority-transition-inventory.json"
-            ).read_text(encoding="utf-8")
-        )
-        expected = {
-            ("crates/carrick-vmm-hvf/src/host_signal.rs", 488),
-            ("crates/carrick-vmm-hvf/src/io_wait.rs", 168),
-            ("crates/carrick-vmm-hvf/src/io_wait.rs", 188),
-            ("crates/carrick-vmm-hvf/src/io_wait.rs", 217),
-            ("crates/carrick-vmm-hvf/src/io_wait.rs", 229),
-            ("crates/carrick-vmm-hvf/src/io_wait.rs", 906),
-            ("crates/carrick-vmm-hvf/src/io_wait.rs", 914),
-            ("crates/carrick-runtime/src/lib.rs", 1256),
-            ("crates/carrick-runtime/src/lib.rs", 1308),
-            ("crates/carrick-runtime/src/lib.rs", 1318),
-        }
-        actual = {
-            (row["file"], row["line"])
-            for row in inventory
-            if row["classification"] == "forbidden_semantic"
-        }
-        self.assertTrue(expected <= actual, expected - actual)
+    def test_complete_refresh_drops_removed_rows(self):
+        self.assertEqual(self.host_authority.refresh([], [reviewed_row()], True), [])
 
-    def test_ignores_comments_and_balanced_cfg_test_module_bodies(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture(
-                "// libc::kill(1, 0);\n"
-                "#[cfg(test)] mod ignored { fn probe() { let _ = \"{\"; libc::kill(1, 0); } }\n"
-                "#[cfg(test)] pub(crate) mod hidden { libc::kill(1, 0); }\n"
-                "fn live() { libc::kill(1, 0); }\n"
-                "fn literal() { let url = \"http://example\"; libc::kill(1, 0); }\n"
-            )
-        )
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]["line"], 4)
-        self.assertEqual(rows[1]["line"], 5)
-
-    def test_masks_multiline_restricted_modules_when_cfg_implies_test(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture(
-                "#[cfg(\n"
-                "    all(\n"
-                "        test,\n"
-                "        target_os = \"macos\",\n"
-                "    )\n"
-                ")]\n"
-                "pub(in crate::dispatch)\n"
-                "mod\n"
-                "    hidden\n"
-                "{\n"
-                "    fn hidden() { libc::kill(1, 0); }\n"
-                "}\n"
-                "#[cfg(any(test, target_os = \"macos\"))]\n"
-                "mod reachable_without_test {\n"
-                "    fn live_on_macos() { libc::kill(2, 0); }\n"
-                "}\n"
-                "fn live() { libc::kill(3, 0); }\n"
-            )
-        )
-        self.assertEqual(
-            [(row["line"], row["text"]) for row in rows],
-            [
-                (15, "fn live_on_macos() { libc::kill(2, 0); }"),
-                (17, "fn live() { libc::kill(3, 0); }"),
-            ],
-        )
-
-    def test_masks_nonmodule_items_when_cfg_implies_test(self):
-        host_authority = load_host_authority()
-        rows = host_authority.generate(
-            self.fixture(
-                "fn production() {\n"
-                "    #[cfg(test)]\n"
-                "    let test_pid = std::process::id();\n"
-                "    let live_pid = std::process::id();\n"
-                "}\n"
-                "#[cfg(all(test, target_os = \"macos\"))]\n"
-                "fn test_helper() { libc::kill(1, 0); }\n"
-            )
-        )
-        self.assertEqual(
-            [(row["line"], row["kind"], row["operations"]) for row in rows],
-            [(4, "host_identity", ["std::process::id"])],
-        )
+    def test_partial_refresh_fails_closed(self):
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "partial"):
+            self.host_authority.refresh([actual_row()], [reviewed_row()], False)
 
 
 if __name__ == "__main__":
