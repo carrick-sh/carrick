@@ -8,12 +8,18 @@ belong to the pinned compiler that produced the diagnostics.
 
 from __future__ import annotations
 
+import argparse
+import fnmatch
 import json
+import os
+import platform
 import re
+import subprocess
 import sys
+import tomllib
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, NamedTuple
 
 
 CLIPPY_CODE = "clippy::disallowed_methods"
@@ -24,6 +30,14 @@ OPERATION_PATH = re.compile(
 CATALOG_ID = re.compile(r"HA-CATALOG-[A-Z0-9]+(?:-[A-Z0-9]+)*")
 CATALOG_TOKEN = re.compile(r"HA-CATALOG-[^:\s]+")
 REVIEW_ID = re.compile(r"HA-([0-9]{6})")
+CATALOG_REASON = re.compile(r"^(HA-CATALOG-[A-Z0-9]+(?:-[A-Z0-9]+)*):")
+
+ROOT = Path(__file__).resolve().parents[2]
+MATRIX_PATH = ROOT / "scripts" / "migrate" / "host-authority-build-matrix.json"
+INVENTORY_PATH = (
+    ROOT / "scripts" / "migrate" / "host-authority-transition-inventory.json"
+)
+CLIPPY_CONFIG_PATH = ROOT / "clippy.toml"
 
 ACTUAL_FIELDS = {"catalog_id", "operation", "source", "expansion", "profiles"}
 REVIEW_FIELDS = {
@@ -65,6 +79,358 @@ GENERIC_RESOURCES = {
 
 class InventoryError(Exception):
     """Compiler census evidence cannot satisfy the checked review contract."""
+
+
+class Profile(NamedTuple):
+    """One exact product compilation selected by the checked matrix."""
+
+    id: str
+    host: str
+    command: tuple[str, ...]
+
+
+class Matrix(NamedTuple):
+    """Validated product matrix and its pinned compiler identities."""
+
+    schema: int
+    rustc_release: str
+    clippy_release: str
+    required_profiles: tuple[str, ...]
+    profiles: dict[str, Profile]
+
+
+def _expected_profile_commands() -> dict[str, tuple[str, ...]]:
+    commands = {
+        "macos-cli-default": (
+            "cargo",
+            "clippy",
+            "-p",
+            "carrick-cli",
+            "--bin",
+            "carrick",
+            "--message-format=json",
+            "--",
+            "--force-warn",
+            CLIPPY_CODE,
+        ),
+        "macos-runtime-default": (
+            "cargo",
+            "clippy",
+            "-p",
+            "carrick-runtime",
+            "--lib",
+            "--message-format=json",
+            "--",
+            "--force-warn",
+            CLIPPY_CODE,
+        ),
+        "macos-hvf-default": (
+            "cargo",
+            "clippy",
+            "-p",
+            "carrick-vmm-hvf",
+            "--lib",
+            "--message-format=json",
+            "--",
+            "--force-warn",
+            CLIPPY_CODE,
+        ),
+    }
+    for host, features in (
+        ("linux", "syscall-shim,platform-linux"),
+        ("freebsd", "platform-freebsd"),
+        ("netbsd", "platform-netbsd"),
+    ):
+        for target, package, target_args in (
+            ("cli", "carrick-cli", ("--bin", "carrick")),
+            ("runtime", "carrick-runtime", ("--lib",)),
+        ):
+            commands[f"{host}-{target}"] = (
+                "cargo",
+                "clippy",
+                "-p",
+                package,
+                "--no-default-features",
+                "--features",
+                features,
+                *target_args,
+                "--message-format=json",
+                "--",
+                "--force-warn",
+                CLIPPY_CODE,
+            )
+    return commands
+
+
+EXPECTED_PROFILE_COMMANDS = _expected_profile_commands()
+EXPECTED_PROFILE_HOSTS = {
+    profile_id: profile_id.split("-", 1)[0]
+    for profile_id in EXPECTED_PROFILE_COMMANDS
+}
+
+
+def _json_file(path: Path, label: str) -> object:
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise InventoryError(f"missing {label}: {path}") from error
+    except json.JSONDecodeError as error:
+        raise InventoryError(f"malformed {label} JSON at {path}: {error}") from error
+
+
+def load_matrix(path: Path) -> Matrix:
+    """Load and fail closed on any drift in the checked nine-profile matrix."""
+    raw = _json_file(Path(path), "host-authority build matrix")
+    if not isinstance(raw, dict) or set(raw) != {
+        "schema",
+        "toolchain",
+        "required_profiles",
+        "profiles",
+    }:
+        raise InventoryError("invalid host-authority build matrix schema")
+    if raw.get("schema") != 1:
+        raise InventoryError("unsupported host-authority build matrix schema")
+    toolchain = raw.get("toolchain")
+    if not isinstance(toolchain, dict) or set(toolchain) != {
+        "rustc_release",
+        "clippy_release",
+    }:
+        raise InventoryError("invalid matrix toolchain requirements")
+    rustc_release = toolchain.get("rustc_release")
+    clippy_release = toolchain.get("clippy_release")
+    if rustc_release != "1.96.0" or clippy_release != "0.1.96":
+        raise InventoryError(
+            "matrix toolchain must pin rustc 1.96.0 and Clippy 0.1.96"
+        )
+
+    required_raw = raw.get("required_profiles")
+    if not isinstance(required_raw, list) or not all(
+        isinstance(profile_id, str) and profile_id for profile_id in required_raw
+    ):
+        raise InventoryError("matrix required profiles must be a nonempty string list")
+    if not required_raw or len(required_raw) != len(set(required_raw)):
+        raise InventoryError("matrix required profile IDs must be nonempty and unique")
+    if set(required_raw) != set(EXPECTED_PROFILE_COMMANDS):
+        missing = sorted(set(EXPECTED_PROFILE_COMMANDS) - set(required_raw))
+        extra = sorted(set(required_raw) - set(EXPECTED_PROFILE_COMMANDS))
+        raise InventoryError(
+            f"matrix required profile set is incomplete: missing={missing}, extra={extra}"
+        )
+
+    profiles_raw = raw.get("profiles")
+    if not isinstance(profiles_raw, list) or not profiles_raw:
+        raise InventoryError("matrix profiles must be a nonempty list")
+    profiles: dict[str, Profile] = {}
+    for index, raw_profile in enumerate(profiles_raw, start=1):
+        if not isinstance(raw_profile, dict) or set(raw_profile) != {
+            "id",
+            "host",
+            "command",
+        }:
+            raise InventoryError(f"invalid matrix profile {index} schema")
+        profile_id = raw_profile.get("id")
+        host = raw_profile.get("host")
+        command = raw_profile.get("command")
+        if not isinstance(profile_id, str) or not profile_id:
+            raise InventoryError(f"invalid matrix profile ID at row {index}")
+        if profile_id in profiles:
+            raise InventoryError(f"duplicate matrix profile ID: {profile_id}")
+        if not isinstance(host, str) or not host:
+            raise InventoryError(f"invalid host for matrix profile {profile_id}")
+        if not isinstance(command, list) or not command or not all(
+            isinstance(argument, str) and argument for argument in command
+        ):
+            raise InventoryError(f"invalid command for matrix profile {profile_id}")
+        if "--message-format=json" not in command:
+            raise InventoryError(
+                f"matrix profile {profile_id} omits required JSON message format"
+            )
+        if "--force-warn" not in command or CLIPPY_CODE not in command:
+            raise InventoryError(
+                f"matrix profile {profile_id} omits required force-warn lint"
+            )
+        expected_command = EXPECTED_PROFILE_COMMANDS.get(profile_id)
+        expected_host = EXPECTED_PROFILE_HOSTS.get(profile_id)
+        if expected_command is None or expected_host is None:
+            raise InventoryError(f"undeclared matrix profile ID: {profile_id}")
+        if host != expected_host:
+            raise InventoryError(
+                f"matrix profile {profile_id} has wrong host {host!r}"
+            )
+        if tuple(command) != expected_command:
+            raise InventoryError(
+                f"matrix profile {profile_id} does not compile its exact product target"
+            )
+        profiles[profile_id] = Profile(profile_id, host, tuple(command))
+
+    if set(profiles) != set(required_raw):
+        missing = sorted(set(required_raw) - set(profiles))
+        extra = sorted(set(profiles) - set(required_raw))
+        raise InventoryError(
+            f"matrix profile declarations disagree: missing={missing}, extra={extra}"
+        )
+    ordered = {profile_id: profiles[profile_id] for profile_id in required_raw}
+    return Matrix(
+        schema=1,
+        rustc_release=rustc_release,
+        clippy_release=clippy_release,
+        required_profiles=tuple(required_raw),
+        profiles=ordered,
+    )
+
+
+def current_host_id() -> str:
+    """Return the matrix host ID for the current native execution host."""
+    host = platform.system().casefold()
+    mapped = {
+        "darwin": "macos",
+        "linux": "linux",
+        "freebsd": "freebsd",
+        "netbsd": "netbsd",
+    }
+    try:
+        return mapped[host]
+    except KeyError as error:
+        raise InventoryError(f"unsupported host for authority census: {host}") from error
+
+
+def select_profiles(
+    matrix: Matrix,
+    selector: str | None,
+    current_host: str | None = None,
+) -> list[Profile]:
+    """Select a nonempty current-host subset, preserving matrix order."""
+    host = current_host or current_host_id()
+    if selector is None:
+        selected = [
+            profile for profile in matrix.profiles.values() if profile.host == host
+        ]
+    else:
+        patterns = [pattern.strip() for pattern in selector.split(",")]
+        if not patterns or any(not pattern for pattern in patterns):
+            raise InventoryError("profile selection must be nonempty")
+        matched_ids: list[str] = []
+        for pattern in patterns:
+            matches = [
+                profile_id
+                for profile_id in matrix.required_profiles
+                if fnmatch.fnmatchcase(profile_id, pattern)
+            ]
+            if not matches:
+                raise InventoryError(f"profile selector matched no profile: {pattern}")
+            for profile_id in matches:
+                if profile_id in matched_ids:
+                    raise InventoryError(
+                        f"profile selection contains duplicate ID: {profile_id}"
+                    )
+                matched_ids.append(profile_id)
+        selected = [matrix.profiles[profile_id] for profile_id in matched_ids]
+    if not selected:
+        raise InventoryError(f"no authority census profile is available on {host}")
+    unavailable = [profile.id for profile in selected if profile.host != host]
+    if unavailable:
+        raise InventoryError(
+            f"profiles unavailable on current host {host}: {sorted(unavailable)}"
+        )
+    return selected
+
+
+def _completed_text(
+    command: Sequence[str],
+    *,
+    runner: Any,
+    cwd: Path,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return runner(
+        list(command),
+        cwd=cwd,
+        env=dict(env) if env is not None else None,
+        shell=False,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _command_failure(label: str, result: subprocess.CompletedProcess[str]) -> None:
+    stderr = result.stderr.strip() if isinstance(result.stderr, str) else ""
+    detail = stderr or "<captured stderr was empty>"
+    raise InventoryError(
+        f"{label} failed with exit {result.returncode}; captured stderr: {detail}"
+    )
+
+
+def verify_toolchain(
+    matrix: Matrix,
+    runner: Any = subprocess.run,
+    root: Path = ROOT,
+) -> dict[str, str]:
+    """Verify and return the exact pinned compiler identities for the receipt."""
+    identities: dict[str, str] = {}
+    checks = (
+        ("rustc", ["rustc", "-V"], matrix.rustc_release),
+        ("clippy", ["cargo", "clippy", "-V"], matrix.clippy_release),
+    )
+    for label, command, release in checks:
+        result = _completed_text(command, runner=runner, cwd=Path(root))
+        if result.returncode != 0:
+            _command_failure(f"{label} identity check", result)
+        identity = result.stdout.strip() if isinstance(result.stdout, str) else ""
+        prefix = f"{label} {release}"
+        if not identity.startswith(prefix):
+            raise InventoryError(
+                f"{label} identity mismatch: required {prefix!r}, got {identity!r}"
+            )
+        identities[label] = identity
+    return identities
+
+
+def run_profile(
+    profile: Profile,
+    runner: Any = subprocess.run,
+    *,
+    root: Path = ROOT,
+    current_host: str | None = None,
+) -> list[dict[str, object]]:
+    """Compile one available product profile and parse its Cargo JSON stream."""
+    host = current_host or current_host_id()
+    if profile.host != host:
+        raise InventoryError(
+            f"profile {profile.id} is unavailable on current host {host}"
+        )
+    environment = os.environ.copy()
+    environment["CARGO_TARGET_DIR"] = str(
+        Path(root) / "target" / "host-authority-census" / profile.id
+    )
+    result = _completed_text(
+        profile.command,
+        runner=runner,
+        cwd=Path(root),
+        env=environment,
+    )
+    if result.returncode != 0:
+        _command_failure(f"authority census profile {profile.id}", result)
+    stdout = result.stdout if isinstance(result.stdout, str) else ""
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    if not lines:
+        raise InventoryError(
+            f"authority census profile {profile.id} produced no Cargo JSON messages"
+        )
+    messages: list[dict[str, object]] = []
+    for index, line in enumerate(lines, start=1):
+        try:
+            message: Any = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise InventoryError(
+                f"profile {profile.id} emitted malformed Cargo JSON row {index}: {error}"
+            ) from error
+        if not isinstance(message, dict):
+            raise InventoryError(
+                f"profile {profile.id} Cargo JSON row {index} is not an object"
+            )
+        messages.append(message)
+    return messages
 
 
 def _canonical_json(value: object) -> str:
@@ -698,13 +1064,284 @@ def refresh(
     return rows
 
 
-def main(argv: Sequence[str]) -> int:
-    """Fail closed until Task 3 installs matrix execution and CLI routing."""
-    print(
-        "compiler authority census matrix orchestration is not configured yet",
-        file=sys.stderr,
+def load_production_catalog(path: Path) -> dict[str, str]:
+    """Load only the stable object-form Clippy catalog installed by Task 4."""
+    try:
+        configuration = tomllib.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise InventoryError(f"production Clippy catalog is missing: {path}") from error
+    except tomllib.TOMLDecodeError as error:
+        raise InventoryError(f"production Clippy catalog is malformed: {error}") from error
+    entries = configuration.get("disallowed-methods")
+    if not isinstance(entries, list) or not entries:
+        raise InventoryError(
+            "production host-authority catalog is unavailable until Task 4: "
+            "clippy.toml has no object-form disallowed-methods entries"
+        )
+    catalog: dict[str, str] = {}
+    for index, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict):
+            raise InventoryError(
+                f"production catalog entry {index} is not an object with a stable ID"
+            )
+        operation = entry.get("path")
+        reason = entry.get("reason")
+        if not isinstance(operation, str) or not isinstance(reason, str):
+            raise InventoryError(
+                f"production catalog entry {index} lacks path or stable-ID reason"
+            )
+        match = CATALOG_REASON.match(reason)
+        if match is None:
+            raise InventoryError(
+                f"production catalog entry {operation!r} lacks a stable catalog ID"
+            )
+        if operation in catalog:
+            raise InventoryError(f"duplicate production catalog operation: {operation}")
+        catalog[operation] = match.group(1)
+    return _validate_operation_catalog(catalog)
+
+
+def load_inventory(path: Path) -> list[dict[str, object]]:
+    """Load the checked review rows without accepting legacy object shapes."""
+    raw = _json_file(Path(path), "host-authority inventory")
+    if not isinstance(raw, list):
+        raise InventoryError("host-authority inventory must be a JSON list")
+    if not all(isinstance(row, dict) for row in raw):
+        raise InventoryError("host-authority inventory rows must be JSON objects")
+    return raw
+
+
+def run_census(
+    matrix: Matrix,
+    profiles: Sequence[Profile],
+    operation_catalog: Mapping[str, str],
+    runner: Any = subprocess.run,
+    *,
+    root: Path = ROOT,
+    current_host: str | None = None,
+) -> dict[str, object]:
+    """Run a selected local subset and return pure normalized receipt data."""
+    selected = list(profiles)
+    if not selected:
+        raise InventoryError("executed profile subset must be nonempty")
+    selected_ids = [profile.id for profile in selected]
+    if len(selected_ids) != len(set(selected_ids)):
+        raise InventoryError("executed profile subset contains duplicate IDs")
+    unknown = sorted(set(selected_ids) - set(matrix.required_profiles))
+    if unknown:
+        raise InventoryError(f"executed profile subset contains unknown IDs: {unknown}")
+    catalog = _validate_operation_catalog(operation_catalog)
+    identities = verify_toolchain(matrix, runner=runner, root=Path(root))
+    batches = []
+    for profile in selected:
+        messages = run_profile(
+            profile,
+            runner=runner,
+            root=Path(root),
+            current_host=current_host,
+        )
+        batches.append(
+            normalize_messages(messages, profile.id, Path(root), catalog)
+        )
+    rows = merge_profiles(batches)
+    pending = [
+        profile_id
+        for profile_id in matrix.required_profiles
+        if profile_id not in selected_ids
+    ]
+    return {
+        "toolchain": identities,
+        "executed_profiles": selected_ids,
+        "pending_profiles": pending,
+        "rows": rows,
+    }
+
+
+def _unreviewed_candidate_rows(
+    actual: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    indexed = _actual_index(actual)
+    rows = []
+    for number, row in enumerate(
+        sorted(indexed.values(), key=_sort_key), start=1
+    ):
+        rows.append(
+            {
+                "review_id": f"HA-{number:06d}",
+                **row,
+                "classification": "unreviewed",
+                "evidence": {},
+                "rationale": "",
+            }
+        )
+    return rows
+
+
+def candidate_document(
+    actual: list[dict[str, object]],
+    expected: list[dict[str, object]],
+    executed_profiles: Sequence[str],
+    required_profiles: Sequence[str],
+    toolchain: Mapping[str, str],
+) -> dict[str, object]:
+    """Build an explicit partial or refreshable complete candidate receipt."""
+    executed = _profile_set(executed_profiles, "executed")
+    required = _profile_set(required_profiles, "required")
+    if not executed <= required:
+        raise InventoryError(
+            f"candidate executed profiles are outside required: {sorted(executed - required)}"
+        )
+    for row in actual:
+        valid = _validate_actual_row(row, "candidate")
+        row_profiles = set(valid["profiles"])
+        if not row_profiles <= executed:
+            raise InventoryError(
+                "candidate row contains an unexecuted profile: "
+                f"{sorted(row_profiles - executed)}"
+            )
+    if not isinstance(toolchain, Mapping) or set(toolchain) != {"rustc", "clippy"}:
+        raise InventoryError("candidate requires pinned rustc and Clippy identities")
+    if not all(isinstance(value, str) and value for value in toolchain.values()):
+        raise InventoryError("candidate tool identities must be nonempty strings")
+    complete = executed == required
+    rows = (
+        refresh(actual, expected, True)
+        if complete
+        else _unreviewed_candidate_rows(actual)
     )
-    return 2
+    return {
+        "schema": 1,
+        "kind": "host-authority-census-candidate",
+        "complete": complete,
+        "toolchain": dict(toolchain),
+        "executed_profiles": sorted(executed),
+        "pending_profiles": sorted(required - executed),
+        "rows": rows,
+    }
+
+
+def _argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compile the pinned host-authority product matrix and compare "
+            "compiler-resolved Clippy diagnostics with reviewed inventory rows."
+        ),
+        epilog=(
+            "Checks may execute a nonempty current-host subset and report all "
+            "other required profiles pending. A partial refresh candidate is "
+            "written only as explicitly partial, with executed rows unreviewed, "
+            "and exits nonzero; only all nine profiles produce a complete "
+            "refreshable candidate."
+        ),
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--check",
+        action="store_true",
+        help="compare only executed profile rows; never rewrite inventory",
+    )
+    mode.add_argument(
+        "--refresh-candidate",
+        metavar="PATH",
+        type=Path,
+        help=(
+            "write a candidate receipt; subsets are marked partial, contain only "
+            "unreviewed executed rows, and exit nonzero"
+        ),
+    )
+    parser.add_argument(
+        "--profiles",
+        metavar="GLOB[,GLOB...]",
+        help=(
+            "select current-host profile IDs (glob syntax); default selects every "
+            "profile available on the current host"
+        ),
+    )
+    return parser
+
+
+def main(
+    argv: Sequence[str],
+    *,
+    runner: Any = subprocess.run,
+    matrix: Matrix | None = None,
+    operation_catalog: Mapping[str, str] | None = None,
+    expected: list[dict[str, object]] | None = None,
+    current_host: str | None = None,
+    root: Path = ROOT,
+) -> int:
+    """Run the fail-closed CLI, with pure dependency injection for tests."""
+    arguments = _argument_parser().parse_args(list(argv))
+    try:
+        checked_matrix = matrix or load_matrix(
+            Path(root) / MATRIX_PATH.relative_to(ROOT)
+        )
+        catalog = (
+            dict(operation_catalog)
+            if operation_catalog is not None
+            else load_production_catalog(
+                Path(root) / CLIPPY_CONFIG_PATH.relative_to(ROOT)
+            )
+        )
+        reviews = (
+            expected
+            if expected is not None
+            else load_inventory(Path(root) / INVENTORY_PATH.relative_to(ROOT))
+        )
+        selected = select_profiles(
+            checked_matrix, arguments.profiles, current_host=current_host
+        )
+        result = run_census(
+            checked_matrix,
+            selected,
+            catalog,
+            runner=runner,
+            root=Path(root),
+            current_host=current_host,
+        )
+        rows = result["rows"]
+        executed = result["executed_profiles"]
+        pending = result["pending_profiles"]
+        identities = result["toolchain"]
+        assert isinstance(rows, list)
+        assert isinstance(executed, list)
+        assert isinstance(pending, list)
+        assert isinstance(identities, Mapping)
+        if arguments.refresh_candidate is not None:
+            document = candidate_document(
+                rows,
+                reviews,
+                executed,
+                checked_matrix.required_profiles,
+                identities,
+            )
+            arguments.refresh_candidate.write_text(
+                json.dumps(document, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            if document["complete"] is not True:
+                print(
+                    "error: wrote an explicitly partial, non-authoritative "
+                    f"candidate; pending profiles: {', '.join(pending)}",
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                f"wrote complete refresh candidate: {arguments.refresh_candidate}"
+            )
+            return 0
+        validate(rows, reviews, executed, checked_matrix.required_profiles)
+        if pending:
+            print(
+                "host-authority census subset passed; result is partial; "
+                f"pending profiles: {', '.join(pending)}"
+            )
+        else:
+            print("host-authority census complete: all required profiles passed")
+        return 0
+    except InventoryError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

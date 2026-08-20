@@ -2,13 +2,19 @@
 """Tests for compiler-resolved host-authority diagnostic reviews."""
 
 import copy
+import contextlib
 import importlib.util
+import io
+import json
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "scripts" / "migrate" / "check-host-authority-transitions.py"
+MATRIX = ROOT / "scripts" / "migrate" / "host-authority-build-matrix.json"
 MESSAGES = (
     ROOT
     / "scripts"
@@ -24,6 +30,79 @@ FIXTURE_CATALOG = {
     "std::process::id": "HA-CATALOG-FIXTURE-PROCESS-ID",
     "std::thread::yield_now": "HA-CATALOG-FIXTURE-THREAD-YIELD-NOW",
 }
+
+REQUIRED_PROFILES = [
+    "macos-cli-default",
+    "macos-runtime-default",
+    "macos-hvf-default",
+    "linux-cli",
+    "linux-runtime",
+    "freebsd-cli",
+    "freebsd-runtime",
+    "netbsd-cli",
+    "netbsd-runtime",
+]
+
+EXPECTED_COMMANDS = {
+    "macos-cli-default": [
+        "cargo",
+        "clippy",
+        "-p",
+        "carrick-cli",
+        "--bin",
+        "carrick",
+        "--message-format=json",
+        "--",
+        "--force-warn",
+        "clippy::disallowed_methods",
+    ],
+    "macos-runtime-default": [
+        "cargo",
+        "clippy",
+        "-p",
+        "carrick-runtime",
+        "--lib",
+        "--message-format=json",
+        "--",
+        "--force-warn",
+        "clippy::disallowed_methods",
+    ],
+    "macos-hvf-default": [
+        "cargo",
+        "clippy",
+        "-p",
+        "carrick-vmm-hvf",
+        "--lib",
+        "--message-format=json",
+        "--",
+        "--force-warn",
+        "clippy::disallowed_methods",
+    ],
+}
+
+for host, features in (
+    ("linux", "syscall-shim,platform-linux"),
+    ("freebsd", "platform-freebsd"),
+    ("netbsd", "platform-netbsd"),
+):
+    for target, package, target_args in (
+        ("cli", "carrick-cli", ["--bin", "carrick"]),
+        ("runtime", "carrick-runtime", ["--lib"]),
+    ):
+        EXPECTED_COMMANDS[f"{host}-{target}"] = [
+            "cargo",
+            "clippy",
+            "-p",
+            package,
+            "--no-default-features",
+            "--features",
+            features,
+            *target_args,
+            "--message-format=json",
+            "--",
+            "--force-warn",
+            "clippy::disallowed_methods",
+        ]
 
 
 def load_host_authority():
@@ -758,6 +837,332 @@ class RefreshTest(unittest.TestCase):
     def test_partial_refresh_fails_closed(self):
         with self.assertRaisesRegex(self.host_authority.InventoryError, "partial"):
             self.host_authority.refresh([actual_row()], [reviewed_row()], False)
+
+
+class FakeRunner:
+    def __init__(self, cargo_stdout: str | None = None):
+        self.calls = []
+        self.cargo_stdout = (
+            json.dumps({"reason": "build-finished", "success": True}) + "\n"
+            if cargo_stdout is None
+            else cargo_stdout
+        )
+        self.cargo_returncode = 0
+        self.cargo_stderr = ""
+        self.rustc_version = "rustc 1.96.0 (abcdef 2026-08-01)\n"
+        self.clippy_version = "clippy 0.1.96 (abcdef 2026-08-01)\n"
+
+    def __call__(self, argv, **kwargs):
+        argv = list(argv)
+        self.calls.append((argv, kwargs))
+        if argv == ["rustc", "-V"]:
+            return subprocess.CompletedProcess(argv, 0, self.rustc_version, "")
+        if argv == ["cargo", "clippy", "-V"]:
+            return subprocess.CompletedProcess(argv, 0, self.clippy_version, "")
+        return subprocess.CompletedProcess(
+            argv,
+            self.cargo_returncode,
+            self.cargo_stdout,
+            self.cargo_stderr,
+        )
+
+
+class MatrixOrchestrationTest(unittest.TestCase):
+    def setUp(self):
+        self.host_authority = load_host_authority()
+
+    def load(self):
+        return self.host_authority.load_matrix(MATRIX)
+
+    def write_matrix(self, payload):
+        temporary = tempfile.TemporaryDirectory()
+        path = Path(temporary.name) / "matrix.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        self.addCleanup(temporary.cleanup)
+        return path
+
+    def canonical_payload(self):
+        return {
+            "schema": 1,
+            "toolchain": {
+                "rustc_release": "1.96.0",
+                "clippy_release": "0.1.96",
+            },
+            "required_profiles": list(REQUIRED_PROFILES),
+            "profiles": [
+                {
+                    "id": profile_id,
+                    "host": profile_id.split("-", 1)[0],
+                    "command": list(EXPECTED_COMMANDS[profile_id]),
+                }
+                for profile_id in REQUIRED_PROFILES
+            ],
+        }
+
+    def test_checked_matrix_declares_exact_nine_product_profiles(self):
+        matrix = self.load()
+        self.assertEqual(list(matrix.required_profiles), REQUIRED_PROFILES)
+        self.assertEqual(list(matrix.profiles), REQUIRED_PROFILES)
+        self.assertEqual(matrix.rustc_release, "1.96.0")
+        self.assertEqual(matrix.clippy_release, "0.1.96")
+        self.assertEqual(
+            {profile_id: list(profile.command) for profile_id, profile in matrix.profiles.items()},
+            EXPECTED_COMMANDS,
+        )
+
+    def test_matrix_rejects_duplicate_or_missing_profile_ids(self):
+        duplicate_required = self.canonical_payload()
+        duplicate_required["required_profiles"].append("macos-cli-default")
+        duplicate_profile = self.canonical_payload()
+        duplicate_profile["profiles"].append(
+            copy.deepcopy(duplicate_profile["profiles"][0])
+        )
+        missing_profile = self.canonical_payload()
+        missing_profile["profiles"].pop()
+        for label, payload in (
+            ("duplicate required", duplicate_required),
+            ("duplicate profile", duplicate_profile),
+            ("missing profile", missing_profile),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    self.host_authority.InventoryError, "profile"
+                ):
+                    self.host_authority.load_matrix(self.write_matrix(payload))
+
+    def test_matrix_rejects_commands_missing_json_or_force_warn(self):
+        cases = {
+            "json": "--message-format=json",
+            "force-warn": "--force-warn",
+        }
+        for label, argument in cases.items():
+            payload = self.canonical_payload()
+            payload["profiles"][0]["command"].remove(argument)
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    self.host_authority.InventoryError, f"(?i){label}"
+                ):
+                    self.host_authority.load_matrix(self.write_matrix(payload))
+
+    def test_run_profile_uses_exact_argv_workspace_and_isolated_target(self):
+        profile = self.load().profiles["macos-hvf-default"]
+        runner = FakeRunner()
+        messages = self.host_authority.run_profile(
+            profile, runner=runner, root=ROOT, current_host="macos"
+        )
+        self.assertEqual(messages, [{"reason": "build-finished", "success": True}])
+        self.assertEqual(runner.calls[0][0], EXPECTED_COMMANDS[profile.id])
+        kwargs = runner.calls[0][1]
+        self.assertEqual(kwargs["cwd"], ROOT)
+        self.assertFalse(kwargs["shell"])
+        self.assertTrue(kwargs["capture_output"])
+        self.assertTrue(kwargs["text"])
+        self.assertFalse(kwargs["check"])
+        self.assertEqual(
+            kwargs["env"]["CARGO_TARGET_DIR"],
+            str(ROOT / "target" / "host-authority-census" / profile.id),
+        )
+
+    def test_run_profile_preserves_stderr_on_compile_failure(self):
+        profile = self.load().profiles["macos-hvf-default"]
+        runner = FakeRunner()
+        runner.cargo_returncode = 17
+        runner.cargo_stderr = "specific compiler failure\n"
+        with self.assertRaisesRegex(
+            self.host_authority.InventoryError, "specific compiler failure"
+        ):
+            self.host_authority.run_profile(
+                profile, runner=runner, root=ROOT, current_host="macos"
+            )
+
+    def test_run_profile_rejects_malformed_or_empty_json_stdout(self):
+        profile = self.load().profiles["macos-hvf-default"]
+        for label, stdout in (("malformed", "not json\n"), ("empty", "")):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    self.host_authority.InventoryError, "JSON"
+                ):
+                    self.host_authority.run_profile(
+                        profile,
+                        runner=FakeRunner(stdout),
+                        root=ROOT,
+                        current_host="macos",
+                    )
+
+    def test_host_mismatch_is_unavailable_without_running(self):
+        profile = self.load().profiles["linux-cli"]
+        runner = FakeRunner()
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "unavailable"):
+            self.host_authority.run_profile(
+                profile, runner=runner, root=ROOT, current_host="macos"
+            )
+        self.assertEqual(runner.calls, [])
+
+    def test_tool_identities_are_pinned_and_checked_before_profiles(self):
+        matrix = self.load()
+        runner = FakeRunner()
+        identities = self.host_authority.verify_toolchain(matrix, runner=runner)
+        self.assertEqual(
+            identities,
+            {
+                "rustc": "rustc 1.96.0 (abcdef 2026-08-01)",
+                "clippy": "clippy 0.1.96 (abcdef 2026-08-01)",
+            },
+        )
+        self.assertEqual(
+            [call[0] for call in runner.calls],
+            [["rustc", "-V"], ["cargo", "clippy", "-V"]],
+        )
+        mismatch = FakeRunner()
+        mismatch.clippy_version = "clippy 0.1.95 (stale)\n"
+        with self.assertRaisesRegex(
+            self.host_authority.InventoryError, "0.1.96"
+        ):
+            self.host_authority.verify_toolchain(matrix, runner=mismatch)
+
+    def test_profile_selection_is_nonempty_local_and_supports_globs(self):
+        matrix = self.load()
+        expected = REQUIRED_PROFILES[:3]
+        self.assertEqual(
+            [profile.id for profile in self.host_authority.select_profiles(matrix, None, "macos")],
+            expected,
+        )
+        self.assertEqual(
+            [
+                profile.id
+                for profile in self.host_authority.select_profiles(
+                    matrix, "macos-*", "macos"
+                )
+            ],
+            expected,
+        )
+        for selector in ("", "does-not-exist"):
+            with self.subTest(selector=selector):
+                with self.assertRaisesRegex(
+                    self.host_authority.InventoryError, "profile"
+                ):
+                    self.host_authority.select_profiles(matrix, selector, "macos")
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "unavailable"):
+            self.host_authority.select_profiles(matrix, "linux-*", "macos")
+
+    def test_census_uses_fake_catalog_and_records_pending_profiles(self):
+        matrix = self.load()
+        runner = FakeRunner(json.dumps(diagnostic()) + "\n")
+        selected = self.host_authority.select_profiles(
+            matrix, "macos-hvf-default", "macos"
+        )
+        result = self.host_authority.run_census(
+            matrix,
+            selected,
+            FIXTURE_CATALOG,
+            runner=runner,
+            root=ROOT,
+            current_host="macos",
+        )
+        self.assertEqual(result["executed_profiles"], ["macos-hvf-default"])
+        self.assertEqual(
+            result["pending_profiles"],
+            [profile for profile in REQUIRED_PROFILES if profile != "macos-hvf-default"],
+        )
+        self.assertEqual(
+            result["rows"],
+            [actual_row(catalog_id="HA-CATALOG-FIXTURE-PROCESS-ID")],
+        )
+        self.assertEqual(
+            [call[0] for call in runner.calls[:3]],
+            [
+                ["rustc", "-V"],
+                ["cargo", "clippy", "-V"],
+                EXPECTED_COMMANDS["macos-hvf-default"],
+            ],
+        )
+
+    def test_partial_candidate_is_unreviewed_marked_partial_and_nonzero(self):
+        matrix = self.load()
+        runner = FakeRunner(json.dumps(diagnostic()) + "\n")
+        expected = [
+            reviewed_row(
+                review_id="HA-999999",
+                profiles=["linux-runtime", "macos-hvf-default"],
+            )
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.json"
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = self.host_authority.main(
+                    [
+                        "--profiles",
+                        "macos-hvf-default",
+                        "--refresh-candidate",
+                        str(candidate),
+                    ],
+                    runner=runner,
+                    matrix=matrix,
+                    operation_catalog=FIXTURE_CATALOG,
+                    expected=expected,
+                    current_host="macos",
+                    root=ROOT,
+                )
+            document = json.loads(candidate.read_text(encoding="utf-8"))
+        self.assertNotEqual(status, 0)
+        self.assertFalse(document["complete"])
+        self.assertEqual(document["executed_profiles"], ["macos-hvf-default"])
+        self.assertEqual(document["rows"][0]["classification"], "unreviewed")
+        self.assertEqual(document["rows"][0]["evidence"], {})
+        self.assertEqual(document["rows"][0]["rationale"], "")
+        self.assertNotEqual(document["rows"][0]["review_id"], "HA-999999")
+        self.assertIn("partial", stderr.getvalue())
+
+    def test_complete_candidate_requires_every_required_profile(self):
+        matrix = self.load()
+        all_profiles = sorted(REQUIRED_PROFILES)
+        actual = [actual_row(profiles=all_profiles)]
+        expected = [reviewed_row(profiles=all_profiles)]
+        complete = self.host_authority.candidate_document(
+            actual,
+            expected,
+            all_profiles,
+            REQUIRED_PROFILES,
+            {"rustc": "rustc pinned", "clippy": "clippy pinned"},
+        )
+        self.assertTrue(complete["complete"])
+        self.assertEqual(complete["rows"], expected)
+        partial = self.host_authority.candidate_document(
+            [actual_row()],
+            expected,
+            ["macos-hvf-default"],
+            REQUIRED_PROFILES,
+            {"rustc": "rustc pinned", "clippy": "clippy pinned"},
+        )
+        self.assertFalse(partial["complete"])
+        self.assertTrue(
+            all(row["classification"] == "unreviewed" for row in partial["rows"])
+        )
+
+    def test_partial_check_projects_reviewed_rows_without_writing(self):
+        matrix = self.load()
+        runner = FakeRunner(json.dumps(diagnostic()) + "\n")
+        expected = [
+            reviewed_row(
+                profiles=["linux-runtime", "macos-hvf-default"],
+                catalog_id="HA-CATALOG-FIXTURE-PROCESS-ID",
+            )
+        ]
+        status = self.host_authority.main(
+            ["--check", "--profiles", "macos-hvf-default"],
+            runner=runner,
+            matrix=matrix,
+            operation_catalog=FIXTURE_CATALOG,
+            expected=expected,
+            current_host="macos",
+            root=ROOT,
+        )
+        self.assertEqual(status, 0)
+
+    def test_real_execution_fails_when_production_catalog_is_unavailable(self):
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "Task 4"):
+            self.host_authority.load_production_catalog(ROOT / "clippy.toml")
 
 
 if __name__ == "__main__":
