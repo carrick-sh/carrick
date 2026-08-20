@@ -1049,6 +1049,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "mqnotifycrossproc": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "mqueue": {
     "class": "conformance",
     "excluded": false,
@@ -2245,6 +2250,11 @@
     "runner": "generic"
   },
   "waitidcputime": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "waitidsiuid": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
