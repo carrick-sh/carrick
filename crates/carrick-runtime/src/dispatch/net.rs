@@ -899,6 +899,17 @@ impl SyscallDispatcher {
             {
                 LINUX_EPOLLIN
             }
+            OpenDescription::Mqueue { queue, .. } => {
+                let state = queue.state.lock();
+                let mut ready = 0;
+                if requested_events & LINUX_EPOLLIN != 0 && !state.messages.is_empty() {
+                    ready |= LINUX_EPOLLIN;
+                }
+                if requested_events & LINUX_EPOLLOUT != 0 && state.messages.len() < state.max_msg {
+                    ready |= LINUX_EPOLLOUT;
+                }
+                ready
+            }
             OpenDescription::HostSocket { base, .. } if base.pending_socket_error().is_some() => {
                 let mut ready = LINUX_EPOLLERR;
                 if requested_events & LINUX_EPOLLOUT != 0 {
@@ -1984,11 +1995,10 @@ impl SyscallDispatcher {
             // A POSIX message queue is readable iff it holds at least one
             // message and writable iff it has room — read the backing file's
             // header (under its OFD lock) to decide. (mq_overview(7)/poll(2).)
-            OpenDescription::Mqueue {
-                host_fd, max_msg, ..
-            } => {
-                let (readable, writable) =
-                    crate::dispatch::mqueue::poll_readiness(host_fd.raw(), *max_msg);
+            OpenDescription::Mqueue { queue, .. } => {
+                let state = queue.state.lock();
+                let readable = !state.messages.is_empty();
+                let writable = state.messages.len() < state.max_msg;
                 if requested_events & LINUX_POLLIN != 0 && readable {
                     ready |= LINUX_POLLIN;
                 }

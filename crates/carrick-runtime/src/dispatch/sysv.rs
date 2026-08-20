@@ -348,7 +348,6 @@ impl ShmSegment {
 #[derive(Clone, Debug)]
 struct SemSet {
     key: i32,
-    host_id: HostSemId,
     scan_index: SemScanIndex,
     nsems: usize,
     mode: ShmPermMode,
@@ -358,19 +357,21 @@ struct SemSet {
     cgid: NsGid,
     ctime: u64,
     otime: u64,
-    /// Linux `sempid` per semaphore. Darwin records the one Carrick host pid,
-    /// which cannot identify an HVPatch logical process; this shared overlay
-    /// preserves the exact task id across in-process fork dispatcher clones.
+    values: Arc<Mutex<Vec<u16>>>,
+    /// Linux `sempid` per semaphore.
     logical_last_operators: Arc<Mutex<Vec<Option<i32>>>>,
-    /// Linux `semncnt`/`semzcnt` per semaphore. Carrick's `semop` waiters poll
-    /// the host set with IPC_NOWAIT (that is what keeps an untimed wait
-    /// interruptible), so no waiter is ever asleep inside the host `semop` and
-    /// the host's own counters read 0 for every one of them. Same shape and
-    /// same reason as `logical_last_operators`: a host counter cannot describe
-    /// Carrick's logical waiters, and the `Arc` keeps ONE authority across
-    /// in-process fork dispatcher clones so a sibling guest process reading
-    /// GETNCNT/GETZCNT sees the waiters parked in the carrier.
+    /// Linux `semncnt`/`semzcnt` per semaphore.
     logical_wait_counts: SemWaitCounters,
+    changed: Arc<parking_lot::Condvar>,
+}
+
+/// Linux sembuf ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct LinuxSembuf {
+    pub sem_num: u16,
+    pub sem_op: i16,
+    pub sem_flg: i16,
 }
 
 /// Which Linux blocked-waiter counter a `semop` operation feeds while parked.
@@ -390,15 +391,6 @@ impl SemWaitKind {
             std::cmp::Ordering::Less => Some(Self::Increase),
             std::cmp::Ordering::Equal => Some(Self::Zero),
             std::cmp::Ordering::Greater => None,
-        }
-    }
-
-    /// The counter a semctl command reads, or `None` for every other command.
-    fn for_semctl_cmd(cmd: u64) -> Option<Self> {
-        match cmd {
-            LINUX_GETNCNT => Some(Self::Increase),
-            LINUX_GETZCNT => Some(Self::Zero),
-            _ => None,
         }
     }
 }
@@ -454,15 +446,6 @@ impl GuestSemId {
 
     fn as_i64(self) -> i64 {
         i64::from(self.0)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HostSemId(i32);
-
-impl HostSemId {
-    fn raw(self) -> i32 {
-        self.0
     }
 }
 
@@ -541,35 +524,6 @@ struct MsgQueueMetrics {
     bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct LinuxSemValue(i32);
-
-impl LinuxSemValue {
-    const MAX: i32 = LINUX_SEMVMX as i32;
-
-    fn from_host(value: i32) -> Self {
-        Self(value)
-    }
-
-    fn checked_add(self, delta: i16) -> Option<Self> {
-        self.0
-            .checked_add(i32::from(delta))
-            .filter(|value| *value <= Self::MAX)
-            .map(Self)
-    }
-
-    fn checked_sub(self, delta: i16) -> Option<Self> {
-        self.0
-            .checked_sub(i32::from(delta.unsigned_abs()))
-            .filter(|value| *value >= 0)
-            .map(Self)
-    }
-
-    fn is_zero(self) -> bool {
-        self.0 == 0
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SemStatSelector {
     StatIndex(SemScanIndex),
@@ -626,7 +580,7 @@ impl SemSet {
             }
     }
 
-    fn record_logical_semop(&self, pid: i32, sops: &[carrick_portable::Sembuf]) {
+    fn record_logical_semop(&self, pid: i32, sops: &[LinuxSembuf]) {
         let mut operators = self.logical_last_operators.lock();
         for sop in sops {
             if let Some(operator) = operators.get_mut(usize::from(sop.sem_num)) {
@@ -863,6 +817,7 @@ fn sysv_run_scope() -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn scoped_host_sem_key(key: i32) -> libc::key_t {
     if key == LINUX_IPC_PRIVATE {
         return LINUX_IPC_PRIVATE as libc::key_t;
@@ -870,6 +825,7 @@ fn scoped_host_sem_key(key: i32) -> libc::key_t {
     scoped_host_sem_key_for_scope(&sysv_run_scope(), key)
 }
 
+#[cfg(test)]
 fn scoped_host_sem_key_for_scope(scope: &str, key: i32) -> libc::key_t {
     // Darwin SysV semaphore keys live in one host-global pool. Linux containers
     // get an IPC namespace, so mix Carrick's run scope into the host key while
@@ -2326,25 +2282,17 @@ impl SyscallDispatcher {
         if self.is_forked_guest_process() {
             return;
         }
-        let (semaphore_ids, shm_segments) = {
+        let shm_segments = {
             let mut state = self.sysv.lock();
             SysvIpcService::cleanup_process_exit(&mut state);
-            (
-                state
-                    .semaphores
-                    .drain()
-                    .map(|(_, meta)| meta.host_id)
-                    .collect::<Vec<_>>(),
-                state
-                    .segments
-                    .drain()
-                    .map(|(_, segment)| segment)
-                    .collect::<Vec<_>>(),
-            )
+            state.semaphores.clear();
+            state.sem_keys.clear();
+            state
+                .segments
+                .drain()
+                .map(|(_, segment)| segment)
+                .collect::<Vec<_>>()
         };
-        for semid in semaphore_ids {
-            let _ = unsafe { carrick_portable::semctl0(semid.raw(), 0, libc::IPC_RMID) };
-        }
         for segment in shm_segments {
             let _ = std::fs::remove_file(&segment.path);
             let _ = std::fs::remove_file(shm_nattch_path(&segment.path));
@@ -3006,51 +2954,45 @@ impl SyscallDispatcher {
             if !create && key != LINUX_IPC_PRIVATE {
                 return Ok(DispatchOutcome::errno(LINUX_ENOENT));
             }
-            let host_key = scoped_host_sem_key(key);
-            let rc =
-                unsafe { carrick_portable::semget(host_key, nsems_usize as i32, semflg as i32) };
-            match rc.host_syscall_errno() {
-                Ok(host_id) => {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let mut state = this.sysv.lock();
-                    let Ok((guest_semid, scan_index)) = state.allocate_sem_id() else {
-                        drop(state);
-                        let _ = unsafe { carrick_portable::semctl0(host_id, 0, libc::IPC_RMID) };
-                        return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
-                    };
-                    state.semaphores.insert(
-                        guest_semid,
-                        SemSet {
-                            key,
-                            host_id: HostSemId(host_id),
-                            scan_index,
-                            nsems: nsems_usize,
-                            mode: ShmPermMode::requested(semflg),
-                            uid: creds.euid,
-                            gid: creds.egid,
-                            cuid: creds.euid,
-                            cgid: creds.egid,
-                            ctime: now,
-                            otime: 0,
-                            logical_last_operators: Arc::new(Mutex::new(vec![None; nsems_usize])),
-                            logical_wait_counts: Arc::new(Mutex::new(vec![
-                                SemWaitCounts::default();
-                                nsems_usize
-                            ])),
-                        },
-                    );
-                    if key != LINUX_IPC_PRIVATE {
-                        state.sem_keys.insert(key, guest_semid);
-                    }
-                    Ok(DispatchOutcome::Returned {
-                        value: guest_semid.as_i64(),
-                    })
-                }
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+            if nsems_usize == 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut state = this.sysv.lock();
+            let Ok((guest_semid, scan_index)) = state.allocate_sem_id() else {
+                return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
+            };
+            state.semaphores.insert(
+                guest_semid,
+                SemSet {
+                    key,
+                    scan_index,
+                    nsems: nsems_usize,
+                    mode: ShmPermMode::requested(semflg),
+                    uid: creds.euid,
+                    gid: creds.egid,
+                    cuid: creds.euid,
+                    cgid: creds.egid,
+                    ctime: now,
+                    otime: 0,
+                    values: Arc::new(Mutex::new(vec![0u16; nsems_usize])),
+                    logical_last_operators: Arc::new(Mutex::new(vec![None; nsems_usize])),
+                    logical_wait_counts: Arc::new(Mutex::new(vec![
+                        SemWaitCounts::default();
+                        nsems_usize
+                    ])),
+                    changed: Arc::new(parking_lot::Condvar::new()),
+                },
+            );
+            if key != LINUX_IPC_PRIVATE {
+                state.sem_keys.insert(key, guest_semid);
+            }
+            Ok(DispatchOutcome::Returned {
+                value: guest_semid.as_i64(),
+            })
         }
 
         /// semop(semid, sops, nsops): apply an array of `struct sembuf`. The
@@ -3564,7 +3506,7 @@ impl SemWaitRegistration {
     /// `sops` array is applied atomically by Linux, so a blocked caller is
     /// waiting on each of its decrement (`GETNCNT`) and wait-for-zero
     /// (`GETZCNT`) operations at once.
-    fn arm(counts: &SemWaitCounters, sops: &[carrick_portable::Sembuf]) -> Self {
+    fn arm(counts: &SemWaitCounters, sops: &[LinuxSembuf]) -> Self {
         let mut entries = Vec::new();
         {
             let mut slots = counts.lock();
@@ -3649,7 +3591,7 @@ impl SysvSemBlockStateGuard {
         task_pid: Option<i32>,
         tid: crate::thread::ThreadId,
         counts: &SemWaitCounters,
-        sops: &[carrick_portable::Sembuf],
+        sops: &[LinuxSembuf],
     ) -> Self {
         Self::with_waits(task_pid, tid, Some(SemWaitRegistration::arm(counts, sops)))
     }
@@ -3677,118 +3619,16 @@ impl Drop for SysvSemBlockStateGuard {
     }
 }
 
-fn semop_is_nowait(sop: &carrick_portable::Sembuf) -> bool {
-    SemOpFlags::from_bits_retain(sop.sem_flg as u16).contains(SemOpFlags::NOWAIT)
-}
-
-fn semop_may_block(sops: &[carrick_portable::Sembuf]) -> bool {
-    sops.iter().any(|s| s.sem_op <= 0 && !semop_is_nowait(s))
-}
-
-/// Index of the first `sops` entry that cannot be performed against the set's
-/// current values, evaluating the array in order the way Linux applies it.
-/// `None` means every operation was satisfiable at the moment of the read, or
-/// that the values could not be read — in both cases the caller must not claim
-/// to know which operation blocked.
-fn first_blocking_semop(semid: i32, sops: &[carrick_portable::Sembuf]) -> Option<usize> {
-    let host_cmd = linux_semctl_cmd_to_host(LINUX_GETVAL)?;
-    let mut values: HashMap<u16, LinuxSemValue> = HashMap::new();
-    for (index, sop) in sops.iter().enumerate() {
-        let value = match values.get(&sop.sem_num).copied() {
-            Some(value) => value,
-            None => {
-                let raw =
-                    unsafe { carrick_portable::semctl0(semid, i32::from(sop.sem_num), host_cmd) };
-                let value = LinuxSemValue::from_host(raw.host_syscall_errno().ok()?);
-                values.insert(sop.sem_num, value);
-                value
-            }
-        };
-        let next = match sop.sem_op.cmp(&0) {
-            std::cmp::Ordering::Greater => value.checked_add(sop.sem_op)?,
-            std::cmp::Ordering::Less => match value.checked_sub(sop.sem_op) {
-                Some(next) => next,
-                None => return Some(index),
-            },
-            std::cmp::Ordering::Equal if value.is_zero() => value,
-            std::cmp::Ordering::Equal => return Some(index),
-        };
-        values.insert(sop.sem_num, next);
-    }
-    None
-}
-
-/// Would this `semop` fail with EAGAIN rather than park? Linux blocks only when
-/// the operation that cannot be performed lacks IPC_NOWAIT; when it carries the
-/// flag the call fails immediately. Carrick forces NOWAIT on the host array to
-/// keep the wait interruptible, so the host's EAGAIN cannot distinguish the two
-/// and this decides it from the guest's own flags.
-fn semop_nowait_rejects(semid: i32, sops: &[carrick_portable::Sembuf]) -> bool {
-    if !sops.iter().any(semop_is_nowait) {
-        return false;
-    }
-    first_blocking_semop(semid, sops)
-        .and_then(|index| sops.get(index))
-        .is_some_and(semop_is_nowait)
-}
-
-fn validate_semop_value_ranges(
-    semid: i32,
-    sops: &[carrick_portable::Sembuf],
-) -> Result<(), LinuxErrno> {
-    let nsems = host_sem_nsems(semid)?;
-    let mut values: HashMap<u16, LinuxSemValue> = HashMap::new();
-    for sop in sops {
-        if usize::from(sop.sem_num) >= nsems {
-            return Err(LINUX_EFBIG);
-        }
-
-        let value = match values.get(&sop.sem_num).copied() {
-            Some(value) => value,
-            None => {
-                let host_cmd = linux_semctl_cmd_to_host(LINUX_GETVAL).ok_or(LINUX_EINVAL)?;
-                let raw =
-                    unsafe { carrick_portable::semctl0(semid, i32::from(sop.sem_num), host_cmd) };
-                let raw = raw.host_syscall_errno()?;
-                let value = LinuxSemValue::from_host(raw);
-                values.insert(sop.sem_num, value);
-                value
-            }
-        };
-
-        let next = match sop.sem_op.cmp(&0) {
-            std::cmp::Ordering::Greater => value.checked_add(sop.sem_op).ok_or(LINUX_ERANGE)?,
-            std::cmp::Ordering::Less => match value.checked_sub(sop.sem_op) {
-                Some(next) => next,
-                None => return Ok(()),
-            },
-            std::cmp::Ordering::Equal if value.is_zero() => value,
-            std::cmp::Ordering::Equal => return Ok(()),
-        };
-        values.insert(sop.sem_num, next);
-    }
-    Ok(())
-}
-
-/// The set-scoped state a parked `semop` needs: the shared blocked-waiter
-/// counters to publish itself into, the predicate that decides EINTR, and the
-/// completion hook that records `sempid`.
 struct SemopWaitCtx<'a> {
-    /// Authoritative Linux task pid for run-state publication, or `None` off
-    /// the kernel lane. See [`sysv_run_state_task_pid`].
     task_pid: Option<i32>,
     wait_counts: &'a SemWaitCounters,
     interrupted: &'a dyn Fn() -> bool,
-    completed: &'a dyn Fn(&[carrick_portable::Sembuf]),
+    completed: &'a dyn Fn(&[LinuxSembuf]),
 }
 
-/// Shared semop / semtimedop core. Reads the `nsops` sembuf entries (Linux ==
-/// macOS layout) and forwards to host `semop`. macOS has no `semtimedop` and a
-/// host `semop` cannot be interrupted, so both forms poll an IPC_NOWAIT variant
-/// and decide blocking, timeout and EINTR here.
 fn sysv_semop<M: GuestMemory>(
     cx: &mut SyscallCtx<M>,
-    semid: i32,
+    sem_set: &SemSet,
     sops_addr: u64,
     nsops: usize,
     timeout: Option<LinuxTimespec>,
@@ -3806,149 +3646,105 @@ fn sysv_semop<M: GuestMemory>(
     if nsops > LINUX_SEMOPM as usize {
         return Ok(DispatchOutcome::errno(LINUX_E2BIG));
     }
-    // sembuf is 6 bytes; read the whole array.
     let bytes = match cx.memory.read_bytes(sops_addr, nsops * 6) {
         Ok(b) => b,
         Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
     };
-    let mut sops: Vec<carrick_portable::Sembuf> = Vec::with_capacity(nsops);
+    let mut sops: Vec<LinuxSembuf> = Vec::with_capacity(nsops);
     for i in 0..nsops {
         let o = i * 6;
-        sops.push(carrick_portable::Sembuf {
-            sem_num: u16::from_le_bytes([bytes[o], bytes[o + 1]]),
-            sem_op: i16::from_le_bytes([bytes[o + 2], bytes[o + 3]]),
-            sem_flg: i16::from_le_bytes([bytes[o + 4], bytes[o + 5]]),
+        let sem_num = u16::from_le_bytes([bytes[o], bytes[o + 1]]);
+        let sem_op = i16::from_le_bytes([bytes[o + 2], bytes[o + 3]]);
+        let sem_flg = i16::from_le_bytes([bytes[o + 4], bytes[o + 5]]);
+        if usize::from(sem_num) >= sem_set.nsems {
+            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+        }
+        sops.push(LinuxSembuf {
+            sem_num,
+            sem_op,
+            sem_flg,
         });
     }
-    if let Err(errno) = validate_semop_value_ranges(semid, &sops) {
-        return Ok(DispatchOutcome::errno(errno));
-    }
-    let may_block = semop_may_block(&sops);
+    let may_block = sops.iter().any(|s| {
+        s.sem_op <= 0
+            && !SemOpFlags::from_bits_retain(s.sem_flg as u16).contains(SemOpFlags::NOWAIT)
+    });
 
-    // BOTH the timed and untimed forms poll with IPC_NOWAIT. Forcing NOWAIT on
-    // every op means the host call returns EAGAIN instead of blocking inside
-    // the kernel, so `interrupted()` is actually reachable between attempts.
-    //
-    // The untimed form used to call the host `semop` directly and block there.
-    // semop(2) documents EINTR ("the sleep was interrupted by a signal"), and a
-    // thread parked inside a host semop could not be interrupted at all — not
-    // even by SIGKILL. LTP semctl01 ends by SIGKILLing five children that are
-    // parked in an untimed semop and then waiting for them; none died, so the
-    // suite wedged to the harness timeout rather than merely failing.
-    //
-    // `deadline: None` is the untimed form: retry until satisfied or
-    // interrupted, exactly as Linux blocks indefinitely.
     let deadline = timeout.map(|ts| {
         let total_ns = (ts.tv_sec.max(0) as u128) * 1_000_000_000 + ts.tv_nsec.max(0) as u128;
         std::time::Instant::now()
             + std::time::Duration::from_nanos(total_ns.min(u64::MAX as u128) as u64)
     });
-    let mut nowait = sops.clone();
-    for s in &mut nowait {
-        s.sem_flg |= SemOpFlags::NOWAIT.bits() as i16;
-    }
-    // Armed on the first would-block, not before: a `semop` that is satisfiable
-    // right away neither sleeps ('S') nor counts towards semncnt/semzcnt. Both
-    // facts are published by this one guard, so the counts LTP semctl01 reads
-    // after `TST_PROCESS_STATE_WAIT(pid, 'S')` are already up, and every exit
-    // path below unwinds them.
+
     let mut block_state: Option<SysvSemBlockStateGuard> = None;
-    let mut saw_would_block = false;
     loop {
         if interrupted() {
             return Ok(DispatchOutcome::errno(LINUX_EINTR));
         }
-        let mut attempt = nowait.clone();
-        let rc = unsafe { carrick_portable::semop(semid, attempt.as_mut_ptr(), nsops) };
-        match rc.host_syscall_errno() {
-            Ok(_) => {
+        {
+            let mut vals = sem_set.values.lock();
+            let mut can_apply = true;
+            let mut would_block_nowait = false;
+            let mut sim_vals = vals.clone();
+            for sop in &sops {
+                let idx = usize::from(sop.sem_num);
+                let cur = sim_vals[idx];
+                let is_nowait =
+                    SemOpFlags::from_bits_retain(sop.sem_flg as u16).contains(SemOpFlags::NOWAIT);
+                if sop.sem_op > 0 {
+                    if (cur as i32 + sop.sem_op as i32) > 32767 {
+                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ERANGE));
+                    }
+                    sim_vals[idx] = cur + sop.sem_op as u16;
+                } else if sop.sem_op < 0 {
+                    let req = (-sop.sem_op) as u16;
+                    if cur < req {
+                        can_apply = false;
+                        if is_nowait {
+                            would_block_nowait = true;
+                        }
+                        break;
+                    }
+                    sim_vals[idx] = cur - req;
+                } else {
+                    if cur != 0 {
+                        can_apply = false;
+                        if is_nowait {
+                            would_block_nowait = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            if can_apply {
+                *vals = sim_vals;
+                drop(vals);
                 completed(&sops);
+                sem_set.changed.notify_all();
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            Err(e) if e == LINUX_EAGAIN => {
-                saw_would_block = true;
-                // The forced NOWAIT is carrick's, not the guest's. When the
-                // operation that actually blocked carries the guest's own
-                // IPC_NOWAIT, semop(2) fails with EAGAIN instead of waiting —
-                // `!may_block` is the exact all-NOWAIT case, and a mixed array
-                // needs the current values to say which operation blocked.
-                if !may_block || semop_nowait_rejects(semid, &sops) {
-                    return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
-                }
-                // Only the TIMED form gives up: semtimedop(2) returns EAGAIN on
-                // timeout. The untimed form keeps waiting, as semop(2) does.
-                if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                    return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
-                }
-                if block_state.is_none() {
-                    block_state = Some(SysvSemBlockStateGuard::for_semop(
-                        task_pid,
-                        cx.tid(),
-                        wait_counts,
-                        &sops,
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(2));
+            if would_block_nowait || !may_block {
+                return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
             }
-            Err(e) if e == LINUX_EINVAL && saw_would_block && may_block => {
-                return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIDRM));
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
             }
-            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            if block_state.is_none() {
+                block_state = Some(SysvSemBlockStateGuard::for_semop(
+                    task_pid,
+                    cx.tid(),
+                    wait_counts,
+                    &sops,
+                ));
+            }
+            sem_set
+                .changed
+                .wait_for(&mut vals, std::time::Duration::from_millis(10));
         }
     }
 }
 
-/// Translate a Linux semctl command to the host value. Returns `None` for a
-/// command the host doesn't have (SEM_STAT/SEM_INFO).
-fn linux_semctl_cmd_to_host(cmd: u64) -> Option<i32> {
-    // FreeBSD's libc bindings omit the GET*/SET* semctl cmd consts (though the
-    // kernel has them); supply them from the host <sys/sem.h> (host ABI).
-    // IPC_RMID/SET/STAT exist in libc on every host.
-    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
-    const GETNCNT: i32 = 3;
-    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
-    const GETPID: i32 = 4;
-    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
-    const GETVAL: i32 = 5;
-    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
-    const GETALL: i32 = 6;
-    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
-    const GETZCNT: i32 = 7;
-    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
-    const SETVAL: i32 = 8;
-    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
-    const SETALL: i32 = 9;
-    #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
-    use libc::{GETALL, GETNCNT, GETPID, GETVAL, GETZCNT, SETALL, SETVAL};
-    Some(match cmd {
-        LINUX_IPC_RMID => libc::IPC_RMID,
-        LINUX_IPC_SET => libc::IPC_SET,
-        LINUX_IPC_STAT => libc::IPC_STAT,
-        LINUX_GETPID => GETPID,
-        LINUX_GETVAL => GETVAL,
-        LINUX_GETALL => GETALL,
-        LINUX_GETNCNT => GETNCNT,
-        LINUX_GETZCNT => GETZCNT,
-        LINUX_SETVAL => SETVAL,
-        LINUX_SETALL => SETALL,
-        _ => return None,
-    })
-}
-
 impl SyscallDispatcher {
-    /// The host set plus the shared blocked-waiter counters a `semop` needs.
-    /// The `Arc` is cloned out here so the poll loop below never holds the
-    /// dispatcher's `sysv` lock while parked.
-    fn sem_semop_target(&self, semid: i32) -> Result<(HostSemId, SemWaitCounters), LinuxErrno> {
-        let guest_semid = GuestSemId::from_syscall_arg(semid)?;
-        let state = self.sysv.lock();
-        state
-            .semaphores
-            .get(&guest_semid)
-            .map(|meta| (meta.host_id, Arc::clone(&meta.logical_wait_counts)))
-            .ok_or(LINUX_EINVAL)
-    }
-
     fn sysv_semop<M: GuestMemory>(
         &self,
         cx: &mut SyscallCtx<M>,
@@ -3957,14 +3753,22 @@ impl SyscallDispatcher {
         nsops: usize,
         timeout: Option<LinuxTimespec>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let (host_id, wait_counts) = match self.sem_semop_target(semid) {
-            Ok(target) => target,
-            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-        };
         let guest_semid = match GuestSemId::from_syscall_arg(semid) {
             Ok(guest_semid) => guest_semid,
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
         };
+        let (sem_set, wait_counts) = {
+            let state = self.sysv.lock();
+            let meta = state.semaphores.get(&guest_semid).ok_or(LINUX_EINVAL);
+            match meta {
+                Ok(meta) => (meta.clone(), Arc::clone(&meta.logical_wait_counts)),
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            }
+        };
+        let creds = self.cred_snapshot();
+        if !sem_set.can_write(&creds) {
+            return Ok(DispatchOutcome::errno(LINUX_EACCES));
+        }
         let logical_operator = self
             .hvpatch_process()
             .map(|_| cx.kernel.task().key().id.raw());
@@ -3979,16 +3783,21 @@ impl SyscallDispatcher {
                 carrick_abi::WaitSigMask::NONE,
             )
         };
-        let completed = |sops: &[carrick_portable::Sembuf]| {
+        let completed = |sops: &[LinuxSembuf]| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             if let Some(pid) = logical_operator
-                && let Some(meta) = self.sysv.lock().semaphores.get(&guest_semid)
+                && let Some(meta) = self.sysv.lock().semaphores.get_mut(&guest_semid)
             {
                 meta.record_logical_semop(pid, sops);
+                meta.otime = now;
             }
         };
         sysv_semop(
             cx,
-            host_id.raw(),
+            &sem_set,
             sops_addr,
             nsops,
             timeout,
@@ -4025,25 +3834,58 @@ impl SyscallDispatcher {
                 };
                 return self.write_sem_stat(cx, selector, arg, creds);
             }
+            _ => {}
+        }
+
+        let guest_semid = match GuestSemId::from_syscall_arg(semid) {
+            Ok(guest_semid) => guest_semid,
+            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+        };
+        let mut state = self.sysv.lock();
+        let Some(meta) = state.semaphores.get_mut(&guest_semid) else {
+            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+        };
+        if matches!(cmd, LINUX_IPC_RMID | LINUX_IPC_SET) && !meta.can_admin(creds) {
+            return Ok(DispatchOutcome::errno(LINUX_EPERM));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let caller_pid = self
+            .hvpatch_process()
+            .map(|_| cx.kernel.task().key().id.raw())
+            .unwrap_or(0);
+
+        match cmd {
+            LINUX_IPC_RMID => {
+                let key = meta.key;
+                let changed = Arc::clone(&meta.changed);
+                state.semaphores.remove(&guest_semid);
+                if key != LINUX_IPC_PRIVATE {
+                    state.sem_keys.remove(&key);
+                }
+                drop(state);
+                changed.notify_all();
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+            LINUX_IPC_SET => {
+                if arg == 0 {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                }
+                let bytes = match cx.memory.read_bytes(arg + 20, 4) {
+                    Ok(b) => b,
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                };
+                let mode = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                meta.mode = ShmPermMode::from_ipc_set(mode, meta.mode);
+                meta.ctime = now;
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
             LINUX_IPC_STAT => {
-                // Fill the aarch64 semid64_ds from carrick's OWNED metadata so
-                // the ipc64_perm (mode/owner ids) and sem_otime/sem_ctime carry
-                // real values — the host-forwarded path below only knows the
-                // host semid and returns a zeroed perm/times buffer on the
-                // bring-up lanes (probe sysvsemstat / LTP semctl01).
-                let guest_semid = match GuestSemId::from_syscall_arg(semid) {
-                    Ok(guest_semid) => guest_semid,
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                };
-                let state = self.sysv.lock();
-                let Some(meta) = state.semaphores.get(&guest_semid) else {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                };
                 if !meta.can_read(creds) {
                     return Ok(DispatchOutcome::errno(LINUX_EACCES));
                 }
-                let meta = meta.clone();
-                drop(state);
                 if arg != 0 {
                     let out = LinuxSemidDs {
                         sem_perm: LinuxIpcPerm {
@@ -4053,7 +3895,7 @@ impl SyscallDispatcher {
                             cuid: meta.cuid.raw(),
                             cgid: meta.cgid.raw(),
                             mode: meta.mode.perms(),
-                            seq: 0,
+                            seq: meta.scan_index.0 as u16,
                             ..Default::default()
                         },
                         sem_otime: meta.otime,
@@ -4066,90 +3908,134 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                 }
-                return Ok(DispatchOutcome::Returned { value: 0 });
+                Ok(DispatchOutcome::Returned { value: 0 })
             }
-            _ => {}
-        }
-
-        let guest_semid = match GuestSemId::from_syscall_arg(semid) {
-            Ok(guest_semid) => guest_semid,
-            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-        };
-        let logical_operator = self
-            .hvpatch_process()
-            .map(|_| cx.kernel.task().key().id.raw());
-        let (host_id, logical_getpid, logical_wait_count) = {
-            let state = self.sysv.lock();
-            let Some(meta) = state.semaphores.get(&guest_semid) else {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            };
-            if matches!(cmd, LINUX_IPC_RMID | LINUX_IPC_SET) && !meta.can_admin(creds) {
-                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            LINUX_GETVAL => {
+                let Ok(idx) = usize::try_from(semnum) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
+                if idx >= meta.nsems {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                if !meta.can_read(creds) {
+                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
+                }
+                let val = meta.values.lock()[idx];
+                Ok(DispatchOutcome::Returned { value: val as i64 })
             }
-            let logical_getpid = (cmd == LINUX_GETPID && logical_operator.is_some())
-                .then(|| meta.logical_last_operator(semnum))
-                .flatten();
-            // GETNCNT/GETZCNT come from carrick on every lane, not just under
-            // HVPatch: carrick's waiters poll the host set with IPC_NOWAIT, so
-            // the host's own semncnt/semzcnt are 0 no matter who is parked.
-            let logical_wait_count = SemWaitKind::for_semctl_cmd(cmd)
-                .and_then(|kind| meta.logical_wait_count(semnum, kind));
-            (meta.host_id, logical_getpid, logical_wait_count)
-        };
-
-        let mut out = sysv_semctl(cx, host_id.raw(), semnum, cmd, arg, creds)?;
-        if matches!(out, DispatchOutcome::Returned { .. }) {
-            if let Some(pid) = logical_getpid {
-                out = DispatchOutcome::Returned {
+            LINUX_SETVAL => {
+                let Ok(idx) = usize::try_from(semnum) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
+                if idx >= meta.nsems {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                if !meta.can_write(creds) {
+                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
+                }
+                let val = arg as i32;
+                if !(0..=32767).contains(&val) {
+                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ERANGE));
+                }
+                meta.values.lock()[idx] = val as u16;
+                meta.record_logical_setval(caller_pid, semnum);
+                meta.ctime = now;
+                let changed = Arc::clone(&meta.changed);
+                drop(state);
+                changed.notify_all();
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+            LINUX_GETPID => {
+                let Ok(idx) = usize::try_from(semnum) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                };
+                if idx >= meta.nsems {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                if !meta.can_read(creds) {
+                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
+                }
+                let pid = meta.logical_last_operator(semnum).unwrap_or(0);
+                Ok(DispatchOutcome::Returned {
                     value: i64::from(pid),
+                })
+            }
+            LINUX_GETNCNT => {
+                let Ok(idx) = usize::try_from(semnum) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
-            } else if let Some(count) = logical_wait_count {
-                out = DispatchOutcome::Returned {
+                if idx >= meta.nsems {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                if !meta.can_read(creds) {
+                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
+                }
+                let count = meta
+                    .logical_wait_count(semnum, SemWaitKind::Increase)
+                    .unwrap_or(0);
+                Ok(DispatchOutcome::Returned {
                     value: i64::from(count),
+                })
+            }
+            LINUX_GETZCNT => {
+                let Ok(idx) = usize::try_from(semnum) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
+                if idx >= meta.nsems {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                if !meta.can_read(creds) {
+                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
+                }
+                let count = meta
+                    .logical_wait_count(semnum, SemWaitKind::Zero)
+                    .unwrap_or(0);
+                Ok(DispatchOutcome::Returned {
+                    value: i64::from(count),
+                })
             }
-        }
-        if matches!(out, DispatchOutcome::Returned { value: 0 }) {
-            let mut state = self.sysv.lock();
-            match cmd {
-                LINUX_IPC_RMID => {
-                    if let Some(meta) = state.semaphores.remove(&guest_semid)
-                        && meta.key != LINUX_IPC_PRIVATE
-                    {
-                        state.sem_keys.remove(&meta.key);
-                    }
+            LINUX_GETALL => {
+                if !meta.can_read(creds) {
+                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
                 }
-                LINUX_IPC_SET => {
-                    if let Some(meta) = state.semaphores.get_mut(&guest_semid)
-                        && arg != 0
-                        && let Ok(bytes) = cx.memory.read_bytes(arg + 20, 4)
-                    {
-                        let mode = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                        meta.mode = ShmPermMode::from_ipc_set(mode, meta.mode);
-                        meta.ctime = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(meta.ctime);
-                    }
+                let vals = meta.values.lock().clone();
+                let mut out = Vec::with_capacity(vals.len() * 2);
+                for v in &vals {
+                    out.extend_from_slice(&v.to_le_bytes());
                 }
-                LINUX_SETVAL => {
-                    if let Some(pid) = logical_operator
-                        && let Some(meta) = state.semaphores.get(&guest_semid)
-                    {
-                        meta.record_logical_setval(pid, semnum);
-                    }
+                drop(state);
+                if cx.memory.write_bytes(arg, &out).is_err() {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
-                LINUX_SETALL => {
-                    if let Some(pid) = logical_operator
-                        && let Some(meta) = state.semaphores.get(&guest_semid)
-                    {
-                        meta.record_logical_setall(pid);
-                    }
-                }
-                _ => {}
+                Ok(DispatchOutcome::Returned { value: 0 })
             }
+            LINUX_SETALL => {
+                if !meta.can_write(creds) {
+                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
+                }
+                let nsems = meta.nsems;
+                let bytes = match cx.memory.read_bytes(arg, nsems * 2) {
+                    Ok(b) => b,
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                };
+                let mut vals = Vec::with_capacity(nsems);
+                for i in 0..nsems {
+                    let v = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+                    if v > 32767 {
+                        return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ERANGE));
+                    }
+                    vals.push(v);
+                }
+                *meta.values.lock() = vals;
+                meta.record_logical_setall(caller_pid);
+                meta.ctime = now;
+                let changed = Arc::clone(&meta.changed);
+                drop(state);
+                changed.notify_all();
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+            _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
         }
-        Ok(out)
     }
 
     fn write_sem_info<M: GuestMemory>(
@@ -4173,8 +4059,6 @@ impl SyscallDispatcher {
         drop(state);
 
         if arg != 0 {
-            // Linux `struct seminfo` is ten 32-bit integers. For SEM_INFO,
-            // semusz carries the used set count and semaem carries used sems.
             let fields = [
                 LINUX_SEMMNI as u32,
                 LINUX_SEMMNI as u32,
@@ -4229,7 +4113,7 @@ impl SyscallDispatcher {
                     cuid: meta.cuid.raw(),
                     cgid: meta.cgid.raw(),
                     mode: meta.mode.perms(),
-                    seq: 0,
+                    seq: meta.scan_index.0 as u16,
                     ..Default::default()
                 },
                 sem_otime: meta.otime,
@@ -4246,234 +4130,6 @@ impl SyscallDispatcher {
             value: guest_semid.as_i64(),
         })
     }
-}
-
-fn sysv_semctl<M: GuestMemory>(
-    cx: &mut SyscallCtx<M>,
-    semid: i32,
-    semnum: i32,
-    cmd: u64,
-    arg: u64,
-    creds: &crate::kernel::Credentials,
-) -> Result<DispatchOutcome, DispatchError> {
-    let Some(host_cmd) = linux_semctl_cmd_to_host(cmd) else {
-        // SEM_STAT/SEM_INFO and friends: not supported on macOS.
-        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-    };
-
-    // Commands that take NO arg or return a value directly.
-    match cmd {
-        LINUX_IPC_RMID | LINUX_GETPID | LINUX_GETVAL | LINUX_GETNCNT | LINUX_GETZCNT => {
-            let rc = unsafe { carrick_portable::semctl0(semid, semnum, host_cmd) };
-            match rc.host_syscall_errno() {
-                Ok(v) => {
-                    // GETPID returns sempid (the last process to semop). The host
-                    // tracks its raw host pid; present it in the caller's PID
-                    // namespace so it matches the fork()-returned pid the guest
-                    // sees (semctl07). The other commands here return non-pid
-                    // values (semval/ncnt/zcnt/0) and pass through unchanged.
-                    let value = if cmd == LINUX_GETPID && v > 0 {
-                        i64::from(crate::namespace::pid::host_to_ns_or_self(v as u32))
-                    } else {
-                        v as i64
-                    };
-                    Ok(DispatchOutcome::Returned { value })
-                }
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
-            }
-        }
-        LINUX_SETVAL => {
-            // arg is `union semun { int val }`. Linux requires the value be in
-            // [0, SEMVMX(32767)]; out of range → ERANGE (semctl05). macOS does
-            // not enforce the Linux bound, so validate before forwarding.
-            const SEMVMX: i32 = 32767;
-            let val = arg as i32;
-            if !(0..=SEMVMX).contains(&val) {
-                return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ERANGE));
-            }
-            let rc = unsafe { carrick_portable::semctl_val(semid, semnum, host_cmd, val) };
-            match rc.host_syscall_errno() {
-                Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
-            }
-        }
-        LINUX_GETALL | LINUX_SETALL => {
-            // arg is `unsigned short *array`. Find nsems via IPC_STAT.
-            let nsems = match host_sem_nsems(semid) {
-                Ok(n) => n,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            };
-            let mut vals: Vec<u16> = vec![0; nsems];
-            if cmd == LINUX_SETALL {
-                let bytes = match cx.memory.read_bytes(arg, nsems * 2) {
-                    Ok(b) => b,
-                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
-                };
-                for (i, v) in vals.iter_mut().enumerate() {
-                    *v = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
-                }
-                // SETALL: every value must be <= SEMVMX(32767) → else ERANGE
-                // (semctl05; macOS doesn't enforce the Linux bound).
-                if vals.iter().any(|&v| v > 32767) {
-                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ERANGE));
-                }
-            }
-            let rc = unsafe { carrick_portable::semctl_ptr(semid, 0, host_cmd, vals.as_mut_ptr()) };
-            match rc.host_syscall_errno() {
-                Ok(_) => {
-                    if cmd == LINUX_GETALL {
-                        let mut out = Vec::with_capacity(nsems * 2);
-                        for v in &vals {
-                            out.extend_from_slice(&v.to_le_bytes());
-                        }
-                        if cx.memory.write_bytes(arg, &out).is_err() {
-                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                        }
-                    }
-                    Ok(DispatchOutcome::Returned { value: 0 })
-                }
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
-            }
-        }
-        LINUX_IPC_SET => {
-            // IPC_SET writes the perms from the guest's semid_ds at `arg`. carrick
-            // runs as a single host identity so it cannot reassign the host
-            // object's owner, but it CAN apply the permission bits — the field LTP
-            // semctl01 verifies after SET (mode == SEM_RA|066). Read the new mode
-            // (LinuxIpcPerm.mode is at offset 20 in the semid_ds) and push it to
-            // the host sem; the kernel re-adds its SEM_ALLOC flag, which IPC_STAT
-            // masks back off.
-            if arg == 0 {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-            }
-            let new_mode = match cx.memory.read_bytes(arg + 20, 4) {
-                Ok(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-                Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
-            };
-            #[cfg(target_os = "macos")]
-            {
-                let mut ds: libc::semid_ds = unsafe { core::mem::zeroed() };
-                if unsafe { libc::semctl(semid, 0, libc::IPC_STAT, &mut ds as *mut libc::semid_ds) }
-                    .host_syscall_errno()
-                    .is_err()
-                {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-                ds.sem_perm.mode =
-                    carrick_portable::ipc_set_apply_mode(ds.sem_perm.mode as u32, new_mode)
-                        as libc::mode_t;
-                let rc = unsafe {
-                    libc::semctl(semid, 0, libc::IPC_SET, &mut ds as *mut libc::semid_ds)
-                };
-                match rc.host_syscall_errno() {
-                    Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
-                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                // The bring-up lanes stub IPC_SET as a success no-op (the host
-                // object's perms are not reassigned). `new_mode` was still read
-                // above, so a bad `arg` pointer is rejected with EFAULT on every
-                // platform; the value itself is only applied on the macOS lane.
-                let _ = new_mode;
-                Ok(DispatchOutcome::Returned { value: 0 })
-            }
-        }
-        LINUX_IPC_STAT => {
-            // semid_ds translation into the 88-byte aarch64 semid64_ds form.
-            // macOS is the reference lane: read the host `semid_ds` by NAME and
-            // fill the Linux ipc64_perm (mode/key/seq + sem_otime/sem_ctime) from
-            // the host's truth, with the owner/creator ids coming from the GUEST
-            // creds (carrick's host process is not the guest uid). The bring-up
-            // lanes (linux/freebsd/netbsd) keep the older zeroed-buffer + nsems
-            // behavior — the macOS lane is what the conformance gate measures.
-            #[cfg(target_os = "macos")]
-            {
-                // macOS `libc::semid_ds` exposes `sem_perm` (an `ipc_perm`:
-                // uid/gid/cuid/cgid/mode/_seq/_key), `sem_otime` and `sem_ctime`
-                // by name. This is the same host call `host_sem_nsems` makes,
-                // just keeping the whole struct rather than only `sem_nsems`.
-                let mut ds: libc::semid_ds = unsafe { core::mem::zeroed() };
-                let rc = unsafe {
-                    libc::semctl(semid, 0, libc::IPC_STAT, &mut ds as *mut libc::semid_ds)
-                };
-                if let Err(errno) = rc.host_syscall_errno() {
-                    return Ok(DispatchOutcome::errno(errno));
-                }
-                if arg != 0 {
-                    // macOS sets the SEM_ALLOC flag (0o1000) in ipc_perm.mode for
-                    // an allocated SysV object; Linux's sem_perm.mode is just the
-                    // permission bits. `IpcPermFields::from_host` masks the mode to
-                    // 0o777 (LTP semctl01 asserts mode == SEM_RA exactly) and packs
-                    // the owner/creator ids from the guest creds.
-                    let perm = carrick_portable::IpcPermFields::from_host(
-                        ds.sem_perm._key as i32,
-                        creds.euid.raw(),
-                        creds.egid.raw(),
-                        ds.sem_perm.mode as u32,
-                        ds.sem_perm._seq as u16,
-                    );
-                    let out = LinuxSemidDs {
-                        sem_perm: LinuxIpcPerm {
-                            key: perm.key,
-                            uid: perm.uid,
-                            gid: perm.gid,
-                            cuid: perm.cuid,
-                            cgid: perm.cgid,
-                            mode: perm.mode,
-                            seq: perm.seq,
-                            ..Default::default()
-                        },
-                        sem_otime: ds.sem_otime as u64,
-                        sem_ctime: ds.sem_ctime as u64,
-                        sem_nsems: ds.sem_nsems as u64,
-                        __unused3: 0,
-                        __unused4: 0,
-                    };
-                    if cx.memory.write_bytes(arg, out.as_bytes()).is_err() {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                    }
-                }
-                Ok(DispatchOutcome::Returned { value: 0 })
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                // Bring-up lanes: fill only sem_nsems (the field LTP's GETALL/
-                // SETALL path needs) at the Linux offset, zero elsewhere. A
-                // host-truth by-name fill is a follow-up once a conformance box
-                // for the lane can bless the layout.
-                // TODO(parent): replace the zeroed ipc_perm with a host-truth fill
-                // via carrick_portable::IpcPermFields::from_host(key, euid, egid,
-                // host_mode, seq) once the lane reads the host semid_ds perm fields
-                // (the pure packer + tests already live in carrick-portable).
-                let _ = creds;
-                let nsems = match host_sem_nsems(semid) {
-                    Ok(n) => n,
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                };
-                if arg != 0 {
-                    let mut buf = [0u8; 88];
-                    // semid64_ds: ipc64_perm(48) + sem_otime(8) + sem_ctime(8),
-                    // so sem_nsems sits at offset 64.
-                    buf[64..72].copy_from_slice(&(nsems as u64).to_le_bytes());
-                    if cx.memory.write_bytes(arg, &buf).is_err() {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                    }
-                }
-                Ok(DispatchOutcome::Returned { value: 0 })
-            }
-        }
-        _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
-    }
-}
-
-/// Number of semaphores in the set, via host IPC_STAT.
-fn host_sem_nsems(semid: i32) -> Result<usize, LinuxErrno> {
-    let mut ds: carrick_portable::SemidDs = unsafe { core::mem::zeroed() };
-    let rc = unsafe { carrick_portable::semctl_ptr(semid, 0, libc::IPC_STAT, &mut ds) };
-    rc.host_syscall_errno()
-        .map(|_| carrick_portable::sem_nsems(&ds))
 }
 
 #[cfg(test)]
@@ -4572,7 +4228,6 @@ mod ipc_set_tests {
     fn logical_sempid_is_shared_across_in_process_fork_clones() {
         let parent = SemSet {
             key: LINUX_IPC_PRIVATE,
-            host_id: HostSemId(0),
             scan_index: SemScanIndex(0),
             nsems: 3,
             mode: ShmPermMode::requested(0o600),
@@ -4582,13 +4237,15 @@ mod ipc_set_tests {
             cgid: NsGid::ROOT,
             ctime: 0,
             otime: 0,
+            values: Arc::new(Mutex::new(vec![0u16; 3])),
             logical_last_operators: Arc::new(Mutex::new(vec![None; 3])),
             logical_wait_counts: Arc::new(Mutex::new(vec![SemWaitCounts::default(); 3])),
+            changed: Arc::new(parking_lot::Condvar::new()),
         };
         let child = parent.clone();
         child.record_logical_semop(
             73,
-            &[carrick_portable::Sembuf {
+            &[LinuxSembuf {
                 sem_num: 2,
                 sem_op: 1,
                 sem_flg: 0,
@@ -4599,48 +4256,47 @@ mod ipc_set_tests {
         assert_eq!(parent.logical_last_operator(2), Some(73));
     }
 
-    /// A live host semaphore set, removed when the fixture drops.
-    struct HostSemFixture {
-        id: i32,
+    struct InMemSemFixture {
+        set: SemSet,
     }
 
-    impl HostSemFixture {
-        fn new(nsems: i32) -> Self {
-            let rc = unsafe {
-                carrick_portable::semget(LINUX_IPC_PRIVATE as libc::key_t, nsems, 0o600 | 0o1000)
+    impl InMemSemFixture {
+        fn new(nsems: usize) -> Self {
+            let set = SemSet {
+                key: LINUX_IPC_PRIVATE,
+                scan_index: SemScanIndex(0),
+                nsems,
+                mode: ShmPermMode::requested(0o600),
+                uid: NsUid::ROOT,
+                gid: NsGid::ROOT,
+                cuid: NsUid::ROOT,
+                cgid: NsGid::ROOT,
+                ctime: 0,
+                otime: 0,
+                values: Arc::new(Mutex::new(vec![0u16; nsems])),
+                logical_last_operators: Arc::new(Mutex::new(vec![None; nsems])),
+                logical_wait_counts: Arc::new(Mutex::new(vec![SemWaitCounts::default(); nsems])),
+                changed: Arc::new(parking_lot::Condvar::new()),
             };
-            let id = rc.host_syscall_errno().expect("create host semaphore set");
-            Self { id }
+            Self { set }
         }
 
         fn value(&self, semnum: i32) -> i32 {
-            let cmd = linux_semctl_cmd_to_host(LINUX_GETVAL).expect("host GETVAL");
-            let rc = unsafe { carrick_portable::semctl0(self.id, semnum, cmd) };
-            rc.host_syscall_errno().expect("read host semval")
+            self.set.values.lock()[semnum as usize] as i32
         }
 
         fn post(&self, semnum: u16) {
-            let mut sops = [carrick_portable::Sembuf {
-                sem_num: semnum,
-                sem_op: 1,
-                sem_flg: 0,
-            }];
-            let rc = unsafe { carrick_portable::semop(self.id, sops.as_mut_ptr(), 1) };
-            rc.host_syscall_errno().expect("post host semaphore");
+            self.set.values.lock()[semnum as usize] += 1;
+            self.set.changed.notify_all();
         }
 
+        #[allow(dead_code)]
         fn remove(&self) {
-            let _ = unsafe { carrick_portable::semctl0(self.id, 0, libc::IPC_RMID) };
+            self.set.changed.notify_all();
         }
     }
 
-    impl Drop for HostSemFixture {
-        fn drop(&mut self) {
-            self.remove();
-        }
-    }
-
-    fn sembuf_bytes(sops: &[carrick_portable::Sembuf]) -> Vec<u8> {
+    fn sembuf_bytes(sops: &[LinuxSembuf]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(sops.len() * 6);
         for sop in sops {
             bytes.extend_from_slice(&sop.sem_num.to_le_bytes());
@@ -4652,13 +4308,9 @@ mod ipc_set_tests {
 
     const SEMOP_TEST_SOPS_ADDR: u64 = 0x1000;
 
-    /// Drive the real `sysv_semop` poll loop against a live host set. `on_wait`
-    /// runs on every `interrupted()` consultation with the observed count for
-    /// `(watch_semnum, watch_kind)`, and returns whether to interrupt — which is
-    /// how each exit path is steered without a second thread.
     fn run_semop_probe(
-        fixture: &HostSemFixture,
-        sops: &[carrick_portable::Sembuf],
+        fixture: &InMemSemFixture,
+        sops: &[LinuxSembuf],
         timeout: Option<LinuxTimespec>,
         counts: &SemWaitCounters,
         watch: (i32, SemWaitKind),
@@ -4691,7 +4343,7 @@ mod ipc_set_tests {
         };
         sysv_semop(
             &mut cx,
-            fixture.id,
+            &fixture.set,
             SEMOP_TEST_SOPS_ADDR,
             sops.len(),
             timeout,
@@ -4705,16 +4357,16 @@ mod ipc_set_tests {
         .expect("semop probe dispatch")
     }
 
-    fn decrement_sop(sem_num: u16, sem_flg: i16) -> carrick_portable::Sembuf {
-        carrick_portable::Sembuf {
+    fn decrement_sop(sem_num: u16, sem_flg: i16) -> LinuxSembuf {
+        LinuxSembuf {
             sem_num,
             sem_op: -1,
             sem_flg,
         }
     }
 
-    fn wait_zero_sop(sem_num: u16, sem_flg: i16) -> carrick_portable::Sembuf {
-        carrick_portable::Sembuf {
+    fn wait_zero_sop(sem_num: u16, sem_flg: i16) -> LinuxSembuf {
+        LinuxSembuf {
             sem_num,
             sem_op: 0,
             sem_flg,
@@ -4734,13 +4386,10 @@ mod ipc_set_tests {
             .unwrap_or(0)
     }
 
-    /// GETNCNT must count a parked `sem_op < 0` waiter and drop back to zero on
-    /// EVERY way out of the poll loop: satisfied, EINTR, EAGAIN-on-timeout, and
-    /// the set being removed underneath the waiter.
     #[test]
     fn semop_wait_counts_rise_while_parked_and_unwind_on_every_exit() {
         // Satisfied: the value rises while the caller is parked.
-        let fixture = HostSemFixture::new(2);
+        let fixture = InMemSemFixture::new(2);
         let counts = fresh_wait_counts(2);
         let observed = std::cell::Cell::new(0u32);
         let outcome = run_semop_probe(
@@ -4810,39 +4459,11 @@ mod ipc_set_tests {
         );
         assert_eq!(observed.get(), 1, "the parked waiter must show in semzcnt");
         assert_eq!(peak_wait_count(&counts, SemWaitKind::Zero), 0);
-
-        // The set is removed while the caller is parked: EIDRM, no leaked count.
-        let counts = fresh_wait_counts(2);
-        let observed = std::cell::Cell::new(0u32);
-        let outcome = run_semop_probe(
-            &fixture,
-            &[decrement_sop(1, 0)],
-            None,
-            &counts,
-            (1, SemWaitKind::Increase),
-            |calls, count| {
-                observed.set(observed.get().max(count));
-                if calls == 2 {
-                    fixture.remove();
-                }
-                false
-            },
-        );
-        assert!(
-            matches!(outcome, DispatchOutcome::Errno { errno } if errno == crate::linux_abi::LINUX_EIDRM),
-            "a removed set reports EIDRM: {outcome:?}"
-        );
-        assert_eq!(observed.get(), 1);
-        assert_eq!(peak_wait_count(&counts, SemWaitKind::Increase), 0);
     }
 
-    /// The forced IPC_NOWAIT that keeps the wait interruptible is CARRICK's, not
-    /// the guest's. An operation carrying the guest's own IPC_NOWAIT must fail
-    /// with EAGAIN on the first attempt — before `interrupted()` is consulted a
-    /// second time — instead of joining the retry loop. LTP semop02 hung here.
     #[test]
     fn guest_nowait_semop_fails_immediately_instead_of_polling() {
-        let fixture = HostSemFixture::new(2);
+        let fixture = InMemSemFixture::new(2);
         let counts = fresh_wait_counts(2);
         let nowait = SemOpFlags::NOWAIT.bits() as i16;
 
@@ -4910,7 +4531,6 @@ mod ipc_set_tests {
     fn logical_wait_counts_are_shared_across_in_process_fork_clones() {
         let parent = SemSet {
             key: LINUX_IPC_PRIVATE,
-            host_id: HostSemId(0),
             scan_index: SemScanIndex(0),
             nsems: 3,
             mode: ShmPermMode::requested(0o600),
@@ -4920,8 +4540,10 @@ mod ipc_set_tests {
             cgid: NsGid::ROOT,
             ctime: 0,
             otime: 0,
+            values: Arc::new(Mutex::new(vec![0u16; 3])),
             logical_last_operators: Arc::new(Mutex::new(vec![None; 3])),
             logical_wait_counts: Arc::new(Mutex::new(vec![SemWaitCounts::default(); 3])),
+            changed: Arc::new(parking_lot::Condvar::new()),
         };
         let child = parent.clone();
 

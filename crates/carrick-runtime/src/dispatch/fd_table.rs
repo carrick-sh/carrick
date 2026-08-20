@@ -1256,22 +1256,7 @@ pub(super) enum OpenDescription {
     },
     Mqueue {
         base: OpenDescriptionBase,
-        /// OWNING handle (see [`HostFdRef`]) to the real host fd of the backing
-        /// file under `/tmp/carrick-mqueue/`; only read for poll/readiness.
-        /// Every read-modify-write opens a FRESH fd against `path` and takes an
-        /// OFD lock on it, so a `libc::fork`-shared description's OFD lock can
-        /// never be self-re-entrant and the serialization is true across
-        /// processes.
-        host_fd: HostFdRef,
-        /// Absolute host path of the hidden backing object (under
-        /// `/tmp/carrick-mqueue/`), re-opened per operation for the OFD-locked
-        /// RMW.
-        path: String,
-        /// `mq_msgsize` the queue was created with (a send EMSGSIZEs above it; a
-        /// receive EMSGSIZEs below it).
-        msg_size: usize,
-        /// `mq_maxmsg` the queue was created with (capacity of the ring).
-        max_msg: usize,
+        queue: Arc<crate::dispatch::mqueue::MqueueInner>,
     },
 }
 
@@ -1359,8 +1344,7 @@ impl OpenDescription {
         match self {
             Self::HostPipe { host_fd, .. }
             | Self::HostSocket { host_fd, .. }
-            | Self::HostFile { host_fd, .. }
-            | Self::Mqueue { host_fd, .. } => Some(host_fd.raw()),
+            | Self::HostFile { host_fd, .. } => Some(host_fd.raw()),
             _ => None,
         }
     }
