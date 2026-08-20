@@ -10,7 +10,9 @@ import os
 import pwd
 import subprocess
 import tempfile
+import tomllib
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest import mock
 
@@ -25,6 +27,64 @@ MESSAGES = (
     / "fixtures"
     / "host-authority-census"
     / "messages.jsonl"
+)
+CLIPPY_CONFIG = ROOT / "clippy.toml"
+INVENTORY = ROOT / "scripts" / "migrate" / "host-authority-transition-inventory.json"
+
+# Literal snapshot of every canonical operation in the rejected lexical
+# inventory.  This must not be derived from either production artifact: the
+# point of the contract is to catch an omitted operation during migration.
+REJECTED_INVENTORY_OPERATIONS = {
+    "applevisor_sys::hv_vcpus_exit",
+    "libc::fork",
+    "libc::geteuid",
+    "libc::getpgrp",
+    "libc::getpid",
+    "libc::getppid",
+    "libc::getrlimit",
+    "libc::getsid",
+    "libc::getuid",
+    "libc::kill",
+    "libc::killpg",
+    "libc::setrlimit",
+    "libc::wait4",
+    "libc::waitid",
+    "std::fs::File::create",
+    "std::fs::File::open",
+    "std::fs::OpenOptions::new",
+    "std::fs::copy",
+    "std::fs::create_dir",
+    "std::fs::create_dir_all",
+    "std::fs::hard_link",
+    "std::fs::metadata",
+    "std::fs::read",
+    "std::fs::read_dir",
+    "std::fs::read_link",
+    "std::fs::read_to_string",
+    "std::fs::remove_dir",
+    "std::fs::remove_dir_all",
+    "std::fs::remove_file",
+    "std::fs::rename",
+    "std::fs::set_permissions",
+    "std::fs::symlink_metadata",
+    "std::fs::write",
+    "std::net::TcpListener::bind",
+    "std::net::UdpSocket::bind",
+    "std::process::id",
+    "std::thread::Builder::new",
+    "std::thread::sleep",
+    "std::thread::spawn",
+    "std::thread::yield_now",
+}
+REQUIRED_CATALOG_ADDITIONS = {
+    "libc::dlopen",
+    "libc::dlsym",
+    "libc::syscall",
+    "libc::waitpid",
+    "std::fs::OpenOptions::open",
+}
+EXPECTED_PRODUCTION_OPERATIONS = (
+    REJECTED_INVENTORY_OPERATIONS | REQUIRED_CATALOG_ADDITIONS
 )
 FIXTURE_CATALOG = {
     "libc::waitpid": "HA-CATALOG-FIXTURE-PROCESS-WAITPID",
@@ -1763,9 +1823,237 @@ class MatrixOrchestrationTest(unittest.TestCase):
         )
         self.assertEqual(status, 0)
 
-    def test_real_execution_fails_when_production_catalog_is_unavailable(self):
-        with self.assertRaisesRegex(self.host_authority.InventoryError, "Task 4"):
-            self.host_authority.load_production_catalog(ROOT / "clippy.toml")
+    def test_production_catalog_has_complete_unique_stable_operation_bindings(self):
+        configuration = tomllib.loads(CLIPPY_CONFIG.read_text(encoding="utf-8"))
+        entries = configuration.get("disallowed-methods")
+        self.assertIsInstance(entries, list)
+        self.assertTrue(entries)
+
+        by_operation = {}
+        catalog_ids = set()
+        allow_invalid = []
+        for entry in entries:
+            self.assertIsInstance(entry, dict)
+            self.assertTrue(
+                set(entry) <= {"path", "reason", "allow-invalid"},
+                entry,
+            )
+            operation = entry.get("path")
+            reason = entry.get("reason")
+            self.assertIsInstance(operation, str)
+            self.assertIsInstance(reason, str)
+            catalog_id, separator, explanation = reason.partition(":")
+            self.assertEqual(separator, ":", reason)
+            self.assertTrue(explanation.strip(), reason)
+            self.assertRegex(
+                catalog_id,
+                r"^HA-CATALOG-[A-Z0-9]+(?:-[A-Z0-9]+)*$",
+            )
+            self.assertNotIn(operation, by_operation)
+            self.assertNotIn(catalog_id, catalog_ids)
+            by_operation[operation] = catalog_id
+            catalog_ids.add(catalog_id)
+            if entry.get("allow-invalid") is True:
+                allow_invalid.append(operation)
+
+        self.assertEqual(set(by_operation), EXPECTED_PRODUCTION_OPERATIONS)
+        self.assertEqual(allow_invalid, [])
+        self.assertEqual(
+            self.host_authority.load_production_catalog(CLIPPY_CONFIG),
+            by_operation,
+        )
+
+
+class ProductionInventoryTest(unittest.TestCase):
+    def setUp(self):
+        self.host_authority = load_host_authority()
+        self.rows = json.loads(INVENTORY.read_text(encoding="utf-8"))
+        self.assertTrue(
+            self.rows
+            and all(
+                {"review_id", "operation", "source", "profiles"} <= set(row)
+                for row in self.rows
+            ),
+            "canonical inventory still uses the rejected lexical schema",
+        )
+
+    def row_at(self, file, line, operation):
+        matches = [
+            row
+            for row in self.rows
+            if row["source"]["file"] == file
+            and row["source"]["line"] == line
+            and row["operation"] == operation
+        ]
+        self.assertEqual(len(matches), 1, (file, line, operation, matches))
+        return matches[0]
+
+    def test_inventory_uses_compiler_resolved_schema_and_catalog_bindings(self):
+        self.assertEqual(len(self.rows), 682)
+        catalog = self.host_authority.load_production_catalog(CLIPPY_CONFIG)
+        identities = set()
+        for row in self.rows:
+            self.assertEqual(
+                set(row),
+                {
+                    "review_id",
+                    "catalog_id",
+                    "operation",
+                    "source",
+                    "expansion",
+                    "profiles",
+                    "classification",
+                    "evidence",
+                    "rationale",
+                },
+            )
+            self.assertEqual(row["catalog_id"], catalog[row["operation"]])
+            actual = {
+                field: row[field]
+                for field in self.host_authority.ACTUAL_FIELDS
+            }
+            identity = self.host_authority.diagnostic_identity(actual)
+            self.assertNotIn(identity, identities)
+            identities.add(identity)
+
+    def test_inventory_has_only_complete_unique_reviews(self):
+        self.assertEqual(
+            [row["review_id"] for row in self.rows],
+            [f"HA-{number:06d}" for number in range(1, 683)],
+        )
+        self.assertEqual(len({row["review_id"] for row in self.rows}), 682)
+        self.assertEqual(
+            Counter(row["classification"] for row in self.rows),
+            Counter(
+                {
+                    "forbidden_semantic": 158,
+                    "declared_backing": 333,
+                    "declared_substrate": 191,
+                }
+            ),
+        )
+        self.assertFalse(
+            {
+                row["classification"]
+                for row in self.rows
+            }
+            & {"legacy_unreachable", "unreviewed"}
+        )
+
+    def test_inventory_profile_membership_matches_real_macos_capture(self):
+        self.assertEqual(
+            Counter(tuple(row["profiles"]) for row in self.rows),
+            Counter(
+                {
+                    ("macos-cli-default",): 180,
+                    ("macos-cli-default", "macos-runtime-default"): 390,
+                    (
+                        "macos-cli-default",
+                        "macos-hvf-default",
+                        "macos-runtime-default",
+                    ): 112,
+                }
+            ),
+        )
+
+    def test_waitpid_openoptions_and_hvf_operations_are_bound(self):
+        operation_counts = Counter(row["operation"] for row in self.rows)
+        self.assertEqual(operation_counts["libc::waitpid"], 7)
+        self.assertEqual(operation_counts["std::fs::OpenOptions::new"], 19)
+        self.assertEqual(operation_counts["std::fs::OpenOptions::open"], 19)
+        self.assertEqual(operation_counts["applevisor_sys::hv_vcpus_exit"], 1)
+        self.assertEqual(
+            {
+                (row["source"]["file"], row["source"]["line"])
+                for row in self.rows
+                if row["operation"] == "libc::waitpid"
+            },
+            {
+                ("crates/carrick-cli/src/commands.rs", 237),
+                ("crates/carrick-runtime/src/file_authority/ipc.rs", 102),
+                ("crates/carrick-runtime/src/interactive_supervisor.rs", 324),
+                ("crates/carrick-runtime/src/interactive_supervisor.rs", 340),
+                ("crates/carrick-runtime/src/interactive_supervisor.rs", 508),
+                ("crates/carrick-runtime/src/namespace/supervisor.rs", 269),
+                ("crates/carrick-runtime/src/namespace/supervisor.rs", 283),
+            },
+        )
+        hvf_exit = self.row_at(
+            "crates/carrick-vmm-hvf/src/vcpu_kick.rs",
+            99,
+            "applevisor_sys::hv_vcpus_exit",
+        )
+        self.assertEqual(hvf_exit["classification"], "declared_substrate")
+        self.assertEqual(
+            hvf_exit["profiles"],
+            [
+                "macos-cli-default",
+                "macos-hvf-default",
+                "macos-runtime-default",
+            ],
+        )
+
+    def test_liveness_wait_and_permit_sites_have_strict_classifications(self):
+        forbidden = {
+            ("crates/carrick-runtime/src/container.rs", 392, "libc::kill"),
+            (
+                "crates/carrick-runtime/src/namespace/supervisor.rs",
+                179,
+                "libc::kill",
+            ),
+            (
+                "crates/carrick-runtime/src/namespace/supervisor.rs",
+                269,
+                "libc::waitpid",
+            ),
+            (
+                "crates/carrick-runtime/src/namespace/supervisor.rs",
+                283,
+                "libc::waitpid",
+            ),
+            ("crates/carrick-vmm-hvf/src/host_signal.rs", 488, "libc::waitid"),
+            ("crates/carrick-vmm-hvf/src/io_wait.rs", 168, "libc::waitid"),
+            ("crates/carrick-vmm-hvf/src/io_wait.rs", 188, "std::process::id"),
+            ("crates/carrick-vmm-hvf/src/io_wait.rs", 217, "std::process::id"),
+            ("crates/carrick-vmm-hvf/src/io_wait.rs", 229, "libc::waitid"),
+            ("crates/carrick-vmm-hvf/src/io_wait.rs", 906, "std::process::id"),
+            ("crates/carrick-vmm-hvf/src/io_wait.rs", 914, "std::process::id"),
+        }
+        for file, line, operation in forbidden:
+            with self.subTest(file=file, line=line, operation=operation):
+                self.assertEqual(
+                    self.row_at(file, line, operation)["classification"],
+                    "forbidden_semantic",
+                )
+
+        substrate = {
+            (
+                "crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs",
+                74,
+                "libc::waitid",
+            ),
+            (
+                "crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs",
+                107,
+                "libc::kill",
+            ),
+            (
+                "crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs",
+                346,
+                "std::thread::Builder::new",
+            ),
+            (
+                "crates/carrick-runtime/src/interactive_supervisor.rs",
+                508,
+                "libc::waitpid",
+            ),
+        }
+        for file, line, operation in substrate:
+            with self.subTest(file=file, line=line, operation=operation):
+                self.assertEqual(
+                    self.row_at(file, line, operation)["classification"],
+                    "declared_substrate",
+                )
 
 
 if __name__ == "__main__":
