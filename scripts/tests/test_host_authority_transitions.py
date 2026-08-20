@@ -49,33 +49,184 @@ class HostAuthorityInventoryTest(unittest.TestCase):
         with self.assertRaises(host_authority.InventoryError):
             host_authority.validate(rows, expected)
 
-    def test_ignores_type_annotations_and_detects_qualified_operations(self):
+    def test_requires_a_classification_specific_authority_rationale(self):
         host_authority = load_host_authority()
         rows = host_authority.generate(
-            self.fixture(
-                "struct Types { file: std::fs::File, address: std::net::SocketAddr }\n"
-                "fn opens() { let _ = std::fs::File::open(\"/tmp/x\"); }\n"
-                "fn connects() { let _ = std::net::TcpStream::connect(\"127.0.0.1:1\"); }\n"
-            )
+            self.fixture("fn carrier() { std::thread::yield_now(); }\n")
         )
-        self.assertEqual([(row["line"], row["kind"]) for row in rows], [
-            (2, "ambient_filesystem"),
-            (3, "ambient_network"),
-        ])
+        generic = [
+            {
+                **rows[0],
+                "classification": "declared_substrate",
+                "rationale": "host CPU yielding is carrier execution",
+            }
+        ]
+        with self.assertRaises(host_authority.InventoryError):
+            host_authority.validate(rows, generic)
+        concrete = [
+            {
+                **rows[0],
+                "classification": "declared_substrate",
+                "rationale": (
+                    "authenticated carrier: yields the current vCPU worker's host "
+                    "thread without accepting a process identifier"
+                ),
+            }
+        ]
+        host_authority.validate(rows, concrete)
 
-    def test_detects_imported_network_socket_operations(self):
+    def test_rejects_a_prefixed_generic_or_disjunctive_rationale(self):
+        host_authority = load_host_authority()
+        rows = host_authority.generate(
+            self.fixture("fn carrier() { std::thread::yield_now(); }\n")
+        )
+        for rationale in (
+            (
+                "authenticated carrier: performs a carrier-side operation; "
+                "Carrick created that resource"
+            ),
+            "authenticated carrier: schedules a timer or a worker",
+        ):
+            expected = [
+                {
+                    **rows[0],
+                    "classification": "declared_substrate",
+                    "rationale": rationale,
+                }
+            ]
+            with self.subTest(rationale=rationale):
+                with self.assertRaises(host_authority.InventoryError):
+                    host_authority.validate(rows, expected)
+
+    def test_legacy_requires_a_compile_or_standalone_target_exclusion(self):
+        host_authority = load_host_authority()
+        rows = host_authority.generate(
+            self.fixture("fn current() { let _ = std::process::id(); }\n")
+        )
+        runtime_waiver = [
+            {
+                **rows[0],
+                "classification": "legacy_unreachable",
+                "rationale": "no active dispatch context reaches this fallback",
+            }
+        ]
+        with self.assertRaises(host_authority.InventoryError):
+            host_authority.validate(rows, runtime_waiver)
+        compile_exclusion = [
+            {
+                **rows[0],
+                "classification": "legacy_unreachable",
+                "rationale": (
+                    "compile-time exclusion: cfg(test) path module is absent from "
+                    "the HVPatch product target"
+                ),
+            }
+        ]
+        host_authority.validate(rows, compile_exclusion)
+
+    def test_detects_qualified_and_multiline_aliased_filesystem_operations(self):
         host_authority = load_host_authority()
         rows = host_authority.generate(
             self.fixture(
-                "use std::net::{TcpStream as Stream, UdpSocket};\n"
-                "fn connects() { let _ = Stream::connect(\"127.0.0.1:1\"); }\n"
-                "fn binds() { let _ = UdpSocket::bind(\"127.0.0.1:1\"); }\n"
+                "use std::fs::{\n"
+                "    File as HostFile,\n"
+                "    OpenOptions,\n"
+                "    metadata as host_metadata,\n"
+                "};\n"
+                "struct Types { qualified: std::fs::File, imported: HostFile }\n"
+                "fn qualified() {\n"
+                "    let _: Option<std::fs::File> = None;\n"
+                "    let _ = std::fs::File::open(\"/tmp/qualified\");\n"
+                "}\n"
+                "fn imported() {\n"
+                "    let _: Option<HostFile> = None;\n"
+                "    let _ = HostFile::open(\"/tmp/imported\");\n"
+                "    let _ = OpenOptions::new();\n"
+                "    let _ = host_metadata(\"/tmp/imported\");\n"
+                "}\n"
             )
         )
         self.assertEqual([(row["line"], row["kind"]) for row in rows], [
-            (2, "ambient_network"),
-            (3, "ambient_network"),
+            (9, "ambient_filesystem"),
+            (13, "ambient_filesystem"),
+            (14, "ambient_filesystem"),
+            (15, "ambient_filesystem"),
         ])
+        self.assertEqual(
+            [row.get("operations") for row in rows],
+            [
+                ["std::fs::File::open"],
+                ["std::fs::File::open"],
+                ["std::fs::OpenOptions::new"],
+                ["std::fs::metadata"],
+            ],
+        )
+
+    def test_detects_multiline_aliased_network_socket_operations(self):
+        host_authority = load_host_authority()
+        rows = host_authority.generate(
+            self.fixture(
+                "use std::net::{\n"
+                "    TcpStream as Stream,\n"
+                "    TcpListener,\n"
+                "    UdpSocket as Datagram,\n"
+                "};\n"
+                "struct Types { address: std::net::SocketAddr, stream: Stream }\n"
+                "fn sockets() {\n"
+                "    let _ = Stream::connect(\"127.0.0.1:1\");\n"
+                "    let _ = TcpListener::bind(\"127.0.0.1:2\");\n"
+                "    let _ = Datagram::bind(\"127.0.0.1:3\");\n"
+                "}\n"
+            )
+        )
+        self.assertEqual([(row["line"], row["kind"]) for row in rows], [
+            (8, "ambient_network"),
+            (9, "ambient_network"),
+            (10, "ambient_network"),
+        ])
+        self.assertEqual(
+            [row.get("operations") for row in rows],
+            [
+                ["std::net::TcpStream::connect"],
+                ["std::net::TcpListener::bind"],
+                ["std::net::UdpSocket::bind"],
+            ],
+        )
+
+    def test_block_local_import_alias_expires_at_its_closing_brace(self):
+        host_authority = load_host_authority()
+        rows = host_authority.generate(
+            self.fixture(
+                "fn scoped() {\n"
+                "    {\n"
+                "        use std::net::TcpStream as ScopedStream;\n"
+                "        let _ = ScopedStream::connect(\"127.0.0.1:1\");\n"
+                "    }\n"
+                "}\n"
+                "fn outside() {\n"
+                "    let _ = ScopedStream::connect(\"127.0.0.1:2\");\n"
+                "}\n"
+            )
+        )
+        self.assertEqual(
+            [(row["line"], row["kind"]) for row in rows],
+            [(4, "ambient_network")],
+        )
+
+    def test_inventory_contains_calls_not_imports_or_type_mentions(self):
+        host_authority = load_host_authority()
+        rows = host_authority.generate(
+            self.fixture(
+                "use applevisor_sys::{hv_vcpu_t, hv_vcpus_exit};\n"
+                "use std::fs::{File as HostFile, OpenOptions};\n"
+                "use std::net::TcpStream as Stream;\n"
+                "use std::thread::{spawn, JoinHandle};\n"
+                "type Stop = unsafe fn(*const hv_vcpu_t, u32);\n"
+                "struct Types { file: HostFile, options: OpenOptions, stream: Stream }\n"
+                "fn takes(_: JoinHandle<()>, _: Stop) {}\n"
+            )
+        )
+        self.assertEqual(rows, [])
 
     def test_accepts_an_exact_reviewed_inventory_and_rejects_drift(self):
         host_authority = load_host_authority()
@@ -85,7 +236,10 @@ class HostAuthorityInventoryTest(unittest.TestCase):
             {
                 **rows[0],
                 "classification": "declared_substrate",
-                "rationale": "host CPU yielding is carrier execution, not guest identity",
+                "rationale": (
+                    "authenticated carrier: yields the current vCPU worker's host "
+                    "thread without accepting a process identifier"
+                ),
             }
         ]
         host_authority.validate(rows, expected)
@@ -108,6 +262,37 @@ class HostAuthorityInventoryTest(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["line"], 4)
         self.assertEqual(rows[1]["line"], 5)
+
+    def test_masks_multiline_restricted_modules_when_cfg_implies_test(self):
+        host_authority = load_host_authority()
+        rows = host_authority.generate(
+            self.fixture(
+                "#[cfg(\n"
+                "    all(\n"
+                "        test,\n"
+                "        target_os = \"macos\",\n"
+                "    )\n"
+                ")]\n"
+                "pub(in crate::dispatch)\n"
+                "mod\n"
+                "    hidden\n"
+                "{\n"
+                "    fn hidden() { libc::kill(1, 0); }\n"
+                "}\n"
+                "#[cfg(any(test, target_os = \"macos\"))]\n"
+                "mod reachable_without_test {\n"
+                "    fn live_on_macos() { libc::kill(2, 0); }\n"
+                "}\n"
+                "fn live() { libc::kill(3, 0); }\n"
+            )
+        )
+        self.assertEqual(
+            [(row["line"], row["text"]) for row in rows],
+            [
+                (15, "fn live_on_macos() { libc::kill(2, 0); }"),
+                (17, "fn live() { libc::kill(3, 0); }"),
+            ],
+        )
 
 
 if __name__ == "__main__":

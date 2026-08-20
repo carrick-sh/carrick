@@ -4,2039 +4,2750 @@
     "line": 56,
     "kind": "host_identity",
     "text": ".unwrap_or_else(|| std::process::id() as i32)",
-    "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/abi_args.rs:56`, `.unwrap_or_else(|| std::process::id() as i32)` is `caller_task_pid`'s exact no-active-dispatch-context fallback; HVPatch syscall dispatch publishes an active task context, so this remains migration debt."
+    "operations": [
+      "std::process::id"
+    ],
+    "classification": "forbidden_semantic",
+    "rationale": "guest answer: caller_task_pid returns the carrier PID when invoked without an active task context, so any future guest-facing caller can expose host identity"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/abi_args.rs",
     "line": 78,
     "kind": "host_identity",
     "text": "let host = std::process::id();",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/abi_args.rs:78`, `let host = std::process::id();` is the unconditional host-PID comparison in `NsPid::names_self`; production signal, credential, and process callers use this self-identity decision, so it is explicit guest-semantic debt. Concrete operation form: `let host = std::process::id();`."
+    "rationale": "guest answer: NsPid::names_self treats the carrier PID as the calling Linux task when deciding whether a guest PID targets self"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/abi_args.rs",
     "line": 136,
     "kind": "host_identity",
     "text": "HostPid(std::process::id())",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/abi_args.rs:136`, `HostPid(std::process::id())` constructs `HostPid::current` from the host PID; the helper exposes host process identity to its future callers, so it is explicit guest-semantic debt rather than a no-callers waiver. Concrete operation form: `HostPid(std::process::id())`."
+    "rationale": "guest answer: HostPid::current constructs the current host PID value, which a future guest-facing use can expose as Linux process identity"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/creds.rs",
     "line": 132,
     "kind": "host_identity",
     "text": "let host = std::process::id();",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/creds.rs:132`, `let host = std::process::id();` consumes host PID in `is_self_priority_target` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let host = std::process::id();`."
+    "rationale": "guest answer: priority-target resolution uses the carrier PID to select the guest credential record returned for the requested process"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs.rs",
     "line": 1267,
     "kind": "host_identity",
     "text": ".is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs.rs:1267`, `.is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());` consumes host PID in `proc_self_magic_link` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `.is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());`."
+    "rationale": "guest answer: the carrier PID decides whether a numeric /proc PID may expose the selected self-only process magic link"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs.rs",
     "line": 1319,
     "kind": "host_identity",
     "text": ".is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs.rs:1319`, `.is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());` consumes host PID in `proc_self_fdinfo_number` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `.is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());`."
+    "rationale": "guest answer: the carrier PID decides whether a numeric /proc PID may expose this task's fdinfo records"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs.rs",
     "line": 4900,
     "kind": "host_identity",
     "text": "if matches!(target, crate::dispatch::signal::SignalTarget::HostProcess(pid) if pid.0 == std::process::id())",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs.rs:4900`, `if matches!(target, crate::dispatch::signal::SignalTarget::HostProcess(pid) if pid.0 == std::process::id())` consumes host PID in `send_async_owner_signal` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `if matches!(target, crate::dispatch::signal::SignalTarget::HostProcess(pid) if pid.0 == std::process::id())`."
+    "rationale": "host target: the resolved FASYNC process-owner PID is compared with the carrier PID before that recipient is signaled"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs.rs",
     "line": 4901,
     "kind": "host_identity",
     "text": "|| matches!(target, crate::dispatch::signal::SignalTarget::HostThread(pid) if pid.0 == std::process::id())",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs.rs:4901`, `|| matches!(target, crate::dispatch::signal::SignalTarget::HostThread(pid) if pid.0 == std::process::id())` consumes host PID in `send_async_owner_signal` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `|| matches!(target, crate::dispatch::signal::SignalTarget::HostThread(pid) if pid.0 == std::process::id())`."
+    "rationale": "host target: the resolved FASYNC thread-owner PID is compared with the carrier PID before that recipient is signaled"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/access.rs",
     "line": 319,
     "kind": "ambient_filesystem",
     "text": "&& std::fs::metadata(path)",
+    "operations": [
+      "std::fs::metadata"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/access.rs:319`, `&& std::fs::metadata(path)` performs `check_exec_target`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `&& std::fs::metadata(path)`."
+    "rationale": "authorized backing: stats the loader-selected bare run-elf executable only when the explicit host-filesystem exec fallback is enabled"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
     "line": 355,
     "kind": "host_identity",
     "text": "std::env::temp_dir().join(format!(\"carrick-shm-{}\", std::process::id()));",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/state.rs:355`, `std::env::temp_dir().join(format!(\"carrick-shm-{}\", std::process::id()));` performs `new`'s host PID against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `std::env::temp_dir().join(format!(\"carrick-shm-{}\", std::process::id()));`."
+    "rationale": "authorized backing: derives the private /dev/shm bind root beneath the host temporary directory from the current carrier PID"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
     "line": 356,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::create_dir_all(&shm_host);",
+    "operations": [
+      "std::fs::create_dir_all"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/state.rs:356`, `let _ = std::fs::create_dir_all(&shm_host);` performs `new`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let _ = std::fs::create_dir_all(&shm_host);`."
+    "rationale": "authorized backing: creates the carrier-derived temporary directory used exclusively as this runtime's /dev/shm bind root"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
     "line": 364,
     "kind": "ambient_filesystem",
     "text": "std::fs::set_permissions(&shm_host, std::fs::Permissions::from_mode(0o1777));",
+    "operations": [
+      "std::fs::set_permissions"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/state.rs:364`, `std::fs::set_permissions(&shm_host, std::fs::Permissions::from_mode(0o1777));` performs `new`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `std::fs::set_permissions(&shm_host, std::fs::Permissions::from_mode(0o1777));`."
+    "rationale": "authorized backing: applies sticky world-writable mode to the already-derived /dev/shm backing directory and no other host path"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
     "line": 79,
     "kind": "carrier_substrate",
     "text": "std::thread::spawn(move || {",
+    "operations": [
+      "std::thread::spawn"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/tests.rs:79`, `std::thread::spawn(move || {` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in `dispatch/fs.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/fs.rs includes this file only through its cfg(test) path module for fs/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
     "line": 90,
     "kind": "carrier_substrate",
     "text": "std::thread::yield_now();",
+    "operations": [
+      "std::thread::yield_now"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/tests.rs:90`, `std::thread::yield_now();` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in `dispatch/fs.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/fs.rs includes this file only through its cfg(test) path module for fs/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
     "line": 121,
     "kind": "carrier_substrate",
     "text": "let worker = std::thread::spawn(move || {",
+    "operations": [
+      "std::thread::spawn"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/tests.rs:121`, `let worker = std::thread::spawn(move || {` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in `dispatch/fs.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/fs.rs includes this file only through its cfg(test) path module for fs/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
     "line": 364,
     "kind": "ambient_filesystem",
     "text": "std::fs::create_dir_all(lower.path().join(\"walk/sub\")).unwrap();",
+    "operations": [
+      "std::fs::create_dir_all"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/tests.rs:364`, `std::fs::create_dir_all(lower.path().join(\"walk/sub\")).unwrap();` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in `dispatch/fs.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/fs.rs includes this file only through its cfg(test) path module for fs/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
     "line": 365,
     "kind": "ambient_filesystem",
     "text": "std::fs::write(lower.path().join(\"walk/file.txt\"), b\"lower file\").unwrap();",
+    "operations": [
+      "std::fs::write"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/tests.rs:365`, `std::fs::write(lower.path().join(\"walk/file.txt\"), b\"lower file\").unwrap();` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in `dispatch/fs.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/fs.rs includes this file only through its cfg(test) path module for fs/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
     "line": 366,
     "kind": "ambient_filesystem",
     "text": "std::fs::write(lower.path().join(\"walk/sub/deep.txt\"), b\"deep\").unwrap();",
+    "operations": [
+      "std::fs::write"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/tests.rs:366`, `std::fs::write(lower.path().join(\"walk/sub/deep.txt\"), b\"deep\").unwrap();` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in `dispatch/fs.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/fs.rs includes this file only through its cfg(test) path module for fs/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
     "line": 783,
     "kind": "ambient_filesystem",
     "text": "let host = std::fs::metadata(lower.path().join(\"walk/sub/deep.txt\")).unwrap();",
+    "operations": [
+      "std::fs::metadata"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/tests.rs:783`, `let host = std::fs::metadata(lower.path().join(\"walk/sub/deep.txt\")).unwrap();` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in `dispatch/fs.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/fs.rs includes this file only through its cfg(test) path module for fs/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
     "line": 1434,
     "kind": "host_identity",
     "text": "path.push(format!(\"carrick-splice-loop-{}\", std::process::id()));",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/tests.rs:1434`, `path.push(format!(\"carrick-splice-loop-{}\", std::process::id()));` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in `dispatch/fs.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/fs.rs includes this file only through its cfg(test) path module for fs/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
     "line": 1437,
     "kind": "ambient_filesystem",
     "text": "std::fs::write(&path, &contents).expect(\"write splice source\");",
+    "operations": [
+      "std::fs::write"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/tests.rs:1437`, `std::fs::write(&path, &contents).expect(\"write splice source\");` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in `dispatch/fs.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/fs.rs includes this file only through its cfg(test) path module for fs/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
     "line": 1516,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(&path);",
+    "operations": [
+      "std::fs::remove_file"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/tests.rs:1516`, `let _ = std::fs::remove_file(&path);` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in `dispatch/fs.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/fs.rs includes this file only through its cfg(test) path module for fs/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
     "line": 1538,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(&path);",
+    "operations": [
+      "std::fs::remove_file"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/tests.rs:1538`, `let _ = std::fs::remove_file(&path);` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in `dispatch/fs.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/fs.rs includes this file only through its cfg(test) path module for fs/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
     "line": 1598,
     "kind": "ambient_filesystem",
     "text": "std::fs::write(host.path().join(\"target\"), b\"old\").unwrap();",
+    "operations": [
+      "std::fs::write"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/tests.rs:1598`, `std::fs::write(host.path().join(\"target\"), b\"old\").unwrap();` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in `dispatch/fs.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/fs.rs includes this file only through its cfg(test) path module for fs/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
     "line": 1624,
     "kind": "ambient_filesystem",
     "text": "assert_eq!(std::fs::read(host.path().join(\"target\")).unwrap(), b\"old\");",
+    "operations": [
+      "std::fs::read"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/tests.rs:1624`, `assert_eq!(std::fs::read(host.path().join(\"target\")).unwrap(), b\"old\");` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in `dispatch/fs.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/fs.rs includes this file only through its cfg(test) path module for fs/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
     "line": 1678,
     "kind": "carrier_substrate",
     "text": "let thread = std::thread::spawn(move || {",
+    "operations": [
+      "std::thread::spawn"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/tests.rs:1678`, `let thread = std::thread::spawn(move || {` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in `dispatch/fs.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/fs.rs includes this file only through its cfg(test) path module for fs/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
     "line": 1739,
     "kind": "ambient_filesystem",
     "text": "std::fs::write(host.path().join(\"target\"), b\"payload\").unwrap();",
+    "operations": [
+      "std::fs::write"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/tests.rs:1739`, `std::fs::write(host.path().join(\"target\"), b\"payload\").unwrap();` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in `dispatch/fs.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/fs.rs includes this file only through its cfg(test) path module for fs/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 72,
     "kind": "host_identity",
     "text": "let dir = std::env::temp_dir().join(format!(\"carrick-alias-maxprot-{}\", std::process::id()));",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:72`, `let dir = std::env::temp_dir().join(format!(\"carrick-alias-maxprot-{}\", std::process::id()));` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 73,
     "kind": "ambient_filesystem",
     "text": "std::fs::create_dir_all(&dir).expect(\"scratch dir\");",
+    "operations": [
+      "std::fs::create_dir_all"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:73`, `std::fs::create_dir_all(&dir).expect(\"scratch dir\");` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 76,
     "kind": "ambient_filesystem",
     "text": "let mut file = std::fs::File::create(&path).expect(\"create backing\");",
+    "operations": [
+      "std::fs::File::create"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:76`, `let mut file = std::fs::File::create(&path).expect(\"create backing\");` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 98,
     "kind": "ambient_filesystem",
     "text": "let readonly = std::fs::File::open(&path).expect(\"open O_RDONLY\");",
+    "operations": [
+      "std::fs::File::open"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:98`, `let readonly = std::fs::File::open(&path).expect(\"open O_RDONLY\");` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 109,
     "kind": "ambient_filesystem",
     "text": "let readwrite = std::fs::OpenOptions::new()",
+    "operations": [
+      "std::fs::OpenOptions::new"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:109`, `let readwrite = std::fs::OpenOptions::new()` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 124,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_dir_all(&dir);",
+    "operations": [
+      "std::fs::remove_dir_all"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:124`, `let _ = std::fs::remove_dir_all(&dir);` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 654,
     "kind": "carrier_substrate",
     "text": "let thread = std::thread::spawn(move || {",
+    "operations": [
+      "std::thread::spawn"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:654`, `let thread = std::thread::spawn(move || {` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 1534,
     "kind": "host_process_control",
     "text": "let child = unsafe { libc::fork() };",
+    "operations": [
+      "libc::fork"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:1534`, `let child = unsafe { libc::fork() };` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 1774,
     "kind": "host_process_control",
     "text": "let child = unsafe { libc::fork() };",
+    "operations": [
+      "libc::fork"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:1774`, `let child = unsafe { libc::fork() };` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 1781,
     "kind": "host_identity",
     "text": "unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };",
+    "operations": [
+      "libc::setrlimit"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:1781`, `unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 1986,
     "kind": "host_process_control",
     "text": "let child = unsafe { libc::fork() };",
+    "operations": [
+      "libc::fork"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:1986`, `let child = unsafe { libc::fork() };` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 2498,
     "kind": "host_process_control",
     "text": "let child = unsafe { libc::fork() };",
+    "operations": [
+      "libc::fork"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:2498`, `let child = unsafe { libc::fork() };` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 2505,
     "kind": "host_identity",
     "text": "unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };",
+    "operations": [
+      "libc::setrlimit"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:2505`, `unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 3836,
     "kind": "host_process_control",
     "text": "let pid = unsafe { libc::fork() };",
+    "operations": [
+      "libc::fork"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:3836`, `let pid = unsafe { libc::fork() };` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 3843,
     "kind": "host_identity",
     "text": "unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };",
+    "operations": [
+      "libc::setrlimit"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:3843`, `unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 4726,
     "kind": "carrier_substrate",
     "text": "let worker = std::thread::spawn(move || {",
+    "operations": [
+      "std::thread::spawn"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:4726`, `let worker = std::thread::spawn(move || {` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 4748,
     "kind": "carrier_substrate",
     "text": "std::thread::yield_now();",
+    "operations": [
+      "std::thread::yield_now"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:4748`, `std::thread::yield_now();` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 4857,
     "kind": "carrier_substrate",
     "text": "let worker = std::thread::spawn(move || {",
+    "operations": [
+      "std::thread::spawn"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:4857`, `let worker = std::thread::spawn(move || {` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 4860,
     "kind": "carrier_substrate",
     "text": "std::thread::sleep(std::time::Duration::from_millis(40));",
+    "operations": [
+      "std::thread::sleep"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:4860`, `std::thread::sleep(std::time::Duration::from_millis(40));` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 5883,
     "kind": "carrier_substrate",
     "text": "let thread = std::thread::spawn(move || {",
+    "operations": [
+      "std::thread::spawn"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:5883`, `let thread = std::thread::spawn(move || {` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
     "line": 5984,
     "kind": "carrier_substrate",
     "text": "let thread = std::thread::spawn(move || {",
+    "operations": [
+      "std::thread::spawn"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mem/tests.rs:5984`, `let thread = std::thread::spawn(move || {` is excluded from HVPatch release execution by `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in `dispatch/mem.rs`; this is migration debt, not a completion waiver."
+    "rationale": "compile-time exclusion: dispatch/mem.rs includes this file only through its cfg(test) path module for mem/tests.rs, so the listed operation is absent from product builds"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mod.rs",
     "line": 2538,
     "kind": "host_identity",
     "text": "let observed_pid = i32::try_from(std::process::id()).unwrap_or(1);",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mod.rs:2538`, `let observed_pid = i32::try_from(std::process::id()).unwrap_or(1);` consumes host PID in `bootstrap_one_task_binding` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let observed_pid = i32::try_from(std::process::id()).unwrap_or(1);`."
+    "rationale": "guest answer: bootstrap task publication seeds the Linux root task identity from the carrier PID"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mod.rs",
     "line": 3368,
     "kind": "host_identity",
     "text": "let observed_pid = i32::try_from(std::process::id())",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mod.rs:3368`, `let observed_pid = i32::try_from(std::process::id())` consumes host PID in `reset_one_task_kernel_binding_for_current_process` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let observed_pid = i32::try_from(std::process::id())`."
+    "rationale": "guest answer: one-task kernel reset rebinds the Linux task identity to the current carrier PID"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mod.rs",
     "line": 3663,
     "kind": "host_identity",
     "text": ".unwrap_or_else(|| std::process::id() as i32)",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mod.rs:3663`, `.unwrap_or_else(|| std::process::id() as i32)` is the `event_ring_guest_pid` diagnostic fallback used only when no virtual PID was published; it records carrier provenance and does not answer a guest syscall. Concrete operation form: `.unwrap_or_else(|| std::process::id() as i32)`."
+    "rationale": "authenticated carrier: records the current carrier PID only as event-ring provenance when no virtual PID was published"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mod.rs",
     "line": 4703,
     "kind": "host_identity",
     "text": ".free_if_owner(index, std::process::id());",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mod.rs:4703`, `.free_if_owner(index, std::process::id());` consumes host PID in `close_open_file_and_free_pty` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `.free_if_owner(index, std::process::id());`."
+    "rationale": "guest answer: PTY slot release authorizes ownership with the carrier PID, determining whether the guest-visible PTY index is freed"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mod.rs",
     "line": 4895,
     "kind": "host_identity",
     "text": ".set_controlling(host_slave_name, std::process::id())",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mod.rs:4895`, `.set_controlling(host_slave_name, std::process::id())` consumes host PID in `register_controlling_pty` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `.set_controlling(host_slave_name, std::process::id())`."
+    "rationale": "guest answer: controlling-terminal registration stores the carrier PID as owner, determining later guest /dev/tty access"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mqueue.rs",
     "line": 390,
     "kind": "host_identity",
     "text": ".unwrap_or_else(|| std::process::id() as i32);",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mqueue.rs:390`, `.unwrap_or_else(|| std::process::id() as i32);` consumes host PID in `mq_notify` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `.unwrap_or_else(|| std::process::id() as i32);`."
+    "rationale": "guest answer: mq_notify registration and unregister ownership use the carrier PID as the calling Linux process identity"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mqueue.rs",
     "line": 545,
     "kind": "host_identity",
     "text": ".unwrap_or_else(|| std::process::id() as i32);",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mqueue.rs:545`, `.unwrap_or_else(|| std::process::id() as i32);` consumes host PID in `deliver_notify` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `.unwrap_or_else(|| std::process::id() as i32);`."
+    "rationale": "host target: the stored message-notification signal recipient PID is compared with the carrier PID before delivery"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mqueue.rs",
     "line": 562,
     "kind": "host_process_control",
     "text": "unsafe { libc::kill(pid, host_signo) };",
+    "operations": [
+      "libc::kill"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mqueue.rs:562`, `unsafe { libc::kill(pid, host_signo) };` consumes host process-control operation in `deliver_notify` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `unsafe { libc::kill(pid, host_signo) };`."
+    "rationale": "host target: the fallback message-queue notification sends a host signal to the stored recipient PID"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mqueue.rs",
     "line": 573,
     "kind": "host_identity",
     "text": ".unwrap_or_else(|| std::process::id() as i32);",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mqueue.rs:573`, `.unwrap_or_else(|| std::process::id() as i32);` consumes host PID in `deliver_notify` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `.unwrap_or_else(|| std::process::id() as i32);`."
+    "rationale": "host target: message-queue thread notification compares the stored recipient with the carrier PID before enqueueing its netlink event"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net.rs",
     "line": 2578,
     "kind": "host_identity",
     "text": "let dest_pid = if *pid != 0 { *pid } else { std::process::id() };",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:2578`, `let dest_pid = if *pid != 0 { *pid } else { std::process::id() };` consumes host PID in `netlink_send` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let dest_pid = if *pid != 0 { *pid } else { std::process::id() };`."
+    "rationale": "guest answer: a synthetic netlink reply uses the carrier PID as nlmsg_pid when the socket has no guest-assigned port ID"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net.rs",
     "line": 5630,
     "kind": "host_identity",
     "text": "std::process::id()",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5630`, `std::process::id()` consumes host PID in `bind` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `std::process::id()`."
+    "rationale": "guest answer: AF_NETLINK bind publishes the carrier PID as the socket port ID when the guest requests automatic assignment"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net.rs",
     "line": 5654,
     "kind": "ambient_filesystem",
     "text": "if let Ok(md) = std::fs::symlink_metadata(&*p) {",
+    "operations": [
+      "std::fs::symlink_metadata"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5654`, `if let Ok(md) = std::fs::symlink_metadata(&*p) {` performs `bind`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `if let Ok(md) = std::fs::symlink_metadata(&*p) {`."
+    "rationale": "authorized backing: inspects only the hashed autobind socket node beneath Carrick's private AF_UNIX abstract-socket directory"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net.rs",
     "line": 5657,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(&*p);",
+    "operations": [
+      "std::fs::remove_file"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5657`, `let _ = std::fs::remove_file(&*p);` performs `bind`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let _ = std::fs::remove_file(&*p);`."
+    "rationale": "authorized backing: unlinks only a stale socket node at the hashed autobind path after confirming its socket type"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net.rs",
     "line": 5754,
     "kind": "ambient_filesystem",
     "text": "&& let Ok(md) = std::fs::symlink_metadata(path)",
+    "operations": [
+      "std::fs::symlink_metadata"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5754`, `&& let Ok(md) = std::fs::symlink_metadata(path)` performs `bind`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `&& let Ok(md) = std::fs::symlink_metadata(path)`."
+    "rationale": "authorized backing: inspects only the hashed AF_UNIX host node produced by the socket-path registry"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net.rs",
     "line": 5758,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(path);",
+    "operations": [
+      "std::fs::remove_file"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5758`, `let _ = std::fs::remove_file(path);` performs `bind`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let _ = std::fs::remove_file(path);`."
+    "rationale": "authorized backing: unlinks only the registered hashed AF_UNIX host node after confirming its socket type"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net.rs",
     "line": 6381,
     "kind": "host_identity",
     "text": "std::process::id(), fd.0, len, dest_addr.0",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:6381`, `std::process::id(), fd.0, len, dest_addr.0` performs `sendto`'s carrier-side host PID; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `std::process::id(), fd.0, len, dest_addr.0`."
+    "rationale": "authenticated carrier: emits the current carrier PID solely in the opt-in CARRICK_NET_DEBUG sendto diagnostic"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
     "line": 1434,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::create_dir_all(&base);",
+    "operations": [
+      "std::fs::create_dir_all"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net/support.rs:1434`, `let _ = std::fs::create_dir_all(&base);` performs `unix_socket_host_path`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let _ = std::fs::create_dir_all(&base);`."
+    "rationale": "authorized backing: creates only the selected namespace subdirectory beneath Carrick's private AF_UNIX host root"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
     "line": 1472,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::create_dir_all(&base);",
+    "operations": [
+      "std::fs::create_dir_all"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net/support.rs:1472`, `let _ = std::fs::create_dir_all(&base);` performs `autobind_unix_host_path`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let _ = std::fs::create_dir_all(&base);`."
+    "rationale": "authorized backing: creates only the abstract subdirectory beneath Carrick's private AF_UNIX host root for autobind nodes"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 424,
     "kind": "host_identity",
     "text": "0 => PtraceWaitTarget::ProcessGroup(HostPgid(unsafe { libc::getpgrp() } as u32)),",
+    "operations": [
+      "libc::getpgrp"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:424`, `0 => PtraceWaitTarget::ProcessGroup(HostPgid(unsafe { libc::getpgrp() } as u32)),` consumes host process group in `ptrace_wait_target_for_wait4` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `0 => PtraceWaitTarget::ProcessGroup(HostPgid(unsafe { libc::getpgrp() } as u32)),`."
+    "rationale": "guest answer: wait4 target 0 uses the carrier's host process group to select which ptrace child events match"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 452,
     "kind": "host_identity",
     "text": "u32::try_from(unsafe { libc::getpgrp() }).ok()",
+    "operations": [
+      "libc::getpgrp"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:452`, `u32::try_from(unsafe { libc::getpgrp() }).ok()` consumes host process group in `ptrace_wait_target_for_waitid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `u32::try_from(unsafe { libc::getpgrp() }).ok()`."
+    "rationale": "guest answer: waitid P_PGID with id 0 uses the carrier's host process group to select ptrace child events"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 479,
     "kind": "host_identity",
     "text": "PtraceWaitTarget::Any => crate::guest_cpu::wait_any_park_pid(std::process::id()),",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:479`, `PtraceWaitTarget::Any => crate::guest_cpu::wait_any_park_pid(std::process::id()),` consumes host PID in `ptrace_wait_park_pid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `PtraceWaitTarget::Any => crate::guest_cpu::wait_any_park_pid(std::process::id()),`."
+    "rationale": "guest answer: an any-child ptrace wait uses the carrier PID to choose the host child on which the guest wait parks"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 481,
     "kind": "host_identity",
     "text": "let has_direct_member = crate::guest_cpu::direct_children_for_wait(std::process::id())",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:481`, `let has_direct_member = crate::guest_cpu::direct_children_for_wait(std::process::id())` consumes host PID in `ptrace_wait_park_pid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let has_direct_member = crate::guest_cpu::direct_children_for_wait(std::process::id())`."
+    "rationale": "guest answer: process-group ptrace parking enumerates direct host children of the carrier to decide whether a matching child exists"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 491,
     "kind": "host_identity",
     "text": "crate::guest_cpu::pending_adopted_child(std::process::id(), target)",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:491`, `crate::guest_cpu::pending_adopted_child(std::process::id(), target)` consumes host PID in `ptrace_wait_park_pid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `crate::guest_cpu::pending_adopted_child(std::process::id(), target)`."
+    "rationale": "guest answer: process-group ptrace parking queries adopted-child state under the carrier PID to choose a guest wait target"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 511,
     "kind": "host_process_control",
     "text": "libc::waitid(",
+    "operations": [
+      "libc::waitid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:511`, `libc::waitid(` consumes host process-control operation in `child_is_terminally_waitable` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `libc::waitid(`."
+    "rationale": "guest answer: ptrace lease cleanup peeks at the exact host child with waitid to decide whether its guest-visible stop is terminal"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 794,
     "kind": "host_identity",
     "text": "bootstrap_host_pid: std::process::id(),",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:794`, `bootstrap_host_pid: std::process::id(),` consumes host PID in `new` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `bootstrap_host_pid: std::process::id(),`."
+    "rationale": "guest answer: process state stores the carrier PID as the bootstrap Linux process identity for later fork and exit decisions"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 924,
     "kind": "host_identity",
     "text": "std::process::id() != self.proc.lock().bootstrap_host_pid",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:924`, `std::process::id() != self.proc.lock().bootstrap_host_pid` consumes host PID in `is_forked_guest_process` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `std::process::id() != self.proc.lock().bootstrap_host_pid`."
+    "rationale": "guest answer: guest-process exit behavior is selected by comparing the current carrier PID with the recorded bootstrap host PID"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 960,
     "kind": "host_identity",
     "text": "u32::try_from(unsafe { libc::getppid() }).unwrap_or(0)",
+    "operations": [
+      "libc::getppid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:960`, `u32::try_from(unsafe { libc::getppid() }).unwrap_or(0)` consumes host parent PID in `proc_after_fork_child` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `u32::try_from(unsafe { libc::getppid() }).unwrap_or(0)`."
+    "rationale": "guest answer: post-fork subreaper ancestry falls back to the host parent PID recorded as the Linux adopter"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 1019,
     "kind": "host_identity",
     "text": "if std::process::id() == bootstrap_host_pid {",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:1019`, `if std::process::id() == bootstrap_host_pid {` consumes host PID in `clone_parent_host_pid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `if std::process::id() == bootstrap_host_pid {`."
+    "rationale": "guest answer: clone parentage treats the bootstrap carrier PID as having no Linux parent in the modeled process tree"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 1024,
     "kind": "host_identity",
     "text": "unsafe { libc::getppid() as u32 }",
+    "operations": [
+      "libc::getppid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:1024`, `unsafe { libc::getppid() as u32 }` consumes host parent PID in `clone_parent_host_pid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `unsafe { libc::getppid() as u32 }`."
+    "rationale": "guest answer: clone parentage falls back to the host parent PID as the Linux parent when no adopted parent is recorded"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 1818,
     "kind": "host_identity",
     "text": "let ns_tid = if tid == std::process::id() {",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:1818`, `let ns_tid = if tid == std::process::id() {` consumes host PID in `gettid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let ns_tid = if tid == std::process::id() {`."
+    "rationale": "guest answer: gettid translates a registry TID only when it equals the carrier PID, changing the TID returned to the guest"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 2038,
     "kind": "carrier_substrate",
     "text": "std::thread::yield_now();",
+    "operations": [
+      "std::thread::yield_now"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:2038`, `std::thread::yield_now();` performs `sched_yield`'s carrier-side carrier substrate; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `std::thread::yield_now();`."
+    "rationale": "authenticated carrier: sched_yield yields only the current vCPU worker's host thread and selects no process target"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 2335,
     "kind": "carrier_substrate",
     "text": "std::thread::sleep(timeout);",
+    "operations": [
+      "std::thread::sleep"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:2335`, `std::thread::sleep(timeout);` performs `futex`'s carrier-side carrier substrate; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `std::thread::sleep(timeout);`."
+    "rationale": "authenticated carrier: the no-thread futex fallback parks only the current syscall worker for the decoded guest timeout"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 2687,
     "kind": "host_process_control",
     "text": "(unsafe { libc::kill(host, 0) == 0 })",
+    "operations": [
+      "libc::kill"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:2687`, `(unsafe { libc::kill(host, 0) == 0 })` consumes host process-control operation in `ptrace` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `(unsafe { libc::kill(host, 0) == 0 })`."
+    "rationale": "host target: ptrace liveness fallback probes the host PID translated from the guest tracee target"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 2701,
     "kind": "host_identity",
     "text": "let tracer_pid = u32::try_from(unsafe { libc::getppid() }).unwrap_or(0);",
+    "operations": [
+      "libc::getppid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:2701`, `let tracer_pid = u32::try_from(unsafe { libc::getppid() }).unwrap_or(0);` consumes host parent PID in `ptrace` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let tracer_pid = u32::try_from(unsafe { libc::getppid() }).unwrap_or(0);`."
+    "rationale": "guest answer: virtual PTRACE_TRACEME registers the host parent PID as the guest tracer identity"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 3005,
     "kind": "host_identity",
     "text": "unsafe { libc::getuid() },",
+    "operations": [
+      "libc::getuid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3005`, `unsafe { libc::getuid() },` consumes host UID in `waitid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `unsafe { libc::getuid() },`."
+    "rationale": "guest answer: HVPatch waitid writes the host UID into the guest SIGCHLD siginfo sender field"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 3058,
     "kind": "host_identity",
     "text": "(libc::P_PGID, unsafe { libc::getpgrp() } as libc::id_t)",
+    "operations": [
+      "libc::getpgrp"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3058`, `(libc::P_PGID, unsafe { libc::getpgrp() } as libc::id_t)` consumes host process group in `waitid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `(libc::P_PGID, unsafe { libc::getpgrp() } as libc::id_t)`."
+    "rationale": "host target: waitid P_PGID with id 0 submits the carrier's host process group as the child-selection target"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 3105,
     "kind": "host_process_control",
     "text": "libc::waitid(",
+    "operations": [
+      "libc::waitid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3105`, `libc::waitid(` consumes host process-control operation in `waitid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `libc::waitid(`."
+    "rationale": "host target: virtual ptrace waitid peeks at the exact leased host child to produce its guest wait event"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 3174,
     "kind": "host_process_control",
     "text": "libc::waitid(host_idtype, host_id, &mut info, internal_options)",
+    "operations": [
+      "libc::waitid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3174`, `libc::waitid(host_idtype, host_id, &mut info, internal_options)` consumes host process-control operation in `waitid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `libc::waitid(host_idtype, host_id, &mut info, internal_options)`."
+    "rationale": "host target: the main waitid probe submits the single host-domain selector translated from the guest wait request"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 3213,
     "kind": "host_process_control",
     "text": "libc::waitid(",
+    "operations": [
+      "libc::waitid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3213`, `libc::waitid(` consumes host process-control operation in `waitid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `libc::waitid(`."
+    "rationale": "host target: native ptrace waitid consumes the previously selected exact host-child event for the guest wait result"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 3278,
     "kind": "host_process_control",
     "text": "let r = unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };",
+    "operations": [
+      "libc::waitid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3278`, `let r = unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };` consumes host process-control operation in `waitid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let r = unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };`."
+    "rationale": "host target: blocking waitid submits the single translated host-domain selector and returns that target's state to the guest"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 3281,
     "kind": "carrier_substrate",
     "text": "std::thread::sleep(std::time::Duration::from_millis(10));",
+    "operations": [
+      "std::thread::sleep"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3281`, `std::thread::sleep(std::time::Duration::from_millis(10));` performs `waitid`'s carrier-side carrier substrate; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `std::thread::sleep(std::time::Duration::from_millis(10));`."
+    "rationale": "authenticated carrier: the blocking waitid compatibility loop parks only the current syscall worker between host-state polls"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 3496,
     "kind": "host_identity",
     "text": "crate::guest_cpu::direct_child_ptrace_stop_pending(std::process::id())",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3496`, `crate::guest_cpu::direct_child_ptrace_stop_pending(std::process::id())` consumes host PID in `wait4` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `crate::guest_cpu::direct_child_ptrace_stop_pending(std::process::id())`."
+    "rationale": "guest answer: wait4 stop selection queries ptrace-pending state for direct host children of the carrier PID"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 3526,
     "kind": "host_identity",
     "text": "return crate::guest_cpu::wait_any_park_pid(std::process::id());",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3526`, `return crate::guest_cpu::wait_any_park_pid(std::process::id());` consumes host PID in `wait4` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `return crate::guest_cpu::wait_any_park_pid(std::process::id());`."
+    "rationale": "guest answer: wait4 with target -1 uses the carrier PID to choose the host child on which an any-child wait parks"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 3540,
     "kind": "host_process_control",
     "text": "libc::wait4(",
+    "operations": [
+      "libc::wait4"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3540`, `libc::wait4(` consumes host process-control operation in `wait4` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `libc::wait4(`."
+    "rationale": "host target: virtual ptrace wait4 polls each exact leased host child and converts its state into a guest wait result"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 3604,
     "kind": "host_process_control",
     "text": "libc::wait4(",
+    "operations": [
+      "libc::wait4"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3604`, `libc::wait4(` consumes host process-control operation in `wait4` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `libc::wait4(`."
+    "rationale": "host target: virtual-native wait4 fallback submits the single host-domain selector derived from the guest wait request"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 3629,
     "kind": "host_process_control",
     "text": "libc::wait4(",
+    "operations": [
+      "libc::wait4"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3629`, `libc::wait4(` consumes host process-control operation in `wait4` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `libc::wait4(`."
+    "rationale": "host target: the pre-park wait4 probe polls the single translated host-domain selector before returning a guest wait outcome"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 3672,
     "kind": "host_process_control",
     "text": "unsafe { libc::wait4(host_target, &mut host_status, host_options, &mut host_rusage) };",
+    "operations": [
+      "libc::wait4"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3672`, `unsafe { libc::wait4(host_target, &mut host_status, host_options, &mut host_rusage) };` consumes host process-control operation in `wait4` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `unsafe { libc::wait4(host_target, &mut host_status, host_options, &mut host_rusage) };`."
+    "rationale": "host target: blocking wait4 submits the single translated host-domain selector and returns that target's status to the guest"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 3701,
     "kind": "host_identity",
     "text": "crate::guest_cpu::adopted_child_wait(std::process::id(), host_target)",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3701`, `crate::guest_cpu::adopted_child_wait(std::process::id(), host_target)` consumes host PID in `wait4` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `crate::guest_cpu::adopted_child_wait(std::process::id(), host_target)`."
+    "rationale": "guest answer: ECHILD fallback searches adopted-child records owned by the carrier PID to produce a guest reap result"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 3795,
     "kind": "host_process_control",
     "text": "&& unsafe { libc::kill(host_target, 0) } == -1",
+    "operations": [
+      "libc::kill"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3795`, `&& unsafe { libc::kill(host_target, 0) } == -1` consumes host process-control operation in `wait4` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `&& unsafe { libc::kill(host_target, 0) } == -1`."
+    "rationale": "host target: wait4 error translation probes the guest-selected process-group number in the host PID namespace to determine the guest errno"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 3841,
     "kind": "host_process_control",
     "text": "libc::wait4(result, &mut host_status, host_options, &mut host_rusage)",
+    "operations": [
+      "libc::wait4"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3841`, `libc::wait4(result, &mut host_status, host_options, &mut host_rusage)` consumes host process-control operation in `wait4` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `libc::wait4(result, &mut host_status, host_options, &mut host_rusage)`."
+    "rationale": "host target: after forcing a ptrace-stopped child to continue, wait4 blocks on that exact host child for the guest terminal status"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
     "line": 4189,
     "kind": "host_identity",
     "text": "let target_euid = if host_pid as u32 == std::process::id() {",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:4189`, `let target_euid = if host_pid as u32 == std::process::id() {` consumes host PID in `pidfd_send_signal` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let target_euid = if host_pid as u32 == std::process::id() {`."
+    "rationale": "guest answer: pidfd signal permission treats a target equal to the carrier PID as self and substitutes the caller's guest euid"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/signal.rs",
     "line": 1481,
     "kind": "host_identity",
     "text": "let signal_target_names_self = pid == std::process::id() as i64",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:1481`, `let signal_target_names_self = pid == std::process::id() as i64` consumes host PID in `kill` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let signal_target_names_self = pid == std::process::id() as i64`."
+    "rationale": "guest answer: kill target routing compares the requested guest PID with the carrier PID to classify the signal recipient"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/signal.rs",
     "line": 2296,
     "kind": "host_identity",
     "text": "let host_pid = std::process::id() as i64;",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:2296`, `let host_pid = std::process::id() as i64;` consumes host PID in `sigpending_limit_exceeded` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let host_pid = std::process::id() as i64;`."
+    "rationale": "host target: queued-signal routing compares the translated recipient PID with the carrier PID before delivering to that recipient"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/signal.rs",
     "line": 2630,
     "kind": "host_identity",
     "text": "let host_pid = std::process::id() as i64;",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:2630`, `let host_pid = std::process::id() as i64;` consumes host PID in `bootstrap_signal_send_as` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let host_pid = std::process::id() as i64;`."
+    "rationale": "host target: bootstrap signal delivery treats the carrier PID as the guest's self recipient when classifying the requested target"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/signal.rs",
     "line": 2664,
     "kind": "host_identity",
     "text": "if target == 0 && unsafe { libc::getpgrp() } != std::process::id() as i32 {",
+    "operations": [
+      "libc::getpgrp",
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:2664`, `if target == 0 && unsafe { libc::getpgrp() } != std::process::id() as i32 {` consumes host PID in `bootstrap_signal_send_as` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `if target == 0 && unsafe { libc::getpgrp() } != std::process::id() as i32 {`."
+    "rationale": "host target: guest kill(0) delivery is narrowed to self when the carrier does not lead its host process group"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/signal.rs",
     "line": 2710,
     "kind": "host_identity",
     "text": ".unwrap_or_else(|| unsafe { libc::getuid() });",
+    "operations": [
+      "libc::getuid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:2710`, `.unwrap_or_else(|| unsafe { libc::getuid() });` consumes host UID in `bootstrap_signal_send_as` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `.unwrap_or_else(|| unsafe { libc::getuid() });`."
+    "rationale": "guest answer: explicit-signal metadata falls back to the host UID for the sender identity reported in siginfo"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/signal.rs",
     "line": 2762,
     "kind": "host_process_control",
     "text": "let rc = unsafe { libc::kill(target as i32, host_signum) };",
+    "operations": [
+      "libc::kill"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:2762`, `let rc = unsafe { libc::kill(target as i32, host_signum) };` consumes host process-control operation in `bootstrap_signal_send_as` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let rc = unsafe { libc::kill(target as i32, host_signum) };`."
+    "rationale": "host target: bootstrap signal delivery passes the single host-domain target encoded from the guest signal selector to host kill"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 700,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::create_dir_all(SHM_DIR);",
+    "operations": [
+      "std::fs::create_dir_all"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:700`, `let _ = std::fs::create_dir_all(SHM_DIR);` performs `ensure_dir`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let _ = std::fs::create_dir_all(SHM_DIR);`."
+    "rationale": "authorized backing: creates only Carrick's fixed /tmp/carrick-shm root for SysV IPC artifacts"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 702,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::set_permissions(SHM_DIR, std::fs::Permissions::from_mode(0o1777));",
+    "operations": [
+      "std::fs::set_permissions"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:702`, `let _ = std::fs::set_permissions(SHM_DIR, std::fs::Permissions::from_mode(0o1777));` performs `ensure_dir`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let _ = std::fs::set_permissions(SHM_DIR, std::fs::Permissions::from_mode(0o1777));`."
+    "rationale": "authorized backing: applies sticky world-writable mode only to Carrick's fixed /tmp/carrick-shm root"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 710,
     "kind": "host_identity",
     "text": "std::process::id(),",
-    "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:710`, `std::process::id(),` consumes host PID in `private_name` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `std::process::id(),`."
+    "operations": [
+      "std::process::id"
+    ],
+    "classification": "declared_backing",
+    "rationale": "authorized backing: uses the carrier PID only to make an IPC_PRIVATE artifact name unique beneath the fixed SysV backing root"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 791,
     "kind": "host_identity",
     "text": "std::process::id(),",
-    "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:791`, `std::process::id(),` consumes host PID in `init_sysv_run_scope` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `std::process::id(),`."
+    "operations": [
+      "std::process::id"
+    ],
+    "classification": "declared_backing",
+    "rationale": "authorized backing: freezes the top-level carrier PID only as the fallback run-scope name beneath the fixed SysV backing root"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 802,
     "kind": "host_identity",
     "text": "std::process::id()",
-    "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:802`, `std::process::id()` consumes host PID in `sysv_run_scope` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `std::process::id()`."
+    "operations": [
+      "std::process::id"
+    ],
+    "classification": "declared_backing",
+    "rationale": "authorized backing: derives the fallback SysV run-scope name from the carrier PID only when configured scope variables are absent"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 1230,
     "kind": "ambient_filesystem",
     "text": "let entries = std::fs::read_dir(SHM_DIR).map_err(|_| LINUX_EINVAL)?;",
+    "operations": [
+      "std::fs::read_dir"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1230`, `let entries = std::fs::read_dir(SHM_DIR).map_err(|_| LINUX_EINVAL)?;` performs `lookup_msg_queue_path`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let entries = std::fs::read_dir(SHM_DIR).map_err(|_| LINUX_EINVAL)?;`."
+    "rationale": "authorized backing: enumerates only Carrick's fixed SysV root to resolve a serialized message-queue ID to its artifact"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 1252,
     "kind": "ambient_filesystem",
     "text": "if let Ok(entries) = std::fs::read_dir(SHM_DIR) {",
+    "operations": [
+      "std::fs::read_dir"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1252`, `if let Ok(entries) = std::fs::read_dir(SHM_DIR) {` performs `cleanup_msg_queue_files_for_scope`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `if let Ok(entries) = std::fs::read_dir(SHM_DIR) {`."
+    "rationale": "authorized backing: enumerates only Carrick's fixed SysV root while selecting artifacts tagged with the current run scope"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 1256,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(path);",
+    "operations": [
+      "std::fs::remove_file"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1256`, `let _ = std::fs::remove_file(path);` performs `cleanup_msg_queue_files_for_scope`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let _ = std::fs::remove_file(path);`."
+    "rationale": "authorized backing: removes only message-queue artifacts whose names match the authenticated current run scope"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 1283,
     "kind": "host_identity",
     "text": "host_pid: unsafe { libc::getpid() },",
-    "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1283`, `host_pid: unsafe { libc::getpid() },` consumes host PID in `new` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `host_pid: unsafe { libc::getpid() },`."
+    "operations": [
+      "libc::getpid"
+    ],
+    "classification": "declared_backing",
+    "rationale": "authorized backing: records the current carrier PID as ownership generation for this thread-local message-queue FD cache"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 1289,
     "kind": "host_identity",
     "text": "let host_pid = unsafe { libc::getpid() };",
-    "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1289`, `let host_pid = unsafe { libc::getpid() };` consumes host PID in `refresh_for_current_process` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let host_pid = unsafe { libc::getpid() };`."
+    "operations": [
+      "libc::getpid"
+    ],
+    "classification": "declared_backing",
+    "rationale": "authorized backing: compares the current carrier PID with the FD-cache generation before closing inherited queue descriptors"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 1718,
     "kind": "host_identity",
     "text": "host_pid: unsafe { libc::getpid() },",
-    "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1718`, `host_pid: unsafe { libc::getpid() },` consumes host PID in `new` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `host_pid: unsafe { libc::getpid() },`."
+    "operations": [
+      "libc::getpid"
+    ],
+    "classification": "declared_backing",
+    "rationale": "authorized backing: records the current carrier PID as ownership generation for this thread-local queue wait-word mapping cache"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 1724,
     "kind": "host_identity",
     "text": "let host_pid = unsafe { libc::getpid() };",
-    "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1724`, `let host_pid = unsafe { libc::getpid() };` consumes host PID in `refresh_for_current_process` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let host_pid = unsafe { libc::getpid() };`."
+    "operations": [
+      "libc::getpid"
+    ],
+    "classification": "declared_backing",
+    "rationale": "authorized backing: compares the current carrier PID with the wait-word cache generation before discarding inherited mappings"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 1855,
     "kind": "ambient_filesystem",
     "text": "let mut file = std::fs::OpenOptions::new()",
+    "operations": [
+      "std::fs::OpenOptions::new"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1855`, `let mut file = std::fs::OpenOptions::new()` performs `wake_msg_queue_waiters`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let mut file = std::fs::OpenOptions::new()`."
+    "rationale": "authorized backing: opens only the attachment-count sidecar derived from the selected SysV shared-memory segment artifact"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 2048,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(shm_nattch_path(&segment.path));",
+    "operations": [
+      "std::fs::remove_file"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:2048`, `let _ = std::fs::remove_file(shm_nattch_path(&segment.path));` performs `shmctl_rmid`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let _ = std::fs::remove_file(shm_nattch_path(&segment.path));`."
+    "rationale": "authorized backing: removes only the attachment-count sidecar paired with the SysV segment selected by IPC_RMID"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 2297,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(&segment.path);",
+    "operations": [
+      "std::fs::remove_file"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:2297`, `let _ = std::fs::remove_file(&segment.path);` performs `cleanup_sysv_ipc_on_process_exit`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let _ = std::fs::remove_file(&segment.path);`."
+    "rationale": "authorized backing: top-level process-exit cleanup removes only shared-memory segment artifacts owned by this SysV state table"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 2298,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(shm_nattch_path(&segment.path));",
+    "operations": [
+      "std::fs::remove_file"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:2298`, `let _ = std::fs::remove_file(shm_nattch_path(&segment.path));` performs `cleanup_sysv_ipc_on_process_exit`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let _ = std::fs::remove_file(shm_nattch_path(&segment.path));`."
+    "rationale": "authorized backing: top-level process-exit cleanup removes only attachment-count sidecars paired with owned SysV segments"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 2804,
     "kind": "carrier_substrate",
     "text": "std::thread::yield_now();",
+    "operations": [
+      "std::thread::yield_now"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:2804`, `std::thread::yield_now();` performs `msgsnd`'s carrier-side carrier substrate; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `std::thread::yield_now();`."
+    "rationale": "authenticated carrier: a blocking msgsnd yields only the current syscall worker when its queue wait token cannot be opened"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 2884,
     "kind": "carrier_substrate",
     "text": "std::thread::yield_now();",
+    "operations": [
+      "std::thread::yield_now"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:2884`, `std::thread::yield_now();` performs `msgrcv`'s carrier-side carrier substrate; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `std::thread::yield_now();`."
+    "rationale": "authenticated carrier: a blocking msgrcv yields only the current syscall worker when its queue wait token cannot be opened"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 3091,
     "kind": "ambient_filesystem",
     "text": "std::fs::rename(&path, &id_path).map_err(|_| LINUX_EIO)?;",
+    "operations": [
+      "std::fs::rename"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:3091`, `std::fs::rename(&path, &id_path).map_err(|_| LINUX_EIO)?;` performs `msgget_open`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `std::fs::rename(&path, &id_path).map_err(|_| LINUX_EIO)?;`."
+    "rationale": "authorized backing: renames only the newly created IPC_PRIVATE queue artifact to its inode-derived ID path within the SysV root"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 3272,
     "kind": "ambient_filesystem",
     "text": "if let Ok(entries) = std::fs::read_dir(SHM_DIR) {",
+    "operations": [
+      "std::fs::read_dir"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:3272`, `if let Ok(entries) = std::fs::read_dir(SHM_DIR) {` performs `sorted_msg_queue_ids`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `if let Ok(entries) = std::fs::read_dir(SHM_DIR) {`."
+    "rationale": "authorized backing: enumerates only message-queue artifacts under Carrick's fixed SysV root to build guest queue indices"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 3410,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(&path);",
+    "operations": [
+      "std::fs::remove_file"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:3410`, `let _ = std::fs::remove_file(&path);` performs `msg_queue_metrics`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let _ = std::fs::remove_file(&path);`."
+    "rationale": "authorized backing: IPC_RMID removes only the queue artifact resolved from the authorized guest message-queue ID"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
     "line": 3411,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(msg_queue_wait_path(&path));",
+    "operations": [
+      "std::fs::remove_file"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:3411`, `let _ = std::fs::remove_file(msg_queue_wait_path(&path));` performs `msg_queue_metrics`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let _ = std::fs::remove_file(msg_queue_wait_path(&path));`."
+    "rationale": "authorized backing: IPC_RMID removes only the wait-word sidecar derived from the selected message-queue artifact"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/time.rs",
     "line": 1061,
     "kind": "host_identity",
     "text": "if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {",
+    "operations": [
+      "libc::getrlimit"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/time.rs:1061`, `if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {` reads the native `RLIMIT_NOFILE` ceiling in `raise_host_nofile_backing`; this only sizes host FD backing after guest-limit publication, and no guest value selects another host resource. Concrete operation form: `if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {`."
+    "rationale": "authorized backing: reads the carrier's RLIMIT_NOFILE ceiling only to size real FD backing after the guest limit is published"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/time.rs",
     "line": 1084,
     "kind": "host_identity",
     "text": "libc::setrlimit(libc::RLIMIT_NOFILE, &new);",
+    "operations": [
+      "libc::setrlimit"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/time.rs:1084`, `libc::setrlimit(libc::RLIMIT_NOFILE, &new);` raises native `RLIMIT_NOFILE` in `raise_host_nofile_backing`; this supplies FD backing for the published guest cap, and no guest value selects another host resource. Concrete operation form: `libc::setrlimit(libc::RLIMIT_NOFILE, &new);`."
+    "rationale": "authorized backing: raises only the carrier's RLIMIT_NOFILE soft limit to supply real descriptors beneath the published guest cap"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/time.rs",
     "line": 1131,
     "kind": "carrier_substrate",
     "text": "std::thread::yield_now();",
+    "operations": [
+      "std::thread::yield_now"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/time.rs:1131`, `std::thread::yield_now();` performs `try_hold_rlimit_cpu_for_fork_until`'s carrier-side carrier substrate; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `std::thread::yield_now();`."
+    "rationale": "authenticated carrier: yields the current runtime thread while it waits to acquire the RLIMIT_CPU fork-publication gate"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/time.rs",
     "line": 1164,
     "kind": "carrier_substrate",
     "text": "std::thread::Builder::new()",
+    "operations": [
+      "std::thread::Builder::new"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/time.rs:1164`, `std::thread::Builder::new()` performs `arm_rlimit_cpu`'s carrier-side carrier substrate; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `std::thread::Builder::new()`."
+    "rationale": "authenticated carrier: creates the dedicated helper thread that enforces this carrier's modeled RLIMIT_CPU deadline"
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/time.rs",
     "line": 1217,
     "kind": "carrier_substrate",
     "text": "std::thread::sleep(Duration::from_nanos(delay_ns));",
+    "operations": [
+      "std::thread::sleep"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/time.rs:1217`, `std::thread::sleep(Duration::from_nanos(delay_ns));` performs `enforce_rlimit_cpu`'s carrier-side carrier substrate; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `std::thread::sleep(Duration::from_nanos(delay_ns));`."
+    "rationale": "authenticated carrier: parks the RLIMIT_CPU helper thread until its next modeled guest-CPU deadline"
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
     "line": 199,
     "kind": "host_identity",
     "text": "let init_host_pgid = unsafe { libc::getpgrp() };",
+    "operations": [
+      "libc::getpgrp"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:199`, `let init_host_pgid = unsafe { libc::getpgrp() };` consumes host process group in `set_init` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let init_host_pgid = unsafe { libc::getpgrp() };`."
+    "rationale": "guest answer: namespace initialization maps guest process group 1 to the carrier's current host process group"
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
     "line": 206,
     "kind": "host_identity",
     "text": "let init_host_sid = unsafe { libc::getsid(0) };",
+    "operations": [
+      "libc::getsid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:206`, `let init_host_sid = unsafe { libc::getsid(0) };` consumes host identity in `set_init` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let init_host_sid = unsafe { libc::getsid(0) };`."
+    "rationale": "guest answer: namespace initialization maps guest session 1 to the carrier's current host session"
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
     "line": 331,
     "kind": "host_identity",
     "text": "let pgid = unsafe { libc::getpgrp() };",
+    "operations": [
+      "libc::getpgrp"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:331`, `let pgid = unsafe { libc::getpgrp() };` consumes host process group in `refresh_init_host_pgid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let pgid = unsafe { libc::getpgrp() };`."
+    "rationale": "guest answer: refreshing namespace process group 1 publishes the carrier's current host process group"
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
     "line": 377,
     "kind": "host_identity",
     "text": "let host = std::process::id();",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:377`, `let host = std::process::id();` consumes host PID in `self_ns_pid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let host = std::process::id();`."
+    "rationale": "guest answer: self_ns_pid uses the carrier PID as the calling Linux PID fallback when no active task context exists"
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
     "line": 417,
     "kind": "host_identity",
     "text": "return unsafe { libc::getppid() } as u32;",
+    "operations": [
+      "libc::getppid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:417`, `return unsafe { libc::getppid() } as u32;` consumes host parent PID in `self_ns_ppid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `return unsafe { libc::getppid() } as u32;`."
+    "rationale": "guest answer: self_ns_ppid returns the host parent PID directly when PID namespaces are disabled and no task context answers"
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
     "line": 419,
     "kind": "host_identity",
     "text": "let self_host = std::process::id();",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:419`, `let self_host = std::process::id();` consumes host PID in `self_ns_ppid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let self_host = std::process::id();`."
+    "rationale": "guest answer: parent-PID fallback uses the carrier PID to test init, orphan, and namespace-member state"
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
     "line": 436,
     "kind": "host_identity",
     "text": "let host_ppid = unsafe { libc::getppid() } as u32;",
+    "operations": [
+      "libc::getppid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:436`, `let host_ppid = unsafe { libc::getppid() } as u32;` consumes host parent PID in `self_ns_ppid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let host_ppid = unsafe { libc::getppid() } as u32;`."
+    "rationale": "guest answer: parent-PID fallback translates the carrier's host parent into the PPid reported to the Linux task"
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
     "line": 641,
     "kind": "host_identity",
     "text": "r.mark_execed(std::process::id());",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:641`, `r.mark_execed(std::process::id());` consumes host PID in `mark_self_execed` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `r.mark_execed(std::process::id());`."
+    "rationale": "guest answer: post-exec process-group rules mark the namespace member keyed by the carrier PID as having execed"
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
     "line": 652,
     "kind": "host_identity",
     "text": "r.is_execed_child_of(target_host_pid, std::process::id())",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:652`, `r.is_execed_child_of(target_host_pid, std::process::id())` consumes host PID in `is_execed_child_of_current` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `r.is_execed_child_of(target_host_pid, std::process::id())`."
+    "rationale": "guest answer: setpgid eligibility tests whether the guest target is an execed child of the carrier PID"
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
     "line": 667,
     "kind": "host_identity",
     "text": "register_child(std::process::id(), 0);",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:667`, `register_child(std::process::id(), 0);` consumes host PID in `join_existing` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `register_child(std::process::id(), 0);`."
+    "rationale": "guest answer: carrick exec registers the carrier PID as the new namespace member whose guest parent is outside the namespace"
   },
   {
     "file": "crates/carrick-runtime/src/namespace/supervisor.rs",
     "line": 179,
     "kind": "host_process_control",
     "text": "let rc = unsafe { libc::kill(pid, 0) };",
+    "operations": [
+      "libc::kill"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/namespace/supervisor.rs:179`, `let rc = unsafe { libc::kill(pid, 0) };` performs `host_pid_fully_gone`'s carrier-side host process-control operation; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `let rc = unsafe { libc::kill(pid, 0) };`."
+    "rationale": "authenticated carrier: liveness probing targets only a host PID read from an authenticated namespace-member slot before reclaiming its records"
   },
   {
     "file": "crates/carrick-runtime/src/namespace/supervisor.rs",
     "line": 241,
     "kind": "host_process_control",
     "text": "libc::killpg(init_host_pid, libc::SIGKILL);",
+    "operations": [
+      "libc::killpg"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/namespace/supervisor.rs:241`, `libc::killpg(init_host_pid, libc::SIGKILL);` performs `teardown`'s carrier-side host process-control operation; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `libc::killpg(init_host_pid, libc::SIGKILL);`."
+    "rationale": "authenticated carrier: namespace teardown sends SIGKILL only to the process group led by the supervisor's recorded init child"
   },
   {
     "file": "crates/carrick-runtime/src/namespace/supervisor.rs",
     "line": 257,
     "kind": "host_process_control",
     "text": "libc::kill(host as i32, libc::SIGKILL);",
+    "operations": [
+      "libc::kill"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/namespace/supervisor.rs:257`, `libc::kill(host as i32, libc::SIGKILL);` performs `teardown`'s carrier-side host process-control operation; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `libc::kill(host as i32, libc::SIGKILL);`."
-  },
-  {
-    "file": "crates/carrick-runtime/src/namespace/supervisor.rs",
-    "line": 435,
-    "kind": "host_process_control",
-    "text": "let child = unsafe { libc::fork() };",
-    "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/namespace/supervisor.rs:435`, `let child = unsafe { libc::fork() };` performs `member_exit_status_harvested_from_poll_event`'s carrier-side host process-control operation; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `let child = unsafe { libc::fork() };`."
-  },
-  {
-    "file": "crates/carrick-runtime/src/namespace/supervisor.rs",
-    "line": 500,
-    "kind": "host_process_control",
-    "text": "let child = unsafe { libc::fork() };",
-    "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/namespace/supervisor.rs:500`, `let child = unsafe { libc::fork() };` performs `fully_gone_distinguishes_zombie_from_reaped`'s carrier-side host process-control operation; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `let child = unsafe { libc::fork() };`."
-  },
-  {
-    "file": "crates/carrick-runtime/src/namespace/supervisor.rs",
-    "line": 511,
-    "kind": "host_process_control",
-    "text": "libc::waitid(",
-    "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/namespace/supervisor.rs:511`, `libc::waitid(` performs `fully_gone_distinguishes_zombie_from_reaped`'s carrier-side host process-control operation; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `libc::waitid(`."
-  },
-  {
-    "file": "crates/carrick-runtime/src/namespace/supervisor.rs",
-    "line": 525,
-    "kind": "carrier_substrate",
-    "text": "std::thread::sleep(Duration::from_millis(5));",
-    "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/namespace/supervisor.rs:525`, `std::thread::sleep(Duration::from_millis(5));` performs `fully_gone_distinguishes_zombie_from_reaped`'s carrier-side carrier substrate; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `std::thread::sleep(Duration::from_millis(5));`."
+    "rationale": "authenticated carrier: namespace teardown sends SIGKILL only to live host PIDs read from authenticated member slots"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 173,
     "kind": "ambient_filesystem",
     "text": "std::fs::write(&sidecar, buf).map_err(map_io_error)",
+    "operations": [
+      "std::fs::write"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:173`, `std::fs::write(&sidecar, buf).map_err(map_io_error)` performs `write_symlink_owner_sidecar`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `std::fs::write(&sidecar, buf).map_err(map_io_error)`."
+    "rationale": "authorized backing: writes owner metadata only to the sidecar derived from a capability-resolved symlink beneath the configured bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 185,
     "kind": "ambient_filesystem",
     "text": "let Ok(buf) = std::fs::read(&sidecar) else {",
+    "operations": [
+      "std::fs::read"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:185`, `let Ok(buf) = std::fs::read(&sidecar) else {` performs `read_symlink_owner_sidecar`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let Ok(buf) = std::fs::read(&sidecar) else {`."
+    "rationale": "authorized backing: reads owner metadata only from the sidecar derived from a capability-resolved symlink beneath the configured bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 375,
     "kind": "ambient_filesystem",
     "text": "std::fs::metadata(&host)",
+    "operations": [
+      "std::fs::metadata"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:375`, `std::fs::metadata(&host)` performs `lookup`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `std::fs::metadata(&host)`."
+    "rationale": "authorized backing: follows and stats only the host object produced by capability resolution beneath the configured bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 382,
     "kind": "ambient_filesystem",
     "text": "std::fs::symlink_metadata(&host)",
+    "operations": [
+      "std::fs::symlink_metadata"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:382`, `std::fs::symlink_metadata(&host)` performs `lookup_nofollow`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `std::fs::symlink_metadata(&host)`."
+    "rationale": "authorized backing: lstats only the host object produced by capability resolution beneath the configured bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 403,
     "kind": "ambient_filesystem",
     "text": "std::fs::read_link(&host).map_err(map_io_error)",
+    "operations": [
+      "std::fs::read_link"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:403`, `std::fs::read_link(&host).map_err(map_io_error)` performs `readlink`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `std::fs::read_link(&host).map_err(map_io_error)`."
+    "rationale": "authorized backing: reads a symlink target only from the capability-resolved object beneath the configured bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 408,
     "kind": "ambient_filesystem",
     "text": "std::fs::read(&host).map_err(map_io_error)",
+    "operations": [
+      "std::fs::read"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:408`, `std::fs::read(&host).map_err(map_io_error)` performs `read_file`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `std::fs::read(&host).map_err(map_io_error)`."
+    "rationale": "authorized backing: reads bytes only from the capability-resolved file beneath the configured bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 414,
     "kind": "ambient_filesystem",
     "text": "for entry in std::fs::read_dir(&host).map_err(map_io_error)? {",
+    "operations": [
+      "std::fs::read_dir"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:414`, `for entry in std::fs::read_dir(&host).map_err(map_io_error)? {` performs `readdir`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `for entry in std::fs::read_dir(&host).map_err(map_io_error)? {`."
+    "rationale": "authorized backing: enumerates only the capability-resolved directory beneath the configured bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 483,
     "kind": "ambient_filesystem",
     "text": "let existed_before_create = flags.create && std::fs::symlink_metadata(&host).is_ok();",
+    "operations": [
+      "std::fs::symlink_metadata"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:483`, `let existed_before_create = flags.create && std::fs::symlink_metadata(&host).is_ok();` performs `open`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let existed_before_create = flags.create && std::fs::symlink_metadata(&host).is_ok();`."
+    "rationale": "authorized backing: lstats only the capability-resolved open target to determine whether creation replaced an existing bind-root object"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 532,
     "kind": "ambient_filesystem",
     "text": "for entry in std::fs::read_dir(&host).map_err(map_io_error)? {",
+    "operations": [
+      "std::fs::read_dir"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:532`, `for entry in std::fs::read_dir(&host).map_err(map_io_error)? {` performs `watch_fds`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `for entry in std::fs::read_dir(&host).map_err(map_io_error)? {`."
+    "rationale": "authorized backing: enumerates only the capability-resolved directory while collecting real watch descriptors beneath the bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 550,
     "kind": "ambient_filesystem",
     "text": "std::fs::create_dir(&host).map_err(map_io_error)?;",
+    "operations": [
+      "std::fs::create_dir"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:550`, `std::fs::create_dir(&host).map_err(map_io_error)?;` performs `mkdir`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `std::fs::create_dir(&host).map_err(map_io_error)?;`."
+    "rationale": "authorized backing: creates only the capability-resolved directory beneath the configured writable bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 553,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode));",
+    "operations": [
+      "std::fs::set_permissions"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:553`, `let _ = std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode));` performs `mkdir`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let _ = std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode));`."
+    "rationale": "authorized backing: applies the guest mode only to the just-created capability-resolved directory beneath the bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 589,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(&sidecar);",
+    "operations": [
+      "std::fs::remove_file"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:589`, `let _ = std::fs::remove_file(&sidecar);` performs `unlink`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let _ = std::fs::remove_file(&sidecar);`."
+    "rationale": "authorized backing: unlink cleanup removes only the owner sidecar derived from the selected bind-root symlink"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 591,
     "kind": "ambient_filesystem",
     "text": "std::fs::remove_file(&host).map_err(map_io_error)",
+    "operations": [
+      "std::fs::remove_file"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:591`, `std::fs::remove_file(&host).map_err(map_io_error)` performs `unlink`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `std::fs::remove_file(&host).map_err(map_io_error)`."
+    "rationale": "authorized backing: unlinks only the capability-resolved file selected beneath the configured writable bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 606,
     "kind": "ambient_filesystem",
     "text": "std::fs::remove_dir(&host).map_err(map_io_error)",
+    "operations": [
+      "std::fs::remove_dir"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:606`, `std::fs::remove_dir(&host).map_err(map_io_error)` performs `rmdir`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `std::fs::remove_dir(&host).map_err(map_io_error)`."
+    "rationale": "authorized backing: removes only the capability-resolved directory selected beneath the configured writable bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 621,
     "kind": "ambient_filesystem",
     "text": "std::fs::rename(&host_from, &host_to).map_err(map_io_error)?;",
+    "operations": [
+      "std::fs::rename"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:621`, `std::fs::rename(&host_from, &host_to).map_err(map_io_error)?;` performs `rename`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `std::fs::rename(&host_from, &host_to).map_err(map_io_error)?;`."
+    "rationale": "authorized backing: renames only the capability-resolved source and destination objects within the configured writable bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 632,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::rename(&src, &dst);",
+    "operations": [
+      "std::fs::rename"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:632`, `let _ = std::fs::rename(&src, &dst);` performs `rename`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let _ = std::fs::rename(&src, &dst);`."
+    "rationale": "authorized backing: moves only the source owner sidecar to the destination sidecar paired with the authorized bind-root rename"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 634,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(&dst);",
+    "operations": [
+      "std::fs::remove_file"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:634`, `let _ = std::fs::remove_file(&dst);` performs `rename`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let _ = std::fs::remove_file(&dst);`."
+    "rationale": "authorized backing: removes only the stale destination owner sidecar paired with the authorized bind-root rename"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 654,
     "kind": "ambient_filesystem",
     "text": "std::fs::hard_link(&host_from, &host_to).map_err(map_io_error)",
+    "operations": [
+      "std::fs::hard_link"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:654`, `std::fs::hard_link(&host_from, &host_to).map_err(map_io_error)` performs `link`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `std::fs::hard_link(&host_from, &host_to).map_err(map_io_error)`."
+    "rationale": "authorized backing: hard-links only capability-resolved source and destination objects within the configured writable bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 663,
     "kind": "ambient_filesystem",
     "text": "std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode)).map_err(map_io_error)",
+    "operations": [
+      "std::fs::set_permissions"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:663`, `std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode)).map_err(map_io_error)` performs `chmod`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode)).map_err(map_io_error)`."
+    "rationale": "authorized backing: applies the guest mode only to the capability-resolved object beneath the configured writable bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 679,
     "kind": "ambient_filesystem",
     "text": "let file = std::fs::OpenOptions::new()",
+    "operations": [
+      "std::fs::OpenOptions::new"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:679`, `let file = std::fs::OpenOptions::new()` performs `create_socket`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let file = std::fs::OpenOptions::new()`."
+    "rationale": "authorized backing: opens only the capability-resolved socket-marker file selected beneath the configured writable bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 709,
     "kind": "ambient_filesystem",
     "text": "std::fs::symlink_metadata(&host)",
+    "operations": [
+      "std::fs::symlink_metadata"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:709`, `std::fs::symlink_metadata(&host)` performs `chown`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `std::fs::symlink_metadata(&host)`."
+    "rationale": "authorized backing: lstats only the capability-resolved chown target when the guest requests no symlink following"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 711,
     "kind": "ambient_filesystem",
     "text": "std::fs::metadata(&host)",
+    "operations": [
+      "std::fs::metadata"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:711`, `std::fs::metadata(&host)` performs `chown`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `std::fs::metadata(&host)`."
+    "rationale": "authorized backing: follows and stats only the capability-resolved chown target beneath the configured bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
     "line": 773,
     "kind": "ambient_filesystem",
     "text": "let file = std::fs::OpenOptions::new()",
+    "operations": [
+      "std::fs::OpenOptions::new"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:773`, `let file = std::fs::OpenOptions::new()` performs `truncate`'s host filesystem operation against its pre-authorized backing object; Carrick fixed that object before this call and guest input cannot widen the host authority. Concrete operation form: `let file = std::fs::OpenOptions::new()`."
+    "rationale": "authorized backing: opens only the capability-resolved writable file selected for guest truncate beneath the bind root"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/dev.rs",
     "line": 150,
     "kind": "host_identity",
     "text": "let index = table.insert(slave_name, std::process::id());",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/dev.rs:150`, `let index = table.insert(slave_name, std::process::id());` consumes host PID in `open` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let index = table.insert(slave_name, std::process::id());`."
+    "rationale": "guest answer: /dev/ptmx stores the carrier PID as PTY owner, controlling later guest slave lookup and release"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/devpts.rs",
     "line": 263,
     "kind": "host_identity",
     "text": "let index = table.insert(slave_name, std::process::id());",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/devpts.rs:263`, `let index = table.insert(slave_name, std::process::id());` consumes host PID in `open` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let index = table.insert(slave_name, std::process::id());`."
+    "rationale": "guest answer: /dev/pts/ptmx stores the carrier PID as PTY owner, controlling later guest slave lookup and release"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/etc_services.rs",
     "line": 92,
     "kind": "ambient_filesystem",
     "text": "if let Ok(host) = std::fs::read(\"/etc/services\")",
+    "operations": [
+      "std::fs::read"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/etc_services.rs:92`, `if let Ok(host) = std::fs::read(\"/etc/services\")` consumes host filesystem operation in `synthesize_etc_services` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `if let Ok(host) = std::fs::read(\"/etc/services\")`."
+    "rationale": "guest answer: bytes from the host /etc/services become the guest's /etc/services service-name and port database"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
     "line": 509,
     "kind": "host_identity",
     "text": "if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, limit.as_mut_ptr()) } != 0 {",
+    "operations": [
+      "libc::getrlimit"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:509`, `if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, limit.as_mut_ptr()) } != 0 {` consumes host resource limit in `host_rlimit_nproc` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, limit.as_mut_ptr()) } != 0 {`."
+    "rationale": "guest answer: the host RLIMIT_NPROC soft limit supplies the value rendered in guest /proc/sys/kernel/threads-max"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
     "line": 529,
     "kind": "ambient_filesystem",
     "text": "let raw = std::fs::read_to_string(\"/proc/sys/kernel/threads-max\").ok()?;",
+    "operations": [
+      "std::fs::read_to_string"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:529`, `let raw = std::fs::read_to_string(\"/proc/sys/kernel/threads-max\").ok()?;` consumes host filesystem operation in `host_kernel_threads_max` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let raw = std::fs::read_to_string(\"/proc/sys/kernel/threads-max\").ok()?;`."
+    "rationale": "guest answer: the Linux host's kernel threads-max file supplies the value rendered in guest /proc/sys/kernel/threads-max"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
     "line": 1220,
     "kind": "host_identity",
     "text": "return Some((true, std::process::id()));",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1220`, `return Some((true, std::process::id()));` consumes host PID in `proc_live_pid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `return Some((true, std::process::id()));`."
+    "rationale": "guest answer: /proc self aliases resolve to the carrier PID and expose that process as the live guest reader"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
     "line": 1228,
     "kind": "host_identity",
     "text": "Some((host == std::process::id(), host))",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1228`, `Some((host == std::process::id(), host))` consumes host PID in `proc_live_pid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `Some((host == std::process::id(), host))`."
+    "rationale": "guest answer: numeric /proc liveness compares the resolved host PID with the carrier PID to decide whether self-only files appear"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
     "line": 1620,
     "kind": "host_identity",
     "text": "let self_host_pid = std::process::id();",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1620`, `let self_host_pid = std::process::id();` consumes host PID in `synthetic_task_dir` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let self_host_pid = std::process::id();`."
+    "rationale": "guest answer: /proc task-directory rendering translates a registry TID only when it equals the carrier PID"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
     "line": 1650,
     "kind": "host_identity",
     "text": "if pid == std::process::id() {",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1650`, `if pid == std::process::id() {` consumes host PID in `synthetic_task_dir` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `if pid == std::process::id() {`."
+    "rationale": "guest answer: /proc task-directory liveness treats a PID equal to the carrier PID as the calling Linux task"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
     "line": 1686,
     "kind": "host_process_control",
     "text": "libc::waitid(",
+    "operations": [
+      "libc::waitid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1686`, `libc::waitid(` consumes host process-control operation in `host_child_exited_unreaped` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `libc::waitid(`."
+    "rationale": "guest answer: a host waitid peek decides whether a /proc PID remains visible as an exited but unreaped guest child"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
     "line": 1726,
     "kind": "host_identity",
     "text": "(std::process::id(), None)",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1726`, `(std::process::id(), None)` consumes host PID in `proc_pid_dir_host_pid` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `(std::process::id(), None)`."
+    "rationale": "guest answer: bare /proc/self and /proc/thread-self directories resolve to the carrier PID before guest liveness checks"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
     "line": 2014,
     "kind": "host_identity",
     "text": "proc_pid_dir_entries_for_known_process(path, host_pid == std::process::id())",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:2014`, `proc_pid_dir_entries_for_known_process(path, host_pid == std::process::id())` consumes host PID in `proc_pid_dir_entries` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `proc_pid_dir_entries_for_known_process(path, host_pid == std::process::id())`."
+    "rationale": "guest answer: /proc PID directory contents expose self-only entries when the resolved host PID equals the carrier PID"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
     "line": 3172,
     "kind": "host_identity",
     "text": "|| unsafe { libc::getppid() } as u32,",
+    "operations": [
+      "libc::getppid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3172`, `|| unsafe { libc::getppid() } as u32,` consumes host parent PID in `synthetic_proc_self_stat` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `|| unsafe { libc::getppid() } as u32,`."
+    "rationale": "guest answer: /proc/self/stat falls back to the host parent PID for its PPid field when no kernel identity is present"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
     "line": 3474,
     "kind": "host_identity",
     "text": "let ppid = unsafe { libc::getppid() } as u32;",
+    "operations": [
+      "libc::getppid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3474`, `let ppid = unsafe { libc::getppid() } as u32;` consumes host parent PID in `synthetic_proc_pid_file` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let ppid = unsafe { libc::getppid() } as u32;`."
+    "rationale": "guest answer: /proc task stat and status render the host parent PID as PPid for a locally registered thread"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
     "line": 3475,
     "kind": "host_identity",
     "text": "let me = std::process::id();",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3475`, `let me = std::process::id();` consumes host PID in `synthetic_proc_pid_file` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let me = std::process::id();`."
+    "rationale": "guest answer: /proc task stat and status render the carrier PID as the thread group's Tgid, process group, and session"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
     "line": 3525,
     "kind": "host_identity",
     "text": "let ppid = unsafe { libc::getppid() } as u32;",
+    "operations": [
+      "libc::getppid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3525`, `let ppid = unsafe { libc::getppid() } as u32;` consumes host parent PID in `synthetic_proc_pid_file` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let ppid = unsafe { libc::getppid() } as u32;`."
+    "rationale": "guest answer: published-process /proc stat and status fall back to the host parent PID for PPid"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
     "line": 3526,
     "kind": "host_identity",
     "text": "let me = std::process::id();",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3526`, `let me = std::process::id();` consumes host PID in `synthetic_proc_pid_file` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let me = std::process::id();`."
+    "rationale": "guest answer: published-process /proc stat and status render the carrier PID as Tgid, process group, and session"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
     "line": 3593,
     "kind": "host_identity",
     "text": "let fallback_ppid = std::process::id();",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3593`, `let fallback_ppid = std::process::id();` consumes host PID in `synthetic_proc_pid_file` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let fallback_ppid = std::process::id();`."
+    "rationale": "guest answer: peer /proc stat and status use the carrier PID as fallback PPid when host process information is unavailable"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
     "line": 3594,
     "kind": "host_identity",
     "text": "let fallback_pgid = unsafe { libc::getpgrp() as u32 };",
+    "operations": [
+      "libc::getpgrp"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3594`, `let fallback_pgid = unsafe { libc::getpgrp() as u32 };` consumes host process group in `synthetic_proc_pid_file` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `let fallback_pgid = unsafe { libc::getpgrp() as u32 };`."
+    "rationale": "guest answer: peer /proc stat falls back to the carrier's host process group for guest Pgrp and Session fields"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
     "line": 3664,
     "kind": "host_identity",
     "text": "\"self\" | \"thread-self\" => std::process::id(),",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3664`, `\"self\" | \"thread-self\" => std::process::id(),` consumes host PID in `parse_proc_pid_path` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `\"self\" | \"thread-self\" => std::process::id(),`."
+    "rationale": "guest answer: parsing the selected /proc self alias substitutes the carrier PID as the requested Linux PID"
   },
   {
     "file": "crates/carrick-runtime/src/vfs/resolvconf.rs",
     "line": 113,
     "kind": "ambient_filesystem",
     "text": "if let Ok(host) = std::fs::read_to_string(\"/etc/resolv.conf\") {",
+    "operations": [
+      "std::fs::read_to_string"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/resolvconf.rs:113`, `if let Ok(host) = std::fs::read_to_string(\"/etc/resolv.conf\") {` consumes host filesystem operation in `synthesize_resolv_conf` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `if let Ok(host) = std::fs::read_to_string(\"/etc/resolv.conf\") {`."
-  },
-  {
-    "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
-    "line": 19,
-    "kind": "carrier_substrate",
-    "text": "hv_vcpu_set_reg, hv_vcpu_t, hv_vcpus_exit, hv_vm_config_create,",
-    "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs:19`, `hv_vcpu_set_reg, hv_vcpu_t, hv_vcpus_exit, hv_vm_config_create,` is excluded from HVPatch release execution by the standalone Cargo `hvf_fork_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "guest answer: resolver directives read from host /etc/resolv.conf become the guest's synthesized DNS configuration"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
     "line": 101,
     "kind": "carrier_substrate",
     "text": "let stopper = std::thread::spawn(move || {",
+    "operations": [
+      "std::thread::spawn"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs:101`, `let stopper = std::thread::spawn(move || {` is excluded from HVPatch release execution by the standalone Cargo `hvf_fork_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_fork_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
     "line": 103,
     "kind": "carrier_substrate",
     "text": "unsafe { hv_vcpus_exit(&vcpu, 1) }",
+    "operations": [
+      "applevisor_sys::hv_vcpus_exit"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs:103`, `unsafe { hv_vcpus_exit(&vcpu, 1) }` is excluded from HVPatch release execution by the standalone Cargo `hvf_fork_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_fork_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
     "line": 295,
     "kind": "host_process_control",
     "text": "let pid = unsafe { libc::fork() };",
+    "operations": [
+      "libc::fork"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs:295`, `let pid = unsafe { libc::fork() };` is excluded from HVPatch release execution by the standalone Cargo `hvf_fork_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_fork_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
     "line": 487,
     "kind": "host_process_control",
     "text": "let pid = unsafe { libc::fork() };",
+    "operations": [
+      "libc::fork"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs:487`, `let pid = unsafe { libc::fork() };` is excluded from HVPatch release execution by the standalone Cargo `hvf_fork_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_fork_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
     "line": 597,
     "kind": "host_identity",
     "text": "let pid = unsafe { libc::getpid() };",
+    "operations": [
+      "libc::getpid"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs:597`, `let pid = unsafe { libc::getpid() };` is excluded from HVPatch release execution by the standalone Cargo `hvf_fork_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_fork_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
     "line": 598,
     "kind": "carrier_substrate",
     "text": "let sender = std::thread::spawn(move || {",
+    "operations": [
+      "std::thread::spawn"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs:598`, `let sender = std::thread::spawn(move || {` is excluded from HVPatch release execution by the standalone Cargo `hvf_fork_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_fork_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
     "line": 603,
     "kind": "host_process_control",
     "text": "libc::kill(pid, signum);",
+    "operations": [
+      "libc::kill"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs:603`, `libc::kill(pid, signum);` is excluded from HVPatch release execution by the standalone Cargo `hvf_fork_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_fork_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
     "line": 607,
     "kind": "carrier_substrate",
     "text": "std::thread::yield_now();",
+    "operations": [
+      "std::thread::yield_now"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs:607`, `std::thread::yield_now();` is excluded from HVPatch release execution by the standalone Cargo `hvf_fork_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_fork_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
     "line": 675,
     "kind": "host_process_control",
     "text": "let pid = unsafe { libc::fork() };",
+    "operations": [
+      "libc::fork"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs:675`, `let pid = unsafe { libc::fork() };` is excluded from HVPatch release execution by the standalone Cargo `hvf_fork_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_fork_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
     "line": 751,
     "kind": "host_process_control",
     "text": "let pid = unsafe { libc::fork() };",
+    "operations": [
+      "libc::fork"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs:751`, `let pid = unsafe { libc::fork() };` is excluded from HVPatch release execution by the standalone Cargo `hvf_fork_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_fork_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
     "line": 816,
     "kind": "host_process_control",
     "text": "let child = unsafe { libc::fork() };",
+    "operations": [
+      "libc::fork"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs:816`, `let child = unsafe { libc::fork() };` is excluded from HVPatch release execution by the standalone Cargo `hvf_fork_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_fork_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
     "line": 944,
     "kind": "carrier_substrate",
     "text": "std::thread::spawn(move || {",
+    "operations": [
+      "std::thread::spawn"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs:944`, `std::thread::spawn(move || {` is excluded from HVPatch release execution by the standalone Cargo `hvf_fork_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_fork_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
     "line": 996,
     "kind": "host_process_control",
     "text": "let pid = unsafe { libc::fork() };",
+    "operations": [
+      "libc::fork"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs:996`, `let pid = unsafe { libc::fork() };` is excluded from HVPatch release execution by the standalone Cargo `hvf_fork_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_fork_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
     "line": 1078,
     "kind": "host_process_control",
     "text": "unsafe { libc::kill(pid, libc::SIGKILL) };",
+    "operations": [
+      "libc::kill"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs:1078`, `unsafe { libc::kill(pid, libc::SIGKILL) };` is excluded from HVPatch release execution by the standalone Cargo `hvf_fork_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_fork_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
     "line": 1091,
     "kind": "carrier_substrate",
     "text": "std::thread::sleep(Duration::from_micros(micros));",
+    "operations": [
+      "std::thread::sleep"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs:1091`, `std::thread::sleep(Duration::from_micros(micros));` is excluded from HVPatch release execution by the standalone Cargo `hvf_fork_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_fork_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_kernel_memory_probe.rs",
     "line": 687,
     "kind": "carrier_substrate",
     "text": "workers.push(std::thread::spawn(move || {",
+    "operations": [
+      "std::thread::spawn"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_kernel_memory_probe.rs:687`, `workers.push(std::thread::spawn(move || {` is excluded from HVPatch release execution by the standalone Cargo `hvf_kernel_memory_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_kernel_memory_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_kernel_memory_probe.rs",
     "line": 935,
     "kind": "host_identity",
     "text": "\"pid\": std::process::id(),",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_kernel_memory_probe.rs:935`, `\"pid\": std::process::id(),` is excluded from HVPatch release execution by the standalone Cargo `hvf_kernel_memory_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_kernel_memory_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_svc_tax_probe.rs",
     "line": 387,
     "kind": "host_process_control",
     "text": "let child = unsafe { libc::fork() };",
+    "operations": [
+      "libc::fork"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_svc_tax_probe.rs:387`, `let child = unsafe { libc::fork() };` is excluded from HVPatch release execution by the standalone Cargo `hvf_svc_tax_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_svc_tax_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_svc_tax_probe.rs",
     "line": 462,
     "kind": "host_identity",
     "text": "std::process::id(),",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvf_svc_tax_probe.rs:462`, `std::process::id(),` is excluded from HVPatch release execution by the standalone Cargo `hvf_svc_tax_probe` binary target; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: the listed operation belongs only to the Cargo hvf_svc_tax_probe binary and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvpatch_probe_support/mod.rs",
     "line": 355,
     "kind": "host_identity",
     "text": "std::process::id(),",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvpatch_probe_support/mod.rs:355`, `std::process::id(),` is excluded from HVPatch release execution by the three standalone targets `hvf_info_load_probe`, `hvf_bl_exit_free_probe`, and `hvf_compute_baseline_probe`; this is migration debt, not a completion waiver."
+    "rationale": "standalone target exclusion: this support module is imported only by the hvf_info_load_probe, hvf_bl_exit_free_probe, and hvf_compute_baseline_probe binaries and is absent from the carrick product target"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
     "line": 249,
     "kind": "host_identity",
     "text": "owner_pid: unsafe { libc::getpid() },",
+    "operations": [
+      "libc::getpid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/host_signal.rs:249`, `owner_pid: unsafe { libc::getpid() },` performs `hold_for_fork`'s carrier-side host PID; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `owner_pid: unsafe { libc::getpid() },`."
+    "rationale": "authenticated carrier: the fork-hold guard records the current carrier PID so only its creating process releases the held signal state"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
     "line": 265,
     "kind": "host_identity",
     "text": "if unsafe { libc::getpid() } == self.owner_pid {",
+    "operations": [
+      "libc::getpid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/host_signal.rs:265`, `if unsafe { libc::getpid() } == self.owner_pid {` performs `drop`'s carrier-side host PID; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `if unsafe { libc::getpid() } == self.owner_pid {`."
+    "rationale": "authenticated carrier: guard drop compares the current carrier PID with its recorded owner before restoring that carrier's signal state"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
     "line": 488,
     "kind": "host_process_control",
     "text": "libc::waitid(",
+    "operations": [
+      "libc::waitid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/host_signal.rs:488`, `libc::waitid(` performs `publish_child_exit_if_waitable`'s carrier-side host process-control operation; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `libc::waitid(`."
+    "rationale": "authenticated carrier: exit publication peeks with waitid only at the recorded direct host child associated with a Carrick task"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
     "line": 1006,
     "kind": "host_process_control",
     "text": "libc::kill(target_host_pid, XSIG_NUDGE_HOST_SIGNUM);",
+    "operations": [
+      "libc::kill"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/host_signal.rs:1006`, `libc::kill(target_host_pid, XSIG_NUDGE_HOST_SIGNUM);` performs `xsig_nudge`'s carrier-side host process-control operation; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `libc::kill(target_host_pid, XSIG_NUDGE_HOST_SIGNUM);`."
+    "rationale": "authenticated carrier: xsig nudge signals only the recorded host recipient whose explicit-signal ring accepted the message"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
     "line": 1304,
     "kind": "host_identity",
     "text": "record_sender(signum, unsafe { libc::getpid() });",
+    "operations": [
+      "libc::getpid"
+    ],
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-vmm-hvf/src/host_signal.rs:1304`, `record_sender(signum, unsafe { libc::getpid() });` consumes host PID in `raise_for_self` to determine guest-visible process state; this host authority can alter the guest result, so it is explicit semantic debt. Concrete operation form: `record_sender(signum, unsafe { libc::getpid() });`."
+    "rationale": "guest answer: raise_for_self records the carrier PID as the sender PID later exposed in guest signal metadata"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/io_wait.rs",
     "line": 168,
     "kind": "host_process_control",
     "text": "libc::waitid(",
+    "operations": [
+      "libc::waitid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/io_wait.rs:168`, `libc::waitid(` performs `child_ptrace_trap_stop_ready`'s carrier-side host process-control operation; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `libc::waitid(`."
+    "rationale": "authenticated carrier: ptrace-stop readiness peeks with waitid only at the exact recorded host child"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/io_wait.rs",
     "line": 188,
     "kind": "host_identity",
     "text": "crate::guest_cpu::direct_children_for_wait(std::process::id())",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/io_wait.rs:188`, `crate::guest_cpu::direct_children_for_wait(std::process::id())` performs `any_direct_child_ptrace_trap_stop_ready`'s carrier-side host PID; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `crate::guest_cpu::direct_children_for_wait(std::process::id())`."
+    "rationale": "authenticated carrier: any-child ptrace readiness enumerates only direct host children of the current VM carrier"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/io_wait.rs",
     "line": 217,
     "kind": "host_identity",
     "text": "&& (crate::guest_cpu::direct_child_ptrace_stop_pending(std::process::id())",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/io_wait.rs:217`, `&& (crate::guest_cpu::direct_child_ptrace_stop_pending(std::process::id())` performs `child_status_ready`'s carrier-side host PID; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `&& (crate::guest_cpu::direct_child_ptrace_stop_pending(std::process::id())`."
+    "rationale": "authenticated carrier: child-status readiness queries ptrace-stop state only for direct host children of the current VM carrier"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/io_wait.rs",
     "line": 229,
     "kind": "host_process_control",
     "text": "libc::waitid(",
+    "operations": [
+      "libc::waitid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/io_wait.rs:229`, `libc::waitid(` performs `child_status_ready`'s carrier-side host process-control operation; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `libc::waitid(`."
+    "rationale": "authenticated carrier: child-status readiness peeks with waitid only at the exact host child selected by Carrick's wait state"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/io_wait.rs",
     "line": 906,
     "kind": "host_identity",
     "text": "let cap = (host_direct_children_for_wait(std::process::id()).len()",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/io_wait.rs:906`, `let cap = (host_direct_children_for_wait(std::process::id()).len()` performs `wait_proc_exit_any_kqueue`'s carrier-side host PID; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `let cap = (host_direct_children_for_wait(std::process::id()).len()`."
+    "rationale": "authenticated carrier: any-child kqueue waiting sizes its watch set from direct host children of the current VM carrier"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/io_wait.rs",
     "line": 914,
     "kind": "host_identity",
     "text": "for child in host_direct_children_for_wait(std::process::id()) {",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/io_wait.rs:914`, `for child in host_direct_children_for_wait(std::process::id()) {` performs `wait_proc_exit_any_kqueue`'s carrier-side host PID; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `for child in host_direct_children_for_wait(std::process::id()) {`."
+    "rationale": "authenticated carrier: any-child kqueue waiting arms process-exit watches only for direct host children of the current VM carrier"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/itimer.rs",
     "line": 20,
     "kind": "carrier_substrate",
     "text": "let _ = std::thread::Builder::new()",
+    "operations": [
+      "std::thread::Builder::new"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/itimer.rs:20`, `let _ = std::thread::Builder::new()` performs `spawn_fallback_timer`'s carrier-side carrier substrate; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `let _ = std::thread::Builder::new()`."
+    "rationale": "authenticated carrier: creates the dedicated host helper thread that publishes this carrier's modeled interval-timer expirations"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/posix_timer.rs",
     "line": 30,
     "kind": "carrier_substrate",
     "text": "let _ = std::thread::Builder::new()",
+    "operations": [
+      "std::thread::Builder::new"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/posix_timer.rs:30`, `let _ = std::thread::Builder::new()` performs `arm`'s carrier-side carrier substrate; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `let _ = std::thread::Builder::new()`."
+    "rationale": "authenticated carrier: creates the dedicated host helper thread that publishes the selected Carrick POSIX timer's expirations"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 378,
     "kind": "host_identity",
     "text": "std::process::id()",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:378`, `std::process::id()` supplies the carrier PID only as the unique name for `create_exec_private_file_artifact`; the private artifact is carrier-owned backing and guest data cannot select its host path. Concrete operation form: `std::process::id()`."
+    "rationale": "authorized backing: uses the carrier PID only to make the private executable staging artifact's host name unique"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 380,
     "kind": "ambient_filesystem",
     "text": "let file = std::fs::OpenOptions::new()",
+    "operations": [
+      "std::fs::OpenOptions::new"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:380`, `let file = std::fs::OpenOptions::new()` creates the unique carrier-private executable artifact; Carrick derived its path from carrier state and guest data cannot select another host file. Concrete operation form: `let file = std::fs::OpenOptions::new()`."
+    "rationale": "authorized backing: creates only the carrier-derived private executable staging artifact used for the current exec image"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 386,
     "kind": "ambient_filesystem",
     "text": "if let Err(error) = std::fs::remove_file(&path) {",
+    "operations": [
+      "std::fs::remove_file"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:386`, `if let Err(error) = std::fs::remove_file(&path) {` unlinks the just-created carrier-private executable artifact after opening it; cleanup is confined to that carrier-derived path. Concrete operation form: `if let Err(error) = std::fs::remove_file(&path) {`."
+    "rationale": "authorized backing: unlinks only the just-opened private executable staging artifact from its carrier-derived path"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 388,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(&path);",
+    "operations": [
+      "std::fs::remove_file"
+    ],
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:388`, `let _ = std::fs::remove_file(&path);` retries cleanup after private-artifact creation failed; it can unlink only the same carrier-derived path. Concrete operation form: `let _ = std::fs::remove_file(&path);`."
+    "rationale": "authorized backing: error cleanup retries unlink only for the same carrier-derived executable staging path"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 1779,
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() },",
+    "operations": [
+      "libc::getpid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:1779`, `unsafe { libc::getpid() },` is the admission first-park diagnostic for the current VM carrier; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `unsafe { libc::getpid() },`."
+    "rationale": "authenticated carrier: records the current VM carrier PID in the first-park vCPU-admission diagnostic"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 1794,
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() },",
+    "operations": [
+      "libc::getpid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:1794`, `unsafe { libc::getpid() },` is the admission-exhausted diagnostic for the current VM carrier; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `unsafe { libc::getpid() },`."
+    "rationale": "authenticated carrier: records the current VM carrier PID in the exhausted vCPU-admission diagnostic"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 1839,
     "kind": "carrier_substrate",
     "text": "std::thread::sleep(backoff.next_delay());",
+    "operations": [
+      "std::thread::sleep"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:1839`, `std::thread::sleep(backoff.next_delay());` is the atomic vCPU-permit backoff sleep for the current VM carrier; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `std::thread::sleep(backoff.next_delay());`."
+    "rationale": "authenticated carrier: parks only the current VM carrier's admission worker during bounded vCPU-capacity backoff"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 2447,
     "kind": "host_identity",
     "text": "match region.acquire(atomic_permit_slot::MAX_SLOTS, std::process::id()) {",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2447`, `match region.acquire(atomic_permit_slot::MAX_SLOTS, std::process::id()) {` is the VM-residency ownership key for the current carrier VM; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `match region.acquire(atomic_permit_slot::MAX_SLOTS, std::process::id()) {`."
+    "rationale": "authenticated carrier: uses the current carrier PID as the ownership key for this VM's residency-table slot"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 2451,
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() }",
+    "operations": [
+      "libc::getpid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2451`, `unsafe { libc::getpid() }` is the VM-residency-table-full diagnostic for the current carrier; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `unsafe { libc::getpid() }`."
+    "rationale": "authenticated carrier: records the current carrier PID only in the VM-residency-table-full diagnostic"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 2525,
     "kind": "host_identity",
     "text": "let pid = std::process::id();",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2525`, `let pid = std::process::id();` is the global vCPU-permit owner key for the current carrier; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `let pid = std::process::id();`."
+    "rationale": "authenticated carrier: uses the current carrier PID as owner of this VM's global vCPU permit"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 2543,
     "kind": "carrier_substrate",
     "text": "std::thread::sleep(backoff.next_delay());",
+    "operations": [
+      "std::thread::sleep"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2543`, `std::thread::sleep(backoff.next_delay());` is the global vCPU-permit backoff sleep for the current carrier; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `std::thread::sleep(backoff.next_delay());`."
+    "rationale": "authenticated carrier: parks only the current VM carrier's worker while retrying its global vCPU permit"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 2682,
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() },",
+    "operations": [
+      "libc::getpid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2682`, `unsafe { libc::getpid() },` is the HV_NO_RESOURCES recovery diagnostic for the current carrier; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `unsafe { libc::getpid() },`."
+    "rationale": "authenticated carrier: records the current carrier PID in the first HV_NO_RESOURCES recovery diagnostic"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 2693,
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() },",
+    "operations": [
+      "libc::getpid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2693`, `unsafe { libc::getpid() },` is the HV_NO_RESOURCES retry diagnostic for the current carrier; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `unsafe { libc::getpid() },`."
+    "rationale": "authenticated carrier: records the current carrier PID in the HV_NO_RESOURCES retry diagnostic"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 2703,
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() },",
+    "operations": [
+      "libc::getpid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2703`, `unsafe { libc::getpid() },` is the terminal HV_NO_RESOURCES diagnostic for the current carrier; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `unsafe { libc::getpid() },`."
+    "rationale": "authenticated carrier: records the current carrier PID in the terminal HV_NO_RESOURCES diagnostic"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 2860,
     "kind": "host_identity",
     "text": "let pid = std::process::id();",
+    "operations": [
+      "std::process::id"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2860`, `let pid = std::process::id();` is the VM-slot-probe permit owner key for the current carrier; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `let pid = std::process::id();`."
+    "rationale": "authenticated carrier: uses the current carrier PID as owner of the VM-slot probe's temporary vCPU permit"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 2879,
     "kind": "carrier_substrate",
     "text": "std::thread::sleep(backoff.next_delay());",
+    "operations": [
+      "std::thread::sleep"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2879`, `std::thread::sleep(backoff.next_delay());` is the VM-slot-probe backoff sleep for the current carrier; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `std::thread::sleep(backoff.next_delay());`."
+    "rationale": "authenticated carrier: parks only the VM-slot probe worker while retrying its temporary vCPU permit"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 3024,
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() },",
+    "operations": [
+      "libc::getpid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:3024`, `unsafe { libc::getpid() },` is the debug-only kick-statistics provenance field; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `unsafe { libc::getpid() },`."
+    "rationale": "authenticated carrier: records the current carrier PID only in the opt-in vCPU-kick statistics diagnostic"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 10882,
     "kind": "host_identity",
     "text": "crate::probes::fork_quiesce(3, rc as i64, vcpu.id() as i64, unsafe { libc::getpid() });",
+    "operations": [
+      "libc::getpid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:10882`, `crate::probes::fork_quiesce(3, rc as i64, vcpu.id() as i64, unsafe { libc::getpid() });` is the fork-quiesce USDT carrier provenance field; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `crate::probes::fork_quiesce(3, rc as i64, vcpu.id() as i64, unsafe { libc::getpid() });`."
+    "rationale": "authenticated carrier: publishes the current carrier PID as provenance on the fork-quiesce failure USDT event"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 11105,
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() },",
+    "operations": [
+      "libc::getpid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:11105`, `unsafe { libc::getpid() },` is the post-teardown fork-quiesce USDT carrier provenance field; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `unsafe { libc::getpid() },`."
+    "rationale": "authenticated carrier: publishes the current carrier PID as provenance on the post-teardown fork-quiesce USDT event"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 11456,
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() }",
+    "operations": [
+      "libc::getpid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:11456`, `unsafe { libc::getpid() }` is the post-rebuild fork-post USDT parent-carrier provenance field; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `unsafe { libc::getpid() }`."
+    "rationale": "authenticated carrier: publishes the current parent-carrier PID as provenance on the post-rebuild fork USDT event"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 13398,
     "kind": "host_identity",
     "text": "libc::getpid()",
+    "operations": [
+      "libc::getpid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:13398`, `libc::getpid()` is the direct-EL0 vCPU-fault USDT carrier provenance argument; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `libc::getpid()`."
+    "rationale": "authenticated carrier: publishes the current carrier PID only as provenance on a direct-EL0 vCPU-fault USDT event"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 13444,
     "kind": "host_identity",
     "text": "pid = unsafe { libc::getpid() },",
+    "operations": [
+      "libc::getpid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:13444`, `pid = unsafe { libc::getpid() },` is the EL1-resume panic-log carrier provenance field; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `pid = unsafe { libc::getpid() },`."
+    "rationale": "authenticated carrier: records the current carrier PID only in the EL1-resume failure panic diagnostic"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
     "line": 13485,
     "kind": "host_identity",
     "text": "libc::getpid()",
+    "operations": [
+      "libc::getpid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:13485`, `libc::getpid()` is the HVC-path vCPU-fault USDT carrier provenance argument; Carrick owns this carrier-side resource, and no guest identifier selects its host target. Concrete operation form: `libc::getpid()`."
+    "rationale": "authenticated carrier: publishes the current carrier PID only as provenance on an HVC-path vCPU-fault USDT event"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/vcpu_kick.rs",
     "line": 99,
     "kind": "carrier_substrate",
     "text": "unsafe { applevisor_sys::hv_vcpus_exit(ids.as_ptr(), ids.len() as u32) }",
+    "operations": [
+      "applevisor_sys::hv_vcpus_exit"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/vcpu_kick.rs:99`, `unsafe { applevisor_sys::hv_vcpus_exit(ids.as_ptr(), ids.len() as u32) }` performs `kick_ids`'s carrier-side carrier substrate; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `unsafe { applevisor_sys::hv_vcpus_exit(ids.as_ptr(), ids.len() as u32) }`."
+    "rationale": "authenticated carrier: exits only HVF vCPU IDs obtained from Carrick's live vCPU registry for this VM"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/vcpu_kick.rs",
     "line": 317,
     "kind": "carrier_substrate",
     "text": "let handle = std::thread::Builder::new()",
+    "operations": [
+      "std::thread::Builder::new"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/vcpu_kick.rs:317`, `let handle = std::thread::Builder::new()` performs `spawn_signal_pump_inner`'s carrier-side carrier substrate; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `let handle = std::thread::Builder::new()`."
+    "rationale": "authenticated carrier: creates the dedicated signal-pump thread for this VM carrier's registered vCPUs"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs",
     "line": 74,
     "kind": "host_process_control",
     "text": "libc::waitid(",
+    "operations": [
+      "libc::waitid"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs:74`, `libc::waitid(` performs `pid_confirmed_dead`'s carrier-side host process-control operation; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `libc::waitid(`."
+    "rationale": "authenticated carrier: permit reclamation peeks with waitid only at the recorded host process that owns the permit slot"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs",
     "line": 107,
     "kind": "host_process_control",
     "text": "let rc = unsafe { libc::kill(pid, 0) };",
+    "operations": [
+      "libc::kill"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs:107`, `let rc = unsafe { libc::kill(pid, 0) };` performs `pid_is_gone`'s carrier-side host process-control operation; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `let rc = unsafe { libc::kill(pid, 0) };`."
+    "rationale": "authenticated carrier: permit reclamation probes liveness only for the recorded host PID that owns the permit slot"
   },
   {
     "file": "crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs",
     "line": 346,
     "kind": "carrier_substrate",
     "text": "if let Err(err) = std::thread::Builder::new()",
+    "operations": [
+      "std::thread::Builder::new"
+    ],
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs:346`, `if let Err(err) = std::thread::Builder::new()` performs `spawn_reaper`'s carrier-side carrier substrate; Carrick created that resource and no guest identifier can select its host target. Concrete operation form: `if let Err(err) = std::thread::Builder::new()`."
+    "rationale": "authenticated carrier: creates the process-wide helper thread that reclaims permits from authenticated dead carrier owners"
   }
 ]
