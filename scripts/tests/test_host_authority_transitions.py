@@ -84,7 +84,7 @@ def actual_row(
     location: dict[str, object] | None = None,
     expansion: dict[str, object] | None = None,
     profiles: list[str] | None = None,
-    catalog_id: str | None = None,
+    catalog_id: str | None = "HA-CATALOG-PROCESS-ID",
 ):
     return {
         "catalog_id": catalog_id,
@@ -102,7 +102,7 @@ def reviewed_row(
     location: dict[str, object] | None = None,
     expansion: dict[str, object] | None = None,
     profiles: list[str] | None = None,
-    catalog_id: str | None = None,
+    catalog_id: str | None = "HA-CATALOG-PROCESS-ID",
     classification: str = "forbidden_semantic",
     evidence: dict[str, object] | None = None,
     rationale: str = (
@@ -164,9 +164,12 @@ class DiagnosticNormalizationTest(unittest.TestCase):
     def setUp(self):
         self.host_authority = load_host_authority()
 
-    def normalize(self, messages):
+    def normalize(self, messages, *, allow_missing_catalog_id=True):
         return self.host_authority.normalize_messages(
-            messages, "macos-hvf-default", ROOT
+            messages,
+            "macos-hvf-default",
+            ROOT,
+            allow_missing_catalog_id=allow_missing_catalog_id,
         )
 
     def test_recorded_messages_normalize_all_resolved_operations(self):
@@ -234,6 +237,24 @@ class DiagnosticNormalizationTest(unittest.TestCase):
         )[0]
         self.assertEqual(row["catalog_id"], "HA-CATALOG-PROCESS-ID")
 
+    def test_production_normalization_requires_catalog_reason_by_default(self):
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "catalog ID"):
+            self.host_authority.normalize_messages(
+                [diagnostic()], "macos-hvf-default", ROOT
+            )
+
+    def test_rejects_unstable_catalog_reason_id_syntax(self):
+        message = diagnostic(
+            children=[
+                {
+                    "level": "note",
+                    "message": "HA-CATALOG-PROCESS-ID-lower: invalid stable ID",
+                }
+            ]
+        )
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "catalog"):
+            self.normalize([message], allow_missing_catalog_id=False)
+
     def test_normalizes_outermost_workspace_macro_callsite(self):
         expansion = {
             "span": {
@@ -245,13 +266,24 @@ class DiagnosticNormalizationTest(unittest.TestCase):
                     byte_end=220,
                 ),
                 "expansion": {
-                    "span": compiler_span(
-                        "ROOT/crates/example/src/caller.rs",
-                        30,
-                        9,
-                        byte_start=300,
-                        byte_end=330,
-                    )
+                    "span": {
+                        **compiler_span(
+                            "/private/tmp/cargo-registry/dependency-macro.rs",
+                            25,
+                            3,
+                            byte_start=250,
+                            byte_end=270,
+                        ),
+                        "expansion": {
+                            "span": compiler_span(
+                                "ROOT/crates/example/src/caller.rs",
+                                30,
+                                9,
+                                byte_start=300,
+                                byte_end=330,
+                            )
+                        },
+                    }
                 },
             }
         }
@@ -267,6 +299,32 @@ class DiagnosticNormalizationTest(unittest.TestCase):
                 byte_end=330,
             ),
         )
+
+    def test_rejects_expansion_chain_with_no_workspace_callsite(self):
+        expansion = {
+            "span": {
+                **compiler_span(
+                    "/private/tmp/cargo-registry/dependency-macro.rs",
+                    25,
+                    3,
+                    byte_start=250,
+                    byte_end=270,
+                ),
+                "expansion": {
+                    "span": compiler_span(
+                        "/private/tmp/cargo-registry/outer-macro.rs",
+                        40,
+                        4,
+                        byte_start=400,
+                        byte_end=440,
+                    )
+                },
+            }
+        }
+        with self.assertRaisesRegex(
+            self.host_authority.InventoryError, "no workspace callsite"
+        ):
+            self.normalize([diagnostic(expansion=expansion)])
 
     def test_rejects_missing_malformed_and_reversed_span_coordinates(self):
         cases = {}
@@ -309,6 +367,21 @@ class DiagnosticNormalizationTest(unittest.TestCase):
         message["message"]["message"] = "disallowed host operation changed shape"
         with self.assertRaisesRegex(self.host_authority.InventoryError, "operation"):
             self.normalize([message])
+
+    def test_disallowed_message_shape_with_missing_or_renamed_code_fails_closed(self):
+        missing = diagnostic()
+        del missing["message"]["code"]
+        renamed = diagnostic()
+        renamed["message"]["code"] = {
+            "code": "clippy::renamed_disallowed_methods",
+            "explanation": None,
+        }
+        for label, message in (("missing", missing), ("renamed", renamed)):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    self.host_authority.InventoryError, "interface drift"
+                ):
+                    self.normalize([message])
 
     def test_rejects_missing_primary_span(self):
         with self.assertRaisesRegex(self.host_authority.InventoryError, "primary span"):
@@ -388,7 +461,7 @@ class ReviewValidationTest(unittest.TestCase):
     def setUp(self):
         self.host_authority = load_host_authority()
         self.executed = ["macos-hvf-default"]
-        self.required = ["macos-hvf-default"]
+        self.required = ["linux-runtime", "macos-hvf-default"]
 
     def validate(self, actual, expected):
         self.host_authority.validate(actual, expected, self.executed, self.required)
@@ -396,18 +469,64 @@ class ReviewValidationTest(unittest.TestCase):
     def test_accepts_exact_review_shape(self):
         self.validate([actual_row()], [reviewed_row()])
 
+    def test_missing_catalog_id_requires_explicit_fixture_policy(self):
+        actual = [actual_row(catalog_id=None)]
+        expected = [reviewed_row(catalog_id=None)]
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "catalog ID"):
+            self.validate(actual, expected)
+        self.host_authority.validate(
+            actual,
+            expected,
+            self.executed,
+            self.required,
+            allow_missing_catalog_id=True,
+        )
+
     def test_partial_check_compares_only_executed_profile_membership(self):
         expected = reviewed_row(profiles=["linux-runtime", "macos-hvf-default"])
         self.validate([actual_row()], [expected])
 
-    def test_rejects_missing_executed_profile(self):
-        with self.assertRaisesRegex(self.host_authority.InventoryError, "profile"):
+    def test_accepts_nonempty_executed_subset_of_required_profiles(self):
+        self.host_authority.validate(
+            [actual_row()],
+            [reviewed_row()],
+            ["macos-hvf-default"],
+            ["linux-runtime", "macos-hvf-default"],
+        )
+
+    def test_rejects_executed_profile_outside_required_profiles(self):
+        with self.assertRaisesRegex(
+            self.host_authority.InventoryError, "outside required"
+        ):
             self.host_authority.validate(
                 [actual_row()],
                 [reviewed_row()],
+                ["macos-hvf-default", "undeclared-profile"],
                 ["macos-hvf-default"],
-                ["macos-hvf-default", "macos-runtime-default"],
             )
+
+    def test_rejects_actual_or_expected_profile_outside_required_profiles(self):
+        cases = {
+            "actual": (
+                [actual_row(profiles=["undeclared-profile"])],
+                [reviewed_row()],
+            ),
+            "expected": (
+                [actual_row()],
+                [reviewed_row(profiles=["undeclared-profile"])],
+            ),
+        }
+        for label, (actual, expected) in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    self.host_authority.InventoryError, "outside required"
+                ):
+                    self.host_authority.validate(
+                        actual,
+                        expected,
+                        ["macos-hvf-default"],
+                        ["macos-hvf-default"],
+                    )
 
     def test_rejects_new_removed_and_retargeted_rows(self):
         cases = {
@@ -545,17 +664,22 @@ class RefreshTest(unittest.TestCase):
             [{**old, "profiles": ["linux-runtime", "macos-hvf-default"]}],
         )
 
+    def test_catalog_id_is_part_of_exact_review_identity(self):
+        old = reviewed_row(catalog_id="HA-CATALOG-PROCESS-ID")
+        changed = actual_row(catalog_id="HA-CATALOG-PROCESS-ID-V2")
+        self.assertNotEqual(
+            self.host_authority.diagnostic_identity(old),
+            self.host_authority.diagnostic_identity(changed),
+        )
+
     def test_same_start_changed_end_span_does_not_inherit_review(self):
         changed_end = actual_row(location=source(byte_end=121))
-        row = self.host_authority.refresh(
-            [changed_end], [reviewed_row(review_id="HA-000003")], True
-        )[0]
-        self.assertEqual(row["source"]["byte_start"], 100)
-        self.assertEqual(row["source"]["line_start"], 10)
-        self.assertEqual(row["source"]["column_start"], 5)
-        self.assertEqual(row["source"]["byte_end"], 121)
-        self.assertEqual(row["review_id"], "HA-000004")
-        self.assertEqual(row["classification"], "unreviewed")
+        with self.assertRaisesRegex(
+            self.host_authority.InventoryError, "missing expected identity"
+        ):
+            self.host_authority.refresh(
+                [changed_end], [reviewed_row(review_id="HA-000003")], True
+            )
 
     def test_changed_operation_source_or_expansion_never_inherits_review(self):
         changed = [
@@ -573,16 +697,29 @@ class RefreshTest(unittest.TestCase):
         ]
         for actual in changed:
             with self.subTest(actual=actual):
-                row = self.host_authority.refresh(
-                    [actual], [reviewed_row(review_id="HA-000003")], True
-                )[0]
-                self.assertEqual(row["review_id"], "HA-000004")
-                self.assertEqual(row["classification"], "unreviewed")
-                self.assertEqual(row["evidence"], {})
-                self.assertEqual(row["rationale"], "")
+                with self.assertRaisesRegex(
+                    self.host_authority.InventoryError, "missing expected identity"
+                ):
+                    self.host_authority.refresh(
+                        [actual], [reviewed_row(review_id="HA-000003")], True
+                    )
 
-    def test_complete_refresh_drops_removed_rows(self):
-        self.assertEqual(self.host_authority.refresh([], [reviewed_row()], True), [])
+    def test_catalog_id_change_cannot_inherit_or_implicitly_remove_review(self):
+        changed = actual_row(catalog_id="HA-CATALOG-PROCESS-ID-V2")
+        with self.assertRaisesRegex(
+            self.host_authority.InventoryError, "missing expected identity"
+        ):
+            self.host_authority.refresh(
+                [changed],
+                [reviewed_row(catalog_id="HA-CATALOG-PROCESS-ID")],
+                True,
+            )
+
+    def test_complete_refresh_rejects_removed_reviewed_rows(self):
+        with self.assertRaisesRegex(
+            self.host_authority.InventoryError, "missing expected identity"
+        ):
+            self.host_authority.refresh([], [reviewed_row()], True)
 
     def test_partial_refresh_fails_closed(self):
         with self.assertRaisesRegex(self.host_authority.InventoryError, "partial"):
