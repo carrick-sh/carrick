@@ -337,6 +337,8 @@ pub struct RuntimeNetwork {
     pub(crate) model: model::LinuxNetworkModel,
     pub provider: Box<dyn NetworkProvider>,
     pub lease: NetworkLease,
+    #[allow(dead_code)]
+    pub(crate) unix_sockets: std::sync::Arc<crate::dispatch::net::unix_pure::UnixSocketRegistry>,
 }
 
 /// Give a bridge namespace an identity no other instance can hold, once, in the
@@ -402,6 +404,9 @@ impl RuntimeNetwork {
             model,
             provider,
             lease,
+            unix_sockets: std::sync::Arc::new(
+                crate::dispatch::net::unix_pure::UnixSocketRegistry::new(),
+            ),
         })
     }
 
@@ -415,6 +420,9 @@ impl RuntimeNetwork {
             lease: NetworkLease {
                 id: NetworkLeaseId(0),
             },
+            unix_sockets: std::sync::Arc::new(
+                crate::dispatch::net::unix_pure::UnixSocketRegistry::new(),
+            ),
         }
     }
 
