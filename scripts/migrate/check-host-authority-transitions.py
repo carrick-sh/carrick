@@ -30,7 +30,10 @@ PATTERNS = {
         r"\blibc::(?:getifaddrs|gethostname|getaddrinfo)\s*\("
     ),
     "ambient_filesystem": re.compile(
-        r"\b(?:std::fs::|std::fs\b|File::open\s*\(|OpenOptions::new\s*\()"
+        r"\bstd::fs::(?:read|read_to_string|write|metadata|symlink_metadata|"
+        r"read_link|read_dir|create_dir|create_dir_all|set_permissions|"
+        r"remove_file|remove_dir|remove_dir_all|rename|hard_link|"
+        r"File::(?:open|create)|OpenOptions::new)\s*\("
     ),
     "ambient_network": re.compile(
         r"\bstd::net::(?:TcpStream::(?:connect|connect_timeout)|"
@@ -40,6 +43,16 @@ PATTERNS = {
         r"\b(?:std::thread::(?:spawn|sleep|yield_now)|"
         r"std::thread::Builder::new|hv_vcpus_exit)\b"
     ),
+}
+NETWORK_IMPORT = re.compile(r"^\s*use\s+std::net::(?P<items>[^;]+);")
+NETWORK_ITEM = re.compile(
+    r"^\s*(?P<type>TcpStream|TcpListener|UdpSocket)"
+    r"(?:\s+as\s+(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?\s*$"
+)
+NETWORK_METHODS = {
+    "TcpStream": ("connect", "connect_timeout"),
+    "TcpListener": ("bind",),
+    "UdpSocket": ("bind", "connect"),
 }
 CLASSIFICATIONS = {
     "forbidden_semantic",
@@ -195,6 +208,32 @@ def production_source(root: Path) -> list[Path]:
     return sorted(paths)
 
 
+def imported_network_types(line: str) -> dict[str, tuple[str, ...]]:
+    """Extract direct and braced std::net socket type imports from one line."""
+    match = NETWORK_IMPORT.match(line)
+    if match is None:
+        return {}
+    items = match.group("items").strip()
+    if items.startswith("{") and items.endswith("}"):
+        candidates = items[1:-1].split(",")
+    else:
+        candidates = [items]
+    imports: dict[str, tuple[str, ...]] = {}
+    for candidate in candidates:
+        item = NETWORK_ITEM.match(candidate)
+        if item is not None:
+            imports[item.group("alias") or item.group("type")] = NETWORK_METHODS[item.group("type")]
+    return imports
+
+
+def imported_network_operation(line: str, imports: dict[str, tuple[str, ...]]) -> bool:
+    """True when an imported std::net socket type invokes a socket operation."""
+    return any(
+        re.search(rf"\b{re.escape(name)}::(?:{'|'.join(methods)})\s*\(", line)
+        for name, methods in imports.items()
+    )
+
+
 def generate(root: Path) -> list[dict[str, object]]:
     """Return sorted source rows for all declared guest-facing transitions."""
     entries: list[dict[str, object]] = []
@@ -203,10 +242,14 @@ def generate(root: Path) -> list[dict[str, object]]:
         visible = mask_cfg_test_modules(mask_string_literals(mask_comments(source)))
         relative = str(path.relative_to(root))
         source_lines = source.splitlines()
+        imports: dict[str, tuple[str, ...]] = {}
         for number, line in enumerate(visible.splitlines(), 1):
             text = source_lines[number - 1].strip()
+            imports.update(imported_network_types(line))
             for kind, pattern in PATTERNS.items():
-                if pattern.search(line):
+                if pattern.search(line) or (
+                    kind == "ambient_network" and imported_network_operation(line, imports)
+                ):
                     entries.append(
                         {"file": relative, "line": number, "kind": kind, "text": text}
                     )
