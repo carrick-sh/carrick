@@ -21,7 +21,8 @@ OPERATION_MESSAGE = re.compile(r"use of a disallowed method `([^`]+)`")
 OPERATION_PATH = re.compile(
     r"[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+"
 )
-CATALOG_ID = re.compile(r"\b(HA-CATALOG-[A-Z0-9]+(?:-[A-Z0-9]+)*)\b")
+CATALOG_ID = re.compile(r"HA-CATALOG-[A-Z0-9]+(?:-[A-Z0-9]+)*")
+CATALOG_TOKEN = re.compile(r"HA-CATALOG-[^:\s]+")
 REVIEW_ID = re.compile(r"HA-([0-9]{6})")
 
 ACTUAL_FIELDS = {"catalog_id", "operation", "source", "expansion", "profiles"}
@@ -74,6 +75,17 @@ def diagnostic_identity(row: Mapping[str, object]) -> str:
     """Return the review-preservation identity for one resolved diagnostic."""
     return _canonical_json(
         {
+            "catalog_id": row.get("catalog_id"),
+            "operation": row.get("operation"),
+            "source": row.get("source"),
+            "expansion": row.get("expansion"),
+        }
+    )
+
+
+def _diagnostic_site_identity(row: Mapping[str, object]) -> str:
+    return _canonical_json(
+        {
             "operation": row.get("operation"),
             "source": row.get("source"),
             "expansion": row.get("expansion"),
@@ -119,7 +131,9 @@ def _cargo_object(raw: object, index: int) -> dict[str, object]:
     return value
 
 
-def _workspace_file(file_name: object, root: Path, label: str) -> str:
+def _workspace_file_or_none(
+    file_name: object, root: Path, label: str
+) -> str | None:
     if not isinstance(file_name, str) or not file_name:
         raise InventoryError(f"{label} has no source file")
     if file_name.startswith("ROOT/"):
@@ -130,13 +144,20 @@ def _workspace_file(file_name: object, root: Path, label: str) -> str:
     normalized = candidate.resolve(strict=False)
     try:
         relative = normalized.relative_to(root)
-    except ValueError as error:
-        raise InventoryError(f"{label} path is outside root: {file_name}") from error
+    except ValueError:
+        return None
     posix = relative.as_posix()
     parsed = PurePosixPath(posix)
     if posix in {"", "."} or ".." in parsed.parts:
         raise InventoryError(f"{label} path is outside root: {file_name}")
     return posix
+
+
+def _workspace_file(file_name: object, root: Path, label: str) -> str:
+    relative = _workspace_file_or_none(file_name, root, label)
+    if relative is None:
+        raise InventoryError(f"{label} path is outside root: {file_name}")
+    return relative
 
 
 def _positive_int(value: object, label: str) -> int:
@@ -188,10 +209,28 @@ def _span_point(span: object, root: Path, label: str) -> dict[str, object]:
     }
 
 
+def _workspace_expansion_point(
+    span: object, root: Path, label: str
+) -> dict[str, object] | None:
+    if not isinstance(span, Mapping):
+        raise InventoryError(f"{label} is not a compiler span")
+    coordinates = _span_coordinates(span, label)
+    file_name = _workspace_file_or_none(span.get("file_name"), root, label)
+    if file_name is None:
+        return None
+    return {
+        "file": file_name,
+        **coordinates,
+        "line": coordinates["line_start"],
+        "column": coordinates["column_start"],
+    }
+
+
 def _outermost_expansion(
     primary: Mapping[str, object], root: Path
 ) -> dict[str, object] | None:
     expansion = primary.get("expansion")
+    had_expansion = expansion is not None
     outermost = None
     visited: set[int] = set()
     while expansion is not None:
@@ -202,9 +241,15 @@ def _outermost_expansion(
             raise InventoryError("cyclic macro expansion in compiler primary span")
         visited.add(marker)
         callsite = expansion.get("span")
-        outermost = _span_point(callsite, root, "macro expansion callsite span")
+        workspace_callsite = _workspace_expansion_point(
+            callsite, root, "macro expansion callsite span"
+        )
+        if workspace_callsite is not None:
+            outermost = workspace_callsite
         assert isinstance(callsite, Mapping)
         expansion = callsite.get("expansion")
+    if had_expansion and outermost is None:
+        raise InventoryError("macro expansion chain has no workspace callsite")
     return outermost
 
 
@@ -222,10 +267,11 @@ def _catalog_reason(children: object) -> str | None:
         message = child.get("message")
         if not isinstance(message, str):
             raise InventoryError("Clippy diagnostic note has no message")
-        found = CATALOG_ID.findall(message)
-        if "HA-CATALOG-" in message and not found:
-            raise InventoryError(f"malformed catalog reason child: {message!r}")
-        matches.extend(found)
+        tokens = CATALOG_TOKEN.findall(message)
+        if "HA-CATALOG-" in message:
+            if len(tokens) != 1 or CATALOG_ID.fullmatch(tokens[0]) is None:
+                raise InventoryError(f"malformed catalog reason child: {message!r}")
+            matches.append(tokens[0])
     if len(matches) > 1:
         raise InventoryError(f"conflicting catalog reason children: {matches}")
     return matches[0] if matches else None
@@ -257,13 +303,16 @@ def _validate_profiles(profiles: object, label: str) -> list[str]:
     return profiles
 
 
-def _validate_actual_row(row: object, label: str) -> dict[str, object]:
+def _validate_actual_row(
+    row: object, label: str, *, allow_missing_catalog_id: bool = False
+) -> dict[str, object]:
     if not isinstance(row, dict) or set(row) != ACTUAL_FIELDS:
         raise InventoryError(f"invalid {label} row schema: {row!r}")
     catalog_id = row.get("catalog_id")
-    if catalog_id is not None and (
-        not isinstance(catalog_id, str) or CATALOG_ID.fullmatch(catalog_id) is None
-    ):
+    if catalog_id is None:
+        if not allow_missing_catalog_id:
+            raise InventoryError(f"missing {label} catalog ID: {row!r}")
+    elif not isinstance(catalog_id, str) or CATALOG_ID.fullmatch(catalog_id) is None:
         raise InventoryError(f"invalid {label} catalog ID: {row!r}")
     operation = row.get("operation")
     if not isinstance(operation, str) or OPERATION_PATH.fullmatch(operation) is None:
@@ -277,14 +326,24 @@ def _validate_actual_row(row: object, label: str) -> dict[str, object]:
 
 
 def normalize_messages(
-    messages: Iterable[object], profile_id: str, root: Path
+    messages: Iterable[object],
+    profile_id: str,
+    root: Path,
+    *,
+    allow_missing_catalog_id: bool = False,
 ) -> list[dict[str, object]]:
-    """Normalize one profile's Cargo/Clippy JSON diagnostic stream."""
+    """Normalize one profile's Cargo/Clippy JSON diagnostic stream.
+
+    ``allow_missing_catalog_id`` exists only for the pinned Task 1 string-form
+    fixture. Production callers leave it false. This function validates stable
+    ID syntax; Task 4 binds each operation to its configured catalog ID.
+    """
     if not isinstance(profile_id, str) or not profile_id:
         raise InventoryError("profile ID must be a non-empty string")
     workspace = Path(root).resolve(strict=False)
     rows: list[dict[str, object]] = []
     identities: set[str] = set()
+    sites: dict[str, str | None] = {}
     for index, raw in enumerate(messages, start=1):
         cargo = _cargo_object(raw, index)
         if cargo.get("reason") != "compiler-message":
@@ -292,11 +351,18 @@ def normalize_messages(
         reason = cargo.get("message")
         if not isinstance(reason, Mapping):
             raise InventoryError(f"compiler message {index} has no diagnostic object")
-        code = reason.get("code")
-        if not isinstance(code, Mapping) or code.get("code") != CLIPPY_CODE:
-            continue
         text = reason.get("message")
-        match = OPERATION_MESSAGE.fullmatch(text) if isinstance(text, str) else None
+        shaped = OPERATION_MESSAGE.fullmatch(text) if isinstance(text, str) else None
+        code = reason.get("code")
+        code_name = code.get("code") if isinstance(code, Mapping) else None
+        if shaped is not None and code_name != CLIPPY_CODE:
+            raise InventoryError(
+                "Clippy diagnostic interface drift: disallowed-method message "
+                f"has code {code_name!r}"
+            )
+        if code_name != CLIPPY_CODE:
+            continue
+        match = shaped
         if match is None or OPERATION_PATH.fullmatch(match.group(1)) is None:
             raise InventoryError(f"unknown Clippy operation message: {text!r}")
         operation = match.group(1)
@@ -320,11 +386,20 @@ def normalize_messages(
             "expansion": _outermost_expansion(primary, workspace),
             "profiles": [profile_id],
         }
-        _validate_actual_row(row, "normalized")
+        _validate_actual_row(
+            row,
+            "normalized",
+            allow_missing_catalog_id=allow_missing_catalog_id,
+        )
         identity = diagnostic_identity(row)
         if identity in identities:
             raise InventoryError(f"duplicate diagnostic identity: {identity}")
         identities.add(identity)
+        site = _diagnostic_site_identity(row)
+        prior_catalog = sites.get(site)
+        if site in sites and prior_catalog != row["catalog_id"]:
+            raise InventoryError(f"catalog ID disagreement for diagnostic site: {site}")
+        sites[site] = row["catalog_id"]
         rows.append(row)
     return sorted(rows, key=_sort_key)
 
@@ -334,6 +409,7 @@ def merge_profiles(
 ) -> list[dict[str, object]]:
     """Merge profile membership only for exactly identical diagnostics."""
     merged: dict[str, dict[str, object]] = {}
+    catalog_by_site: dict[str, str | None] = {}
     for batch_index, batch in enumerate(profile_rows, start=1):
         batch_identities: set[str] = set()
         for raw_row in batch:
@@ -342,6 +418,13 @@ def merge_profiles(
             assert isinstance(profiles, list)
             if len(profiles) != 1:
                 raise InventoryError("unmerged profile row must name exactly one profile")
+            site = _diagnostic_site_identity(row)
+            prior_catalog = catalog_by_site.get(site)
+            if site in catalog_by_site and prior_catalog != row["catalog_id"]:
+                raise InventoryError(
+                    f"catalog ID disagreement for diagnostic site: {site}"
+                )
+            catalog_by_site[site] = row["catalog_id"]
             identity = diagnostic_identity(row)
             if identity in batch_identities:
                 raise InventoryError(
@@ -418,7 +501,10 @@ def _validate_review(row: dict[str, object], *, allow_unreviewed: bool) -> None:
 
 
 def _reviewed_index(
-    rows: Sequence[dict[str, object]], *, allow_unreviewed: bool
+    rows: Sequence[dict[str, object]],
+    *,
+    allow_unreviewed: bool,
+    allow_missing_catalog_id: bool = False,
 ) -> tuple[dict[str, dict[str, object]], int]:
     indexed: dict[str, dict[str, object]] = {}
     review_ids: dict[str, str] = {}
@@ -427,7 +513,11 @@ def _reviewed_index(
         if not isinstance(row, dict) or set(row) != REVIEW_FIELDS:
             raise InventoryError(f"invalid reviewed row schema: {row!r}")
         actual = {field: row[field] for field in ACTUAL_FIELDS}
-        _validate_actual_row(actual, "reviewed")
+        _validate_actual_row(
+            actual,
+            "reviewed",
+            allow_missing_catalog_id=allow_missing_catalog_id,
+        )
         identity = diagnostic_identity(actual)
         if identity in indexed:
             raise InventoryError(f"duplicate reviewed diagnostic identity: {identity}")
@@ -446,10 +536,14 @@ def _reviewed_index(
     return indexed, maximum
 
 
-def _actual_index(rows: Sequence[dict[str, object]]) -> dict[str, dict[str, object]]:
+def _actual_index(
+    rows: Sequence[dict[str, object]], *, allow_missing_catalog_id: bool = False
+) -> dict[str, dict[str, object]]:
     indexed: dict[str, dict[str, object]] = {}
     for row in rows:
-        valid = _validate_actual_row(row, "actual")
+        valid = _validate_actual_row(
+            row, "actual", allow_missing_catalog_id=allow_missing_catalog_id
+        )
         identity = diagnostic_identity(valid)
         if identity in indexed:
             raise InventoryError(f"duplicate actual diagnostic identity: {identity}")
@@ -473,21 +567,38 @@ def validate(
     expected: list[dict[str, object]],
     executed_profiles: Sequence[str],
     required_profiles: Sequence[str],
+    *,
+    allow_missing_catalog_id: bool = False,
 ) -> None:
-    """Require exact reviewed rows for every profile declared as executed."""
+    """Require exact reviewed rows for every profile declared as executed.
+
+    Missing catalog IDs are rejected unless the Task 1 fixture caller opts in
+    explicitly. Stable syntax is checked here; Task 4 owns operation-to-ID
+    catalog consistency.
+    """
     executed = _profile_set(executed_profiles, "executed")
     required = _profile_set(required_profiles, "required")
-    if executed != required:
-        missing = sorted(required - executed)
-        extra = sorted(executed - required)
+    if not executed <= required:
         raise InventoryError(
-            f"profile execution mismatch: missing={missing}, unexpected={extra}"
+            "executed profiles are outside required profiles: "
+            f"{sorted(executed - required)}"
         )
-    actual_by_identity = _actual_index(actual)
-    reviewed_by_identity, _ = _reviewed_index(expected, allow_unreviewed=False)
+    actual_by_identity = _actual_index(
+        actual, allow_missing_catalog_id=allow_missing_catalog_id
+    )
+    reviewed_by_identity, _ = _reviewed_index(
+        expected,
+        allow_unreviewed=False,
+        allow_missing_catalog_id=allow_missing_catalog_id,
+    )
 
     for row in actual_by_identity.values():
         profiles = set(row["profiles"])
+        if not profiles <= required:
+            raise InventoryError(
+                "actual row profiles are outside required profiles: "
+                f"{sorted(profiles - required)}"
+            )
         if not profiles <= executed:
             raise InventoryError(
                 f"actual row contains an unexecuted profile: {sorted(profiles - executed)}"
@@ -495,7 +606,13 @@ def validate(
 
     projected: dict[str, dict[str, object]] = {}
     for identity, reviewed in reviewed_by_identity.items():
-        profiles = sorted(set(reviewed["profiles"]) & executed)
+        reviewed_profiles = set(reviewed["profiles"])
+        if not reviewed_profiles <= required:
+            raise InventoryError(
+                "expected row profiles are outside required profiles: "
+                f"{sorted(reviewed_profiles - required)}"
+            )
+        profiles = sorted(reviewed_profiles & executed)
         if not profiles:
             continue
         projected[identity] = {
@@ -530,6 +647,9 @@ def refresh(
     reviewed_by_identity, maximum = _reviewed_index(
         expected, allow_unreviewed=True
     )
+    missing = sorted(set(reviewed_by_identity) - set(actual_by_identity))
+    if missing:
+        raise InventoryError(f"refresh is missing expected identity: {missing}")
     rows: list[dict[str, object]] = []
     next_number = maximum
     for identity, row in sorted(
