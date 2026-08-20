@@ -109,6 +109,7 @@ AMBIENT_BUILD_AUTHORITY = {
     "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "--cfg target_override",
     "CARGO_PROFILE_DEV_LTO": "true",
     "CARGO_CONFIG": "/tmp/attacker-config.toml",
+    "RUSTUP_TOOLCHAIN": "stable-attacker-target",
 }
 
 for host, features in (
@@ -967,6 +968,18 @@ class MatrixOrchestrationTest(unittest.TestCase):
             ],
         }
 
+    def write_minimal_workspace(self, root, channel="1.96.0"):
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+        checked_config = root / ".cargo" / "config.toml"
+        checked_config.parent.mkdir()
+        checked_config.write_text("[build]\n", encoding="utf-8")
+        if channel is not None:
+            (root / "rust-toolchain.toml").write_text(
+                f'[toolchain]\nchannel = "{channel}"\n', encoding="utf-8"
+            )
+        return root
+
     def test_checked_matrix_declares_exact_nine_product_profiles(self):
         matrix = self.load()
         self.assertEqual(list(matrix.required_profiles), REQUIRED_PROFILES)
@@ -1058,7 +1071,12 @@ class MatrixOrchestrationTest(unittest.TestCase):
                 self.assertIn("PATH", environment)
                 self.assertIn("CARGO_HOME", environment)
                 for variable in AMBIENT_BUILD_AUTHORITY:
-                    self.assertNotIn(variable, environment)
+                    if variable != "RUSTUP_TOOLCHAIN":
+                        self.assertNotIn(variable, environment)
+                self.assertEqual(environment["RUSTUP_TOOLCHAIN"], "1.96.0")
+                self.assertNotIn(
+                    "aarch64-apple-darwin", environment["RUSTUP_TOOLCHAIN"]
+                )
         profile_environment = runner.calls[-1][1]["env"]
         self.assertEqual(
             profile_environment["CARGO_TARGET_DIR"],
@@ -1072,10 +1090,9 @@ class MatrixOrchestrationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             ancestor = Path(directory) / "ancestor"
             root = ancestor / "nested" / "worktree"
-            root.mkdir(parents=True)
-            (root / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+            self.write_minimal_workspace(root)
             checked_config = root / ".cargo" / "config.toml"
-            checked_config.parent.mkdir()
+            checked_config.parent.mkdir(exist_ok=True)
             checked_config.write_text(
                 '[build]\nrustflags = ["-C", "force-frame-pointers=yes"]\n',
                 encoding="utf-8",
@@ -1185,10 +1202,9 @@ class MatrixOrchestrationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             temporary = Path(directory)
             root = temporary / "worktree"
-            root.mkdir()
-            (root / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+            self.write_minimal_workspace(root)
             checked_config = root / ".cargo" / "config.toml"
-            checked_config.parent.mkdir()
+            checked_config.parent.mkdir(exist_ok=True)
             checked_config.write_text(
                 '[build]\nrustflags = ["-C", "force-frame-pointers=yes"]\n',
                 encoding="utf-8",
@@ -1327,12 +1343,55 @@ class MatrixOrchestrationTest(unittest.TestCase):
             [call[0] for call in runner.calls],
             [["rustc", "-Vv"], expected_clippy_version_command()],
         )
+        for _argv, kwargs in runner.calls:
+            self.assertEqual(kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.96.0")
         mismatch = FakeRunner()
         mismatch.clippy_version = "clippy 0.1.95 (stale)\n"
         with self.assertRaisesRegex(
             self.host_authority.InventoryError, "0.1.96"
         ):
             self.host_authority.verify_toolchain(matrix, runner=mismatch)
+
+    def test_checked_toolchain_channel_is_required_and_matches_matrix_before_runner(
+        self,
+    ):
+        matrix = self.load()
+        selected = ["macos-hvf-default"]
+        cases = (
+            ("missing", None, matrix),
+            ("malformed", "__MALFORMED__", matrix),
+            (
+                "matrix mismatch",
+                "1.96.0",
+                matrix._replace(rustc_release="1.96.1"),
+            ),
+        )
+        for label, channel, checked_matrix in cases:
+            with self.subTest(
+                label=label
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "worktree"
+                self.write_minimal_workspace(
+                    root,
+                    None if channel in (None, "__MALFORMED__") else channel,
+                )
+                if channel == "__MALFORMED__":
+                    (root / "rust-toolchain.toml").write_text(
+                        "[toolchain\nchannel = 1.96.0\n", encoding="utf-8"
+                    )
+                runner = FakeRunner(json.dumps(diagnostic()) + "\n")
+                with self.assertRaisesRegex(
+                    self.host_authority.InventoryError, "toolchain|TOML|channel"
+                ):
+                    self.host_authority.run_census(
+                        checked_matrix,
+                        selected,
+                        FIXTURE_CATALOG,
+                        runner=runner,
+                        root=root,
+                        current_host="macos",
+                    )
+                self.assertEqual(runner.calls, [])
 
     def test_tool_release_tokens_and_rustc_host_must_match_exactly(self):
         matrix = self.load()
@@ -1412,6 +1471,8 @@ class MatrixOrchestrationTest(unittest.TestCase):
                 expected_profile_command("macos-hvf-default"),
             ],
         )
+        for _argv, kwargs in runner.calls:
+            self.assertEqual(kwargs["env"]["RUSTUP_TOOLCHAIN"], "1.96.0")
 
     def test_census_rejects_rustc_host_before_profile_execution(self):
         matrix = self.load()
@@ -1554,10 +1615,9 @@ class MatrixOrchestrationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             temporary = Path(directory)
             root = temporary / "worktree"
-            root.mkdir()
-            (root / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+            self.write_minimal_workspace(root)
             checked_config = root / ".cargo" / "config.toml"
-            checked_config.parent.mkdir()
+            checked_config.parent.mkdir(exist_ok=True)
             checked_config.write_text(
                 '[build]\nrustflags = ["-C", "force-frame-pointers=yes"]\n',
                 encoding="utf-8",
