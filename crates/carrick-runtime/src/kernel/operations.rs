@@ -1656,6 +1656,41 @@ impl Kernel {
         true
     }
 
+    /// Publish one short kernel-owned event to an exact live task generation,
+    /// then wake that same retained task after publication.
+    ///
+    /// The registry read lock stays held only while `publish` mutates its leaf
+    /// object. That makes the live-generation check and publication atomic
+    /// against task exit, reap and PID reuse; the callback must not re-enter
+    /// Kernel topology. The wake happens after both publication and registry
+    /// unlock, so a waker can safely re-enter and can never observe the event
+    /// as absent after spending its wake.
+    pub(crate) fn publish_task_event_and_wake(
+        &self,
+        target: TaskKey,
+        publish: impl FnOnce() -> bool,
+    ) -> bool {
+        let task = {
+            let state = self.registry().state.read();
+            let Some(record) = state
+                .tasks
+                .get(&target.id)
+                .filter(|record| record.task.key() == target)
+            else {
+                return false;
+            };
+            if record.task.lifecycle() != TaskLifecycle::Live {
+                return false;
+            }
+            if !publish() {
+                return false;
+            }
+            Arc::clone(&record.task)
+        };
+        task.wake();
+        true
+    }
+
     /// Resolve one live Linux tid to its owning task, optionally requiring an
     /// exact tgid. Kernel-lane `tkill` uses the global form; `tgkill` supplies
     /// the tgid so a live tid from a different thread group is still ESRCH.
@@ -3591,7 +3626,7 @@ pub enum KernelOperationError {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU16;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use carrick_abi::{LinuxCloneFlags, LinuxSigaction, SigSet};
     use carrick_guest_mem::Gpa;
@@ -5237,6 +5272,91 @@ mod tests {
             self.pending_when_woken
                 .store(self.queue.pending_count(), Ordering::SeqCst);
         }
+    }
+
+    #[derive(Debug)]
+    struct EventPublicationWaker {
+        wakes: AtomicUsize,
+        published: Arc<AtomicBool>,
+        published_when_woken: AtomicBool,
+    }
+
+    impl super::super::objects::TaskWaker for EventPublicationWaker {
+        fn wake_task(&self) {
+            self.published_when_woken
+                .store(self.published.load(Ordering::SeqCst), Ordering::SeqCst);
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A shared kernel object can outlive the task that registered it. Its
+    /// final event publication therefore has to authenticate and publish in
+    /// one transaction: checking liveness, dropping the registry lock, then
+    /// mutating the shared object lets exit/reap/PID-reuse redirect the event.
+    #[test]
+    fn exact_task_event_publication_serializes_exit_and_wakes_after_publish() {
+        let (kernel, root) = bootstrap(79);
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(9_080),
+                "async object target".to_owned(),
+                None,
+            )
+            .expect("child");
+        let target = child.task().key();
+        let published = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(EventPublicationWaker {
+            wakes: AtomicUsize::new(0),
+            published: Arc::clone(&published),
+            published_when_woken: AtomicBool::new(false),
+        });
+        child
+            .task()
+            .set_waker(Arc::clone(&waker) as Arc<dyn super::super::objects::TaskWaker>);
+
+        let (publish_entered_tx, publish_entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_publish_tx, release_publish_rx) = std::sync::mpsc::sync_channel(0);
+        let publishing_kernel = Arc::clone(&kernel);
+        let publishing_flag = Arc::clone(&published);
+        let publisher = std::thread::spawn(move || {
+            publishing_kernel.publish_task_event_and_wake(target, || {
+                publish_entered_tx.send(()).unwrap();
+                release_publish_rx.recv().unwrap();
+                publishing_flag.store(true, Ordering::SeqCst);
+                true
+            })
+        });
+        publish_entered_rx.recv().unwrap();
+
+        let (exit_started_tx, exit_started_rx) = std::sync::mpsc::sync_channel(0);
+        let (exit_done_tx, exit_done_rx) = std::sync::mpsc::sync_channel(0);
+        let exiting_kernel = Arc::clone(&kernel);
+        let exiter = std::thread::spawn(move || {
+            exit_started_tx.send(()).unwrap();
+            let result = exiting_kernel
+                .exit_task_key_eventually(target, LinuxWaitStatus::from_wait_encoding(0));
+            exit_done_tx.send(result).unwrap();
+        });
+        exit_started_rx.recv().unwrap();
+        assert!(matches!(
+            exit_done_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release_publish_tx.send(()).unwrap();
+        assert!(publisher.join().unwrap());
+        assert!(
+            exit_done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("exit completes after publication")
+                .is_ok()
+        );
+        exiter.join().unwrap();
+        assert!(published.load(Ordering::SeqCst));
+        assert_eq!(waker.wakes.load(Ordering::SeqCst), 1);
+        assert!(waker.published_when_woken.load(Ordering::SeqCst));
     }
 
     /// Delivery must WAKE the target, not merely enqueue. A guest parked in a

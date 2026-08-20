@@ -38,6 +38,35 @@ pub(crate) struct ProcessContext {
     mm_backend: std::sync::Arc<parking_lot::RwLock<std::sync::Arc<stage1_mm::Stage1MmBackend>>>,
 }
 
+/// Build a real HVPatch process binding for cross-subsystem unit tests. This
+/// lives in test support rather than adding a production-only escape hatch to
+/// `SyscallDispatcher`: tests exercise the same `bind_hvpatch_process` marker
+/// and exact Kernel graph used by a running guest.
+#[cfg(test)]
+pub(crate) fn process_context_for_tests(
+    pid: i32,
+) -> (ProcessContext, crate::kernel::KernelContext) {
+    let (resources, backend) = MmResources::new_root(0x4000).expect("test HVPatch root resources");
+    let bootstrap = crate::kernel::RootBootstrap::with_mm_backend(
+        pid,
+        crate::thread::ThreadId::synthetic_for_tests(pid),
+        backend.clone(),
+        "hvpatch-test-root".to_owned(),
+    )
+    .expect("test HVPatch bootstrap");
+    let (kernel, root) =
+        crate::kernel::Kernel::bootstrap_root(bootstrap).expect("test HVPatch kernel");
+    backend.bind_inventory(&kernel, root.shared().mm().id());
+    let resources = std::sync::Arc::new(resources);
+    resources
+        .publish_root(root.task().key())
+        .expect("publish test HVPatch root");
+    (
+        ProcessContext::new(resources, root.task_binding(), backend),
+        root,
+    )
+}
+
 #[derive(Clone)]
 struct ProcessTimerTarget {
     kernel: std::sync::Weak<crate::kernel::Kernel>,
