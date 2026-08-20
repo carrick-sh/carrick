@@ -27,6 +27,10 @@ fi
 lint_tmp="$(mktemp -d "${TMPDIR:-/tmp}/carrick-semgrep.XXXXXX")"
 trap 'rm -rf "$lint_tmp"' EXIT
 export SEMGREP_LOG_FILE="${SEMGREP_LOG_FILE:-$lint_tmp/semgrep.log}"
+if ! : > "$SEMGREP_LOG_FILE"; then
+    echo "error: cannot write semgrep log file: $SEMGREP_LOG_FILE" >&2
+    exit 1
+fi
 export SEMGREP_SEND_METRICS=off
 export SEMGREP_ENABLE_VERSION_CHECK=0
 export OTEL_SDK_DISABLED=true
