@@ -255,6 +255,39 @@ fn manifest_records_group_handler_and_compatibility_notes() {
 }
 
 #[test]
+fn authority_partition_matches_host_boundary_rules() {
+    use carrick_runtime::syscall::Authority;
+
+    // Process, signal, credentials, lifecycle, sched (except yield) are Guest authority
+    let getpid = lookup_aarch64(172).unwrap();
+    assert_eq!(getpid.authority, Authority::Guest);
+
+    let getppid = lookup_aarch64(173).unwrap();
+    assert_eq!(getppid.authority, Authority::Guest);
+
+    let kill = lookup_aarch64(129).unwrap();
+    assert_eq!(kill.authority, Authority::Guest);
+
+    let wait4 = lookup_aarch64(260).unwrap();
+    assert_eq!(wait4.authority, Authority::Guest);
+
+    let prlimit64 = lookup_aarch64(261).unwrap();
+    assert_eq!(prlimit64.authority, Authority::Guest);
+
+    let sched_yield = lookup_aarch64(124).unwrap();
+    assert_eq!(sched_yield.authority, Authority::Host);
+
+    let openat = lookup_aarch64(56).unwrap();
+    assert_eq!(openat.authority, Authority::Host);
+
+    let mmap = lookup_aarch64(222).unwrap();
+    assert_eq!(mmap.authority, Authority::Hybrid);
+
+    let clock_gettime = lookup_aarch64(113).unwrap();
+    assert_eq!(clock_gettime.authority, Authority::Hybrid);
+}
+
+#[test]
 fn bringup_manifest_entries_have_a_handler_owner() {
     for syscall in aarch64_table() {
         if syscall.support == SupportLevel::BringUp {
