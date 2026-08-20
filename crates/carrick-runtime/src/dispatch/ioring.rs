@@ -1102,6 +1102,9 @@ impl SyscallDispatcher {
                 // task and FileTable generation that submitted the SQE. Close
                 // notifications must observe the slot before removal; epoll
                 // detach must likewise happen before the fd number is reusable.
+                if is_stdio_fd(sqe.fd) {
+                    self.captured_file_table().lock_closed_stdio()[sqe.fd as usize] = true;
+                }
                 self.discard_splice_pushback_if_final(sqe.fd);
                 self.dnotify_close_fd(sqe.fd);
                 self.inotify_close_for_fd(sqe.fd);
@@ -1126,6 +1129,10 @@ impl SyscallDispatcher {
                             0,
                         );
                         self.close_open_file_and_free_pty(&open_file);
+                        self.note_fd_closed(sqe.fd);
+                        0
+                    }
+                    None if is_stdio_fd(sqe.fd) => {
                         self.note_fd_closed(sqe.fd);
                         0
                     }
@@ -1355,6 +1362,109 @@ mod tests {
         }
     }
 
+    fn run_close_sqe(
+        dispatcher: &SyscallDispatcher,
+        context: &crate::kernel::KernelContext,
+        memory: &mut LinearMemory,
+        fd: i32,
+    ) -> i32 {
+        let mut close_sqe = sqe(LINUX_IORING_OP_CLOSE, 0x51);
+        close_sqe.fd = fd;
+        super::super::resources::with_captured_resources(context, || {
+            dispatcher.io_uring_run_op(memory, &close_sqe)
+        })
+    }
+
+    #[test]
+    fn close_sqe_marks_redirected_stdin_closed_and_reuses_fd_zero() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x4000]);
+        memory.write_bytes(0x1000, b"stdin_redirect\0").unwrap();
+        let source = returned_fd(dispatch_call(
+            &dispatcher,
+            &context,
+            &mut memory,
+            180,
+            [
+                0x1000,
+                LINUX_O_RDWR | LINUX_O_CREAT | LINUX_O_EXCL,
+                0o600,
+                0,
+                0,
+                0,
+            ],
+        ));
+        assert_eq!(
+            dispatch_call(
+                &dispatcher,
+                &context,
+                &mut memory,
+                24,
+                [source as u64, 0, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+
+        assert_eq!(run_close_sqe(&dispatcher, &context, &mut memory, 0), 0);
+        super::super::resources::with_captured_resources(&context, || {
+            assert!(dispatcher.open_file(0).is_none());
+            assert!(
+                dispatcher.stdio_is_closed(0),
+                "redirected fd 0 must not fall back to inherited host stdin"
+            );
+        });
+
+        memory.write_bytes(0x1100, b"stdin_reuse\0").unwrap();
+        assert_eq!(
+            returned_fd(dispatch_call(
+                &dispatcher,
+                &context,
+                &mut memory,
+                180,
+                [
+                    0x1100,
+                    LINUX_O_RDWR | LINUX_O_CREAT | LINUX_O_EXCL,
+                    0o600,
+                    0,
+                    0,
+                    0,
+                ],
+            )),
+            0,
+            "the next lowest-fd open must reuse explicitly closed stdin"
+        );
+    }
+
+    #[test]
+    fn close_sqe_accepts_and_records_bare_stdout_and_stderr() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x1000]);
+
+        assert_eq!(run_close_sqe(&dispatcher, &context, &mut memory, 1), 0);
+        assert_eq!(run_close_sqe(&dispatcher, &context, &mut memory, 2), 0);
+        super::super::resources::with_captured_resources(&context, || {
+            assert!(dispatcher.stdio_is_closed(1));
+            assert!(dispatcher.stdio_is_closed(2));
+            let open = dispatcher.open_fd_numbers();
+            assert!(!open.contains(&1));
+            assert!(!open.contains(&2));
+        });
+    }
+
+    #[test]
+    fn close_sqe_rejects_missing_nonstdio_fd() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x1000]);
+
+        assert_eq!(
+            run_close_sqe(&dispatcher, &context, &mut memory, 91),
+            cqe_err(LINUX_EBADF)
+        );
+    }
+
     #[test]
     fn close_sqe_retires_exact_mqueue_registration_and_netlink_retention() {
         use zerocopy::IntoBytes as _;
@@ -1413,11 +1523,7 @@ mod tests {
         );
         assert_eq!(netlink.fd_ref_count(), refs_before + 1);
 
-        let mut close_sqe = sqe(LINUX_IORING_OP_CLOSE, 0x51);
-        close_sqe.fd = mqd;
-        let close_result = super::super::resources::with_captured_resources(&context, || {
-            dispatcher.io_uring_run_op(&mut memory, &close_sqe)
-        });
+        let close_result = run_close_sqe(&dispatcher, &context, &mut memory, mqd);
         assert_eq!(close_result, 0);
         assert_eq!(
             netlink.fd_ref_count(),
