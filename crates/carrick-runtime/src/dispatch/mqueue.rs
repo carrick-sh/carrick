@@ -107,13 +107,13 @@ impl Drop for RetainedNetlinkDescription {
 #[derive(Debug)]
 pub enum MqueueNotify {
     Signal {
-        registration: crate::kernel::FileDescriptionId,
+        registration: MqueueRegistration,
         target: MqueueNotifyTarget,
         signo: i32,
         value: i64,
     },
     Thread {
-        registration: crate::kernel::FileDescriptionId,
+        registration: MqueueRegistration,
         /// The route and the resource it is allowed to use are one value, so a
         /// kernel TaskKey cannot accidentally be paired with a host fd (or a
         /// host pid with a retained kernel description).
@@ -122,8 +122,14 @@ pub enum MqueueNotify {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MqueueRegistration {
+    file_table: crate::kernel::FileTableId,
+    description: crate::kernel::FileDescriptionId,
+}
+
 impl MqueueNotify {
-    fn registration(&self) -> crate::kernel::FileDescriptionId {
+    fn registration(&self) -> MqueueRegistration {
         match self {
             Self::Signal { registration, .. } | Self::Thread { registration, .. } => *registration,
         }
@@ -144,7 +150,7 @@ enum MqueueNotifySpec {
 }
 
 impl MqueueNotifySpec {
-    fn bind(self, registration: crate::kernel::FileDescriptionId) -> MqueueNotify {
+    fn bind(self, registration: MqueueRegistration) -> MqueueNotify {
         match self {
             Self::Signal {
                 target,
@@ -161,6 +167,24 @@ impl MqueueNotifySpec {
                 target,
                 data,
             },
+        }
+    }
+}
+
+impl MqueueNotify {
+    fn kernel_owner(&self) -> Option<crate::kernel::TaskKey> {
+        let target = match self {
+            Self::Signal { target, .. } => target,
+            Self::Thread { target, .. } => {
+                return match target {
+                    MqueueNotifyTarget::Kernel(task, _) => Some(*task),
+                    MqueueNotifyTarget::Host(_, _) => None,
+                };
+            }
+        };
+        match target {
+            MqueueNotifyTarget::Kernel(task, ()) => Some(*task),
+            MqueueNotifyTarget::Host(_, ()) => None,
         }
     }
 }
@@ -196,22 +220,80 @@ impl MqueueInner {
         }
     }
 
-    /// Remove only the registration owned by the exact open-file description
-    /// whose final logical reference is closing. A different open of the same
-    /// named queue is a different identity and must not disturb it.
-    pub(crate) fn retire_notification_owner(
-        &self,
-        owner: crate::kernel::FileDescriptionId,
-    ) -> Option<MqueueNotify> {
+    /// Remove only the registration owned by this exact FileTable generation
+    /// and open-file description. A fork copy or a different open of the same
+    /// named queue has a different owner-local identity and cannot disturb it.
+    fn retire_registration(&self, registration: MqueueRegistration) -> Option<MqueueNotify> {
         let mut state = self.state.lock();
         if state
             .notify
             .as_ref()
-            .is_some_and(|notification| notification.registration() == owner)
+            .is_some_and(|notification| notification.registration() == registration)
         {
             state.notify.take()
         } else {
             None
+        }
+    }
+
+    fn retire_task_owner(&self, owner: crate::kernel::TaskKey) -> Option<MqueueNotify> {
+        let mut state = self.state.lock();
+        if state
+            .notify
+            .as_ref()
+            .is_some_and(|notification| notification.kernel_owner() == Some(owner))
+        {
+            state.notify.take()
+        } else {
+            None
+        }
+    }
+
+    fn registration_owner(
+        &self,
+        registration: MqueueRegistration,
+    ) -> Option<Option<crate::kernel::TaskKey>> {
+        let state = self.state.lock();
+        state
+            .notify
+            .as_ref()
+            .filter(|notification| notification.registration() == registration)
+            .map(MqueueNotify::kernel_owner)
+    }
+
+    fn rebind_exec_registration(
+        &self,
+        owner: crate::kernel::TaskKey,
+        old_table: crate::kernel::FileTableId,
+        successor: Option<crate::kernel::FileTableId>,
+        description: crate::kernel::FileDescriptionId,
+    ) -> Option<MqueueNotify> {
+        let mut state = self.state.lock();
+        let notification = state.notify.as_mut()?;
+        if notification
+            .kernel_owner()
+            .is_some_and(|registered| registered != owner)
+        {
+            return None;
+        }
+        if notification.registration()
+            != (MqueueRegistration {
+                file_table: old_table,
+                description,
+            })
+        {
+            return None;
+        }
+        if let Some(successor) = successor {
+            match notification {
+                MqueueNotify::Signal { registration, .. }
+                | MqueueNotify::Thread { registration, .. } => {
+                    registration.file_table = successor;
+                }
+            }
+            None
+        } else {
+            state.notify.take()
         }
     }
 }
@@ -283,13 +365,169 @@ impl SyscallDispatcher {
         }
     }
 
-    fn mqueue_file_description(
+    fn mqueue_description_queue(
+        description: &Arc<crate::kernel::FileDescription>,
+    ) -> Option<Arc<MqueueInner>> {
+        let open = description.read();
+        let OpenDescription::Mqueue { queue, .. } = &*open else {
+            return None;
+        };
+        Some(Arc::clone(queue))
+    }
+
+    /// One fd slot has already left `files`. Retire a registration only when
+    /// no alias to the same open description remains in that exact FileTable.
+    /// A fork copy has a different FileTableId and cannot affect the owner;
+    /// CLONE_FILES peers share the same table, so their close correctly changes
+    /// the one shared alias set.
+    pub(in crate::dispatch) fn mqueue_owner_alias_closed(
         &self,
-        fd: i32,
-    ) -> Result<Arc<crate::kernel::FileDescription>, LinuxErrno> {
-        self.open_file(fd)
-            .map(|slot| slot.description())
-            .ok_or(LINUX_EBADF)
+        files: &Arc<crate::kernel::FileTable>,
+        open_file: &OpenFile,
+    ) {
+        let alias_remains = files
+            .read_open_files()
+            .values()
+            .any(|slot| Arc::ptr_eq(&slot.description, &open_file.description));
+        self.mqueue_owner_alias_closed_known(files.id(), open_file, alias_remains);
+    }
+
+    /// Variant for dup replacement, whose caller already owns the FileTable
+    /// write guard and therefore must supply the alias observation made under
+    /// that same guard rather than recursively reading the table.
+    pub(in crate::dispatch) fn mqueue_owner_alias_closed_known(
+        &self,
+        file_table: crate::kernel::FileTableId,
+        open_file: &OpenFile,
+        alias_remains: bool,
+    ) {
+        if alias_remains {
+            return;
+        }
+        let kernel = self
+            .hvpatch_process()
+            .map(|process| Arc::clone(process.kernel_graph()));
+        let Some(queue) = Self::mqueue_description_queue(&open_file.description) else {
+            return;
+        };
+        let registration = MqueueRegistration {
+            file_table,
+            description: open_file.description.id(),
+        };
+        let Some(owner) = queue.registration_owner(registration) else {
+            return;
+        };
+        // Exec may already have published the owner's successor FileTable while
+        // a CLONE_FILES peer closes the last alias in the old table. Pin any
+        // successor alias under its table READ lock before taking description
+        // WRITE, so the peer close cannot erase a record that has moved with
+        // the execing owner.
+        let owner_tables = owner
+            .and_then(|owner| {
+                kernel
+                    .as_ref()
+                    .map(|kernel| kernel.task_file_tables_exact(owner))
+            })
+            .unwrap_or_default();
+        let successor_index = owner_tables.iter().position(|files| {
+            files.id() != file_table
+                && files
+                    .read_open_files()
+                    .values()
+                    .any(|slot| slot.description.id() == open_file.description.id())
+        });
+        let successor_slots = successor_index.map(|index| owner_tables[index].read_open_files());
+        let successor = successor_index.and_then(|index| {
+            successor_slots.as_ref().and_then(|slots| {
+                slots
+                    .values()
+                    .any(|slot| slot.description.id() == open_file.description.id())
+                    .then_some(owner_tables[index].id())
+            })
+        });
+        // Registration holds table READ -> description READ -> queue. The fd
+        // removal already linearized under table WRITE; take description WRITE
+        // before queue so an in-flight registrar either published first (and
+        // is removed here) or cannot validate the now-absent owner-local alias.
+        let open = open_file.description.write();
+        let OpenDescription::Mqueue { queue, .. } = &*open else {
+            return;
+        };
+        let retired = if let (Some(owner), Some(successor)) = (owner, successor) {
+            queue.rebind_exec_registration(
+                owner,
+                file_table,
+                Some(successor),
+                open_file.description.id(),
+            )
+        } else {
+            queue.retire_registration(registration)
+        };
+        drop(open);
+        drop(retired);
+    }
+
+    /// Process exit owns notification lifetime even when CLONE_FILES keeps the
+    /// FileTable and its descriptions live in another task. Scan the exiting
+    /// task's exact table, then remove only records carrying its full TaskKey.
+    pub(in crate::dispatch) fn mqueue_retire_task_owner(
+        &self,
+        owner: crate::kernel::TaskKey,
+        files: &Arc<crate::kernel::FileTable>,
+    ) {
+        let descriptions: Vec<_> = files
+            .read_open_files()
+            .values()
+            .map(crate::kernel::FileSlot::description)
+            .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        for description in descriptions {
+            if !seen.insert(description.id()) {
+                continue;
+            }
+            let Some(queue) = Self::mqueue_description_queue(&description) else {
+                continue;
+            };
+            let retired = queue.retire_task_owner(owner);
+            drop(retired);
+        }
+    }
+
+    /// Exec creates a fresh FileTable generation. Move the execing task's
+    /// registrations for surviving descriptions to that generation and retire
+    /// registrations whose last owner-local alias was CLOEXEC. Registrations
+    /// owned by a CLONE_FILES peer remain bound to the old shared table.
+    pub(in crate::dispatch) fn mqueue_rebind_exec_file_table(
+        &self,
+        owner: crate::kernel::TaskKey,
+        old: &Arc<crate::kernel::FileTable>,
+        successor: &Arc<crate::kernel::FileTable>,
+    ) {
+        let successor_descriptions: std::collections::BTreeSet<_> = successor
+            .read_open_files()
+            .values()
+            .map(|slot| slot.description.id())
+            .collect();
+        let old_descriptions: Vec<_> = old
+            .read_open_files()
+            .values()
+            .map(crate::kernel::FileSlot::description)
+            .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        for description in old_descriptions {
+            if !seen.insert(description.id()) {
+                continue;
+            }
+            let Some(queue) = Self::mqueue_description_queue(&description) else {
+                continue;
+            };
+            let successor_table = successor_descriptions
+                .contains(&description.id())
+                .then_some(successor.id());
+            let retired =
+                queue.rebind_exec_registration(owner, old.id(), successor_table, description.id());
+            drop(retired);
+        }
     }
 
     define_syscall! {
@@ -546,9 +784,11 @@ impl SyscallDispatcher {
             };
 
             if sevp.0 == 0 {
-                let description = match this.mqueue_file_description(mqd) {
-                    Ok(description) => description,
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                let files = this.captured_file_table();
+                let open_files = files.read_open_files();
+                let description = match open_files.get(&mqd) {
+                    Some(slot) => slot.description(),
+                    None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                 };
                 // Close takes description WRITE then queue. Keep the matching
                 // READ->queue order until publication, so either unregister
@@ -558,7 +798,10 @@ impl SyscallDispatcher {
                 let OpenDescription::Mqueue { queue, .. } = &*open else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
-                let registration = description.id();
+                let registration = MqueueRegistration {
+                    file_table: files.id(),
+                    description: description.id(),
+                };
                 let mut state = queue.state.lock();
                 let delivery = match state.notify.take() {
                     Some(MqueueNotify::Signal {
@@ -585,6 +828,7 @@ impl SyscallDispatcher {
                 };
                 drop(state);
                 drop(open);
+                drop(open_files);
                 if let Some(delivery) = delivery {
                     deliver_notify(this, cx.kernel, cx.tid(), delivery);
                 }
@@ -639,9 +883,11 @@ impl SyscallDispatcher {
                 _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             };
 
-            let description = match this.mqueue_file_description(mqd) {
-                Ok(description) => description,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            let files = this.captured_file_table();
+            let open_files = files.read_open_files();
+            let description = match open_files.get(&mqd) {
+                Some(slot) => slot.description(),
+                None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
             };
             // See unregister above: the read guard is the lifetime lease that
             // prevents last-close from turning the description into Closed
@@ -650,7 +896,12 @@ impl SyscallDispatcher {
             let OpenDescription::Mqueue { queue, .. } = &*open else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let notify_record = notify_record.map(|spec| spec.bind(description.id()));
+            let notify_record = notify_record.map(|spec| {
+                spec.bind(MqueueRegistration {
+                    file_table: files.id(),
+                    description: description.id(),
+                })
+            });
             let mut state = queue.state.lock();
             if state.notify.is_some() {
                 return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EBUSY));
@@ -999,12 +1250,25 @@ mod tests {
         registry_id: i32,
         name: &str,
     ) -> crate::kernel::KernelContext {
+        fork_test_task_with_flags(
+            parent,
+            registry_id,
+            name,
+            carrick_abi::LinuxCloneFlags::empty(),
+        )
+    }
+
+    fn fork_test_task_with_flags(
+        parent: &crate::kernel::KernelContext,
+        registry_id: i32,
+        name: &str,
+        flags: carrick_abi::LinuxCloneFlags,
+    ) -> crate::kernel::KernelContext {
         parent
             .kernel()
             .reserve_fork(
                 parent,
-                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
-                    .unwrap(),
+                crate::kernel::ClonePlan::from_flags(flags).unwrap(),
                 name.to_owned(),
                 None,
             )
@@ -1380,6 +1644,290 @@ mod tests {
         assert!(
             queue.state.lock().notify.is_none(),
             "close linearized after registration must retire that registration"
+        );
+    }
+
+    #[test]
+    fn copied_file_table_owner_exit_purges_registration_despite_parent_description_ref() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_015);
+        dispatcher.bind_hvpatch_process(process);
+        let parent = dispatcher.capture_one_task_context().unwrap();
+        let parent_binding = parent.task_binding();
+        let parent_tid = parent.thread().key().tid;
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x7000]);
+        let name = b"owner_exit\0";
+        let mqd = open_test_queue(&dispatcher, &parent, &mut memory, 0x1000, name);
+        let netlink_fd = open_test_netlink(&dispatcher, &parent, &mut memory);
+        let netlink = file_description(&dispatcher, &parent, netlink_fd);
+        let parent_netlink_refs = netlink.fd_ref_count();
+        let (_, queue) = mqueue_description_and_queue(&dispatcher, &parent, mqd);
+
+        let child = fork_test_task(&parent, 82_015, "copied-table notify owner");
+        assert_ne!(
+            child.resources().files().id(),
+            parent.resources().files().id()
+        );
+        let old_key = child.task().key();
+        register_thread_notification(
+            &dispatcher,
+            &child,
+            &mut memory,
+            mqd,
+            netlink_fd,
+            [0x42; NOTIFY_DATA_SIZE],
+        );
+        assert!(queue.state.lock().notify.is_some());
+        assert_eq!(netlink.fd_ref_count(), parent_netlink_refs + 2);
+
+        child
+            .kernel()
+            .exit_task_key_eventually_notifying(
+                old_key,
+                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+                |_| dispatcher.retire_hvpatch_process_fds(&child),
+            )
+            .unwrap();
+        assert!(
+            queue.state.lock().notify.is_none(),
+            "owner exit must purge its exact registration even while the parent retains the description"
+        );
+        assert_eq!(
+            netlink.fd_ref_count(),
+            parent_netlink_refs,
+            "owner exit releases both the child's inherited fd and retained notification ref"
+        );
+
+        drop(child);
+        assert!(matches!(
+            parent.kernel().wait_child(
+                parent.task().key().id,
+                Some(old_key.id),
+                crate::kernel::WaitMode::Consume,
+            ),
+            Ok(crate::kernel::WaitOutcome::Exited(_))
+        ));
+        parent.kernel().sweep_retired_threads();
+        parent.kernel().ids().set_next_for_tests(old_key.id.raw());
+        let fresh_parent = parent_binding.capture(parent_tid).unwrap();
+        let replacement = fork_test_task(&fresh_parent, 82_016, "replacement notify owner");
+        assert_eq!(replacement.task().key().id, old_key.id);
+        assert_ne!(replacement.task().key(), old_key);
+        register_signal_notification(&dispatcher, &replacement, &mut memory, mqd, 34, 12, 0x1100);
+        assert!(queue.state.lock().notify.is_some());
+    }
+
+    #[test]
+    fn inherited_parent_close_does_not_clear_child_registration() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_017);
+        dispatcher.bind_hvpatch_process(process);
+        let parent = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
+        let mqd = open_test_queue(&dispatcher, &parent, &mut memory, 0x1000, b"parent_close\0");
+        let (_, queue) = mqueue_description_and_queue(&dispatcher, &parent, mqd);
+        let child = fork_test_task(&parent, 82_017, "child notify owner");
+        register_signal_notification(&dispatcher, &child, &mut memory, mqd, 34, 13, 0x1100);
+
+        close_test_fd(&dispatcher, &parent, &mut memory, mqd);
+        assert!(
+            queue.state.lock().notify.is_some(),
+            "a different copied FileTable closing its alias cannot retire the child owner's record"
+        );
+        assert_eq!(
+            dispatch_call(
+                &dispatcher,
+                &child,
+                &mut memory,
+                184,
+                [mqd as u64, 0, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert!(queue.state.lock().notify.is_none());
+    }
+
+    #[test]
+    fn cloexec_last_owner_alias_clears_with_parent_global_reference() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_018);
+        dispatcher.bind_hvpatch_process(process);
+        let parent = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
+        let mqd = open_test_queue(
+            &dispatcher,
+            &parent,
+            &mut memory,
+            0x1000,
+            b"cloexec_owner\0",
+        );
+        let (_, queue) = mqueue_description_and_queue(&dispatcher, &parent, mqd);
+        let child = fork_test_task(&parent, 82_018, "cloexec notify owner");
+        child
+            .resources()
+            .files()
+            .write_open_files()
+            .get_mut(&mqd)
+            .expect("child mqd")
+            .fd_flags |= LINUX_FD_CLOEXEC;
+        register_signal_notification(&dispatcher, &child, &mut memory, mqd, 34, 14, 0x1100);
+
+        let old_files = child.resources().files();
+        let prepared = child.kernel().prepare_exec(&child, None).unwrap();
+        let replacement = child.kernel().commit_exec(prepared, None).unwrap();
+        dispatcher.close_draining_file_table(
+            replacement.kernel(),
+            &old_files,
+            Some(replacement.task().key()),
+            Some(&replacement.resources().files()),
+        );
+        assert!(
+            queue.state.lock().notify.is_none(),
+            "CLOEXEC closing the owner's last local alias must clear even while parent retains the global description"
+        );
+    }
+
+    #[test]
+    fn exec_transfer_rebinds_registration_to_successor_file_table() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_019);
+        dispatcher.bind_hvpatch_process(process);
+        let parent = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
+        let mqd = open_test_queue(
+            &dispatcher,
+            &parent,
+            &mut memory,
+            0x1000,
+            b"exec_transfer\0",
+        );
+        let (_, queue) = mqueue_description_and_queue(&dispatcher, &parent, mqd);
+        let child = fork_test_task(&parent, 82_019, "exec notify owner");
+        register_signal_notification(&dispatcher, &child, &mut memory, mqd, 34, 15, 0x1100);
+
+        let old_files = child.resources().files();
+        let prepared = child.kernel().prepare_exec(&child, None).unwrap();
+        let replacement = child.kernel().commit_exec(prepared, None).unwrap();
+        assert_ne!(old_files.id(), replacement.resources().files().id());
+        dispatcher.close_draining_file_table(
+            replacement.kernel(),
+            &old_files,
+            Some(replacement.task().key()),
+            Some(&replacement.resources().files()),
+        );
+        assert!(queue.state.lock().notify.is_some());
+
+        close_test_fd(&dispatcher, &replacement, &mut memory, mqd);
+        assert!(
+            queue.state.lock().notify.is_none(),
+            "successor table's last alias must own and retire the transferred registration"
+        );
+    }
+
+    #[test]
+    fn shared_table_peer_close_in_exec_commit_window_rebinds_exact_owner() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_021);
+        dispatcher.bind_hvpatch_process(process);
+        let parent = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
+        let mqd = open_test_queue(
+            &dispatcher,
+            &parent,
+            &mut memory,
+            0x1000,
+            b"exec_peer_close\0",
+        );
+        let (_, queue) = mqueue_description_and_queue(&dispatcher, &parent, mqd);
+        let child = fork_test_task_with_flags(
+            &parent,
+            82_021,
+            "exec shared-table notify owner",
+            carrick_abi::LinuxCloneFlags::FILES,
+        );
+        register_signal_notification(&dispatcher, &child, &mut memory, mqd, 34, 16, 0x1100);
+
+        let old_files = child.resources().files();
+        let prepared = child.kernel().prepare_exec(&child, None).unwrap();
+        let replacement = child.kernel().commit_exec(prepared, None).unwrap();
+        let successor = replacement.resources().files();
+        assert_ne!(old_files.id(), successor.id());
+
+        // Kernel exec is committed, but dispatcher close/rebind has not run.
+        // The CLONE_FILES peer removes the old table's last alias in this exact
+        // window; the close hook must discover the exact owner's successor.
+        close_test_fd(&dispatcher, &parent, &mut memory, mqd);
+        assert!(
+            queue.state.lock().notify.is_some(),
+            "peer close must transfer, not erase, the execing owner's registration"
+        );
+        dispatcher.close_draining_file_table(
+            replacement.kernel(),
+            &old_files,
+            Some(replacement.task().key()),
+            Some(&successor),
+        );
+        close_test_fd(&dispatcher, &replacement, &mut memory, mqd);
+        assert!(queue.state.lock().notify.is_none());
+    }
+
+    #[test]
+    fn shared_file_table_owner_exit_purges_without_closing_shared_alias() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_020);
+        dispatcher.bind_hvpatch_process(process);
+        let parent = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x7000]);
+        let mqd = open_test_queue(
+            &dispatcher,
+            &parent,
+            &mut memory,
+            0x1000,
+            b"shared_table_exit\0",
+        );
+        let netlink_fd = open_test_netlink(&dispatcher, &parent, &mut memory);
+        let netlink = file_description(&dispatcher, &parent, netlink_fd);
+        let refs_before = netlink.fd_ref_count();
+        let (_, queue) = mqueue_description_and_queue(&dispatcher, &parent, mqd);
+        let child = fork_test_task_with_flags(
+            &parent,
+            82_020,
+            "shared-table notify owner",
+            carrick_abi::LinuxCloneFlags::FILES,
+        );
+        assert_eq!(
+            child.resources().files().id(),
+            parent.resources().files().id()
+        );
+        register_thread_notification(
+            &dispatcher,
+            &child,
+            &mut memory,
+            mqd,
+            netlink_fd,
+            [0x53; NOTIFY_DATA_SIZE],
+        );
+        assert_eq!(netlink.fd_ref_count(), refs_before + 1);
+
+        child
+            .kernel()
+            .exit_task_key_eventually_notifying(
+                child.task().key(),
+                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+                |_| dispatcher.retire_hvpatch_process_fds(&child),
+            )
+            .unwrap();
+        assert!(queue.state.lock().notify.is_none());
+        assert_eq!(netlink.fd_ref_count(), refs_before);
+        assert!(
+            parent
+                .resources()
+                .files()
+                .read_open_files()
+                .contains_key(&mqd),
+            "shared FileTable stays live for parent"
         );
     }
 

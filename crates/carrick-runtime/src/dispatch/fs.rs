@@ -3858,17 +3858,25 @@ impl SyscallDispatcher {
         self.detach_fd_from_epolls(new_fd);
         self.discard_splice_pushback_if_final(new_fd);
 
-        {
+        let replaced = {
             let files = self.captured_file_table();
             let mut table = files.write_open_files();
-            if let Some(replaced) = table.remove(&new_fd) {
-                let pid = self.event_ring_guest_pid();
-                self.record_fd_close_owner(new_fd, pid, &replaced);
-                self.release_hvpatch_classic_record_locks(owner, &replaced);
-                self.close_open_file_and_free_pty(&replaced);
-            }
+            let replaced = table.remove(&new_fd).map(|replaced| {
+                let alias_remains = table
+                    .values()
+                    .any(|slot| Arc::ptr_eq(&slot.description, &replaced.description));
+                (Arc::clone(&files), replaced, alias_remains)
+            });
             retain_open_file(&description);
             table.insert(new_fd, OpenFile::new(description, fd_flags));
+            replaced
+        };
+        if let Some((files, replaced, alias_remains)) = replaced {
+            self.mqueue_owner_alias_closed_known(files.id(), &replaced, alias_remains);
+            let pid = self.event_ring_guest_pid();
+            self.record_fd_close_owner(new_fd, pid, &replaced);
+            self.release_hvpatch_classic_record_locks(owner, &replaced);
+            self.close_open_file_and_free_pty(&replaced);
         }
         self.clear_closed_stdio(new_fd);
         DispatchOutcome::Returned {
@@ -9244,9 +9252,11 @@ impl SyscallDispatcher {
             // removal to THIS registration. detach takes only a read lock, so it
             // does not deadlock with the separate write below.
             this.detach_fd_from_epolls(fd.0);
-            let removed = this.captured_file_table().write_open_files().remove(&fd.0);
+            let files = this.captured_file_table();
+            let removed = files.write_open_files().remove(&fd.0);
             Ok(
                 if let Some(open_file) = removed {
+                    this.mqueue_owner_alias_closed(&files, &open_file);
                     this.record_fd_close_owner(fd.0, cx.tid().raw(), &open_file);
                     this.release_hvpatch_classic_record_locks(
                         cx.kernel.task().key(),
@@ -9316,7 +9326,10 @@ impl SyscallDispatcher {
                 for fd in fds {
                     this.discard_splice_pushback_if_final(fd);
                     this.detach_fd_from_epolls(fd);
-                    if let Some(open_file) = this.captured_file_table().write_open_files().remove(&fd) {
+                    let files = this.captured_file_table();
+                    let removed = files.write_open_files().remove(&fd);
+                    if let Some(open_file) = removed {
+                        this.mqueue_owner_alias_closed(&files, &open_file);
                         this.record_fd_close_owner(fd, cx.tid().raw(), &open_file);
                         this.release_hvpatch_classic_record_locks(
                             cx.kernel.task().key(),

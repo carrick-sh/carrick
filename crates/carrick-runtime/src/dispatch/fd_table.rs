@@ -1589,42 +1589,28 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
         }
     }
 
-    fn release_fd_ref(&self, identity: crate::kernel::FileDescriptionId) {
-        let retired_notification = {
-            let mut description = self.write();
-            let remaining = description.release_fd_ref();
-            match &*description {
-                OpenDescription::PipeReader { pipe, .. } => {
-                    let mut state = pipe.state.lock();
-                    state.readers = state.readers.saturating_sub(1);
-                    drop(state);
-                    pipe.changed.notify_all();
-                }
-                OpenDescription::PipeWriter { pipe, .. } => {
-                    let mut state = pipe.state.lock();
-                    state.writers = state.writers.saturating_sub(1);
-                    drop(state);
-                    pipe.changed.notify_all();
-                }
-                _ => {}
+    fn release_fd_ref(&self) {
+        let mut description = self.write();
+        let remaining = description.release_fd_ref();
+        match &*description {
+            OpenDescription::PipeReader { pipe, .. } => {
+                let mut state = pipe.state.lock();
+                state.readers = state.readers.saturating_sub(1);
+                drop(state);
+                pipe.changed.notify_all();
             }
-            let retired_notification = if remaining == 0
-                && let OpenDescription::Mqueue { queue, .. } = &*description
-            {
-                queue.retire_notification_owner(identity)
-            } else {
-                None
-            };
-            if remaining == 0 {
-                let was_epoll = matches!(&*description, OpenDescription::Epoll { .. });
-                *description = OpenDescription::Closed { was_epoll };
+            OpenDescription::PipeWriter { pipe, .. } => {
+                let mut state = pipe.state.lock();
+                state.writers = state.writers.saturating_sub(1);
+                drop(state);
+                pipe.changed.notify_all();
             }
-            retired_notification
-        };
-        // A SIGEV_THREAD registration owns a logical reference to a DIFFERENT
-        // FileDescription. Release it only after the mqueue description and
-        // queue locks are both gone, keeping teardown lock ordering acyclic.
-        drop(retired_notification);
+            _ => {}
+        }
+        if remaining == 0 {
+            let was_epoll = matches!(&*description, OpenDescription::Epoll { .. });
+            *description = OpenDescription::Closed { was_epoll };
+        }
     }
 
     fn fd_ref_count(&self) -> usize {

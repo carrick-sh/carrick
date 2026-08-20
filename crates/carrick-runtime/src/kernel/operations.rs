@@ -1810,6 +1810,32 @@ impl Kernel {
         })
     }
 
+    /// Current FileTable generations of one exact live task. Exec/CLONE_FILES
+    /// lifecycle glue uses this to authenticate a notification's owner-local
+    /// alias after an old shared table changes concurrently with exec.
+    pub(crate) fn task_file_tables_exact(&self, target: TaskKey) -> Vec<Arc<FileTable>> {
+        let state = self.registry().state.read();
+        let Some(task) = state
+            .tasks
+            .get(&target.id)
+            .map(|record| &record.task)
+            .filter(|task| task.key() == target && task.lifecycle() == TaskLifecycle::Live)
+        else {
+            return Vec::new();
+        };
+        let mut tables = Vec::new();
+        for thread_key in task.thread_keys() {
+            let Some(thread) = task.thread(thread_key.tid) else {
+                continue;
+            };
+            let files = thread.resources().files();
+            if !tables.iter().any(|observed| Arc::ptr_eq(observed, &files)) {
+                tables.push(files);
+            }
+        }
+        tables
+    }
+
     pub(crate) fn retire_file_table_if_unreferenced(&self, target: &Arc<FileTable>) {
         self.retire_file_table_generation(target, None);
     }

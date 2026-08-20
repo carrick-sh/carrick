@@ -3313,7 +3313,13 @@ impl SyscallDispatcher {
             .map_err(|error| error.to_string())?;
         *self.kernel_binding.write() = context.task_binding();
         self.publish_external_credential_projection(&context, &context.resources().credentials());
-        self.close_draining_file_table(&kernel, &old_files, Some(context.task().key()));
+        let successor_files = context.resources().files();
+        self.close_draining_file_table(
+            &kernel,
+            &old_files,
+            Some(context.task().key()),
+            Some(&successor_files),
+        );
         Ok(context)
     }
 
@@ -3322,7 +3328,11 @@ impl SyscallDispatcher {
         kernel: &Arc<crate::kernel::Kernel>,
         files: &Arc<crate::kernel::FileTable>,
         owner: Option<crate::kernel::TaskKey>,
+        exec_successor: Option<&Arc<crate::kernel::FileTable>>,
     ) {
+        if let (Some(owner), Some(successor)) = (owner, exec_successor) {
+            self.mqueue_rebind_exec_file_table(owner, files, successor);
+        }
         kernel.retire_file_table_if_unreferenced(files);
         let pid = self.event_ring_guest_pid();
         let events = kernel.take_file_close_events(files.id());
@@ -3488,6 +3498,7 @@ impl SyscallDispatcher {
                         context.kernel(),
                         &context.resources().files(),
                         Some(context.task().key()),
+                        None,
                     );
                     return Ok(());
                 }
@@ -3654,7 +3665,8 @@ impl SyscallDispatcher {
             .classic_record_locks
             .release_owner(context.task().key());
         let files = self.file_table_for_context(context);
-        self.close_draining_file_table(context.kernel(), &files, Some(context.task().key()));
+        self.mqueue_retire_task_owner(context.task().key(), &files);
+        self.close_draining_file_table(context.kernel(), &files, Some(context.task().key()), None);
     }
 
     fn event_ring_guest_pid(&self) -> i32 {
