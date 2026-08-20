@@ -854,6 +854,7 @@ where
                     committed_context.kernel(),
                     &old_files,
                     Some(committed_context.task().key()),
+                    Some(&committed_context.resources().files()),
                 );
                 emit_runtime_stage(
                     carrick_observability::probes::HvpatchExecRuntimeStagePhase::CloseCloexec,
