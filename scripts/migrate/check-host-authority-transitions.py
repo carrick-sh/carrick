@@ -2166,11 +2166,11 @@ def _snapshot_records(
         relative = entry["path"]
         path = snapshot_root / relative
         try:
-            metadata = path.lstat()
+            before = path.lstat()
         except FileNotFoundError as error:
             raise InventoryError(f"snapshot input is missing: {relative}") from error
         if entry["mode"] == "120000":
-            if not stat.S_ISLNK(metadata.st_mode):
+            if not stat.S_ISLNK(before.st_mode):
                 raise InventoryError(f"snapshot symlink type changed: {relative}")
             target = os.readlink(path)
             resolved = _relative_symlink_target(relative, target)
@@ -2181,10 +2181,29 @@ def _snapshot_records(
             content = os.fsencode(target)
             actual_mode = "120000"
         else:
-            if not stat.S_ISREG(metadata.st_mode):
+            if not stat.S_ISREG(before.st_mode):
                 raise InventoryError(f"snapshot file type changed: {relative}")
             content = path.read_bytes()
-            actual_mode = "100755" if metadata.st_mode & stat.S_IXUSR else "100644"
+            actual_mode = "100755" if before.st_mode & stat.S_IXUSR else "100644"
+        after = path.lstat()
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if before_identity != after_identity:
+            raise InventoryError(f"snapshot input changed while hashing: {relative}")
         if actual_mode != entry["mode"]:
             raise InventoryError(f"snapshot mode changed: {relative}")
         records.append(
