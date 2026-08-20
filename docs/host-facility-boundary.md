@@ -80,15 +80,19 @@ local check is deliberately reported as partial and is not cross-platform
 completeness. The rejected lexical-scanner commits were breaker evidence, not
 closure; the compiler-resolved successor plan replaces them.
 
-The narrow escape companion uses Semgrep plus a comment/string/raw-string-aware
-syntax pass. Together they catch unmistakable catalog escapes such as raw
-`libc::syscall`, `dlopen`/`dlsym`, assembly and its import aliases, and local
-declarations or `link_name` aliases of watched host APIs, including syntax in
-macro token trees. Exclusions are exact reviewed relative paths; a nested path
-with the same suffix is not exempt. The syntax pass does not resolve Rust
-names, cfg, modules, or reachability, and it does not turn an enumerated
-catalog into a capability boundary. Phase 1 must still introduce the typed
-host-capability facade and deny raw host APIs outside that facade.
+The narrow escape companion uses Semgrep plus a checked standalone Rust helper
+that tokenizes with `proc_macro2`. Together they catch unmistakable catalog
+escapes such as raw `libc::syscall`, `dlopen`/`dlsym`, assembly and its import
+aliases, and local declarations or `link_name` aliases of watched host APIs,
+including syntax in recursively nested macro token groups. Comments are absent
+from that token stream; strings, raw/byte/C strings, characters, labels, and
+lifetimes remain atomic tokens instead of being interpreted by a hand lexer.
+Exclusions are exact reviewed relative paths; a nested path with the same
+suffix is not exempt. The Python wrapper only validates the helper's JSON,
+applies those exact path allowlists, and propagates build/scan failure. Neither
+layer resolves Rust names, cfg, modules, or reachability, and neither turns an
+enumerated catalog into a capability boundary. Phase 1 must still introduce
+the typed host-capability facade and deny raw host APIs outside that facade.
 
 ## The test that catches this class
 
@@ -166,9 +170,9 @@ The table now carries `Authority { Guest, Host, Hybrid }` alongside
    evidence; human review, not the validator, establishes semantic truth.
 4. The 173 `forbidden_semantic` rows are frozen debt, not accepted authority or
    completed fixes. Classifying a row never makes its behavior correct.
-5. Semgrep and the supplemental syntax pass prevent new unmistakable bypass
-   syntax outside exact reviewed modules, including macro token bodies and
-   renamed imports. Only the Phase 1 typed capability facade can make raw
+5. Semgrep and the checked `proc_macro2` token helper prevent new unmistakable
+   bypass syntax outside exact reviewed modules, including nested macro groups
+   and renamed imports. Only the Phase 1 typed capability facade can make raw
    host-authority access structurally unavailable elsewhere.
 
 Phase 0 therefore makes the current local boundary explicit and drift-gated.
