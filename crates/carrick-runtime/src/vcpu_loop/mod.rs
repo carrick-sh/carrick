@@ -1928,7 +1928,7 @@ where
         Ok(())
     }
 
-    fn require_execution_authority_for_destructive_save(&self) -> Result<(), RuntimeError> {
+    fn begin_reclaim_snapshot_save(&self) -> Result<(), RuntimeError> {
         let thread = self.kernel_thread.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("destructive save lost Kernel thread".to_owned())
         })?;
@@ -1939,7 +1939,7 @@ where
             )
         })?;
         thread
-            .validate_running_execution_lease(lease)
+            .begin_switch_out(lease)
             .map_err(|error| RuntimeError::Configuration(error.to_string()))
     }
 
@@ -1956,13 +1956,6 @@ where
             )
         })?;
         if let Err(error) = lease.replace_task_state(state.clone()) {
-            let _ = thread.fail_from_executor(
-                lease,
-                crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
-            );
-            return Err(RuntimeError::Configuration(error.to_string()));
-        }
-        if let Err(error) = thread.begin_switch_out(&lease) {
             let _ = thread.fail_from_executor(
                 lease,
                 crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
@@ -2642,7 +2635,7 @@ where
         // thread's vCPU alone while other processes continue running.
         let single_threaded_process =
             self.registry.live_count() == 1 && self.process_fork_barrier.is_none();
-        self.require_execution_authority_for_destructive_save()?;
+        self.begin_reclaim_snapshot_save()?;
         let cpu = if single_threaded_process {
             // Single-threaded: this thread IS the whole process — no sibling
             // can race the teardown, so release unconditionally via the
@@ -5370,6 +5363,10 @@ where
         let result = assemble_run_result(&kernel, -1, None, state.max_traps, true);
         Ok(VcpuLoopOutcome::TrapLimit(Box::new(result)))
     })();
+    // The exact Kernel execution lease must settle before any terminal branch
+    // retires graph/MM/ASID/backend authority. Paths that already settled in
+    // `handle_thread_exit` make this an intentional no-op.
+    state.settle_execution_lease_on_loop_departure();
     // Every terminal HVPatch process transition (root or in-process child)
     // has one owner and one ordering point. Output and process-fd lifetime are
     // finalized before Linux exit publication; only after the zombie/pidfd and
@@ -5807,7 +5804,6 @@ where
             result = Ok(VcpuLoopOutcome::ThreadDone);
         }
     }
-    state.settle_execution_lease_on_loop_departure();
     // This thread is leaving its vCPU loop. The engine's Drop is a no-op.
     // HVPatch ProcessExit retires its vCPU in the process cleanup above;
     // mature VMM ProcessExit keeps its historical process-death teardown.
@@ -6083,6 +6079,53 @@ mod tests {
             .rfind("engine.destroy_vcpu_on_thread_exit()")
             .expect("common vCPU destruction");
         assert!(departure < destroy);
+    }
+
+    #[test]
+    fn switching_out_precedes_every_destructive_reclaim_save() {
+        let source = include_str!("mod.rs");
+        let begin = source
+            .find(concat!("begin_reclaim_", "snapshot_save()?;"))
+            .expect("exact lease must enter SwitchingOut");
+        let shared_save = source
+            .find("engine.save_shared_wait_state()")
+            .expect("shared destructive save");
+        let private_save = source
+            .find("engine.save_guest_state()")
+            .expect("private destructive save");
+        assert!(begin < shared_save && begin < private_save);
+
+        let settle = source
+            .split("fn settle_reclaim_snapshot")
+            .nth(1)
+            .and_then(|tail| tail.split("fn claim_reclaim_snapshot").next())
+            .expect("settlement body");
+        assert!(!settle.contains("begin_switch_out"));
+    }
+
+    #[test]
+    fn loop_departure_settles_before_every_terminal_retirement_branch() {
+        let source = include_str!("mod.rs");
+        let loop_start = source
+            .find("let mut result: Result<VcpuLoopOutcome")
+            .expect("run loop start");
+        let terminal_branch = source[loop_start..]
+            .find("let terminal_hvpatch_process")
+            .map(|offset| loop_start + offset)
+            .expect("terminal cleanup branch");
+        let settlement = source[..terminal_branch]
+            .rfind("state.settle_execution_lease_on_loop_departure()")
+            .expect("branch-complete execution settlement");
+        assert!(settlement > loop_start && settlement < terminal_branch);
+        for retirement in [
+            "retire_in_process_address_space",
+            "process.exit_thread",
+            "engine.destroy_vcpu_on_thread_exit()",
+        ] {
+            if let Some(offset) = source[terminal_branch..].find(retirement) {
+                assert!(settlement < terminal_branch + offset, "{retirement}");
+            }
+        }
     }
 
     /// `SA_RESTART` must resume the calls `signal(7)` says it resumes, and must

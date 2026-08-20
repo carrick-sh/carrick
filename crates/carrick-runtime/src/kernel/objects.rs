@@ -3913,6 +3913,7 @@ struct ThreadExecutionRecord {
     state: ThreadExecutionState,
     task_state: Option<Box<MigratableTaskState>>,
     next_executor_epoch: u64,
+    exec_invalidation_pending: bool,
 }
 
 impl ThreadExecutionRecord {
@@ -3921,6 +3922,7 @@ impl ThreadExecutionRecord {
             state: ThreadExecutionState::Uninitialized,
             task_state: None,
             next_executor_epoch: 1,
+            exec_invalidation_pending: false,
         }
     }
 }
@@ -4152,6 +4154,7 @@ impl Thread {
         }
         let generation = ExecutionGeneration::INITIAL;
         execution.task_state = Some(Box::new(state));
+        execution.exec_invalidation_pending = false;
         execution.state = ThreadExecutionState::Runnable { generation };
         drop(execution);
         self.revision.publish();
@@ -4345,6 +4348,7 @@ impl Thread {
         };
         execution.task_state = None;
         let _ = lease.task_state.take();
+        execution.exec_invalidation_pending = false;
         execution.state = ThreadExecutionState::Failed { generation, reason };
         lease.settled = true;
         drop(execution);
@@ -4360,6 +4364,7 @@ impl Thread {
             return;
         }
         execution.task_state = None;
+        execution.exec_invalidation_pending = false;
         execution.state = ThreadExecutionState::Failed {
             generation: ExecutionGeneration::INITIAL,
             reason,
@@ -4384,19 +4389,26 @@ impl Thread {
         let Some(generation) = lease.generation.next() else {
             return Err((ThreadExecutionError::GenerationExhausted, lease));
         };
-        match settlement {
-            ExecutionSettlement::Runnable => {
-                execution.task_state = lease.task_state.take();
-                execution.state = ThreadExecutionState::Runnable { generation };
-            }
-            ExecutionSettlement::Blocked(reason) => {
-                execution.task_state = lease.task_state.take();
-                execution.state = ThreadExecutionState::Blocked { generation, reason };
-            }
-            ExecutionSettlement::Exited => {
-                execution.task_state = None;
-                let _ = lease.task_state.take();
-                execution.state = ThreadExecutionState::Exited { generation };
+        if execution.exec_invalidation_pending {
+            execution.task_state = None;
+            let _ = lease.task_state.take();
+            execution.state = ThreadExecutionState::Exited { generation };
+            execution.exec_invalidation_pending = false;
+        } else {
+            match settlement {
+                ExecutionSettlement::Runnable => {
+                    execution.task_state = lease.task_state.take();
+                    execution.state = ThreadExecutionState::Runnable { generation };
+                }
+                ExecutionSettlement::Blocked(reason) => {
+                    execution.task_state = lease.task_state.take();
+                    execution.state = ThreadExecutionState::Blocked { generation, reason };
+                }
+                ExecutionSettlement::Exited => {
+                    execution.task_state = None;
+                    let _ = lease.task_state.take();
+                    execution.state = ThreadExecutionState::Exited { generation };
+                }
             }
         }
         lease.settled = true;
@@ -4458,6 +4470,7 @@ impl Thread {
             .next()
             .unwrap_or_else(|| std::process::abort());
         execution.task_state = None;
+        execution.exec_invalidation_pending = false;
         execution.state = ThreadExecutionState::Failed {
             generation,
             reason: ExecutionFailure::UnsettledLeaseDropped {
@@ -4474,6 +4487,12 @@ impl Thread {
     /// entry state before it can be claimed.
     pub(super) fn invalidate_execution_for_exec(&self) {
         let mut execution = self.execution.lock();
+        if matches!(execution.state, ThreadExecutionState::SwitchingOut { .. }) {
+            execution.exec_invalidation_pending = true;
+            drop(execution);
+            self.revision.publish();
+            return;
+        }
         let generation = execution
             .state
             .generation()
@@ -4481,6 +4500,7 @@ impl Thread {
             .next()
             .unwrap_or_else(|| std::process::abort());
         execution.task_state = None;
+        execution.exec_invalidation_pending = false;
         execution.state = ThreadExecutionState::Exited { generation };
         drop(execution);
         self.revision.publish();

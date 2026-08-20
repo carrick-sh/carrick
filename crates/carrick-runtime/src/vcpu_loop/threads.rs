@@ -262,7 +262,7 @@ where
             // was still spare at the instant they parked.
             let reclaim_now = engine.reclaims();
             let snapshot = if reclaim_now {
-                self.require_execution_authority_for_destructive_save()?;
+                self.begin_reclaim_snapshot_save()?;
                 let cpu = engine.save_guest_state().map_err(|error| {
                     self.fail_snapshot_boundary(
                         crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
