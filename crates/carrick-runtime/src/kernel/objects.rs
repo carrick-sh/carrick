@@ -415,6 +415,7 @@ pub enum FileDescriptionBackingKind {
     File,
     Directory,
     SyntheticFile,
+    SyntheticDevice,
     EventFd,
     TimerFd,
     Epoll,

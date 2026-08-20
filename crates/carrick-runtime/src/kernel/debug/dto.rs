@@ -1099,6 +1099,7 @@ fn backing_kind_name(backing: &FileDescriptionBackingSnapshot) -> &'static str {
         Kind::File => "file",
         Kind::Directory => "directory",
         Kind::SyntheticFile => "synthetic-file",
+        Kind::SyntheticDevice => "synthetic-device",
         Kind::EventFd => "eventfd",
         Kind::TimerFd => "timerfd",
         Kind::Epoll => "epoll",

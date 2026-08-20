@@ -45,7 +45,6 @@ mod overlay_dispatch_tests {
         const EVENTFD_WRITE_EVENT: u8 = 21;
         let dispatcher = SyscallDispatcher::new();
         let state = EventFdState::new(0x0102_0304);
-        let host_read_fd = state.read_fd.as_ref().expect("readiness pipe").raw();
         let increment = LinuxEventfdValue { value: 7 };
 
         assert!(matches!(
@@ -55,11 +54,11 @@ mod overlay_dispatch_tests {
         assert!(
             crate::event_ring::contains_event(
                 EVENTFD_WRITE_EVENT,
-                host_read_fd,
+                -1,
                 0x0102_0304,
                 0x0102_030b,
             ),
-            "the always-on ring must bind an eventfd write to its host readiness fd"
+            "the always-on ring must record the in-memory eventfd transition"
         );
     }
 
@@ -4110,5 +4109,34 @@ mod container_policy_dispatch_tests {
             }])
             .expect("install guest seccomp filter");
         assert!(!dispatcher.identity_fast_path_enabled());
+    }
+
+    #[test]
+    fn synthetic_device_stat_source_reports_chardev_and_rdev() {
+        use crate::vfs::SyntheticDeviceKind;
+
+        let kinds = [
+            (SyntheticDeviceKind::Null, "/dev/null"),
+            (SyntheticDeviceKind::Zero, "/dev/zero"),
+            (SyntheticDeviceKind::Full, "/dev/full"),
+            (SyntheticDeviceKind::Random, "/dev/random"),
+            (SyntheticDeviceKind::Urandom, "/dev/urandom"),
+        ];
+
+        for (kind, expected_path) in kinds {
+            let desc = OpenDescription::SyntheticDevice {
+                base: OpenDescriptionBase::new(0),
+                kind,
+            };
+            assert_eq!(desc.open_path(), Some(expected_path));
+            assert_eq!(desc.readlink_target(), None);
+            match desc.stat_source() {
+                OpenStatSource::Record(record) => {
+                    assert_eq!(record.mode & LINUX_S_IFMT, LINUX_S_IFCHR);
+                    assert_eq!(record.rdev, kind.rdev());
+                }
+                other => panic!("expected OpenStatSource::Record, got {:?}", other),
+            }
+        }
     }
 }

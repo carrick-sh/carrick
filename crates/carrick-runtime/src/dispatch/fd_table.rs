@@ -137,41 +137,13 @@ pub(super) struct EventFdState {
     /// behavior).
     slot: Option<usize>,
     local: std::sync::atomic::AtomicU64,
-    /// Host pipe whose read end mirrors "counter > 0": a byte is present iff
-    /// the eventfd is readable. This gives the eventfd a REAL host fd that the
-    /// epoll instance kqueue watches via `EVFILT_READ` natively
-    /// (level-triggered -> can't be lost), so Go's netpollBreak wakes the poller
-    /// without relying on the coarse `EVFILT_USER` broadcast — and that a
-    /// BLOCKING guest read parks on (`WaitOnFds`), which a kernel-shared pipe
-    /// makes work across forked guest processes. `None` if pipe creation failed
-    /// (then readiness falls back to the in-memory recompute + broadcast and
-    /// blocking reads degrade to EAGAIN). The owned [`HostFdRef`]s close the two
-    /// ends when this state drops (replacing the historical bespoke `Drop`).
-    /// The bytes are managed entirely by carrick (write_eventfd / read_eventfd);
-    /// the guest never reads the pipe directly.
-    pub(super) read_fd: Option<HostFdRef>,
-    pub(super) write_fd: Option<HostFdRef>,
 }
 
 impl EventFdState {
     pub(super) fn new(counter: u64) -> Self {
-        let (read_fd, write_fd) = match make_readiness_pipe() {
-            Some((read_fd, write_fd)) => (Some(read_fd), Some(write_fd)),
-            None => (None, None),
-        };
-        // Reflect a non-zero initial value as "readable" right away.
-        if counter > 0
-            && let Some(write_fd) = &write_fd
-        {
-            let byte = [1u8];
-            // BLOCKING-IO-OK: readiness pipe is set to O_NONBLOCK during creation
-            unsafe { libc::write(write_fd.raw(), byte.as_ptr().cast(), 1) };
-        }
         Self {
             slot: crate::eventfd_shm::alloc(counter),
             local: std::sync::atomic::AtomicU64::new(counter),
-            read_fd,
-            write_fd,
         }
     }
 
@@ -186,38 +158,6 @@ impl EventFdState {
     /// Current counter value (racy snapshot — poll/epoll readiness only).
     pub(super) fn counter_value(&self) -> u64 {
         self.counter_ref().load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Make `read_fd` readable iff `count > 0`: ensure a byte is present when
-    /// readable, drained when not. `count` is the caller's post-update view.
-    /// Cross-process race guard: after draining for a 0 count, RE-CHECK the
-    /// shared counter — a concurrent writer's 0→n byte may have been eaten by
-    /// this drain, and a parked reader would then sleep past a ready counter.
-    pub(super) fn sync_readiness(&self, count: u64) {
-        let (Some(read_fd), Some(write_fd)) = (&self.read_fd, &self.write_fd) else {
-            return;
-        };
-        if count > 0 {
-            // Ensure a byte is present (idempotent: a full pipe EAGAINs).
-            let byte = [1u8];
-            // BLOCKING-IO-OK: readiness pipe is set to O_NONBLOCK during creation
-            unsafe { libc::write(write_fd.raw(), byte.as_ptr().cast(), 1) };
-        } else {
-            // Drain any bytes so the read end is not readable.
-            let mut buf = [0u8; 64];
-            loop {
-                // BLOCKING-IO-OK: readiness pipe is set to O_NONBLOCK during creation
-                let n = unsafe { libc::read(read_fd.raw(), buf.as_mut_ptr().cast(), buf.len()) };
-                if n <= 0 {
-                    break;
-                }
-            }
-            if self.counter_value() > 0 {
-                let byte = [1u8];
-                // BLOCKING-IO-OK: readiness pipe is set to O_NONBLOCK during creation
-                unsafe { libc::write(write_fd.raw(), byte.as_ptr().cast(), 1) };
-            }
-        }
     }
 }
 
@@ -1075,6 +1015,10 @@ pub(super) enum OpenDescription {
         contents: Vec<u8>,
         offset: usize,
     },
+    SyntheticDevice {
+        base: OpenDescriptionBase,
+        kind: crate::vfs::SyntheticDeviceKind,
+    },
     EventFd {
         base: OpenDescriptionBase,
         state: Arc<EventFdState>,
@@ -1429,6 +1373,7 @@ impl OpenDescription {
             Self::File { .. } => "file",
             Self::Directory { .. } => "directory",
             Self::SyntheticFile { .. } => "synthetic_file",
+            Self::SyntheticDevice { .. } => "synthetic_device",
             Self::EventFd { .. } => "eventfd",
             Self::TimerFd { .. } => "timerfd",
             Self::Epoll { .. } => "epoll",
@@ -1458,6 +1403,7 @@ impl OpenDescription {
             OpenDescription::File { path, .. }
             | OpenDescription::Directory { path, .. }
             | OpenDescription::SyntheticFile { path, .. } => Some(path.as_str()),
+            OpenDescription::SyntheticDevice { kind, .. } => Some(kind.as_str()),
             // A host-fd-backed regular file (e.g. `--fs host`) carries the guest
             // path it was opened at in its metadata — surface it so
             // readlink(/proc/self/fd/N) and fexecve (execveat AT_EMPTY_PATH)
@@ -1481,6 +1427,7 @@ impl OpenDescription {
             OpenDescription::File { .. }
             | OpenDescription::Directory { .. }
             | OpenDescription::SyntheticFile { .. }
+            | OpenDescription::SyntheticDevice { .. }
             | OpenDescription::HostFile { .. } => return None,
             OpenDescription::EventFd { .. } => "anon_inode:[eventfd]".to_owned(),
             OpenDescription::TimerFd { .. } => "anon_inode:[timerfd]".to_owned(),
@@ -1545,6 +1492,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::File { .. } => Kind::File,
             OpenDescription::Directory { .. } => Kind::Directory,
             OpenDescription::SyntheticFile { .. } => Kind::SyntheticFile,
+            OpenDescription::SyntheticDevice { .. } => Kind::SyntheticDevice,
             OpenDescription::EventFd { .. } => Kind::EventFd,
             OpenDescription::TimerFd { .. } => Kind::TimerFd,
             OpenDescription::Epoll { .. } => Kind::Epoll,
@@ -1583,6 +1531,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::File { path, .. }
             | OpenDescription::Directory { path, .. }
             | OpenDescription::SyntheticFile { path, .. } => Some(path.clone()),
+            OpenDescription::SyntheticDevice { kind, .. } => Some(kind.as_str().to_string()),
             OpenDescription::HostFile { metadata, .. } => {
                 Some(metadata.path.to_string_lossy().into_owned())
             }
@@ -1905,6 +1854,7 @@ impl OpenDescription {
             OpenDescription::File { base, .. }
             | OpenDescription::Directory { base, .. }
             | OpenDescription::SyntheticFile { base, .. }
+            | OpenDescription::SyntheticDevice { base, .. }
             | OpenDescription::EventFd { base, .. }
             | OpenDescription::TimerFd { base, .. }
             | OpenDescription::Epoll { base, .. }
@@ -1935,6 +1885,7 @@ impl OpenDescription {
             OpenDescription::File { base, .. }
             | OpenDescription::Directory { base, .. }
             | OpenDescription::SyntheticFile { base, .. }
+            | OpenDescription::SyntheticDevice { base, .. }
             | OpenDescription::EventFd { base, .. }
             | OpenDescription::TimerFd { base, .. }
             | OpenDescription::Epoll { base, .. }
@@ -2110,6 +2061,11 @@ impl OpenDescription {
                 if let Some(ino) = crate::vfs::proc::ns_link_inode(path) {
                     record.ino = ino;
                 }
+                OpenStatSource::Record(record)
+            }
+            OpenDescription::SyntheticDevice { kind, .. } => {
+                let mut record = StatRecord::synthetic(kind.as_str(), 0, LINUX_S_IFCHR | 0o666);
+                record.rdev = kind.rdev();
                 OpenStatSource::Record(record)
             }
             OpenDescription::EventFd { .. } => {

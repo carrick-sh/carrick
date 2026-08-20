@@ -447,6 +447,7 @@ impl SyscallDispatcher {
             | OpenDescription::Mqueue { .. }
             | OpenDescription::BpfMap { .. }
             | OpenDescription::BpfProg { .. }
+            | OpenDescription::SyntheticDevice { .. }
             | OpenDescription::Netlink { .. } => synthetic_readonly_access(mode),
         }
     }

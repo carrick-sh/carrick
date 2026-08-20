@@ -197,6 +197,7 @@ impl SyscallDispatcher {
             | OpenDescription::Mqueue { .. }
             | OpenDescription::BpfMap { .. }
             | OpenDescription::BpfProg { .. }
+            | OpenDescription::SyntheticDevice { .. }
             | OpenDescription::Netlink { .. } => Ok(Err(LINUX_EINVAL)),
         }
     }
@@ -258,6 +259,7 @@ impl SyscallDispatcher {
             | OpenDescription::Mqueue { .. }
             | OpenDescription::BpfMap { .. }
             | OpenDescription::BpfProg { .. }
+            | OpenDescription::SyntheticDevice { .. }
             | OpenDescription::Netlink { .. } => return Err(LINUX_EINVAL),
         };
         Ok(bytes)
