@@ -347,9 +347,33 @@ pub fn ns_to_host_or_self(ns_pid: u32) -> Option<u32> {
     }
 }
 
-/// The current process's own ns-pid. The container init is ns-pid 1. Identity
-/// (the host pid) when namespaces are off.
+/// The CALLING Linux process's own pid — what `getpid(2)` reports.
+///
+/// The first question this asks is "who is calling?", and only carrick's kernel
+/// can answer it. Under HVPatch every logical Linux process is a thread of ONE
+/// VM carrier, so the host-pid derivation below describes the carrier and is
+/// identical for all of them: the pid-namespace region holds exactly one
+/// registration, the carrier's, mapped to ns-pid 1, so this function returned
+/// **1 for every guest process**. Everything built on it inherited that —
+/// `NsPid::names_self()` said yes to pid 1 from any process (so a child's
+/// `capset(hdr{pid:1})` mutated the child instead of failing EPERM),
+/// `readlink("/proc/self")` resolved to "1" for everyone, and `/proc/<own
+/// pid>/…` was ENOENT for any process that was not the init.
+///
+/// The dispatch boundary installs the calling task for exactly this class of
+/// question (see `dispatch::resources::with_active_context`), so the kernel
+/// graph answers whenever a guest syscall is in flight. Outside any dispatch
+/// scope there is no calling Linux process to describe — runtime-internal
+/// callers, and the unit suite — and the carrier's host-pid derivation is then
+/// the honest answer rather than a wrong one.
 pub fn self_ns_pid() -> u32 {
+    if let Some(pid) = crate::dispatch::resources::with_active_context(|context| {
+        u32::try_from(context.task().key().id.raw()).ok()
+    })
+    .flatten()
+    {
+        return pid;
+    }
     let host = std::process::id();
     // `host_to_ns_or_self` returns 0 for a host pid that isn't mapped in the
     // namespace region — correct for a FOREIGN pid (invisible across the pid-ns
@@ -363,27 +387,31 @@ pub fn self_ns_pid() -> u32 {
     }
 }
 
-/// Whether the namespace-visible process `ns_pid` is the leader of its session.
-/// Linux rejects `setpgid()` for a session leader with `EPERM`; Darwin cannot
-/// answer that after pid-ns translation because the host process may not be a
-/// session leader even when the guest-visible pid/sid pair says it is.
-pub fn ns_pid_is_session_leader(ns_pid: u32) -> bool {
-    let Some(host_pid) = ns_to_host_or_self(ns_pid) else {
-        return false;
-    };
-    let sid = unsafe { libc::getsid(host_pid as i32) };
-    if sid <= 0 {
-        return false;
-    }
-    host_to_ns_pgid(sid as u32) == ns_pid
-}
-
-/// The current process's parent pid as its ns sees it — the value `getppid()`
-/// returns and `/proc/self/status` shows as `PPid:`. The ns-init (ns-pid 1) has
-/// no parent inside the namespace, so 0; a reparented orphan reports 1; others
-/// translate their host ppid (0 if the parent is outside the ns). Identity
-/// (the real host ppid) when namespaces are off (§5.3, §5.4).
+/// The CALLING Linux process's parent pid — the value `getppid()` returns and
+/// `/proc/self/status` shows as `PPid:`.
+///
+/// Same authority and same reason as [`self_ns_pid`]: the host `getppid()` names
+/// the carrier's Darwin parent (a shell, or the NsSupervisor), which is one
+/// value shared by every guest process and is not a guest pid at all. The kernel
+/// graph also observes reparenting, which a fork-time snapshot cannot: an orphan
+/// whose parent exited must report its new reaper. A caller with no parent in
+/// the graph is the namespace init, whose `PPid` is 0 (`pid_namespaces(7)`).
 pub fn self_ns_ppid() -> u32 {
+    if let Some(ppid) = crate::dispatch::resources::with_active_context(|context| {
+        context
+            .kernel()
+            .process_identity(context.task().key().id)
+            .map(|identity| {
+                identity
+                    .parent
+                    .and_then(|parent| u32::try_from(parent.raw()).ok())
+                    .unwrap_or(0)
+            })
+    })
+    .flatten()
+    {
+        return ppid;
+    }
     if !enabled() {
         // SAFETY: getppid is always safe.
         return unsafe { libc::getppid() } as u32;

@@ -131,56 +131,22 @@ use crate::linux_abi::{
 /// caller's `len` to equal this exactly; get_robust_list reports it.
 const ROBUST_LIST_HEAD_SIZE: u64 = 24;
 
-fn translate_setpgid_args(pid: NsPid, pgid: NsPid) -> Result<(i32, i32), LinuxErrno> {
-    // A negative pgid is EINVAL, checked before any pid/pgid lookup (Linux
-    // checks it first; under a namespace we translate, so the host would never
-    // otherwise see the raw negative value — LTP setpgid02 case 1).
-    if pgid.raw() < 0 {
-        return Err(LINUX_EINVAL);
+/// The Linux process a pid-taking identity syscall names: `0` is the caller,
+/// anything positive is a guest pid, anything negative is ESRCH.
+///
+/// Resolution is entirely guest-domain. The pid arguments of `getpgid`/`getsid`
+/// have never been host pids under HVPatch — a Linux process there is a thread
+/// of one carrier — so translating them through the pid-namespace region and
+/// handing the result to Darwin asked the host about a number that means
+/// something else in its own namespace.
+fn identity_target_task(
+    context: &crate::kernel::KernelContext,
+    pid: Pid,
+) -> Result<crate::kernel::TaskId, LinuxErrno> {
+    if pid.0 == 0 {
+        return Ok(context.task().key().id);
     }
-    if !crate::namespace::pid::enabled() {
-        return Ok((pid.raw(), pgid.raw()));
-    }
-
-    let target_ns_pid = if pid.raw() == 0 {
-        crate::namespace::pid::self_ns_pid()
-    } else {
-        pid.raw() as u32
-    };
-    let idempotent_init_self_setpgid = pid.raw() == 0
-        && target_ns_pid == crate::namespace::pid::NS_INIT_PID
-        && (pgid.raw() == 0 || pgid.raw() as u32 == target_ns_pid);
-    if crate::namespace::pid::ns_pid_is_session_leader(target_ns_pid)
-        && !idempotent_init_self_setpgid
-    {
-        return Err(LINUX_EPERM);
-    }
-
-    // pid 0 = "the calling process" (host 0 passthrough); a non-zero ns-pid that
-    // names no member is ESRCH.
-    let host_pid = if pid.raw() == 0 {
-        0
-    } else {
-        match pid.to_host() {
-            Some(h) => h.get() as i32,
-            None => return Err(LINUX_ESRCH),
-        }
-    };
-    // pgid 0 = "same as pid"; pgid == pid creates a new group led by the target.
-    // Any other pgid must name an EXISTING group — one that resolves to no host
-    // group cannot be joined → EPERM (NOT ESRCH): setpgid02 case 3 passes the
-    // system pid_max as a guaranteed-invalid pgid and expects EPERM.
-    let host_pgid = if pgid.raw() == 0 {
-        0
-    } else if pgid.raw() == pid.raw() {
-        host_pid
-    } else {
-        match pgid.to_host_pgid() {
-            Some(h) => h.get() as i32,
-            None => return Err(LINUX_EPERM),
-        }
-    };
-    Ok((host_pid, host_pgid))
+    crate::kernel::TaskId::from_abi_positive(pid.0).map_err(|_| LINUX_ESRCH)
 }
 
 /// Per-Linux-policy priority window for `sched_get_priority_{max,min}`. RT
@@ -683,7 +649,6 @@ pub(super) struct ProcState {
     /// process. `None` preserves the host-pid identity model of every other
     /// backend.
     pub virtual_pid: Option<u32>,
-    pub virtual_ppid: Option<u32>,
     pub hvpatch_process: Option<crate::hvpatch::ProcessContext>,
     /// Interval-timer state for `[ITIMER_REAL, ITIMER_VIRTUAL, ITIMER_PROF]`,
     /// indexed by the `which` value. Anchored to the monotonic clock so
@@ -828,7 +793,6 @@ impl ProcState {
             timerslack_default: LINUX_DEFAULT_TIMERSLACK_NS,
             bootstrap_host_pid: std::process::id(),
             virtual_pid: None,
-            virtual_ppid: None,
             hvpatch_process: None,
             itimers: [None, None, None],
             affinity: default_affinity(crate::host_facts::logical_cpu_count()),
@@ -842,7 +806,6 @@ impl ProcState {
     pub(super) fn fork_clone(&self, parent_guest_pid: u32, child_guest_pid: u32) -> Self {
         let mut child = self.clone();
         child.virtual_pid = Some(child_guest_pid);
-        child.virtual_ppid = Some(parent_guest_pid);
         child.pdeathsig = 0;
         child.subreaper_ancestor = if self.child_subreaper != 0 {
             parent_guest_pid
@@ -1977,26 +1940,22 @@ impl SyscallDispatcher {
         /// reports an empty list with the ABI-fixed length; the test checks only
         /// the errno/return path, not the contents.
         fn get_robust_list(this, cx, pid: Pid, head_ptr: GuestPtr, len_ptr: GuestPtr) {
-            let pid = i64::from(pid.0);
-            let self_pid = std::process::id() as i64;
-            if pid != 0 && pid != self_pid {
-                // Does the task exist? kill(pid,0) probes it: rc==0 means it
-                // exists and we may signal it; errno EPERM means it exists but
-                // is owned by another user (e.g. pid 1 / launchd, which LTP
-                // uses as its EPERM case); errno ESRCH means no such task. The
-                // robust list of any task that ISN'T us is inaccessible without
-                // ptrace privilege → EPERM; a nonexistent task → ESRCH.
-                if pid > 0 && pid <= i32::MAX as i64 {
-                    let exists = if let Some(live) = this.guest_pid_is_live(pid as i32) {
-                        live
-                    } else {
-                        let rc = unsafe { libc::kill(pid as i32, 0) };
-                        rc == 0
-                            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-                    };
-                    return Ok(DispatchOutcome::errno(if exists { LINUX_EPERM } else { LINUX_ESRCH }));
-                }
-                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+            // "Is this me?" is a guest question. It used to compare against
+            // `std::process::id()`, so guest process 3 asking for its OWN
+            // robust list (`get_robust_list(getpid(), …)`, exactly what glibc's
+            // and LTP's helpers do) failed the self test against the carrier's
+            // five-digit pid, took the peer branch, and got EPERM for its own
+            // list. Only the `pid == 0` spelling worked.
+            let is_self = pid.0 == 0 || u32::try_from(pid.0).is_ok_and(|pid| pid == this.identity_pid());
+            if !is_self {
+                // Another task's robust list is inaccessible without ptrace
+                // privilege → EPERM; a pid naming no process → ESRCH (LTP
+                // get_robust_list01 uses pid 1 for the EPERM case and an unused
+                // pid for ESRCH). Existence is zombie-inclusive because Linux
+                // keeps an unreaped process addressable.
+                let exists = crate::kernel::TaskId::from_abi_positive(pid.0)
+                    .is_ok_and(|task| cx.kernel.kernel().process_identity(task).is_some());
+                return Ok(DispatchOutcome::errno(if exists { LINUX_EPERM } else { LINUX_ESRCH }));
             }
             if head_ptr.0 == 0 || len_ptr.0 == 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
@@ -2854,131 +2813,98 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::errno(LINUX_EPERM))
         }
 
+        /// setpgid(pid, pgid): move a process between groups, in the kernel
+        /// graph and nowhere else.
+        ///
+        /// The host call this replaces moved the CARRIER's Darwin group. Every
+        /// guest process is a thread of that one carrier, so one guest calling
+        /// `setpgid` relocated all of them at once — and the pgid it was handed
+        /// is a guest number that names an unrelated Darwin group, so the move
+        /// went somewhere arbitrary. The graph also owns the session, leader
+        /// and already-execed-child rules `libc::setpgid` could only enforce
+        /// against host state that no guest process actually occupies.
         fn setpgid(this, cx, pid: Pid, pgid: Pid) {
-            if let Some(process) = this.hvpatch_process() {
-                if pgid.0 < 0 {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-                if pid.0 < 0 {
-                    return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-                }
-                let target = (pid.0 != 0).then_some(pid.0);
-                let group = (pgid.0 != 0).then_some(pgid.0);
-                return match process.set_process_group(target, group) {
-                    Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
-                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
-                };
+            // Linux orders these two before any lookup: a negative pgid is
+            // EINVAL (LTP setpgid02 case 1), a negative pid is ESRCH.
+            if pgid.0 < 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            // PID namespace (§6.6): pgids stay host-level in Phase 2, but the
-            // ns-pid ARGS must be translated to host pids before the host call.
-            // pid 0 = "the calling process", pgid 0 = "same as pid" — both pass
-            // through (0 means self to the host too). A non-zero ns-pid that
-            // isn't a member is ESRCH. Identity when ns is off.
-            let (hpid, hpgid) = match translate_setpgid_args(pid, pgid) {
-                Ok(args) => args,
+            if pid.0 < 0 {
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+            }
+            let target = match (pid.0 != 0)
+                .then(|| crate::kernel::TaskId::from_abi_positive(pid.0))
+                .transpose()
+            {
+                Ok(target) => target,
+                Err(_) => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
+            };
+            let group = match (pgid.0 != 0)
+                .then(|| crate::kernel::ProcessGroupId::from_abi_positive(pgid.0))
+                .transpose()
+            {
+                Ok(group) => group,
+                Err(_) => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+            };
+            match cx
+                .kernel
+                .kernel()
+                .set_process_group(cx.kernel.task().key().id, target, group)
+            {
+                Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                Err(error) => Ok(DispatchOutcome::errno(
+                    crate::hvpatch::identity_operation_errno(error),
+                )),
+            }
+        }
+
+        /// getpgid(pid): the process group of `pid`, or of the caller for pid 0.
+        ///
+        /// Answers from the kernel graph including the ZOMBIE table, because
+        /// Linux keeps an exited-but-unreaped child addressable until `wait(2)`:
+        /// a shell that reaps a job member and then asks for its group must get
+        /// the group, not ESRCH.
+        fn getpgid(this, cx, pid: Pid) {
+            let target = match identity_target_task(cx.kernel, pid) {
+                Ok(target) => target,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            if pid.0 > 0 && crate::namespace::pid::is_execed_child_of_current(pid.0 as u32) {
-                return Ok(DispatchOutcome::errno(LINUX_EACCES));
+            match cx.kernel.kernel().process_identity(target) {
+                Some(identity) => Ok(DispatchOutcome::Returned {
+                    value: i64::from(identity.process_group.raw()),
+                }),
+                None => Ok(DispatchOutcome::errno(LINUX_ESRCH)),
             }
-            if let Err(errno) = (unsafe { libc::setpgid(hpid, hpgid) }).host_syscall_errno() {
-                return Ok(DispatchOutcome::errno(errno));
-            }
-            if crate::namespace::pid::enabled()
-                && pid.0 == 0
-                && (pgid.0 == 0 || pgid.0 as u32 == crate::namespace::pid::NS_INIT_PID)
-            {
-                crate::namespace::pid::refresh_init_host_pgid();
-            }
-            Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn getpgid(this, cx, pid: Pid) {
-            if let Some(process) = this.hvpatch_process() {
-                if pid.0 < 0 {
-                    return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-                }
-                return match process.process_group((pid.0 != 0).then_some(pid.0)) {
-                    Ok(pgid) => Ok(DispatchOutcome::Returned {
-                        value: i64::from(pgid),
-                    }),
-                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
-                };
-            }
-            // Translate the ns-pid arg (0 = self) to a host pid, then translate
-            // the returned host pgid back to its ns-pid so a self-led group
-            // reads as the caller's own ns-pid — getpgid(0)==getpid() holds
-            // inside the namespace (§5.3, §6.6).
-            let hpid = if crate::namespace::pid::enabled() && pid.0 != 0 {
-                match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
-                    Some(h) => h as i32,
-                    None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
-                }
-            } else {
-                pid.0
-            };
-            let r = (unsafe { libc::getpgid(hpid) }).host_syscall_errno()?;
-            let ns_r = if crate::namespace::pid::enabled() {
-                crate::namespace::pid::host_to_ns_pgid(r as u32) as i32
-            } else {
-                r
-            };
-            Ok(DispatchOutcome::Returned {
-                value: i64::from(ns_r),
-            })
-        }
-
+        /// getsid(pid): the session of `pid`, or of the caller for pid 0. Same
+        /// zombie-inclusive authority as `getpgid`.
         fn getsid(this, cx, pid: Pid) {
-            if let Some(process) = this.hvpatch_process() {
-                if pid.0 < 0 {
-                    return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-                }
-                return match process.session_id((pid.0 != 0).then_some(pid.0)) {
-                    Ok(sid) => Ok(DispatchOutcome::Returned {
-                        value: i64::from(sid),
-                    }),
-                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
-                };
+            let target = match identity_target_task(cx.kernel, pid) {
+                Ok(target) => target,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
+            match cx.kernel.kernel().process_identity(target) {
+                Some(identity) => Ok(DispatchOutcome::Returned {
+                    value: i64::from(identity.session.raw()),
+                }),
+                None => Ok(DispatchOutcome::errno(LINUX_ESRCH)),
             }
-            let hpid = if crate::namespace::pid::enabled() && pid.0 != 0 {
-                match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
-                    Some(h) => h as i32,
-                    None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
-                }
-            } else {
-                pid.0
-            };
-            let r = (unsafe { libc::getsid(hpid) }).host_syscall_errno()?;
-            let ns_r = if crate::namespace::pid::enabled() {
-                crate::namespace::pid::host_to_ns_pgid(r as u32) as i32
-            } else {
-                r
-            };
-            Ok(DispatchOutcome::Returned {
-                value: i64::from(ns_r),
-            })
         }
 
+        /// setsid(): a new session led by the caller. Same authority and the
+        /// same reason as `setpgid` — `libc::setsid()` would detach the CARRIER
+        /// from its controlling terminal on one guest process's behalf, which
+        /// every other guest process would then observe.
         fn setsid(this, cx) {
-            if let Some(process) = this.hvpatch_process() {
-                return match process.create_session() {
-                    Ok(sid) => Ok(DispatchOutcome::Returned {
-                        value: i64::from(sid),
-                    }),
-                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
-                };
+            match cx.kernel.kernel().create_session(cx.kernel.task().key().id, None) {
+                Ok(sid) => Ok(DispatchOutcome::Returned {
+                    value: i64::from(sid.raw()),
+                }),
+                Err(error) => Ok(DispatchOutcome::errno(
+                    crate::hvpatch::identity_operation_errno(error),
+                )),
             }
-            let r = (unsafe { libc::setsid() }).host_syscall_errno()?;
-            // setsid returns the new session id (== the caller's pid); report it
-            // as the caller's ns-pid (§5.3, §6.6). Identity when ns is off.
-            let ns_r = if crate::namespace::pid::enabled() {
-                crate::namespace::pid::host_to_ns_pgid(r as u32) as i32
-            } else {
-                r
-            };
-            Ok(DispatchOutcome::Returned {
-                value: i64::from(ns_r),
-            })
         }
 
         fn waitid(this, cx, idtype: u64, id: u64, infop_addr: GuestPtr, options: u64) {
@@ -3022,7 +2948,7 @@ impl SyscallDispatcher {
                     // this resolves there and never consults Darwin.
                     LINUX_P_PGID if id <= i32::MAX as u64 => {
                         let group = if id == 0 {
-                            match process.process_group(None) {
+                            match process.process_group() {
                                 Ok(group) => group,
                                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                             }
@@ -3465,7 +3391,7 @@ impl SyscallDispatcher {
                         include_stopped,
                         include_continued,
                     ),
-                    0 => match process.process_group(None) {
+                    0 => match process.process_group() {
                         Ok(group) => process.wait_child_in_process_group_with_job_control(
                             group,
                             false,
@@ -5095,39 +5021,6 @@ mod native_virtual_ptrace_tests {
 }
 
 #[cfg(test)]
-mod setpgid_tests {
-    use super::{NsPid, translate_setpgid_args};
-    use crate::linux_abi::LINUX_EPERM;
-
-    #[test]
-    fn namespace_init_setpgid_is_eperm_when_host_sid_differs_from_pgid() {
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0, "fork for isolated pid namespace test failed");
-        if child == 0 {
-            let ok = unsafe { libc::setpgid(0, 0) } >= 0
-                && crate::namespace::pid::init(std::process::id())
-                && crate::namespace::pid::self_ns_pid() == crate::namespace::pid::NS_INIT_PID
-                && translate_setpgid_args(NsPid(1), NsPid(1)) == Err(LINUX_EPERM)
-                && translate_setpgid_args(NsPid(1), NsPid(0)) == Err(LINUX_EPERM)
-                && translate_setpgid_args(NsPid(0), NsPid(0)) == Ok((0, 0))
-                && translate_setpgid_args(
-                    NsPid(0),
-                    NsPid(crate::namespace::pid::NS_INIT_PID as i32),
-                ) == Ok((0, unsafe { libc::getpgrp() }));
-            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
-        }
-
-        let mut status = 0;
-        let waited = unsafe { libc::waitpid(child, &mut status, 0) };
-        assert_eq!(waited, child);
-        assert!(
-            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-            "child status {status:#x}"
-        );
-    }
-}
-
-#[cfg(test)]
 mod affinity_tests {
     use super::{affinity_from_bytes, affinity_to_bytes, default_affinity, lowest_set_cpu};
 
@@ -5390,5 +5283,176 @@ mod process_vm_copy_tests {
         assert_eq!(process_vm_copy_self(&mut memory, &[], &[]).unwrap(), 0);
         let src = [LinuxIovec::new(SRC, 100)];
         assert_eq!(process_vm_copy_self(&mut memory, &src, &[]).unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod process_identity_dispatch_tests {
+    use super::*;
+    use crate::compat::CompatReporter;
+    use crate::kernel::{ClonePlan, KernelContext, LinuxWaitStatus, WaitMode};
+    use crate::thread::ThreadId;
+
+    const SYS_SETPGID: u64 = 154;
+    const SYS_GETPGID: u64 = 155;
+    const SYS_GETSID: u64 = 156;
+    const SYS_SETSID: u64 = 157;
+
+    fn fork_child(parent: &KernelContext, registry_id: i32) -> KernelContext {
+        parent
+            .kernel()
+            .reserve_fork(
+                parent,
+                ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty()).unwrap(),
+                format!("identity-child-{registry_id}"),
+                None,
+            )
+            .unwrap()
+            .prepare_reference(ThreadId::synthetic_for_tests(registry_id))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0
+    }
+
+    /// Re-read a caller's own context after the graph has moved underneath it,
+    /// the way the trap loop captures a fresh one per syscall.
+    fn refreshed(context: &KernelContext) -> KernelContext {
+        context
+            .kernel()
+            .context(context.task().key().id, context.thread().key().tid)
+            .unwrap()
+    }
+
+    fn call(
+        dispatcher: &mut SyscallDispatcher,
+        caller: &KernelContext,
+        number: u64,
+        arg: i64,
+    ) -> DispatchOutcome {
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
+        dispatcher
+            .dispatch(
+                caller,
+                SyscallRequest::new(number, SyscallArgs::from([arg as u64, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &CompatReporter::default(),
+            )
+            .unwrap()
+    }
+
+    fn returned(outcome: DispatchOutcome) -> i64 {
+        match outcome {
+            DispatchOutcome::Returned { value } => value,
+            other => panic!("expected a value, got {other:?}"),
+        }
+    }
+
+    /// `getpgid`/`getsid`/`setpgid`/`setsid` must describe the process that
+    /// CALLED them, and must keep describing an exited child until it is reaped.
+    ///
+    /// This needs three live processes to say anything. Every one of these
+    /// syscalls used to be answered by Darwin — `libc::getpgid(0)` and friends
+    /// on the calling HOST process. Under HVPatch that is the VM carrier, one
+    /// process shared by every logical guest process, so all three callers here
+    /// received the same number and a `setpgid` from one would have moved all of
+    /// them at once. With a single task the two readings are indistinguishable:
+    /// the caller is the only process, so "the carrier's group" and "my group"
+    /// are the same answer, which is why the existing single-process job-control
+    /// assertions passed with the bug in place.
+    #[test]
+    fn identity_syscalls_answer_the_calling_process_and_outlive_its_exit() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let root = dispatcher.capture_one_task_context().unwrap();
+        let first = fork_child(&root, 8801);
+        let root = refreshed(&root);
+        let second = fork_child(&root, 8802);
+        let root = refreshed(&root);
+        let (first_pid, second_pid) = (
+            i64::from(first.task().key().id.raw()),
+            i64::from(second.task().key().id.raw()),
+        );
+        assert_ne!(first_pid, second_pid);
+
+        // Both children inherit the forking process's group and session.
+        let root_group = returned(call(&mut dispatcher, &root, SYS_GETPGID, 0));
+        assert_eq!(
+            returned(call(&mut dispatcher, &first, SYS_GETPGID, 0)),
+            root_group
+        );
+        assert_eq!(
+            returned(call(&mut dispatcher, &second, SYS_GETPGID, 0)),
+            root_group
+        );
+
+        // One child leaves for a group of its own. Only that child moves.
+        assert_eq!(returned(call(&mut dispatcher, &first, SYS_SETPGID, 0)), 0);
+        let first = refreshed(&first);
+        let first_group = returned(call(&mut dispatcher, &first, SYS_GETPGID, 0));
+        assert_eq!(first_group, first_pid, "a new group is led by its creator");
+        assert_eq!(
+            returned(call(&mut dispatcher, &second, SYS_GETPGID, 0)),
+            root_group
+        );
+        assert_ne!(first_group, root_group);
+
+        // A peer asking about that child gets the child's group, not its own.
+        assert_eq!(
+            returned(call(&mut dispatcher, &second, SYS_GETPGID, first_pid)),
+            first_group
+        );
+
+        // A new session detaches only its creator, and a peer observes it.
+        let root_session = returned(call(&mut dispatcher, &root, SYS_GETSID, 0));
+        assert_eq!(
+            returned(call(&mut dispatcher, &first, SYS_GETSID, 0)),
+            root_session,
+            "changing groups does not change sessions",
+        );
+        assert_eq!(
+            returned(call(&mut dispatcher, &second, SYS_SETSID, 0)),
+            second_pid
+        );
+        let second = refreshed(&second);
+        assert_eq!(
+            returned(call(&mut dispatcher, &second, SYS_GETSID, 0)),
+            second_pid
+        );
+        assert_eq!(
+            returned(call(&mut dispatcher, &root, SYS_GETSID, second_pid)),
+            second_pid
+        );
+        assert_ne!(root_session, second_pid);
+
+        // An exited child stays addressable until its parent reaps it: `wait(2)`
+        // removes a process from the table, `_exit(2)` does not.
+        root.kernel()
+            .prepare_task_exit(
+                first.task().key().id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(
+            returned(call(&mut dispatcher, &root, SYS_GETPGID, first_pid)),
+            first_group,
+            "an unreaped child still reports the group it exited in",
+        );
+        root.kernel()
+            .wait_child(
+                root.task().key().id,
+                Some(first.task().key().id),
+                WaitMode::Consume,
+            )
+            .unwrap();
+        assert_eq!(
+            call(&mut dispatcher, &root, SYS_GETPGID, first_pid),
+            DispatchOutcome::errno(LINUX_ESRCH),
+            "a reaped child is gone from the process table",
+        );
     }
 }

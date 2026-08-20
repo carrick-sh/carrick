@@ -351,22 +351,6 @@ impl ProcessContext {
         std::sync::Arc::new(ProcessTimerDelivery::new(self))
     }
 
-    /// Linux-visible parent from the authoritative task graph. Dispatcher
-    /// snapshots remember the creator only for non-kernel lanes; HVPatch must
-    /// observe reparenting performed atomically during task-exit publication.
-    pub(crate) fn parent_pid(&self) -> Option<i32> {
-        self.kernel_graph()
-            .task_identity(self.task_id())
-            .ok()
-            .map(|identity| {
-                identity
-                    .parent
-                    .map_or(carrick_abi::LINUX_BOOTSTRAP_PID as i32, |parent| {
-                        parent.id.raw()
-                    })
-            })
-    }
-
     pub(crate) fn wait_until_job_control_resumed(&self) -> bool {
         if let Some(task) = self
             .kernel_graph()
@@ -938,63 +922,25 @@ impl ProcessContext {
         }
     }
 
-    pub(crate) fn process_group(
-        &self,
-        target: Option<i32>,
-    ) -> Result<i32, crate::linux_abi::LinuxErrno> {
-        let target = target
-            .map(crate::kernel::TaskId::from_abi_positive)
-            .transpose()
-            .map_err(|_| crate::linux_abi::LINUX_ESRCH)?
-            .unwrap_or(self.task_id());
+    /// This process's OWN process group. A peer's group is a different
+    /// question with a different answer — `Kernel::process_identity` includes
+    /// the zombie table, because Linux keeps an unreaped process addressable —
+    /// so it deliberately has no `target` parameter to be reached through.
+    pub(crate) fn process_group(&self) -> Result<i32, crate::linux_abi::LinuxErrno> {
         self.kernel_graph()
-            .task_identity(target)
+            .task_identity(self.task_id())
             .map(|identity| identity.process_group.raw())
-            .map_err(identity_operation_errno)
-    }
-
-    pub(crate) fn session_id(
-        &self,
-        target: Option<i32>,
-    ) -> Result<i32, crate::linux_abi::LinuxErrno> {
-        let target = target
-            .map(crate::kernel::TaskId::from_abi_positive)
-            .transpose()
-            .map_err(|_| crate::linux_abi::LINUX_ESRCH)?
-            .unwrap_or(self.task_id());
-        self.kernel_graph()
-            .task_identity(target)
-            .map(|identity| identity.session.raw())
-            .map_err(identity_operation_errno)
-    }
-
-    pub(crate) fn set_process_group(
-        &self,
-        target: Option<i32>,
-        group: Option<i32>,
-    ) -> Result<(), crate::linux_abi::LinuxErrno> {
-        let target = target
-            .map(crate::kernel::TaskId::from_abi_positive)
-            .transpose()
-            .map_err(|_| crate::linux_abi::LINUX_ESRCH)?;
-        let group = group
-            .map(crate::kernel::ProcessGroupId::from_abi_positive)
-            .transpose()
-            .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
-        self.kernel_graph()
-            .set_process_group(self.task_id(), target, group)
-            .map_err(identity_operation_errno)
-    }
-
-    pub(crate) fn create_session(&self) -> Result<i32, crate::linux_abi::LinuxErrno> {
-        self.kernel_graph()
-            .create_session(self.task_id(), None)
-            .map(crate::kernel::SessionId::raw)
             .map_err(identity_operation_errno)
     }
 }
 
-fn identity_operation_errno(
+/// The errno a guest-identity operation on the kernel graph reports.
+///
+/// Shared with the `setpgid`/`setsid` dispatch paths so an identity failure has
+/// ONE spelling: those used to reach this through per-call wrappers on
+/// `ProcessContext`, which existed only because the dispatch side could not see
+/// the graph directly. It can, so the wrappers are gone.
+pub(crate) fn identity_operation_errno(
     error: crate::kernel::KernelOperationError,
 ) -> crate::linux_abi::LinuxErrno {
     match error {
@@ -1823,7 +1769,14 @@ mod tests {
         let grandchild_process =
             child_process.published_child_context(&grandchild_context, grandchild_backend);
 
-        assert_eq!(grandchild_process.parent_pid(), Some(child_process.pid()));
+        let grandchild_parent = || {
+            grandchild_process
+                .kernel_graph()
+                .process_identity(grandchild_process.task_id())
+                .and_then(|identity| identity.parent)
+                .map(crate::kernel::TaskId::raw)
+        };
+        assert_eq!(grandchild_parent(), Some(child_process.pid()));
         child_process
             .publish_exit_status(
                 crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
@@ -1832,7 +1785,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            grandchild_process.parent_pid(),
+            grandchild_parent(),
             Some(root_process.pid()),
             "the current kernel parent, not the fork-time dispatcher snapshot, is guest-visible",
         );
@@ -2260,7 +2213,7 @@ mod tests {
         let child = parent.published_child_context(&child_context, backend);
 
         assert_eq!(parent.live_process_count(), 2);
-        assert_eq!(child.process_group(None).unwrap(), parent.pid());
+        assert_eq!(child.process_group().unwrap(), parent.pid());
         assert!(matches!(
             parent.wait_child_with_job_control(Some(child.pid()), false, false, false),
             WaitResult::StillRunning

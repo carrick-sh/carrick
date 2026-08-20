@@ -713,7 +713,7 @@ mod net;
 mod perf;
 mod proc;
 mod proctitle;
-mod resources;
+pub(crate) mod resources;
 #[macro_use]
 mod signal;
 mod bpf;
