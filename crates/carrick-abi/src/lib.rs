@@ -3808,6 +3808,127 @@ pub const LINUX_PRIO_PGRP: u64 = 1;
 pub const LINUX_PRIO_USER: u64 = 2;
 pub const LINUX_DEFAULT_UMASK: u32 = 0o022;
 pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
+/// A `getrlimit`/`setrlimit`/`prlimit64` resource (asm-generic `resource.h`,
+/// shared by aarch64 and x86_64).
+///
+/// An ordinal enum rather than the bare `u64` the syscall carries, for the
+/// reason `docs/typed-interfaces-audit.md` gives: the previous shape indexed a
+/// 16-slot array with `resource as usize` straight off a guest register, so the
+/// bounds check and the meaning lived in different places. Every one of the
+/// sixteen is named here — including the six carrick never treats specially —
+/// because an unnamed resource is exactly what made `RLIM_NLIMITS` a
+/// hand-maintained count that could drift from the array it guards.
+///
+/// [`Self::from_guest_arg`] is the ONLY constructor from a guest value, so an
+/// out-of-range resource cannot become an index; it becomes `EINVAL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum LinuxResource {
+    Cpu = 0,
+    Fsize = 1,
+    Data = 2,
+    Stack = 3,
+    Core = 4,
+    Rss = 5,
+    Nproc = 6,
+    Nofile = 7,
+    Memlock = 8,
+    As = 9,
+    Locks = 10,
+    Sigpending = 11,
+    Msgqueue = 12,
+    Nice = 13,
+    Rtprio = 14,
+    Rttime = 15,
+}
+
+impl LinuxResource {
+    /// Every resource, in ordinal order. The array a limit set indexes.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Cpu,
+        Self::Fsize,
+        Self::Data,
+        Self::Stack,
+        Self::Core,
+        Self::Rss,
+        Self::Nproc,
+        Self::Nofile,
+        Self::Memlock,
+        Self::As,
+        Self::Locks,
+        Self::Sigpending,
+        Self::Msgqueue,
+        Self::Nice,
+        Self::Rtprio,
+        Self::Rttime,
+    ];
+
+    /// `RLIM_NLIMITS`. Derived from the enum rather than hand-numbered.
+    pub const COUNT: usize = 16;
+
+    /// Decode the resource argument of `getrlimit`/`setrlimit`/`prlimit64`.
+    /// A value at or above `RLIM_NLIMITS` is `EINVAL`, which is what Linux
+    /// answers and what LTP `getrlimit02` pins.
+    pub fn from_guest_arg(raw: u64) -> Result<Self, LinuxErrno> {
+        Self::ALL
+            .get(usize::try_from(raw).map_err(|_| LINUX_EINVAL)?)
+            .copied()
+            .ok_or(LINUX_EINVAL)
+    }
+
+    /// Position in a limit set. Total by construction — no bounds check needed
+    /// at the use site, which is the point of the type.
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The `/proc/<pid>/limits` row label (proc(5)), so that file is rendered
+    /// from the same table the syscalls answer from instead of a frozen
+    /// literal that drifts away from it.
+    pub const fn proc_limits_name(self) -> &'static str {
+        match self {
+            Self::Cpu => "Max cpu time",
+            Self::Fsize => "Max file size",
+            Self::Data => "Max data size",
+            Self::Stack => "Max stack size",
+            Self::Core => "Max core file size",
+            Self::Rss => "Max resident set",
+            Self::Nproc => "Max processes",
+            Self::Nofile => "Max open files",
+            Self::Memlock => "Max locked memory",
+            Self::As => "Max address space",
+            Self::Locks => "Max file locks",
+            Self::Sigpending => "Max pending signals",
+            Self::Msgqueue => "Max msgqueue size",
+            Self::Nice => "Max nice priority",
+            Self::Rtprio => "Max realtime priority",
+            Self::Rttime => "Max realtime timeout",
+        }
+    }
+
+    /// The units column of `/proc/<pid>/limits`, or `None` where Linux leaves
+    /// it blank.
+    pub const fn proc_limits_units(self) -> Option<&'static str> {
+        match self {
+            Self::Cpu => Some("seconds"),
+            Self::Fsize
+            | Self::Data
+            | Self::Stack
+            | Self::Core
+            | Self::Rss
+            | Self::Memlock
+            | Self::As
+            | Self::Msgqueue => Some("bytes"),
+            Self::Nproc => Some("processes"),
+            Self::Nofile => Some("files"),
+            Self::Locks => Some("locks"),
+            Self::Sigpending => Some("signals"),
+            Self::Rttime => Some("us"),
+            Self::Nice | Self::Rtprio => None,
+        }
+    }
+}
+
 // getrlimit/setrlimit/prlimit64 resource numbers (asm-generic resource.h;
 // shared by aarch64 and x86_64). Only the resources carrick treats specially
 // are named; a resource >= RLIM_NLIMITS is EINVAL.
@@ -3822,6 +3943,67 @@ pub const LINUX_RLIMIT_MEMLOCK: u64 = 8;
 pub const LINUX_RLIMIT_AS: u64 = 9;
 pub const LINUX_RLIMIT_SIGPENDING: u64 = 11;
 pub const LINUX_RLIM_NLIMITS: u64 = 16;
+
+#[cfg(test)]
+mod linux_resource_tests {
+    use super::*;
+
+    /// The ordinal enum must agree with the hand-numbered constants it
+    /// replaces, and with `RLIM_NLIMITS`. This is the assertion that lets the
+    /// constants be deleted later without re-deriving the numbering.
+    #[test]
+    fn ordinals_match_the_abi_constants() {
+        for (resource, expected) in [
+            (LinuxResource::Cpu, LINUX_RLIMIT_CPU),
+            (LinuxResource::Fsize, LINUX_RLIMIT_FSIZE),
+            (LinuxResource::Data, LINUX_RLIMIT_DATA),
+            (LinuxResource::Stack, LINUX_RLIMIT_STACK),
+            (LinuxResource::Core, LINUX_RLIMIT_CORE),
+            (LinuxResource::Nproc, LINUX_RLIMIT_NPROC),
+            (LinuxResource::Nofile, LINUX_RLIMIT_NOFILE),
+            (LinuxResource::Memlock, LINUX_RLIMIT_MEMLOCK),
+            (LinuxResource::As, LINUX_RLIMIT_AS),
+            (LinuxResource::Sigpending, LINUX_RLIMIT_SIGPENDING),
+        ] {
+            assert_eq!(resource.index() as u64, expected, "{resource:?}");
+        }
+        assert_eq!(LinuxResource::COUNT as u64, LINUX_RLIM_NLIMITS);
+        assert_eq!(LinuxResource::ALL.len(), LinuxResource::COUNT);
+    }
+
+    /// `ALL` is dense and ordered, so `index()` really is a position.
+    #[test]
+    fn all_is_dense_and_ordered() {
+        for (position, resource) in LinuxResource::ALL.iter().enumerate() {
+            assert_eq!(resource.index(), position, "{resource:?}");
+        }
+    }
+
+    /// A guest register is decoded, never cast. Out of range is EINVAL, which
+    /// is what Linux answers (LTP getrlimit02's invalid-resource case).
+    #[test]
+    fn out_of_range_is_einval_not_an_index() {
+        assert_eq!(LinuxResource::from_guest_arg(0), Ok(LinuxResource::Cpu));
+        assert_eq!(LinuxResource::from_guest_arg(15), Ok(LinuxResource::Rttime));
+        assert_eq!(LinuxResource::from_guest_arg(16), Err(LINUX_EINVAL));
+        assert_eq!(LinuxResource::from_guest_arg(u64::MAX), Err(LINUX_EINVAL));
+        // -1 as the guest sees it.
+        assert_eq!(
+            LinuxResource::from_guest_arg(u64::from(u32::MAX)),
+            Err(LINUX_EINVAL)
+        );
+    }
+
+    /// Every resource renders a `/proc/<pid>/limits` row, so that file can be
+    /// generated from the limit set instead of frozen as a literal.
+    #[test]
+    fn every_resource_renders_a_proc_limits_row() {
+        for resource in LinuxResource::ALL {
+            assert!(!resource.proc_limits_name().is_empty(), "{resource:?}");
+        }
+    }
+}
+
 pub const LINUX_RUSAGE_SELF: i32 = 0;
 pub const LINUX_RUSAGE_CHILDREN: i32 = -1;
 pub const LINUX_RUSAGE_THREAD: i32 = 1;

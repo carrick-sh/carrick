@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use carrick_abi::keyring::{KeyRequestDefault, KeySerial};
-use carrick_abi::{LinuxSigaction, LinuxSigaltstack, LinuxSiginfo, NsGid, NsUid, SigSet};
+use carrick_abi::{
+    LINUX_RLIM_INFINITY, LinuxResource, LinuxRlimit, LinuxSigaction, LinuxSigaltstack,
+    LinuxSiginfo, NsGid, NsUid, SigSet,
+};
 use carrick_hal::ThreadId;
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -2402,6 +2405,74 @@ pub struct Task {
     /// namespace and grant the full set as a single atomic step; splitting
     /// them would let a reader observe a fresh namespace with the old caps.
     creds_ns: Mutex<ProcessCredsNs>,
+    /// This process's resource limits (`getrlimit(2)`, `prlimit(2)`).
+    ///
+    /// On the TASK because that is Linux's own scope — an rlimit lives in
+    /// `signal_struct`, shared by every thread of a thread group — and because a
+    /// peer must be able to WRITE it: `prlimit(pid, …)` sets ANOTHER process's
+    /// limit. Held in the dispatcher's private `ProcState` instead, there was no
+    /// path from any other task into the table at all, so `prlimit` silently
+    /// wrote the CALLER's limits: the target saw nothing change and the caller's
+    /// own soft NOFILE moved underneath it. Go's `TestPrlimitFileLimit` is
+    /// exactly that shape.
+    ///
+    /// `ArcSwap` rather than a `Mutex` because the read path is hot and runs
+    /// under other locks — `Nofile` is consulted inside fd allocation while the
+    /// file table is held, and `Fsize` on every regular-file write — so a read
+    /// must not be able to block on a writer.
+    rlimits: ArcSwap<RlimitSet>,
+    /// Serializes read-modify-write on [`Self::rlimits`]. `ArcSwap` gives atomic
+    /// publication, not atomic update: `setrlimit` has to compare the new soft
+    /// against the CURRENT hard, and two concurrent writers reading the same
+    /// snapshot would each publish a set built from a stale one.
+    rlimit_write: Mutex<()>,
+}
+
+/// A process's sixteen resource limits, indexed by [`LinuxResource`].
+///
+/// A dense array rather than a map of overrides: the previous shape stored
+/// `Option<LinuxRlimit>` per slot and resolved "unset" to a default at every
+/// read, which is why three different files answered "max processes" three
+/// different ways. One table, one answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RlimitSet {
+    limits: [LinuxRlimit; LinuxResource::COUNT],
+}
+
+impl RlimitSet {
+    /// The limits a guest process starts with.
+    ///
+    /// These are carrick's answer for a container, and they are the SINGLE
+    /// source: `getrlimit`, `/proc/<pid>/limits` and every enforcement site read
+    /// this table, so they cannot disagree the way the frozen `/proc` literal
+    /// disagreed with `getrlimit` on four resources.
+    pub const fn carrick_defaults() -> Self {
+        const INF: u64 = LINUX_RLIM_INFINITY;
+        let unlimited = LinuxRlimit::new(INF, INF);
+        let mut limits = [unlimited; LinuxResource::COUNT];
+        // Docker's default container limits, which the conformance oracle runs
+        // with; anything not listed is unlimited.
+        limits[LinuxResource::Nofile.index()] = LinuxRlimit::new(1_048_576, 1_048_576);
+        limits[LinuxResource::Nproc.index()] = LinuxRlimit::new(8_192, 8_192);
+        limits[LinuxResource::Stack.index()] = LinuxRlimit::new(8 * 1024 * 1024, INF);
+        limits[LinuxResource::Sigpending.index()] = LinuxRlimit::new(63_880, 63_880);
+        limits[LinuxResource::Msgqueue.index()] = LinuxRlimit::new(819_200, 819_200);
+        limits[LinuxResource::Nice.index()] = LinuxRlimit::new(0, 0);
+        limits[LinuxResource::Rtprio.index()] = LinuxRlimit::new(0, 0);
+        Self { limits }
+    }
+
+    pub const fn get(&self, resource: LinuxResource) -> LinuxRlimit {
+        self.limits[resource.index()]
+    }
+
+    /// Returns the set with `resource` replaced — `RlimitSet` is `Copy`, so a
+    /// writer publishes a whole new snapshot rather than mutating one readers
+    /// may be holding.
+    pub const fn with(mut self, resource: LinuxResource, limit: LinuxRlimit) -> Self {
+        self.limits[resource.index()] = limit;
+        self
+    }
 }
 
 /// A process's keyring pointers. Serials rather than object references: the
@@ -2480,6 +2551,8 @@ impl Task {
             ioprio: AtomicU32::new(Task::DEFAULT_IOPRIO),
             keyrings: Mutex::new(ProcessKeyrings::default()),
             creds_ns: Mutex::new(ProcessCredsNs::default()),
+            rlimits: ArcSwap::new(Arc::new(RlimitSet::carrick_defaults())),
+            rlimit_write: Mutex::new(()),
         }
     }
 
@@ -2537,6 +2610,45 @@ impl Task {
         // identical, and each side's later `PR_CAPBSET_DROP` / `capset` /
         // `uid_map` write is invisible to the other.
         self.inherit_creds_ns_from(parent);
+        // Resource limits are inherited as a COPY (`fork(2)`), and each side
+        // owns its own afterwards — the whole point of the defect this fixes is
+        // that one process's `prlimit` must not move another's.
+        self.rlimits.store(Arc::new(parent.rlimits()));
+    }
+
+    /// This process's limit for one resource.
+    ///
+    /// `ArcSwap::load` is a hazard-pointer guard, not an allocation, so this is
+    /// safe to call on the hot paths that need it — fd allocation holds the file
+    /// table while asking for `Nofile`, and every regular-file write asks for
+    /// `Fsize`.
+    pub fn rlimit(&self, resource: LinuxResource) -> LinuxRlimit {
+        self.rlimits.load().get(resource)
+    }
+
+    /// This process's whole limit set, for `/proc/<pid>/limits`.
+    pub fn rlimits(&self) -> RlimitSet {
+        **self.rlimits.load()
+    }
+
+    /// Replace one resource's limit under the write lock, letting `decide` see
+    /// the CURRENT value.
+    ///
+    /// The closure is where `setrlimit`'s rules live (a soft above the hard is
+    /// EINVAL; raising the hard needs CAP_SYS_RESOURCE), and it must run against
+    /// the value it will replace — which is why this is a read-modify-write
+    /// under a mutex rather than a bare `ArcSwap::store`.
+    pub fn replace_rlimit<E>(
+        &self,
+        resource: LinuxResource,
+        decide: impl FnOnce(LinuxRlimit) -> Result<LinuxRlimit, E>,
+    ) -> Result<LinuxRlimit, E> {
+        let _write = self.rlimit_write.lock();
+        let current = self.rlimits.load();
+        let old = current.get(resource);
+        let new = decide(old)?;
+        self.rlimits.store(Arc::new(current.with(resource, new)));
+        Ok(old)
     }
 
     /// A snapshot of this process's capability sets and user-namespace view,
@@ -4316,6 +4428,122 @@ mod tests {
                 .expect("leader thread");
             Self { ids, task, leader }
         }
+    }
+
+    /// A limit belongs to ONE task, so writing another task's does not move
+    /// this one's.
+    ///
+    /// This is the property the previous design could not have: rlimits lived in
+    /// the dispatcher's private `ProcState`, reachable only by the thread running
+    /// that process, so `prlimit(pid, …)` had nowhere to write except the
+    /// CALLER's table. Go's `TestPrlimitFileLimit` observes both halves of that —
+    /// the target unchanged AND the caller's own soft NOFILE moved underneath it.
+    ///
+    /// Deliberately written with TWO tasks: with one, every identity in the
+    /// system coincides and the defect is invisible, which is why the four
+    /// existing single-process rlimit probes all pass with the bug in place.
+    #[test]
+    fn an_rlimit_belongs_to_one_task_not_to_whoever_writes_it() {
+        let parent = Fixture::new();
+        let child = Fixture::new();
+
+        let default_nofile = parent.task.rlimit(LinuxResource::Nofile);
+        assert_eq!(child.task.rlimit(LinuxResource::Nofile), default_nofile);
+
+        // Stand in for `prlimit(child_pid, RLIMIT_NOFILE, {42, …})`.
+        let target = LinuxRlimit::new(42, default_nofile.rlim_max);
+        let old = child
+            .task
+            .replace_rlimit(LinuxResource::Nofile, |_current| Ok::<_, ()>(target))
+            .expect("replace");
+
+        assert_eq!(
+            old, default_nofile,
+            "the OLD value is the target's, reported before the write"
+        );
+        assert_eq!(child.task.rlimit(LinuxResource::Nofile), target);
+        assert_eq!(
+            parent.task.rlimit(LinuxResource::Nofile),
+            default_nofile,
+            "writing the child's limit must not move the parent's"
+        );
+        // ...and only the named resource moved.
+        assert_eq!(
+            child.task.rlimit(LinuxResource::Fsize),
+            parent.task.rlimit(LinuxResource::Fsize)
+        );
+    }
+
+    /// `decide` sees the value it is replacing, which is what `setrlimit`'s
+    /// rules need: a soft above the CURRENT hard is EINVAL.
+    #[test]
+    fn replace_rlimit_shows_the_writer_the_current_value() {
+        let fixture = Fixture::new();
+        let before = fixture.task.rlimit(LinuxResource::Nofile);
+
+        let refused = fixture
+            .task
+            .replace_rlimit(LinuxResource::Nofile, |current| {
+                assert_eq!(current, before, "the closure must see the live value");
+                Err("soft above hard")
+            });
+        assert_eq!(refused, Err("soft above hard"));
+        assert_eq!(
+            fixture.task.rlimit(LinuxResource::Nofile),
+            before,
+            "a refused write publishes nothing"
+        );
+    }
+
+    /// fork inherits limits as a COPY, and the two then diverge (`fork(2)`).
+    #[test]
+    fn fork_inherits_rlimits_as_a_copy() {
+        let parent = Fixture::new();
+        let lowered = LinuxRlimit::new(64, 4096);
+        parent
+            .task
+            .replace_rlimit(LinuxResource::Nofile, |_| Ok::<_, ()>(lowered))
+            .expect("parent lowers its own");
+
+        let child = Fixture::new();
+        child.task.inherit_fork_attributes_from(&parent.task);
+        assert_eq!(
+            child.task.rlimit(LinuxResource::Nofile),
+            lowered,
+            "inherited"
+        );
+
+        let raised = LinuxRlimit::new(128, 4096);
+        child
+            .task
+            .replace_rlimit(LinuxResource::Nofile, |_| Ok::<_, ()>(raised))
+            .expect("child changes its own");
+        assert_eq!(child.task.rlimit(LinuxResource::Nofile), raised);
+        assert_eq!(
+            parent.task.rlimit(LinuxResource::Nofile),
+            lowered,
+            "the child owns its copy; the parent is untouched"
+        );
+    }
+
+    /// One table answers every reader, so `getrlimit` and `/proc/<pid>/limits`
+    /// cannot disagree — they disagreed on four resources when `/proc` was a
+    /// frozen literal.
+    #[test]
+    fn the_default_set_is_the_single_source_for_every_resource() {
+        let fixture = Fixture::new();
+        let set = fixture.task.rlimits();
+        for resource in LinuxResource::ALL {
+            assert_eq!(
+                set.get(resource),
+                fixture.task.rlimit(resource),
+                "{resource:?} must read the same through both accessors"
+            );
+        }
+        assert_eq!(
+            set.get(LinuxResource::Core),
+            LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)
+        );
     }
 
     fn siginfo(signal: LinuxSignal, payload: i32) -> LinuxSiginfo {
