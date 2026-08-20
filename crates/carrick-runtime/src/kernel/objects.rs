@@ -491,7 +491,7 @@ pub(crate) trait FileDescriptionBacking: Any + Send + Sync {
 
     fn retain_fd_ref(&self);
 
-    fn release_fd_ref(&self);
+    fn release_fd_ref(&self, identity: FileDescriptionId);
 
     fn fd_ref_count(&self) -> usize;
 
@@ -668,7 +668,7 @@ impl FileDescription {
         let FileDescriptionKind::Concrete(backing) = &self.kind else {
             return;
         };
-        backing.0.release_fd_ref();
+        backing.0.release_fd_ref(self.id);
         self.revision.publish();
     }
 

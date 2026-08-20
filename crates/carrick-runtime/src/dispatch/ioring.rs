@@ -582,7 +582,7 @@ impl crate::kernel::FileDescriptionBacking for IoUringBacking {
     fn retain_fd_ref(&self) {
         self.open_metadata.read().retain_fd_ref();
     }
-    fn release_fd_ref(&self) {
+    fn release_fd_ref(&self, _identity: crate::kernel::FileDescriptionId) {
         self.open_metadata.read().release_fd_ref();
     }
     fn fd_ref_count(&self) -> usize {

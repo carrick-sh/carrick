@@ -107,17 +107,62 @@ impl Drop for RetainedNetlinkDescription {
 #[derive(Debug)]
 pub enum MqueueNotify {
     Signal {
+        registration: crate::kernel::FileDescriptionId,
         target: MqueueNotifyTarget,
         signo: i32,
         value: i64,
     },
     Thread {
+        registration: crate::kernel::FileDescriptionId,
         /// The route and the resource it is allowed to use are one value, so a
         /// kernel TaskKey cannot accidentally be paired with a host fd (or a
         /// host pid with a retained kernel description).
         target: MqueueNotifyTarget<RetainedNetlinkDescription, i32>,
         data: [u8; NOTIFY_DATA_SIZE],
     },
+}
+
+impl MqueueNotify {
+    fn registration(&self) -> crate::kernel::FileDescriptionId {
+        match self {
+            Self::Signal { registration, .. } | Self::Thread { registration, .. } => *registration,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum MqueueNotifySpec {
+    Signal {
+        target: MqueueNotifyTarget,
+        signo: i32,
+        value: i64,
+    },
+    Thread {
+        target: MqueueNotifyTarget<RetainedNetlinkDescription, i32>,
+        data: [u8; NOTIFY_DATA_SIZE],
+    },
+}
+
+impl MqueueNotifySpec {
+    fn bind(self, registration: crate::kernel::FileDescriptionId) -> MqueueNotify {
+        match self {
+            Self::Signal {
+                target,
+                signo,
+                value,
+            } => MqueueNotify::Signal {
+                registration,
+                target,
+                signo,
+                value,
+            },
+            Self::Thread { target, data } => MqueueNotify::Thread {
+                registration,
+                target,
+                data,
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -148,6 +193,25 @@ impl MqueueInner {
                 notify: None,
             }),
             changed: parking_lot::Condvar::new(),
+        }
+    }
+
+    /// Remove only the registration owned by the exact open-file description
+    /// whose final logical reference is closing. A different open of the same
+    /// named queue is a different identity and must not disturb it.
+    pub(crate) fn retire_notification_owner(
+        &self,
+        owner: crate::kernel::FileDescriptionId,
+    ) -> Option<MqueueNotify> {
+        let mut state = self.state.lock();
+        if state
+            .notify
+            .as_ref()
+            .is_some_and(|notification| notification.registration() == owner)
+        {
+            state.notify.take()
+        } else {
+            None
         }
     }
 }
@@ -217,6 +281,15 @@ impl SyscallDispatcher {
             }),
             _ => Err(LINUX_EBADF),
         }
+    }
+
+    fn mqueue_file_description(
+        &self,
+        fd: i32,
+    ) -> Result<Arc<crate::kernel::FileDescription>, LinuxErrno> {
+        self.open_file(fd)
+            .map(|slot| slot.description())
+            .ok_or(LINUX_EBADF)
     }
 
     define_syscall! {
@@ -467,22 +540,43 @@ impl SyscallDispatcher {
         /// notification for the empty→non-empty transition.
         fn mq_notify(this, cx, mqd: u64, sevp: GuestPtr) {
             let caller = this.mqueue_notify_target(cx.kernel);
+            let mqd = match i32::try_from(mqd) {
+                Ok(mqd) => mqd,
+                Err(_) => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
+            };
 
             if sevp.0 == 0 {
-                let mq = match this.mq_description(mqd as i32) {
-                    Ok(v) => v,
+                let description = match this.mqueue_file_description(mqd) {
+                    Ok(description) => description,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 };
-                let mut state = mq.queue.state.lock();
+                // Close takes description WRITE then queue. Keep the matching
+                // READ->queue order until publication, so either unregister
+                // wins before close (and close observes no record) or close
+                // wins and this sees Closed/EBADF. There is no stale midpoint.
+                let open = description.read();
+                let OpenDescription::Mqueue { queue, .. } = &*open else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
+                let registration = description.id();
+                let mut state = queue.state.lock();
                 let delivery = match state.notify.take() {
-                    Some(MqueueNotify::Signal { target, .. })
-                        if target.same_owner(&caller) => None,
+                    Some(MqueueNotify::Signal {
+                        registration: owner,
+                        target,
+                        ..
+                    }) if owner == registration && target.same_owner(&caller) => None,
                     Some(MqueueNotify::Thread {
+                        registration: owner,
                         target,
                         mut data,
-                    }) if target.same_owner(&caller) => {
+                    }) if owner == registration && target.same_owner(&caller) => {
                         data[NOTIFY_DATA_SIZE - 1] = MQ_NOTIFY_EVENT_REMOVED as u8;
-                        Some(MqueueNotify::Thread { target, data })
+                        Some(MqueueNotify::Thread {
+                            registration: owner,
+                            target,
+                            data,
+                        })
                     }
                     other => {
                         state.notify = other;
@@ -490,6 +584,7 @@ impl SyscallDispatcher {
                     }
                 };
                 drop(state);
+                drop(open);
                 if let Some(delivery) = delivery {
                     deliver_notify(this, cx.kernel, cx.tid(), delivery);
                 }
@@ -510,7 +605,7 @@ impl SyscallDispatcher {
                     if !(1..=64).contains(&s) {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
-                    Some(MqueueNotify::Signal {
+                    Some(MqueueNotifySpec::Signal {
                         target: caller,
                         signo: s,
                         value: sigev_value as i64,
@@ -539,16 +634,24 @@ impl SyscallDispatcher {
                     let mut data = [0u8; NOTIFY_DATA_SIZE];
                     data.copy_from_slice(&bytes);
                     data[NOTIFY_DATA_SIZE - 1] = MQ_NOTIFY_EVENT_MSG as u8;
-                    Some(MqueueNotify::Thread { target, data })
+                    Some(MqueueNotifySpec::Thread { target, data })
                 }
                 _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             };
 
-            let mq = match this.mq_description(mqd as i32) {
-                Ok(v) => v,
+            let description = match this.mqueue_file_description(mqd) {
+                Ok(description) => description,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            let mut state = mq.queue.state.lock();
+            // See unregister above: the read guard is the lifetime lease that
+            // prevents last-close from turning the description into Closed
+            // between validation and queue publication.
+            let open = description.read();
+            let OpenDescription::Mqueue { queue, .. } = &*open else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            let notify_record = notify_record.map(|spec| spec.bind(description.id()));
+            let mut state = queue.state.lock();
             if state.notify.is_some() {
                 return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EBUSY));
             }
@@ -618,6 +721,7 @@ fn deliver_notify(
             target,
             signo,
             value,
+            ..
         } => match target {
             MqueueNotifyTarget::Kernel(target, ()) => {
                 let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signo) else {
@@ -664,7 +768,7 @@ fn deliver_notify(
                 }
             }
         },
-        MqueueNotify::Thread { target, data } => match target {
+        MqueueNotify::Thread { target, data, .. } => match target {
             MqueueNotifyTarget::Kernel(target, description) => {
                 let _ = context
                     .kernel()
@@ -770,6 +874,23 @@ mod tests {
                 0,
                 0,
             ],
+        ))
+    }
+
+    fn open_existing_test_queue(
+        dispatcher: &SyscallDispatcher,
+        context: &crate::kernel::KernelContext,
+        memory: &mut LinearMemory,
+        name_address: u64,
+        name: &[u8],
+    ) -> i32 {
+        memory.write_bytes(name_address, name).unwrap();
+        returned_fd(dispatch_call(
+            dispatcher,
+            context,
+            memory,
+            180,
+            [name_address, LINUX_O_RDWR, 0, 0, 0, 0],
         ))
     }
 
@@ -907,6 +1028,34 @@ mod tests {
         })
     }
 
+    fn mqueue_description_and_queue(
+        dispatcher: &SyscallDispatcher,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+    ) -> (Arc<crate::kernel::FileDescription>, Arc<MqueueInner>) {
+        let description = file_description(dispatcher, context, fd);
+        let queue = {
+            let open = description.read();
+            let OpenDescription::Mqueue { queue, .. } = &*open else {
+                panic!("fd {fd} is not an mqueue");
+            };
+            Arc::clone(queue)
+        };
+        (description, queue)
+    }
+
+    fn close_test_fd(
+        dispatcher: &SyscallDispatcher,
+        context: &crate::kernel::KernelContext,
+        memory: &mut LinearMemory,
+        fd: i32,
+    ) {
+        assert_eq!(
+            dispatch_call(dispatcher, context, memory, 57, [fd as u64, 0, 0, 0, 0, 0],),
+            DispatchOutcome::Returned { value: 0 },
+        );
+    }
+
     fn netlink_bytes(
         dispatcher: &SyscallDispatcher,
         context: &crate::kernel::KernelContext,
@@ -1041,6 +1190,197 @@ mod tests {
                 ..
             }) if *pid == std::process::id() as libc::pid_t
         ));
+    }
+
+    #[test]
+    fn last_mqueue_description_close_clears_registration_for_replacement_generation() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_010);
+        dispatcher.bind_hvpatch_process(process);
+        let owner = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
+        let name = b"close_owner\0";
+        let mqd = open_test_queue(&dispatcher, &owner, &mut memory, 0x1000, name);
+        let (_, queue) = mqueue_description_and_queue(&dispatcher, &owner, mqd);
+        register_signal_notification(&dispatcher, &owner, &mut memory, mqd, 34, 7, 0x1100);
+        assert!(queue.state.lock().notify.is_some());
+
+        close_test_fd(&dispatcher, &owner, &mut memory, mqd);
+        assert!(
+            queue.state.lock().notify.is_none(),
+            "last close must retire the description-owned registration"
+        );
+
+        let replacement = fork_test_task(&owner, 82_010, "replacement notify owner");
+        let replacement_mqd =
+            open_existing_test_queue(&dispatcher, &replacement, &mut memory, 0x1000, name);
+        register_signal_notification(
+            &dispatcher,
+            &replacement,
+            &mut memory,
+            replacement_mqd,
+            34,
+            8,
+            0x1100,
+        );
+        assert!(queue.state.lock().notify.is_some());
+    }
+
+    #[test]
+    fn dup_keeps_registration_until_last_description_reference_closes() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_011);
+        dispatcher.bind_hvpatch_process(process);
+        let owner = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
+        let mqd = open_test_queue(&dispatcher, &owner, &mut memory, 0x1000, b"dup_owner\0");
+        let (_, queue) = mqueue_description_and_queue(&dispatcher, &owner, mqd);
+        let duplicate = returned_fd(dispatch_call(
+            &dispatcher,
+            &owner,
+            &mut memory,
+            23,
+            [mqd as u64, 0, 0, 0, 0, 0],
+        ));
+        register_signal_notification(&dispatcher, &owner, &mut memory, mqd, 34, 9, 0x1100);
+
+        close_test_fd(&dispatcher, &owner, &mut memory, mqd);
+        assert!(
+            queue.state.lock().notify.is_some(),
+            "a dup keeps the registering open description alive"
+        );
+        close_test_fd(&dispatcher, &owner, &mut memory, duplicate);
+        assert!(
+            queue.state.lock().notify.is_none(),
+            "the final reference retires the registration"
+        );
+    }
+
+    #[test]
+    fn closing_thread_registration_releases_retained_netlink_reference() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_012);
+        dispatcher.bind_hvpatch_process(process);
+        let owner = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
+        let mqd = open_test_queue(&dispatcher, &owner, &mut memory, 0x1000, b"thread_owner\0");
+        let (_, queue) = mqueue_description_and_queue(&dispatcher, &owner, mqd);
+        let netlink_fd = open_test_netlink(&dispatcher, &owner, &mut memory);
+        let netlink = file_description(&dispatcher, &owner, netlink_fd);
+        let refs_before = netlink.fd_ref_count();
+        register_thread_notification(
+            &dispatcher,
+            &owner,
+            &mut memory,
+            mqd,
+            netlink_fd,
+            [0x31; NOTIFY_DATA_SIZE],
+        );
+        assert_eq!(netlink.fd_ref_count(), refs_before + 1);
+
+        close_test_fd(&dispatcher, &owner, &mut memory, mqd);
+        assert!(queue.state.lock().notify.is_none());
+        assert_eq!(
+            netlink.fd_ref_count(),
+            refs_before,
+            "retiring the registration drops its retained netlink reference"
+        );
+    }
+
+    #[test]
+    fn another_description_for_same_queue_cannot_unregister_owner() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_013);
+        dispatcher.bind_hvpatch_process(process);
+        let owner = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
+        let name = b"wrong_description\0";
+        let owner_mqd = open_test_queue(&dispatcher, &owner, &mut memory, 0x1000, name);
+        let other_mqd = open_existing_test_queue(&dispatcher, &owner, &mut memory, 0x1000, name);
+        let (_, queue) = mqueue_description_and_queue(&dispatcher, &owner, owner_mqd);
+        register_signal_notification(&dispatcher, &owner, &mut memory, owner_mqd, 34, 10, 0x1100);
+
+        assert_eq!(
+            dispatch_call(
+                &dispatcher,
+                &owner,
+                &mut memory,
+                184,
+                [other_mqd as u64, 0, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert!(
+            queue.state.lock().notify.is_some(),
+            "only the exact registering open description may unregister"
+        );
+    }
+
+    #[test]
+    fn registration_holds_description_read_lock_until_queue_publication() {
+        let dispatcher = Arc::new(SyscallDispatcher::new());
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_014);
+        dispatcher.bind_hvpatch_process(process);
+        let owner = dispatcher.capture_one_task_context().unwrap();
+        let close_context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
+        let mqd = open_test_queue(&dispatcher, &owner, &mut memory, 0x1000, b"close_race\0");
+        let (description, queue) = mqueue_description_and_queue(&dispatcher, &owner, mqd);
+        use zerocopy::IntoBytes as _;
+        let sigevent = crate::linux_abi::LinuxSigevent {
+            sigev_value: 11,
+            sigev_signo: 34,
+            sigev_notify: crate::linux_abi::LINUX_SIGEV_SIGNAL,
+            _sigev_un: [0; 48],
+        };
+        memory.write_bytes(0x1100, sigevent.as_bytes()).unwrap();
+
+        let queue_guard = queue.state.lock();
+        let registering_dispatcher = Arc::clone(&dispatcher);
+        let register_thread = std::thread::spawn(move || {
+            dispatch_call(
+                &registering_dispatcher,
+                &owner,
+                &mut memory,
+                184,
+                [mqd as u64, 0x1100, 0, 0, 0, 0],
+            )
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        while description.try_write_for_test().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "registration dropped the description read lock before queue publication"
+            );
+            std::thread::yield_now();
+        }
+
+        let closing_dispatcher = Arc::clone(&dispatcher);
+        let close_thread = std::thread::spawn(move || {
+            let mut close_memory = LinearMemory::new(0x1000, vec![0u8; 0x1000]);
+            dispatch_call(
+                &closing_dispatcher,
+                &close_context,
+                &mut close_memory,
+                57,
+                [mqd as u64, 0, 0, 0, 0, 0],
+            )
+        });
+        drop(queue_guard);
+
+        assert_eq!(
+            register_thread.join().unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            close_thread.join().unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert!(
+            queue.state.lock().notify.is_none(),
+            "close linearized after registration must retire that registration"
+        );
     }
 
     #[test]
