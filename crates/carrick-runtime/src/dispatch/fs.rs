@@ -182,10 +182,12 @@ mod access;
 mod fd_helpers;
 mod legacy_aio;
 mod pathres;
+pub(crate) mod pipe;
 mod sendfile;
 mod stat;
 mod state;
 mod xattr;
+pub(crate) use pipe::*;
 use state::*;
 pub(super) use state::{FsState, RuntimeIo, host_fd_offset};
 pub(crate) use state::{LegacyAioContextId, SplicePushback};
@@ -4321,7 +4323,7 @@ impl SyscallDispatcher {
         let open = open_file.description.read();
         match &*open {
             OpenDescription::PipeReader { pipe, .. } | OpenDescription::PipeWriter { pipe, .. } => {
-                Ok(Some(pipe.lock().buffer.len()))
+                Ok(Some(pipe.buffered_bytes()))
             }
             OpenDescription::HostPipe {
                 host_fd,
@@ -5489,13 +5491,7 @@ impl SyscallDispatcher {
     /// legacy `PipeReader` source. A short destination write must leave the
     /// source byte stream exactly as it found it minus what was delivered.
     fn restore_pipe_bytes(pipe: &PipeRef, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let mut pipe = pipe.lock();
-        for byte in bytes.iter().rev() {
-            pipe.buffer.push_front(*byte);
-        }
+        pipe::restore_pipe_bytes(pipe, bytes);
     }
 
     /// The destination's readiness park for a blocking `splice`/`vmsplice`
@@ -5592,7 +5588,9 @@ impl SyscallDispatcher {
             {
                 let mut open = open_file.description.write();
                 match &mut *open {
-                    OpenDescription::PipeWriter { pipe, .. } => return write_pipe(bytes, pipe),
+                    OpenDescription::PipeWriter { base, pipe } => {
+                        return write_pipe(bytes, pipe, base.status_flags(), tid);
+                    }
                     OpenDescription::HostPipe {
                         base,
                         host_fd,
@@ -7290,74 +7288,28 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
 
-            if crate::dispatch::fs::state::HOST_PIPE_FD_PRESSURE
-                .is_exhausted_by(this.captured_file_table().read_open_files().len())
-            {
-                return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
-            }
-
-            // Allocate a real host pipe so the two ends share state via the
-            // kernel and survive `libc::fork(2)` natively. macOS's `pipe(2)`
-            // returns two fds: [0] read end, [1] write end.
-            let mut host_fds = [0i32; 2];
-            if (unsafe { libc::pipe(host_fds.as_mut_ptr()) }) != 0 {
-                return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
-            }
-
-            let host_read = host_fds[0];
-            let host_write = host_fds[1];
-
-            // The access mode must be encoded per end so fcntl(F_GETFL) reports
-            // it: the read end is O_RDONLY (0), the write end O_WRONLY. Without
-            // this, glibc's fdopen(write_end, "w") sees O_RDONLY via F_GETFL and
-            // fails with EINVAL ("Failed to open new FD - fdopen") — apt's dpkg
-            // status pipe hit exactly that.
             let nonblock = flags & LINUX_O_NONBLOCK;
-            // Keep host pipe ends non-blocking regardless of the guest-visible
-            // O_NONBLOCK bit. Blocking-mode guest calls park through WaitOnFds
-            // after a host EAGAIN instead of blocking under dispatcher locks.
-            for hfd in [host_read, host_write] {
-                crate::dispatch::net::set_host_nonblocking(hfd);
-            }
             let fd_flags = linux_fd_flags_from_open_flags(flags);
-            // Both ends share ONE capacity cell so F_SETPIPE_SZ on either end is
-            // observed by F_GETPIPE_SZ on the other (Linux: one buffer per pipe;
-            // CPython test_subprocess.test_pipesizes sets on write, reads on read).
-            let cap_cell = Arc::new(std::sync::atomic::AtomicI64::new(
-                crate::linux_abi::LINUX_PIPE_BUF_SIZE,
-            ));
+
+            let pipe_id = next_pipe_id();
+            let pipe = Arc::new(PipeInner::new(pipe_id, DEFAULT_PIPE_CAPACITY));
+
             let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY | nonblock);
-            read_base.set_pipe_capacity_cell(Arc::clone(&cap_cell));
+            read_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
             let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY | nonblock);
-            write_base.set_pipe_capacity_cell(cap_cell);
-            // One stable pipe id shared by BOTH ends — the fork-coherent FASYNC
-            // join key (LTP fcntl31 arms the read end, the forked child writes
-            // the write end). Derived from the read end's host (device, inode)
-            // pair and assigned before any fork, so both ends inherit the SAME
-            // id. BSD gives the two ends DIFFERENT st_ino values, so a per-fd
-            // inode key would never match across ends.
-            let pipe_id = host_inode_pipe_id(host_read);
+            write_base.set_pipe_capacity_cell(Arc::clone(&pipe.capacity_cell));
+
             let read_open = OpenFile::from_open_description(
-                Arc::new(RwLock::new(OpenDescription::HostPipe {
-                    host_fd: HostFdRef::new(host_read),
-                    is_read_end: true,
-                    pipe_id,
+                Arc::new(RwLock::new(OpenDescription::PipeReader {
                     base: read_base,
-                    pty: None,
-                    bidirectional: false,
-                    write_kind: HostWriteKind::PipeLike,
+                    pipe: Arc::clone(&pipe),
                 })),
                 fd_flags,
             );
             let write_open = OpenFile::from_open_description(
-                Arc::new(RwLock::new(OpenDescription::HostPipe {
-                    host_fd: HostFdRef::new(host_write),
-                    is_read_end: false,
-                    pipe_id,
+                Arc::new(RwLock::new(OpenDescription::PipeWriter {
                     base: write_base,
-                    pty: None,
-                    bidirectional: false,
-                    write_kind: HostWriteKind::PipeLike,
+                    pipe,
                 })),
                 fd_flags,
             );
@@ -7520,10 +7472,17 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::errno(LINUX_EBUSY));
                     }
                     let capacity = rounded.max(page) as i64;
-                    open_file.description.write().set_pipe_capacity(capacity);
-                    // macOS pipes expose no portable buffer-resize API, so this
-                    // is bookkeeping only — but F_GETPIPE_SZ now reports it back
-                    // exactly, which is the observable contract the guest checks.
+                    let is_inmem_pipe = match &*open_file.description.read() {
+                        OpenDescription::PipeReader { pipe, .. }
+                        | OpenDescription::PipeWriter { pipe, .. } => {
+                            pipe.set_capacity(capacity as usize)?;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if !is_inmem_pipe {
+                        open_file.description.write().set_pipe_capacity(capacity);
+                    }
                     DispatchOutcome::Returned { value: capacity }
                 }
                 // Directory-change notification (dnotify). It is obsolete, but
@@ -8653,7 +8612,7 @@ impl SyscallDispatcher {
                     let available: i32 = match this.open_file(fd.0).as_ref() {
                         Some(open_file) => match &*open_file.description.read() {
                             OpenDescription::PipeReader { pipe, .. } => {
-                                let len = pipe.lock().buffer.len();
+                                let len = pipe.buffered_bytes();
                                 i32::try_from(len).unwrap_or(i32::MAX)
                             }
                             // FIONREAD on a pipe WRITE end reports the bytes
@@ -9925,7 +9884,10 @@ impl SyscallDispatcher {
                     );
                 }
                 OpenDescription::PipeReader { base, pipe } => {
-                    return Ok(read_pipe(memory, address, length, pipe, base.status_flags()));
+                    let pipe = Arc::clone(pipe);
+                    let flags = base.status_flags();
+                    drop(open);
+                    return Ok(read_pipe(memory, address, length, &pipe, flags, tid));
                 }
                 OpenDescription::HostPipe {
                     host_fd,
@@ -10042,6 +10004,7 @@ impl SyscallDispatcher {
             let iov = iov.0;
             let iovcnt =
                 usize::try_from(vlen).map_err(|_| DispatchError::LengthTooLarge(vlen))?;
+            let tid = cx.tid();
             let memory = &mut *cx.memory;
             let iovecs = read_iovecs(memory, iov, iovcnt)?;
             let Some(open_file) = this.open_file(fd.0) else {
@@ -10149,6 +10112,29 @@ impl SyscallDispatcher {
                         owner,
                         nonblocking,
                     ));
+                }
+                OpenDescription::PipeReader { base, pipe } => {
+                    let pipe = Arc::clone(pipe);
+                    let flags = base.status_flags();
+                    drop(open);
+                    let mut total = 0i64;
+                    for iov in &iovecs {
+                        let len = usize::try_from(iov.iov_len)
+                            .map_err(|_| DispatchError::LengthTooLarge(iov.iov_len))?;
+                        if len == 0 {
+                            continue;
+                        }
+                        match read_pipe(memory, iov.iov_base, len, &pipe, flags, tid) {
+                            DispatchOutcome::Returned { value } => {
+                                total += value;
+                                if (value as usize) < len {
+                                    break;
+                                }
+                            }
+                            other => return Ok(other),
+                        }
+                    }
+                    return Ok(DispatchOutcome::Returned { value: total });
                 }
                 _ => {}
             }
@@ -12299,8 +12285,15 @@ impl SyscallDispatcher {
                         OpenDescription::EventFd { state, .. } => {
                             return Ok(write_eventfd(this, &bytes, state));
                         }
-                        OpenDescription::PipeWriter { pipe, .. } => {
-                            return Ok(write_pipe(&bytes, pipe));
+                        OpenDescription::PipeWriter { base, pipe } => {
+                            let pipe = Arc::clone(pipe);
+                            let flags = base.status_flags();
+                            drop(open);
+                            let outcome = write_pipe(&bytes, &pipe, flags, cx.tid());
+                            if matches!(outcome, DispatchOutcome::Returned { value } if value > 0) {
+                                this.notify_inmem_epoll();
+                            }
+                            return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
                         }
                         OpenDescription::HostPipe {
                             base,
@@ -12786,8 +12779,8 @@ impl SyscallDispatcher {
                                     }
                                 }
                             }
-                            OpenDescription::PipeWriter { pipe, .. } => {
-                                outcome = write_pipe(&bytes, pipe);
+                            OpenDescription::PipeWriter { base, pipe } => {
+                                outcome = write_pipe(&bytes, pipe, base.status_flags(), cx.tid());
                                 writeback = None;
                             }
                             OpenDescription::HostPipe {

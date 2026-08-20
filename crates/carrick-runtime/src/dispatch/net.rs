@@ -887,8 +887,8 @@ impl SyscallDispatcher {
                 LINUX_EPOLLIN
             }
             OpenDescription::PipeReader { pipe, .. } if requested_events & LINUX_EPOLLIN != 0 => {
-                let pipe = pipe.lock();
-                if !pipe.buffer.is_empty() || pipe.writers == 0 {
+                let state = pipe.state.lock();
+                if !state.buffer.is_empty() || state.writers == 0 {
                     LINUX_EPOLLIN
                 } else {
                     0
@@ -1818,21 +1818,21 @@ impl SyscallDispatcher {
             // read channel — the fsconfig error log — is unimplemented).
             OpenDescription::FsContext { .. } => {}
             OpenDescription::PipeReader { pipe, .. } => {
-                if requested_events & LINUX_POLLIN != 0 {
-                    let pipe = pipe.lock();
-                    if !pipe.buffer.is_empty() {
-                        ready |= LINUX_POLLIN;
-                    }
-                    if pipe.writers == 0 {
-                        ready |= LINUX_POLLHUP;
-                    }
+                let state = pipe.state.lock();
+                if requested_events & LINUX_POLLIN != 0 && !state.buffer.is_empty() {
+                    ready |= LINUX_POLLIN;
+                }
+                if state.writers == 0 {
+                    ready |= LINUX_POLLHUP;
                 }
             }
             OpenDescription::PipeWriter { pipe, .. } => {
-                let pipe = pipe.lock();
-                if pipe.readers == 0 {
+                let state = pipe.state.lock();
+                if state.readers == 0 {
                     ready |= LINUX_POLLERR;
-                } else if requested_events & LINUX_POLLOUT != 0 {
+                } else if requested_events & LINUX_POLLOUT != 0
+                    && state.buffer.len() < state.capacity
+                {
                     ready |= LINUX_POLLOUT;
                 }
             }

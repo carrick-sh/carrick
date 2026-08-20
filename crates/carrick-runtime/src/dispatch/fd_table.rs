@@ -1581,12 +1581,12 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
         description.retain_fd_ref();
         match &*description {
             OpenDescription::PipeReader { pipe, .. } => {
-                let mut pipe = pipe.lock();
-                pipe.readers = pipe.readers.saturating_add(1);
+                let mut state = pipe.state.lock();
+                state.readers = state.readers.saturating_add(1);
             }
             OpenDescription::PipeWriter { pipe, .. } => {
-                let mut pipe = pipe.lock();
-                pipe.writers = pipe.writers.saturating_add(1);
+                let mut state = pipe.state.lock();
+                state.writers = state.writers.saturating_add(1);
             }
             _ => {}
         }
@@ -1597,12 +1597,16 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
         let remaining = description.release_fd_ref();
         match &*description {
             OpenDescription::PipeReader { pipe, .. } => {
-                let mut pipe = pipe.lock();
-                pipe.readers = pipe.readers.saturating_sub(1);
+                let mut state = pipe.state.lock();
+                state.readers = state.readers.saturating_sub(1);
+                drop(state);
+                pipe.changed.notify_all();
             }
             OpenDescription::PipeWriter { pipe, .. } => {
-                let mut pipe = pipe.lock();
-                pipe.writers = pipe.writers.saturating_sub(1);
+                let mut state = pipe.state.lock();
+                state.writers = state.writers.saturating_sub(1);
+                drop(state);
+                pipe.changed.notify_all();
             }
             _ => {}
         }
@@ -1678,14 +1682,7 @@ impl Drop for FileDescriptionWriteGuard<'_> {
     }
 }
 
-pub(super) type PipeRef = Arc<Mutex<PipeState>>;
-
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct PipeState {
-    pub(super) buffer: VecDeque<u8>,
-    pub(super) readers: usize,
-    pub(super) writers: usize,
-}
+pub(crate) use super::fs::pipe::PipeRef;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TtyFdKind {

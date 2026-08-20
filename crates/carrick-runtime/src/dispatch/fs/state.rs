@@ -29,6 +29,7 @@ pub(in crate::dispatch) const PATH_OPEN_FD_PRESSURE: PathOpenFdPressure =
 /// until pipe storage is synthetic or pooled we must fail fd-fill tests
 /// deterministically instead of spending the LTP timeout opening tens of
 /// thousands of host pipes and surfacing Darwin-specific errno shapes.
+#[allow(dead_code)]
 pub(in crate::dispatch) const HOST_PIPE_FD_PRESSURE: PathOpenFdPressure =
     PathOpenFdPressure::new(4 * 1024);
 
