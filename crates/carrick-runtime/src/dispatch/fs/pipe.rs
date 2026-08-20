@@ -133,14 +133,13 @@ pub(crate) fn read_pipe<M: GuestMemory>(
 pub(crate) fn read_pipe_bytes(
     buf: &mut [u8],
     pipe: &PipeRef,
-    status_flags: u64,
+    _status_flags: u64,
     _tid: crate::thread::ThreadId,
 ) -> Result<usize, LinuxErrno> {
     if buf.is_empty() {
         return Ok(0);
     }
     let length = buf.len();
-    let nonblocking = status_flags & LINUX_O_NONBLOCK != 0;
     let mut state = pipe.state.lock();
     if !state.buffer.is_empty() {
         let read_len = state.buffer.len().min(length);
@@ -158,11 +157,7 @@ pub(crate) fn read_pipe_bytes(
         // EOF
         return Ok(0);
     }
-    if nonblocking {
-        Err(LINUX_EAGAIN)
-    } else {
-        Err(LINUX_EAGAIN)
-    }
+    Err(LINUX_EAGAIN)
 }
 
 pub(crate) fn take_pipe_bytes(
