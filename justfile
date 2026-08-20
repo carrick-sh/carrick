@@ -93,6 +93,7 @@ clippy *ARGS:
 # offline environment and an explicit writable log path.
 lint-domains:
     ./scripts/lint-domains.sh
+    python3 scripts/migrate/check-host-authority-transitions.py
 
 
 # Dependency license / bans / sources gate (matches CI). Enforces the deny.toml
