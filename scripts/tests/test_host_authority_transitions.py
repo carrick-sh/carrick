@@ -49,17 +49,33 @@ class HostAuthorityInventoryTest(unittest.TestCase):
         with self.assertRaises(host_authority.InventoryError):
             host_authority.validate(rows, expected)
 
-    def test_ignores_std_net_type_annotations_but_detects_socket_operations(self):
+    def test_ignores_type_annotations_and_detects_qualified_operations(self):
         host_authority = load_host_authority()
         rows = host_authority.generate(
             self.fixture(
-                "fn type_only(addr: std::net::SocketAddr) {}\n"
+                "struct Types { file: std::fs::File, address: std::net::SocketAddr }\n"
+                "fn opens() { let _ = std::fs::File::open(\"/tmp/x\"); }\n"
                 "fn connects() { let _ = std::net::TcpStream::connect(\"127.0.0.1:1\"); }\n"
             )
         )
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["kind"], "ambient_network")
-        self.assertEqual(rows[0]["line"], 2)
+        self.assertEqual([(row["line"], row["kind"]) for row in rows], [
+            (2, "ambient_filesystem"),
+            (3, "ambient_network"),
+        ])
+
+    def test_detects_imported_network_socket_operations(self):
+        host_authority = load_host_authority()
+        rows = host_authority.generate(
+            self.fixture(
+                "use std::net::{TcpStream as Stream, UdpSocket};\n"
+                "fn connects() { let _ = Stream::connect(\"127.0.0.1:1\"); }\n"
+                "fn binds() { let _ = UdpSocket::bind(\"127.0.0.1:1\"); }\n"
+            )
+        )
+        self.assertEqual([(row["line"], row["kind"]) for row in rows], [
+            (2, "ambient_network"),
+            (3, "ambient_network"),
+        ])
 
     def test_accepts_an_exact_reviewed_inventory_and_rejects_drift(self):
         host_authority = load_host_authority()
