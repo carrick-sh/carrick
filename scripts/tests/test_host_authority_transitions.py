@@ -30,6 +30,8 @@ MESSAGES = (
 )
 CLIPPY_CONFIG = ROOT / "clippy.toml"
 INVENTORY = ROOT / "scripts" / "migrate" / "host-authority-transition-inventory.json"
+CATALOG_MANIFEST = ROOT / "scripts" / "migrate" / "host-authority-catalog.json"
+MACOS_CAPTURE = ROOT / "scripts" / "migrate" / "host-authority-macos-capture.json"
 
 # Literal snapshot of every canonical operation in the rejected lexical
 # inventory.  This must not be derived from either production artifact: the
@@ -328,6 +330,15 @@ def reviewed_row(
         "classification": classification,
         "evidence": evidence,
         "rationale": rationale,
+    }
+
+
+def injected_receipt(reviewed):
+    return {
+        "rows": [
+            {field: row[field] for field in load_host_authority().ACTUAL_FIELDS}
+            for row in reviewed
+        ]
     }
 
 
@@ -1613,7 +1624,9 @@ class MatrixOrchestrationTest(unittest.TestCase):
                     runner=runner,
                     matrix=matrix,
                     operation_catalog=FIXTURE_CATALOG,
+                    catalog_manifest=FIXTURE_CATALOG,
                     expected=expected,
+                    capture_receipt=injected_receipt(expected),
                     current_host="macos",
                     root=ROOT,
                 )
@@ -1656,7 +1669,9 @@ class MatrixOrchestrationTest(unittest.TestCase):
                         runner=runner,
                         matrix=matrix,
                         operation_catalog=FIXTURE_CATALOG,
+                        catalog_manifest=FIXTURE_CATALOG,
                         expected=[],
+                        capture_receipt=injected_receipt([]),
                         current_host="macos",
                         root=temporary_root,
                     )
@@ -1724,7 +1739,9 @@ class MatrixOrchestrationTest(unittest.TestCase):
                     runner=runner,
                     matrix=matrix,
                     operation_catalog=FIXTURE_CATALOG,
+                    catalog_manifest=FIXTURE_CATALOG,
                     expected=[],
+                    capture_receipt=injected_receipt([]),
                     current_host="macos",
                     root=root,
                 )
@@ -1817,7 +1834,9 @@ class MatrixOrchestrationTest(unittest.TestCase):
             runner=runner,
             matrix=matrix,
             operation_catalog=FIXTURE_CATALOG,
+            catalog_manifest=FIXTURE_CATALOG,
             expected=expected,
+            capture_receipt=injected_receipt(expected),
             current_host="macos",
             root=ROOT,
         )
@@ -1858,8 +1877,10 @@ class MatrixOrchestrationTest(unittest.TestCase):
 
         self.assertEqual(set(by_operation), EXPECTED_PRODUCTION_OPERATIONS)
         self.assertEqual(allow_invalid, [])
+        manifest = self.host_authority.load_catalog_manifest(CATALOG_MANIFEST)
+        self.assertEqual(manifest, by_operation)
         self.assertEqual(
-            self.host_authority.load_production_catalog(CLIPPY_CONFIG),
+            self.host_authority.load_production_catalog(CLIPPY_CONFIG, manifest),
             by_operation,
         )
 
@@ -1890,7 +1911,10 @@ class ProductionInventoryTest(unittest.TestCase):
 
     def test_inventory_uses_compiler_resolved_schema_and_catalog_bindings(self):
         self.assertEqual(len(self.rows), 682)
-        catalog = self.host_authority.load_production_catalog(CLIPPY_CONFIG)
+        manifest = self.host_authority.load_catalog_manifest(CATALOG_MANIFEST)
+        catalog = self.host_authority.load_production_catalog(
+            CLIPPY_CONFIG, manifest
+        )
         identities = set()
         for row in self.rows:
             self.assertEqual(
@@ -1926,9 +1950,9 @@ class ProductionInventoryTest(unittest.TestCase):
             Counter(row["classification"] for row in self.rows),
             Counter(
                 {
-                    "forbidden_semantic": 158,
-                    "declared_backing": 333,
-                    "declared_substrate": 191,
+                    "forbidden_semantic": 173,
+                    "declared_backing": 322,
+                    "declared_substrate": 187,
                 }
             ),
         )
@@ -2054,6 +2078,270 @@ class ProductionInventoryTest(unittest.TestCase):
                     self.row_at(file, line, operation)["classification"],
                     "declared_substrate",
                 )
+
+    def test_reviewer_identified_semantic_channels_are_classified_from_source(self):
+        semantic = {
+            ("crates/carrick-runtime/src/exec_helpers.rs", 349, "std::fs::read"):
+                "guest child signal wait status",
+            ("crates/carrick-runtime/src/exec_helpers.rs", 350, "std::fs::remove_file"):
+                "guest child signal wait status",
+            ("crates/carrick-runtime/src/exec_helpers.rs", 412, "std::fs::write"):
+                "guest child signal wait status",
+            ("crates/carrick-runtime/src/exec_helpers.rs", 430, "std::fs::write"):
+                "guest child signal wait status",
+            ("crates/carrick-runtime/src/exec_helpers.rs", 412, "std::process::id"):
+                "guest child signal wait status",
+            ("crates/carrick-runtime/src/exec_helpers.rs", 430, "std::process::id"):
+                "guest child signal wait status",
+            ("crates/carrick-runtime/src/cred_ipc.rs", 91, "std::fs::metadata"):
+                "guest cross-process signal permission",
+            ("crates/carrick-runtime/src/cred_ipc.rs", 112, "std::fs::read"):
+                "guest cross-process signal permission",
+            ("crates/carrick-runtime/src/dispatch/mod.rs", 4703, "std::process::id"):
+                "guest PTY entry lifetime",
+            ("crates/carrick-runtime/src/dispatch/mod.rs", 4895, "std::process::id"):
+                "guest controlling PTY identity",
+            ("crates/carrick-runtime/src/vfs/dev.rs", 150, "std::process::id"):
+                "guest PTY entry ownership",
+            ("crates/carrick-runtime/src/vfs/devpts.rs", 263, "std::process::id"):
+                "guest PTY entry ownership",
+            ("crates/carrick-runtime/src/network/socket_namespace.rs", 1648, "std::process::id"):
+                "guest service-name record liveness",
+            ("crates/carrick-runtime/src/network/socket_namespace.rs", 1665, "std::process::id"):
+                "guest listener-reservation liveness",
+            ("crates/carrick-runtime/src/network/socket_namespace.rs", 1731, "std::process::id"):
+                "guest endpoint-record liveness",
+        }
+        for (file, line, operation), resource in semantic.items():
+            with self.subTest(file=file, line=line, operation=operation):
+                row = self.row_at(file, line, operation)
+                self.assertEqual(row["classification"], "forbidden_semantic")
+                self.assertIn(resource, row["evidence"]["resource"])
+
+        diagnostic = {
+            ("crates/carrick-runtime/src/network/socket_namespace.rs", 1685):
+                "diagnostic instance identity",
+            ("crates/carrick-runtime/src/network/socket_namespace.rs", 1874):
+                "NSREJECT diagnostic event",
+        }
+        for (file, line), resource in diagnostic.items():
+            with self.subTest(file=file, line=line):
+                row = self.row_at(file, line, "std::process::id")
+                self.assertEqual(row["classification"], "declared_substrate")
+                self.assertIn(resource, row["evidence"]["resource"])
+
+        rosetta = self.row_at(
+            "crates/carrick-runtime/src/lib.rs",
+            364,
+            "std::fs::read_to_string",
+        )
+        self.assertEqual(rosetta["classification"], "declared_backing")
+        self.assertIn("binfmt_misc Rosetta registration", rosetta["evidence"]["resource"])
+
+    def test_every_review_is_source_specific_without_blanket_templates(self):
+        rationales = set()
+        resources = set()
+        for row in self.rows:
+            source_identity = f'{row["source"]["file"]}:{row["source"]["line"]}'
+            self.assertIn(source_identity, row["rationale"])
+            self.assertIn(row["operation"], row["rationale"])
+            self.assertNotIn(
+                "filesystem artifact explicitly authorized by the active CLI command",
+                row["evidence"]["resource"],
+            )
+            self.assertNotIn(row["rationale"], rationales)
+            rationales.add(row["rationale"])
+            resources.add(row["evidence"]["resource"])
+        self.assertGreaterEqual(len(resources), 350)
+
+        grouped = {}
+        for row in self.rows:
+            grouped.setdefault(row["evidence"]["resource"], set()).add(
+                (row["classification"], row["evidence"]["authority"])
+            )
+        self.assertTrue(all(len(roles) == 1 for roles in grouped.values()))
+
+
+class IndependentAuthorityArtifactsTest(unittest.TestCase):
+    def setUp(self):
+        self.host_authority = load_host_authority()
+
+    def require_interface(self, name):
+        self.assertTrue(
+            hasattr(self.host_authority, name),
+            f"production checker lacks independent {name} interface",
+        )
+        return getattr(self.host_authority, name)
+
+    def write_json(self, payload):
+        temporary = tempfile.TemporaryDirectory()
+        path = Path(temporary.name) / "artifact.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        self.addCleanup(temporary.cleanup)
+        return path
+
+    def write_toml(self, configuration):
+        temporary = tempfile.TemporaryDirectory()
+        path = Path(temporary.name) / "clippy.toml"
+        lines = ["disallowed-methods = ["]
+        for entry in configuration["disallowed-methods"]:
+            fields = [
+                f'path = {json.dumps(entry["path"])}',
+                f'reason = {json.dumps(entry["reason"])}',
+            ]
+            if "allow-invalid" in entry:
+                fields.append(
+                    f'allow-invalid = {str(entry["allow-invalid"]).lower()}'
+                )
+            if "unexpected" in entry:
+                fields.append(f'unexpected = {json.dumps(entry["unexpected"])}')
+            lines.append("  { " + ", ".join(fields) + " },")
+        lines.append("]")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.addCleanup(temporary.cleanup)
+        return path
+
+    def test_independent_catalog_manifest_binds_exact_strict_clippy_entries(self):
+        load_manifest = self.require_interface("load_catalog_manifest")
+        manifest = load_manifest(CATALOG_MANIFEST)
+        self.assertEqual(set(manifest), EXPECTED_PRODUCTION_OPERATIONS)
+        self.assertEqual(len(manifest), 45)
+        production = self.host_authority.load_production_catalog(
+            CLIPPY_CONFIG, manifest
+        )
+        self.assertEqual(production, manifest)
+
+        configuration = tomllib.loads(CLIPPY_CONFIG.read_text(encoding="utf-8"))
+        for label, mutate in (
+            (
+                "missing unused escape",
+                lambda entries: [e for e in entries if e["path"] != "libc::syscall"],
+            ),
+            (
+                "retargeted operation",
+                lambda entries: [
+                    ({**e, "path": "libc::printf"} if e["path"] == "libc::syscall" else e)
+                    for e in entries
+                ],
+            ),
+            (
+                "changed stable ID",
+                lambda entries: [
+                    (
+                        {
+                            **e,
+                            "reason": e["reason"].replace(
+                                "HA-CATALOG-ESCAPE-SYSCALL",
+                                "HA-CATALOG-ESCAPE-DLOPEN",
+                            ),
+                        }
+                        if e["path"] == "libc::syscall"
+                        else e
+                    )
+                    for e in entries
+                ],
+            ),
+            (
+                "allow invalid false",
+                lambda entries: [{**entries[0], "allow-invalid": False}, *entries[1:]],
+            ),
+            (
+                "allow invalid true",
+                lambda entries: [{**entries[0], "allow-invalid": True}, *entries[1:]],
+            ),
+            (
+                "unexpected key",
+                lambda entries: [{**entries[0], "unexpected": "value"}, *entries[1:]],
+            ),
+        ):
+            mutated = {**configuration, "disallowed-methods": mutate(copy.deepcopy(configuration["disallowed-methods"]))}
+            with self.subTest(label=label):
+                with self.assertRaises(self.host_authority.InventoryError):
+                    self.host_authority.load_production_catalog(
+                        self.write_toml(mutated), manifest
+                    )
+
+        manifest_payload = json.loads(CATALOG_MANIFEST.read_text(encoding="utf-8"))
+        missing = copy.deepcopy(manifest_payload)
+        missing["operations"] = [
+            row for row in missing["operations"] if row["operation"] != "libc::dlsym"
+        ]
+        with self.assertRaises(self.host_authority.InventoryError):
+            load_manifest(self.write_json(missing))
+
+    def test_independent_capture_receipt_exactly_binds_inventory_projection(self):
+        load_manifest = self.require_interface("load_catalog_manifest")
+        load_receipt = self.require_interface("load_capture_receipt")
+        validate_receipt = self.require_interface("validate_inventory_against_receipt")
+        matrix = self.host_authority.load_matrix(MATRIX)
+        catalog = load_manifest(CATALOG_MANIFEST)
+        receipt = load_receipt(MACOS_CAPTURE, matrix, catalog)
+        inventory = self.host_authority.load_inventory(INVENTORY)
+        validate_receipt(inventory, receipt)
+        self.assertEqual(len(receipt["rows"]), 682)
+        self.assertEqual(
+            receipt["executed_profiles"],
+            ["macos-cli-default", "macos-hvf-default", "macos-runtime-default"],
+        )
+
+        mutations = []
+        changed_operation = copy.deepcopy(inventory)
+        changed_operation[0]["operation"] = "libc::fork"
+        mutations.append(("operation", changed_operation))
+        changed_catalog = copy.deepcopy(inventory)
+        changed_catalog[0]["catalog_id"] = "HA-CATALOG-PROCESS-FORK"
+        mutations.append(("catalog", changed_catalog))
+        changed_source = copy.deepcopy(inventory)
+        changed_source[0]["source"]["line"] += 1
+        mutations.append(("source", changed_source))
+        changed_profiles = copy.deepcopy(inventory)
+        changed_profiles[0]["profiles"] = ["macos-cli-default"]
+        mutations.append(("profiles", changed_profiles))
+        empty_review = copy.deepcopy(inventory)
+        empty_review[0]["rationale"] = ""
+        mutations.append(("empty review", empty_review))
+        for label, rows in mutations:
+            with self.subTest(label=label):
+                with self.assertRaises(self.host_authority.InventoryError):
+                    validate_receipt(rows, receipt)
+
+        receipt_payload = json.loads(MACOS_CAPTURE.read_text(encoding="utf-8"))
+        receipt_payload["rows"][0]["profiles"] = ["macos-cli-default"]
+        with self.assertRaises(self.host_authority.InventoryError):
+            load_receipt(self.write_json(receipt_payload), matrix, catalog)
+
+        substituted_profile = json.loads(
+            MACOS_CAPTURE.read_text(encoding="utf-8")
+        )
+        substituted_profile["profiles"][0]["command"][2] = "carrick-runtime"
+        substituted_profile["profiles_sha256"] = (
+            self.host_authority._canonical_digest(substituted_profile["profiles"])
+        )
+        with self.assertRaises(self.host_authority.InventoryError):
+            load_receipt(self.write_json(substituted_profile), matrix, catalog)
+
+        substituted_toolchain = json.loads(
+            MACOS_CAPTURE.read_text(encoding="utf-8")
+        )
+        substituted_toolchain["toolchain"]["clippy"] = "clippy 0.1.95"
+        with self.assertRaises(self.host_authority.InventoryError):
+            load_receipt(self.write_json(substituted_toolchain), matrix, catalog)
+
+    def test_static_checker_validates_independent_artifacts_without_cargo(self):
+        self.require_interface("load_capture_receipt")
+        calls = []
+
+        def reject_cargo(*args, **kwargs):
+            calls.append((args, kwargs))
+            self.fail("static authority validation invoked Cargo")
+
+        self.assertEqual(
+            self.host_authority.main(
+                ["--static"], root=ROOT, runner=reject_cargo
+            ),
+            0,
+        )
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

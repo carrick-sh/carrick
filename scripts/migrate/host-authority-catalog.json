@@ -1,0 +1,186 @@
+{
+  "kind": "host-authority-catalog",
+  "operations": [
+    {
+      "catalog_id": "HA-CATALOG-HVF-VCPUS-EXIT",
+      "operation": "applevisor_sys::hv_vcpus_exit"
+    },
+    {
+      "catalog_id": "HA-CATALOG-ESCAPE-DLOPEN",
+      "operation": "libc::dlopen"
+    },
+    {
+      "catalog_id": "HA-CATALOG-ESCAPE-DLSYM",
+      "operation": "libc::dlsym"
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-FORK",
+      "operation": "libc::fork"
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-GETEUID",
+      "operation": "libc::geteuid"
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-GETPGRP",
+      "operation": "libc::getpgrp"
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-GETPID",
+      "operation": "libc::getpid"
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-GETPPID",
+      "operation": "libc::getppid"
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-GETRLIMIT",
+      "operation": "libc::getrlimit"
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-GETSID",
+      "operation": "libc::getsid"
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-GETUID",
+      "operation": "libc::getuid"
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-KILL",
+      "operation": "libc::kill"
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-KILLPG",
+      "operation": "libc::killpg"
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-SETRLIMIT",
+      "operation": "libc::setrlimit"
+    },
+    {
+      "catalog_id": "HA-CATALOG-ESCAPE-SYSCALL",
+      "operation": "libc::syscall"
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-WAIT4",
+      "operation": "libc::wait4"
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-WAITID",
+      "operation": "libc::waitid"
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-WAITPID",
+      "operation": "libc::waitpid"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-FILE-CREATE",
+      "operation": "std::fs::File::create"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-FILE-OPEN",
+      "operation": "std::fs::File::open"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-NEW",
+      "operation": "std::fs::OpenOptions::new"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-OPEN",
+      "operation": "std::fs::OpenOptions::open"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-COPY",
+      "operation": "std::fs::copy"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-CREATE-DIR",
+      "operation": "std::fs::create_dir"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-CREATE-DIR-ALL",
+      "operation": "std::fs::create_dir_all"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-HARD-LINK",
+      "operation": "std::fs::hard_link"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-METADATA",
+      "operation": "std::fs::metadata"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-READ",
+      "operation": "std::fs::read"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-READ-DIR",
+      "operation": "std::fs::read_dir"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-READ-LINK",
+      "operation": "std::fs::read_link"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-READ-TO-STRING",
+      "operation": "std::fs::read_to_string"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-REMOVE-DIR",
+      "operation": "std::fs::remove_dir"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-REMOVE-DIR-ALL",
+      "operation": "std::fs::remove_dir_all"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-REMOVE-FILE",
+      "operation": "std::fs::remove_file"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-RENAME",
+      "operation": "std::fs::rename"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-SET-PERMISSIONS",
+      "operation": "std::fs::set_permissions"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-SYMLINK-METADATA",
+      "operation": "std::fs::symlink_metadata"
+    },
+    {
+      "catalog_id": "HA-CATALOG-FS-WRITE",
+      "operation": "std::fs::write"
+    },
+    {
+      "catalog_id": "HA-CATALOG-NET-TCP-LISTENER-BIND",
+      "operation": "std::net::TcpListener::bind"
+    },
+    {
+      "catalog_id": "HA-CATALOG-NET-UDP-SOCKET-BIND",
+      "operation": "std::net::UdpSocket::bind"
+    },
+    {
+      "catalog_id": "HA-CATALOG-PROCESS-ID",
+      "operation": "std::process::id"
+    },
+    {
+      "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
+      "operation": "std::thread::Builder::new"
+    },
+    {
+      "catalog_id": "HA-CATALOG-THREAD-SLEEP",
+      "operation": "std::thread::sleep"
+    },
+    {
+      "catalog_id": "HA-CATALOG-THREAD-SPAWN",
+      "operation": "std::thread::spawn"
+    },
+    {
+      "catalog_id": "HA-CATALOG-THREAD-YIELD-NOW",
+      "operation": "std::thread::yield_now"
+    }
+  ],
+  "schema": 1
+}

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fnmatch
+import hashlib
 import json
 import os
 import platform
@@ -50,6 +51,19 @@ INVENTORY_PATH = (
     ROOT / "scripts" / "migrate" / "host-authority-transition-inventory.json"
 )
 CLIPPY_CONFIG_PATH = ROOT / "clippy.toml"
+CATALOG_MANIFEST_PATH = (
+    ROOT / "scripts" / "migrate" / "host-authority-catalog.json"
+)
+MACOS_CAPTURE_PATH = (
+    ROOT / "scripts" / "migrate" / "host-authority-macos-capture.json"
+)
+CATALOG_ENTRY_COUNT = 45
+REQUIRED_ESCAPE_OPERATIONS = {"libc::syscall", "libc::dlopen", "libc::dlsym"}
+LOCAL_MACOS_PROFILES = (
+    "macos-cli-default",
+    "macos-hvf-default",
+    "macos-runtime-default",
+)
 
 ACTUAL_FIELDS = {"catalog_id", "operation", "source", "expansion", "profiles"}
 REVIEW_FIELDS = {
@@ -1365,8 +1379,59 @@ def refresh(
     return rows
 
 
-def load_production_catalog(path: Path) -> dict[str, str]:
-    """Load only the stable object-form Clippy catalog installed by Task 4."""
+def _canonical_digest(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_complete_catalog(operation_catalog: object) -> dict[str, str]:
+    catalog = _validate_operation_catalog(operation_catalog)
+    if len(catalog) != CATALOG_ENTRY_COUNT:
+        raise InventoryError(
+            "host-authority catalog must contain exactly "
+            f"{CATALOG_ENTRY_COUNT} operations, got {len(catalog)}"
+        )
+    missing_escape = sorted(REQUIRED_ESCAPE_OPERATIONS - set(catalog))
+    if missing_escape:
+        raise InventoryError(
+            f"host-authority catalog omits required escape operations: {missing_escape}"
+        )
+    return catalog
+
+
+def load_catalog_manifest(path: Path) -> dict[str, str]:
+    """Load the independent exact operation-to-catalog-ID authority."""
+    raw = _json_file(Path(path), "host-authority catalog manifest")
+    if not isinstance(raw, dict) or set(raw) != {"schema", "kind", "operations"}:
+        raise InventoryError("invalid host-authority catalog manifest schema")
+    if raw.get("schema") != 1 or raw.get("kind") != "host-authority-catalog":
+        raise InventoryError("unsupported host-authority catalog manifest")
+    operations = raw.get("operations")
+    if not isinstance(operations, list):
+        raise InventoryError("catalog manifest operations must be a list")
+    catalog: dict[str, str] = {}
+    for index, row in enumerate(operations, start=1):
+        if not isinstance(row, dict) or set(row) != {"operation", "catalog_id"}:
+            raise InventoryError(f"invalid catalog manifest row {index}: {row!r}")
+        operation = row.get("operation")
+        catalog_id = row.get("catalog_id")
+        if not isinstance(operation, str) or not isinstance(catalog_id, str):
+            raise InventoryError(f"invalid catalog manifest row {index}: {row!r}")
+        if operation in catalog:
+            raise InventoryError(f"duplicate catalog manifest operation: {operation}")
+        catalog[operation] = catalog_id
+    if list(catalog) != sorted(catalog):
+        raise InventoryError("catalog manifest operations must be sorted")
+    return _validate_complete_catalog(catalog)
+
+
+def load_production_catalog(
+    path: Path, operation_manifest: Mapping[str, str]
+) -> dict[str, str]:
+    """Bind strict object-form Clippy entries to the independent manifest."""
+    manifest = _validate_complete_catalog(operation_manifest)
     try:
         configuration = tomllib.loads(Path(path).read_text(encoding="utf-8"))
     except FileNotFoundError as error:
@@ -1381,9 +1446,10 @@ def load_production_catalog(path: Path) -> dict[str, str]:
         )
     catalog: dict[str, str] = {}
     for index, entry in enumerate(entries, start=1):
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or set(entry) != {"path", "reason"}:
             raise InventoryError(
-                f"production catalog entry {index} is not an object with a stable ID"
+                "production catalog entry "
+                f"{index} must contain exactly path and reason"
             )
         operation = entry.get("path")
         reason = entry.get("reason")
@@ -1392,14 +1458,160 @@ def load_production_catalog(path: Path) -> dict[str, str]:
                 f"production catalog entry {index} lacks path or stable-ID reason"
             )
         match = CATALOG_REASON.match(reason)
-        if match is None:
+        if match is None or not reason[match.end() :].strip():
             raise InventoryError(
-                f"production catalog entry {operation!r} lacks a stable catalog ID"
+                "production catalog entry "
+                f"{operation!r} lacks a stable catalog ID or explanation"
             )
         if operation in catalog:
             raise InventoryError(f"duplicate production catalog operation: {operation}")
         catalog[operation] = match.group(1)
-    return _validate_operation_catalog(catalog)
+    catalog = _validate_complete_catalog(catalog)
+    if catalog != manifest:
+        missing = sorted(set(manifest) - set(catalog))
+        extra = sorted(set(catalog) - set(manifest))
+        changed = sorted(
+            operation
+            for operation in set(catalog) & set(manifest)
+            if catalog[operation] != manifest[operation]
+        )
+        raise InventoryError(
+            "production Clippy catalog disagrees with independent manifest: "
+            f"missing={missing}, extra={extra}, changed={changed}"
+        )
+    return catalog
+
+
+def _capture_profile_rows(matrix: Matrix) -> list[dict[str, object]]:
+    rows = []
+    for profile_id in LOCAL_MACOS_PROFILES:
+        profile = matrix.profiles.get(profile_id)
+        if profile is None:
+            raise InventoryError(f"capture profile missing from matrix: {profile_id}")
+        rows.append(
+            {
+                "id": profile.id,
+                "host": profile.host,
+                "host_triple": profile.host_triple,
+                "command": list(profile.command),
+            }
+        )
+    return rows
+
+
+def load_capture_receipt(
+    path: Path, matrix: Matrix, operation_catalog: Mapping[str, str]
+) -> dict[str, object]:
+    """Load and authenticate the checked macOS compiler-capture receipt."""
+    raw = _json_file(Path(path), "host-authority macOS capture receipt")
+    fields = {
+        "schema",
+        "kind",
+        "source_head",
+        "toolchain",
+        "executed_profiles",
+        "pending_profiles",
+        "profiles",
+        "diagnostic_counts",
+        "catalog_sha256",
+        "profiles_sha256",
+        "rows_sha256",
+        "rows",
+    }
+    if not isinstance(raw, dict) or set(raw) != fields:
+        raise InventoryError("invalid host-authority macOS capture schema")
+    if raw.get("schema") != 1 or raw.get("kind") != "host-authority-macos-capture":
+        raise InventoryError("unsupported host-authority macOS capture")
+    source_head = raw.get("source_head")
+    if not isinstance(source_head, str) or re.fullmatch(r"[0-9a-f]{40}", source_head) is None:
+        raise InventoryError("capture source_head must be a full lowercase Git hash")
+
+    catalog = _validate_complete_catalog(operation_catalog)
+    if raw.get("catalog_sha256") != _canonical_digest(catalog):
+        raise InventoryError("capture catalog digest mismatch")
+
+    profiles = raw.get("profiles")
+    expected_profiles = _capture_profile_rows(matrix)
+    if profiles != expected_profiles:
+        raise InventoryError("capture profile metadata disagrees with checked matrix")
+    if raw.get("profiles_sha256") != _canonical_digest(expected_profiles):
+        raise InventoryError("capture profile digest mismatch")
+    if raw.get("executed_profiles") != list(LOCAL_MACOS_PROFILES):
+        raise InventoryError("capture executed profiles are not the exact macOS slice")
+    expected_pending = sorted(set(matrix.required_profiles) - set(LOCAL_MACOS_PROFILES))
+    if raw.get("pending_profiles") != expected_pending:
+        raise InventoryError("capture pending profiles disagree with checked matrix")
+
+    toolchain = raw.get("toolchain")
+    if not isinstance(toolchain, dict) or set(toolchain) != {
+        "rustc",
+        "clippy",
+        "host_triple",
+    }:
+        raise InventoryError("capture has invalid toolchain metadata")
+    rustc, host_triple = _rustc_verbose_identity(
+        toolchain.get("rustc") if isinstance(toolchain.get("rustc"), str) else "",
+        matrix.rustc_release,
+    )
+    clippy = _clippy_identity(
+        toolchain.get("clippy") if isinstance(toolchain.get("clippy"), str) else "",
+        matrix.clippy_release,
+    )
+    if host_triple != HOST_TRIPLES["macos"] or toolchain.get("host_triple") != host_triple:
+        raise InventoryError("capture toolchain host triple is not canonical macOS")
+    if toolchain != {"rustc": rustc, "clippy": clippy, "host_triple": host_triple}:
+        raise InventoryError("capture toolchain identity is not canonical")
+
+    rows = raw.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise InventoryError("capture rows must be a nonempty list")
+    identities: set[str] = set()
+    normalized_rows = []
+    for index, row in enumerate(rows, start=1):
+        valid = _validate_actual_row(row, f"capture row {index}")
+        operation = valid["operation"]
+        if valid["catalog_id"] != catalog.get(operation):
+            raise InventoryError(f"capture row {index} has wrong catalog binding")
+        profiles_for_row = valid["profiles"]
+        if not set(profiles_for_row) <= set(LOCAL_MACOS_PROFILES):
+            raise InventoryError(f"capture row {index} contains a non-macOS profile")
+        identity = diagnostic_identity(valid)
+        if identity in identities:
+            raise InventoryError(f"duplicate capture diagnostic identity: {identity}")
+        identities.add(identity)
+        normalized_rows.append(valid)
+    if normalized_rows != sorted(normalized_rows, key=_sort_key):
+        raise InventoryError("capture rows must be in canonical diagnostic order")
+    if raw.get("rows_sha256") != _canonical_digest(normalized_rows):
+        raise InventoryError("capture row digest mismatch")
+
+    counts = raw.get("diagnostic_counts")
+    expected_counts = {
+        profile_id: sum(profile_id in row["profiles"] for row in normalized_rows)
+        for profile_id in LOCAL_MACOS_PROFILES
+    }
+    expected_counts["merged"] = len(normalized_rows)
+    if counts != expected_counts:
+        raise InventoryError(
+            f"capture diagnostic counts mismatch: expected={expected_counts}, got={counts}"
+        )
+    return raw
+
+
+def validate_inventory_against_receipt(
+    inventory: Sequence[dict[str, object]], receipt: Mapping[str, object]
+) -> None:
+    """Require exact actual-row equality while independently validating reviews."""
+    _reviewed_index(inventory, allow_unreviewed=False)
+    projected = [
+        {field: row[field] for field in ACTUAL_FIELDS}
+        for row in inventory
+    ]
+    receipt_rows = receipt.get("rows")
+    if projected != receipt_rows:
+        raise InventoryError(
+            "reviewed inventory actual projection disagrees with compiler capture"
+        )
 
 
 def load_inventory(path: Path) -> list[dict[str, object]]:
@@ -1685,6 +1897,14 @@ def _argument_parser() -> argparse.ArgumentParser:
             "unreviewed executed rows, and exit nonzero"
         ),
     )
+    mode.add_argument(
+        "--static",
+        action="store_true",
+        help=(
+            "validate the independent catalog, capture receipt, and reviewed "
+            "inventory without launching Cargo"
+        ),
+    )
     parser.add_argument(
         "--profiles",
         metavar="GLOB[,GLOB...]",
@@ -1702,7 +1922,9 @@ def main(
     runner: Any = subprocess.run,
     matrix: Matrix | None = None,
     operation_catalog: Mapping[str, str] | None = None,
+    catalog_manifest: Mapping[str, str] | None = None,
     expected: list[dict[str, object]] | None = None,
+    capture_receipt: Mapping[str, object] | None = None,
     current_host: str | None = None,
     root: Path = ROOT,
 ) -> int:
@@ -1721,11 +1943,19 @@ def main(
             else contextlib.nullcontext(None)
         )
         with destination_manager as candidate_destination:
+            manifest = (
+                dict(catalog_manifest)
+                if catalog_manifest is not None
+                else load_catalog_manifest(
+                    Path(root) / CATALOG_MANIFEST_PATH.relative_to(ROOT)
+                )
+            )
             catalog = (
                 dict(operation_catalog)
                 if operation_catalog is not None
                 else load_production_catalog(
-                    Path(root) / CLIPPY_CONFIG_PATH.relative_to(ROOT)
+                    Path(root) / CLIPPY_CONFIG_PATH.relative_to(ROOT),
+                    manifest,
                 )
             )
             reviews = (
@@ -1735,6 +1965,22 @@ def main(
                     Path(root) / INVENTORY_PATH.relative_to(ROOT)
                 )
             )
+            receipt = (
+                dict(capture_receipt)
+                if capture_receipt is not None
+                else load_capture_receipt(
+                    Path(root) / MACOS_CAPTURE_PATH.relative_to(ROOT),
+                    checked_matrix,
+                    catalog,
+                )
+            )
+            validate_inventory_against_receipt(reviews, receipt)
+            if arguments.static:
+                print(
+                    "host-authority static authority passed: exact catalog, "
+                    "macOS compiler receipt, and reviewed inventory agree"
+                )
+                return 0
             selected = select_profiles(
                 checked_matrix, arguments.profiles, current_host=current_host
             )
