@@ -3751,7 +3751,8 @@ impl ExecutionGeneration {
 pub struct ExecutorId(u32);
 
 impl ExecutorId {
-    pub fn synthetic_for_tests(raw: u32) -> Self {
+    #[cfg(test)]
+    pub(super) fn synthetic_for_tests(raw: u32) -> Self {
         Self(raw)
     }
 }
@@ -3882,6 +3883,12 @@ pub struct ThreadExecutionLease {
     cpu_state: Option<GuestCpuState>,
     settled: bool,
 }
+
+/// A settlement either consumes the exact lease successfully or returns that
+/// same still-live authority with the typed rejection. Callers may retry the
+/// returned lease against its true owner; discarding it still invokes the
+/// fail-closed unsettled-lease policy.
+pub type ThreadExecutionSettlementResult = Result<(), (ThreadExecutionError, ThreadExecutionLease)>;
 
 impl std::fmt::Debug for ThreadExecutionLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -4124,7 +4131,7 @@ impl Thread {
     pub fn yield_from_executor(
         &self,
         lease: ThreadExecutionLease,
-    ) -> Result<(), ThreadExecutionError> {
+    ) -> ThreadExecutionSettlementResult {
         self.settle_execution_lease(lease, ExecutionSettlement::Runnable)
     }
 
@@ -4132,14 +4139,14 @@ impl Thread {
         &self,
         lease: ThreadExecutionLease,
         reason: BlockedReason,
-    ) -> Result<(), ThreadExecutionError> {
+    ) -> ThreadExecutionSettlementResult {
         self.settle_execution_lease(lease, ExecutionSettlement::Blocked(reason))
     }
 
     pub fn exit_from_executor(
         &self,
         lease: ThreadExecutionLease,
-    ) -> Result<(), ThreadExecutionError> {
+    ) -> ThreadExecutionSettlementResult {
         self.settle_execution_lease(lease, ExecutionSettlement::Exited)
     }
 
@@ -4147,16 +4154,18 @@ impl Thread {
         &self,
         mut lease: ThreadExecutionLease,
         settlement: ExecutionSettlement,
-    ) -> Result<(), ThreadExecutionError> {
-        self.validate_execution_lease_owner(&lease)?;
+    ) -> ThreadExecutionSettlementResult {
+        if let Err(error) = self.validate_execution_lease_owner(&lease) {
+            return Err((error, lease));
+        }
         let mut execution = self.execution.lock();
         if !Self::execution_state_matches_lease(execution.state, &lease) {
-            return Err(Self::stale_lease_error(&lease));
+            let error = Self::stale_lease_error(&lease);
+            return Err((error, lease));
         }
-        let generation = lease
-            .generation
-            .next()
-            .ok_or(ThreadExecutionError::GenerationExhausted)?;
+        let Some(generation) = lease.generation.next() else {
+            return Err((ThreadExecutionError::GenerationExhausted, lease));
+        };
         match settlement {
             ExecutionSettlement::Runnable => {
                 execution.cpu_state = lease.cpu_state.take();

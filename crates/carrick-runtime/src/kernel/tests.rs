@@ -196,9 +196,23 @@ fn thread_execution_stale_owner_and_generation_cannot_settle() {
     let wrong_owner_lease = thread_a
         .claim_runnable(ExecutorId::synthetic_for_tests(21))
         .unwrap();
+    let (error, wrong_owner_lease) = thread_b
+        .yield_from_executor(wrong_owner_lease)
+        .expect_err("wrong owner must return the unsettled lease");
     assert!(matches!(
-        thread_b.yield_from_executor(wrong_owner_lease),
-        Err(ThreadExecutionError::LeaseOwnerMismatch { .. })
+        error,
+        ThreadExecutionError::LeaseOwnerMismatch { .. }
+    ));
+    assert!(matches!(
+        thread_a.execution_state(),
+        ThreadExecutionState::Running { .. }
+    ));
+    thread_a
+        .yield_from_executor(wrong_owner_lease)
+        .expect("true owner settles returned lease");
+    assert!(matches!(
+        thread_a.execution_state(),
+        ThreadExecutionState::Runnable { .. }
     ));
     assert!(matches!(
         thread_b.execution_state(),
@@ -211,7 +225,7 @@ fn thread_execution_stale_owner_and_generation_cannot_settle() {
     thread_b.invalidate_execution_for_exec();
     assert!(matches!(
         thread_b.park_from_executor(stale_lease, BlockedReason::ChildState),
-        Err(ThreadExecutionError::StaleLease { .. })
+        Err((ThreadExecutionError::StaleLease { .. }, _))
     ));
     assert!(matches!(
         thread_b.execution_state(),
@@ -229,7 +243,7 @@ fn thread_execution_stale_owner_and_generation_cannot_settle() {
     thread_c.invalidate_execution_for_exec();
     assert!(matches!(
         thread_c.exit_from_executor(stale_exit_lease),
-        Err(ThreadExecutionError::StaleLease { .. })
+        Err((ThreadExecutionError::StaleLease { .. }, _))
     ));
     assert!(matches!(
         thread_c.execution_state(),
