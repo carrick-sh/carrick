@@ -284,14 +284,21 @@ impl Vfs for DevptsVfs {
             libc::O_RDONLY
         };
         oflag |= libc::O_NOCTTY;
-        if flags.nonblock {
-            oflag |= libc::O_NONBLOCK;
-        }
         let cpath = CString::new(slave_name).map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
         // SAFETY: cpath is a valid NUL-terminated path to a host slave pty device.
-        let host_fd = unsafe { libc::open(cpath.as_ptr(), oflag) };
+        // Darwin pty slave opens must include O_NONBLOCK so open(2) never blocks
+        // waiting for carrier; clear O_NONBLOCK afterwards if the guest did not request it.
+        let host_fd = unsafe { libc::open(cpath.as_ptr(), oflag | libc::O_NONBLOCK) };
         if host_fd < 0 {
             return Err(super::dev::host_open_errno());
+        }
+        if !flags.nonblock {
+            unsafe {
+                let cur = libc::fcntl(host_fd, libc::F_GETFL);
+                if cur >= 0 {
+                    libc::fcntl(host_fd, libc::F_SETFL, cur & !libc::O_NONBLOCK);
+                }
+            }
         }
         let status_flags = if flags.nonblock {
             crate::linux_abi::LINUX_O_NONBLOCK as u32

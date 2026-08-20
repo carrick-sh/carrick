@@ -1,13 +1,12 @@
-use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::time::Duration;
-
 use carrick_abi::*;
 use carrick_guest_mem::GuestMemory;
 use parking_lot::{Condvar, Mutex};
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use super::DispatchOutcome;
+use crate::dispatch::WaitFds;
 
 pub(crate) const DEFAULT_PIPE_CAPACITY: usize = 65536; // 64 KiB = 16 Linux pages
 pub(crate) const MAX_PIPE_CAPACITY: usize = 1048576; // 1 MiB (/proc/sys/fs/pipe-max-size)
@@ -44,13 +43,21 @@ impl PipeInner {
             state: Mutex::new(PipeState {
                 buffer: VecDeque::with_capacity(capacity.min(65536)),
                 capacity,
-                readers: 1,
-                writers: 1,
+                readers: 0,
+                writers: 0,
                 pipe_id,
             }),
             changed: Condvar::new(),
             capacity_cell: Arc::new(AtomicI64::new(capacity as i64)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_connected(pipe_id: u64, capacity: usize) -> Self {
+        let pipe = Self::new(pipe_id, capacity);
+        pipe.state.lock().readers = 1;
+        pipe.state.lock().writers = 1;
+        pipe
     }
 
     #[allow(dead_code)]
@@ -87,38 +94,38 @@ pub(crate) fn read_pipe<M: GuestMemory>(
     length: usize,
     pipe: &PipeRef,
     status_flags: u64,
-    tid: crate::thread::ThreadId,
+    fd: i32,
 ) -> DispatchOutcome {
     if length == 0 {
         return DispatchOutcome::Returned { value: 0 };
     }
     let nonblocking = status_flags & LINUX_O_NONBLOCK != 0;
     let mut state = pipe.state.lock();
-    loop {
-        if !state.buffer.is_empty() {
-            let read_len = state.buffer.len().min(length);
-            let bytes: Vec<u8> = state.buffer.drain(..read_len).collect();
-            drop(state);
-            pipe.changed.notify_all();
-            if memory.write_bytes(address, &bytes).is_err() {
-                return DispatchOutcome::errno(LINUX_EFAULT);
-            }
-            return DispatchOutcome::Returned {
-                value: read_len as i64,
-            };
+    if !state.buffer.is_empty() {
+        let read_len = state.buffer.len().min(length);
+        let bytes: Vec<u8> = state.buffer.drain(..read_len).collect();
+        drop(state);
+        pipe.changed.notify_all();
+        if memory.write_bytes(address, &bytes).is_err() {
+            return DispatchOutcome::errno(LINUX_EFAULT);
         }
-        if state.writers == 0 {
-            // EOF: all writers closed and buffer empty
-            return DispatchOutcome::Returned { value: 0 };
+        return DispatchOutcome::Returned {
+            value: read_len as i64,
+        };
+    }
+    if state.writers == 0 {
+        // EOF: all writers closed and buffer empty
+        return DispatchOutcome::Returned { value: 0 };
+    }
+    if nonblocking {
+        DispatchOutcome::errno(LINUX_EAGAIN)
+    } else {
+        DispatchOutcome::WaitOnFds {
+            fds: WaitFds::raw_one(fd, libc::POLLIN),
+            timeout: None,
+            on_timeout: LINUX_EAGAIN.guest_retval(),
+            sig_mask: carrick_abi::WaitSigMask::NONE,
         }
-        if nonblocking {
-            return DispatchOutcome::errno(LINUX_EAGAIN);
-        }
-        if crate::host_signal::has_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE)
-        {
-            return DispatchOutcome::errno(LINUX_EINTR);
-        }
-        pipe.changed.wait_for(&mut state, Duration::from_millis(10));
     }
 }
 
@@ -127,7 +134,7 @@ pub(crate) fn read_pipe_bytes(
     buf: &mut [u8],
     pipe: &PipeRef,
     status_flags: u64,
-    tid: crate::thread::ThreadId,
+    _tid: crate::thread::ThreadId,
 ) -> Result<usize, LinuxErrno> {
     if buf.is_empty() {
         return Ok(0);
@@ -135,31 +142,26 @@ pub(crate) fn read_pipe_bytes(
     let length = buf.len();
     let nonblocking = status_flags & LINUX_O_NONBLOCK != 0;
     let mut state = pipe.state.lock();
-    loop {
-        if !state.buffer.is_empty() {
-            let read_len = state.buffer.len().min(length);
-            for (dest, src) in buf[..read_len]
-                .iter_mut()
-                .zip(state.buffer.drain(..read_len))
-            {
-                *dest = src;
-            }
-            drop(state);
-            pipe.changed.notify_all();
-            return Ok(read_len);
-        }
-        if state.writers == 0 {
-            // EOF
-            return Ok(0);
-        }
-        if nonblocking {
-            return Err(LINUX_EAGAIN);
-        }
-        if crate::host_signal::has_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE)
+    if !state.buffer.is_empty() {
+        let read_len = state.buffer.len().min(length);
+        for (dest, src) in buf[..read_len]
+            .iter_mut()
+            .zip(state.buffer.drain(..read_len))
         {
-            return Err(LINUX_EINTR);
+            *dest = src;
         }
-        pipe.changed.wait_for(&mut state, Duration::from_millis(10));
+        drop(state);
+        pipe.changed.notify_all();
+        return Ok(read_len);
+    }
+    if state.writers == 0 {
+        // EOF
+        return Ok(0);
+    }
+    if nonblocking {
+        Err(LINUX_EAGAIN)
+    } else {
+        Err(LINUX_EAGAIN)
     }
 }
 
@@ -202,7 +204,7 @@ pub(crate) fn write_pipe(
     bytes: &[u8],
     pipe: &PipeRef,
     status_flags: u64,
-    tid: crate::thread::ThreadId,
+    fd: i32,
 ) -> DispatchOutcome {
     let nonblocking = status_flags & LINUX_O_NONBLOCK != 0;
     let length = bytes.len();
@@ -215,56 +217,29 @@ pub(crate) fn write_pipe(
         return DispatchOutcome::Returned { value: 0 };
     }
 
-    let mut written = 0;
-    while written < length {
-        if state.readers == 0 {
-            if written > 0 {
-                return DispatchOutcome::Returned {
-                    value: written as i64,
-                };
-            }
-            return DispatchOutcome::errno(LINUX_EPIPE);
+    let capacity = state.capacity;
+    let available = capacity.saturating_sub(state.buffer.len());
+
+    // For writes <= PIPE_BUF (4096), write must be atomic: all or wait.
+    let needed = if length <= PIPE_BUF { length } else { 1 };
+
+    if available >= needed {
+        let chunk_len = length.min(available);
+        state.buffer.extend(&bytes[..chunk_len]);
+        drop(state);
+        pipe.changed.notify_all();
+        DispatchOutcome::Returned {
+            value: chunk_len as i64,
         }
-
-        let capacity = state.capacity;
-        let available = capacity.saturating_sub(state.buffer.len());
-
-        // For writes <= PIPE_BUF (4096), write must be atomic: all or wait.
-        let needed = if length <= PIPE_BUF { length } else { 1 };
-
-        if available >= needed {
-            let chunk_len = (length - written).min(available);
-            state.buffer.extend(&bytes[written..written + chunk_len]);
-            written += chunk_len;
-            drop(state);
-            pipe.changed.notify_all();
-            if written == length || nonblocking {
-                return DispatchOutcome::Returned {
-                    value: written as i64,
-                };
-            }
-            state = pipe.state.lock();
-        } else {
-            if written > 0 {
-                return DispatchOutcome::Returned {
-                    value: written as i64,
-                };
-            }
-            if nonblocking {
-                return DispatchOutcome::errno(LINUX_EAGAIN);
-            }
-            if crate::host_signal::has_unblocked_pending_for(
-                tid.raw(),
-                carrick_abi::SigBlockMask::NONE,
-            ) {
-                return DispatchOutcome::errno(LINUX_EINTR);
-            }
-            pipe.changed.wait_for(&mut state, Duration::from_millis(10));
+    } else if nonblocking {
+        DispatchOutcome::errno(LINUX_EAGAIN)
+    } else {
+        DispatchOutcome::WaitOnFds {
+            fds: WaitFds::raw_one(fd, libc::POLLOUT),
+            timeout: None,
+            on_timeout: LINUX_EAGAIN.guest_retval(),
+            sig_mask: carrick_abi::WaitSigMask::NONE,
         }
-    }
-
-    DispatchOutcome::Returned {
-        value: written as i64,
     }
 }
 
@@ -274,11 +249,11 @@ mod tests {
 
     #[test]
     fn in_memory_pipe_basic_read_write() {
-        let pipe = Arc::new(PipeInner::new(1, 65536));
+        let pipe = Arc::new(PipeInner::new_connected(1, 65536));
         let tid = crate::thread::ThreadId::synthetic_for_tests(1);
 
         let data = b"hello, in-memory pipe!";
-        let out = write_pipe(data, &pipe, 0, tid);
+        let out = write_pipe(data, &pipe, 0, 4);
         assert_eq!(
             out,
             DispatchOutcome::Returned {
@@ -294,8 +269,7 @@ mod tests {
 
     #[test]
     fn in_memory_pipe_capacity_and_resize() {
-        let pipe = Arc::new(PipeInner::new(2, 4096));
-        let tid = crate::thread::ThreadId::synthetic_for_tests(1);
+        let pipe = Arc::new(PipeInner::new_connected(2, 4096));
 
         assert_eq!(pipe.get_capacity(), 4096);
         assert_eq!(pipe.set_capacity(8192), Ok(8192));
@@ -303,7 +277,7 @@ mod tests {
 
         // Fill 5000 bytes
         let data = vec![0x42u8; 5000];
-        let out = write_pipe(&data, &pipe, 0, tid);
+        let out = write_pipe(&data, &pipe, 0, 4);
         assert_eq!(out, DispatchOutcome::Returned { value: 5000 });
 
         // Shrinking below buffered bytes must return EBUSY
@@ -315,12 +289,12 @@ mod tests {
 
     #[test]
     fn in_memory_pipe_broken_pipe_and_eof() {
-        let pipe = Arc::new(PipeInner::new(3, 4096));
+        let pipe = Arc::new(PipeInner::new_connected(3, 4096));
         let tid = crate::thread::ThreadId::synthetic_for_tests(1);
 
         // Close all readers
         pipe.state.lock().readers = 0;
-        let out = write_pipe(b"test", &pipe, 0, tid);
+        let out = write_pipe(b"test", &pipe, 0, 4);
         assert_eq!(out, DispatchOutcome::errno(LINUX_EPIPE));
 
         // Restore reader, close all writers
@@ -333,7 +307,7 @@ mod tests {
 
     #[test]
     fn in_memory_pipe_nonblocking_eagain() {
-        let pipe = Arc::new(PipeInner::new(4, 4096));
+        let pipe = Arc::new(PipeInner::new_connected(4, 4096));
         let tid = crate::thread::ThreadId::synthetic_for_tests(1);
 
         // Read from empty nonblocking pipe -> EAGAIN
@@ -346,13 +320,13 @@ mod tests {
         // Fill pipe to capacity
         let data = vec![0xaa; 4096];
         assert_eq!(
-            write_pipe(&data, &pipe, LINUX_O_NONBLOCK, tid),
+            write_pipe(&data, &pipe, LINUX_O_NONBLOCK, 4),
             DispatchOutcome::Returned { value: 4096 }
         );
 
         // Write to full nonblocking pipe -> EAGAIN
         assert_eq!(
-            write_pipe(b"more", &pipe, LINUX_O_NONBLOCK, tid),
+            write_pipe(b"more", &pipe, LINUX_O_NONBLOCK, 4),
             DispatchOutcome::errno(LINUX_EAGAIN)
         );
     }

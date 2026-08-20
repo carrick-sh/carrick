@@ -4259,6 +4259,9 @@ impl SyscallDispatcher {
     fn host_pipe_pipe_id(&self, fd: i32) -> Option<u64> {
         let open_file = self.open_file(fd)?;
         let host_socket_fd = match &*open_file.description.read() {
+            OpenDescription::PipeReader { pipe, .. } | OpenDescription::PipeWriter { pipe, .. } => {
+                return Some(pipe.pipe_id());
+            }
             OpenDescription::HostPipe { pipe_id, .. } => {
                 return (*pipe_id != 0).then_some(*pipe_id);
             }
@@ -5551,7 +5554,7 @@ impl SyscallDispatcher {
                 let mut open = open_file.description.write();
                 match &mut *open {
                     OpenDescription::PipeWriter { base, pipe } => {
-                        return write_pipe(bytes, pipe, base.status_flags(), tid);
+                        return write_pipe(bytes, pipe, base.status_flags(), fd);
                     }
                     OpenDescription::HostPipe {
                         base,
@@ -9849,7 +9852,7 @@ impl SyscallDispatcher {
                     let pipe = Arc::clone(pipe);
                     let flags = base.status_flags();
                     drop(open);
-                    return Ok(read_pipe(memory, address, length, &pipe, flags, tid));
+                    return Ok(read_pipe(memory, address, length, &pipe, flags, fd.0));
                 }
                 OpenDescription::HostPipe {
                     host_fd,
@@ -10086,7 +10089,7 @@ impl SyscallDispatcher {
                         if len == 0 {
                             continue;
                         }
-                        match read_pipe(memory, iov.iov_base, len, &pipe, flags, tid) {
+                        match read_pipe(memory, iov.iov_base, len, &pipe, flags, fd.0) {
                             DispatchOutcome::Returned { value } => {
                                 total += value;
                                 if (value as usize) < len {
@@ -12251,9 +12254,12 @@ impl SyscallDispatcher {
                             let pipe = Arc::clone(pipe);
                             let flags = base.status_flags();
                             drop(open);
-                            let outcome = write_pipe(&bytes, &pipe, flags, cx.tid());
-                            if matches!(outcome, DispatchOutcome::Returned { value } if value > 0) {
-                                this.notify_inmem_epoll();
+                            let outcome = write_pipe(&bytes, &pipe, flags, fd);
+                            if let DispatchOutcome::Returned { value } = outcome {
+                                if value > 0 {
+                                    this.notify_inmem_epoll();
+                                    this.fasync_notify_after_write(cx.kernel, fd, value);
+                                }
                             }
                             return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
                         }
@@ -12742,7 +12748,7 @@ impl SyscallDispatcher {
                                 }
                             }
                             OpenDescription::PipeWriter { base, pipe } => {
-                                outcome = write_pipe(&bytes, pipe, base.status_flags(), cx.tid());
+                                outcome = write_pipe(&bytes, pipe, base.status_flags(), fd);
                                 writeback = None;
                             }
                             OpenDescription::HostPipe {

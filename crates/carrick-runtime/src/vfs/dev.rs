@@ -147,7 +147,7 @@ impl Vfs for DevVfs {
             let mut table = self.pty_table.lock();
             let (master_fd, slave_name) =
                 open_master(flags.nonblock).map_err(crate::host_to_linux_errno)?;
-            let index = table.insert(slave_name, 1);
+            let index = table.insert(slave_name, std::process::id());
             let status_flags = if flags.nonblock {
                 crate::linux_abi::LINUX_O_NONBLOCK as u32
             } else {

@@ -533,18 +533,43 @@ fn pipe2_fd_fill_fails_fast_with_emfile() {
     let mut dispatcher = SyscallDispatcher::new();
     let mut fds = Vec::new();
 
-    for _ in 0..2048 {
-        assert_eq!(
-            dispatcher
-                .dispatch(
-                    &dispatcher.capture_one_task_context().unwrap(),
-                    SyscallRequest::new(59, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
-                    &mut memory,
-                    &reporter,
-                )
-                .unwrap(),
-            DispatchOutcome::Returned { value: 0 }
-        );
+    // Set RLIMIT_NOFILE to soft=64, hard=1_048_576 so we can exhaust it quickly and deterministically.
+    let limit = LinuxRlimit::new(64, 1_048_576);
+    memory
+        .write_bytes(0x4080, &limit.rlim_cur.to_le_bytes())
+        .unwrap();
+    memory
+        .write_bytes(0x4088, &limit.rlim_max.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(261, SyscallArgs::from([0, 7, 0x4080, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    for _ in 0..64 {
+        let outcome = dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(59, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        if outcome
+            == (DispatchOutcome::Errno {
+                errno: LINUX_EMFILE,
+            })
+        {
+            break;
+        }
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
         let pair = read_fd_pair(&memory, 0x4000);
         fds.push(pair.read_fd as u64);
         fds.push(pair.write_fd as u64);
@@ -577,6 +602,26 @@ fn pipe2_fd_fill_fails_fast_with_emfile() {
             DispatchOutcome::Returned { value: 0 }
         );
     }
+
+    // Restore default RLIMIT_NOFILE
+    let default_limit = LinuxRlimit::new(1_048_576, 1_048_576);
+    memory
+        .write_bytes(0x4080, &default_limit.rlim_cur.to_le_bytes())
+        .unwrap();
+    memory
+        .write_bytes(0x4088, &default_limit.rlim_max.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &dispatcher.capture_one_task_context().unwrap(),
+                SyscallRequest::new(261, SyscallArgs::from([0, 7, 0x4080, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
 }
 
 #[test]

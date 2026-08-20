@@ -887,13 +887,31 @@ impl SyscallDispatcher {
             {
                 LINUX_EPOLLIN
             }
-            OpenDescription::PipeReader { pipe, .. } if requested_events & LINUX_EPOLLIN != 0 => {
+            OpenDescription::PipeReader { pipe, .. } => {
                 let state = pipe.state.lock();
-                if !state.buffer.is_empty() || state.writers == 0 {
-                    LINUX_EPOLLIN
-                } else {
-                    0
+                let mut ready = 0;
+                if requested_events & LINUX_EPOLLIN != 0 && !state.buffer.is_empty() {
+                    ready |= LINUX_EPOLLIN;
                 }
+                if state.writers == 0 {
+                    ready |= LINUX_EPOLLHUP;
+                    if requested_events & LINUX_EPOLLIN != 0 {
+                        ready |= LINUX_EPOLLIN;
+                    }
+                }
+                ready
+            }
+            OpenDescription::PipeWriter { pipe, .. } => {
+                let state = pipe.state.lock();
+                let mut ready = 0;
+                if state.readers == 0 {
+                    ready |= LINUX_EPOLLERR | LINUX_EPOLLHUP;
+                } else if requested_events & LINUX_EPOLLOUT != 0
+                    && state.buffer.len() < state.capacity
+                {
+                    ready |= LINUX_EPOLLOUT;
+                }
+                ready
             }
             OpenDescription::TimerFd { state, .. }
                 if requested_events & LINUX_EPOLLIN != 0 && timerfd_ready_count(state) > 0 =>
@@ -1069,6 +1087,12 @@ impl SyscallDispatcher {
     }
 
     fn host_read_avail_for_poll(&self, fd: i32) -> u64 {
+        if let Some(open_file) = self.open_file(fd) {
+            let open = open_file.description.read();
+            if let OpenDescription::PipeReader { pipe, .. } = &*open {
+                return pipe.buffered_bytes() as u64;
+            }
+        }
         let Some(host_fd) = self.host_fd_for_poll(fd) else {
             return 0;
         };
@@ -4023,17 +4047,35 @@ impl SyscallDispatcher {
                 }
                 let requested = interest.event.events;
                 let raw_ready = this.epoll_ready_events(*fd, requested);
+                let read_avail = if raw_ready & READ_READY_BITS != 0 {
+                    this.host_read_avail_for_poll(*fd)
+                } else {
+                    0
+                };
+                let read_growth = if requested & LINUX_EPOLLET != 0
+                    && raw_ready & READ_READY_BITS != 0
+                    && read_avail > interest.last_read_avail
+                {
+                    raw_ready & READ_READY_BITS
+                } else {
+                    0
+                };
                 let ready_events = if requested & LINUX_EPOLLET != 0 {
-                    raw_ready & !interest.last_ready
+                    (raw_ready & !interest.last_ready) | read_growth
                 } else {
                     raw_ready
+                };
+                let read_avail_update = if raw_ready & READ_READY_BITS == 0 {
+                    Some(0)
+                } else {
+                    Some(read_avail)
                 };
                 ready_updates.push((
                     *fd,
                     interest.reg_gen,
                     interest.io_gen,
                     raw_ready,
-                    Some(0),
+                    read_avail_update,
                     false,
                     false,
                     false,
