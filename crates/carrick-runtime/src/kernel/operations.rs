@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 
-use carrick_abi::LinuxSiginfo;
+use carrick_abi::{LinuxSiginfo, NsUid};
 use carrick_hal::{KernelTransactionId, ThreadId};
 use parking_lot::{Condvar, Mutex};
 
@@ -52,8 +52,15 @@ impl WaitJobControl {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WaitOutcome {
     Exited(Zombie),
-    Stopped { task: TaskId, signal: LinuxSignal },
-    Continued { task: TaskId },
+    Stopped {
+        task: TaskId,
+        signal: LinuxSignal,
+        euid: NsUid,
+    },
+    Continued {
+        task: TaskId,
+        euid: NsUid,
+    },
     StillRunning,
     NoChild,
 }
@@ -3402,10 +3409,15 @@ impl Kernel {
                             mode == WaitMode::Consume,
                         )
                         .map(|event| match event {
-                            TaskJobControlEvent::Stopped(signal) => {
-                                WaitOutcome::Stopped { task: *id, signal }
-                            }
-                            TaskJobControlEvent::Continued => WaitOutcome::Continued { task: *id },
+                            TaskJobControlEvent::Stopped(signal) => WaitOutcome::Stopped {
+                                task: *id,
+                                signal,
+                                euid: record.task.process_credentials().euid(),
+                            },
+                            TaskJobControlEvent::Continued => WaitOutcome::Continued {
+                                task: *id,
+                                euid: record.task.process_credentials().euid(),
+                            },
                         })
                 })
                 .flatten()
@@ -4584,6 +4596,15 @@ mod tests {
     fn job_control_stop_and_continue_are_task_scoped_and_waitable() {
         let (kernel, root) = bootstrap(1);
         let child_id = fork_child(&kernel, &root, "job-control child", 708);
+        let child_euid = carrick_abi::NsUid::new(4_242);
+        let child = kernel
+            .context(child_id, LinuxTid::for_task_leader(child_id))
+            .expect("child context");
+        let _child = kernel
+            .update_credentials(&child, |credentials| {
+                credentials.seed_identity(child_euid, carrick_abi::NsGid::new(4_242));
+            })
+            .expect("set non-root child credentials");
         let sigstop = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).expect("SIGSTOP");
 
         assert!(kernel.stop_task_for_job_control(child_id, sigstop, None));
@@ -4601,6 +4622,7 @@ mod tests {
             WaitOutcome::Stopped {
                 task: child_id,
                 signal: sigstop,
+                euid: child_euid,
             }
         );
 
@@ -4617,7 +4639,10 @@ mod tests {
                     WaitMode::Consume,
                 )
                 .expect("wait continued child"),
-            WaitOutcome::Continued { task: child_id }
+            WaitOutcome::Continued {
+                task: child_id,
+                euid: child_euid,
+            }
         );
     }
 
@@ -4634,6 +4659,12 @@ mod tests {
             )
             .expect("fork child");
         let child_id = child.task().key().id;
+        let child_euid = carrick_abi::NsUid::new(4_243);
+        let child = kernel
+            .update_credentials(&child, |credentials| {
+                credentials.seed_identity(child_euid, carrick_abi::NsGid::new(4_243));
+            })
+            .expect("set non-root ptrace child credentials");
         let signal = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGUSR1).expect("SIGUSR1");
 
         assert!(kernel.claim_ptrace_traceme(&child));
@@ -4645,6 +4676,7 @@ mod tests {
             WaitOutcome::Stopped {
                 task: child_id,
                 signal,
+                euid: child_euid,
             }
         );
         assert!(!kernel.resume_task_from_ptrace(child.task().key(), child_id, None,));
@@ -4863,6 +4895,12 @@ mod tests {
         let child_context = kernel
             .context(child_id, LinuxTid::for_task_leader(child_id))
             .expect("child context");
+        let child_euid = carrick_abi::NsUid::new(4_244);
+        let child_context = kernel
+            .update_credentials(&child_context, |credentials| {
+                credentials.seed_identity(child_euid, carrick_abi::NsGid::new(4_244));
+            })
+            .expect("set non-root child credentials");
         let sigstop = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).expect("SIGSTOP");
         let sigtstp = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGTSTP).expect("SIGTSTP");
 
@@ -4887,6 +4925,7 @@ mod tests {
             WaitOutcome::Stopped {
                 task: child_id,
                 signal: sigstop,
+                euid: child_euid,
             },
             "only an intervening SIGCONT invalidates dequeued stop work",
         );
