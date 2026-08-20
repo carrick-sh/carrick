@@ -5279,9 +5279,19 @@ impl HvfVmState {
         })
     }
 
+    /// Plan which mappings, frames and stage-2 leases a munmap retires.
+    ///
+    /// `authority_mapping_count` reports the authority's VM-WIDE live-mapping
+    /// count for a frame. It is not redundant with the backend reference
+    /// counts consulted below: `inventory.extents` is per-mm, the authority's
+    /// count spans every mm, and `RetireFrame` is rejected unless the frame
+    /// reaches zero mappings there. Retiring on the per-mm population alone
+    /// aborts the carrier the moment a second Linux process maps the same
+    /// frame, which is precisely what a forking guest does.
     fn inventory_lease_retirement_shape(
         inventory: &HvpatchFrameInventory,
         leases: &std::collections::BTreeSet<(u64, u64)>,
+        authority_mapping_count: &dyn Fn(carrick_hal::FrameId) -> Option<usize>,
     ) -> Result<InventoryLeaseRetirement, TrapError> {
         let mappings: Vec<_> = inventory
             .extents
@@ -5310,7 +5320,13 @@ impl HvfVmState {
                     "HVPatch alias retirement frame {frame:?} reference underflow"
                 )));
             }
-            if removed == live {
+            // Both populations must agree. `removed == live` says this mm
+            // dropped the last backend reference it knows about; the authority
+            // count says no OTHER mm still maps the frame. Requiring both can
+            // only decline a retirement, never invent one, and a frame left
+            // live is reclaimed by a later unmap where a wrong retirement
+            // aborts the whole carrier.
+            if removed == live && authority_mapping_count(frame) == Some(removed) {
                 frames.insert(frame);
             }
         }
@@ -10208,7 +10224,9 @@ impl HvfVmState {
         }
         let retirement = {
             let inventory = self.frame_inventory.lock();
-            Self::inventory_lease_retirement_shape(&inventory, &planned_leases)?
+            Self::inventory_lease_retirement_shape(&inventory, &planned_leases, &|frame| {
+                authority.frame_mapping_count(frame).ok().flatten()
+            })?
         };
         if retirement.mappings.is_empty() {
             let actual = unregister_alias(va, len, self.mm_root_slot);
@@ -15756,7 +15774,10 @@ mod frame_inventory_backend_tests {
             registry.stage2_references.insert(lease, 3);
         }
         let leases = std::collections::BTreeSet::from([lease]);
-        let shared = HvfVmState::inventory_lease_retirement_shape(&inventory, &leases).unwrap();
+        let authority_agrees = |_frame| Some(2usize);
+        let shared =
+            HvfVmState::inventory_lease_retirement_shape(&inventory, &leases, &authority_agrees)
+                .unwrap();
         assert!(shared.frames.is_empty());
         assert!(shared.stage2_leases.is_empty());
 
@@ -15766,12 +15787,68 @@ mod frame_inventory_backend_tests {
             registry.stage2_references.insert(lease, 2);
         }
         let final_owner =
-            HvfVmState::inventory_lease_retirement_shape(&inventory, &leases).unwrap();
+            HvfVmState::inventory_lease_retirement_shape(&inventory, &leases, &authority_agrees)
+                .unwrap();
         assert_eq!(
             final_owner.frames,
             std::collections::BTreeSet::from([frame])
         );
         assert_eq!(final_owner.stage2_leases, leases);
+    }
+
+    /// A frame this mm has finished with, which a SIBLING mm still maps.
+    ///
+    /// The per-mm populations say retire: this inventory holds the only extent
+    /// naming the frame and the backend reference count it tracks falls to
+    /// zero. The authority disagrees, because a forked sibling still has the
+    /// frame mapped, and `RetireFrame` rejects any frame whose VM-wide mapping
+    /// count is non-zero — which aborted the carrier
+    /// (`FATAL: apply HVPatch alias retirement inventory: frame ... still has
+    /// live mappings`, seen on `arm64:musl:recursionguard` under gate load).
+    /// Retirement must defer to the authority's count.
+    #[test]
+    fn lease_retirement_defers_to_a_sibling_mm_still_mapping_the_frame() {
+        let frame = carrick_hal::FrameId::from_kernel_allocation(id(71));
+        let mapping = carrick_hal::MappingId::from_kernel_allocation(id(72));
+        let lease = (0xb000_0000_0000, 0x4000);
+        let mut inventory = HvpatchFrameInventory::default();
+        inventory.extents.insert(
+            (lease.0, 0x4000),
+            InventoryExtent {
+                frame,
+                mapping,
+                backing: InventoryBackingIdentity::Private(11),
+                stage2_base: lease.0,
+                stage2_length: lease.1,
+            },
+        );
+        {
+            let mut registry = inventory.frames.lock();
+            registry.references.insert(frame, 1);
+            registry
+                .extent_references
+                .insert((frame, lease.0, 0x4000), 1);
+            registry.stage2_references.insert(lease, 1);
+        }
+        let leases = std::collections::BTreeSet::from([lease]);
+
+        // Two mms map the frame; this transaction unmaps one of them.
+        let sibling_still_maps = |_frame| Some(2usize);
+        let shape =
+            HvfVmState::inventory_lease_retirement_shape(&inventory, &leases, &sibling_still_maps)
+                .unwrap();
+        assert_eq!(shape.mappings.len(), 1, "the mapping is still unmapped");
+        assert!(
+            shape.frames.is_empty(),
+            "a frame a sibling mm still maps must not be retired: {:?}",
+            shape.frames
+        );
+
+        // Last mm out does retire it.
+        let last_owner = |_frame| Some(1usize);
+        let shape =
+            HvfVmState::inventory_lease_retirement_shape(&inventory, &leases, &last_owner).unwrap();
+        assert_eq!(shape.frames, std::collections::BTreeSet::from([frame]));
     }
 
     #[test]
