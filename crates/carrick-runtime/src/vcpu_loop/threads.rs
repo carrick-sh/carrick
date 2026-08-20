@@ -287,7 +287,7 @@ where
                 if engine.reclaim_refreshes_kicker() {
                     self.kicker.unregister(self.this_tid);
                 }
-                Some((st, old_slot))
+                Some(old_slot)
             } else {
                 None
             };
@@ -331,7 +331,7 @@ where
             if thread_should_finish_for_exec_replacement(&self.registry, self.this_tid) {
                 return Ok(BlockingWaitCompletion::ExecReplacedThread);
             }
-            if let Some((st, old_slot)) = snapshot {
+            if let Some(old_slot) = snapshot {
                 // Prefer the thread's OWN just-released slot (reuse its clean vCPU,
                 // no re-bind) over reclaiming another thread's — esp. an exited one.
                 //
@@ -375,7 +375,7 @@ where
                     return Ok(BlockingWaitCompletion::ExecReplacedThread);
                 };
                 carrick_hal::vcpu_sched::set_current_lease(new);
-                let (cpu, execution_lease) = self.claim_reclaim_snapshot(&st)?;
+                let (cpu, execution_lease) = self.claim_reclaim_snapshot()?;
                 if engine.reclaim_refreshes_kicker() {
                     // HVF recreates the vCPU: do it under the topology lock so
                     // vcpu_create can't race a concurrent fork's hv_vm_destroy/

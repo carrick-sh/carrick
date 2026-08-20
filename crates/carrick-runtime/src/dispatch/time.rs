@@ -892,14 +892,7 @@ impl SyscallDispatcher {
             let (self_user_us, self_system_us) = task_self_cpu_us();
             let rusage = match who {
                 LINUX_RUSAGE_THREAD => {
-                    // Per-thread guest CPU: the guest's getrusage traps out and runs
-                    // this dispatch ON its own vCPU thread, so guest_cpu's per-thread
-                    // slot IS this thread's user CPU. Guest cycles (HVF/KVM/bhyve)
-                    // don't accrue to the host thread's rusage, so self_thread_cpu_us
-                    // is only carrick-side overhead — take the larger.
-                    let (host_user, system_us) =
-                        crate::host_proc::self_thread_cpu_us().unwrap_or((0, 0));
-                    let user_us = crate::guest_cpu::this_thread_us().max(host_user);
+                    let (user_us, system_us) = task_thread_cpu_us();
                     rusage_from(user_us, system_us, host.maxrss_bytes, host.majflt)
                 }
                 LINUX_RUSAGE_CHILDREN => {
@@ -1291,6 +1284,14 @@ pub(crate) fn task_self_cpu_us() -> (u64, u64) {
     .unwrap_or((0, 0))
 }
 
+pub(crate) fn task_thread_cpu_us() -> (u64, u64) {
+    super::resources::with_active_context(|context| {
+        let thread = context.thread();
+        (thread.cpu_us(), thread.system_cpu_us())
+    })
+    .unwrap_or((0, 0))
+}
+
 /// The calling Linux process's CHILDREN ledger as (user µs, system µs) — the
 /// summed CPU of every child it has reaped, including those children's own
 /// reaped children.
@@ -1353,6 +1354,17 @@ mod rlimit_tests {
     use super::*;
 
     static RLIMIT_CPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn thread_cpu_surfaces_read_exact_logical_thread_accounting() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        context.thread().charge_user_ns(17_000);
+        context.thread().charge_system_ns(19_000);
+        super::super::resources::with_captured_resources(&context, || {
+            assert_eq!(task_thread_cpu_us(), (17, 19));
+        });
+    }
     #[test]
     fn nofile_uses_process_override() {
         let dispatcher = SyscallDispatcher::new();

@@ -6493,40 +6493,23 @@ fn linux_clock_duration(clock_id: u64) -> Option<Duration> {
         // the host's symbolic libc constants rather than passing through.
         LINUX_CLOCK_PROCESS_CPUTIME_ID => {
             let (u, s) = time::task_self_cpu_us();
-            if u > 0 || s > 0 {
-                Some(Duration::from_micros(u.saturating_add(s)))
-            } else {
-                host_clock_duration(libc::CLOCK_PROCESS_CPUTIME_ID)
-            }
+            Some(Duration::from_micros(u.saturating_add(s)))
         }
         LINUX_CLOCK_THREAD_CPUTIME_ID => {
-            let user_us = crate::guest_cpu::this_thread_us();
-            if user_us > 0 {
-                Some(Duration::from_micros(user_us))
-            } else {
-                host_clock_duration(libc::CLOCK_THREAD_CPUTIME_ID)
-            }
+            let (u, s) = time::task_thread_cpu_us();
+            Some(Duration::from_micros(u.saturating_add(s)))
         }
         // A dynamic per-task CPU-clock id (negative) → best-effort current
         // thread/process CPU time (CLOCK_PROCESS_CPUTIME_ID may be unimplemented
         // on some hosts, so fall back to the thread clock).
         _ => match dynamic_cpu_clock(clock_id)? {
             DynamicCpuClock::PerThread => {
-                let user_us = crate::guest_cpu::this_thread_us();
-                if user_us > 0 {
-                    Some(Duration::from_micros(user_us))
-                } else {
-                    host_clock_duration(libc::CLOCK_THREAD_CPUTIME_ID)
-                }
+                let (u, s) = time::task_thread_cpu_us();
+                Some(Duration::from_micros(u.saturating_add(s)))
             }
             DynamicCpuClock::PerProcess => {
                 let (u, s) = time::task_self_cpu_us();
-                if u > 0 || s > 0 {
-                    Some(Duration::from_micros(u.saturating_add(s)))
-                } else {
-                    host_clock_duration(libc::CLOCK_PROCESS_CPUTIME_ID)
-                        .or_else(|| host_clock_duration(libc::CLOCK_THREAD_CPUTIME_ID))
-                }
+                Some(Duration::from_micros(u.saturating_add(s)))
             }
         },
     }
@@ -7032,6 +7015,8 @@ impl SyscallDispatcher {
                     ppid: identity.parent.map_or(0, |parent| parent.id.raw() as u32),
                     pgrp: identity.process_group.raw() as u32,
                     session: identity.session.raw() as u32,
+                    user_cpu_us: task.self_cpu_us(),
+                    system_cpu_us: task.self_system_cpu_us(),
                 })
             })
     }
@@ -7046,14 +7031,17 @@ impl SyscallDispatcher {
     fn synthetic_proc_processes(
         hvpatch_process: Option<&crate::hvpatch::ProcessContext>,
     ) -> Option<Vec<crate::vfs::SyntheticProcProcess>> {
-        let mut processes: Vec<_> = hvpatch_process?
-            .kernel_graph()
-            .registry()
+        let registry = hvpatch_process?.kernel_graph().registry();
+        let mut processes: Vec<_> = registry
             .live_processes()
             .into_iter()
             .map(|process| {
                 let pid = process.key.id.raw() as u32;
                 let init = carrick_abi::LINUX_BOOTSTRAP_PID as u32;
+                let (user_cpu_us, system_cpu_us) =
+                    registry.task(process.key.id).map_or((0, 0), |task| {
+                        (task.self_cpu_us(), task.self_system_cpu_us())
+                    });
                 crate::vfs::SyntheticProcProcess {
                     pid,
                     // A parentless task is an orphan reparented to init — except
@@ -7086,6 +7074,8 @@ impl SyscallDispatcher {
                     // `ProcState.task_name`; identity is fixed first because
                     // it is what LTP and `getpgid`/`getsid` actually read.
                     comm: process.diagnostic_name,
+                    user_cpu_us,
+                    system_cpu_us,
                 }
             })
             .collect();
@@ -7139,6 +7129,8 @@ impl SyscallDispatcher {
                     tid: thread.key().tid.raw() as u32,
                     state: states.get(&registry_id).copied().unwrap_or('R'),
                     comm,
+                    user_cpu_us: thread.cpu_us(),
+                    system_cpu_us: thread.system_cpu_us(),
                 }
             })
             .collect();

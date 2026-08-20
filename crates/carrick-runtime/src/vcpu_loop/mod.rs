@@ -1723,7 +1723,6 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
 }
 
 struct BlockingWaitReclaim {
-    state: crate::kernel::objects::MigratableTaskState,
     old_slot: Option<carrick_hal::SlotId>,
     single_threaded_process: bool,
 }
@@ -1910,13 +1909,13 @@ where
             lease
         } else {
             thread
-                .publish_initial_cpu_state(state.cpu.clone())
+                .publish_initial_task_state(state.clone())
                 .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
             thread
                 .claim_runnable(executor)
                 .map_err(|error| RuntimeError::Configuration(error.to_string()))?
         };
-        if let Err(error) = lease.replace_cpu_state(state.cpu.clone()) {
+        if let Err(error) = lease.replace_task_state(state.clone()) {
             let _ = thread.fail_from_executor(
                 lease,
                 crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
@@ -1937,7 +1936,6 @@ where
 
     fn claim_reclaim_snapshot(
         &self,
-        expected: &crate::kernel::objects::MigratableTaskState,
     ) -> Result<
         (
             carrick_hal::threaded::GuestCpuState,
@@ -1954,8 +1952,19 @@ where
             .claim_blocked_for_transitional_executor(executor)
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let abi = <E::Arch as carrick_hal::GuestArch>::linux_guest_abi();
-        let cpu = match lease.cpu_state_for_restore(abi, 1) {
-            Ok(cpu) => cpu.clone(),
+        let current_mm = self
+            .service_kernel_context
+            .as_ref()
+            .map(|context| context.shared().mm().id())
+            .ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "typed reclaim restore lost current Kernel MM authority".to_owned(),
+                )
+            })?;
+        let current_asid_generation = current_mm.raw();
+        let state = match lease.task_state_for_restore(abi, 1, current_mm, current_asid_generation)
+        {
+            Ok(state) => state.clone(),
             Err(error) => {
                 let _ = thread.fail_from_executor(
                     lease,
@@ -1964,14 +1973,7 @@ where
                 return Err(RuntimeError::Configuration(error.to_string()));
             }
         };
-        let current_mm = self
-            .service_kernel_context
-            .as_ref()
-            .map(|context| context.shared().mm().id());
-        if cpu != expected.cpu
-            || expected.mm.raw() != expected.asid_generation
-            || current_mm != Some(expected.mm)
-        {
+        if state.cpu.task_identity() != (current_mm.raw(), current_asid_generation) {
             let _ = thread.fail_from_executor(
                 lease,
                 crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
@@ -1980,7 +1982,7 @@ where
                 "typed reclaim restore authority does not match parked generation".to_owned(),
             ));
         }
-        Ok((cpu, lease))
+        Ok((state.cpu, lease))
     }
 
     fn complete_reclaim_restore(
@@ -2670,7 +2672,6 @@ where
             );
         }
         Ok(Some(BlockingWaitReclaim {
-            state,
             old_slot,
             single_threaded_process,
         }))
@@ -2854,7 +2855,7 @@ where
             }
         };
         carrick_hal::vcpu_sched::set_current_lease(new_lease);
-        let (cpu, execution_lease) = self.claim_reclaim_snapshot(&reclaim.state)?;
+        let (cpu, execution_lease) = self.claim_reclaim_snapshot()?;
         if engine.reclaim_refreshes_kicker() {
             let _topo = crate::fork_quiesce::acquire_topology_lock(
                 carrick_observability::probes::HvpatchTopologyOperation::VcpuRebind,
@@ -4460,15 +4461,9 @@ where
             // /proc/<pid>/stat reads `R`. A genuine guest-blocking wait re-publishes
             // `Blocked` below for the duration of the park (see `block_guard`).
             state.publish_thread_run_state(crate::run_state::RunState::Running, 'R');
-            let guest_cpu_slot = carrick_host::guest_cpu::this_thread_slot();
-            let guest_run_started_us = carrick_host::guest_cpu::slot_us(guest_cpu_slot);
             let next = engine.next_syscall();
             if let Some(thread) = state.kernel_thread.as_ref() {
-                thread.charge_user_ns(
-                    carrick_host::guest_cpu::slot_us(guest_cpu_slot)
-                        .saturating_sub(guest_run_started_us)
-                        .saturating_mul(1_000),
-                );
+                thread.charge_user_ns(engine.take_guest_run_receipt_ns());
             }
             // Any exit surfaced by the engine is past its internal EL1-vector
             // kick swallow: either guest EL0 ran or a real guest boundary was
@@ -6001,6 +5996,14 @@ mod tests {
     use super::*;
     use std::num::NonZeroU64;
     use std::time::Duration;
+
+    #[test]
+    fn guest_run_accounting_uses_non_aliasing_engine_receipts() {
+        let source = include_str!("mod.rs");
+        assert!(!source.contains(concat!("this_thread_", "slot")));
+        assert!(!source.contains(concat!("slot_", "us(")));
+        assert!(source.contains(concat!("take_guest_run_", "receipt_ns")));
+    }
 
     /// `SA_RESTART` must resume the calls `signal(7)` says it resumes, and must
     /// NOT resume the ones it says always fail with `EINTR`.

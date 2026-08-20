@@ -8,7 +8,8 @@ use carrick_hal::threaded::{
 };
 
 use super::objects::{
-    BlockedReason, ExecutionFailure, ExecutorId, ThreadExecutionError, ThreadExecutionState,
+    BlockedReason, ExecutionFailure, ExecutorId, MigratableTaskState, ThreadExecutionError,
+    ThreadExecutionState,
 };
 use super::{Kernel, RootBootstrap};
 
@@ -75,12 +76,51 @@ fn x86_test_task_state() -> X86TaskCpuStateV1 {
     .expect("valid x86 task state")
 }
 
+fn migratable(context: &super::KernelContext, cpu: GuestCpuState) -> MigratableTaskState {
+    let mm = context.shared().mm().id();
+    let cpu = match cpu {
+        GuestCpuState::Aarch64V1(state) => {
+            let mut state = (*state).clone();
+            state.mm_generation = mm.raw();
+            state.asid_generation = mm.raw();
+            GuestCpuState::from_aarch64_v1(state)
+        }
+        GuestCpuState::X86_64V1(state) => GuestCpuState::from_x86_64_v1(
+            X86TaskCpuStateV1::new(
+                *state.gprs(),
+                state.rip(),
+                state.rflags(),
+                state.rsp(),
+                state.cr0(),
+                state.cr3(),
+                state.cr4(),
+                state.efer(),
+                state.fs_base(),
+                state.gs_base(),
+                mm.raw(),
+                mm.raw(),
+                state.xsave().to_vec(),
+                state.resume_payload().to_vec(),
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    };
+    MigratableTaskState {
+        cpu,
+        mm,
+        asid_generation: mm.raw(),
+    }
+}
+
 #[test]
 fn thread_execution_claims_exact_generation_and_parks() {
     let (_kernel, context) = bootstrap(9100);
     let thread = context.thread();
     let state = GuestCpuState::from_aarch64_v1(aarch64_test_task_state());
-    let generation = thread.publish_initial_cpu_state(state).unwrap();
+    let generation = thread
+        .publish_initial_task_state(migratable(&context, state))
+        .unwrap();
     let lease = thread
         .claim_runnable(ExecutorId::synthetic_for_tests(7))
         .unwrap();
@@ -104,7 +144,10 @@ fn thread_execution_switching_out_preserves_exact_owner() {
     let (_kernel, context) = bootstrap(9107);
     let thread = context.thread();
     let generation = thread
-        .publish_initial_cpu_state(GuestCpuState::from_aarch64_v1(aarch64_test_task_state()))
+        .publish_initial_task_state(migratable(
+            &context,
+            GuestCpuState::from_aarch64_v1(aarch64_test_task_state()),
+        ))
         .unwrap();
     let executor = ExecutorId::synthetic_for_tests(9);
     let lease = thread.claim_runnable(executor).unwrap();
@@ -128,14 +171,17 @@ fn thread_execution_reclaim_publishes_and_reclaims_exact_typed_state() {
     let (_kernel, context) = bootstrap(9108);
     let thread = context.thread();
     let initial = GuestCpuState::from_aarch64_v1(aarch64_test_task_state());
-    thread.publish_initial_cpu_state(initial).unwrap();
+    thread
+        .publish_initial_task_state(migratable(&context, initial))
+        .unwrap();
     let executor = ExecutorId::for_transitional_thread(ThreadId::synthetic_for_tests(9108))
         .expect("transitional executor");
     let mut lease = thread.claim_runnable(executor).unwrap();
     let mut replacement = aarch64_test_task_state();
     replacement.gprs[0] = 0xfeed;
     let replacement = GuestCpuState::from_aarch64_v1(replacement);
-    lease.replace_cpu_state(replacement.clone()).unwrap();
+    let replacement = migratable(&context, replacement);
+    lease.replace_task_state(replacement.clone()).unwrap();
     thread.begin_switch_out(&lease).unwrap();
     thread
         .park_from_executor(lease, BlockedReason::HostWait)
@@ -146,11 +192,46 @@ fn thread_execution_reclaim_publishes_and_reclaims_exact_typed_state() {
         .expect("claim exact blocked generation");
     assert_eq!(
         resumed
-            .cpu_state_for_restore(LinuxGuestAbi::Aarch64, 1)
-            .unwrap(),
-        &replacement
+            .task_state_for_restore(
+                LinuxGuestAbi::Aarch64,
+                1,
+                context.shared().mm().id(),
+                context.shared().mm().id().raw(),
+            )
+            .unwrap()
+            .cpu,
+        replacement.cpu
     );
     thread.exit_from_executor(resumed).unwrap();
+}
+
+#[test]
+fn thread_execution_lease_owns_complete_mm_and_asid_authority() {
+    let (_kernel, context) = bootstrap(9109);
+    let thread = context.thread();
+    let mm = context.shared().mm().id();
+    let mut cpu = aarch64_test_task_state();
+    cpu.mm_generation = mm.raw();
+    cpu.asid_generation = 37;
+    let state = MigratableTaskState {
+        cpu: GuestCpuState::from_aarch64_v1(cpu),
+        mm,
+        asid_generation: 37,
+    };
+
+    thread
+        .publish_initial_task_state(state.clone())
+        .expect("publish complete task authority");
+    let lease = thread
+        .claim_runnable(ExecutorId::synthetic_for_tests(37))
+        .expect("claim complete task authority");
+    assert_eq!(
+        lease
+            .task_state_for_restore(LinuxGuestAbi::Aarch64, 1, mm, 37)
+            .expect("exact MM/ASID restore"),
+        &state
+    );
+    thread.exit_from_executor(lease).unwrap();
 }
 
 #[test]
@@ -204,23 +285,41 @@ fn thread_execution_restore_rejects_wrong_architecture_and_version() {
     let (_kernel, context) = bootstrap(9101);
     let thread = context.thread();
     thread
-        .publish_initial_cpu_state(GuestCpuState::from_aarch64_v1(aarch64_test_task_state()))
+        .publish_initial_task_state(migratable(
+            &context,
+            GuestCpuState::from_aarch64_v1(aarch64_test_task_state()),
+        ))
         .unwrap();
     let lease = thread
         .claim_runnable(ExecutorId::synthetic_for_tests(11))
         .unwrap();
 
     assert!(matches!(
-        lease.cpu_state_for_restore(LinuxGuestAbi::X86_64, 1),
+        lease.task_state_for_restore(
+            LinuxGuestAbi::X86_64,
+            1,
+            context.shared().mm().id(),
+            context.shared().mm().id().raw(),
+        ),
         Err(ThreadExecutionError::SnapshotArchitectureMismatch { .. })
     ));
     assert!(matches!(
-        lease.cpu_state_for_restore(LinuxGuestAbi::Aarch64, 2),
+        lease.task_state_for_restore(
+            LinuxGuestAbi::Aarch64,
+            2,
+            context.shared().mm().id(),
+            context.shared().mm().id().raw(),
+        ),
         Err(ThreadExecutionError::SnapshotVersionMismatch { .. })
     ));
     assert!(
         lease
-            .cpu_state_for_restore(LinuxGuestAbi::Aarch64, 1)
+            .task_state_for_restore(
+                LinuxGuestAbi::Aarch64,
+                1,
+                context.shared().mm().id(),
+                context.shared().mm().id().raw(),
+            )
             .is_ok()
     );
     thread.yield_from_executor(lease).unwrap();
@@ -233,10 +332,16 @@ fn thread_execution_stale_owner_and_generation_cannot_settle() {
     let thread_a = context_a.thread();
     let thread_b = context_b.thread();
     thread_a
-        .publish_initial_cpu_state(GuestCpuState::from_aarch64_v1(aarch64_test_task_state()))
+        .publish_initial_task_state(migratable(
+            &context_a,
+            GuestCpuState::from_aarch64_v1(aarch64_test_task_state()),
+        ))
         .unwrap();
     thread_b
-        .publish_initial_cpu_state(GuestCpuState::from_x86_64_v1(x86_test_task_state()).unwrap())
+        .publish_initial_task_state(migratable(
+            &context_b,
+            GuestCpuState::from_x86_64_v1(x86_test_task_state()).unwrap(),
+        ))
         .unwrap();
 
     let wrong_owner_lease = thread_a
@@ -281,7 +386,10 @@ fn thread_execution_stale_owner_and_generation_cannot_settle() {
     let (_kernel_c, context_c) = bootstrap(9104);
     let thread_c = context_c.thread();
     thread_c
-        .publish_initial_cpu_state(GuestCpuState::from_aarch64_v1(aarch64_test_task_state()))
+        .publish_initial_task_state(migratable(
+            &context_c,
+            GuestCpuState::from_aarch64_v1(aarch64_test_task_state()),
+        ))
         .unwrap();
     let stale_exit_lease = thread_c
         .claim_runnable(ExecutorId::synthetic_for_tests(23))
@@ -302,7 +410,10 @@ fn thread_execution_dropped_unsettled_lease_fails_closed() {
     let (_kernel, context) = bootstrap(9105);
     let thread = context.thread();
     let generation = thread
-        .publish_initial_cpu_state(GuestCpuState::from_aarch64_v1(aarch64_test_task_state()))
+        .publish_initial_task_state(migratable(
+            &context,
+            GuestCpuState::from_aarch64_v1(aarch64_test_task_state()),
+        ))
         .unwrap();
     let lease = thread
         .claim_runnable(ExecutorId::synthetic_for_tests(31))
@@ -323,7 +434,10 @@ fn thread_execution_exec_transfers_runner_and_accounting_not_cpu_state() {
     let (kernel, context) = bootstrap(9106);
     let old_thread = Arc::clone(context.thread());
     old_thread
-        .publish_initial_cpu_state(GuestCpuState::from_aarch64_v1(aarch64_test_task_state()))
+        .publish_initial_task_state(migratable(
+            &context,
+            GuestCpuState::from_aarch64_v1(aarch64_test_task_state()),
+        ))
         .unwrap();
     old_thread.charge_user_ns(17_000);
     old_thread.charge_system_ns(9_000);
@@ -335,12 +449,15 @@ fn thread_execution_exec_transfers_runner_and_accounting_not_cpu_state() {
     runner
         .adopt_thread(replacement)
         .expect("runner ownership transferred");
+    // The exec syscall wrapper still holds the captured predecessor context
+    // until it charges the complete service interval after publication.
+    old_thread.charge_system_ns(2_000);
 
     assert!(matches!(
         old_thread.execution_state(),
         ThreadExecutionState::Exited { .. }
     ));
-    assert_eq!(replacement.system_cpu_us(), 9);
+    assert_eq!(replacement.system_cpu_us(), 11);
     assert_eq!(replacement.cpu_us(), 17);
     assert_eq!(
         replacement.execution_state(),
@@ -348,18 +465,30 @@ fn thread_execution_exec_transfers_runner_and_accounting_not_cpu_state() {
     );
 
     let seeded = GuestCpuState::from_x86_64_v1(x86_test_task_state()).unwrap();
-    replacement.publish_initial_cpu_state(seeded).unwrap();
+    replacement
+        .publish_initial_task_state(migratable(&committed, seeded))
+        .unwrap();
     let lease = replacement
         .claim_runnable(ExecutorId::synthetic_for_tests(41))
         .unwrap();
     assert!(
         lease
-            .cpu_state_for_restore(LinuxGuestAbi::X86_64, 1)
+            .task_state_for_restore(
+                LinuxGuestAbi::X86_64,
+                1,
+                committed.shared().mm().id(),
+                committed.shared().mm().id().raw(),
+            )
             .is_ok()
     );
     assert!(
         lease
-            .cpu_state_for_restore(LinuxGuestAbi::Aarch64, 1)
+            .task_state_for_restore(
+                LinuxGuestAbi::Aarch64,
+                1,
+                committed.shared().mm().id(),
+                committed.shared().mm().id().raw(),
+            )
             .is_err()
     );
     replacement.exit_from_executor(lease).unwrap();
