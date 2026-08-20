@@ -9,11 +9,15 @@ belong to the pinned compiler that produced the diagnostics.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fnmatch
 import json
 import os
 import platform
+import pwd
 import re
+import secrets
+import stat
 import subprocess
 import sys
 import tempfile
@@ -105,6 +109,25 @@ class Matrix(NamedTuple):
     clippy_release: str
     required_profiles: tuple[str, ...]
     profiles: dict[str, Profile]
+
+
+class ExecutionContext(NamedTuple):
+    """Isolated Cargo discovery roots for one census invocation."""
+
+    cwd: Path
+    cargo_home: Path
+    rustup_home: Path
+    cargo_config: Path
+    manifest: Path
+
+
+class CandidateDestination(NamedTuple):
+    """Authenticated candidate name bound to one held directory object."""
+
+    display_path: Path
+    directory_fd: int
+    name: str
+    canonical_identity: tuple[int, int] | None
 
 
 def _expected_profile_commands() -> dict[str, tuple[str, ...]]:
@@ -322,19 +345,83 @@ def current_host_id() -> str:
         raise InventoryError(f"unsupported host for authority census: {host}") from error
 
 
+@contextlib.contextmanager
+def _execution_context(root: Path):
+    workspace = Path(root).resolve(strict=True)
+    cargo_config = workspace / ".cargo" / "config.toml"
+    manifest = workspace / "Cargo.toml"
+    for path, label in (
+        (cargo_config, "checked Cargo config"),
+        (manifest, "workspace manifest"),
+    ):
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError as error:
+            raise InventoryError(f"missing {label}: {path}") from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise InventoryError(f"{label} is not a regular checked file: {path}")
+    with tempfile.TemporaryDirectory(
+        prefix=f"carrick-authority-{workspace.name}-"
+    ) as directory:
+        task_root = Path(directory)
+        cwd = task_root / "work"
+        cargo_home = task_root / "cargo-home"
+        cwd.mkdir()
+        cargo_home.mkdir()
+        canonical_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(
+            strict=True
+        )
+        canonical_cargo_home = canonical_home / ".cargo"
+        for cache_name in ("registry", "git"):
+            cache = canonical_cargo_home / cache_name
+            if cache.exists():
+                if not cache.is_dir():
+                    raise InventoryError(
+                        f"canonical Cargo cache is not a directory: {cache}"
+                    )
+                (cargo_home / cache_name).symlink_to(
+                    cache.resolve(strict=True), target_is_directory=True
+                )
+        yield ExecutionContext(
+            cwd,
+            cargo_home,
+            canonical_home / ".rustup",
+            cargo_config,
+            manifest,
+        )
+
+
 def _sanitized_build_environment(
-    *, target_dir: Path | None = None
+    cargo_home: Path,
+    rustup_home: Path,
+    *,
+    target_dir: Path | None = None,
 ) -> dict[str, str]:
     """Construct the minimal tool environment without ambient build controls."""
-    home = Path.home()
     environment = {
         "PATH": os.environ.get("PATH", os.defpath),
-        "CARGO_HOME": os.environ.get("CARGO_HOME", str(home / ".cargo")),
-        "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(home / ".rustup")),
+        "CARGO_HOME": str(cargo_home),
+        "RUSTUP_HOME": str(rustup_home),
     }
     if target_dir is not None:
         environment["CARGO_TARGET_DIR"] = str(target_dir)
     return environment
+
+
+def _profile_command(
+    profile: Profile, execution: ExecutionContext
+) -> list[str]:
+    if profile.command[:2] != ("cargo", "clippy"):
+        raise InventoryError(f"profile {profile.id} is not a Cargo Clippy command")
+    return [
+        "cargo",
+        "--config",
+        str(execution.cargo_config),
+        "clippy",
+        "--manifest-path",
+        str(execution.manifest),
+        *profile.command[2:],
+    ]
 
 
 def select_profiles(
@@ -459,18 +546,40 @@ def verify_toolchain(
     runner: Any = subprocess.run,
     root: Path = ROOT,
     required_host_triple: str | None = None,
+    *,
+    _execution: ExecutionContext | None = None,
 ) -> dict[str, str]:
     """Verify and return the exact pinned compiler identities for the receipt."""
+    if _execution is None:
+        with _execution_context(Path(root)) as execution:
+            return verify_toolchain(
+                matrix,
+                runner=runner,
+                root=root,
+                required_host_triple=required_host_triple,
+                _execution=execution,
+            )
     outputs: dict[str, str] = {}
     for label, command in (
         ("rustc", ["rustc", "-Vv"]),
-        ("clippy", ["cargo", "clippy", "-V"]),
+        (
+            "clippy",
+            [
+                "cargo",
+                "--config",
+                str(_execution.cargo_config),
+                "clippy",
+                "-V",
+            ],
+        ),
     ):
         result = _completed_text(
             command,
             runner=runner,
-            cwd=Path(root),
-            env=_sanitized_build_environment(),
+            cwd=_execution.cwd,
+            env=_sanitized_build_environment(
+                _execution.cargo_home, _execution.rustup_home
+            ),
         )
         if result.returncode != 0:
             _command_failure(f"{label} identity check", result)
@@ -498,22 +607,34 @@ def run_profile(
     *,
     root: Path = ROOT,
     current_host: str | None = None,
+    _execution: ExecutionContext | None = None,
 ) -> list[dict[str, object]]:
     """Compile one available product profile and parse its Cargo JSON stream."""
+    if _execution is None:
+        with _execution_context(Path(root)) as execution:
+            return run_profile(
+                profile,
+                runner=runner,
+                root=root,
+                current_host=current_host,
+                _execution=execution,
+            )
     host = current_host or current_host_id()
     if profile.host != host:
         raise InventoryError(
             f"profile {profile.id} is unavailable on current host {host}"
         )
     environment = _sanitized_build_environment(
+        _execution.cargo_home,
+        _execution.rustup_home,
         target_dir=(
             Path(root) / "target" / "host-authority-census" / profile.id
         )
     )
     result = _completed_text(
-        profile.command,
+        _profile_command(profile, _execution),
         runner=runner,
-        cwd=Path(root),
+        cwd=_execution.cwd,
         env=environment,
     )
     if result.returncode != 0:
@@ -1245,23 +1366,26 @@ def run_census(
         raise InventoryError(
             f"executed profiles span multiple host triples: {sorted(required_triples)}"
         )
-    identities = verify_toolchain(
-        matrix,
-        runner=runner,
-        root=Path(root),
-        required_host_triple=next(iter(required_triples)),
-    )
-    batches = []
-    for profile in selected:
-        messages = run_profile(
-            profile,
+    with _execution_context(Path(root)) as execution:
+        identities = verify_toolchain(
+            matrix,
             runner=runner,
             root=Path(root),
-            current_host=current_host,
+            required_host_triple=next(iter(required_triples)),
+            _execution=execution,
         )
-        batches.append(
-            normalize_messages(messages, profile.id, Path(root), catalog)
-        )
+        batches = []
+        for profile in selected:
+            messages = run_profile(
+                profile,
+                runner=runner,
+                root=Path(root),
+                current_host=current_host,
+                _execution=execution,
+            )
+            batches.append(
+                normalize_messages(messages, profile.id, Path(root), catalog)
+            )
     rows = merge_profiles(batches)
     pending = [
         profile_id
@@ -1345,50 +1469,117 @@ def candidate_document(
     }
 
 
-def _candidate_path(
-    requested: Path, canonical_inventory: Path
-) -> Path:
-    candidate = requested.expanduser().resolve(strict=False)
+def _authenticate_candidate_entry(
+    directory_fd: int,
+    name: str,
+    canonical_identity: tuple[int, int] | None,
+) -> None:
+    try:
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(metadata.st_mode):
+        raise InventoryError("refresh candidate target is a symlink")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise InventoryError("refresh candidate target is not a regular file")
+    identity = (metadata.st_dev, metadata.st_ino)
+    if canonical_identity is not None and identity == canonical_identity:
+        raise InventoryError("refresh candidate target hardlinks canonical inventory")
+
+
+@contextlib.contextmanager
+def _candidate_destination(requested: Path, canonical_inventory: Path):
+    requested = requested.expanduser()
+    try:
+        requested_metadata = requested.lstat()
+    except FileNotFoundError:
+        requested_metadata = None
+    if requested_metadata is not None and stat.S_ISLNK(requested_metadata.st_mode):
+        raise InventoryError("refresh candidate target is a symlink")
+    candidate = requested.resolve(strict=False)
     canonical = canonical_inventory.expanduser().resolve(strict=False)
     if candidate == canonical:
         raise InventoryError(
             "refresh candidate path resolves to the canonical inventory"
         )
-    if requested.exists() and canonical_inventory.exists():
-        try:
-            aliases_canonical = requested.samefile(canonical_inventory)
-        except OSError as error:
-            raise InventoryError(
-                f"cannot authenticate refresh candidate path: {error}"
-            ) from error
-        if aliases_canonical:
-            raise InventoryError(
-                "refresh candidate path aliases the canonical inventory"
-            )
-    return candidate
-
-
-def _write_candidate_atomically(path: Path, document: Mapping[str, object]) -> None:
-    """Publish a candidate in one same-directory rename."""
-    temporary_path: Path | None = None
+    canonical_identity = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as stream:
-            temporary_path = Path(stream.name)
+        canonical_metadata = canonical.stat()
+    except FileNotFoundError:
+        pass
+    else:
+        canonical_identity = (
+            canonical_metadata.st_dev,
+            canonical_metadata.st_ino,
+        )
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        directory_fd = os.open(candidate.parent, flags)
+    except OSError as error:
+        raise InventoryError(
+            f"cannot authenticate refresh candidate parent: {error}"
+        ) from error
+    try:
+        opened = os.fstat(directory_fd)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise InventoryError("refresh candidate parent is not a directory")
+        _authenticate_candidate_entry(
+            directory_fd, candidate.name, canonical_identity
+        )
+        yield CandidateDestination(
+            candidate,
+            directory_fd,
+            candidate.name,
+            canonical_identity,
+        )
+    finally:
+        os.close(directory_fd)
+
+
+def _write_candidate_atomically(
+    destination: CandidateDestination, document: Mapping[str, object]
+) -> None:
+    """Publish through one authenticated directory descriptor."""
+    temporary_name = (
+        f".{destination.name}.{secrets.token_hex(12)}.tmp"
+    )
+    temporary_fd: int | None = None
+    try:
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC,
+            0o600,
+            dir_fd=destination.directory_fd,
+        )
+        with os.fdopen(temporary_fd, mode="w", encoding="utf-8") as stream:
+            temporary_fd = None
             json.dump(document, stream, indent=2, sort_keys=True)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_path, path)
+        _authenticate_candidate_entry(
+            destination.directory_fd,
+            destination.name,
+            destination.canonical_identity,
+        )
+        os.replace(
+            temporary_name,
+            destination.name,
+            src_dir_fd=destination.directory_fd,
+            dst_dir_fd=destination.directory_fd,
+        )
+        os.fsync(destination.directory_fd)
     except BaseException:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        try:
+            os.unlink(temporary_name, dir_fd=destination.directory_fd)
+        except FileNotFoundError:
+            pass
         raise
 
 
@@ -1449,76 +1640,89 @@ def main(
             Path(root) / MATRIX_PATH.relative_to(ROOT)
         )
         canonical_inventory = Path(root) / INVENTORY_PATH.relative_to(ROOT)
-        candidate_path = (
-            _candidate_path(arguments.refresh_candidate, canonical_inventory)
+        destination_manager = (
+            _candidate_destination(
+                arguments.refresh_candidate, canonical_inventory
+            )
             if arguments.refresh_candidate is not None
-            else None
+            else contextlib.nullcontext(None)
         )
-        catalog = (
-            dict(operation_catalog)
-            if operation_catalog is not None
-            else load_production_catalog(
-                Path(root) / CLIPPY_CONFIG_PATH.relative_to(ROOT)
-            )
-        )
-        reviews = (
-            expected
-            if expected is not None
-            else load_inventory(Path(root) / INVENTORY_PATH.relative_to(ROOT))
-        )
-        selected = select_profiles(
-            checked_matrix, arguments.profiles, current_host=current_host
-        )
-        result = run_census(
-            checked_matrix,
-            selected,
-            catalog,
-            runner=runner,
-            root=Path(root),
-            current_host=current_host,
-        )
-        rows = result["rows"]
-        executed = result["executed_profiles"]
-        pending = result["pending_profiles"]
-        identities = result["toolchain"]
-        assert isinstance(rows, list)
-        assert isinstance(executed, list)
-        assert isinstance(pending, list)
-        assert isinstance(identities, Mapping)
-        if candidate_path is not None:
-            document = candidate_document(
-                rows,
-                reviews,
-                executed,
-                checked_matrix.required_profiles,
-                identities,
-            )
-            try:
-                _write_candidate_atomically(candidate_path, document)
-            except OSError as error:
-                raise InventoryError(
-                    f"cannot publish refresh candidate atomically: {error}"
-                ) from error
-            if document["complete"] is not True:
-                print(
-                    "error: wrote an explicitly partial, non-authoritative "
-                    f"candidate; pending profiles: {', '.join(pending)}",
-                    file=sys.stderr,
+        with destination_manager as candidate_destination:
+            catalog = (
+                dict(operation_catalog)
+                if operation_catalog is not None
+                else load_production_catalog(
+                    Path(root) / CLIPPY_CONFIG_PATH.relative_to(ROOT)
                 )
-                return 1
-            print(
-                f"wrote complete refresh candidate: {candidate_path}"
             )
+            reviews = (
+                expected
+                if expected is not None
+                else load_inventory(
+                    Path(root) / INVENTORY_PATH.relative_to(ROOT)
+                )
+            )
+            selected = select_profiles(
+                checked_matrix, arguments.profiles, current_host=current_host
+            )
+            result = run_census(
+                checked_matrix,
+                selected,
+                catalog,
+                runner=runner,
+                root=Path(root),
+                current_host=current_host,
+            )
+            rows = result["rows"]
+            executed = result["executed_profiles"]
+            pending = result["pending_profiles"]
+            identities = result["toolchain"]
+            assert isinstance(rows, list)
+            assert isinstance(executed, list)
+            assert isinstance(pending, list)
+            assert isinstance(identities, Mapping)
+            if candidate_destination is not None:
+                document = candidate_document(
+                    rows,
+                    reviews,
+                    executed,
+                    checked_matrix.required_profiles,
+                    identities,
+                )
+                try:
+                    _write_candidate_atomically(
+                        candidate_destination, document
+                    )
+                except OSError as error:
+                    raise InventoryError(
+                        "cannot publish refresh candidate atomically: "
+                        f"{error}"
+                    ) from error
+                if document["complete"] is not True:
+                    print(
+                        "error: wrote an explicitly partial, non-authoritative "
+                        f"candidate; pending profiles: {', '.join(pending)}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                print(
+                    "wrote complete refresh candidate: "
+                    f"{candidate_destination.display_path}"
+                )
+                return 0
+            validate(
+                rows, reviews, executed, checked_matrix.required_profiles
+            )
+            if pending:
+                print(
+                    "host-authority census subset passed; result is partial; "
+                    f"pending profiles: {', '.join(pending)}"
+                )
+            else:
+                print(
+                    "host-authority census complete: all required profiles passed"
+                )
             return 0
-        validate(rows, reviews, executed, checked_matrix.required_profiles)
-        if pending:
-            print(
-                "host-authority census subset passed; result is partial; "
-                f"pending profiles: {', '.join(pending)}"
-            )
-        else:
-            print("host-authority census complete: all required profiles passed")
-        return 0
     except InventoryError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

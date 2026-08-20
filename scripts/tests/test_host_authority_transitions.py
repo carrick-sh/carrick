@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import pwd
 import subprocess
 import tempfile
 import unittest
@@ -135,6 +136,28 @@ for host, features in (
             "--force-warn",
             "clippy::disallowed_methods",
         ]
+
+
+def expected_profile_command(profile_id: str, root: Path = ROOT):
+    return [
+        "cargo",
+        "--config",
+        str((root / ".cargo" / "config.toml").resolve()),
+        "clippy",
+        "--manifest-path",
+        str((root / "Cargo.toml").resolve()),
+        *EXPECTED_COMMANDS[profile_id][2:],
+    ]
+
+
+def expected_clippy_version_command(root: Path = ROOT):
+    return [
+        "cargo",
+        "--config",
+        str((root / ".cargo" / "config.toml").resolve()),
+        "clippy",
+        "-V",
+    ]
 
 
 def load_host_authority():
@@ -897,7 +920,11 @@ class FakeRunner:
         self.calls.append((argv, kwargs))
         if argv == ["rustc", "-Vv"]:
             return subprocess.CompletedProcess(argv, 0, self.rustc_version, "")
-        if argv == ["cargo", "clippy", "-V"]:
+        if (
+            argv[0] == "cargo"
+            and argv[-2:] == ["clippy", "-V"]
+            and "--manifest-path" not in argv
+        ):
             return subprocess.CompletedProcess(argv, 0, self.clippy_version, "")
         return subprocess.CompletedProcess(
             argv,
@@ -1002,9 +1029,11 @@ class MatrixOrchestrationTest(unittest.TestCase):
             profile, runner=runner, root=ROOT, current_host="macos"
         )
         self.assertEqual(messages, [{"reason": "build-finished", "success": True}])
-        self.assertEqual(runner.calls[0][0], EXPECTED_COMMANDS[profile.id])
+        self.assertEqual(
+            runner.calls[0][0], expected_profile_command(profile.id)
+        )
         kwargs = runner.calls[0][1]
-        self.assertEqual(kwargs["cwd"], ROOT)
+        self.assertFalse(Path(kwargs["cwd"]).is_relative_to(ROOT))
         self.assertFalse(kwargs["shell"])
         self.assertTrue(kwargs["capture_output"])
         self.assertTrue(kwargs["text"])
@@ -1035,6 +1064,120 @@ class MatrixOrchestrationTest(unittest.TestCase):
             profile_environment["CARGO_TARGET_DIR"],
             str(ROOT / "target" / "host-authority-census" / profile.id),
         )
+
+    def test_profile_uses_only_isolated_cargo_home_and_checked_config(self):
+        matrix = self.load()
+        profile = matrix.profiles["macos-hvf-default"]
+        original_command = profile.command
+        with tempfile.TemporaryDirectory() as directory:
+            ancestor = Path(directory) / "ancestor"
+            root = ancestor / "nested" / "worktree"
+            root.mkdir(parents=True)
+            (root / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+            checked_config = root / ".cargo" / "config.toml"
+            checked_config.parent.mkdir()
+            checked_config.write_text(
+                '[build]\nrustflags = ["-C", "force-frame-pointers=yes"]\n',
+                encoding="utf-8",
+            )
+            checked_config_text = checked_config.read_text(encoding="utf-8")
+            ancestor_config = ancestor / ".cargo" / "config.toml"
+            ancestor_config.parent.mkdir()
+            ancestor_config.write_text(
+                '[build]\nrustc = "/tmp/ancestor-rustc"\n', encoding="utf-8"
+            )
+            ambient_home = Path(directory) / "ambient-cargo-home"
+            ambient_home.mkdir()
+            (ambient_home / "config.toml").write_text(
+                '[build]\nrustc = "/tmp/ambient-rustc"\n', encoding="utf-8"
+            )
+            (ambient_home / "credentials.toml").write_text(
+                "[registry]\ntoken = 'secret'\n", encoding="utf-8"
+            )
+            canonical_home = Path(directory) / "canonical-user-home"
+            canonical_cargo = canonical_home / ".cargo"
+            for cache_name in ("registry", "git"):
+                cache = canonical_cargo / cache_name
+                cache.mkdir(parents=True)
+                (cache / "cache-sentinel").write_text(
+                    cache_name, encoding="utf-8"
+                )
+            for forbidden in ("config.toml", "credentials.toml", "env", "bin"):
+                path = canonical_cargo / forbidden
+                if "." in forbidden:
+                    path.write_text("forbidden\n", encoding="utf-8")
+                else:
+                    path.mkdir()
+            fake = FakeRunner()
+            observations = []
+
+            def runner(argv, **kwargs):
+                cargo_home = Path(kwargs["env"]["CARGO_HOME"])
+                observations.append(
+                    {
+                        "argv": list(argv),
+                        "cwd": Path(kwargs["cwd"]),
+                        "cargo_home": cargo_home,
+                        "rustup_home": Path(kwargs["env"]["RUSTUP_HOME"]),
+                        "home_entries": sorted(
+                            path.relative_to(cargo_home).as_posix()
+                            for path in cargo_home.rglob("*")
+                        ),
+                        "cache_targets": {
+                            name: (cargo_home / name).resolve()
+                            for name in ("registry", "git")
+                            if (cargo_home / name).exists()
+                        },
+                    }
+                )
+                return fake(argv, **kwargs)
+
+            with mock.patch.object(
+                pwd,
+                "getpwuid",
+                return_value=mock.Mock(pw_dir=str(canonical_home)),
+            ), mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": str(ambient_home),
+                    "CARGO_HOME": str(ambient_home),
+                    "RUSTUP_HOME": str(ambient_home / "rustup"),
+                },
+                clear=False,
+            ):
+                self.host_authority.run_profile(
+                    profile,
+                    runner=runner,
+                    root=root,
+                    current_host="macos",
+                )
+
+        self.assertEqual(profile.command, original_command)
+        self.assertEqual(len(observations), 1)
+        observed = observations[0]
+        self.assertNotEqual(observed["cargo_home"], ambient_home)
+        self.assertEqual(observed["home_entries"], ["git", "registry"])
+        self.assertEqual(
+            observed["cache_targets"],
+            {
+                "registry": (canonical_cargo / "registry").resolve(),
+                "git": (canonical_cargo / "git").resolve(),
+            },
+        )
+        self.assertEqual(
+            observed["rustup_home"], canonical_home.resolve() / ".rustup"
+        )
+        self.assertFalse(observed["cwd"].is_relative_to(ancestor))
+        self.assertEqual(
+            observed["argv"][:4],
+            ["cargo", "--config", str(checked_config.resolve()), "clippy"],
+        )
+        manifest_index = observed["argv"].index("--manifest-path")
+        self.assertEqual(
+            observed["argv"][manifest_index + 1],
+            str((root / "Cargo.toml").resolve()),
+        )
+        self.assertIn("force-frame-pointers=yes", checked_config_text)
 
     def test_run_profile_preserves_stderr_on_compile_failure(self):
         profile = self.load().profiles["macos-hvf-default"]
@@ -1085,7 +1228,7 @@ class MatrixOrchestrationTest(unittest.TestCase):
         )
         self.assertEqual(
             [call[0] for call in runner.calls],
-            [["rustc", "-Vv"], ["cargo", "clippy", "-V"]],
+            [["rustc", "-Vv"], expected_clippy_version_command()],
         )
         mismatch = FakeRunner()
         mismatch.clippy_version = "clippy 0.1.95 (stale)\n"
@@ -1168,8 +1311,8 @@ class MatrixOrchestrationTest(unittest.TestCase):
             [call[0] for call in runner.calls[:3]],
             [
                 ["rustc", "-Vv"],
-                ["cargo", "clippy", "-V"],
-                EXPECTED_COMMANDS["macos-hvf-default"],
+                expected_clippy_version_command(),
+                expected_profile_command("macos-hvf-default"),
             ],
         )
 
@@ -1304,24 +1447,110 @@ class MatrixOrchestrationTest(unittest.TestCase):
                     inventory.read_text(encoding="utf-8"), "canonical sentinel\n"
                 )
                 self.assertEqual(runner.calls, [])
-                self.assertIn("canonical inventory", stderr.getvalue())
+                expected_error = (
+                    "symlink" if alias_kind == "symlink" else "canonical inventory"
+                )
+                self.assertIn(expected_error, stderr.getvalue())
+
+    def test_candidate_parent_swap_cannot_redirect_publication_to_inventory(self):
+        matrix = self.load()
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            root = temporary / "worktree"
+            root.mkdir()
+            (root / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+            checked_config = root / ".cargo" / "config.toml"
+            checked_config.parent.mkdir()
+            checked_config.write_text(
+                '[build]\nrustflags = ["-C", "force-frame-pointers=yes"]\n',
+                encoding="utf-8",
+            )
+            inventory = (
+                root
+                / "scripts"
+                / "migrate"
+                / "host-authority-transition-inventory.json"
+            )
+            inventory.parent.mkdir(parents=True)
+            inventory.write_text("canonical sentinel\n", encoding="utf-8")
+            candidate_parent = temporary / "candidate-parent"
+            candidate_parent.mkdir()
+            moved_parent = temporary / "authenticated-parent"
+            candidate = candidate_parent / inventory.name
+            fake = FakeRunner()
+            swapped = False
+
+            def runner(argv, **kwargs):
+                nonlocal swapped
+                if "--manifest-path" in argv and not swapped:
+                    candidate_parent.rename(moved_parent)
+                    candidate_parent.symlink_to(
+                        inventory.parent, target_is_directory=True
+                    )
+                    swapped = True
+                return fake(argv, **kwargs)
+
+            real_open = self.host_authority.os.open
+            directory_fds = []
+
+            def capturing_open(path, flags, mode=0o777, *, dir_fd=None):
+                descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                if flags & self.host_authority.os.O_DIRECTORY:
+                    directory_fds.append(descriptor)
+                return descriptor
+
+            with mock.patch.object(
+                self.host_authority.os, "open", side_effect=capturing_open
+            ):
+                result = self.host_authority.main(
+                    ["--refresh-candidate", str(candidate)],
+                    runner=runner,
+                    matrix=matrix,
+                    operation_catalog=FIXTURE_CATALOG,
+                    expected=[],
+                    current_host="macos",
+                    root=root,
+                )
+
+            self.assertEqual(result, 1)
+            self.assertTrue(swapped)
+            self.assertEqual(
+                inventory.read_text(encoding="utf-8"), "canonical sentinel\n"
+            )
+            published = moved_parent / inventory.name
+            self.assertTrue(published.is_file())
+            self.assertFalse(published.is_symlink())
+            self.assertTrue(directory_fds)
+            for descriptor in directory_fds:
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
 
     def test_atomic_candidate_write_leaves_existing_file_on_replace_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             candidate = Path(directory) / "candidate.json"
+            canonical = Path(directory) / "canonical.json"
             candidate.write_text("existing candidate\n", encoding="utf-8")
-            with mock.patch.object(
-                self.host_authority.os,
-                "replace",
-                side_effect=OSError("injected replace failure"),
-            ):
-                with self.assertRaisesRegex(OSError, "injected replace failure"):
-                    self.host_authority._write_candidate_atomically(
-                        candidate, {"schema": 1}
-                    )
+            canonical.write_text("canonical\n", encoding="utf-8")
+            with self.host_authority._candidate_destination(
+                candidate, canonical
+            ) as destination:
+                directory_fd = destination.directory_fd
+                with mock.patch.object(
+                    self.host_authority.os,
+                    "replace",
+                    side_effect=OSError("injected replace failure"),
+                ):
+                    with self.assertRaisesRegex(
+                        OSError, "injected replace failure"
+                    ):
+                        self.host_authority._write_candidate_atomically(
+                            destination, {"schema": 1}
+                        )
             self.assertEqual(
                 candidate.read_text(encoding="utf-8"), "existing candidate\n"
             )
+            with self.assertRaises(OSError):
+                os.fstat(directory_fd)
 
     def test_complete_candidate_requires_every_required_profile(self):
         matrix = self.load()
