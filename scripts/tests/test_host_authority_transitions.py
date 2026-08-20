@@ -17,6 +17,13 @@ MESSAGES = (
     / "host-authority-census"
     / "messages.jsonl"
 )
+FIXTURE_CATALOG = {
+    "libc::waitpid": "HA-CATALOG-FIXTURE-PROCESS-WAITPID",
+    "std::fs::metadata": "HA-CATALOG-FIXTURE-FS-METADATA",
+    "std::fs::read": "HA-CATALOG-FIXTURE-FS-READ",
+    "std::process::id": "HA-CATALOG-FIXTURE-PROCESS-ID",
+    "std::thread::yield_now": "HA-CATALOG-FIXTURE-THREAD-YIELD-NOW",
+}
 
 
 def load_host_authority():
@@ -164,12 +171,12 @@ class DiagnosticNormalizationTest(unittest.TestCase):
     def setUp(self):
         self.host_authority = load_host_authority()
 
-    def normalize(self, messages, *, allow_missing_catalog_id=True):
+    def normalize(self, messages, operation_catalog=None):
         return self.host_authority.normalize_messages(
             messages,
             "macos-hvf-default",
             ROOT,
-            allow_missing_catalog_id=allow_missing_catalog_id,
+            FIXTURE_CATALOG if operation_catalog is None else operation_catalog,
         )
 
     def test_recorded_messages_normalize_all_resolved_operations(self):
@@ -194,7 +201,7 @@ class DiagnosticNormalizationTest(unittest.TestCase):
             if row["operation"] == "std::process::id"
             and row["source"]["line"] == 11
         )
-        self.assertIsNone(row["catalog_id"])
+        self.assertEqual(row["catalog_id"], "HA-CATALOG-FIXTURE-PROCESS-ID")
         self.assertEqual(row["operation"], "std::process::id")
         self.assertEqual(row["profiles"], ["macos-hvf-default"])
         self.assertEqual(
@@ -227,21 +234,55 @@ class DiagnosticNormalizationTest(unittest.TestCase):
                         {
                             "level": "note",
                             "message": (
-                                "HA-CATALOG-PROCESS-ID: host process identity "
-                                "requires reviewed authority"
+                                "HA-CATALOG-FIXTURE-PROCESS-ID: host process "
+                                "identity requires reviewed authority"
                             ),
                         }
                     ]
                 )
             ]
         )[0]
-        self.assertEqual(row["catalog_id"], "HA-CATALOG-PROCESS-ID")
+        self.assertEqual(row["catalog_id"], "HA-CATALOG-FIXTURE-PROCESS-ID")
 
-    def test_production_normalization_requires_catalog_reason_by_default(self):
-        with self.assertRaisesRegex(self.host_authority.InventoryError, "catalog ID"):
+    def test_normalization_requires_explicit_operation_catalog(self):
+        with self.assertRaises(TypeError):
             self.host_authority.normalize_messages(
                 [diagnostic()], "macos-hvf-default", ROOT
             )
+
+    def test_rejects_missing_unknown_or_conflicting_operation_catalog(self):
+        cases = {
+            "empty mapping": {},
+            "missing operation": {
+                "std::fs::read": "HA-CATALOG-FIXTURE-FS-READ"
+            },
+            "unknown operation": {
+                "not a canonical operation": "HA-CATALOG-FIXTURE-UNKNOWN"
+            },
+            "invalid ID": {"std::process::id": "catalog-process-id"},
+            "conflicting ID": {
+                "std::process::id": "HA-CATALOG-FIXTURE-CONFLICT",
+                "std::fs::read": "HA-CATALOG-FIXTURE-CONFLICT",
+            },
+        }
+        for label, operation_catalog in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(
+                    self.host_authority.InventoryError, "catalog"
+                ):
+                    self.normalize([diagnostic()], operation_catalog)
+
+    def test_rejects_diagnostic_child_id_mismatched_with_operation_catalog(self):
+        message = diagnostic(
+            children=[
+                {
+                    "level": "note",
+                    "message": "HA-CATALOG-OTHER-ID: stale configured reason",
+                }
+            ]
+        )
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "mismatch"):
+            self.normalize([message])
 
     def test_rejects_unstable_catalog_reason_id_syntax(self):
         message = diagnostic(
@@ -253,7 +294,7 @@ class DiagnosticNormalizationTest(unittest.TestCase):
             ]
         )
         with self.assertRaisesRegex(self.host_authority.InventoryError, "catalog"):
-            self.normalize([message], allow_missing_catalog_id=False)
+            self.normalize([message])
 
     def test_normalizes_outermost_workspace_macro_callsite(self):
         expansion = {
@@ -469,18 +510,11 @@ class ReviewValidationTest(unittest.TestCase):
     def test_accepts_exact_review_shape(self):
         self.validate([actual_row()], [reviewed_row()])
 
-    def test_missing_catalog_id_requires_explicit_fixture_policy(self):
+    def test_null_catalog_id_is_rejected_without_bypass(self):
         actual = [actual_row(catalog_id=None)]
         expected = [reviewed_row(catalog_id=None)]
         with self.assertRaisesRegex(self.host_authority.InventoryError, "catalog ID"):
             self.validate(actual, expected)
-        self.host_authority.validate(
-            actual,
-            expected,
-            self.executed,
-            self.required,
-            allow_missing_catalog_id=True,
-        )
 
     def test_partial_check_compares_only_executed_profile_membership(self):
         expected = reviewed_row(profiles=["linux-runtime", "macos-hvf-default"])

@@ -303,16 +303,11 @@ def _validate_profiles(profiles: object, label: str) -> list[str]:
     return profiles
 
 
-def _validate_actual_row(
-    row: object, label: str, *, allow_missing_catalog_id: bool = False
-) -> dict[str, object]:
+def _validate_actual_row(row: object, label: str) -> dict[str, object]:
     if not isinstance(row, dict) or set(row) != ACTUAL_FIELDS:
         raise InventoryError(f"invalid {label} row schema: {row!r}")
     catalog_id = row.get("catalog_id")
-    if catalog_id is None:
-        if not allow_missing_catalog_id:
-            raise InventoryError(f"missing {label} catalog ID: {row!r}")
-    elif not isinstance(catalog_id, str) or CATALOG_ID.fullmatch(catalog_id) is None:
+    if not isinstance(catalog_id, str) or CATALOG_ID.fullmatch(catalog_id) is None:
         raise InventoryError(f"invalid {label} catalog ID: {row!r}")
     operation = row.get("operation")
     if not isinstance(operation, str) or OPERATION_PATH.fullmatch(operation) is None:
@@ -325,25 +320,53 @@ def _validate_actual_row(
     return row
 
 
+def _validate_operation_catalog(operation_catalog: object) -> dict[str, str]:
+    if not isinstance(operation_catalog, Mapping) or not operation_catalog:
+        raise InventoryError("operation catalog must be a non-empty mapping")
+    snapshot: dict[str, str] = {}
+    catalog_owners: dict[str, str] = {}
+    for operation, catalog_id in operation_catalog.items():
+        if (
+            not isinstance(operation, str)
+            or OPERATION_PATH.fullmatch(operation) is None
+        ):
+            raise InventoryError(f"invalid operation catalog path: {operation!r}")
+        if (
+            not isinstance(catalog_id, str)
+            or CATALOG_ID.fullmatch(catalog_id) is None
+        ):
+            raise InventoryError(
+                f"invalid operation catalog ID for {operation}: {catalog_id!r}"
+            )
+        prior = catalog_owners.get(catalog_id)
+        if prior is not None and prior != operation:
+            raise InventoryError(
+                f"operation catalog ID conflict: {catalog_id} maps {prior} and {operation}"
+            )
+        catalog_owners[catalog_id] = operation
+        snapshot[operation] = catalog_id
+    return snapshot
+
+
 def normalize_messages(
     messages: Iterable[object],
     profile_id: str,
     root: Path,
-    *,
-    allow_missing_catalog_id: bool = False,
+    operation_catalog: Mapping[str, str],
 ) -> list[dict[str, object]]:
     """Normalize one profile's Cargo/Clippy JSON diagnostic stream.
 
-    ``allow_missing_catalog_id`` exists only for the pinned Task 1 string-form
-    fixture. Production callers leave it false. This function validates stable
-    ID syntax; Task 4 binds each operation to its configured catalog ID.
+    The required operation catalog is snapshotted and checked before messages
+    are consumed. Task 1 supplies its checked fixture mapping; Task 4 supplies
+    the parsed object-form ``clippy.toml`` catalog for production.
     """
     if not isinstance(profile_id, str) or not profile_id:
         raise InventoryError("profile ID must be a non-empty string")
     workspace = Path(root).resolve(strict=False)
+    catalog = _validate_operation_catalog(operation_catalog)
     rows: list[dict[str, object]] = []
     identities: set[str] = set()
-    sites: dict[str, str | None] = {}
+    sites: dict[str, str] = {}
     for index, raw in enumerate(messages, start=1):
         cargo = _cargo_object(raw, index)
         if cargo.get("reason") != "compiler-message":
@@ -366,6 +389,17 @@ def normalize_messages(
         if match is None or OPERATION_PATH.fullmatch(match.group(1)) is None:
             raise InventoryError(f"unknown Clippy operation message: {text!r}")
         operation = match.group(1)
+        catalog_id = catalog.get(operation)
+        if catalog_id is None:
+            raise InventoryError(
+                f"missing operation catalog mapping for diagnostic: {operation}"
+            )
+        child_catalog_id = _catalog_reason(reason.get("children"))
+        if child_catalog_id is not None and child_catalog_id != catalog_id:
+            raise InventoryError(
+                "diagnostic catalog ID mismatch for "
+                f"{operation}: mapped={catalog_id}, child={child_catalog_id}"
+            )
         spans = reason.get("spans")
         if not isinstance(spans, list):
             raise InventoryError("Clippy operation diagnostic has no span list")
@@ -380,17 +414,13 @@ def normalize_messages(
             )
         primary = primary_spans[0]
         row = {
-            "catalog_id": _catalog_reason(reason.get("children")),
+            "catalog_id": catalog_id,
             "operation": operation,
             "source": _span_point(primary, workspace, "compiler primary span"),
             "expansion": _outermost_expansion(primary, workspace),
             "profiles": [profile_id],
         }
-        _validate_actual_row(
-            row,
-            "normalized",
-            allow_missing_catalog_id=allow_missing_catalog_id,
-        )
+        _validate_actual_row(row, "normalized")
         identity = diagnostic_identity(row)
         if identity in identities:
             raise InventoryError(f"duplicate diagnostic identity: {identity}")
@@ -409,7 +439,7 @@ def merge_profiles(
 ) -> list[dict[str, object]]:
     """Merge profile membership only for exactly identical diagnostics."""
     merged: dict[str, dict[str, object]] = {}
-    catalog_by_site: dict[str, str | None] = {}
+    catalog_by_site: dict[str, str] = {}
     for batch_index, batch in enumerate(profile_rows, start=1):
         batch_identities: set[str] = set()
         for raw_row in batch:
@@ -504,7 +534,6 @@ def _reviewed_index(
     rows: Sequence[dict[str, object]],
     *,
     allow_unreviewed: bool,
-    allow_missing_catalog_id: bool = False,
 ) -> tuple[dict[str, dict[str, object]], int]:
     indexed: dict[str, dict[str, object]] = {}
     review_ids: dict[str, str] = {}
@@ -513,11 +542,7 @@ def _reviewed_index(
         if not isinstance(row, dict) or set(row) != REVIEW_FIELDS:
             raise InventoryError(f"invalid reviewed row schema: {row!r}")
         actual = {field: row[field] for field in ACTUAL_FIELDS}
-        _validate_actual_row(
-            actual,
-            "reviewed",
-            allow_missing_catalog_id=allow_missing_catalog_id,
-        )
+        _validate_actual_row(actual, "reviewed")
         identity = diagnostic_identity(actual)
         if identity in indexed:
             raise InventoryError(f"duplicate reviewed diagnostic identity: {identity}")
@@ -536,14 +561,10 @@ def _reviewed_index(
     return indexed, maximum
 
 
-def _actual_index(
-    rows: Sequence[dict[str, object]], *, allow_missing_catalog_id: bool = False
-) -> dict[str, dict[str, object]]:
+def _actual_index(rows: Sequence[dict[str, object]]) -> dict[str, dict[str, object]]:
     indexed: dict[str, dict[str, object]] = {}
     for row in rows:
-        valid = _validate_actual_row(
-            row, "actual", allow_missing_catalog_id=allow_missing_catalog_id
-        )
+        valid = _validate_actual_row(row, "actual")
         identity = diagnostic_identity(valid)
         if identity in indexed:
             raise InventoryError(f"duplicate actual diagnostic identity: {identity}")
@@ -567,14 +588,11 @@ def validate(
     expected: list[dict[str, object]],
     executed_profiles: Sequence[str],
     required_profiles: Sequence[str],
-    *,
-    allow_missing_catalog_id: bool = False,
 ) -> None:
     """Require exact reviewed rows for every profile declared as executed.
 
-    Missing catalog IDs are rejected unless the Task 1 fixture caller opts in
-    explicitly. Stable syntax is checked here; Task 4 owns operation-to-ID
-    catalog consistency.
+    All rows require stable non-null catalog IDs. Normalization has already
+    bound those IDs to the explicit operation catalog supplied by its caller.
     """
     executed = _profile_set(executed_profiles, "executed")
     required = _profile_set(required_profiles, "required")
@@ -583,13 +601,10 @@ def validate(
             "executed profiles are outside required profiles: "
             f"{sorted(executed - required)}"
         )
-    actual_by_identity = _actual_index(
-        actual, allow_missing_catalog_id=allow_missing_catalog_id
-    )
+    actual_by_identity = _actual_index(actual)
     reviewed_by_identity, _ = _reviewed_index(
         expected,
         allow_unreviewed=False,
-        allow_missing_catalog_id=allow_missing_catalog_id,
     )
 
     for row in actual_by_identity.values():
