@@ -724,7 +724,7 @@ impl SyscallDispatcher {
         let open = open_file.description.read();
         match &*open {
             OpenDescription::PipeWriter { pipe, .. } => {
-                if pipe.lock().readers == 0 {
+                if pipe.state.lock().readers == 0 {
                     Some(LINUX_EPIPE)
                 } else {
                     None
