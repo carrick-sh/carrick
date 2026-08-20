@@ -2927,9 +2927,11 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// inventory rows but without this second guard, which left the closure probe
 /// gate unable to run at all: `memfdsecret` and `uffdpolicy` (`51f0697ea`),
 /// `newmountapi` (`b6217325e`), and `overlaysymlink` (`4fb68d5fa`). The gating
-/// row count therefore moves from 858 to 866 — 433 conformance sources under
-/// arm64 musl AND GNU.
-const PROBE_SOURCE_COUNT: usize = 459;
+/// row count therefore moved from 858 to 866 — 433 conformance sources under
+/// arm64 musl AND GNU. `waitidsiuid` and `mqnotifycrossproc` (`301ac30a9`)
+/// move the source denominator from 459 to 461 and the gating rows from 866 to
+/// 870 — 435 conformance sources under both libc variants.
+const PROBE_SOURCE_COUNT: usize = 461;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -5400,7 +5402,12 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
 
     let sources = all_probe_source_names();
     assert_eq!(DEDICATED_PROBE_RUNNERS.len(), 20);
-    assert!(validate_closure_probe_rows(&inventory(), &sources).is_ok());
+    assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
+    let generic = validate_closure_probe_rows(&inventory(), &sources)
+        .expect("checked-in closure probe inventory must match the source denominator");
+    assert_eq!(generic.len(), 415);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 435);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 870);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")

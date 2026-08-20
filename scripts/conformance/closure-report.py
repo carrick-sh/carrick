@@ -281,7 +281,10 @@ def validate_probe_log(log: str, inventory: dict[str, Any]) -> dict[str, Any]:
         name for name, row in inventory.items() if row.get("class") == "conformance" and row.get("runner") != "generic"
     }
     dedicated_runners = {inventory[name].get("runner") for name in dedicated}
-    if len(generic) != 409 or len(dedicated) != 20:
+    # The source-level denominator is guarded independently in
+    # carrick-cli/tests/conformance.rs. This reporter owns only the 435
+    # conformance sources: 415 generic plus 20 dedicated scenarios.
+    if len(generic) != 415 or len(dedicated) != 20:
         raise ReportError(
             f"probe inventory denominator drifted: {len(generic)} generic, {len(dedicated)} dedicated"
         )

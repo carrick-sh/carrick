@@ -3,7 +3,7 @@
 //! HVPatch owns Linux process identity, credentials, and child-exit state. A
 //! terminal `waitid` result must therefore describe the logical child, not the
 //! VM carrier or the host user executing Carrick. The child reports its guest
-//! effective UID through a pipe before exiting; the parent compares that
+//! real UID through a pipe before exiting; the parent compares that
 //! independently observed value with `siginfo_t.si_uid`.
 //!
 //! Every wait is bounded. Output contains relationships only: no PID, UID,
@@ -111,10 +111,10 @@ unsafe fn cleanup_child_bounded(pid: libc::pid_t) {
 
 fn print_failure() {
     report!(
-        child_reported_euid = false,
+        child_reported_ruid = false,
         waitid_reaped_child = false,
         waitid_si_pid_matches_child = false,
-        waitid_si_uid_matches_child_euid = false,
+        waitid_si_uid_matches_child_ruid = false,
         waitid_si_code_is_cld_exited = false,
         waitid_si_status_matches_exit = false,
     );
@@ -131,8 +131,18 @@ fn main() {
         let child = libc::fork();
         if child == 0 {
             libc::close(pipefd[0]);
-            let euid = libc::geteuid();
-            let _ = write_exact(pipefd[1], &euid.to_ne_bytes());
+            // Linux specifies SIGCHLD si_uid as the child's REAL uid. When
+            // privileged, make real/effective differ so the probe catches an
+            // implementation that accidentally reports the effective uid.
+            let ruid = libc::getuid();
+            let identity_ready = if ruid == 0 {
+                (libc::geteuid() != ruid || libc::seteuid(65_534) == 0) && libc::geteuid() != ruid
+            } else {
+                true
+            };
+            if identity_ready {
+                let _ = write_exact(pipefd[1], &ruid.to_ne_bytes());
+            }
             libc::close(pipefd[1]);
             libc::_exit(CHILD_EXIT);
         }
@@ -146,9 +156,9 @@ fn main() {
 
         let deadline = Instant::now() + WAIT_DEADLINE;
         let mut uid_bytes = [0u8; core::mem::size_of::<libc::uid_t>()];
-        let child_reported_euid = read_exact_bounded(pipefd[0], &mut uid_bytes, deadline);
+        let child_reported_ruid = read_exact_bounded(pipefd[0], &mut uid_bytes, deadline);
         libc::close(pipefd[0]);
-        let child_euid = libc::uid_t::from_ne_bytes(uid_bytes);
+        let child_ruid = libc::uid_t::from_ne_bytes(uid_bytes);
 
         let mut terminal_info: libc::siginfo_t = core::mem::zeroed();
         let mut reaped = false;
@@ -179,11 +189,11 @@ fn main() {
         }
 
         report!(
-            child_reported_euid = child_reported_euid,
+            child_reported_ruid = child_reported_ruid,
             waitid_reaped_child = reaped,
             waitid_si_pid_matches_child = reaped && terminal_info.si_pid() == child,
-            waitid_si_uid_matches_child_euid =
-                reaped && child_reported_euid && terminal_info.si_uid() == child_euid,
+            waitid_si_uid_matches_child_ruid =
+                reaped && child_reported_ruid && terminal_info.si_uid() == child_ruid,
             waitid_si_code_is_cld_exited = reaped && terminal_info.si_code == libc::CLD_EXITED,
             waitid_si_status_matches_exit = reaped && terminal_info.si_status() == CHILD_EXIT,
         );

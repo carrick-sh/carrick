@@ -323,8 +323,8 @@ class ClosureReportTest(unittest.TestCase):
             inventory(),
         )
 
-        self.assertEqual(summary["rows"], 858)
-        self.assertEqual(summary["passed"], 853)
+        self.assertEqual(summary["rows"], 870)
+        self.assertEqual(summary["passed"], 865)
         self.assertEqual(
             {(row["libc"], row["source"]) for row in summary["failures"]},
             {("gnu", "abortdeath"), ("gnu", "acceptsock")},
@@ -386,8 +386,8 @@ class ClosureReportTest(unittest.TestCase):
 
         summary = closure_report.validate_probe_log(log, inventory())
 
-        self.assertEqual(summary["rows"], 858)
-        self.assertEqual(summary["passed"], 858)
+        self.assertEqual(summary["rows"], 870)
+        self.assertEqual(summary["passed"], 870)
 
     def test_ledger_renders_assertion_and_probe_red_sections(self):
         scope = scope_2127()
