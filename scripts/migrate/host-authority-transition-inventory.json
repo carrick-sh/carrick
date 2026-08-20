@@ -887,10 +887,10 @@
   },
   {
     "catalog_id": "HA-CATALOG-PROCESS-GETPID",
-    "classification": "declared_backing",
+    "classification": "declared_substrate",
     "evidence": {
-      "authority": "authorized_backing",
-      "resource": "run-scoped SysV shared-memory process record used by `new`"
+      "authority": "authenticated_carrier",
+      "resource": "message-queue descriptor cache fork ownership sentinel initialized by `MsgQueueFdCache::new`"
     },
     "expansion": null,
     "operation": "libc::getpid",
@@ -898,7 +898,7 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1283 in `new`, `libc::getpid` accesses only the run-scoped SysV shared-memory process record used by `new`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1283 in `MsgQueueFdCache::new`, `libc::getpid` authenticates only the current carrier that owns the message-queue descriptor cache fork ownership sentinel; no guest identity selects a host target.",
     "review_id": "HA-000034",
     "source": {
       "byte_end": 41139,
@@ -914,10 +914,10 @@
   },
   {
     "catalog_id": "HA-CATALOG-PROCESS-GETPID",
-    "classification": "declared_backing",
+    "classification": "declared_substrate",
     "evidence": {
-      "authority": "authorized_backing",
-      "resource": "run-scoped SysV shared-memory process record used by `refresh_for_current_process`"
+      "authority": "authenticated_carrier",
+      "resource": "inherited message-queue descriptors drained after `MsgQueueFdCache::refresh_for_current_process` detects a carrier fork"
     },
     "expansion": null,
     "operation": "libc::getpid",
@@ -925,7 +925,7 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1289 in `refresh_for_current_process`, `libc::getpid` accesses only the run-scoped SysV shared-memory process record used by `refresh_for_current_process`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1289 in `MsgQueueFdCache::refresh_for_current_process`, `libc::getpid` authenticates the current carrier so inherited message-queue descriptors are drained after a host fork; it does not answer guest process identity.",
     "review_id": "HA-000035",
     "source": {
       "byte_end": 41291,
@@ -941,10 +941,10 @@
   },
   {
     "catalog_id": "HA-CATALOG-PROCESS-GETPID",
-    "classification": "declared_backing",
+    "classification": "declared_substrate",
     "evidence": {
-      "authority": "authorized_backing",
-      "resource": "run-scoped SysV semaphore process record used by `new`"
+      "authority": "authenticated_carrier",
+      "resource": "message-queue wait-word mapping cache fork ownership sentinel initialized by `MsgQueueWaitWordCache::new`"
     },
     "expansion": null,
     "operation": "libc::getpid",
@@ -952,7 +952,7 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1718 in `new`, `libc::getpid` accesses only the run-scoped SysV semaphore process record used by `new`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1718 in `MsgQueueWaitWordCache::new`, `libc::getpid` authenticates only the current carrier that owns the message-queue wait-word mapping cache fork ownership sentinel; no guest identity selects a host target.",
     "review_id": "HA-000036",
     "source": {
       "byte_end": 55381,
@@ -968,10 +968,10 @@
   },
   {
     "catalog_id": "HA-CATALOG-PROCESS-GETPID",
-    "classification": "declared_backing",
+    "classification": "declared_substrate",
     "evidence": {
-      "authority": "authorized_backing",
-      "resource": "run-scoped SysV semaphore process record used by `refresh_for_current_process`"
+      "authority": "authenticated_carrier",
+      "resource": "inherited message-queue wait-word mappings cleared after `MsgQueueWaitWordCache::refresh_for_current_process` detects a carrier fork"
     },
     "expansion": null,
     "operation": "libc::getpid",
@@ -979,7 +979,7 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1724 in `refresh_for_current_process`, `libc::getpid` accesses only the run-scoped SysV semaphore process record used by `refresh_for_current_process`.",
+    "rationale": "At crates/carrick-runtime/src/dispatch/sysv.rs:1724 in `MsgQueueWaitWordCache::refresh_for_current_process`, `libc::getpid` authenticates the current carrier so inherited message-queue wait-word mappings are cleared after a host fork; it does not answer guest process identity.",
     "review_id": "HA-000037",
     "source": {
       "byte_end": 55533,

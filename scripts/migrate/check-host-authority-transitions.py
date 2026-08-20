@@ -101,6 +101,11 @@ GENERIC_RESOURCES = {
     "network operation",
     "process state",
 }
+BLANKET_RESOURCE_FRAGMENTS = {
+    "artifact selected by the active cli command",
+    "artifact explicitly authorized by the active cli command",
+}
+MAX_IDENTICAL_RESOURCE_REVIEWS = 12
 
 
 class InventoryError(Exception):
@@ -144,7 +149,7 @@ class CandidateDestination(NamedTuple):
     display_path: Path
     directory_fd: int
     name: str
-    canonical_identity: tuple[int, int] | None
+    protected_identities: frozenset[tuple[int, int]]
 
 
 def _expected_profile_commands() -> dict[str, tuple[str, ...]]:
@@ -1343,9 +1348,6 @@ def refresh(
     reviewed_by_identity, maximum = _reviewed_index(
         expected, allow_unreviewed=True
     )
-    missing = sorted(set(reviewed_by_identity) - set(actual_by_identity))
-    if missing:
-        raise InventoryError(f"refresh is missing expected identity: {missing}")
     rows: list[dict[str, object]] = []
     next_number = maximum
     for identity, row in sorted(
@@ -1603,6 +1605,7 @@ def validate_inventory_against_receipt(
 ) -> None:
     """Require exact actual-row equality while independently validating reviews."""
     _reviewed_index(inventory, allow_unreviewed=False)
+    validate_source_specific_reviews(inventory)
     projected = [
         {field: row[field] for field in ACTUAL_FIELDS}
         for row in inventory
@@ -1612,6 +1615,68 @@ def validate_inventory_against_receipt(
         raise InventoryError(
             "reviewed inventory actual projection disagrees with compiler capture"
         )
+
+
+def validate_source_specific_reviews(
+    inventory: Sequence[dict[str, object]],
+) -> None:
+    """Enforce structural source bindings without claiming semantic proof."""
+    rationales: set[str] = set()
+    resources: dict[str, list[dict[str, object]]] = {}
+    for row in inventory:
+        source = row.get("source")
+        operation = row.get("operation")
+        rationale = row.get("rationale")
+        evidence = row.get("evidence")
+        if (
+            not isinstance(source, Mapping)
+            or not isinstance(operation, str)
+            or not isinstance(rationale, str)
+            or not isinstance(evidence, Mapping)
+        ):
+            raise InventoryError("source-specific review has invalid structure")
+        source_file = source.get("file")
+        source_line = source.get("line")
+        source_identity = f"{source_file}:{source_line}"
+        if source_identity not in rationale:
+            raise InventoryError(
+                "review rationale does not bind its exact source file and line: "
+                f"{row.get('review_id')}"
+            )
+        if operation not in rationale:
+            raise InventoryError(
+                "review rationale does not bind its canonical operation: "
+                f"{row.get('review_id')}"
+            )
+        if rationale in rationales:
+            raise InventoryError("review rationales must be unique across inventory")
+        rationales.add(rationale)
+
+        resource = evidence.get("resource")
+        if not isinstance(resource, str):
+            raise InventoryError("source-specific review has invalid evidence resource")
+        normalized = _normalized_resource(resource)
+        if any(fragment in normalized for fragment in BLANKET_RESOURCE_FRAGMENTS):
+            raise InventoryError(
+                f"blanket evidence resource is not source-specific: {resource!r}"
+            )
+        resources.setdefault(normalized, []).append(row)
+
+    for normalized, rows in resources.items():
+        if len(rows) > MAX_IDENTICAL_RESOURCE_REVIEWS:
+            raise InventoryError(
+                "evidence resource is repeated as a blanket substitution: "
+                f"{normalized!r} appears {len(rows)} times"
+            )
+        roles = {
+            (row.get("classification"), row["evidence"].get("authority"))
+            for row in rows
+        }
+        if len(roles) != 1:
+            raise InventoryError(
+                "one evidence resource cannot cross classification or authority: "
+                f"{normalized!r}"
+            )
 
 
 def load_inventory(path: Path) -> list[dict[str, object]]:
@@ -1711,6 +1776,9 @@ def candidate_document(
     executed_profiles: Sequence[str],
     required_profiles: Sequence[str],
     toolchain: Mapping[str, str],
+    matrix: Matrix,
+    operation_catalog: Mapping[str, str],
+    source_head: str,
 ) -> dict[str, object]:
     """Build an explicit partial or refreshable complete candidate receipt."""
     executed = _profile_set(executed_profiles, "executed")
@@ -1743,6 +1811,15 @@ def candidate_document(
         if complete
         else _unreviewed_candidate_rows(actual)
     )
+    capture_receipt = compiler_capture_receipt(
+        matrix,
+        operation_catalog,
+        actual,
+        sorted(executed),
+        sorted(required - executed),
+        toolchain,
+        source_head,
+    )
     return {
         "schema": 1,
         "kind": "host-authority-census-candidate",
@@ -1750,14 +1827,106 @@ def candidate_document(
         "toolchain": dict(toolchain),
         "executed_profiles": sorted(executed),
         "pending_profiles": sorted(required - executed),
+        "capture_sha256": _canonical_digest(capture_receipt),
+        "capture_receipt": capture_receipt,
         "rows": rows,
     }
+
+
+def compiler_capture_receipt(
+    matrix: Matrix,
+    operation_catalog: Mapping[str, str],
+    actual: Sequence[dict[str, object]],
+    executed_profiles: Sequence[str],
+    pending_profiles: Sequence[str],
+    toolchain: Mapping[str, str],
+    source_head: str,
+) -> dict[str, object]:
+    """Build a self-contained exact receipt for newly executed profiles."""
+    if re.fullmatch(r"[0-9a-f]{40}", source_head) is None:
+        raise InventoryError("candidate source_head must be a full lowercase Git hash")
+    catalog = _validate_operation_catalog(operation_catalog)
+    executed = _profile_set(executed_profiles, "capture executed")
+    if (
+        not isinstance(pending_profiles, Sequence)
+        or isinstance(pending_profiles, (str, bytes))
+        or not all(
+            isinstance(profile_id, str) and profile_id
+            for profile_id in pending_profiles
+        )
+        or list(pending_profiles) != sorted(set(pending_profiles))
+    ):
+        raise InventoryError("capture pending profiles contain invalid IDs")
+    pending = set(pending_profiles)
+    required = set(matrix.required_profiles)
+    if executed | pending != required or executed & pending:
+        raise InventoryError("capture executed and pending profiles must partition matrix")
+    profiles = []
+    for profile_id in sorted(executed):
+        profile = matrix.profiles[profile_id]
+        profiles.append(
+            {
+                "id": profile.id,
+                "host": profile.host,
+                "host_triple": profile.host_triple,
+                "command": list(profile.command),
+            }
+        )
+    normalized_rows = [
+        _validate_actual_row(dict(row), "candidate capture") for row in actual
+    ]
+    for index, row in enumerate(normalized_rows, start=1):
+        if row["catalog_id"] != catalog.get(row["operation"]):
+            raise InventoryError(
+                f"candidate capture row {index} has wrong catalog binding"
+            )
+    if normalized_rows != sorted(normalized_rows, key=_sort_key):
+        raise InventoryError("candidate capture rows are not canonically sorted")
+    counts = {
+        profile_id: sum(
+            profile_id in row["profiles"] for row in normalized_rows
+        )
+        for profile_id in sorted(executed)
+    }
+    counts["merged"] = len(normalized_rows)
+    return {
+        "schema": 1,
+        "kind": "host-authority-compiler-capture",
+        "source_head": source_head,
+        "toolchain": dict(toolchain),
+        "executed_profiles": sorted(executed),
+        "pending_profiles": sorted(pending),
+        "profiles": profiles,
+        "diagnostic_counts": counts,
+        "catalog_sha256": _canonical_digest(catalog),
+        "toolchain_sha256": _canonical_digest(dict(toolchain)),
+        "profiles_sha256": _canonical_digest(profiles),
+        "rows_sha256": _canonical_digest(normalized_rows),
+        "rows": normalized_rows,
+    }
+
+
+def current_source_head(root: Path) -> str:
+    """Resolve the exact Git commit associated with a compiler capture."""
+    completed = subprocess.run(
+        ["git", "-C", str(Path(root).resolve()), "rev-parse", "HEAD"],
+        cwd="/",
+        capture_output=True,
+        text=True,
+        check=False,
+        shell=False,
+    )
+    source_head = completed.stdout.strip()
+    if completed.returncode != 0 or re.fullmatch(r"[0-9a-f]{40}", source_head) is None:
+        detail = completed.stderr.strip()
+        raise InventoryError(f"cannot resolve candidate source HEAD: {detail}")
+    return source_head
 
 
 def _authenticate_candidate_entry(
     directory_fd: int,
     name: str,
-    canonical_identity: tuple[int, int] | None,
+    protected_identities: frozenset[tuple[int, int]],
 ) -> None:
     try:
         metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -1768,12 +1937,31 @@ def _authenticate_candidate_entry(
     if not stat.S_ISREG(metadata.st_mode):
         raise InventoryError("refresh candidate target is not a regular file")
     identity = (metadata.st_dev, metadata.st_ino)
-    if canonical_identity is not None and identity == canonical_identity:
-        raise InventoryError("refresh candidate target hardlinks canonical inventory")
+    if identity in protected_identities:
+        raise InventoryError(
+            "refresh candidate target hardlinks a checked authority artifact"
+        )
+
+
+def protected_candidate_paths(root: Path) -> tuple[Path, ...]:
+    """Return every checked authority artifact a candidate may not replace."""
+    root = Path(root)
+    return tuple(
+        root / path.relative_to(ROOT)
+        for path in (
+            INVENTORY_PATH,
+            MACOS_CAPTURE_PATH,
+            CATALOG_MANIFEST_PATH,
+            MATRIX_PATH,
+            CLIPPY_CONFIG_PATH,
+        )
+    )
 
 
 @contextlib.contextmanager
-def _candidate_destination(requested: Path, canonical_inventory: Path):
+def _candidate_destination(
+    requested: Path, protected_paths: Sequence[Path]
+):
     requested = requested.expanduser()
     try:
         requested_metadata = requested.lstat()
@@ -1782,21 +1970,21 @@ def _candidate_destination(requested: Path, canonical_inventory: Path):
     if requested_metadata is not None and stat.S_ISLNK(requested_metadata.st_mode):
         raise InventoryError("refresh candidate target is a symlink")
     candidate = requested.resolve(strict=False)
-    canonical = canonical_inventory.expanduser().resolve(strict=False)
-    if candidate == canonical:
-        raise InventoryError(
-            "refresh candidate path resolves to the canonical inventory"
+    protected_identities: set[tuple[int, int]] = set()
+    for protected_path in protected_paths:
+        protected = protected_path.expanduser().resolve(strict=False)
+        if candidate == protected:
+            raise InventoryError(
+                "refresh candidate path resolves to a checked authority artifact"
+            )
+        try:
+            protected_metadata = protected.stat()
+        except FileNotFoundError:
+            continue
+        protected_identities.add(
+            (protected_metadata.st_dev, protected_metadata.st_ino)
         )
-    canonical_identity = None
-    try:
-        canonical_metadata = canonical.stat()
-    except FileNotFoundError:
-        pass
-    else:
-        canonical_identity = (
-            canonical_metadata.st_dev,
-            canonical_metadata.st_ino,
-        )
+    frozen_identities = frozenset(protected_identities)
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
         directory_fd = os.open(candidate.parent, flags)
@@ -1809,13 +1997,13 @@ def _candidate_destination(requested: Path, canonical_inventory: Path):
         if not stat.S_ISDIR(opened.st_mode):
             raise InventoryError("refresh candidate parent is not a directory")
         _authenticate_candidate_entry(
-            directory_fd, candidate.name, canonical_identity
+            directory_fd, candidate.name, frozen_identities
         )
         yield CandidateDestination(
             candidate,
             directory_fd,
             candidate.name,
-            canonical_identity,
+            frozen_identities,
         )
     finally:
         os.close(directory_fd)
@@ -1849,7 +2037,7 @@ def _write_candidate_atomically(
         _authenticate_candidate_entry(
             destination.directory_fd,
             destination.name,
-            destination.canonical_identity,
+            destination.protected_identities,
         )
         os.replace(
             temporary_name,
@@ -1925,6 +2113,7 @@ def main(
     catalog_manifest: Mapping[str, str] | None = None,
     expected: list[dict[str, object]] | None = None,
     capture_receipt: Mapping[str, object] | None = None,
+    source_head: str | None = None,
     current_host: str | None = None,
     root: Path = ROOT,
 ) -> int:
@@ -1934,10 +2123,9 @@ def main(
         checked_matrix = matrix or load_matrix(
             Path(root) / MATRIX_PATH.relative_to(ROOT)
         )
-        canonical_inventory = Path(root) / INVENTORY_PATH.relative_to(ROOT)
         destination_manager = (
             _candidate_destination(
-                arguments.refresh_candidate, canonical_inventory
+                arguments.refresh_candidate, protected_candidate_paths(root)
             )
             if arguments.refresh_candidate is not None
             else contextlib.nullcontext(None)
@@ -1965,22 +2153,23 @@ def main(
                     Path(root) / INVENTORY_PATH.relative_to(ROOT)
                 )
             )
-            receipt = (
-                dict(capture_receipt)
-                if capture_receipt is not None
-                else load_capture_receipt(
-                    Path(root) / MACOS_CAPTURE_PATH.relative_to(ROOT),
-                    checked_matrix,
-                    catalog,
+            if candidate_destination is None:
+                receipt = (
+                    dict(capture_receipt)
+                    if capture_receipt is not None
+                    else load_capture_receipt(
+                        Path(root) / MACOS_CAPTURE_PATH.relative_to(ROOT),
+                        checked_matrix,
+                        catalog,
+                    )
                 )
-            )
-            validate_inventory_against_receipt(reviews, receipt)
-            if arguments.static:
-                print(
-                    "host-authority static authority passed: exact catalog, "
-                    "macOS compiler receipt, and reviewed inventory agree"
-                )
-                return 0
+                validate_inventory_against_receipt(reviews, receipt)
+                if arguments.static:
+                    print(
+                        "host-authority static authority passed: exact catalog, "
+                        "macOS compiler receipt, and reviewed inventory agree"
+                    )
+                    return 0
             selected = select_profiles(
                 checked_matrix, arguments.profiles, current_host=current_host
             )
@@ -2007,6 +2196,9 @@ def main(
                     executed,
                     checked_matrix.required_profiles,
                     identities,
+                    checked_matrix,
+                    catalog,
+                    source_head or current_source_head(root),
                 )
                 try:
                     _write_candidate_atomically(

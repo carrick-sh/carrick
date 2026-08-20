@@ -3,6 +3,7 @@
 
 import copy
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -310,7 +311,8 @@ def reviewed_row(
     classification: str = "forbidden_semantic",
     evidence: dict[str, object] | None = None,
     rationale: str = (
-        "The carrier PID would otherwise answer guest getpid semantics."
+        "At crates/example/src/lib.rs:10, std::process::id would otherwise "
+        "answer guest getpid semantics."
     ),
 ):
     if evidence is None:
@@ -914,12 +916,11 @@ class RefreshTest(unittest.TestCase):
 
     def test_same_start_changed_end_span_does_not_inherit_review(self):
         changed_end = actual_row(location=source(byte_end=121))
-        with self.assertRaisesRegex(
-            self.host_authority.InventoryError, "missing expected identity"
-        ):
-            self.host_authority.refresh(
-                [changed_end], [reviewed_row(review_id="HA-000003")], True
-            )
+        refreshed = self.host_authority.refresh(
+            [changed_end], [reviewed_row(review_id="HA-000003")], True
+        )
+        self.assertEqual(refreshed[0]["classification"], "unreviewed")
+        self.assertEqual(refreshed[0]["review_id"], "HA-000004")
 
     def test_changed_operation_source_or_expansion_never_inherits_review(self):
         changed = [
@@ -937,33 +938,41 @@ class RefreshTest(unittest.TestCase):
         ]
         for actual in changed:
             with self.subTest(actual=actual):
-                with self.assertRaisesRegex(
-                    self.host_authority.InventoryError, "missing expected identity"
-                ):
-                    self.host_authority.refresh(
-                        [actual], [reviewed_row(review_id="HA-000003")], True
-                    )
+                refreshed = self.host_authority.refresh(
+                    [actual], [reviewed_row(review_id="HA-000003")], True
+                )
+                self.assertEqual(refreshed[0]["classification"], "unreviewed")
+                self.assertEqual(refreshed[0]["review_id"], "HA-000004")
 
     def test_catalog_id_change_cannot_inherit_or_implicitly_remove_review(self):
         changed = actual_row(catalog_id="HA-CATALOG-PROCESS-ID-V2")
-        with self.assertRaisesRegex(
-            self.host_authority.InventoryError, "missing expected identity"
-        ):
-            self.host_authority.refresh(
-                [changed],
-                [reviewed_row(catalog_id="HA-CATALOG-PROCESS-ID")],
-                True,
-            )
+        refreshed = self.host_authority.refresh(
+            [changed],
+            [reviewed_row(catalog_id="HA-CATALOG-PROCESS-ID")],
+            True,
+        )
+        self.assertEqual(refreshed[0]["classification"], "unreviewed")
+        self.assertNotEqual(refreshed[0]["review_id"], "HA-000001")
 
-    def test_complete_refresh_rejects_removed_reviewed_rows(self):
-        with self.assertRaisesRegex(
-            self.host_authority.InventoryError, "missing expected identity"
-        ):
-            self.host_authority.refresh([], [reviewed_row()], True)
+    def test_complete_refresh_omits_removed_reviewed_rows(self):
+        self.assertEqual(
+            self.host_authority.refresh([], [reviewed_row()], True), []
+        )
 
     def test_partial_refresh_fails_closed(self):
         with self.assertRaisesRegex(self.host_authority.InventoryError, "partial"):
             self.host_authority.refresh([actual_row()], [reviewed_row()], False)
+
+    def test_complete_refresh_drops_removed_rows_and_unreviews_retargeted_rows(self):
+        prior = reviewed_row(review_id="HA-000007")
+        retargeted = actual_row(location=source(line=11))
+        refreshed = self.host_authority.refresh([retargeted], [prior], True)
+        self.assertEqual(len(refreshed), 1)
+        self.assertEqual(refreshed[0]["source"]["line"], 11)
+        self.assertEqual(refreshed[0]["classification"], "unreviewed")
+        self.assertEqual(refreshed[0]["evidence"], {})
+        self.assertEqual(refreshed[0]["rationale"], "")
+        self.assertNotEqual(refreshed[0]["review_id"], prior["review_id"])
 
 
 class FakeRunner:
@@ -1640,6 +1649,149 @@ class MatrixOrchestrationTest(unittest.TestCase):
         self.assertNotEqual(document["rows"][0]["review_id"], "HA-999999")
         self.assertIn("partial", stderr.getvalue())
 
+    def test_refresh_candidate_replaces_stale_receipt_after_running_compiler(self):
+        matrix = self.load()
+        runner = FakeRunner(json.dumps(diagnostic()) + "\n")
+        inventory = [
+            reviewed_row(
+                location=source(line=11),
+                profiles=["macos-hvf-default"],
+                catalog_id="HA-CATALOG-FIXTURE-PROCESS-ID",
+                rationale=(
+                    "At crates/example/src/lib.rs:11, std::process::id acts on "
+                    "the reviewed guest-visible process identity."
+                ),
+            )
+        ]
+        stale_receipt = injected_receipt(
+            [
+                reviewed_row(
+                    location=source(line=12),
+                    profiles=["macos-hvf-default"],
+                    catalog_id="HA-CATALOG-FIXTURE-PROCESS-ID",
+                )
+            ]
+        )
+
+        static_runner = FakeRunner()
+        static_status = self.host_authority.main(
+            ["--static"],
+            runner=static_runner,
+            matrix=matrix,
+            operation_catalog=FIXTURE_CATALOG,
+            catalog_manifest=FIXTURE_CATALOG,
+            expected=inventory,
+            capture_receipt=stale_receipt,
+            current_host="macos",
+            root=ROOT,
+        )
+        self.assertNotEqual(static_status, 0)
+        self.assertEqual(static_runner.calls, [])
+
+        check_runner = FakeRunner(json.dumps(diagnostic()) + "\n")
+        check_status = self.host_authority.main(
+            ["--check", "--profiles", "macos-hvf-default"],
+            runner=check_runner,
+            matrix=matrix,
+            operation_catalog=FIXTURE_CATALOG,
+            catalog_manifest=FIXTURE_CATALOG,
+            expected=inventory,
+            capture_receipt=stale_receipt,
+            current_host="macos",
+            root=ROOT,
+        )
+        self.assertNotEqual(check_status, 0)
+        self.assertEqual(check_runner.calls, [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.json"
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                refresh_status = self.host_authority.main(
+                    [
+                        "--refresh-candidate",
+                        str(candidate),
+                        "--profiles",
+                        "macos-hvf-default",
+                    ],
+                    runner=runner,
+                    matrix=matrix,
+                    operation_catalog=FIXTURE_CATALOG,
+                    catalog_manifest=FIXTURE_CATALOG,
+                    expected=inventory,
+                    capture_receipt=stale_receipt,
+                    current_host="macos",
+                    root=ROOT,
+                )
+            document = json.loads(candidate.read_text(encoding="utf-8"))
+
+        self.assertNotEqual(refresh_status, 0)
+        self.assertEqual(len(runner.calls), 3)
+        self.assertFalse(document["complete"])
+        self.assertEqual(document["rows"][0]["classification"], "unreviewed")
+        capture = document["capture_receipt"]
+        self.assertEqual(capture["kind"], "host-authority-compiler-capture")
+        self.assertEqual(capture["rows"], [actual_row(catalog_id="HA-CATALOG-FIXTURE-PROCESS-ID")])
+        self.assertEqual(
+            capture["diagnostic_counts"],
+            {"macos-hvf-default": 1, "merged": 1},
+        )
+        self.assertEqual(
+            capture["profiles"],
+            [
+                {
+                    "id": "macos-hvf-default",
+                    "host": "macos",
+                    "host_triple": "aarch64-apple-darwin",
+                    "command": EXPECTED_COMMANDS["macos-hvf-default"],
+                }
+            ],
+        )
+        canonical = lambda value: hashlib.sha256(
+            json.dumps(
+                value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(capture["rows_sha256"], canonical(capture["rows"]))
+        self.assertEqual(
+            capture["profiles_sha256"], canonical(capture["profiles"])
+        )
+        self.assertEqual(
+            capture["toolchain_sha256"], canonical(capture["toolchain"])
+        )
+        self.assertEqual(document["capture_sha256"], canonical(capture))
+        self.assertRegex(capture["source_head"], r"^[0-9a-f]{40}$")
+        self.assertIn("partial", stderr.getvalue())
+
+    def test_refresh_candidate_cannot_overwrite_checked_capture_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            inventory = (
+                temporary_root
+                / "scripts"
+                / "migrate"
+                / "host-authority-transition-inventory.json"
+            )
+            capture = (
+                temporary_root
+                / "scripts"
+                / "migrate"
+                / "host-authority-macos-capture.json"
+            )
+            capture.parent.mkdir(parents=True)
+            capture.write_text("checked capture sentinel\n", encoding="utf-8")
+            inventory.write_text("checked inventory sentinel\n", encoding="utf-8")
+            protected = self.host_authority.protected_candidate_paths(
+                temporary_root
+            )
+            with self.assertRaises(self.host_authority.InventoryError):
+                with self.host_authority._candidate_destination(
+                    capture, protected
+                ):
+                    pass
+            preserved = capture.read_text(encoding="utf-8")
+        self.assertEqual(preserved, "checked capture sentinel\n")
+
     def test_candidate_path_cannot_equal_or_alias_canonical_inventory(self):
         matrix = self.load()
         for alias_kind in ("direct", "symlink", "hardlink"):
@@ -1681,7 +1833,9 @@ class MatrixOrchestrationTest(unittest.TestCase):
                 )
                 self.assertEqual(runner.calls, [])
                 expected_error = (
-                    "symlink" if alias_kind == "symlink" else "canonical inventory"
+                    "symlink"
+                    if alias_kind == "symlink"
+                    else "checked authority artifact"
                 )
                 self.assertIn(expected_error, stderr.getvalue())
 
@@ -1742,6 +1896,7 @@ class MatrixOrchestrationTest(unittest.TestCase):
                     catalog_manifest=FIXTURE_CATALOG,
                     expected=[],
                     capture_receipt=injected_receipt([]),
+                    source_head="0" * 40,
                     current_host="macos",
                     root=root,
                 )
@@ -1766,7 +1921,7 @@ class MatrixOrchestrationTest(unittest.TestCase):
             candidate.write_text("existing candidate\n", encoding="utf-8")
             canonical.write_text("canonical\n", encoding="utf-8")
             with self.host_authority._candidate_destination(
-                candidate, canonical
+                candidate, [canonical]
             ) as destination:
                 directory_fd = destination.directory_fd
                 with mock.patch.object(
@@ -1789,8 +1944,18 @@ class MatrixOrchestrationTest(unittest.TestCase):
     def test_complete_candidate_requires_every_required_profile(self):
         matrix = self.load()
         all_profiles = sorted(REQUIRED_PROFILES)
-        actual = [actual_row(profiles=all_profiles)]
-        expected = [reviewed_row(profiles=all_profiles)]
+        actual = [
+            actual_row(
+                profiles=all_profiles,
+                catalog_id="HA-CATALOG-FIXTURE-PROCESS-ID",
+            )
+        ]
+        expected = [
+            reviewed_row(
+                profiles=all_profiles,
+                catalog_id="HA-CATALOG-FIXTURE-PROCESS-ID",
+            )
+        ]
         complete = self.host_authority.candidate_document(
             actual,
             expected,
@@ -1801,11 +1966,14 @@ class MatrixOrchestrationTest(unittest.TestCase):
                 "clippy": "clippy pinned",
                 "host_triple": "aarch64-apple-darwin",
             },
+            matrix,
+            FIXTURE_CATALOG,
+            "0" * 40,
         )
         self.assertTrue(complete["complete"])
         self.assertEqual(complete["rows"], expected)
         partial = self.host_authority.candidate_document(
-            [actual_row()],
+            [actual_row(catalog_id="HA-CATALOG-FIXTURE-PROCESS-ID")],
             expected,
             ["macos-hvf-default"],
             REQUIRED_PROFILES,
@@ -1814,11 +1982,33 @@ class MatrixOrchestrationTest(unittest.TestCase):
                 "clippy": "clippy pinned",
                 "host_triple": "aarch64-apple-darwin",
             },
+            matrix,
+            FIXTURE_CATALOG,
+            "0" * 40,
         )
         self.assertFalse(partial["complete"])
         self.assertTrue(
             all(row["classification"] == "unreviewed" for row in partial["rows"])
         )
+
+    def test_candidate_capture_rejects_wrong_catalog_binding(self):
+        matrix = self.load()
+        with self.assertRaisesRegex(
+            self.host_authority.InventoryError, "catalog binding"
+        ):
+            self.host_authority.compiler_capture_receipt(
+                matrix,
+                FIXTURE_CATALOG,
+                [actual_row(catalog_id="HA-CATALOG-WRONG")],
+                ["macos-hvf-default"],
+                sorted(set(REQUIRED_PROFILES) - {"macos-hvf-default"}),
+                {
+                    "rustc": "rustc pinned",
+                    "clippy": "clippy pinned",
+                    "host_triple": "aarch64-apple-darwin",
+                },
+                "0" * 40,
+            )
 
     def test_partial_check_projects_reviewed_rows_without_writing(self):
         matrix = self.load()
@@ -1951,8 +2141,8 @@ class ProductionInventoryTest(unittest.TestCase):
             Counter(
                 {
                     "forbidden_semantic": 173,
-                    "declared_backing": 322,
-                    "declared_substrate": 187,
+                    "declared_backing": 318,
+                    "declared_substrate": 191,
                 }
             ),
         )
@@ -2137,6 +2327,26 @@ class ProductionInventoryTest(unittest.TestCase):
         )
         self.assertEqual(rosetta["classification"], "declared_backing")
         self.assertIn("binfmt_misc Rosetta registration", rosetta["evidence"]["resource"])
+
+    def test_sysv_message_queue_fork_caches_are_carrier_substrate(self):
+        expected = {
+            "HA-000034": "message-queue descriptor cache fork ownership",
+            "HA-000035": "inherited message-queue descriptors",
+            "HA-000036": "message-queue wait-word mapping cache fork ownership",
+            "HA-000037": "inherited message-queue wait-word mappings",
+        }
+        for review_id, resource in expected.items():
+            with self.subTest(review_id=review_id):
+                row = next(row for row in self.rows if row["review_id"] == review_id)
+                self.assertEqual(row["classification"], "declared_substrate")
+                self.assertEqual(row["evidence"]["authority"], "authenticated_carrier")
+                self.assertIn(resource, row["evidence"]["resource"])
+
+        for review_id in ("HA-000533", "HA-000534", "HA-000535"):
+            with self.subTest(sibling=review_id):
+                row = next(row for row in self.rows if row["review_id"] == review_id)
+                self.assertEqual(row["classification"], "declared_backing")
+                self.assertEqual(row["evidence"]["authority"], "authorized_backing")
 
     def test_every_review_is_source_specific_without_blanket_templates(self):
         rationales = set()
@@ -2342,6 +2552,64 @@ class IndependentAuthorityArtifactsTest(unittest.TestCase):
             0,
         )
         self.assertEqual(calls, [])
+
+    def test_production_review_validation_rejects_non_source_specific_reviews(self):
+        validate = self.require_interface("validate_inventory_against_receipt")
+        base = reviewed_row(
+            rationale=(
+                "At crates/example/src/lib.rs:10, std::process::id acts on "
+                "the guest-visible process identity."
+            )
+        )
+        mutations = {
+            "wrong file": "At crates/wrong/src/lib.rs:10, std::process::id acts on the identity.",
+            "wrong line": "At crates/example/src/lib.rs:11, std::process::id acts on the identity.",
+            "wrong operation": "At crates/example/src/lib.rs:10, libc::getpid acts on the identity.",
+        }
+        for label, rationale in mutations.items():
+            row = {**base, "rationale": rationale}
+            with self.subTest(label=label):
+                with self.assertRaises(self.host_authority.InventoryError):
+                    validate([row], injected_receipt([row]))
+
+        blanket_rows = []
+        for number in range(1, 14):
+            line = number + 20
+            blanket_rows.append(
+                reviewed_row(
+                    review_id=f"HA-{number:06d}",
+                    location=source(line=line, byte_start=line * 10, byte_end=line * 10 + 5),
+                    evidence={
+                        "authority": "authorized_backing",
+                        "resource": "filesystem artifact selected by the active CLI command",
+                    },
+                    classification="declared_backing",
+                    rationale=(
+                        f"At crates/example/src/lib.rs:{line}, std::process::id "
+                        "accesses the selected filesystem artifact."
+                    ),
+                )
+            )
+        with self.assertRaises(self.host_authority.InventoryError):
+            validate(blanket_rows, injected_receipt(blanket_rows))
+
+    def test_production_review_validation_requires_unique_rationales(self):
+        validate = self.require_interface("validate_inventory_against_receipt")
+        rationale = (
+            "At crates/example/src/lib.rs:10, std::process::id and libc::getpid "
+            "act on one concrete process identity."
+        )
+        rows = [
+            reviewed_row(rationale=rationale),
+            reviewed_row(
+                review_id="HA-000002",
+                operation="libc::getpid",
+                catalog_id="HA-CATALOG-PROCESS-GETPID",
+                rationale=rationale,
+            ),
+        ]
+        with self.assertRaises(self.host_authority.InventoryError):
+            validate(rows, injected_receipt(rows))
 
 
 if __name__ == "__main__":
