@@ -712,6 +712,8 @@ pub(crate) mod net;
 #[macro_use]
 mod perf;
 mod proc;
+#[cfg(test)]
+pub(crate) use proc::build_hvpatch_waitid_siginfo;
 mod proctitle;
 pub(crate) mod resources;
 #[macro_use]

@@ -291,6 +291,7 @@ impl PreparedProcessExec {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ChildExit {
     pid: crate::kernel::TaskId,
+    euid: carrick_abi::NsUid,
     status: i32,
 }
 
@@ -301,6 +302,10 @@ impl ChildExit {
 
     pub(crate) const fn status(self) -> i32 {
         self.status
+    }
+
+    pub(crate) const fn euid(self) -> carrick_abi::NsUid {
+        self.euid
     }
 }
 
@@ -762,17 +767,20 @@ impl ProcessContext {
         ) {
             Ok(crate::kernel::WaitOutcome::Exited(zombie)) => WaitResult::Exited(ChildExit {
                 pid: zombie.key.id,
+                euid: zombie.euid,
                 status: zombie.status.raw(),
             }),
-            Ok(crate::kernel::WaitOutcome::Stopped { task, signal }) => {
+            Ok(crate::kernel::WaitOutcome::Stopped { task, signal, euid }) => {
                 WaitResult::StateChanged(ChildExit {
                     pid: task,
+                    euid,
                     status: (signal.raw() << 8) | 0x7f,
                 })
             }
-            Ok(crate::kernel::WaitOutcome::Continued { task }) => {
+            Ok(crate::kernel::WaitOutcome::Continued { task, euid }) => {
                 WaitResult::StateChanged(ChildExit {
                     pid: task,
+                    euid,
                     status: 0xffff,
                 })
             }
@@ -816,21 +824,24 @@ impl ProcessContext {
         {
             Ok(crate::kernel::WaitOutcome::Exited(zombie)) => WaitResult::Exited(ChildExit {
                 pid: zombie.key.id,
+                euid: zombie.euid,
                 status: zombie.status.raw(),
             }),
             // A P_PIDFD wait runs in Consume mode too, so reporting a
             // job-control event as "still running" DISCARDS it. Render the
             // same wait-status encoding `wait_child_with_job_control`
             // produces and let the caller decide whether it asked for it.
-            Ok(crate::kernel::WaitOutcome::Stopped { task, signal }) => {
+            Ok(crate::kernel::WaitOutcome::Stopped { task, signal, euid }) => {
                 WaitResult::StateChanged(ChildExit {
                     pid: task,
+                    euid,
                     status: (signal.raw() << 8) | 0x7f,
                 })
             }
-            Ok(crate::kernel::WaitOutcome::Continued { task }) => {
+            Ok(crate::kernel::WaitOutcome::Continued { task, euid }) => {
                 WaitResult::StateChanged(ChildExit {
                     pid: task,
+                    euid,
                     status: 0xffff,
                 })
             }
@@ -884,17 +895,20 @@ impl ProcessContext {
             ) {
             Ok(crate::kernel::WaitOutcome::Exited(zombie)) => WaitResult::Exited(ChildExit {
                 pid: zombie.key.id,
+                euid: zombie.euid,
                 status: zombie.status.raw(),
             }),
-            Ok(crate::kernel::WaitOutcome::Stopped { task, signal }) => {
+            Ok(crate::kernel::WaitOutcome::Stopped { task, signal, euid }) => {
                 WaitResult::StateChanged(ChildExit {
                     pid: task,
+                    euid,
                     status: (signal.raw() << 8) | 0x7f,
                 })
             }
-            Ok(crate::kernel::WaitOutcome::Continued { task }) => {
+            Ok(crate::kernel::WaitOutcome::Continued { task, euid }) => {
                 WaitResult::StateChanged(ChildExit {
                     pid: task,
+                    euid,
                     status: 0xffff,
                 })
             }
@@ -1357,6 +1371,14 @@ mod tests {
 
     fn test_vma_source() -> crate::kernel::SharedVmaSnapshotSource {
         SyscallDispatcher::new().vma_snapshot_source()
+    }
+
+    fn siginfo_i32(bytes: &[u8; crate::linux_abi::LINUX_SIGINFO_SIZE], offset: usize) -> i32 {
+        i32::from_ne_bytes(bytes[offset..offset + 4].try_into().expect("siginfo i32"))
+    }
+
+    fn siginfo_u32(bytes: &[u8; crate::linux_abi::LINUX_SIGINFO_SIZE], offset: usize) -> u32 {
+        u32::from_ne_bytes(bytes[offset..offset + 4].try_into().expect("siginfo u32"))
     }
 
     fn authoritative_root() -> (ProcessContext, crate::kernel::KernelContext) {
@@ -2205,6 +2227,13 @@ mod tests {
         let published = prepared.commit().unwrap();
         let (child_context, wait) = published.into_parts().unwrap();
         assert!(wait.is_none());
+        let child_euid = carrick_abi::NsUid::new(5_252);
+        let child_context = parent
+            .kernel_graph()
+            .update_credentials(&child_context, |credentials| {
+                credentials.seed_identity(child_euid, carrick_abi::NsGid::new(5_252));
+            })
+            .expect("set non-root child credentials");
         let child_id = child_context.task().key().id;
         let backend = parent
             .mm_resources()
@@ -2226,13 +2255,17 @@ mod tests {
                 .root_slot(child_context.task().key())
                 .is_none()
         );
-        let WaitResult::Exited(exit) =
-            parent.wait_child_with_job_control(Some(child.pid()), false, false, false)
-        else {
+        let WaitResult::Exited(exit) = parent.wait_child_key(child.task_key(), false) else {
             panic!("kernel zombie was not visible through adapter wait");
         };
         assert_eq!(exit.pid(), child_id);
         assert_eq!(exit.status(), 23 << 8);
+        assert_eq!(exit.euid(), child_euid);
+        let siginfo = crate::dispatch::build_hvpatch_waitid_siginfo(exit);
+        assert_eq!(siginfo_i32(&siginfo, 16), child_id.raw());
+        assert_eq!(siginfo_u32(&siginfo, 20), child_euid.raw());
+        assert_eq!(siginfo_i32(&siginfo, 8), libc::CLD_EXITED);
+        assert_eq!(siginfo_i32(&siginfo, 24), 23);
         assert_eq!(parent.live_process_count(), 1);
     }
 
@@ -2257,6 +2290,13 @@ mod tests {
             .unwrap();
         let (child_context, wait) = published.into_parts().unwrap();
         assert!(wait.is_none());
+        let child_euid = carrick_abi::NsUid::new(5_353);
+        let child_context = parent
+            .kernel_graph()
+            .update_credentials(&child_context, |credentials| {
+                credentials.seed_identity(child_euid, carrick_abi::NsGid::new(5_353));
+            })
+            .expect("set non-root child credentials");
         let backend = parent
             .mm_resources()
             .publish_child(child_context.task().key(), prepared_mm)
@@ -2280,6 +2320,14 @@ mod tests {
             (carrick_abi::LINUX_SIGSTOP << 8) | 0x7f,
             "adapter publishes the Linux wait-status encoding, not Darwin's signal numbers",
         );
+        assert_eq!(stopped.euid(), child_euid);
+        let stopped_siginfo = crate::dispatch::build_hvpatch_waitid_siginfo(stopped);
+        assert_eq!(siginfo_u32(&stopped_siginfo, 20), child_euid.raw());
+        assert_eq!(siginfo_i32(&stopped_siginfo, 8), libc::CLD_STOPPED);
+        assert_eq!(
+            siginfo_i32(&stopped_siginfo, 24),
+            carrick_abi::LINUX_SIGSTOP,
+        );
 
         let sigcont = crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT)
             .expect("SIGCONT");
@@ -2288,12 +2336,25 @@ mod tests {
                 .kernel_graph()
                 .post_signal_to_task(child.task_id(), sigcont, None)
         );
-        let WaitResult::StateChanged(continued) =
-            parent.wait_child_with_job_control(Some(child.pid()), false, false, true)
+        let WaitResult::StateChanged(continued) = parent
+            .wait_child_in_process_group_with_job_control(
+                child.process_group().expect("child process group"),
+                false,
+                false,
+                true,
+            )
         else {
             panic!("task-scoped continue was not waitable");
         };
         assert_eq!(continued.status(), 0xffff);
+        assert_eq!(continued.euid(), child_euid);
+        let continued_siginfo = crate::dispatch::build_hvpatch_waitid_siginfo(continued);
+        assert_eq!(siginfo_u32(&continued_siginfo, 20), child_euid.raw());
+        assert_eq!(siginfo_i32(&continued_siginfo, 8), libc::CLD_CONTINUED,);
+        assert_eq!(
+            siginfo_i32(&continued_siginfo, 24),
+            carrick_abi::LINUX_SIGCONT,
+        );
 
         finalize_test_child(&child, 0, child_tid);
         assert!(matches!(
