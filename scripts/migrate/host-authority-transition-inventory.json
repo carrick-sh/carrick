@@ -1,0 +1,2434 @@
+[
+  {
+    "file": "crates/carrick-runtime/src/dispatch/abi_args.rs",
+    "line": 56,
+    "kind": "host_identity",
+    "text": ".unwrap_or_else(|| std::process::id() as i32)",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is `resources::with_active_context` returning `None`; an HVPatch syscall has an active task context, so this host-identity fallback is migration debt"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/abi_args.rs",
+    "line": 78,
+    "kind": "host_identity",
+    "text": "let host = std::process::id();",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is `resources::with_active_context` returning `None`; an HVPatch syscall has an active task context, so this host-identity fallback is migration debt"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/abi_args.rs",
+    "line": 136,
+    "kind": "host_identity",
+    "text": "HostPid(std::process::id())",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is `resources::with_active_context` returning `None`; an HVPatch syscall has an active task context, so this host-identity fallback is migration debt"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/creds.rs",
+    "line": 132,
+    "kind": "host_identity",
+    "text": "let host = std::process::id();",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "line": 1267,
+    "kind": "host_identity",
+    "text": ".is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "line": 1319,
+    "kind": "host_identity",
+    "text": ".is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "line": 1361,
+    "kind": "ambient_network",
+    "text": "&& let std::net::IpAddr::V4(v4) = a.addr",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "line": 4900,
+    "kind": "host_identity",
+    "text": "if matches!(target, crate::dispatch::signal::SignalTarget::HostProcess(pid) if pid.0 == std::process::id())",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
+    "line": 4901,
+    "kind": "host_identity",
+    "text": "|| matches!(target, crate::dispatch::signal::SignalTarget::HostThread(pid) if pid.0 == std::process::id())",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/access.rs",
+    "line": 319,
+    "kind": "ambient_filesystem",
+    "text": "&& std::fs::metadata(path)",
+    "classification": "declared_backing",
+    "rationale": "the already-resolved filesystem backend path is the concrete authority; this metadata read observes that selected backing and cannot widen a guest path outside it"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+    "line": 355,
+    "kind": "host_identity",
+    "text": "std::env::temp_dir().join(format!(\"carrick-shm-{}\", std::process::id()));",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+    "line": 356,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::create_dir_all(&shm_host);",
+    "classification": "declared_backing",
+    "rationale": "the runtime-created private shared-memory directory is the concrete backing authority; guest values only select entries held by the Carrick file state and cannot widen it"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
+    "line": 364,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::set_permissions(&shm_host, std::fs::Permissions::from_mode(0o1777));",
+    "classification": "declared_backing",
+    "rationale": "the runtime-created private shared-memory directory is the concrete backing authority; guest values only select entries held by the Carrick file state and cannot widen it"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
+    "line": 79,
+    "kind": "carrier_substrate",
+    "text": "std::thread::spawn(move || {",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in dispatch/fs.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
+    "line": 90,
+    "kind": "carrier_substrate",
+    "text": "std::thread::yield_now();",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in dispatch/fs.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
+    "line": 121,
+    "kind": "carrier_substrate",
+    "text": "let worker = std::thread::spawn(move || {",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in dispatch/fs.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
+    "line": 364,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::create_dir_all(lower.path().join(\"walk/sub\")).unwrap();",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in dispatch/fs.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
+    "line": 365,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::write(lower.path().join(\"walk/file.txt\"), b\"lower file\").unwrap();",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in dispatch/fs.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
+    "line": 366,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::write(lower.path().join(\"walk/sub/deep.txt\"), b\"deep\").unwrap();",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in dispatch/fs.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
+    "line": 783,
+    "kind": "ambient_filesystem",
+    "text": "let host = std::fs::metadata(lower.path().join(\"walk/sub/deep.txt\")).unwrap();",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in dispatch/fs.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
+    "line": 1434,
+    "kind": "host_identity",
+    "text": "path.push(format!(\"carrick-splice-loop-{}\", std::process::id()));",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in dispatch/fs.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
+    "line": 1437,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::write(&path, &contents).expect(\"write splice source\");",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in dispatch/fs.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
+    "line": 1516,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::remove_file(&path);",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in dispatch/fs.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
+    "line": 1538,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::remove_file(&path);",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in dispatch/fs.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
+    "line": 1598,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::write(host.path().join(\"target\"), b\"old\").unwrap();",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in dispatch/fs.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
+    "line": 1624,
+    "kind": "ambient_filesystem",
+    "text": "assert_eq!(std::fs::read(host.path().join(\"target\")).unwrap(), b\"old\");",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in dispatch/fs.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
+    "line": 1678,
+    "kind": "carrier_substrate",
+    "text": "let thread = std::thread::spawn(move || {",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in dispatch/fs.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
+    "line": 1739,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::write(host.path().join(\"target\"), b\"payload\").unwrap();",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"fs/tests.rs\"] mod tests;` in dispatch/fs.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 72,
+    "kind": "host_identity",
+    "text": "let dir = std::env::temp_dir().join(format!(\"carrick-alias-maxprot-{}\", std::process::id()));",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 73,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::create_dir_all(&dir).expect(\"scratch dir\");",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 76,
+    "kind": "ambient_filesystem",
+    "text": "let mut file = std::fs::File::create(&path).expect(\"create backing\");",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 80,
+    "kind": "ambient_filesystem",
+    "text": "let map_then_grant_write = |file: &std::fs::File| -> (bool, i32) {",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 98,
+    "kind": "ambient_filesystem",
+    "text": "let readonly = std::fs::File::open(&path).expect(\"open O_RDONLY\");",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 109,
+    "kind": "ambient_filesystem",
+    "text": "let readwrite = std::fs::OpenOptions::new()",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 124,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::remove_dir_all(&dir);",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 654,
+    "kind": "carrier_substrate",
+    "text": "let thread = std::thread::spawn(move || {",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 1534,
+    "kind": "host_process_control",
+    "text": "let child = unsafe { libc::fork() };",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 1774,
+    "kind": "host_process_control",
+    "text": "let child = unsafe { libc::fork() };",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 1781,
+    "kind": "host_identity",
+    "text": "unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 1986,
+    "kind": "host_process_control",
+    "text": "let child = unsafe { libc::fork() };",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 2498,
+    "kind": "host_process_control",
+    "text": "let child = unsafe { libc::fork() };",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 2505,
+    "kind": "host_identity",
+    "text": "unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 3836,
+    "kind": "host_process_control",
+    "text": "let pid = unsafe { libc::fork() };",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 3843,
+    "kind": "host_identity",
+    "text": "unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 4726,
+    "kind": "carrier_substrate",
+    "text": "let worker = std::thread::spawn(move || {",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 4748,
+    "kind": "carrier_substrate",
+    "text": "std::thread::yield_now();",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 4857,
+    "kind": "carrier_substrate",
+    "text": "let worker = std::thread::spawn(move || {",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 4860,
+    "kind": "carrier_substrate",
+    "text": "std::thread::sleep(std::time::Duration::from_millis(40));",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 5883,
+    "kind": "carrier_substrate",
+    "text": "let thread = std::thread::spawn(move || {",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mem/tests.rs",
+    "line": 5984,
+    "kind": "carrier_substrate",
+    "text": "let thread = std::thread::spawn(move || {",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact compile discriminator is `#[cfg(test)] #[path = \"mem/tests.rs\"] mod tests;` in dispatch/mem.rs; HVPatch release builds do not compile this test module"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "line": 2538,
+    "kind": "host_identity",
+    "text": "let observed_pid = i32::try_from(std::process::id()).unwrap_or(1);",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "line": 3368,
+    "kind": "host_identity",
+    "text": "let observed_pid = i32::try_from(std::process::id())",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "line": 3663,
+    "kind": "host_identity",
+    "text": ".unwrap_or_else(|| std::process::id() as i32)",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "line": 4527,
+    "kind": "ambient_filesystem",
+    "text": "pub fn open_exec_host_file(&self, path: &str) -> Option<std::fs::File> {",
+    "classification": "declared_backing",
+    "rationale": "the captured Carrick file-table/rootfs capability is the concrete authority; the helper opens only its already-authorized executable backing and cannot widen a guest path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "line": 4703,
+    "kind": "host_identity",
+    "text": ".free_if_owner(index, std::process::id());",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mod.rs",
+    "line": 4895,
+    "kind": "host_identity",
+    "text": ".set_controlling(host_slave_name, std::process::id())",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mqueue.rs",
+    "line": 390,
+    "kind": "host_identity",
+    "text": ".unwrap_or_else(|| std::process::id() as i32);",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mqueue.rs",
+    "line": 545,
+    "kind": "host_identity",
+    "text": ".unwrap_or_else(|| std::process::id() as i32);",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mqueue.rs",
+    "line": 562,
+    "kind": "host_process_control",
+    "text": "unsafe { libc::kill(pid, host_signo) };",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/mqueue.rs",
+    "line": 573,
+    "kind": "host_identity",
+    "text": ".unwrap_or_else(|| std::process::id() as i32);",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 220,
+    "kind": "ambient_network",
+    "text": "fn host_sockaddr_to_socket_addr(bytes: &[u8]) -> Option<std::net::SocketAddr> {",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 231,
+    "kind": "ambient_network",
+    "text": "let ip = std::net::Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 232,
+    "kind": "ambient_network",
+    "text": "Some(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port))",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 241,
+    "kind": "ambient_network",
+    "text": "Some(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 242,
+    "kind": "ambient_network",
+    "text": "std::net::Ipv6Addr::from(octets),",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 252,
+    "kind": "ambient_network",
+    "text": "fn socket_addr_to_host_sockaddr(addr: std::net::SocketAddr) -> Option<Vec<u8>> {",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 254,
+    "kind": "ambient_network",
+    "text": "std::net::SocketAddr::V4(v4) => {",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 261,
+    "kind": "ambient_network",
+    "text": "std::net::SocketAddr::V6(v6) => {",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 272,
+    "kind": "ambient_network",
+    "text": "fn socket_addr_to_linux_sockaddr(addr: std::net::SocketAddr) -> Option<Vec<u8>> {",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 274,
+    "kind": "ambient_network",
+    "text": "std::net::SocketAddr::V4(v4) => {",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 281,
+    "kind": "ambient_network",
+    "text": "std::net::SocketAddr::V6(v6) => {",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 319,
+    "kind": "ambient_network",
+    "text": "fn host_socket_addr(host_fd: i32, _family: i32, peer: bool) -> Option<std::net::SocketAddr> {",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 2393,
+    "kind": "ambient_network",
+    "text": "guest_peer: std::net::SocketAddr,",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 2408,
+    "kind": "ambient_network",
+    "text": ".then_some(GuestSocketAddr(std::net::SocketAddr::new(",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 2410,
+    "kind": "ambient_network",
+    "text": "std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 2412,
+    "kind": "ambient_network",
+    "text": "std::net::IpAddr::V4(self.network.spec.ipv4)",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 2432,
+    "kind": "ambient_network",
+    "text": "guest_peer: std::net::SocketAddr,",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 2450,
+    "kind": "ambient_network",
+    "text": "&& let Some(host_local) = socket_addr_to_host_sockaddr(std::net::SocketAddr::new(",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 2451,
+    "kind": "ambient_network",
+    "text": "std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 2578,
+    "kind": "host_identity",
+    "text": "let dest_pid = if *pid != 0 { *pid } else { std::process::id() };",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 2671,
+    "kind": "ambient_network",
+    "text": "requested: std::net::SocketAddr,",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 2707,
+    "kind": "ambient_network",
+    "text": "requested: std::net::SocketAddr,",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 2746,
+    "kind": "ambient_network",
+    "text": "fn is_dns_gateway_addr(&self, addr: std::net::SocketAddr) -> bool {",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 2748,
+    "kind": "ambient_network",
+    "text": "&& matches!(addr.ip(), std::net::IpAddr::V4(ip) if ip == self.network.spec.gateway_v4)",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 2751,
+    "kind": "ambient_network",
+    "text": "fn connected_guest_peer_addr(&self, fd: i32) -> Option<std::net::SocketAddr> {",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 2880,
+    "kind": "ambient_network",
+    "text": "&& matches!(listener_ip, std::net::IpAddr::V4(ip) if !ip.is_loopback()))",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 2881,
+    "kind": "ambient_network",
+    "text": ".then_some(GuestSocketAddr(std::net::SocketAddr::new(",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 5630,
+    "kind": "host_identity",
+    "text": "std::process::id()",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 5654,
+    "kind": "ambient_filesystem",
+    "text": "if let Ok(md) = std::fs::symlink_metadata(&*p) {",
+    "classification": "declared_backing",
+    "rationale": "the runtime-owned Unix-socket backing directory is the concrete authority; a guest socket name is translated to an allocated local node and cannot choose an ambient host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 5657,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::remove_file(&*p);",
+    "classification": "declared_backing",
+    "rationale": "the runtime-owned Unix-socket backing directory is the concrete authority; a guest socket name is translated to an allocated local node and cannot choose an ambient host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 5720,
+    "kind": "ambient_network",
+    "text": "let mut rewritten_bind: Option<(std::net::SocketAddr, PortProtocol)> = None;",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 5754,
+    "kind": "ambient_filesystem",
+    "text": "&& let Ok(md) = std::fs::symlink_metadata(path)",
+    "classification": "declared_backing",
+    "rationale": "the runtime-owned Unix-socket backing directory is the concrete authority; a guest socket name is translated to an allocated local node and cannot choose an ambient host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 5758,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::remove_file(path);",
+    "classification": "declared_backing",
+    "rationale": "the runtime-owned Unix-socket backing directory is the concrete authority; a guest socket name is translated to an allocated local node and cannot choose an ambient host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 5796,
+    "kind": "ambient_network",
+    "text": "std::net::IpAddr::V4(ip)",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 5797,
+    "kind": "ambient_network",
+    "text": "if ip == std::net::Ipv4Addr::UNSPECIFIED || ip == this.network.spec.ipv4",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 5801,
+    "kind": "ambient_network",
+    "text": "socket_addr_to_host_sockaddr(std::net::SocketAddr::new(",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 5802,
+    "kind": "ambient_network",
+    "text": "std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 5844,
+    "kind": "ambient_network",
+    "text": "std::net::SocketAddr::new(guest_local.ip(), host_local.port())",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 5998,
+    "kind": "ambient_network",
+    "text": "std::net::SocketAddr,",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 6011,
+    "kind": "ambient_network",
+    "text": "let synthetic_host_peer = std::net::SocketAddr::new(",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 6012,
+    "kind": "ambient_network",
+    "text": "std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 6053,
+    "kind": "ambient_network",
+    "text": "let synthetic_host_peer = std::net::SocketAddr::new(",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 6054,
+    "kind": "ambient_network",
+    "text": "std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net.rs",
+    "line": 6381,
+    "kind": "host_identity",
+    "text": "std::process::id(), fd.0, len, dest_addr.0",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
+    "line": 833,
+    "kind": "ambient_network",
+    "text": "std::net::IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
+    "line": 928,
+    "kind": "ambient_network",
+    "text": "fn ip_addr_bytes(addr: std::net::IpAddr) -> Option<(u8, Vec<u8>)> {",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
+    "line": 930,
+    "kind": "ambient_network",
+    "text": "std::net::IpAddr::V4(ip) => Some((LINUX_AF_INET as u8, ip.octets().to_vec())),",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
+    "line": 931,
+    "kind": "ambient_network",
+    "text": "std::net::IpAddr::V6(ip) => Some((LINUX_AF_INET6 as u8, ip.octets().to_vec())),",
+    "classification": "declared_backing",
+    "rationale": "the typed address is already-authorized wire data in Carrick's network model; converting its bytes cannot select host identity or widen the configured network attachment"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
+    "line": 1434,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::create_dir_all(&base);",
+    "classification": "declared_backing",
+    "rationale": "the runtime-owned Unix-socket backing directory is the concrete authority; a guest socket name is translated to an allocated local node and cannot choose an ambient host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
+    "line": 1472,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::create_dir_all(&base);",
+    "classification": "declared_backing",
+    "rationale": "the runtime-owned Unix-socket backing directory is the concrete authority; a guest socket name is translated to an allocated local node and cannot choose an ambient host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 424,
+    "kind": "host_identity",
+    "text": "0 => PtraceWaitTarget::ProcessGroup(HostPgid(unsafe { libc::getpgrp() } as u32)),",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 452,
+    "kind": "host_identity",
+    "text": "u32::try_from(unsafe { libc::getpgrp() }).ok()",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 479,
+    "kind": "host_identity",
+    "text": "PtraceWaitTarget::Any => crate::guest_cpu::wait_any_park_pid(std::process::id()),",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 481,
+    "kind": "host_identity",
+    "text": "let has_direct_member = crate::guest_cpu::direct_children_for_wait(std::process::id())",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 491,
+    "kind": "host_identity",
+    "text": "crate::guest_cpu::pending_adopted_child(std::process::id(), target)",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 511,
+    "kind": "host_process_control",
+    "text": "libc::waitid(",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 794,
+    "kind": "host_identity",
+    "text": "bootstrap_host_pid: std::process::id(),",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 924,
+    "kind": "host_identity",
+    "text": "std::process::id() != self.proc.lock().bootstrap_host_pid",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 960,
+    "kind": "host_identity",
+    "text": "u32::try_from(unsafe { libc::getppid() }).unwrap_or(0)",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 1019,
+    "kind": "host_identity",
+    "text": "if std::process::id() == bootstrap_host_pid {",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 1024,
+    "kind": "host_identity",
+    "text": "unsafe { libc::getppid() as u32 }",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 1818,
+    "kind": "host_identity",
+    "text": "let ns_tid = if tid == std::process::id() {",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 2038,
+    "kind": "carrier_substrate",
+    "text": "std::thread::yield_now();",
+    "classification": "declared_substrate",
+    "rationale": "the call only schedules, parks, wakes, or exits the authenticated Carrick carrier/vCPU; it accepts no guest PID, UID, group, or namespace identifier"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 2335,
+    "kind": "carrier_substrate",
+    "text": "std::thread::sleep(timeout);",
+    "classification": "declared_substrate",
+    "rationale": "the call only schedules, parks, wakes, or exits the authenticated Carrick carrier/vCPU; it accepts no guest PID, UID, group, or namespace identifier"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 2687,
+    "kind": "host_process_control",
+    "text": "(unsafe { libc::kill(host, 0) == 0 })",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 2701,
+    "kind": "host_identity",
+    "text": "let tracer_pid = u32::try_from(unsafe { libc::getppid() }).unwrap_or(0);",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 3005,
+    "kind": "host_identity",
+    "text": "unsafe { libc::getuid() },",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 3058,
+    "kind": "host_identity",
+    "text": "(libc::P_PGID, unsafe { libc::getpgrp() } as libc::id_t)",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 3105,
+    "kind": "host_process_control",
+    "text": "libc::waitid(",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 3174,
+    "kind": "host_process_control",
+    "text": "libc::waitid(host_idtype, host_id, &mut info, internal_options)",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 3213,
+    "kind": "host_process_control",
+    "text": "libc::waitid(",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 3278,
+    "kind": "host_process_control",
+    "text": "let r = unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 3281,
+    "kind": "carrier_substrate",
+    "text": "std::thread::sleep(std::time::Duration::from_millis(10));",
+    "classification": "declared_substrate",
+    "rationale": "the call only schedules, parks, wakes, or exits the authenticated Carrick carrier/vCPU; it accepts no guest PID, UID, group, or namespace identifier"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 3496,
+    "kind": "host_identity",
+    "text": "crate::guest_cpu::direct_child_ptrace_stop_pending(std::process::id())",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 3526,
+    "kind": "host_identity",
+    "text": "return crate::guest_cpu::wait_any_park_pid(std::process::id());",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 3540,
+    "kind": "host_process_control",
+    "text": "libc::wait4(",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 3604,
+    "kind": "host_process_control",
+    "text": "libc::wait4(",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 3629,
+    "kind": "host_process_control",
+    "text": "libc::wait4(",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 3672,
+    "kind": "host_process_control",
+    "text": "unsafe { libc::wait4(host_target, &mut host_status, host_options, &mut host_rusage) };",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 3701,
+    "kind": "host_identity",
+    "text": "crate::guest_cpu::adopted_child_wait(std::process::id(), host_target)",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 3795,
+    "kind": "host_process_control",
+    "text": "&& unsafe { libc::kill(host_target, 0) } == -1",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 3841,
+    "kind": "host_process_control",
+    "text": "libc::wait4(result, &mut host_status, host_options, &mut host_rusage)",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/proc.rs",
+    "line": 4189,
+    "kind": "host_identity",
+    "text": "let target_euid = if host_pid as u32 == std::process::id() {",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/signal.rs",
+    "line": 1481,
+    "kind": "host_identity",
+    "text": "let signal_target_names_self = pid == std::process::id() as i64",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/signal.rs",
+    "line": 2296,
+    "kind": "host_identity",
+    "text": "let host_pid = std::process::id() as i64;",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/signal.rs",
+    "line": 2630,
+    "kind": "host_identity",
+    "text": "let host_pid = std::process::id() as i64;",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/signal.rs",
+    "line": 2664,
+    "kind": "host_identity",
+    "text": "if target == 0 && unsafe { libc::getpgrp() } != std::process::id() as i32 {",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/signal.rs",
+    "line": 2710,
+    "kind": "host_identity",
+    "text": ".unwrap_or_else(|| unsafe { libc::getuid() });",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/signal.rs",
+    "line": 2762,
+    "kind": "host_process_control",
+    "text": "let rc = unsafe { libc::kill(target as i32, host_signum) };",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 700,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::create_dir_all(SHM_DIR);",
+    "classification": "declared_backing",
+    "rationale": "the fixed runtime `SHM_DIR` is the concrete IPC backing authority; guest IPC identifiers are encoded beneath that root and cannot select an arbitrary host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 702,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::set_permissions(SHM_DIR, std::fs::Permissions::from_mode(0o1777));",
+    "classification": "declared_backing",
+    "rationale": "the fixed runtime `SHM_DIR` is the concrete IPC backing authority; guest IPC identifiers are encoded beneath that root and cannot select an arbitrary host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 710,
+    "kind": "host_identity",
+    "text": "std::process::id(),",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 791,
+    "kind": "host_identity",
+    "text": "std::process::id(),",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 802,
+    "kind": "host_identity",
+    "text": "std::process::id()",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 1230,
+    "kind": "ambient_filesystem",
+    "text": "let entries = std::fs::read_dir(SHM_DIR).map_err(|_| LINUX_EINVAL)?;",
+    "classification": "declared_backing",
+    "rationale": "the fixed runtime `SHM_DIR` is the concrete IPC backing authority; guest IPC identifiers are encoded beneath that root and cannot select an arbitrary host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 1252,
+    "kind": "ambient_filesystem",
+    "text": "if let Ok(entries) = std::fs::read_dir(SHM_DIR) {",
+    "classification": "declared_backing",
+    "rationale": "the fixed runtime `SHM_DIR` is the concrete IPC backing authority; guest IPC identifiers are encoded beneath that root and cannot select an arbitrary host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 1256,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::remove_file(path);",
+    "classification": "declared_backing",
+    "rationale": "the fixed runtime `SHM_DIR` is the concrete IPC backing authority; guest IPC identifiers are encoded beneath that root and cannot select an arbitrary host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 1283,
+    "kind": "host_identity",
+    "text": "host_pid: unsafe { libc::getpid() },",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 1289,
+    "kind": "host_identity",
+    "text": "let host_pid = unsafe { libc::getpid() };",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 1718,
+    "kind": "host_identity",
+    "text": "host_pid: unsafe { libc::getpid() },",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 1724,
+    "kind": "host_identity",
+    "text": "let host_pid = unsafe { libc::getpid() };",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 1849,
+    "kind": "ambient_filesystem",
+    "text": "f: impl FnOnce(&mut std::fs::File, u64) -> std::io::Result<R>,",
+    "classification": "declared_backing",
+    "rationale": "the fixed runtime `SHM_DIR` is the concrete IPC backing authority; guest IPC identifiers are encoded beneath that root and cannot select an arbitrary host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 1855,
+    "kind": "ambient_filesystem",
+    "text": "let mut file = std::fs::OpenOptions::new()",
+    "classification": "declared_backing",
+    "rationale": "the fixed runtime `SHM_DIR` is the concrete IPC backing authority; guest IPC identifiers are encoded beneath that root and cannot select an arbitrary host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 2048,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::remove_file(shm_nattch_path(&segment.path));",
+    "classification": "declared_backing",
+    "rationale": "the fixed runtime `SHM_DIR` is the concrete IPC backing authority; guest IPC identifiers are encoded beneath that root and cannot select an arbitrary host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 2297,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::remove_file(&segment.path);",
+    "classification": "declared_backing",
+    "rationale": "the fixed runtime `SHM_DIR` is the concrete IPC backing authority; guest IPC identifiers are encoded beneath that root and cannot select an arbitrary host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 2298,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::remove_file(shm_nattch_path(&segment.path));",
+    "classification": "declared_backing",
+    "rationale": "the fixed runtime `SHM_DIR` is the concrete IPC backing authority; guest IPC identifiers are encoded beneath that root and cannot select an arbitrary host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 2804,
+    "kind": "carrier_substrate",
+    "text": "std::thread::yield_now();",
+    "classification": "declared_substrate",
+    "rationale": "the call only schedules, parks, wakes, or exits the authenticated Carrick carrier/vCPU; it accepts no guest PID, UID, group, or namespace identifier"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 2884,
+    "kind": "carrier_substrate",
+    "text": "std::thread::yield_now();",
+    "classification": "declared_substrate",
+    "rationale": "the call only schedules, parks, wakes, or exits the authenticated Carrick carrier/vCPU; it accepts no guest PID, UID, group, or namespace identifier"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 3091,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::rename(&path, &id_path).map_err(|_| LINUX_EIO)?;",
+    "classification": "declared_backing",
+    "rationale": "the fixed runtime `SHM_DIR` is the concrete IPC backing authority; guest IPC identifiers are encoded beneath that root and cannot select an arbitrary host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 3272,
+    "kind": "ambient_filesystem",
+    "text": "if let Ok(entries) = std::fs::read_dir(SHM_DIR) {",
+    "classification": "declared_backing",
+    "rationale": "the fixed runtime `SHM_DIR` is the concrete IPC backing authority; guest IPC identifiers are encoded beneath that root and cannot select an arbitrary host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 3410,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::remove_file(&path);",
+    "classification": "declared_backing",
+    "rationale": "the fixed runtime `SHM_DIR` is the concrete IPC backing authority; guest IPC identifiers are encoded beneath that root and cannot select an arbitrary host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
+    "line": 3411,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::remove_file(msg_queue_wait_path(&path));",
+    "classification": "declared_backing",
+    "rationale": "the fixed runtime `SHM_DIR` is the concrete IPC backing authority; guest IPC identifiers are encoded beneath that root and cannot select an arbitrary host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/time.rs",
+    "line": 1061,
+    "kind": "host_identity",
+    "text": "if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/time.rs",
+    "line": 1084,
+    "kind": "host_identity",
+    "text": "libc::setrlimit(libc::RLIMIT_NOFILE, &new);",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/time.rs",
+    "line": 1131,
+    "kind": "carrier_substrate",
+    "text": "std::thread::yield_now();",
+    "classification": "declared_substrate",
+    "rationale": "the call only schedules, parks, wakes, or exits the authenticated Carrick carrier/vCPU; it accepts no guest PID, UID, group, or namespace identifier"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/time.rs",
+    "line": 1164,
+    "kind": "carrier_substrate",
+    "text": "std::thread::Builder::new()",
+    "classification": "declared_substrate",
+    "rationale": "the call only schedules, parks, wakes, or exits the authenticated Carrick carrier/vCPU; it accepts no guest PID, UID, group, or namespace identifier"
+  },
+  {
+    "file": "crates/carrick-runtime/src/dispatch/time.rs",
+    "line": 1217,
+    "kind": "carrier_substrate",
+    "text": "std::thread::sleep(Duration::from_nanos(delay_ns));",
+    "classification": "declared_substrate",
+    "rationale": "the call only schedules, parks, wakes, or exits the authenticated Carrick carrier/vCPU; it accepts no guest PID, UID, group, or namespace identifier"
+  },
+  {
+    "file": "crates/carrick-runtime/src/namespace/pid.rs",
+    "line": 199,
+    "kind": "host_identity",
+    "text": "let init_host_pgid = unsafe { libc::getpgrp() };",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/namespace/pid.rs",
+    "line": 206,
+    "kind": "host_identity",
+    "text": "let init_host_sid = unsafe { libc::getsid(0) };",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/namespace/pid.rs",
+    "line": 331,
+    "kind": "host_identity",
+    "text": "let pgid = unsafe { libc::getpgrp() };",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/namespace/pid.rs",
+    "line": 377,
+    "kind": "host_identity",
+    "text": "let host = std::process::id();",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/namespace/pid.rs",
+    "line": 417,
+    "kind": "host_identity",
+    "text": "return unsafe { libc::getppid() } as u32;",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/namespace/pid.rs",
+    "line": 419,
+    "kind": "host_identity",
+    "text": "let self_host = std::process::id();",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/namespace/pid.rs",
+    "line": 436,
+    "kind": "host_identity",
+    "text": "let host_ppid = unsafe { libc::getppid() } as u32;",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/namespace/pid.rs",
+    "line": 641,
+    "kind": "host_identity",
+    "text": "r.mark_execed(std::process::id());",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/namespace/pid.rs",
+    "line": 652,
+    "kind": "host_identity",
+    "text": "r.is_execed_child_of(target_host_pid, std::process::id())",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/namespace/pid.rs",
+    "line": 667,
+    "kind": "host_identity",
+    "text": "register_child(std::process::id(), 0);",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/namespace/supervisor.rs",
+    "line": 179,
+    "kind": "host_process_control",
+    "text": "let rc = unsafe { libc::kill(pid, 0) };",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/namespace/supervisor.rs",
+    "line": 241,
+    "kind": "host_process_control",
+    "text": "libc::killpg(init_host_pid, libc::SIGKILL);",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/namespace/supervisor.rs",
+    "line": 257,
+    "kind": "host_process_control",
+    "text": "libc::kill(host as i32, libc::SIGKILL);",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/namespace/supervisor.rs",
+    "line": 435,
+    "kind": "host_process_control",
+    "text": "let child = unsafe { libc::fork() };",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/namespace/supervisor.rs",
+    "line": 500,
+    "kind": "host_process_control",
+    "text": "let child = unsafe { libc::fork() };",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/namespace/supervisor.rs",
+    "line": 511,
+    "kind": "host_process_control",
+    "text": "libc::waitid(",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/namespace/supervisor.rs",
+    "line": 525,
+    "kind": "carrier_substrate",
+    "text": "std::thread::sleep(Duration::from_millis(5));",
+    "classification": "declared_substrate",
+    "rationale": "the call only schedules, parks, wakes, or exits the authenticated Carrick carrier/vCPU; it accepts no guest PID, UID, group, or namespace identifier"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 173,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::write(&sidecar, buf).map_err(map_io_error)",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 185,
+    "kind": "ambient_filesystem",
+    "text": "let Ok(buf) = std::fs::read(&sidecar) else {",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 311,
+    "kind": "ambient_filesystem",
+    "text": "fn metadata_from_host(host: &Path, meta: std::fs::Metadata, nofollow: bool) -> Metadata {",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 375,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::metadata(&host)",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 382,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::symlink_metadata(&host)",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 403,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::read_link(&host).map_err(map_io_error)",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 408,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::read(&host).map_err(map_io_error)",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 414,
+    "kind": "ambient_filesystem",
+    "text": "for entry in std::fs::read_dir(&host).map_err(map_io_error)? {",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 483,
+    "kind": "ambient_filesystem",
+    "text": "let existed_before_create = flags.create && std::fs::symlink_metadata(&host).is_ok();",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 532,
+    "kind": "ambient_filesystem",
+    "text": "for entry in std::fs::read_dir(&host).map_err(map_io_error)? {",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 550,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::create_dir(&host).map_err(map_io_error)?;",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 553,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode));",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 589,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::remove_file(&sidecar);",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 591,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::remove_file(&host).map_err(map_io_error)",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 606,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::remove_dir(&host).map_err(map_io_error)",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 621,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::rename(&host_from, &host_to).map_err(map_io_error)?;",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 632,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::rename(&src, &dst);",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 634,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::remove_file(&dst);",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 654,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::hard_link(&host_from, &host_to).map_err(map_io_error)",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 663,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode)).map_err(map_io_error)",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 679,
+    "kind": "ambient_filesystem",
+    "text": "let file = std::fs::OpenOptions::new()",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 686,
+    "kind": "ambient_filesystem",
+    "text": "file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 709,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::symlink_metadata(&host)",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 711,
+    "kind": "ambient_filesystem",
+    "text": "std::fs::metadata(&host)",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/bind.rs",
+    "line": 773,
+    "kind": "ambient_filesystem",
+    "text": "let file = std::fs::OpenOptions::new()",
+    "classification": "declared_backing",
+    "rationale": "the configured BindVfs root is the concrete authority; normalized guest-relative paths select bytes beneath that root and cannot widen to another host path"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/dev.rs",
+    "line": 150,
+    "kind": "host_identity",
+    "text": "let index = table.insert(slave_name, std::process::id());",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID is recorded in the PTY table while producing guest terminal state, so host identity participates in guest-visible metadata and remains explicit semantic debt"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/devpts.rs",
+    "line": 263,
+    "kind": "host_identity",
+    "text": "let index = table.insert(slave_name, std::process::id());",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/etc_services.rs",
+    "line": 92,
+    "kind": "ambient_filesystem",
+    "text": "if let Ok(host) = std::fs::read(\"/etc/services\")",
+    "classification": "forbidden_semantic",
+    "rationale": "the guest /etc/services answer is derived from the ambient host `/etc/services` file, so host file contents decide guest-visible metadata and this remains explicit semantic debt"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/proc.rs",
+    "line": 509,
+    "kind": "host_identity",
+    "text": "if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, limit.as_mut_ptr()) } != 0 {",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/proc.rs",
+    "line": 529,
+    "kind": "ambient_filesystem",
+    "text": "let raw = std::fs::read_to_string(\"/proc/sys/kernel/threads-max\").ok()?;",
+    "classification": "declared_backing",
+    "rationale": "the runtime-owned backing object is the concrete authority; the host file operation only reads or mutates its already-authorized bytes and cannot widen a guest-controlled value"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/proc.rs",
+    "line": 1220,
+    "kind": "host_identity",
+    "text": "return Some((true, std::process::id()));",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/proc.rs",
+    "line": 1228,
+    "kind": "host_identity",
+    "text": "Some((host == std::process::id(), host))",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/proc.rs",
+    "line": 1620,
+    "kind": "host_identity",
+    "text": "let self_host_pid = std::process::id();",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/proc.rs",
+    "line": 1650,
+    "kind": "host_identity",
+    "text": "if pid == std::process::id() {",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/proc.rs",
+    "line": 1686,
+    "kind": "host_process_control",
+    "text": "libc::waitid(",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/proc.rs",
+    "line": 1726,
+    "kind": "host_identity",
+    "text": "(std::process::id(), None)",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/proc.rs",
+    "line": 2014,
+    "kind": "host_identity",
+    "text": "proc_pid_dir_entries_for_known_process(path, host_pid == std::process::id())",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/proc.rs",
+    "line": 3172,
+    "kind": "host_identity",
+    "text": "|| unsafe { libc::getppid() } as u32,",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/proc.rs",
+    "line": 3474,
+    "kind": "host_identity",
+    "text": "let ppid = unsafe { libc::getppid() } as u32;",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/proc.rs",
+    "line": 3475,
+    "kind": "host_identity",
+    "text": "let me = std::process::id();",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/proc.rs",
+    "line": 3525,
+    "kind": "host_identity",
+    "text": "let ppid = unsafe { libc::getppid() } as u32;",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/proc.rs",
+    "line": 3526,
+    "kind": "host_identity",
+    "text": "let me = std::process::id();",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/proc.rs",
+    "line": 3593,
+    "kind": "host_identity",
+    "text": "let fallback_ppid = std::process::id();",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/proc.rs",
+    "line": 3594,
+    "kind": "host_identity",
+    "text": "let fallback_pgid = unsafe { libc::getpgrp() as u32 };",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/proc.rs",
+    "line": 3664,
+    "kind": "host_identity",
+    "text": "\"self\" | \"thread-self\" => std::process::id(),",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-runtime/src/vfs/resolvconf.rs",
+    "line": 113,
+    "kind": "ambient_filesystem",
+    "text": "if let Ok(host) = std::fs::read_to_string(\"/etc/resolv.conf\") {",
+    "classification": "forbidden_semantic",
+    "rationale": "the guest resolver answer is derived from the ambient host `/etc/resolv.conf` file, so host namespace configuration decides guest-visible metadata and this remains explicit semantic debt"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
+    "line": 19,
+    "kind": "carrier_substrate",
+    "text": "hv_vcpu_set_reg, hv_vcpu_t, hv_vcpus_exit, hv_vm_config_create,",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_fork_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
+    "line": 101,
+    "kind": "carrier_substrate",
+    "text": "let stopper = std::thread::spawn(move || {",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_fork_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
+    "line": 103,
+    "kind": "carrier_substrate",
+    "text": "unsafe { hv_vcpus_exit(&vcpu, 1) }",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_fork_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
+    "line": 295,
+    "kind": "host_process_control",
+    "text": "let pid = unsafe { libc::fork() };",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_fork_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
+    "line": 487,
+    "kind": "host_process_control",
+    "text": "let pid = unsafe { libc::fork() };",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_fork_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
+    "line": 597,
+    "kind": "host_identity",
+    "text": "let pid = unsafe { libc::getpid() };",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_fork_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
+    "line": 598,
+    "kind": "carrier_substrate",
+    "text": "let sender = std::thread::spawn(move || {",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_fork_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
+    "line": 603,
+    "kind": "host_process_control",
+    "text": "libc::kill(pid, signum);",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_fork_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
+    "line": 607,
+    "kind": "carrier_substrate",
+    "text": "std::thread::yield_now();",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_fork_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
+    "line": 675,
+    "kind": "host_process_control",
+    "text": "let pid = unsafe { libc::fork() };",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_fork_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
+    "line": 751,
+    "kind": "host_process_control",
+    "text": "let pid = unsafe { libc::fork() };",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_fork_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
+    "line": 816,
+    "kind": "host_process_control",
+    "text": "let child = unsafe { libc::fork() };",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_fork_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
+    "line": 944,
+    "kind": "carrier_substrate",
+    "text": "std::thread::spawn(move || {",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_fork_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
+    "line": 996,
+    "kind": "host_process_control",
+    "text": "let pid = unsafe { libc::fork() };",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_fork_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
+    "line": 1078,
+    "kind": "host_process_control",
+    "text": "unsafe { libc::kill(pid, libc::SIGKILL) };",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_fork_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
+    "line": 1091,
+    "kind": "carrier_substrate",
+    "text": "std::thread::sleep(Duration::from_micros(micros));",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_fork_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_kernel_memory_probe.rs",
+    "line": 687,
+    "kind": "carrier_substrate",
+    "text": "workers.push(std::thread::spawn(move || {",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_kernel_memory_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_kernel_memory_probe.rs",
+    "line": 935,
+    "kind": "host_identity",
+    "text": "\"pid\": std::process::id(),",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_kernel_memory_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_svc_tax_probe.rs",
+    "line": 387,
+    "kind": "host_process_control",
+    "text": "let child = unsafe { libc::fork() };",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_svc_tax_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvf_svc_tax_probe.rs",
+    "line": 462,
+    "kind": "host_identity",
+    "text": "std::process::id(),",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `hvf_svc_tax_probe` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/bin/hvpatch_probe_support/mod.rs",
+    "line": 355,
+    "kind": "host_identity",
+    "text": "std::process::id(),",
+    "classification": "legacy_unreachable",
+    "rationale": "the exact runtime discriminator is Cargo selecting the standalone `mod` binary target; carrick-cli links the HVPatch library path, not this probe executable"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
+    "line": 249,
+    "kind": "host_identity",
+    "text": "owner_pid: unsafe { libc::getpid() },",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
+    "line": 265,
+    "kind": "host_identity",
+    "text": "if unsafe { libc::getpid() } == self.owner_pid {",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
+    "line": 488,
+    "kind": "host_process_control",
+    "text": "libc::waitid(",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
+    "line": 1006,
+    "kind": "host_process_control",
+    "text": "libc::kill(target_host_pid, XSIG_NUDGE_HOST_SIGNUM);",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
+    "line": 1304,
+    "kind": "host_identity",
+    "text": "record_sender(signum, unsafe { libc::getpid() });",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/io_wait.rs",
+    "line": 168,
+    "kind": "host_process_control",
+    "text": "libc::waitid(",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/io_wait.rs",
+    "line": 188,
+    "kind": "host_identity",
+    "text": "crate::guest_cpu::direct_children_for_wait(std::process::id())",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/io_wait.rs",
+    "line": 217,
+    "kind": "host_identity",
+    "text": "&& (crate::guest_cpu::direct_child_ptrace_stop_pending(std::process::id())",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/io_wait.rs",
+    "line": 229,
+    "kind": "host_process_control",
+    "text": "libc::waitid(",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/io_wait.rs",
+    "line": 906,
+    "kind": "host_identity",
+    "text": "let cap = (host_direct_children_for_wait(std::process::id()).len()",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/io_wait.rs",
+    "line": 914,
+    "kind": "host_identity",
+    "text": "for child in host_direct_children_for_wait(std::process::id()) {",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/itimer.rs",
+    "line": 20,
+    "kind": "carrier_substrate",
+    "text": "let _ = std::thread::Builder::new()",
+    "classification": "declared_substrate",
+    "rationale": "the call only schedules, parks, wakes, or exits the authenticated Carrick carrier/vCPU; it accepts no guest PID, UID, group, or namespace identifier"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/posix_timer.rs",
+    "line": 30,
+    "kind": "carrier_substrate",
+    "text": "let _ = std::thread::Builder::new()",
+    "classification": "declared_substrate",
+    "rationale": "the call only schedules, parks, wakes, or exits the authenticated Carrick carrier/vCPU; it accepts no guest PID, UID, group, or namespace identifier"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 307,
+    "kind": "ambient_filesystem",
+    "text": "file: std::sync::Arc<std::fs::File>,",
+    "classification": "declared_backing",
+    "rationale": "the VM carrier creates and owns this temporary backing file; the carrier-generated path, not a guest identifier, determines the only host file it can access"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 365,
+    "kind": "ambient_filesystem",
+    "text": ") -> Result<std::fs::File, std::io::Error> {",
+    "classification": "declared_backing",
+    "rationale": "the VM carrier creates and owns this temporary backing file; the carrier-generated path, not a guest identifier, determines the only host file it can access"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 378,
+    "kind": "host_identity",
+    "text": "std::process::id()",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 380,
+    "kind": "ambient_filesystem",
+    "text": "let file = std::fs::OpenOptions::new()",
+    "classification": "declared_backing",
+    "rationale": "the VM carrier creates and owns this temporary backing file; the carrier-generated path, not a guest identifier, determines the only host file it can access"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 386,
+    "kind": "ambient_filesystem",
+    "text": "if let Err(error) = std::fs::remove_file(&path) {",
+    "classification": "declared_backing",
+    "rationale": "the VM carrier creates and owns this temporary backing file; the carrier-generated path, not a guest identifier, determines the only host file it can access"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 388,
+    "kind": "ambient_filesystem",
+    "text": "let _ = std::fs::remove_file(&path);",
+    "classification": "declared_backing",
+    "rationale": "the VM carrier creates and owns this temporary backing file; the carrier-generated path, not a guest identifier, determines the only host file it can access"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 1779,
+    "kind": "host_identity",
+    "text": "unsafe { libc::getpid() },",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 1794,
+    "kind": "host_identity",
+    "text": "unsafe { libc::getpid() },",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 1839,
+    "kind": "carrier_substrate",
+    "text": "std::thread::sleep(backoff.next_delay());",
+    "classification": "declared_substrate",
+    "rationale": "the call only schedules, parks, wakes, or exits the authenticated Carrick carrier/vCPU; it accepts no guest PID, UID, group, or namespace identifier"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 2447,
+    "kind": "host_identity",
+    "text": "match region.acquire(atomic_permit_slot::MAX_SLOTS, std::process::id()) {",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 2451,
+    "kind": "host_identity",
+    "text": "unsafe { libc::getpid() }",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 2525,
+    "kind": "host_identity",
+    "text": "let pid = std::process::id();",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 2543,
+    "kind": "carrier_substrate",
+    "text": "std::thread::sleep(backoff.next_delay());",
+    "classification": "declared_substrate",
+    "rationale": "the call only schedules, parks, wakes, or exits the authenticated Carrick carrier/vCPU; it accepts no guest PID, UID, group, or namespace identifier"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 2682,
+    "kind": "host_identity",
+    "text": "unsafe { libc::getpid() },",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 2693,
+    "kind": "host_identity",
+    "text": "unsafe { libc::getpid() },",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 2703,
+    "kind": "host_identity",
+    "text": "unsafe { libc::getpid() },",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 2860,
+    "kind": "host_identity",
+    "text": "let pid = std::process::id();",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 2879,
+    "kind": "carrier_substrate",
+    "text": "std::thread::sleep(backoff.next_delay());",
+    "classification": "declared_substrate",
+    "rationale": "the call only schedules, parks, wakes, or exits the authenticated Carrick carrier/vCPU; it accepts no guest PID, UID, group, or namespace identifier"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 3024,
+    "kind": "host_identity",
+    "text": "unsafe { libc::getpid() },",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 10882,
+    "kind": "host_identity",
+    "text": "crate::probes::fork_quiesce(3, rc as i64, vcpu.id() as i64, unsafe { libc::getpid() });",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 11105,
+    "kind": "host_identity",
+    "text": "unsafe { libc::getpid() },",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 11456,
+    "kind": "host_identity",
+    "text": "unsafe { libc::getpid() }",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 13398,
+    "kind": "host_identity",
+    "text": "libc::getpid()",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 13444,
+    "kind": "host_identity",
+    "text": "pid = unsafe { libc::getpid() },",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/trap.rs",
+    "line": 13485,
+    "kind": "host_identity",
+    "text": "libc::getpid()",
+    "classification": "forbidden_semantic",
+    "rationale": "the host PID, credential, process-group, wait, signal, or liveness result participates in Carrick process semantics; it is frozen as explicit semantic debt rather than allowing a guest identifier to select an arbitrary host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/vcpu_kick.rs",
+    "line": 99,
+    "kind": "carrier_substrate",
+    "text": "unsafe { applevisor_sys::hv_vcpus_exit(ids.as_ptr(), ids.len() as u32) }",
+    "classification": "declared_substrate",
+    "rationale": "the call only schedules, parks, wakes, or exits the authenticated Carrick carrier/vCPU; it accepts no guest PID, UID, group, or namespace identifier"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/vcpu_kick.rs",
+    "line": 317,
+    "kind": "carrier_substrate",
+    "text": "let handle = std::thread::Builder::new()",
+    "classification": "declared_substrate",
+    "rationale": "the call only schedules, parks, wakes, or exits the authenticated Carrick carrier/vCPU; it accepts no guest PID, UID, group, or namespace identifier"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs",
+    "line": 74,
+    "kind": "host_process_control",
+    "text": "libc::waitid(",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs",
+    "line": 107,
+    "kind": "host_process_control",
+    "text": "let rc = unsafe { libc::kill(pid, 0) };",
+    "classification": "declared_substrate",
+    "rationale": "the operation addresses an authenticated carrier child recorded by Carrick's lifecycle registry; guest IDs are translated before this point and cannot widen the host target"
+  },
+  {
+    "file": "crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs",
+    "line": 346,
+    "kind": "carrier_substrate",
+    "text": "if let Err(err) = std::thread::Builder::new()",
+    "classification": "declared_substrate",
+    "rationale": "the call only schedules, parks, wakes, or exits the authenticated Carrick carrier/vCPU; it accepts no guest PID, UID, group, or namespace identifier"
+  }
+]
