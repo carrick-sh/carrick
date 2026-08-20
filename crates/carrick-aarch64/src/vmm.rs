@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{Aarch64SyscallFrame, Gpa, MemoryError, SharedFutexLocation};
+use carrick_hal::threaded::Aarch64TaskCpuStateV1;
 use carrick_hal::{
     GuestEntryRegs, GuestVmBackend, MemPerms, ProcessForkRequest, Reg, SlotId, SysReg, TrapError,
     VcpuKick, VcpuRegistry,
@@ -858,21 +859,23 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     fn rebind_to_slot(
         &mut self,
         slot: SlotId,
-        snapshot: &Aarch64VcpuSnapshot,
+        state: &Aarch64TaskCpuStateV1,
         vcpu: &mut Self::Vcpu,
     ) -> Result<(), TrapError> {
-        let _ = (slot, snapshot, vcpu);
-        Ok(())
+        let _ = (slot, state, vcpu);
+        Err(TrapError::Hypervisor(
+            "aarch64 backend does not support complete typed guest-state restore".to_owned(),
+        ))
     }
 
     /// Restore state saved by [`Self::save_shared_wait_state`].
     fn rebind_shared_wait_state(
         &mut self,
         slot: SlotId,
-        snapshot: &Aarch64VcpuSnapshot,
+        state: &Aarch64TaskCpuStateV1,
         vcpu: &mut Self::Vcpu,
     ) -> Result<(), TrapError> {
-        self.rebind_to_slot(slot, snapshot, vcpu)
+        self.rebind_to_slot(slot, state, vcpu)
     }
 
     /// MT whole-VM lease — VM-only release by the LAST parker, whose own vCPU
@@ -893,10 +896,10 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     fn rebind_shared_wait_state_mt(
         &mut self,
         slot: SlotId,
-        snapshot: &Aarch64VcpuSnapshot,
+        state: &Aarch64TaskCpuStateV1,
         vcpu: &mut Self::Vcpu,
     ) -> Result<(), TrapError> {
-        self.rebind_shared_wait_state(slot, snapshot, vcpu)
+        self.rebind_shared_wait_state(slot, state, vcpu)
     }
 
     /// Pre-fork admission gate (see `SyscallTrap::fork_admission_check`):

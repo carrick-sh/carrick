@@ -30,6 +30,7 @@ use carrick_guest_mem::{
     SharedFutexLocation,
 };
 use carrick_hal::guest_arch::GuestArch as _;
+use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 use carrick_hal::{
     ForkOutcome, GuestEntryRegs, OsError, ProcessForkRequest, RawSyscall, Reg, SlotId, SysReg,
     SyscallTrap, ThreadedEngine, TrapError,
@@ -111,6 +112,11 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// bootstrap exactly; `Some` is re-applied after every exec replacement.
     process_asid: Option<u16>,
 
+    /// Exact Kernel MM identity generation authorizing task snapshots.
+    mm_generation: u64,
+    /// Exact ASID allocation generation authorizing the task's TTBR values.
+    asid_generation: u64,
+
     // ── shared memory state (the X86EngineCore parallels) ──
     /// Live stage-1 page-table editor over the guest's own translation tables at
     /// `LINUX_PAGE_TABLES_BASE`. Built lazily on first protect/unmap edit; reset
@@ -121,12 +127,6 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// Process-wide PROT_NONE ranges; the EFAULT gate on every syscall-buffer
     /// access. SHARED by `CLONE_THREAD` siblings (`Arc` clone), COW'd on fork.
     protections: Arc<MemoryProtections>,
-
-    /// Per-thread reclaim snapshot stash (M:N reclaim-on-block, HVF only today):
-    /// `save_guest_state` snapshots this vCPU at a block point, `rebind_to_slot`
-    /// restores on wake. The same host thread saves/restores, so a plain `Option`
-    /// field.
-    reclaim_snapshot: Option<Aarch64VcpuSnapshot>,
 
     /// Runtime-published mmap-arena high-water used only for fork footprint
     /// diagnostics. The runtime refreshes it immediately before every fork.
@@ -168,7 +168,129 @@ struct ParentForkCowRollback {
     armed_ranges: Vec<crate::vmm::ForkCowRange>,
 }
 
+fn aarch64_task_state_from_snapshot(
+    snapshot: &Aarch64VcpuSnapshot,
+    pending_resume_pc: Option<u64>,
+    last_syscall_nr: Option<u64>,
+    last_syscall_orig_x0: u64,
+    last_fault_esr: u64,
+    last_exit_class: u64,
+    is_forked_child: bool,
+    mm_generation: u64,
+    asid_generation: u64,
+) -> Result<Aarch64TaskCpuStateV1, TrapError> {
+    if mm_generation == 0 || asid_generation == 0 {
+        return Err(TrapError::Hypervisor(
+            "aarch64 snapshot has no exact MM/ASID generation binding".to_owned(),
+        ));
+    }
+    let (pc, pstate) = core_resume_pair(pending_resume_pc, snapshot);
+    Ok(Aarch64TaskCpuStateV1 {
+        gprs: snapshot.gprs,
+        pc,
+        pstate,
+        trap_pc: snapshot.pc,
+        trap_pstate: snapshot.pstate,
+        sp_el0: snapshot.sp_el0,
+        elr_el1: snapshot.elr_el1,
+        spsr_el1: snapshot.spsr_el1,
+        ttbr0: snapshot.ttbr0,
+        ttbr1: snapshot.ttbr1,
+        tcr: snapshot.tcr,
+        actlr_el1: snapshot.actlr_el1,
+        tpidr_el0: snapshot.tpidr_el0,
+        tpidrro_el0: snapshot.tpidrro_el0,
+        contextidr_el1: snapshot.contextidr_el1,
+        vregs: snapshot.vregs,
+        fpsr: snapshot.fpsr,
+        fpcr: snapshot.fpcr,
+        pending_resume_pc,
+        last_syscall_nr,
+        last_syscall_orig_x0,
+        last_fault_esr,
+        last_exit_class,
+        is_forked_child,
+        mm_generation,
+        asid_generation,
+    })
+}
+
+/// Overlay one migratable task image onto a destination executor snapshot.
+/// Executor-local SP_EL1/mailbox state and invariant EL1 configuration are
+/// retained from `destination`; invalid executor configuration fails closed.
+pub fn restore_aarch64_task_state(
+    destination: &Aarch64VcpuSnapshot,
+    state: &Aarch64TaskCpuStateV1,
+) -> Result<Aarch64VcpuSnapshot, TrapError> {
+    let boot = carrick_hal::Aarch64GuestArch::bootstrap_sysregs();
+    let expected_vbar = carrick_mem::memory::LINUX_EL1_VECTORS_BASE;
+    if destination.vbar != expected_vbar
+        || destination.sctlr != boot.sctlr_el1
+        || destination.mair != boot.mair_el1
+        || destination.cpacr != boot.cpacr_el1
+    {
+        return Err(TrapError::Hypervisor(format!(
+            "aarch64 destination executor invariant mismatch: vbar={:#x}/{expected_vbar:#x} \
+             sctlr={:#x}/{:#x} mair={:#x}/{:#x} cpacr={:#x}/{:#x}",
+            destination.vbar,
+            destination.sctlr,
+            boot.sctlr_el1,
+            destination.mair,
+            boot.mair_el1,
+            destination.cpacr,
+            boot.cpacr_el1,
+        )));
+    }
+    if state.mm_generation == 0 || state.asid_generation == 0 {
+        return Err(TrapError::Hypervisor(
+            "aarch64 restore rejected stale zero MM/ASID generation".to_owned(),
+        ));
+    }
+    let mut restored = destination.clone();
+    restored.gprs = state.gprs;
+    restored.pc = state.trap_pc;
+    restored.pstate = state.trap_pstate;
+    restored.sp_el0 = state.sp_el0;
+    restored.elr_el1 = state.elr_el1;
+    restored.spsr_el1 = state.spsr_el1;
+    restored.ttbr0 = state.ttbr0;
+    restored.ttbr1 = state.ttbr1;
+    restored.tcr = state.tcr;
+    restored.actlr_el1 = state.actlr_el1;
+    restored.tpidr_el0 = state.tpidr_el0;
+    restored.tpidrro_el0 = state.tpidrro_el0;
+    restored.contextidr_el1 = state.contextidr_el1;
+    restored.vregs = state.vregs;
+    restored.fpsr = state.fpsr;
+    restored.fpcr = state.fpcr;
+    Ok(restored)
+}
+
 impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
+    fn validate_task_metadata(&self, state: &Aarch64TaskCpuStateV1) -> Result<(), TrapError> {
+        if state.mm_generation != self.mm_generation
+            || state.asid_generation != self.asid_generation
+        {
+            return Err(TrapError::Hypervisor(format!(
+                "AArch64 restore generation mismatch: snapshot mm/asid={}/{} destination={}/{}",
+                state.mm_generation,
+                state.asid_generation,
+                self.mm_generation,
+                self.asid_generation
+            )));
+        }
+        Ok(())
+    }
+
+    fn apply_task_metadata(&mut self, state: &Aarch64TaskCpuStateV1) {
+        self.pending_resume_pc = state.pending_resume_pc;
+        self.last_syscall_nr = state.last_syscall_nr;
+        self.last_syscall_orig_x0 = state.last_syscall_orig_x0;
+        self.last_fault_esr = state.last_fault_esr;
+        self.last_exit_class = state.last_exit_class;
+        self.is_forked_child = state.is_forked_child;
+    }
+
     /// Build an engine around an already-constructed VM + vCPU (the backend's
     /// bring-up produces these). Mirrors `X86EngineCore::from_parts`: the
     /// tracking fields start cleared, and a freshly brought-up engine gets a
@@ -188,9 +310,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             last_exit_class: 0,
             is_forked_child: false,
             process_asid: None,
+            mm_generation: 1,
+            asid_generation: 1,
             page_tables,
             protections: Arc::new(MemoryProtections::default()),
-            reclaim_snapshot: None,
             fork_arena_high_water: u64::MAX,
             pending_process_fork: None,
             pt_snapshot_scratch: None,
@@ -272,11 +395,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         &self.protections
     }
 
-    /// The per-thread reclaim snapshot stash (M:N reclaim-on-block).
-    pub fn reclaim_snapshot(&self) -> Option<&Aarch64VcpuSnapshot> {
-        self.reclaim_snapshot.as_ref()
-    }
-
     /// Like [`from_parts`](Self::from_parts) but ADOPTS the spawning thread's
     /// page-table editor + PROT_NONE bookkeeping — used to make a
     /// `clone(CLONE_THREAD)` sibling SHARE its parent's stage-1 manager (same VM,
@@ -300,9 +418,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             last_exit_class: 0,
             is_forked_child: false,
             process_asid: None,
+            mm_generation: 1,
+            asid_generation: 1,
             page_tables,
             protections,
-            reclaim_snapshot: None,
             fork_arena_high_water: u64::MAX,
             pending_process_fork: None,
             pt_snapshot_scratch: None,
@@ -1761,11 +1880,18 @@ fn seed_sibling_snapshot(
 }
 
 impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
+    fn bind_task_snapshot_identity(&mut self, mm_generation: u64, asid_generation: u64) {
+        self.mm_generation = mm_generation;
+        self.asid_generation = asid_generation;
+    }
+
     fn bind_frame_cow(
         &mut self,
         authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
         identity: carrick_hal::FrameCowIdentity,
     ) {
+        self.mm_generation = identity.mm;
+        self.asid_generation = identity.mm;
         self.vm.bind_frame_cow(authority, identity);
     }
 
@@ -2381,46 +2507,94 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.reclaim_refreshes_kicker()
     }
 
-    fn save_guest_state(&mut self) -> Vec<u8> {
-        // M:N reclaim-on-block. KVM aarch64 does not reclaim (`reclaims()` is false),
-        // so this is never called on that path; HVF DESTROYS its vCPU in place here
-        // (passing `&mut self.vcpu`) and stashes the snapshot internally, so the
-        // returned bytes are unused (empty). On any failure return empty —
-        // `rebind_to_slot` then errors (a reclaim failure is fatal to the thread,
-        // never silent corruption).
-        match self.vm.save_guest_state(&mut self.vcpu) {
-            Ok(snap) => serialize_snapshot(&snap),
-            Err(_) => Vec::new(),
-        }
+    fn save_guest_state(&mut self) -> Result<GuestCpuState, TrapError> {
+        let snapshot = self
+            .vm
+            .save_guest_state(&mut self.vcpu)
+            .map_err(|error| TrapError::Hypervisor(format!("save AArch64 guest state: {error}")))?;
+        Ok(GuestCpuState::from_aarch64_v1(
+            aarch64_task_state_from_snapshot(
+                &snapshot,
+                self.pending_resume_pc,
+                self.last_syscall_nr,
+                self.last_syscall_orig_x0,
+                self.last_fault_esr,
+                self.last_exit_class,
+                self.is_forked_child,
+                self.mm_generation,
+                self.asid_generation,
+            )?,
+        ))
     }
 
-    fn save_shared_wait_state(&mut self) -> Vec<u8> {
-        match self.vm.save_shared_wait_state(&mut self.vcpu) {
-            Ok(snap) => serialize_snapshot(&snap),
-            Err(_) => Vec::new(),
-        }
+    fn save_shared_wait_state(&mut self) -> Result<GuestCpuState, TrapError> {
+        let snapshot = self
+            .vm
+            .save_shared_wait_state(&mut self.vcpu)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("save shared-wait AArch64 guest state: {error}"))
+            })?;
+        Ok(GuestCpuState::from_aarch64_v1(
+            aarch64_task_state_from_snapshot(
+                &snapshot,
+                self.pending_resume_pc,
+                self.last_syscall_nr,
+                self.last_syscall_orig_x0,
+                self.last_fault_esr,
+                self.last_exit_class,
+                self.is_forked_child,
+                self.mm_generation,
+                self.asid_generation,
+            )?,
+        ))
     }
 
-    fn rebind_to_slot(&mut self, slot: SlotId, state: &[u8]) -> Result<(), TrapError> {
-        // HVF stashes the snapshot internally (it destroyed the vCPU in place), so
-        // the serialized `state` is empty for it; reconstruct a snapshot only if
-        // present (a future serialize-based backend), else hand a zeroed placeholder
-        // the HVF rebind ignores (it `take`s its own stashed snapshot). The backend
-        // recreates the vCPU and writes it back through `&mut self.vcpu`.
-        let snap = deserialize_snapshot(state).unwrap_or_else(zeroed_snapshot);
-        self.vm.rebind_to_slot(slot, &snap, &mut self.vcpu)
+    fn rebind_to_slot(&mut self, slot: SlotId, state: &GuestCpuState) -> Result<(), TrapError> {
+        let GuestCpuState::Aarch64V1(state) = state else {
+            return Err(TrapError::Hypervisor(format!(
+                "AArch64 restore rejected {:?} snapshot version {}",
+                state.guest_abi(),
+                state.version()
+            )));
+        };
+        self.validate_task_metadata(state)?;
+        self.vm.rebind_to_slot(slot, state, &mut self.vcpu)?;
+        self.apply_task_metadata(state);
+        Ok(())
     }
 
-    fn rebind_shared_wait_state(&mut self, slot: SlotId, state: &[u8]) -> Result<(), TrapError> {
-        let snap = deserialize_snapshot(state).unwrap_or_else(zeroed_snapshot);
+    fn rebind_shared_wait_state(
+        &mut self,
+        slot: SlotId,
+        state: &GuestCpuState,
+    ) -> Result<(), TrapError> {
+        let GuestCpuState::Aarch64V1(state) = state else {
+            return Err(TrapError::Hypervisor(
+                "AArch64 shared-wait restore rejected non-AArch64 V1 state".to_owned(),
+            ));
+        };
+        self.validate_task_metadata(state)?;
         self.vm
-            .rebind_shared_wait_state(slot, &snap, &mut self.vcpu)
+            .rebind_shared_wait_state(slot, state, &mut self.vcpu)?;
+        self.apply_task_metadata(state);
+        Ok(())
     }
 
-    fn rebind_shared_wait_state_mt(&mut self, slot: SlotId, state: &[u8]) -> Result<(), TrapError> {
-        let snap = deserialize_snapshot(state).unwrap_or_else(zeroed_snapshot);
+    fn rebind_shared_wait_state_mt(
+        &mut self,
+        slot: SlotId,
+        state: &GuestCpuState,
+    ) -> Result<(), TrapError> {
+        let GuestCpuState::Aarch64V1(state) = state else {
+            return Err(TrapError::Hypervisor(
+                "AArch64 MT shared-wait restore rejected non-AArch64 V1 state".to_owned(),
+            ));
+        };
+        self.validate_task_metadata(state)?;
         self.vm
-            .rebind_shared_wait_state_mt(slot, &snap, &mut self.vcpu)
+            .rebind_shared_wait_state_mt(slot, state, &mut self.vcpu)?;
+        self.apply_task_metadata(state);
+        Ok(())
     }
 
     fn release_vm_after_reclaim_park(&mut self) -> Result<bool, TrapError> {
@@ -2583,153 +2757,6 @@ fn decode_hvpatch_island_origin(resume_pc: u64, svc: u32, return_branch: u32) ->
     u64::try_from(origin).ok()
 }
 
-/// An all-zero [`Aarch64VcpuSnapshot`]. Used as the placeholder the engine hands to
-/// a destroy-in-place reclaim backend (HVF), which ignores it and `take`s its own
-/// internally-stashed snapshot. A serialize-based backend never hits this path
-/// (its `state` deserializes).
-fn zeroed_snapshot() -> Aarch64VcpuSnapshot {
-    Aarch64VcpuSnapshot {
-        gprs: [0; 31],
-        pc: 0,
-        pstate: 0,
-        sp_el0: 0,
-        sp_el1: 0,
-        elr_el1: 0,
-        spsr_el1: 0,
-        ttbr0: 0,
-        ttbr1: 0,
-        tcr: 0,
-        sctlr: 0,
-        mair: 0,
-        vbar: 0,
-        cpacr: 0,
-        tpidr_el0: 0,
-        tpidrro_el0: 0,
-        tpidr_el1: 0,
-        contextidr_el1: 0,
-        actlr_el1: 0,
-        vregs: [0; 32],
-        fpsr: 0,
-        fpcr: 0,
-    }
-}
-
-/// Serialize an [`Aarch64VcpuSnapshot`] for the reclaim save→rebind round-trip
-/// (same host thread, so endianness/layout are trivially consistent). KVM aarch64
-/// never reclaims, so this is exercised only by a later HVF migration; kept here
-/// so the engine is self-contained.
-fn serialize_snapshot(s: &Aarch64VcpuSnapshot) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(31 * 8 + 17 * 8 + 32 * 16 + 8);
-    for g in &s.gprs {
-        buf.extend_from_slice(&g.to_le_bytes());
-    }
-    for v in [
-        s.pc,
-        s.pstate,
-        s.sp_el0,
-        s.sp_el1,
-        s.elr_el1,
-        s.spsr_el1,
-        s.ttbr0,
-        s.ttbr1,
-        s.tcr,
-        s.sctlr,
-        s.mair,
-        s.vbar,
-        s.cpacr,
-        s.tpidr_el0,
-        s.tpidrro_el0,
-        s.tpidr_el1,
-        s.contextidr_el1,
-        s.actlr_el1,
-    ] {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    for v in &s.vregs {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    buf.extend_from_slice(&s.fpsr.to_le_bytes());
-    buf.extend_from_slice(&s.fpcr.to_le_bytes());
-    buf
-}
-
-fn deserialize_snapshot(state: &[u8]) -> Option<Aarch64VcpuSnapshot> {
-    const GPR_BYTES: usize = 31 * 8;
-    const SPECIAL_BYTES: usize = 18 * 8;
-    const VREG_BYTES: usize = 32 * 16;
-    const TOTAL: usize = GPR_BYTES + SPECIAL_BYTES + VREG_BYTES + 8;
-    if state.len() < TOTAL {
-        return None;
-    }
-    let rd64 = |off: usize| -> u64 {
-        u64::from_le_bytes(state[off..off + 8].try_into().unwrap_or([0u8; 8]))
-    };
-    let mut gprs = [0u64; 31];
-    for (i, g) in gprs.iter_mut().enumerate() {
-        *g = rd64(i * 8);
-    }
-    let mut o = GPR_BYTES;
-    let mut next = || {
-        let v = rd64(o);
-        o += 8;
-        v
-    };
-    let pc = next();
-    let pstate = next();
-    let sp_el0 = next();
-    let sp_el1 = next();
-    let elr_el1 = next();
-    let spsr_el1 = next();
-    let ttbr0 = next();
-    let ttbr1 = next();
-    let tcr = next();
-    let sctlr = next();
-    let mair = next();
-    let vbar = next();
-    let cpacr = next();
-    let tpidr_el0 = next();
-    let tpidrro_el0 = next();
-    let tpidr_el1 = next();
-    let contextidr_el1 = next();
-    let actlr_el1 = next();
-    let mut vregs = [0u128; 32];
-    for (i, v) in vregs.iter_mut().enumerate() {
-        let base = GPR_BYTES + SPECIAL_BYTES + i * 16;
-        *v = u128::from_le_bytes(state[base..base + 16].try_into().unwrap_or([0u8; 16]));
-    }
-    let fp_base = GPR_BYTES + SPECIAL_BYTES + VREG_BYTES;
-    let fpsr = u32::from_le_bytes(state[fp_base..fp_base + 4].try_into().unwrap_or([0u8; 4]));
-    let fpcr = u32::from_le_bytes(
-        state[fp_base + 4..fp_base + 8]
-            .try_into()
-            .unwrap_or([0u8; 4]),
-    );
-    Some(Aarch64VcpuSnapshot {
-        gprs,
-        pc,
-        pstate,
-        sp_el0,
-        sp_el1,
-        elr_el1,
-        spsr_el1,
-        ttbr0,
-        ttbr1,
-        tcr,
-        sctlr,
-        mair,
-        vbar,
-        cpacr,
-        tpidr_el0,
-        tpidrro_el0,
-        tpidr_el1,
-        contextidr_el1,
-        actlr_el1,
-        vregs,
-        fpsr,
-        fpcr,
-    })
-}
-
 /// `Aarch64EngineCore` is `Send` when the backend pair is: the VM/vCPU hold the
 /// host VMM fds (Send) and raw window pointers valid in every thread.
 //
@@ -2743,27 +2770,28 @@ mod tests {
     use super::*;
 
     fn sample() -> Aarch64VcpuSnapshot {
+        let boot = carrick_hal::Aarch64GuestArch::bootstrap_sysregs();
         Aarch64VcpuSnapshot {
-            gprs: [0xAA; 31],
-            pc: 0x1000,
-            pstate: 0x3c0,
-            sp_el0: 0xDEAD,
-            sp_el1: 0xBEEF,
-            elr_el1: 0x4000_0000,
-            spsr_el1: 0x5,
-            ttbr0: 0x100,
-            ttbr1: 0x100,
-            tcr: 0x200,
-            sctlr: 0x300,
-            mair: 0xFF,
-            vbar: 0x400,
-            cpacr: 0x3 << 20,
-            tpidr_el0: 0x1234,
-            tpidrro_el0: 0x5678,
-            tpidr_el1: 0x9abc,
-            contextidr_el1: 0xd00d,
-            actlr_el1: 0x2,
-            vregs: [0x9; 32],
+            gprs: std::array::from_fn(|index| 0x1000 + index as u64),
+            pc: 0x2000,
+            pstate: 0x3000,
+            sp_el0: 0x4000,
+            sp_el1: 0x5000,
+            elr_el1: 0x6000,
+            spsr_el1: 0x7000,
+            ttbr0: 0x8000,
+            ttbr1: 0x9000,
+            tcr: 0xa000,
+            sctlr: boot.sctlr_el1,
+            mair: boot.mair_el1,
+            vbar: carrick_mem::memory::LINUX_EL1_VECTORS_BASE,
+            cpacr: boot.cpacr_el1,
+            tpidr_el0: 0xb000,
+            tpidrro_el0: 0xc000,
+            tpidr_el1: 0xd000,
+            contextidr_el1: 0xe000,
+            actlr_el1: 0xf000,
+            vregs: std::array::from_fn(|index| 0x1_0000_0000 + index as u128),
             fpsr: 0x11,
             fpcr: 0x22,
         }
@@ -2854,41 +2882,112 @@ mod tests {
         assert_eq!(bootstrap_calls, 1);
     }
 
-    /// The reclaim snapshot (de)serialization round-trips every field bit-exact
-    /// (same-thread save→rebind; exercised by a later HVF migration).
     #[test]
-    fn snapshot_serialization_roundtrips() {
-        let s = sample();
-        let bytes = serialize_snapshot(&s);
-        let back = deserialize_snapshot(&bytes).expect("round-trip");
-        // EVERY field, not a spot check: this snapshot is what a
-        // destroy/recreate reclaim restores a vCPU from, so a field that is
-        // silently dropped becomes guest-visible state that vanishes across a
-        // park. `contextidr_el1` is here because exactly that happened to it.
-        assert_eq!(back.gprs, s.gprs);
-        assert_eq!(back.pc, s.pc);
-        assert_eq!(back.pstate, s.pstate);
-        assert_eq!(back.sp_el0, s.sp_el0);
-        assert_eq!(back.sp_el1, s.sp_el1);
-        assert_eq!(back.elr_el1, s.elr_el1);
-        assert_eq!(back.spsr_el1, s.spsr_el1);
-        assert_eq!(back.ttbr0, s.ttbr0);
-        assert_eq!(back.ttbr1, s.ttbr1);
-        assert_eq!(back.tcr, s.tcr);
-        assert_eq!(back.sctlr, s.sctlr);
-        assert_eq!(back.mair, s.mair);
-        assert_eq!(back.vbar, s.vbar);
-        assert_eq!(back.cpacr, s.cpacr);
-        assert_eq!(back.tpidr_el0, s.tpidr_el0);
-        assert_eq!(back.tpidrro_el0, s.tpidrro_el0);
-        assert_eq!(back.tpidr_el1, s.tpidr_el1);
-        assert_eq!(back.contextidr_el1, s.contextidr_el1);
-        assert_eq!(back.actlr_el1, s.actlr_el1);
-        assert_eq!(back.vregs, s.vregs);
-        assert_eq!(back.fpsr, s.fpsr);
-        assert_eq!(back.fpcr, s.fpcr);
-        // A short buffer is rejected, not silently zero-filled.
-        assert!(deserialize_snapshot(&bytes[..bytes.len() - 1]).is_none());
+    fn snapshot_typed_state_roundtrips_every_task_field() {
+        let source = sample();
+        let task = aarch64_task_state_from_snapshot(
+            &source,
+            Some(0x7100),
+            Some(221),
+            0x7200,
+            0x7300,
+            0x74,
+            true,
+            17,
+            19,
+        )
+        .expect("complete task snapshot");
+        let restored = restore_aarch64_task_state(&source, &task).expect("typed restore");
+        assert_eq!(restored.gprs, source.gprs);
+        assert_eq!(restored.pc, source.pc);
+        assert_eq!(restored.pstate, source.pstate);
+        assert_eq!(restored.sp_el0, source.sp_el0);
+        assert_eq!(restored.elr_el1, source.elr_el1);
+        assert_eq!(restored.spsr_el1, source.spsr_el1);
+        assert_eq!(restored.ttbr0, source.ttbr0);
+        assert_eq!(restored.ttbr1, source.ttbr1);
+        assert_eq!(restored.tcr, source.tcr);
+        assert_eq!(restored.actlr_el1, source.actlr_el1);
+        assert_eq!(restored.tpidr_el0, source.tpidr_el0);
+        assert_eq!(restored.tpidrro_el0, source.tpidrro_el0);
+        assert_eq!(restored.contextidr_el1, source.contextidr_el1);
+        assert_eq!(restored.vregs, source.vregs);
+        assert_eq!(restored.fpsr, source.fpsr);
+        assert_eq!(restored.fpcr, source.fpcr);
+        assert_eq!(task.pending_resume_pc, Some(0x7100));
+        assert_eq!(task.pc, 0x7100);
+        assert_eq!(task.pstate, source.spsr_el1);
+        assert_eq!(task.trap_pc, source.pc);
+        assert_eq!(task.trap_pstate, source.pstate);
+        assert_eq!(task.last_syscall_nr, Some(221));
+        assert_eq!(task.last_syscall_orig_x0, 0x7200);
+        assert_eq!(task.last_fault_esr, 0x7300);
+        assert_eq!(task.last_exit_class, 0x74);
+        assert!(task.is_forked_child);
+        assert_eq!(task.mm_generation, 17);
+        assert_eq!(task.asid_generation, 19);
+    }
+
+    /// A task snapshot must restore every migratable field while retaining the
+    /// destination executor's stack/mailbox and invariant EL1 configuration.
+    ///
+    /// The historical byte boundary copied source executor-local state here;
+    /// this regression test keeps the typed overlay split explicit.
+    #[test]
+    fn snapshot_roundtrip_preserves_complete_task_state_and_destination_local_state() {
+        let source = sample();
+        let destination = Aarch64VcpuSnapshot {
+            sp_el1: 0xd001,
+            tpidr_el1: 0xd002,
+            vbar: source.vbar,
+            sctlr: source.sctlr,
+            mair: source.mair,
+            cpacr: source.cpacr,
+            ..sample()
+        };
+
+        let task = aarch64_task_state_from_snapshot(
+            &source,
+            Some(source.elr_el1),
+            Some(172),
+            source.gprs[0],
+            0xdead_0001,
+            0x15,
+            false,
+            23,
+            29,
+        )
+        .expect("complete snapshot");
+        let restored = restore_aarch64_task_state(&destination, &task).expect("cross executor");
+
+        assert_eq!(restored.gprs, source.gprs);
+        assert_eq!(restored.pc, source.pc);
+        assert_eq!(restored.pstate, source.pstate);
+        assert_eq!(restored.sp_el0, source.sp_el0);
+        assert_eq!(restored.ttbr0, source.ttbr0);
+        assert_eq!(restored.ttbr1, source.ttbr1);
+        assert_eq!(restored.tcr, source.tcr);
+        assert_eq!(restored.actlr_el1, source.actlr_el1);
+        assert_eq!(restored.tpidr_el0, source.tpidr_el0);
+        assert_eq!(restored.tpidrro_el0, source.tpidrro_el0);
+        assert_eq!(restored.contextidr_el1, source.contextidr_el1);
+        assert_eq!(restored.vregs, source.vregs);
+        assert_eq!(restored.fpsr, source.fpsr);
+        assert_eq!(restored.fpcr, source.fpcr);
+        assert_eq!(
+            restored.sp_el1, destination.sp_el1,
+            "SP_EL1 must stay executor-local"
+        );
+        assert_eq!(
+            restored.tpidr_el1, destination.tpidr_el1,
+            "mailbox scratch binding must stay executor-local"
+        );
+        assert_eq!(restored.vbar, destination.vbar);
+        assert_eq!(restored.sctlr, destination.sctlr);
+        assert_eq!(restored.mair, destination.mair);
+        assert_eq!(restored.cpacr, destination.cpacr);
+        assert_eq!(task.mm_generation, 23);
+        assert_eq!(task.asid_generation, 29);
     }
 
     #[test]

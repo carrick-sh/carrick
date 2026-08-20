@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -3258,7 +3258,7 @@ impl Task {
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
-            cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
+            user_ns: AtomicU64::new(0),
             system_ns: AtomicU64::new(0),
             crash_vote: Mutex::new(None),
             crash_safe_point_participant: AtomicBool::new(false),
@@ -3284,7 +3284,7 @@ impl Task {
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
-            cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
+            user_ns: AtomicU64::new(0),
             system_ns: AtomicU64::new(0),
             crash_vote: Mutex::new(None),
             crash_safe_point_participant: AtomicBool::new(false),
@@ -3310,7 +3310,7 @@ impl Task {
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
-            cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
+            user_ns: AtomicU64::new(0),
             system_ns: AtomicU64::new(0),
             crash_vote: Mutex::new(None),
             crash_safe_point_participant: AtomicBool::new(false),
@@ -3336,7 +3336,7 @@ impl Task {
             revision: ObjectRevision::new(),
             runner_gate: Arc::clone(&caller.runner_gate),
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
-            cpu_slot: AtomicUsize::new(caller.cpu_slot.load(Ordering::Acquire)),
+            user_ns: AtomicU64::new(caller.user_ns.load(Ordering::Acquire)),
             system_ns: AtomicU64::new(caller.system_ns.load(Ordering::Acquire)),
             crash_vote: Mutex::new(None),
             crash_safe_point_participant: AtomicBool::new(false),
@@ -3751,6 +3751,18 @@ impl ExecutionGeneration {
 pub struct ExecutorId(u32);
 
 impl ExecutorId {
+    /// Transitional exact owner for the current welded-thread scheduler. Task 4
+    /// replaces this with persistent executor-pool IDs; no raw constructor is
+    /// exposed.
+    pub fn for_transitional_thread(thread: ThreadId) -> Result<Self, ThreadExecutionError> {
+        let raw = u32::try_from(thread.raw())
+            .map_err(|_| ThreadExecutionError::InvalidTransitionalExecutor(thread))?;
+        if raw == 0 {
+            return Err(ThreadExecutionError::InvalidTransitionalExecutor(thread));
+        }
+        Ok(Self(raw))
+    }
+
     #[cfg(test)]
     pub(super) fn synthetic_for_tests(raw: u32) -> Self {
         Self(raw)
@@ -3760,6 +3772,16 @@ impl ExecutorId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockedReason {
     ChildState,
+    HostWait,
+}
+
+/// Scheduler-owned task authority. `MmId` is the existing never-reused Kernel
+/// identity; no parallel pointer or numeric MM domain is introduced.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigratableTaskState {
+    pub cpu: GuestCpuState,
+    pub mm: MmId,
+    pub asid_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3768,6 +3790,9 @@ pub enum ExecutionFailure {
         executor: ExecutorId,
         executor_epoch: u64,
     },
+    SnapshotSaveFailed,
+    SnapshotRestoreFailed,
+    SnapshotGenerationMismatch,
 }
 
 /// Public observation of a thread's scheduler-owned execution state.
@@ -3821,6 +3846,8 @@ impl ThreadExecutionState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ThreadExecutionError {
+    #[error("thread {0} cannot identify a transitional executor")]
+    InvalidTransitionalExecutor(ThreadId),
     #[error("thread execution generation overflowed")]
     GenerationExhausted,
     #[error("thread execution transition {operation} is invalid from {state:?}")]
@@ -3944,6 +3971,34 @@ impl ThreadExecutionLease {
         }
         Ok(state)
     }
+
+    /// Replace the lease's pre-run image with the exact state captured at the
+    /// switch-out boundary. Architecture and version may not drift while one
+    /// execution generation is running.
+    pub fn replace_cpu_state(
+        &mut self,
+        replacement: GuestCpuState,
+    ) -> Result<(), ThreadExecutionError> {
+        let Some(current) = self.cpu_state.as_ref() else {
+            return Err(ThreadExecutionError::MissingCpuState {
+                generation: self.generation,
+            });
+        };
+        if current.guest_abi() != replacement.guest_abi() {
+            return Err(ThreadExecutionError::SnapshotArchitectureMismatch {
+                expected: current.guest_abi(),
+                actual: replacement.guest_abi(),
+            });
+        }
+        if current.version() != replacement.version() {
+            return Err(ThreadExecutionError::SnapshotVersionMismatch {
+                expected: current.version(),
+                actual: replacement.version(),
+            });
+        }
+        self.cpu_state = Some(replacement);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3976,21 +4031,14 @@ pub struct Thread {
     revision: ObjectRevision,
     runner_gate: Arc<RunnerGate>,
     execution: Mutex<ThreadExecutionRecord>,
-    /// This thread's `guest_cpu` slot, claimed the first time it runs guest
-    /// code, or [`CPU_SLOT_UNBOUND`] before then. Recording it here is what
-    /// lets the owning [`Task`] total its own threads' CPU: under HVPatch every
-    /// Linux process is a thread of ONE host process, so the host's per-process
-    /// counters describe every guest process at once and cannot answer
-    /// "how much CPU has *this* Linux process used".
-    cpu_slot: AtomicUsize,
+    /// Guest USER time charged directly to this exact logical thread across
+    /// every host execution interval. Executor slots are never identities.
+    user_ns: AtomicU64,
     /// Guest SYSTEM time for this thread, in nanoseconds: the CPU carrick has
     /// burned servicing THIS thread's syscalls.
     ///
-    /// The `cpu_slot` above measures time inside `hv_vcpu_run` — the guest
-    /// executing its own instructions, which is Linux's USER time. Service
-    /// time happens on the host thread outside that call and is invisible to
-    /// the slot, which is why `times`/`getrusage` reported system time as zero
-    /// even after per-task user accounting landed. Accumulated at the one
+    /// Service time happens on the host thread outside guest execution.
+    /// Accumulated at the one
     /// dispatch boundary that reliably runs on the guest thread
     /// (`dispatch::resources::with_captured_resources`), from
     /// `CLOCK_THREAD_CPUTIME_ID` so a BLOCKED syscall — `wait4`, `epoll_wait` —
@@ -4017,9 +4065,6 @@ pub struct Thread {
     /// gets for free by starting it at `None`.
     thread_keyring: Mutex<Option<KeySerial>>,
 }
-
-/// A thread that has not yet run guest code and so owns no `guest_cpu` slot.
-pub const CPU_SLOT_UNBOUND: usize = usize::MAX;
 
 impl Thread {
     pub const fn key(&self) -> ThreadKey {
@@ -4097,6 +4142,52 @@ impl Thread {
         })
     }
 
+    /// Transitional welded-thread wake path used until Task 3 installs the run
+    /// queue. It claims only the exact blocked generation and never infers
+    /// authority from a wake edge or host-thread slot.
+    pub fn claim_blocked_for_transitional_executor(
+        self: &Arc<Self>,
+        executor: ExecutorId,
+    ) -> Result<ThreadExecutionLease, ThreadExecutionError> {
+        let mut execution = self.execution.lock();
+        let generation = match execution.state {
+            ThreadExecutionState::Blocked { generation, .. } => generation,
+            state => {
+                return Err(ThreadExecutionError::InvalidTransition {
+                    operation: "claim_blocked_for_transitional_executor",
+                    state,
+                });
+            }
+        };
+        let executor_epoch = execution.next_executor_epoch;
+        execution.next_executor_epoch = executor_epoch
+            .checked_add(1)
+            .ok_or(ThreadExecutionError::GenerationExhausted)?;
+        let Some(cpu_state) = execution.cpu_state.take() else {
+            return Err(ThreadExecutionError::InvalidTransition {
+                operation: "claim_blocked_without_cpu_state",
+                state: execution.state,
+            });
+        };
+        execution.state = ThreadExecutionState::Running {
+            generation,
+            executor,
+            executor_epoch,
+            wake_pending: false,
+        };
+        drop(execution);
+        self.revision.publish();
+        Ok(ThreadExecutionLease {
+            owner: Arc::downgrade(self),
+            owner_key: self.key,
+            generation,
+            executor,
+            executor_epoch,
+            cpu_state: Some(cpu_state),
+            settled: false,
+        })
+    }
+
     /// Publish that the executor has begun saving the leased task state.
     pub fn begin_switch_out(
         &self,
@@ -4148,6 +4239,47 @@ impl Thread {
         lease: ThreadExecutionLease,
     ) -> ThreadExecutionSettlementResult {
         self.settle_execution_lease(lease, ExecutionSettlement::Exited)
+    }
+
+    pub fn fail_from_executor(
+        &self,
+        mut lease: ThreadExecutionLease,
+        reason: ExecutionFailure,
+    ) -> ThreadExecutionSettlementResult {
+        if let Err(error) = self.validate_execution_lease_owner(&lease) {
+            return Err((error, lease));
+        }
+        let mut execution = self.execution.lock();
+        if !Self::execution_state_matches_lease(execution.state, &lease) {
+            let error = Self::stale_lease_error(&lease);
+            return Err((error, lease));
+        }
+        let Some(generation) = lease.generation.next() else {
+            return Err((ThreadExecutionError::GenerationExhausted, lease));
+        };
+        execution.cpu_state = None;
+        let _ = lease.cpu_state.take();
+        execution.state = ThreadExecutionState::Failed { generation, reason };
+        lease.settled = true;
+        drop(execution);
+        self.revision.publish();
+        Ok(())
+    }
+
+    /// Fail a task whose first backend snapshot could not be captured before a
+    /// lease existed. No guessed or empty state is published.
+    pub fn fail_uninitialized_snapshot(&self, reason: ExecutionFailure) {
+        let mut execution = self.execution.lock();
+        if execution.state != ThreadExecutionState::Uninitialized {
+            return;
+        }
+        execution.cpu_state = None;
+        execution.state = ThreadExecutionState::Failed {
+            generation: ExecutionGeneration::INITIAL,
+            reason,
+        };
+        drop(execution);
+        self.revision.publish();
     }
 
     fn settle_execution_lease(
@@ -4347,25 +4479,16 @@ impl Thread {
         self.crash_safe_point_participant.load(Ordering::Acquire)
     }
 
-    /// Record the `guest_cpu` slot this thread runs on. Must be called BY the
-    /// thread itself — the slot comes from its own thread-local claim — which
-    /// is why it is bound at the syscall dispatch boundary rather than by
-    /// whichever thread happens to create the object.
-    pub fn bind_own_cpu_slot(&self) {
-        if self.cpu_slot.load(Ordering::Relaxed) == CPU_SLOT_UNBOUND {
-            self.cpu_slot.store(
-                carrick_host::guest_cpu::this_thread_slot(),
-                Ordering::Release,
-            );
-        }
+    /// Guest USER CPU (µs) accumulated across every execution interval.
+    pub fn cpu_us(&self) -> u64 {
+        self.user_ns.load(Ordering::Acquire) / 1000
     }
 
-    /// Guest USER CPU (µs) this thread has accumulated, or zero before it has
-    /// run — time spent executing guest instructions.
-    pub fn cpu_us(&self) -> u64 {
-        match self.cpu_slot.load(Ordering::Acquire) {
-            CPU_SLOT_UNBOUND => 0,
-            slot => carrick_host::guest_cpu::slot_us(slot),
+    /// Charge guest execution CPU directly to this logical thread. Executor
+    /// slots are intentionally not accounting identities.
+    pub fn charge_user_ns(&self, delta_ns: u64) {
+        if delta_ns != 0 {
+            self.user_ns.fetch_add(delta_ns, Ordering::AcqRel);
         }
     }
 

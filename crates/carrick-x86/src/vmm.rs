@@ -529,7 +529,15 @@ pub trait X86Vmm: Sized + GuestVmBackend {
         layout: BringupLayout,
         snapshot: &X86VcpuSnapshot,
     ) -> Result<(), TrapError> {
-        bringup_fns::restore(vcpu, layout, snapshot)
+        bringup_fns::restore(vcpu, layout, snapshot)?;
+        if let Some(xsave) = &snapshot.xsave
+            && !vcpu.set_xsave(xsave)?
+        {
+            return Err(TrapError::Hypervisor(
+                "x86 backend refused complete XSAVE restore".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Replace the live guest image with `new_image` (`execve(2)`). The default
@@ -566,14 +574,20 @@ pub trait X86Vmm: Sized + GuestVmBackend {
 
     /// Save THIS thread's full guest CPU state (GPRs + RSP/RFLAGS + FS/GS base +
     /// FP/AVX) before releasing its vCPU slot at a block point.
-    fn save_guest_state(&self) -> Vec<u8> {
-        Vec::new()
+    fn save_guest_state(&self, vcpu: &Self::Vcpu) -> Result<X86VcpuSnapshot, TrapError> {
+        bringup_fns::snapshot(vcpu)
     }
 
     /// Re-bind to `slot`'s vCPU and restore `state` into it after a block.
-    fn rebind_to_slot(&mut self, slot: carrick_hal::SlotId, state: &[u8]) -> Result<(), TrapError> {
-        let _ = (slot, state);
-        Ok(())
+    fn rebind_to_slot(
+        &mut self,
+        vcpu: &mut Self::Vcpu,
+        slot: carrick_hal::SlotId,
+        layout: BringupLayout,
+        state: &X86VcpuSnapshot,
+    ) -> Result<(), TrapError> {
+        let _ = slot;
+        self.restore_vcpu(vcpu, layout, state)
     }
 
     /// Build the `Send` payload a `clone(CLONE_THREAD)` sibling thread needs to

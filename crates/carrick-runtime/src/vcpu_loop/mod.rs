@@ -1678,6 +1678,9 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
     crash_capture: Option<Arc<crate::kernel::CrashCaptureAuthority>>,
     kernel_thread: Option<crate::kernel::ThreadRef>,
+    /// Exact Task 1 execution authority while this logical thread is running.
+    /// Empty only before its first reclaim snapshot and while blocked.
+    execution_lease: Mutex<Option<crate::kernel::objects::ThreadExecutionLease>>,
     /// Authoritative Linux TGID for a task multiplexed by HVPatch. `None` on
     /// the one-host-process-per-task native/VMM lanes.
     hvpatch_task_pid: Option<i32>,
@@ -1720,7 +1723,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
 }
 
 struct BlockingWaitReclaim {
-    state: Vec<u8>,
+    state: crate::kernel::objects::MigratableTaskState,
     old_slot: Option<carrick_hal::SlotId>,
     single_threaded_process: bool,
 }
@@ -1825,6 +1828,7 @@ where
             process_fork_barrier,
             crash_capture,
             kernel_thread,
+            execution_lease: Mutex::new(None),
             hvpatch_task_pid,
             linux_tid,
             fatal_image_generation,
@@ -1848,6 +1852,158 @@ where
             .map_or_else(crate::fork_quiesce::is_quiescing, |barrier| {
                 barrier.is_quiescing()
             })
+    }
+
+    fn current_migratable_binding(
+        &self,
+        cpu: carrick_hal::threaded::GuestCpuState,
+    ) -> Result<crate::kernel::objects::MigratableTaskState, RuntimeError> {
+        let context = self.service_kernel_context.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "typed reclaim snapshot has no exact Kernel context".to_owned(),
+            )
+        })?;
+        let mm = context.shared().mm().id();
+        let generation = mm.raw();
+        let (cpu_mm, cpu_asid) = match &cpu {
+            carrick_hal::threaded::GuestCpuState::Aarch64V1(state) => {
+                (state.mm_generation, state.asid_generation)
+            }
+            carrick_hal::threaded::GuestCpuState::X86_64V1(state) => {
+                (state.mm_generation(), state.asid_generation())
+            }
+        };
+        if cpu_mm != generation || cpu_asid != generation {
+            return Err(RuntimeError::Configuration(format!(
+                "typed reclaim generation mismatch: cpu mm/asid={cpu_mm}/{cpu_asid} \
+                 Kernel mm/asid={generation}/{generation}"
+            )));
+        }
+        Ok(crate::kernel::objects::MigratableTaskState {
+            cpu,
+            mm,
+            asid_generation: generation,
+        })
+    }
+
+    fn fail_snapshot_boundary(&self, reason: crate::kernel::objects::ExecutionFailure) {
+        let Some(thread) = self.kernel_thread.as_ref() else {
+            return;
+        };
+        if let Some(lease) = self.execution_lease.lock().take() {
+            let _ = thread.fail_from_executor(lease, reason);
+        } else {
+            thread.fail_uninitialized_snapshot(reason);
+        }
+    }
+
+    fn settle_reclaim_snapshot(
+        &self,
+        state: &crate::kernel::objects::MigratableTaskState,
+    ) -> Result<(), RuntimeError> {
+        let Some(thread) = self.kernel_thread.as_ref() else {
+            return Ok(());
+        };
+        let executor = crate::kernel::objects::ExecutorId::for_transitional_thread(self.this_tid)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let mut lease = if let Some(lease) = self.execution_lease.lock().take() {
+            lease
+        } else {
+            thread
+                .publish_initial_cpu_state(state.cpu.clone())
+                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            thread
+                .claim_runnable(executor)
+                .map_err(|error| RuntimeError::Configuration(error.to_string()))?
+        };
+        if let Err(error) = lease.replace_cpu_state(state.cpu.clone()) {
+            let _ = thread.fail_from_executor(
+                lease,
+                crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
+            );
+            return Err(RuntimeError::Configuration(error.to_string()));
+        }
+        if let Err(error) = thread.begin_switch_out(&lease) {
+            let _ = thread.fail_from_executor(
+                lease,
+                crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
+            );
+            return Err(RuntimeError::Configuration(error.to_string()));
+        }
+        thread
+            .park_from_executor(lease, crate::kernel::objects::BlockedReason::HostWait)
+            .map_err(|(error, _lease)| RuntimeError::Configuration(error.to_string()))
+    }
+
+    fn claim_reclaim_snapshot(
+        &self,
+        expected: &crate::kernel::objects::MigratableTaskState,
+    ) -> Result<
+        (
+            carrick_hal::threaded::GuestCpuState,
+            crate::kernel::objects::ThreadExecutionLease,
+        ),
+        RuntimeError,
+    > {
+        let thread = self.kernel_thread.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("typed reclaim restore lost Kernel thread".to_owned())
+        })?;
+        let executor = crate::kernel::objects::ExecutorId::for_transitional_thread(self.this_tid)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let lease = thread
+            .claim_blocked_for_transitional_executor(executor)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let abi = <E::Arch as carrick_hal::GuestArch>::linux_guest_abi();
+        let cpu = match lease.cpu_state_for_restore(abi, 1) {
+            Ok(cpu) => cpu.clone(),
+            Err(error) => {
+                let _ = thread.fail_from_executor(
+                    lease,
+                    crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
+                );
+                return Err(RuntimeError::Configuration(error.to_string()));
+            }
+        };
+        let current_mm = self
+            .service_kernel_context
+            .as_ref()
+            .map(|context| context.shared().mm().id());
+        if cpu != expected.cpu
+            || expected.mm.raw() != expected.asid_generation
+            || current_mm != Some(expected.mm)
+        {
+            let _ = thread.fail_from_executor(
+                lease,
+                crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
+            );
+            return Err(RuntimeError::Configuration(
+                "typed reclaim restore authority does not match parked generation".to_owned(),
+            ));
+        }
+        Ok((cpu, lease))
+    }
+
+    fn complete_reclaim_restore(
+        &self,
+        lease: crate::kernel::objects::ThreadExecutionLease,
+        result: Result<(), TrapError>,
+    ) -> Result<(), RuntimeError> {
+        let thread = self.kernel_thread.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("typed reclaim restore lost Kernel thread".to_owned())
+        })?;
+        match result {
+            Ok(()) => {
+                *self.execution_lease.lock() = Some(lease);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = thread.fail_from_executor(
+                    lease,
+                    crate::kernel::objects::ExecutionFailure::SnapshotRestoreFailed,
+                );
+                Err(RuntimeError::Trap(error))
+            }
+        }
     }
 
     /// Publish this runtime thread's process-visible state without confusing
@@ -2399,7 +2555,7 @@ where
         &self,
         engine: &mut E,
         park_class: crate::thread::VcpuParkClass,
-    ) -> Option<BlockingWaitReclaim> {
+    ) -> Result<Option<BlockingWaitReclaim>, RuntimeError> {
         self.park_vcpu_for_blocking_wait_with_policy(engine, park_class, false)
     }
 
@@ -2408,9 +2564,9 @@ where
         engine: &mut E,
         park_class: crate::thread::VcpuParkClass,
         force_reclaim: bool,
-    ) -> Option<BlockingWaitReclaim> {
+    ) -> Result<Option<BlockingWaitReclaim>, RuntimeError> {
         if !engine.reclaims() {
-            return None;
+            return Ok(None);
         }
         // KEEP the vCPU when the pool is uncontended, unless the caller has
         // already classified this wait as long enough to yield proactively.
@@ -2434,7 +2590,7 @@ where
             scheduler.has_spare_capacity(),
             scheduler.has_waiters(),
         ) {
-            return None;
+            return Ok(None);
         }
         let park_started = std::time::Instant::now();
         // A one-thread Linux process does not necessarily own the VM: hvpatch
@@ -2444,7 +2600,7 @@ where
         // thread's vCPU alone while other processes continue running.
         let single_threaded_process =
             self.registry.live_count() == 1 && self.process_fork_barrier.is_none();
-        let state = if single_threaded_process {
+        let cpu = if single_threaded_process {
             // Single-threaded: this thread IS the whole process — no sibling
             // can race the teardown, so release unconditionally via the
             // combined vCPU+VM park (the historical pre-lease path, kept
@@ -2455,7 +2611,12 @@ where
             let _ = self
                 .registry
                 .park_vcpu_classified(self.this_tid, park_class);
-            let st = engine.save_shared_wait_state();
+            let st = engine.save_shared_wait_state().map_err(|error| {
+                self.fail_snapshot_boundary(
+                    crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
+                );
+                RuntimeError::Trap(error)
+            })?;
             self.registry.set_vm_released(true);
             st
         } else {
@@ -2475,12 +2636,23 @@ where
             // and wedged the CPython forkserver suite (cluster B). The
             // release is DEFERRED to the slicing wait arms' second parked
             // full slice — see `try_upgrade_vm_release_on_slice_tick`.
-            let st = engine.save_guest_state();
+            let st = engine.save_guest_state().map_err(|error| {
+                self.fail_snapshot_boundary(
+                    crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
+                );
+                RuntimeError::Trap(error)
+            })?;
             let _ = self
                 .registry
                 .park_vcpu_classified(self.this_tid, park_class);
             st
         };
+        let state = self.current_migratable_binding(cpu).inspect_err(|_error| {
+            self.fail_snapshot_boundary(
+                crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
+            );
+        })?;
+        self.settle_reclaim_snapshot(&state)?;
         let old_slot = carrick_hal::vcpu_sched::current_slot();
         if let Some(lease) = carrick_hal::vcpu_sched::take_current_lease() {
             carrick_hal::vcpu_sched::global()
@@ -2497,11 +2669,11 @@ where
                 Relaxed,
             );
         }
-        Some(BlockingWaitReclaim {
+        Ok(Some(BlockingWaitReclaim {
             state,
             old_slot,
             single_threaded_process,
-        })
+        }))
     }
 
     /// Deferred MT whole-VM release — the SLICE-TICK UPGRADE. Called only
@@ -2639,11 +2811,11 @@ where
         engine: &mut E,
         timeout: Option<Duration>,
         park_class: crate::thread::VcpuParkClass,
-    ) -> Option<BlockingWaitReclaim> {
+    ) -> Result<Option<BlockingWaitReclaim>, RuntimeError> {
         if should_reclaim_vcpu_for_timed_wait(timeout) {
             self.park_vcpu_for_blocking_wait_with_policy(engine, park_class, true)
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -2682,6 +2854,7 @@ where
             }
         };
         carrick_hal::vcpu_sched::set_current_lease(new_lease);
+        let (cpu, execution_lease) = self.claim_reclaim_snapshot(&reclaim.state)?;
         if engine.reclaim_refreshes_kicker() {
             let _topo = crate::fork_quiesce::acquire_topology_lock(
                 carrick_observability::probes::HvpatchTopologyOperation::VcpuRebind,
@@ -2700,25 +2873,20 @@ where
             // set the flag with the lease off, so ignoring a claim is safe).
             let claimed = self.registry.unpark_vcpu(self.this_tid);
             let rebuild_vm = reclaim.single_threaded_process || (mt_vm_lease_enabled() && claimed);
-            if rebuild_vm {
+            let restore_result = if rebuild_vm {
                 if reclaim.single_threaded_process {
-                    engine
-                        .rebind_shared_wait_state(new_lease.slot, &reclaim.state)
-                        .map_err(RuntimeError::Trap)?;
+                    engine.rebind_shared_wait_state(new_lease.slot, &cpu)
                 } else {
                     // MT first waker: rebuild the process VM on behalf of the
                     // still-parked siblings — the mapping replay must carry
                     // the UNION of every thread's dynamic mappings, not just
                     // this thread's per-thread list.
-                    engine
-                        .rebind_shared_wait_state_mt(new_lease.slot, &reclaim.state)
-                        .map_err(RuntimeError::Trap)?;
+                    engine.rebind_shared_wait_state_mt(new_lease.slot, &cpu)
                 }
             } else {
-                engine
-                    .rebind_to_slot(new_lease.slot, &reclaim.state)
-                    .map_err(RuntimeError::Trap)?;
-            }
+                engine.rebind_to_slot(new_lease.slot, &cpu)
+            };
+            self.complete_reclaim_restore(execution_lease, restore_result)?;
             self.register_vcpu(engine);
         } else {
             if self.fork_is_quiescing() {
@@ -2745,21 +2913,16 @@ where
             // branch: unpark always, honor an MT claim only with the lease on.
             let claimed = self.registry.unpark_vcpu(self.this_tid);
             let rebuild_vm = reclaim.single_threaded_process || (mt_vm_lease_enabled() && claimed);
-            if rebuild_vm {
+            let restore_result = if rebuild_vm {
                 if reclaim.single_threaded_process {
-                    engine
-                        .rebind_shared_wait_state(new_lease.slot, &reclaim.state)
-                        .map_err(RuntimeError::Trap)?;
+                    engine.rebind_shared_wait_state(new_lease.slot, &cpu)
                 } else {
-                    engine
-                        .rebind_shared_wait_state_mt(new_lease.slot, &reclaim.state)
-                        .map_err(RuntimeError::Trap)?;
+                    engine.rebind_shared_wait_state_mt(new_lease.slot, &cpu)
                 }
             } else {
-                engine
-                    .rebind_to_slot(new_lease.slot, &reclaim.state)
-                    .map_err(RuntimeError::Trap)?;
-            }
+                engine.rebind_to_slot(new_lease.slot, &cpu)
+            };
+            self.complete_reclaim_restore(execution_lease, restore_result)?;
         }
         let prev = reclaim.old_slot.unwrap_or(new_lease.slot);
         crate::probes::mn_reclaim(
@@ -3022,7 +3185,7 @@ where
                     let reclaim = self.park_vcpu_for_blocking_wait(
                         engine,
                         crate::thread::VcpuParkClass::FdBacked,
-                    );
+                    )?;
                     let outcome = crate::dispatch::drive_blocking_record_lock(&lock);
                     self.resume_vcpu_after_blocking_wait(engine, reclaim)?;
                     break Ok(outcome);
@@ -3047,7 +3210,7 @@ where
                     };
                     let wait_trace =
                         trace_hvpatch_wait_begin(kernel, self.this_tid, 1, &fds, engine);
-                    let reclaim = self.park_vcpu_for_timed_wait(engine, timeout, park_class);
+                    let reclaim = self.park_vcpu_for_timed_wait(engine, timeout, park_class)?;
                     let wait_result = self.waiter.wait_with_dispatch_pending(
                         &fds,
                         timeout,
@@ -3141,7 +3304,7 @@ where
                     };
                     let wait_trace =
                         trace_hvpatch_wait_begin(kernel, self.this_tid, 2, &fds, engine);
-                    let reclaim = self.park_vcpu_for_timed_wait(engine, timeout, park_class);
+                    let reclaim = self.park_vcpu_for_timed_wait(engine, timeout, park_class)?;
                     let wait_result = self.waiter.wait_with_dispatch_pending(
                         &fds,
                         timeout,
@@ -3225,7 +3388,7 @@ where
                     };
                     let wait_trace =
                         trace_hvpatch_wait_begin(kernel, self.this_tid, 3, &fds, engine);
-                    let reclaim = self.park_vcpu_for_timed_wait(engine, timeout, park_class);
+                    let reclaim = self.park_vcpu_for_timed_wait(engine, timeout, park_class)?;
                     let wait_result = self.waiter.wait_poll_with_dispatch_pending(
                         &fds,
                         timeout,
@@ -3282,7 +3445,7 @@ where
                     let reclaim = self.park_vcpu_for_blocking_wait(
                         engine,
                         crate::thread::VcpuParkClass::FdBacked,
-                    );
+                    )?;
                     let wait_result = self.waiter.wait_proc_exit_with_dispatch_pending(
                         pid,
                         sig_mask.block_mask(),
@@ -3325,7 +3488,7 @@ where
                     let reclaim = self.park_vcpu_for_blocking_wait(
                         engine,
                         crate::thread::VcpuParkClass::FdBacked,
-                    );
+                    )?;
                     let wait_result = self.waiter.wait_proc_state_with_dispatch_pending(
                         sig_mask.block_mask(),
                         || {
@@ -3396,7 +3559,7 @@ where
                     let wait_reclaim = self.park_vcpu_for_blocking_wait(
                         engine,
                         crate::thread::VcpuParkClass::ReleaseSafe,
-                    );
+                    )?;
                     let wait_result = self.waiter.wait_with_dispatch_pending(
                         &[],
                         Some(Duration::from_millis(10)),
@@ -3486,7 +3649,7 @@ where
                         engine,
                         guest_remaining,
                         crate::thread::VcpuParkClass::ReleaseSafe,
-                    );
+                    )?;
                     // Lost-kick safety net for skip-resume signal waits. A
                     // sibling can drain the xsig ring and publish a
                     // process-directed signal into dispatcher state while its
@@ -3683,7 +3846,7 @@ where
                         engine,
                         Some(remaining_until_deadline),
                         crate::thread::VcpuParkClass::ReleaseSafe,
-                    );
+                    )?;
                     // Inner re-wait loop (see the WaitOnSignals arm): an idle
                     // parked TimedOut tick re-arms the wait WITHOUT the
                     // resume/re-park round trip. Every tick re-checks the
@@ -4098,13 +4261,16 @@ where
         in_guest,
         max_traps,
     );
+    let task_snapshot_context = kernel
+        .dispatcher
+        .capture_kernel_context(state.linux_tid)
+        .map_err(|error| {
+            RuntimeError::Configuration(format!("bind task snapshot authority: {error}"))
+        })?;
+    let mm_generation = task_snapshot_context.shared().mm().id().raw();
+    engine.bind_task_snapshot_identity(mm_generation, mm_generation);
     if let Some(process) = kernel.hvpatch_process.as_ref() {
-        let context = kernel
-            .dispatcher
-            .capture_kernel_context(state.linux_tid)
-            .map_err(|error| {
-                RuntimeError::Configuration(format!("bind HVPatch frame-COW authority: {error}"))
-            })?;
+        let context = &task_snapshot_context;
         let binding = process.mm_binding().ok_or_else(|| {
             RuntimeError::Configuration("HVPatch task has no mm binding for frame COW".to_owned())
         })?;
@@ -4294,7 +4460,16 @@ where
             // /proc/<pid>/stat reads `R`. A genuine guest-blocking wait re-publishes
             // `Blocked` below for the duration of the park (see `block_guard`).
             state.publish_thread_run_state(crate::run_state::RunState::Running, 'R');
+            let guest_cpu_slot = carrick_host::guest_cpu::this_thread_slot();
+            let guest_run_started_us = carrick_host::guest_cpu::slot_us(guest_cpu_slot);
             let next = engine.next_syscall();
+            if let Some(thread) = state.kernel_thread.as_ref() {
+                thread.charge_user_ns(
+                    carrick_host::guest_cpu::slot_us(guest_cpu_slot)
+                        .saturating_sub(guest_run_started_us)
+                        .saturating_mul(1_000),
+                );
+            }
             // Any exit surfaced by the engine is past its internal EL1-vector
             // kick swallow: either guest EL0 ran or a real guest boundary was
             // reached. The prior syscall resume pair is no longer live.
@@ -4688,7 +4863,7 @@ where
                     let reclaim = state.park_vcpu_for_blocking_wait(
                         &mut engine,
                         crate::thread::VcpuParkClass::ReleaseSafe,
-                    );
+                    )?;
                     std::thread::yield_now();
                     state.resume_vcpu_after_blocking_wait(&mut engine, reclaim)?;
                     last_syscall_retval = Some(state.complete_returned(&mut engine, 0)?);

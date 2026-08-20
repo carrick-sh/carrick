@@ -23,6 +23,9 @@ use carrick_guest_mem::{
     SharedFutexLocation,
 };
 use carrick_hal::guest_arch::GuestArch as _;
+use carrick_hal::threaded::{
+    GuestCpuState, X86_TASK_RESUME_MAGIC, X86_TASK_RESUME_PAYLOAD_LEN, X86TaskCpuStateV1,
+};
 use carrick_hal::x8664_arch::{SegmentBaseRegs, SyscallNorm, X8664GuestArch, service_arch_prctl};
 use carrick_hal::{
     ForkOutcome, GuestEntryRegs, OsError, RawSyscall, Reg, SysReg, SyscallTrap, ThreadedEngine,
@@ -206,6 +209,10 @@ pub struct X86EngineCore<V: X86Vmm> {
     sysret_resume: Option<SysretResume>,
     /// `true` on the child side of a guest `fork(2)`.
     is_forked_child: bool,
+    /// Exact Kernel MM identity generation authorizing task snapshots.
+    mm_generation: u64,
+    /// Exact ASID allocation generation authorizing the task's CR3.
+    asid_generation: u64,
     /// Process-wide PROT_NONE set: the SHARED host-side EFAULT gate every x86
     /// backend (KVM/bhyve/NVMM) inherits via `GuestMemory::read_bytes`/
     /// `write_bytes`. Held as `Arc` so `clone(CLONE_THREAD)` siblings share ONE
@@ -252,6 +259,8 @@ impl<V: X86Vmm> X86EngineCore<V> {
             last_syscall_canonical: None,
             sysret_resume: None,
             is_forked_child: false,
+            mm_generation: 1,
+            asid_generation: 1,
             protections,
         }
     }
@@ -1454,11 +1463,141 @@ pub struct X86SiblingSpec<V: X86Vmm> {
 // `Arc<MemoryProtections>` is `Send + Sync`.
 unsafe impl<V: X86Vmm> Send for X86SiblingSpec<V> where V::SiblingBuilder: Send {}
 
+const X86_RESUME_PENDING_PC: u64 = 1 << 0;
+const X86_RESUME_LAST_SYSCALL: u64 = 1 << 1;
+const X86_RESUME_SYSRET: u64 = 1 << 2;
+const X86_RESUME_FORKED_CHILD: u64 = 1 << 3;
+const X86_RESUME_VALID_FLAGS: u64 =
+    X86_RESUME_PENDING_PC | X86_RESUME_LAST_SYSCALL | X86_RESUME_SYSRET | X86_RESUME_FORKED_CHILD;
+
+fn write_resume_u64(payload: &mut [u8; X86_TASK_RESUME_PAYLOAD_LEN], offset: usize, value: u64) {
+    payload[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn read_resume_u64(payload: &[u8; X86_TASK_RESUME_PAYLOAD_LEN], offset: usize) -> u64 {
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&payload[offset..offset + 8]);
+    u64::from_le_bytes(bytes)
+}
+
+fn encode_x86_resume_metadata<V: X86Vmm>(
+    engine: &X86EngineCore<V>,
+) -> [u8; X86_TASK_RESUME_PAYLOAD_LEN] {
+    let mut payload = [0_u8; X86_TASK_RESUME_PAYLOAD_LEN];
+    let mut flags = 0_u64;
+    if engine.pending_resume_pc.is_some() {
+        flags |= X86_RESUME_PENDING_PC;
+    }
+    if engine.last_syscall_canonical.is_some() {
+        flags |= X86_RESUME_LAST_SYSCALL;
+    }
+    if engine.sysret_resume.is_some() {
+        flags |= X86_RESUME_SYSRET;
+    }
+    if engine.is_forked_child {
+        flags |= X86_RESUME_FORKED_CHILD;
+    }
+    write_resume_u64(&mut payload, 0, flags);
+    write_resume_u64(&mut payload, 8, engine.pending_resume_pc.unwrap_or(0));
+    write_resume_u64(&mut payload, 16, engine.last_orig_rax);
+    write_resume_u64(&mut payload, 24, engine.last_syscall_canonical.unwrap_or(0));
+    write_resume_u64(
+        &mut payload,
+        32,
+        engine.sysret_resume.map_or(0, |resume| resume.user_pc),
+    );
+    write_resume_u64(
+        &mut payload,
+        40,
+        engine.sysret_resume.map_or(0, |resume| resume.user_rflags),
+    );
+    write_resume_u64(&mut payload, 56, X86_TASK_RESUME_MAGIC);
+    payload
+}
+
+fn decode_x86_resume_metadata(
+    payload: &[u8; X86_TASK_RESUME_PAYLOAD_LEN],
+) -> Result<(Option<u64>, u64, Option<u64>, Option<SysretResume>, bool), TrapError> {
+    let flags = read_resume_u64(payload, 0);
+    if flags & !X86_RESUME_VALID_FLAGS != 0 || read_resume_u64(payload, 56) != X86_TASK_RESUME_MAGIC
+    {
+        return Err(TrapError::Hypervisor(
+            "x86 V1 resume payload is corrupt or uses an unsupported flag".to_owned(),
+        ));
+    }
+    let pending_resume_pc =
+        (flags & X86_RESUME_PENDING_PC != 0).then(|| read_resume_u64(payload, 8));
+    let last_orig_rax = read_resume_u64(payload, 16);
+    let last_syscall = (flags & X86_RESUME_LAST_SYSCALL != 0).then(|| read_resume_u64(payload, 24));
+    let sysret_resume = (flags & X86_RESUME_SYSRET != 0).then(|| SysretResume {
+        user_pc: read_resume_u64(payload, 32),
+        user_rflags: read_resume_u64(payload, 40),
+    });
+    Ok((
+        pending_resume_pc,
+        last_orig_rax,
+        last_syscall,
+        sysret_resume,
+        flags & X86_RESUME_FORKED_CHILD != 0,
+    ))
+}
+
+fn x86_task_state_from_snapshot<V: X86Vmm>(
+    engine: &X86EngineCore<V>,
+    snapshot: &X86VcpuSnapshot,
+) -> Result<X86TaskCpuStateV1, TrapError> {
+    if engine.mm_generation == 0 || engine.asid_generation == 0 {
+        return Err(TrapError::Hypervisor(
+            "x86 snapshot has no exact MM/ASID generation binding".to_owned(),
+        ));
+    }
+    let xsave = snapshot.xsave.ok_or_else(|| {
+        TrapError::Hypervisor("x86 snapshot did not capture complete XSAVE state".to_owned())
+    })?;
+    X86TaskCpuStateV1::new(
+        snapshot.gprs,
+        snapshot.rip,
+        snapshot.rflags,
+        snapshot.rsp,
+        snapshot.cr0,
+        snapshot.cr3,
+        snapshot.cr4,
+        snapshot.efer,
+        snapshot.fs_base,
+        snapshot.gs_base,
+        engine.mm_generation,
+        engine.asid_generation,
+        xsave.to_vec(),
+        encode_x86_resume_metadata(engine).to_vec(),
+    )
+}
+
+fn x86_snapshot_from_task(state: &X86TaskCpuStateV1) -> X86VcpuSnapshot {
+    X86VcpuSnapshot {
+        gprs: *state.gprs(),
+        rip: state.rip(),
+        rsp: state.rsp(),
+        rflags: state.rflags(),
+        cr0: state.cr0(),
+        cr3: state.cr3(),
+        cr4: state.cr4(),
+        efer: state.efer(),
+        fs_base: state.fs_base(),
+        gs_base: state.gs_base(),
+        xsave: Some(*state.xsave()),
+    }
+}
+
 impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
     type Arch = X8664GuestArch;
     type KickHandle = V::KickHandle;
     type SiblingSpec = X86SiblingSpec<V>;
     type ProcessSpec = ();
+
+    fn bind_task_snapshot_identity(&mut self, mm_generation: u64, asid_generation: u64) {
+        self.mm_generation = mm_generation;
+        self.asid_generation = asid_generation;
+    }
 
     fn diagnostic_wait_registers(&self) -> Option<carrick_hal::GuestWaitRegisters> {
         Some(carrick_hal::GuestWaitRegisters {
@@ -1484,12 +1623,47 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
         self.vm.reclaims()
     }
 
-    fn save_guest_state(&mut self) -> Vec<u8> {
-        self.vm.save_guest_state()
+    fn save_guest_state(&mut self) -> Result<GuestCpuState, TrapError> {
+        let snapshot = self
+            .vm
+            .save_guest_state(&self.vcpu)
+            .map_err(|error| TrapError::Hypervisor(format!("save x86 guest state: {error}")))?;
+        GuestCpuState::from_x86_64_v1(x86_task_state_from_snapshot(self, &snapshot)?)
     }
 
-    fn rebind_to_slot(&mut self, slot: carrick_hal::SlotId, state: &[u8]) -> Result<(), TrapError> {
-        self.vm.rebind_to_slot(slot, state)
+    fn rebind_to_slot(
+        &mut self,
+        slot: carrick_hal::SlotId,
+        state: &GuestCpuState,
+    ) -> Result<(), TrapError> {
+        let GuestCpuState::X86_64V1(state) = state else {
+            return Err(TrapError::Hypervisor(format!(
+                "x86 restore rejected {:?} snapshot version {}",
+                state.guest_abi(),
+                state.version()
+            )));
+        };
+        if state.mm_generation() != self.mm_generation
+            || state.asid_generation() != self.asid_generation
+        {
+            return Err(TrapError::Hypervisor(format!(
+                "x86 restore generation mismatch: snapshot mm/asid={}/{} destination={}/{}",
+                state.mm_generation(),
+                state.asid_generation(),
+                self.mm_generation,
+                self.asid_generation
+            )));
+        }
+        let metadata = decode_x86_resume_metadata(state.resume_payload())?;
+        let snapshot = x86_snapshot_from_task(state);
+        self.vm
+            .rebind_to_slot(&mut self.vcpu, slot, self.layout, &snapshot)?;
+        self.pending_resume_pc = metadata.0;
+        self.last_orig_rax = metadata.1;
+        self.last_syscall_canonical = metadata.2;
+        self.sysret_resume = metadata.3;
+        self.is_forked_child = metadata.4;
+        Ok(())
     }
 
     fn fork_vfork(&mut self) -> Result<ForkOutcome, TrapError> {
@@ -1585,10 +1759,19 @@ mod tests {
 
     #[derive(Default)]
     struct TestVcpu {
+        gprs: [u64; 16],
         rcx: u64,
         r11: u64,
         rip: u64,
+        rsp: u64,
         rflags: u64,
+        cr0: u64,
+        cr3: u64,
+        cr4: u64,
+        efer: u64,
+        fs_base: u64,
+        gs_base: u64,
+        xsave: Option<[u8; crate::vmm::XSAVE_LEN]>,
         prepared_sysret: bool,
         get_gprs_calls: std::cell::Cell<u32>,
         set_gprs_calls: u32,
@@ -1759,10 +1942,28 @@ mod tests {
     impl X86Vcpu for TestVcpu {
         fn get_gpr(&self, reg: X86Reg) -> Result<u64, TrapError> {
             Ok(match reg {
+                X86Reg::Rax => self.gprs[0],
+                X86Reg::Rbx => self.gprs[1],
                 X86Reg::Rcx => self.rcx,
+                X86Reg::Rdx => self.gprs[3],
+                X86Reg::Rsi => self.gprs[4],
+                X86Reg::Rdi => self.gprs[5],
+                X86Reg::Rbp => self.gprs[6],
+                X86Reg::Rsp => self.rsp,
+                X86Reg::R8 => self.gprs[8],
+                X86Reg::R9 => self.gprs[9],
+                X86Reg::R10 => self.gprs[10],
                 X86Reg::R11 => self.r11,
+                X86Reg::R12 => self.gprs[12],
+                X86Reg::R13 => self.gprs[13],
+                X86Reg::R14 => self.gprs[14],
+                X86Reg::R15 => self.gprs[15],
                 X86Reg::Rip => self.rip,
                 X86Reg::Rflags => self.rflags,
+                X86Reg::Cr0 => self.cr0,
+                X86Reg::Cr3 => self.cr3,
+                X86Reg::Cr4 => self.cr4,
+                X86Reg::Efer => self.efer,
                 _ => 0,
             })
         }
@@ -1774,10 +1975,37 @@ mod tests {
                 ));
             }
             match reg {
-                X86Reg::Rcx => self.rcx = v,
-                X86Reg::R11 => self.r11 = v,
+                X86Reg::Rax => self.gprs[0] = v,
+                X86Reg::Rbx => self.gprs[1] = v,
+                X86Reg::Rcx => {
+                    self.gprs[2] = v;
+                    self.rcx = v;
+                }
+                X86Reg::Rdx => self.gprs[3] = v,
+                X86Reg::Rsi => self.gprs[4] = v,
+                X86Reg::Rdi => self.gprs[5] = v,
+                X86Reg::Rbp => self.gprs[6] = v,
+                X86Reg::Rsp => {
+                    self.gprs[7] = v;
+                    self.rsp = v;
+                }
+                X86Reg::R8 => self.gprs[8] = v,
+                X86Reg::R9 => self.gprs[9] = v,
+                X86Reg::R10 => self.gprs[10] = v,
+                X86Reg::R11 => {
+                    self.gprs[11] = v;
+                    self.r11 = v;
+                }
+                X86Reg::R12 => self.gprs[12] = v,
+                X86Reg::R13 => self.gprs[13] = v,
+                X86Reg::R14 => self.gprs[14] = v,
+                X86Reg::R15 => self.gprs[15] = v,
                 X86Reg::Rip => self.rip = v,
                 X86Reg::Rflags => self.rflags = v,
+                X86Reg::Cr0 => self.cr0 = v,
+                X86Reg::Cr3 => self.cr3 = v,
+                X86Reg::Cr4 => self.cr4 = v,
+                X86Reg::Efer => self.efer = v,
                 _ => {}
             }
             Ok(())
@@ -1815,18 +2043,20 @@ mod tests {
         }
 
         fn get_fs_base(&self) -> Result<u64, TrapError> {
-            Ok(0)
+            Ok(self.fs_base)
         }
 
-        fn set_fs_base(&mut self, _v: u64) -> Result<(), TrapError> {
+        fn set_fs_base(&mut self, v: u64) -> Result<(), TrapError> {
+            self.fs_base = v;
             Ok(())
         }
 
         fn get_gs_base(&self) -> Result<u64, TrapError> {
-            Ok(0)
+            Ok(self.gs_base)
         }
 
-        fn set_gs_base(&mut self, _v: u64) -> Result<(), TrapError> {
+        fn set_gs_base(&mut self, v: u64) -> Result<(), TrapError> {
+            self.gs_base = v;
             Ok(())
         }
 
@@ -1844,6 +2074,15 @@ mod tests {
         }
 
         fn set_fp(&mut self, _fx: &[u8; 512]) -> Result<bool, TrapError> {
+            Ok(true)
+        }
+
+        fn get_xsave(&self) -> Result<Option<[u8; crate::vmm::XSAVE_LEN]>, TrapError> {
+            Ok(self.xsave)
+        }
+
+        fn set_xsave(&mut self, xs: &[u8; crate::vmm::XSAVE_LEN]) -> Result<bool, TrapError> {
+            self.xsave = Some(*xs);
             Ok(true)
         }
 
@@ -1894,6 +2133,154 @@ mod tests {
             x86_fault_signal(X86FaultKind::GeneralProtection, 0),
             Some((libc::SIGSEGV, 128)),
             "user CLI #GP is SIGSEGV/SI_KERNEL on Docker linux/amd64"
+        );
+    }
+
+    #[test]
+    fn snapshot_boundary_is_typed_and_rejects_corrupt_payloads() {
+        let layout = test_layout();
+        let expected_gprs = std::array::from_fn(|index| 0x100 + index as u64);
+        let expected_xsave = std::array::from_fn(|index| (index % 251) as u8);
+        let vcpu = TestVcpu {
+            gprs: expected_gprs,
+            rcx: expected_gprs[2],
+            r11: expected_gprs[11],
+            rip: 0x200,
+            rsp: expected_gprs[7],
+            rflags: 0x246,
+            cr0: 0x8000_0011,
+            cr3: 0x4000,
+            cr4: 0x40620,
+            efer: 0xd01,
+            fs_base: 0x5000,
+            gs_base: 0x6000,
+            xsave: Some(expected_xsave),
+            ..Default::default()
+        };
+        let mut engine = X86EngineCore::from_parts(TestVmm, vcpu, layout);
+        engine.bind_task_snapshot_identity(7, 11);
+        engine.pending_resume_pc = Some(0x0040_1234);
+        engine.last_orig_rax = 0x55;
+        engine.last_syscall_canonical = Some(202);
+        engine.sysret_resume = Some(SysretResume {
+            user_pc: 0x0040_5678,
+            user_rflags: 0x246,
+        });
+
+        engine.is_forked_child = true;
+
+        let saved = engine.save_guest_state().expect("complete typed save");
+        let GuestCpuState::X86_64V1(saved_x86) = &saved else {
+            panic!("x86 engine returned the wrong typed variant");
+        };
+        assert_eq!(saved_x86.gprs(), &expected_gprs);
+        assert_eq!(saved_x86.rip(), 0x200);
+        assert_eq!(saved_x86.rflags(), 0x246);
+        assert_eq!(saved_x86.rsp(), expected_gprs[7]);
+        assert_eq!(saved_x86.cr0(), 0x8000_0011);
+        assert_eq!(saved_x86.cr3(), 0x4000);
+        assert_eq!(saved_x86.cr4(), 0x40620);
+        assert_eq!(saved_x86.efer(), 0xd01);
+        assert_eq!(saved_x86.fs_base(), 0x5000);
+        assert_eq!(saved_x86.gs_base(), 0x6000);
+        assert_eq!(saved_x86.xsave(), &expected_xsave);
+        assert_eq!(saved_x86.mm_generation(), 7);
+        assert_eq!(saved_x86.asid_generation(), 11);
+
+        let mut destination = X86EngineCore::from_parts(TestVmm, TestVcpu::default(), layout);
+        destination.bind_task_snapshot_identity(7, 11);
+        destination
+            .rebind_to_slot(3, &saved)
+            .expect("typed restore");
+        assert_eq!(destination.vcpu.gprs, expected_gprs);
+        assert_eq!(destination.vcpu.rcx, expected_gprs[2]);
+        assert_eq!(destination.vcpu.r11, expected_gprs[11]);
+        assert_eq!(destination.vcpu.rip, 0x200);
+        assert_eq!(destination.vcpu.rsp, expected_gprs[7]);
+        assert_eq!(destination.vcpu.rflags, 0x246);
+        assert_eq!(destination.vcpu.cr0, 0x8000_0011);
+        assert_eq!(destination.vcpu.cr3, 0x4000);
+        assert_eq!(destination.vcpu.cr4, 0x40620);
+        assert_eq!(destination.vcpu.efer, 0xd01);
+        assert_eq!(destination.vcpu.fs_base, 0x5000);
+        assert_eq!(destination.vcpu.gs_base, 0x6000);
+        assert_eq!(destination.vcpu.xsave, Some(expected_xsave));
+        assert_eq!(destination.pending_resume_pc, Some(0x0040_1234));
+        assert_eq!(destination.last_orig_rax, 0x55);
+        assert_eq!(destination.last_syscall_canonical, Some(202));
+        assert_eq!(
+            destination.sysret_resume,
+            Some(SysretResume {
+                user_pc: 0x0040_5678,
+                user_rflags: 0x246,
+            })
+        );
+        assert!(destination.is_forked_child);
+
+        let mut valid_resume = vec![0; carrick_hal::threaded::X86_TASK_RESUME_PAYLOAD_LEN];
+        valid_resume[56..64]
+            .copy_from_slice(&carrick_hal::threaded::X86_TASK_RESUME_MAGIC.to_le_bytes());
+        assert!(
+            carrick_hal::threaded::X86TaskCpuStateV1::new(
+                std::array::from_fn(|index| 0x100 + index as u64),
+                0x200,
+                0x246,
+                0x300,
+                0x400,
+                0x500,
+                0x600,
+                0x700,
+                0x800,
+                0x900,
+                7,
+                11,
+                vec![0xa5; carrick_hal::threaded::X86_TASK_XSAVE_LEN - 1],
+                valid_resume.clone(),
+            )
+            .is_err(),
+            "truncated XSAVE must fail closed"
+        );
+        assert!(
+            carrick_hal::threaded::X86TaskCpuStateV1::new(
+                std::array::from_fn(|index| 0x100 + index as u64),
+                0x200,
+                0x246,
+                0x300,
+                0x400,
+                0x500,
+                0x600,
+                0x700,
+                0x800,
+                0x900,
+                7,
+                11,
+                vec![0xa5; carrick_hal::threaded::X86_TASK_XSAVE_LEN],
+                vec![0x5a; carrick_hal::threaded::X86_TASK_RESUME_PAYLOAD_LEN - 1],
+            )
+            .is_err(),
+            "truncated resume payload must fail closed"
+        );
+        let mut corrupt_resume = valid_resume;
+        corrupt_resume[56] ^= 0xff;
+        assert!(
+            carrick_hal::threaded::X86TaskCpuStateV1::new(
+                expected_gprs,
+                0x200,
+                0x246,
+                0x300,
+                0x400,
+                0x500,
+                0x600,
+                0x700,
+                0x800,
+                0x900,
+                7,
+                11,
+                vec![0xa5; carrick_hal::threaded::X86_TASK_XSAVE_LEN],
+                corrupt_resume,
+            )
+            .is_err(),
+            "corrupt resume payload must fail closed"
         );
     }
 

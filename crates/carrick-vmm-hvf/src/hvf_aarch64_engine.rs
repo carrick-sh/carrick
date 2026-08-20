@@ -29,11 +29,13 @@
 
 use std::sync::{Arc, OnceLock};
 
+use carrick_aarch64::engine::restore_aarch64_task_state;
 use carrick_aarch64::{
     Aarch64EngineCore, Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy,
 };
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{Gpa, MemoryError, SharedFutexLocation};
+use carrick_hal::threaded::Aarch64TaskCpuStateV1;
 use carrick_hal::{
     GuestEntryRegs, GuestVmBackend, ProcessForkRequest, Reg, SlotId, SysReg, TrapError,
     VcpuRegistry,
@@ -859,56 +861,59 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         &mut self,
         vcpu: &mut Self::Vcpu,
     ) -> Result<Aarch64VcpuSnapshot, TrapError> {
-        // M:N reclaim BLOCK side: snapshot + DESTROY this vCPU (frees an HVF
-        // concurrent-vCPU slot). The snapshot is stashed INTERNALLY in
-        // `self.state.reclaim_snapshot` (read by `rebind_to_slot` on the SAME
-        // thread), so the engine's serialized bytes are unused — return a zeroed
-        // snapshot the engine drops. The vCPU handle is left stale until the wake.
+        let snapshot = vcpu.snapshot().map_err(|error| {
+            TrapError::Hypervisor(format!("HVF reclaim typed snapshot capture: {error}"))
+        })?;
         self.state
             .reclaim_park(&mut vcpu.inner, &mut vcpu.mailbox)?;
-        Ok(zeroed_snapshot())
+        Ok(snapshot)
     }
 
     fn save_shared_wait_state(
         &mut self,
         vcpu: &mut Self::Vcpu,
     ) -> Result<Aarch64VcpuSnapshot, TrapError> {
+        let snapshot = vcpu.snapshot().map_err(|error| {
+            TrapError::Hypervisor(format!("HVF shared-wait typed snapshot capture: {error}"))
+        })?;
         self.state
             .shared_wait_park(&mut vcpu.inner, &mut vcpu.mailbox)?;
-        Ok(zeroed_snapshot())
+        Ok(snapshot)
     }
 
     fn rebind_to_slot(
         &mut self,
         _slot: SlotId,
-        _snapshot: &Aarch64VcpuSnapshot,
+        state: &Aarch64TaskCpuStateV1,
         vcpu: &mut Self::Vcpu,
     ) -> Result<(), TrapError> {
-        // M:N reclaim WAKE side: recreate this thread's vCPU in the EXISTING VM and
-        // restore the parked state, writing the new vCPU back through `vcpu`. The
-        // engine's `_snapshot` placeholder is ignored — HVF `take`s its own stashed
-        // `reclaim_snapshot`. Slot id ignored (HVF recreates its OWN vCPU; no pool).
         self.state
-            .reclaim_resume(&mut vcpu.inner, &mut vcpu.mailbox)
+            .reclaim_resume(&mut vcpu.inner, &mut vcpu.mailbox)?;
+        let destination = vcpu.snapshot()?;
+        let restored = restore_aarch64_task_state(&destination, state)?;
+        vcpu.restore(&restored)
     }
 
     fn rebind_shared_wait_state(
         &mut self,
         _slot: SlotId,
-        _snapshot: &Aarch64VcpuSnapshot,
+        state: &Aarch64TaskCpuStateV1,
         vcpu: &mut Self::Vcpu,
     ) -> Result<(), TrapError> {
         self.state.shared_wait_resume(
             &mut vcpu.inner,
             &mut vcpu.mailbox,
             /*replay_alias_union=*/ false,
-        )
+        )?;
+        let destination = vcpu.snapshot()?;
+        let restored = restore_aarch64_task_state(&destination, state)?;
+        vcpu.restore(&restored)
     }
 
     fn rebind_shared_wait_state_mt(
         &mut self,
         _slot: SlotId,
-        _snapshot: &Aarch64VcpuSnapshot,
+        state: &Aarch64TaskCpuStateV1,
         vcpu: &mut Self::Vcpu,
     ) -> Result<(), TrapError> {
         // MT whole-VM lease first-waker rebuild: `self.mappings` is PER-THREAD,
@@ -920,7 +925,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             &mut vcpu.inner,
             &mut vcpu.mailbox,
             /*replay_alias_union=*/ true,
-        )
+        )?;
+        let destination = vcpu.snapshot()?;
+        let restored = restore_aarch64_task_state(&destination, state)?;
+        vcpu.restore(&restored)
     }
 
     fn release_vm_after_reclaim_park(&mut self) -> Result<bool, TrapError> {
@@ -1012,35 +1020,6 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn fpsimd_enabled(&self) -> bool {
         crate::trap::fpsimd_save_enabled()
-    }
-}
-
-/// An all-zero neutral snapshot the engine drops (HVF's reclaim stashes the real
-/// snapshot internally). Mirrors the engine's own placeholder.
-fn zeroed_snapshot() -> Aarch64VcpuSnapshot {
-    Aarch64VcpuSnapshot {
-        gprs: [0; 31],
-        pc: 0,
-        pstate: 0,
-        sp_el0: 0,
-        sp_el1: 0,
-        elr_el1: 0,
-        spsr_el1: 0,
-        ttbr0: 0,
-        ttbr1: 0,
-        tcr: 0,
-        sctlr: 0,
-        mair: 0,
-        vbar: 0,
-        cpacr: 0,
-        tpidr_el0: 0,
-        contextidr_el1: 0,
-        tpidrro_el0: 0,
-        tpidr_el1: 0,
-        actlr_el1: 0,
-        vregs: [0; 32],
-        fpsr: 0,
-        fpcr: 0,
     }
 }
 

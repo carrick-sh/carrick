@@ -262,7 +262,18 @@ where
             // was still spare at the instant they parked.
             let reclaim_now = engine.reclaims();
             let snapshot = if reclaim_now {
-                let st = engine.save_guest_state();
+                let cpu = engine.save_guest_state().map_err(|error| {
+                    self.fail_snapshot_boundary(
+                        crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
+                    );
+                    RuntimeError::Trap(error)
+                })?;
+                let st = self.current_migratable_binding(cpu).inspect_err(|_error| {
+                    self.fail_snapshot_boundary(
+                        crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
+                    );
+                })?;
+                self.settle_reclaim_snapshot(&st)?;
                 let old_slot = carrick_hal::vcpu_sched::current_slot();
                 if let Some(l) = carrick_hal::vcpu_sched::take_current_lease() {
                     carrick_hal::vcpu_sched::global()
@@ -364,6 +375,7 @@ where
                     return Ok(BlockingWaitCompletion::ExecReplacedThread);
                 };
                 carrick_hal::vcpu_sched::set_current_lease(new);
+                let (cpu, execution_lease) = self.claim_reclaim_snapshot(&st)?;
                 if engine.reclaim_refreshes_kicker() {
                     // HVF recreates the vCPU: do it under the topology lock so
                     // vcpu_create can't race a concurrent fork's hv_vm_destroy/
@@ -376,9 +388,8 @@ where
                             .map_or(0, crate::hvpatch::ProcessContext::pid),
                         self.this_tid.raw(),
                     );
-                    engine
-                        .rebind_to_slot(new.slot, &st)
-                        .map_err(RuntimeError::Trap)?;
+                    let restore_result = engine.rebind_to_slot(new.slot, &cpu);
+                    self.complete_reclaim_restore(execution_lease, restore_result)?;
                     self.register_vcpu(engine);
                 } else {
                     // If a fork quiesce began while (or right after) we
@@ -405,9 +416,8 @@ where
                     if kicker_dropped {
                         self.register_vcpu(engine);
                     }
-                    engine
-                        .rebind_to_slot(new.slot, &st)
-                        .map_err(RuntimeError::Trap)?;
+                    let restore_result = engine.rebind_to_slot(new.slot, &cpu);
+                    self.complete_reclaim_restore(execution_lease, restore_result)?;
                 }
                 let prev = old_slot.unwrap_or(new.slot);
                 crate::probes::mn_reclaim(
@@ -486,8 +496,8 @@ where
             // duration of the shared-word wait. ReleaseSafe: the wake is the
             // cross-process futex mirror / __ulock predicate, the ORIGINAL
             // (E4) VM-released wait shape, proven vCPU-less.
-            let reclaim =
-                self.park_vcpu_for_blocking_wait(engine, crate::thread::VcpuParkClass::ReleaseSafe);
+            let reclaim = self
+                .park_vcpu_for_blocking_wait(engine, crate::thread::VcpuParkClass::ReleaseSafe)?;
 
             let publish_wait_enrolled = || {
                 self.publish_thread_run_state(crate::run_state::RunState::Blocked, 'S');
@@ -737,7 +747,7 @@ where
         // materializer holds the topology lock until `start_tx`, so resuming the
         // parent first would exchange the slot deadlock for a topology deadlock.
         let parent_reclaim =
-            self.park_vcpu_for_blocking_wait(engine, crate::thread::VcpuParkClass::ReleaseSafe);
+            self.park_vcpu_for_blocking_wait(engine, crate::thread::VcpuParkClass::ReleaseSafe)?;
         let handle = std::thread::Builder::new()
             .name(host_thread_name)
             .spawn(move || {
@@ -1319,6 +1329,17 @@ where
         code: i32,
         traps: usize,
     ) -> VcpuLoopOutcome {
+        if let (Some(thread), Some(lease)) = (
+            self.kernel_thread.as_ref(),
+            self.execution_lease.lock().take(),
+        ) && let Err((error, lease)) = thread.exit_from_executor(lease)
+        {
+            tracing::error!(%error, "settle exact execution lease on thread exit failed");
+            let _ = thread.fail_from_executor(
+                lease,
+                crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
+            );
+        }
         // Exit-cleanup gate: the moment `kicker.unregister` below runs, a
         // concurrent fork's quiesce stops counting this thread — but the
         // cleanup that follows (`host_signal::forget_thread`) takes a

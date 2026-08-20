@@ -831,7 +831,15 @@ pub struct Aarch64TaskCpuStateV1 {
     pub pc: u64,
     /// Exact EL0 processor state paired with [`Self::pc`].
     pub pstate: u64,
+    /// Raw vCPU PC at the scheduler boundary (EL1 while a syscall is pending).
+    pub trap_pc: u64,
+    /// Raw vCPU PSTATE paired with [`Self::trap_pc`].
+    pub trap_pstate: u64,
     pub sp_el0: u64,
+    /// Trap-time EL0 return address retained while a syscall is pending.
+    pub elr_el1: u64,
+    /// Trap-time EL0 PSTATE paired with [`Self::elr_el1`].
+    pub spsr_el1: u64,
     pub ttbr0: u64,
     pub ttbr1: u64,
     pub tcr: u64,
@@ -863,7 +871,8 @@ pub const X86_TASK_XSAVE_LEN: usize = 832;
 /// Task 2 maps the existing pending-resume/syscall fields into this fixed V1
 /// payload. Fixing the size here makes truncation or an unversioned extension
 /// fail before state can enter the Kernel object graph.
-pub const X86_TASK_RESUME_PAYLOAD_LEN: usize = 32;
+pub const X86_TASK_RESUME_PAYLOAD_LEN: usize = 64;
+pub const X86_TASK_RESUME_MAGIC: u64 = 0x4352_4b58_3836_5631;
 
 /// Version-one migratable x86_64 task state owned by a Kernel thread.
 ///
@@ -876,7 +885,10 @@ pub struct X86TaskCpuStateV1 {
     rip: u64,
     rflags: u64,
     rsp: u64,
+    cr0: u64,
     cr3: u64,
+    cr4: u64,
+    efer: u64,
     fs_base: u64,
     gs_base: u64,
     mm_generation: u64,
@@ -892,7 +904,10 @@ impl X86TaskCpuStateV1 {
         rip: u64,
         rflags: u64,
         rsp: u64,
+        cr0: u64,
         cr3: u64,
+        cr4: u64,
+        efer: u64,
         fs_base: u64,
         gs_base: u64,
         mm_generation: u64,
@@ -900,31 +915,75 @@ impl X86TaskCpuStateV1 {
         xsave: Vec<u8>,
         resume_payload: Vec<u8>,
     ) -> Result<Self, TrapError> {
-        let xsave = xsave.try_into().map_err(|payload: Vec<u8>| {
+        if mm_generation == 0 || asid_generation == 0 {
+            return Err(TrapError::Hypervisor(
+                "x86 task-state V1 requires exact nonzero MM/ASID generations".to_owned(),
+            ));
+        }
+        let xsave: Box<[u8; X86_TASK_XSAVE_LEN]> = xsave.try_into().map_err(|payload: Vec<u8>| {
             TrapError::Hypervisor(format!(
                 "x86 task-state V1 XSAVE length mismatch: expected {X86_TASK_XSAVE_LEN}, got {}",
                 payload.len()
             ))
         })?;
-        let resume_payload = resume_payload.try_into().map_err(|payload: Vec<u8>| {
-            TrapError::Hypervisor(format!(
-                "x86 task-state V1 resume payload length mismatch: expected \
+        let resume_payload: Box<[u8; X86_TASK_RESUME_PAYLOAD_LEN]> =
+            resume_payload.try_into().map_err(|payload: Vec<u8>| {
+                TrapError::Hypervisor(format!(
+                    "x86 task-state V1 resume payload length mismatch: expected \
                  {X86_TASK_RESUME_PAYLOAD_LEN}, got {}",
-                payload.len()
-            ))
-        })?;
+                    payload.len()
+                ))
+            })?;
+        let magic = u64::from_le_bytes(
+            resume_payload[56..64]
+                .try_into()
+                .map_err(|_| TrapError::Hypervisor("x86 resume magic is truncated".to_owned()))?,
+        );
+        if magic != X86_TASK_RESUME_MAGIC {
+            return Err(TrapError::Hypervisor(format!(
+                "x86 task-state V1 resume payload magic mismatch: expected \
+                 {X86_TASK_RESUME_MAGIC:#x}, got {magic:#x}"
+            )));
+        }
+        let flags = u64::from_le_bytes(
+            resume_payload[0..8]
+                .try_into()
+                .map_err(|_| TrapError::Hypervisor("x86 resume flags are truncated".to_owned()))?,
+        );
+        if flags & !0xf != 0 || resume_payload[48..56] != [0; 8] {
+            return Err(TrapError::Hypervisor(
+                "x86 task-state V1 resume payload contains unsupported flags or reserved bytes"
+                    .to_owned(),
+            ));
+        }
+        let read_u64 = |offset: usize| {
+            let mut bytes = [0_u8; 8];
+            bytes.copy_from_slice(&resume_payload[offset..offset + 8]);
+            u64::from_le_bytes(bytes)
+        };
+        if (flags & 1 == 0 && read_u64(8) != 0)
+            || (flags & 2 == 0 && read_u64(24) != 0)
+            || (flags & 4 == 0 && (read_u64(32) != 0 || read_u64(40) != 0))
+        {
+            return Err(TrapError::Hypervisor(
+                "x86 task-state V1 resume payload contains data without authority flags".to_owned(),
+            ));
+        }
         Ok(Self {
             gprs,
             rip,
             rflags,
             rsp,
+            cr0,
             cr3,
+            cr4,
+            efer,
             fs_base,
             gs_base,
             mm_generation,
             asid_generation,
-            xsave: Box::new(xsave),
-            resume_payload: Box::new(resume_payload),
+            xsave,
+            resume_payload,
         })
     }
 
@@ -946,6 +1005,18 @@ impl X86TaskCpuStateV1 {
 
     pub const fn cr3(&self) -> u64 {
         self.cr3
+    }
+
+    pub const fn cr0(&self) -> u64 {
+        self.cr0
+    }
+
+    pub const fn cr4(&self) -> u64 {
+        self.cr4
+    }
+
+    pub const fn efer(&self) -> u64 {
+        self.efer
     }
 
     pub const fn fs_base(&self) -> u64 {
@@ -1089,6 +1160,9 @@ pub struct FrameCowIdentity {
 }
 
 pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
+    /// Bind the exact Kernel MM and ASID allocation generations that authorize
+    /// scheduler snapshots produced by this engine.
+    fn bind_task_snapshot_identity(&mut self, _mm_generation: u64, _asid_generation: u64) {}
     fn bind_frame_cow(
         &mut self,
         _authority: std::sync::Arc<dyn FrameCowAuthority>,
@@ -1283,27 +1357,35 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     /// backend-serialized bytes round-tripped to [`rebind_to_slot`](Self::rebind_to_slot).
     /// `&mut self`: HVF DESTROYS its vCPU inside this call (snapshot then
     /// hv_vcpu_destroy); bhyve/KVM read registers and ignore the extra mutability.
-    fn save_guest_state(&mut self) -> Vec<u8> {
-        Vec::new()
+    fn save_guest_state(&mut self) -> Result<GuestCpuState, TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend does not support complete typed guest-state snapshots".to_owned(),
+        ))
     }
     /// Save state for a process-shared futex wait. Backends that can release
     /// stronger host resources while parked may override this separately from
     /// the generic private-futex reclaim path.
-    fn save_shared_wait_state(&mut self) -> Vec<u8> {
+    fn save_shared_wait_state(&mut self) -> Result<GuestCpuState, TrapError> {
         self.save_guest_state()
     }
     /// Re-bind this engine to `slot`'s vCPU and restore `state` into it — called by
     /// the owning thread when it re-acquires a (possibly different) slot after a
     /// block. Only when [`reclaims`](Self::reclaims).
-    fn rebind_to_slot(&mut self, slot: crate::SlotId, state: &[u8]) -> Result<(), TrapError> {
+    fn rebind_to_slot(
+        &mut self,
+        slot: crate::SlotId,
+        state: &GuestCpuState,
+    ) -> Result<(), TrapError> {
         let _ = (slot, state);
-        Ok(())
+        Err(TrapError::Hypervisor(
+            "backend does not support complete typed guest-state restore".to_owned(),
+        ))
     }
     /// Restore state saved by [`Self::save_shared_wait_state`].
     fn rebind_shared_wait_state(
         &mut self,
         slot: crate::SlotId,
-        state: &[u8],
+        state: &GuestCpuState,
     ) -> Result<(), TrapError> {
         self.rebind_to_slot(slot, state)
     }
@@ -1335,7 +1417,7 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     fn rebind_shared_wait_state_mt(
         &mut self,
         slot: crate::SlotId,
-        state: &[u8],
+        state: &GuestCpuState,
     ) -> Result<(), TrapError> {
         self.rebind_shared_wait_state(slot, state)
     }
