@@ -344,6 +344,14 @@ def injected_receipt(reviewed):
     }
 
 
+def fixture_source_provenance():
+    return {
+        "source_head": "0" * 40,
+        "source_tree_sha256": "1" * 64,
+        "source_file_count": 6,
+    }
+
+
 def diagnostic(
     operation: str = "std::process::id",
     *,
@@ -974,6 +982,83 @@ class RefreshTest(unittest.TestCase):
         self.assertEqual(refreshed[0]["rationale"], "")
         self.assertNotEqual(refreshed[0]["review_id"], prior["review_id"])
 
+    def test_complete_refresh_rejects_invalid_reviews_before_carrying_them(self):
+        actual = actual_row(catalog_id="HA-CATALOG-PROCESS-ID")
+        cases = {
+            "wrong source": [
+                reviewed_row(
+                    rationale=(
+                        "At crates/wrong/src/lib.rs:10, std::process::id acts "
+                        "on the guest-visible process identity."
+                    )
+                )
+            ],
+            "blanket resource": [
+                reviewed_row(
+                    classification="declared_backing",
+                    evidence={
+                        "authority": "authorized_backing",
+                        "resource": (
+                            "filesystem artifact explicitly authorized by the "
+                            "active CLI command"
+                        ),
+                    },
+                    rationale=(
+                        "At crates/example/src/lib.rs:10, std::process::id "
+                        "accesses the selected filesystem artifact."
+                    ),
+                )
+            ],
+        }
+        for label, reviews in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaises(self.host_authority.InventoryError):
+                    self.host_authority.refresh([actual], reviews, True)
+
+        duplicate_rationale = (
+            "At crates/example/src/lib.rs:10, std::process::id and libc::getpid "
+            "act on one concrete process identity."
+        )
+        actual_rows = [
+            actual,
+            actual_row(
+                operation="libc::getpid",
+                catalog_id="HA-CATALOG-PROCESS-GETPID",
+            ),
+        ]
+        reviewed_rows = [
+            reviewed_row(rationale=duplicate_rationale),
+            reviewed_row(
+                review_id="HA-000002",
+                operation="libc::getpid",
+                catalog_id="HA-CATALOG-PROCESS-GETPID",
+                rationale=duplicate_rationale,
+            ),
+        ]
+        with self.assertRaises(self.host_authority.InventoryError):
+            self.host_authority.refresh(actual_rows, reviewed_rows, True)
+
+    def test_partial_candidate_does_not_carry_invalid_existing_reviews(self):
+        matrix = load_host_authority().load_matrix(MATRIX)
+        invalid = reviewed_row(rationale="blanket review")
+        partial = self.host_authority.candidate_document(
+            [actual_row(catalog_id="HA-CATALOG-FIXTURE-PROCESS-ID")],
+            [invalid],
+            ["macos-hvf-default"],
+            REQUIRED_PROFILES,
+            {
+                "rustc": "rustc pinned",
+                "clippy": "clippy pinned",
+                "host_triple": "aarch64-apple-darwin",
+            },
+            matrix,
+            FIXTURE_CATALOG,
+            fixture_source_provenance(),
+        )
+        self.assertFalse(partial["complete"])
+        self.assertEqual(partial["rows"][0]["classification"], "unreviewed")
+        self.assertEqual(partial["rows"][0]["rationale"], "")
+
 
 class FakeRunner:
     def __init__(self, cargo_stdout: str | None = None):
@@ -1059,6 +1144,171 @@ class MatrixOrchestrationTest(unittest.TestCase):
                 f'[toolchain]\nchannel = "{channel}"\n', encoding="utf-8"
             )
         return root
+
+    def initialize_product_repo(self, root):
+        self.write_minimal_workspace(root)
+        (root / "Cargo.lock").write_text("# locked\n", encoding="utf-8")
+        crate = root / "crates" / "example"
+        source_dir = crate / "src"
+        source_dir.mkdir(parents=True)
+        (crate / "Cargo.toml").write_text(
+            '[package]\nname = "example"\nversion = "0.0.0"\n',
+            encoding="utf-8",
+        )
+        (source_dir / "lib.rs").write_text(
+            "pub fn product() {}\n", encoding="utf-8"
+        )
+        commands = (
+            ["git", "init", "-q", str(root)],
+            ["git", "-C", str(root), "add", "."],
+            [
+                "git",
+                "-C",
+                str(root),
+                "-c",
+                "user.name=Authority Test",
+                "-c",
+                "user.email=authority@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        )
+        for command in commands:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+        return source_dir / "lib.rs"
+
+    def test_product_source_provenance_ignores_ambient_git_redirects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "worktree"
+            self.initialize_product_repo(root)
+            expected_head = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            redirected = Path(directory) / "attacker.git"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "GIT_DIR": str(redirected),
+                    "GIT_WORK_TREE": str(Path(directory) / "attacker-tree"),
+                    "GIT_INDEX_FILE": str(Path(directory) / "attacker-index"),
+                    "GIT_OBJECT_DIRECTORY": str(Path(directory) / "attacker-objects"),
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(
+                        Path(directory) / "attacker-alternates"
+                    ),
+                    "GIT_COMMON_DIR": str(Path(directory) / "attacker-common"),
+                    "GIT_CONFIG_GLOBAL": str(Path(directory) / "attacker-config"),
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "core.worktree",
+                    "GIT_CONFIG_VALUE_0": str(
+                        Path(directory) / "config-attacker-tree"
+                    ),
+                },
+                clear=False,
+            ):
+                provenance = self.host_authority.product_source_provenance(root)
+        self.assertEqual(provenance["source_head"], expected_head)
+        self.assertRegex(provenance["source_tree_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(provenance["source_file_count"], 6)
+
+    def test_product_source_digest_tracks_dirty_tracked_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "worktree"
+            source_path = self.initialize_product_repo(root)
+            before = self.host_authority.product_source_provenance(root)
+            source_path.write_text("pub fn changed() {}\n", encoding="utf-8")
+            after = self.host_authority.product_source_provenance(root)
+        self.assertEqual(before["source_head"], after["source_head"])
+        self.assertEqual(before["source_file_count"], after["source_file_count"])
+        self.assertNotEqual(
+            before["source_tree_sha256"], after["source_tree_sha256"]
+        )
+
+    def test_product_source_provenance_rejects_relevant_untracked_files(self):
+        for relative in (
+            Path("crates/example/src/untracked.rs"),
+            Path("crates/untracked/Cargo.toml"),
+        ):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "worktree"
+                self.initialize_product_repo(root)
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("untracked\n", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    self.host_authority.InventoryError, "untracked product"
+                ):
+                    self.host_authority.product_source_provenance(root)
+
+    def test_refresh_rejects_source_or_head_mutation_during_compilation(self):
+        matrix = self.load()
+        for mutation in ("source", "head"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "worktree"
+                source_path = self.initialize_product_repo(root)
+                candidate = Path(directory) / "candidate.json"
+                fake = FakeRunner()
+                changed = False
+
+                def runner(argv, **kwargs):
+                    nonlocal changed
+                    if "--manifest-path" in argv and not changed:
+                        source_path.write_text(
+                            f"pub fn changed_{mutation}() {{}}\n",
+                            encoding="utf-8",
+                        )
+                        if mutation == "head":
+                            subprocess.run(
+                                ["git", "-C", str(root), "add", str(source_path)],
+                                check=True,
+                                capture_output=True,
+                                text=True,
+                            )
+                            subprocess.run(
+                                [
+                                    "git",
+                                    "-C",
+                                    str(root),
+                                    "-c",
+                                    "user.name=Authority Test",
+                                    "-c",
+                                    "user.email=authority@example.invalid",
+                                    "commit",
+                                    "-qm",
+                                    "mutated",
+                                ],
+                                check=True,
+                                capture_output=True,
+                                text=True,
+                            )
+                        changed = True
+                    return fake(argv, **kwargs)
+
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    status = self.host_authority.main(
+                        [
+                            "--refresh-candidate",
+                            str(candidate),
+                            "--profiles",
+                            "macos-hvf-default",
+                        ],
+                        runner=runner,
+                        matrix=matrix,
+                        operation_catalog=FIXTURE_CATALOG,
+                        catalog_manifest=FIXTURE_CATALOG,
+                        expected=[],
+                        capture_receipt=injected_receipt([]),
+                        current_host="macos",
+                        root=root,
+                    )
+                self.assertTrue(changed)
+                self.assertEqual(status, 2)
+                self.assertFalse(candidate.exists())
+                self.assertIn("source", stderr.getvalue().casefold())
 
     def test_checked_matrix_declares_exact_nine_product_profiles(self):
         matrix = self.load()
@@ -1761,6 +2011,8 @@ class MatrixOrchestrationTest(unittest.TestCase):
         )
         self.assertEqual(document["capture_sha256"], canonical(capture))
         self.assertRegex(capture["source_head"], r"^[0-9a-f]{40}$")
+        self.assertRegex(capture["source_tree_sha256"], r"^[0-9a-f]{64}$")
+        self.assertGreater(capture["source_file_count"], 0)
         self.assertIn("partial", stderr.getvalue())
 
     def test_refresh_candidate_cannot_overwrite_checked_capture_receipt(self):
@@ -1844,7 +2096,7 @@ class MatrixOrchestrationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             temporary = Path(directory)
             root = temporary / "worktree"
-            self.write_minimal_workspace(root)
+            self.initialize_product_repo(root)
             checked_config = root / ".cargo" / "config.toml"
             checked_config.parent.mkdir(exist_ok=True)
             checked_config.write_text(
@@ -1896,7 +2148,6 @@ class MatrixOrchestrationTest(unittest.TestCase):
                     catalog_manifest=FIXTURE_CATALOG,
                     expected=[],
                     capture_receipt=injected_receipt([]),
-                    source_head="0" * 40,
                     current_host="macos",
                     root=root,
                 )
@@ -1968,7 +2219,7 @@ class MatrixOrchestrationTest(unittest.TestCase):
             },
             matrix,
             FIXTURE_CATALOG,
-            "0" * 40,
+            fixture_source_provenance(),
         )
         self.assertTrue(complete["complete"])
         self.assertEqual(complete["rows"], expected)
@@ -1984,7 +2235,7 @@ class MatrixOrchestrationTest(unittest.TestCase):
             },
             matrix,
             FIXTURE_CATALOG,
-            "0" * 40,
+            fixture_source_provenance(),
         )
         self.assertFalse(partial["complete"])
         self.assertTrue(
@@ -2007,7 +2258,7 @@ class MatrixOrchestrationTest(unittest.TestCase):
                     "clippy": "clippy pinned",
                     "host_triple": "aarch64-apple-darwin",
                 },
-                "0" * 40,
+                fixture_source_provenance(),
             )
 
     def test_partial_check_projects_reviewed_rows_without_writing(self):

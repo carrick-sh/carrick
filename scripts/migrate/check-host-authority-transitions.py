@@ -106,6 +106,18 @@ BLANKET_RESOURCE_FRAGMENTS = {
     "artifact explicitly authorized by the active cli command",
 }
 MAX_IDENTICAL_RESOURCE_REVIEWS = 12
+PRODUCT_SOURCE_ROOT_FILES = (
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    ".cargo/config.toml",
+)
+PRODUCT_SOURCE_TREES = ("crates", "scripts/dtrace")
+SOURCE_PROVENANCE_FIELDS = {
+    "source_head",
+    "source_tree_sha256",
+    "source_file_count",
+}
 
 
 class InventoryError(Exception):
@@ -1348,6 +1360,13 @@ def refresh(
     reviewed_by_identity, maximum = _reviewed_index(
         expected, allow_unreviewed=True
     )
+    carried_reviews = [
+        reviewed_by_identity[identity]
+        for identity in actual_by_identity
+        if identity in reviewed_by_identity
+        and reviewed_by_identity[identity]["classification"] != "unreviewed"
+    ]
+    validate_source_specific_reviews(carried_reviews)
     rows: list[dict[str, object]] = []
     next_number = maximum
     for identity, row in sorted(
@@ -1378,6 +1397,9 @@ def refresh(
                 "rationale": review["rationale"],
             }
         )
+    validate_source_specific_reviews(
+        [row for row in rows if row["classification"] != "unreviewed"]
+    )
     return rows
 
 
@@ -1778,7 +1800,7 @@ def candidate_document(
     toolchain: Mapping[str, str],
     matrix: Matrix,
     operation_catalog: Mapping[str, str],
-    source_head: str,
+    source_provenance: Mapping[str, object],
 ) -> dict[str, object]:
     """Build an explicit partial or refreshable complete candidate receipt."""
     executed = _profile_set(executed_profiles, "executed")
@@ -1818,7 +1840,7 @@ def candidate_document(
         sorted(executed),
         sorted(required - executed),
         toolchain,
-        source_head,
+        source_provenance,
     )
     return {
         "schema": 1,
@@ -1840,11 +1862,10 @@ def compiler_capture_receipt(
     executed_profiles: Sequence[str],
     pending_profiles: Sequence[str],
     toolchain: Mapping[str, str],
-    source_head: str,
+    source_provenance: Mapping[str, object],
 ) -> dict[str, object]:
     """Build a self-contained exact receipt for newly executed profiles."""
-    if re.fullmatch(r"[0-9a-f]{40}", source_head) is None:
-        raise InventoryError("candidate source_head must be a full lowercase Git hash")
+    provenance = _validate_source_provenance(source_provenance)
     catalog = _validate_operation_catalog(operation_catalog)
     executed = _profile_set(executed_profiles, "capture executed")
     if (
@@ -1892,7 +1913,7 @@ def compiler_capture_receipt(
     return {
         "schema": 1,
         "kind": "host-authority-compiler-capture",
-        "source_head": source_head,
+        **provenance,
         "toolchain": dict(toolchain),
         "executed_profiles": sorted(executed),
         "pending_profiles": sorted(pending),
@@ -1906,21 +1927,230 @@ def compiler_capture_receipt(
     }
 
 
-def current_source_head(root: Path) -> str:
-    """Resolve the exact Git commit associated with a compiler capture."""
+def _validate_source_provenance(
+    provenance: Mapping[str, object],
+) -> dict[str, object]:
+    if (
+        not isinstance(provenance, Mapping)
+        or set(provenance) != SOURCE_PROVENANCE_FIELDS
+    ):
+        raise InventoryError("candidate has invalid product-source provenance")
+    source_head = provenance.get("source_head")
+    source_digest = provenance.get("source_tree_sha256")
+    file_count = provenance.get("source_file_count")
+    if (
+        not isinstance(source_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}", source_head) is None
+    ):
+        raise InventoryError("candidate source_head must be a full lowercase Git hash")
+    if (
+        not isinstance(source_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_digest) is None
+    ):
+        raise InventoryError("candidate source_tree_sha256 must be a SHA-256 digest")
+    if (
+        not isinstance(file_count, int)
+        or isinstance(file_count, bool)
+        or file_count <= 0
+    ):
+        raise InventoryError("candidate source_file_count must be positive")
+    return dict(provenance)
+
+
+def _sanitized_git_environment() -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_OPTIONAL_LOCKS": "0",
+        }
+    )
+    return environment
+
+
+def _git_output(root: Path, arguments: Sequence[str], label: str) -> bytes:
+    root = Path(root).resolve(strict=True)
     completed = subprocess.run(
-        ["git", "-C", str(Path(root).resolve()), "rev-parse", "HEAD"],
+        [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            f"core.worktree={root}",
+            "-C",
+            str(root),
+            *arguments,
+        ],
         cwd="/",
+        env=_sanitized_git_environment(),
         capture_output=True,
-        text=True,
+        text=False,
         check=False,
         shell=False,
     )
-    source_head = completed.stdout.strip()
-    if completed.returncode != 0 or re.fullmatch(r"[0-9a-f]{40}", source_head) is None:
-        detail = completed.stderr.strip()
-        raise InventoryError(f"cannot resolve candidate source HEAD: {detail}")
-    return source_head
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "replace").strip()
+        raise InventoryError(f"cannot resolve product-source {label}: {detail}")
+    return completed.stdout
+
+
+def _is_relevant_untracked_product_path(relative: PurePosixPath) -> bool:
+    parts = relative.parts
+    if not parts:
+        return False
+    if parts[0] == "crates":
+        if relative.name in {"Cargo.toml", "Cargo.lock", "build.rs"}:
+            return True
+        if relative.suffix in {".rs", ".c", ".h", ".S"}:
+            return True
+        return "src" in parts[2:] or "csrc" in parts[2:]
+    return parts[:2] == ("scripts", "dtrace") and relative.suffix == ".d"
+
+
+def _relevant_untracked_product_paths(
+    root: Path, tracked: set[PurePosixPath]
+) -> list[str]:
+    untracked = []
+    for tree in PRODUCT_SOURCE_TREES:
+        base = root / tree
+        if not base.exists():
+            continue
+        for directory, directory_names, file_names in os.walk(
+            base, followlinks=False
+        ):
+            directory_path = Path(directory)
+            symlink_directories = [
+                name
+                for name in directory_names
+                if (directory_path / name).is_symlink()
+            ]
+            directory_names[:] = [
+                name for name in directory_names if name not in symlink_directories
+            ]
+            for name in [*file_names, *symlink_directories]:
+                path = directory_path / name
+                relative = PurePosixPath(path.relative_to(root).as_posix())
+                if (
+                    relative not in tracked
+                    and _is_relevant_untracked_product_path(relative)
+                ):
+                    untracked.append(relative.as_posix())
+    return sorted(untracked)
+
+
+def _tracked_product_paths(root: Path) -> list[PurePosixPath]:
+    output = _git_output(
+        root,
+        [
+            "ls-files",
+            "-z",
+            "--cached",
+            "--",
+            *PRODUCT_SOURCE_ROOT_FILES,
+            *PRODUCT_SOURCE_TREES,
+        ],
+        "tracked inputs",
+    )
+    decoded = [
+        PurePosixPath(os.fsdecode(raw))
+        for raw in output.split(b"\0")
+        if raw
+    ]
+    if decoded != sorted(set(decoded), key=lambda path: path.as_posix()):
+        raise InventoryError("tracked product-source paths are not unique and sorted")
+    required = {PurePosixPath(path) for path in PRODUCT_SOURCE_ROOT_FILES}
+    missing = sorted(path.as_posix() for path in required - set(decoded))
+    if missing:
+        raise InventoryError(f"tracked product-source inputs are missing: {missing}")
+    for relative in decoded:
+        if relative.is_absolute() or ".." in relative.parts:
+            raise InventoryError(f"invalid tracked product-source path: {relative}")
+    return decoded
+
+
+def _product_source_record(root: Path, relative: PurePosixPath) -> dict[str, object]:
+    path = root.joinpath(*relative.parts)
+    try:
+        before = path.lstat()
+    except FileNotFoundError as error:
+        raise InventoryError(
+            f"tracked product-source input is missing: {relative}"
+        ) from error
+    if stat.S_ISREG(before.st_mode):
+        kind = "file"
+        content = path.read_bytes()
+    elif stat.S_ISLNK(before.st_mode):
+        kind = "symlink"
+        content = os.fsencode(os.readlink(path))
+    else:
+        raise InventoryError(
+            f"tracked product-source input has unsupported type: {relative}"
+        )
+    after = path.lstat()
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_identity != after_identity:
+        raise InventoryError(f"product-source input changed while hashing: {relative}")
+    return {
+        "path": relative.as_posix(),
+        "type": kind,
+        "mode": f"{stat.S_IMODE(before.st_mode):04o}",
+        "content_sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
+def product_source_provenance(root: Path) -> dict[str, object]:
+    """Hash the exact tracked product inputs under a sanitized Git identity."""
+    root = Path(root).resolve(strict=True)
+    top = os.fsdecode(
+        _git_output(root, ["rev-parse", "--show-toplevel"], "worktree root")
+    ).strip()
+    if Path(top).resolve(strict=True) != root:
+        raise InventoryError("product-source Git worktree root was redirected")
+    source_head = os.fsdecode(
+        _git_output(root, ["rev-parse", "HEAD"], "HEAD")
+    ).strip()
+    if re.fullmatch(r"[0-9a-f]{40}", source_head) is None:
+        raise InventoryError("product-source HEAD is not a full lowercase Git hash")
+    tracked_paths = _tracked_product_paths(root)
+    tracked = set(tracked_paths)
+    untracked_before = _relevant_untracked_product_paths(root, tracked)
+    if untracked_before:
+        raise InventoryError(
+            f"untracked product-source inputs are forbidden: {untracked_before}"
+        )
+    records = [
+        _product_source_record(root, relative) for relative in tracked_paths
+    ]
+    untracked_after = _relevant_untracked_product_paths(root, tracked)
+    if untracked_after:
+        raise InventoryError(
+            f"untracked product-source inputs are forbidden: {untracked_after}"
+        )
+    return {
+        "source_head": source_head,
+        "source_tree_sha256": _canonical_digest(records),
+        "source_file_count": len(records),
+    }
 
 
 def _authenticate_candidate_entry(
@@ -2113,7 +2343,6 @@ def main(
     catalog_manifest: Mapping[str, str] | None = None,
     expected: list[dict[str, object]] | None = None,
     capture_receipt: Mapping[str, object] | None = None,
-    source_head: str | None = None,
     current_host: str | None = None,
     root: Path = ROOT,
 ) -> int:
@@ -2173,6 +2402,7 @@ def main(
             selected = select_profiles(
                 checked_matrix, arguments.profiles, current_host=current_host
             )
+            source_before = product_source_provenance(root)
             result = run_census(
                 checked_matrix,
                 selected,
@@ -2181,6 +2411,12 @@ def main(
                 root=Path(root),
                 current_host=current_host,
             )
+            source_after = product_source_provenance(root)
+            if source_after != source_before:
+                raise InventoryError(
+                    "product source or HEAD changed during compiler capture: "
+                    f"before={source_before}, after={source_after}"
+                )
             rows = result["rows"]
             executed = result["executed_profiles"]
             pending = result["pending_profiles"]
@@ -2198,7 +2434,7 @@ def main(
                     identities,
                     checked_matrix,
                     catalog,
-                    source_head or current_source_head(root),
+                    source_before,
                 )
                 try:
                     _write_candidate_atomically(
