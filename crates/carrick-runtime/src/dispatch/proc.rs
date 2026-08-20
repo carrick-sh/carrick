@@ -4816,14 +4816,14 @@ fn hvpatch_waitid_exit_fields(wait_status: i32) -> (i32, i32) {
 }
 
 /// Render one authoritative HVPatch child state change into Linux's SIGCHLD
-/// `siginfo_t` layout. The child pid, effective uid, and wait status all come
+/// `siginfo_t` layout. The child pid, real uid, and wait status all come
 /// from the same Carrick-kernel wait result; host process credentials are not
 /// meaningful for logical guest children sharing the VM carrier.
 pub(crate) fn build_hvpatch_waitid_siginfo(
     exit: crate::hvpatch::ChildExit,
 ) -> [u8; crate::linux_abi::LINUX_SIGINFO_SIZE] {
     let (si_code, si_status) = hvpatch_waitid_exit_fields(exit.status());
-    build_linux_sigchld_siginfo(exit.pid().raw(), exit.euid().raw(), si_code, si_status)
+    build_linux_sigchld_siginfo(exit.pid().raw(), exit.ruid().raw(), si_code, si_status)
 }
 
 /// Build a Linux `siginfo_t` (SIGCHLD layout) for `waitid` from the fields

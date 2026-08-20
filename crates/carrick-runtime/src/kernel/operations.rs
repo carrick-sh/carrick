@@ -55,11 +55,11 @@ pub enum WaitOutcome {
     Stopped {
         task: TaskId,
         signal: LinuxSignal,
-        euid: NsUid,
+        ruid: NsUid,
     },
     Continued {
         task: TaskId,
-        euid: NsUid,
+        ruid: NsUid,
     },
     StillRunning,
     NoChild,
@@ -3473,11 +3473,11 @@ impl Kernel {
                             TaskJobControlEvent::Stopped(signal) => WaitOutcome::Stopped {
                                 task: *id,
                                 signal,
-                                euid: record.task.process_credentials().euid(),
+                                ruid: record.task.process_credentials().ruid(),
                             },
                             TaskJobControlEvent::Continued => WaitOutcome::Continued {
                                 task: *id,
-                                euid: record.task.process_credentials().euid(),
+                                ruid: record.task.process_credentials().ruid(),
                             },
                         })
                 })
@@ -4657,15 +4657,17 @@ mod tests {
     fn job_control_stop_and_continue_are_task_scoped_and_waitable() {
         let (kernel, root) = bootstrap(1);
         let child_id = fork_child(&kernel, &root, "job-control child", 708);
-        let child_euid = carrick_abi::NsUid::new(4_242);
+        let child_ruid = carrick_abi::NsUid::new(4_242);
+        let child_euid = carrick_abi::NsUid::new(6_242);
         let child = kernel
             .context(child_id, LinuxTid::for_task_leader(child_id))
             .expect("child context");
         let _child = kernel
             .update_credentials(&child, |credentials| {
-                credentials.seed_identity(child_euid, carrick_abi::NsGid::new(4_242));
+                credentials.seed_identity(child_euid, carrick_abi::NsGid::new(6_242));
+                credentials.set_uid_triple(child_ruid, child_euid, child_euid);
             })
-            .expect("set non-root child credentials");
+            .expect("set distinct child real and effective credentials");
         let sigstop = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).expect("SIGSTOP");
 
         assert!(kernel.stop_task_for_job_control(child_id, sigstop, None));
@@ -4683,7 +4685,7 @@ mod tests {
             WaitOutcome::Stopped {
                 task: child_id,
                 signal: sigstop,
-                euid: child_euid,
+                ruid: child_ruid,
             }
         );
 
@@ -4702,7 +4704,7 @@ mod tests {
                 .expect("wait continued child"),
             WaitOutcome::Continued {
                 task: child_id,
-                euid: child_euid,
+                ruid: child_ruid,
             }
         );
     }
@@ -4720,10 +4722,10 @@ mod tests {
             )
             .expect("fork child");
         let child_id = child.task().key().id;
-        let child_euid = carrick_abi::NsUid::new(4_243);
+        let child_ruid = carrick_abi::NsUid::new(4_243);
         let child = kernel
             .update_credentials(&child, |credentials| {
-                credentials.seed_identity(child_euid, carrick_abi::NsGid::new(4_243));
+                credentials.seed_identity(child_ruid, carrick_abi::NsGid::new(4_243));
             })
             .expect("set non-root ptrace child credentials");
         let signal = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGUSR1).expect("SIGUSR1");
@@ -4737,7 +4739,7 @@ mod tests {
             WaitOutcome::Stopped {
                 task: child_id,
                 signal,
-                euid: child_euid,
+                ruid: child_ruid,
             }
         );
         assert!(!kernel.resume_task_from_ptrace(child.task().key(), child_id, None,));
@@ -4956,10 +4958,10 @@ mod tests {
         let child_context = kernel
             .context(child_id, LinuxTid::for_task_leader(child_id))
             .expect("child context");
-        let child_euid = carrick_abi::NsUid::new(4_244);
+        let child_ruid = carrick_abi::NsUid::new(4_244);
         let child_context = kernel
             .update_credentials(&child_context, |credentials| {
-                credentials.seed_identity(child_euid, carrick_abi::NsGid::new(4_244));
+                credentials.seed_identity(child_ruid, carrick_abi::NsGid::new(4_244));
             })
             .expect("set non-root child credentials");
         let sigstop = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).expect("SIGSTOP");
@@ -4986,7 +4988,7 @@ mod tests {
             WaitOutcome::Stopped {
                 task: child_id,
                 signal: sigstop,
-                euid: child_euid,
+                ruid: child_ruid,
             },
             "only an intervening SIGCONT invalidates dequeued stop work",
         );
@@ -5115,6 +5117,17 @@ mod tests {
         let (kernel, root) = bootstrap(1);
         let root_id = root.task().key().id;
         let child_id = fork_child(&kernel, &root, "wait group child", 702);
+        let child_ruid = carrick_abi::NsUid::new(4_702);
+        let child_euid = carrick_abi::NsUid::new(6_702);
+        let child = kernel
+            .context(child_id, LinuxTid::for_task_leader(child_id))
+            .expect("child context");
+        let _child = kernel
+            .update_credentials(&child, |credentials| {
+                credentials.seed_identity(child_euid, carrick_abi::NsGid::new(6_702));
+                credentials.set_uid_triple(child_ruid, child_euid, child_euid);
+            })
+            .expect("set distinct child real and effective credentials");
         let group = kernel
             .create_process_group(child_id, None)
             .expect("child process group");
@@ -5125,9 +5138,14 @@ mod tests {
         let outcome = kernel
             .wait_child_in_process_group(root_id, group, WaitMode::Consume)
             .expect("wait child group");
-        assert!(
-            matches!(outcome, WaitOutcome::Exited(ref zombie) if zombie.key.id == child_id),
-            "wait must select the child from its guest process group: {outcome:?}",
+        let WaitOutcome::Exited(zombie) = outcome else {
+            panic!("wait must select the child from its guest process group: {outcome:?}");
+        };
+        assert_eq!(zombie.key.id, child_id);
+        assert_eq!(zombie.ruid, child_ruid, "waitid retains the real uid");
+        assert_eq!(
+            zombie.euid, child_euid,
+            "ownership retains the effective uid"
         );
     }
 
