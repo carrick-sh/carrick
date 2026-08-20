@@ -32,7 +32,10 @@ PATTERNS = {
     "ambient_filesystem": re.compile(
         r"\b(?:std::fs::|std::fs\b|File::open\s*\(|OpenOptions::new\s*\()"
     ),
-    "ambient_network": re.compile(r"\bstd::net::"),
+    "ambient_network": re.compile(
+        r"\bstd::net::(?:TcpStream::(?:connect|connect_timeout)|"
+        r"TcpListener::bind|UdpSocket::(?:bind|connect))\s*\("
+    ),
     "carrier_substrate": re.compile(
         r"\b(?:std::thread::(?:spawn|sleep|yield_now)|"
         r"std::thread::Builder::new|hv_vcpus_exit)\b"

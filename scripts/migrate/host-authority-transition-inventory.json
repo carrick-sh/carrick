@@ -5,15 +5,15 @@
     "kind": "host_identity",
     "text": ".unwrap_or_else(|| std::process::id() as i32)",
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/abi_args.rs:56`, `.unwrap_or_else(|| std::process::id() as i32)` is unreachable from the HVPatch release path under `resources::with_active_context` returning `None`; an HVPatch syscall has an active task context; this exact discriminator records migration debt and is not a completion waiver."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/abi_args.rs:56`, `.unwrap_or_else(|| std::process::id() as i32)` is unreachable from the HVPatch release path under `resources::with_active_context` returning `None`; HVPatch syscall dispatch has an active task context; this exact discriminator records migration debt and is not a completion waiver."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/abi_args.rs",
     "line": 78,
     "kind": "host_identity",
     "text": "let host = std::process::id();",
-    "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/abi_args.rs:78`, `let host = std::process::id();` is unreachable from the HVPatch release path under `resources::with_active_context` returning `None`; an HVPatch syscall has an active task context; this exact discriminator records migration debt and is not a completion waiver."
+    "classification": "forbidden_semantic",
+    "rationale": "At `crates/carrick-runtime/src/dispatch/abi_args.rs:78`, `let host = std::process::id();` reads a host identity/limit for the `NsPid::names_self` decision used by production signal, credential, and process callers; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/abi_args.rs",
@@ -21,7 +21,7 @@
     "kind": "host_identity",
     "text": "HostPid(std::process::id())",
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/abi_args.rs:136`, `HostPid(std::process::id())` is unreachable from the HVPatch release path under `resources::with_active_context` returning `None`; an HVPatch syscall has an active task context; this exact discriminator records migration debt and is not a completion waiver."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/abi_args.rs:136`, `HostPid(std::process::id())` is unreachable from the HVPatch release path under the source-wide `HostPid::current()` caller audit finding no production invocation; this exact discriminator records migration debt and is not a completion waiver."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/creds.rs",
@@ -29,7 +29,7 @@
     "kind": "host_identity",
     "text": "let host = std::process::id();",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/creds.rs:132`, `let host = std::process::id();` reads host identity or a host limit for the compatibility credential/caller identity path; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/creds.rs:132`, `let host = std::process::id();` reads a host identity/limit for the compatibility credential/caller identity path; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs.rs",
@@ -37,7 +37,7 @@
     "kind": "host_identity",
     "text": ".is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs.rs:1267`, `.is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());` reads host identity or a host limit for the guest filesystem and signal-target path; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/fs.rs:1267`, `.is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());` reads a host identity/limit for the guest filesystem and signal-target path; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs.rs",
@@ -45,15 +45,7 @@
     "kind": "host_identity",
     "text": ".is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs.rs:1319`, `.is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());` reads host identity or a host limit for the guest filesystem and signal-target path; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/fs.rs",
-    "line": 1361,
-    "kind": "ambient_network",
-    "text": "&& let std::net::IpAddr::V4(v4) = a.addr",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs.rs:1361`, `&& let std::net::IpAddr::V4(v4) = a.addr` accesses the already-validated network address held in the filesystem view; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/fs.rs:1319`, `.is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());` reads a host identity/limit for the guest filesystem and signal-target path; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs.rs",
@@ -61,7 +53,7 @@
     "kind": "host_identity",
     "text": "if matches!(target, crate::dispatch::signal::SignalTarget::HostProcess(pid) if pid.0 == std::process::id())",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs.rs:4900`, `if matches!(target, crate::dispatch::signal::SignalTarget::HostProcess(pid) if pid.0 == std::process::id())` reads host identity or a host limit for the guest filesystem and signal-target path; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/fs.rs:4900`, `if matches!(target, crate::dispatch::signal::SignalTarget::HostProcess(pid) if pid.0 == std::process::id())` reads a host identity/limit for the guest filesystem and signal-target path; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs.rs",
@@ -69,7 +61,7 @@
     "kind": "host_identity",
     "text": "|| matches!(target, crate::dispatch::signal::SignalTarget::HostThread(pid) if pid.0 == std::process::id())",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs.rs:4901`, `|| matches!(target, crate::dispatch::signal::SignalTarget::HostThread(pid) if pid.0 == std::process::id())` reads host identity or a host limit for the guest filesystem and signal-target path; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/fs.rs:4901`, `|| matches!(target, crate::dispatch::signal::SignalTarget::HostThread(pid) if pid.0 == std::process::id())` reads a host identity/limit for the guest filesystem and signal-target path; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/access.rs",
@@ -77,7 +69,7 @@
     "kind": "ambient_filesystem",
     "text": "&& std::fs::metadata(path)",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/access.rs:319`, `&& std::fs::metadata(path)` accesses the already-resolved filesystem-backend metadata object; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/access.rs:319`, `&& std::fs::metadata(path)` accesses the already-resolved filesystem-backend metadata object; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
@@ -85,7 +77,7 @@
     "kind": "host_identity",
     "text": "std::env::temp_dir().join(format!(\"carrick-shm-{}\", std::process::id()));",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/state.rs:355`, `std::env::temp_dir().join(format!(\"carrick-shm-{}\", std::process::id()));` accesses the runtime-created `/dev/shm` backing directory; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/state.rs:355`, `std::env::temp_dir().join(format!(\"carrick-shm-{}\", std::process::id()));` accesses the runtime-created `/dev/shm` backing directory; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
@@ -93,7 +85,7 @@
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::create_dir_all(&shm_host);",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/state.rs:356`, `let _ = std::fs::create_dir_all(&shm_host);` accesses the runtime-created `/dev/shm` backing directory; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/state.rs:356`, `let _ = std::fs::create_dir_all(&shm_host);` accesses the runtime-created `/dev/shm` backing directory; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/state.rs",
@@ -101,7 +93,7 @@
     "kind": "ambient_filesystem",
     "text": "std::fs::set_permissions(&shm_host, std::fs::Permissions::from_mode(0o1777));",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/state.rs:364`, `std::fs::set_permissions(&shm_host, std::fs::Permissions::from_mode(0o1777));` accesses the runtime-created `/dev/shm` backing directory; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/fs/state.rs:364`, `std::fs::set_permissions(&shm_host, std::fs::Permissions::from_mode(0o1777));` accesses the runtime-created `/dev/shm` backing directory; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/fs/tests.rs",
@@ -405,7 +397,7 @@
     "kind": "host_identity",
     "text": "let observed_pid = i32::try_from(std::process::id()).unwrap_or(1);",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mod.rs:2538`, `let observed_pid = i32::try_from(std::process::id()).unwrap_or(1);` reads host identity or a host limit for the dispatcher fallback, ownership, and controlling-terminal state; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/mod.rs:2538`, `let observed_pid = i32::try_from(std::process::id()).unwrap_or(1);` reads a host identity/limit for dispatcher ownership and controlling-terminal state; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mod.rs",
@@ -413,15 +405,15 @@
     "kind": "host_identity",
     "text": "let observed_pid = i32::try_from(std::process::id())",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mod.rs:3368`, `let observed_pid = i32::try_from(std::process::id())` reads host identity or a host limit for the dispatcher fallback, ownership, and controlling-terminal state; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/mod.rs:3368`, `let observed_pid = i32::try_from(std::process::id())` reads a host identity/limit for dispatcher ownership and controlling-terminal state; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mod.rs",
     "line": 3663,
     "kind": "host_identity",
     "text": ".unwrap_or_else(|| std::process::id() as i32)",
-    "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mod.rs:3663`, `.unwrap_or_else(|| std::process::id() as i32)` reads host identity or a host limit for the dispatcher fallback, ownership, and controlling-terminal state; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "classification": "declared_substrate",
+    "rationale": "At `crates/carrick-runtime/src/dispatch/mod.rs:3663`, `.unwrap_or_else(|| std::process::id() as i32)` operates only on the event-ring diagnostic fallback; the host PID is recorded only when no virtual PID has been published; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mod.rs",
@@ -429,7 +421,7 @@
     "kind": "ambient_filesystem",
     "text": "pub fn open_exec_host_file(&self, path: &str) -> Option<std::fs::File> {",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mod.rs:4527`, `pub fn open_exec_host_file(&self, path: &str) -> Option<std::fs::File> {` accesses the captured Carrick file-table/rootfs executable backing; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/mod.rs:4527`, `pub fn open_exec_host_file(&self, path: &str) -> Option<std::fs::File> {` accesses the captured Carrick file-table/rootfs executable backing; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mod.rs",
@@ -437,7 +429,7 @@
     "kind": "host_identity",
     "text": ".free_if_owner(index, std::process::id());",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mod.rs:4703`, `.free_if_owner(index, std::process::id());` reads host identity or a host limit for the dispatcher fallback, ownership, and controlling-terminal state; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/mod.rs:4703`, `.free_if_owner(index, std::process::id());` reads a host identity/limit for dispatcher ownership and controlling-terminal state; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mod.rs",
@@ -445,7 +437,7 @@
     "kind": "host_identity",
     "text": ".set_controlling(host_slave_name, std::process::id())",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mod.rs:4895`, `.set_controlling(host_slave_name, std::process::id())` reads host identity or a host limit for the dispatcher fallback, ownership, and controlling-terminal state; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/mod.rs:4895`, `.set_controlling(host_slave_name, std::process::id())` reads a host identity/limit for dispatcher ownership and controlling-terminal state; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mqueue.rs",
@@ -453,7 +445,7 @@
     "kind": "host_identity",
     "text": ".unwrap_or_else(|| std::process::id() as i32);",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mqueue.rs:390`, `.unwrap_or_else(|| std::process::id() as i32);` reads host identity or a host limit for POSIX message-queue notification delivery; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/mqueue.rs:390`, `.unwrap_or_else(|| std::process::id() as i32);` reads a host identity/limit for POSIX message-queue notification delivery; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mqueue.rs",
@@ -461,7 +453,7 @@
     "kind": "host_identity",
     "text": ".unwrap_or_else(|| std::process::id() as i32);",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mqueue.rs:545`, `.unwrap_or_else(|| std::process::id() as i32);` reads host identity or a host limit for POSIX message-queue notification delivery; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/mqueue.rs:545`, `.unwrap_or_else(|| std::process::id() as i32);` reads a host identity/limit for POSIX message-queue notification delivery; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mqueue.rs",
@@ -469,7 +461,7 @@
     "kind": "host_process_control",
     "text": "unsafe { libc::kill(pid, host_signo) };",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mqueue.rs:562`, `unsafe { libc::kill(pid, host_signo) };` acts on or observes a host process for POSIX message-queue notification delivery; the resulting host status or signal target can decide guest process behavior, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/mqueue.rs:562`, `unsafe { libc::kill(pid, host_signo) };` acts on a host process for POSIX message-queue notification delivery; the resulting host operation can decide guest process behavior, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/mqueue.rs",
@@ -477,159 +469,7 @@
     "kind": "host_identity",
     "text": ".unwrap_or_else(|| std::process::id() as i32);",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/mqueue.rs:573`, `.unwrap_or_else(|| std::process::id() as i32);` reads host identity or a host limit for POSIX message-queue notification delivery; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 220,
-    "kind": "ambient_network",
-    "text": "fn host_sockaddr_to_socket_addr(bytes: &[u8]) -> Option<std::net::SocketAddr> {",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:220`, `fn host_sockaddr_to_socket_addr(bytes: &[u8]) -> Option<std::net::SocketAddr> {` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 231,
-    "kind": "ambient_network",
-    "text": "let ip = std::net::Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:231`, `let ip = std::net::Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 232,
-    "kind": "ambient_network",
-    "text": "Some(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port))",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:232`, `Some(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port))` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 241,
-    "kind": "ambient_network",
-    "text": "Some(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:241`, `Some(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 242,
-    "kind": "ambient_network",
-    "text": "std::net::Ipv6Addr::from(octets),",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:242`, `std::net::Ipv6Addr::from(octets),` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 252,
-    "kind": "ambient_network",
-    "text": "fn socket_addr_to_host_sockaddr(addr: std::net::SocketAddr) -> Option<Vec<u8>> {",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:252`, `fn socket_addr_to_host_sockaddr(addr: std::net::SocketAddr) -> Option<Vec<u8>> {` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 254,
-    "kind": "ambient_network",
-    "text": "std::net::SocketAddr::V4(v4) => {",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:254`, `std::net::SocketAddr::V4(v4) => {` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 261,
-    "kind": "ambient_network",
-    "text": "std::net::SocketAddr::V6(v6) => {",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:261`, `std::net::SocketAddr::V6(v6) => {` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 272,
-    "kind": "ambient_network",
-    "text": "fn socket_addr_to_linux_sockaddr(addr: std::net::SocketAddr) -> Option<Vec<u8>> {",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:272`, `fn socket_addr_to_linux_sockaddr(addr: std::net::SocketAddr) -> Option<Vec<u8>> {` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 274,
-    "kind": "ambient_network",
-    "text": "std::net::SocketAddr::V4(v4) => {",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:274`, `std::net::SocketAddr::V4(v4) => {` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 281,
-    "kind": "ambient_network",
-    "text": "std::net::SocketAddr::V6(v6) => {",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:281`, `std::net::SocketAddr::V6(v6) => {` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 319,
-    "kind": "ambient_network",
-    "text": "fn host_socket_addr(host_fd: i32, _family: i32, peer: bool) -> Option<std::net::SocketAddr> {",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:319`, `fn host_socket_addr(host_fd: i32, _family: i32, peer: bool) -> Option<std::net::SocketAddr> {` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 2393,
-    "kind": "ambient_network",
-    "text": "guest_peer: std::net::SocketAddr,",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:2393`, `guest_peer: std::net::SocketAddr,` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 2408,
-    "kind": "ambient_network",
-    "text": ".then_some(GuestSocketAddr(std::net::SocketAddr::new(",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:2408`, `.then_some(GuestSocketAddr(std::net::SocketAddr::new(` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 2410,
-    "kind": "ambient_network",
-    "text": "std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:2410`, `std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 2412,
-    "kind": "ambient_network",
-    "text": "std::net::IpAddr::V4(self.network.spec.ipv4)",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:2412`, `std::net::IpAddr::V4(self.network.spec.ipv4)` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 2432,
-    "kind": "ambient_network",
-    "text": "guest_peer: std::net::SocketAddr,",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:2432`, `guest_peer: std::net::SocketAddr,` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 2450,
-    "kind": "ambient_network",
-    "text": "&& let Some(host_local) = socket_addr_to_host_sockaddr(std::net::SocketAddr::new(",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:2450`, `&& let Some(host_local) = socket_addr_to_host_sockaddr(std::net::SocketAddr::new(` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 2451,
-    "kind": "ambient_network",
-    "text": "std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:2451`, `std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/mqueue.rs:573`, `.unwrap_or_else(|| std::process::id() as i32);` reads a host identity/limit for POSIX message-queue notification delivery; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net.rs",
@@ -637,63 +477,7 @@
     "kind": "host_identity",
     "text": "let dest_pid = if *pid != 0 { *pid } else { std::process::id() };",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:2578`, `let dest_pid = if *pid != 0 { *pid } else { std::process::id() };` reads host identity or a host limit for synthetic netlink binding or reply identity; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 2671,
-    "kind": "ambient_network",
-    "text": "requested: std::net::SocketAddr,",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:2671`, `requested: std::net::SocketAddr,` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 2707,
-    "kind": "ambient_network",
-    "text": "requested: std::net::SocketAddr,",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:2707`, `requested: std::net::SocketAddr,` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 2746,
-    "kind": "ambient_network",
-    "text": "fn is_dns_gateway_addr(&self, addr: std::net::SocketAddr) -> bool {",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:2746`, `fn is_dns_gateway_addr(&self, addr: std::net::SocketAddr) -> bool {` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 2748,
-    "kind": "ambient_network",
-    "text": "&& matches!(addr.ip(), std::net::IpAddr::V4(ip) if ip == self.network.spec.gateway_v4)",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:2748`, `&& matches!(addr.ip(), std::net::IpAddr::V4(ip) if ip == self.network.spec.gateway_v4)` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 2751,
-    "kind": "ambient_network",
-    "text": "fn connected_guest_peer_addr(&self, fd: i32) -> Option<std::net::SocketAddr> {",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:2751`, `fn connected_guest_peer_addr(&self, fd: i32) -> Option<std::net::SocketAddr> {` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 2880,
-    "kind": "ambient_network",
-    "text": "&& matches!(listener_ip, std::net::IpAddr::V4(ip) if !ip.is_loopback()))",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:2880`, `&& matches!(listener_ip, std::net::IpAddr::V4(ip) if !ip.is_loopback()))` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 2881,
-    "kind": "ambient_network",
-    "text": ".then_some(GuestSocketAddr(std::net::SocketAddr::new(",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:2881`, `.then_some(GuestSocketAddr(std::net::SocketAddr::new(` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:2578`, `let dest_pid = if *pid != 0 { *pid } else { std::process::id() };` reads a host identity/limit for synthetic netlink binding/reply identity; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net.rs",
@@ -701,7 +485,7 @@
     "kind": "host_identity",
     "text": "std::process::id()",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5630`, `std::process::id()` reads host identity or a host limit for synthetic netlink binding or reply identity; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5630`, `std::process::id()` reads a host identity/limit for synthetic netlink binding/reply identity; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net.rs",
@@ -709,7 +493,7 @@
     "kind": "ambient_filesystem",
     "text": "if let Ok(md) = std::fs::symlink_metadata(&*p) {",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5654`, `if let Ok(md) = std::fs::symlink_metadata(&*p) {` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5654`, `if let Ok(md) = std::fs::symlink_metadata(&*p) {` accesses the runtime-owned Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net.rs",
@@ -717,15 +501,7 @@
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(&*p);",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5657`, `let _ = std::fs::remove_file(&*p);` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 5720,
-    "kind": "ambient_network",
-    "text": "let mut rewritten_bind: Option<(std::net::SocketAddr, PortProtocol)> = None;",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5720`, `let mut rewritten_bind: Option<(std::net::SocketAddr, PortProtocol)> = None;` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5657`, `let _ = std::fs::remove_file(&*p);` accesses the runtime-owned Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net.rs",
@@ -733,7 +509,7 @@
     "kind": "ambient_filesystem",
     "text": "&& let Ok(md) = std::fs::symlink_metadata(path)",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5754`, `&& let Ok(md) = std::fs::symlink_metadata(path)` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5754`, `&& let Ok(md) = std::fs::symlink_metadata(path)` accesses the runtime-owned Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net.rs",
@@ -741,87 +517,7 @@
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(path);",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5758`, `let _ = std::fs::remove_file(path);` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 5796,
-    "kind": "ambient_network",
-    "text": "std::net::IpAddr::V4(ip)",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5796`, `std::net::IpAddr::V4(ip)` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 5797,
-    "kind": "ambient_network",
-    "text": "if ip == std::net::Ipv4Addr::UNSPECIFIED || ip == this.network.spec.ipv4",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5797`, `if ip == std::net::Ipv4Addr::UNSPECIFIED || ip == this.network.spec.ipv4` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 5801,
-    "kind": "ambient_network",
-    "text": "socket_addr_to_host_sockaddr(std::net::SocketAddr::new(",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5801`, `socket_addr_to_host_sockaddr(std::net::SocketAddr::new(` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 5802,
-    "kind": "ambient_network",
-    "text": "std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5802`, `std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 5844,
-    "kind": "ambient_network",
-    "text": "std::net::SocketAddr::new(guest_local.ip(), host_local.port())",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5844`, `std::net::SocketAddr::new(guest_local.ip(), host_local.port())` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 5998,
-    "kind": "ambient_network",
-    "text": "std::net::SocketAddr,",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5998`, `std::net::SocketAddr,` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 6011,
-    "kind": "ambient_network",
-    "text": "let synthetic_host_peer = std::net::SocketAddr::new(",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:6011`, `let synthetic_host_peer = std::net::SocketAddr::new(` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 6012,
-    "kind": "ambient_network",
-    "text": "std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:6012`, `std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 6053,
-    "kind": "ambient_network",
-    "text": "let synthetic_host_peer = std::net::SocketAddr::new(",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:6053`, `let synthetic_host_peer = std::net::SocketAddr::new(` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net.rs",
-    "line": 6054,
-    "kind": "ambient_network",
-    "text": "std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:6054`, `std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),` accesses the runtime-owned socket-address or Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/net.rs:5758`, `let _ = std::fs::remove_file(path);` accesses the runtime-owned Unix-socket backing registry; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net.rs",
@@ -833,43 +529,11 @@
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
-    "line": 833,
-    "kind": "ambient_network",
-    "text": "std::net::IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net/support.rs:833`, `std::net::IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80` accesses the network model wire-address conversion or runtime-owned socket directory; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
-    "line": 928,
-    "kind": "ambient_network",
-    "text": "fn ip_addr_bytes(addr: std::net::IpAddr) -> Option<(u8, Vec<u8>)> {",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net/support.rs:928`, `fn ip_addr_bytes(addr: std::net::IpAddr) -> Option<(u8, Vec<u8>)> {` accesses the network model wire-address conversion or runtime-owned socket directory; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
-    "line": 930,
-    "kind": "ambient_network",
-    "text": "std::net::IpAddr::V4(ip) => Some((LINUX_AF_INET as u8, ip.octets().to_vec())),",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net/support.rs:930`, `std::net::IpAddr::V4(ip) => Some((LINUX_AF_INET as u8, ip.octets().to_vec())),` accesses the network model wire-address conversion or runtime-owned socket directory; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
-    "line": 931,
-    "kind": "ambient_network",
-    "text": "std::net::IpAddr::V6(ip) => Some((LINUX_AF_INET6 as u8, ip.octets().to_vec())),",
-    "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net/support.rs:931`, `std::net::IpAddr::V6(ip) => Some((LINUX_AF_INET6 as u8, ip.octets().to_vec())),` accesses the network model wire-address conversion or runtime-owned socket directory; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
-  },
-  {
-    "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
     "line": 1434,
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::create_dir_all(&base);",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net/support.rs:1434`, `let _ = std::fs::create_dir_all(&base);` accesses the network model wire-address conversion or runtime-owned socket directory; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/net/support.rs:1434`, `let _ = std::fs::create_dir_all(&base);` accesses the runtime-owned Unix-socket directory; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/net/support.rs",
@@ -877,7 +541,7 @@
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::create_dir_all(&base);",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/net/support.rs:1472`, `let _ = std::fs::create_dir_all(&base);` accesses the network model wire-address conversion or runtime-owned socket directory; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/net/support.rs:1472`, `let _ = std::fs::create_dir_all(&base);` accesses the runtime-owned Unix-socket directory; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -885,7 +549,7 @@
     "kind": "host_identity",
     "text": "0 => PtraceWaitTarget::ProcessGroup(HostPgid(unsafe { libc::getpgrp() } as u32)),",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:424`, `0 => PtraceWaitTarget::ProcessGroup(HostPgid(unsafe { libc::getpgrp() } as u32)),` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:424`, `0 => PtraceWaitTarget::ProcessGroup(HostPgid(unsafe { libc::getpgrp() } as u32)),` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -893,7 +557,7 @@
     "kind": "host_identity",
     "text": "u32::try_from(unsafe { libc::getpgrp() }).ok()",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:452`, `u32::try_from(unsafe { libc::getpgrp() }).ok()` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:452`, `u32::try_from(unsafe { libc::getpgrp() }).ok()` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -901,7 +565,7 @@
     "kind": "host_identity",
     "text": "PtraceWaitTarget::Any => crate::guest_cpu::wait_any_park_pid(std::process::id()),",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:479`, `PtraceWaitTarget::Any => crate::guest_cpu::wait_any_park_pid(std::process::id()),` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:479`, `PtraceWaitTarget::Any => crate::guest_cpu::wait_any_park_pid(std::process::id()),` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -909,7 +573,7 @@
     "kind": "host_identity",
     "text": "let has_direct_member = crate::guest_cpu::direct_children_for_wait(std::process::id())",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:481`, `let has_direct_member = crate::guest_cpu::direct_children_for_wait(std::process::id())` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:481`, `let has_direct_member = crate::guest_cpu::direct_children_for_wait(std::process::id())` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -917,7 +581,7 @@
     "kind": "host_identity",
     "text": "crate::guest_cpu::pending_adopted_child(std::process::id(), target)",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:491`, `crate::guest_cpu::pending_adopted_child(std::process::id(), target)` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:491`, `crate::guest_cpu::pending_adopted_child(std::process::id(), target)` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -925,7 +589,7 @@
     "kind": "host_process_control",
     "text": "libc::waitid(",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:511`, `libc::waitid(` acts on or observes a host process for guest wait, ptrace, credential, or process-group semantics; the resulting host status or signal target can decide guest process behavior, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:511`, `libc::waitid(` acts on a host process for guest wait, ptrace, credential, and process-group semantics; the resulting host operation can decide guest process behavior, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -933,7 +597,7 @@
     "kind": "host_identity",
     "text": "bootstrap_host_pid: std::process::id(),",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:794`, `bootstrap_host_pid: std::process::id(),` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:794`, `bootstrap_host_pid: std::process::id(),` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -941,7 +605,7 @@
     "kind": "host_identity",
     "text": "std::process::id() != self.proc.lock().bootstrap_host_pid",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:924`, `std::process::id() != self.proc.lock().bootstrap_host_pid` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:924`, `std::process::id() != self.proc.lock().bootstrap_host_pid` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -949,7 +613,7 @@
     "kind": "host_identity",
     "text": "u32::try_from(unsafe { libc::getppid() }).unwrap_or(0)",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:960`, `u32::try_from(unsafe { libc::getppid() }).unwrap_or(0)` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:960`, `u32::try_from(unsafe { libc::getppid() }).unwrap_or(0)` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -957,7 +621,7 @@
     "kind": "host_identity",
     "text": "if std::process::id() == bootstrap_host_pid {",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:1019`, `if std::process::id() == bootstrap_host_pid {` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:1019`, `if std::process::id() == bootstrap_host_pid {` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -965,7 +629,7 @@
     "kind": "host_identity",
     "text": "unsafe { libc::getppid() as u32 }",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:1024`, `unsafe { libc::getppid() as u32 }` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:1024`, `unsafe { libc::getppid() as u32 }` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -973,7 +637,7 @@
     "kind": "host_identity",
     "text": "let ns_tid = if tid == std::process::id() {",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:1818`, `let ns_tid = if tid == std::process::id() {` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:1818`, `let ns_tid = if tid == std::process::id() {` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -997,7 +661,7 @@
     "kind": "host_process_control",
     "text": "(unsafe { libc::kill(host, 0) == 0 })",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:2687`, `(unsafe { libc::kill(host, 0) == 0 })` acts on or observes a host process for guest wait, ptrace, credential, or process-group semantics; the resulting host status or signal target can decide guest process behavior, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:2687`, `(unsafe { libc::kill(host, 0) == 0 })` acts on a host process for guest wait, ptrace, credential, and process-group semantics; the resulting host operation can decide guest process behavior, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -1005,7 +669,7 @@
     "kind": "host_identity",
     "text": "let tracer_pid = u32::try_from(unsafe { libc::getppid() }).unwrap_or(0);",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:2701`, `let tracer_pid = u32::try_from(unsafe { libc::getppid() }).unwrap_or(0);` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:2701`, `let tracer_pid = u32::try_from(unsafe { libc::getppid() }).unwrap_or(0);` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -1013,7 +677,7 @@
     "kind": "host_identity",
     "text": "unsafe { libc::getuid() },",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3005`, `unsafe { libc::getuid() },` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3005`, `unsafe { libc::getuid() },` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -1021,7 +685,7 @@
     "kind": "host_identity",
     "text": "(libc::P_PGID, unsafe { libc::getpgrp() } as libc::id_t)",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3058`, `(libc::P_PGID, unsafe { libc::getpgrp() } as libc::id_t)` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3058`, `(libc::P_PGID, unsafe { libc::getpgrp() } as libc::id_t)` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -1029,7 +693,7 @@
     "kind": "host_process_control",
     "text": "libc::waitid(",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3105`, `libc::waitid(` acts on or observes a host process for guest wait, ptrace, credential, or process-group semantics; the resulting host status or signal target can decide guest process behavior, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3105`, `libc::waitid(` acts on a host process for guest wait, ptrace, credential, and process-group semantics; the resulting host operation can decide guest process behavior, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -1037,7 +701,7 @@
     "kind": "host_process_control",
     "text": "libc::waitid(host_idtype, host_id, &mut info, internal_options)",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3174`, `libc::waitid(host_idtype, host_id, &mut info, internal_options)` acts on or observes a host process for guest wait, ptrace, credential, or process-group semantics; the resulting host status or signal target can decide guest process behavior, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3174`, `libc::waitid(host_idtype, host_id, &mut info, internal_options)` acts on a host process for guest wait, ptrace, credential, and process-group semantics; the resulting host operation can decide guest process behavior, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -1045,7 +709,7 @@
     "kind": "host_process_control",
     "text": "libc::waitid(",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3213`, `libc::waitid(` acts on or observes a host process for guest wait, ptrace, credential, or process-group semantics; the resulting host status or signal target can decide guest process behavior, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3213`, `libc::waitid(` acts on a host process for guest wait, ptrace, credential, and process-group semantics; the resulting host operation can decide guest process behavior, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -1053,7 +717,7 @@
     "kind": "host_process_control",
     "text": "let r = unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3278`, `let r = unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };` acts on or observes a host process for guest wait, ptrace, credential, or process-group semantics; the resulting host status or signal target can decide guest process behavior, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3278`, `let r = unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };` acts on a host process for guest wait, ptrace, credential, and process-group semantics; the resulting host operation can decide guest process behavior, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -1069,7 +733,7 @@
     "kind": "host_identity",
     "text": "crate::guest_cpu::direct_child_ptrace_stop_pending(std::process::id())",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3496`, `crate::guest_cpu::direct_child_ptrace_stop_pending(std::process::id())` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3496`, `crate::guest_cpu::direct_child_ptrace_stop_pending(std::process::id())` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -1077,7 +741,7 @@
     "kind": "host_identity",
     "text": "return crate::guest_cpu::wait_any_park_pid(std::process::id());",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3526`, `return crate::guest_cpu::wait_any_park_pid(std::process::id());` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3526`, `return crate::guest_cpu::wait_any_park_pid(std::process::id());` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -1085,7 +749,7 @@
     "kind": "host_process_control",
     "text": "libc::wait4(",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3540`, `libc::wait4(` acts on or observes a host process for guest wait, ptrace, credential, or process-group semantics; the resulting host status or signal target can decide guest process behavior, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3540`, `libc::wait4(` acts on a host process for guest wait, ptrace, credential, and process-group semantics; the resulting host operation can decide guest process behavior, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -1093,7 +757,7 @@
     "kind": "host_process_control",
     "text": "libc::wait4(",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3604`, `libc::wait4(` acts on or observes a host process for guest wait, ptrace, credential, or process-group semantics; the resulting host status or signal target can decide guest process behavior, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3604`, `libc::wait4(` acts on a host process for guest wait, ptrace, credential, and process-group semantics; the resulting host operation can decide guest process behavior, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -1101,7 +765,7 @@
     "kind": "host_process_control",
     "text": "libc::wait4(",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3629`, `libc::wait4(` acts on or observes a host process for guest wait, ptrace, credential, or process-group semantics; the resulting host status or signal target can decide guest process behavior, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3629`, `libc::wait4(` acts on a host process for guest wait, ptrace, credential, and process-group semantics; the resulting host operation can decide guest process behavior, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -1109,7 +773,7 @@
     "kind": "host_process_control",
     "text": "unsafe { libc::wait4(host_target, &mut host_status, host_options, &mut host_rusage) };",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3672`, `unsafe { libc::wait4(host_target, &mut host_status, host_options, &mut host_rusage) };` acts on or observes a host process for guest wait, ptrace, credential, or process-group semantics; the resulting host status or signal target can decide guest process behavior, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3672`, `unsafe { libc::wait4(host_target, &mut host_status, host_options, &mut host_rusage) };` acts on a host process for guest wait, ptrace, credential, and process-group semantics; the resulting host operation can decide guest process behavior, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -1117,7 +781,7 @@
     "kind": "host_identity",
     "text": "crate::guest_cpu::adopted_child_wait(std::process::id(), host_target)",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3701`, `crate::guest_cpu::adopted_child_wait(std::process::id(), host_target)` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3701`, `crate::guest_cpu::adopted_child_wait(std::process::id(), host_target)` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -1125,7 +789,7 @@
     "kind": "host_process_control",
     "text": "&& unsafe { libc::kill(host_target, 0) } == -1",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3795`, `&& unsafe { libc::kill(host_target, 0) } == -1` acts on or observes a host process for guest wait, ptrace, credential, or process-group semantics; the resulting host status or signal target can decide guest process behavior, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3795`, `&& unsafe { libc::kill(host_target, 0) } == -1` acts on a host process for guest wait, ptrace, credential, and process-group semantics; the resulting host operation can decide guest process behavior, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -1133,7 +797,7 @@
     "kind": "host_process_control",
     "text": "libc::wait4(result, &mut host_status, host_options, &mut host_rusage)",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3841`, `libc::wait4(result, &mut host_status, host_options, &mut host_rusage)` acts on or observes a host process for guest wait, ptrace, credential, or process-group semantics; the resulting host status or signal target can decide guest process behavior, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:3841`, `libc::wait4(result, &mut host_status, host_options, &mut host_rusage)` acts on a host process for guest wait, ptrace, credential, and process-group semantics; the resulting host operation can decide guest process behavior, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/proc.rs",
@@ -1141,7 +805,7 @@
     "kind": "host_identity",
     "text": "let target_euid = if host_pid as u32 == std::process::id() {",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:4189`, `let target_euid = if host_pid as u32 == std::process::id() {` reads host identity or a host limit for guest wait, ptrace, credential, or process-group semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/proc.rs:4189`, `let target_euid = if host_pid as u32 == std::process::id() {` reads a host identity/limit for guest wait, ptrace, credential, and process-group semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/signal.rs",
@@ -1149,7 +813,7 @@
     "kind": "host_identity",
     "text": "let signal_target_names_self = pid == std::process::id() as i64",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:1481`, `let signal_target_names_self = pid == std::process::id() as i64` reads host identity or a host limit for guest signal self-targeting, sender attribution, or permission semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:1481`, `let signal_target_names_self = pid == std::process::id() as i64` reads a host identity/limit for guest signal self-targeting, sender attribution, and permission semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/signal.rs",
@@ -1157,7 +821,7 @@
     "kind": "host_identity",
     "text": "let host_pid = std::process::id() as i64;",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:2296`, `let host_pid = std::process::id() as i64;` reads host identity or a host limit for guest signal self-targeting, sender attribution, or permission semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:2296`, `let host_pid = std::process::id() as i64;` reads a host identity/limit for guest signal self-targeting, sender attribution, and permission semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/signal.rs",
@@ -1165,7 +829,7 @@
     "kind": "host_identity",
     "text": "let host_pid = std::process::id() as i64;",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:2630`, `let host_pid = std::process::id() as i64;` reads host identity or a host limit for guest signal self-targeting, sender attribution, or permission semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:2630`, `let host_pid = std::process::id() as i64;` reads a host identity/limit for guest signal self-targeting, sender attribution, and permission semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/signal.rs",
@@ -1173,7 +837,7 @@
     "kind": "host_identity",
     "text": "if target == 0 && unsafe { libc::getpgrp() } != std::process::id() as i32 {",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:2664`, `if target == 0 && unsafe { libc::getpgrp() } != std::process::id() as i32 {` reads host identity or a host limit for guest signal self-targeting, sender attribution, or permission semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:2664`, `if target == 0 && unsafe { libc::getpgrp() } != std::process::id() as i32 {` reads a host identity/limit for guest signal self-targeting, sender attribution, and permission semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/signal.rs",
@@ -1181,7 +845,7 @@
     "kind": "host_identity",
     "text": ".unwrap_or_else(|| unsafe { libc::getuid() });",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:2710`, `.unwrap_or_else(|| unsafe { libc::getuid() });` reads host identity or a host limit for guest signal self-targeting, sender attribution, or permission semantics; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:2710`, `.unwrap_or_else(|| unsafe { libc::getuid() });` reads a host identity/limit for guest signal self-targeting, sender attribution, and permission semantics; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/signal.rs",
@@ -1189,7 +853,7 @@
     "kind": "host_process_control",
     "text": "let rc = unsafe { libc::kill(target as i32, host_signum) };",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:2762`, `let rc = unsafe { libc::kill(target as i32, host_signum) };` acts on or observes a host process for guest signal self-targeting, sender attribution, or permission semantics; the resulting host status or signal target can decide guest process behavior, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/signal.rs:2762`, `let rc = unsafe { libc::kill(target as i32, host_signum) };` acts on a host process for guest signal self-targeting, sender attribution, and permission semantics; the resulting host operation can decide guest process behavior, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1197,7 +861,7 @@
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::create_dir_all(SHM_DIR);",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:700`, `let _ = std::fs::create_dir_all(SHM_DIR);` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:700`, `let _ = std::fs::create_dir_all(SHM_DIR);` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1205,7 +869,7 @@
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::set_permissions(SHM_DIR, std::fs::Permissions::from_mode(0o1777));",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:702`, `let _ = std::fs::set_permissions(SHM_DIR, std::fs::Permissions::from_mode(0o1777));` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:702`, `let _ = std::fs::set_permissions(SHM_DIR, std::fs::Permissions::from_mode(0o1777));` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1213,7 +877,7 @@
     "kind": "host_identity",
     "text": "std::process::id(),",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:710`, `std::process::id(),` reads host identity or a host limit for SysV IPC ownership and creator identity; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:710`, `std::process::id(),` reads a host identity/limit for SysV IPC ownership and creator identity; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1221,7 +885,7 @@
     "kind": "host_identity",
     "text": "std::process::id(),",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:791`, `std::process::id(),` reads host identity or a host limit for SysV IPC ownership and creator identity; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:791`, `std::process::id(),` reads a host identity/limit for SysV IPC ownership and creator identity; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1229,7 +893,7 @@
     "kind": "host_identity",
     "text": "std::process::id()",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:802`, `std::process::id()` reads host identity or a host limit for SysV IPC ownership and creator identity; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:802`, `std::process::id()` reads a host identity/limit for SysV IPC ownership and creator identity; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1237,7 +901,7 @@
     "kind": "ambient_filesystem",
     "text": "let entries = std::fs::read_dir(SHM_DIR).map_err(|_| LINUX_EINVAL)?;",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1230`, `let entries = std::fs::read_dir(SHM_DIR).map_err(|_| LINUX_EINVAL)?;` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1230`, `let entries = std::fs::read_dir(SHM_DIR).map_err(|_| LINUX_EINVAL)?;` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1245,7 +909,7 @@
     "kind": "ambient_filesystem",
     "text": "if let Ok(entries) = std::fs::read_dir(SHM_DIR) {",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1252`, `if let Ok(entries) = std::fs::read_dir(SHM_DIR) {` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1252`, `if let Ok(entries) = std::fs::read_dir(SHM_DIR) {` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1253,7 +917,7 @@
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(path);",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1256`, `let _ = std::fs::remove_file(path);` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1256`, `let _ = std::fs::remove_file(path);` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1261,7 +925,7 @@
     "kind": "host_identity",
     "text": "host_pid: unsafe { libc::getpid() },",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1283`, `host_pid: unsafe { libc::getpid() },` reads host identity or a host limit for SysV IPC ownership and creator identity; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1283`, `host_pid: unsafe { libc::getpid() },` reads a host identity/limit for SysV IPC ownership and creator identity; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1269,7 +933,7 @@
     "kind": "host_identity",
     "text": "let host_pid = unsafe { libc::getpid() };",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1289`, `let host_pid = unsafe { libc::getpid() };` reads host identity or a host limit for SysV IPC ownership and creator identity; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1289`, `let host_pid = unsafe { libc::getpid() };` reads a host identity/limit for SysV IPC ownership and creator identity; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1277,7 +941,7 @@
     "kind": "host_identity",
     "text": "host_pid: unsafe { libc::getpid() },",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1718`, `host_pid: unsafe { libc::getpid() },` reads host identity or a host limit for SysV IPC ownership and creator identity; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1718`, `host_pid: unsafe { libc::getpid() },` reads a host identity/limit for SysV IPC ownership and creator identity; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1285,7 +949,7 @@
     "kind": "host_identity",
     "text": "let host_pid = unsafe { libc::getpid() };",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1724`, `let host_pid = unsafe { libc::getpid() };` reads host identity or a host limit for SysV IPC ownership and creator identity; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1724`, `let host_pid = unsafe { libc::getpid() };` reads a host identity/limit for SysV IPC ownership and creator identity; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1293,7 +957,7 @@
     "kind": "ambient_filesystem",
     "text": "f: impl FnOnce(&mut std::fs::File, u64) -> std::io::Result<R>,",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1849`, `f: impl FnOnce(&mut std::fs::File, u64) -> std::io::Result<R>,` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1849`, `f: impl FnOnce(&mut std::fs::File, u64) -> std::io::Result<R>,` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1301,7 +965,7 @@
     "kind": "ambient_filesystem",
     "text": "let mut file = std::fs::OpenOptions::new()",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1855`, `let mut file = std::fs::OpenOptions::new()` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:1855`, `let mut file = std::fs::OpenOptions::new()` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1309,7 +973,7 @@
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(shm_nattch_path(&segment.path));",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:2048`, `let _ = std::fs::remove_file(shm_nattch_path(&segment.path));` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:2048`, `let _ = std::fs::remove_file(shm_nattch_path(&segment.path));` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1317,7 +981,7 @@
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(&segment.path);",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:2297`, `let _ = std::fs::remove_file(&segment.path);` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:2297`, `let _ = std::fs::remove_file(&segment.path);` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1325,7 +989,7 @@
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(shm_nattch_path(&segment.path));",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:2298`, `let _ = std::fs::remove_file(shm_nattch_path(&segment.path));` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:2298`, `let _ = std::fs::remove_file(shm_nattch_path(&segment.path));` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1349,7 +1013,7 @@
     "kind": "ambient_filesystem",
     "text": "std::fs::rename(&path, &id_path).map_err(|_| LINUX_EIO)?;",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:3091`, `std::fs::rename(&path, &id_path).map_err(|_| LINUX_EIO)?;` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:3091`, `std::fs::rename(&path, &id_path).map_err(|_| LINUX_EIO)?;` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1357,7 +1021,7 @@
     "kind": "ambient_filesystem",
     "text": "if let Ok(entries) = std::fs::read_dir(SHM_DIR) {",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:3272`, `if let Ok(entries) = std::fs::read_dir(SHM_DIR) {` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:3272`, `if let Ok(entries) = std::fs::read_dir(SHM_DIR) {` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1365,7 +1029,7 @@
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(&path);",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:3410`, `let _ = std::fs::remove_file(&path);` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:3410`, `let _ = std::fs::remove_file(&path);` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/sysv.rs",
@@ -1373,23 +1037,23 @@
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(msg_queue_wait_path(&path));",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:3411`, `let _ = std::fs::remove_file(msg_queue_wait_path(&path));` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/sysv.rs:3411`, `let _ = std::fs::remove_file(msg_queue_wait_path(&path));` accesses the fixed runtime `SHM_DIR` IPC backing root; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/time.rs",
     "line": 1061,
     "kind": "host_identity",
     "text": "if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {",
-    "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/time.rs:1061`, `if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {` reads host identity or a host limit for guest rlimit presentation; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "classification": "declared_backing",
+    "rationale": "At `crates/carrick-runtime/src/dispatch/time.rs:1061`, `if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {` accesses the native process `RLIMIT_NOFILE` backing for already-published guest FD capacity; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/time.rs",
     "line": 1084,
     "kind": "host_identity",
     "text": "libc::setrlimit(libc::RLIMIT_NOFILE, &new);",
-    "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/time.rs:1084`, `libc::setrlimit(libc::RLIMIT_NOFILE, &new);` reads host identity or a host limit for guest rlimit presentation; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "classification": "declared_backing",
+    "rationale": "At `crates/carrick-runtime/src/dispatch/time.rs:1084`, `libc::setrlimit(libc::RLIMIT_NOFILE, &new);` accesses the native process `RLIMIT_NOFILE` backing for already-published guest FD capacity; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/time.rs",
@@ -1397,7 +1061,7 @@
     "kind": "carrier_substrate",
     "text": "std::thread::yield_now();",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/time.rs:1131`, `std::thread::yield_now();` operates only on the current carrier timer worker or park; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/time.rs:1131`, `std::thread::yield_now();` operates only on the current carrier timer worker; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/time.rs",
@@ -1405,7 +1069,7 @@
     "kind": "carrier_substrate",
     "text": "std::thread::Builder::new()",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/time.rs:1164`, `std::thread::Builder::new()` operates only on the current carrier timer worker or park; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/time.rs:1164`, `std::thread::Builder::new()` operates only on the current carrier timer worker; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
   },
   {
     "file": "crates/carrick-runtime/src/dispatch/time.rs",
@@ -1413,7 +1077,7 @@
     "kind": "carrier_substrate",
     "text": "std::thread::sleep(Duration::from_nanos(delay_ns));",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-runtime/src/dispatch/time.rs:1217`, `std::thread::sleep(Duration::from_nanos(delay_ns));` operates only on the current carrier timer worker or park; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-runtime/src/dispatch/time.rs:1217`, `std::thread::sleep(Duration::from_nanos(delay_ns));` operates only on the current carrier timer worker; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
@@ -1421,7 +1085,7 @@
     "kind": "host_identity",
     "text": "let init_host_pgid = unsafe { libc::getpgrp() };",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:199`, `let init_host_pgid = unsafe { libc::getpgrp() };` reads host identity or a host limit for the host-to-namespace PID translation table; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:199`, `let init_host_pgid = unsafe { libc::getpgrp() };` reads a host identity/limit for the host-to-namespace PID translation table; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
@@ -1429,7 +1093,7 @@
     "kind": "host_identity",
     "text": "let init_host_sid = unsafe { libc::getsid(0) };",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:206`, `let init_host_sid = unsafe { libc::getsid(0) };` reads host identity or a host limit for the host-to-namespace PID translation table; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:206`, `let init_host_sid = unsafe { libc::getsid(0) };` reads a host identity/limit for the host-to-namespace PID translation table; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
@@ -1437,7 +1101,7 @@
     "kind": "host_identity",
     "text": "let pgid = unsafe { libc::getpgrp() };",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:331`, `let pgid = unsafe { libc::getpgrp() };` reads host identity or a host limit for the host-to-namespace PID translation table; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:331`, `let pgid = unsafe { libc::getpgrp() };` reads a host identity/limit for the host-to-namespace PID translation table; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
@@ -1445,7 +1109,7 @@
     "kind": "host_identity",
     "text": "let host = std::process::id();",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:377`, `let host = std::process::id();` reads host identity or a host limit for the host-to-namespace PID translation table; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:377`, `let host = std::process::id();` reads a host identity/limit for the host-to-namespace PID translation table; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
@@ -1453,7 +1117,7 @@
     "kind": "host_identity",
     "text": "return unsafe { libc::getppid() } as u32;",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:417`, `return unsafe { libc::getppid() } as u32;` reads host identity or a host limit for the host-to-namespace PID translation table; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:417`, `return unsafe { libc::getppid() } as u32;` reads a host identity/limit for the host-to-namespace PID translation table; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
@@ -1461,7 +1125,7 @@
     "kind": "host_identity",
     "text": "let self_host = std::process::id();",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:419`, `let self_host = std::process::id();` reads host identity or a host limit for the host-to-namespace PID translation table; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:419`, `let self_host = std::process::id();` reads a host identity/limit for the host-to-namespace PID translation table; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
@@ -1469,7 +1133,7 @@
     "kind": "host_identity",
     "text": "let host_ppid = unsafe { libc::getppid() } as u32;",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:436`, `let host_ppid = unsafe { libc::getppid() } as u32;` reads host identity or a host limit for the host-to-namespace PID translation table; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:436`, `let host_ppid = unsafe { libc::getppid() } as u32;` reads a host identity/limit for the host-to-namespace PID translation table; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
@@ -1477,7 +1141,7 @@
     "kind": "host_identity",
     "text": "r.mark_execed(std::process::id());",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:641`, `r.mark_execed(std::process::id());` reads host identity or a host limit for the host-to-namespace PID translation table; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:641`, `r.mark_execed(std::process::id());` reads a host identity/limit for the host-to-namespace PID translation table; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
@@ -1485,7 +1149,7 @@
     "kind": "host_identity",
     "text": "r.is_execed_child_of(target_host_pid, std::process::id())",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:652`, `r.is_execed_child_of(target_host_pid, std::process::id())` reads host identity or a host limit for the host-to-namespace PID translation table; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:652`, `r.is_execed_child_of(target_host_pid, std::process::id())` reads a host identity/limit for the host-to-namespace PID translation table; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/namespace/pid.rs",
@@ -1493,7 +1157,7 @@
     "kind": "host_identity",
     "text": "register_child(std::process::id(), 0);",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:667`, `register_child(std::process::id(), 0);` reads host identity or a host limit for the host-to-namespace PID translation table; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/namespace/pid.rs:667`, `register_child(std::process::id(), 0);` reads a host identity/limit for the host-to-namespace PID translation table; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/namespace/supervisor.rs",
@@ -1557,7 +1221,7 @@
     "kind": "ambient_filesystem",
     "text": "std::fs::write(&sidecar, buf).map_err(map_io_error)",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:173`, `std::fs::write(&sidecar, buf).map_err(map_io_error)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:173`, `std::fs::write(&sidecar, buf).map_err(map_io_error)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1565,7 +1229,7 @@
     "kind": "ambient_filesystem",
     "text": "let Ok(buf) = std::fs::read(&sidecar) else {",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:185`, `let Ok(buf) = std::fs::read(&sidecar) else {` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:185`, `let Ok(buf) = std::fs::read(&sidecar) else {` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1573,7 +1237,7 @@
     "kind": "ambient_filesystem",
     "text": "fn metadata_from_host(host: &Path, meta: std::fs::Metadata, nofollow: bool) -> Metadata {",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:311`, `fn metadata_from_host(host: &Path, meta: std::fs::Metadata, nofollow: bool) -> Metadata {` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:311`, `fn metadata_from_host(host: &Path, meta: std::fs::Metadata, nofollow: bool) -> Metadata {` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1581,7 +1245,7 @@
     "kind": "ambient_filesystem",
     "text": "std::fs::metadata(&host)",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:375`, `std::fs::metadata(&host)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:375`, `std::fs::metadata(&host)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1589,7 +1253,7 @@
     "kind": "ambient_filesystem",
     "text": "std::fs::symlink_metadata(&host)",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:382`, `std::fs::symlink_metadata(&host)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:382`, `std::fs::symlink_metadata(&host)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1597,7 +1261,7 @@
     "kind": "ambient_filesystem",
     "text": "std::fs::read_link(&host).map_err(map_io_error)",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:403`, `std::fs::read_link(&host).map_err(map_io_error)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:403`, `std::fs::read_link(&host).map_err(map_io_error)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1605,7 +1269,7 @@
     "kind": "ambient_filesystem",
     "text": "std::fs::read(&host).map_err(map_io_error)",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:408`, `std::fs::read(&host).map_err(map_io_error)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:408`, `std::fs::read(&host).map_err(map_io_error)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1613,7 +1277,7 @@
     "kind": "ambient_filesystem",
     "text": "for entry in std::fs::read_dir(&host).map_err(map_io_error)? {",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:414`, `for entry in std::fs::read_dir(&host).map_err(map_io_error)? {` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:414`, `for entry in std::fs::read_dir(&host).map_err(map_io_error)? {` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1621,7 +1285,7 @@
     "kind": "ambient_filesystem",
     "text": "let existed_before_create = flags.create && std::fs::symlink_metadata(&host).is_ok();",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:483`, `let existed_before_create = flags.create && std::fs::symlink_metadata(&host).is_ok();` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:483`, `let existed_before_create = flags.create && std::fs::symlink_metadata(&host).is_ok();` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1629,7 +1293,7 @@
     "kind": "ambient_filesystem",
     "text": "for entry in std::fs::read_dir(&host).map_err(map_io_error)? {",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:532`, `for entry in std::fs::read_dir(&host).map_err(map_io_error)? {` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:532`, `for entry in std::fs::read_dir(&host).map_err(map_io_error)? {` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1637,7 +1301,7 @@
     "kind": "ambient_filesystem",
     "text": "std::fs::create_dir(&host).map_err(map_io_error)?;",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:550`, `std::fs::create_dir(&host).map_err(map_io_error)?;` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:550`, `std::fs::create_dir(&host).map_err(map_io_error)?;` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1645,7 +1309,7 @@
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode));",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:553`, `let _ = std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode));` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:553`, `let _ = std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode));` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1653,7 +1317,7 @@
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(&sidecar);",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:589`, `let _ = std::fs::remove_file(&sidecar);` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:589`, `let _ = std::fs::remove_file(&sidecar);` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1661,7 +1325,7 @@
     "kind": "ambient_filesystem",
     "text": "std::fs::remove_file(&host).map_err(map_io_error)",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:591`, `std::fs::remove_file(&host).map_err(map_io_error)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:591`, `std::fs::remove_file(&host).map_err(map_io_error)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1669,7 +1333,7 @@
     "kind": "ambient_filesystem",
     "text": "std::fs::remove_dir(&host).map_err(map_io_error)",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:606`, `std::fs::remove_dir(&host).map_err(map_io_error)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:606`, `std::fs::remove_dir(&host).map_err(map_io_error)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1677,7 +1341,7 @@
     "kind": "ambient_filesystem",
     "text": "std::fs::rename(&host_from, &host_to).map_err(map_io_error)?;",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:621`, `std::fs::rename(&host_from, &host_to).map_err(map_io_error)?;` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:621`, `std::fs::rename(&host_from, &host_to).map_err(map_io_error)?;` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1685,7 +1349,7 @@
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::rename(&src, &dst);",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:632`, `let _ = std::fs::rename(&src, &dst);` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:632`, `let _ = std::fs::rename(&src, &dst);` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1693,7 +1357,7 @@
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(&dst);",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:634`, `let _ = std::fs::remove_file(&dst);` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:634`, `let _ = std::fs::remove_file(&dst);` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1701,7 +1365,7 @@
     "kind": "ambient_filesystem",
     "text": "std::fs::hard_link(&host_from, &host_to).map_err(map_io_error)",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:654`, `std::fs::hard_link(&host_from, &host_to).map_err(map_io_error)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:654`, `std::fs::hard_link(&host_from, &host_to).map_err(map_io_error)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1709,7 +1373,7 @@
     "kind": "ambient_filesystem",
     "text": "std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode)).map_err(map_io_error)",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:663`, `std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode)).map_err(map_io_error)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:663`, `std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode)).map_err(map_io_error)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1717,7 +1381,7 @@
     "kind": "ambient_filesystem",
     "text": "let file = std::fs::OpenOptions::new()",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:679`, `let file = std::fs::OpenOptions::new()` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:679`, `let file = std::fs::OpenOptions::new()` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1725,7 +1389,7 @@
     "kind": "ambient_filesystem",
     "text": "file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:686`, `file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:686`, `file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1733,7 +1397,7 @@
     "kind": "ambient_filesystem",
     "text": "std::fs::symlink_metadata(&host)",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:709`, `std::fs::symlink_metadata(&host)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:709`, `std::fs::symlink_metadata(&host)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1741,7 +1405,7 @@
     "kind": "ambient_filesystem",
     "text": "std::fs::metadata(&host)",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:711`, `std::fs::metadata(&host)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:711`, `std::fs::metadata(&host)` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/bind.rs",
@@ -1749,7 +1413,7 @@
     "kind": "ambient_filesystem",
     "text": "let file = std::fs::OpenOptions::new()",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:773`, `let file = std::fs::OpenOptions::new()` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-runtime/src/vfs/bind.rs:773`, `let file = std::fs::OpenOptions::new()` accesses the configured BindVfs root capability; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/dev.rs",
@@ -1757,7 +1421,7 @@
     "kind": "host_identity",
     "text": "let index = table.insert(slave_name, std::process::id());",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/dev.rs:150`, `let index = table.insert(slave_name, std::process::id());` reads host identity or a host limit for the guest `/dev/ptmx` PTY ownership table; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/dev.rs:150`, `let index = table.insert(slave_name, std::process::id());` reads a host identity/limit for the guest `/dev/ptmx` PTY ownership table; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/devpts.rs",
@@ -1765,7 +1429,7 @@
     "kind": "host_identity",
     "text": "let index = table.insert(slave_name, std::process::id());",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/devpts.rs:263`, `let index = table.insert(slave_name, std::process::id());` reads host identity or a host limit for the guest `/dev/pts/ptmx` PTY ownership table; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/devpts.rs:263`, `let index = table.insert(slave_name, std::process::id());` reads a host identity/limit for the guest `/dev/pts/ptmx` PTY ownership table; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/etc_services.rs",
@@ -1773,7 +1437,7 @@
     "kind": "ambient_filesystem",
     "text": "if let Ok(host) = std::fs::read(\"/etc/services\")",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/etc_services.rs:92`, `if let Ok(host) = std::fs::read(\"/etc/services\")` reads ambient host file bytes for the guest `/etc/services` renderer; those bytes directly decide a guest-visible answer, so this is explicit semantic debt rather than authorized backing."
+    "rationale": "At `crates/carrick-runtime/src/vfs/etc_services.rs:92`, `if let Ok(host) = std::fs::read(\"/etc/services\")` reads ambient host file bytes for the guest `/etc/services` renderer; those bytes directly decide a guest-visible answer, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
@@ -1781,7 +1445,7 @@
     "kind": "host_identity",
     "text": "if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, limit.as_mut_ptr()) } != 0 {",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:509`, `if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, limit.as_mut_ptr()) } != 0 {` reads host identity or a host limit for the synthetic guest `/proc` renderer; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:509`, `if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, limit.as_mut_ptr()) } != 0 {` reads a host identity/limit for the synthetic guest `/proc` renderer; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
@@ -1789,7 +1453,7 @@
     "kind": "ambient_filesystem",
     "text": "let raw = std::fs::read_to_string(\"/proc/sys/kernel/threads-max\").ok()?;",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:529`, `let raw = std::fs::read_to_string(\"/proc/sys/kernel/threads-max\").ok()?;` reads ambient host file bytes for the synthetic guest `/proc` renderer; those bytes directly decide a guest-visible answer, so this is explicit semantic debt rather than authorized backing."
+    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:529`, `let raw = std::fs::read_to_string(\"/proc/sys/kernel/threads-max\").ok()?;` reads ambient host file bytes for the synthetic guest `/proc` renderer; those bytes directly decide a guest-visible answer, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
@@ -1797,7 +1461,7 @@
     "kind": "host_identity",
     "text": "return Some((true, std::process::id()));",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1220`, `return Some((true, std::process::id()));` reads host identity or a host limit for the synthetic guest `/proc` renderer; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1220`, `return Some((true, std::process::id()));` reads a host identity/limit for the synthetic guest `/proc` renderer; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
@@ -1805,7 +1469,7 @@
     "kind": "host_identity",
     "text": "Some((host == std::process::id(), host))",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1228`, `Some((host == std::process::id(), host))` reads host identity or a host limit for the synthetic guest `/proc` renderer; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1228`, `Some((host == std::process::id(), host))` reads a host identity/limit for the synthetic guest `/proc` renderer; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
@@ -1813,7 +1477,7 @@
     "kind": "host_identity",
     "text": "let self_host_pid = std::process::id();",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1620`, `let self_host_pid = std::process::id();` reads host identity or a host limit for the synthetic guest `/proc` renderer; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1620`, `let self_host_pid = std::process::id();` reads a host identity/limit for the synthetic guest `/proc` renderer; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
@@ -1821,7 +1485,7 @@
     "kind": "host_identity",
     "text": "if pid == std::process::id() {",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1650`, `if pid == std::process::id() {` reads host identity or a host limit for the synthetic guest `/proc` renderer; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1650`, `if pid == std::process::id() {` reads a host identity/limit for the synthetic guest `/proc` renderer; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
@@ -1829,7 +1493,7 @@
     "kind": "host_process_control",
     "text": "libc::waitid(",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1686`, `libc::waitid(` acts on or observes a host process for the synthetic guest `/proc` renderer; the resulting host status or signal target can decide guest process behavior, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1686`, `libc::waitid(` acts on a host process for the synthetic guest `/proc` renderer; the resulting host operation can decide guest process behavior, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
@@ -1837,7 +1501,7 @@
     "kind": "host_identity",
     "text": "(std::process::id(), None)",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1726`, `(std::process::id(), None)` reads host identity or a host limit for the synthetic guest `/proc` renderer; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:1726`, `(std::process::id(), None)` reads a host identity/limit for the synthetic guest `/proc` renderer; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
@@ -1845,7 +1509,7 @@
     "kind": "host_identity",
     "text": "proc_pid_dir_entries_for_known_process(path, host_pid == std::process::id())",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:2014`, `proc_pid_dir_entries_for_known_process(path, host_pid == std::process::id())` reads host identity or a host limit for the synthetic guest `/proc` renderer; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:2014`, `proc_pid_dir_entries_for_known_process(path, host_pid == std::process::id())` reads a host identity/limit for the synthetic guest `/proc` renderer; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
@@ -1853,7 +1517,7 @@
     "kind": "host_identity",
     "text": "|| unsafe { libc::getppid() } as u32,",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3172`, `|| unsafe { libc::getppid() } as u32,` reads host identity or a host limit for the synthetic guest `/proc` renderer; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3172`, `|| unsafe { libc::getppid() } as u32,` reads a host identity/limit for the synthetic guest `/proc` renderer; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
@@ -1861,7 +1525,7 @@
     "kind": "host_identity",
     "text": "let ppid = unsafe { libc::getppid() } as u32;",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3474`, `let ppid = unsafe { libc::getppid() } as u32;` reads host identity or a host limit for the synthetic guest `/proc` renderer; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3474`, `let ppid = unsafe { libc::getppid() } as u32;` reads a host identity/limit for the synthetic guest `/proc` renderer; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
@@ -1869,7 +1533,7 @@
     "kind": "host_identity",
     "text": "let me = std::process::id();",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3475`, `let me = std::process::id();` reads host identity or a host limit for the synthetic guest `/proc` renderer; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3475`, `let me = std::process::id();` reads a host identity/limit for the synthetic guest `/proc` renderer; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
@@ -1877,7 +1541,7 @@
     "kind": "host_identity",
     "text": "let ppid = unsafe { libc::getppid() } as u32;",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3525`, `let ppid = unsafe { libc::getppid() } as u32;` reads host identity or a host limit for the synthetic guest `/proc` renderer; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3525`, `let ppid = unsafe { libc::getppid() } as u32;` reads a host identity/limit for the synthetic guest `/proc` renderer; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
@@ -1885,7 +1549,7 @@
     "kind": "host_identity",
     "text": "let me = std::process::id();",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3526`, `let me = std::process::id();` reads host identity or a host limit for the synthetic guest `/proc` renderer; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3526`, `let me = std::process::id();` reads a host identity/limit for the synthetic guest `/proc` renderer; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
@@ -1893,7 +1557,7 @@
     "kind": "host_identity",
     "text": "let fallback_ppid = std::process::id();",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3593`, `let fallback_ppid = std::process::id();` reads host identity or a host limit for the synthetic guest `/proc` renderer; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3593`, `let fallback_ppid = std::process::id();` reads a host identity/limit for the synthetic guest `/proc` renderer; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
@@ -1901,7 +1565,7 @@
     "kind": "host_identity",
     "text": "let fallback_pgid = unsafe { libc::getpgrp() as u32 };",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3594`, `let fallback_pgid = unsafe { libc::getpgrp() as u32 };` reads host identity or a host limit for the synthetic guest `/proc` renderer; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3594`, `let fallback_pgid = unsafe { libc::getpgrp() as u32 };` reads a host identity/limit for the synthetic guest `/proc` renderer; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/proc.rs",
@@ -1909,7 +1573,7 @@
     "kind": "host_identity",
     "text": "\"self\" | \"thread-self\" => std::process::id(),",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3664`, `\"self\" | \"thread-self\" => std::process::id(),` reads host identity or a host limit for the synthetic guest `/proc` renderer; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-runtime/src/vfs/proc.rs:3664`, `\"self\" | \"thread-self\" => std::process::id(),` reads a host identity/limit for the synthetic guest `/proc` renderer; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-runtime/src/vfs/resolvconf.rs",
@@ -1917,7 +1581,7 @@
     "kind": "ambient_filesystem",
     "text": "if let Ok(host) = std::fs::read_to_string(\"/etc/resolv.conf\") {",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-runtime/src/vfs/resolvconf.rs:113`, `if let Ok(host) = std::fs::read_to_string(\"/etc/resolv.conf\") {` reads ambient host file bytes for the guest resolver configuration renderer; those bytes directly decide a guest-visible answer, so this is explicit semantic debt rather than authorized backing."
+    "rationale": "At `crates/carrick-runtime/src/vfs/resolvconf.rs:113`, `if let Ok(host) = std::fs::read_to_string(\"/etc/resolv.conf\") {` reads ambient host file bytes for the guest resolver configuration renderer; those bytes directly decide a guest-visible answer, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/bin/hvf_fork_probe.rs",
@@ -2085,7 +1749,7 @@
     "kind": "host_identity",
     "text": "std::process::id(),",
     "classification": "legacy_unreachable",
-    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvpatch_probe_support/mod.rs:355`, `std::process::id(),` is unreachable from the HVPatch release path under the standalone `hvf_info_load_probe`, `hvf_bl_exit_free_probe`, or `hvf_compute_baseline_probe` target importing this shared module; this exact discriminator records migration debt and is not a completion waiver."
+    "rationale": "At `crates/carrick-vmm-hvf/src/bin/hvpatch_probe_support/mod.rs:355`, `std::process::id(),` is unreachable from the HVPatch release path under the three standalone targets `hvf_info_load_probe`, `hvf_bl_exit_free_probe`, and `hvf_compute_baseline_probe` importing this shared module; this exact discriminator records migration debt and is not a completion waiver."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
@@ -2125,7 +1789,7 @@
     "kind": "host_identity",
     "text": "record_sender(signum, unsafe { libc::getpid() });",
     "classification": "forbidden_semantic",
-    "rationale": "At `crates/carrick-vmm-hvf/src/host_signal.rs:1304`, `record_sender(signum, unsafe { libc::getpid() });` reads host identity or a host limit for guest synthetic signal sender (`si_pid`) attribution; that value can leak into or decide guest-visible process metadata, so this is explicit semantic debt."
+    "rationale": "At `crates/carrick-vmm-hvf/src/host_signal.rs:1304`, `record_sender(signum, unsafe { libc::getpid() });` reads a host identity/limit for guest synthetic signal sender (`si_pid`) attribution; that value can alter guest-visible process metadata, so this is explicit semantic debt."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/io_wait.rs",
@@ -2197,7 +1861,7 @@
     "kind": "ambient_filesystem",
     "text": "file: std::sync::Arc<std::fs::File>,",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:307`, `file: std::sync::Arc<std::fs::File>,` accesses the VM carrier private executable-artifact file; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:307`, `file: std::sync::Arc<std::fs::File>,` accesses the VM carrier private executable-artifact file; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2205,7 +1869,7 @@
     "kind": "ambient_filesystem",
     "text": ") -> Result<std::fs::File, std::io::Error> {",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:365`, `) -> Result<std::fs::File, std::io::Error> {` accesses the VM carrier private executable-artifact file; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:365`, `) -> Result<std::fs::File, std::io::Error> {` accesses the VM carrier private executable-artifact file; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2213,7 +1877,7 @@
     "kind": "host_identity",
     "text": "std::process::id()",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:378`, `std::process::id()` accesses the VM carrier private executable-artifact file; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:378`, `std::process::id()` accesses the VM carrier private executable-artifact file; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2221,7 +1885,7 @@
     "kind": "ambient_filesystem",
     "text": "let file = std::fs::OpenOptions::new()",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:380`, `let file = std::fs::OpenOptions::new()` accesses the VM carrier private executable-artifact file; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:380`, `let file = std::fs::OpenOptions::new()` accesses the VM carrier private executable-artifact file; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2229,7 +1893,7 @@
     "kind": "ambient_filesystem",
     "text": "if let Err(error) = std::fs::remove_file(&path) {",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:386`, `if let Err(error) = std::fs::remove_file(&path) {` accesses the VM carrier private executable-artifact file; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:386`, `if let Err(error) = std::fs::remove_file(&path) {` accesses the VM carrier private executable-artifact file; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2237,7 +1901,7 @@
     "kind": "ambient_filesystem",
     "text": "let _ = std::fs::remove_file(&path);",
     "classification": "declared_backing",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:388`, `let _ = std::fs::remove_file(&path);` accesses the VM carrier private executable-artifact file; Carrick selected that backing authority before this operation, and guest-controlled data is only normalized or looked up beneath it and cannot widen to another host object."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:388`, `let _ = std::fs::remove_file(&path);` accesses the VM carrier private executable-artifact file; Carrick selected that backing authority before this operation, and guest-controlled data is normalized beneath it without selecting another host object."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2245,7 +1909,7 @@
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() },",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:1779`, `unsafe { libc::getpid() },` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:1779`, `unsafe { libc::getpid() },` is the admission first-park diagnostic line for the current VM carrier; its PID is printed only for host-side troubleshooting and is never returned to the guest. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2253,7 +1917,7 @@
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() },",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:1794`, `unsafe { libc::getpid() },` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:1794`, `unsafe { libc::getpid() },` is the admission-exhausted diagnostic line for the current VM carrier; its PID is printed only for host-side troubleshooting and is never returned to the guest. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2261,7 +1925,7 @@
     "kind": "carrier_substrate",
     "text": "std::thread::sleep(backoff.next_delay());",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:1839`, `std::thread::sleep(backoff.next_delay());` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:1839`, `std::thread::sleep(backoff.next_delay());` is the bounded atomic-permit backoff sleep for the current VM carrier; it schedules no guest-selected host target. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2269,7 +1933,7 @@
     "kind": "host_identity",
     "text": "match region.acquire(atomic_permit_slot::MAX_SLOTS, std::process::id()) {",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2447`, `match region.acquire(atomic_permit_slot::MAX_SLOTS, std::process::id()) {` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2447`, `match region.acquire(atomic_permit_slot::MAX_SLOTS, std::process::id()) {` is the VM-residency table ownership key for the current carrier VM; the table is keyed by the creating carrier, not by a guest PID. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2277,7 +1941,7 @@
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() }",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2451`, `unsafe { libc::getpid() }` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2451`, `unsafe { libc::getpid() }` is the VM-residency-table-full diagnostic for the current carrier; the PID is logging provenance and is not guest metadata. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2285,7 +1949,7 @@
     "kind": "host_identity",
     "text": "let pid = std::process::id();",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2525`, `let pid = std::process::id();` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2525`, `let pid = std::process::id();` is the global vCPU-permit owner key for the current carrier; admission uses the carrier PID created by Carrick, not a guest PID. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2293,7 +1957,7 @@
     "kind": "carrier_substrate",
     "text": "std::thread::sleep(backoff.next_delay());",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2543`, `std::thread::sleep(backoff.next_delay());` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2543`, `std::thread::sleep(backoff.next_delay());` is the global vCPU-permit backoff sleep for the current carrier; it parks no guest-selected host target. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2301,7 +1965,7 @@
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() },",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2682`, `unsafe { libc::getpid() },` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2682`, `unsafe { libc::getpid() },` is the HV_NO_RESOURCES recovery diagnostic for the current carrier; the PID is logging provenance and is not guest metadata. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2309,7 +1973,7 @@
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() },",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2693`, `unsafe { libc::getpid() },` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2693`, `unsafe { libc::getpid() },` is the HV_NO_RESOURCES retry diagnostic for the current carrier; the PID is logging provenance and is not guest metadata. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2317,7 +1981,7 @@
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() },",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2703`, `unsafe { libc::getpid() },` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2703`, `unsafe { libc::getpid() },` is the terminal HV_NO_RESOURCES diagnostic for the current carrier; the PID is logging provenance and is not guest metadata. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2325,7 +1989,7 @@
     "kind": "host_identity",
     "text": "let pid = std::process::id();",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2860`, `let pid = std::process::id();` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2860`, `let pid = std::process::id();` is the VM-slot probe permit owner key for the current carrier; the probe uses the carrier PID to measure host capacity, not guest identity. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2333,7 +1997,7 @@
     "kind": "carrier_substrate",
     "text": "std::thread::sleep(backoff.next_delay());",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2879`, `std::thread::sleep(backoff.next_delay());` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:2879`, `std::thread::sleep(backoff.next_delay());` is the VM-slot probe backoff sleep for the current carrier; it parks no guest-selected host target. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2341,7 +2005,7 @@
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() },",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:3024`, `unsafe { libc::getpid() },` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:3024`, `unsafe { libc::getpid() },` is the debug-only kick statistics provenance field for the current carrier; the PID is emitted only to diagnostics. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2349,7 +2013,7 @@
     "kind": "host_identity",
     "text": "crate::probes::fork_quiesce(3, rc as i64, vcpu.id() as i64, unsafe { libc::getpid() });",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:10882`, `crate::probes::fork_quiesce(3, rc as i64, vcpu.id() as i64, unsafe { libc::getpid() });` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:10882`, `crate::probes::fork_quiesce(3, rc as i64, vcpu.id() as i64, unsafe { libc::getpid() });` is the fork-quiesce USDT record for the carrier that destroys its vCPU; the PID identifies the carrier in the trace and is not guest state. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2357,7 +2021,7 @@
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() },",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:11105`, `unsafe { libc::getpid() },` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:11105`, `unsafe { libc::getpid() },` is the fork-quiesce USDT record after VM teardown; the PID identifies the carrier in the trace and is not guest state. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2365,7 +2029,7 @@
     "kind": "host_identity",
     "text": "unsafe { libc::getpid() }",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:11456`, `unsafe { libc::getpid() }` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:11456`, `unsafe { libc::getpid() }` is the fork-post USDT record for the parent carrier after rebuild; the PID is trace provenance and is not guest state. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2373,7 +2037,7 @@
     "kind": "host_identity",
     "text": "libc::getpid()",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:13398`, `libc::getpid()` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:13398`, `libc::getpid()` is the direct-EL0 vCPU-fault USDT argument; the PID is trace provenance for the carrier and is not delivered to the guest. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2381,7 +2045,7 @@
     "kind": "host_identity",
     "text": "pid = unsafe { libc::getpid() },",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:13444`, `pid = unsafe { libc::getpid() },` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:13444`, `pid = unsafe { libc::getpid() },` is the EL1-resume panic diagnostic; the PID identifies the failing carrier in host logs and is not guest state. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/trap.rs",
@@ -2389,7 +2053,7 @@
     "kind": "host_identity",
     "text": "libc::getpid()",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:13485`, `libc::getpid()` operates only on the current VM carrier admission record or its diagnostic probe stream; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/trap.rs:13485`, `libc::getpid()` is the HVC-path vCPU-fault USDT argument; the PID is trace provenance for the carrier and is not delivered to the guest. Carrick owns that carrier-side resource, so no guest identifier can select or widen a host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/vcpu_kick.rs",
@@ -2397,7 +2061,7 @@
     "kind": "carrier_substrate",
     "text": "unsafe { applevisor_sys::hv_vcpus_exit(ids.as_ptr(), ids.len() as u32) }",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/vcpu_kick.rs:99`, `unsafe { applevisor_sys::hv_vcpus_exit(ids.as_ptr(), ids.len() as u32) }` operates only on the authenticated vCPU kick worker and handle; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/vcpu_kick.rs:99`, `unsafe { applevisor_sys::hv_vcpus_exit(ids.as_ptr(), ids.len() as u32) }` operates only on the authenticated vCPU kick handle; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/vcpu_kick.rs",
@@ -2405,7 +2069,7 @@
     "kind": "carrier_substrate",
     "text": "let handle = std::thread::Builder::new()",
     "classification": "declared_substrate",
-    "rationale": "At `crates/carrick-vmm-hvf/src/vcpu_kick.rs:317`, `let handle = std::thread::Builder::new()` operates only on the authenticated vCPU kick worker and handle; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
+    "rationale": "At `crates/carrick-vmm-hvf/src/vcpu_kick.rs:317`, `let handle = std::thread::Builder::new()` operates only on the authenticated vCPU kick handle; Carrick created and authenticated that carrier-side resource, and no guest PID, UID, group, or namespace value can select or widen its host target."
   },
   {
     "file": "crates/carrick-vmm-hvf/src/vcpu_permit_reaper.rs",
