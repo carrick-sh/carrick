@@ -14,6 +14,7 @@ import itertools
 import json
 import re
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -21,9 +22,7 @@ from typing import Any, NamedTuple
 ROOT = Path(__file__).resolve().parents[2]
 INVENTORY = ROOT / "scripts/migrate/host-authority-transition-inventory.json"
 SOURCE_ROOTS = (
-    Path("crates/carrick-runtime/src/dispatch"),
-    Path("crates/carrick-runtime/src/vfs"),
-    Path("crates/carrick-runtime/src/namespace"),
+    Path("crates/carrick-runtime/src"),
     Path("crates/carrick-vmm-hvf/src"),
 )
 
@@ -125,23 +124,39 @@ CLASSIFICATIONS = {
     "declared_backing",
     "legacy_unreachable",
 }
-RATIONALE_PREFIXES = {
-    "forbidden_semantic": ("guest answer: ", "host target: "),
-    "declared_substrate": ("authenticated carrier: ",),
-    "declared_backing": ("authorized backing: ",),
-    "legacy_unreachable": (
-        "compile-time exclusion: ",
-        "standalone target exclusion: ",
-    ),
+AUTHORITIES = {
+    "forbidden_semantic": {"guest_answer", "host_target"},
+    "declared_substrate": {"authenticated_carrier"},
+    "declared_backing": {"authorized_backing"},
+    "legacy_unreachable": {
+        "compile_time_exclusion",
+        "standalone_target_exclusion",
+    },
 }
-BANNED_RATIONALE_FRAGMENTS = (
-    "Concrete operation form:",
+BANNED_REVIEW_FRAGMENTS = (
+    "concrete operation form:",
     "guest-visible process state",
-    "Carrick created that resource",
+    "carrick created that resource",
     "pre-authorized backing object",
     "performs a carrier-side",
 )
-REVIEW_FIELDS = {"classification", "rationale"}
+GENERIC_RESOURCES = {
+    "authenticated carrier",
+    "authorized backing",
+    "backing object",
+    "carrier resource",
+    "compile time exclusion",
+    "filesystem operation",
+    "guest answer",
+    "host resource",
+    "host target",
+    "network operation",
+    "process state",
+    "runtime resource",
+    "standalone target exclusion",
+}
+DISJUNCTION = re.compile(r"\b(?:or|versus)\b", re.IGNORECASE)
+REVIEW_FIELDS = {"classification", "evidence", "rationale"}
 
 
 class InventoryError(Exception):
@@ -405,13 +420,14 @@ def _skip_visibility(tokens: list[Token], index: int) -> int:
     return index
 
 
-def test_only_module_ranges(tokens: list[Token]) -> list[tuple[int, int]]:
-    """Return token-index ranges for inline modules whose cfg requires test."""
-    ranges: list[tuple[int, int]] = []
+def _attributed_items(
+    tokens: list[Token],
+) -> list[tuple[int, list[tuple[bool, list[Token]]]]]:
+    """Return each attributed item's token index and its complete attributes."""
+    items: list[tuple[int, list[tuple[bool, list[Token]]]]] = []
     index = 0
     while index < len(tokens):
-        first = _attribute(tokens, index)
-        if first is None:
+        if _attribute(tokens, index) is None:
             index += 1
             continue
         cursor = index
@@ -422,20 +438,82 @@ def test_only_module_ranges(tokens: list[Token]) -> list[tuple[int, int]]:
                 break
             cursor, inner, body = parsed
             attributes.append((inner, body))
-        implies_test = any(
-            not inner and _cfg_attribute_implies_test(body)
-            for inner, body in attributes
-        )
-        if implies_test:
-            item = _skip_visibility(tokens, cursor)
-            if item < len(tokens) and tokens[item].value == "mod":
+        items.append((_skip_visibility(tokens, cursor), attributes))
+        index = max(cursor, index + 1)
+    return items
+
+
+def _attributes_imply_test(attributes: list[tuple[bool, list[Token]]]) -> bool:
+    return any(
+        not inner and _cfg_attribute_implies_test(body)
+        for inner, body in attributes
+    )
+
+
+def _cfg_predicate_text(attributes: list[tuple[bool, list[Token]]]) -> str | None:
+    for inner, body in attributes:
+        if inner or len(body) < 3 or body[0].value != "cfg" or body[1].value != "(":
+            continue
+        close = _matching_delimiter(body, 1)
+        if close == len(body) - 1:
+            return "".join(token.value for token in body[2:close])
+    return None
+
+
+def test_only_module_ranges(tokens: list[Token]) -> list[tuple[int, int]]:
+    """Return token-index ranges for inline modules whose cfg requires test."""
+    ranges: list[tuple[int, int]] = []
+    for item, attributes in _attributed_items(tokens):
+        if not _attributes_imply_test(attributes):
+            continue
+        if item < len(tokens) and tokens[item].value == "mod":
+            item += 1
+            if item < len(tokens) and tokens[item].kind == "ident":
                 item += 1
-                if item < len(tokens) and tokens[item].kind == "ident":
-                    item += 1
-                    if item < len(tokens) and tokens[item].value == "{":
-                        close = _matching_delimiter(tokens, item)
-                        if close is not None:
-                            ranges.append((item, close))
+                if item < len(tokens) and tokens[item].value == "{":
+                    close = _matching_delimiter(tokens, item)
+                    if close is not None:
+                        ranges.append((item, close))
+    return ranges
+
+
+def _item_end(tokens: list[Token], start: int) -> int | None:
+    stack: list[str] = []
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    for index in range(start, len(tokens)):
+        value = tokens[index].value
+        if value in pairs:
+            stack.append(pairs[value])
+        elif stack and value == stack[-1]:
+            stack.pop()
+            if not stack and value == "}":
+                return index
+        elif value == ";" and not stack:
+            return index
+    return None
+
+
+def test_only_item_ranges(tokens: list[Token]) -> list[tuple[int, int]]:
+    """Return complete attributed items/statements unavailable in production."""
+    ranges: list[tuple[int, int]] = []
+    index = 0
+    while index < len(tokens):
+        if _attribute(tokens, index) is None:
+            index += 1
+            continue
+        cursor = index
+        attributes: list[tuple[bool, list[Token]]] = []
+        while True:
+            parsed = _attribute(tokens, cursor)
+            if parsed is None:
+                break
+            cursor, inner, body = parsed
+            attributes.append((inner, body))
+        item = _skip_visibility(tokens, cursor)
+        if _attributes_imply_test(attributes):
+            end = _item_end(tokens, item)
+            if end is not None:
+                ranges.append((index, end))
         index = max(cursor, index + 1)
     return ranges
 
@@ -458,13 +536,22 @@ def _without_ranges(tokens: list[Token], ranges: list[tuple[int, int]]) -> list[
 
 
 def _scope_map(tokens: list[Token]) -> tuple[list[int], list[dict[str, object]]]:
-    scopes: list[dict[str, object]] = [{"parent": None, "aliases": {}, "globs": []}]
+    scopes: list[dict[str, object]] = [
+        {"parent": None, "aliases": {}, "globs": [], "value_bindings": {}}
+    ]
     stack = [0]
     scope_for_token: list[int] = []
     for token in tokens:
         scope_for_token.append(stack[-1])
         if token.value == "{":
-            scopes.append({"parent": stack[-1], "aliases": {}, "globs": []})
+            scopes.append(
+                {
+                    "parent": stack[-1],
+                    "aliases": {},
+                    "globs": [],
+                    "value_bindings": {},
+                }
+            )
             stack.append(len(scopes) - 1)
         elif token.value == "}" and len(stack) > 1:
             stack.pop()
@@ -473,8 +560,8 @@ def _scope_map(tokens: list[Token]) -> tuple[list[int], list[dict[str, object]]]
 
 def _parse_use_tree(
     tokens: list[Token],
-) -> tuple[dict[str, tuple[str, ...]], list[tuple[str, ...]]]:
-    aliases: dict[str, tuple[str, ...]] = {}
+) -> tuple[dict[str, set[tuple[str, ...]]], list[tuple[str, ...]]]:
+    aliases: dict[str, set[tuple[str, ...]]] = {}
     globs: list[tuple[str, ...]] = []
 
     def group(index: int, end: int, prefix: tuple[str, ...]) -> int:
@@ -494,6 +581,9 @@ def _parse_use_tree(
             index += 1
         if index < end and tokens[index].value == "{":
             return group(index + 1, end, prefix)
+        if index < end and tokens[index].value == "*":
+            globs.append(prefix)
+            return index + 1
         segments: list[str] = []
         while index < end and tokens[index].kind == "ident":
             segments.append(tokens[index].value)
@@ -522,7 +612,7 @@ def _parse_use_tree(
             alias = tokens[index].value
             index += 1
         if alias != "_" and canonical:
-            aliases[alias] = canonical
+            aliases.setdefault(alias, set()).add(canonical)
         return index
 
     group(0, len(tokens), ())
@@ -558,8 +648,54 @@ def _collect_imports(
         scope_globs = scope["globs"]
         assert isinstance(scope_aliases, dict)
         assert isinstance(scope_globs, list)
-        scope_aliases.update(aliases)
+        for alias, paths in aliases.items():
+            existing = scope_aliases.setdefault(alias, set())
+            assert isinstance(existing, set)
+            existing.update(paths)
         scope_globs.extend(globs)
+
+
+def _collect_value_bindings(
+    tokens: list[Token], scope_for_token: list[int], scopes: list[dict[str, object]]
+) -> None:
+    """Record lexical let bindings that shadow imported function values."""
+    ignored = {"mut", "ref", "self", "Self", "crate", "super"}
+    for index, token in enumerate(tokens):
+        if token.value != "let" or token.kind != "ident":
+            continue
+        end = _use_end(tokens, index + 1)
+        if end is None:
+            continue
+        pattern_end = end
+        stack: list[str] = []
+        pairs = {"(": ")", "[": "]", "{": "}"}
+        for cursor in range(index + 1, end):
+            value = tokens[cursor].value
+            if value in pairs:
+                stack.append(pairs[value])
+            elif stack and value == stack[-1]:
+                stack.pop()
+            elif not stack and value in {"=", ":"}:
+                pattern_end = cursor
+                break
+        names: set[str] = set()
+        for cursor in range(index + 1, pattern_end):
+            candidate = tokens[cursor]
+            if candidate.kind != "ident" or candidate.value in ignored:
+                continue
+            if candidate.value == "_" or not candidate.value[0].islower():
+                continue
+            if cursor > index + 1 and tokens[cursor - 1].value == "::":
+                continue
+            if cursor + 1 < pattern_end and tokens[cursor + 1].value == "::":
+                continue
+            names.add(candidate.value)
+        bindings = scopes[scope_for_token[index]]["value_bindings"]
+        assert isinstance(bindings, dict)
+        for name in names:
+            activations = bindings.setdefault(name, [])
+            assert isinstance(activations, list)
+            activations.append(end)
 
 
 def _scope_chain(scope_id: int, scopes: list[dict[str, object]]) -> list[int]:
@@ -574,7 +710,10 @@ def _scope_chain(scope_id: int, scopes: list[dict[str, object]]) -> list[int]:
 
 
 def _canonical_paths(
-    path: tuple[str, ...], scope_id: int, scopes: list[dict[str, object]]
+    path: tuple[str, ...],
+    scope_id: int,
+    scopes: list[dict[str, object]],
+    call_index: int,
 ) -> set[tuple[str, ...]]:
     results: set[tuple[str, ...]] = set()
 
@@ -582,15 +721,26 @@ def _canonical_paths(
         if not candidate:
             return
         first = candidate[0]
+        if first == "self" and len(candidate) > 1:
+            expand(candidate[1:], seen | {"self"})
+            return
         if first in seen:
             results.add(candidate)
             return
         for current in _scope_chain(scope_id, scopes):
+            if len(candidate) == 1:
+                bindings = scopes[current]["value_bindings"]
+                assert isinstance(bindings, dict)
+                activations = bindings.get(first, [])
+                assert isinstance(activations, list)
+                if any(activation < call_index for activation in activations):
+                    return
             aliases = scopes[current]["aliases"]
             assert isinstance(aliases, dict)
-            replacement = aliases.get(first)
-            if isinstance(replacement, tuple):
-                expand((*replacement, *candidate[1:]), seen | {first})
+            replacements = aliases.get(first)
+            if isinstance(replacements, set):
+                for replacement in replacements:
+                    expand((*replacement, *candidate[1:]), seen | {first})
                 return
         results.add(candidate)
         for current in _scope_chain(scope_id, scopes):
@@ -604,10 +754,58 @@ def _canonical_paths(
     return results
 
 
+def _matching_open(tokens: list[Token], close: int) -> int | None:
+    pairs = {")": "(", "]": "[", "}": "{"}
+    closing = tokens[close].value
+    opening = pairs.get(closing)
+    if opening is None:
+        return None
+    stack = [opening]
+    for index in range(close - 1, -1, -1):
+        value = tokens[index].value
+        if value in pairs:
+            stack.append(pairs[value])
+        elif stack and value == stack[-1]:
+            stack.pop()
+            if not stack:
+                return index
+    return None
+
+
+def _path_range(
+    tokens: list[Token], start: int, end: int
+) -> tuple[tuple[str, ...], int] | None:
+    while start < end and tokens[start].value == "(" and tokens[end - 1].value == ")":
+        close = _matching_delimiter(tokens, start)
+        if close != end - 1:
+            break
+        start += 1
+        end -= 1
+    if start >= end or tokens[start].kind != "ident":
+        return None
+    parts = [tokens[start].value]
+    cursor = start + 1
+    while cursor < end:
+        if (
+            cursor + 1 >= end
+            or tokens[cursor].value != "::"
+            or tokens[cursor + 1].kind != "ident"
+        ):
+            return None
+        parts.append(tokens[cursor + 1].value)
+        cursor += 2
+    return tuple(parts), start
+
+
 def _call_path(
     tokens: list[Token], call_index: int
 ) -> tuple[tuple[str, ...], int] | None:
     index = call_index - 1
+    if index >= 0 and tokens[index].value == ")":
+        opening = _matching_open(tokens, index)
+        if opening is None:
+            return None
+        return _path_range(tokens, opening + 1, index)
     if index >= 0 and tokens[index].value == ">":
         depth = 1
         index -= 1
@@ -637,9 +835,10 @@ def _call_path(
 def scan_source(source: str) -> list[tuple[int, str, str]]:
     """Return ``(line, kind, operation)`` for executable watched calls."""
     all_tokens = rust_tokens(source)
-    tokens = _without_ranges(all_tokens, test_only_module_ranges(all_tokens))
+    tokens = _without_ranges(all_tokens, test_only_item_ranges(all_tokens))
     scope_for_token, scopes = _scope_map(tokens)
     _collect_imports(tokens, scope_for_token, scopes)
+    _collect_value_bindings(tokens, scope_for_token, scopes)
     found: set[tuple[int, str, str]] = set()
     for index, token in enumerate(tokens):
         if token.value != "(":
@@ -648,13 +847,205 @@ def scan_source(source: str) -> list[tuple[int, str, str]]:
         if parsed is None:
             continue
         path, start = parsed
-        for canonical in _canonical_paths(path, scope_for_token[start], scopes):
+        for canonical in _canonical_paths(
+            path, scope_for_token[start], scopes, call_index=index
+        ):
             operation = OPERATIONS.get(canonical)
             if operation is None:
                 continue
             kind, name = operation
             found.add((tokens[start].line, kind, name))
     return sorted(found)
+
+
+def _rust_string_value(token: Token) -> str | None:
+    if token.kind != "literal":
+        return None
+    value = token.value
+    if value.startswith('"'):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, str) else None
+    match = re.fullmatch(r'r(?P<hashes>#+)?"(?P<body>.*)"(?P=hashes)', value, re.DOTALL)
+    return None if match is None else match.group("body")
+
+
+def _path_attribute(attributes: list[tuple[bool, list[Token]]]) -> str | None:
+    for inner, body in attributes:
+        if inner or len(body) != 3:
+            continue
+        if body[0].value == "path" and body[1].value == "=":
+            return _rust_string_value(body[2])
+    return None
+
+
+def _module_source_candidates(
+    declaring: Path,
+    module: str,
+    path_attribute: str | None,
+    *,
+    crate_root: bool = False,
+) -> tuple[Path, ...]:
+    if path_attribute is not None:
+        return (declaring.parent / path_attribute,)
+    if crate_root or declaring.name in {"lib.rs", "main.rs", "mod.rs"}:
+        base = declaring.parent
+    else:
+        base = declaring.parent / declaring.stem
+    return (base / f"{module}.rs", base / module / "mod.rs")
+
+
+def _external_cfg_exclusions(
+    root: Path, sources: list[Path]
+) -> dict[str, dict[str, object]]:
+    references: dict[Path, list[tuple[bool, dict[str, object]]]] = {}
+    for declaring in sources:
+        tokens = rust_tokens(declaring.read_text(encoding="utf-8"))
+        for item, attributes in _attributed_items(tokens):
+            if (
+                item + 2 >= len(tokens)
+                or tokens[item].value != "mod"
+                or tokens[item + 1].kind != "ident"
+                or tokens[item + 2].value != ";"
+            ):
+                continue
+            module = tokens[item + 1].value
+            candidates = _module_source_candidates(
+                declaring, module, _path_attribute(attributes)
+            )
+            target = next((candidate for candidate in candidates if candidate.exists()), None)
+            if target is None:
+                continue
+            predicate = _cfg_predicate_text(attributes)
+            metadata: dict[str, object] = {
+                "kind": "cfg_path_module",
+                "declaration_file": str(declaring.relative_to(root)),
+                "module": module,
+                "predicate": predicate or "<unconditional>",
+            }
+            references.setdefault(target.resolve(), []).append(
+                (_attributes_imply_test(attributes), metadata)
+            )
+    exclusions: dict[str, dict[str, object]] = {}
+    for target, declarations in references.items():
+        if not declarations or not all(excluded for excluded, _ in declarations):
+            continue
+        metadata = {json.dumps(item, sort_keys=True): item for _, item in declarations}
+        if len(metadata) != 1:
+            raise InventoryError(f"ambiguous cfg exclusion for {target}")
+        path = Path(target)
+        try:
+            relative = str(path.relative_to(root.resolve()))
+        except ValueError:
+            continue
+        exclusions[relative] = next(iter(metadata.values()))
+    return exclusions
+
+
+def _manifest_bin_roots(
+    root: Path, source_root: Path
+) -> tuple[str, dict[Path, str]] | None:
+    manifest = source_root.parent / "Cargo.toml"
+    if not manifest.exists():
+        return None
+    try:
+        document = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise InventoryError(f"cannot parse {manifest}: {error}") from error
+    roots: dict[Path, str] = {}
+    for entry in document.get("bin", []):
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        path = entry.get("path")
+        if isinstance(name, str) and isinstance(path, str):
+            roots[(manifest.parent / path).resolve()] = name
+    package = document.get("package", {})
+    autobins = not isinstance(package, dict) or package.get("autobins", True) is not False
+    if autobins:
+        for path in (source_root / "bin").glob("*.rs"):
+            roots.setdefault(path.resolve(), path.stem)
+        for path in (source_root / "bin").glob("*/main.rs"):
+            roots.setdefault(path.resolve(), path.parent.name)
+    return str(manifest.relative_to(root)), roots
+
+
+def _production_module_references(path: Path, *, crate_root: bool) -> list[Path]:
+    tokens = rust_tokens(path.read_text(encoding="utf-8"))
+    attributed = {item: attributes for item, attributes in _attributed_items(tokens)}
+    references: list[Path] = []
+    for index, token in enumerate(tokens):
+        if token.value != "mod" or index + 2 >= len(tokens):
+            continue
+        if tokens[index + 1].kind != "ident" or tokens[index + 2].value != ";":
+            continue
+        attributes = attributed.get(index, [])
+        if _attributes_imply_test(attributes):
+            continue
+        references.extend(
+            candidate
+            for candidate in _module_source_candidates(
+                path,
+                tokens[index + 1].value,
+                _path_attribute(attributes),
+                crate_root=crate_root,
+            )
+            if candidate.exists()
+        )
+    return references
+
+
+def _standalone_target_exclusions(
+    root: Path,
+) -> dict[str, dict[str, object]]:
+    ownership: dict[Path, tuple[str, set[str]]] = {}
+    for source_root_relative in SOURCE_ROOTS:
+        source_root = root / source_root_relative
+        manifest_roots = _manifest_bin_roots(root, source_root)
+        if manifest_roots is None:
+            continue
+        manifest, bin_roots = manifest_roots
+        for bin_root, target in bin_roots.items():
+            if not bin_root.exists():
+                continue
+            queue = [(bin_root, True)]
+            visited: set[Path] = set()
+            while queue:
+                path, crate_root = queue.pop()
+                path = path.resolve()
+                if path in visited:
+                    continue
+                visited.add(path)
+                current_manifest, targets = ownership.setdefault(path, (manifest, set()))
+                if current_manifest != manifest:
+                    raise InventoryError(f"standalone source has multiple manifests: {path}")
+                targets.add(target)
+                queue.extend(
+                    (referenced, False)
+                    for referenced in _production_module_references(
+                        path, crate_root=crate_root
+                    )
+                )
+    exclusions: dict[str, dict[str, object]] = {}
+    for path, (manifest, targets) in ownership.items():
+        exclusions[str(path.relative_to(root.resolve()))] = {
+            "kind": "standalone_cargo_target",
+            "manifest": manifest,
+            "targets": sorted(targets),
+        }
+    return exclusions
+
+
+def product_exclusions(root: Path, sources: list[Path]) -> dict[str, dict[str, object]]:
+    exclusions = _external_cfg_exclusions(root, sources)
+    for path, exclusion in _standalone_target_exclusions(root).items():
+        prior = exclusions.get(path)
+        if prior is not None and prior != exclusion:
+            raise InventoryError(f"source has ambiguous product exclusions: {path}")
+        exclusions[path] = exclusion
+    return exclusions
 
 
 def production_source(root: Path) -> list[Path]:
@@ -674,7 +1065,9 @@ def production_source(root: Path) -> list[Path]:
 def generate(root: Path) -> list[dict[str, object]]:
     """Return sorted source rows for all declared guest-facing transitions."""
     entries: list[dict[str, object]] = []
-    for path in production_source(root):
+    sources = production_source(root)
+    exclusions = product_exclusions(root, sources)
+    for path in sources:
         source = path.read_text(encoding="utf-8")
         relative = str(path.relative_to(root))
         source_lines = source.splitlines()
@@ -682,15 +1075,16 @@ def generate(root: Path) -> list[dict[str, object]]:
         for line, kind, operation in scan_source(source):
             grouped.setdefault((line, kind), set()).add(operation)
         for (line, kind), operations in grouped.items():
-            entries.append(
-                {
-                    "file": relative,
-                    "line": line,
-                    "kind": kind,
-                    "text": source_lines[line - 1].strip(),
-                    "operations": sorted(operations),
-                }
-            )
+            row: dict[str, object] = {
+                "file": relative,
+                "line": line,
+                "kind": kind,
+                "text": source_lines[line - 1].strip(),
+                "operations": sorted(operations),
+            }
+            if relative in exclusions:
+                row["product_exclusion"] = exclusions[relative]
+            entries.append(row)
     return sorted(entries, key=lambda row: (row["file"], row["line"], row["kind"]))
 
 
@@ -701,8 +1095,77 @@ def source_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     ]
 
 
+def row_identity(row: dict[str, object]) -> str:
+    """Return the collision-free identity of every generated source field."""
+    return json.dumps(
+        {key: value for key, value in row.items() if key not in REVIEW_FIELDS},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _unique_rows(
+    rows: list[dict[str, object]], label: str
+) -> dict[str, dict[str, object]]:
+    indexed: dict[str, dict[str, object]] = {}
+    for row in rows:
+        identity = row_identity(row)
+        if identity in indexed:
+            raise InventoryError(f"duplicate {label} inventory identity: {identity}")
+        indexed[identity] = row
+    return indexed
+
+
+def _normalized_claim(value: str) -> str:
+    return re.sub(r"[^a-z0-9/_-]+", " ", value.casefold()).strip()
+
+
+def _validate_review_text(value: object, label: str, row: dict[str, object]) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise InventoryError(f"empty inventory {label}: {row}")
+    normalized = _normalized_claim(value)
+    if len(normalized) < 8 or normalized in GENERIC_RESOURCES:
+        raise InventoryError(f"generic inventory {label}: {row}")
+    folded = value.casefold()
+    if any(fragment in folded for fragment in BANNED_REVIEW_FRAGMENTS):
+        raise InventoryError(f"generic inventory {label}: {row}")
+    if DISJUNCTION.search(value):
+        raise InventoryError(f"disjunctive inventory {label}: {row}")
+    return value
+
+
+def _validate_evidence(row: dict[str, object]) -> None:
+    classification = row["classification"]
+    evidence = row.get("evidence")
+    if not isinstance(evidence, dict):
+        raise InventoryError(f"missing structured inventory evidence: {row}")
+    authority = evidence.get("authority")
+    if authority not in AUTHORITIES[classification]:
+        raise InventoryError(f"invalid structured inventory authority: {row}")
+    _validate_review_text(evidence.get("resource"), "evidence resource", row)
+    exclusion = row.get("product_exclusion")
+    if classification == "legacy_unreachable":
+        if not isinstance(exclusion, dict):
+            raise InventoryError(f"legacy row has no recognized product exclusion: {row}")
+        expected_authority = {
+            "cfg_path_module": "compile_time_exclusion",
+            "standalone_cargo_target": "standalone_target_exclusion",
+        }.get(exclusion.get("kind"))
+        if authority != expected_authority or evidence.get("exclusion") != exclusion:
+            raise InventoryError(f"legacy evidence does not bind its source exclusion: {row}")
+        if set(evidence) != {"authority", "resource", "exclusion"}:
+            raise InventoryError(f"invalid legacy evidence schema: {row}")
+    else:
+        if exclusion is not None:
+            raise InventoryError(f"excluded product source is not classified legacy: {row}")
+        if set(evidence) != {"authority", "resource"}:
+            raise InventoryError(f"invalid authority evidence schema: {row}")
+
+
 def validate(actual: list[dict[str, object]], expected: list[dict[str, object]]) -> None:
     """Require exact source rows and a complete concrete classification review."""
+    _unique_rows(actual, "generated")
+    _unique_rows(expected, "reviewed")
     if source_rows(actual) != source_rows(expected):
         raise InventoryError("guest-facing host-transition inventory drifted")
     for row in expected:
@@ -712,37 +1175,33 @@ def validate(actual: list[dict[str, object]], expected: list[dict[str, object]])
             raise InventoryError(f"unreviewed inventory row: {row}")
         if classification not in CLASSIFICATIONS:
             raise InventoryError(f"invalid inventory classification: {row}")
-        if not isinstance(rationale, str) or not rationale.strip():
-            raise InventoryError(f"empty inventory rationale: {row}")
-        prefixes = RATIONALE_PREFIXES[classification]
-        if not rationale.startswith(prefixes):
-            raise InventoryError(
-                f"rationale does not name its concrete authority role: {row}"
-            )
-        if any(fragment in rationale for fragment in BANNED_RATIONALE_FRAGMENTS):
-            raise InventoryError(f"generic inventory rationale: {row}")
-        if classification != "legacy_unreachable" and re.search(
-            r"\b(?:or|versus)\b", rationale
-        ):
-            raise InventoryError(f"disjunctive inventory rationale: {row}")
+        _validate_review_text(rationale, "rationale", row)
+        _validate_evidence(row)
 
 
 def reviewed_rows(
     actual: list[dict[str, object]], expected: list[dict[str, object]]
 ) -> list[dict[str, object]]:
-    previous = {
-        (row.get("file"), row.get("kind"), row.get("text")): row for row in expected
-    }
+    _unique_rows(actual, "generated")
+    previous = _unique_rows(expected, "reviewed")
     rows: list[dict[str, object]] = []
     for row in actual:
-        prior = previous.get((row["file"], row["kind"], row["text"]))
+        prior = previous.get(row_identity(row))
         if prior is None:
-            rows.append({**row, "classification": "unreviewed", "rationale": ""})
+            rows.append(
+                {
+                    **row,
+                    "classification": "unreviewed",
+                    "evidence": {},
+                    "rationale": "",
+                }
+            )
         else:
             rows.append(
                 {
                     **row,
                     "classification": prior.get("classification", "unreviewed"),
+                    "evidence": prior.get("evidence", {}),
                     "rationale": prior.get("rationale", ""),
                 }
             )
@@ -772,10 +1231,12 @@ def main(argv: list[str]) -> int:
             print(error, file=sys.stderr)
             return 1
     if argv == ["--write"]:
-        INVENTORY.write_text(
-            json.dumps(reviewed_rows(actual, expected), indent=2) + "\n",
-            encoding="utf-8",
-        )
+        try:
+            rewritten = reviewed_rows(actual, expected)
+        except InventoryError as error:
+            print(error, file=sys.stderr)
+            return 1
+        INVENTORY.write_text(json.dumps(rewritten, indent=2) + "\n", encoding="utf-8")
         return 0
     try:
         validate(actual, expected)
