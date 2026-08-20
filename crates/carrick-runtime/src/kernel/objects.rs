@@ -3751,6 +3751,11 @@ impl ExecutionGeneration {
 pub struct ExecutorId(u32);
 
 impl ExecutorId {
+    pub(super) const fn from_scheduler(raw: u32) -> Self {
+        debug_assert!(raw != 0);
+        Self(raw)
+    }
+
     /// Transitional exact owner for the current welded-thread scheduler. Task 4
     /// replaces this with persistent executor-pool IDs; no raw constructor is
     /// exposed.
@@ -3846,7 +3851,7 @@ pub enum ThreadExecutionState {
 }
 
 impl ThreadExecutionState {
-    const fn generation(self) -> Option<ExecutionGeneration> {
+    pub const fn generation(self) -> Option<ExecutionGeneration> {
         match self {
             Self::Uninitialized => None,
             Self::Runnable { generation }
@@ -3865,6 +3870,13 @@ pub enum ThreadExecutionError {
     InvalidTransitionalExecutor(ThreadId),
     #[error("thread execution generation overflowed")]
     GenerationExhausted,
+    #[error("scheduler expected thread {expected:?}, got {actual:?}")]
+    SchedulerThreadMismatch {
+        expected: ThreadKey,
+        actual: ThreadKey,
+    },
+    #[error("a scheduler wake is pending; settlement must publish through the scheduler")]
+    SchedulerSettlementRequired,
     #[error("thread execution transition {operation} is invalid from {state:?}")]
     InvalidTransition {
         operation: &'static str,
@@ -3906,6 +3918,22 @@ pub enum ThreadExecutionError {
         expected_asid_generation: u64,
         actual_asid_generation: u64,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ThreadSchedulerAction {
+    Queue {
+        key: ThreadKey,
+        generation: ExecutionGeneration,
+        closing_authorized: bool,
+    },
+    Kick {
+        executor: ExecutorId,
+        executor_epoch: u64,
+        key: ThreadKey,
+        generation: ExecutionGeneration,
+    },
+    None,
 }
 
 #[derive(Debug)]
@@ -4137,6 +4165,101 @@ impl Thread {
         self.execution.lock().state
     }
 
+    /// Minimal Linux run-state projection consumed by `/proc` wiring in a
+    /// later task. Executor identity is deliberately absent from the answer.
+    pub const fn linux_run_state_from_execution(state: ThreadExecutionState) -> Option<char> {
+        match state {
+            ThreadExecutionState::Runnable { .. } | ThreadExecutionState::Running { .. } => {
+                Some('R')
+            }
+            ThreadExecutionState::Blocked { .. } => Some('S'),
+            ThreadExecutionState::Uninitialized
+            | ThreadExecutionState::SwitchingOut { .. }
+            | ThreadExecutionState::Exited { .. }
+            | ThreadExecutionState::Failed { .. } => None,
+        }
+    }
+
+    pub fn linux_run_state(&self) -> Option<char> {
+        Self::linux_run_state_from_execution(self.execution_state())
+    }
+
+    /// Decide one exact scheduler wake while holding only this thread's
+    /// execution record. Queue insertion and kick delivery are returned as
+    /// typed actions and must happen after this method releases the lock.
+    pub(crate) fn scheduler_wake(
+        &self,
+        expected: ThreadKey,
+    ) -> Result<ThreadSchedulerAction, ThreadExecutionError> {
+        if expected != self.key {
+            return Err(ThreadExecutionError::SchedulerThreadMismatch {
+                expected,
+                actual: self.key,
+            });
+        }
+        let mut execution = self.execution.lock();
+        let action = match execution.state {
+            ThreadExecutionState::Blocked { generation, .. } => {
+                let generation = generation
+                    .next()
+                    .ok_or(ThreadExecutionError::GenerationExhausted)?;
+                execution.state = ThreadExecutionState::Runnable { generation };
+                ThreadSchedulerAction::Queue {
+                    key: self.key,
+                    generation,
+                    closing_authorized: true,
+                }
+            }
+            ThreadExecutionState::Runnable { generation } => ThreadSchedulerAction::Queue {
+                key: self.key,
+                generation,
+                closing_authorized: false,
+            },
+            ThreadExecutionState::Running {
+                generation,
+                executor,
+                executor_epoch,
+                ..
+            } => {
+                execution.state = ThreadExecutionState::Running {
+                    generation,
+                    executor,
+                    executor_epoch,
+                    wake_pending: true,
+                };
+                ThreadSchedulerAction::Kick {
+                    executor,
+                    executor_epoch,
+                    key: self.key,
+                    generation,
+                }
+            }
+            ThreadExecutionState::SwitchingOut {
+                generation,
+                executor,
+                executor_epoch,
+                ..
+            } => {
+                execution.state = ThreadExecutionState::SwitchingOut {
+                    generation,
+                    executor,
+                    executor_epoch,
+                    wake_pending: true,
+                };
+                ThreadSchedulerAction::None
+            }
+            state => {
+                return Err(ThreadExecutionError::InvalidTransition {
+                    operation: "scheduler_wake",
+                    state,
+                });
+            }
+        };
+        drop(execution);
+        self.revision.publish();
+        Ok(action)
+    }
+
     /// Seed the first complete task snapshot after backend materialization.
     /// New, fork, clone, and exec-replacement objects all begin uninitialized,
     /// and no other state accepts this publication.
@@ -4312,7 +4435,8 @@ impl Thread {
         &self,
         lease: ThreadExecutionLease,
     ) -> ThreadExecutionSettlementResult {
-        self.settle_execution_lease(lease, ExecutionSettlement::Runnable)
+        self.settle_execution_lease(lease, ExecutionSettlement::Runnable, false)
+            .map(|_| ())
     }
 
     pub fn park_from_executor(
@@ -4320,14 +4444,31 @@ impl Thread {
         lease: ThreadExecutionLease,
         reason: BlockedReason,
     ) -> ThreadExecutionSettlementResult {
-        self.settle_execution_lease(lease, ExecutionSettlement::Blocked(reason))
+        self.settle_execution_lease(lease, ExecutionSettlement::Blocked(reason), false)
+            .map(|_| ())
     }
 
     pub fn exit_from_executor(
         &self,
         lease: ThreadExecutionLease,
     ) -> ThreadExecutionSettlementResult {
-        self.settle_execution_lease(lease, ExecutionSettlement::Exited)
+        self.settle_execution_lease(lease, ExecutionSettlement::Exited, false)
+            .map(|_| ())
+    }
+
+    pub(crate) fn scheduler_yield_from_executor(
+        &self,
+        lease: ThreadExecutionLease,
+    ) -> Result<ThreadSchedulerAction, (ThreadExecutionError, ThreadExecutionLease)> {
+        self.settle_execution_lease(lease, ExecutionSettlement::Runnable, true)
+    }
+
+    pub(crate) fn scheduler_park_from_executor(
+        &self,
+        lease: ThreadExecutionLease,
+        reason: BlockedReason,
+    ) -> Result<ThreadSchedulerAction, (ThreadExecutionError, ThreadExecutionLease)> {
+        self.settle_execution_lease(lease, ExecutionSettlement::Blocked(reason), true)
     }
 
     pub fn fail_from_executor(
@@ -4377,7 +4518,8 @@ impl Thread {
         &self,
         mut lease: ThreadExecutionLease,
         settlement: ExecutionSettlement,
-    ) -> ThreadExecutionSettlementResult {
+        scheduler_owned: bool,
+    ) -> Result<ThreadSchedulerAction, (ThreadExecutionError, ThreadExecutionLease)> {
         if let Err(error) = self.validate_execution_lease_owner(&lease) {
             return Err((error, lease));
         }
@@ -4389,6 +4531,20 @@ impl Thread {
         let Some(generation) = lease.generation.next() else {
             return Err((ThreadExecutionError::GenerationExhausted, lease));
         };
+        let wake_pending = matches!(
+            execution.state,
+            ThreadExecutionState::Running {
+                wake_pending: true,
+                ..
+            } | ThreadExecutionState::SwitchingOut {
+                wake_pending: true,
+                ..
+            }
+        );
+        if wake_pending && !scheduler_owned && !matches!(settlement, ExecutionSettlement::Exited) {
+            return Err((ThreadExecutionError::SchedulerSettlementRequired, lease));
+        }
+        let mut action = ThreadSchedulerAction::None;
         if execution.exec_invalidation_pending {
             execution.task_state = None;
             let _ = lease.task_state.take();
@@ -4399,10 +4555,26 @@ impl Thread {
                 ExecutionSettlement::Runnable => {
                     execution.task_state = lease.task_state.take();
                     execution.state = ThreadExecutionState::Runnable { generation };
+                    if scheduler_owned {
+                        action = ThreadSchedulerAction::Queue {
+                            key: self.key,
+                            generation,
+                            closing_authorized: true,
+                        };
+                    }
                 }
                 ExecutionSettlement::Blocked(reason) => {
                     execution.task_state = lease.task_state.take();
-                    execution.state = ThreadExecutionState::Blocked { generation, reason };
+                    if wake_pending {
+                        execution.state = ThreadExecutionState::Runnable { generation };
+                        action = ThreadSchedulerAction::Queue {
+                            key: self.key,
+                            generation,
+                            closing_authorized: true,
+                        };
+                    } else {
+                        execution.state = ThreadExecutionState::Blocked { generation, reason };
+                    }
                 }
                 ExecutionSettlement::Exited => {
                     execution.task_state = None;
@@ -4414,7 +4586,7 @@ impl Thread {
         lease.settled = true;
         drop(execution);
         self.revision.publish();
-        Ok(())
+        Ok(action)
     }
 
     fn validate_execution_lease_owner(

@@ -17,6 +17,7 @@ pub mod mm_transaction;
 pub mod objects;
 pub mod operations;
 pub mod registry;
+pub mod scheduler;
 pub mod snapshot;
 
 #[cfg(test)]
@@ -81,6 +82,10 @@ pub use operations::{
 pub use registry::{
     IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,
     TaskReservation, ThreadClaim, ThreadReservation,
+};
+pub use scheduler::{
+    ExecutorBinding, ExecutorKick, ExecutorKickToken, ExecutorRegistration, RunQueue,
+    RunQueueError, RunnableThread, Scheduler, SchedulerError, SubmissionAuthority, WakeDisposition,
 };
 pub use snapshot::{
     CredentialsSnapshotRow, FileDescriptionSnapshotKind, FileDescriptionSnapshotRow,

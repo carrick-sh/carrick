@@ -629,6 +629,28 @@ struct HvpatchRuntimeEndpoint {
     /// notification recaptures one CURRENT live thread through this binding so
     /// exec's replacement Sighand is observed without accepting PID reuse.
     task_binding: crate::kernel::KernelTaskBinding,
+    /// Migration-only exact scheduler endpoint. While absent, the welded
+    /// runner below remains the explicitly transitional fallback. When
+    /// present, exact-generation scheduler wake is authoritative and the
+    /// legacy wake vehicles are compatibility nudges only.
+    scheduler: Option<Arc<crate::kernel::scheduler::Scheduler>>,
+}
+
+impl HvpatchRuntimeEndpoint {
+    fn wake_scheduler_exact(
+        &self,
+        snapshot: &crate::kernel::core::KernelTaskSignalSnapshot,
+    ) -> bool {
+        let Some(scheduler) = self.scheduler.as_ref() else {
+            return false;
+        };
+        for thread in snapshot.threads() {
+            if let Err(error) = scheduler.wake(thread.key()) {
+                tracing::debug!(thread = ?thread.key(), %error, "exact scheduler wake rejected");
+            }
+        }
+        true
+    }
 }
 
 /// The kernel lane's [`TaskWaker`](crate::kernel::TaskWaker): the three vehicles a guest task on this
@@ -741,6 +763,7 @@ impl HvpatchRuntimeDirectory {
                 .dispatcher
                 .mark_in_process_signal_pending(signal_context, signal);
         }
+        let _scheduler_authoritative = endpoint.wake_scheduler_exact(&signal_snapshot);
         // Child waitability is independent of SIGCHLD disposition. The Kernel
         // zombie is durable, but a parent can be between its initial wait query
         // and host-wait enrollment when publication occurs; always nudge every
@@ -1230,6 +1253,7 @@ impl KernelState {
             HvpatchRuntimeEndpoint {
                 kernel: Arc::downgrade(self),
                 task_binding: binding,
+                scheduler: None,
             },
         );
     }
@@ -6510,6 +6534,78 @@ mod tests {
     }
 
     #[test]
+    fn hvpatch_migration_endpoint_routes_task_wake_to_exact_scheduler_generation() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        let mm = context.shared().mm().id();
+        context
+            .thread()
+            .publish_initial_task_state(crate::kernel::objects::MigratableTaskState {
+                cpu: carrick_hal::threaded::GuestCpuState::from_aarch64_v1(
+                    carrick_hal::threaded::Aarch64TaskCpuStateV1 {
+                        gprs: [0; 31],
+                        pc: 0x1000,
+                        pstate: 0,
+                        trap_pc: 0,
+                        trap_pstate: 0,
+                        sp_el0: 0x2000,
+                        elr_el1: 0,
+                        spsr_el1: 0,
+                        ttbr0: 0,
+                        ttbr1: 0,
+                        tcr: 0,
+                        actlr_el1: 0,
+                        tpidr_el0: 0,
+                        tpidrro_el0: 0,
+                        contextidr_el1: 0,
+                        vregs: [0; 32],
+                        fpsr: 0,
+                        fpcr: 0,
+                        pending_resume_pc: None,
+                        last_syscall_nr: None,
+                        last_syscall_orig_x0: 0,
+                        last_fault_esr: 0,
+                        last_exit_class: 0,
+                        is_forked_child: false,
+                        syscall_continuation: None,
+                        mm_generation: mm.raw(),
+                        asid_generation: mm.raw(),
+                    },
+                ),
+                mm,
+                asid_generation: mm.raw(),
+            })
+            .expect("initial scheduler state");
+        let scheduler = Arc::new(crate::kernel::scheduler::Scheduler::new(Arc::clone(
+            context.kernel(),
+        )));
+        let kernel = Arc::new(KernelState::new(
+            dispatcher,
+            Arc::new(EndpointTestForkCoordinator),
+            Arc::new(EndpointTestSignalArrival),
+            None,
+            None,
+            None,
+        ));
+        let endpoint = HvpatchRuntimeEndpoint {
+            kernel: Arc::downgrade(&kernel),
+            task_binding: context.task_binding(),
+            scheduler: Some(Arc::clone(&scheduler)),
+        };
+        let snapshot = context
+            .task_binding()
+            .capture_signal_snapshot()
+            .expect("signal snapshot");
+
+        assert!(endpoint.wake_scheduler_exact(&snapshot));
+        assert_eq!(scheduler.queued_len(), 1);
+        assert!(matches!(
+            context.thread().execution_state(),
+            crate::kernel::objects::ThreadExecutionState::Runnable { .. }
+        ));
+    }
+
+    #[test]
     fn hvpatch_child_exit_reads_the_post_exec_sighand_generation() {
         let dispatcher = SyscallDispatcher::new();
         let pre_exec = dispatcher
@@ -6530,6 +6626,7 @@ mod tests {
             HvpatchRuntimeEndpoint {
                 kernel: Arc::downgrade(&kernel),
                 task_binding: pre_exec.task_binding(),
+                scheduler: None,
             },
         );
 

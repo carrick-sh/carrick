@@ -1722,6 +1722,23 @@ impl Kernel {
         })
     }
 
+    /// Resolve one scheduler request to the exact live thread generation.
+    /// Numeric TID lookup is never returned on its own: the caller-supplied
+    /// serial must still match while the registry read lock is held.
+    pub(crate) fn exact_thread_for_scheduler(
+        &self,
+        key: ThreadKey,
+    ) -> Option<Arc<super::objects::Thread>> {
+        let state = self.registry().state.read();
+        state.tasks.values().find_map(|record| {
+            if record.task.lifecycle() != TaskLifecycle::Live {
+                return None;
+            }
+            let thread = record.task.thread(key.tid)?;
+            (thread.key() == key).then_some(thread)
+        })
+    }
+
     /// Post one thread-directed signal to an exact live `(tgid, tid)` pair.
     /// The pending queue is published before the task wake, matching the
     /// process-directed ordering in [`Self::post_signal_to_task`].
