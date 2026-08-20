@@ -873,6 +873,19 @@ pub trait FrameCowAuthority: Send + Sync {
         gpa: carrick_guest_mem::Gpa,
         length: crate::FrameLength,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// How many live mappings the authority currently holds for `frame`,
+    /// across EVERY mm — `None` if the authority does not know the frame.
+    ///
+    /// `RetireFrame` is rejected unless the frame's mapping count reaches
+    /// zero, and that count is VM-wide. A backend deciding retirement from a
+    /// per-mm population is therefore asking a different question than the one
+    /// the authority answers: the two agree while exactly one Linux process
+    /// exists and diverge the instant a second mm maps the same frame.
+    fn frame_mapping_count(
+        &self,
+        frame: crate::FrameId,
+    ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

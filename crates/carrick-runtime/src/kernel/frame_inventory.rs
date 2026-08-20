@@ -318,6 +318,17 @@ impl FrameInventoryAuthority {
         })
     }
 
+    /// Live mappings naming `frame`, across every mm; `None` once the frame
+    /// is retired or was never inserted.
+    ///
+    /// This is the population `RetireFrame` enforces, so a backend planning a
+    /// retirement must gate on THIS number rather than on its own per-mm
+    /// bookkeeping.
+    pub fn frame_mapping_count(&self, frame: FrameId) -> Option<usize> {
+        let state = self.state.lock();
+        state.frames.get(&frame).map(|entry| entry.mapping_count)
+    }
+
     pub(crate) fn snapshot_until(&self, deadline: Instant) -> Option<FrameInventorySnapshot> {
         self.state
             .try_lock_until(deadline)

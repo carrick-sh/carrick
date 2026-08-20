@@ -285,6 +285,13 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
             .frame_inventory()
             .mapping_is_live_exact(self.mm, mapping, frame, gpa, length))
     }
+
+    fn frame_mapping_count(
+        &self,
+        frame: carrick_hal::FrameId,
+    ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.kernel.frame_inventory().frame_mapping_count(frame))
+    }
 }
 
 pub(super) fn requires_no_unwind_host_exit(kernel: &Kernel, engine_is_forked_child: bool) -> bool {
