@@ -338,9 +338,26 @@ impl ChildExit {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
+pub(crate) struct RetiredThreadResources {
+    owner: crate::kernel::TaskKey,
+    files: std::sync::Arc<crate::kernel::FileTable>,
+}
+
+impl RetiredThreadResources {
+    pub(crate) const fn owner(&self) -> crate::kernel::TaskKey {
+        self.owner
+    }
+
+    pub(crate) fn files(&self) -> std::sync::Arc<crate::kernel::FileTable> {
+        std::sync::Arc::clone(&self.files)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum ProcessThreadExit {
-    Retired,
+    Retired(RetiredThreadResources),
+    AlreadyRetired,
     LastThread,
 }
 
@@ -733,10 +750,10 @@ impl ProcessContext {
             Err(crate::kernel::KernelError::UnknownThread(_)) => {
                 // Exec replacement may already have retired this exact old
                 // thread while its host loop is unwinding.
-                return Ok(ProcessThreadExit::Retired);
+                return Ok(ProcessThreadExit::AlreadyRetired);
             }
             Err(_) if !self.kernel_graph().task_is_live(self.task_id()) => {
-                return Ok(ProcessThreadExit::Retired);
+                return Ok(ProcessThreadExit::AlreadyRetired);
             }
             Err(_) => {
                 return Err(crate::kernel::KernelOperationError::UnknownTask(
@@ -744,10 +761,18 @@ impl ProcessContext {
                 ));
             }
         };
+        // Capture the retiring thread's exact owner/table generation before
+        // Kernel publication removes the thread from the authoritative graph.
+        // Callers use this receipt to consume only that generation's close
+        // events; recapturing afterward could select a surviving peer table.
+        let retired = RetiredThreadResources {
+            owner: context.task().key(),
+            files: context.resources().files(),
+        };
         loop {
             let observed = self.kernel_graph().reservation_epoch();
             match self.kernel_graph().exit_thread(&context, None) {
-                Ok(_) => return Ok(ProcessThreadExit::Retired),
+                Ok(_) => return Ok(ProcessThreadExit::Retired(retired)),
                 Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
                     self.kernel_graph().wait_for_reservation_change(observed);
                 }
@@ -757,13 +782,13 @@ impl ProcessContext {
                 Err(crate::kernel::KernelOperationError::UnknownThread(_))
                     if !context.exact_thread_is_live() =>
                 {
-                    return Ok(ProcessThreadExit::Retired);
+                    return Ok(ProcessThreadExit::AlreadyRetired);
                 }
                 Err(crate::kernel::KernelOperationError::ParentExited)
                 | Err(crate::kernel::KernelOperationError::UnknownTask(_))
                     if !self.kernel_graph().task_is_live(self.task_id()) =>
                 {
-                    return Ok(ProcessThreadExit::Retired);
+                    return Ok(ProcessThreadExit::AlreadyRetired);
                 }
                 Err(error) => return Err(error),
             }

@@ -179,7 +179,7 @@ pub(crate) fn is_structural_namespace_mutation(canonical_nr: u64) -> bool {
 }
 
 mod access;
-mod fd_helpers;
+pub(in crate::dispatch) mod fd_helpers;
 mod legacy_aio;
 mod pathres;
 pub(crate) mod pipe;

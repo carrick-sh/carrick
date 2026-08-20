@@ -5,7 +5,7 @@
 use super::*;
 use crate::linux_abi::LinuxErrno;
 
-pub(super) fn event_ring_host_fd(open_file: &OpenFile) -> i32 {
+pub(in crate::dispatch) fn event_ring_host_fd(open_file: &OpenFile) -> i32 {
     let Some(description) = open_file
         .description
         .concrete_backing::<RwLock<OpenDescription>>()
