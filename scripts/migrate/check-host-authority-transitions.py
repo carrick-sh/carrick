@@ -12,15 +12,18 @@ import argparse
 import contextlib
 import fnmatch
 import hashlib
+import io
 import json
 import os
 import platform
+import posixpath
 import pwd
 import re
 import secrets
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import tomllib
 from collections.abc import Iterable, Mapping, Sequence
@@ -106,15 +109,21 @@ BLANKET_RESOURCE_FRAGMENTS = {
     "artifact explicitly authorized by the active cli command",
 }
 MAX_IDENTICAL_RESOURCE_REVIEWS = 12
-PRODUCT_SOURCE_ROOT_FILES = (
+PRODUCT_SOURCE_PATHS = (
     "Cargo.toml",
     "Cargo.lock",
     "rust-toolchain.toml",
-    ".cargo/config.toml",
+    "clippy.toml",
+    ".cargo",
+    "crates",
+    "fixtures",
+    "scripts",
 )
-PRODUCT_SOURCE_TREES = ("crates", "scripts/dtrace")
 SOURCE_PROVENANCE_FIELDS = {
     "source_head",
+    "source_git_tree",
+    "source_path_manifest",
+    "source_path_manifest_sha256",
     "source_tree_sha256",
     "source_file_count",
 }
@@ -162,6 +171,14 @@ class CandidateDestination(NamedTuple):
     directory_fd: int
     name: str
     protected_identities: frozenset[tuple[int, int]]
+
+
+class SourceSnapshot(NamedTuple):
+    """Private read-only materialization of one authenticated Git commit."""
+
+    root: Path
+    provenance: dict[str, object]
+    entries: tuple[dict[str, str], ...]
 
 
 def _expected_profile_commands() -> dict[str, tuple[str, ...]]:
@@ -432,8 +449,9 @@ def _checked_toolchain_channel(workspace: Path) -> str:
 
 
 @contextlib.contextmanager
-def _execution_context(root: Path):
+def _execution_context(root: Path, *, state_root: Path | None = None):
     workspace = Path(root).resolve(strict=True)
+    state_workspace = Path(state_root or workspace).resolve(strict=True)
     toolchain_channel = _checked_toolchain_channel(workspace)
     cargo_config = workspace / ".cargo" / "config.toml"
     manifest = workspace / "Cargo.toml"
@@ -447,13 +465,15 @@ def _execution_context(root: Path):
             raise InventoryError(f"missing {label}: {path}") from error
         if not stat.S_ISREG(metadata.st_mode):
             raise InventoryError(f"{label} is not a regular checked file: {path}")
-    census_root = workspace / "target" / "host-authority-census"
+    census_root = state_workspace / "target" / "host-authority-census"
     census_root.mkdir(parents=True, exist_ok=True)
     census_root = census_root.resolve(strict=True)
-    if not census_root.is_relative_to(workspace):
+    if not census_root.is_relative_to(state_workspace):
         raise InventoryError(
-            f"authority census target root escapes workspace: {census_root}"
+            f"authority census target root escapes state workspace: {census_root}"
         )
+    if census_root.is_relative_to(workspace) and state_workspace != workspace:
+        raise InventoryError("authority census target root is inside source snapshot")
     cargo_cwd = _authenticated_cargo_cwd()
     with tempfile.TemporaryDirectory(
         prefix=f"task-{workspace.name}-", dir=census_root
@@ -735,6 +755,7 @@ def run_profile(
         _execution.toolchain_channel,
         target_dir=_execution.target_root / profile.id,
     )
+    environment["CLIPPY_CONF_DIR"] = str(Path(root).resolve(strict=True))
     result = _completed_text(
         _profile_command(profile, _execution),
         runner=runner,
@@ -1718,6 +1739,7 @@ def run_census(
     runner: Any = subprocess.run,
     *,
     root: Path = ROOT,
+    state_root: Path | None = None,
     current_host: str | None = None,
 ) -> dict[str, object]:
     """Run a selected local subset and return pure normalized receipt data."""
@@ -1738,7 +1760,7 @@ def run_census(
         raise InventoryError(
             f"executed profiles span multiple host triples: {sorted(required_triples)}"
         )
-    with _execution_context(Path(root)) as execution:
+    with _execution_context(Path(root), state_root=state_root) as execution:
         identities = verify_toolchain(
             matrix,
             runner=runner,
@@ -1936,6 +1958,9 @@ def _validate_source_provenance(
     ):
         raise InventoryError("candidate has invalid product-source provenance")
     source_head = provenance.get("source_head")
+    source_git_tree = provenance.get("source_git_tree")
+    source_manifest = provenance.get("source_path_manifest")
+    manifest_digest = provenance.get("source_path_manifest_sha256")
     source_digest = provenance.get("source_tree_sha256")
     file_count = provenance.get("source_file_count")
     if (
@@ -1943,6 +1968,47 @@ def _validate_source_provenance(
         or re.fullmatch(r"[0-9a-f]{40}", source_head) is None
     ):
         raise InventoryError("candidate source_head must be a full lowercase Git hash")
+    if (
+        not isinstance(source_git_tree, str)
+        or re.fullmatch(r"[0-9a-f]{40}", source_git_tree) is None
+    ):
+        raise InventoryError("candidate source_git_tree must be a full Git tree hash")
+    if (
+        not isinstance(source_manifest, list)
+        or not source_manifest
+        or any(
+            not isinstance(entry, dict)
+            or set(entry) != {"path", "mode", "type", "git_object"}
+            or not all(isinstance(value, str) and value for value in entry.values())
+            for entry in source_manifest
+        )
+    ):
+        raise InventoryError("candidate source_path_manifest is invalid")
+    manifest_paths = [entry["path"] for entry in source_manifest]
+    if manifest_paths != sorted(set(manifest_paths)):
+        raise InventoryError("candidate source_path_manifest is not unique and sorted")
+    for entry in source_manifest:
+        relative = PurePosixPath(entry["path"])
+        mode = entry["mode"]
+        kind = entry["type"]
+        if relative.is_absolute() or ".." in relative.parts:
+            raise InventoryError("candidate source_path_manifest contains unsafe path")
+        if mode not in {"040000", "100644", "100755", "120000"}:
+            raise InventoryError("candidate source_path_manifest contains invalid mode")
+        if (kind == "tree") != (mode == "040000") or kind not in {"blob", "tree"}:
+            raise InventoryError("candidate source_path_manifest contains invalid type")
+        if re.fullmatch(r"[0-9a-f]{40}", entry["git_object"]) is None:
+            raise InventoryError(
+                "candidate source_path_manifest contains invalid Git object"
+            )
+    if (
+        not isinstance(manifest_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", manifest_digest) is None
+        or manifest_digest != _canonical_digest(source_manifest)
+    ):
+        raise InventoryError(
+            "candidate source_path_manifest_sha256 must be a SHA-256 digest"
+        )
     if (
         not isinstance(source_digest, str)
         or re.fullmatch(r"[0-9a-f]{64}", source_digest) is None
@@ -1952,6 +2018,8 @@ def _validate_source_provenance(
         not isinstance(file_count, int)
         or isinstance(file_count, bool)
         or file_count <= 0
+        or file_count
+        != sum(entry["type"] == "blob" for entry in source_manifest)
     ):
         raise InventoryError("candidate source_file_count must be positive")
     return dict(provenance)
@@ -1999,127 +2067,183 @@ def _git_output(root: Path, arguments: Sequence[str], label: str) -> bytes:
     return completed.stdout
 
 
-def _is_relevant_untracked_product_path(relative: PurePosixPath) -> bool:
-    parts = relative.parts
-    if not parts:
-        return False
-    if parts[0] == "crates":
-        if relative.name in {"Cargo.toml", "Cargo.lock", "build.rs"}:
-            return True
-        if relative.suffix in {".rs", ".c", ".h", ".S"}:
-            return True
-        return "src" in parts[2:] or "csrc" in parts[2:]
-    return parts[:2] == ("scripts", "dtrace") and relative.suffix == ".d"
-
-
-def _relevant_untracked_product_paths(
-    root: Path, tracked: set[PurePosixPath]
-) -> list[str]:
-    untracked = []
-    for tree in PRODUCT_SOURCE_TREES:
-        base = root / tree
-        if not base.exists():
-            continue
-        for directory, directory_names, file_names in os.walk(
-            base, followlinks=False
-        ):
-            directory_path = Path(directory)
-            symlink_directories = [
-                name
-                for name in directory_names
-                if (directory_path / name).is_symlink()
-            ]
-            directory_names[:] = [
-                name for name in directory_names if name not in symlink_directories
-            ]
-            for name in [*file_names, *symlink_directories]:
-                path = directory_path / name
-                relative = PurePosixPath(path.relative_to(root).as_posix())
-                if (
-                    relative not in tracked
-                    and _is_relevant_untracked_product_path(relative)
-                ):
-                    untracked.append(relative.as_posix())
-    return sorted(untracked)
-
-
-def _tracked_product_paths(root: Path) -> list[PurePosixPath]:
+def _git_tree_entries(root: Path, source_head: str) -> tuple[dict[str, str], ...]:
     output = _git_output(
         root,
         [
-            "ls-files",
+            "ls-tree",
+            "-r",
+            "-t",
             "-z",
-            "--cached",
+            "--full-tree",
+            source_head,
             "--",
-            *PRODUCT_SOURCE_ROOT_FILES,
-            *PRODUCT_SOURCE_TREES,
+            *PRODUCT_SOURCE_PATHS,
         ],
-        "tracked inputs",
+        "snapshot path manifest",
     )
-    decoded = [
-        PurePosixPath(os.fsdecode(raw))
-        for raw in output.split(b"\0")
-        if raw
-    ]
-    if decoded != sorted(set(decoded), key=lambda path: path.as_posix()):
-        raise InventoryError("tracked product-source paths are not unique and sorted")
-    required = {PurePosixPath(path) for path in PRODUCT_SOURCE_ROOT_FILES}
-    missing = sorted(path.as_posix() for path in required - set(decoded))
+    entries: list[dict[str, str]] = []
+    for raw in output.split(b"\0"):
+        if not raw:
+            continue
+        metadata, separator, raw_path = raw.partition(b"\t")
+        fields = metadata.decode("ascii", "strict").split()
+        if not separator or len(fields) != 3:
+            raise InventoryError("invalid Git snapshot path manifest row")
+        mode, kind, object_id = fields
+        relative = PurePosixPath(os.fsdecode(raw_path))
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+            raise InventoryError(f"invalid Git snapshot path: {relative}")
+        if kind not in {"blob", "tree"}:
+            raise InventoryError(f"unsupported Git snapshot object type: {kind}")
+        entries.append(
+            {
+                "path": relative.as_posix(),
+                "mode": mode,
+                "type": kind,
+                "git_object": object_id,
+            }
+        )
+    entries.sort(key=lambda entry: entry["path"])
+    if not entries or len({entry["path"] for entry in entries}) != len(entries):
+        raise InventoryError("Git snapshot path manifest is empty or ambiguous")
+    files = {entry["path"] for entry in entries if entry["type"] == "blob"}
+    required = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "clippy.toml"}
+    missing = sorted(required - files)
     if missing:
         raise InventoryError(f"tracked product-source inputs are missing: {missing}")
-    for relative in decoded:
-        if relative.is_absolute() or ".." in relative.parts:
-            raise InventoryError(f"invalid tracked product-source path: {relative}")
-    return decoded
+    return tuple(entries)
 
 
-def _product_source_record(root: Path, relative: PurePosixPath) -> dict[str, object]:
-    path = root.joinpath(*relative.parts)
-    try:
-        before = path.lstat()
-    except FileNotFoundError as error:
-        raise InventoryError(
-            f"tracked product-source input is missing: {relative}"
-        ) from error
-    if stat.S_ISREG(before.st_mode):
-        kind = "file"
-        content = path.read_bytes()
-    elif stat.S_ISLNK(before.st_mode):
-        kind = "symlink"
-        content = os.fsencode(os.readlink(path))
-    else:
-        raise InventoryError(
-            f"tracked product-source input has unsupported type: {relative}"
+def _relative_symlink_target(path: str, target: str) -> str:
+    if not target or PurePosixPath(target).is_absolute():
+        raise InventoryError(f"snapshot symlink {path} has an absolute or empty target")
+    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
+    if resolved == ".." or resolved.startswith("../") or resolved.startswith("/"):
+        raise InventoryError(f"snapshot symlink {path} escapes the authenticated tree")
+    return resolved
+
+
+def _validate_archive_members(
+    archive: tarfile.TarFile, entries: Sequence[Mapping[str, str]]
+) -> None:
+    manifest = {entry["path"]: entry for entry in entries}
+    for member in archive.getmembers():
+        name = member.name.rstrip("/")
+        relative = PurePosixPath(name)
+        if (
+            not name
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or name not in manifest
+        ):
+            raise InventoryError(f"Git archive contains unauthenticated path: {name}")
+        expected = manifest[name]
+        if member.isdir():
+            actual_type = "tree"
+        elif member.isfile() or member.issym():
+            actual_type = "blob"
+        else:
+            raise InventoryError(f"Git archive contains unsupported entry: {name}")
+        if actual_type != expected["type"]:
+            raise InventoryError(f"Git archive type disagrees for {name}")
+        if member.issym():
+            target = _relative_symlink_target(name, member.linkname)
+            if target not in manifest:
+                raise InventoryError(
+                    f"snapshot symlink {name} targets unauthenticated path {target}"
+                )
+
+
+def _snapshot_records(
+    snapshot_root: Path, entries: Sequence[Mapping[str, str]]
+) -> list[dict[str, str]]:
+    manifest_paths = {entry["path"] for entry in entries}
+    records: list[dict[str, str]] = []
+    for entry in entries:
+        if entry["type"] != "blob":
+            continue
+        relative = entry["path"]
+        path = snapshot_root / relative
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError as error:
+            raise InventoryError(f"snapshot input is missing: {relative}") from error
+        if entry["mode"] == "120000":
+            if not stat.S_ISLNK(metadata.st_mode):
+                raise InventoryError(f"snapshot symlink type changed: {relative}")
+            target = os.readlink(path)
+            resolved = _relative_symlink_target(relative, target)
+            if resolved not in manifest_paths or not (snapshot_root / resolved).exists():
+                raise InventoryError(
+                    f"snapshot symlink {relative} is dangling or unauthenticated"
+                )
+            content = os.fsencode(target)
+            actual_mode = "120000"
+        else:
+            if not stat.S_ISREG(metadata.st_mode):
+                raise InventoryError(f"snapshot file type changed: {relative}")
+            content = path.read_bytes()
+            actual_mode = "100755" if metadata.st_mode & stat.S_IXUSR else "100644"
+        if actual_mode != entry["mode"]:
+            raise InventoryError(f"snapshot mode changed: {relative}")
+        records.append(
+            {
+                **dict(entry),
+                "content_sha256": hashlib.sha256(content).hexdigest(),
+            }
         )
-    after = path.lstat()
-    before_identity = (
-        before.st_dev,
-        before.st_ino,
-        before.st_mode,
-        before.st_size,
-        before.st_mtime_ns,
-        before.st_ctime_ns,
-    )
-    after_identity = (
-        after.st_dev,
-        after.st_ino,
-        after.st_mode,
-        after.st_size,
-        after.st_mtime_ns,
-        after.st_ctime_ns,
-    )
-    if before_identity != after_identity:
-        raise InventoryError(f"product-source input changed while hashing: {relative}")
+    return records
+
+
+def _snapshot_provenance(
+    snapshot_root: Path,
+    source_head: str,
+    source_git_tree: str,
+    entries: Sequence[Mapping[str, str]],
+) -> dict[str, object]:
+    records = _snapshot_records(snapshot_root, entries)
     return {
-        "path": relative.as_posix(),
-        "type": kind,
-        "mode": f"{stat.S_IMODE(before.st_mode):04o}",
-        "content_sha256": hashlib.sha256(content).hexdigest(),
+        "source_head": source_head,
+        "source_git_tree": source_git_tree,
+        "source_path_manifest": [dict(entry) for entry in entries],
+        "source_path_manifest_sha256": _canonical_digest(list(entries)),
+        "source_tree_sha256": _canonical_digest(records),
+        "source_file_count": len(records),
     }
 
 
-def product_source_provenance(root: Path) -> dict[str, object]:
-    """Hash the exact tracked product inputs under a sanitized Git identity."""
+def _make_snapshot_read_only(root: Path) -> None:
+    directories = [root]
+    for directory, names, files in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        directories.extend(
+            directory_path / name
+            for name in names
+            if not (directory_path / name).is_symlink()
+        )
+        for name in files:
+            path = directory_path / name
+            if not path.is_symlink():
+                mode = stat.S_IMODE(path.stat().st_mode)
+                path.chmod(mode & ~0o222)
+    for directory in reversed(directories):
+        directory.chmod(stat.S_IMODE(directory.stat().st_mode) & ~0o222)
+
+
+def _make_snapshot_removable(root: Path) -> None:
+    for directory, names, _files in os.walk(root, topdown=False, followlinks=False):
+        directory_path = Path(directory)
+        for name in names:
+            path = directory_path / name
+            if not path.is_symlink():
+                path.chmod(stat.S_IMODE(path.stat().st_mode) | 0o700)
+        directory_path.chmod(stat.S_IMODE(directory_path.stat().st_mode) | 0o700)
+
+
+@contextlib.contextmanager
+def product_source_snapshot(root: Path):
+    """Yield a private read-only archive of one clean authenticated HEAD."""
     root = Path(root).resolve(strict=True)
     top = os.fsdecode(
         _git_output(root, ["rev-parse", "--show-toplevel"], "worktree root")
@@ -2131,26 +2255,66 @@ def product_source_provenance(root: Path) -> dict[str, object]:
     ).strip()
     if re.fullmatch(r"[0-9a-f]{40}", source_head) is None:
         raise InventoryError("product-source HEAD is not a full lowercase Git hash")
-    tracked_paths = _tracked_product_paths(root)
-    tracked = set(tracked_paths)
-    untracked_before = _relevant_untracked_product_paths(root, tracked)
-    if untracked_before:
+    dirty = _git_output(
+        root,
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=no",
+            "--",
+            *PRODUCT_SOURCE_PATHS,
+        ],
+        "clean snapshot inputs",
+    )
+    if dirty:
         raise InventoryError(
-            f"untracked product-source inputs are forbidden: {untracked_before}"
+            "authoritative compiler capture requires clean tracked snapshot inputs"
         )
-    records = [
-        _product_source_record(root, relative) for relative in tracked_paths
+    head_after_status = os.fsdecode(
+        _git_output(root, ["rev-parse", "HEAD"], "stable HEAD")
+    ).strip()
+    if head_after_status != source_head:
+        raise InventoryError("product-source HEAD changed before snapshot materialization")
+    source_git_tree = os.fsdecode(
+        _git_output(root, ["rev-parse", f"{source_head}^{{tree}}"], "Git tree")
+    ).strip()
+    if re.fullmatch(r"[0-9a-f]{40}", source_git_tree) is None:
+        raise InventoryError("product-source Git tree is not a full lowercase hash")
+    entries = _git_tree_entries(root, source_head)
+    manifest_paths = {entry["path"] for entry in entries}
+    archive_paths = [
+        path
+        for path in PRODUCT_SOURCE_PATHS
+        if path in manifest_paths
+        or any(candidate.startswith(f"{path}/") for candidate in manifest_paths)
     ]
-    untracked_after = _relevant_untracked_product_paths(root, tracked)
-    if untracked_after:
-        raise InventoryError(
-            f"untracked product-source inputs are forbidden: {untracked_after}"
+    archive_bytes = _git_output(
+        root,
+        ["archive", "--format=tar", source_head, "--", *archive_paths],
+        "private snapshot archive",
+    )
+    snapshot_parent = root / "target" / "host-authority-census" / "snapshots"
+    snapshot_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="source-", dir=snapshot_parent) as directory:
+        snapshot_root = Path(directory)
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
+            _validate_archive_members(archive, entries)
+            archive.extractall(snapshot_root, filter="fully_trusted")
+        provenance = _snapshot_provenance(
+            snapshot_root, source_head, source_git_tree, entries
         )
-    return {
-        "source_head": source_head,
-        "source_tree_sha256": _canonical_digest(records),
-        "source_file_count": len(records),
-    }
+        _make_snapshot_read_only(snapshot_root)
+        try:
+            yield SourceSnapshot(snapshot_root, provenance, entries)
+        finally:
+            _make_snapshot_removable(snapshot_root)
+
+
+def product_source_provenance(root: Path) -> dict[str, object]:
+    """Return provenance for the exact private snapshot that would compile."""
+    with product_source_snapshot(root) as snapshot:
+        return snapshot.provenance
 
 
 def _authenticate_candidate_entry(
@@ -2349,130 +2513,166 @@ def main(
     """Run the fail-closed CLI, with pure dependency injection for tests."""
     arguments = _argument_parser().parse_args(list(argv))
     try:
-        checked_matrix = matrix or load_matrix(
-            Path(root) / MATRIX_PATH.relative_to(ROOT)
-        )
+        original_root = Path(root).resolve(strict=True)
         destination_manager = (
             _candidate_destination(
-                arguments.refresh_candidate, protected_candidate_paths(root)
+                arguments.refresh_candidate, protected_candidate_paths(original_root)
             )
             if arguments.refresh_candidate is not None
             else contextlib.nullcontext(None)
         )
         with destination_manager as candidate_destination:
-            manifest = (
-                dict(catalog_manifest)
-                if catalog_manifest is not None
-                else load_catalog_manifest(
-                    Path(root) / CATALOG_MANIFEST_PATH.relative_to(ROOT)
-                )
+            snapshot_manager = (
+                contextlib.nullcontext(None)
+                if arguments.static
+                else product_source_snapshot(original_root)
             )
-            catalog = (
-                dict(operation_catalog)
-                if operation_catalog is not None
-                else load_production_catalog(
-                    Path(root) / CLIPPY_CONFIG_PATH.relative_to(ROOT),
-                    manifest,
+            with snapshot_manager as snapshot:
+                input_root = snapshot.root if snapshot is not None else original_root
+                checked_matrix = matrix or load_matrix(
+                    input_root / MATRIX_PATH.relative_to(ROOT)
                 )
-            )
-            reviews = (
-                expected
-                if expected is not None
-                else load_inventory(
-                    Path(root) / INVENTORY_PATH.relative_to(ROOT)
-                )
-            )
-            if candidate_destination is None:
-                receipt = (
-                    dict(capture_receipt)
-                    if capture_receipt is not None
-                    else load_capture_receipt(
-                        Path(root) / MACOS_CAPTURE_PATH.relative_to(ROOT),
-                        checked_matrix,
-                        catalog,
-                    )
-                )
-                validate_inventory_against_receipt(reviews, receipt)
-                if arguments.static:
-                    print(
-                        "host-authority static authority passed: exact catalog, "
-                        "macOS compiler receipt, and reviewed inventory agree"
-                    )
-                    return 0
-            selected = select_profiles(
-                checked_matrix, arguments.profiles, current_host=current_host
-            )
-            source_before = product_source_provenance(root)
-            result = run_census(
-                checked_matrix,
-                selected,
-                catalog,
-                runner=runner,
-                root=Path(root),
-                current_host=current_host,
-            )
-            source_after = product_source_provenance(root)
-            if source_after != source_before:
-                raise InventoryError(
-                    "product source or HEAD changed during compiler capture: "
-                    f"before={source_before}, after={source_after}"
-                )
-            rows = result["rows"]
-            executed = result["executed_profiles"]
-            pending = result["pending_profiles"]
-            identities = result["toolchain"]
-            assert isinstance(rows, list)
-            assert isinstance(executed, list)
-            assert isinstance(pending, list)
-            assert isinstance(identities, Mapping)
-            if candidate_destination is not None:
-                document = candidate_document(
-                    rows,
-                    reviews,
-                    executed,
-                    checked_matrix.required_profiles,
-                    identities,
+                return _run_checked_mode(
+                    arguments,
+                    candidate_destination,
+                    snapshot,
+                    input_root,
+                    original_root,
                     checked_matrix,
-                    catalog,
-                    source_before,
+                    runner,
+                    operation_catalog,
+                    catalog_manifest,
+                    expected,
+                    capture_receipt,
+                    current_host,
                 )
-                try:
-                    _write_candidate_atomically(
-                        candidate_destination, document
-                    )
-                except OSError as error:
-                    raise InventoryError(
-                        "cannot publish refresh candidate atomically: "
-                        f"{error}"
-                    ) from error
-                if document["complete"] is not True:
-                    print(
-                        "error: wrote an explicitly partial, non-authoritative "
-                        f"candidate; pending profiles: {', '.join(pending)}",
-                        file=sys.stderr,
-                    )
-                    return 1
-                print(
-                    "wrote complete refresh candidate: "
-                    f"{candidate_destination.display_path}"
-                )
-                return 0
-            validate(
-                rows, reviews, executed, checked_matrix.required_profiles
-            )
-            if pending:
-                print(
-                    "host-authority census subset passed; result is partial; "
-                    f"pending profiles: {', '.join(pending)}"
-                )
-            else:
-                print(
-                    "host-authority census complete: all required profiles passed"
-                )
-            return 0
     except InventoryError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
+
+
+def _run_checked_mode(
+    arguments: argparse.Namespace,
+    candidate_destination: CandidateDestination | None,
+    snapshot: SourceSnapshot | None,
+    input_root: Path,
+    original_root: Path,
+    checked_matrix: Matrix,
+    runner: Any,
+    operation_catalog: Mapping[str, str] | None,
+    catalog_manifest: Mapping[str, str] | None,
+    expected: list[dict[str, object]] | None,
+    capture_receipt: Mapping[str, object] | None,
+    current_host: str | None,
+) -> int:
+    """Execute one mode using only authenticated snapshot inputs when live."""
+    manifest = (
+        dict(catalog_manifest)
+        if catalog_manifest is not None
+        else load_catalog_manifest(
+            input_root / CATALOG_MANIFEST_PATH.relative_to(ROOT)
+        )
+    )
+    catalog = (
+        dict(operation_catalog)
+        if operation_catalog is not None
+        else load_production_catalog(
+            input_root / CLIPPY_CONFIG_PATH.relative_to(ROOT), manifest
+        )
+    )
+    reviews = (
+        expected
+        if expected is not None
+        else load_inventory(input_root / INVENTORY_PATH.relative_to(ROOT))
+    )
+    if candidate_destination is None:
+        receipt = (
+            dict(capture_receipt)
+            if capture_receipt is not None
+            else load_capture_receipt(
+                input_root / MACOS_CAPTURE_PATH.relative_to(ROOT),
+                checked_matrix,
+                catalog,
+            )
+        )
+        validate_inventory_against_receipt(reviews, receipt)
+        if arguments.static:
+            print(
+                "host-authority static authority passed: exact catalog, "
+                "macOS compiler receipt, and reviewed inventory agree"
+            )
+            return 0
+    if snapshot is None:
+        raise InventoryError("live compiler mode has no authenticated snapshot")
+    selected = select_profiles(
+        checked_matrix, arguments.profiles, current_host=current_host
+    )
+    result = run_census(
+        checked_matrix,
+        selected,
+        catalog,
+        runner=runner,
+        root=input_root,
+        state_root=original_root,
+        current_host=current_host,
+    )
+    source_after = _snapshot_provenance(
+        snapshot.root,
+        str(snapshot.provenance["source_head"]),
+        str(snapshot.provenance["source_git_tree"]),
+        snapshot.entries,
+    )
+    if source_after != snapshot.provenance:
+        raise InventoryError(
+            "private source snapshot changed during compiler capture: "
+            f"before={snapshot.provenance}, after={source_after}"
+        )
+    rows = result["rows"]
+    executed = result["executed_profiles"]
+    pending = result["pending_profiles"]
+    identities = result["toolchain"]
+    assert isinstance(rows, list)
+    assert isinstance(executed, list)
+    assert isinstance(pending, list)
+    assert isinstance(identities, Mapping)
+    if candidate_destination is not None:
+        document = candidate_document(
+            rows,
+            reviews,
+            executed,
+            checked_matrix.required_profiles,
+            identities,
+            checked_matrix,
+            catalog,
+            snapshot.provenance,
+        )
+        try:
+            _write_candidate_atomically(candidate_destination, document)
+        except OSError as error:
+            raise InventoryError(
+                "cannot publish refresh candidate atomically: " f"{error}"
+            ) from error
+        if document["complete"] is not True:
+            print(
+                "error: wrote an explicitly partial, non-authoritative "
+                f"candidate; pending profiles: {', '.join(pending)}",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            "wrote complete refresh candidate: "
+            f"{candidate_destination.display_path}"
+        )
+        return 0
+    validate(rows, reviews, executed, checked_matrix.required_profiles)
+    if pending:
+        print(
+            "host-authority census subset passed; result is partial; "
+            f"pending profiles: {', '.join(pending)}"
+        )
+    else:
+        print("host-authority census complete: all required profiles passed")
+    return 0
 
 
 if __name__ == "__main__":
