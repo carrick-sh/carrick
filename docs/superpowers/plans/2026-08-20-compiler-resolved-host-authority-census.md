@@ -428,6 +428,7 @@ git commit -m "security: census resolved host authority calls"
 
 **Files:**
 - Create: `.semgrep/host-authority-escape-hatches.yml`
+- Create: `scripts/migrate/check-host-authority-escape-hatches.py`
 - Create: `scripts/tests/test_host_authority_escape_hatches.py`
 - Modify: `scripts/lint-domains.sh`
 - Modify: `justfile`
@@ -440,7 +441,8 @@ git commit -m "security: census resolved host authority calls"
 
 - [ ] **Step 1: Write red escape-hatch fixtures**
 
-Use temporary Rust files and the real Semgrep launcher. Require findings for:
+Use temporary Rust files and the real deterministic lint launcher. Require
+findings for:
 `libc::syscall`, `dlsym`/`dlopen`, `asm!`/`global_asm!`, and a local `extern
 "C"` declaration of `waitpid`, `kill`, or filesystem/process-control host APIs.
 Require no finding for comments, strings, the checked boundary fixture, or
@@ -448,9 +450,15 @@ ordinary safe Rust calls already covered by Clippy.
 
 - [ ] **Step 2: Add narrow Semgrep deny rules**
 
-Rules must identify unmistakable escape-hatch constructs only. Exclusions are
-path-specific reviewed boundary modules, not broad directory globs. Each rule
-message names the compiler catalog or typed capability facade as the required
+Rules must identify unmistakable escape-hatch constructs only. Because Semgrep
+1.166 does not reliably inspect Rust macro token trees or preserve extern
+ABI/link-name context, supplement it with a fail-closed
+comment/string/raw-string-aware lexical syntax checker. That checker may
+recognize only direct escape syntax, assembly import aliases, extern ABI and
+`link_name` forms, and exact relative-path exemptions; it must not recover Rust
+name, cfg, module, or reachability semantics. Exclusions are exact reviewed
+boundary files, never suffix matches or directory globs. Every diagnostic
+names the compiler catalog or typed capability facade as the required
 replacement.
 
 - [ ] **Step 3: Wire deterministic local checks**

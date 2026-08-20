@@ -4,17 +4,17 @@ rules:
     severity: ERROR
     paths:
       exclude:
-        - crates/carrick-portable/src/lib.rs
-        - crates/carrick-vmm-kvm/src/kvm_aarch64_engine.rs
-        - crates/carrick-aarch64/src/engine.rs
-        - crates/carrick-host/src/netbsd_futex.rs
-        - crates/carrick-host-linux/src/epoll_mux.rs
-        - crates/carrick-host/src/shared_word.rs
-        - crates/carrick-vmm-nvmm/src/nvmm.rs
-        - crates/carrick-vmm-bhyve/fixtures/bhyve-asyncsig/src/main.rs
-        - crates/carrick-vmm-bhyve/fixtures/bhyve-fork-raw/src/main.rs
-        - crates/carrick-vmm-bhyve/fixtures/bhyve-vfork-exec/src/main.rs
-        - crates/carrick-vmm-bhyve/fixtures/bhyve-vfork-exit/src/main.rs
+        - /crates/carrick-portable/src/lib.rs
+        - /crates/carrick-vmm-kvm/src/kvm_aarch64_engine.rs
+        - /crates/carrick-aarch64/src/engine.rs
+        - /crates/carrick-host/src/netbsd_futex.rs
+        - /crates/carrick-host-linux/src/epoll_mux.rs
+        - /crates/carrick-host/src/shared_word.rs
+        - /crates/carrick-vmm-nvmm/src/nvmm.rs
+        - /crates/carrick-vmm-bhyve/fixtures/bhyve-asyncsig/src/main.rs
+        - /crates/carrick-vmm-bhyve/fixtures/bhyve-fork-raw/src/main.rs
+        - /crates/carrick-vmm-bhyve/fixtures/bhyve-vfork-exec/src/main.rs
+        - /crates/carrick-vmm-bhyve/fixtures/bhyve-vfork-exit/src/main.rs
     pattern: libc::syscall(...)
     message: |
       Raw libc::syscall bypasses resolved-operation review. Add a named
@@ -38,22 +38,22 @@ rules:
     severity: ERROR
     paths:
       exclude:
-        - crates/carrick-dsr-aarch64/src/counter.rs
-        - crates/carrick-dsr-aarch64/src/emit.rs
-        - crates/carrick-dsr-x86/src/gateway.rs
-        - crates/carrick-dsr-x86/tests/fixtures/computeloop.rs
-        - crates/carrick-dsr-x86/tests/fixtures/tinyguest.rs
-        - crates/carrick-native-darwin/src/direct.rs
-        - crates/carrick-runtime/tools/vdso_getrandom_blob.rs
-        - crates/carrick-vmm-bhyve/fixtures/bhyve-fpsignal/src/main.rs
-        - crates/carrick-vmm-bhyve/fixtures/bhyve-sigfpe/src/main.rs
-        - crates/carrick-vmm-bhyve/fixtures/bhyve-sigill/src/main.rs
-        - crates/carrick-vmm-bhyve/fixtures/bhyve-sigsegv-default/src/main.rs
-        - crates/carrick-vmm-bhyve/fixtures/bhyve-sigsegv-gp/src/main.rs
-        - crates/carrick-vmm-bhyve/fixtures/bhyve-sigsegv/src/main.rs
-        - crates/carrick-vmm-hvf/src/trap/sysreg.rs
-        - crates/carrick-vmm-kvm/src/guest_setup.rs
-        - crates/carrick-vmm-kvm/src/kvm.rs
+        - /crates/carrick-dsr-aarch64/src/counter.rs
+        - /crates/carrick-dsr-aarch64/src/emit.rs
+        - /crates/carrick-dsr-x86/src/gateway.rs
+        - /crates/carrick-dsr-x86/tests/fixtures/computeloop.rs
+        - /crates/carrick-dsr-x86/tests/fixtures/tinyguest.rs
+        - /crates/carrick-native-darwin/src/direct.rs
+        - /crates/carrick-runtime/tools/vdso_getrandom_blob.rs
+        - /crates/carrick-vmm-bhyve/fixtures/bhyve-fpsignal/src/main.rs
+        - /crates/carrick-vmm-bhyve/fixtures/bhyve-sigfpe/src/main.rs
+        - /crates/carrick-vmm-bhyve/fixtures/bhyve-sigill/src/main.rs
+        - /crates/carrick-vmm-bhyve/fixtures/bhyve-sigsegv-default/src/main.rs
+        - /crates/carrick-vmm-bhyve/fixtures/bhyve-sigsegv-gp/src/main.rs
+        - /crates/carrick-vmm-bhyve/fixtures/bhyve-sigsegv/src/main.rs
+        - /crates/carrick-vmm-hvf/src/trap/sysreg.rs
+        - /crates/carrick-vmm-kvm/src/guest_setup.rs
+        - /crates/carrick-vmm-kvm/src/kvm.rs
     patterns:
       - pattern-either:
           - pattern: asm!(...)

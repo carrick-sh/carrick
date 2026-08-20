@@ -36,7 +36,9 @@ class HostAuthorityEscapeHatchTest(unittest.TestCase):
         self.assertTrue(self.cert.is_file(), "real Semgrep tests require /etc/ssl/cert.pem")
         self.log = self.root / "semgrep.log"
 
-    def run_lint(self, files: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    def run_lint(
+        self, files: dict[str, str], semgrep_bin: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
         for relative, body in files.items():
             path = self.root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -49,8 +51,45 @@ class HostAuthorityEscapeHatchTest(unittest.TestCase):
                 "SEMGREP_LOG_FILE": str(self.log),
             }
         )
+        if semgrep_bin is not None:
+            env["SEMGREP_BIN"] = str(semgrep_bin)
         return subprocess.run(
             [str(LAUNCHER)],
+            cwd=self.root,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+
+    def run_escape_semgrep_only(
+        self, files: dict[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        shutil.rmtree(self.root / "crates", ignore_errors=True)
+        for relative, body in files.items():
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+        env = os.environ.copy()
+        env.update(
+            {
+                "SSL_CERT_FILE": str(self.cert),
+                "SEMGREP_LOG_FILE": str(self.log),
+                "SEMGREP_SEND_METRICS": "off",
+                "SEMGREP_ENABLE_VERSION_CHECK": "0",
+                "OTEL_SDK_DISABLED": "true",
+            }
+        )
+        return subprocess.run(
+            [
+                "semgrep",
+                "--config",
+                ".semgrep/host-authority-escape-hatches.yml",
+                "crates/",
+                "--severity",
+                "ERROR",
+                "--error",
+                "--quiet",
+            ],
             cwd=self.root,
             env=env,
             text=True,
@@ -85,6 +124,39 @@ class HostAuthorityEscapeHatchTest(unittest.TestCase):
             with self.subTest(macro_call=macro_call):
                 self.assert_rejected(f"pub unsafe fn call() {{ {macro_call}; }}\n")
 
+    def test_rejects_assembly_import_aliases(self):
+        fixtures = (
+            'use core::arch::asm; pub unsafe fn call() { asm!("nop"); }\n',
+            'use core::arch::{asm, global_asm}; global_asm!(".text");\n',
+            (
+                'use core::arch::asm as carrier_asm; '
+                'pub unsafe fn call() { carrier_asm!("nop"); }\n'
+            ),
+            (
+                'use core::arch::{global_asm as carrier_global_asm}; '
+                'carrier_global_asm!(".text");\n'
+            ),
+        )
+        for body in fixtures:
+            with self.subTest(body=body):
+                self.assert_rejected(body)
+
+    def test_rejects_escape_hatches_inside_macro_rules(self):
+        fixtures = (
+            'macro_rules! call { () => { core::arch::asm!("nop") }; }\n',
+            'macro_rules! call { () => { asm!("nop") }; }\n',
+            'macro_rules! call { () => { core::arch::global_asm!(".text") }; }\n',
+            (
+                'macro_rules! call { () => { unsafe { '
+                'libc::syscall(libc::SYS_getpid) } }; }\n'
+            ),
+            'macro_rules! call { () => { unsafe { libc::dlopen(0 as _) } }; }\n',
+            'macro_rules! call { () => { unsafe { libc::dlsym(0 as _, 0 as _) } }; }\n',
+        )
+        for body in fixtures:
+            with self.subTest(body=body):
+                self.assert_rejected(body)
+
     def test_rejects_local_host_api_declarations(self):
         declarations = {
             "waitpid": "fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;",
@@ -96,6 +168,23 @@ class HostAuthorityEscapeHatchTest(unittest.TestCase):
             with self.subTest(operation=operation):
                 self.assert_rejected(f'unsafe extern "C" {{ {declaration} }}\n')
 
+    def test_rejects_local_host_api_declaration_variants(self):
+        fixtures = (
+            'unsafe extern { fn waitpid(pid: i32) -> i32; }\n',
+            'unsafe extern "C-unwind" { fn kill(pid: i32, signal: i32) -> i32; }\n',
+            (
+                'unsafe extern "C" { #[link_name = "waitpid"] '
+                'fn carrier_wait(pid: i32) -> i32; }\n'
+            ),
+            (
+                'macro_rules! declare_wait { () => { unsafe extern "C" { '
+                'fn waitpid(pid: i32) -> i32; } }; }\n'
+            ),
+        )
+        for body in fixtures:
+            with self.subTest(body=body):
+                self.assert_rejected(body)
+
     def test_ignores_comments_strings_and_catalog_covered_safe_rust(self):
         result = self.run_lint(
             {
@@ -104,12 +193,98 @@ class HostAuthorityEscapeHatchTest(unittest.TestCase):
 // unsafe extern "C" { fn waitpid(pid: i32) -> i32; }
 pub fn safe() -> u32 {
     let _description = "extern \"C\" { fn waitpid(); } libc::dlsym";
+    let _raw = r###"libc::syscall(1); core::arch::global_asm!(\"x\")"###;
     std::process::id()
+}
+
+pub trait SafeTrait {
+    fn waitpid(&self, pid: i32) -> i32;
+}
+
+macro_rules! documentation_only {
+    () => {{
+        // unsafe extern "C-unwind" { fn kill(pid: i32); }
+        "#[link_name = \"waitpid\"] fn renamed(); asm!(\"nop\")"
+    }};
+}
+
+macro_rules! compiler_catalog_owned {
+    () => {{ std::process::id() }};
 }
 '''
             }
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_launcher_propagates_supplemental_checker_failure(self):
+        fake_semgrep = self.root / "semgrep-success"
+        fake_semgrep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_semgrep.chmod(0o755)
+        result = self.run_lint(
+            {
+                "crates/fixture/src/lib.rs": (
+                    'macro_rules! hidden { () => { unsafe { '
+                    'libc::syscall(1) } }; }\n'
+                )
+            },
+            semgrep_bin=fake_semgrep,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("raw libc::syscall bypasses review", result.stderr)
+
+    def test_nested_suffix_lookalikes_do_not_inherit_boundary_exclusions(self):
+        fixtures = {
+            "crates/nested/crates/carrick-portable/src/lib.rs": (
+                "pub unsafe fn call() { let _ = libc::syscall(1); }\n"
+            ),
+            "crates/nested/crates/carrick-dsr-aarch64/src/emit.rs": (
+                'pub unsafe fn emit() { core::arch::asm!("nop"); }\n'
+            ),
+        }
+        for relative, body in fixtures.items():
+            with self.subTest(relative=relative):
+                result = self.run_lint({relative: body})
+                self.assertNotEqual(
+                    result.returncode,
+                    0,
+                    f"nested suffix path inherited an exact boundary: {relative}",
+                )
+                self.assertRegex(
+                    result.stdout + result.stderr,
+                    re.compile(r"compiler\s+host-\s*authority\s+catalog"),
+                )
+
+    def test_semgrep_boundary_exclusions_are_root_anchored(self):
+        cases = (
+            (
+                "crates/carrick-portable/src/lib.rs",
+                "pub unsafe fn call() { let _ = libc::syscall(1); }\n",
+                0,
+            ),
+            (
+                "crates/nested/crates/carrick-portable/src/lib.rs",
+                "pub unsafe fn call() { let _ = libc::syscall(1); }\n",
+                1,
+            ),
+            (
+                "crates/carrick-dsr-aarch64/src/emit.rs",
+                'pub unsafe fn emit() { core::arch::asm!("nop"); }\n',
+                0,
+            ),
+            (
+                "crates/nested/crates/carrick-dsr-aarch64/src/emit.rs",
+                'pub unsafe fn emit() { core::arch::asm!("nop"); }\n',
+                1,
+            ),
+        )
+        for relative, body, expected_status in cases:
+            with self.subTest(relative=relative):
+                result = self.run_escape_semgrep_only({relative: body})
+                self.assertEqual(
+                    result.returncode,
+                    expected_status,
+                    result.stdout + result.stderr,
+                )
 
     def test_checked_boundary_modules_are_path_specific_exemptions(self):
         result = self.run_lint(

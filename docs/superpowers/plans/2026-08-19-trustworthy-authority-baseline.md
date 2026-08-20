@@ -63,6 +63,10 @@ musl/GNU conformance probes.
   the local compiler diagnostics and exact profile memberships.
 - `.semgrep/host-authority-escape-hatches.yml` — narrow deny rules for raw
   syscall, dynamic lookup, assembly, and watched local FFI declarations.
+- `scripts/migrate/check-host-authority-escape-hatches.py` — fail-closed,
+  comment/string-aware syntax companion for macro token trees, assembly import
+  aliases, ABI variants, `link_name`, and exact-path boundary enforcement; it
+  never resolves Rust names or cfg.
 - `scripts/tests/test_host_authority_transitions.py` — compiler receipt,
   inventory drift, classification, and matrix contracts.
 - `scripts/tests/test_host_authority_escape_hatches.py` — real temporary-file
@@ -290,9 +294,11 @@ The replacement boundary keeps these facts separate:
 4. Linux, FreeBSD, and NetBSD CLI/runtime profiles remain pending. A passing
    three-profile local check is explicitly partial, not cross-platform
    completeness.
-5. Narrow Semgrep rules deny unmistakable catalog escape hatches outside exact
-   reviewed boundary modules. Phase 1 must still introduce the typed
-   host-capability facade and deny raw host APIs outside it.
+5. Narrow Semgrep rules and a comment/string-aware syntax companion deny
+   unmistakable catalog escape hatches outside exact reviewed boundary paths,
+   including macro bodies and renamed imports. They do not resolve Rust names
+   or cfg. Phase 1 must still introduce the typed host-capability facade and
+   deny raw host APIs outside it.
 
 The normal gate is read-only:
 
