@@ -1,0 +1,82 @@
+rules:
+  - id: carrick-no-raw-host-syscall-escape
+    languages: [rust]
+    severity: ERROR
+    paths:
+      exclude:
+        - crates/carrick-portable/src/lib.rs
+        - crates/carrick-vmm-kvm/src/kvm_aarch64_engine.rs
+        - crates/carrick-aarch64/src/engine.rs
+        - crates/carrick-host/src/netbsd_futex.rs
+        - crates/carrick-host-linux/src/epoll_mux.rs
+        - crates/carrick-host/src/shared_word.rs
+        - crates/carrick-vmm-nvmm/src/nvmm.rs
+        - crates/carrick-vmm-bhyve/fixtures/bhyve-asyncsig/src/main.rs
+        - crates/carrick-vmm-bhyve/fixtures/bhyve-fork-raw/src/main.rs
+        - crates/carrick-vmm-bhyve/fixtures/bhyve-vfork-exec/src/main.rs
+        - crates/carrick-vmm-bhyve/fixtures/bhyve-vfork-exit/src/main.rs
+    pattern: libc::syscall(...)
+    message: |
+      Raw libc::syscall bypasses resolved-operation review. Add a named
+      operation to the compiler host-authority catalog or route the operation
+      through the typed host-capability facade.
+
+  - id: carrick-no-dynamic-host-symbol-escape
+    languages: [rust]
+    severity: ERROR
+    patterns:
+      - pattern-either:
+          - pattern: libc::dlopen(...)
+          - pattern: libc::dlsym(...)
+    message: |
+      Dynamic host symbol lookup bypasses resolved-operation review. Add a
+      named operation to the compiler host-authority catalog or route the
+      operation through the typed host-capability facade.
+
+  - id: carrick-no-unreviewed-inline-assembly
+    languages: [rust]
+    severity: ERROR
+    paths:
+      exclude:
+        - crates/carrick-dsr-aarch64/src/counter.rs
+        - crates/carrick-dsr-aarch64/src/emit.rs
+        - crates/carrick-dsr-x86/src/gateway.rs
+        - crates/carrick-dsr-x86/tests/fixtures/computeloop.rs
+        - crates/carrick-dsr-x86/tests/fixtures/tinyguest.rs
+        - crates/carrick-native-darwin/src/direct.rs
+        - crates/carrick-runtime/tools/vdso_getrandom_blob.rs
+        - crates/carrick-vmm-bhyve/fixtures/bhyve-fpsignal/src/main.rs
+        - crates/carrick-vmm-bhyve/fixtures/bhyve-sigfpe/src/main.rs
+        - crates/carrick-vmm-bhyve/fixtures/bhyve-sigill/src/main.rs
+        - crates/carrick-vmm-bhyve/fixtures/bhyve-sigsegv-default/src/main.rs
+        - crates/carrick-vmm-bhyve/fixtures/bhyve-sigsegv-gp/src/main.rs
+        - crates/carrick-vmm-bhyve/fixtures/bhyve-sigsegv/src/main.rs
+        - crates/carrick-vmm-hvf/src/trap/sysreg.rs
+        - crates/carrick-vmm-kvm/src/guest_setup.rs
+        - crates/carrick-vmm-kvm/src/kvm.rs
+    patterns:
+      - pattern-either:
+          - pattern: asm!(...)
+          - pattern: global_asm!(...)
+          - pattern: core::arch::asm!(...)
+          - pattern: core::arch::global_asm!(...)
+          - pattern: std::arch::asm!(...)
+          - pattern: std::arch::global_asm!(...)
+    message: |
+      Inline assembly bypasses resolved-operation review. Add the host
+      operation to the compiler host-authority catalog or isolate it behind
+      the typed host-capability facade in a reviewed boundary module.
+
+  - id: carrick-no-local-host-api-declaration
+    languages: [rust]
+    severity: ERROR
+    patterns:
+      - pattern: fn $FUNCTION(...);
+      - pattern-regex: '(?s)(?:unsafe\s+)?extern\s*"C"\s*\{[^}]*\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^;{}]*\)\s*(?:->[^;{}]+)?;'
+      - metavariable-regex:
+          metavariable: $FUNCTION
+          regex: '^(waitpid|wait4|waitid|kill|killpg|pthread_kill|fork|vfork|execve|posix_spawn|open|openat|close|unlink|unlinkat|rename|renameat|mkdir|mkdirat|rmdir|chdir|fchdir|chroot)$'
+    message: |
+      A local host API declaration bypasses resolved-operation review. Use the
+      compiler host-authority catalog binding or route the operation through
+      the typed host-capability facade.

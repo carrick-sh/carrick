@@ -89,11 +89,15 @@ clippy *ARGS:
 # Typed-domain semgrep gate: blocks the bug SHAPES the newtypes exist to kill
 # (raw wait-set complements, bit=signum masks, host pids in NsPid, hand-numbered
 # private syscall numbers, function-local LINUX_* consts, inline errno
-# negation). The launcher fails closed while giving Semgrep a deterministic
-# offline environment and an explicit writable log path.
+# negation). Narrow escape-hatch rules additionally deny raw syscall, dynamic
+# lookup, assembly, and local host-API redeclarations outside exact reviewed
+# boundary modules. The launcher fails closed while giving Semgrep a
+# deterministic offline environment and an explicit writable log path. The
+# compiler census checks this host's product profiles and reports all other
+# required profiles pending; a partial local pass is not matrix completeness.
 lint-domains:
     ./scripts/lint-domains.sh
-    python3 scripts/migrate/check-host-authority-transitions.py
+    python3 scripts/migrate/check-host-authority-transitions.py --check
 
 
 # Dependency license / bans / sources gate (matches CI). Enforces the deny.toml

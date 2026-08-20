@@ -35,4 +35,15 @@ export SEMGREP_SEND_METRICS=off
 export SEMGREP_ENABLE_VERSION_CHECK=0
 export OTEL_SDK_DISABLED=true
 
+checked_configs=(
+    .semgrep/typed-domains.yml
+    .semgrep/host-authority-escape-hatches.yml
+)
+for checked_config in "${checked_configs[@]}"; do
+    if [[ ! -r "$checked_config" ]]; then
+        echo "error: required Semgrep config is missing: $checked_config" >&2
+        exit 1
+    fi
+done
+
 "$semgrep_bin" --config .semgrep/ crates/ --severity ERROR --error --quiet
