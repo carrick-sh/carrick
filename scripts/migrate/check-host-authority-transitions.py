@@ -44,6 +44,7 @@ HOST_TRIPLES = {
 }
 
 ROOT = Path(__file__).resolve().parents[2]
+CARGO_CWD = Path("/")
 MATRIX_PATH = ROOT / "scripts" / "migrate" / "host-authority-build-matrix.json"
 INVENTORY_PATH = (
     ROOT / "scripts" / "migrate" / "host-authority-transition-inventory.json"
@@ -117,6 +118,7 @@ class ExecutionContext(NamedTuple):
     cwd: Path
     cargo_home: Path
     rustup_home: Path
+    target_root: Path
     cargo_config: Path
     manifest: Path
 
@@ -345,6 +347,33 @@ def current_host_id() -> str:
         raise InventoryError(f"unsupported host for authority census: {host}") from error
 
 
+def _authenticated_cargo_cwd(root: Path = CARGO_CWD) -> Path:
+    if os.name != "posix":
+        raise InventoryError("authority census Cargo execution requires Unix")
+    current_host_id()
+    try:
+        metadata = root.lstat()
+    except FileNotFoundError as error:
+        raise InventoryError(f"Cargo cwd root is missing: {root}") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise InventoryError(f"Cargo cwd root is not a directory: {root}")
+    resolved = root.resolve(strict=True)
+    resolved_metadata = resolved.stat()
+    if (metadata.st_dev, metadata.st_ino) != (
+        resolved_metadata.st_dev,
+        resolved_metadata.st_ino,
+    ):
+        raise InventoryError(f"Cargo cwd root is not the expected directory: {root}")
+    for config_name in ("config", "config.toml"):
+        config = resolved / ".cargo" / config_name
+        try:
+            config.lstat()
+        except FileNotFoundError:
+            continue
+        raise InventoryError(f"root Cargo config is forbidden: {config}")
+    return resolved
+
+
 @contextlib.contextmanager
 def _execution_context(root: Path):
     workspace = Path(root).resolve(strict=True)
@@ -360,13 +389,19 @@ def _execution_context(root: Path):
             raise InventoryError(f"missing {label}: {path}") from error
         if not stat.S_ISREG(metadata.st_mode):
             raise InventoryError(f"{label} is not a regular checked file: {path}")
+    census_root = workspace / "target" / "host-authority-census"
+    census_root.mkdir(parents=True, exist_ok=True)
+    census_root = census_root.resolve(strict=True)
+    if not census_root.is_relative_to(workspace):
+        raise InventoryError(
+            f"authority census target root escapes workspace: {census_root}"
+        )
+    cargo_cwd = _authenticated_cargo_cwd()
     with tempfile.TemporaryDirectory(
-        prefix=f"carrick-authority-{workspace.name}-"
+        prefix=f"task-{workspace.name}-", dir=census_root
     ) as directory:
         task_root = Path(directory)
-        cwd = task_root / "work"
         cargo_home = task_root / "cargo-home"
-        cwd.mkdir()
         cargo_home.mkdir()
         canonical_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(
             strict=True
@@ -383,9 +418,10 @@ def _execution_context(root: Path):
                     cache.resolve(strict=True), target_is_directory=True
                 )
         yield ExecutionContext(
-            cwd,
+            cargo_cwd,
             cargo_home,
             canonical_home / ".rustup",
+            census_root,
             cargo_config,
             manifest,
         )
@@ -627,9 +663,7 @@ def run_profile(
     environment = _sanitized_build_environment(
         _execution.cargo_home,
         _execution.rustup_home,
-        target_dir=(
-            Path(root) / "target" / "host-authority-census" / profile.id
-        )
+        target_dir=_execution.target_root / profile.id,
     )
     result = _completed_text(
         _profile_command(profile, _execution),

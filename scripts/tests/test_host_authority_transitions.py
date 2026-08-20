@@ -1179,6 +1179,103 @@ class MatrixOrchestrationTest(unittest.TestCase):
         )
         self.assertIn("force-frame-pointers=yes", checked_config_text)
 
+    def test_hostile_temp_ancestor_cannot_choose_cargo_cwd_or_home(self):
+        matrix = self.load()
+        profile = matrix.profiles["macos-hvf-default"]
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            root = temporary / "worktree"
+            root.mkdir()
+            (root / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+            checked_config = root / ".cargo" / "config.toml"
+            checked_config.parent.mkdir()
+            checked_config.write_text(
+                '[build]\nrustflags = ["-C", "force-frame-pointers=yes"]\n',
+                encoding="utf-8",
+            )
+            hostile_parent = temporary / "hostile-temp-parent"
+            hostile_tmp = hostile_parent / "tmp"
+            hostile_tmp.mkdir(parents=True)
+            hostile_config = hostile_parent / ".cargo" / "config.toml"
+            hostile_config.parent.mkdir()
+            hostile_config.write_text(
+                '[build]\nrustc = "/tmp/hostile-rustc"\n', encoding="utf-8"
+            )
+            canonical_home = temporary / "canonical-home"
+            canonical_home.mkdir()
+            fake = FakeRunner()
+            observations = []
+
+            def runner(argv, **kwargs):
+                observations.append(
+                    {
+                        "cwd": Path(kwargs["cwd"]),
+                        "environment": dict(kwargs["env"]),
+                    }
+                )
+                return fake(argv, **kwargs)
+
+            with mock.patch.object(
+                pwd,
+                "getpwuid",
+                return_value=mock.Mock(pw_dir=str(canonical_home)),
+            ), mock.patch.object(tempfile, "tempdir", None), mock.patch.dict(
+                os.environ,
+                {
+                    "TMPDIR": str(hostile_tmp),
+                    "TEMP": str(hostile_tmp),
+                    "TMP": str(hostile_tmp),
+                },
+                clear=False,
+            ):
+                self.host_authority.run_profile(
+                    profile,
+                    runner=runner,
+                    root=root,
+                    current_host="macos",
+                )
+
+        self.assertEqual(len(observations), 1)
+        observed = observations[0]
+        self.assertEqual(observed["cwd"], Path("/"))
+        cargo_home = Path(observed["environment"]["CARGO_HOME"])
+        target_dir = Path(observed["environment"]["CARGO_TARGET_DIR"])
+        census_root = root.resolve() / "target" / "host-authority-census"
+        self.assertTrue(cargo_home.is_relative_to(census_root))
+        self.assertTrue(target_dir.is_absolute())
+        self.assertTrue(target_dir.is_relative_to(census_root))
+        self.assertFalse(cargo_home.is_relative_to(hostile_parent))
+        for variable in ("TMPDIR", "TEMP", "TMP"):
+            self.assertNotIn(variable, observed["environment"])
+
+    def test_cargo_root_cwd_rejects_configs_nonunix_and_nondirectory(self):
+        self.assertEqual(self.host_authority.CARGO_CWD, Path("/"))
+        with tempfile.TemporaryDirectory() as directory:
+            fake_root = Path(directory) / "root"
+            fake_root.mkdir()
+            for config_name in ("config", "config.toml"):
+                cargo = fake_root / ".cargo"
+                cargo.mkdir(exist_ok=True)
+                config = cargo / config_name
+                config.write_text("hostile\n", encoding="utf-8")
+                with self.subTest(config_name=config_name):
+                    with self.assertRaisesRegex(
+                        self.host_authority.InventoryError, "Cargo config"
+                    ):
+                        self.host_authority._authenticated_cargo_cwd(fake_root)
+                config.unlink()
+            not_directory = Path(directory) / "not-a-directory"
+            not_directory.write_text("file\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                self.host_authority.InventoryError, "directory"
+            ):
+                self.host_authority._authenticated_cargo_cwd(not_directory)
+        with mock.patch.object(self.host_authority.os, "name", "nt"):
+            with self.assertRaisesRegex(
+                self.host_authority.InventoryError, "Unix"
+            ):
+                self.host_authority._authenticated_cargo_cwd(Path("/"))
+
     def test_run_profile_preserves_stderr_on_compile_failure(self):
         profile = self.load().profiles["macos-hvf-default"]
         runner = FakeRunner()
