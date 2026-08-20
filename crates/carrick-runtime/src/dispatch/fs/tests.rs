@@ -7,7 +7,7 @@ fn logical_lock_request(
 ) -> LogicalRecordLockRequest {
     LogicalRecordLockRequest {
         file: LeaseFileId::Path("/logical-lock".to_owned()),
-        owner: LogicalRecordLockOwner {
+        owner: LogicalRecordLockOwner::Process {
             pid: owner.0,
             serial: owner.1,
         },
@@ -2182,4 +2182,83 @@ fn dispatch_openat2_for_test(
         memory,
         &CompatReporter::default(),
     )
+}
+
+#[test]
+fn hvpatch_ofd_locks_conflict_with_posix_and_other_ofd() {
+    let locks = LogicalRecordLocks::default();
+    let file = LeaseFileId::Path("/test-ofd".to_owned());
+    let posix = LogicalRecordLockRequest {
+        file: file.clone(),
+        owner: LogicalRecordLockOwner::Process {
+            pid: 100,
+            serial: 1,
+        },
+        range: LogicalRecordLockRange { start: 0, end: 50 },
+        write: true,
+    };
+    let ofd1 = LogicalRecordLockRequest {
+        file: file.clone(),
+        owner: LogicalRecordLockOwner::Ofd(0x1000),
+        range: LogicalRecordLockRange { start: 0, end: 50 },
+        write: true,
+    };
+    let ofd2 = LogicalRecordLockRequest {
+        file: file.clone(),
+        owner: LogicalRecordLockOwner::Ofd(0x2000),
+        range: LogicalRecordLockRange { start: 0, end: 50 },
+        write: false,
+    };
+
+    assert_eq!(locks.try_set(posix.clone()), Ok(()));
+    // OFD lock conflicts with POSIX lock
+    assert_eq!(locks.try_set(ofd1.clone()), Err(LINUX_EAGAIN));
+
+    // Release POSIX lock
+    locks.unlock(&posix.file, posix.owner, posix.range);
+
+    // OFD1 acquires exclusive
+    assert_eq!(locks.try_set(ofd1.clone()), Ok(()));
+    // OFD2 read lock conflicts with OFD1 write lock
+    assert_eq!(locks.try_set(ofd2.clone()), Err(LINUX_EAGAIN));
+
+    // Release OFD1 via release_ofd
+    locks.release_ofd(&file, 0x1000);
+    // Now OFD2 can acquire
+    assert_eq!(locks.try_set(ofd2.clone()), Ok(()));
+}
+
+#[test]
+fn hvpatch_flock_shared_and_exclusive_semantics() {
+    let locks = LogicalRecordLocks::default();
+    let file = LeaseFileId::Path("/test-flock".to_owned());
+
+    // OFD 1 and OFD 2 acquire shared flock
+    assert_eq!(locks.try_flock(file.clone(), 0x1000, false), Ok(()));
+    assert_eq!(locks.try_flock(file.clone(), 0x2000, false), Ok(()));
+
+    // OFD 3 tries exclusive flock -> conflicts
+    assert_eq!(
+        locks.try_flock(file.clone(), 0x3000, true),
+        Err(LINUX_EAGAIN)
+    );
+
+    // Unlock OFD 1 and OFD 2
+    locks.unlock_flock(&file, 0x1000);
+    locks.unlock_flock(&file, 0x2000);
+
+    // OFD 3 acquires exclusive flock
+    assert_eq!(locks.try_flock(file.clone(), 0x3000, true), Ok(()));
+
+    // OFD 1 tries shared -> conflicts
+    assert_eq!(
+        locks.try_flock(file.clone(), 0x1000, false),
+        Err(LINUX_EAGAIN)
+    );
+
+    // Release OFD 3
+    locks.release_ofd(&file, 0x3000);
+
+    // Now OFD 1 can acquire exclusive
+    assert_eq!(locks.try_flock(file.clone(), 0x1000, true), Ok(()));
 }

@@ -430,6 +430,7 @@ fn forward_record_lock<M: GuestMemory>(
     this: &SyscallDispatcher,
     cx: &mut SyscallCtx<'_, M>,
     host_fd: i32,
+    desc_ptr: usize,
     linux_cmd: u64,
     arg: u64,
 ) -> DispatchOutcome {
@@ -476,7 +477,7 @@ fn forward_record_lock<M: GuestMemory>(
         _ => return DispatchOutcome::errno(LINUX_EINVAL),
     };
 
-    if this.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch && !is_ofd {
+    if this.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch {
         let file = match logical_record_lock_file(host_fd) {
             Ok(file) => file,
             Err(errno) => return DispatchOutcome::errno(errno),
@@ -485,9 +486,13 @@ fn forward_record_lock<M: GuestMemory>(
             Ok(range) => range,
             Err(errno) => return DispatchOutcome::errno(errno),
         };
-        let owner = LogicalRecordLockOwner::from(cx.kernel.task().key());
+        let owner = if is_ofd {
+            LogicalRecordLockOwner::Ofd(desc_ptr)
+        } else {
+            LogicalRecordLockOwner::from(cx.kernel.task().key())
+        };
         if l_type_linux == LINUX_F_UNLCK as i16 {
-            if linux_cmd == LINUX_F_GETLK {
+            if matches!(linux_cmd, LINUX_F_GETLK | LINUX_F_OFD_GETLK) {
                 return DispatchOutcome::errno(LINUX_EINVAL);
             }
             this.fs.classic_record_locks.unlock(&file, owner, range);
@@ -499,13 +504,13 @@ fn forward_record_lock<M: GuestMemory>(
             range,
             write: l_type_linux == LINUX_F_WRLCK as i16,
         };
-        if linux_cmd == LINUX_F_GETLK {
+        if matches!(linux_cmd, LINUX_F_GETLK | LINUX_F_OFD_GETLK) {
             let conflict = this.fs.classic_record_locks.conflict(&request);
-            return write_logical_record_lock_conflict(&mut *cx.memory, arg, conflict);
+            return write_logical_record_lock_conflict(&mut *cx.memory, arg, conflict, is_ofd);
         }
         match this.fs.classic_record_locks.try_set(request.clone()) {
             Ok(()) => return DispatchOutcome::Returned { value: 0 },
-            Err(errno) if linux_cmd == LINUX_F_SETLK => {
+            Err(errno) if matches!(linux_cmd, LINUX_F_SETLK | LINUX_F_OFD_SETLK) => {
                 return DispatchOutcome::errno(errno);
             }
             Err(errno) if errno != LINUX_EAGAIN => return DispatchOutcome::errno(errno),
@@ -674,20 +679,52 @@ fn tee_host_passthrough(
 /// conflict for lease purposes iff they name the same underlying file: the host
 /// inode under `--fs host`, or the guest open-path for the in-memory backing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum LeaseFileId {
+pub(crate) enum LeaseFileId {
     Inode { dev: u64, ino: u64 },
     Path(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct LogicalRecordLockOwner {
-    pid: i32,
-    serial: u64,
+pub(crate) enum LogicalRecordLockOwner {
+    Process { pid: i32, serial: u64 },
+    Ofd(usize),
+}
+
+impl LogicalRecordLockOwner {
+    #[allow(dead_code)]
+    pub(crate) fn is_ofd(&self) -> bool {
+        matches!(self, Self::Ofd(_))
+    }
+
+    pub(crate) fn pid(&self) -> i32 {
+        match self {
+            Self::Process { pid, .. } => *pid,
+            Self::Ofd(_) => -1,
+        }
+    }
+
+    pub(crate) fn conflicts_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Process {
+                    pid: p1,
+                    serial: s1,
+                },
+                Self::Process {
+                    pid: p2,
+                    serial: s2,
+                },
+            ) => p1 != p2 || s1 != s2,
+            (Self::Ofd(d1), Self::Ofd(d2)) => d1 != d2,
+            // A POSIX lock ALWAYS conflicts with an OFD lock (even from the same process).
+            (Self::Process { .. }, Self::Ofd(_)) | (Self::Ofd(_), Self::Process { .. }) => true,
+        }
+    }
 }
 
 impl From<crate::kernel::TaskKey> for LogicalRecordLockOwner {
     fn from(key: crate::kernel::TaskKey) -> Self {
-        Self {
+        Self::Process {
             pid: key.id.raw(),
             serial: key.serial.raw(),
         }
@@ -715,6 +752,13 @@ struct LogicalRecordLock {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LogicalFlock {
+    pub(crate) file: LeaseFileId,
+    pub(crate) owner: usize,
+    pub(crate) write: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LogicalRecordLockRequest {
     file: LeaseFileId,
     owner: LogicalRecordLockOwner,
@@ -730,6 +774,7 @@ pub(crate) struct LogicalRecordLockRequest {
 #[derive(Default)]
 struct LogicalRecordLockState {
     locks: Vec<LogicalRecordLock>,
+    flocks: Vec<LogicalFlock>,
     /// Which owner each currently-BLOCKED owner is waiting on. An entry exists
     /// only while that owner is parked in `wait_set_interruptibly`.
     waiting_on: std::collections::HashMap<LogicalRecordLockOwner, LogicalRecordLockOwner>,
@@ -750,7 +795,7 @@ impl LogicalRecordLocks {
             .iter()
             .filter(|lock| {
                 lock.file == request.file
-                    && lock.owner != request.owner
+                    && lock.owner.conflicts_with(&request.owner)
                     && lock.range.overlaps(request.range)
                     && (lock.write || request.write)
             })
@@ -835,6 +880,83 @@ impl LogicalRecordLocks {
         self.changed.notify_all();
     }
 
+    pub(crate) fn try_flock(
+        &self,
+        file: LeaseFileId,
+        owner: usize,
+        write: bool,
+    ) -> Result<(), LinuxErrno> {
+        let mut state = self.state.lock();
+        let conflict = state
+            .flocks
+            .iter()
+            .any(|lock| lock.file == file && lock.owner != owner && (lock.write || write));
+        if conflict {
+            return Err(LINUX_EAGAIN);
+        }
+        state
+            .flocks
+            .retain(|lock| lock.file != file || lock.owner != owner);
+        state.flocks.push(LogicalFlock { file, owner, write });
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    pub(crate) fn unlock_flock(&self, file: &LeaseFileId, owner: usize) {
+        let mut state = self.state.lock();
+        state
+            .flocks
+            .retain(|lock| lock.file != *file || lock.owner != owner);
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn wait_flock_interruptibly(
+        &self,
+        file: &LeaseFileId,
+        owner: usize,
+        write: bool,
+        tid: crate::thread::ThreadId,
+    ) -> Result<(), LinuxErrno> {
+        let mut state = self.state.lock();
+        loop {
+            let conflict = state
+                .flocks
+                .iter()
+                .any(|lock| lock.file == *file && lock.owner != owner && (lock.write || write));
+            if !conflict {
+                state
+                    .flocks
+                    .retain(|lock| lock.file != *file || lock.owner != owner);
+                state.flocks.push(LogicalFlock {
+                    file: file.clone(),
+                    owner,
+                    write,
+                });
+                self.changed.notify_all();
+                return Ok(());
+            }
+            if crate::host_signal::has_unblocked_pending_for(
+                tid.raw(),
+                carrick_abi::SigBlockMask::NONE,
+            ) {
+                return Err(LINUX_EINTR);
+            }
+            self.changed
+                .wait_for(&mut state, std::time::Duration::from_millis(10));
+        }
+    }
+
+    pub(crate) fn release_ofd(&self, file: &LeaseFileId, owner: usize) {
+        let mut state = self.state.lock();
+        state
+            .locks
+            .retain(|lock| lock.file != *file || lock.owner != LogicalRecordLockOwner::Ofd(owner));
+        state
+            .flocks
+            .retain(|lock| lock.file != *file || lock.owner != owner);
+        self.changed.notify_all();
+    }
+
     /// Would `me` blocking on `blocker` close a cycle in the wait-for graph?
     ///
     /// fcntl(2): "EDEADLK — It was detected that the specified F_SETLKW command
@@ -890,8 +1012,14 @@ impl LogicalRecordLocks {
                 self.changed.notify_all();
                 break Ok(());
             };
-            if Self::would_deadlock(&state, request.owner, blocker.owner) {
-                break Err(crate::linux_abi::LINUX_EDEADLK);
+            if let (
+                LogicalRecordLockOwner::Process { .. },
+                LogicalRecordLockOwner::Process { .. },
+            ) = (request.owner, blocker.owner)
+            {
+                if Self::would_deadlock(&state, request.owner, blocker.owner) {
+                    break Err(crate::linux_abi::LINUX_EDEADLK);
+                }
             }
             // Publish the edge only while actually parked, and refresh it each
             // iteration: the owner that blocks us can change as locks move.
@@ -1017,6 +1145,7 @@ fn write_logical_record_lock_conflict(
     memory: &mut impl GuestMemory,
     arg: u64,
     conflict: Option<LogicalRecordLock>,
+    is_ofd: bool,
 ) -> DispatchOutcome {
     let Some(conflict) = conflict else {
         return if memory
@@ -1039,11 +1168,12 @@ fn write_logical_record_lock_conflict(
     } else {
         i64::try_from(conflict.range.end.saturating_sub(conflict.range.start)).unwrap_or(i64::MAX)
     };
+    let pid = if is_ofd { -1 } else { conflict.owner.pid() };
     out[0..2].copy_from_slice(&lock_type.to_le_bytes());
     out[2..4].copy_from_slice(&(libc::SEEK_SET as i16).to_le_bytes());
     out[8..16].copy_from_slice(&(conflict.range.start as i64).to_le_bytes());
     out[16..24].copy_from_slice(&len.to_le_bytes());
-    out[24..28].copy_from_slice(&conflict.owner.pid.to_le_bytes());
+    out[24..28].copy_from_slice(&pid.to_le_bytes());
     if memory.write_bytes(arg, &out).is_err() {
         DispatchOutcome::errno(LINUX_EFAULT)
     } else {
@@ -1576,6 +1706,11 @@ impl SyscallDispatcher {
             self.fs
                 .classic_record_locks
                 .release_file_owner(&file, LogicalRecordLockOwner::from(owner));
+            let is_last_ref = Arc::strong_count(&open_file.description) <= 2;
+            if is_last_ref {
+                let desc_ptr = Arc::as_ptr(&open_file.description) as usize;
+                self.fs.classic_record_locks.release_ofd(&file, desc_ptr);
+            }
         }
     }
 
@@ -7640,9 +7775,12 @@ impl SyscallDispatcher {
                     if !this.fd_is_valid(fd.0) {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     }
+                    let desc_ptr = this
+                        .open_file(fd.0)
+                        .map_or(0, |of| Arc::as_ptr(&of.description) as usize);
                     match this.host_file_fd_for_flush(fd.0) {
                         Ok(Some(host_fd)) => {
-                            forward_record_lock(this, cx, host_fd, command, arg)
+                            forward_record_lock(this, cx, host_fd, desc_ptr, command, arg)
                         }
                         // Not host-backed → preserve the single-tenant no-op,
                         // but still do the kernel's front-door flock validation
@@ -7658,9 +7796,12 @@ impl SyscallDispatcher {
                     if !this.fd_is_valid(fd.0) {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     }
+                    let desc_ptr = this
+                        .open_file(fd.0)
+                        .map_or(0, |of| Arc::as_ptr(&of.description) as usize);
                     match this.host_file_fd_for_flush(fd.0) {
                         Ok(Some(host_fd)) => {
-                            forward_record_lock(this, cx, host_fd, command, arg)
+                            forward_record_lock(this, cx, host_fd, desc_ptr, command, arg)
                         }
                         // Not host-backed → "no lock present": leave the
                         // caller's struct flock untouched (l_type=F_UNLCK is
@@ -7674,19 +7815,17 @@ impl SyscallDispatcher {
                     }
                 }
                 // OFD locks (F_OFD_*) are owned by the open file description, not
-                // the process. macOS has them natively (F_OFD_SETLK/SETLKW/GETLK),
-                // and carrick's fork model maps a guest OFD 1:1 onto a host OFD
-                // (dup shares the description + host fd; clone(2) forks a real host
-                // process that inherits the host fd table), so the macOS kernel
-                // arbitrates OFD conflicts/inheritance with Linux semantics.
-                // Forward exactly like the classic commands; fall back to the
-                // single-tenant no-op for non-host-backed (--fs memory/synthetic)
-                // fds, after the same front-door flock validation.
+                // the process.
                 LINUX_F_OFD_SETLK | LINUX_F_OFD_SETLKW | LINUX_F_OFD_GETLK => {
                     if !this.fd_is_valid(fd.0) {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     }
-                    if !carrick_portable::host_ofd_locks_supported() {
+                    let desc_ptr = this
+                        .open_file(fd.0)
+                        .map_or(0, |of| Arc::as_ptr(&of.description) as usize);
+                    if this.execution_backend() != crate::page_profile::ExecutionBackend::HvPatch
+                        && !carrick_portable::host_ofd_locks_supported()
+                    {
                         return Ok(match validate_flock_arg(&*cx.memory, arg) {
                             Ok(()) => DispatchOutcome::errno(LINUX_ENOTSUP),
                             Err(errno) => DispatchOutcome::errno(errno),
@@ -7694,7 +7833,7 @@ impl SyscallDispatcher {
                     }
                     match this.host_file_fd_for_flush(fd.0) {
                         Ok(Some(host_fd)) => {
-                            forward_record_lock(this, cx, host_fd, command, arg)
+                            forward_record_lock(this, cx, host_fd, desc_ptr, command, arg)
                         }
                         Ok(None) => match validate_flock_arg(&*cx.memory, arg) {
                             Ok(()) => DispatchOutcome::Returned { value: 0 },
@@ -8791,9 +8930,9 @@ impl SyscallDispatcher {
         fn flock(this, cx, fd: Fd, operation: u64) {
 
             let fd: Fd = fd;
-            if !this.fd_is_valid(fd.0) {
+            let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            }
+            };
 
             let lock_operation = operation & !LINUX_LOCK_NB;
             if !matches!(
@@ -8802,56 +8941,42 @@ impl SyscallDispatcher {
             ) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            // Host-backed fd: forward to the macOS kernel's flock(2) so that
-            // cross-process lock conflicts are real — a forked guest shares the
-            // same host fd, so the parent's lock blocks the child's conflicting
-            // LOCK_NB attempt (flock04/06). macOS LOCK_SH/EX/UN/NB are
-            // numerically identical to Linux's, so `operation` passes straight
-            // through; EWOULDBLOCK maps to Linux EAGAIN via host_syscall_errno.
-            // A non-host fd (in-memory backend) keeps the single-tenant no-op.
-            if let Some(host_fd) = this.regular_host_file_fd(fd.0) {
-                // flock(2): "EINTR — while waiting to acquire a lock, the call
-                // was interrupted by delivery of a signal caught by a handler."
-                // A bare blocking host flock cannot honour that: the thread
-                // parks inside the macOS kernel where carrick can observe
-                // nothing, so no guest signal — not even SIGKILL — ends it, and
-                // LTP flock07 (child blocks on LOCK_EX, parent signals it after
-                // 1 s, test asserts EINTR) wedged to the harness timeout.
-                //
-                // Always ask the host NON-blocking and own the waiting here, so
-                // the interrupt check is reachable between attempts. LOCK_UN and
-                // an uncontended acquire still complete on the first pass.
-                let guest_nonblock = operation & LINUX_LOCK_NB != 0;
-                let host_operation = (operation as i32) | libc::LOCK_NB;
-                let tid = cx.tid();
-                loop {
-                    let rc = unsafe { libc::flock(host_fd.get(), host_operation) };
-                    match rc.host_syscall_errno() {
-                        Ok(_) => return Ok(DispatchOutcome::Returned { value: 0 }),
-                        // The guest asked for LOCK_NB itself: report the
-                        // would-block verbatim rather than waiting on its
-                        // behalf.
-                        Err(errno) if errno == LINUX_EAGAIN && guest_nonblock => {
-                            return Ok(DispatchOutcome::errno(errno));
-                        }
-                        Err(errno) if errno == LINUX_EAGAIN => {
-                            let non_interrupting =
-                                this.non_interrupting_signal_mask(cx.kernel, tid);
-                            if this.signal_wait_should_eintr(
-                                cx.kernel,
-                                tid,
-                                carrick_abi::SigSet::EMPTY,
-                                carrick_abi::SigBlockMask::blocking_all_of(non_interrupting),
-                            ) {
-                                return Ok(DispatchOutcome::errno(LINUX_EINTR));
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(2));
-                        }
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+
+            let file = {
+                let description = open_file.description.read();
+                Self::lease_file_identity(&description)
+            };
+            let Some(file) = file else {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            };
+
+            let desc_ptr = Arc::as_ptr(&open_file.description) as usize;
+
+            if lock_operation == LINUX_LOCK_UN {
+                this.fs.classic_record_locks.unlock_flock(&file, desc_ptr);
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+
+            let write = lock_operation == LINUX_LOCK_EX;
+            let nonblocking = operation & LINUX_LOCK_NB != 0;
+
+            match this
+                .fs
+                .classic_record_locks
+                .try_flock(file.clone(), desc_ptr, write)
+            {
+                Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                Err(errno) if nonblocking => Ok(DispatchOutcome::errno(errno)),
+                Err(_) => {
+                    let tid = cx.tid();
+                    match this.fs.classic_record_locks.wait_flock_interruptibly(
+                        &file, desc_ptr, write, tid,
+                    ) {
+                        Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                        Err(errno) => Ok(DispatchOutcome::errno(errno)),
                     }
                 }
             }
-            Ok(DispatchOutcome::Returned { value: 0 })
 
         }
 
