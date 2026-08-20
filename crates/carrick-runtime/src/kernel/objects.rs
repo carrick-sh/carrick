@@ -3258,8 +3258,7 @@ impl Task {
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
-            user_ns: AtomicU64::new(0),
-            system_ns: AtomicU64::new(0),
+            cpu_accounting: Arc::new(ThreadCpuAccounting::default()),
             crash_vote: Mutex::new(None),
             crash_safe_point_participant: AtomicBool::new(false),
             thread_keyring: Mutex::new(None),
@@ -3284,8 +3283,7 @@ impl Task {
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
-            user_ns: AtomicU64::new(0),
-            system_ns: AtomicU64::new(0),
+            cpu_accounting: Arc::new(ThreadCpuAccounting::default()),
             crash_vote: Mutex::new(None),
             crash_safe_point_participant: AtomicBool::new(false),
             thread_keyring: Mutex::new(None),
@@ -3310,8 +3308,7 @@ impl Task {
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
-            user_ns: AtomicU64::new(0),
-            system_ns: AtomicU64::new(0),
+            cpu_accounting: Arc::new(ThreadCpuAccounting::default()),
             crash_vote: Mutex::new(None),
             crash_safe_point_participant: AtomicBool::new(false),
             thread_keyring: Mutex::new(None),
@@ -3336,8 +3333,11 @@ impl Task {
             revision: ObjectRevision::new(),
             runner_gate: Arc::clone(&caller.runner_gate),
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
-            user_ns: AtomicU64::new(caller.user_ns.load(Ordering::Acquire)),
-            system_ns: AtomicU64::new(caller.system_ns.load(Ordering::Acquire)),
+            // The syscall service scope that committed exec still holds the
+            // predecessor context until its final charge. Sharing this exact
+            // logical ledger makes that post-publication interval visible to
+            // the replacement without a second charge or a timing race.
+            cpu_accounting: Arc::clone(&caller.cpu_accounting),
             crash_vote: Mutex::new(None),
             crash_safe_point_participant: AtomicBool::new(false),
             thread_keyring: Mutex::new(None),
@@ -3784,6 +3784,21 @@ pub struct MigratableTaskState {
     pub asid_generation: u64,
 }
 
+impl MigratableTaskState {
+    fn validate_identity(&self) -> Result<(), ThreadExecutionError> {
+        let (cpu_mm_generation, cpu_asid_generation) = self.cpu.task_identity();
+        if cpu_mm_generation != self.mm.raw() || cpu_asid_generation != self.asid_generation {
+            return Err(ThreadExecutionError::SnapshotCpuIdentityMismatch {
+                expected_mm_generation: self.mm.raw(),
+                actual_mm_generation: cpu_mm_generation,
+                expected_asid_generation: self.asid_generation,
+                actual_asid_generation: cpu_asid_generation,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionFailure {
     UnsettledLeaseDropped {
@@ -3878,12 +3893,25 @@ pub enum ThreadExecutionError {
     SnapshotVersionMismatch { expected: u16, actual: u16 },
     #[error("execution lease for generation {generation:?} carries no CPU snapshot")]
     MissingCpuState { generation: ExecutionGeneration },
+    #[error("snapshot MM mismatch: expected {expected:?}, got {actual:?}")]
+    SnapshotMmMismatch { expected: MmId, actual: MmId },
+    #[error("snapshot ASID generation mismatch: expected {expected}, got {actual}")]
+    SnapshotAsidGenerationMismatch { expected: u64, actual: u64 },
+    #[error(
+        "CPU snapshot identity mismatch: expected MM/ASID {expected_mm_generation}/{expected_asid_generation}, got {actual_mm_generation}/{actual_asid_generation}"
+    )]
+    SnapshotCpuIdentityMismatch {
+        expected_mm_generation: u64,
+        actual_mm_generation: u64,
+        expected_asid_generation: u64,
+        actual_asid_generation: u64,
+    },
 }
 
 #[derive(Debug)]
 struct ThreadExecutionRecord {
     state: ThreadExecutionState,
-    cpu_state: Option<GuestCpuState>,
+    task_state: Option<Box<MigratableTaskState>>,
     next_executor_epoch: u64,
 }
 
@@ -3891,7 +3919,7 @@ impl ThreadExecutionRecord {
     const fn uninitialized() -> Self {
         Self {
             state: ThreadExecutionState::Uninitialized,
-            cpu_state: None,
+            task_state: None,
             next_executor_epoch: 1,
         }
     }
@@ -3907,7 +3935,7 @@ pub struct ThreadExecutionLease {
     generation: ExecutionGeneration,
     executor: ExecutorId,
     executor_epoch: u64,
-    cpu_state: Option<GuestCpuState>,
+    task_state: Option<Box<MigratableTaskState>>,
     settled: bool,
 }
 
@@ -3945,28 +3973,42 @@ impl ThreadExecutionLease {
 
     /// Return the typed snapshot only when the restoring backend names the
     /// exact architecture and version it implements.
-    pub fn cpu_state_for_restore(
+    pub fn task_state_for_restore(
         &self,
         expected_abi: LinuxGuestAbi,
         expected_version: u16,
-    ) -> Result<&GuestCpuState, ThreadExecutionError> {
-        let Some(state) = self.cpu_state.as_ref() else {
+        expected_mm: MmId,
+        expected_asid_generation: u64,
+    ) -> Result<&MigratableTaskState, ThreadExecutionError> {
+        let Some(state) = self.task_state.as_ref() else {
             return Err(ThreadExecutionError::MissingCpuState {
                 generation: self.generation,
             });
         };
-        let actual_abi = state.guest_abi();
+        let actual_abi = state.cpu.guest_abi();
         if actual_abi != expected_abi {
             return Err(ThreadExecutionError::SnapshotArchitectureMismatch {
                 expected: expected_abi,
                 actual: actual_abi,
             });
         }
-        let actual_version = state.version();
+        let actual_version = state.cpu.version();
         if actual_version != expected_version {
             return Err(ThreadExecutionError::SnapshotVersionMismatch {
                 expected: expected_version,
                 actual: actual_version,
+            });
+        }
+        if state.mm != expected_mm {
+            return Err(ThreadExecutionError::SnapshotMmMismatch {
+                expected: expected_mm,
+                actual: state.mm,
+            });
+        }
+        if state.asid_generation != expected_asid_generation {
+            return Err(ThreadExecutionError::SnapshotAsidGenerationMismatch {
+                expected: expected_asid_generation,
+                actual: state.asid_generation,
             });
         }
         Ok(state)
@@ -3975,28 +4017,41 @@ impl ThreadExecutionLease {
     /// Replace the lease's pre-run image with the exact state captured at the
     /// switch-out boundary. Architecture and version may not drift while one
     /// execution generation is running.
-    pub fn replace_cpu_state(
+    pub fn replace_task_state(
         &mut self,
-        replacement: GuestCpuState,
+        replacement: MigratableTaskState,
     ) -> Result<(), ThreadExecutionError> {
-        let Some(current) = self.cpu_state.as_ref() else {
+        replacement.validate_identity()?;
+        let Some(current) = self.task_state.as_ref() else {
             return Err(ThreadExecutionError::MissingCpuState {
                 generation: self.generation,
             });
         };
-        if current.guest_abi() != replacement.guest_abi() {
+        if current.cpu.guest_abi() != replacement.cpu.guest_abi() {
             return Err(ThreadExecutionError::SnapshotArchitectureMismatch {
-                expected: current.guest_abi(),
-                actual: replacement.guest_abi(),
+                expected: current.cpu.guest_abi(),
+                actual: replacement.cpu.guest_abi(),
             });
         }
-        if current.version() != replacement.version() {
+        if current.cpu.version() != replacement.cpu.version() {
             return Err(ThreadExecutionError::SnapshotVersionMismatch {
-                expected: current.version(),
-                actual: replacement.version(),
+                expected: current.cpu.version(),
+                actual: replacement.cpu.version(),
             });
         }
-        self.cpu_state = Some(replacement);
+        if current.mm != replacement.mm {
+            return Err(ThreadExecutionError::SnapshotMmMismatch {
+                expected: current.mm,
+                actual: replacement.mm,
+            });
+        }
+        if current.asid_generation != replacement.asid_generation {
+            return Err(ThreadExecutionError::SnapshotAsidGenerationMismatch {
+                expected: current.asid_generation,
+                actual: replacement.asid_generation,
+            });
+        }
+        self.task_state = Some(Box::new(replacement));
         Ok(())
     }
 }
@@ -4033,7 +4088,7 @@ pub struct Thread {
     execution: Mutex<ThreadExecutionRecord>,
     /// Guest USER time charged directly to this exact logical thread across
     /// every host execution interval. Executor slots are never identities.
-    user_ns: AtomicU64,
+    cpu_accounting: Arc<ThreadCpuAccounting>,
     /// Guest SYSTEM time for this thread, in nanoseconds: the CPU carrick has
     /// burned servicing THIS thread's syscalls.
     ///
@@ -4043,7 +4098,6 @@ pub struct Thread {
     /// (`dispatch::resources::with_captured_resources`), from
     /// `CLOCK_THREAD_CPUTIME_ID` so a BLOCKED syscall — `wait4`, `epoll_wait` —
     /// contributes nothing, exactly as on Linux.
-    system_ns: AtomicU64,
     /// This thread's answer to one task-local crash-capture generation: exact
     /// architectural state read at a safe point, or an explicit withdrawal
     /// from a park it cannot publish from. The generation prevents a delayed
@@ -4066,6 +4120,12 @@ pub struct Thread {
     thread_keyring: Mutex<Option<KeySerial>>,
 }
 
+#[derive(Debug, Default)]
+struct ThreadCpuAccounting {
+    user_ns: AtomicU64,
+    system_ns: AtomicU64,
+}
+
 impl Thread {
     pub const fn key(&self) -> ThreadKey {
         self.key
@@ -4078,19 +4138,20 @@ impl Thread {
     /// Seed the first complete task snapshot after backend materialization.
     /// New, fork, clone, and exec-replacement objects all begin uninitialized,
     /// and no other state accepts this publication.
-    pub fn publish_initial_cpu_state(
+    pub fn publish_initial_task_state(
         &self,
-        state: GuestCpuState,
+        state: MigratableTaskState,
     ) -> Result<ExecutionGeneration, ThreadExecutionError> {
+        state.validate_identity()?;
         let mut execution = self.execution.lock();
         if execution.state != ThreadExecutionState::Uninitialized {
             return Err(ThreadExecutionError::InvalidTransition {
-                operation: "publish_initial_cpu_state",
+                operation: "publish_initial_task_state",
                 state: execution.state,
             });
         }
         let generation = ExecutionGeneration::INITIAL;
-        execution.cpu_state = Some(state);
+        execution.task_state = Some(Box::new(state));
         execution.state = ThreadExecutionState::Runnable { generation };
         drop(execution);
         self.revision.publish();
@@ -4116,7 +4177,7 @@ impl Thread {
         let next_executor_epoch = executor_epoch
             .checked_add(1)
             .ok_or(ThreadExecutionError::GenerationExhausted)?;
-        let Some(cpu_state) = execution.cpu_state.take() else {
+        let Some(task_state) = execution.task_state.take() else {
             return Err(ThreadExecutionError::InvalidTransition {
                 operation: "claim_runnable_without_cpu_state",
                 state: execution.state,
@@ -4137,7 +4198,7 @@ impl Thread {
             generation,
             executor,
             executor_epoch,
-            cpu_state: Some(cpu_state),
+            task_state: Some(task_state),
             settled: false,
         })
     }
@@ -4163,7 +4224,7 @@ impl Thread {
         execution.next_executor_epoch = executor_epoch
             .checked_add(1)
             .ok_or(ThreadExecutionError::GenerationExhausted)?;
-        let Some(cpu_state) = execution.cpu_state.take() else {
+        let Some(task_state) = execution.task_state.take() else {
             return Err(ThreadExecutionError::InvalidTransition {
                 operation: "claim_blocked_without_cpu_state",
                 state: execution.state,
@@ -4183,7 +4244,7 @@ impl Thread {
             generation,
             executor,
             executor_epoch,
-            cpu_state: Some(cpu_state),
+            task_state: Some(task_state),
             settled: false,
         })
     }
@@ -4257,8 +4318,8 @@ impl Thread {
         let Some(generation) = lease.generation.next() else {
             return Err((ThreadExecutionError::GenerationExhausted, lease));
         };
-        execution.cpu_state = None;
-        let _ = lease.cpu_state.take();
+        execution.task_state = None;
+        let _ = lease.task_state.take();
         execution.state = ThreadExecutionState::Failed { generation, reason };
         lease.settled = true;
         drop(execution);
@@ -4273,7 +4334,7 @@ impl Thread {
         if execution.state != ThreadExecutionState::Uninitialized {
             return;
         }
-        execution.cpu_state = None;
+        execution.task_state = None;
         execution.state = ThreadExecutionState::Failed {
             generation: ExecutionGeneration::INITIAL,
             reason,
@@ -4300,16 +4361,16 @@ impl Thread {
         };
         match settlement {
             ExecutionSettlement::Runnable => {
-                execution.cpu_state = lease.cpu_state.take();
+                execution.task_state = lease.task_state.take();
                 execution.state = ThreadExecutionState::Runnable { generation };
             }
             ExecutionSettlement::Blocked(reason) => {
-                execution.cpu_state = lease.cpu_state.take();
+                execution.task_state = lease.task_state.take();
                 execution.state = ThreadExecutionState::Blocked { generation, reason };
             }
             ExecutionSettlement::Exited => {
-                execution.cpu_state = None;
-                let _ = lease.cpu_state.take();
+                execution.task_state = None;
+                let _ = lease.task_state.take();
                 execution.state = ThreadExecutionState::Exited { generation };
             }
         }
@@ -4371,7 +4432,7 @@ impl Thread {
             .generation
             .next()
             .unwrap_or_else(|| std::process::abort());
-        execution.cpu_state = None;
+        execution.task_state = None;
         execution.state = ThreadExecutionState::Failed {
             generation,
             reason: ExecutionFailure::UnsettledLeaseDropped {
@@ -4394,7 +4455,7 @@ impl Thread {
             .unwrap_or(ExecutionGeneration::INITIAL)
             .next()
             .unwrap_or_else(|| std::process::abort());
-        execution.cpu_state = None;
+        execution.task_state = None;
         execution.state = ThreadExecutionState::Exited { generation };
         drop(execution);
         self.revision.publish();
@@ -4481,21 +4542,23 @@ impl Thread {
 
     /// Guest USER CPU (µs) accumulated across every execution interval.
     pub fn cpu_us(&self) -> u64 {
-        self.user_ns.load(Ordering::Acquire) / 1000
+        self.cpu_accounting.user_ns.load(Ordering::Acquire) / 1000
     }
 
     /// Charge guest execution CPU directly to this logical thread. Executor
     /// slots are intentionally not accounting identities.
     pub fn charge_user_ns(&self, delta_ns: u64) {
         if delta_ns != 0 {
-            self.user_ns.fetch_add(delta_ns, Ordering::AcqRel);
+            self.cpu_accounting
+                .user_ns
+                .fetch_add(delta_ns, Ordering::AcqRel);
         }
     }
 
     /// Guest SYSTEM CPU (µs) this thread has accumulated — carrick's own CPU
     /// spent servicing this thread's syscalls. See [`Self::system_ns`].
     pub fn system_cpu_us(&self) -> u64 {
-        self.system_ns.load(Ordering::Acquire) / 1000
+        self.cpu_accounting.system_ns.load(Ordering::Acquire) / 1000
     }
 
     /// Charge `delta_ns` of syscall-service CPU to this thread. Called once per
@@ -4503,7 +4566,9 @@ impl Thread {
     /// host thread's own CPU clock so blocked time is excluded.
     pub fn charge_system_ns(&self, delta_ns: u64) {
         if delta_ns != 0 {
-            self.system_ns.fetch_add(delta_ns, Ordering::AcqRel);
+            self.cpu_accounting
+                .system_ns
+                .fetch_add(delta_ns, Ordering::AcqRel);
         }
     }
 

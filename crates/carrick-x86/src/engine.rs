@@ -213,6 +213,8 @@ pub struct X86EngineCore<V: X86Vmm> {
     mm_generation: u64,
     /// Exact ASID allocation generation authorizing the task's CR3.
     asid_generation: u64,
+    /// Non-aliasing guest-run time awaiting the exact logical-thread charge.
+    pending_guest_run_receipt_ns: u64,
     /// Process-wide PROT_NONE set: the SHARED host-side EFAULT gate every x86
     /// backend (KVM/bhyve/NVMM) inherits via `GuestMemory::read_bytes`/
     /// `write_bytes`. Held as `Arc` so `clone(CLONE_THREAD)` siblings share ONE
@@ -261,6 +263,7 @@ impl<V: X86Vmm> X86EngineCore<V> {
             is_forked_child: false,
             mm_generation: 1,
             asid_generation: 1,
+            pending_guest_run_receipt_ns: 0,
             protections,
         }
     }
@@ -1047,7 +1050,11 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
             // add to the host thread's rusage. Mirrors the KVM (KvmTrapEngine) and
             // HVF trap loops, but lives HERE so every backend on this shared engine
             // gets it for free.
+            let run_started = std::time::Instant::now();
             let run_result = carrick_host::guest_cpu::timed_run(|| self.vcpu.run());
+            self.pending_guest_run_receipt_ns = self
+                .pending_guest_run_receipt_ns
+                .saturating_add(run_started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
             match run_result? {
                 X86Exit::Syscall { frame, resume_pc } => {
                     self.sysret_resume = None;
@@ -1599,6 +1606,18 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
         self.asid_generation = asid_generation;
     }
 
+    fn take_guest_run_receipt_ns(&mut self) -> u64 {
+        std::mem::take(&mut self.pending_guest_run_receipt_ns)
+    }
+
+    fn snapshot_guest_state_for_exec(&mut self) -> Result<GuestCpuState, TrapError> {
+        let snapshot = self
+            .vm
+            .save_guest_state(&self.vcpu)
+            .map_err(|error| TrapError::Hypervisor(format!("snapshot x86 exec state: {error}")))?;
+        GuestCpuState::from_x86_64_v1(x86_task_state_from_snapshot(self, &snapshot)?)
+    }
+
     fn diagnostic_wait_registers(&self) -> Option<carrick_hal::GuestWaitRegisters> {
         Some(carrick_hal::GuestWaitRegisters {
             pc: self.current_pc().ok()?,
@@ -2101,6 +2120,32 @@ mod tests {
             gdt_base: 0x1000_1000,
             pml4_base: 0x1000_2000,
         }
+    }
+
+    #[test]
+    fn concurrent_guest_run_receipts_do_not_alias_past_512_host_threads() {
+        const THREADS: usize = 520;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut engine =
+                        X86EngineCore::from_parts(TestVmm, TestVcpu::default(), test_layout());
+                    barrier.wait();
+                    assert!(engine.next_syscall().unwrap().is_none());
+                    let receipt = engine.take_guest_run_receipt_ns();
+                    assert_eq!(engine.take_guest_run_receipt_ns(), 0);
+                    receipt
+                })
+            })
+            .collect();
+        let receipts: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("receipt worker"))
+            .collect();
+        assert_eq!(receipts.len(), THREADS);
+        assert!(receipts.iter().all(|receipt| *receipt > 0));
     }
 
     #[test]

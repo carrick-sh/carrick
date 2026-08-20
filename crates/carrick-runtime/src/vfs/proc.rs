@@ -122,6 +122,8 @@ pub struct SyntheticProcIdentity {
     pub ppid: u32,
     pub pgrp: u32,
     pub session: u32,
+    pub user_cpu_us: u64,
+    pub system_cpu_us: u64,
 }
 
 /// One authoritative Linux thread rendered by the in-process HVPatch `/proc`
@@ -133,6 +135,8 @@ pub struct SyntheticProcThread {
     pub tid: u32,
     pub state: char,
     pub comm: Option<String>,
+    pub user_cpu_us: u64,
+    pub system_cpu_us: u64,
 }
 
 /// One LIVE Linux process other than the reader, rendered by the in-process
@@ -159,6 +163,8 @@ pub struct SyntheticProcProcess {
     /// once.
     pub tids: Vec<u32>,
     pub comm: String,
+    pub user_cpu_us: u64,
+    pub system_cpu_us: u64,
 }
 
 /// One exited-but-unreaped Linux process rendered by the in-process HVPatch
@@ -3174,6 +3180,15 @@ fn synthetic_proc_self_stat(ctx: &SyntheticProcContext) -> String {
     );
     let pgrp = identity.map_or(pid, |identity| identity.pgrp);
     let session = identity.map_or(pid, |identity| identity.session);
+    let (utime_ticks, stime_ticks) = identity.map_or_else(
+        || (self_utime_ticks(), 0),
+        |identity| {
+            (
+                cpu_us_to_ticks(identity.user_cpu_us),
+                cpu_us_to_ticks(identity.system_cpu_us),
+            )
+        },
+    );
     let (nthreads, state) = match ctx.threads.as_ref() {
         Some(threads) => (
             threads.len().max(1),
@@ -3203,7 +3218,8 @@ fn synthetic_proc_self_stat(ctx: &SyntheticProcContext) -> String {
         pgrp,
         session,
         nthreads,
-        self_utime_ticks(),
+        utime_ticks,
+        stime_ticks,
     )
 }
 
@@ -3240,6 +3256,7 @@ fn proc_stat_line(
     session: u32,
     num_threads: usize,
     utime_ticks: u64,
+    stime_ticks: u64,
 ) -> String {
     // Field 14 is utime (user CPU, in clock ticks). It MUST advance: a real test
     // setup spins `do { read } while (utime == 0)` to confirm CPU was consumed
@@ -3256,10 +3273,66 @@ fn proc_stat_line(
     // the tail (Go runtime, ps, monitoring agents) reads a short array if any
     // are missing. The final `0` is field 52.
     format!(
-        "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 -1 4194560 0 0 0 0 {utime_ticks} 0 0 0 \
+        "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 -1 4194560 0 0 0 0 {utime_ticks} {stime_ticks} 0 0 \
 20 0 {num_threads} 0 1 10485760 256 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 \
 17 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
     )
+}
+
+#[cfg(test)]
+#[test]
+fn proc_stat_line_renders_exact_logical_user_and_system_ticks() {
+    let line = proc_stat_line(7, "task", 'R', 1, 7, 7, 1, 17, 19);
+    let fields: Vec<_> = line.split_whitespace().collect();
+    assert_eq!(fields[13], "17");
+    assert_eq!(fields[14], "19");
+}
+
+#[cfg(test)]
+#[test]
+fn synthetic_self_thread_and_peer_stat_use_published_logical_cpu() {
+    let ctx = SyntheticProcContext {
+        executable_path: "/bin/self".to_owned(),
+        identity: Some(SyntheticProcIdentity {
+            pid: 3,
+            tid: 3,
+            ppid: 1,
+            pgrp: 3,
+            session: 3,
+            user_cpu_us: 1_700_000,
+            system_cpu_us: 1_900_000,
+        }),
+        threads: Some(vec![SyntheticProcThread {
+            tid: 4,
+            state: 'R',
+            comm: Some("worker".to_owned()),
+            user_cpu_us: 2_300_000,
+            system_cpu_us: 2_900_000,
+        }]),
+        processes: Some(vec![SyntheticProcProcess {
+            pid: 7,
+            ppid: 1,
+            pgrp: 7,
+            session: 7,
+            state: 'S',
+            tids: vec![7],
+            comm: "peer".to_owned(),
+            user_cpu_us: 3_100_000,
+            system_cpu_us: 3_700_000,
+        }]),
+        ..SyntheticProcContext::default()
+    };
+    let ticks = |path| {
+        let line = String::from_utf8(synthetic_file(path, &ctx).unwrap()).unwrap();
+        let fields: Vec<_> = line.split_whitespace().collect();
+        (
+            fields[13].parse::<u64>().unwrap(),
+            fields[14].parse::<u64>().unwrap(),
+        )
+    };
+    assert_eq!(ticks("/proc/self/stat"), (170, 190));
+    assert_eq!(ticks("/proc/self/task/4/stat"), (230, 290));
+    assert_eq!(ticks("/proc/7/stat"), (310, 370));
 }
 
 /// This process's accumulated guest user-CPU time in clock ticks (field 14 of
@@ -3268,7 +3341,11 @@ fn proc_stat_line(
 /// read (which tight loops hammer). All guest cycles count as user time; there
 /// is no cheap cross-platform user/system split, so `stime` stays 0.
 fn self_utime_ticks() -> u64 {
-    crate::guest_cpu::total_us().saturating_mul(carrick_abi::LINUX_CLK_TCK as u64) / 1_000_000
+    cpu_us_to_ticks(crate::guest_cpu::total_us())
+}
+
+fn cpu_us_to_ticks(cpu_us: u64) -> u64 {
+    cpu_us.saturating_mul(carrick_abi::LINUX_CLK_TCK as u64) / 1_000_000
 }
 
 fn synthetic_proc_pid_file(
@@ -3323,7 +3400,8 @@ fn synthetic_proc_pid_file(
                         identity.pgrp,
                         identity.session,
                         threads.len().max(1),
-                        self_utime_ticks(),
+                        cpu_us_to_ticks(thread.user_cpu_us),
+                        cpu_us_to_ticks(thread.system_cpu_us),
                     )
                     .into_bytes(),
                 );
@@ -3371,6 +3449,7 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{count}\n",
                     zombie.session,
                     1,
                     0,
+                    0,
                 )
                 .into_bytes(),
             ),
@@ -3415,11 +3494,8 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t1\n",
                     process.pgrp,
                     process.session,
                     threads,
-                    // CPU accounting is per-carrier, not per-Linux-process, so
-                    // charging a peer this process's ticks would be a fresh
-                    // instance of exactly the bug this arm fixes. 0 until the
-                    // kernel graph carries per-task CPU.
-                    0,
+                    cpu_us_to_ticks(process.user_cpu_us),
+                    cpu_us_to_ticks(process.system_cpu_us),
                 )
                 .into_bytes(),
             ),
@@ -3488,6 +3564,7 @@ Threads:\t{threads}\n",
                         me,
                         own_threads.len().max(1),
                         self_utime_ticks(),
+                        0,
                     )
                     .into_bytes(),
                 );
@@ -3526,7 +3603,7 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{n}\n",
         let me = std::process::id();
         let comm = self_comm;
         return match rest {
-            "stat" => Some(proc_stat_line(pid, comm, state, ppid, me, me, 1, 0).into_bytes()),
+            "stat" => Some(proc_stat_line(pid, comm, state, ppid, me, me, 1, 0, 0).into_bytes()),
             "comm" => Some(format!("{comm}\n").into_bytes()),
             "cmdline" => {
                 let mut b = comm.as_bytes().to_vec();
@@ -3610,7 +3687,8 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t1\n",
         // a single thread (num_threads=1). The multi-threaded-fork warning only
         // reads the caller's OWN /proc/self/stat, which uses the live count.
         "stat" => Some(
-            proc_stat_line(pid, &comm, state, disp_ppid, disp_pgid, disp_pgid, 1, 0).into_bytes(),
+            proc_stat_line(pid, &comm, state, disp_ppid, disp_pgid, disp_pgid, 1, 0, 0)
+                .into_bytes(),
         ),
         "comm" => Some(format!("{comm}\n").into_bytes()),
         "cmdline" => {
@@ -4059,17 +4137,23 @@ mod tests {
                 ppid: 0,
                 pgrp: 1,
                 session: 1,
+                user_cpu_us: 0,
+                system_cpu_us: 0,
             }),
             threads: Some(vec![
                 SyntheticProcThread {
                     tid: 1,
                     state: 'R',
                     comm: Some("mainthread".to_owned()),
+                    user_cpu_us: 0,
+                    system_cpu_us: 0,
                 },
                 SyntheticProcThread {
                     tid: 2,
                     state: 'S',
                     comm: Some("worker-thread".to_owned()),
+                    user_cpu_us: 0,
+                    system_cpu_us: 0,
                 },
             ]),
             ..SyntheticProcContext::default()
@@ -4159,11 +4243,15 @@ mod tests {
                 tid: 73,
                 state: 'R',
                 comm: Some("leader".to_owned()),
+                user_cpu_us: 0,
+                system_cpu_us: 0,
             },
             SyntheticProcThread {
                 tid: 74,
                 state: 'S',
                 comm: Some("waiter".to_owned()),
+                user_cpu_us: 0,
+                system_cpu_us: 0,
             },
         ];
         let ctx = OpenContext {
@@ -4173,6 +4261,8 @@ mod tests {
                 ppid: 1,
                 pgrp: 73,
                 session: 73,
+                user_cpu_us: 0,
+                system_cpu_us: 0,
             }),
             threads: Some(&threads),
             ..OpenContext::default()
@@ -4581,6 +4671,8 @@ mod tests {
             ppid: 1,
             pgrp: 2,
             session: 1,
+            user_cpu_us: 0,
+            system_cpu_us: 0,
         });
 
         let line = String::from_utf8(synthetic_file("/proc/self/stat", &context).unwrap()).unwrap();
@@ -5342,6 +5434,8 @@ mod tests {
                 ppid: 1,
                 pgrp: 1,
                 session: 1,
+                user_cpu_us: 0,
+                system_cpu_us: 0,
             }),
             processes: Some(vec![
                 SyntheticProcProcess {
@@ -5352,6 +5446,8 @@ mod tests {
                     state: 'S',
                     tids: vec![1],
                     comm: "sh".to_owned(),
+                    user_cpu_us: 0,
+                    system_cpu_us: 0,
                 },
                 SyntheticProcProcess {
                     pid: 2,
@@ -5361,6 +5457,8 @@ mod tests {
                     state: 'R',
                     tids: vec![2],
                     comm: "cat".to_owned(),
+                    user_cpu_us: 0,
+                    system_cpu_us: 0,
                 },
             ]),
             ..demo_ctx()
@@ -5401,6 +5499,8 @@ mod tests {
                 ppid: 1,
                 pgrp: 1,
                 session: 1,
+                user_cpu_us: 0,
+                system_cpu_us: 0,
             }),
             processes: Some(vec![SyntheticProcProcess {
                 pid: 7,
@@ -5410,6 +5510,8 @@ mod tests {
                 state: 'S',
                 tids: vec![7, 8],
                 comm: "sleep".to_owned(),
+                user_cpu_us: 0,
+                system_cpu_us: 0,
             }]),
             ..demo_ctx()
         };
@@ -5465,6 +5567,8 @@ mod tests {
                 ppid: 1,
                 pgrp: 1,
                 session: 1,
+                user_cpu_us: 0,
+                system_cpu_us: 0,
             }),
             processes: Some(Vec::new()),
             ..demo_ctx()
@@ -5483,6 +5587,8 @@ mod tests {
                 ppid: 1,
                 pgrp: 1,
                 session: 1,
+                user_cpu_us: 0,
+                system_cpu_us: 0,
             }),
             processes: Some(vec![SyntheticProcProcess {
                 pid: 7,
@@ -5492,6 +5598,8 @@ mod tests {
                 state: 'S',
                 tids: vec![7, 9],
                 comm: "sleep".to_owned(),
+                user_cpu_us: 0,
+                system_cpu_us: 0,
             }]),
             zombies: Some(vec![SyntheticProcZombie {
                 pid: 11,

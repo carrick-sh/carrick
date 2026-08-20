@@ -3539,6 +3539,53 @@ fn final_exec_physical_extents(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReclaimParkAuthority {
+    Live,
+    VcpuParked,
+    VmParked,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ReclaimParkAuthority {
+    fn mark_vcpu_parked(&mut self) -> Result<(), TrapError> {
+        if *self != Self::Live {
+            return Err(TrapError::Hypervisor(
+                "vCPU reclaim park attempted without live executor authority".to_owned(),
+            ));
+        }
+        *self = Self::VcpuParked;
+        Ok(())
+    }
+
+    fn mark_vm_parked(&mut self) -> Result<(), TrapError> {
+        if *self != Self::VcpuParked {
+            return Err(TrapError::Hypervisor(
+                "VM reclaim park attempted without parked vCPU authority".to_owned(),
+            ));
+        }
+        *self = Self::VmParked;
+        Ok(())
+    }
+
+    fn destination_vcpu_is_live(self) -> Result<(), TrapError> {
+        (self == Self::Live).then_some(()).ok_or_else(|| {
+            TrapError::Hypervisor("destination executor vCPU is not live".to_owned())
+        })
+    }
+
+    fn mark_live_after_recreate(&mut self) -> Result<(), TrapError> {
+        if *self == Self::Live {
+            return Err(TrapError::Hypervisor(
+                "reclaim resume attempted to recreate a live destination vCPU".to_owned(),
+            ));
+        }
+        *self = Self::Live;
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct HvfVmState {
     _vm:
         std::mem::ManuallyDrop<applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>>,
@@ -3547,11 +3594,9 @@ pub(crate) struct HvfVmState {
     /// only; guest data frames live at stable global IPAs outside the slot.
     /// Ordinary VMM engines leave this unset.
     mm_root_slot: Option<(u64, u64)>,
-    /// Per-thread snapshot stashed by the M:N reclaim between `reclaim_park`
-    /// (snapshot + destroy this vCPU at a block point) and `reclaim_resume`
-    /// (recreate + restore on wake). The SAME host thread saves then restores, so
-    /// a plain field is safe and avoids serializing `VcpuSnapshot` through bytes.
-    reclaim_snapshot: Option<VcpuSnapshot>,
+    /// Executor-local lifecycle only. Task registers are owned exclusively by
+    /// the Kernel's typed execution lease and never stashed in this backend.
+    reclaim_authority: ReclaimParkAuthority,
     /// The exception class of the most recent vCPU exit. We need to remember
     /// whether the trap came in via EL0 `svc` (`EC = 0x15`) or the EL1 vector
     /// stub's `hvc` (`EC = 0x16`) so `complete_syscall` knows whether to
@@ -6231,7 +6276,7 @@ impl HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
             mappings: Vec::new(),
             mm_root_slot: None,
-            reclaim_snapshot: None,
+            reclaim_authority: ReclaimParkAuthority::Live,
             last_exit_class: 0,
             last_fault_esr: 0,
             is_forked_child: false,
@@ -10594,9 +10639,8 @@ impl HvfVmState {
     /// parks in the futex wait. The SAME thread recreates it via
     /// [`reclaim_resume`](Self::reclaim_resume) on wake. Unlike the fork
     /// path this does NOT publish mappings or rebuild the VM — the VM is unchanged;
-    /// only the per-thread vCPU is recycled. (No `FORK_VCPU_SNAPSHOT` / no
-    /// `rebuilt_vm_cell`: the snapshot is stashed in `self.reclaim_snapshot`, and
-    /// recreate uses the existing `self._vm`.)
+    /// only the per-thread vCPU is recycled. Task state is returned through the
+    /// typed engine boundary; this backend retains only executor lifecycle.
     ///
     /// WIRED via the HVF engine override `ThreadedEngine::save_guest_state`
     /// (`hvf_aarch64_engine.rs:536`), which passes the engine's separately-owned
@@ -10609,8 +10653,6 @@ impl HvfVmState {
         vcpu: &mut applevisor::vcpu::Vcpu,
         mailbox: &mut MailboxBinding,
     ) -> Result<(), TrapError> {
-        let snap = HvfInner::snapshot_vcpu_from(vcpu)?;
-        self.reclaim_snapshot = Some(snap);
         // Raw destroy — only the owning thread may, and applevisor's Drop would
         // panic on the post-destroy handle.
         let vcpu_id = vcpu.id();
@@ -10623,13 +10665,14 @@ impl HvfVmState {
                 "reclaim_park: hv_vcpu_destroy rc={rc:#x}"
             )));
         }
+        self.reclaim_authority.mark_vcpu_parked()?;
         self.release_mailbox_for_reclaim(mailbox)?;
         Ok(())
     }
 
-    /// M:N reclaim — WAKE side. Recreate this thread's vCPU in the EXISTING VM (no
-    /// fork rebuild) and restore the parked register state (incl. TPIDR_EL0/
-    /// TPIDRRO_EL0/TPIDR_EL1 and the V-regs). The CALLER must hold
+    /// M:N reclaim — WAKE side. Recreate this executor's vCPU in the EXISTING VM
+    /// when it was locally parked. A live destination executor is retained as-is;
+    /// the caller overlays only Kernel-owned typed task state. The CALLER must hold
     /// `fork_quiesce::topology_lock` so `vcpu_create` cannot race a concurrent
     /// fork's `hv_vm_destroy`/`create`. Writes the recreated vCPU back through
     /// `vcpu` via `std::mem::replace` + `forget` of the old (already-destroyed)
@@ -10644,10 +10687,14 @@ impl HvfVmState {
         vcpu: &mut applevisor::vcpu::Vcpu,
         mailbox: &mut MailboxBinding,
     ) -> Result<(), TrapError> {
-        let snap = self
-            .reclaim_snapshot
-            .take()
-            .ok_or_else(|| TrapError::Hypervisor("reclaim_resume: no parked snapshot".into()))?;
+        if self.reclaim_authority.destination_vcpu_is_live().is_ok() {
+            return Ok(());
+        }
+        if self.reclaim_authority != ReclaimParkAuthority::VcpuParked {
+            return Err(TrapError::Hypervisor(
+                "reclaim_resume: executor requires whole-VM recreation".to_owned(),
+            ));
+        }
         let new_vcpu = create_vcpu(&self._vm)?;
         enable_el0_counter_access(new_vcpu.id());
         self.vcpu_id = new_vcpu.id();
@@ -10655,9 +10702,8 @@ impl HvfVmState {
         // Replace the destroyed handle WITHOUT running applevisor's panicky Drop on
         // the (already hv_vcpu_destroy'd) old one — mirror the fork rebuild.
         std::mem::forget(std::mem::replace(vcpu, new_vcpu));
-        HvfInner::restore_vcpu_into(vcpu, &snap)?;
         self.reacquire_mailbox_after_vcpu_create(vcpu, mailbox)?;
-        self.last_exit_class = snap.last_exit_class;
+        self.reclaim_authority.mark_live_after_recreate()?;
         Ok(())
     }
 
@@ -10669,8 +10715,6 @@ impl HvfVmState {
         vcpu: &mut applevisor::vcpu::Vcpu,
         mailbox: &mut MailboxBinding,
     ) -> Result<(), TrapError> {
-        let snap = HvfInner::snapshot_vcpu_from(vcpu)?;
-        self.reclaim_snapshot = Some(snap);
         let vcpu_id = vcpu.id();
         let vcpu_rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu_id) };
         if vcpu_rc == 0 {
@@ -10681,6 +10725,7 @@ impl HvfVmState {
                 "shared_wait_park: hv_vcpu_destroy rc={vcpu_rc:#x}"
             )));
         }
+        self.reclaim_authority.mark_vcpu_parked()?;
         self.release_mailbox_for_reclaim(mailbox)?;
         crate::probes::vm_lifecycle(2, -1);
         let vm_rc = unsafe { inventory_hv_vm_destroy() };
@@ -10690,13 +10735,14 @@ impl HvfVmState {
             )));
         }
         record_vm_released();
+        self.reclaim_authority.mark_vm_parked()?;
         Ok(())
     }
 
     /// MT whole-VM lease — VM-only release by the LAST parker of a
     /// multi-threaded process. Its own vCPU was ALREADY destroyed by
-    /// [`Self::reclaim_park`] (the snapshot is stashed in `reclaim_snapshot`,
-    /// the same field [`Self::shared_wait_resume`] restores from), and every
+    /// [`Self::reclaim_park`] (its executor lifecycle is recorded in
+    /// `reclaim_authority`), and every
     /// sibling's registry "parked" mark is set only AFTER its own
     /// `reclaim_park` destroy — so when the runtime's re-check passes, zero
     /// vCPUs are live and the bare `hv_vm_destroy` succeeds. Any nonzero rc
@@ -10705,9 +10751,9 @@ impl HvfVmState {
     /// destroyed, and the caller must NOT set the vm-released flag — the park
     /// stays vCPU-only and the wake side stays `reclaim_resume`.
     pub(crate) fn release_vm_after_reclaim_park(&mut self) -> Result<(), TrapError> {
-        if self.reclaim_snapshot.is_none() {
+        if self.reclaim_authority != ReclaimParkAuthority::VcpuParked {
             return Err(TrapError::Hypervisor(
-                "release_vm_after_reclaim_park: no parked snapshot (reclaim_park did not run)"
+                "release_vm_after_reclaim_park: no parked vCPU authority (reclaim_park did not run)"
                     .into(),
             ));
         }
@@ -10719,6 +10765,7 @@ impl HvfVmState {
             )));
         }
         record_vm_released();
+        self.reclaim_authority.mark_vm_parked()?;
         Ok(())
     }
 
@@ -10749,9 +10796,11 @@ impl HvfVmState {
         mailbox: &mut MailboxBinding,
         replay_alias_union: bool,
     ) -> Result<(), TrapError> {
-        let snap = self.reclaim_snapshot.take().ok_or_else(|| {
-            TrapError::Hypervisor("shared_wait_resume: no parked snapshot".into())
-        })?;
+        if self.reclaim_authority != ReclaimParkAuthority::VmParked {
+            return Err(TrapError::Hypervisor(
+                "shared_wait_resume: no parked VM executor authority".to_owned(),
+            ));
+        }
         let (new_vm, permit) = create_vm_with_admission(VmCreateAdmission::SharedWaitResume)?;
         let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
         enable_el0_counter_access(new_vcpu.id());
@@ -10850,9 +10899,8 @@ impl HvfVmState {
             }
         }
 
-        HvfInner::restore_vcpu_into(vcpu, &snap)?;
         self.reacquire_mailbox_after_vcpu_create(vcpu, mailbox)?;
-        self.last_exit_class = snap.last_exit_class;
+        self.reclaim_authority.mark_live_after_recreate()?;
         Ok(())
     }
 
@@ -11239,7 +11287,7 @@ impl HvfVmState {
             &mut self.mappings,
             Vec::with_capacity(mapping_descs.len()),
         ));
-        self.reclaim_snapshot = None;
+        self.reclaim_authority = ReclaimParkAuthority::Live;
         self.last_exit_class = snap.last_exit_class;
         self.last_fault_esr = 0;
         self.is_forked_child = is_child;
@@ -11548,7 +11596,7 @@ impl HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
             mappings: Vec::with_capacity(mappings.len()),
             mm_root_slot,
-            reclaim_snapshot: None,
+            reclaim_authority: ReclaimParkAuthority::Live,
             last_exit_class: 0,
             last_fault_esr: 0,
             is_forked_child: false,
@@ -12415,7 +12463,7 @@ impl HvfVmState {
             _vm: std::mem::ManuallyDrop::new(spec.vm),
             mappings: mapped,
             mm_root_slot: Some(spec.mm_root_slot),
-            reclaim_snapshot: None,
+            reclaim_authority: ReclaimParkAuthority::Live,
             last_exit_class: 0,
             last_fault_esr: 0,
             is_forked_child: false,
@@ -12834,7 +12882,7 @@ impl HvfVmState {
             drop_backings_started,
         );
         let page_tables_started = std::time::Instant::now();
-        self.reclaim_snapshot = None;
+        self.reclaim_authority = ReclaimParkAuthority::Live;
         self.last_exit_class = 0;
         self.last_fault_esr = 0;
         self.is_forked_child = was_forked_child;
@@ -13814,6 +13862,18 @@ fn raw_hvf_stage2_calls_are_inventory_gated() {
         2,
         "both lazy replay paths must use exact serialized replay"
     );
+}
+
+#[cfg(test)]
+#[test]
+fn reclaim_park_authority_contains_no_task_snapshot() {
+    let mut authority = ReclaimParkAuthority::Live;
+    authority.mark_vcpu_parked().unwrap();
+    assert_eq!(authority, ReclaimParkAuthority::VcpuParked);
+    assert!(authority.destination_vcpu_is_live().is_err());
+    authority.mark_live_after_recreate().unwrap();
+    assert_eq!(authority, ReclaimParkAuthority::Live);
+    assert!(authority.destination_vcpu_is_live().is_ok());
 }
 
 /// Back one guest region with a raw `mmap(MAP_ANON)` buffer + `hv_vm_map`,

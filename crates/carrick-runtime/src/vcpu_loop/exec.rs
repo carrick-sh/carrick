@@ -109,6 +109,31 @@ fn should_update_host_process_title(is_hvpatch: bool) -> bool {
     !is_hvpatch
 }
 
+fn retire_execution_authority_for_exec(
+    thread: &std::sync::Arc<crate::kernel::Thread>,
+    lease_slot: &parking_lot::Mutex<Option<crate::kernel::objects::ThreadExecutionLease>>,
+) -> Result<(), crate::kernel::objects::ThreadExecutionError> {
+    let Some(lease) = lease_slot.lock().take() else {
+        return Ok(());
+    };
+    thread
+        .exit_from_executor(lease)
+        .map_err(|(error, _lease)| error)
+}
+
+fn publish_execution_authority_after_exec(
+    replacement: &std::sync::Arc<crate::kernel::Thread>,
+    executor: crate::kernel::objects::ExecutorId,
+    state: crate::kernel::objects::MigratableTaskState,
+    lease_slot: &parking_lot::Mutex<Option<crate::kernel::objects::ThreadExecutionLease>>,
+) -> Result<(), crate::kernel::objects::ThreadExecutionError> {
+    replacement.publish_initial_task_state(state)?;
+    let lease = replacement.claim_runnable(executor)?;
+    debug_assert!(lease_slot.lock().is_none());
+    *lease_slot.lock() = Some(lease);
+    Ok(())
+}
+
 /// Diagnostic-only deterministic failures for fallible operations that follow
 /// HVPatch sibling teardown. A nonempty absolute `@PATH` suffix is mandatory,
 /// so a container launcher can reach the probe before its selected child
@@ -198,8 +223,130 @@ mod exec_image_verification_tests {
     use super::{
         ExecBackendPublicationGate, HvpatchExecInventoryFailureInjection, apply_exec_inventory,
         exec_regions_to_verify_with_mappings, first_byte_mismatch,
-        parse_hvpatch_exec_inventory_failure_injection, should_update_host_process_title,
+        parse_hvpatch_exec_inventory_failure_injection, publish_execution_authority_after_exec,
+        retire_execution_authority_for_exec, should_update_host_process_title,
     };
+
+    #[test]
+    fn reclaim_exec_reclaim_replaces_the_exact_kernel_execution_lease() {
+        use std::sync::Arc;
+
+        use carrick_hal::ThreadId;
+        use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
+
+        use crate::kernel::objects::{
+            BlockedReason, ExecutorId, MigratableTaskState, ThreadExecutionState,
+        };
+        use crate::kernel::{Kernel, RootBootstrap};
+
+        fn cpu_state(mm_generation: u64) -> GuestCpuState {
+            GuestCpuState::from_aarch64_v1(Aarch64TaskCpuStateV1 {
+                gprs: [0; 31],
+                pc: 0,
+                pstate: 0,
+                trap_pc: 0,
+                trap_pstate: 0,
+                sp_el0: 0,
+                elr_el1: 0,
+                spsr_el1: 0,
+                ttbr0: 0,
+                ttbr1: 0,
+                tcr: 0,
+                actlr_el1: 0,
+                tpidr_el0: 0,
+                tpidrro_el0: 0,
+                contextidr_el1: 0,
+                vregs: [0; 32],
+                fpsr: 0,
+                fpcr: 0,
+                pending_resume_pc: None,
+                last_syscall_nr: None,
+                last_syscall_orig_x0: 0,
+                last_fault_esr: 0,
+                last_exit_class: 0,
+                is_forked_child: false,
+                mm_generation,
+                asid_generation: mm_generation,
+            })
+        }
+
+        let input = RootBootstrap::for_reference_model(
+            19_101,
+            ThreadId::synthetic_for_tests(19_101),
+            "reclaim exec reclaim".to_owned(),
+        )
+        .unwrap();
+        let (kernel, context) = Kernel::bootstrap_root(input).unwrap();
+        let old_thread = Arc::clone(context.thread());
+        let executor =
+            ExecutorId::for_transitional_thread(ThreadId::synthetic_for_tests(19_101)).unwrap();
+        let old_mm = context.shared().mm().id();
+        let cpu = cpu_state(old_mm.raw());
+        let old_state = MigratableTaskState {
+            cpu,
+            mm: old_mm,
+            asid_generation: old_mm.raw(),
+        };
+        old_thread
+            .publish_initial_task_state(old_state.clone())
+            .unwrap();
+        let mut lease = old_thread.claim_runnable(executor).unwrap();
+        lease.replace_task_state(old_state).unwrap();
+        old_thread.begin_switch_out(&lease).unwrap();
+        old_thread
+            .park_from_executor(lease, BlockedReason::HostWait)
+            .unwrap();
+        let active = old_thread
+            .claim_blocked_for_transitional_executor(executor)
+            .unwrap();
+        let lease_slot = parking_lot::Mutex::new(Some(active));
+
+        retire_execution_authority_for_exec(&old_thread, &lease_slot).unwrap();
+        let prepared = kernel.prepare_exec(&context, None).unwrap();
+        let committed = kernel.commit_exec(prepared, None).unwrap();
+        let replacement = Arc::clone(committed.thread());
+        let replacement_mm = committed.shared().mm().id();
+        let replacement_state = MigratableTaskState {
+            cpu: cpu_state(replacement_mm.raw()),
+            mm: replacement_mm,
+            asid_generation: replacement_mm.raw(),
+        };
+        publish_execution_authority_after_exec(
+            &replacement,
+            executor,
+            replacement_state.clone(),
+            &lease_slot,
+        )
+        .unwrap();
+
+        let mut replacement_lease = lease_slot.lock().take().unwrap();
+        replacement_lease
+            .replace_task_state(replacement_state.clone())
+            .unwrap();
+        replacement.begin_switch_out(&replacement_lease).unwrap();
+        replacement
+            .park_from_executor(replacement_lease, BlockedReason::HostWait)
+            .unwrap();
+        let resumed = replacement
+            .claim_blocked_for_transitional_executor(executor)
+            .unwrap();
+        assert_eq!(
+            resumed
+                .task_state_for_restore(
+                    carrick_abi::LinuxGuestAbi::Aarch64,
+                    1,
+                    replacement_mm,
+                    replacement_mm.raw(),
+                )
+                .unwrap(),
+            &replacement_state
+        );
+        assert!(matches!(
+            old_thread.execution_state(),
+            ThreadExecutionState::Exited { .. }
+        ));
+        replacement.exit_from_executor(resumed).unwrap();
+    }
 
     #[test]
     fn hvpatch_exec_verifier_covers_initialized_data_as_well_as_code() {
@@ -769,6 +916,21 @@ where
                     }
                 }
                 let old_files = prepared_kernel_exec.old_file_table();
+                let retiring_thread = self.kernel_thread.as_ref().cloned().ok_or_else(|| {
+                    RuntimeError::Configuration(
+                        "committed exec lost predecessor Kernel thread authority".to_owned(),
+                    )
+                })?;
+                if let Err(error) =
+                    retire_execution_authority_for_exec(&retiring_thread, &self.execution_lease)
+                {
+                    return Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        &format!("retire predecessor execution lease for exec: {error}"),
+                    )
+                    .map(Some);
+                }
                 let committed_context =
                     match (kernel.hvpatch_process.as_ref(), prepared_kernel_exec) {
                         (Some(process), RuntimePreparedExec::Hvpatch(prepared)) => {
@@ -814,6 +976,54 @@ where
                         .map(Some);
                     }
                 };
+                let committed_mm = committed_context.shared().mm().id();
+                let committed_asid_generation = committed_mm.raw();
+                engine.bind_task_snapshot_identity(committed_mm.raw(), committed_asid_generation);
+                let replacement_cpu = match engine.snapshot_guest_state_for_exec() {
+                    Ok(state) => state,
+                    Err(error) => {
+                        committed_context.thread().fail_uninitialized_snapshot(
+                            crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
+                        );
+                        return Self::exec_failed_past_no_return(
+                            kernel,
+                            engine,
+                            &format!("capture replacement execution state after exec: {error}"),
+                        )
+                        .map(Some);
+                    }
+                };
+                let replacement_state = crate::kernel::objects::MigratableTaskState {
+                    cpu: replacement_cpu,
+                    mm: committed_mm,
+                    asid_generation: committed_asid_generation,
+                };
+                let executor = match crate::kernel::objects::ExecutorId::for_transitional_thread(
+                    self.this_tid,
+                ) {
+                    Ok(executor) => executor,
+                    Err(error) => {
+                        return Self::exec_failed_past_no_return(
+                            kernel,
+                            engine,
+                            &format!("identify replacement executor after exec: {error}"),
+                        )
+                        .map(Some);
+                    }
+                };
+                if let Err(error) = publish_execution_authority_after_exec(
+                    committed_context.thread(),
+                    executor,
+                    replacement_state,
+                    &self.execution_lease,
+                ) {
+                    return Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        &format!("publish replacement execution lease after exec: {error}"),
+                    )
+                    .map(Some);
+                }
                 // `exec` publishes a new Mm generation while keeping this host
                 // engine/vCPU.  Frame-COW callbacks must therefore move from
                 // the retired mm to the committed replacement before any
@@ -826,7 +1036,6 @@ where
                             "committed HVPatch exec has no replacement mm binding".to_owned(),
                         )
                     })?;
-                    let committed_mm = committed_context.shared().mm().id();
                     let authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority> =
                         std::sync::Arc::new(super::KernelFrameCowAuthority {
                             kernel: std::sync::Arc::clone(committed_context.kernel()),

@@ -117,6 +117,9 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// Exact ASID allocation generation authorizing the task's TTBR values.
     asid_generation: u64,
 
+    /// Non-aliasing guest-run time awaiting the exact logical-thread charge.
+    pending_guest_run_receipt_ns: u64,
+
     // ── shared memory state (the X86EngineCore parallels) ──
     /// Live stage-1 page-table editor over the guest's own translation tables at
     /// `LINUX_PAGE_TABLES_BASE`. Built lazily on first protect/unmap edit; reset
@@ -312,6 +315,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             process_asid: None,
             mm_generation: 1,
             asid_generation: 1,
+            pending_guest_run_receipt_ns: 0,
             page_tables,
             protections: Arc::new(MemoryProtections::default()),
             fork_arena_high_water: u64::MAX,
@@ -420,6 +424,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             process_asid: None,
             mm_generation: 1,
             asid_generation: 1,
+            pending_guest_run_receipt_ns: 0,
             page_tables,
             protections,
             fork_arena_high_water: u64::MAX,
@@ -1356,7 +1361,11 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
             // run) into this thread's guest_cpu slot so getrusage(RUSAGE_SELF) /
             // times / `/proc` see it. Done ONCE here, so every aarch64 backend on
             // this shared engine gets it for free (mirrors carrick-x86).
+            let run_started = std::time::Instant::now();
             let run_result = carrick_host::guest_cpu::timed_run(|| self.vcpu.run());
+            self.pending_guest_run_receipt_ns = self
+                .pending_guest_run_receipt_ns
+                .saturating_add(run_started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
             match run_result.map_err(|error| self.vm.enrich_vcpu_run_error(&self.vcpu, error))? {
                 Aarch64Exit::Syscall { frame, resume_pc } => {
                     // The EL0 `svc` re-entered EL1 and hit the sentinel store. The
@@ -1883,6 +1892,28 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     fn bind_task_snapshot_identity(&mut self, mm_generation: u64, asid_generation: u64) {
         self.mm_generation = mm_generation;
         self.asid_generation = asid_generation;
+    }
+
+    fn take_guest_run_receipt_ns(&mut self) -> u64 {
+        std::mem::take(&mut self.pending_guest_run_receipt_ns)
+    }
+
+    fn snapshot_guest_state_for_exec(&mut self) -> Result<GuestCpuState, TrapError> {
+        require_migratable_fpsimd_authority(self.vm.fpsimd_enabled())?;
+        let snapshot = self.vcpu.snapshot()?;
+        Ok(GuestCpuState::from_aarch64_v1(
+            aarch64_task_state_from_snapshot(
+                &snapshot,
+                self.pending_resume_pc,
+                self.last_syscall_nr,
+                self.last_syscall_orig_x0,
+                self.last_fault_esr,
+                self.last_exit_class,
+                self.is_forked_child,
+                self.mm_generation,
+                self.asid_generation,
+            )?,
+        ))
     }
 
     fn bind_frame_cow(
@@ -2508,6 +2539,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     }
 
     fn save_guest_state(&mut self) -> Result<GuestCpuState, TrapError> {
+        require_migratable_fpsimd_authority(self.vm.fpsimd_enabled())?;
         let snapshot = self
             .vm
             .save_guest_state(&mut self.vcpu)
@@ -2528,6 +2560,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     }
 
     fn save_shared_wait_state(&mut self) -> Result<GuestCpuState, TrapError> {
+        require_migratable_fpsimd_authority(self.vm.fpsimd_enabled())?;
         let snapshot = self
             .vm
             .save_shared_wait_state(&mut self.vcpu)
@@ -2734,6 +2767,17 @@ fn require_core_fpsimd_authority(enabled: bool) -> Result<(), TrapError> {
     } else {
         Err(TrapError::Hypervisor(
             "complete AArch64 core registers require live FP/SIMD capture; CARRICK_NO_FPSIMD disables that authority"
+                .to_owned(),
+        ))
+    }
+}
+
+fn require_migratable_fpsimd_authority(enabled: bool) -> Result<(), TrapError> {
+    if enabled {
+        Ok(())
+    } else {
+        Err(TrapError::Hypervisor(
+            "complete AArch64 migratable state requires live FP/SIMD capture; CARRICK_NO_FPSIMD disables that authority"
                 .to_owned(),
         ))
     }
@@ -3046,6 +3090,16 @@ mod tests {
             .expect_err("zero-fabricated FP/SIMD state cannot be complete core authority");
         assert!(error.to_string().contains("FP/SIMD"));
         assert!(require_core_fpsimd_authority(true).is_ok());
+    }
+
+    #[test]
+    fn migratable_snapshot_rejects_disabled_fpsimd_authority() {
+        let live = sample();
+        assert_ne!(live.vregs, [0; 32]);
+        let error = require_migratable_fpsimd_authority(false)
+            .expect_err("disabled FP/SIMD cannot publish a zero-filled successful snapshot");
+        assert!(error.to_string().contains("FP/SIMD"));
+        assert!(require_migratable_fpsimd_authority(true).is_ok());
     }
 
     #[test]

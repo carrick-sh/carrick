@@ -1077,6 +1077,14 @@ impl GuestCpuState {
             Self::Aarch64V1(_) | Self::X86_64V1(_) => 1,
         }
     }
+
+    /// Exact MM/ASID generations embedded in this architectural image.
+    pub fn task_identity(&self) -> (u64, u64) {
+        match self {
+            Self::Aarch64V1(state) => (state.mm_generation, state.asid_generation),
+            Self::X86_64V1(state) => (state.mm_generation(), state.asid_generation()),
+        }
+    }
 }
 
 /// Complete AArch64 EL0 architectural state captured at a crash-generation
@@ -1163,6 +1171,16 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     /// Bind the exact Kernel MM and ASID allocation generations that authorize
     /// scheduler snapshots produced by this engine.
     fn bind_task_snapshot_identity(&mut self, _mm_generation: u64, _asid_generation: u64) {}
+
+    /// Consume the exact, engine-local duration accumulated by backend run
+    /// calls since the previous receipt. The value is never addressed through
+    /// a process-global host-thread slot and therefore cannot alias after host
+    /// thread churn.
+    fn take_guest_run_receipt_ns(&mut self) -> u64;
+
+    /// Capture the freshly materialized exec image without parking or
+    /// destroying the destination executor's live vCPU.
+    fn snapshot_guest_state_for_exec(&mut self) -> Result<GuestCpuState, TrapError>;
     fn bind_frame_cow(
         &mut self,
         _authority: std::sync::Arc<dyn FrameCowAuthority>,
