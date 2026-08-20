@@ -137,13 +137,26 @@ pub(super) struct EventFdState {
     /// behavior).
     slot: Option<usize>,
     local: std::sync::atomic::AtomicU64,
+    pub(super) read_fd: Option<HostFdRef>,
+    pub(super) write_fd: Option<HostFdRef>,
 }
 
 impl EventFdState {
     pub(super) fn new(counter: u64) -> Self {
+        let (read_fd, write_fd) = match make_readiness_pipe() {
+            Some((r, w)) => (Some(r), Some(w)),
+            None => (None, None),
+        };
+        if counter > 0 {
+            if let Some(w) = &write_fd {
+                let _ = unsafe { libc::write(w.raw(), [1u8].as_ptr() as *const _, 1) };
+            }
+        }
         Self {
             slot: crate::eventfd_shm::alloc(counter),
             local: std::sync::atomic::AtomicU64::new(counter),
+            read_fd,
+            write_fd,
         }
     }
 

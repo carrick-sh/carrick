@@ -7202,7 +7202,9 @@ fn read_eventfd(
     loop {
         let current = counter.load(std::sync::atomic::Ordering::SeqCst);
         if current == 0 {
-            return would_block_outcome(-1, libc::POLLIN, nonblocking, None);
+            let host_fd = state.read_fd.as_ref().map(|r| r.raw()).unwrap_or(-1);
+            let owner = state.read_fd.clone();
+            return would_block_outcome(host_fd, libc::POLLIN, nonblocking, owner);
         }
         let taken = if semaphore { 1 } else { current };
         if counter
@@ -7215,6 +7217,13 @@ fn read_eventfd(
             .is_err()
         {
             continue; // raced another reader/writer — re-derive
+        }
+        if current - taken == 0 {
+            if let Some(r) = &state.read_fd {
+                let mut buf = [0u8; 16];
+                // BLOCKING-IO-OK: make_readiness_pipe creates non-blocking pipes with O_NONBLOCK.
+                let _ = unsafe { libc::read(r.raw(), buf.as_mut_ptr() as *mut _, buf.len()) };
+            }
         }
         let eventfd_value = LinuxEventfdValue {
             value: if semaphore { 1 } else { current },
@@ -7289,6 +7298,10 @@ fn write_eventfd(this: &SyscallDispatcher, bytes: &[u8], state: &EventFdState) -
             next as u32 as i32,
         );
         if current == 0 && next > 0 {
+            if let Some(w) = &state.write_fd {
+                // BLOCKING-IO-OK: make_readiness_pipe creates non-blocking pipes with O_NONBLOCK.
+                let _ = unsafe { libc::write(w.raw(), [1u8].as_ptr() as *const _, 1) };
+            }
             this.notify_inmem_epoll();
         }
         return DispatchOutcome::Returned {
