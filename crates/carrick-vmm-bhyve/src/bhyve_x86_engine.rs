@@ -58,6 +58,7 @@ use carrick_hal::SharedFutexLocation;
 use carrick_hal::TrapError;
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::pml4::Pml4Manager;
+use carrick_x86::bringup_fns::X86VcpuSnapshot;
 use carrick_x86::{
     BringupLayout, ForkRamStrategy, MsrInstall, WindowPlan, X86EngineCore, X86Exit, X86Reg, X86Seg,
     X86Vcpu, X86Vmm,
@@ -100,32 +101,6 @@ const BHYVE_X86_SYSRET_RIP: u64 = carrick_mem::memory::LINUX_EL0_TRAMPOLINE_BASE
 fn should_surface_bhyve_kick(rip: u64, cs: u64) -> bool {
     (cs & 3) == 3 || rip == BHYVE_X86_SYSRET_RIP
 }
-
-/// The per-thread CPU registers captured/restored across an M:N reclaim re-bind:
-/// the 16 GPRs + RIP + RFLAGS. Process-wide control regs (CR0/3/4, EFER, CS) are
-/// NOT included — identical across the process's threads, they persist on the
-/// recycled vCPU (which `reopen_vcpu` does NOT reset). FS/GS base (TLS) is saved
-/// separately via the segment descriptor. (FP/AVX is a follow-up increment.)
-const SNAPSHOT_REGS: [c_int; 18] = [
-    VM_REG_GUEST_RAX,
-    VM_REG_GUEST_RBX,
-    VM_REG_GUEST_RCX,
-    VM_REG_GUEST_RDX,
-    VM_REG_GUEST_RSI,
-    VM_REG_GUEST_RDI,
-    VM_REG_GUEST_RBP,
-    VM_REG_GUEST_RSP,
-    VM_REG_GUEST_R8,
-    VM_REG_GUEST_R9,
-    VM_REG_GUEST_R10,
-    VM_REG_GUEST_R11,
-    VM_REG_GUEST_R12,
-    VM_REG_GUEST_R13,
-    VM_REG_GUEST_R14,
-    VM_REG_GUEST_R15,
-    VM_REG_GUEST_RIP,
-    VM_REG_GUEST_RFLAGS,
-];
 
 // ─── VcpuHandle: the shared, swappable per-vCPU runtime state ─────────────────
 
@@ -2197,59 +2172,17 @@ impl X86Vmm for BhyveVmm {
         BhyveKickHandle::for_current_thread(Arc::clone(&self.h.kick_pending))
     }
 
-    fn save_guest_state(&self) -> Vec<u8> {
-        // Captured at a ring-0 (LSTAR-stub) syscall block point — the per-thread
-        // GPRs/RSP/RIP/RFLAGS + FS/GS base + FP/AVX. See SNAPSHOT_REGS.
-        //
-        // FAIL LOUD: any failed read makes save return an EMPTY buffer, which
-        // `rebind_to_slot` rejects (returns Err) rather than restoring zeroed FS/GS
-        // base or silently-dropped SSE/AVX into the reclaimed thread — that is a
-        // silent data-corruption bug (Go &c. use SSE). The old code
-        // `.unwrap_or_default()` / `.ok().flatten()` swallowed every error and, for
-        // FP, conflated a genuine failure with the legitimate "no FP yet" case.
-        let vc = self.h.as_bhyve();
-        let build = || -> Result<Vec<u8>, TrapError> {
-            let vals = vc
-                .get_register_set(&SNAPSHOT_REGS)
-                .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-            let (fb, fl, fa) = vc
-                .get_desc(VM_REG_GUEST_FS)
-                .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-            let (gb, gl, ga) = vc
-                .get_desc(VM_REG_GUEST_GS)
-                .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-            // FP/AVX via the FXSAVE/XSAVE stub (valid at the ring-0 syscall
-            // boundary, `started`+CPL-0). `Ok(None)` is the LEGIT "the vCPU has not
-            // reached a real syscall yet" case (nothing to preserve); only `Err` is
-            // a genuine failure that must abort the reclaim.
-            let xsave = BhyveX86Vcpu {
-                h: Arc::clone(&self.h),
-            }
-            .get_xsave()?;
-            let mut buf = Vec::with_capacity(SNAPSHOT_REGS.len() * 8 + 33 + carrick_x86::XSAVE_LEN);
-            for v in &vals {
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            buf.extend_from_slice(&fb.to_le_bytes());
-            buf.extend_from_slice(&gb.to_le_bytes());
-            for x in [fl, fa, gl, ga] {
-                buf.extend_from_slice(&x.to_le_bytes());
-            }
-            match xsave {
-                Some(xs) => {
-                    buf.push(1);
-                    buf.extend_from_slice(&xs);
-                }
-                None => buf.push(0),
-            }
-            Ok(buf)
-        };
-        // Err -> empty buffer -> rebind_to_slot returns a clean TrapError instead
-        // of restoring corruption.
-        build().unwrap_or_default()
+    fn save_guest_state(&self, vcpu: &Self::Vcpu) -> Result<X86VcpuSnapshot, TrapError> {
+        carrick_x86::bringup_fns::snapshot(vcpu)
     }
 
-    fn rebind_to_slot(&mut self, slot: carrick_hal::SlotId, state: &[u8]) -> Result<(), TrapError> {
+    fn rebind_to_slot(
+        &mut self,
+        vcpu: &mut Self::Vcpu,
+        slot: carrick_hal::SlotId,
+        layout: BringupLayout,
+        state: &X86VcpuSnapshot,
+    ) -> Result<(), TrapError> {
         let id = slot as c_int;
         let cur = self.h.slot().id;
         // Re-open the recycled vCPU and swap it in — only if the slot actually
@@ -2307,67 +2240,7 @@ impl X86Vmm for BhyveVmm {
                 self.h.started.store(was_started, Ordering::SeqCst);
             }
         }
-        // A reclaim snapshot that failed to capture is returned EMPTY (or short)
-        // by `save_guest_state`; refuse to restore zeroed/garbage state rather than
-        // silently corrupt the reclaimed thread. Minimum valid length = the
-        // SNAPSHOT_REGS GPRs + FS/GS base (16) + the four 4-byte desc limit/access
-        // words (16) + the 1-byte FP-present flag.
-        let min_len = SNAPSHOT_REGS.len() * 8 + 33;
-        if state.len() < min_len {
-            return Err(TrapError::Hypervisor(
-                "bhyve reclaim: guest-state snapshot was incomplete (a register/FP \
-                 read failed at save); refusing to restore zeroed state"
-                    .to_owned(),
-            ));
-        }
-        // Restore the saved per-thread state into the freed vCPU.
-        let n = SNAPSHOT_REGS.len();
-        let mut vals = Vec::with_capacity(n);
-        for i in 0..n {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&state[i * 8..i * 8 + 8]);
-            vals.push(u64::from_le_bytes(b));
-        }
-        let rd_u64 = |off: usize| {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&state[off..off + 8]);
-            u64::from_le_bytes(b)
-        };
-        let rd_u32 = |off: usize| {
-            let mut b = [0u8; 4];
-            b.copy_from_slice(&state[off..off + 4]);
-            u32::from_le_bytes(b)
-        };
-        let base = n * 8;
-        let fb = rd_u64(base);
-        let gb = rd_u64(base + 8);
-        let fl = rd_u32(base + 16);
-        let fa = rd_u32(base + 20);
-        let gl = rd_u32(base + 24);
-        let ga = rd_u32(base + 28);
-        let mut vc = self.h.as_bhyve();
-        vc.set_register_set(&SNAPSHOT_REGS, &vals)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-        vc.set_desc(VM_REG_GUEST_FS, fb, fl, fa)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-        vc.set_desc(VM_REG_GUEST_GS, gb, gl, ga)
-            .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-        // Restore FP/AVX if it was captured (the flag byte follows the descriptors).
-        let fp_off = base + 32;
-        if state.get(fp_off) == Some(&1) && state.len() >= fp_off + 1 + carrick_x86::XSAVE_LEN {
-            let mut xs = [0u8; carrick_x86::XSAVE_LEN];
-            xs.copy_from_slice(&state[fp_off + 1..fp_off + 1 + carrick_x86::XSAVE_LEN]);
-            // Propagate a failed FP/AVX restore: dropping it silently leaves the
-            // reclaimed thread with stale SSE/AVX (the save-side bug's twin).
-            BhyveX86Vcpu {
-                h: Arc::clone(&self.h),
-            }
-            .set_xsave(&xs)
-            .map_err(|e| {
-                TrapError::Hypervisor(format!("bhyve reclaim: FP/AVX restore failed: {e}"))
-            })?;
-        }
-        Ok(())
+        self.restore_vcpu(vcpu, layout, state)
     }
 
     fn build_sibling_builder(&self) -> Result<Self::SiblingBuilder, TrapError> {

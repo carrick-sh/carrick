@@ -3,8 +3,8 @@ use std::sync::Arc;
 use carrick_abi::LinuxGuestAbi;
 use carrick_hal::ThreadId;
 use carrick_hal::threaded::{
-    Aarch64TaskCpuStateV1, GuestCpuState, X86_TASK_RESUME_PAYLOAD_LEN, X86_TASK_XSAVE_LEN,
-    X86TaskCpuStateV1,
+    Aarch64TaskCpuStateV1, GuestCpuState, X86_TASK_RESUME_MAGIC, X86_TASK_RESUME_PAYLOAD_LEN,
+    X86_TASK_XSAVE_LEN, X86TaskCpuStateV1,
 };
 
 use super::objects::{
@@ -27,7 +27,11 @@ fn aarch64_test_task_state() -> Aarch64TaskCpuStateV1 {
         gprs: std::array::from_fn(|index| index as u64 + 1),
         pc: 0x1000,
         pstate: 0x2000,
+        trap_pc: 0x2100,
+        trap_pstate: 0x2200,
         sp_el0: 0x3000,
+        elr_el1: 0x3100,
+        spsr_el1: 0x3200,
         ttbr0: 0x4000,
         ttbr1: 0x5000,
         tcr: 0x6000,
@@ -50,6 +54,8 @@ fn aarch64_test_task_state() -> Aarch64TaskCpuStateV1 {
 }
 
 fn x86_test_task_state() -> X86TaskCpuStateV1 {
+    let mut resume = vec![0; X86_TASK_RESUME_PAYLOAD_LEN];
+    resume[56..64].copy_from_slice(&X86_TASK_RESUME_MAGIC.to_le_bytes());
     X86TaskCpuStateV1::new(
         std::array::from_fn(|index| index as u64 + 0x20),
         0x2000,
@@ -58,10 +64,13 @@ fn x86_test_task_state() -> X86TaskCpuStateV1 {
         0x4000,
         0x5000,
         0x6000,
+        0x7000,
+        0x8000,
+        0x9000,
         23,
         29,
         vec![0x5a; X86_TASK_XSAVE_LEN],
-        vec![0xa5; X86_TASK_RESUME_PAYLOAD_LEN],
+        resume,
     )
     .expect("valid x86 task state")
 }
@@ -115,13 +124,47 @@ fn thread_execution_switching_out_preserves_exact_owner() {
 }
 
 #[test]
+fn thread_execution_reclaim_publishes_and_reclaims_exact_typed_state() {
+    let (_kernel, context) = bootstrap(9108);
+    let thread = context.thread();
+    let initial = GuestCpuState::from_aarch64_v1(aarch64_test_task_state());
+    thread.publish_initial_cpu_state(initial).unwrap();
+    let executor = ExecutorId::for_transitional_thread(ThreadId::synthetic_for_tests(9108))
+        .expect("transitional executor");
+    let mut lease = thread.claim_runnable(executor).unwrap();
+    let mut replacement = aarch64_test_task_state();
+    replacement.gprs[0] = 0xfeed;
+    let replacement = GuestCpuState::from_aarch64_v1(replacement);
+    lease.replace_cpu_state(replacement.clone()).unwrap();
+    thread.begin_switch_out(&lease).unwrap();
+    thread
+        .park_from_executor(lease, BlockedReason::HostWait)
+        .unwrap();
+
+    let resumed = thread
+        .claim_blocked_for_transitional_executor(executor)
+        .expect("claim exact blocked generation");
+    assert_eq!(
+        resumed
+            .cpu_state_for_restore(LinuxGuestAbi::Aarch64, 1)
+            .unwrap(),
+        &replacement
+    );
+    thread.exit_from_executor(resumed).unwrap();
+}
+
+#[test]
 fn thread_execution_x86_rejects_invalid_xsave_and_resume_payload_sizes() {
     let valid_xsave = vec![0; X86_TASK_XSAVE_LEN];
-    let valid_resume = vec![0; X86_TASK_RESUME_PAYLOAD_LEN];
+    let mut valid_resume = vec![0; X86_TASK_RESUME_PAYLOAD_LEN];
+    valid_resume[56..64].copy_from_slice(&X86_TASK_RESUME_MAGIC.to_le_bytes());
 
     assert!(
         X86TaskCpuStateV1::new(
             [0; 16],
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -138,6 +181,9 @@ fn thread_execution_x86_rejects_invalid_xsave_and_resume_payload_sizes() {
     assert!(
         X86TaskCpuStateV1::new(
             [0; 16],
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -279,6 +325,7 @@ fn thread_execution_exec_transfers_runner_and_accounting_not_cpu_state() {
     old_thread
         .publish_initial_cpu_state(GuestCpuState::from_aarch64_v1(aarch64_test_task_state()))
         .unwrap();
+    old_thread.charge_user_ns(17_000);
     old_thread.charge_system_ns(9_000);
     let mut runner = old_thread.bind_runner().expect("old runner");
 
@@ -294,6 +341,7 @@ fn thread_execution_exec_transfers_runner_and_accounting_not_cpu_state() {
         ThreadExecutionState::Exited { .. }
     ));
     assert_eq!(replacement.system_cpu_us(), 9);
+    assert_eq!(replacement.cpu_us(), 17);
     assert_eq!(
         replacement.execution_state(),
         ThreadExecutionState::Uninitialized
@@ -315,4 +363,24 @@ fn thread_execution_exec_transfers_runner_and_accounting_not_cpu_state() {
             .is_err()
     );
     replacement.exit_from_executor(lease).unwrap();
+}
+
+#[test]
+fn thread_execution_cpu_intervals_never_inherit_between_logical_tasks() {
+    let (_kernel_a, context_a) = bootstrap(9110);
+    let (_kernel_b, context_b) = bootstrap(9111);
+    let thread_a = context_a.thread();
+    let thread_b = context_b.thread();
+
+    thread_a.charge_user_ns(11_000);
+    thread_a.charge_system_ns(13_000);
+    thread_b.charge_user_ns(17_000);
+    thread_b.charge_system_ns(19_000);
+
+    assert_eq!((thread_a.cpu_us(), thread_a.system_cpu_us()), (11, 13));
+    assert_eq!((thread_b.cpu_us(), thread_b.system_cpu_us()), (17, 19));
+    assert_eq!(context_a.task().self_cpu_us(), 11);
+    assert_eq!(context_a.task().self_system_cpu_us(), 13);
+    assert_eq!(context_b.task().self_cpu_us(), 17);
+    assert_eq!(context_b.task().self_system_cpu_us(), 19);
 }
