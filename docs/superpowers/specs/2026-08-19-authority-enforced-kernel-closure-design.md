@@ -191,6 +191,15 @@ There is no generic `HostCapability`. A `Hybrid` operation receives only the
 specific backing capability named in its declaration. Possessing file backing
 does not grant host process, network, or ambient path authority.
 
+Authority classifies **who owns the semantic answer**, not whether the host CPU
+ever executes an instruction. A Guest-authority operation may use explicitly
+declared substrate mechanics through a narrower mediator: bounded guest-memory
+copy/materialization, authenticated carrier park/kick, and hardware clock reads
+whose Linux-visible interpretation remains in the kernel. Those mechanics do
+not grant host process, identity, credential, path, namespace, or signal
+authority. They are named in the syscall/operation declaration and audited like
+every other transition.
+
 ### Explicit syscall declarations
 
 The syscall table becomes the single source of truth for:
@@ -234,7 +243,9 @@ layered:
    ambient `libc`, `std::process`, `std::fs`, and `std::net` uses in
    kernel-domain paths and drives the reviewed legacy inventory to zero.
 5. **Fake adapters:** Guest-authority tests run with host adapters that panic on
-   any use; Hybrid tests panic on any capability except the declared one.
+   semantic or undeclared host access; explicitly declared guest-memory and
+   carrier substrate calls remain observable. Hybrid tests panic on any
+   capability except the declared backing or substrate capability.
 6. **Runtime boundary probes:** every host-capability transition records the
    syscall, task generation, capability kind, operation, and outcome. Closure
    mode rejects an unauthorized or unclassified transition.
@@ -387,8 +398,8 @@ syscall/operation
 ```
 
 The gate fails for a missing or duplicate mapping, an authority/handler drift,
-an unclassified transition, or a Guest operation that touches any host
-capability.
+an unclassified transition, or a Guest operation that touches semantic host
+authority or an undeclared substrate capability.
 
 ### Coverage expansion
 
@@ -480,9 +491,10 @@ baseline. Phase 0 does not claim security, conformance, or performance closure.
 Temporary reviewed inventory entries may prevent regression during migration,
 but they are not waivers and cannot survive phase completion.
 
-**Exit gate:** all Guest handlers are structurally unable to call host
-capabilities; Hybrid handlers can call only declared backing capabilities;
-zero unauthorized runtime transitions under focused and closure surfaces.
+**Exit gate:** all Guest handlers are structurally unable to call ambient or
+semantic host capabilities and can reach only declared substrate mediators;
+Hybrid handlers can call only declared backing and substrate capabilities; zero
+unauthorized runtime transitions under focused and closure surfaces.
 
 ### Phase 2: fork, wait, exit, and pidfd
 
@@ -543,8 +555,9 @@ than Docker at all declared fan-outs.
 4. Add missing LTP, ecosystem, multi-task, hostile-input, and authority probes.
 
 **Exit gate:** the generated authority ledger is complete; every Guest row has
-zero host transitions; every Hybrid transition is declared and exercised;
-fresh full closure shows no regressions.
+zero semantic-host transitions and only declared substrate transitions; every
+Hybrid transition is declared and exercised; fresh full closure shows no
+regressions.
 
 ### Phase 6: exact conformance closure
 
