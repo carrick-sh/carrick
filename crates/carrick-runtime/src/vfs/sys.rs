@@ -85,72 +85,10 @@ struct NetIface {
     is_loopback: bool,
 }
 
-/// Enumerate host interfaces via `getifaddrs(3)`, one entry per `AF_LINK`
-/// record (which carries the name, index, MAC, and flags). Backs the synthetic
-/// `/sys/class/net` tree.
-#[cfg(target_os = "macos")]
-fn host_net_interfaces() -> Vec<NetIface> {
-    let mut out = Vec::new();
-    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs allocates a list we free with freeifaddrs below.
-    if unsafe { libc::getifaddrs(&mut head) } != 0 || head.is_null() {
-        return out;
-    }
-    let mut cur = head;
-    while !cur.is_null() {
-        // SAFETY: cur is a non-null node in the getifaddrs list.
-        let ifa = unsafe { &*cur };
-        if !ifa.ifa_addr.is_null()
-            && (unsafe { (*ifa.ifa_addr).sa_family } as i32) == carrick_portable::AF_LINK
-        {
-            // SAFETY: an AF_LINK ifa_addr is a sockaddr_dl.
-            let sdl = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_dl) };
-            let nlen = sdl.sdl_nlen as usize;
-            let alen = (sdl.sdl_alen as usize).min(6);
-            let name: String = sdl
-                .sdl_data
-                .iter()
-                .take(nlen)
-                .map(|&c| c as u8 as char)
-                .collect();
-            let mut mac = [0u8; 6];
-            for (i, slot) in mac.iter_mut().enumerate().take(alen) {
-                if let Some(&c) = sdl.sdl_data.get(nlen + i) {
-                    *slot = c as u8;
-                }
-            }
-            let flags = ifa.ifa_flags as i32;
-            out.push(NetIface {
-                name,
-                index: sdl.sdl_index as u32,
-                mac,
-                mac_len: alen,
-                flags: ifa.ifa_flags as u32,
-                is_loopback: flags & libc::IFF_LOOPBACK != 0,
-            });
-        }
-        cur = ifa.ifa_next;
-    }
-    // SAFETY: free the list getifaddrs allocated.
-    unsafe { libc::freeifaddrs(head) };
-    out
-}
-
-#[cfg(not(target_os = "macos"))]
-fn host_net_interfaces() -> Vec<NetIface> {
-    // Off-macOS the AF_LINK/getifaddrs walk above is not wired up (Linux uses
-    // AF_PACKET/sockaddr_ll, not BSD's sockaddr_dl), so synthesize at least the
-    // loopback interface — every Linux box has `lo`, and a wholly empty
-    // /sys/class/net diverges from Docker for anything that enumerates
-    // interfaces. Full host enumeration on these backends is a follow-up.
-    vec![NetIface {
-        name: "lo".to_owned(),
-        index: 1,
-        mac: [0u8; 6],
-        mac_len: 6,
-        flags: (libc::IFF_LOOPBACK | libc::IFF_UP | libc::IFF_RUNNING) as u32,
-        is_loopback: true,
-    }]
+fn default_net_model() -> crate::network::model::LinuxNetworkModel {
+    crate::network::model::LinuxNetworkModel::from_spec(
+        &carrick_spec::NetworkNamespaceSpec::default(),
+    )
 }
 
 fn net_interfaces_from_model(model: &crate::network::model::LinuxNetworkModel) -> Vec<NetIface> {
@@ -182,9 +120,9 @@ fn net_interfaces_from_model(model: &crate::network::model::LinuxNetworkModel) -
 
 /// Render `/sys/class/net/<if>/<attr>` for a live interface, or `None` if the
 /// path isn't a recognized attribute of a present interface.
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 fn synthetic_net_file(path: &str) -> Option<Vec<u8>> {
-    synthetic_net_file_from_interfaces(path, host_net_interfaces())
+    synthetic_net_file_from_interfaces(path, net_interfaces_from_model(&default_net_model()))
 }
 
 fn synthetic_net_file_from_interfaces(path: &str, interfaces: Vec<NetIface>) -> Option<Vec<u8>> {
@@ -283,9 +221,15 @@ impl SysVfs {
     }
 
     fn net_interfaces(&self) -> Vec<NetIface> {
-        self.network_model
-            .as_ref()
-            .map_or_else(host_net_interfaces, net_interfaces_from_model)
+        let default_model;
+        let model = match &self.network_model {
+            Some(m) => m,
+            None => {
+                default_model = default_net_model();
+                &default_model
+            }
+        };
+        net_interfaces_from_model(model)
     }
 
     fn synthetic_net_file(&self, path: &str) -> Option<Vec<u8>> {
@@ -548,10 +492,8 @@ mod tests {
             EntryKind::Directory
         );
         let ifaces = v.readdir("/sys/class/net").unwrap();
-        assert!(!ifaces.is_empty(), "host interfaces should be listed");
-        // Interface names mirror the host's getifaddrs view (the same source
-        // carrick's netlink uses), so find the loopback by its type (772 =
-        // ARPHRD_LOOPBACK) rather than hard-coding a name.
+        // Interface names mirror the LinuxNetworkModel view, so find the
+        // loopback by its type (772 = ARPHRD_LOOPBACK) rather than hard-coding a name.
         let lo = ifaces
             .iter()
             .map(|d| d.name.clone())

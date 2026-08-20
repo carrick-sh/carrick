@@ -1403,56 +1403,17 @@ fn proc_symlink_metadata(size: u64) -> Metadata {
     }
 }
 
-/// Host interfaces mapped to Linux-plausible names: `lo0`→`lo` (always present),
-/// the first ethernet-like uplink (`enN`)→`eth0`; Darwin-only pseudo-interfaces
-/// (awdl/llw/utun/bridge/gif/stf/…) are dropped so a guest never sees macOS-isms
-/// or tries `if_nametoindex("en0")`. Feeds dev/igmp/igmp6/dev_mcast so the iface
-/// NAME correlates across all of /proc/net.
+/// (index, name, has_ipv4, has_ipv6) for each interface Carrick advertises.
+/// Driven entirely by `LinuxNetworkModel`, so the guest's view is consistent and
+/// isolated from host network configuration.
 fn linux_interfaces(
     network: &carrick_spec::NetworkNamespaceSpec,
 ) -> Vec<(u32, String, bool, bool)> {
-    if network.mode != carrick_spec::NetworkMode::Host {
-        return crate::network::model::LinuxNetworkModel::from_spec(network)
-            .links
-            .into_iter()
-            .map(|link| (link.index, link.name, link.has_ipv4, link.has_ipv6))
-            .collect();
-    }
-    host_linux_interfaces()
-}
-
-fn host_linux_interfaces() -> Vec<(u32, String, bool, bool)> {
-    let mut out: Vec<(u32, String, bool, bool)> = Vec::new();
-    let mut have_eth = false;
-    for (_idx, name, v4, v6) in host_mc_interfaces() {
-        if name == "lo0" || name == "lo" {
-            if !out.iter().any(|(_, n, _, _)| n == "lo") {
-                // Loopback always carries both IPv4 (127.0.0.1) and IPv6 (::1).
-                out.push((1, "lo".to_owned(), true, true));
-            }
-        } else if name.starts_with("en") && !have_eth {
-            have_eth = true;
-            // NO IPv6 on the uplink, even in host mode, and for the same reason
-            // `LinuxNetworkModel` gives none: what would be emitted is not the
-            // host's real address but a FABRICATED `fe80::…:1`
-            // (`synthetic_proc_net_if_inet6`), and carrick cannot service an IPv6
-            // multicast join on it — libuv's `udp_multicast_join6` gets
-            // EADDRNOTAVAIL where the oracle skips.
-            //
-            // Inheriting the host's `v6` here made the fabrication guest-visible
-            // in host mode only, which is the mode the conformance surface runs
-            // in, so the model's fix never applied where it mattered. It is wrong
-            // in both directions: libuv's `can_ipv6_external()` and
-            // `tcp_connect6_link_local` both key off "does any enumerated
-            // interface carry an fe80:: address", and Linux answers no.
-            let _ = v6;
-            out.push((2, "eth0".to_owned(), v4, false));
-        }
-    }
-    if !out.iter().any(|(_, n, _, _)| n == "lo") {
-        out.insert(0, (1, "lo".to_owned(), true, true));
-    }
-    out
+    crate::network::model::LinuxNetworkModel::from_spec(network)
+        .links
+        .into_iter()
+        .map(|link| (link.index, link.name, link.has_ipv4, link.has_ipv6))
+        .collect()
 }
 
 /// Render `/proc/net/<name>` (and its `self/net` / `<pid>/net` aliases). carrick
@@ -1614,53 +1575,6 @@ fn synthetic_proc_net_netstat() -> Vec<u8> {
 TcpExt: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
 IpExt: InNoRoutes InTruncatedPkts InMcastPkts OutMcastPkts InBcastPkts OutBcastPkts InOctets OutOctets InMcastOctets OutMcastOctets InBcastOctets OutBcastOctets InCsumErrors InNoECTPkts InECT1Pkts InECT0Pkts InCEPkts ReasmOverlaps\n\
 IpExt: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n".to_vec()
-}
-
-/// `(index, name, has_ipv4, has_ipv6)` for each host interface, via getifaddrs.
-/// Used to synthesize `/proc/net/igmp[6]` so a guest's `Interface.MulticastAddrs`
-/// reports the standard multicast groups every Linux interface joins.
-#[cfg(target_os = "macos")]
-fn host_mc_interfaces() -> Vec<(u32, String, bool, bool)> {
-    use std::collections::BTreeMap;
-    let mut map: BTreeMap<String, (u32, bool, bool)> = BTreeMap::new();
-    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    if unsafe { libc::getifaddrs(&mut head) } != 0 || head.is_null() {
-        return Vec::new();
-    }
-    let mut cur = head;
-    while !cur.is_null() {
-        let ifa = unsafe { &*cur };
-        cur = ifa.ifa_next;
-        if ifa.ifa_name.is_null() {
-            continue;
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
-            .to_string_lossy()
-            .into_owned();
-        let idx = {
-            let c = std::ffi::CString::new(name.clone()).unwrap_or_default();
-            unsafe { libc::if_nametoindex(c.as_ptr()) }
-        };
-        let entry = map.entry(name).or_insert((idx, false, false));
-        if idx != 0 {
-            entry.0 = idx;
-        }
-        if !ifa.ifa_addr.is_null() {
-            match unsafe { (*ifa.ifa_addr).sa_family } as i32 {
-                libc::AF_INET => entry.1 = true,
-                libc::AF_INET6 => entry.2 = true,
-                _ => {}
-            }
-        }
-    }
-    unsafe { libc::freeifaddrs(head) };
-    map.into_iter()
-        .map(|(name, (idx, v4, v6))| (idx, name, v4, v6))
-        .collect()
-}
-#[cfg(not(target_os = "macos"))]
-fn host_mc_interfaces() -> Vec<(u32, String, bool, bool)> {
-    vec![(1, "lo".to_owned(), true, true)]
 }
 
 /// `/proc/net/igmp`: one block per IPv4 interface listing the all-hosts group

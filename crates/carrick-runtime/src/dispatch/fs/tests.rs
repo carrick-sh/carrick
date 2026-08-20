@@ -189,33 +189,17 @@ fn readv_host_write_guard_finishes_every_exposed_range_on_error() {
 
 #[test]
 fn inet4_ioctl_view_uses_linux_interface_names() {
-    let ifaces = vec![
-        HostInet4Iface {
-            name: "lo0".to_owned(),
-            flags_host: libc::IFF_UP as u32 | libc::IFF_LOOPBACK as u32,
-            addr_be: [127, 0, 0, 1],
-        },
-        HostInet4Iface {
-            name: "utun0".to_owned(),
-            flags_host: libc::IFF_UP as u32,
-            addr_be: [10, 0, 0, 1],
-        },
-        HostInet4Iface {
-            name: "en4".to_owned(),
-            flags_host: libc::IFF_UP as u32 | libc::IFF_MULTICAST as u32,
-            addr_be: [192, 0, 2, 4],
-        },
-        HostInet4Iface {
-            name: "en0".to_owned(),
-            flags_host: libc::IFF_UP as u32 | libc::IFF_MULTICAST as u32,
-            addr_be: [192, 0, 2, 1],
-        },
-    ];
-
-    let ifaces = linux_guest_inet4_interfaces(ifaces);
+    let spec = carrick_spec::NetworkNamespaceSpec::bridge_default(
+        Some("web".to_string()),
+        Vec::new(),
+        Vec::new(),
+    );
+    let model = crate::network::model::LinuxNetworkModel::from_spec(&spec);
+    let ifaces = inet4_interfaces_from_model(&model);
     let names: Vec<_> = ifaces.iter().map(|iface| iface.name.as_str()).collect();
     assert_eq!(names, ["lo", "eth0"]);
-    assert_eq!(ifaces[1].addr_be, [192, 0, 2, 1]);
+    assert_eq!(ifaces[0].addr_be, [127, 0, 0, 1]);
+    assert_eq!(ifaces[1].addr_be, spec.ipv4.octets());
     assert_eq!(linux_if_nametoindex("lo"), Some(1));
     assert_eq!(linux_if_indextoname(2), Some("eth0"));
 }
