@@ -345,8 +345,27 @@ def injected_receipt(reviewed):
 
 
 def fixture_source_provenance():
+    manifest = [
+        {
+            "path": f"fixture/input-{index}",
+            "mode": "100644",
+            "type": "blob",
+            "git_object": f"{index:x}" * 40,
+        }
+        for index in range(1, 7)
+    ]
     return {
         "source_head": "0" * 40,
+        "source_git_tree": "2" * 40,
+        "source_path_manifest": manifest,
+        "source_path_manifest_sha256": hashlib.sha256(
+            json.dumps(
+                manifest,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest(),
         "source_tree_sha256": "1" * 64,
         "source_file_count": 6,
     }
@@ -1148,6 +1167,9 @@ class MatrixOrchestrationTest(unittest.TestCase):
     def initialize_product_repo(self, root):
         self.write_minimal_workspace(root)
         (root / "Cargo.lock").write_text("# locked\n", encoding="utf-8")
+        (root / "clippy.toml").write_text(
+            "disallowed-methods = []\n", encoding="utf-8"
+        )
         crate = root / "crates" / "example"
         source_dir = crate / "src"
         source_dir.mkdir(parents=True)
@@ -1211,104 +1233,192 @@ class MatrixOrchestrationTest(unittest.TestCase):
             ):
                 provenance = self.host_authority.product_source_provenance(root)
         self.assertEqual(provenance["source_head"], expected_head)
+        self.assertRegex(provenance["source_git_tree"], r"^[0-9a-f]{40}$")
+        self.assertEqual(
+            len([entry for entry in provenance["source_path_manifest"] if entry["type"] == "blob"]),
+            provenance["source_file_count"],
+        )
+        self.assertRegex(
+            provenance["source_path_manifest_sha256"], r"^[0-9a-f]{64}$"
+        )
         self.assertRegex(provenance["source_tree_sha256"], r"^[0-9a-f]{64}$")
-        self.assertEqual(provenance["source_file_count"], 6)
+        self.assertEqual(provenance["source_file_count"], 7)
 
-    def test_product_source_digest_tracks_dirty_tracked_content(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "worktree"
-            source_path = self.initialize_product_repo(root)
-            before = self.host_authority.product_source_provenance(root)
-            source_path.write_text("pub fn changed() {}\n", encoding="utf-8")
-            after = self.host_authority.product_source_provenance(root)
-        self.assertEqual(before["source_head"], after["source_head"])
-        self.assertEqual(before["source_file_count"], after["source_file_count"])
-        self.assertNotEqual(
-            before["source_tree_sha256"], after["source_tree_sha256"]
+    def run_fixture_refresh(self, root, candidate, runner):
+        matrix = self.load()
+        return self.host_authority.main(
+            [
+                "--refresh-candidate",
+                str(candidate),
+                "--profiles",
+                "macos-hvf-default",
+            ],
+            runner=runner,
+            matrix=matrix,
+            operation_catalog=FIXTURE_CATALOG,
+            catalog_manifest=FIXTURE_CATALOG,
+            expected=[],
+            capture_receipt=injected_receipt([]),
+            current_host="macos",
+            root=root,
         )
 
-    def test_product_source_provenance_rejects_relevant_untracked_files(self):
-        for relative in (
-            Path("crates/example/src/untracked.rs"),
-            Path("crates/untracked/Cargo.toml"),
-        ):
-            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory) / "worktree"
-                self.initialize_product_repo(root)
-                path = root / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("untracked\n", encoding="utf-8")
-                with self.assertRaisesRegex(
-                    self.host_authority.InventoryError, "untracked product"
-                ):
-                    self.host_authority.product_source_provenance(root)
-
-    def test_refresh_rejects_source_or_head_mutation_during_compilation(self):
-        matrix = self.load()
-        for mutation in ("source", "head"):
+    def test_live_refresh_rejects_dirty_tracked_worktree_or_index_before_runner(self):
+        for mutation in ("worktree", "index"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory) / "worktree"
-                source_path = self.initialize_product_repo(root)
-                candidate = Path(directory) / "candidate.json"
+                source = self.initialize_product_repo(root)
+                source.write_text("pub fn dirty() {}\n", encoding="utf-8")
+                if mutation == "index":
+                    subprocess.run(
+                        ["git", "-C", str(root), "add", str(source)],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
                 fake = FakeRunner()
-                changed = False
-
-                def runner(argv, **kwargs):
-                    nonlocal changed
-                    if "--manifest-path" in argv and not changed:
-                        source_path.write_text(
-                            f"pub fn changed_{mutation}() {{}}\n",
-                            encoding="utf-8",
-                        )
-                        if mutation == "head":
-                            subprocess.run(
-                                ["git", "-C", str(root), "add", str(source_path)],
-                                check=True,
-                                capture_output=True,
-                                text=True,
-                            )
-                            subprocess.run(
-                                [
-                                    "git",
-                                    "-C",
-                                    str(root),
-                                    "-c",
-                                    "user.name=Authority Test",
-                                    "-c",
-                                    "user.email=authority@example.invalid",
-                                    "commit",
-                                    "-qm",
-                                    "mutated",
-                                ],
-                                check=True,
-                                capture_output=True,
-                                text=True,
-                            )
-                        changed = True
-                    return fake(argv, **kwargs)
-
+                candidate = Path(directory) / "candidate.json"
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr):
-                    status = self.host_authority.main(
-                        [
-                            "--refresh-candidate",
-                            str(candidate),
-                            "--profiles",
-                            "macos-hvf-default",
-                        ],
-                        runner=runner,
-                        matrix=matrix,
-                        operation_catalog=FIXTURE_CATALOG,
-                        catalog_manifest=FIXTURE_CATALOG,
-                        expected=[],
-                        capture_receipt=injected_receipt([]),
-                        current_host="macos",
-                        root=root,
-                    )
-                self.assertTrue(changed)
+                    status = self.run_fixture_refresh(root, candidate, fake)
                 self.assertEqual(status, 2)
+                self.assertEqual(fake.calls, [])
                 self.assertFalse(candidate.exists())
-                self.assertIn("source", stderr.getvalue().casefold())
+                self.assertIn("clean", stderr.getvalue().casefold())
+
+    def test_live_refresh_rejects_tracked_external_symlink_before_runner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "worktree"
+            self.initialize_product_repo(root)
+            escape = root / "crates" / "example" / "escape"
+            escape.symlink_to("../../../outside")
+            subprocess.run(
+                ["git", "-C", str(root), "add", str(escape)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(root), "-c", "user.name=Authority Test",
+                    "-c", "user.email=authority@example.invalid", "commit", "-qm",
+                    "external symlink",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            fake = FakeRunner()
+            candidate = Path(directory) / "candidate.json"
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = self.run_fixture_refresh(root, candidate, fake)
+            self.assertEqual(status, 2)
+            self.assertEqual(fake.calls, [])
+            self.assertFalse(candidate.exists())
+            self.assertIn("symlink", stderr.getvalue().casefold())
+
+    def test_untracked_include_asset_is_absent_from_snapshot_and_compilation_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "worktree"
+            source = self.initialize_product_repo(root)
+            source.write_text(
+                'pub static ASSET: &[u8] = include_bytes!("asset.bin");\n',
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "add", str(source)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(root), "-c", "user.name=Authority Test",
+                    "-c", "user.email=authority@example.invalid", "commit", "-qm",
+                    "tracked include",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            (source.parent / "asset.bin").write_bytes(b"ambient")
+            fake = FakeRunner()
+            observed_snapshot = None
+
+            def runner(argv, **kwargs):
+                nonlocal observed_snapshot
+                if "--manifest-path" in argv:
+                    manifest = Path(argv[argv.index("--manifest-path") + 1])
+                    observed_snapshot = manifest.parent
+                    if not (observed_snapshot / "crates/example/src/asset.bin").exists():
+                        return subprocess.CompletedProcess(
+                            argv, 101, "", "include_bytes asset is absent from snapshot"
+                        )
+                return fake(argv, **kwargs)
+
+            candidate = Path(directory) / "candidate.json"
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = self.run_fixture_refresh(root, candidate, runner)
+            self.assertEqual(status, 2)
+            self.assertIsNotNone(observed_snapshot)
+            self.assertNotEqual(observed_snapshot, root)
+            self.assertIn("asset is absent", stderr.getvalue())
+            self.assertFalse(candidate.exists())
+
+    def test_workspace_change_and_restore_cannot_change_private_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "worktree"
+            source = self.initialize_product_repo(root)
+            original = source.read_bytes()
+            fake = FakeRunner()
+            observed = {}
+
+            def runner(argv, **kwargs):
+                if "--manifest-path" in argv:
+                    snapshot_root = Path(argv[argv.index("--manifest-path") + 1]).parent
+                    snapshot_source = snapshot_root / "crates/example/src/lib.rs"
+                    observed["root"] = snapshot_root
+                    observed["before"] = snapshot_source.read_bytes()
+                    source.write_bytes(b"pub fn transient_attacker() {}\n")
+                    source.write_bytes(original)
+                    observed["after"] = snapshot_source.read_bytes()
+                return fake(argv, **kwargs)
+
+            candidate = Path(directory) / "candidate.json"
+            status = self.run_fixture_refresh(root, candidate, runner)
+            self.assertEqual(status, 1)
+            self.assertTrue(candidate.exists())
+            self.assertNotEqual(observed["root"], root)
+            self.assertEqual(observed["before"], original)
+            self.assertEqual(observed["after"], original)
+
+    def test_snapshot_digest_mutation_during_compilation_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "worktree"
+            self.initialize_product_repo(root)
+            fake = FakeRunner()
+            mutated = False
+
+            def runner(argv, **kwargs):
+                nonlocal mutated
+                if "--manifest-path" in argv and not mutated:
+                    snapshot_root = Path(argv[argv.index("--manifest-path") + 1]).parent
+                    source = snapshot_root / "crates/example/src/lib.rs"
+                    source.chmod(0o644)
+                    source.write_text("pub fn compiler_mutated() {}\n", encoding="utf-8")
+                    mutated = True
+                return fake(argv, **kwargs)
+
+            candidate = Path(directory) / "candidate.json"
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = self.run_fixture_refresh(root, candidate, runner)
+            self.assertTrue(mutated)
+            self.assertEqual(status, 2)
+            self.assertFalse(candidate.exists())
+            self.assertIn("snapshot", stderr.getvalue().casefold())
 
     def test_checked_matrix_declares_exact_nine_product_profiles(self):
         matrix = self.load()
@@ -2011,6 +2121,11 @@ class MatrixOrchestrationTest(unittest.TestCase):
         )
         self.assertEqual(document["capture_sha256"], canonical(capture))
         self.assertRegex(capture["source_head"], r"^[0-9a-f]{40}$")
+        self.assertRegex(capture["source_git_tree"], r"^[0-9a-f]{40}$")
+        self.assertTrue(capture["source_path_manifest"])
+        self.assertRegex(
+            capture["source_path_manifest_sha256"], r"^[0-9a-f]{64}$"
+        )
         self.assertRegex(capture["source_tree_sha256"], r"^[0-9a-f]{64}$")
         self.assertGreater(capture["source_file_count"], 0)
         self.assertIn("partial", stderr.getvalue())
@@ -2102,6 +2217,22 @@ class MatrixOrchestrationTest(unittest.TestCase):
             checked_config.write_text(
                 '[build]\nrustflags = ["-C", "force-frame-pointers=yes"]\n',
                 encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "add", str(checked_config)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(root), "-c", "user.name=Authority Test",
+                    "-c", "user.email=authority@example.invalid", "commit", "-qm",
+                    "checked config",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
             )
             inventory = (
                 root
