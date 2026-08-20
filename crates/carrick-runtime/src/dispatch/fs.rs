@@ -6807,14 +6807,8 @@ impl SyscallDispatcher {
     /// this offset is EFBIG + SIGXFSZ on Linux (llseek01). Stored in the
     /// per-process override table (RLIMIT_FSIZE == resource 1).
     fn fsize_soft_limit(&self) -> Option<u64> {
-        let ov = self
-            .proc
-            .lock()
-            .rlimit_overrides
-            .get(LINUX_RLIMIT_FSIZE as usize)
-            .copied()
-            .flatten()?;
-        (ov.rlim_cur != LINUX_RLIM_INFINITY).then_some(ov.rlim_cur)
+        let limit = self.task_rlimits().get(carrick_abi::LinuxResource::Fsize);
+        (limit.rlim_cur != LINUX_RLIM_INFINITY).then_some(limit.rlim_cur)
     }
 
     /// Enforce RLIMIT_FSIZE for a regular-file write starting at `offset` that

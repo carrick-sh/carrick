@@ -61,10 +61,10 @@ pub use objects::{
     Credentials, FileDescription, FileDescriptionBackingKind, FileDescriptionBackingSnapshot,
     FileSlot, FileTable, FsContext, HandlerFrameState, LinuxWaitStatus, Mm, ObjectGraphError,
     OpenDescriptionBackingSnapshot, PendingQueue, PendingSignal, PidfdTarget, ProcessGroup,
-    RunnerDirective, Session, Sighand, SignalAuthority, SignalDequeue, SignalDisposition,
-    SignalPendingOwner, Task, TaskKey, TaskLifecycle, TaskPendingSignals, TaskRef, TaskRusage,
-    TaskShared, TaskSharedCloneError, TaskWaker, Thread, ThreadKey, ThreadRef, ThreadResources,
-    ThreadRunner, ThreadSignalState, Zombie,
+    RlimitSet, RunnerDirective, Session, Sighand, SignalAuthority, SignalDequeue,
+    SignalDisposition, SignalPendingOwner, Task, TaskKey, TaskLifecycle, TaskPendingSignals,
+    TaskRef, TaskRusage, TaskShared, TaskSharedCloneError, TaskWaker, Thread, ThreadKey, ThreadRef,
+    ThreadResources, ThreadRunner, ThreadSignalState, Zombie,
 };
 pub(crate) use objects::{FileDescriptionBacking, JobControlStopInvalidationGeneration};
 pub(crate) use operations::ExactSignalTargetAuthorization;

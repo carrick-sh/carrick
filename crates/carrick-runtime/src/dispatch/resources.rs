@@ -13,6 +13,14 @@ pub(super) struct CapturedResources {
     fs_context: Arc<crate::kernel::FsContext>,
     files: Arc<crate::kernel::FileTable>,
     mm: Arc<crate::kernel::Mm>,
+    /// The task whose resource limits apply to this operation.
+    ///
+    /// Captured here for the same reason the credentials are: enforcement sites
+    /// deep in the filesystem and memory subsystems take only `&self` and must
+    /// not re-derive the binding. Rlimits moved onto the task so a PEER can
+    /// write them (`prlimit(pid, …)`), so a reader that still consulted the
+    /// dispatcher's private copy would not see a limit another process had set.
+    task: crate::kernel::TaskRef,
 }
 
 impl CapturedResources {
@@ -22,6 +30,7 @@ impl CapturedResources {
             fs_context: context.resources().fs_context(),
             files: context.resources().files(),
             mm: context.shared().mm(),
+            task: Arc::clone(context.task()),
         }
     }
 
@@ -39,6 +48,10 @@ impl CapturedResources {
 
     pub(super) fn mm(&self) -> Arc<crate::kernel::Mm> {
         Arc::clone(&self.mm)
+    }
+
+    pub(super) fn task(&self) -> crate::kernel::TaskRef {
+        Arc::clone(&self.task)
     }
 }
 
@@ -158,6 +171,19 @@ pub(super) fn with_retiring_file_table<R>(
     RETIRING_FILE_TABLES.with(|stack| stack.borrow_mut().push(files));
     let _pop = Pop;
     operation()
+}
+
+/// This operation's resource limits, from the captured task.
+///
+/// `None` only where no boundary has installed a binding (unit tests and lanes
+/// with no kernel graph); callers fall back to the defaults.
+pub(super) fn rlimits() -> Option<crate::kernel::RlimitSet> {
+    CAPTURED_RESOURCES.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .map(|resources| resources.task().rlimits())
+    })
 }
 
 pub(super) fn credentials() -> Option<Arc<crate::kernel::Credentials>> {

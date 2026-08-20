@@ -430,14 +430,7 @@ use crate::linux_abi::{
     LINUX_R_OK,
     LINUX_RLIM_INFINITY,
     LINUX_RLIM_NLIMITS,
-    LINUX_RLIMIT_AS,
-    LINUX_RLIMIT_CPU,
-    LINUX_RLIMIT_DATA,
-    LINUX_RLIMIT_FSIZE,
     LINUX_RLIMIT_MEMLOCK,
-    LINUX_RLIMIT_NOFILE,
-    LINUX_RLIMIT_NPROC,
-    LINUX_RLIMIT_STACK,
     LINUX_RNDGETENTCNT,
     LINUX_RT_SIGSET_SIZE,
     LINUX_RTM_GETADDR,
@@ -3566,6 +3559,29 @@ impl SyscallDispatcher {
     /// A zombie is reported, not dropped: Linux keeps an exited-but-unreaped
     /// process addressable by `sched_*`, `setpriority` and `process_vm_*`, and
     /// applies the same ownership rule using the credentials it held at exit.
+    /// The task whose per-task state a pid-taking syscall must act on.
+    ///
+    /// `0` and the caller's own pid resolve to the CALLER without a registry
+    /// lookup, exactly as Linux treats them. Any other pid resolves through the
+    /// kernel graph — never through a host probe, because a guest pid is not a
+    /// host pid at all under HVPatch, so `kill(pid, 0)` asks Darwin about a
+    /// namespace it knows nothing about and answers by coincidence.
+    ///
+    /// `None` means the pid names no live guest task, which the caller reports
+    /// as `ESRCH`.
+    pub(crate) fn task_for_guest_pid(
+        &self,
+        context: &crate::kernel::KernelContext,
+        pid: i32,
+    ) -> Option<crate::kernel::TaskRef> {
+        if pid == 0 || u32::try_from(pid).is_ok_and(|pid| pid == self.identity_pid()) {
+            return Some(std::sync::Arc::clone(context.task()));
+        }
+        let process = self.hvpatch_process()?;
+        let task = crate::kernel::TaskId::from_abi_positive(pid).ok()?;
+        process.kernel_graph().live_task(task)
+    }
+
     pub(crate) fn guest_process_target(&self, pid: i32) -> Option<GuestProcessTarget> {
         let process = self.hvpatch_process()?;
         let Ok(task) = crate::kernel::TaskId::from_abi_positive(pid) else {

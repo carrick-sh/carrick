@@ -670,8 +670,6 @@ pub(super) struct ProcState {
     /// Per-resource `setrlimit`/`prlimit64` overrides, indexed by the Linux
     /// resource number (0..16). `None` uses the Carrick default from
     /// `rlimit_for_resource`. This process/thread-group authority is independent
-    /// of CLONE_FILES; the fd allocator reads RLIMIT_NOFILE from the same table.
-    pub rlimit_overrides: [Option<crate::linux_abi::LinuxRlimit>; 16],
     /// Host pid of the ROOT guest process, captured at construction — before
     /// any guest `fork(2)`. Carrick forks each guest process as a real host
     /// child, so the host process tree mirrors the guest tree. A forked child
@@ -828,7 +826,6 @@ impl ProcState {
             no_new_privs: false,
             timerslack: LINUX_DEFAULT_TIMERSLACK_NS,
             timerslack_default: LINUX_DEFAULT_TIMERSLACK_NS,
-            rlimit_overrides: [None; 16],
             bootstrap_host_pid: std::process::id(),
             virtual_pid: None,
             virtual_ppid: None,
@@ -4839,14 +4836,7 @@ impl SyscallDispatcher {
     /// The carrick default is RLIM_INFINITY; a `setrlimit(RLIMIT_CORE, 0)` in the
     /// override table disables it.
     fn rlimit_core_enabled(&self) -> bool {
-        match self
-            .proc
-            .lock()
-            .rlimit_overrides
-            .get(crate::linux_abi::LINUX_RLIMIT_CORE as usize)
-            .copied()
-            .flatten()
-        {
+        match Some(self.task_rlimits().get(carrick_abi::LinuxResource::Core)) {
             Some(limit) => limit.rlim_cur != 0,
             None => true,
         }
