@@ -708,7 +708,7 @@ pub(crate) use fs::{LegacyAioContextId, SplicePushback};
 #[macro_use]
 mod mem;
 #[macro_use]
-mod net;
+pub(crate) mod net;
 #[macro_use]
 mod perf;
 mod proc;

@@ -337,6 +337,7 @@ pub(crate) fn sctp_forget(host_fd: i32) {
 }
 mod reuseport;
 mod support;
+pub(crate) mod unix_pure;
 
 /// Drop `host_fd` from any `SO_REUSEPORT` group. Called from the close path in
 /// `dispatch`; see `reuseport::leave`.
