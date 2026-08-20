@@ -6471,15 +6471,43 @@ fn linux_clock_duration(clock_id: u64) -> Option<Duration> {
         LINUX_CLOCK_BOOTTIME | LINUX_CLOCK_BOOTTIME_ALARM => Some(boottime_duration()),
         // Linux↔macOS clock-id numbering DIFFERS, so map the Linux ids to
         // the host's symbolic libc constants rather than passing through.
-        LINUX_CLOCK_PROCESS_CPUTIME_ID => host_clock_duration(libc::CLOCK_PROCESS_CPUTIME_ID),
-        LINUX_CLOCK_THREAD_CPUTIME_ID => host_clock_duration(libc::CLOCK_THREAD_CPUTIME_ID),
+        LINUX_CLOCK_PROCESS_CPUTIME_ID => {
+            let (u, s) = time::task_self_cpu_us();
+            if u > 0 || s > 0 {
+                Some(Duration::from_micros(u.saturating_add(s)))
+            } else {
+                host_clock_duration(libc::CLOCK_PROCESS_CPUTIME_ID)
+            }
+        }
+        LINUX_CLOCK_THREAD_CPUTIME_ID => {
+            let user_us = crate::guest_cpu::this_thread_us();
+            if user_us > 0 {
+                Some(Duration::from_micros(user_us))
+            } else {
+                host_clock_duration(libc::CLOCK_THREAD_CPUTIME_ID)
+            }
+        }
         // A dynamic per-task CPU-clock id (negative) → best-effort current
         // thread/process CPU time (CLOCK_PROCESS_CPUTIME_ID may be unimplemented
         // on some hosts, so fall back to the thread clock).
         _ => match dynamic_cpu_clock(clock_id)? {
-            DynamicCpuClock::PerThread => host_clock_duration(libc::CLOCK_THREAD_CPUTIME_ID),
-            DynamicCpuClock::PerProcess => host_clock_duration(libc::CLOCK_PROCESS_CPUTIME_ID)
-                .or_else(|| host_clock_duration(libc::CLOCK_THREAD_CPUTIME_ID)),
+            DynamicCpuClock::PerThread => {
+                let user_us = crate::guest_cpu::this_thread_us();
+                if user_us > 0 {
+                    Some(Duration::from_micros(user_us))
+                } else {
+                    host_clock_duration(libc::CLOCK_THREAD_CPUTIME_ID)
+                }
+            }
+            DynamicCpuClock::PerProcess => {
+                let (u, s) = time::task_self_cpu_us();
+                if u > 0 || s > 0 {
+                    Some(Duration::from_micros(u.saturating_add(s)))
+                } else {
+                    host_clock_duration(libc::CLOCK_PROCESS_CPUTIME_ID)
+                        .or_else(|| host_clock_duration(libc::CLOCK_THREAD_CPUTIME_ID))
+                }
+            }
         },
     }
 }
@@ -6626,27 +6654,44 @@ fn linux_access_flags_are_supported(flags: u64) -> bool {
     flags & !SUPPORTED == 0
 }
 
+static GUEST_REALTIME_OFFSET_NS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+pub(crate) fn get_guest_realtime_offset_ns() -> i64 {
+    GUEST_REALTIME_OFFSET_NS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub(crate) fn set_guest_realtime_offset_ns(delta_ns: i64) {
+    GUEST_REALTIME_OFFSET_NS.store(delta_ns, std::sync::atomic::Ordering::SeqCst);
+}
+
 fn realtime_duration() -> Duration {
-    // On macOS/HVF, compute REALTIME the SAME way the guest's vDSO fast path does
-    // — the suspend-excluding uptime counter plus the shared realtime_off the vvar
-    // page was stamped with — so the trapping clock_gettime read and the userspace
-    // vDSO read agree by construction. Reading a live SystemTime::now() here used
-    // an unrelated base (wall clock vs guest CNTVCT + boot-stamped offset), so LTP
-    // clock_gettime04 (which reads each clock via BOTH paths) saw REALTIME travel
-    // backwards. The offset is itself `unix_ns - uptime_ns`, so this still tracks
-    // the wall clock (within the boot-stamp's NTP slew, sub-µs over a test). The
-    // #[cfg(target_os = "linux")] path keeps the native time-ns-virtualized wall.
-    #[cfg(not(target_os = "linux"))]
-    {
-        if let Some(off_ns) = crate::vdso::realtime_off_ns()
-            && let Some(uptime) = host_clock_duration(carrick_portable::CLOCK_UPTIME_RAW)
+    let offset_ns = get_guest_realtime_offset_ns();
+    let base = {
+        #[cfg(not(target_os = "linux"))]
         {
-            return Duration::from_nanos((uptime.as_nanos() as u64).wrapping_add(off_ns));
+            if let Some(off_ns) = crate::vdso::realtime_off_ns()
+                && let Some(uptime) = host_clock_duration(carrick_portable::CLOCK_UPTIME_RAW)
+            {
+                Duration::from_nanos((uptime.as_nanos() as u64).wrapping_add(off_ns))
+            } else {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or(Duration::ZERO)
+            }
         }
+        #[cfg(target_os = "linux")]
+        {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+        }
+    };
+    if offset_ns >= 0 {
+        base.saturating_add(Duration::from_nanos(offset_ns as u64))
+    } else {
+        base.saturating_sub(Duration::from_nanos((-offset_ns) as u64))
     }
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
 }
 
 /// Read a host (macOS) POSIX clock via `libc::clock_gettime`. `clock_id`

@@ -50,6 +50,8 @@ pub const CAP_NET_RAW: u32 = 13;
 pub const CAP_SYS_PTRACE: u32 = 19;
 pub const CAP_SYS_ADMIN: u32 = 21;
 pub const CAP_SYS_NICE: u32 = 23;
+pub const CAP_SYS_RESOURCE: u32 = 24;
+pub const CAP_SYS_TIME: u32 = 25;
 pub const CAP_MKNOD: u32 = 27;
 pub const CAP_MAC_OVERRIDE: u32 = 32;
 pub const CAP_WAKE_ALARM: u32 = 35;
@@ -64,7 +66,6 @@ pub const FS_CAPABILITIES: u64 = (1 << CAP_CHOWN)
     | (1 << CAP_LINUX_IMMUTABLE)
     | (1 << CAP_MKNOD)
     | (1 << CAP_MAC_OVERRIDE);
-pub const CAP_SYS_RESOURCE: u32 = 24;
 
 /// Resolve a docker `--cap-add` name (no `CAP_` prefix, case-insensitive) to
 /// its capability number. Only the capabilities carrick actually models are
