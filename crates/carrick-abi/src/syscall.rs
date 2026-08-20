@@ -48,6 +48,17 @@ pub enum SyscallHandler {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Authority {
+    /// 100% guest kernel state: MUST NEVER make host process/identity/signal calls.
+    Guest,
+    /// Real hardware/host I/O (file byte I/O, INET wire sockets, physical pages, CPU time).
+    Host,
+    /// Hybrid: metadata & synchronization in guest, physical storage/pages on host.
+    Hybrid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Syscall {
     pub number: u64,
     pub name: &'static str,
@@ -56,6 +67,7 @@ pub struct Syscall {
     pub subsystem: &'static str,
     pub support: SupportLevel,
     pub handler: SyscallHandler,
+    pub authority: Authority,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compat_note: Option<&'static str>,
 }
@@ -84,7 +96,76 @@ const fn syscall(
         subsystem: group,
         support,
         handler: handler_for_aarch64(number),
+        authority: authority_for_aarch64(number),
         compat_note: compat_note_for_aarch64(number),
+    }
+}
+
+pub const fn authority_for_aarch64(number: u64) -> Authority {
+    match number {
+        // sched_yield: yields hardware vCPU / CPU cycle
+        124 => Authority::Host,
+
+        // SysV msg queues and shared memory:
+        186..=189 | 194..=197 => Authority::Hybrid,
+
+        // Clocks & time sources:
+        // Monotonic hardware clocks / gettime:
+        113 | 114 | 169 | 171 | 266 | 403 | 405 | 406 => Authority::Hybrid,
+        // Sleep operations:
+        101 | 115 | 407 => Authority::Host,
+
+        // Memory mappings (Stage-1 guest metadata + Stage-2 host pages):
+        214..=216
+        | 222..=239
+        | 282
+        | 284
+        | 288..=290
+        | 425
+        | 426
+        | 427
+        | 440
+        | 447
+        | 450
+        | 453
+        | 462 => Authority::Hybrid,
+
+        // Real Network Sockets & Wire Traffic:
+        198..=212 | 242 | 243 | 269 | 417 | 441 => Authority::Host,
+
+        // Real File I/O & Host FS:
+        0..=18
+        | 23..=29
+        | 32..=57
+        | 59..=73
+        | 75..=84
+        | 88
+        | 213
+        | 262..=265
+        | 267
+        | 276
+        | 279
+        | 285..=287
+        | 291
+        | 292
+        | 412..=414
+        | 416
+        | 428..=433
+        | 436
+        | 437
+        | 439
+        | 442
+        | 443
+        | 451
+        | 452
+        | 457
+        | 458 => Authority::Host,
+
+        // Random entropy source:
+        278 => Authority::Host,
+
+        // All process, credentials, lifecycle, signals, futex, timers, synthetic IPC, POSIX mqueues, semaphores, keyrings, ptrace, namespaces:
+        _ => Authority::Guest,
     }
 }
 

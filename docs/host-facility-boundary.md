@@ -64,9 +64,9 @@ resources — but each is a place to ask "whose truth is this?".
 | call | uses | verdict |
 |---|---:|---|
 | `std::process::id()` | 92 | mostly guest questions; `signal.rs` still carries comments saying "getpid() exposes the host pid", which described the RETIRED one-process-per-guest model |
-| `getifaddrs` | 20 | guest netns view built from the host's interface list |
-| `libc::kill(pid, 0)` | 8 | guest pid existence probed against the HOST's pid space |
-| `libc::getpgrp` / `getsid` | 12 | guest process groups/sessions read from the carrier's |
+| `getifaddrs` | 20 | guest netns view built from the host's interface list — replace with `NetNs` reads |
+| `libc::kill(pid, 0)` | 8 | FIXED under HVPatch — answered by kernel graph; legacy fallbacks unreached |
+| `libc::getpgrp` / `getsid` | 12 | FIXED under HVPatch — answered by kernel graph `ProcessIdentity` |
 | `peer_ucred` | 4 | FIXED — now `identity_pid` + `cred_snapshot` |
 | `libc::getrlimit(RLIMIT_NPROC)` in `vfs/proc.rs` | 1 | `/proc/…/limits` synthesised from the HOST's limits |
 | `gethostname` | 1 | UTS namespace is guest state |
@@ -77,7 +77,7 @@ Ranked first, because it closes a known row and shares its root cause with the
 `docs/identity-and-scope-domains.md` audit: **give rlimits a kernel-graph home
 keyed by `TaskId`**, the way credentials already have. That fixes
 `TestPrlimitFileLimit` (`prlimit` on another process), `/proc/…/limits`, and
-removes two host calls at once.
+removes two host calls at once. (DONE in `Task::rlimits`).
 
 ## The test that catches this class
 
@@ -123,34 +123,31 @@ Host `libc` calls inside the guest-authority dispatch modules:
 Most of the `sysv`/`mqueue` count is LEGITIMATE and must stay: those subsystems
 keep their segments in real files, so `open`/`close`/`pread`/`pwrite`/`ftruncate`/
 `fstat` there are backing-store I/O, which is exactly what the host is for.
+SysV semaphores, by contrast, are pure in-kernel synchronization with no backing
+store and are moved to pure in-memory state.
 
 What does not belong, by name:
 
 | call | uses | what it answers wrongly |
 |---|---:|---|
-| `libc::getpgrp` | 6 | the CARRIER's process group, not the guest's |
-| `libc::kill` | 5 | delivers a guest signal to a host pid |
-| `libc::wait4` | 5 | reaps host children; guest `fork` creates none |
-| `libc::waitid` | 5 | same |
-| `libc::getppid` | 4 | the carrier's parent |
-| `libc::getpid` | 4 | the carrier |
+| `libc::getpgrp` | 6 | FIXED under HVPatch (carrier's group vs guest group) |
+| `libc::kill` | 5 | FIXED under HVPatch (delivers via kernel graph queues) |
+| `libc::wait4` | 5 | FIXED under HVPatch (waits via kernel graph child state) |
+| `libc::waitid` | 5 | FIXED under HVPatch (same) |
+| `libc::getppid` | 4 | FIXED under HVPatch (parent read from kernel graph) |
+| `libc::getpid` | 4 | FIXED under HVPatch (virtual_pid / TaskId) |
 
 ## Make it mechanical, not aspirational
 
-The table already carries `SupportLevel` and `SyscallHandler` (which SUBSYSTEM
-serves it). It carries no `Authority` — WHOSE state the answer is — which is why
-this class keeps recurring silently. The fix that stops it recurring:
+The table now carries `Authority { Guest, Host, Hybrid }` alongside
+`SupportLevel` and `SyscallHandler` in `carrick_abi::syscall::Syscall`:
 
-1. Add `Authority { Guest, Host, Hybrid }` to `Syscall`, derived per row rather
-   than hand-numbered, following the typed-domain rules already in force.
-2. Extend the `just lint-domains` semgrep gate so a `Guest`-authority syscall's
-   dispatch path may not call host identity/process primitives
-   (`std::process::id`, `libc::get{pid,ppid,pgrp,sid,uid,gid}`, `libc::kill`,
-   `libc::wait*`, `libc::getrlimit`). The gate already blocks shipped bug shapes
-   this exact way; this is one more shape.
+1. `Authority { Guest, Host, Hybrid }` is defined in `carrick_abi::syscall` and
+   derived per syscall row in `AARCH64_SYSCALLS` via `authority_for_aarch64`.
+2. The `just lint-domains` semgrep gate enforces that `Guest`-authority syscall
+   dispatch paths do not call host identity/process primitives.
 3. `Hybrid` rows (SysV shm, mqueue, timers) declare that they touch the host for
-   BACKING only, so the lint allows I/O primitives there and still blocks identity
-   ones.
+   BACKING only, allowing I/O primitives there while blocking identity ones.
 
 That converts "we should service this ourselves" from a habit into a build
 failure, which is the only form that survives.
