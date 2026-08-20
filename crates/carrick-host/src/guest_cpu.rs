@@ -164,13 +164,32 @@ pub fn finish_active(delta_ns: u64) {
 /// shared x86 engine) wraps its run the same way, so a new backend gets correct
 /// `getrusage`/`times`/`/proc` guest CPU time by calling this instead of copying
 /// the `Instant::now()` / `begin_active` / `finish_active` dance. Returns `run`'s
-/// value unchanged.
-pub fn timed_run<T>(run: impl FnOnce() -> T) -> T {
-    let start = std::time::Instant::now();
+/// value together with the exact measured run interval. Wrapper bookkeeping
+/// occurs outside the receipt interval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimedRun<T> {
+    pub value: T,
+    pub elapsed_ns: u64,
+}
+
+fn timed_run_with_clock<T>(
+    mut now_ns: impl FnMut() -> u64,
+    run: impl FnOnce() -> T,
+) -> TimedRun<T> {
     begin_active();
-    let result = run();
-    finish_active(start.elapsed().as_nanos().min(u64::MAX as u128) as u64);
-    result
+    let start = now_ns();
+    let value = run();
+    let elapsed_ns = now_ns().saturating_sub(start);
+    finish_active(elapsed_ns);
+    TimedRun { value, elapsed_ns }
+}
+
+pub fn timed_run<T>(run: impl FnOnce() -> T) -> TimedRun<T> {
+    let started = std::time::Instant::now();
+    timed_run_with_clock(
+        || started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        run,
+    )
 }
 
 /// Process-wide guest CPU time (nanoseconds): the sum across all vCPU slots,
@@ -1372,6 +1391,19 @@ mod tests {
     use std::sync::Mutex;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn exact_run_receipt_excludes_wrapper_bookkeeping() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        reset();
+        let ticks =
+            std::cell::RefCell::new(std::collections::VecDeque::from([1_000_u64, 1_075_u64]));
+        let receipt = timed_run_with_clock(|| ticks.borrow_mut().pop_front().unwrap(), || 41_u64);
+        assert_eq!(receipt.value, 41);
+        assert_eq!(receipt.elapsed_ns, 75);
+        assert_eq!(total_ns(), 75);
+        reset();
+    }
 
     /// Register a (test) child through the production pre-fork path: claim +
     /// fill by the parent, then publish the child pid by ref. The legacy

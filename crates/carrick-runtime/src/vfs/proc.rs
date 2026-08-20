@@ -178,6 +178,8 @@ pub struct SyntheticProcZombie {
     pub pgrp: u32,
     pub session: u32,
     pub comm: String,
+    pub user_cpu_us: u64,
+    pub system_cpu_us: u64,
 }
 
 /// Minimal live state needed by synthetic `/proc` renderers.
@@ -3335,6 +3337,35 @@ fn synthetic_self_thread_and_peer_stat_use_published_logical_cpu() {
     assert_eq!(ticks("/proc/7/stat"), (310, 370));
 }
 
+#[cfg(test)]
+#[test]
+fn synthetic_zombie_stat_uses_exact_published_rusage() {
+    let ctx = SyntheticProcContext {
+        identity: Some(SyntheticProcIdentity {
+            pid: 3,
+            tid: 3,
+            ppid: 1,
+            pgrp: 3,
+            session: 3,
+            user_cpu_us: 0,
+            system_cpu_us: 0,
+        }),
+        zombies: Some(vec![SyntheticProcZombie {
+            pid: 9,
+            ppid: 3,
+            pgrp: 3,
+            session: 3,
+            comm: "gone".to_owned(),
+            user_cpu_us: 4_100_000,
+            system_cpu_us: 4_300_000,
+        }]),
+        ..SyntheticProcContext::default()
+    };
+    let line = String::from_utf8(synthetic_file("/proc/9/stat", &ctx).unwrap()).unwrap();
+    let fields: Vec<_> = line.split_whitespace().collect();
+    assert_eq!((fields[13], fields[14]), ("410", "430"));
+}
+
 /// This process's accumulated guest user-CPU time in clock ticks (field 14 of
 /// `/proc/<pid>/stat`). Reads only the cheap cross-process `guest_cpu` atomic
 /// accumulator — NO syscall — so it is safe to call on every `/proc/self/stat`
@@ -3448,8 +3479,8 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{count}\n",
                     zombie.pgrp,
                     zombie.session,
                     1,
-                    0,
-                    0,
+                    cpu_us_to_ticks(zombie.user_cpu_us),
+                    cpu_us_to_ticks(zombie.system_cpu_us),
                 )
                 .into_bytes(),
             ),
@@ -5607,6 +5638,8 @@ mod tests {
                 pgrp: 1,
                 session: 1,
                 comm: "gone".to_owned(),
+                user_cpu_us: 0,
+                system_cpu_us: 0,
             }]),
             ..demo_ctx()
         }
@@ -5689,6 +5722,8 @@ mod tests {
                 pgrp: 40,
                 session: 39,
                 comm: "logical-child".to_owned(),
+                user_cpu_us: 0,
+                system_cpu_us: 0,
             }]),
             ..SyntheticProcContext::default()
         };

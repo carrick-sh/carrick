@@ -179,6 +179,7 @@ fn aarch64_task_state_from_snapshot(
     last_fault_esr: u64,
     last_exit_class: u64,
     is_forked_child: bool,
+    syscall_continuation: Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>,
     mm_generation: u64,
     asid_generation: u64,
 ) -> Result<Aarch64TaskCpuStateV1, TrapError> {
@@ -213,6 +214,7 @@ fn aarch64_task_state_from_snapshot(
         last_fault_esr,
         last_exit_class,
         is_forked_child,
+        syscall_continuation,
         mm_generation,
         asid_generation,
     })
@@ -1361,12 +1363,14 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
             // run) into this thread's guest_cpu slot so getrusage(RUSAGE_SELF) /
             // times / `/proc` see it. Done ONCE here, so every aarch64 backend on
             // this shared engine gets it for free (mirrors carrick-x86).
-            let run_started = std::time::Instant::now();
-            let run_result = carrick_host::guest_cpu::timed_run(|| self.vcpu.run());
+            let run = carrick_host::guest_cpu::timed_run(|| self.vcpu.run());
             self.pending_guest_run_receipt_ns = self
                 .pending_guest_run_receipt_ns
-                .saturating_add(run_started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
-            match run_result.map_err(|error| self.vm.enrich_vcpu_run_error(&self.vcpu, error))? {
+                .saturating_add(run.elapsed_ns);
+            match run
+                .value
+                .map_err(|error| self.vm.enrich_vcpu_run_error(&self.vcpu, error))?
+            {
                 Aarch64Exit::Syscall { frame, resume_pc } => {
                     // The EL0 `svc` re-entered EL1 and hit the sentinel store. The
                     // hardware already set ELR_EL1 = (svc addr + 4); the EL1
@@ -1898,9 +1902,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         std::mem::take(&mut self.pending_guest_run_receipt_ns)
     }
 
-    fn snapshot_guest_state_for_exec(&mut self) -> Result<GuestCpuState, TrapError> {
+    fn snapshot_guest_state_for_publication(&mut self) -> Result<GuestCpuState, TrapError> {
         require_migratable_fpsimd_authority(self.vm.fpsimd_enabled())?;
         let snapshot = self.vcpu.snapshot()?;
+        let continuation = self.vm.task_continuation(&self.vcpu)?;
         Ok(GuestCpuState::from_aarch64_v1(
             aarch64_task_state_from_snapshot(
                 &snapshot,
@@ -1910,6 +1915,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 self.last_fault_esr,
                 self.last_exit_class,
                 self.is_forked_child,
+                continuation,
                 self.mm_generation,
                 self.asid_generation,
             )?,
@@ -2540,6 +2546,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn save_guest_state(&mut self) -> Result<GuestCpuState, TrapError> {
         require_migratable_fpsimd_authority(self.vm.fpsimd_enabled())?;
+        let continuation = self.vm.task_continuation(&self.vcpu)?;
         let snapshot = self
             .vm
             .save_guest_state(&mut self.vcpu)
@@ -2553,6 +2560,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 self.last_fault_esr,
                 self.last_exit_class,
                 self.is_forked_child,
+                continuation,
                 self.mm_generation,
                 self.asid_generation,
             )?,
@@ -2561,6 +2569,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn save_shared_wait_state(&mut self) -> Result<GuestCpuState, TrapError> {
         require_migratable_fpsimd_authority(self.vm.fpsimd_enabled())?;
+        let continuation = self.vm.task_continuation(&self.vcpu)?;
         let snapshot = self
             .vm
             .save_shared_wait_state(&mut self.vcpu)
@@ -2576,6 +2585,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 self.last_fault_esr,
                 self.last_exit_class,
                 self.is_forked_child,
+                continuation,
                 self.mm_generation,
                 self.asid_generation,
             )?,
@@ -2813,6 +2823,28 @@ unsafe impl<V: Aarch64Vmm> Send for Aarch64EngineCore<V> {}
 mod tests {
     use super::*;
 
+    fn continuation() -> carrick_hal::threaded::Aarch64SyscallContinuationV1 {
+        carrick_hal::threaded::Aarch64SyscallContinuationV1 {
+            sequence: 0x101,
+            state: 1,
+            trap_kind: 2,
+            response_action: 3,
+            flags: 4,
+            native_nr: 5,
+            args: [6, 7, 8, 9, 10, 11],
+            x8: 12,
+            resume_pc: 13,
+            spsr: 14,
+            fp: 15,
+            lr: 16,
+            sp: 17,
+            esr: 18,
+            return_value: 19,
+            resume_x16: 20,
+            resume_x17: 21,
+        }
+    }
+
     fn sample() -> Aarch64VcpuSnapshot {
         let boot = carrick_hal::Aarch64GuestArch::bootstrap_sysregs();
         Aarch64VcpuSnapshot {
@@ -2937,6 +2969,7 @@ mod tests {
             0x7300,
             0x74,
             true,
+            Some(continuation()),
             17,
             19,
         )
@@ -2968,6 +3001,7 @@ mod tests {
         assert_eq!(task.last_fault_esr, 0x7300);
         assert_eq!(task.last_exit_class, 0x74);
         assert!(task.is_forked_child);
+        assert_eq!(task.syscall_continuation, Some(continuation()));
         assert_eq!(task.mm_generation, 17);
         assert_eq!(task.asid_generation, 19);
     }
@@ -2998,6 +3032,7 @@ mod tests {
             0xdead_0001,
             0x15,
             false,
+            Some(continuation()),
             23,
             29,
         )
@@ -3032,6 +3067,7 @@ mod tests {
         assert_eq!(restored.cpacr, destination.cpacr);
         assert_eq!(task.mm_generation, 23);
         assert_eq!(task.asid_generation, 29);
+        assert_eq!(task.syscall_continuation, Some(continuation()));
     }
 
     #[test]

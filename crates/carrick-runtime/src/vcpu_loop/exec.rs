@@ -227,48 +227,49 @@ mod exec_image_verification_tests {
         retire_execution_authority_for_exec, should_update_host_process_title,
     };
 
+    fn cpu_state_for_exec_test(mm_generation: u64) -> carrick_hal::threaded::Aarch64TaskCpuStateV1 {
+        carrick_hal::threaded::Aarch64TaskCpuStateV1 {
+            gprs: [0; 31],
+            pc: 0,
+            pstate: 0,
+            trap_pc: 0,
+            trap_pstate: 0,
+            sp_el0: 0,
+            elr_el1: 0,
+            spsr_el1: 0,
+            ttbr0: 0,
+            ttbr1: 0,
+            tcr: 0,
+            actlr_el1: 0,
+            tpidr_el0: 0,
+            tpidrro_el0: 0,
+            contextidr_el1: 0,
+            vregs: [0; 32],
+            fpsr: 0,
+            fpcr: 0,
+            pending_resume_pc: None,
+            last_syscall_nr: None,
+            last_syscall_orig_x0: 0,
+            last_fault_esr: 0,
+            last_exit_class: 0,
+            is_forked_child: false,
+            syscall_continuation: None,
+            mm_generation,
+            asid_generation: mm_generation,
+        }
+    }
+
     #[test]
     fn reclaim_exec_reclaim_replaces_the_exact_kernel_execution_lease() {
         use std::sync::Arc;
 
         use carrick_hal::ThreadId;
-        use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
+        use carrick_hal::threaded::GuestCpuState;
 
         use crate::kernel::objects::{
             BlockedReason, ExecutorId, MigratableTaskState, ThreadExecutionState,
         };
         use crate::kernel::{Kernel, RootBootstrap};
-
-        fn cpu_state(mm_generation: u64) -> GuestCpuState {
-            GuestCpuState::from_aarch64_v1(Aarch64TaskCpuStateV1 {
-                gprs: [0; 31],
-                pc: 0,
-                pstate: 0,
-                trap_pc: 0,
-                trap_pstate: 0,
-                sp_el0: 0,
-                elr_el1: 0,
-                spsr_el1: 0,
-                ttbr0: 0,
-                ttbr1: 0,
-                tcr: 0,
-                actlr_el1: 0,
-                tpidr_el0: 0,
-                tpidrro_el0: 0,
-                contextidr_el1: 0,
-                vregs: [0; 32],
-                fpsr: 0,
-                fpcr: 0,
-                pending_resume_pc: None,
-                last_syscall_nr: None,
-                last_syscall_orig_x0: 0,
-                last_fault_esr: 0,
-                last_exit_class: 0,
-                is_forked_child: false,
-                mm_generation,
-                asid_generation: mm_generation,
-            })
-        }
 
         let input = RootBootstrap::for_reference_model(
             19_101,
@@ -281,7 +282,7 @@ mod exec_image_verification_tests {
         let executor =
             ExecutorId::for_transitional_thread(ThreadId::synthetic_for_tests(19_101)).unwrap();
         let old_mm = context.shared().mm().id();
-        let cpu = cpu_state(old_mm.raw());
+        let cpu = GuestCpuState::from_aarch64_v1(cpu_state_for_exec_test(old_mm.raw()));
         let old_state = MigratableTaskState {
             cpu,
             mm: old_mm,
@@ -307,7 +308,7 @@ mod exec_image_verification_tests {
         let replacement = Arc::clone(committed.thread());
         let replacement_mm = committed.shared().mm().id();
         let replacement_state = MigratableTaskState {
-            cpu: cpu_state(replacement_mm.raw()),
+            cpu: GuestCpuState::from_aarch64_v1(cpu_state_for_exec_test(replacement_mm.raw())),
             mm: replacement_mm,
             asid_generation: replacement_mm.raw(),
         };
@@ -346,6 +347,65 @@ mod exec_image_verification_tests {
             ThreadExecutionState::Exited { .. }
         ));
         replacement.exit_from_executor(resumed).unwrap();
+    }
+
+    #[test]
+    fn predecessor_authority_is_validated_before_destructive_exec_replacement() {
+        let source = include_str!("exec.rs");
+        let retire = source
+            .find(concat!(
+                "retire_execution_authority_for_",
+                "exec(&retiring_thread"
+            ))
+            .expect("predecessor lease validation");
+        let replace = source
+            .rfind("engine.execve_into(&img)")
+            .expect("destructive backend replacement");
+        assert!(
+            retire < replace,
+            "stale or wrong predecessor authority must reject before execve_into destroys the old image"
+        );
+
+        use crate::kernel::objects::{ExecutorId, MigratableTaskState};
+        use crate::kernel::{Kernel, RootBootstrap};
+        use carrick_hal::ThreadId;
+        use carrick_hal::threaded::GuestCpuState;
+        use std::sync::Arc;
+
+        let input = RootBootstrap::for_reference_model(
+            19_103,
+            ThreadId::synthetic_for_tests(19_103),
+            "stale exec authority".to_owned(),
+        )
+        .unwrap();
+        let (kernel, context) = Kernel::bootstrap_root(input).unwrap();
+        let thread = Arc::clone(context.thread());
+        let mm = context.shared().mm().id();
+        let mut cpu = cpu_state_for_exec_test(mm.raw());
+        cpu.mm_generation = mm.raw();
+        cpu.asid_generation = mm.raw();
+        thread
+            .publish_initial_task_state(MigratableTaskState {
+                cpu: GuestCpuState::from_aarch64_v1(cpu),
+                mm,
+                asid_generation: mm.raw(),
+            })
+            .unwrap();
+        let lease = thread
+            .claim_runnable(
+                ExecutorId::for_transitional_thread(ThreadId::synthetic_for_tests(19_103)).unwrap(),
+            )
+            .unwrap();
+        let slot = parking_lot::Mutex::new(Some(lease));
+        let prepared = kernel.prepare_exec(&context, None).unwrap();
+        let _replacement = kernel.commit_exec(prepared, None).unwrap();
+        let destructive_calls = std::cell::Cell::new(0);
+        let authorized = retire_execution_authority_for_exec(&thread, &slot);
+        if authorized.is_ok() {
+            destructive_calls.set(destructive_calls.get() + 1);
+        }
+        assert!(authorized.is_err());
+        assert_eq!(destructive_calls.get(), 0);
     }
 
     #[test]
@@ -868,6 +928,18 @@ where
                 );
                 let engine_replace_started = std::time::Instant::now();
                 let mut backend_publication_gate = ExecBackendPublicationGate::default();
+                let retiring_thread = self.kernel_thread.as_ref().cloned().ok_or_else(|| {
+                    RuntimeError::Configuration(
+                        "committed exec lost predecessor Kernel thread authority".to_owned(),
+                    )
+                })?;
+                if let Err(error) =
+                    retire_execution_authority_for_exec(&retiring_thread, &self.execution_lease)
+                {
+                    return Err(RuntimeError::Configuration(format!(
+                        "reject exec before backend replacement: {error}"
+                    )));
+                }
                 if let Err(error) = engine.execve_into(&img) {
                     return Self::exec_failed_past_no_return(
                         kernel,
@@ -916,21 +988,6 @@ where
                     }
                 }
                 let old_files = prepared_kernel_exec.old_file_table();
-                let retiring_thread = self.kernel_thread.as_ref().cloned().ok_or_else(|| {
-                    RuntimeError::Configuration(
-                        "committed exec lost predecessor Kernel thread authority".to_owned(),
-                    )
-                })?;
-                if let Err(error) =
-                    retire_execution_authority_for_exec(&retiring_thread, &self.execution_lease)
-                {
-                    return Self::exec_failed_past_no_return(
-                        kernel,
-                        engine,
-                        &format!("retire predecessor execution lease for exec: {error}"),
-                    )
-                    .map(Some);
-                }
                 let committed_context =
                     match (kernel.hvpatch_process.as_ref(), prepared_kernel_exec) {
                         (Some(process), RuntimePreparedExec::Hvpatch(prepared)) => {
@@ -979,7 +1036,7 @@ where
                 let committed_mm = committed_context.shared().mm().id();
                 let committed_asid_generation = committed_mm.raw();
                 engine.bind_task_snapshot_identity(committed_mm.raw(), committed_asid_generation);
-                let replacement_cpu = match engine.snapshot_guest_state_for_exec() {
+                let replacement_cpu = match engine.snapshot_guest_state_for_publication() {
                     Ok(state) => state,
                     Err(error) => {
                         committed_context.thread().fail_uninitialized_snapshot(

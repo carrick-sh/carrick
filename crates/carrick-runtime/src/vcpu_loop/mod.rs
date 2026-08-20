@@ -1896,6 +1896,53 @@ where
         }
     }
 
+    fn publish_initial_execution_authority(
+        &self,
+        cpu: carrick_hal::threaded::GuestCpuState,
+    ) -> Result<(), RuntimeError> {
+        let thread = self.kernel_thread.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "initial execution publication lost Kernel thread".to_owned(),
+            )
+        })?;
+        let executor = crate::kernel::objects::ExecutorId::for_transitional_thread(self.this_tid)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let state = self.current_migratable_binding(cpu)?;
+        thread
+            .publish_initial_task_state(state)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let lease = thread
+            .claim_runnable(executor)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let mut slot = self.execution_lease.lock();
+        if slot.is_some() {
+            let _ = thread.fail_from_executor(
+                lease,
+                crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
+            );
+            return Err(RuntimeError::Configuration(
+                "initial execution publication found an existing lease".to_owned(),
+            ));
+        }
+        *slot = Some(lease);
+        Ok(())
+    }
+
+    fn require_execution_authority_for_destructive_save(&self) -> Result<(), RuntimeError> {
+        let thread = self.kernel_thread.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("destructive save lost Kernel thread".to_owned())
+        })?;
+        let lease = self.execution_lease.lock();
+        let lease = lease.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "destructive save attempted without exact execution lease".to_owned(),
+            )
+        })?;
+        thread
+            .validate_running_execution_lease(lease)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))
+    }
+
     fn settle_reclaim_snapshot(
         &self,
         state: &crate::kernel::objects::MigratableTaskState,
@@ -1903,18 +1950,11 @@ where
         let Some(thread) = self.kernel_thread.as_ref() else {
             return Ok(());
         };
-        let executor = crate::kernel::objects::ExecutorId::for_transitional_thread(self.this_tid)
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        let mut lease = if let Some(lease) = self.execution_lease.lock().take() {
-            lease
-        } else {
-            thread
-                .publish_initial_task_state(state.clone())
-                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-            thread
-                .claim_runnable(executor)
-                .map_err(|error| RuntimeError::Configuration(error.to_string()))?
-        };
+        let mut lease = self.execution_lease.lock().take().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "destructive save completed without exact execution lease".to_owned(),
+            )
+        })?;
         if let Err(error) = lease.replace_task_state(state.clone()) {
             let _ = thread.fail_from_executor(
                 lease,
@@ -2602,6 +2642,7 @@ where
         // thread's vCPU alone while other processes continue running.
         let single_threaded_process =
             self.registry.live_count() == 1 && self.process_fork_barrier.is_none();
+        self.require_execution_authority_for_destructive_save()?;
         let cpu = if single_threaded_process {
             // Single-threaded: this thread IS the whole process — no sibling
             // can race the teardown, so release unconditionally via the
@@ -4216,21 +4257,17 @@ where
     // wake, and then exit.  Before this guard those late leases leaked until
     // the global pool was exhausted during a cold Go build.
     let _vcpu_lease_guard = VcpuLeaseGuard;
-    let kernel_thread = if kernel.hvpatch_process.is_some() {
-        Some(Arc::clone(
-            kernel
-                .dispatcher
-                .capture_kernel_context(linux_tid)
-                .map_err(|error| {
-                    RuntimeError::Configuration(format!(
-                        "bind HVPatch crash-register authority: {error}"
-                    ))
-                })?
-                .thread(),
-        ))
-    } else {
-        None
-    };
+    let kernel_thread = Some(Arc::clone(
+        kernel
+            .dispatcher
+            .capture_kernel_context(linux_tid)
+            .map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "bind initial Kernel execution authority: {error}"
+                ))
+            })?
+            .thread(),
+    ));
     // Join the guest-executor population for exactly the lifetime of this loop.
     // ONE guard carries both facets that mean "this thread's vCPU loop is live":
     // the census a stop-the-world barrier's raise decision reads, and the crash
@@ -4291,6 +4328,15 @@ where
             });
         engine.bind_frame_cow(authority, identity);
     }
+    let initial_cpu = engine
+        .snapshot_guest_state_for_publication()
+        .map_err(|error| {
+            state.fail_snapshot_boundary(
+                crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
+            );
+            RuntimeError::Trap(error)
+        })?;
+    state.publish_initial_execution_authority(initial_cpu)?;
     state.register_vcpu(&engine);
     // Stamp this thread's tid into TPIDR_EL1 for the EL1 gettid fast path (main
     // thread at boot; each worker at spawn). Re-stamped after fork/exec below.
@@ -5761,6 +5807,7 @@ where
             result = Ok(VcpuLoopOutcome::ThreadDone);
         }
     }
+    state.settle_execution_lease_on_loop_departure();
     // This thread is leaving its vCPU loop. The engine's Drop is a no-op.
     // HVPatch ProcessExit retires its vCPU in the process cleanup above;
     // mature VMM ProcessExit keeps its historical process-death teardown.
@@ -6003,6 +6050,39 @@ mod tests {
         assert!(!source.contains(concat!("this_thread_", "slot")));
         assert!(!source.contains(concat!("slot_", "us(")));
         assert!(source.contains(concat!("take_guest_run_", "receipt_ns")));
+    }
+
+    #[test]
+    fn initial_execution_authority_precedes_registration_and_guest_run() {
+        let source = include_str!("mod.rs");
+        let publish = source
+            .find(concat!(
+                "state.publish_initial_",
+                "execution_authority(initial_cpu)"
+            ))
+            .expect("initial task state must be published and claimed");
+        let register = source
+            .find("state.register_vcpu(&engine)")
+            .expect("vCPU registration boundary");
+        let run = source
+            .find("let next = engine.next_syscall()")
+            .expect("first guest run boundary");
+        assert!(publish < register && register < run);
+
+        let settle = source
+            .split("fn settle_reclaim_snapshot")
+            .nth(1)
+            .and_then(|tail| tail.split("fn claim_reclaim_snapshot").next())
+            .expect("destructive-save settlement body");
+        assert!(!settle.contains(concat!("publish_initial_", "task_state")));
+        assert!(settle.contains("execution_lease.lock().take()"));
+        let departure = source
+            .rfind("state.settle_execution_lease_on_loop_departure()")
+            .expect("common loop-departure settlement");
+        let destroy = source
+            .rfind("engine.destroy_vcpu_on_thread_exit()")
+            .expect("common vCPU destruction");
+        assert!(departure < destroy);
     }
 
     /// `SA_RESTART` must resume the calls `signal(7)` says it resumes, and must

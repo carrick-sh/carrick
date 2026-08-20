@@ -49,6 +49,7 @@ fn aarch64_test_task_state() -> Aarch64TaskCpuStateV1 {
         last_fault_esr: 0x1500,
         last_exit_class: 0x16,
         is_forked_child: false,
+        syscall_continuation: None,
         mm_generation: 17,
         asid_generation: 19,
     }

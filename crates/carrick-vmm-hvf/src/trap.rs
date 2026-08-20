@@ -8978,6 +8978,7 @@ impl HvfVmState {
         &self,
         vcpu: &applevisor::vcpu::Vcpu,
         binding: &mut MailboxBinding,
+        continuation: Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>,
     ) -> Result<(), TrapError> {
         use applevisor::prelude::SysReg;
 
@@ -8988,9 +8989,9 @@ impl HvfVmState {
         let address = lease.id().guest_address();
         let pointer = self.mailbox_host_pointer(lease.id())?;
         // SAFETY: the allocator lease uniquely owns the complete fixed slot.
-        unsafe { binding.reacquire_after_reclaim(lease, pointer) }.map_err(|error| {
-            TrapError::Hypervisor(format!("resume AArch64 syscall mailbox: {error}"))
-        })?;
+        unsafe { binding.reacquire_after_reclaim(lease, pointer, continuation) }.map_err(
+            |error| TrapError::Hypervisor(format!("resume AArch64 syscall mailbox: {error}")),
+        )?;
         vcpu.set_sys_reg(SysReg::SP_EL1, address).map_err(hvf_error)
     }
 
@@ -10686,8 +10687,18 @@ impl HvfVmState {
         &mut self,
         vcpu: &mut applevisor::vcpu::Vcpu,
         mailbox: &mut MailboxBinding,
+        continuation: Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>,
     ) -> Result<(), TrapError> {
         if self.reclaim_authority.destination_vcpu_is_live().is_ok() {
+            if let Some(continuation) = continuation {
+                mailbox
+                    .import_task_continuation(continuation)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "restore task continuation into live destination mailbox: {error}"
+                        ))
+                    })?;
+            }
             return Ok(());
         }
         if self.reclaim_authority != ReclaimParkAuthority::VcpuParked {
@@ -10695,6 +10706,11 @@ impl HvfVmState {
                 "reclaim_resume: executor requires whole-VM recreation".to_owned(),
             ));
         }
+        let continuation = continuation.ok_or_else(|| {
+            TrapError::Hypervisor(
+                "reclaim_resume: parked syscall has no typed continuation authority".to_owned(),
+            )
+        })?;
         let new_vcpu = create_vcpu(&self._vm)?;
         enable_el0_counter_access(new_vcpu.id());
         self.vcpu_id = new_vcpu.id();
@@ -10702,7 +10718,7 @@ impl HvfVmState {
         // Replace the destroyed handle WITHOUT running applevisor's panicky Drop on
         // the (already hv_vcpu_destroy'd) old one — mirror the fork rebuild.
         std::mem::forget(std::mem::replace(vcpu, new_vcpu));
-        self.reacquire_mailbox_after_vcpu_create(vcpu, mailbox)?;
+        self.reacquire_mailbox_after_vcpu_create(vcpu, mailbox, Some(continuation))?;
         self.reclaim_authority.mark_live_after_recreate()?;
         Ok(())
     }
@@ -10795,12 +10811,18 @@ impl HvfVmState {
         vcpu: &mut applevisor::vcpu::Vcpu,
         mailbox: &mut MailboxBinding,
         replay_alias_union: bool,
+        continuation: Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>,
     ) -> Result<(), TrapError> {
         if self.reclaim_authority != ReclaimParkAuthority::VmParked {
             return Err(TrapError::Hypervisor(
                 "shared_wait_resume: no parked VM executor authority".to_owned(),
             ));
         }
+        let continuation = continuation.ok_or_else(|| {
+            TrapError::Hypervisor(
+                "shared_wait_resume: parked syscall has no typed continuation authority".to_owned(),
+            )
+        })?;
         let (new_vm, permit) = create_vm_with_admission(VmCreateAdmission::SharedWaitResume)?;
         let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
         enable_el0_counter_access(new_vcpu.id());
@@ -10899,7 +10921,7 @@ impl HvfVmState {
             }
         }
 
-        self.reacquire_mailbox_after_vcpu_create(vcpu, mailbox)?;
+        self.reacquire_mailbox_after_vcpu_create(vcpu, mailbox, Some(continuation))?;
         self.reclaim_authority.mark_live_after_recreate()?;
         Ok(())
     }

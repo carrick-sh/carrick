@@ -225,6 +225,11 @@ pub struct X86EngineCore<V: X86Vmm> {
 }
 
 impl<V: X86Vmm> X86EngineCore<V> {
+    fn record_guest_run_receipt_ns(&mut self, elapsed_ns: u64) {
+        self.pending_guest_run_receipt_ns =
+            self.pending_guest_run_receipt_ns.saturating_add(elapsed_ns);
+    }
+
     /// Build an engine around an already-constructed VM + vCPU (the backend's
     /// bring-up produces these). `layout` is the GPA layout the bring-up used.
     pub fn from_parts(vm: V, vcpu: V::Vcpu, layout: BringupLayout) -> Self {
@@ -1050,12 +1055,9 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
             // add to the host thread's rusage. Mirrors the KVM (KvmTrapEngine) and
             // HVF trap loops, but lives HERE so every backend on this shared engine
             // gets it for free.
-            let run_started = std::time::Instant::now();
-            let run_result = carrick_host::guest_cpu::timed_run(|| self.vcpu.run());
-            self.pending_guest_run_receipt_ns = self
-                .pending_guest_run_receipt_ns
-                .saturating_add(run_started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
-            match run_result? {
+            let run = carrick_host::guest_cpu::timed_run(|| self.vcpu.run());
+            self.record_guest_run_receipt_ns(run.elapsed_ns);
+            match run.value? {
                 X86Exit::Syscall { frame, resume_pc } => {
                     self.sysret_resume = None;
                     record_x86_syscall_stat(frame.rax);
@@ -1610,7 +1612,7 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
         std::mem::take(&mut self.pending_guest_run_receipt_ns)
     }
 
-    fn snapshot_guest_state_for_exec(&mut self) -> Result<GuestCpuState, TrapError> {
+    fn snapshot_guest_state_for_publication(&mut self) -> Result<GuestCpuState, TrapError> {
         let snapshot = self
             .vm
             .save_guest_state(&self.vcpu)
@@ -2127,16 +2129,17 @@ mod tests {
         const THREADS: usize = 520;
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
         let handles: Vec<_> = (0..THREADS)
-            .map(|_| {
+            .map(|index| {
                 let barrier = std::sync::Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     let mut engine =
                         X86EngineCore::from_parts(TestVmm, TestVcpu::default(), test_layout());
                     barrier.wait();
-                    assert!(engine.next_syscall().unwrap().is_none());
+                    let expected = index as u64 + 1;
+                    engine.record_guest_run_receipt_ns(expected);
                     let receipt = engine.take_guest_run_receipt_ns();
                     assert_eq!(engine.take_guest_run_receipt_ns(), 0);
-                    receipt
+                    (receipt, expected)
                 })
             })
             .collect();
@@ -2145,7 +2148,11 @@ mod tests {
             .map(|handle| handle.join().expect("receipt worker"))
             .collect();
         assert_eq!(receipts.len(), THREADS);
-        assert!(receipts.iter().all(|receipt| *receipt > 0));
+        assert!(
+            receipts
+                .iter()
+                .all(|(receipt, expected)| receipt == expected)
+        );
     }
 
     #[test]

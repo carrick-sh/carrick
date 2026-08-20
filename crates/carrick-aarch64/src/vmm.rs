@@ -696,6 +696,15 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         true
     }
 
+    /// Export task-owned syscall continuation independently of executor-local
+    /// mailbox storage. Non-mailbox backends have no continuation payload.
+    fn task_continuation(
+        &self,
+        _vcpu: &Self::Vcpu,
+    ) -> Result<Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>, TrapError> {
+        Ok(None)
+    }
+
     /// Backing-only fixed-size READ into `dst` whose stage-1 translation is `ipa`,
     /// the no-alloc hot path (`read_u32`/`read_u64`/struct headers). Default:
     /// allocate via [`Self::translated_read`] + copy. HVF overrides to
