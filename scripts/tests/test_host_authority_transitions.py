@@ -49,6 +49,18 @@ class HostAuthorityInventoryTest(unittest.TestCase):
         with self.assertRaises(host_authority.InventoryError):
             host_authority.validate(rows, expected)
 
+    def test_ignores_std_net_type_annotations_but_detects_socket_operations(self):
+        host_authority = load_host_authority()
+        rows = host_authority.generate(
+            self.fixture(
+                "fn type_only(addr: std::net::SocketAddr) {}\n"
+                "fn connects() { let _ = std::net::TcpStream::connect(\"127.0.0.1:1\"); }\n"
+            )
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "ambient_network")
+        self.assertEqual(rows[0]["line"], 2)
+
     def test_accepts_an_exact_reviewed_inventory_and_rejects_drift(self):
         host_authority = load_host_authority()
         root = self.fixture("fn carrier() { std::thread::yield_now(); }\n")
