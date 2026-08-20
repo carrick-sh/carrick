@@ -565,11 +565,11 @@ fn host_sysctl_u64(name: &str) -> Option<u64> {
     }
 }
 
-fn context_guest_hostname(ctx: &SyntheticProcContext) -> &str {
+fn context_guest_hostname(ctx: &SyntheticProcContext) -> String {
     if ctx.guest_hostname.is_empty() {
         crate::execute::guest_hostname()
     } else {
-        &ctx.guest_hostname
+        ctx.guest_hostname.clone()
     }
 }
 
@@ -1412,10 +1412,23 @@ fn linux_interfaces(
     network: &carrick_spec::NetworkNamespaceSpec,
 ) -> Vec<(u32, String, bool, bool)> {
     if network.mode != carrick_spec::NetworkMode::Host {
-        return crate::network::model::LinuxNetworkModel::from_spec(network)
+        let model = crate::network::model::LinuxNetworkModel::from_spec(network);
+        return model
             .links
-            .into_iter()
-            .map(|link| (link.index, link.name, link.has_ipv4, link.has_ipv6))
+            .iter()
+            .map(|link| {
+                // Whether a link carries a family is DERIVED from the address
+                // list rather than stored beside it, so `/proc/net/if_inet6`
+                // cannot claim a link has IPv6 while the same namespace hands
+                // out no IPv6 address for it — which is exactly how a
+                // fabricated `fe80::…:1` reached the guest.
+                (
+                    link.index,
+                    link.name.clone(),
+                    model.link_carries(&link.name, false),
+                    model.link_carries(&link.name, true),
+                )
+            })
             .collect();
     }
     host_linux_interfaces()
