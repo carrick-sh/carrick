@@ -188,15 +188,21 @@ fn privileged_op_stubs_return_eperm_or_enosys() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
+/// Job-control queries answer from carrick's own kernel, not from Darwin.
+///
+/// This test used to assert the opposite — that `getpgid(0)`/`getsid(0)` equal
+/// `libc::getpgid(0)`/`libc::getsid(0)` — which was true only while a Linux
+/// process WAS a host process. Under HVPatch every guest process is a thread of
+/// one carrier, so the host answer is a single number shared by all of them, and
+/// the guest saw its Mac shell's five-digit group. The per-process behaviour
+/// needs more than one task to observe at all; that lives in
+/// `dispatch::proc::process_identity_dispatch_tests`. What is left here is the
+/// single-process half: the guest identity relation and the argument validation.
 #[test]
-fn job_control_queries_match_host_process_group_state() {
+fn job_control_queries_answer_from_the_kernel_graph() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
-    let host_pgid = unsafe { libc::getpgid(0) };
-    let host_sid = unsafe { libc::getsid(0) };
-    assert!(host_pgid > 0);
-    assert!(host_sid > 0);
 
     assert_eq!(
         dispatcher
@@ -224,9 +230,18 @@ fn job_control_queries_match_host_process_group_state() {
             errno: LinuxErrno::new(22)
         }
     );
-    // Successful setpgid(0, 0) and setsid() mutate process-global state for the
-    // test harness, so this unit test covers non-mutating host-backed queries
-    // and validation errors only.
+    // The bootstrap process leads its own group and session, so Linux's
+    // `getpid() == getpgid(0) == getsid(0)` relation holds for it. Asserting the
+    // relation rather than a number is the point: a host-backed answer breaks it
+    // the instant carrick's pid space stops coinciding with Darwin's.
+    let guest_pid = dispatcher
+        .dispatch(
+            &dispatcher.capture_one_task_context().unwrap(),
+            SyscallRequest::new(172, SyscallArgs::from([0; 6])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
     assert_eq!(
         dispatcher
             .dispatch(
@@ -236,9 +251,7 @@ fn job_control_queries_match_host_process_group_state() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Returned {
-            value: i64::from(host_pgid),
-        }
+        guest_pid
     );
     assert_eq!(
         dispatcher
@@ -262,9 +275,7 @@ fn job_control_queries_match_host_process_group_state() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Returned {
-            value: i64::from(host_sid),
-        }
+        guest_pid
     );
     assert_eq!(
         dispatcher

@@ -70,9 +70,10 @@ pub(crate) use objects::{FileDescriptionBacking, JobControlStopInvalidationGener
 pub(crate) use operations::ExactSignalTargetAuthorization;
 pub use operations::{
     ChildStartOutcome, ChildStartWait, ForkReservation, KernelFailpoint, KernelOperationError,
-    PreparedFork, PreparedTaskExit, PreparedThreadClone, PublishedFork, PublishedThreadClone,
-    ReservedPidfdSubscription, SignalTargetAuthorization, StartedFork, StartedThreadClone,
-    TaskIdentity, TaskOperationReservation, ThreadCloneReservation, WaitMode, WaitOutcome,
+    PreparedFork, PreparedTaskExit, PreparedThreadClone, ProcessIdentity, ProcessState,
+    PublishedFork, PublishedThreadClone, ReservedPidfdSubscription, SignalTargetAuthorization,
+    StartedFork, StartedThreadClone, TaskIdentity, TaskOperationReservation,
+    ThreadCloneReservation, WaitMode, WaitOutcome,
 };
 pub use registry::{
     IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,

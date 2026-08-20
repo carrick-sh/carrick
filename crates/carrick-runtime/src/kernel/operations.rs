@@ -103,6 +103,32 @@ pub struct TaskIdentity {
     pub session: SessionId,
 }
 
+/// Whether a Linux process is still running or has exited and is waiting to be
+/// reaped. Both are addressable: `wait(2)` is what removes a process from the
+/// table, not `_exit(2)`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessState {
+    Live,
+    Zombie,
+}
+
+/// Everything a guest-visible "who is that process?" question needs:
+/// `getpgid`, `getsid`, `getppid`, and `/proc/<pid>/stat` fields 4-6.
+///
+/// Distinct from [`TaskIdentity`], which describes one exact LIVE task
+/// generation for the fork/exit machinery. The two differ on the case that
+/// matters here: Linux keeps an exited-but-unreaped child fully addressable, so
+/// `getpgid(child)` after the child `_exit`s reports the child's group where a
+/// live-only lookup reports ESRCH.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessIdentity {
+    pub pid: TaskId,
+    pub parent: Option<TaskId>,
+    pub process_group: ProcessGroupId,
+    pub session: SessionId,
+    pub state: ProcessState,
+}
+
 #[derive(Clone, Debug)]
 pub struct ReservedPidfdSubscription {
     domain: Arc<KernelDomain>,
@@ -981,6 +1007,41 @@ impl Kernel {
             mm: record.task.shared().mm().id(),
             process_group: record.task.process_group(),
             session: record.task.session(),
+        })
+    }
+
+    /// Resolve one guest pid to the identity tuple every guest-visible "who is
+    /// that process?" answer is built from — live or unreaped zombie.
+    ///
+    /// This is deliberately the ONE accessor for that question. `getpgid`,
+    /// `getsid` and `/proc/<pid>/stat` each used to reach for their own lookup,
+    /// which is how they came to disagree about the same process; sharing this
+    /// makes disagreement unrepresentable.
+    ///
+    /// The zombie arm is the behaviour change. [`Zombie`] has carried
+    /// `process_group` and `session` since it was introduced and nothing ever
+    /// read them, so a guest that had not yet reaped a child and asked
+    /// `getpgid(child)` got ESRCH — Linux answers with the group the child was
+    /// in, because `wait(2)`, not `_exit(2)`, is what removes a process from
+    /// the table. Job-control shells rely on that: they look up a stopped or
+    /// exited member's group before reaping it.
+    pub(crate) fn process_identity(&self, task_id: TaskId) -> Option<ProcessIdentity> {
+        let state = self.registry().state.read();
+        if let Some(record) = state.tasks.get(&task_id) {
+            return Some(ProcessIdentity {
+                pid: task_id,
+                parent: record.task.parent().map(|parent| parent.id),
+                process_group: record.task.process_group(),
+                session: record.task.session(),
+                state: ProcessState::Live,
+            });
+        }
+        state.zombies.get(&task_id).map(|record| ProcessIdentity {
+            pid: task_id,
+            parent: record.zombie.parent.map(|parent| parent.id),
+            process_group: record.zombie.process_group,
+            session: record.zombie.session,
+            state: ProcessState::Zombie,
         })
     }
 
@@ -6889,6 +6950,108 @@ mod tests {
             vec![first.task.key(), second.task.key()]
         );
         assert_eq!(first.task.session(), root.task.session());
+    }
+
+    /// Two live processes must describe THEMSELVES, and an exited one must stay
+    /// describable until it is reaped.
+    ///
+    /// Both halves are invisible with a single task. With one process the pid,
+    /// the process group and the session are the same number, so "the answer is
+    /// wrong" and "the answer is right" produce identical output — which is
+    /// exactly how a constant standing where a per-process function belongs
+    /// survived. The second child exists so the two groups can disagree, and
+    /// the exit exists because `getpgid` on an unreaped child returned ESRCH
+    /// while `Zombie::process_group` sat there unread.
+    #[test]
+    fn process_identity_answers_per_process_and_survives_exit() {
+        let (kernel, root) = bootstrap(370);
+        let fork_plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let first = kernel
+            .fork_task(
+                &root,
+                fork_plan,
+                ThreadId::synthetic_for_tests(371),
+                "first".to_string(),
+                None,
+            )
+            .expect("first child");
+        let refreshed_root = kernel
+            .context(root.task.key().id, root.thread.key().tid)
+            .expect("refreshed root context");
+        let second = kernel
+            .fork_task(
+                &refreshed_root,
+                fork_plan,
+                ThreadId::synthetic_for_tests(372),
+                "second".to_string(),
+                None,
+            )
+            .expect("second child");
+        kernel
+            .set_process_group(root.task.key().id, Some(first.task.key().id), None)
+            .expect("give the first child its own group");
+
+        let first_identity = kernel
+            .process_identity(first.task.key().id)
+            .expect("first child identity");
+        let second_identity = kernel
+            .process_identity(second.task.key().id)
+            .expect("second child identity");
+
+        // Relations, never absolute numbers: each child names ITSELF, both name
+        // the same parent, and only the child that called setpgid left the
+        // inherited group.
+        assert_ne!(first_identity.pid, second_identity.pid);
+        assert_eq!(first_identity.parent, Some(root.task.key().id));
+        assert_eq!(second_identity.parent, Some(root.task.key().id));
+        assert_eq!(
+            first_identity.process_group,
+            ProcessGroupId::from_leader(first.task.key().id)
+        );
+        assert_eq!(
+            second_identity.process_group,
+            kernel
+                .process_identity(root.task.key().id)
+                .expect("root identity")
+                .process_group
+        );
+        assert_ne!(first_identity.process_group, second_identity.process_group);
+        assert_eq!(first_identity.session, second_identity.session);
+        assert_eq!(first_identity.state, ProcessState::Live);
+        assert_eq!(second_identity.state, ProcessState::Live);
+
+        kernel
+            .prepare_task_exit(
+                first.task.key().id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("prepare first child exit")
+            .commit()
+            .expect("commit first child exit");
+
+        let zombie_identity = kernel
+            .process_identity(first.task.key().id)
+            .expect("an unreaped child is still addressable");
+        assert_eq!(zombie_identity.state, ProcessState::Zombie);
+        assert_eq!(zombie_identity.process_group, first_identity.process_group);
+        assert_eq!(zombie_identity.session, first_identity.session);
+        assert_eq!(zombie_identity.parent, first_identity.parent);
+        // The live sibling is untouched by its sibling's exit.
+        assert_eq!(
+            kernel.process_identity(second.task.key().id),
+            Some(second_identity)
+        );
+
+        assert!(matches!(
+            kernel.wait_child(
+                root.task.key().id,
+                Some(first.task.key().id),
+                WaitMode::Consume,
+            ),
+            Ok(WaitOutcome::Exited(_))
+        ));
+        assert_eq!(kernel.process_identity(first.task.key().id), None);
     }
 
     #[test]
