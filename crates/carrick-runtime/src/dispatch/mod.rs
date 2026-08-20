@@ -7194,22 +7194,11 @@ fn read_eventfd(
             errno: LINUX_EINVAL,
         };
     }
-    // The counter is a cross-process shared atomic (forked guest processes
-    // share the eventfd — LTP eventfd2_03's semaphore ping-pong), so takes are
-    // CAS loops and a BLOCKING read parks on the readiness pipe (kernel-shared
-    // → a sibling process's write wakes the park) instead of a per-process
-    // condvar that another process's write can never signal — which also
-    // removes a dispatcher-blocking wait the fork-quiesce could deadlock on.
     let counter = state.counter_ref();
     loop {
         let current = counter.load(std::sync::atomic::Ordering::SeqCst);
         if current == 0 {
-            // No readiness pipe (creation failed) keeps the historical `-1`
-            // park fd: poll ignores a negative fd, preserving the degraded
-            // behavior exactly. Owner stays `None` — the `Arc<EventFdState>`
-            // held by the description keeps the pipe alive; no lifetime change.
-            let park_fd = state.read_fd.as_ref().map_or(-1, |fd| fd.raw());
-            return would_block_outcome(park_fd, libc::POLLIN, nonblocking, None);
+            return would_block_outcome(-1, libc::POLLIN, nonblocking, None);
         }
         let taken = if semaphore { 1 } else { current };
         if counter
@@ -7238,14 +7227,10 @@ fn read_eventfd(
         }
         crate::event_ring::rec(
             crate::event_ring::EFDREAD,
-            state.read_fd.as_ref().map_or(-1, |fd| fd.raw()),
+            -1,
             current as u32 as i32,
             (current - taken) as u32 as i32,
         );
-        // Keep the host readiness pipe in sync (drains it when the counter
-        // hits 0, so the read end stops being readable; EFD_SEMAPHORE keeps it
-        // readable while the counter is still > 0).
-        state.sync_readiness(current - taken);
         return DispatchOutcome::Returned {
             value: core::mem::size_of::<LinuxEventfdValue>() as i64,
         };
@@ -7295,19 +7280,11 @@ fn write_eventfd(this: &SyscallDispatcher, bytes: &[u8], state: &EventFdState) -
         }
         crate::event_ring::rec(
             crate::event_ring::EFDWRITE,
-            state.read_fd.as_ref().map_or(-1, |fd| fd.raw()),
+            -1,
             current as u32 as i32,
             next as u32 as i32,
         );
-        // Mirror readiness onto the host pipe so the epoll instance kqueue sees
-        // it natively (level-triggered, can't be lost) — the robust path for
-        // Go's netpollBreak — and so a sibling PROCESS parked on the pipe wakes.
-        state.sync_readiness(next);
         if current == 0 && next > 0 {
-            // Belt-and-suspenders for any epoll instance that (rarely)
-            // registered the eventfd before its host fd was available: also
-            // poke the in-memory wake broadcast. Redundant with the host-backed
-            // pipe above; harmless.
             this.notify_inmem_epoll();
         }
         return DispatchOutcome::Returned {
@@ -7676,6 +7653,49 @@ fn read_from_contents_at(
             .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
         if read_len < iov_len {
             break;
+        }
+    }
+    Ok(total)
+}
+
+fn read_from_synthetic_device_iovecs(
+    memory: &mut impl GuestMemory,
+    kind: crate::vfs::SyntheticDeviceKind,
+    iovecs: &[LinuxIovec],
+) -> Result<usize, DispatchError> {
+    let mut total = 0usize;
+    match kind {
+        crate::vfs::SyntheticDeviceKind::Null => {}
+        crate::vfs::SyntheticDeviceKind::Zero | crate::vfs::SyntheticDeviceKind::Full => {
+            for iovec in iovecs {
+                let iov_len = usize::try_from(iovec.iov_len)
+                    .map_err(|_| DispatchError::LengthTooLarge(iovec.iov_len))?;
+                if iov_len == 0 {
+                    continue;
+                }
+                let zeroes = vec![0u8; iov_len];
+                if memory.write_bytes(iovec.iov_base, &zeroes).is_err() {
+                    return Ok(total);
+                }
+                total += iov_len;
+            }
+        }
+        crate::vfs::SyntheticDeviceKind::Random | crate::vfs::SyntheticDeviceKind::Urandom => {
+            for iovec in iovecs {
+                let iov_len = usize::try_from(iovec.iov_len)
+                    .map_err(|_| DispatchError::LengthTooLarge(iovec.iov_len))?;
+                if iov_len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u8; iov_len];
+                unsafe {
+                    libc::arc4random_buf(buf.as_mut_ptr().cast(), iov_len);
+                }
+                if memory.write_bytes(iovec.iov_base, &buf).is_err() {
+                    return Ok(total);
+                }
+                total += iov_len;
+            }
         }
     }
     Ok(total)

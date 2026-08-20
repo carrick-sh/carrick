@@ -212,6 +212,39 @@ pub struct OpenFlags {
     pub mode: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntheticDeviceKind {
+    Null,
+    Zero,
+    Full,
+    Random,
+    Urandom,
+}
+
+impl SyntheticDeviceKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Null => "/dev/null",
+            Self::Zero => "/dev/zero",
+            Self::Full => "/dev/full",
+            Self::Random => "/dev/random",
+            Self::Urandom => "/dev/urandom",
+        }
+    }
+
+    pub const fn rdev(self) -> u64 {
+        // Standard Linux character device major 1, minors:
+        // 3: /dev/null, 5: /dev/zero, 7: /dev/full, 8: /dev/random, 9: /dev/urandom
+        match self {
+            Self::Null => (1 << 8) | 3,
+            Self::Zero => (1 << 8) | 5,
+            Self::Full => (1 << 8) | 7,
+            Self::Random => (1 << 8) | 8,
+            Self::Urandom => (1 << 8) | 9,
+        }
+    }
+}
+
 /// What a successful [`Vfs::open`] returns. Each variant carries just
 /// enough information for the dispatcher to construct its own private
 /// `OpenDescription` *without* the mount needing to know about that enum —
@@ -220,6 +253,9 @@ pub struct OpenFlags {
 ///
 /// * [`HostFd`](VfsHandle::HostFd) — a real macOS fd, returned by [`DevVfs`]
 ///   for char-device passthrough; the dispatcher wraps it as a `HostPipe`.
+/// * [`SyntheticDevice`](VfsHandle::SyntheticDevice) — an in-memory synthetic
+///   device (`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`);
+///   the dispatcher serves I/O without passing to host libc.
 /// * [`Bytes`](VfsHandle::Bytes) — an in-memory blob, returned by the
 ///   synthetic mounts ([`ProcVfs`], [`SysVfs`], [`ResolvConfVfs`],
 ///   [`EtcServicesVfs`]); becomes `OpenDescription::SyntheticFile`.
@@ -241,6 +277,11 @@ pub enum VfsHandle {
     HostFd {
         host_fd: i32,
         is_read_end: bool,
+        status_flags: u32,
+    },
+    /// An in-memory synthetic character device (`/dev/null`, `/dev/zero`, etc.).
+    SyntheticDevice {
+        kind: SyntheticDeviceKind,
         status_flags: u32,
     },
     /// In-memory bytes. Used by ProcVfs/SysVfs for the synthetic

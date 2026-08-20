@@ -16,9 +16,6 @@ pub(super) fn event_ring_host_fd(open_file: &OpenFile) -> i32 {
         OpenDescription::HostPipe { host_fd, .. }
         | OpenDescription::HostFile { host_fd, .. }
         | OpenDescription::HostSocket { host_fd, .. } => host_fd.raw(),
-        OpenDescription::EventFd { state, .. } => {
-            state.read_fd.as_ref().map_or(-1, |host_fd| host_fd.raw())
-        }
         OpenDescription::Pidfd { kqueue, .. } => kqueue.poll_fd(),
         OpenDescription::Inotify { state, .. } => state.poll_fd(),
         OpenDescription::Fanotify { group, .. } => group.poll_fd(),

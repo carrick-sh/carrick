@@ -871,6 +871,16 @@ impl SyscallDispatcher {
         }
         let open = open_file.description.read();
         match &*open {
+            OpenDescription::SyntheticDevice { .. } => {
+                let mut ready = 0;
+                if requested_events & LINUX_EPOLLIN != 0 {
+                    ready |= LINUX_EPOLLIN;
+                }
+                if requested_events & LINUX_EPOLLOUT != 0 {
+                    ready |= LINUX_EPOLLOUT;
+                }
+                ready
+            }
             OpenDescription::EventFd { state, .. }
                 if state.counter_value() > 0 && requested_events & LINUX_EPOLLIN != 0 =>
             {
@@ -1362,14 +1372,6 @@ impl SyscallDispatcher {
                     }
                 }
                 // eventfd is host-backed by a readiness pipe (read end readable
-                // iff counter > 0), so epoll/poll/select watch it natively via
-                // EVFILT_READ/POLLIN — no in-memory recompute or EVFILT_USER
-                // broadcast needed (the robust path for Go's netpollBreak).
-                // No readiness pipe (creation failed) yields `None` here →
-                // the synthetic path, exactly like the historical `-1` guard.
-                OpenDescription::EventFd { state, .. } => {
-                    state.read_fd.as_ref().map(|fd| fd.view())
-                }
                 // A pidfd is read-ready when its process exits; the backing
                 // multiplexer's poll fd (the kqueue fd on macOS, the
                 // pidfd-bearing epoll fd on Linux) is what poll/epoll watch.
@@ -1725,6 +1727,14 @@ impl SyscallDispatcher {
             OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => {
                 if requested_events & LINUX_POLLIN != 0 {
                     ready |= LINUX_POLLIN;
+                }
+            }
+            OpenDescription::SyntheticDevice { .. } => {
+                if requested_events & LINUX_POLLIN != 0 {
+                    ready |= LINUX_POLLIN;
+                }
+                if requested_events & LINUX_POLLOUT != 0 {
+                    ready |= LINUX_POLLOUT;
                 }
             }
             // Regular files are always ready for read and write.

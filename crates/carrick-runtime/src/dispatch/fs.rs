@@ -47,6 +47,7 @@
 //! the Darwin `copyfile`/`fclonefileat` fast path), `access` (DAC checks),
 //! and `xattr`.
 use super::*;
+use crate::linux_abi::LINUX_ENOSPC;
 
 syscall_table! {
     /// Per-module syscall routing for the `fs` subsystem (Task A1).
@@ -3978,6 +3979,23 @@ impl SyscallDispatcher {
                 };
                 VfsOpenAttempt::Installed(new_fd)
             }
+            crate::vfs::VfsHandle::SyntheticDevice { kind, status_flags } => {
+                let open_file = OpenFile::from_open_description(
+                    Arc::new(RwLock::new(OpenDescription::SyntheticDevice {
+                        kind,
+                        base: OpenDescriptionBase::new(
+                            ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC,
+                        ),
+                    })),
+                    linux_fd_flags_from_open_flags(flags),
+                );
+                let new_fd = match self.install_fd_at_or_above(0, open_file) {
+                    Ok(fd) => fd,
+                    Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
+                };
+                self.record_fd_open_path(new_fd, kind.as_str().to_string());
+                VfsOpenAttempt::Installed(new_fd)
+            }
             crate::vfs::VfsHandle::Bytes {
                 path,
                 contents,
@@ -7111,6 +7129,7 @@ impl SyscallDispatcher {
                 | OpenDescription::Mqueue { .. }
                 | OpenDescription::BpfMap { .. }
                 | OpenDescription::BpfProg { .. }
+                | OpenDescription::SyntheticDevice { .. }
                 | OpenDescription::Netlink { .. } => DispatchOutcome::errno(LINUX_ENOTDIR),
             })
 
@@ -9458,6 +9477,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::SyntheticDevice { .. }
                 // A perf event fd is an unseekable stream (verified ESPIPE
                 // against the Docker oracle).
                 | OpenDescription::PerfEvent { .. }
@@ -9514,6 +9534,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
+                | OpenDescription::SyntheticDevice { .. }
                 | OpenDescription::PerfEvent { .. }
                 | OpenDescription::FsContext { .. }
                 | OpenDescription::Mqueue { .. }
@@ -9685,6 +9706,24 @@ impl SyscallDispatcher {
                         *offset += read_len;
                         (read_len, bytes)
                     }
+                }
+                OpenDescription::SyntheticDevice { kind, .. } => {
+                    let (read_len, bytes) = match kind {
+                        crate::vfs::SyntheticDeviceKind::Null => (0, Vec::new()),
+                        crate::vfs::SyntheticDeviceKind::Zero
+                        | crate::vfs::SyntheticDeviceKind::Full => {
+                            (length, vec![0u8; length])
+                        }
+                        crate::vfs::SyntheticDeviceKind::Random
+                        | crate::vfs::SyntheticDeviceKind::Urandom => {
+                            let mut buf = vec![0u8; length];
+                            unsafe {
+                                libc::arc4random_buf(buf.as_mut_ptr().cast(), length);
+                            }
+                            (length, buf)
+                        }
+                    };
+                    (read_len, bytes)
                 }
                 OpenDescription::EventFd {
                     base,
@@ -10006,6 +10045,9 @@ impl SyscallDispatcher {
                     *offset += read_len;
                     read_len
                 }
+                OpenDescription::SyntheticDevice { kind, .. } => {
+                    read_from_synthetic_device_iovecs(memory, *kind, &iovecs)?
+                }
                 OpenDescription::HostFile { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
@@ -10096,6 +10138,21 @@ impl SyscallDispatcher {
                     .take(length)
                     .copied()
                     .collect(),
+                OpenDescription::SyntheticDevice { kind, .. } => {
+                    match kind {
+                        crate::vfs::SyntheticDeviceKind::Null => Vec::new(),
+                        crate::vfs::SyntheticDeviceKind::Zero
+                        | crate::vfs::SyntheticDeviceKind::Full => vec![0u8; length],
+                        crate::vfs::SyntheticDeviceKind::Random
+                        | crate::vfs::SyntheticDeviceKind::Urandom => {
+                            let mut buf = vec![0u8; length];
+                            unsafe {
+                                libc::arc4random_buf(buf.as_mut_ptr().cast(), length);
+                            }
+                            buf
+                        }
+                    }
+                }
                 OpenDescription::HostFile { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
@@ -10255,6 +10312,9 @@ impl SyscallDispatcher {
                 OpenDescription::SyntheticFile { contents, .. } => {
                     read_from_contents_at(memory, contents, offset, &iovecs)?
                 }
+                OpenDescription::SyntheticDevice { kind, .. } => {
+                    read_from_synthetic_device_iovecs(memory, *kind, &iovecs)?
+                }
                 OpenDescription::HostFile { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
@@ -10332,6 +10392,18 @@ impl SyscallDispatcher {
             // so seek-to-end then write() instead (matching the plain write()
             // append path).
             let is_append = open.is_append();
+            if let OpenDescription::SyntheticDevice { kind, .. } = &*open {
+                match kind {
+                    crate::vfs::SyntheticDeviceKind::Full => {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
+                    }
+                    _ => {
+                        return Ok(DispatchOutcome::Returned {
+                            value: length as i64,
+                        });
+                    }
+                }
+            }
             // Real host file: positional write via libc::pwrite (visible
             // across fork; kernel offset untouched).
             if let OpenDescription::HostFile {
@@ -10443,6 +10515,7 @@ impl SyscallDispatcher {
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
                 | OpenDescription::Inotify { .. }
+                | OpenDescription::SyntheticDevice { .. }
                 | OpenDescription::Fanotify { .. } => LINUX_ESPIPE,
             };
             Ok(DispatchOutcome::errno(errno))
@@ -10501,6 +10574,20 @@ impl SyscallDispatcher {
             // pwritev() on an O_APPEND fd with EINVAL), and restore the offset
             // afterward.
             let is_append = open.is_append();
+            if let OpenDescription::SyntheticDevice { kind, .. } = &*open {
+                match kind {
+                    crate::vfs::SyntheticDeviceKind::Full => {
+                        return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
+                    }
+                    _ => {
+                        let mut total = 0i64;
+                        for iov in &iovecs {
+                            total += iov.iov_len as i64;
+                        }
+                        return Ok(DispatchOutcome::Returned { value: total });
+                    }
+                }
+            }
             // Real host file: positional writev via libc::pwrite per iovec.
             if let OpenDescription::HostFile {
                 host_fd, writable, ..
@@ -10598,6 +10685,7 @@ impl SyscallDispatcher {
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
                 | OpenDescription::Inotify { .. }
+                | OpenDescription::SyntheticDevice { .. }
                 | OpenDescription::Fanotify { .. } => LINUX_ESPIPE,
             };
             Ok(DispatchOutcome::errno(errno))
@@ -12071,6 +12159,18 @@ impl SyscallDispatcher {
                 {
                     let mut open = open_file.description.write();
                     match &mut *open {
+                        OpenDescription::SyntheticDevice { kind, .. } => {
+                            match kind {
+                                crate::vfs::SyntheticDeviceKind::Full => {
+                                    return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
+                                }
+                                _ => {
+                                    return Ok(DispatchOutcome::Returned {
+                                        value: bytes.len() as i64,
+                                    });
+                                }
+                            }
+                        }
                         OpenDescription::EventFd { state, .. } => {
                             return Ok(write_eventfd(this, &bytes, state));
                         }
@@ -12548,6 +12648,19 @@ impl SyscallDispatcher {
                     {
                         let mut open = open_file.description.write();
                         match &mut *open {
+                            OpenDescription::SyntheticDevice { kind, .. } => {
+                                match kind {
+                                    crate::vfs::SyntheticDeviceKind::Full => {
+                                        return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
+                                    }
+                                    _ => {
+                                        outcome = DispatchOutcome::Returned {
+                                            value: bytes.len() as i64,
+                                        };
+                                        writeback = None;
+                                    }
+                                }
+                            }
                             OpenDescription::PipeWriter { pipe, .. } => {
                                 outcome = write_pipe(&bytes, pipe);
                                 writeback = None;

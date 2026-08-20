@@ -14,25 +14,20 @@ use crate::dispatch::linux_errno;
 use crate::linux_abi::{LINUX_ENOENT, LINUX_ENOTDIR};
 
 use super::devpts::{PtyTable, open_master};
-use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
+use super::{
+    DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, SyntheticDeviceKind, Vfs, VfsError,
+    VfsHandle,
+};
 
-/// macOS character devices that have the same name and semantics as
-/// their Linux counterparts. `/dev/full` is mapped to `/dev/zero`
-/// because macOS lacks a "always-ENOSPC-on-write" device — the
-/// closest available approximation reads as an endless stream of zero
-/// bytes (exactly like Linux `/dev/full` on read; splice08 splices
-/// zeros out of it) and discards writes. macOS `/dev/zero` accepts and
-/// discards writes just like the prior `/dev/null` mapping, so the
-/// apt/dpkg existence probes are unaffected. Neither host device raises
-/// ENOSPC, so the write side is a best-effort approximation either way.
-const PASSTHROUGHS: &[(&str, &str)] = &[
-    ("/dev/null", "/dev/null"),
-    ("/dev/zero", "/dev/zero"),
-    ("/dev/random", "/dev/random"),
-    ("/dev/urandom", "/dev/urandom"),
-    ("/dev/full", "/dev/zero"),
+/// Standard Linux character devices served purely in memory.
+const SYNTHETIC_DEVICES: &[(&str, SyntheticDeviceKind)] = &[
+    ("/dev/null", SyntheticDeviceKind::Null),
+    ("/dev/zero", SyntheticDeviceKind::Zero),
+    ("/dev/random", SyntheticDeviceKind::Random),
+    ("/dev/urandom", SyntheticDeviceKind::Urandom),
+    ("/dev/full", SyntheticDeviceKind::Full),
 ];
-// NOTE: `/dev/tty` is handled specially (not a host passthrough): it must
+// NOTE: `/dev/tty` is handled specially (not a synthetic device): it must
 // resolve to the GUEST's controlling terminal — the `carrick run -t` pty
 // slave — not carrick's own host /dev/tty. See `open`.
 
@@ -45,11 +40,11 @@ impl DevVfs {
         Self { pty_table }
     }
 
-    fn host_path_for(guest: &str) -> Option<&'static str> {
-        PASSTHROUGHS
+    fn synthetic_kind(guest: &str) -> Option<SyntheticDeviceKind> {
+        SYNTHETIC_DEVICES
             .iter()
             .find(|(g, _)| *g == guest)
-            .map(|(_, h)| *h)
+            .map(|(_, k)| *k)
     }
 }
 
@@ -77,7 +72,7 @@ impl Vfs for DevVfs {
                 mtime_nanos: 0,
             });
         }
-        if Self::host_path_for(path).is_some() {
+        if Self::synthetic_kind(path).is_some() {
             return Ok(Metadata {
                 kind: EntryKind::CharDevice,
                 mode: 0o666,
@@ -95,15 +90,15 @@ impl Vfs for DevVfs {
         if path != "/dev" {
             return Err(LINUX_ENOTDIR);
         }
-        let mut entries: Vec<DirEnt> = PASSTHROUGHS
+        let mut entries: Vec<DirEnt> = SYNTHETIC_DEVICES
             .iter()
             .map(|(guest, _)| DirEnt {
-                // INVARIANT: every PASSTHROUGHS guest path is a "/dev/*" literal
+                // INVARIANT: every SYNTHETIC_DEVICES guest path is a "/dev/*" literal
                 // by construction, so strip_prefix("/dev/") is always Some.
                 #[allow(clippy::expect_used)]
                 name: guest
                     .strip_prefix("/dev/")
-                    .expect("PASSTHROUGHS entries are /dev/* by construction")
+                    .expect("SYNTHETIC_DEVICES entries are /dev/* by construction")
                     .to_string(),
                 kind: EntryKind::CharDevice,
             })
@@ -113,7 +108,7 @@ impl Vfs for DevVfs {
             kind: EntryKind::CharDevice,
         });
         // /dev/tty is a node (the controlling terminal), handled specially in
-        // open() rather than as a host passthrough.
+        // open() rather than as a synthetic device.
         entries.push(DirEnt {
             name: "tty".to_string(),
             kind: EntryKind::CharDevice,
@@ -131,23 +126,28 @@ impl Vfs for DevVfs {
         flags: OpenFlags,
         _ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
-        // Opening the /dev directory itself: return a synthetic directory
-        // listing so `getdents64` / `ls /dev` shows the device entries.
         if path == "/dev" {
-            let entries = self.readdir("/dev").unwrap_or_default();
+            if !flags.directory && flags.write {
+                return Err(crate::linux_abi::LINUX_EISDIR);
+            }
+            let entries = self.readdir(path)?;
+            let status_flags = if flags.nonblock {
+                crate::linux_abi::LINUX_O_NONBLOCK as u32
+            } else {
+                0
+            };
             return Ok(VfsHandle::Directory {
-                path: "/dev".to_string(),
+                path: path.to_string(),
                 entries,
-                status_flags: 0,
+                status_flags,
             });
         }
 
         if path == "/dev/ptmx" {
-            // Hold the table lock across open_master (ptsname isn't thread-safe).
             let mut table = self.pty_table.lock();
             let (master_fd, slave_name) =
                 open_master(flags.nonblock).map_err(crate::host_to_linux_errno)?;
-            let index = table.insert(slave_name, std::process::id());
+            let index = table.insert(slave_name, 1);
             let status_flags = if flags.nonblock {
                 crate::linux_abi::LINUX_O_NONBLOCK as u32
             } else {
@@ -163,10 +163,7 @@ impl Vfs for DevVfs {
 
         if path == "/dev/tty" {
             // The guest's controlling terminal is the `carrick run -t` pty
-            // slave (registered as a pts in the table). Open a fresh fd to it
-            // and present it as a pty so termios/winsize/pgrp ioctls work.
-            // With no controlling terminal (non-interactive), Linux returns
-            // ENXIO.
+            // slave (registered as a pts in the table).
             let table = self.pty_table.lock();
             let index = table.controlling().ok_or(crate::linux_abi::LINUX_ENXIO)?;
             let slave_name = table
@@ -188,13 +185,6 @@ impl Vfs for DevVfs {
                 CString::new(slave_name.clone()).map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
             // SAFETY: cpath is a valid NUL-terminated path to the host slave pty.
             let host_fd = unsafe { libc::open(cpath.as_ptr(), oflag) };
-            #[cfg(feature = "trace-tty")]
-            {
-                let tt = unsafe { libc::isatty(host_fd) };
-                eprintln!(
-                    "[DEVTTYDBG] open(/dev/tty -> {slave_name}) host_fd={host_fd} isatty={tt} oflag=0x{oflag:x}"
-                );
-            }
             if host_fd < 0 {
                 return Err(host_open_errno());
             }
@@ -211,45 +201,16 @@ impl Vfs for DevVfs {
             });
         }
 
-        let host_path = Self::host_path_for(path).ok_or(LINUX_ENOENT)?;
-
-        let mut host_flags = if flags.read && flags.write {
-            libc::O_RDWR
-        } else if flags.write {
-            libc::O_WRONLY
-        } else {
-            libc::O_RDONLY
-        };
-        if flags.nonblock {
-            host_flags |= libc::O_NONBLOCK;
-        }
-        if flags.append {
-            host_flags |= libc::O_APPEND;
+        if let Some(kind) = Self::synthetic_kind(path) {
+            let status_flags = if flags.nonblock {
+                crate::linux_abi::LINUX_O_NONBLOCK as u32
+            } else {
+                0
+            };
+            return Ok(VfsHandle::SyntheticDevice { kind, status_flags });
         }
 
-        let cpath = CString::new(host_path).map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
-        // SAFETY: cpath is a valid NUL-terminated C string.
-        let host_fd = unsafe { libc::open(cpath.as_ptr(), host_flags) };
-        if host_fd < 0 {
-            return Err(host_open_errno());
-        }
-
-        // For chardevs that are effectively bidirectional (null, zero,
-        // urandom, full), use `is_read_end = !write_requested` so the
-        // dispatcher's HostPipe routes read/write to the appropriate
-        // syscall regardless of how the guest opened the fd.
-        let is_read_end = !flags.write;
-        let status_flags = if flags.nonblock {
-            crate::linux_abi::LINUX_O_NONBLOCK as u32
-        } else {
-            0
-        };
-
-        Ok(VfsHandle::HostFd {
-            host_fd,
-            is_read_end,
-            status_flags,
-        })
+        Err(LINUX_ENOENT)
     }
 
     fn name(&self) -> &'static str {
@@ -284,7 +245,7 @@ mod tests {
     #[test]
     fn lookup_known_devs() {
         let v = make_dev();
-        for (guest, _) in PASSTHROUGHS {
+        for (guest, _) in SYNTHETIC_DEVICES {
             let md = v.lookup(guest).expect(guest);
             assert_eq!(md.kind, EntryKind::CharDevice, "{}", guest);
             assert_eq!(md.mode, 0o666, "{}", guest);
@@ -344,81 +305,27 @@ mod tests {
     }
 
     #[test]
-    fn open_null_returns_a_real_host_fd() {
+    fn open_synthetic_devices_returns_synthetic_handle() {
         let v = make_dev();
-        let h = v
-            .open(
-                "/dev/null",
-                OpenFlags {
-                    read: true,
-                    ..Default::default()
-                },
-                &OpenContext::default(),
-            )
-            .unwrap();
-        match h {
-            VfsHandle::HostFd {
-                host_fd,
-                is_read_end,
-                ..
-            } => {
-                assert!(host_fd >= 0);
-                assert!(is_read_end);
-                // Close to avoid leaking the fd.
-                unsafe { libc::close(host_fd) };
+        for (guest, expected_kind) in SYNTHETIC_DEVICES {
+            let h = v
+                .open(
+                    guest,
+                    OpenFlags {
+                        read: true,
+                        write: true,
+                        ..Default::default()
+                    },
+                    &OpenContext::default(),
+                )
+                .unwrap();
+            match h {
+                VfsHandle::SyntheticDevice { kind, status_flags } => {
+                    assert_eq!(kind, *expected_kind, "path: {guest}");
+                    assert_eq!(status_flags, 0);
+                }
+                other => panic!("expected SyntheticDevice for {guest}, got {:?}", other),
             }
-            other => panic!("expected HostFd, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn open_zero_for_write_marks_is_read_end_false() {
-        let v = make_dev();
-        let h = v
-            .open(
-                "/dev/zero",
-                OpenFlags {
-                    write: true,
-                    ..Default::default()
-                },
-                &OpenContext::default(),
-            )
-            .unwrap();
-        match h {
-            VfsHandle::HostFd {
-                host_fd,
-                is_read_end,
-                ..
-            } => {
-                assert!(host_fd >= 0);
-                assert!(!is_read_end);
-                unsafe { libc::close(host_fd) };
-            }
-            other => panic!("expected HostFd, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn open_full_aliases_to_zero() {
-        // /dev/full is mapped to /dev/zero on macOS; open should
-        // succeed regardless.
-        let v = make_dev();
-        let h = v
-            .open(
-                "/dev/full",
-                OpenFlags {
-                    write: true,
-                    ..Default::default()
-                },
-                &OpenContext::default(),
-            )
-            .unwrap();
-        match h {
-            VfsHandle::HostFd { host_fd, .. } => {
-                assert!(host_fd >= 0);
-                unsafe { libc::close(host_fd) };
-            }
-            other => panic!("expected HostFd, got {:?}", other),
         }
     }
 
@@ -453,19 +360,13 @@ mod tests {
             )
             .unwrap();
         match h {
-            VfsHandle::HostFd {
-                host_fd,
-                status_flags,
-                ..
-            } => {
-                assert!(host_fd >= 0);
+            VfsHandle::SyntheticDevice { status_flags, .. } => {
                 assert_ne!(
                     status_flags & (crate::linux_abi::LINUX_O_NONBLOCK as u32),
                     0
                 );
-                unsafe { libc::close(host_fd) };
             }
-            other => panic!("expected HostFd, got {:?}", other),
+            other => panic!("expected SyntheticDevice, got {:?}", other),
         }
     }
 
