@@ -118,6 +118,7 @@ class ExecutionContext(NamedTuple):
     cwd: Path
     cargo_home: Path
     rustup_home: Path
+    toolchain_channel: str
     target_root: Path
     cargo_config: Path
     manifest: Path
@@ -374,9 +375,35 @@ def _authenticated_cargo_cwd(root: Path = CARGO_CWD) -> Path:
     return resolved
 
 
+def _checked_toolchain_channel(workspace: Path) -> str:
+    path = workspace / "rust-toolchain.toml"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise InventoryError(f"missing checked Rust toolchain file: {path}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise InventoryError(
+            f"checked Rust toolchain file is not a regular file: {path}"
+        )
+    try:
+        document = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise InventoryError(
+            f"malformed checked Rust toolchain TOML at {path}: {error}"
+        ) from error
+    toolchain = document.get("toolchain") if isinstance(document, dict) else None
+    if not isinstance(toolchain, dict):
+        raise InventoryError("checked Rust toolchain TOML has no [toolchain] table")
+    channel = toolchain.get("channel")
+    if not isinstance(channel, str) or not channel:
+        raise InventoryError("checked Rust toolchain TOML has no channel string")
+    return channel
+
+
 @contextlib.contextmanager
 def _execution_context(root: Path):
     workspace = Path(root).resolve(strict=True)
+    toolchain_channel = _checked_toolchain_channel(workspace)
     cargo_config = workspace / ".cargo" / "config.toml"
     manifest = workspace / "Cargo.toml"
     for path, label in (
@@ -421,6 +448,7 @@ def _execution_context(root: Path):
             cargo_cwd,
             cargo_home,
             canonical_home / ".rustup",
+            toolchain_channel,
             census_root,
             cargo_config,
             manifest,
@@ -430,6 +458,7 @@ def _execution_context(root: Path):
 def _sanitized_build_environment(
     cargo_home: Path,
     rustup_home: Path,
+    toolchain_channel: str,
     *,
     target_dir: Path | None = None,
 ) -> dict[str, str]:
@@ -438,6 +467,7 @@ def _sanitized_build_environment(
         "PATH": os.environ.get("PATH", os.defpath),
         "CARGO_HOME": str(cargo_home),
         "RUSTUP_HOME": str(rustup_home),
+        "RUSTUP_TOOLCHAIN": toolchain_channel,
     }
     if target_dir is not None:
         environment["CARGO_TARGET_DIR"] = str(target_dir)
@@ -595,6 +625,12 @@ def verify_toolchain(
                 required_host_triple=required_host_triple,
                 _execution=execution,
             )
+    if _execution.toolchain_channel != matrix.rustc_release:
+        raise InventoryError(
+            "checked Rust toolchain channel mismatch: "
+            f"matrix requires {matrix.rustc_release!r}, "
+            f"rust-toolchain.toml selects {_execution.toolchain_channel!r}"
+        )
     outputs: dict[str, str] = {}
     for label, command in (
         ("rustc", ["rustc", "-Vv"]),
@@ -614,7 +650,9 @@ def verify_toolchain(
             runner=runner,
             cwd=_execution.cwd,
             env=_sanitized_build_environment(
-                _execution.cargo_home, _execution.rustup_home
+                _execution.cargo_home,
+                _execution.rustup_home,
+                _execution.toolchain_channel,
             ),
         )
         if result.returncode != 0:
@@ -663,6 +701,7 @@ def run_profile(
     environment = _sanitized_build_environment(
         _execution.cargo_home,
         _execution.rustup_home,
+        _execution.toolchain_channel,
         target_dir=_execution.target_root / profile.id,
     )
     result = _completed_text(
