@@ -539,6 +539,7 @@ fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
 
 #[test]
 fn synthetic_proc_surface_serves_common_process_and_system_files() {
+    let root_nodename = carrick_runtime::execute::guest_hostname();
     let paths: [(&str, &[u8]); 20] = [
         ("/proc/cmdline", b"BOOT_IMAGE="),
         ("/proc/diskstats", b""),
@@ -558,14 +559,12 @@ fn synthetic_proc_surface_serves_common_process_and_system_files() {
         ("/proc/self/statm", b"0 0"),
         ("/proc/self/status", b"Name:\texe"),
         ("/proc/sys/kernel/osrelease", b"carrick"),
-        // --net=host contract: /proc/sys/kernel/hostname is the live host short
-        // name (guest_hostname(), in lockstep with uname nodename), NOT a fixed
-        // string. Derive from the single source of truth so any host name passes;
-        // it falls back to "carrick" when the host has no usable name.
-        (
-            "/proc/sys/kernel/hostname",
-            carrick_runtime::execute::guest_hostname().as_bytes(),
-        ),
+        // /proc/sys/kernel/hostname is the ROOT UTS NAMESPACE's nodename
+        // (`guest_hostname()`, in lockstep with uname's), NOT a fixed string.
+        // Derive from that single source so any host name passes; the namespace
+        // is seeded from the host's short name under the --net=host contract and
+        // falls back to "carrick" when the host has no usable one.
+        ("/proc/sys/kernel/hostname", root_nodename.as_bytes()),
         // boot_id is now a random v4 UUID (was an all-zero sentinel); the only
         // value-stable marker is the version-4 nibble at the 3rd group.
         ("/proc/sys/kernel/random/boot_id", b"-4"),

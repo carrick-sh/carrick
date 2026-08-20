@@ -33,6 +33,14 @@ pub const INITIAL_USER_NS: NsId = 1;
 /// host_pid`), so non-namespaced runs and `run-elf` are unchanged (design §5.2).
 pub const INITIAL_PID_NS: NsId = 1;
 
+/// The initial network namespace. Every guest process starts here; its view is
+/// seeded from the host's wire for `--net host` and replaced by the run's own
+/// model for the container modes (see [`crate::kernel::netns`]).
+pub const INITIAL_NET_NS: NsId = 1;
+
+/// The initial UTS namespace, holding the nodename `uname(2)` reports.
+pub const INITIAL_UTS_NS: NsId = 1;
+
 /// The first namespace id handed out for a *freshly created* namespace
 /// (`unshare`/`clone(CLONE_NEW*)`/launch placement). Ids 1 are reserved for the
 /// initial namespaces above.

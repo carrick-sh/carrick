@@ -44,14 +44,15 @@
 //! `socket()` returns a SYNTHETIC fd (`OpenDescription::Netlink`) with NO host
 //! backing — a userspace in-memory recv queue plus a remembered `(pid, groups)`
 //! binding. `sendto`/`write` of an rtnetlink dump request is parsed and answered
-//! by `support::build_netlink_reply`, which emits properly framed
-//! `NLM_F_MULTI` dumps terminated by `NLMSG_DONE`: RTM_GETLINK yields one
-//! `lo`, RTM_GETADDR yields `127.0.0.1/8`, RTM_GETROUTE yields the connected
-//! route, and everything unmodelled yields a bare `NLMSG_DONE` (an "empty"
-//! dump) so the client sees a well-formed end-of-dump rather than a hang. This
-//! is consistent with carrick presenting itself as a single-`lo`,
-//! loopback-only host (matching `docker run --net host`'s view from the guest's
-//! standpoint for the resolver's purposes).
+//! by `support::build_netlink_reply_for_snapshot` over the network NAMESPACE the
+//! calling task belongs to, which emits properly framed
+//! `NLM_F_MULTI` dumps terminated by `NLMSG_DONE`: RTM_GETLINK yields that
+//! namespace's links, RTM_GETADDR their addresses, RTM_GETROUTE its routes,
+//! and everything unmodelled yields a bare `NLMSG_DONE` (an "empty"
+//! dump) so the client sees a well-formed end-of-dump rather than a hang. The
+//! namespace is the guest's, not the Mac's: under `--net host` it is a mirror of
+//! the host wire taken once (`lo` plus one `eth0`), so the guest never learns
+//! that `awdl0` or `utun3` exist.
 //!
 //! ## epoll → kqueue: the readiness model
 //!
@@ -2531,11 +2532,14 @@ impl SyscallDispatcher {
                 return DispatchOutcome::errno(LINUX_ENOTSOCK);
             };
             let dest_pid = if *pid != 0 { *pid } else { std::process::id() };
-            if self.network.spec.mode == carrick_spec::NetworkMode::Bridge {
-                build_netlink_reply_for_snapshot(request, dest_pid, &self.network.model)
-            } else {
-                build_netlink_reply(request, dest_pid)
-            }
+            // ONE encoder, over the namespace the CALLING task belongs to. The
+            // mode used to select between two encoders over two different data
+            // sources — the spec-built model for bridge, a fresh `getifaddrs(3)`
+            // walk for host — which is why the guest's own surfaces disagreed
+            // with each other, and why the accurate encoder was the one the
+            // conformance lane never exercised.
+            let net_ns = self.caller_net_ns();
+            build_netlink_reply_for_snapshot(request, dest_pid, &net_ns.view())
         };
         if let OpenDescription::Netlink { recv_queue, .. } = &mut *open_file.description.write() {
             recv_queue.extend(reply);

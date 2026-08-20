@@ -26,6 +26,7 @@ use super::ids::{
     LinuxTid, MmId, ObjectIdError, ObjectIdRegistry, ProcessGroupId, SessionId, SighandId, TaskId,
     TaskSerial, ThreadSerial,
 };
+use super::netns::{NetNs, NsProxy, UtsNs};
 use super::registry::{IdRegistry, ProcessGroupClaim, SessionClaim};
 
 #[derive(Default)]
@@ -2426,6 +2427,28 @@ pub struct Task {
     /// against the CURRENT hard, and two concurrent writers reading the same
     /// snapshot would each publish a set built from a stale one.
     rlimit_write: Mutex<()>,
+    /// Which network and UTS namespaces this process belongs to — Linux's
+    /// `nsproxy`.
+    ///
+    /// Both were previously answered from outside the kernel graph and were
+    /// wrong in OPPOSITE directions, which is why they land together. The
+    /// network view was a carrier-global `Arc<RuntimeNetwork>` on the
+    /// dispatcher, so every guest process shared one and `unshare(CLONE_NEWNET)`
+    /// had nowhere to write. The hostname was a `String` in the dispatcher's
+    /// private `ProcState` that the fork path CLONED, so a parent's
+    /// `sethostname` never reached its children — where Linux shares one
+    /// `uts_namespace` across `fork` and the child does see the new name.
+    ///
+    /// `ArcSwap` for the same reason [`Self::rlimits`] uses it: reading a task's
+    /// namespaces is on the guest's syscall path (every `/proc/net` read, every
+    /// `uname`) while replacing them happens only at `unshare`. The proxy is
+    /// swapped whole rather than field-by-field so `unshare(CLONE_NEWNET |
+    /// CLONE_NEWUTS)` cannot be observed half-applied.
+    nsproxy: ArcSwap<NsProxy>,
+    /// Serializes read-modify-write on [`Self::nsproxy`] — an `unshare` builds
+    /// the replacement from the CURRENT proxy, so two concurrent unsharers
+    /// reading one snapshot would each drop the other's namespace.
+    nsproxy_write: Mutex<()>,
 }
 
 /// A process's sixteen resource limits, indexed by [`LinuxResource`].
@@ -2553,6 +2576,8 @@ impl Task {
             creds_ns: Mutex::new(ProcessCredsNs::default()),
             rlimits: ArcSwap::new(Arc::new(RlimitSet::carrick_defaults())),
             rlimit_write: Mutex::new(()),
+            nsproxy: ArcSwap::new(Arc::new(NsProxy::default())),
+            nsproxy_write: Mutex::new(()),
         }
     }
 
@@ -2614,6 +2639,12 @@ impl Task {
         // owns its own afterwards — the whole point of the defect this fixes is
         // that one process's `prlimit` must not move another's.
         self.rlimits.store(Arc::new(parent.rlimits()));
+        // The network and UTS namespaces are inherited as a SHARE, not a copy
+        // (`namespaces(7)`: `fork` without `CLONE_NEW*` leaves the child in
+        // every one of its parent's namespaces). Cloning the `Arc`s is what
+        // makes that true — a parent's `sethostname` or a new address on `eth0`
+        // is visible to children that already exist.
+        self.inherit_ns_from(parent);
     }
 
     /// This process's limit for one resource.
@@ -2716,6 +2747,88 @@ impl Task {
     /// correct execve behaviour and needs no code.
     pub fn inherit_creds_ns_from(&self, parent: &Task) {
         *self.creds_ns.lock() = parent.creds_ns.lock().clone();
+    }
+
+    /// The network namespace this process belongs to. Every guest-facing
+    /// network surface — rtnetlink, `/proc/net/*`, `/sys/class/net`, the `SIOC*`
+    /// ioctls — renders from the view this namespace holds, so two processes in
+    /// different namespaces get different answers and no surface can reach past
+    /// it to the host's own interface list.
+    pub fn net_ns(&self) -> Arc<NetNs> {
+        Arc::clone(self.nsproxy.load().net())
+    }
+
+    /// The UTS namespace this process belongs to — the nodename `uname(2)` and
+    /// `/proc/sys/kernel/hostname` report.
+    pub fn uts_ns(&self) -> Arc<UtsNs> {
+        Arc::clone(self.nsproxy.load().uts())
+    }
+
+    /// `unshare(CLONE_NEWUTS)`: put THIS process in a fresh UTS namespace
+    /// carrying a COPY of the name it can currently see, leaving its parent and
+    /// siblings in the one they share. Returns the new id.
+    ///
+    /// Copy on unshare, share on fork — the two directions this whole pair
+    /// exists to keep apart. `namespaces(7)`: the new namespace is initialised
+    /// from the caller's, and the two diverge from that point, so a later
+    /// `sethostname` on either side is invisible to the other.
+    ///
+    /// Under the write lock because the replacement proxy is built from the
+    /// CURRENT one: two concurrent unsharers reading a single snapshot would
+    /// each discard the other's namespace.
+    ///
+    /// No guest syscall reaches this yet — `unshare(CLONE_NEWUTS)` is accepted
+    /// and ignored and `sethostname` is unconditional EPERM, both in
+    /// `dispatch/proc.rs`, which the process-identity batch moves onto this.
+    pub fn unshare_uts_ns(&self) -> crate::namespace::NsId {
+        let id = crate::namespace::process::alloc_ns_id();
+        let _write = self.nsproxy_write.lock();
+        let current = self.nsproxy.load();
+        let fresh = Arc::new(UtsNs::new(id, current.uts().nodename()));
+        self.nsproxy.store(Arc::new(current.entering_uts(fresh)));
+        id
+    }
+
+    /// `unshare(CLONE_NEWNET)`: put THIS process in a fresh network namespace,
+    /// leaving its parent and siblings in the one they share. Returns the new
+    /// id.
+    ///
+    /// Unlike UTS, a new network namespace is NOT a copy — Linux gives it
+    /// nothing but a loopback device, and every address, route and resolver the
+    /// caller could see is gone. Carrick renders that loopback already
+    /// configured (`127.0.0.1/8`, `::1/128`, up), where Linux leaves it down
+    /// and address-less until something runs `ip link set lo up`; there is no
+    /// guest path to configure a link yet, so a down loopback would be a
+    /// namespace nothing could ever make usable.
+    ///
+    /// Same lock discipline and the same staging as [`Self::unshare_uts_ns`]:
+    /// the guest-facing `unshare` still refuses `CLONE_NEWNET`, and must keep
+    /// refusing until sockets are confined to a namespace as well — accepting
+    /// the flag and then putting the guest's traffic on the host's wire would be
+    /// worse than an honest EPERM.
+    pub fn unshare_net_ns(&self) -> crate::namespace::NsId {
+        let id = crate::namespace::process::alloc_ns_id();
+        let fresh = Arc::new(NetNs::from_model(
+            id,
+            crate::network::model::LinuxNetworkModel::isolated(),
+        ));
+        let _write = self.nsproxy_write.lock();
+        let current = self.nsproxy.load();
+        self.nsproxy.store(Arc::new(current.entering_net(fresh)));
+        id
+    }
+
+    /// Place a fresh `fork` child in every namespace its parent belongs to.
+    ///
+    /// `namespaces(7)`: a `fork` without `CLONE_NEW*` shares the parent's
+    /// namespaces rather than copying their contents, so this clones POINTERS.
+    /// The distinction is guest-visible and was the defect: the hostname lived
+    /// in a struct the fork path cloned by value, so `sethostname` in a parent
+    /// left every existing child reporting the old name from `uname(2)` — where
+    /// Linux reports the new one.
+    fn inherit_ns_from(&self, parent: &Task) {
+        let _write = self.nsproxy_write.lock();
+        self.nsproxy.store(parent.nsproxy.load_full());
     }
 
     /// This process's keyring pointers.
@@ -4523,6 +4636,127 @@ mod tests {
             parent.task.rlimit(LinuxResource::Nofile),
             lowered,
             "the child owns its copy; the parent is untouched"
+        );
+    }
+
+    /// A `fork` child SHARES its parent's UTS namespace, and `unshare` COPIES
+    /// it. Both directions, because carrick had each one wrong.
+    ///
+    /// This is the exact opposite of the rlimit rule two tests above, and
+    /// getting the two backwards is the whole hazard: `fork(2)` copies rlimits
+    /// and shares namespaces (`namespaces(7)`). The hostname lived in a `String`
+    /// the fork path CLONED, so a parent's `sethostname` never reached a child
+    /// that already existed — where Linux shares one `uts_namespace` and the
+    /// child does see the new name.
+    ///
+    /// TWO live tasks by construction. With one guest process the parent and
+    /// the child are the same object, so copy and share are indistinguishable
+    /// and this entire class is invisible — which is why the single-process
+    /// `etchostnamefile` and `selfhostnameresolve` probes pass with the defect
+    /// in place.
+    ///
+    /// The parent unshares FIRST so the whole test runs in a namespace of its
+    /// own: the root one is carrier-wide, and renaming it here would be visible
+    /// to every other test in this binary.
+    #[test]
+    fn fork_shares_the_uts_namespace_and_unshare_copies_it() {
+        let parent = Fixture::new();
+        let root = parent.task.uts_ns().id();
+        parent.task.unshare_uts_ns();
+        parent.task.uts_ns().set_nodename("before-fork");
+
+        let child = Fixture::new();
+        child.task.inherit_fork_attributes_from(&parent.task);
+        assert_eq!(
+            child.task.uts_ns().id(),
+            parent.task.uts_ns().id(),
+            "a fork child is IN its parent's UTS namespace, not holding a copy"
+        );
+
+        parent.task.uts_ns().set_nodename("renamed-after-fork");
+        assert_eq!(
+            child.task.uts_ns().nodename(),
+            "renamed-after-fork",
+            "a name set by the parent reaches a child that already exists"
+        );
+
+        // `unshare` is where a copy is correct: the new namespace starts from
+        // the caller's name and the two diverge from there.
+        let unshared = child.task.unshare_uts_ns();
+        assert_ne!(unshared, parent.task.uts_ns().id());
+        assert_eq!(child.task.uts_ns().nodename(), "renamed-after-fork");
+
+        child.task.uts_ns().set_nodename("child-only");
+        parent.task.uts_ns().set_nodename("parent-only");
+        assert_eq!(child.task.uts_ns().nodename(), "child-only");
+        assert_eq!(parent.task.uts_ns().nodename(), "parent-only");
+        assert_ne!(
+            root,
+            parent.task.uts_ns().id(),
+            "neither task disturbed the namespace it started in"
+        );
+    }
+
+    /// The same pair of rules for the network namespace, where carrick was
+    /// wrong in the OTHER direction: the view was one carrier-global
+    /// `Arc<RuntimeNetwork>` on the dispatcher, so no two guest processes could
+    /// ever hold different ones and `unshare(CLONE_NEWNET)` had nowhere to
+    /// write at all.
+    ///
+    /// `unshare` here is a fresh namespace rather than a copy — Linux gives a
+    /// new network namespace nothing but a loopback — which is why the two
+    /// namespaces cannot share one inheritance helper.
+    #[test]
+    fn fork_shares_the_net_namespace_and_unshare_leaves_the_sibling_alone() {
+        let parent = Fixture::new();
+        let child = Fixture::new();
+        child.task.inherit_fork_attributes_from(&parent.task);
+
+        assert_eq!(
+            child.task.net_ns().id(),
+            parent.task.net_ns().id(),
+            "a fork child is in its parent's network namespace"
+        );
+        assert!(
+            Arc::ptr_eq(&child.task.net_ns(), &parent.task.net_ns()),
+            "shared by pointer, so a republication reaches both"
+        );
+
+        let stayed = parent
+            .task
+            .net_ns()
+            .view()
+            .links
+            .iter()
+            .map(|link| link.name.clone())
+            .collect::<Vec<_>>();
+
+        child.task.unshare_net_ns();
+
+        assert_ne!(child.task.net_ns().id(), parent.task.net_ns().id());
+        assert_eq!(
+            child
+                .task
+                .net_ns()
+                .view()
+                .links
+                .iter()
+                .map(|link| link.name.clone())
+                .collect::<Vec<_>>(),
+            ["lo"],
+            "a fresh network namespace holds loopback and nothing else"
+        );
+        assert_eq!(
+            parent
+                .task
+                .net_ns()
+                .view()
+                .links
+                .iter()
+                .map(|link| link.name.clone())
+                .collect::<Vec<_>>(),
+            stayed,
+            "the namespace the parent stayed in is untouched by its child leaving"
         );
     }
 
