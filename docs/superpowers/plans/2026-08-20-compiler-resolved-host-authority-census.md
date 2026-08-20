@@ -429,6 +429,12 @@ git commit -m "security: census resolved host authority calls"
 **Files:**
 - Create: `.semgrep/host-authority-escape-hatches.yml`
 - Create: `scripts/migrate/check-host-authority-escape-hatches.py`
+- Create: `scripts/tools/host-authority-escape-syntax/Cargo.toml`
+- Create: `scripts/tools/host-authority-escape-syntax/Cargo.lock`
+- Create: `scripts/tools/host-authority-escape-syntax/src/{lib.rs,main.rs}`
+- Create: `scripts/tools/host-authority-escape-syntax/tests/scanner.rs`
+- Create under `scripts/tests/fixtures/host-authority-escape-syntax/`:
+  rustc/rustfmt-valid reject and safe fixtures
 - Create: `scripts/tests/test_host_authority_escape_hatches.py`
 - Modify: `scripts/lint-domains.sh`
 - Modify: `justfile`
@@ -452,14 +458,19 @@ ordinary safe Rust calls already covered by Clippy.
 
 Rules must identify unmistakable escape-hatch constructs only. Because Semgrep
 1.166 does not reliably inspect Rust macro token trees or preserve extern
-ABI/link-name context, supplement it with a fail-closed
-comment/string/raw-string-aware lexical syntax checker. That checker may
-recognize only direct escape syntax, assembly import aliases, extern ABI and
-`link_name` forms, and exact relative-path exemptions; it must not recover Rust
-name, cfg, module, or reachability semantics. Exclusions are exact reviewed
-boundary files, never suffix matches or directory globs. Every diagnostic
-names the compiler catalog or typed capability facade as the required
-replacement.
+ABI/link-name context, supplement it with a small checked standalone Rust
+helper using exact-pinned `proc_macro2` tokenization. It recursively inspects
+every token group; comments are absent and string/char/raw/byte/C literals stay
+atomic. `syn` is permitted only for correct `link_name` literal decoding. The
+helper emits deterministic JSON/text. A Python wrapper runs it locked/offline
+in an isolated repository target, validates the JSON, applies exact
+`PurePosixPath` allowlists, and propagates build/scan status; Python performs no
+Rust lexing or parsing. The token helper recognizes only direct watched libc
+paths and imports/reexports, assembly invocations/import aliases, extern ABI
+declarations, and watched `link_name` literals. It must not recover Rust name,
+cfg, module, or reachability semantics. Exclusions are exact reviewed boundary
+files, never suffix matches or directory globs. Every diagnostic names the
+compiler catalog or typed capability facade as the required replacement.
 
 - [ ] **Step 3: Wire deterministic local checks**
 

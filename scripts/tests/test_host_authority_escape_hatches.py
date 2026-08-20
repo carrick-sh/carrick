@@ -13,6 +13,9 @@ ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / "scripts" / "lint-domains.sh"
 TYPED_CONFIG = ROOT / ".semgrep" / "typed-domains.yml"
 ESCAPE_CONFIG = ROOT / ".semgrep" / "host-authority-escape-hatches.yml"
+CHECKED_FIXTURES = ROOT / "scripts" / "tests" / "fixtures" / "host-authority-escape-syntax"
+REJECT_FIXTURES = ("imports.rs", "macros.rs", "externs.rs")
+SAFE_FIXTURE = "safe.rs"
 
 
 class HostAuthorityEscapeHatchTest(unittest.TestCase):
@@ -37,7 +40,10 @@ class HostAuthorityEscapeHatchTest(unittest.TestCase):
         self.log = self.root / "semgrep.log"
 
     def run_lint(
-        self, files: dict[str, str], semgrep_bin: Path | None = None
+        self,
+        files: dict[str, str],
+        semgrep_bin: Path | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         for relative, body in files.items():
             path = self.root / relative
@@ -53,6 +59,8 @@ class HostAuthorityEscapeHatchTest(unittest.TestCase):
         )
         if semgrep_bin is not None:
             env["SEMGREP_BIN"] = str(semgrep_bin)
+        if extra_env is not None:
+            env.update(extra_env)
         return subprocess.run(
             [str(LAUNCHER)],
             cwd=self.root,
@@ -103,6 +111,52 @@ class HostAuthorityEscapeHatchTest(unittest.TestCase):
             result.stdout + result.stderr,
             re.compile(r"compiler\s+host-\s*authority\s+catalog"),
         )
+
+    def test_checked_fixtures_are_valid_rust_and_rustfmt_clean(self):
+        fixtures = (*REJECT_FIXTURES, SAFE_FIXTURE)
+        with tempfile.TemporaryDirectory() as output_dir:
+            for index, name in enumerate(fixtures):
+                with self.subTest(name=name):
+                    source = CHECKED_FIXTURES / name
+                    self.assertTrue(source.is_file(), f"missing checked fixture: {source}")
+                    rustfmt = subprocess.run(
+                        ["rustfmt", "--check", "--edition", "2024", str(source)],
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertEqual(
+                        rustfmt.returncode, 0, rustfmt.stdout + rustfmt.stderr
+                    )
+                    rustc = subprocess.run(
+                        [
+                            "rustc",
+                            "--crate-name",
+                            f"host_authority_escape_fixture_{index}",
+                            "--crate-type",
+                            "lib",
+                            "--edition",
+                            "2024",
+                            "--emit",
+                            "metadata",
+                            "--out-dir",
+                            output_dir,
+                            str(source),
+                        ],
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertEqual(rustc.returncode, 0, rustc.stdout + rustc.stderr)
+
+    def test_checked_reject_fixtures_are_denied_and_safe_fixture_is_clean(self):
+        for name in REJECT_FIXTURES:
+            with self.subTest(name=name):
+                shutil.rmtree(self.root / "crates", ignore_errors=True)
+                body = (CHECKED_FIXTURES / name).read_text(encoding="utf-8")
+                self.assert_rejected(body)
+        shutil.rmtree(self.root / "crates", ignore_errors=True)
+        safe = (CHECKED_FIXTURES / SAFE_FIXTURE).read_text(encoding="utf-8")
+        result = self.run_lint({"crates/fixture/src/lib.rs": safe})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_rejects_raw_libc_syscall(self):
         self.assert_rejected(
@@ -230,7 +284,30 @@ macro_rules! compiler_catalog_owned {
             semgrep_bin=fake_semgrep,
         )
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("raw libc::syscall bypasses review", result.stderr)
+        self.assertIn("libc::syscall bypasses resolved review", result.stderr)
+
+    def test_launcher_propagates_helper_tokenization_failure(self):
+        fake_semgrep = self.root / "semgrep-success"
+        fake_semgrep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_semgrep.chmod(0o755)
+        result = self.run_lint(
+            {"crates/fixture/src/lib.rs": "fn broken( {\n"},
+            semgrep_bin=fake_semgrep,
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("Rust tokenization failed", result.stderr)
+
+    def test_launcher_propagates_helper_build_failure(self):
+        fake_semgrep = self.root / "semgrep-success"
+        fake_semgrep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_semgrep.chmod(0o755)
+        result = self.run_lint(
+            {"crates/fixture/src/lib.rs": "pub fn safe() {}\n"},
+            semgrep_bin=fake_semgrep,
+            extra_env={"RUSTC": str(self.root / "missing-rustc")},
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("checked Rust token helper exited", result.stderr)
 
     def test_nested_suffix_lookalikes_do_not_inherit_boundary_exclusions(self):
         fixtures = {

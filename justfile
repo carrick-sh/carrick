@@ -89,14 +89,14 @@ clippy *ARGS:
 # Typed-domain semgrep gate: blocks the bug SHAPES the newtypes exist to kill
 # (raw wait-set complements, bit=signum masks, host pids in NsPid, hand-numbered
 # private syscall numbers, function-local LINUX_* consts, inline errno
-# negation). Narrow Semgrep rules plus a comment/string-aware raw-syntax pass
-# additionally deny syscall, dynamic lookup, assembly, import aliases, and
-# local host-API redeclarations outside exact reviewed boundary modules. The
-# launcher fails closed while giving Semgrep a deterministic offline
-# environment and an explicit writable log path. The compiler census remains
-# the semantic authority: it checks this host's product profiles and reports
-# all other required profiles pending; a partial local pass is not matrix
-# completeness.
+# negation). Narrow Semgrep rules plus a checked proc_macro2 token helper deny
+# syscall, dynamic lookup, assembly, import aliases, and local host-API
+# redeclarations outside exact reviewed boundary modules, including macro token
+# groups without hand-lexing comments or literals. The launcher fails closed
+# while giving Semgrep a deterministic offline environment and an explicit
+# writable log path. The compiler census remains the semantic authority: it
+# checks this host's product profiles and reports all other required profiles
+# pending; a partial local pass is not matrix completeness.
 lint-domains:
     ./scripts/lint-domains.sh
     python3 scripts/migrate/check-host-authority-transitions.py --check
