@@ -19,6 +19,9 @@ pub mod operations;
 pub mod registry;
 pub mod snapshot;
 
+#[cfg(test)]
+mod tests;
+
 pub use address::{
     Asid, MmBackend, MmBackendSnapshot, MmBinding, OwnedVmaSnapshot, SharedVmaSnapshotSource,
     SnapshotError, SnapshotTable, Stage1Root, Stage1RootError, Ttbr0, VmaRevision,

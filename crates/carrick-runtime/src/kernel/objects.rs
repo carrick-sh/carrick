@@ -8,10 +8,11 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use carrick_abi::keyring::{KeyRequestDefault, KeySerial};
 use carrick_abi::{
-    LINUX_RLIM_INFINITY, LinuxResource, LinuxRlimit, LinuxSigaction, LinuxSigaltstack,
-    LinuxSiginfo, NsGid, NsUid, SigSet,
+    LINUX_RLIM_INFINITY, LinuxGuestAbi, LinuxResource, LinuxRlimit, LinuxSigaction,
+    LinuxSigaltstack, LinuxSiginfo, NsGid, NsUid, SigSet,
 };
 use carrick_hal::ThreadId;
+use carrick_hal::threaded::GuestCpuState;
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::linux_abi::LINUX_DEFAULT_UMASK;
@@ -3256,6 +3257,7 @@ impl Task {
             signal_pending_hint: AtomicU64::new(0),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
+            execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
             system_ns: AtomicU64::new(0),
             crash_vote: Mutex::new(None),
@@ -3281,6 +3283,7 @@ impl Task {
             signal_pending_hint: AtomicU64::new(0),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
+            execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
             system_ns: AtomicU64::new(0),
             crash_vote: Mutex::new(None),
@@ -3306,6 +3309,7 @@ impl Task {
             signal_pending_hint: AtomicU64::new(0),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
+            execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
             cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
             system_ns: AtomicU64::new(0),
             crash_vote: Mutex::new(None),
@@ -3331,8 +3335,9 @@ impl Task {
             signal_pending_hint: AtomicU64::new(caller.signal_pending_hint.load(Ordering::Acquire)),
             revision: ObjectRevision::new(),
             runner_gate: Arc::clone(&caller.runner_gate),
-            cpu_slot: AtomicUsize::new(CPU_SLOT_UNBOUND),
-            system_ns: AtomicU64::new(0),
+            execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
+            cpu_slot: AtomicUsize::new(caller.cpu_slot.load(Ordering::Acquire)),
+            system_ns: AtomicU64::new(caller.system_ns.load(Ordering::Acquire)),
             crash_vote: Mutex::new(None),
             crash_safe_point_participant: AtomicBool::new(false),
             thread_keyring: Mutex::new(None),
@@ -3721,6 +3726,237 @@ impl Drop for ExecDrain {
     }
 }
 
+/// Version of one published Kernel-owned task CPU snapshot.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ExecutionGeneration(u64);
+
+impl ExecutionGeneration {
+    const INITIAL: Self = Self(1);
+
+    fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// Stable identity of a persistent execution slot.
+///
+/// Production construction arrives with the executor pool in a later task;
+/// Task 1 exposes only an explicitly synthetic constructor for state-machine
+/// tests, rather than a general raw-ID escape hatch.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ExecutorId(u32);
+
+impl ExecutorId {
+    pub fn synthetic_for_tests(raw: u32) -> Self {
+        Self(raw)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockedReason {
+    ChildState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionFailure {
+    UnsettledLeaseDropped {
+        executor: ExecutorId,
+        executor_epoch: u64,
+    },
+}
+
+/// Public observation of a thread's scheduler-owned execution state.
+///
+/// The architectural snapshot is intentionally absent. It remains private in
+/// [`ThreadExecutionRecord`] or moves into the exact non-cloneable lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadExecutionState {
+    Uninitialized,
+    Runnable {
+        generation: ExecutionGeneration,
+    },
+    Running {
+        generation: ExecutionGeneration,
+        executor: ExecutorId,
+        executor_epoch: u64,
+        wake_pending: bool,
+    },
+    SwitchingOut {
+        generation: ExecutionGeneration,
+        executor: ExecutorId,
+        executor_epoch: u64,
+        wake_pending: bool,
+    },
+    Blocked {
+        generation: ExecutionGeneration,
+        reason: BlockedReason,
+    },
+    Exited {
+        generation: ExecutionGeneration,
+    },
+    Failed {
+        generation: ExecutionGeneration,
+        reason: ExecutionFailure,
+    },
+}
+
+impl ThreadExecutionState {
+    const fn generation(self) -> Option<ExecutionGeneration> {
+        match self {
+            Self::Uninitialized => None,
+            Self::Runnable { generation }
+            | Self::Running { generation, .. }
+            | Self::SwitchingOut { generation, .. }
+            | Self::Blocked { generation, .. }
+            | Self::Exited { generation }
+            | Self::Failed { generation, .. } => Some(generation),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ThreadExecutionError {
+    #[error("thread execution generation overflowed")]
+    GenerationExhausted,
+    #[error("thread execution transition {operation} is invalid from {state:?}")]
+    InvalidTransition {
+        operation: &'static str,
+        state: ThreadExecutionState,
+    },
+    #[error("execution lease belongs to {actual:?}, not {expected:?}")]
+    LeaseOwnerMismatch {
+        expected: ThreadKey,
+        actual: ThreadKey,
+    },
+    #[error(
+        "execution lease for generation {generation:?}, executor {executor:?}, epoch \
+         {executor_epoch} is stale"
+    )]
+    StaleLease {
+        generation: ExecutionGeneration,
+        executor: ExecutorId,
+        executor_epoch: u64,
+    },
+    #[error("snapshot architecture mismatch: expected {expected:?}, got {actual:?}")]
+    SnapshotArchitectureMismatch {
+        expected: LinuxGuestAbi,
+        actual: LinuxGuestAbi,
+    },
+    #[error("snapshot version mismatch: expected {expected}, got {actual}")]
+    SnapshotVersionMismatch { expected: u16, actual: u16 },
+    #[error("execution lease for generation {generation:?} carries no CPU snapshot")]
+    MissingCpuState { generation: ExecutionGeneration },
+}
+
+#[derive(Debug)]
+struct ThreadExecutionRecord {
+    state: ThreadExecutionState,
+    cpu_state: Option<GuestCpuState>,
+    next_executor_epoch: u64,
+}
+
+impl ThreadExecutionRecord {
+    const fn uninitialized() -> Self {
+        Self {
+            state: ThreadExecutionState::Uninitialized,
+            cpu_state: None,
+            next_executor_epoch: 1,
+        }
+    }
+}
+
+/// Exact authority to run one thread generation on one executor binding.
+///
+/// The lease is deliberately non-cloneable. Dropping it before a successful
+/// settle operation fails the still-matching thread generation closed.
+pub struct ThreadExecutionLease {
+    owner: Weak<Thread>,
+    owner_key: ThreadKey,
+    generation: ExecutionGeneration,
+    executor: ExecutorId,
+    executor_epoch: u64,
+    cpu_state: Option<GuestCpuState>,
+    settled: bool,
+}
+
+impl std::fmt::Debug for ThreadExecutionLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ThreadExecutionLease")
+            .field("owner_key", &self.owner_key)
+            .field("generation", &self.generation)
+            .field("executor", &self.executor)
+            .field("executor_epoch", &self.executor_epoch)
+            .field("settled", &self.settled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ThreadExecutionLease {
+    pub const fn generation(&self) -> ExecutionGeneration {
+        self.generation
+    }
+
+    pub const fn executor(&self) -> ExecutorId {
+        self.executor
+    }
+
+    pub const fn executor_epoch(&self) -> u64 {
+        self.executor_epoch
+    }
+
+    /// Return the typed snapshot only when the restoring backend names the
+    /// exact architecture and version it implements.
+    pub fn cpu_state_for_restore(
+        &self,
+        expected_abi: LinuxGuestAbi,
+        expected_version: u16,
+    ) -> Result<&GuestCpuState, ThreadExecutionError> {
+        let Some(state) = self.cpu_state.as_ref() else {
+            return Err(ThreadExecutionError::MissingCpuState {
+                generation: self.generation,
+            });
+        };
+        let actual_abi = state.guest_abi();
+        if actual_abi != expected_abi {
+            return Err(ThreadExecutionError::SnapshotArchitectureMismatch {
+                expected: expected_abi,
+                actual: actual_abi,
+            });
+        }
+        let actual_version = state.version();
+        if actual_version != expected_version {
+            return Err(ThreadExecutionError::SnapshotVersionMismatch {
+                expected: expected_version,
+                actual: actual_version,
+            });
+        }
+        Ok(state)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ExecutionSettlement {
+    Runnable,
+    Blocked(BlockedReason),
+    Exited,
+}
+
+impl Drop for ThreadExecutionLease {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        if let Some(owner) = self.owner.upgrade() {
+            owner.fail_unsettled_execution_lease(self);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Thread {
     key: ThreadKey,
@@ -3732,6 +3968,7 @@ pub struct Thread {
     signal_pending_hint: AtomicU64,
     revision: ObjectRevision,
     runner_gate: Arc<RunnerGate>,
+    execution: Mutex<ThreadExecutionRecord>,
     /// This thread's `guest_cpu` slot, claimed the first time it runs guest
     /// code, or [`CPU_SLOT_UNBOUND`] before then. Recording it here is what
     /// lets the owning [`Task`] total its own threads' CPU: under HVPatch every
@@ -3780,6 +4017,246 @@ pub const CPU_SLOT_UNBOUND: usize = usize::MAX;
 impl Thread {
     pub const fn key(&self) -> ThreadKey {
         self.key
+    }
+
+    pub fn execution_state(&self) -> ThreadExecutionState {
+        self.execution.lock().state
+    }
+
+    /// Seed the first complete task snapshot after backend materialization.
+    /// New, fork, clone, and exec-replacement objects all begin uninitialized,
+    /// and no other state accepts this publication.
+    pub fn publish_initial_cpu_state(
+        &self,
+        state: GuestCpuState,
+    ) -> Result<ExecutionGeneration, ThreadExecutionError> {
+        let mut execution = self.execution.lock();
+        if execution.state != ThreadExecutionState::Uninitialized {
+            return Err(ThreadExecutionError::InvalidTransition {
+                operation: "publish_initial_cpu_state",
+                state: execution.state,
+            });
+        }
+        let generation = ExecutionGeneration::INITIAL;
+        execution.cpu_state = Some(state);
+        execution.state = ThreadExecutionState::Runnable { generation };
+        drop(execution);
+        self.revision.publish();
+        Ok(generation)
+    }
+
+    /// Atomically move the exact Runnable snapshot into one executor lease.
+    pub fn claim_runnable(
+        self: &Arc<Self>,
+        executor: ExecutorId,
+    ) -> Result<ThreadExecutionLease, ThreadExecutionError> {
+        let mut execution = self.execution.lock();
+        let generation = match execution.state {
+            ThreadExecutionState::Runnable { generation } => generation,
+            state => {
+                return Err(ThreadExecutionError::InvalidTransition {
+                    operation: "claim_runnable",
+                    state,
+                });
+            }
+        };
+        let executor_epoch = execution.next_executor_epoch;
+        let next_executor_epoch = executor_epoch
+            .checked_add(1)
+            .ok_or(ThreadExecutionError::GenerationExhausted)?;
+        let Some(cpu_state) = execution.cpu_state.take() else {
+            return Err(ThreadExecutionError::InvalidTransition {
+                operation: "claim_runnable_without_cpu_state",
+                state: execution.state,
+            });
+        };
+        execution.next_executor_epoch = next_executor_epoch;
+        execution.state = ThreadExecutionState::Running {
+            generation,
+            executor,
+            executor_epoch,
+            wake_pending: false,
+        };
+        drop(execution);
+        self.revision.publish();
+        Ok(ThreadExecutionLease {
+            owner: Arc::downgrade(self),
+            owner_key: self.key,
+            generation,
+            executor,
+            executor_epoch,
+            cpu_state: Some(cpu_state),
+            settled: false,
+        })
+    }
+
+    /// Publish that the executor has begun saving the leased task state.
+    pub fn begin_switch_out(
+        &self,
+        lease: &ThreadExecutionLease,
+    ) -> Result<(), ThreadExecutionError> {
+        self.validate_execution_lease_owner(lease)?;
+        let mut execution = self.execution.lock();
+        match execution.state {
+            ThreadExecutionState::Running {
+                generation,
+                executor,
+                executor_epoch,
+                wake_pending,
+            } if generation == lease.generation
+                && executor == lease.executor
+                && executor_epoch == lease.executor_epoch =>
+            {
+                execution.state = ThreadExecutionState::SwitchingOut {
+                    generation,
+                    executor,
+                    executor_epoch,
+                    wake_pending,
+                };
+            }
+            _ => return Err(Self::stale_lease_error(lease)),
+        }
+        drop(execution);
+        self.revision.publish();
+        Ok(())
+    }
+
+    pub fn yield_from_executor(
+        &self,
+        lease: ThreadExecutionLease,
+    ) -> Result<(), ThreadExecutionError> {
+        self.settle_execution_lease(lease, ExecutionSettlement::Runnable)
+    }
+
+    pub fn park_from_executor(
+        &self,
+        lease: ThreadExecutionLease,
+        reason: BlockedReason,
+    ) -> Result<(), ThreadExecutionError> {
+        self.settle_execution_lease(lease, ExecutionSettlement::Blocked(reason))
+    }
+
+    pub fn exit_from_executor(
+        &self,
+        lease: ThreadExecutionLease,
+    ) -> Result<(), ThreadExecutionError> {
+        self.settle_execution_lease(lease, ExecutionSettlement::Exited)
+    }
+
+    fn settle_execution_lease(
+        &self,
+        mut lease: ThreadExecutionLease,
+        settlement: ExecutionSettlement,
+    ) -> Result<(), ThreadExecutionError> {
+        self.validate_execution_lease_owner(&lease)?;
+        let mut execution = self.execution.lock();
+        if !Self::execution_state_matches_lease(execution.state, &lease) {
+            return Err(Self::stale_lease_error(&lease));
+        }
+        let generation = lease
+            .generation
+            .next()
+            .ok_or(ThreadExecutionError::GenerationExhausted)?;
+        match settlement {
+            ExecutionSettlement::Runnable => {
+                execution.cpu_state = lease.cpu_state.take();
+                execution.state = ThreadExecutionState::Runnable { generation };
+            }
+            ExecutionSettlement::Blocked(reason) => {
+                execution.cpu_state = lease.cpu_state.take();
+                execution.state = ThreadExecutionState::Blocked { generation, reason };
+            }
+            ExecutionSettlement::Exited => {
+                execution.cpu_state = None;
+                let _ = lease.cpu_state.take();
+                execution.state = ThreadExecutionState::Exited { generation };
+            }
+        }
+        lease.settled = true;
+        drop(execution);
+        self.revision.publish();
+        Ok(())
+    }
+
+    fn validate_execution_lease_owner(
+        &self,
+        lease: &ThreadExecutionLease,
+    ) -> Result<(), ThreadExecutionError> {
+        if lease.owner_key != self.key {
+            return Err(ThreadExecutionError::LeaseOwnerMismatch {
+                expected: self.key,
+                actual: lease.owner_key,
+            });
+        }
+        Ok(())
+    }
+
+    fn execution_state_matches_lease(
+        state: ThreadExecutionState,
+        lease: &ThreadExecutionLease,
+    ) -> bool {
+        matches!(
+            state,
+            ThreadExecutionState::Running {
+                generation,
+                executor,
+                executor_epoch,
+                ..
+            } | ThreadExecutionState::SwitchingOut {
+                generation,
+                executor,
+                executor_epoch,
+                ..
+            } if generation == lease.generation
+                && executor == lease.executor
+                && executor_epoch == lease.executor_epoch
+        )
+    }
+
+    const fn stale_lease_error(lease: &ThreadExecutionLease) -> ThreadExecutionError {
+        ThreadExecutionError::StaleLease {
+            generation: lease.generation,
+            executor: lease.executor,
+            executor_epoch: lease.executor_epoch,
+        }
+    }
+
+    fn fail_unsettled_execution_lease(&self, lease: &ThreadExecutionLease) {
+        let mut execution = self.execution.lock();
+        if !Self::execution_state_matches_lease(execution.state, lease) {
+            return;
+        }
+        let generation = lease
+            .generation
+            .next()
+            .unwrap_or_else(|| std::process::abort());
+        execution.cpu_state = None;
+        execution.state = ThreadExecutionState::Failed {
+            generation,
+            reason: ExecutionFailure::UnsettledLeaseDropped {
+                executor: lease.executor,
+                executor_epoch: lease.executor_epoch,
+            },
+        };
+        drop(execution);
+        self.revision.publish();
+    }
+
+    /// Invalidate the old image at exec publication. The replacement starts
+    /// independently at `Uninitialized` and must receive freshly materialized
+    /// entry state before it can be claimed.
+    pub(super) fn invalidate_execution_for_exec(&self) {
+        let mut execution = self.execution.lock();
+        let generation = execution
+            .state
+            .generation()
+            .unwrap_or(ExecutionGeneration::INITIAL)
+            .next()
+            .unwrap_or_else(|| std::process::abort());
+        execution.cpu_state = None;
+        execution.state = ThreadExecutionState::Exited { generation };
+        drop(execution);
+        self.revision.publish();
     }
 
     /// This thread's `KEY_SPEC_THREAD_KEYRING`, or `None` if it has never
@@ -3948,6 +4425,7 @@ impl Thread {
 
     pub(super) fn transfer_runner_to(&self, replacement: &ThreadRef) {
         debug_assert!(Arc::ptr_eq(&self.runner_gate, &replacement.runner_gate));
+        self.invalidate_execution_for_exec();
         self.runner_gate.transfer_owner(self.key, replacement.key);
     }
 
