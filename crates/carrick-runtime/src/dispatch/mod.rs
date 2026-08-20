@@ -7199,6 +7199,10 @@ impl SyscallDispatcher {
                     pgrp: zombie.process_group.raw() as u32,
                     session: zombie.session.raw() as u32,
                     comm: zombie.diagnostic_name,
+                    user_cpu_us: u64::try_from(zombie.rusage.user_time.as_micros())
+                        .unwrap_or(u64::MAX),
+                    system_cpu_us: u64::try_from(zombie.rusage.system_time.as_micros())
+                        .unwrap_or(u64::MAX),
                 })
                 .collect()
         });

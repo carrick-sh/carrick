@@ -8,6 +8,7 @@ use carrick_aarch64::mailbox::{
     MailboxState, validate_request_metadata,
 };
 use carrick_guest_mem::Aarch64SyscallFrame;
+use carrick_hal::threaded::Aarch64SyscallContinuationV1;
 
 pub use carrick_mem::memory::{
     LINUX_SYSCALL_MAILBOX_ARENA_SIZE, LINUX_SYSCALL_MAILBOX_BASE,
@@ -190,28 +191,6 @@ pub struct MailboxBinding {
     generation: u64,
     last_sequence: u64,
     transport: HvfSyscallTransport,
-    parked: Option<ParkedMailbox>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ParkedMailbox {
-    sequence: u64,
-    state: u32,
-    trap_kind: u32,
-    response_action: u32,
-    flags: u32,
-    native_nr: u64,
-    args: [u64; 6],
-    x8: u64,
-    resume_pc: u64,
-    spsr: u64,
-    fp: u64,
-    lr: u64,
-    sp: u64,
-    esr: u64,
-    return_value: u64,
-    resume_x16: u64,
-    resume_x17: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,7 +245,6 @@ impl MailboxBinding {
             generation: 0,
             last_sequence: 0,
             transport,
-            parked: None,
         };
         // SAFETY: upheld by this constructor's caller.
         unsafe { binding.rebind(host, false) };
@@ -324,13 +302,13 @@ impl MailboxBinding {
         }
     }
 
-    fn snapshot_outstanding(&self, state: u32) -> ParkedMailbox {
+    fn snapshot_outstanding(&self, state: u32) -> Aarch64SyscallContinuationV1 {
         let mailbox = self.host.as_ptr();
         // SAFETY: callers stop the vCPU or are handling its synchronous exit;
         // acquire-loading `state` before this call makes the guest's complete
         // request publication visible.
         unsafe {
-            ParkedMailbox {
+            Aarch64SyscallContinuationV1 {
                 sequence: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).sequence)),
                 state,
                 trap_kind: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).trap_kind)),
@@ -356,7 +334,7 @@ impl MailboxBinding {
         }
     }
 
-    fn restore_outstanding(&self, parked: ParkedMailbox) {
+    fn restore_outstanding(&self, parked: Aarch64SyscallContinuationV1) {
         let mailbox = self.host.as_ptr();
         // SAFETY: the binding uniquely owns the complete destination slot and
         // publishes `state` only after every payload word is restored.
@@ -405,16 +383,16 @@ impl MailboxBinding {
         self.state().store(parked.state, Ordering::Release);
     }
 
-    /// Snapshot the outstanding response vehicle and release this binding's
-    /// finite arena slot while its vCPU is destroyed for an M:N blocking wait.
-    /// The guest is stopped immediately after the HVC, so only the continuation
-    /// payload needs to survive; the next vCPU receives a freshly generated
-    /// binding and resumes the same EL1 continuation from its new `SP_EL1`.
-    pub fn release_for_reclaim(&mut self) -> Result<(), MailboxConsumeError> {
-        if self.lease.is_none() || self.parked.is_some() {
+    pub fn export_task_continuation(
+        &self,
+    ) -> Result<Option<Aarch64SyscallContinuationV1>, MailboxConsumeError> {
+        if self.lease.is_none() {
             return Err(MailboxConsumeError::AlreadyParked);
         }
         let state = self.state().load(Ordering::Acquire);
+        if state == MailboxState::Idle.raw() {
+            return Ok(None);
+        }
         if state != MailboxState::RequestReady.raw() && state != MailboxState::ResponseReady.raw() {
             return Err(MailboxConsumeError::Protocol(
                 MailboxProtocolError::UnexpectedState {
@@ -423,8 +401,57 @@ impl MailboxBinding {
                 },
             ));
         }
-        self.parked = Some(self.snapshot_outstanding(state));
+        Ok(Some(self.snapshot_outstanding(state)))
+    }
+
+    pub fn import_task_continuation(
+        &mut self,
+        continuation: Aarch64SyscallContinuationV1,
+    ) -> Result<(), MailboxConsumeError> {
+        if self.lease.is_none() {
+            return Err(MailboxConsumeError::AlreadyParked);
+        }
+        let state = self.state().load(Ordering::Acquire);
+        if state != MailboxState::Idle.raw() {
+            return Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::UnexpectedState {
+                    expected: MailboxState::Idle,
+                    actual: state,
+                },
+            ));
+        }
+        if continuation.state != MailboxState::RequestReady.raw()
+            && continuation.state != MailboxState::ResponseReady.raw()
+        {
+            return Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::UnexpectedState {
+                    expected: MailboxState::RequestReady,
+                    actual: continuation.state,
+                },
+            ));
+        }
+        self.last_sequence = continuation.sequence;
+        self.restore_outstanding(continuation);
+        Ok(())
+    }
+
+    /// Snapshot the outstanding response vehicle and release this binding's
+    /// finite arena slot while its vCPU is destroyed for an M:N blocking wait.
+    /// The guest is stopped immediately after the HVC, so only the continuation
+    /// payload needs to survive; the next vCPU receives a freshly generated
+    /// binding and resumes the same EL1 continuation from its new `SP_EL1`.
+    pub fn release_for_reclaim(&mut self) -> Result<(), MailboxConsumeError> {
+        if self.lease.is_none() {
+            return Err(MailboxConsumeError::AlreadyParked);
+        }
+        self.export_task_continuation()?.ok_or_else(|| {
+            MailboxConsumeError::Protocol(MailboxProtocolError::UnexpectedState {
+                expected: MailboxState::RequestReady,
+                actual: MailboxState::Idle.raw(),
+            })
+        })?;
         drop(self.lease.take());
+        self.last_sequence = 0;
         Ok(())
     }
 
@@ -439,18 +466,17 @@ impl MailboxBinding {
         &mut self,
         lease: MailboxSlotLease,
         host: NonNull<Aarch64SyscallMailbox>,
+        continuation: Option<Aarch64SyscallContinuationV1>,
     ) -> Result<(), MailboxConsumeError> {
         if self.lease.is_some() {
             return Err(MailboxConsumeError::AlreadyParked);
         }
-        let Some(parked) = self.parked.take() else {
-            return Err(MailboxConsumeError::NotParked);
-        };
         self.lease = Some(lease);
         // SAFETY: the caller supplies the complete uniquely leased slot.
         unsafe { self.rebind(host, false) };
-        self.last_sequence = parked.sequence;
-        self.restore_outstanding(parked);
+        if let Some(continuation) = continuation {
+            self.import_task_continuation(continuation)?;
+        }
         Ok(())
     }
 
@@ -737,6 +763,33 @@ mod tests {
     }
 
     #[test]
+    fn clean_destination_completes_exported_task_continuation() {
+        let (mut source, mut source_mailbox) = binding();
+        publish_valid_request(&source, &mut source_mailbox);
+        source.take_request().unwrap().expect("source request");
+        let continuation = source
+            .export_task_continuation()
+            .unwrap()
+            .expect("typed task continuation");
+
+        let (mut destination, destination_mailbox) = binding();
+        assert_eq!(destination.diagnostics().state, MailboxState::Idle.raw());
+        destination
+            .import_task_continuation(continuation)
+            .expect("restore into clean destination mailbox");
+        destination.publish_normal_return(0x1234).unwrap();
+        assert_eq!(
+            destination_mailbox.response_action,
+            MailboxResponseAction::NormalReturn.raw()
+        );
+        assert_eq!(destination_mailbox.return_value, 0x1234);
+        assert_eq!(
+            destination_mailbox.state.load(Ordering::Acquire),
+            MailboxState::ResponseReady.raw()
+        );
+    }
+
+    #[test]
     fn allocator_exhaustion_and_reuse_are_deterministic() {
         let allocator = Arc::new(MailboxSlotAllocator::new());
         let mut leases = Vec::new();
@@ -967,7 +1020,16 @@ mod tests {
         publish_valid_request(&binding, &mut old_mailbox);
         binding.take_request().expect("protocol").expect("request");
 
+        let continuation = binding
+            .export_task_continuation()
+            .unwrap()
+            .expect("task continuation");
         binding.release_for_reclaim().expect("park mailbox");
+        assert_eq!(binding.sequence(), 0, "source retains no task sequence");
+        assert!(matches!(
+            binding.export_task_continuation(),
+            Err(MailboxConsumeError::AlreadyParked)
+        ));
         let occupier = allocator.allocate().expect("park released old slot");
         assert_eq!(occupier.id().raw(), 0);
         let resumed_lease = allocator.allocate().expect("resume slot");
@@ -997,8 +1059,10 @@ mod tests {
             reserved: [0; 72],
         });
         let resumed_pointer = NonNull::from(resumed_mailbox.as_mut());
-        unsafe { binding.reacquire_after_reclaim(resumed_lease, resumed_pointer) }
-            .expect("move outstanding request");
+        unsafe {
+            binding.reacquire_after_reclaim(resumed_lease, resumed_pointer, Some(continuation))
+        }
+        .expect("move outstanding request");
 
         assert_eq!(binding.slot().raw(), 1);
         assert_eq!(resumed_mailbox.sequence, 1);

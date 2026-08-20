@@ -887,8 +887,11 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         state: &Aarch64TaskCpuStateV1,
         vcpu: &mut Self::Vcpu,
     ) -> Result<(), TrapError> {
-        self.state
-            .reclaim_resume(&mut vcpu.inner, &mut vcpu.mailbox)?;
+        self.state.reclaim_resume(
+            &mut vcpu.inner,
+            &mut vcpu.mailbox,
+            state.syscall_continuation,
+        )?;
         let destination = vcpu.snapshot()?;
         let restored = restore_aarch64_task_state(&destination, state)?;
         vcpu.restore(&restored)
@@ -904,6 +907,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             &mut vcpu.inner,
             &mut vcpu.mailbox,
             /*replay_alias_union=*/ false,
+            state.syscall_continuation,
         )?;
         let destination = vcpu.snapshot()?;
         let restored = restore_aarch64_task_state(&destination, state)?;
@@ -925,6 +929,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             &mut vcpu.inner,
             &mut vcpu.mailbox,
             /*replay_alias_union=*/ true,
+            state.syscall_continuation,
         )?;
         let destination = vcpu.snapshot()?;
         let restored = restore_aarch64_task_state(&destination, state)?;
@@ -1020,6 +1025,15 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn fpsimd_enabled(&self) -> bool {
         crate::trap::fpsimd_save_enabled()
+    }
+
+    fn task_continuation(
+        &self,
+        vcpu: &Self::Vcpu,
+    ) -> Result<Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>, TrapError> {
+        vcpu.mailbox
+            .export_task_continuation()
+            .map_err(|error| TrapError::Hypervisor(format!("export syscall continuation: {error}")))
     }
 }
 

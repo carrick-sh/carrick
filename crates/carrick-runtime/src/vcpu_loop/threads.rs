@@ -262,6 +262,7 @@ where
             // was still spare at the instant they parked.
             let reclaim_now = engine.reclaims();
             let snapshot = if reclaim_now {
+                self.require_execution_authority_for_destructive_save()?;
                 let cpu = engine.save_guest_state().map_err(|error| {
                     self.fail_snapshot_boundary(
                         crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
@@ -1322,13 +1323,7 @@ where
         Ok(())
     }
 
-    pub(super) fn handle_thread_exit(
-        &self,
-        kernel: &Kernel,
-        engine: &mut E,
-        code: i32,
-        traps: usize,
-    ) -> VcpuLoopOutcome {
+    pub(super) fn settle_execution_lease_on_loop_departure(&self) {
         if let (Some(thread), Some(lease)) = (
             self.kernel_thread.as_ref(),
             self.execution_lease.lock().take(),
@@ -1340,6 +1335,16 @@ where
                 crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
             );
         }
+    }
+
+    pub(super) fn handle_thread_exit(
+        &self,
+        kernel: &Kernel,
+        engine: &mut E,
+        code: i32,
+        traps: usize,
+    ) -> VcpuLoopOutcome {
+        self.settle_execution_lease_on_loop_departure();
         // Exit-cleanup gate: the moment `kicker.unregister` below runs, a
         // concurrent fork's quiesce stops counting this thread — but the
         // cleanup that follows (`host_signal::forget_thread`) takes a

@@ -4280,6 +4280,31 @@ impl Thread {
         Ok(())
     }
 
+    /// Authenticate that `lease` is the exact currently running generation
+    /// before a backend crosses a destructive save boundary.
+    pub fn validate_running_execution_lease(
+        &self,
+        lease: &ThreadExecutionLease,
+    ) -> Result<(), ThreadExecutionError> {
+        self.validate_execution_lease_owner(lease)?;
+        let execution = self.execution.lock();
+        if matches!(
+            execution.state,
+            ThreadExecutionState::Running {
+                generation,
+                executor,
+                executor_epoch,
+                ..
+            } if generation == lease.generation
+                && executor == lease.executor
+                && executor_epoch == lease.executor_epoch
+        ) {
+            Ok(())
+        } else {
+            Err(Self::stale_lease_error(lease))
+        }
+    }
+
     pub fn yield_from_executor(
         &self,
         lease: ThreadExecutionLease,

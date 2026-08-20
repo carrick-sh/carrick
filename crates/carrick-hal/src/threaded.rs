@@ -816,6 +816,29 @@ pub struct GuestWaitRegisters {
     pub lr: u64,
 }
 
+/// Task-owned AArch64 syscall continuation transported independently of the
+/// destination executor's mailbox slot, pointer, generation, and SP_EL1.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Aarch64SyscallContinuationV1 {
+    pub sequence: u64,
+    pub state: u32,
+    pub trap_kind: u32,
+    pub response_action: u32,
+    pub flags: u32,
+    pub native_nr: u64,
+    pub args: [u64; 6],
+    pub x8: u64,
+    pub resume_pc: u64,
+    pub spsr: u64,
+    pub fp: u64,
+    pub lr: u64,
+    pub sp: u64,
+    pub esr: u64,
+    pub return_value: u64,
+    pub resume_x16: u64,
+    pub resume_x17: u64,
+}
+
 /// Version-one migratable AArch64 task state owned by a Kernel thread.
 ///
 /// Executor-local EL1 state is deliberately absent: in particular this does
@@ -857,6 +880,7 @@ pub struct Aarch64TaskCpuStateV1 {
     pub last_fault_esr: u64,
     pub last_exit_class: u64,
     pub is_forked_child: bool,
+    pub syscall_continuation: Option<Aarch64SyscallContinuationV1>,
     /// Exact Kernel mm generation that authorized the task translation state.
     pub mm_generation: u64,
     /// Exact ASID allocation generation paired with the task's TTBR values.
@@ -1180,7 +1204,7 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
 
     /// Capture the freshly materialized exec image without parking or
     /// destroying the destination executor's live vCPU.
-    fn snapshot_guest_state_for_exec(&mut self) -> Result<GuestCpuState, TrapError>;
+    fn snapshot_guest_state_for_publication(&mut self) -> Result<GuestCpuState, TrapError>;
     fn bind_frame_cow(
         &mut self,
         _authority: std::sync::Arc<dyn FrameCowAuthority>,
