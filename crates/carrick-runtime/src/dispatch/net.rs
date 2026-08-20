@@ -2464,6 +2464,30 @@ impl SyscallDispatcher {
         }
     }
 
+    /// The guest's `(type, protocol)` for `fd` in ONE lock acquisition.
+    ///
+    /// `recvmsg` needs both — the protocol to spot an SCTP stream, the type to
+    /// decide whether MSG_TRUNC can apply — and asking separately took the open
+    /// description's lock three times per read. That cost nothing measurable
+    /// single-threaded (`go-net_http` stays at ~49 s) but lock contention
+    /// amplifies superlinearly, and the suite went from a 53.8 s MATCH to a
+    /// 540 s truncation under 8-worker gate load.
+    fn socket_guest_type_and_protocol(&self, fd: i32) -> Option<(i32, i32)> {
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::HostSocket {
+                type_, protocol, ..
+            } => Some((*type_, *protocol)),
+            OpenDescription::Netlink {
+                sock_type,
+                protocol,
+                ..
+            } => Some((*sock_type, *protocol)),
+            _ => None,
+        }
+    }
+
     fn socket_guest_protocol(&self, fd: i32) -> Option<i32> {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read();
@@ -6409,9 +6433,12 @@ impl SyscallDispatcher {
             // (tcp_sendmsg with no peer), but macOS returns ENOTCONN. Remap only
             // for stream sockets so datagram ENOTCONN (a real Linux errno) is
             // untouched. (sendto01 "not connected TCP")
-            let is_stream = this.socket_guest_type(fd) == Some(libc::SOCK_STREAM);
-            let is_sctp_stream =
-                is_stream && this.socket_guest_protocol(fd) == Some(LINUX_IPPROTO_SCTP);
+            let (guest_type, guest_protocol) = match this.socket_guest_type_and_protocol(fd) {
+                Some(pair) => (Some(pair.0), Some(pair.1)),
+                None => (None, None),
+            };
+            let is_stream = guest_type == Some(libc::SOCK_STREAM);
+            let is_sctp_stream = is_stream && guest_protocol == Some(LINUX_IPPROTO_SCTP);
             let nonblocking = this.io_is_nonblocking(fd, flags);
             let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
             let connected_send = dest_addr == 0;
@@ -7795,7 +7822,11 @@ impl SyscallDispatcher {
         // when a read consumes the END of one. Its TCP backing has neither
         // property, so cap the read at the current boundary and answer EOR from
         // the recorded one.
-        let is_sctp_stream = self.socket_guest_protocol(fd) == Some(LINUX_IPPROTO_SCTP);
+        let (guest_type, guest_protocol) = match self.socket_guest_type_and_protocol(fd) {
+            Some(pair) => (Some(pair.0), Some(pair.1)),
+            None => (None, None),
+        };
+        let is_sctp_stream = guest_protocol == Some(LINUX_IPPROTO_SCTP);
         let sctp_peek = flags & LinuxMsgFlags::PEEK.bits() != 0;
         let sctp_eor = std::cell::Cell::new(false);
         // macOS reports MSG_TRUNC for a ZERO-length datagram read into a
@@ -7812,7 +7843,7 @@ impl SyscallDispatcher {
         // directly. Restricted to datagram-shaped sockets — on a stream, a byte
         // the guest did not ask for must stay queued.
         let datagram_shaped = matches!(
-            self.socket_guest_type(fd),
+            guest_type,
             Some(t) if t == libc::SOCK_DGRAM || t == libc::SOCK_SEQPACKET
         );
         let zero_len_datagram_read = total == 0 && datagram_shaped && !is_netlink;
@@ -8004,7 +8035,7 @@ impl SyscallDispatcher {
             // on datagram/seqpacket sockets — a stream has no record to truncate
             // and simply leaves the rest queued. macOS sets it on a stream too
             // when the data does not fit.
-            if self.socket_guest_type(fd) == Some(libc::SOCK_STREAM) {
+            if guest_type == Some(libc::SOCK_STREAM) {
                 linux_flags &= !LinuxMsgFlags::TRUNC.bits();
             }
             // A zero-length read of a datagram truncates it only if it carried
