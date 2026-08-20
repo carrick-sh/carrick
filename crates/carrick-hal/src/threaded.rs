@@ -816,6 +816,198 @@ pub struct GuestWaitRegisters {
     pub lr: u64,
 }
 
+/// Version-one migratable AArch64 task state owned by a Kernel thread.
+///
+/// Executor-local EL1 state is deliberately absent: in particular this does
+/// not carry `SP_EL1`, the syscall-mailbox binding, `VBAR_EL1`, `SCTLR_EL1`,
+/// `MAIR_EL1`, or `CPACR_EL1`. A persistent executor validates and retains
+/// those values while this state moves only the Linux task's architectural
+/// identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Aarch64TaskCpuStateV1 {
+    /// X0..X30.
+    pub gprs: [u64; 31],
+    /// Exact EL0 resume instruction pointer.
+    pub pc: u64,
+    /// Exact EL0 processor state paired with [`Self::pc`].
+    pub pstate: u64,
+    pub sp_el0: u64,
+    pub ttbr0: u64,
+    pub ttbr1: u64,
+    pub tcr: u64,
+    pub actlr_el1: u64,
+    pub tpidr_el0: u64,
+    pub tpidrro_el0: u64,
+    pub contextidr_el1: u64,
+    /// V0..V31.
+    pub vregs: [u128; 32],
+    pub fpsr: u32,
+    pub fpcr: u32,
+    pub pending_resume_pc: Option<u64>,
+    pub last_syscall_nr: Option<u64>,
+    pub last_syscall_orig_x0: u64,
+    pub last_fault_esr: u64,
+    pub last_exit_class: u64,
+    pub is_forked_child: bool,
+    /// Exact Kernel mm generation that authorized the task translation state.
+    pub mm_generation: u64,
+    /// Exact ASID allocation generation paired with the task's TTBR values.
+    pub asid_generation: u64,
+}
+
+/// Full x87/SSE/AVX XSAVE size for the V1 x86 task snapshot (`XCR0 = 0b111`).
+pub const X86_TASK_XSAVE_LEN: usize = 832;
+
+/// Exact backend-resume payload size carried by the V1 x86 task snapshot.
+///
+/// Task 2 maps the existing pending-resume/syscall fields into this fixed V1
+/// payload. Fixing the size here makes truncation or an unversioned extension
+/// fail before state can enter the Kernel object graph.
+pub const X86_TASK_RESUME_PAYLOAD_LEN: usize = 32;
+
+/// Version-one migratable x86_64 task state owned by a Kernel thread.
+///
+/// Variable-sized backend inputs are converted into fixed arrays at the only
+/// constructor. The private fields prevent callers from bypassing that size
+/// validation after construction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct X86TaskCpuStateV1 {
+    gprs: [u64; 16],
+    rip: u64,
+    rflags: u64,
+    rsp: u64,
+    cr3: u64,
+    fs_base: u64,
+    gs_base: u64,
+    mm_generation: u64,
+    asid_generation: u64,
+    xsave: Box<[u8; X86_TASK_XSAVE_LEN]>,
+    resume_payload: Box<[u8; X86_TASK_RESUME_PAYLOAD_LEN]>,
+}
+
+impl X86TaskCpuStateV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        gprs: [u64; 16],
+        rip: u64,
+        rflags: u64,
+        rsp: u64,
+        cr3: u64,
+        fs_base: u64,
+        gs_base: u64,
+        mm_generation: u64,
+        asid_generation: u64,
+        xsave: Vec<u8>,
+        resume_payload: Vec<u8>,
+    ) -> Result<Self, TrapError> {
+        let xsave = xsave.try_into().map_err(|payload: Vec<u8>| {
+            TrapError::Hypervisor(format!(
+                "x86 task-state V1 XSAVE length mismatch: expected {X86_TASK_XSAVE_LEN}, got {}",
+                payload.len()
+            ))
+        })?;
+        let resume_payload = resume_payload.try_into().map_err(|payload: Vec<u8>| {
+            TrapError::Hypervisor(format!(
+                "x86 task-state V1 resume payload length mismatch: expected \
+                 {X86_TASK_RESUME_PAYLOAD_LEN}, got {}",
+                payload.len()
+            ))
+        })?;
+        Ok(Self {
+            gprs,
+            rip,
+            rflags,
+            rsp,
+            cr3,
+            fs_base,
+            gs_base,
+            mm_generation,
+            asid_generation,
+            xsave: Box::new(xsave),
+            resume_payload: Box::new(resume_payload),
+        })
+    }
+
+    pub const fn gprs(&self) -> &[u64; 16] {
+        &self.gprs
+    }
+
+    pub const fn rip(&self) -> u64 {
+        self.rip
+    }
+
+    pub const fn rflags(&self) -> u64 {
+        self.rflags
+    }
+
+    pub const fn rsp(&self) -> u64 {
+        self.rsp
+    }
+
+    pub const fn cr3(&self) -> u64 {
+        self.cr3
+    }
+
+    pub const fn fs_base(&self) -> u64 {
+        self.fs_base
+    }
+
+    pub const fn gs_base(&self) -> u64 {
+        self.gs_base
+    }
+
+    pub const fn mm_generation(&self) -> u64 {
+        self.mm_generation
+    }
+
+    pub const fn asid_generation(&self) -> u64 {
+        self.asid_generation
+    }
+
+    pub const fn xsave(&self) -> &[u8; X86_TASK_XSAVE_LEN] {
+        &self.xsave
+    }
+
+    pub const fn resume_payload(&self) -> &[u8; X86_TASK_RESUME_PAYLOAD_LEN] {
+        &self.resume_payload
+    }
+}
+
+/// Architecture- and version-typed task CPU state accepted by the Kernel.
+///
+/// There is intentionally no raw-byte variant or same-ABI byte constructor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GuestCpuState {
+    Aarch64V1(std::sync::Arc<Aarch64TaskCpuStateV1>),
+    X86_64V1(std::sync::Arc<X86TaskCpuStateV1>),
+}
+
+impl GuestCpuState {
+    pub fn from_aarch64_v1(state: Aarch64TaskCpuStateV1) -> Self {
+        Self::Aarch64V1(std::sync::Arc::new(state))
+    }
+
+    pub fn from_x86_64_v1(state: X86TaskCpuStateV1) -> Result<Self, TrapError> {
+        // `X86TaskCpuStateV1` has no unchecked constructor and keeps both
+        // variable-sized payloads private, so construction itself is the
+        // validation boundary.
+        Ok(Self::X86_64V1(std::sync::Arc::new(state)))
+    }
+
+    pub const fn guest_abi(&self) -> carrick_abi::LinuxGuestAbi {
+        match self {
+            Self::Aarch64V1(_) => carrick_abi::LinuxGuestAbi::Aarch64,
+            Self::X86_64V1(_) => carrick_abi::LinuxGuestAbi::X86_64,
+        }
+    }
+
+    pub const fn version(&self) -> u16 {
+        match self {
+            Self::Aarch64V1(_) | Self::X86_64V1(_) => 1,
+        }
+    }
+}
+
 /// Complete AArch64 EL0 architectural state captured at a crash-generation
 /// safe point.  This is intentionally separate from the best-effort wait
 /// diagnostic above: a core publisher must fail closed if any field is absent.
