@@ -3343,6 +3343,12 @@ impl SyscallDispatcher {
                         self.dnotify_close_fd(event.fd);
                         self.inotify_close_for_fd(event.fd);
                         self.detach_fd_from_epolls(event.fd);
+                        // The whole retiring generation has lost its final
+                        // live Kernel reference, so every alias in it is
+                        // closing. Retire a registration bound to this exact
+                        // owner-local table/description before releasing the
+                        // description's logical fd reference.
+                        self.mqueue_retire_file_table_registration(files.id(), &event.slot);
                         self.record_fd_close_owner(event.fd, pid, &event.slot);
                         if let Some(owner) = owner {
                             self.release_hvpatch_classic_record_locks(owner, &event.slot);

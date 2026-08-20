@@ -467,6 +467,29 @@ impl SyscallDispatcher {
         drop(retired);
     }
 
+    /// Retire one registration bound to a FileTable generation that the
+    /// Kernel has proven fully draining. Unlike an ordinary alias close, this
+    /// must not search the same task for a matching description and infer an
+    /// exec successor: a CLONE_THREAD peer may legitimately have copied the
+    /// same descriptions into a different live table. Exec transfer is
+    /// explicit in `mqueue_rebind_exec_file_table` before close events drain.
+    pub(in crate::dispatch) fn mqueue_retire_file_table_registration(
+        &self,
+        file_table: crate::kernel::FileTableId,
+        open_file: &OpenFile,
+    ) {
+        let open = open_file.description.write();
+        let OpenDescription::Mqueue { queue, .. } = &*open else {
+            return;
+        };
+        let retired = queue.retire_registration(MqueueRegistration {
+            file_table,
+            description: open_file.description.id(),
+        });
+        drop(open);
+        drop(retired);
+    }
+
     /// Process exit owns notification lifetime even when CLONE_FILES keeps the
     /// FileTable and its descriptions live in another task. Scan the exiting
     /// task's exact table, then remove only records carrying its full TaskKey.
@@ -1282,6 +1305,31 @@ mod tests {
             .0
     }
 
+    fn clone_test_thread_with_flags(
+        parent: &crate::kernel::KernelContext,
+        registry_id: i32,
+        extra_flags: carrick_abi::LinuxCloneFlags,
+    ) -> crate::kernel::KernelContext {
+        let flags = carrick_abi::LinuxCloneFlags::THREAD
+            | carrick_abi::LinuxCloneFlags::SIGHAND
+            | carrick_abi::LinuxCloneFlags::VM
+            | extra_flags;
+        parent
+            .kernel()
+            .reserve_thread_clone(
+                parent,
+                crate::kernel::ClonePlan::from_flags(flags).unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(crate::thread::ThreadId::synthetic_for_tests(registry_id))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_context()
+            .expect("test thread context")
+    }
+
     fn file_description(
         dispatcher: &SyscallDispatcher,
         context: &crate::kernel::KernelContext,
@@ -1716,6 +1764,141 @@ mod tests {
         assert_ne!(replacement.task().key(), old_key);
         register_signal_notification(&dispatcher, &replacement, &mut memory, mqd, 34, 12, 0x1100);
         assert!(queue.state.lock().notify.is_some());
+    }
+
+    #[test]
+    fn copied_file_table_thread_exit_closes_owner_registration_exactly_once() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_031);
+        dispatcher.bind_hvpatch_process(process.clone());
+        let leader = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x7000]);
+        let mqd = open_test_queue(
+            &dispatcher,
+            &leader,
+            &mut memory,
+            0x1000,
+            b"thread_copy_exit\0",
+        );
+        let netlink_fd = open_test_netlink(&dispatcher, &leader, &mut memory);
+        let netlink = file_description(&dispatcher, &leader, netlink_fd);
+        let leader_refs = netlink.fd_ref_count();
+        let (_, queue) = mqueue_description_and_queue(&dispatcher, &leader, mqd);
+        let sibling =
+            clone_test_thread_with_flags(&leader, 82_031, carrick_abi::LinuxCloneFlags::empty());
+        assert_ne!(
+            sibling.resources().files().id(),
+            leader.resources().files().id(),
+            "CLONE_THREAD without CLONE_FILES must copy the file table"
+        );
+        register_thread_notification(
+            &dispatcher,
+            &sibling,
+            &mut memory,
+            mqd,
+            netlink_fd,
+            [0x61; NOTIFY_DATA_SIZE],
+        );
+        assert_eq!(netlink.fd_ref_count(), leader_refs + 2);
+
+        let receipt = match process.exit_thread(sibling.thread().key().tid).unwrap() {
+            crate::hvpatch::ProcessThreadExit::Retired(receipt) => receipt,
+            other => panic!("expected newly retired thread, got {other:?}"),
+        };
+        let retired_table = receipt.files();
+        dispatcher.close_draining_file_table(
+            process.kernel_graph(),
+            &retired_table,
+            Some(receipt.owner()),
+            None,
+        );
+        assert!(
+            queue.state.lock().notify.is_none(),
+            "retiring a copied thread table must purge its exact registration"
+        );
+        assert_eq!(
+            netlink.fd_ref_count(),
+            leader_refs,
+            "thread-table close and registration retirement release both logical refs"
+        );
+        assert!(
+            process
+                .kernel_graph()
+                .take_file_close_events(retired_table.id())
+                .is_empty(),
+            "dispatcher cleanup must consume close events exactly once"
+        );
+        assert!(matches!(
+            process.exit_thread(sibling.thread().key().tid).unwrap(),
+            crate::hvpatch::ProcessThreadExit::AlreadyRetired
+        ));
+        dispatcher.close_draining_file_table(
+            process.kernel_graph(),
+            &retired_table,
+            Some(receipt.owner()),
+            None,
+        );
+        assert_eq!(netlink.fd_ref_count(), leader_refs);
+
+        let replacement =
+            clone_test_thread_with_flags(&leader, 82_032, carrick_abi::LinuxCloneFlags::empty());
+        register_signal_notification(&dispatcher, &replacement, &mut memory, mqd, 34, 17, 0x1100);
+        assert!(queue.state.lock().notify.is_some());
+    }
+
+    #[test]
+    fn shared_file_table_survives_nonfinal_thread_exit() {
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_032);
+        dispatcher.bind_hvpatch_process(process.clone());
+        let leader = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x7000]);
+        let mqd = open_test_queue(
+            &dispatcher,
+            &leader,
+            &mut memory,
+            0x1000,
+            b"thread_shared_exit\0",
+        );
+        let (_, queue) = mqueue_description_and_queue(&dispatcher, &leader, mqd);
+        let sibling =
+            clone_test_thread_with_flags(&leader, 82_033, carrick_abi::LinuxCloneFlags::FILES);
+        assert_eq!(
+            sibling.resources().files().id(),
+            leader.resources().files().id()
+        );
+        register_signal_notification(&dispatcher, &sibling, &mut memory, mqd, 34, 18, 0x1100);
+
+        let receipt = match process.exit_thread(sibling.thread().key().tid).unwrap() {
+            crate::hvpatch::ProcessThreadExit::Retired(receipt) => receipt,
+            other => panic!("expected newly retired thread, got {other:?}"),
+        };
+        dispatcher.close_draining_file_table(
+            process.kernel_graph(),
+            &receipt.files(),
+            Some(receipt.owner()),
+            None,
+        );
+        assert!(
+            queue.state.lock().notify.is_some(),
+            "a live CLONE_FILES peer keeps the shared table and registration alive"
+        );
+        assert!(
+            process
+                .kernel_graph()
+                .take_file_close_events(receipt.files().id())
+                .is_empty()
+        );
+        assert_eq!(
+            dispatch_call(
+                &dispatcher,
+                &leader,
+                &mut memory,
+                184,
+                [mqd as u64, 0, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
     }
 
     #[test]

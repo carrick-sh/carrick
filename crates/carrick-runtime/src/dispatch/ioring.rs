@@ -1098,19 +1098,33 @@ impl SyscallDispatcher {
                 }
             }
             LINUX_IORING_OP_CLOSE => {
-                // Same path as close(2): drop the fd from the table and free its
-                // host fd / pty entry. Also clear any io_uring side-table entry
-                // (closing a ring fd this way). Detach from epolls BEFORE freeing
-                // the fd number (same ordering rule as close(2): a freed number is
-                // instantly reusable, and a detach-after-free would rip out a
-                // sibling's reused-fd interest).
+                // Same lifecycle path as close(2), scoped to the exact captured
+                // task and FileTable generation that submitted the SQE. Close
+                // notifications must observe the slot before removal; epoll
+                // detach must likewise happen before the fd number is reusable.
+                self.discard_splice_pushback_if_final(sqe.fd);
+                self.dnotify_close_fd(sqe.fd);
+                self.inotify_close_for_fd(sqe.fd);
+                let identity = super::resources::with_active_context(|context| {
+                    self.fanotify_close_for_fd(context, sqe.fd);
+                    (context.task().key(), context.thread().key().tid.raw())
+                });
                 self.detach_fd_from_epolls(sqe.fd);
-                let removed = self
-                    .captured_file_table()
-                    .write_open_files()
-                    .remove(&sqe.fd);
+                let files = self.captured_file_table();
+                let removed = files.write_open_files().remove(&sqe.fd);
                 match removed {
                     Some(open_file) => {
+                        self.mqueue_owner_alias_closed(&files, &open_file);
+                        if let Some((owner, tid)) = identity {
+                            self.record_fd_close_owner(sqe.fd, tid, &open_file);
+                            self.release_hvpatch_classic_record_locks(owner, &open_file);
+                        }
+                        crate::event_ring::rec(
+                            crate::event_ring::FDCLOSE,
+                            sqe.fd,
+                            super::fs::fd_helpers::event_ring_host_fd(&open_file),
+                            0,
+                        );
                         self.close_open_file_and_free_pty(&open_file);
                         self.note_fd_closed(sqe.fd);
                         0
@@ -1297,6 +1311,32 @@ impl SyscallDispatcher {
 mod tests {
     use super::*;
 
+    fn dispatch_call(
+        dispatcher: &SyscallDispatcher,
+        context: &crate::kernel::KernelContext,
+        memory: &mut LinearMemory,
+        number: u64,
+        args: [u64; 6],
+    ) -> DispatchOutcome {
+        dispatcher
+            .dispatch_normalized(
+                context,
+                SyscallRequest::new(number, SyscallArgs::from(args)),
+                memory,
+                &CompatReporter::default(),
+                None,
+            )
+            .expect("io_uring lifecycle test syscall must be routed")
+            .expect("io_uring lifecycle test syscall must dispatch")
+    }
+
+    fn returned_fd(outcome: DispatchOutcome) -> i32 {
+        match outcome {
+            DispatchOutcome::Returned { value } => i32::try_from(value).expect("fd fits i32"),
+            other => panic!("expected fd, got {other:?}"),
+        }
+    }
+
     fn sqe(opcode: u8, user_data: u64) -> LinuxIoUringSqe {
         LinuxIoUringSqe {
             opcode,
@@ -1313,6 +1353,103 @@ mod tests {
             splice_fd_in: 0,
             pad2: [0; 2],
         }
+    }
+
+    #[test]
+    fn close_sqe_retires_exact_mqueue_registration_and_netlink_retention() {
+        use zerocopy::IntoBytes as _;
+
+        let dispatcher = SyscallDispatcher::new();
+        let (process, _) = crate::hvpatch::process_context_for_tests(83_030);
+        dispatcher.bind_hvpatch_process(process);
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = LinearMemory::new(0x1000, vec![0u8; 0x6000]);
+        memory.write_bytes(0x1000, b"ioring_close\0").unwrap();
+        let mqd = returned_fd(dispatch_call(
+            &dispatcher,
+            &context,
+            &mut memory,
+            180,
+            [
+                0x1000,
+                LINUX_O_RDWR | LINUX_O_CREAT | LINUX_O_EXCL,
+                0o600,
+                0,
+                0,
+                0,
+            ],
+        ));
+        let netlink_fd = returned_fd(dispatch_call(
+            &dispatcher,
+            &context,
+            &mut memory,
+            198,
+            [LINUX_AF_NETLINK as u64, LINUX_SOCK_DGRAM as u64, 0, 0, 0, 0],
+        ));
+        let netlink = super::super::resources::with_captured_resources(&context, || {
+            dispatcher
+                .open_file(netlink_fd)
+                .expect("netlink fd")
+                .description()
+        });
+        let refs_before = netlink.fd_ref_count();
+        memory.write_bytes(0x1200, &[0x53; 32]).unwrap();
+        let sigevent = crate::linux_abi::LinuxSigevent {
+            sigev_value: 0x1200,
+            sigev_signo: netlink_fd,
+            sigev_notify: crate::linux_abi::LINUX_SIGEV_THREAD,
+            _sigev_un: [0; 48],
+        };
+        memory.write_bytes(0x1100, sigevent.as_bytes()).unwrap();
+        assert_eq!(
+            dispatch_call(
+                &dispatcher,
+                &context,
+                &mut memory,
+                184,
+                [mqd as u64, 0x1100, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(netlink.fd_ref_count(), refs_before + 1);
+
+        let mut close_sqe = sqe(LINUX_IORING_OP_CLOSE, 0x51);
+        close_sqe.fd = mqd;
+        let close_result = super::super::resources::with_captured_resources(&context, || {
+            dispatcher.io_uring_run_op(&mut memory, &close_sqe)
+        });
+        assert_eq!(close_result, 0);
+        assert_eq!(
+            netlink.fd_ref_count(),
+            refs_before,
+            "IORING_OP_CLOSE must release the registration's retained netlink description"
+        );
+
+        let replacement_mqd = returned_fd(dispatch_call(
+            &dispatcher,
+            &context,
+            &mut memory,
+            180,
+            [0x1000, LINUX_O_RDWR, 0, 0, 0, 0],
+        ));
+        let replacement = crate::linux_abi::LinuxSigevent {
+            sigev_value: 0x55,
+            sigev_signo: 34,
+            sigev_notify: crate::linux_abi::LINUX_SIGEV_SIGNAL,
+            _sigev_un: [0; 48],
+        };
+        memory.write_bytes(0x1100, replacement.as_bytes()).unwrap();
+        assert_eq!(
+            dispatch_call(
+                &dispatcher,
+                &context,
+                &mut memory,
+                184,
+                [replacement_mqd as u64, 0x1100, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+            "a replacement description must register after the SQE close"
+        );
     }
 
     fn test_description() -> (Arc<crate::kernel::FileDescription>, Arc<IoUringBacking>) {

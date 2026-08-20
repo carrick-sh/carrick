@@ -5547,7 +5547,15 @@ where
                 && let Some(process) = kernel.hvpatch_process.as_ref()
             {
                 match process.exit_thread(state.linux_tid) {
-                    Ok(crate::hvpatch::ProcessThreadExit::Retired) => {}
+                    Ok(crate::hvpatch::ProcessThreadExit::Retired(retired)) => {
+                        kernel.dispatcher.close_draining_file_table(
+                            process.kernel_graph(),
+                            &retired.files(),
+                            Some(retired.owner()),
+                            None,
+                        );
+                    }
+                    Ok(crate::hvpatch::ProcessThreadExit::AlreadyRetired) => {}
                     Ok(crate::hvpatch::ProcessThreadExit::LastThread) | Err(_) => {
                         tracing::error!(
                             pid = process.pid(),

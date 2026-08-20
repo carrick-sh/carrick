@@ -1341,7 +1341,15 @@ where
         if !last {
             if let Some(process) = kernel.hvpatch_process.as_ref() {
                 match process.exit_thread(self.linux_tid) {
-                    Ok(crate::hvpatch::ProcessThreadExit::Retired) => {}
+                    Ok(crate::hvpatch::ProcessThreadExit::Retired(retired)) => {
+                        kernel.dispatcher.close_draining_file_table(
+                            process.kernel_graph(),
+                            &retired.files(),
+                            Some(retired.owner()),
+                            None,
+                        );
+                    }
+                    Ok(crate::hvpatch::ProcessThreadExit::AlreadyRetired) => {}
                     Ok(crate::hvpatch::ProcessThreadExit::LastThread) => {
                         // Concurrent sibling retirement made this the final
                         // authoritative thread after the runtime-registry check.
