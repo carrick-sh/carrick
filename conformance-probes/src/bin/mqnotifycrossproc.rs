@@ -2,14 +2,16 @@
 //!
 //! The parent owns an empty queue and installs a one-shot notification before
 //! releasing a forked child to send one message. The signal case verifies the
-//! full kernel-generated `siginfo_t`: `SI_MESGQ`, sender PID/UID, and the
+//! full kernel-generated `siginfo_t`: `SI_MESGQ`, sender PID/real UID, and the
 //! registered value. The second case exercises musl's `SIGEV_THREAD` wrapper:
 //! a helper thread owned by the parent must invoke the callback when the child
 //! sends. This is deliberately cross-process; self-notification would miss
 //! process-identity and kernel wake-routing bugs.
 //!
-//! All descriptors and names are cleaned up. Every pipe, signal, callback, and
-//! reap wait has a deadline. Output contains booleans only; the unique queue
+//! The complete SIGEV_THREAD phase runs in an independently killable worker,
+//! bounding the musl wrapper itself as well as its callback. All descriptors
+//! and names are cleaned up. Every pipe, signal, callback, and reap wait has a
+//! deadline. Output contains booleans only; the unique queue
 //! names, PIDs, UIDs, values, and elapsed times are never printed.
 
 use conformance_probes::{errno, report};
@@ -37,7 +39,7 @@ extern "C" {
 struct ChildReport {
     present: bool,
     pid: libc::pid_t,
-    euid: libc::uid_t,
+    ruid: libc::uid_t,
     send_ok: bool,
 }
 
@@ -49,12 +51,12 @@ struct SignalResults {
     received: bool,
     code_is_mesgq: bool,
     sender_pid_matches_child: bool,
-    sender_uid_matches_child_euid: bool,
+    sender_uid_matches_child_ruid: bool,
     value_matches: bool,
     child_reaped: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct ThreadResults {
     queue_opened: bool,
     registered: bool,
@@ -62,6 +64,39 @@ struct ThreadResults {
     callback_ran: bool,
     value_matches: bool,
     child_reaped: bool,
+}
+
+impl ThreadResults {
+    const ENCODED_LEN: usize = 6;
+
+    fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        [
+            u8::from(self.queue_opened),
+            u8::from(self.registered),
+            u8::from(self.child_sent),
+            u8::from(self.callback_ran),
+            u8::from(self.value_matches),
+            u8::from(self.child_reaped),
+        ]
+    }
+
+    fn decode(bytes: [u8; Self::ENCODED_LEN]) -> Option<Self> {
+        if bytes.iter().any(|byte| *byte > 1) {
+            return None;
+        }
+        Some(Self {
+            queue_opened: bytes[0] == 1,
+            registered: bytes[1] == 1,
+            child_sent: bytes[2] == 1,
+            callback_ran: bytes[3] == 1,
+            value_matches: bytes[4] == 1,
+            child_reaped: bytes[5] == 1,
+        })
+    }
+
+    fn exercised(self) -> bool {
+        self.queue_opened && self.registered && self.child_sent
+    }
 }
 
 extern "C" fn thread_callback(value: libc::sigval) {
@@ -159,7 +194,18 @@ unsafe fn spawn_sender(mqd: libc::mqd_t) -> Option<(libc::pid_t, i32, i32)> {
         let mut start = [0u8; 1];
         let released = read_exact_bounded(release[0], &mut start, deadline);
         libc::close(release[0]);
+
+        // Linux SI_MESGQ identifies the sender by REAL uid. When privileged,
+        // make real/effective differ without changing the inherited queue
+        // descriptor, so an effective-uid implementation is observably wrong.
+        let ruid = libc::getuid();
+        let identity_ready = if ruid == 0 {
+            (libc::geteuid() != ruid || libc::seteuid(65_534) == 0) && libc::geteuid() != ruid
+        } else {
+            true
+        };
         let send_ok = released
+            && identity_ready
             && libc::mq_send(
                 mqd,
                 MESSAGE.as_ptr().cast::<libc::c_char>(),
@@ -168,10 +214,10 @@ unsafe fn spawn_sender(mqd: libc::mqd_t) -> Option<(libc::pid_t, i32, i32)> {
             ) == 0;
 
         let pid = libc::getpid().to_ne_bytes();
-        let euid = libc::geteuid().to_ne_bytes();
+        let ruid = ruid.to_ne_bytes();
         let sent = [u8::from(send_ok)];
         let _ = write_exact(result[1], &pid);
-        let _ = write_exact(result[1], &euid);
+        let _ = write_exact(result[1], &ruid);
         let _ = write_exact(result[1], &sent);
         libc::close(result[1]);
         libc::_exit(0);
@@ -206,11 +252,11 @@ fn read_child_report(fd: i32) -> ChildReport {
     let pid_end = core::mem::size_of::<libc::pid_t>();
     let uid_end = pid_end + core::mem::size_of::<libc::uid_t>();
     let pid = libc::pid_t::from_ne_bytes(bytes[..pid_end].try_into().unwrap());
-    let euid = libc::uid_t::from_ne_bytes(bytes[pid_end..uid_end].try_into().unwrap());
+    let ruid = libc::uid_t::from_ne_bytes(bytes[pid_end..uid_end].try_into().unwrap());
     ChildReport {
         present: true,
         pid,
-        euid,
+        ruid,
         send_ok: bytes[uid_end] == 1,
     }
 }
@@ -297,8 +343,8 @@ unsafe fn signal_phase(name: &CString) -> SignalResults {
         && child_report.present
         && child_report.pid == child
         && info.si_pid() == child_report.pid;
-    result.sender_uid_matches_child_euid =
-        result.received && child_report.present && info.si_uid() == child_report.euid;
+    result.sender_uid_matches_child_ruid =
+        result.received && child_report.present && info.si_uid() == child_report.ruid;
     result.value_matches = result.received && info.si_value().sival_ptr as usize == SIGNAL_VALUE;
     result.child_reaped = reap_bounded(child);
 
@@ -324,7 +370,9 @@ unsafe fn thread_event() -> libc::sigevent {
     event
 }
 
-unsafe fn thread_phase(name: &CString) -> ThreadResults {
+/// Run inside the independently killable worker. The sender is forked before
+/// `mq_notify(SIGEV_THREAD)` can create musl's helper thread.
+unsafe fn thread_phase_worker(name: &CString) -> ThreadResults {
     let mut result = ThreadResults::default();
     THREAD_CALLED.store(false, Ordering::Release);
     THREAD_OBSERVED_VALUE.store(0, Ordering::Release);
@@ -361,6 +409,94 @@ unsafe fn thread_phase(name: &CString) -> ThreadResults {
     result
 }
 
+/// `Some(status_ok)` means the worker was consumed; `None` means it is still
+/// live at the deadline and must be killed.
+unsafe fn wait_worker_until(pid: libc::pid_t, deadline: Instant) -> Option<bool> {
+    loop {
+        let mut status = 0;
+        let rc = libc::waitpid(pid, &mut status, libc::WNOHANG);
+        if rc == pid {
+            return Some(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        }
+        if rc == -1 && errno() != libc::EINTR {
+            return Some(false);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        libc::usleep(1_000);
+    }
+}
+
+unsafe fn kill_worker_tree_and_reap(pid: libc::pid_t) {
+    // The worker becomes a process-group leader before it forks the sender, so
+    // a stuck libc wrapper cannot leave that sender behind. Confirm ownership
+    // before signaling the group; always signal the exact worker as fallback.
+    if libc::getpgid(pid) == pid {
+        let _ = libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = libc::kill(pid, libc::SIGKILL);
+    let deadline = Instant::now() + CLEANUP_DEADLINE;
+    let mut status = 0;
+    loop {
+        let rc = libc::waitpid(pid, &mut status, libc::WNOHANG);
+        if rc == pid || (rc == -1 && errno() != libc::EINTR) || Instant::now() >= deadline {
+            return;
+        }
+        libc::usleep(1_000);
+    }
+}
+
+/// Isolate the complete musl SIGEV_THREAD path behind a process boundary.
+/// `mq_notify(3)` is a libc wrapper and is not specified to block, but a broken
+/// implementation must still produce deterministic `false` lines rather than
+/// wedge the conformance harness.
+unsafe fn thread_phase_bounded(name: &CString) -> ThreadResults {
+    // Clear any stale name before even allocating the supervision pipe; the
+    // worker repeats this immediately before its own create.
+    let _ = libc::mq_unlink(name.as_ptr());
+    let Some(result_pipe) = make_pipe() else {
+        return ThreadResults::default();
+    };
+    let worker = libc::fork();
+    if worker == 0 {
+        libc::close(result_pipe[0]);
+        let _ = libc::setpgid(0, 0);
+        let result = thread_phase_worker(name);
+        let wrote = write_exact(result_pipe[1], &result.encode());
+        libc::close(result_pipe[1]);
+        libc::_exit(i32::from(!wrote));
+    }
+
+    libc::close(result_pipe[1]);
+    if worker < 0 {
+        libc::close(result_pipe[0]);
+        return ThreadResults::default();
+    }
+    let _ = libc::setpgid(worker, worker);
+
+    let deadline = Instant::now() + WAIT_DEADLINE;
+    let mut encoded = [0u8; ThreadResults::ENCODED_LEN];
+    let got_result = read_exact_bounded(result_pipe[0], &mut encoded, deadline);
+    libc::close(result_pipe[0]);
+    let worker_ok = match wait_worker_until(worker, deadline) {
+        Some(status_ok) => status_ok,
+        None => {
+            kill_worker_tree_and_reap(worker);
+            false
+        }
+    };
+    // The worker normally unlinks after closing its descriptor. This parent
+    // fallback also cleans the namespace if the libc wrapper had to be killed.
+    let _ = libc::mq_unlink(name.as_ptr());
+
+    if got_result && worker_ok {
+        ThreadResults::decode(encoded).unwrap_or_default()
+    } else {
+        ThreadResults::default()
+    }
+}
+
 fn main() {
     unsafe {
         let pid = libc::getpid();
@@ -375,14 +511,14 @@ fn main() {
             signal_received = signal.received,
             signal_code_is_mesgq = signal.code_is_mesgq,
             signal_sender_pid_matches_child = signal.sender_pid_matches_child,
-            signal_sender_uid_matches_child_euid = signal.sender_uid_matches_child_euid,
+            signal_sender_uid_matches_child_ruid = signal.sender_uid_matches_child_ruid,
             signal_value_matches = signal.value_matches,
             signal_child_reaped = signal.child_reaped,
         );
 
-        let thread = thread_phase(&thread_name);
+        let thread = thread_phase_bounded(&thread_name);
         report!(
-            thread_exercised = true,
+            thread_exercised = thread.exercised(),
             thread_queue_opened = thread.queue_opened,
             thread_notification_registered = thread.registered,
             thread_child_sent = thread.child_sent,
