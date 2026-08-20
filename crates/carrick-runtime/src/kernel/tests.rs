@@ -168,6 +168,41 @@ fn thread_execution_switching_out_preserves_exact_owner() {
 }
 
 #[test]
+fn exec_invalidation_cannot_revoke_a_switching_out_lease_before_destructive_save() {
+    let (_kernel, context) = bootstrap(9112);
+    let thread = context.thread();
+    thread
+        .publish_initial_task_state(migratable(
+            &context,
+            GuestCpuState::from_aarch64_v1(aarch64_test_task_state()),
+        ))
+        .unwrap();
+    let executor = ExecutorId::synthetic_for_tests(51);
+    let mut lease = thread.claim_runnable(executor).unwrap();
+    thread.begin_switch_out(&lease).unwrap();
+
+    thread.invalidate_execution_for_exec();
+    assert!(matches!(
+        thread.execution_state(),
+        ThreadExecutionState::SwitchingOut { .. }
+    ));
+
+    lease
+        .replace_task_state(migratable(
+            &context,
+            GuestCpuState::from_aarch64_v1(aarch64_test_task_state()),
+        ))
+        .unwrap();
+    thread
+        .park_from_executor(lease, BlockedReason::HostWait)
+        .unwrap();
+    assert!(matches!(
+        thread.execution_state(),
+        ThreadExecutionState::Exited { .. }
+    ));
+}
+
+#[test]
 fn thread_execution_reclaim_publishes_and_reclaims_exact_typed_state() {
     let (_kernel, context) = bootstrap(9108);
     let thread = context.thread();

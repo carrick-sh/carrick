@@ -113,9 +113,12 @@ fn retire_execution_authority_for_exec(
     thread: &std::sync::Arc<crate::kernel::Thread>,
     lease_slot: &parking_lot::Mutex<Option<crate::kernel::objects::ThreadExecutionLease>>,
 ) -> Result<(), crate::kernel::objects::ThreadExecutionError> {
-    let Some(lease) = lease_slot.lock().take() else {
-        return Ok(());
-    };
+    let lease = lease_slot.lock().take().ok_or_else(|| {
+        crate::kernel::objects::ThreadExecutionError::InvalidTransition {
+            operation: "retire_execution_authority_for_exec_without_lease",
+            state: thread.execution_state(),
+        }
+    })?;
     thread
         .exit_from_executor(lease)
         .map_err(|(error, _lease)| error)
@@ -365,6 +368,23 @@ mod exec_image_verification_tests {
             retire < replace,
             "stale or wrong predecessor authority must reject before execve_into destroys the old image"
         );
+
+        let input = crate::kernel::RootBootstrap::for_reference_model(
+            19_104,
+            carrick_hal::ThreadId::synthetic_for_tests(19_104),
+            "missing exec authority".to_owned(),
+        )
+        .unwrap();
+        let (_kernel, missing_context) = crate::kernel::Kernel::bootstrap_root(input).unwrap();
+        let missing_slot = parking_lot::Mutex::new(None);
+        let missing_destructive_calls = std::cell::Cell::new(0);
+        let missing_authorized =
+            retire_execution_authority_for_exec(missing_context.thread(), &missing_slot);
+        if missing_authorized.is_ok() {
+            missing_destructive_calls.set(missing_destructive_calls.get() + 1);
+        }
+        assert!(missing_authorized.is_err());
+        assert_eq!(missing_destructive_calls.get(), 0);
 
         use crate::kernel::objects::{ExecutorId, MigratableTaskState};
         use crate::kernel::{Kernel, RootBootstrap};
