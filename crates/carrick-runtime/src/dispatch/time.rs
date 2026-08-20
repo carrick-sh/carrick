@@ -101,8 +101,31 @@ fn build_itimerspec_ns(spec: TimerSpecNs) -> LinuxItimerspec {
 }
 
 impl SyscallDispatcher {
+    /// This process's limit for `resource`, from the TASK — the one authority
+    /// `getrlimit`, `/proc/<pid>/limits` and every enforcement site share, so
+    /// they cannot answer differently. A peer's `prlimit` is visible here
+    /// because it wrote the same table.
     pub(crate) fn effective_resource_limit(&self, resource: u64) -> LinuxRlimit {
-        effective_rlimit(resource, &self.proc.lock().rlimit_overrides)
+        let Ok(resource) = carrick_abi::LinuxResource::from_guest_arg(resource) else {
+            return LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY);
+        };
+        self.task_rlimits().get(resource)
+    }
+
+    /// The captured task's limit set, falling back to the defaults on lanes and
+    /// unit tests where no dispatch boundary has installed a binding.
+    pub(crate) fn task_rlimits(&self) -> crate::kernel::RlimitSet {
+        if let Some(limits) = super::resources::rlimits() {
+            return limits;
+        }
+        // Same shape as `cred_snapshot`: a unit test holds a binding but has not
+        // installed the dispatch-boundary thread-local, so read the task
+        // directly rather than silently answering with defaults.
+        #[cfg(test)]
+        if let Ok(context) = self.capture_one_task_context() {
+            return context.task().rlimits();
+        }
+        crate::kernel::RlimitSet::carrick_defaults()
     }
 
     /// A host fork discards the parent's unregistered enforcement pthread.
@@ -122,8 +145,7 @@ impl SyscallDispatcher {
     pub(crate) fn rlimit_cpu_after_fork_child(
         &self,
     ) -> Result<RlimitCpuChildRearm, std::io::Error> {
-        let inherited = self.proc.lock().rlimit_overrides[LINUX_RLIMIT_CPU as usize];
-        let limit = inherited.unwrap_or_else(|| rlimit_for_resource(LINUX_RLIMIT_CPU));
+        let limit = self.task_rlimits().get(carrick_abi::LinuxResource::Cpu);
         arm_rlimit_cpu(limit, self.async_signal_wake_owner())
     }
 
@@ -850,7 +872,7 @@ impl SyscallDispatcher {
             if resource >= LINUX_RLIM_NLIMITS {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let limit = effective_rlimit(resource, &this.proc.lock().rlimit_overrides);
+            let limit = this.effective_resource_limit(resource);
             let memory = &mut *cx.memory;
             if rlimit.0 != 0 && write_kernel_struct_raw(memory, rlimit.0, &limit).is_err() {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
@@ -868,35 +890,33 @@ impl SyscallDispatcher {
             // pid is probed via kill(pid,0) — rc==0 (signalable) or EPERM (exists,
             // foreign owner, e.g. launchd) means it exists, ESRCH means it does
             // not. A negative or out-of-range pid is never a real task → ESRCH.
-            {
-                let pid = i64::from(pid.0);
-                let self_pid = std::process::id() as i64;
-                if pid != 0 && pid != self_pid {
-                    let exists = pid > 0
-                        && pid <= i32::MAX as i64
-                        && if let Some(live) = this.guest_pid_is_live(pid as i32) {
-                            live
-                        } else {
-                            let rc = unsafe { libc::kill(pid as i32, 0) };
-                            rc == 0
-                                || std::io::Error::last_os_error().raw_os_error()
-                                    == Some(libc::EPERM)
-                        };
-                    if !exists {
-                        return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-                    }
-                }
-            }
+            // The pid names WHOSE limits these are, so resolve it to a task and
+            // act on THAT task's state. Previously the pid was only validated for
+            // existence and every read/write then went to `this.proc` — the
+            // CALLER's private table — so `prlimit(child, …)` left the child
+            // untouched and moved the caller's own limit instead. Go's
+            // `TestPrlimitFileLimit` sees both halves of that.
+            //
+            // Resolution is entirely guest-domain. The old existence probe
+            // compared against `std::process::id()` and fell back to
+            // `kill(pid, 0)`: under HVPatch that value is the CARRIER's and is
+            // identical for every guest process, and a guest pid is not a host
+            // pid at all, so the answer was a coincidence either way.
+            let Some(target) = this.task_for_guest_pid(cx.kernel, pid.0) else {
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+            };
             // An invalid resource (>= RLIM_NLIMITS) is EINVAL, checked before any
             // limit read/write (LTP getrlimit02 invalid-resource-type case).
             // Valid resources are 0..=15 (RLIMIT_CPU..RLIMIT_RTTIME); carrick
             // previously treated unknown resources as RLIM_INFINITY and
             // "succeeded".
-            if resource >= LINUX_RLIM_NLIMITS {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            // The old (current) limit is reported BEFORE the new one is applied.
-            let old = effective_rlimit(resource, &this.proc.lock().rlimit_overrides);
+            let resource = match carrick_abi::LinuxResource::from_guest_arg(resource) {
+                Ok(resource) => resource,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
+            // The old (current) limit is reported BEFORE the new one is applied,
+            // and it is the TARGET's, not the caller's.
+            let old = target.rlimit(resource);
             if old_limit.0 != 0 && write_kernel_struct_raw(memory, old_limit.0, &old).is_err() {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
@@ -920,7 +940,7 @@ impl SyscallDispatcher {
                 // (LTP setrlimit03). Without it, a root guest's raise of NOFILE
                 // above nr_open would wrongly succeed.
                 const NR_OPEN_CEILING: u64 = 1024 * 1024;
-                if resource == LINUX_RLIMIT_NOFILE && rlim_max > NR_OPEN_CEILING {
+                if resource == carrick_abi::LinuxResource::Nofile && rlim_max > NR_OPEN_CEILING {
                     return Ok(DispatchOutcome::errno(LINUX_EPERM));
                 }
                 // Raising a (previously-lowered) hard limit needs
@@ -938,36 +958,28 @@ impl SyscallDispatcher {
                 if rlim_max > old.rlim_max && !creds_ns_privileged {
                     return Ok(DispatchOutcome::errno(LINUX_EPERM));
                 }
-                if resource == LINUX_RLIMIT_NOFILE {
-                    // Rlimits are process/thread-group state, independent of
-                    // CLONE_FILES. Keep the complete guest limit in the same
-                    // per-process table as every other resource; fd allocation
-                    // reads this authority rather than the descriptor table.
-                    let soft = rlim_cur.min(1024 * 1024);
-                    this.proc.lock().rlimit_overrides[LINUX_RLIMIT_NOFILE as usize] =
-                        Some(LinuxRlimit::new(soft, rlim_max));
+                let soft = if resource == carrick_abi::LinuxResource::Nofile {
+                    rlim_cur.min(1024 * 1024)
+                } else {
+                    rlim_cur
+                };
+                let limit = LinuxRlimit::new(soft, rlim_max);
+                // Published on the TARGET task, which is the whole point.
+                let _ = target.replace_rlimit(resource, |_current| Ok::<_, ()>(limit));
+                if resource == carrick_abi::LinuxResource::Nofile {
                     // Back the guest's fd soft limit with real host descriptors.
                     // Host-backed opens (regular files, /dev/null and other char
                     // devices, sockets, pipes) each consume a native_run fd, so a
                     // guest that raises RLIMIT_NOFILE and then opens up to that many
                     // fds would hit the HOST process's RLIMIT_NOFILE (EMFILE) long
                     // before its own limit — Linux never does, because the guest's
-                    // fds ARE kernel fds. Raise our own soft limit to cover the
-                    // guest's, plus headroom for carrick's internal descriptors
-                    // (event ring, epoll/kqueue, host stdio). Only ever raises, and
-                    // is clamped to the host's hard limit.
+                    // fds ARE kernel fds. This is the host being the authority for
+                    // CARRICK's own descriptor budget, which is legitimate and must
+                    // stay. Only ever raises, and is clamped to the host's hard
+                    // limit.
                     raise_host_nofile_backing(soft);
-                } else {
-                    // Every other resource round-trips through the per-process
-                    // override table so a subsequent get reads back what was set.
-                    if let Some(slot) = this.proc.lock().rlimit_overrides.get_mut(resource as usize)
-                    {
-                        let limit = LinuxRlimit::new(rlim_cur, rlim_max);
-                        *slot = Some(limit);
-                        if resource == LINUX_RLIMIT_CPU {
-                            let _ = arm_rlimit_cpu(limit, this.async_signal_wake_owner());
-                        }
-                    }
+                } else if resource == carrick_abi::LinuxResource::Cpu {
+                    let _ = arm_rlimit_cpu(limit, this.async_signal_wake_owner());
                 }
             }
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -1170,39 +1182,6 @@ pub(crate) fn publish_rlimit_cpu_signal(
     wake_owner.publish_process_signal(signum);
 }
 
-/// The resource limit carrick reports for `getrlimit`/`prlimit64`, honoring the
-/// process/thread-group override table independently of descriptor sharing.
-fn effective_rlimit(resource: u64, overrides: &[Option<LinuxRlimit>; 16]) -> LinuxRlimit {
-    if let Some(Some(limit)) = overrides.get(resource as usize) {
-        return *limit;
-    }
-    rlimit_for_resource(resource)
-}
-
-/// The default resource limit carrick reports for a resource with no override.
-fn rlimit_for_resource(resource: u64) -> LinuxRlimit {
-    const NOFILE_DEFAULT: u64 = 1024 * 1024;
-    match resource {
-        LINUX_RLIMIT_NOFILE => LinuxRlimit::new(NOFILE_DEFAULT, NOFILE_DEFAULT),
-        LINUX_RLIMIT_NPROC => LinuxRlimit::new(8192, 8192),
-        LINUX_RLIMIT_STACK => {
-            // Linux's default 8 MiB soft RLIMIT_STACK, unlimited hard limit.
-            // CPython (and other runtimes) calibrate their main-thread
-            // C-recursion guard to this value, so it must match the size of
-            // the guest stack carrick actually backs (LINUX_STACK_SIZE) or
-            // deep C recursion overflows the real stack before the guard
-            // fires. Kept as its own constant (rather than reusing
-            // LINUX_STACK_SIZE directly) so the reported limit and the
-            // backed region can diverge if we ever add guard-page slack.
-            LinuxRlimit::new(crate::memory::LINUX_RLIMIT_STACK_SOFT, LINUX_RLIM_INFINITY)
-        }
-        LINUX_RLIMIT_AS | LINUX_RLIMIT_DATA => {
-            LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)
-        }
-        _ => LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY),
-    }
-}
-
 /// Convert a Linux `timeval` to a `Duration` (saturating; negative components,
 /// already rejected by `linux_timeval_usec_is_valid`, clamp to zero).
 fn duration_from_timeval(tv: crate::linux_abi::LinuxTimeval) -> std::time::Duration {
@@ -1325,20 +1304,40 @@ mod rlimit_tests {
     static RLIMIT_CPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[test]
     fn nofile_uses_process_override() {
-        let mut overrides = [None; 16];
-        overrides[LINUX_RLIMIT_NOFILE as usize] = Some(LinuxRlimit::new(2048, 1024 * 1024));
-        let r = effective_rlimit(LINUX_RLIMIT_NOFILE, &overrides);
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        context
+            .task()
+            .replace_rlimit(carrick_abi::LinuxResource::Nofile, |_| {
+                Ok::<_, ()>(LinuxRlimit::new(2048, 1024 * 1024))
+            })
+            .expect("set");
+        let r =
+            dispatcher.effective_resource_limit(carrick_abi::LinuxResource::Nofile.index() as u64);
         // `LinuxRlimit` is `#[repr(C, packed)]`, so copy the fields to locals
         // before asserting to avoid taking references to unaligned fields.
         let (cur, max) = (r.rlim_cur, r.rlim_max);
         assert_eq!(cur, 2048);
         assert_eq!(max, 1024 * 1024);
     }
+    /// An out-of-range resource is no longer resolved to a value at all — it
+    /// cannot be constructed, so it never reaches a limit table. That is the
+    /// point of `LinuxResource::from_guest_arg` being the only constructor: the
+    /// old `rlimit_for_resource(99)` answered "infinity" for a resource Linux
+    /// rejects with EINVAL.
     #[test]
-    fn unknown_resource_is_infinity() {
-        let r = rlimit_for_resource(99);
+    fn unknown_resource_cannot_be_constructed() {
+        assert_eq!(
+            carrick_abi::LinuxResource::from_guest_arg(99),
+            Err(crate::linux_abi::LINUX_EINVAL)
+        );
+        let dispatcher = SyscallDispatcher::new();
+        let r = dispatcher.effective_resource_limit(99);
         let cur = r.rlim_cur;
-        assert_eq!(cur, LINUX_RLIM_INFINITY);
+        assert_eq!(
+            cur, LINUX_RLIM_INFINITY,
+            "a rejected resource reads as unlimited, never as a slot"
+        );
     }
 
     #[test]
@@ -1376,8 +1375,14 @@ mod rlimit_tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dispatcher = SyscallDispatcher::new();
-        dispatcher.proc.lock().rlimit_overrides[LINUX_RLIMIT_CPU as usize] =
-            Some(LinuxRlimit::new(u64::MAX - 1, LINUX_RLIM_INFINITY));
+        dispatcher
+            .capture_one_task_context()
+            .expect("task context")
+            .task()
+            .replace_rlimit(carrick_abi::LinuxResource::Cpu, |_| {
+                Ok::<_, ()>(LinuxRlimit::new(u64::MAX - 1, LINUX_RLIM_INFINITY))
+            })
+            .expect("set cpu limit");
         let before = RLIMIT_CPU_GENERATION.load(Ordering::SeqCst);
         assert_eq!(
             dispatcher
@@ -1392,8 +1397,14 @@ mod rlimit_tests {
             "child hook must arm exactly once"
         );
 
-        dispatcher.proc.lock().rlimit_overrides[LINUX_RLIMIT_CPU as usize] =
-            Some(LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY));
+        dispatcher
+            .capture_one_task_context()
+            .expect("task context")
+            .task()
+            .replace_rlimit(carrick_abi::LinuxResource::Cpu, |_| {
+                Ok::<_, ()>(LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY))
+            })
+            .expect("set cpu limit");
         assert_eq!(
             dispatcher
                 .rlimit_cpu_after_fork_child()
@@ -1409,8 +1420,14 @@ mod rlimit_tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dispatcher = SyscallDispatcher::new();
-        dispatcher.proc.lock().rlimit_overrides[LINUX_RLIMIT_CPU as usize] =
-            Some(LinuxRlimit::new(1, 2));
+        dispatcher
+            .capture_one_task_context()
+            .expect("task context")
+            .task()
+            .replace_rlimit(carrick_abi::LinuxResource::Cpu, |_| {
+                Ok::<_, ()>(LinuxRlimit::new(1, 2))
+            })
+            .expect("set cpu limit");
         FAIL_NEXT_RLIMIT_CPU_SPAWN.with(|fail| fail.set(true));
 
         let error = dispatcher

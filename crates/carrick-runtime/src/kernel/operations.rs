@@ -1021,6 +1021,22 @@ impl Kernel {
         })
     }
 
+    /// Resolve a task id to the LIVE task itself, for the callers that must
+    /// read or write another process's per-task state rather than just test a
+    /// property of it.
+    ///
+    /// `live_task_process_euid` answers "who owns it"; this answers "which task
+    /// is it", which is what `prlimit(pid, …)` needs — Linux lets one process
+    /// write another's limits, so there has to be a path from the caller to the
+    /// target's state. There was none: rlimits lived in the dispatcher's private
+    /// `ProcState`, so the write landed on whoever called.
+    pub(crate) fn live_task(&self, task_id: TaskId) -> Option<TaskRef> {
+        let state = self.registry().state.read();
+        state.tasks.get(&task_id).and_then(|record| {
+            (record.task.lifecycle() == TaskLifecycle::Live).then(|| Arc::clone(&record.task))
+        })
+    }
+
     pub(crate) fn live_task_key(&self, task_id: TaskId) -> Option<TaskKey> {
         let state = self.registry().state.read();
         state.tasks.get(&task_id).and_then(|record| {
