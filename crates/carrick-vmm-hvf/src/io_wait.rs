@@ -108,6 +108,13 @@ impl PinnedWaitFds {
         for wait_fd in fds {
             let fd = wait_fd.fd();
             let events = wait_fd.events();
+            if fd < 0 {
+                // poll(2) ignores negative descriptors. Synthetic in-kernel
+                // waits use one as a wake-only sentinel, so it has no host
+                // object to pin and must remain negative through the park.
+                wait_fds.push((fd, events));
+                continue;
+            }
             if wait_fd.is_anchored() {
                 wait_fds.push((fd, events));
                 continue;
@@ -1411,6 +1418,13 @@ mod tests {
         // rlimit perturbation. new() must return Err, not park on the raw fd.
         let bad = 100_000; // not an open fd in the test process
         assert!(super::PinnedWaitFds::new(&[super::WaitFd::raw(bad, libc::POLLIN)]).is_err());
+    }
+
+    #[test]
+    fn pinned_wait_fds_preserves_negative_poll_sentinel() {
+        let pinned = super::PinnedWaitFds::new(&[super::WaitFd::raw(-1, 0)])
+            .expect("poll ignores negative fd sentinels without pinning them");
+        assert_eq!(pinned.as_wait_fds(), &[(-1, 0)]);
     }
 
     #[test]
