@@ -72,13 +72,14 @@ class HostAuthorityInventoryTest(unittest.TestCase):
             self.fixture(
                 "// libc::kill(1, 0);\n"
                 "#[cfg(test)] mod ignored { fn probe() { let _ = \"{\"; libc::kill(1, 0); } }\n"
+                "#[cfg(test)] pub(crate) mod hidden { libc::kill(1, 0); }\n"
                 "fn live() { libc::kill(1, 0); }\n"
                 "fn literal() { let url = \"http://example\"; libc::kill(1, 0); }\n"
             )
         )
         self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]["line"], 3)
-        self.assertEqual(rows[1]["line"], 4)
+        self.assertEqual(rows[0]["line"], 4)
+        self.assertEqual(rows[1]["line"], 5)
 
 
 if __name__ == "__main__":

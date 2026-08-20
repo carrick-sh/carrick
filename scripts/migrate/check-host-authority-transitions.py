@@ -150,7 +150,9 @@ def mask_cfg_test_modules(source: str) -> str:
     """Mask brace-balanced bodies of modules compiled only for Rust tests."""
     masked = list(source)
     attribute = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
-    module = re.compile(r"\s*\b(?:pub\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{")
+    module = re.compile(
+        r"\s*\b(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{"
+    )
     for match in attribute.finditer(source):
         module_match = module.match(source, match.end())
         if module_match is None:
