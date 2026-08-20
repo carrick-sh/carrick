@@ -319,6 +319,28 @@ impl SyscallDispatcher {
             if !linux_clock_is_settable(clock_id) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
+            if !super::creds::has_effective_capability(
+                cx.kernel,
+                crate::namespace::process::CAP_SYS_TIME,
+            ) {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
+            if clock_id == LINUX_CLOCK_REALTIME {
+                let target_secs = timespec.tv_sec.max(0) as u64;
+                let target_nanos = (timespec.tv_nsec as u32).min(999_999_999);
+                let target_duration = Duration::new(target_secs, target_nanos);
+                let raw_now = {
+                    set_guest_realtime_offset_ns(0);
+                    realtime_duration()
+                };
+                let delta_ns = if target_duration >= raw_now {
+                    (target_duration - raw_now).as_nanos() as i64
+                } else {
+                    -((raw_now - target_duration).as_nanos() as i64)
+                };
+                set_guest_realtime_offset_ns(delta_ns);
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
             Ok(DispatchOutcome::errno(LINUX_EPERM))
         }
 
@@ -760,8 +782,37 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        fn settimeofday(this, cx, _timeval: GuestPtr, _timezone: GuestPtr) {
-            Ok(DispatchOutcome::errno(LINUX_EPERM))
+        fn settimeofday(this, cx, timeval: GuestPtr, _timezone: GuestPtr) {
+            let memory = &*cx.memory;
+            if !super::creds::has_effective_capability(
+                cx.kernel,
+                crate::namespace::process::CAP_SYS_TIME,
+            ) {
+                return Ok(DispatchOutcome::errno(LINUX_EPERM));
+            }
+            if timeval.0 == 0 {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            let bytes = memory.read_bytes(timeval.0, 16)?;
+            let tv_sec = i64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
+            let tv_usec = i64::from_le_bytes(bytes[8..16].try_into().unwrap_or([0; 8]));
+            if !(0..1_000_000).contains(&tv_usec) {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            let target_secs = tv_sec.max(0) as u64;
+            let target_nanos = (tv_usec as u32) * 1000;
+            let target_duration = Duration::new(target_secs, target_nanos);
+            let raw_now = {
+                set_guest_realtime_offset_ns(0);
+                realtime_duration()
+            };
+            let delta_ns = if target_duration >= raw_now {
+                (target_duration - raw_now).as_nanos() as i64
+            } else {
+                -((raw_now - target_duration).as_nanos() as i64)
+            };
+            set_guest_realtime_offset_ns(delta_ns);
+            Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn sysinfo(this, cx, info_ptr: GuestPtr) {
@@ -1232,7 +1283,7 @@ fn el1_counted_system_us(memory: &impl GuestMemory) -> u64 {
     count.saturating_mul(crate::memory::EL1_SHIM_SYSCALL_NOMINAL_NS) / 1_000
 }
 
-fn task_self_cpu_us() -> (u64, u64) {
+pub(crate) fn task_self_cpu_us() -> (u64, u64) {
     super::resources::with_active_context(|context| {
         let task = context.task();
         (task.self_cpu_us(), task.self_system_cpu_us())
@@ -1435,5 +1486,18 @@ mod rlimit_tests {
             .expect_err("finite child limit must surface helper spawn failure");
 
         assert!(error.to_string().contains("injected RLIMIT_CPU"));
+    }
+
+    #[test]
+    fn guest_realtime_offset_virtual_clock() {
+        use crate::dispatch::{get_guest_realtime_offset_ns, set_guest_realtime_offset_ns};
+
+        set_guest_realtime_offset_ns(0);
+        assert_eq!(get_guest_realtime_offset_ns(), 0);
+
+        set_guest_realtime_offset_ns(1_000_000_000);
+        assert_eq!(get_guest_realtime_offset_ns(), 1_000_000_000);
+
+        set_guest_realtime_offset_ns(0);
     }
 }
