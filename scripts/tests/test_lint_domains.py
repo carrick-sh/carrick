@@ -38,7 +38,7 @@ class LintDomainsTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_launcher(self, status="0"):
+    def run_launcher(self, status="0", log_file=None):
         if not SCRIPT.is_file():
             self.fail("required launcher is missing: scripts/lint-domains.sh")
         env = os.environ.copy()
@@ -46,19 +46,23 @@ class LintDomainsTest(unittest.TestCase):
             {
                 "SEMGREP_BIN": str(self.fake),
                 "SSL_CERT_FILE": str(self.cert),
-                "SEMGREP_LOG_FILE": str(self.root / "semgrep.log"),
                 "CAPTURE": str(self.capture),
                 "FAKE_STATUS": status,
             }
         )
-        return subprocess.run([str(SCRIPT)], cwd=ROOT, env=env, text=True)
+        if log_file is not None:
+            env["SEMGREP_LOG_FILE"] = str(log_file)
+        return subprocess.run(
+            [str(SCRIPT)], cwd=ROOT, env=env, text=True, capture_output=True
+        )
 
     def test_launcher_is_offline_and_uses_explicit_writable_paths(self):
-        result = self.run_launcher()
+        log_file = self.root / "semgrep.log"
+        result = self.run_launcher(log_file=log_file)
         self.assertEqual(result.returncode, 0)
         capture = json.loads(self.capture.read_text(encoding="utf-8"))
         self.assertEqual(capture["ssl"], str(self.cert))
-        self.assertEqual(capture["log"], str(self.root / "semgrep.log"))
+        self.assertEqual(capture["log"], str(log_file))
         self.assertEqual(capture["metrics"], "off")
         self.assertEqual(capture["version_check"], "0")
         self.assertEqual(capture["otel"], "true")
@@ -68,7 +72,22 @@ class LintDomainsTest(unittest.TestCase):
         )
 
     def test_launcher_preserves_semgrep_failure(self):
-        self.assertEqual(self.run_launcher("7").returncode, 7)
+        self.assertEqual(
+            self.run_launcher("7", self.root / "semgrep.log").returncode, 7
+        )
+
+    def test_launcher_rejects_unwritable_log_path_before_running_semgrep(self):
+        log_file = self.root / "missing-parent" / "semgrep.log"
+        result = self.run_launcher(log_file=log_file)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("error: cannot write semgrep log file:", result.stderr)
+        self.assertFalse(self.capture.exists())
+
+    def test_launcher_removes_default_temporary_log_directory(self):
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0)
+        capture = json.loads(self.capture.read_text(encoding="utf-8"))
+        self.assertFalse(Path(capture["log"]).parent.exists())
 
 
 if __name__ == "__main__":
