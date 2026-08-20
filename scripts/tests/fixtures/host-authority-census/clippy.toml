@@ -1,0 +1,7 @@
+disallowed-methods = [
+    "std::process::id",
+    "std::fs::read",
+    "std::fs::metadata",
+    "std::thread::yield_now",
+    "libc::waitpid",
+]
