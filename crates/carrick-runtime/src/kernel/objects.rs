@@ -4262,6 +4262,9 @@ pub struct Zombie {
     pub process_group: ProcessGroupId,
     pub session: SessionId,
     pub status: LinuxWaitStatus,
+    /// The real uid this process held when it exited. Linux `waitid(2)` reports
+    /// this value in `siginfo_t.si_uid`, so it must survive task teardown.
+    pub ruid: NsUid,
     /// The effective uid this process held when it exited. An unreaped process
     /// is still addressable by `sched_*`/`setpriority`/`process_vm_*`, and
     /// those calls apply the same ownership rule they apply to a live target,
@@ -4284,13 +4287,15 @@ impl Zombie {
     /// `tms_cutime` totals a whole process subtree.
     pub fn from_task(task: &Task, status: LinuxWaitStatus, diagnostic_name: String) -> Self {
         let (children_user_us, children_system_us) = task.children_cpu_us();
+        let credentials = task.process_credentials();
         Self {
             key: task.key(),
             parent: task.parent(),
             process_group: task.process_group(),
             session: task.session(),
             status,
-            euid: task.process_credentials().euid(),
+            ruid: credentials.ruid(),
+            euid: credentials.euid(),
             rusage: TaskRusage {
                 user_time: Duration::from_micros(task.self_cpu_us()),
                 system_time: Duration::from_micros(task.self_system_cpu_us()),
