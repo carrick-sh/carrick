@@ -42,6 +42,12 @@ impl Drop for DotdotDepthGuard {
 }
 
 impl SyscallDispatcher {
+    /// True only after every recursive path-resolution guard on the current
+    /// executor pthread has unwound.
+    pub(crate) fn executor_boundary_path_resolution_is_clear() -> bool {
+        DOTDOT_RESOLVE_DEPTH.with(|depth| depth.get() == 0)
+    }
+
     /// Layered "is this a directory?" probe used by mkdirat / openat
     /// (O_CREAT) parent-existence checks. The synthetic /proc and
     /// /sys roots count as directories so that

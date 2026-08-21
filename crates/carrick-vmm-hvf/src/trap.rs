@@ -2923,6 +2923,14 @@ thread_local! {
 
 }
 
+/// Whether the current owner pthread carries no legacy fork snapshot across an
+/// executor switch. The persistent-executor backend calls this from its narrow
+/// boundary-audit hook; runtime code does not reach into HVF TLS directly.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn fork_vcpu_snapshot_is_empty_for_executor_boundary() -> bool {
+    FORK_VCPU_SNAPSHOT.with(|snapshot| snapshot.borrow().is_none())
+}
+
 /// Clear the published fork VM (child path; the child is single-threaded).
 pub fn clear_rebuilt_vm_for_fork() {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

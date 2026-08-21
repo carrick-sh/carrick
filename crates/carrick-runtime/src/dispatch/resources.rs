@@ -64,6 +64,14 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
+/// Exhaustive current-thread resource-scope audit used before an executor is
+/// allowed to load another logical task.
+pub(crate) fn executor_boundary_is_clear() -> bool {
+    ACTIVE_CONTEXT.with(|active| active.get().is_null())
+        && CAPTURED_RESOURCES.with(|stack| stack.borrow().is_empty())
+        && RETIRING_FILE_TABLES.with(|stack| stack.borrow().is_empty())
+}
+
 pub(super) fn with_captured_resources<R>(
     context: &crate::kernel::KernelContext,
     operation: impl FnOnce() -> R,

@@ -56,6 +56,8 @@ use crate::run_result::{RunResult, RuntimeError};
 use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
 use crate::trap::{SyscallTrap, TrapError};
 
+pub mod executor;
+
 const SIGNAL_WAIT_SLICE: Duration = Duration::from_millis(50);
 const SHORT_TIMED_WAIT_RECLAIM_CUTOFF: Duration = Duration::from_millis(250);
 
@@ -607,6 +609,9 @@ pub(crate) use signal::{
     deliver_pending_signal, lower_el0_fault, partial_write_interrupt_outcome,
     raise_sigpipe_for_blocking_write, signal_progress_count, signal_wait_expired,
     signal_wait_remaining, signal_wait_slice,
+};
+pub(crate) use signal::{
+    reset_signal_progress_for_executor_boundary, signal_progress_is_zero_for_executor_boundary,
 };
 // Test-only consumer since the DSR translator (the lib-side caller) moved to
 // the arch crate; the ESR decode itself lives in carrick_dsr_aarch64::esr and

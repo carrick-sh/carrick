@@ -1310,6 +1310,31 @@ thread_local! {
         RefCell::new(MsgQueueFdCache::new());
 }
 
+impl SyscallDispatcher {
+    /// Clear host-fd and wait-word caches before an executor pthread changes
+    /// task identity. A live blocked-id is not recoverable here: it represents
+    /// logical wait state that Task 5 must migrate into a continuation, so the
+    /// caller retires the executor after this function reports `false`.
+    pub(crate) fn reset_sysv_executor_boundary_state() -> bool {
+        MSG_QUEUE_FD_CACHE.with(|cache| {
+            for (_, entry) in cache.borrow_mut().entries.drain() {
+                unsafe { libc::close(entry.fd) };
+            }
+        });
+        MSG_QUEUE_WAIT_WORD_CACHE.with(|cache| cache.borrow_mut().entries.clear());
+        let blocked_was_empty = MSG_QUEUE_BLOCKED_IDS.with(|ids| {
+            let mut ids = ids.borrow_mut();
+            let was_empty = ids.is_empty();
+            ids.clear();
+            was_empty
+        });
+        blocked_was_empty
+            && MSG_QUEUE_FD_CACHE.with(|cache| cache.borrow().entries.is_empty())
+            && MSG_QUEUE_WAIT_WORD_CACHE.with(|cache| cache.borrow().entries.is_empty())
+            && MSG_QUEUE_BLOCKED_IDS.with(|ids| ids.borrow().is_empty())
+    }
+}
+
 fn msg_queue_identity(path: &Path) -> Result<CachedMsgQueueIdentity, LinuxErrno> {
     let cpath =
         std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| LINUX_EINVAL)?;

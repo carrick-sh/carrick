@@ -106,6 +106,15 @@ fn topology_held_by_current_thread() -> bool {
     TOPOLOGY_DEPTH.with(|depth| depth.get() > 0)
 }
 
+/// Fail-closed executor-boundary observation for the current owner pthread.
+///
+/// A persistent executor may be reused only after every topology guard has
+/// unwound. This is intentionally an observation rather than a reset: clearing
+/// a live guard would sever the depth from the mutex authority it describes.
+pub fn topology_depth_is_zero_for_executor_boundary() -> bool {
+    TOPOLOGY_DEPTH.with(|depth| depth.get() == 0)
+}
+
 fn enter_topology_depth() {
     TOPOLOGY_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
 }

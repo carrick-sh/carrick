@@ -364,6 +364,16 @@ pub(crate) fn signal_progress_count() -> u64 {
     SIGNAL_PROGRESS.with(std::cell::Cell::get)
 }
 
+/// Reset the executor-local watchdog baseline while returning the exact prior
+/// task's progress receipt. A successor must always begin from zero.
+pub(crate) fn reset_signal_progress_for_executor_boundary() -> u64 {
+    SIGNAL_PROGRESS.with(|progress| progress.replace(0))
+}
+
+pub(crate) fn signal_progress_is_zero_for_executor_boundary() -> bool {
+    SIGNAL_PROGRESS.with(|progress| progress.get() == 0)
+}
+
 /// Drain whatever signal is sitting in the host pending slot and dispatch it to
 /// the guest. Returns `Ok(None)` when nothing was pending.
 pub(crate) fn deliver_pending_signal<T>(
