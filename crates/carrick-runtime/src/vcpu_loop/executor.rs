@@ -87,13 +87,6 @@ pub trait PersistentTaskBinding {
     fn load_identity(&self) -> TaskLoadIdentity;
 
     fn validate_task_state(&self, state: &MigratableTaskState) -> Result<(), TrapError>;
-
-    /// Move any legacy binding-retained scheduler authority into the worker
-    /// before the backend sees this binding. New callers should publish roots
-    /// through `ExecutorPool::submit_root`, which is pool-owned from the start.
-    fn take_submission_authority(&self) -> Option<SubmissionAuthority> {
-        None
-    }
 }
 
 #[derive(Debug)]
@@ -151,6 +144,42 @@ impl SubmissionAuthorityDirectory {
             .iter()
             .position(|entry| entry.thread == thread && entry.generation == generation)?;
         Some(entries.swap_remove(index).authority)
+    }
+
+    fn settle_runnable_with_rollover(
+        &self,
+        scheduler: &Scheduler,
+        running: RunnableThread,
+        authority: Option<SubmissionAuthority>,
+    ) -> Result<(), SchedulerError> {
+        let predecessor_thread = running.thread_key();
+        let predecessor_generation = running.generation();
+        let mut entries = self.0.lock();
+        let successor_generation = scheduler.settle_runnable_successor(running)?;
+        let (Some(authority), Some(successor_generation)) = (authority, successor_generation)
+        else {
+            return Ok(());
+        };
+        let authority = authority
+            .rollover_exact(
+                scheduler,
+                predecessor_thread,
+                predecessor_generation,
+                predecessor_thread,
+                successor_generation,
+            )
+            .map_err(|(error, _authority)| SchedulerError::from(error))?;
+        if entries.iter().any(|entry| {
+            entry.thread == predecessor_thread && entry.generation == successor_generation
+        }) {
+            return Err(crate::kernel::RunQueueError::SubmissionRejected.into());
+        }
+        entries.push(RetainedSubmissionAuthority {
+            thread: predecessor_thread,
+            generation: successor_generation,
+            authority,
+        });
+        Ok(())
     }
 
     fn retire_all(&self) {
@@ -1266,24 +1295,7 @@ where
                 return Err(with_settlement_error(error.to_string(), settlement));
             }
         };
-        let directory_authority = control.authorities.take(thread, generation);
-        let binding_authority = binding.take_submission_authority();
-        let submission_authority = match (directory_authority, binding_authority) {
-            (Some(authority), None) | (None, Some(authority)) => Some(authority),
-            (None, None) => None,
-            (Some(_), Some(_)) => {
-                let settlement = fail_running(
-                    scheduler,
-                    running,
-                    ExecutionFailure::SnapshotRestoreFailed,
-                    receipts,
-                );
-                return Err(with_settlement_error(
-                    "duplicate exact submission authority at worker claim".to_owned(),
-                    settlement,
-                ));
-            }
-        };
+        let submission_authority = control.authorities.take(thread, generation);
         let task = RunnableTask {
             thread,
             generation,
@@ -1434,15 +1446,22 @@ where
             return Err(with_settlement_error(error.to_string(), settlement));
         }
         let settlement = match exit {
-            ExecutorExit::Blocked(reason) => scheduler
-                .settle_blocked(running, reason)
-                .map(|()| ExecutorPoolEvent::SettledBlocked { thread, generation }),
-            ExecutorExit::Yielded | ExecutorExit::Preempted | ExecutorExit::Quiesced => scheduler
-                .settle_runnable(running)
+            ExecutorExit::Blocked(reason) => {
+                drop(submission_authority);
+                scheduler
+                    .settle_blocked(running, reason)
+                    .map(|()| ExecutorPoolEvent::SettledBlocked { thread, generation })
+            }
+            ExecutorExit::Yielded | ExecutorExit::Preempted | ExecutorExit::Quiesced => control
+                .authorities
+                .settle_runnable_with_rollover(scheduler, running, submission_authority)
                 .map(|()| ExecutorPoolEvent::SettledRunnable { thread, generation }),
-            ExecutorExit::Exited => scheduler
-                .settle_exited(running)
-                .map(|()| ExecutorPoolEvent::SettledExited { thread, generation }),
+            ExecutorExit::Exited => {
+                drop(submission_authority);
+                scheduler
+                    .settle_exited(running)
+                    .map(|()| ExecutorPoolEvent::SettledExited { thread, generation })
+            }
             ExecutorExit::Syscall | ExecutorExit::InvalidState => unreachable!(),
         };
         match settlement {
@@ -1546,6 +1565,7 @@ mod tests {
         ComputeUntilKick,
         Block,
         Yield,
+        Preempt,
         Exit,
         FailRun,
         PanicRun,
@@ -1556,6 +1576,8 @@ mod tests {
     struct DescendantPublication {
         child_thread: Arc<crate::kernel::Thread>,
         child_generation: ExecutionGeneration,
+        after_progress: usize,
+        published: Option<std::sync::mpsc::Sender<()>>,
     }
 
     #[derive(Debug)]
@@ -1570,8 +1592,6 @@ mod tests {
         progress: AtomicUsize,
         load_identity: parking_lot::Mutex<Option<TaskLoadIdentity>>,
         required_continuation_sequence: parking_lot::Mutex<Option<u64>>,
-        lineage_authority: parking_lot::Mutex<Option<SubmissionAuthority>>,
-        retain_lineage_authority_in_backend: AtomicBool,
         descendant: parking_lot::Mutex<Option<DescendantPublication>>,
     }
 
@@ -1588,8 +1608,6 @@ mod tests {
                 progress: AtomicUsize::new(0),
                 load_identity: parking_lot::Mutex::new(None),
                 required_continuation_sequence: parking_lot::Mutex::new(None),
-                lineage_authority: parking_lot::Mutex::new(None),
-                retain_lineage_authority_in_backend: AtomicBool::new(false),
                 descendant: parking_lot::Mutex::new(None),
             })
         }
@@ -1654,10 +1672,6 @@ mod tests {
                 )));
             }
             Ok(())
-        }
-
-        fn take_submission_authority(&self) -> Option<SubmissionAuthority> {
-            self.lineage_authority.lock().take()
         }
     }
 
@@ -1742,7 +1756,6 @@ mod tests {
         owner: HostThreadId,
         create_call: usize,
         current: Option<(ThreadKey, ExecutionGeneration, Arc<FakeBinding>)>,
-        retained_lineage_authority: Option<SubmissionAuthority>,
         owner_dirty_cleanup: Option<Box<dyn FnOnce()>>,
         credentials: u64,
         restart_state: u64,
@@ -1753,6 +1766,123 @@ mod tests {
     }
 
     struct BoundaryAuditProbe;
+
+    #[derive(Debug)]
+    struct MaliciousBinding {
+        identity: TaskLoadIdentity,
+        entered: Arc<Barrier>,
+        resume: Arc<Barrier>,
+    }
+
+    impl PersistentTaskBinding for MaliciousBinding {
+        fn load_identity(&self) -> TaskLoadIdentity {
+            self.identity
+        }
+
+        fn validate_task_state(&self, _state: &MigratableTaskState) -> Result<(), TrapError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MaliciousFactory {
+        bindings: parking_lot::Mutex<BTreeMap<ThreadKey, Arc<MaliciousBinding>>>,
+    }
+
+    impl MaliciousFactory {
+        fn install(&self, context: &KernelContext, entered: Arc<Barrier>, resume: Arc<Barrier>) {
+            let mm = context.shared().mm().id();
+            self.bindings.lock().insert(
+                context.thread().key(),
+                Arc::new(MaliciousBinding {
+                    identity: TaskLoadIdentity {
+                        abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                        version: 1,
+                        mm,
+                        asid_generation: mm.raw(),
+                    },
+                    entered,
+                    resume,
+                }),
+            );
+        }
+    }
+
+    impl TaskBindingResolver<MaliciousBinding> for MaliciousFactory {
+        fn resolve(
+            &self,
+            thread: ThreadKey,
+            _generation: ExecutionGeneration,
+        ) -> Result<Arc<MaliciousBinding>, TrapError> {
+            self.bindings
+                .lock()
+                .get(&thread)
+                .cloned()
+                .ok_or_else(|| TrapError::Hypervisor("missing malicious binding".to_owned()))
+        }
+    }
+
+    struct MaliciousExecutor {
+        current: Option<Arc<MaliciousBinding>>,
+    }
+
+    impl PersistentExecutorFactory for MaliciousFactory {
+        type Executor = MaliciousExecutor;
+
+        fn create(&self, _executor: ExecutorId) -> Result<Self::Executor, TrapError> {
+            Ok(MaliciousExecutor { current: None })
+        }
+    }
+
+    impl PersistentExecutor for MaliciousExecutor {
+        type TaskBinding = MaliciousBinding;
+
+        fn load(&mut self, task: &RunnableTask<'_, Self::TaskBinding>) -> Result<(), TrapError> {
+            task.validate_for_load()?;
+            self.current = Some(Arc::clone(task.binding()));
+            Ok(())
+        }
+
+        fn run_until_boundary(
+            &mut self,
+            _need_resched: &AtomicBool,
+            _submission: &super::ExecutorSubmissionContext<'_>,
+        ) -> Result<ExecutorExit, TrapError> {
+            let binding = self.current.as_ref().expect("malicious binding loaded");
+            binding.entered.wait();
+            binding.resume.wait();
+            Err(TrapError::Hypervisor(
+                "malicious backend retains binding through failure".to_owned(),
+            ))
+        }
+
+        fn take_cpu_receipt(&mut self) -> ExecutorCpuReceipt {
+            ExecutorCpuReceipt::default()
+        }
+
+        fn save(
+            &mut self,
+            lease: ThreadExecutionLease,
+        ) -> Result<SavedRunnable, ExecutorSaveError> {
+            Err(ExecutorSaveError::new(
+                TrapError::Hypervisor("malicious executor cannot save".to_owned()),
+                lease,
+            ))
+        }
+
+        fn invalidate_asid(&mut self, _generation: u64) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn audit_boundary(&mut self) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn destroy(self) -> Result<(), TrapError> {
+            drop(self.current);
+            Ok(())
+        }
+    }
 
     impl PersistentExecutor for BoundaryAuditProbe {
         type TaskBinding = FakeBinding;
@@ -1808,7 +1938,6 @@ mod tests {
                 owner: thread::current().id(),
                 create_call: call,
                 current: None,
-                retained_lineage_authority: None,
                 owner_dirty_cleanup: None,
                 credentials: 0,
                 restart_state: 0,
@@ -1848,12 +1977,6 @@ mod tests {
             self.restart_state = binding.marker + 2;
             self.mailbox = binding.marker + 3;
             self.tls = binding.marker + 4;
-            if binding
-                .retain_lineage_authority_in_backend
-                .load(Ordering::SeqCst)
-            {
-                self.retained_lineage_authority = binding.lineage_authority.lock().take();
-            }
             self.current = Some((key.0, key.1, Arc::clone(&binding)));
             self.factory
                 .record(BackendEventKind::Load, self.id, Some(key));
@@ -1876,13 +1999,28 @@ mod tests {
             if let Some(gate) = binding.resume.lock().take() {
                 gate.wait();
             }
-            if let Some(publication) = binding.descendant.lock().take() {
+            let should_publish = binding
+                .descendant
+                .lock()
+                .as_ref()
+                .is_some_and(|publication| {
+                    binding.progress.load(Ordering::SeqCst) >= publication.after_progress
+                });
+            if should_publish {
+                let publication = binding
+                    .descendant
+                    .lock()
+                    .take()
+                    .expect("ready descendant publication");
                 submission
                     .publish_descendant(
                         Arc::clone(&publication.child_thread),
                         publication.child_generation,
                     )
                     .expect("publish descendant during closing");
+                if let Some(published) = publication.published {
+                    published.send(()).expect("publish descendant receipt");
+                }
             }
             let step = {
                 let mut steps = binding.steps.lock();
@@ -1915,6 +2053,7 @@ mod tests {
                 }
                 Step::Block => Ok(ExecutorExit::Blocked(BlockedReason::HostWait)),
                 Step::Yield => Ok(ExecutorExit::Yielded),
+                Step::Preempt => Ok(ExecutorExit::Preempted),
                 Step::Exit => Ok(ExecutorExit::Exited),
                 Step::FailRun => Err(TrapError::Hypervisor("injected run failure".to_owned())),
                 Step::PanicRun => panic!("injected executor panic"),
@@ -2562,31 +2701,18 @@ mod tests {
         let delivery = thread::spawn(move || wake_scheduler.wake(thread_key));
         gate.wait();
 
-        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
-        let probe_kick = Arc::clone(&kick);
-        let probe_ready = Arc::new(Barrier::new(2));
-        let probe_ready_thread = Arc::clone(&probe_ready);
-        let probe = thread::spawn(move || {
-            probe_ready_thread.wait();
-            probe_tx
-                .send(probe_kick.binding.try_lock().is_none())
-                .expect("publish binding-lock probe");
-        });
-        probe_ready.wait();
-        assert_eq!(
-            probe_rx.recv().expect("receive binding-lock probe"),
-            true,
-            "settlement/unbind must be blocked while delivery holds validated binding"
-        );
-        probe.join().expect("join binding-lock probe");
-
         let (successor_tx, successor_rx) = std::sync::mpsc::channel();
+        let (settlement_probe_tx, settlement_probe_rx) = std::sync::mpsc::channel();
         let successor_attempt = Arc::new(Barrier::new(2));
         let successor_attempt_thread = Arc::clone(&successor_attempt);
         let settle_scheduler = Arc::clone(&scheduler);
         let settle_registration = registration.clone();
         let settle_receipts = Arc::clone(&receipts);
+        let settle_kick = Arc::clone(&kick);
         let settlement = thread::spawn(move || {
+            settlement_probe_tx
+                .send(settle_kick.binding.try_lock().is_none())
+                .expect("publish settlement-thread lock probe");
             successor_attempt_thread.wait();
             settle_scheduler
                 .settle_runnable(running)
@@ -2618,6 +2744,12 @@ mod tests {
                 .send(successor_generation)
                 .expect("publish exact successor generation");
         });
+        assert!(
+            settlement_probe_rx
+                .recv()
+                .expect("receive settlement-thread lock probe"),
+            "the actual settlement thread must observe WouldBlock on the held validation lock"
+        );
         gate.wait();
         receipt_gate.wait();
         let receipt_lock_held = kick.binding.try_lock().is_none();
@@ -2792,27 +2924,31 @@ mod tests {
     }
 
     #[test]
-    fn last_worker_failure_revokes_backend_retained_root_authority_before_terminal_drain() {
+    fn malicious_backend_retained_binding_cannot_receive_authority_or_hold_terminal_drain_open() {
         let (kernel, first) = bootstrap(14_242);
         let second = sibling(&kernel, &first, 24_242);
         let scheduler = Arc::new(Scheduler::new(kernel));
-        let factory = Arc::new(FakeFactory::default());
-        let first_binding = FakeBinding::new(92, [Step::FailRun]);
+        let factory = Arc::new(MaliciousFactory::default());
         let entered = Arc::new(Barrier::new(2));
         let resume = Arc::new(Barrier::new(2));
-        *first_binding.entered.lock() = Some(Arc::clone(&entered));
-        *first_binding.resume.lock() = Some(Arc::clone(&resume));
-        first_binding
-            .retain_lineage_authority_in_backend
-            .store(true, Ordering::SeqCst);
-        let second_binding = FakeBinding::new(93, [Step::Exit]);
-        factory.install(&first, Arc::clone(&first_binding));
-        factory.install(&second, second_binding);
+        factory.install(&first, Arc::clone(&entered), Arc::clone(&resume));
+        factory.install(
+            &second,
+            Arc::new(Barrier::new(1)),
+            Arc::new(Barrier::new(1)),
+        );
         let first_generation = publish(&first, 92);
         let second_generation = publish(&second, 93);
-        let first_authority = enqueue_root(&scheduler, &first, first_generation);
-        *first_binding.lineage_authority.lock() = Some(first_authority);
-        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        let pool = ExecutorPool::start(
+            config(1),
+            Arc::clone(&scheduler),
+            Arc::clone(&factory),
+            factory,
+            ExecutorBoundaryAudit::production(),
+        )
+        .expect("start malicious-binding pool");
+        pool.submit_root(Arc::clone(first.thread()), first_generation)
+            .expect("pool owns first root authority");
         entered.wait();
         pool.submit_root(Arc::clone(second.thread()), second_generation)
             .expect("pool owns queued second-root authority before failure");
@@ -2978,14 +3114,60 @@ mod tests {
     }
 
     #[test]
+    fn authority_rolls_across_yield_and_preempt_before_normal_descendant_publication() {
+        let (kernel, root) = bootstrap(14_290);
+        let child = process_child(&kernel, &root, 24_290, "child");
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let factory = Arc::new(FakeFactory::default());
+        let root_binding =
+            FakeBinding::new(98, [Step::Yield, Step::Preempt, Step::Yield, Step::Exit]);
+        let child_binding = FakeBinding::new(99, [Step::Exit]);
+        factory.install(&root, Arc::clone(&root_binding));
+        factory.install(&child, child_binding);
+        let root_generation = publish(&root, 98);
+        let child_generation = publish(&child, 99);
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        *root_binding.descendant.lock() = Some(DescendantPublication {
+            child_thread: Arc::clone(child.thread()),
+            child_generation,
+            after_progress: 4,
+            published: Some(published_tx),
+        });
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        pool.submit_root(Arc::clone(root.thread()), root_generation)
+            .expect("pool-owned root publication");
+        published_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("descendant publication after three authority rollovers");
+        let report = pool.shutdown().expect("normal descendant drain");
+
+        assert!(matches!(
+            root.thread().execution_state(),
+            ThreadExecutionState::Exited { .. }
+        ));
+        assert!(matches!(
+            child.thread().execution_state(),
+            ThreadExecutionState::Exited { .. }
+        ));
+        assert_eq!(report.created(), 1);
+        assert_eq!(report.destroyed(), 1);
+        assert_eq!(report.joined(), 1);
+    }
+
+    #[test]
     fn shutdown_drains_recursive_child_and_grandchild_before_destroy_and_join() {
         let (kernel, root) = bootstrap(14_300);
         let child = process_child(&kernel, &root, 24_300, "child");
         let grandchild = process_child(&kernel, &child, 34_300, "grandchild");
         let scheduler = Arc::new(Scheduler::new(kernel));
         let factory = Arc::new(FakeFactory::default());
-        let root_binding = FakeBinding::new(100, [Step::Exit]);
-        let child_binding = FakeBinding::new(110, [Step::Exit]);
+        let root_binding =
+            FakeBinding::new(100, [Step::Yield, Step::Preempt, Step::Yield, Step::Exit]);
+        let root_entered = Arc::new(Barrier::new(2));
+        let root_resume = Arc::new(Barrier::new(2));
+        *root_binding.entered.lock() = Some(Arc::clone(&root_entered));
+        *root_binding.resume.lock() = Some(Arc::clone(&root_resume));
+        let child_binding = FakeBinding::new(110, [Step::Yield, Step::Preempt, Step::Exit]);
         let grandchild_binding = FakeBinding::new(120, [Step::Exit]);
         factory.install(&root, Arc::clone(&root_binding));
         factory.install(&child, Arc::clone(&child_binding));
@@ -2996,15 +3178,34 @@ mod tests {
         *root_binding.descendant.lock() = Some(DescendantPublication {
             child_thread: Arc::clone(child.thread()),
             child_generation,
+            after_progress: 4,
+            published: None,
         });
         *child_binding.descendant.lock() = Some(DescendantPublication {
             child_thread: Arc::clone(grandchild.thread()),
             child_generation: grandchild_generation,
+            after_progress: 3,
+            published: None,
         });
         let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
         pool.submit_root(Arc::clone(root.thread()), root_generation)
             .expect("pool retains root authority before publication");
-        let report = pool.shutdown().expect("recursive drain");
+        root_entered.wait();
+        let close_started = Arc::new(Barrier::new(2));
+        scheduler.install_close_started_gate(Arc::clone(&close_started));
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let shutdown = thread::spawn(move || {
+            shutdown_tx
+                .send(pool.shutdown())
+                .expect("publish recursive shutdown result");
+        });
+        close_started.wait();
+        root_resume.wait();
+        let report = shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("recursive Closing drain result")
+            .expect("recursive drain");
+        shutdown.join().expect("join recursive shutdown");
         assert!(matches!(
             root.thread().execution_state(),
             ThreadExecutionState::Exited { .. }

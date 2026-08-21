@@ -83,9 +83,10 @@ pub use registry::{
     IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,
     TaskReservation, ThreadClaim, ThreadReservation,
 };
+pub(crate) use scheduler::SubmissionAuthority;
 pub use scheduler::{
     ExecutorBinding, ExecutorKick, ExecutorKickToken, ExecutorRegistration, RunQueue,
-    RunQueueError, RunnableThread, Scheduler, SchedulerError, SubmissionAuthority, WakeDisposition,
+    RunQueueError, RunnableThread, Scheduler, SchedulerError, WakeDisposition,
 };
 pub use snapshot::{
     CredentialsSnapshotRow, FileDescriptionSnapshotKind, FileDescriptionSnapshotRow,

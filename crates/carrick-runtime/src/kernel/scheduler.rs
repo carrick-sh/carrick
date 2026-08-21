@@ -356,6 +356,8 @@ struct RunQueueInner {
     close_observation_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)]
     root_admission_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    close_started_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 impl RunQueueInner {
@@ -487,7 +489,7 @@ impl Drop for WakeAdmission {
 /// admitted only while open; descendants of this retained authority may be
 /// admitted while closing so recursive fork publication cannot be stranded.
 #[derive(Debug)]
-pub struct SubmissionAuthority {
+pub(crate) struct SubmissionAuthority {
     queue: Weak<RunQueueInner>,
     kernel: Weak<Kernel>,
     key: QueueKey,
@@ -503,7 +505,48 @@ impl SubmissionAuthority {
         self.key.generation
     }
 
-    pub fn admit_descendant(
+    pub(crate) fn rollover_exact(
+        mut self,
+        scheduler: &Scheduler,
+        predecessor_thread: ThreadKey,
+        predecessor_generation: ExecutionGeneration,
+        successor_thread: ThreadKey,
+        successor_generation: ExecutionGeneration,
+    ) -> Result<Self, (RunQueueError, Self)> {
+        let exact_successor = predecessor_generation
+            .raw()
+            .checked_add(1)
+            .is_some_and(|next| next == successor_generation.raw());
+        if !self.active
+            || self.key.thread != predecessor_thread
+            || self.key.generation != predecessor_generation
+            || predecessor_thread != successor_thread
+            || !exact_successor
+        {
+            return Err((RunQueueError::AuthorityMismatch, self));
+        }
+        let Some(queue) = self.queue.upgrade() else {
+            return Err((RunQueueError::Closed, self));
+        };
+        let Some(kernel) = self.kernel.upgrade() else {
+            return Err((RunQueueError::Closed, self));
+        };
+        if !Arc::ptr_eq(&queue, &scheduler.queue.inner)
+            || !Arc::ptr_eq(&kernel, &scheduler.kernel)
+            || kernel
+                .with_live_active_scheduler_thread(successor_thread, successor_generation, || ())
+                .is_none()
+        {
+            return Err((RunQueueError::AuthorityMismatch, self));
+        }
+        self.key = QueueKey {
+            thread: successor_thread,
+            generation: successor_generation,
+        };
+        Ok(self)
+    }
+
+    pub(crate) fn admit_descendant(
         &self,
         thread: ThreadKey,
         generation: ExecutionGeneration,
@@ -539,7 +582,7 @@ impl SubmissionAuthority {
             .unwrap_or(Err(RunQueueError::AuthorityMismatch))
     }
 
-    pub fn publish(
+    pub(crate) fn publish(
         &self,
         scheduler: &Scheduler,
         thread: Arc<Thread>,
@@ -710,8 +753,15 @@ impl RunQueue {
                 .unwrap_or_else(|| std::process::abort());
             state.close_waiters_expected = state.waiters;
         }
+        #[cfg(test)]
+        let close_started_gate = self.inner.close_started_gate.lock().clone();
         self.inner.maybe_finish_close(&mut state);
         self.inner.changed.notify_all();
+        drop(state);
+        #[cfg(test)]
+        if let Some(gate) = close_started_gate {
+            gate.wait();
+        }
     }
 
     pub fn wait_closed(&self) {
@@ -749,6 +799,11 @@ impl RunQueue {
     }
 
     #[cfg(test)]
+    fn active_authority_count(&self) -> usize {
+        self.inner.state.lock().active_authorities
+    }
+
+    #[cfg(test)]
     fn install_close_observation_gate(&self, gate: Arc<std::sync::Barrier>) {
         *self.inner.close_observation_gate.lock() = Some(gate);
     }
@@ -756,6 +811,11 @@ impl RunQueue {
     #[cfg(test)]
     fn install_root_admission_gate(&self, gate: Arc<std::sync::Barrier>) {
         *self.inner.root_admission_gate.lock() = Some(gate);
+    }
+
+    #[cfg(test)]
+    fn install_close_started_gate(&self, gate: Arc<std::sync::Barrier>) {
+        *self.inner.close_started_gate.lock() = Some(gate);
     }
 }
 
@@ -910,7 +970,7 @@ impl Scheduler {
         self.executors.clear_binding(registration)
     }
 
-    pub fn admit_root(
+    pub(crate) fn admit_root(
         &self,
         thread: ThreadKey,
         generation: ExecutionGeneration,
@@ -1107,17 +1167,32 @@ impl Scheduler {
         }
     }
 
-    pub fn settle_runnable(&self, mut running: RunnableThread) -> Result<(), SchedulerError> {
+    pub fn settle_runnable(&self, running: RunnableThread) -> Result<(), SchedulerError> {
+        self.settle_runnable_successor(running).map(|_| ())
+    }
+
+    pub(crate) fn settle_runnable_successor(
+        &self,
+        mut running: RunnableThread,
+    ) -> Result<Option<ExecutionGeneration>, SchedulerError> {
         let lease = running.take_lease();
         let action = running
             .thread
             .scheduler_yield_from_executor(lease)
             .map_err(|(error, _lease)| error)?;
+        let successor = match action {
+            ThreadSchedulerAction::Queue {
+                key, generation, ..
+            } if key == running.key.thread => Some(generation),
+            ThreadSchedulerAction::Queue { .. }
+            | ThreadSchedulerAction::Kick { .. }
+            | ThreadSchedulerAction::None => None,
+        };
         self.executors.unbind(running.binding);
         self.snapshot_count.fetch_add(1, Ordering::Relaxed);
         self.apply_settlement_action(&running.thread, action)?;
         running.finish_claim();
-        Ok(())
+        Ok(successor)
     }
 
     pub fn settle_exited(&self, mut running: RunnableThread) -> Result<(), SchedulerError> {
@@ -1198,6 +1273,11 @@ impl Scheduler {
 
     pub fn wait_closed(&self) {
         self.queue.wait_closed();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_close_started_gate(&self, gate: Arc<std::sync::Barrier>) {
+        self.queue.install_close_started_gate(gate);
     }
 
     #[cfg(test)]
@@ -1976,6 +2056,89 @@ mod tests {
                 .is_err()
         );
         drop(authority);
+        scheduler.wait_closed();
+    }
+
+    #[test]
+    fn authority_rollover_rejects_stale_or_wrong_successor_without_loss_or_duplication() {
+        let (kernel, context) = bootstrap(12_119);
+        let wrong = sibling(&kernel, &context, 22_119);
+        publish(&context, 23);
+        let generation = context
+            .thread()
+            .execution_state()
+            .generation()
+            .expect("published root generation");
+        let scheduler = Scheduler::new(kernel);
+        let executor = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        let authority = scheduler
+            .admit_root(context.thread().key(), generation)
+            .unwrap();
+        authority
+            .publish(&scheduler, Arc::clone(context.thread()))
+            .unwrap();
+        assert_eq!(scheduler.queue.active_authority_count(), 1);
+        let running = scheduler.take(&executor).unwrap();
+        scheduler.settle_runnable(running).unwrap();
+        let successor = context
+            .thread()
+            .execution_state()
+            .generation()
+            .expect("runnable successor generation");
+
+        let authority = match authority.rollover_exact(
+            &scheduler,
+            context.thread().key(),
+            successor,
+            context.thread().key(),
+            successor,
+        ) {
+            Err((RunQueueError::AuthorityMismatch, authority)) => authority,
+            other => panic!("stale predecessor rollover must reject: {other:?}"),
+        };
+        assert_eq!(scheduler.queue.active_authority_count(), 1);
+        let authority = match authority.rollover_exact(
+            &scheduler,
+            context.thread().key(),
+            generation,
+            wrong.thread().key(),
+            successor,
+        ) {
+            Err((RunQueueError::AuthorityMismatch, authority)) => authority,
+            other => panic!("wrong-thread rollover must reject: {other:?}"),
+        };
+        assert_eq!(scheduler.queue.active_authority_count(), 1);
+        let authority = match authority.rollover_exact(
+            &scheduler,
+            context.thread().key(),
+            generation,
+            context.thread().key(),
+            generation,
+        ) {
+            Err((RunQueueError::AuthorityMismatch, authority)) => authority,
+            other => panic!("wrong successor generation must reject: {other:?}"),
+        };
+        assert_eq!(scheduler.queue.active_authority_count(), 1);
+        let authority = authority
+            .rollover_exact(
+                &scheduler,
+                context.thread().key(),
+                generation,
+                context.thread().key(),
+                successor,
+            )
+            .expect("exact successor rollover");
+        assert_eq!(authority.thread_key(), context.thread().key());
+        assert_eq!(authority.generation(), successor);
+        assert_eq!(scheduler.queue.active_authority_count(), 1);
+        drop(authority);
+        assert_eq!(scheduler.queue.active_authority_count(), 0);
+
+        let successor_running = scheduler.take(&executor).unwrap();
+        scheduler.settle_exited(successor_running).unwrap();
+        scheduler.close();
         scheduler.wait_closed();
     }
 
