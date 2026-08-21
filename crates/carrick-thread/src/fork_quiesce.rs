@@ -46,9 +46,10 @@
 // invariant; a per-line allow would be pure noise.
 #![allow(clippy::unwrap_used)]
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicI32;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, TryLockError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 // No-op USDT probe stubs. The real probes live in carrick-vmm-hvf's probes module;
@@ -394,12 +395,76 @@ pub fn exec_replacing_other_thread(tid: carrick_hal::ThreadId) -> bool {
     owner != 0 && owner != tid.raw()
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuiesceEventKind {
+    Raised,
+    Released,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuiesceEvent {
+    pub generation: u64,
+    pub kind: QuiesceEventKind,
+}
+
+pub type QuiesceCallback = Arc<dyn Fn(QuiesceEvent) + Send + Sync + 'static>;
+
+struct QuiesceListener {
+    expected_generation: u64,
+    callback: QuiesceCallback,
+}
+
+struct QuiescePublication {
+    generation: u64,
+    kind: QuiesceEventKind,
+    listeners: BTreeMap<u64, QuiesceListener>,
+}
+
+pub struct QuiesceSubscription {
+    barrier: Weak<QuiesceBarrier>,
+    id: u64,
+    expected_generation: u64,
+}
+
+impl Drop for QuiesceSubscription {
+    fn drop(&mut self) {
+        let Some(barrier) = self.barrier.upgrade() else {
+            return;
+        };
+        let mut publication = barrier.publication.lock().unwrap();
+        if publication
+            .listeners
+            .get(&self.id)
+            .is_some_and(|listener| listener.expected_generation == self.expected_generation)
+        {
+            publication.listeners.remove(&self.id);
+        }
+    }
+}
+
+pub enum QuiesceEnrollment {
+    Ready(QuiesceEvent),
+    Subscribed(QuiesceSubscription),
+}
+
 pub struct QuiesceBarrier {
     quiescing: AtomicBool,
     forking: AtomicBool,
     paused: Mutex<usize>,
     cv: Condvar,
+    publication: Mutex<QuiescePublication>,
+    next_listener: AtomicU64,
+}
+
+impl std::fmt::Debug for QuiesceBarrier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QuiesceBarrier")
+            .field("quiescing", &self.is_quiescing())
+            .field("paused", &self.paused_count())
+            .field("generation", &self.publication_generation())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for QuiesceBarrier {
@@ -415,6 +480,12 @@ impl QuiesceBarrier {
             forking: AtomicBool::new(false),
             paused: Mutex::new(0),
             cv: Condvar::new(),
+            publication: Mutex::new(QuiescePublication {
+                generation: 0,
+                kind: QuiesceEventKind::Released,
+                listeners: BTreeMap::new(),
+            }),
+            next_listener: AtomicU64::new(1),
         }
     }
 
@@ -441,6 +512,7 @@ impl QuiesceBarrier {
     /// the run-loop top, so the flag MUST be raised before the wakes.
     pub fn set_quiescing(&self) {
         self.quiescing.store(true, Ordering::SeqCst);
+        self.publish_quiesce_event(QuiesceEventKind::Raised);
     }
 
     /// Step 2 (forking thread): wait until `others` threads have parked at the
@@ -497,6 +569,64 @@ impl QuiesceBarrier {
         self.quiescing.store(false, Ordering::SeqCst);
         let _g = self.paused.lock().unwrap();
         self.cv.notify_all();
+        self.publish_quiesce_event(QuiesceEventKind::Released);
+    }
+
+    pub fn publication_generation(&self) -> u64 {
+        self.publication.lock().unwrap().generation
+    }
+
+    pub fn subscribe_quiesce(
+        self: &Arc<Self>,
+        expected_generation: u64,
+        callback: QuiesceCallback,
+    ) -> QuiesceEnrollment {
+        let mut publication = self.publication.lock().unwrap();
+        if publication.generation != expected_generation {
+            return QuiesceEnrollment::Ready(QuiesceEvent {
+                generation: publication.generation,
+                kind: publication.kind,
+            });
+        }
+        let id = self.next_listener.fetch_add(1, Ordering::Relaxed);
+        if id == 0 || id == u64::MAX {
+            std::process::abort();
+        }
+        publication.listeners.insert(
+            id,
+            QuiesceListener {
+                expected_generation,
+                callback,
+            },
+        );
+        QuiesceEnrollment::Subscribed(QuiesceSubscription {
+            barrier: Arc::downgrade(self),
+            id,
+            expected_generation,
+        })
+    }
+
+    fn publish_quiesce_event(&self, kind: QuiesceEventKind) {
+        let (event, callbacks) = {
+            let mut publication = self.publication.lock().unwrap();
+            publication.generation = publication
+                .generation
+                .checked_add(1)
+                .unwrap_or_else(|| std::process::abort());
+            publication.kind = kind;
+            let event = QuiesceEvent {
+                generation: publication.generation,
+                kind,
+            };
+            let callbacks = std::mem::take(&mut publication.listeners)
+                .into_values()
+                .map(|listener| listener.callback)
+                .collect::<Vec<_>>();
+            (event, callbacks)
+        };
+        for callback in callbacks {
+            callback(event);
+        }
     }
 
     /// Hold the barrier's internal mutex ACROSS `libc::fork`.
@@ -697,6 +827,60 @@ mod tests {
         barrier.set_quiescing();
         assert!(!barrier.wait_quiesced(1, Duration::from_millis(100)));
         barrier.end_quiesce();
+    }
+
+    #[test]
+    fn quiesce_subscription_is_exact_durable_and_one_shot_for_raise_and_release() {
+        let barrier = Arc::new(QuiesceBarrier::new());
+        let observed = barrier.publication_generation();
+        barrier.set_quiescing();
+        let event_before = match barrier.subscribe_quiesce(observed, Arc::new(|_| {})) {
+            QuiesceEnrollment::Ready(event) => event,
+            QuiesceEnrollment::Subscribed(_) => panic!("raise-before-enrollment was lost"),
+        };
+        assert_eq!(event_before.kind, QuiesceEventKind::Raised);
+
+        let callbacks = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&callbacks);
+        let subscription = match barrier.subscribe_quiesce(
+            event_before.generation,
+            Arc::new(move |event| callback_events.lock().unwrap().push(event)),
+        ) {
+            QuiesceEnrollment::Subscribed(subscription) => subscription,
+            QuiesceEnrollment::Ready(_) => panic!("stable generation must subscribe"),
+        };
+        barrier.end_quiesce();
+        assert_eq!(
+            callbacks.lock().unwrap().as_slice(),
+            &[QuiesceEvent {
+                generation: event_before.generation + 1,
+                kind: QuiesceEventKind::Released,
+            }]
+        );
+        barrier.set_quiescing();
+        assert_eq!(callbacks.lock().unwrap().len(), 1, "one-shot callback");
+        drop(subscription);
+        barrier.end_quiesce();
+    }
+
+    #[test]
+    fn dropped_quiesce_subscription_cannot_observe_reused_generation() {
+        let barrier = Arc::new(QuiesceBarrier::new());
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let callback_count = Arc::clone(&callbacks);
+        let subscription = match barrier.subscribe_quiesce(
+            barrier.publication_generation(),
+            Arc::new(move |_| {
+                callback_count.fetch_add(1, Ordering::SeqCst);
+            }),
+        ) {
+            QuiesceEnrollment::Subscribed(subscription) => subscription,
+            QuiesceEnrollment::Ready(_) => panic!("stable generation must subscribe"),
+        };
+        drop(subscription);
+        barrier.set_quiescing();
+        barrier.end_quiesce();
+        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
     }
 
     /// Hermetic stress of the REAL fork-quiesce protocol — the coordination that

@@ -931,7 +931,8 @@ where
                             let pc = child_engine.program_counter().unwrap_or(0);
                             eprintln!("[sibling tid#{tid}] vCPU built, pc={pc:#x}, entering loop");
                         }
-                        let r = run_vcpu_until_exit(
+                        let logical_threads = Arc::clone(&child_threads);
+                        let launch = launch_vcpu_until_exit(
                             Arc::clone(&child_kernel),
                             child_engine,
                             child_registry,
@@ -945,6 +946,15 @@ where
                             sibling_in_guest,
                             max_traps,
                         );
+                        let r = match launch {
+                            VcpuLoopLaunch::Job(receipt) => {
+                                logical_threads
+                                    .lock()
+                                    .push(VcpuThreadHandle::Job(receipt));
+                                return;
+                            }
+                            VcpuLoopLaunch::Direct(result) => result,
+                        };
                         match r {
                             Ok(VcpuLoopOutcome::ProcessExit(result)) => {
                                 tracing::trace!(
@@ -1196,7 +1206,7 @@ where
         // its start gate. Once Kernel publication and runtime registration are
         // authoritative, a vanished receiver is an internal invariant breach,
         // not a guest-visible clone failure.
-        self.threads.lock().push(handle);
+        self.threads.lock().push(VcpuThreadHandle::Host(handle));
         if start_tx.send(true).is_err() {
             tracing::error!(
                 tid = tid.raw(),
@@ -1262,7 +1272,7 @@ where
                 .threads
                 .lock()
                 .iter()
-                .filter(|handle| handle.thread().id() != current_host_thread)
+                .filter(|handle| handle.host_thread_id() != Some(current_host_thread))
                 .filter(|handle| !handle.is_finished())
                 .count();
             let guest_executors = kernel.guest_executor_count();
@@ -1277,9 +1287,9 @@ where
                     .threads
                     .lock()
                     .iter()
-                    .filter(|handle| handle.thread().id() != current_host_thread)
+                    .filter(|handle| handle.host_thread_id() != Some(current_host_thread))
                     .filter(|handle| !handle.is_finished())
-                    .map(|handle| handle.thread().name().unwrap_or("<unnamed>").to_owned())
+                    .map(VcpuThreadHandle::diagnostic_name)
                     .collect();
                 eprintln!(
                     "[FAULTDBG teardown pid={}] unfinished={unfinished_names:?}; debugger window open",
@@ -1311,14 +1321,10 @@ where
             // JoinHandle lives in this vector, but a thread cannot join itself;
             // dropping that one handle is correct because this stack is already
             // performing its terminal cleanup.
-            if handle.thread().id() == current_host_thread {
+            if handle.host_thread_id() == Some(current_host_thread) {
                 continue;
             }
-            if handle.join().is_err() {
-                return Err(RuntimeError::Trap(TrapError::Hypervisor(
-                    "hvpatch sibling panicked during process exit".to_owned(),
-                )));
-            }
+            handle.join()?;
         }
         Ok(())
     }
@@ -1477,7 +1483,7 @@ where
                     .threads
                     .lock()
                     .iter()
-                    .filter(|handle| handle.thread().id() != current_host_thread)
+                    .filter(|handle| handle.host_thread_id() != Some(current_host_thread))
                     .filter(|handle| !handle.is_finished())
                     .count();
                 if unfinished == 0 && kernel.guest_executor_count() <= 1 {
@@ -1504,14 +1510,10 @@ where
 
             let handles = std::mem::take(&mut *self.threads.lock());
             for handle in handles {
-                if handle.thread().id() == current_host_thread {
+                if handle.host_thread_id() == Some(current_host_thread) {
                     continue;
                 }
-                if handle.join().is_err() {
-                    return Err(RuntimeError::Trap(TrapError::Hypervisor(
-                        "hvpatch sibling panicked during exec".to_owned(),
-                    )));
-                }
+                handle.join()?;
             }
             return Ok(());
         }

@@ -2449,6 +2449,9 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::SharedFutexWait {
                             location,
                             waiter_key: location.waiter_key(),
+                            generation:
+                                carrick_thread::platform_futex::carrier_shared_futex_table()
+                                    .prepare_wait(location.waiter_key() as u64),
                             value,
                             timeout,
                         });

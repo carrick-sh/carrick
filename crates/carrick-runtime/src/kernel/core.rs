@@ -502,10 +502,56 @@ pub enum VforkReleaseReason {
     Exit,
 }
 
-#[derive(Debug)]
 struct VforkGateState {
-    release: Mutex<Option<VforkReleaseReason>>,
+    publication: Mutex<VforkGatePublication>,
     changed: Condvar,
+}
+
+type VforkReleaseCallback = Arc<dyn Fn(VforkReleaseReason) + Send + Sync + 'static>;
+
+struct VforkGatePublication {
+    release: Option<VforkReleaseReason>,
+    next_subscriber: u64,
+    subscribers: BTreeMap<u64, VforkReleaseCallback>,
+}
+
+impl std::fmt::Debug for VforkGateState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let publication = self.publication.lock();
+        formatter
+            .debug_struct("VforkGateState")
+            .field("release", &publication.release)
+            .field("subscribers", &publication.subscribers.len())
+            .finish()
+    }
+}
+
+pub struct VforkReleaseSubscription {
+    state: Weak<VforkGateState>,
+    id: u64,
+}
+
+impl std::fmt::Debug for VforkReleaseSubscription {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VforkReleaseSubscription")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for VforkReleaseSubscription {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.upgrade() {
+            state.publication.lock().subscribers.remove(&self.id);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum VforkReleaseEnrollment {
+    Ready(VforkReleaseReason),
+    Subscribed(VforkReleaseSubscription),
 }
 
 #[derive(Clone, Debug)]
@@ -515,27 +561,44 @@ pub struct VforkParentWait {
 
 impl VforkParentWait {
     pub fn released_reason(&self) -> Option<VforkReleaseReason> {
-        *self.state.release.lock()
+        self.state.publication.lock().release
+    }
+
+    pub fn subscribe_release(&self, callback: VforkReleaseCallback) -> VforkReleaseEnrollment {
+        let mut publication = self.state.publication.lock();
+        if let Some(reason) = publication.release {
+            return VforkReleaseEnrollment::Ready(reason);
+        }
+        let id = publication.next_subscriber;
+        publication.next_subscriber = publication
+            .next_subscriber
+            .checked_add(1)
+            .unwrap_or_else(|| std::process::abort());
+        publication.subscribers.insert(id, callback);
+        VforkReleaseEnrollment::Subscribed(VforkReleaseSubscription {
+            state: Arc::downgrade(&self.state),
+            id,
+        })
     }
 
     pub fn wait(&self) -> VforkReleaseReason {
-        let mut release = self.state.release.lock();
+        let mut publication = self.state.publication.lock();
         loop {
-            if let Some(reason) = *release {
+            if let Some(reason) = publication.release {
                 return reason;
             }
-            self.state.changed.wait(&mut release);
+            self.state.changed.wait(&mut publication);
         }
     }
 
     /// Wait for at most `timeout`, allowing an execution backend to service a
     /// concurrent quiesce request while a vfork parent remains suspended.
     pub fn wait_for_release(&self, timeout: std::time::Duration) -> Option<VforkReleaseReason> {
-        let mut release = self.state.release.lock();
-        if release.is_none() {
-            self.state.changed.wait_for(&mut release, timeout);
+        let mut publication = self.state.publication.lock();
+        if publication.release.is_none() {
+            self.state.changed.wait_for(&mut publication, timeout);
         }
-        *release
+        publication.release
     }
 }
 
@@ -547,7 +610,11 @@ pub(super) struct VforkChildRelease {
 impl VforkChildRelease {
     pub(super) fn pair() -> (VforkParentWait, Self) {
         let state = Arc::new(VforkGateState {
-            release: Mutex::new(None),
+            publication: Mutex::new(VforkGatePublication {
+                release: None,
+                next_subscriber: 1,
+                subscribers: BTreeMap::new(),
+            }),
             changed: Condvar::new(),
         });
         (
@@ -559,7 +626,16 @@ impl VforkChildRelease {
     }
 
     pub(super) fn release(self, reason: VforkReleaseReason) {
-        *self.state.release.lock() = Some(reason);
+        let callbacks = {
+            let mut publication = self.state.publication.lock();
+            publication.release = Some(reason);
+            std::mem::take(&mut publication.subscribers)
+                .into_values()
+                .collect::<Vec<_>>()
+        };
+        for callback in callbacks {
+            callback(reason);
+        }
         self.state.changed.notify_all();
     }
 }
@@ -1560,5 +1636,43 @@ mod tests {
         assert!(Arc::ptr_eq(&first.resources, &original_resources));
         assert!(!Arc::ptr_eq(&first.shared, &second.shared));
         assert!(!Arc::ptr_eq(&first.resources, &second.resources));
+    }
+
+    #[test]
+    fn vfork_release_subscription_is_atomic_durable_and_exactly_once() {
+        let (wait, release) = VforkChildRelease::pair();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let subscription = match wait.subscribe_release(Arc::new(move |reason| {
+            assert_eq!(reason, VforkReleaseReason::Exec);
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })) {
+            VforkReleaseEnrollment::Subscribed(subscription) => subscription,
+            VforkReleaseEnrollment::Ready(_) => panic!("unreleased gate is not ready"),
+        };
+        release.release(VforkReleaseReason::Exec);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(subscription);
+
+        assert!(matches!(
+            wait.subscribe_release(Arc::new(|_| panic!("durable ready does not callback"))),
+            VforkReleaseEnrollment::Ready(VforkReleaseReason::Exec)
+        ));
+    }
+
+    #[test]
+    fn dropped_vfork_release_subscription_is_not_called() {
+        let (wait, release) = VforkChildRelease::pair();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let subscription = match wait.subscribe_release(Arc::new(move |_| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })) {
+            VforkReleaseEnrollment::Subscribed(subscription) => subscription,
+            VforkReleaseEnrollment::Ready(_) => panic!("unexpected ready"),
+        };
+        drop(subscription);
+        release.release(VforkReleaseReason::Exit);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

@@ -1607,12 +1607,14 @@ pub enum DispatchOutcome {
     SharedFutexWait {
         location: carrick_guest_mem::SharedFutexLocation,
         waiter_key: usize,
+        generation: crate::thread::FutexWait,
         value: u32,
         timeout: Option<Duration>,
     },
     SharedFutexWaitv {
         location: carrick_guest_mem::SharedFutexLocation,
         waiter_key: usize,
+        generation: crate::thread::FutexWait,
         value: u32,
         timeout: Option<Duration>,
         index: i64,
@@ -1648,6 +1650,7 @@ pub enum DispatchOutcome {
     WaitOnSharedWord {
         location: carrick_guest_mem::SharedFutexLocation,
         waiter_key: usize,
+        generation: crate::thread::FutexWait,
         value: u32,
         /// Owned SysV message-queue wait authority. This keeps the exact
         /// wait-word mmap/fd and blocked queue id alive across executor
@@ -6086,6 +6089,8 @@ fn dispatch_threaded_futex(
                 return DispatchOutcome::SharedFutexWait {
                     location,
                     waiter_key: location.waiter_key(),
+                    generation: carrick_thread::platform_futex::carrier_shared_futex_table()
+                        .prepare_wait(location.waiter_key() as u64),
                     value,
                     timeout,
                 };
@@ -6291,6 +6296,8 @@ pub(super) fn dispatch_futex_waitv_args(
             return DispatchOutcome::SharedFutexWaitv {
                 location,
                 waiter_key: location.waiter_key(),
+                generation: carrick_thread::platform_futex::carrier_shared_futex_table()
+                    .prepare_wait(location.waiter_key() as u64),
                 value: entry.value,
                 timeout,
                 index: index as i64,

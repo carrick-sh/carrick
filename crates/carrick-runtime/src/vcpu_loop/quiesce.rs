@@ -6,6 +6,19 @@
 
 use super::*;
 
+fn read_optional_fork_output(
+    memory: &impl GuestMemory,
+    address: Option<u64>,
+) -> Option<Option<Vec<u8>>> {
+    match address {
+        None => Some(None),
+        Some(address) => memory
+            .read_bytes(address, std::mem::size_of::<i32>())
+            .ok()
+            .map(Some),
+    }
+}
+
 /// Page-table pause ownership is thread-local because the coordinator is the
 /// vCPU service thread. Backends can re-enter the authority while a mapping
 /// syscall already owns the outer Pause-Modify-Resume transaction (for example,
@@ -419,7 +432,7 @@ where
         Ok(())
     }
 
-    pub(super) fn handle_fork(
+    pub(super) async fn handle_fork(
         &mut self,
         kernel: &Kernel,
         kernel_context: &crate::kernel::KernelContext,
@@ -441,21 +454,23 @@ where
             vfork,
         } = request;
         if engine.supports_in_process_fork() {
-            return self.handle_in_process_fork(
-                kernel,
-                kernel_context,
-                engine,
-                ForkRequest {
-                    flags,
-                    pidfd_out,
-                    clone_parent,
-                    parent_tid_addr,
-                    child_tid_addr,
-                    exit_signal,
-                    child_stack,
-                    vfork,
-                },
-            );
+            return self
+                .handle_in_process_fork(
+                    kernel,
+                    kernel_context,
+                    engine,
+                    ForkRequest {
+                        flags,
+                        pidfd_out,
+                        clone_parent,
+                        parent_tid_addr,
+                        child_tid_addr,
+                        exit_signal,
+                        child_stack,
+                        vfork,
+                    },
+                )
+                .await;
         }
         if let Some(reason) = crate::dispatch::SyscallDispatcher::host_fork_file_authority_rejection(
             kernel_context,
@@ -1147,7 +1162,7 @@ where
                     }
                     stamp_guest_tid(engine, self.this_tid, &self.registry, Some(self.linux_tid));
                     kernel.dispatcher.sysv_after_fork_child();
-                    self.waiter = crate::io_wait::ThreadWaiter::new(self.this_tid);
+                    self.waiter.replace_after_host_fork(self.this_tid);
                     // This host-fork child carries the calling thread's runtime
                     // state, so it re-publishes its OWN lifetime in-guest flag
                     // into the fresh child kicker along with the new handle.
@@ -1164,7 +1179,7 @@ where
         Ok(Some(retval))
     }
 
-    fn handle_in_process_fork(
+    async fn handle_in_process_fork(
         &mut self,
         kernel: &Kernel,
         parent_context: &crate::kernel::KernelContext,
@@ -1297,7 +1312,7 @@ where
                         .lock()
                         .iter()
                         .filter(|handle| !handle.is_finished())
-                        .map(|handle| handle.thread().name().unwrap_or("<unnamed>").to_owned())
+                        .map(VcpuThreadHandle::diagnostic_name)
                         .collect();
                     let registered: Vec<_> = self
                         .kicker
@@ -1471,37 +1486,29 @@ where
         );
         let child_key = prepared_fork.child_key();
 
-        let read_output = |address: Option<u64>| -> Option<Option<Vec<u8>>> {
-            match address {
-                None => Some(None),
-                Some(address) => engine
-                    .read_bytes(address, std::mem::size_of::<i32>())
-                    .ok()
-                    .map(Some),
-            }
-        };
-        let Some(parent_tid_original) = read_output(request.parent_tid_addr) else {
+        let Some(parent_tid_original) = read_optional_fork_output(engine, request.parent_tid_addr)
+        else {
             if quiesced {
                 process_barrier.end_quiesce();
             }
             process_barrier.end_fork();
             return Ok(Some(crate::linux_abi::LINUX_EFAULT.guest_retval()));
         };
-        let Some(pidfd_original) = read_output(request.pidfd_out) else {
+        let Some(pidfd_original) = read_optional_fork_output(engine, request.pidfd_out) else {
             if quiesced {
                 process_barrier.end_quiesce();
             }
             process_barrier.end_fork();
             return Ok(Some(crate::linux_abi::LINUX_EFAULT.guest_retval()));
         };
-        let Some(child_tid_original) = read_output(request.child_tid_addr) else {
+        let Some(child_tid_original) = read_optional_fork_output(engine, request.child_tid_addr)
+        else {
             if quiesced {
                 process_barrier.end_quiesce();
             }
             process_barrier.end_fork();
             return Ok(Some(crate::linux_abi::LINUX_EFAULT.guest_retval()));
         };
-
         fork_stage_started = Instant::now();
         let installed_pidfd = if request.pidfd_out.is_some() {
             match kernel
@@ -1738,7 +1745,7 @@ where
                     &child_registry,
                     Some(child_linux_tid),
                 );
-                match run_vcpu_until_exit(
+                match launch_vcpu_until_exit(
                     Arc::clone(&child_kernel),
                     child_engine,
                     child_registry,
@@ -1752,6 +1759,10 @@ where
                     child_in_guest,
                     max_traps,
                 ) {
+                    VcpuLoopLaunch::Job(receipt) => {
+                        child_kernel.enroll_hvpatch_process_job(receipt);
+                    }
+                    VcpuLoopLaunch::Direct(result) => match result {
                     Ok(
                         VcpuLoopOutcome::ProcessExit(_)
                         | VcpuLoopOutcome::ThreadDone
@@ -1763,6 +1774,7 @@ where
                         // wrapper only reports the runtime failure.
                         tracing::error!(child_pid, %error, "hvpatch child loop failed");
                     }
+                    },
                 }
             }) {
             Ok(handle) => handle,
@@ -1996,15 +2008,18 @@ where
             )
             .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
             .with_current_guest_sp(engine.get_reg(carrick_hal::Reg::Sp).ok());
-            match self.suspend_hvpatch_continuation(
-                kernel,
-                engine,
-                request,
-                HvpatchBlockInput::Vfork {
-                    child: child_key,
-                    wait,
-                },
-            )? {
+            match self
+                .suspend_hvpatch_continuation(
+                    kernel,
+                    engine,
+                    request,
+                    HvpatchBlockInput::Vfork {
+                        child: child_key,
+                        wait,
+                    },
+                )
+                .await?
+            {
                 Some(DispatchOutcome::Returned { .. }) => {}
                 Some(DispatchOutcome::ThreadExit { .. }) | None
                     if kernel.process_exiting() || kernel.clone_admission_terminal_cancelled() =>

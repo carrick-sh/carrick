@@ -37,6 +37,7 @@
 //! [`run_vcpu_until_exit`].
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::os::fd::IntoRawFd;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -705,14 +706,20 @@ pub(crate) struct HvpatchRuntimeDirectory {
     endpoints: Mutex<BTreeMap<crate::kernel::TaskKey, HvpatchRuntimeEndpoint>>,
     continuation_wait_service: Mutex<Option<Arc<continuation::CarrierWaitService>>>,
     scheduler: Mutex<Option<Arc<crate::kernel::scheduler::Scheduler>>>,
+    transitional_runner: continuation::TransitionalDedicatedRunner,
     /// Process-child host threads are shared-VM topology, not members of the
     /// creating process's Linux thread group. The outer root run owns their
     /// eventual joins; per-process finalizers must never treat them as sibling
     /// vCPUs or wait for children that Linux has reparented.
     process_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    process_jobs:
+        Mutex<Vec<continuation::LogicalTaskReceipt<Result<VcpuLoopOutcome, RuntimeError>>>>,
 }
 
 impl HvpatchRuntimeDirectory {
+    fn transitional_runner(&self) -> continuation::TransitionalDedicatedRunner {
+        self.transitional_runner.clone()
+    }
     fn continuation_services(
         &self,
         kernel: &Arc<crate::kernel::Kernel>,
@@ -794,11 +801,19 @@ impl HvpatchRuntimeDirectory {
         self.process_threads.lock().push(handle);
     }
 
+    fn enroll_process_job(
+        &self,
+        receipt: continuation::LogicalTaskReceipt<Result<VcpuLoopOutcome, RuntimeError>>,
+    ) {
+        self.process_jobs.lock().push(receipt);
+    }
+
     fn join_process_threads(&self) -> Result<(), RuntimeError> {
         let mut child_panicked = false;
         loop {
             let handles = std::mem::take(&mut *self.process_threads.lock());
-            if handles.is_empty() {
+            let jobs = std::mem::take(&mut *self.process_jobs.lock());
+            if handles.is_empty() && jobs.is_empty() {
                 return if child_panicked {
                     Err(RuntimeError::Unsupported(
                         "HVPatch process child panicked".to_owned(),
@@ -810,6 +825,19 @@ impl HvpatchRuntimeDirectory {
             for handle in handles {
                 if handle.join().is_err() {
                     child_panicked = true;
+                }
+            }
+            for job in jobs {
+                match job.wait() {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        tracing::error!(%error, "HVPatch process job failed");
+                        child_panicked = true;
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "HVPatch process runner failed");
+                        child_panicked = true;
+                    }
                 }
             }
             // A joined child may have forked another process before it left.
@@ -838,16 +866,15 @@ impl HvpatchRuntimeDirectory {
                 .dispatcher
                 .mark_in_process_signal_pending(signal_context, signal);
         }
-        if let Err(error) = endpoint.wake_scheduler_exact(&signal_snapshot) {
-            tracing::error!(parent = ?parent, %error, "authoritative scheduler wake rejected");
-            return;
-        }
         // Child waitability is independent of SIGCHLD disposition. The Kernel
         // zombie is durable, but a parent can be between its initial wait query
         // and host-wait enrollment when publication occurs; always nudge every
         // wait vehicle so it rechecks the authoritative graph even when SIGCHLD
         // is ignored or blocked.
-        signal_context.task().wake();
+        let published = signal_context.task().publish_wake_subscriptions();
+        if !published && let Err(error) = endpoint.wake_scheduler_exact(&signal_snapshot) {
+            tracing::error!(parent = ?parent, %error, "authoritative scheduler wake rejected");
+        }
     }
 }
 
@@ -1262,6 +1289,11 @@ pub(crate) struct KernelState {
 }
 
 impl KernelState {
+    pub(crate) fn transitional_runner(&self) -> Option<continuation::TransitionalDedicatedRunner> {
+        self.hvpatch_runtime
+            .as_ref()
+            .map(|directory| directory.transitional_runner())
+    }
     pub(crate) fn new(
         dispatcher: SyscallDispatcher,
         fork: Arc<dyn HostForkCoordinator>,
@@ -1334,6 +1366,15 @@ impl KernelState {
             std::process::abort();
         };
         directory.enroll_process_thread(handle);
+    }
+
+    fn enroll_hvpatch_process_job(
+        &self,
+        receipt: continuation::LogicalTaskReceipt<Result<VcpuLoopOutcome, RuntimeError>>,
+    ) {
+        if let Some(runtime) = &self.hvpatch_runtime {
+            runtime.enroll_process_job(receipt);
+        }
     }
 
     pub(crate) fn join_hvpatch_process_threads(&self) -> Result<(), RuntimeError> {
@@ -1777,7 +1818,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// Exact Task 1 execution authority while this logical thread is running.
     /// Empty only before its first reclaim snapshot and while blocked.
     execution_lease: Mutex<Option<crate::kernel::objects::ThreadExecutionLease>>,
-    continuation_executor: Option<crate::kernel::ExecutorRegistration>,
+    continuation_executor: Option<TransitionalExecutorRegistration>,
     /// Authoritative Linux TGID for a task multiplexed by HVPatch. `None` on
     /// the one-host-process-per-task native/VMM lanes.
     hvpatch_task_pid: Option<i32>,
@@ -1795,7 +1836,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// where no vCPU run exists yet to consume one.
     observed_task_wake_generation: u64,
     this_tid: ThreadId,
-    threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
     /// The object-safe vCPU registry (the kicker). The shared loop never names
     /// the concrete `VcpuKicker`.
     kicker: Arc<dyn VcpuRegistry>,
@@ -1807,7 +1848,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// [`carrick_hal::InGuestFlag`], whose whole point is that the two halves
     /// of a registration cannot drift apart.
     in_guest: carrick_hal::InGuestFlag,
-    waiter: crate::io_wait::ThreadWaiter,
+    waiter: CompatibilityThreadWaiter,
     max_traps: usize,
     trace: bool,
     /// Set on a vfork (`CLONE_VM|CLONE_VFORK`) CHILD: the write end of the pipe
@@ -1817,6 +1858,62 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// The engine is passed as `&mut E` to each method, so no field owns it; this
     /// pins the generic parameter to the struct.
     _engine: std::marker::PhantomData<fn() -> E>,
+}
+
+enum CompatibilityThreadWaiter {
+    Absent,
+    Present(crate::io_wait::ThreadWaiter),
+}
+
+impl CompatibilityThreadWaiter {
+    fn for_runtime(this_tid: ThreadId, hvpatch: bool) -> Self {
+        if hvpatch {
+            Self::Absent
+        } else {
+            Self::Present(crate::io_wait::ThreadWaiter::new(this_tid))
+        }
+    }
+
+    fn replace_after_host_fork(&mut self, this_tid: ThreadId) {
+        *self = Self::Present(crate::io_wait::ThreadWaiter::new(this_tid));
+    }
+}
+
+impl std::ops::Deref for CompatibilityThreadWaiter {
+    type Target = crate::io_wait::ThreadWaiter;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Present(waiter) => waiter,
+            Self::Absent => std::process::abort(),
+        }
+    }
+}
+
+impl std::ops::DerefMut for CompatibilityThreadWaiter {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Present(waiter) => waiter,
+            Self::Absent => std::process::abort(),
+        }
+    }
+}
+
+struct TransitionalExecutorRegistration {
+    scheduler: Arc<crate::kernel::Scheduler>,
+    registration: crate::kernel::ExecutorRegistration,
+}
+
+impl TransitionalExecutorRegistration {
+    fn registration(&self) -> &crate::kernel::ExecutorRegistration {
+        &self.registration
+    }
+}
+
+impl Drop for TransitionalExecutorRegistration {
+    fn drop(&mut self) {
+        let _ = self.scheduler.unregister_executor(&self.registration);
+    }
 }
 
 struct BlockingWaitReclaim {
@@ -1955,11 +2052,12 @@ where
         linux_tid: crate::kernel::LinuxTid,
         fatal_image_generation: u64,
         this_tid: ThreadId,
-        threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+        threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
         kicker: Arc<dyn VcpuRegistry>,
         in_guest: carrick_hal::InGuestFlag,
         max_traps: usize,
     ) -> Self {
+        let waiter = CompatibilityThreadWaiter::for_runtime(this_tid, hvpatch_task_pid.is_some());
         Self {
             registry,
             futex,
@@ -1980,7 +2078,7 @@ where
             threads,
             kicker,
             in_guest,
-            waiter: crate::io_wait::ThreadWaiter::new(this_tid),
+            waiter,
             max_traps,
             trace: std::env::var_os("CARRICK_TRACE_TRAPS").is_some(),
             vfork_release_fd: None,
@@ -3161,7 +3259,7 @@ where
         }
     }
 
-    fn suspend_hvpatch_continuation(
+    async fn suspend_hvpatch_continuation(
         &mut self,
         kernel: &Kernel,
         engine: &mut E,
@@ -3180,11 +3278,13 @@ where
         })?;
         let (scheduler, service) = directory.continuation_services(context.kernel());
         if self.continuation_executor.is_none() {
-            self.continuation_executor = Some(
-                scheduler
-                    .register_executor(Arc::new(TransitionalSchedulerKick::default()))
-                    .map_err(|error| RuntimeError::Configuration(error.to_string()))?,
-            );
+            let registration = scheduler
+                .register_executor(Arc::new(TransitionalSchedulerKick::default()))
+                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            self.continuation_executor = Some(TransitionalExecutorRegistration {
+                scheduler: Arc::clone(&scheduler),
+                registration,
+            });
         }
 
         let capture = {
@@ -3217,20 +3317,6 @@ where
         }
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         continuation.bind_product_futex(&self.futex);
-        struct OneBlock(Option<continuation::BlockedContinuation>);
-        impl continuation::TaskQuantumSource for OneBlock {
-            fn next_boundary(&mut self) -> continuation::QuantumBoundary {
-                continuation::QuantumBoundary::Block(Box::new(
-                    self.0.take().unwrap_or_else(|| std::process::abort()),
-                ))
-            }
-        }
-        let runner = continuation::TransitionalDedicatedRunner::new();
-        let continuation = match runner.run_task_quantum(&mut OneBlock(Some(continuation))) {
-            continuation::QuantumExit::Blocked(continuation) => *continuation,
-            _ => std::process::abort(),
-        };
-
         let thread = self.kernel_thread.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("HVPatch continuation lost Kernel thread".to_owned())
         })?;
@@ -3294,9 +3380,27 @@ where
         drop(self.guest_execution.take());
         debug_assert!(scheduler.binding_for_thread(thread.key()).is_none());
 
-        let event = service
-            .wait_for_event(token, Duration::from_secs(24 * 60 * 60))
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let event = match service
+            .event_outside_quiesce(token, self.process_fork_barrier.clone())
+            .await
+        {
+            Ok(event) => event,
+            Err(continuation::WaitServiceError::Cancelled(
+                continuation::CancellationCause::Exec
+                | continuation::CancellationCause::ThreadExit
+                | continuation::CancellationCause::ProcessExit
+                | continuation::CancellationCause::ServiceShutdown,
+            )) => return Ok(Some(DispatchOutcome::ThreadExit { code: 0 })),
+            Err(error) => return Err(RuntimeError::Configuration(error.to_string())),
+        };
+        if kernel.process_exiting() || kernel.clone_admission_terminal_cancelled() {
+            service.retire_terminal(token);
+            return Ok(Some(DispatchOutcome::ThreadExit { code: 0 }));
+        }
+        if let Some(outcome) = self.exec_replaced_thread_exit() {
+            service.retire_terminal(token);
+            return Ok(Some(outcome));
+        }
         self.guest_execution = Some(
             kernel
                 .guest_executors
@@ -3319,7 +3423,7 @@ where
             RuntimeError::Configuration("continuation executor vanished".to_owned())
         })?;
         let mut lease = scheduler
-            .take_transitional_lease(executor)
+            .take_transitional_lease(executor.registration())
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let (current_mm, current_asid) = lease
             .task_state_authority()
@@ -3371,6 +3475,22 @@ where
             }
             Completion::ErrnoWithGuestWrites(errno, _writes) => {
                 Some(DispatchOutcome::Errno { errno })
+            }
+            Completion::BlockingWrite { write, outcome } => {
+                let outcome = match outcome {
+                    continuation::BlockingWriteOutcome::Return(value) => {
+                        DispatchOutcome::Returned { value }
+                    }
+                    continuation::BlockingWriteOutcome::Errno(errno) => {
+                        DispatchOutcome::Errno { errno }
+                    }
+                };
+                Some(raise_sigpipe_for_blocking_write(
+                    &kernel.dispatcher,
+                    context,
+                    &write,
+                    outcome,
+                ))
             }
             Completion::InterruptedSleep { remaining } => {
                 Some(crate::dispatch::complete_interrupted_sleep(
@@ -4358,6 +4478,7 @@ where
                 DispatchOutcome::WaitOnSharedWord {
                     location,
                     waiter_key,
+                    generation: _,
                     value,
                     sysv,
                 } => match self.wait_on_shared_word(
@@ -4584,6 +4705,116 @@ enum TrapWatchdog {
     Trip,
 }
 
+pub(crate) enum VcpuLoopLaunch {
+    Direct(Result<VcpuLoopOutcome, RuntimeError>),
+    Job(continuation::LogicalTaskReceipt<Result<VcpuLoopOutcome, RuntimeError>>),
+}
+
+pub(crate) enum VcpuThreadHandle {
+    Host(std::thread::JoinHandle<()>),
+    Job(continuation::LogicalTaskReceipt<Result<VcpuLoopOutcome, RuntimeError>>),
+}
+
+impl VcpuThreadHandle {
+    fn is_finished(&self) -> bool {
+        match self {
+            Self::Host(handle) => handle.is_finished(),
+            Self::Job(receipt) => receipt.is_finished(),
+        }
+    }
+
+    fn host_thread_id(&self) -> Option<std::thread::ThreadId> {
+        match self {
+            Self::Host(handle) => Some(handle.thread().id()),
+            Self::Job(_) => None,
+        }
+    }
+
+    fn diagnostic_name(&self) -> String {
+        match self {
+            Self::Host(handle) => handle.thread().name().unwrap_or("<unnamed>").to_owned(),
+            Self::Job(_) => "transitional-vcpu-job".to_owned(),
+        }
+    }
+
+    fn join(self) -> Result<(), RuntimeError> {
+        match self {
+            Self::Host(handle) => handle.join().map_err(|_| {
+                RuntimeError::Trap(TrapError::Hypervisor(
+                    "HVPatch vCPU bootstrap pthread panicked".to_owned(),
+                ))
+            }),
+            Self::Job(receipt) => receipt
+                .wait()
+                .map_err(|error| {
+                    RuntimeError::Trap(TrapError::Hypervisor(format!(
+                        "HVPatch logical vCPU job failed: {error}"
+                    )))
+                })?
+                .map(|_| ()),
+        }
+    }
+}
+
+impl VcpuLoopLaunch {
+    pub(crate) fn wait(self) -> Result<VcpuLoopOutcome, RuntimeError> {
+        match self {
+            Self::Direct(result) => result,
+            Self::Job(receipt) => receipt.wait().map_err(|error| {
+                RuntimeError::Unsupported(format!("transitional vCPU job failed: {error}"))
+            })?,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_vcpu_until_exit<E: ThreadedEngine + 'static>(
+    kernel: Kernel,
+    engine: E,
+    registry: Arc<ThreadRegistry>,
+    futex: Arc<FutexTable>,
+    platform_futex: Arc<dyn PlatformFutex>,
+    platform_futex_factory: PlatformFutexFactory,
+    linux_tid: crate::kernel::LinuxTid,
+    this_tid: ThreadId,
+    threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
+    kicker: Arc<dyn VcpuRegistry>,
+    in_guest: carrick_hal::InGuestFlag,
+    max_traps: usize,
+) -> VcpuLoopLaunch
+where
+    E::SiblingSpec: 'static,
+{
+    let runner = kernel.transitional_runner();
+    let future = run_vcpu_until_exit(
+        kernel,
+        engine,
+        registry,
+        futex,
+        platform_futex,
+        platform_futex_factory,
+        linux_tid,
+        this_tid,
+        threads,
+        kicker,
+        in_guest,
+        max_traps,
+    );
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut future = Box::pin(future);
+    match future.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(result) => VcpuLoopLaunch::Direct(result),
+        std::task::Poll::Pending => runner.map_or_else(
+            || {
+                VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(
+                    "compatibility vCPU unexpectedly suspended on transitional runner".to_owned(),
+                )))
+            },
+            |runner| VcpuLoopLaunch::Job(runner.spawn(future)),
+        ),
+    }
+}
+
 /// Decide what the progress-aware trap watchdog should do at one checkpoint.
 ///
 /// The watchdog trips on a WALL-TIME stall, not on raw syscall count:
@@ -4612,7 +4843,7 @@ fn trap_watchdog_decision(
 /// thread, or hits the trap limit. Holds NO lock during the vCPU run; takes the
 /// dispatcher lock only to dispatch + complete each syscall.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_vcpu_until_exit<E: ThreadedEngine + 'static>(
+pub(crate) async fn run_vcpu_until_exit<E: ThreadedEngine + 'static>(
     kernel: Kernel,
     mut engine: E,
     registry: Arc<ThreadRegistry>,
@@ -4621,7 +4852,7 @@ pub(crate) fn run_vcpu_until_exit<E: ThreadedEngine + 'static>(
     platform_futex_factory: PlatformFutexFactory,
     linux_tid: crate::kernel::LinuxTid,
     this_tid: ThreadId,
-    threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
     kicker: Arc<dyn VcpuRegistry>,
     in_guest: carrick_hal::InGuestFlag,
     max_traps: usize,
@@ -4629,7 +4860,6 @@ pub(crate) fn run_vcpu_until_exit<E: ThreadedEngine + 'static>(
 where
     E::SiblingSpec: 'static,
 {
-    let _transitional_runner = continuation::TransitionalDedicatedRunner::new();
     // This must wrap the whole run, not only clone-thread closures: an
     // hvpatch process leader may begin without a lease, park, acquire one on
     // wake, and then exit.  Before this guard those late leases leaked until
@@ -4732,7 +4962,7 @@ where
     );
     // Run the vCPU loop in a closure so we can run vCPU cleanup on EVERY exit
     // path — `?` errors, early returns, and the trap-limit fall-through alike.
-    let mut result: Result<VcpuLoopOutcome, RuntimeError> = (|| {
+    let mut result: Result<VcpuLoopOutcome, RuntimeError> = (async {
         // Progress-aware trap watchdog: bound the traps SINCE THE LAST DELIVERED
         // SIGNAL HANDLER, not the lifetime total. A guest legitimately spinning
         // while it waits for a signal (CPython test_io's reentrant-write tests
@@ -5164,7 +5394,9 @@ where
                     &mut engine,
                     continuation_request,
                     HvpatchBlockInput::Dispatch(outcome),
-                )? {
+                )
+                .await?
+                {
                     Some(completed) => completed,
                     None => state.service_threaded_syscall(&kernel, &mut engine, frame)?,
                 };
@@ -5350,6 +5582,7 @@ where
                 DispatchOutcome::SharedFutexWait {
                     location,
                     waiter_key,
+                    generation: _,
                     value,
                     timeout,
                 } => {
@@ -5381,6 +5614,7 @@ where
                 DispatchOutcome::SharedFutexWaitv {
                     location,
                     waiter_key,
+                    generation: _,
                     value,
                     timeout,
                     index,
@@ -5453,6 +5687,7 @@ where
                 DispatchOutcome::WaitOnSharedWord {
                     location: _,
                     waiter_key: _,
+                    generation: _,
                     value: _,
                     sysv: _,
                 } => {
@@ -5628,7 +5863,9 @@ where
                             child_stack,
                             vfork,
                         },
-                    )? {
+                    )
+                    .await?
+                    {
                         Some(retval) => {
                             last_syscall_retval =
                                 Some(state.complete_returned(&mut engine, retval)?);
@@ -5771,7 +6008,8 @@ where
 
         let result = assemble_run_result(&kernel, -1, None, state.max_traps, true);
         Ok(VcpuLoopOutcome::TrapLimit(Box::new(result)))
-    })();
+    })
+    .await;
     // The exact Kernel execution lease must settle before any terminal branch
     // retires graph/MM/ASID/backend authority. Paths that already settled in
     // `handle_thread_exit` make this an intentional no-op.
@@ -6999,7 +7237,8 @@ mod tests {
             compatibility_wake
                 .0
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1
+            0,
+            "exact scheduler publication must not also invoke the broad compatibility waker"
         );
         assert!(matches!(
             context.thread().execution_state(),
@@ -7043,6 +7282,38 @@ mod tests {
             0,
             "a broad compatibility nudge cannot replace rejected scheduler authority"
         );
+    }
+
+    #[test]
+    fn transitional_executor_registration_unregisters_on_repeated_drop() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        let scheduler = Arc::new(crate::kernel::Scheduler::new(Arc::clone(context.kernel())));
+        let baseline = scheduler.registered_executor_count();
+        for _ in 0..256 {
+            let registration = scheduler
+                .register_executor(Arc::new(TransitionalSchedulerKick::default()))
+                .expect("register transitional executor");
+            let owned = TransitionalExecutorRegistration {
+                scheduler: Arc::clone(&scheduler),
+                registration,
+            };
+            assert_eq!(scheduler.registered_executor_count(), baseline + 1);
+            drop(owned);
+            assert_eq!(scheduler.registered_executor_count(), baseline);
+        }
+    }
+
+    #[test]
+    fn hvpatch_runtime_owns_no_legacy_per_task_waiter_sidecar() {
+        assert!(matches!(
+            CompatibilityThreadWaiter::for_runtime(ThreadId::synthetic_for_tests(67_010), true),
+            CompatibilityThreadWaiter::Absent
+        ));
+        assert!(matches!(
+            CompatibilityThreadWaiter::for_runtime(ThreadId::synthetic_for_tests(67_011), false),
+            CompatibilityThreadWaiter::Present(_)
+        ));
     }
 
     #[test]
