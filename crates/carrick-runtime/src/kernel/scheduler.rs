@@ -57,7 +57,17 @@ pub enum SchedulerError {
 }
 
 pub trait ExecutorKick: Send + Sync + std::fmt::Debug {
-    fn kick(&self, token: ExecutorKickToken);
+    /// Atomically install an exact loaded generation at the destination.
+    fn try_bind(&self, binding: ExecutorBinding) -> bool;
+
+    /// Clear only the still-matching destination binding.
+    fn unbind(&self, binding: ExecutorBinding);
+
+    /// Revalidate and consume the exact token at the destination. The host
+    /// nudge may occur only inside the successful exact-binding branch.
+    fn deliver_exact(&self, token: ExecutorKickToken) -> bool;
+
+    fn current_binding(&self) -> Option<ExecutorBinding>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,15 +131,15 @@ impl ExecutorBinding {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ExecutorRegistration {
     id: ExecutorId,
+    close_observation_epoch: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
 struct ExecutorEntry {
     kick: Arc<dyn ExecutorKick>,
-    binding: Option<ExecutorBinding>,
 }
 
 #[derive(Debug)]
@@ -163,14 +173,11 @@ impl ExecutorDirectory {
             .checked_add(1)
             .ok_or(RunQueueError::ExecutorIdExhausted)?;
         let id = ExecutorId::from_scheduler(raw);
-        state.entries.insert(
+        state.entries.insert(id, ExecutorEntry { kick });
+        Ok(ExecutorRegistration {
             id,
-            ExecutorEntry {
-                kick,
-                binding: None,
-            },
-        );
-        Ok(ExecutorRegistration { id })
+            close_observation_epoch: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     fn bind(
@@ -178,67 +185,81 @@ impl ExecutorDirectory {
         registration: &ExecutorRegistration,
         binding: ExecutorBinding,
     ) -> Result<(), RunQueueError> {
-        let mut state = self.state.lock();
-        let entry = state
+        let kick = self
+            .state
+            .lock()
             .entries
-            .get_mut(&registration.id)
+            .get(&registration.id)
+            .map(|entry| Arc::clone(&entry.kick))
             .ok_or(RunQueueError::StaleExecutor)?;
-        if entry.binding.is_some() {
+        if !kick.try_bind(binding) {
             return Err(RunQueueError::ExecutorBusy);
         }
-        entry.binding = Some(binding);
         Ok(())
     }
 
     fn unbind(&self, binding: ExecutorBinding) {
-        let mut state = self.state.lock();
-        let Some(entry) = state.entries.get_mut(&binding.executor) else {
+        let kick = self
+            .state
+            .lock()
+            .entries
+            .get(&binding.executor)
+            .map(|entry| Arc::clone(&entry.kick));
+        let Some(kick) = kick else {
             return;
         };
-        if entry.binding == Some(binding) {
-            entry.binding = None;
-        }
+        kick.unbind(binding);
     }
 
     fn binding_for_thread(&self, thread: ThreadKey) -> Option<ExecutorBinding> {
-        self.state
+        let kicks: Vec<_> = self
+            .state
             .lock()
             .entries
             .values()
-            .filter_map(|entry| entry.binding)
+            .map(|entry| Arc::clone(&entry.kick))
+            .collect();
+        kicks
+            .into_iter()
+            .filter_map(|kick| kick.current_binding())
             .find(|binding| binding.thread == thread)
     }
 
     fn has_running(&self) -> bool {
-        self.state
+        let kicks: Vec<_> = self
+            .state
             .lock()
             .entries
             .values()
-            .any(|entry| entry.binding.is_some())
+            .map(|entry| Arc::clone(&entry.kick))
+            .collect();
+        kicks
+            .into_iter()
+            .any(|kick| kick.current_binding().is_some())
     }
 
     fn current_tokens(&self) -> Vec<ExecutorKickToken> {
-        self.state
+        let kicks: Vec<_> = self
+            .state
             .lock()
             .entries
             .values()
-            .filter_map(|entry| entry.binding.map(ExecutorBinding::token))
+            .map(|entry| Arc::clone(&entry.kick))
+            .collect();
+        kicks
+            .into_iter()
+            .filter_map(|kick| kick.current_binding().map(ExecutorBinding::token))
             .collect()
     }
 
     fn deliver(&self, token: ExecutorKickToken) -> bool {
-        let kick = {
-            let state = self.state.lock();
-            let Some(entry) = state.entries.get(&token.executor) else {
-                return false;
-            };
-            if entry.binding.map(ExecutorBinding::token) != Some(token) {
-                return false;
-            }
-            Arc::clone(&entry.kick)
-        };
-        kick.kick(token);
-        true
+        let kick = self
+            .state
+            .lock()
+            .entries
+            .get(&token.executor)
+            .map(|entry| Arc::clone(&entry.kick));
+        kick.is_some_and(|kick| kick.deliver_exact(token))
     }
 }
 
@@ -263,6 +284,8 @@ struct RunQueueState {
     active_authorities: usize,
     claimed: usize,
     waiters: usize,
+    close_epoch: u64,
+    close_waiters_expected: usize,
     closed_waiter_observations: usize,
 }
 
@@ -275,6 +298,8 @@ impl Default for RunQueueState {
             active_authorities: 0,
             claimed: 0,
             waiters: 0,
+            close_epoch: 0,
+            close_waiters_expected: 0,
             closed_waiter_observations: 0,
         }
     }
@@ -284,16 +309,76 @@ impl Default for RunQueueState {
 struct RunQueueInner {
     state: Mutex<RunQueueState>,
     changed: Condvar,
+    wake_admissions: AtomicU64,
+    #[cfg(test)]
+    close_observation_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 impl RunQueueInner {
-    fn maybe_finish_close(&self, state: &mut RunQueueState) {
-        if state.lifecycle == QueueLifecycle::Closing
-            && state.rows.is_empty()
+    const CLOSING_BIT: u64 = 1 << 63;
+
+    fn try_admit_wake(self: &Arc<Self>) -> Result<WakeAdmission, RunQueueError> {
+        let mut observed = self.wake_admissions.load(Ordering::Acquire);
+        loop {
+            if observed & Self::CLOSING_BIT != 0 {
+                return Err(RunQueueError::Closed);
+            }
+            let count = observed & !Self::CLOSING_BIT;
+            let next = count
+                .checked_add(1)
+                .filter(|next| *next < Self::CLOSING_BIT)
+                .ok_or(RunQueueError::SubmissionRejected)?;
+            match self.wake_admissions.compare_exchange_weak(
+                observed,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(WakeAdmission {
+                        queue: Arc::downgrade(self),
+                        active: true,
+                    });
+                }
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    fn begin_close(&self) {
+        self.wake_admissions
+            .fetch_or(Self::CLOSING_BIT, Ordering::AcqRel);
+    }
+
+    fn active_wake_admissions(&self) -> u64 {
+        self.wake_admissions.load(Ordering::Acquire) & !Self::CLOSING_BIT
+    }
+
+    fn release_wake_admission(&self) {
+        let previous = self.wake_admissions.fetch_sub(1, Ordering::AcqRel);
+        if previous & !Self::CLOSING_BIT == 0 {
+            std::process::abort();
+        }
+        let mut state = self.state.lock();
+        self.maybe_finish_close(&mut state);
+        self.changed.notify_all();
+    }
+
+    fn drain_ready(&self, state: &RunQueueState) -> bool {
+        state.rows.is_empty()
             && state.active_authorities == 0
             && state.claimed == 0
+            && self.active_wake_admissions() == 0
+    }
+
+    fn maybe_finish_close(&self, state: &mut RunQueueState) {
+        if state.lifecycle == QueueLifecycle::Closing
+            && self.drain_ready(state)
+            && state.closed_waiter_observations >= state.close_waiters_expected
         {
             state.lifecycle = QueueLifecycle::Closed;
+            self.changed.notify_all();
+        } else if state.lifecycle == QueueLifecycle::Closing && self.drain_ready(state) {
             self.changed.notify_all();
         }
     }
@@ -336,6 +421,24 @@ impl RunQueueInner {
     }
 }
 
+#[derive(Debug)]
+struct WakeAdmission {
+    queue: Weak<RunQueueInner>,
+    active: bool,
+}
+
+impl Drop for WakeAdmission {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(queue) = self.queue.upgrade() {
+            queue.release_wake_admission();
+        }
+        self.active = false;
+    }
+}
+
 /// Queue authority retained by an exact active generation. New roots may be
 /// admitted only while open; descendants of this retained authority may be
 /// admitted while closing so recursive fork publication cannot be stranded.
@@ -357,28 +460,31 @@ impl SubmissionAuthority {
             return Err(RunQueueError::AuthorityMismatch);
         }
         let kernel = self.kernel.upgrade().ok_or(RunQueueError::Closed)?;
-        let exact = kernel
-            .exact_thread_for_scheduler(thread)
-            .ok_or(RunQueueError::AuthorityMismatch)?;
-        if exact.execution_state().generation() != Some(generation) {
-            return Err(RunQueueError::AuthorityMismatch);
-        }
         let queue = self.queue.upgrade().ok_or(RunQueueError::Closed)?;
-        let mut state = queue.state.lock();
-        if state.lifecycle == QueueLifecycle::Closed {
-            return Err(RunQueueError::Closed);
-        }
-        state.active_authorities = state
-            .active_authorities
-            .checked_add(1)
-            .ok_or(RunQueueError::SubmissionRejected)?;
-        drop(state);
-        Ok(Self {
-            queue: Arc::downgrade(&queue),
-            kernel: Arc::downgrade(&kernel),
-            key: QueueKey { thread, generation },
-            active: true,
-        })
+        kernel
+            .with_live_scheduler_descendant(
+                self.key.thread,
+                self.key.generation,
+                thread,
+                generation,
+                || {
+                    let mut state = queue.state.lock();
+                    if state.lifecycle == QueueLifecycle::Closed {
+                        return Err(RunQueueError::Closed);
+                    }
+                    state.active_authorities = state
+                        .active_authorities
+                        .checked_add(1)
+                        .ok_or(RunQueueError::SubmissionRejected)?;
+                    Ok(Self {
+                        queue: Arc::downgrade(&queue),
+                        kernel: Arc::downgrade(&kernel),
+                        key: QueueKey { thread, generation },
+                        active: true,
+                    })
+                },
+            )
+            .unwrap_or(Err(RunQueueError::AuthorityMismatch))
     }
 
     pub fn publish(
@@ -427,7 +533,9 @@ impl RunQueue {
         key: QueueKey,
     ) -> Result<SubmissionAuthority, RunQueueError> {
         let mut state = self.inner.state.lock();
-        if state.lifecycle != QueueLifecycle::Open {
+        if state.lifecycle != QueueLifecycle::Open
+            || self.inner.wake_admissions.load(Ordering::Acquire) & RunQueueInner::CLOSING_BIT != 0
+        {
             return Err(RunQueueError::SubmissionRejected);
         }
         state.active_authorities = state
@@ -442,7 +550,7 @@ impl RunQueue {
         })
     }
 
-    fn take_row(&self) -> Result<QueueRow, RunQueueError> {
+    fn take_row(&self, executor: &ExecutorRegistration) -> Result<QueueRow, RunQueueError> {
         let mut state = self.inner.state.lock();
         loop {
             if let Some(row) = state.rows.pop_front() {
@@ -455,30 +563,56 @@ impl RunQueue {
             }
             self.inner.maybe_finish_close(&mut state);
             if state.lifecycle == QueueLifecycle::Closed {
-                state.closed_waiter_observations = state
-                    .closed_waiter_observations
-                    .checked_add(1)
-                    .unwrap_or_else(|| std::process::abort());
+                return Err(RunQueueError::Closed);
+            }
+            if state.lifecycle == QueueLifecycle::Closing && self.inner.drain_ready(&state) {
+                if executor.close_observation_epoch.swap(0, Ordering::AcqRel) != 0 {
+                    #[cfg(test)]
+                    let observation_gate = {
+                        let configured = self.inner.close_observation_gate.lock();
+                        configured.clone()
+                    };
+                    #[cfg(test)]
+                    if let Some(gate) = observation_gate {
+                        drop(state);
+                        gate.wait();
+                        state = self.inner.state.lock();
+                    }
+                    state.closed_waiter_observations = state
+                        .closed_waiter_observations
+                        .checked_add(1)
+                        .unwrap_or_else(|| std::process::abort());
+                    self.inner.maybe_finish_close(&mut state);
+                }
                 return Err(RunQueueError::Closed);
             }
             state.waiters = state
                 .waiters
                 .checked_add(1)
                 .unwrap_or_else(|| std::process::abort());
+            let close_epoch = state.close_epoch;
             self.inner.changed.wait(&mut state);
             state.waiters = state
                 .waiters
                 .checked_sub(1)
                 .unwrap_or_else(|| std::process::abort());
+            if state.close_epoch != close_epoch {
+                executor
+                    .close_observation_epoch
+                    .store(state.close_epoch, Ordering::Release);
+            }
         }
     }
 
     /// Claim the first row that still names the exact current Runnable
     /// generation. Stale rows are consumed here and never escape as runnable
     /// authority.
-    pub(crate) fn take(&self, executor: ExecutorId) -> Result<QueueClaim, RunQueueError> {
+    pub(crate) fn take(
+        &self,
+        executor: &ExecutorRegistration,
+    ) -> Result<QueueClaim, RunQueueError> {
         loop {
-            let row = self.take_row()?;
+            let row = self.take_row(executor)?;
             if row.thread.key() != row.key.thread
                 || row.thread.execution_state().generation() != Some(row.key.generation)
                 || !matches!(
@@ -489,7 +623,7 @@ impl RunQueue {
                 self.inner.finish_claim();
                 continue;
             }
-            let lease = match row.thread.claim_runnable(executor) {
+            let lease = match row.thread.claim_runnable(executor.id) {
                 Ok(lease) if lease.generation() == row.key.generation => lease,
                 Ok(lease) => {
                     drop(lease);
@@ -506,9 +640,15 @@ impl RunQueue {
     }
 
     pub fn close(&self) {
+        self.inner.begin_close();
         let mut state = self.inner.state.lock();
         if state.lifecycle == QueueLifecycle::Open {
             state.lifecycle = QueueLifecycle::Closing;
+            state.close_epoch = state
+                .close_epoch
+                .checked_add(1)
+                .unwrap_or_else(|| std::process::abort());
+            state.close_waiters_expected = state.waiters;
         }
         self.inner.maybe_finish_close(&mut state);
         self.inner.changed.notify_all();
@@ -533,6 +673,11 @@ impl RunQueue {
     #[cfg(test)]
     fn closed_waiter_observations(&self) -> usize {
         self.inner.state.lock().closed_waiter_observations
+    }
+
+    #[cfg(test)]
+    fn install_close_observation_gate(&self, gate: Arc<std::sync::Barrier>) {
+        *self.inner.close_observation_gate.lock() = Some(gate);
     }
 }
 
@@ -614,6 +759,12 @@ enum WakeAction {
 }
 
 #[derive(Debug)]
+struct PendingWake {
+    action: WakeAction,
+    _admission: WakeAdmission,
+}
+
+#[derive(Debug)]
 pub struct Scheduler {
     kernel: Arc<Kernel>,
     queue: RunQueue,
@@ -662,8 +813,33 @@ impl Scheduler {
     }
 
     pub fn wake(&self, thread: ThreadKey) -> Result<WakeDisposition, SchedulerError> {
+        let pending = self.begin_wake(thread)?;
+        self.commit_wake(pending)
+    }
+
+    fn begin_wake(&self, thread: ThreadKey) -> Result<PendingWake, SchedulerError> {
+        let admission = self.queue.inner.try_admit_wake()?;
         let action = self.decide_wake(thread)?;
-        self.deliver_wake(action)
+        Ok(PendingWake {
+            action,
+            _admission: admission,
+        })
+    }
+
+    fn commit_wake(&self, pending: PendingWake) -> Result<WakeDisposition, SchedulerError> {
+        let PendingWake { action, _admission } = pending;
+        let result = match action {
+            WakeAction::Queue { thread, key, .. } => {
+                Ok(if self.enqueue_exact(thread, key, true)? {
+                    WakeDisposition::Queued
+                } else {
+                    WakeDisposition::Coalesced
+                })
+            }
+            action => self.deliver_wake(action),
+        };
+        drop(_admission);
+        result
     }
 
     fn decide_wake(&self, key: ThreadKey) -> Result<WakeAction, SchedulerError> {
@@ -739,7 +915,7 @@ impl Scheduler {
     }
 
     pub fn take(&self, executor: &ExecutorRegistration) -> Result<RunnableThread, RunQueueError> {
-        let QueueClaim { row, lease } = self.queue.take(executor.id)?;
+        let QueueClaim { row, lease } = self.queue.take(executor)?;
         let binding = ExecutorBinding {
             executor: executor.id,
             executor_epoch: lease.executor_epoch(),
@@ -873,6 +1049,11 @@ impl Scheduler {
     }
 
     #[cfg(test)]
+    fn is_closing(&self) -> bool {
+        self.queue.inner.wake_admissions.load(Ordering::Acquire) & RunQueueInner::CLOSING_BIT != 0
+    }
+
+    #[cfg(test)]
     fn waiter_count(&self) -> usize {
         self.queue.waiter_count()
     }
@@ -880,6 +1061,11 @@ impl Scheduler {
     #[cfg(test)]
     fn closed_waiter_observations(&self) -> usize {
         self.queue.closed_waiter_observations()
+    }
+
+    #[cfg(test)]
+    fn install_close_observation_gate(&self, gate: Arc<std::sync::Barrier>) {
+        self.queue.install_close_observation_gate(gate);
     }
 }
 
@@ -925,6 +1111,23 @@ mod tests {
             .start_thread()
             .expect("start sibling")
             .into_context()
+    }
+
+    fn process_child(
+        kernel: &Arc<Kernel>,
+        parent: &KernelContext,
+        host_tid: i32,
+        name: &str,
+    ) -> KernelContext {
+        kernel
+            .fork_task(
+                parent,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("process fork plan"),
+                ThreadId::synthetic_for_tests(host_tid),
+                name.to_owned(),
+                None,
+            )
+            .expect("fork process child")
     }
 
     fn task_state(context: &KernelContext, marker: u64) -> MigratableTaskState {
@@ -973,12 +1176,79 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct RecordingKick {
+        binding: parking_lot::Mutex<Option<super::ExecutorBinding>>,
         tokens: parking_lot::Mutex<Vec<ExecutorKickToken>>,
     }
 
     impl ExecutorKick for RecordingKick {
-        fn kick(&self, token: ExecutorKickToken) {
+        fn try_bind(&self, binding: super::ExecutorBinding) -> bool {
+            let mut current = self.binding.lock();
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(binding);
+            true
+        }
+
+        fn unbind(&self, binding: super::ExecutorBinding) {
+            let mut current = self.binding.lock();
+            if *current == Some(binding) {
+                *current = None;
+            }
+        }
+
+        fn deliver_exact(&self, token: ExecutorKickToken) -> bool {
+            let current = self.binding.lock();
+            if (*current).map(super::ExecutorBinding::token) != Some(token) {
+                return false;
+            }
             self.tokens.lock().push(token);
+            true
+        }
+
+        fn current_binding(&self) -> Option<super::ExecutorBinding> {
+            *self.binding.lock()
+        }
+    }
+
+    #[derive(Debug)]
+    struct BarrierKick {
+        entered: Arc<Barrier>,
+        resume: Arc<Barrier>,
+        binding: parking_lot::Mutex<Option<super::ExecutorBinding>>,
+        tokens: parking_lot::Mutex<Vec<ExecutorKickToken>>,
+    }
+
+    impl ExecutorKick for BarrierKick {
+        fn try_bind(&self, binding: super::ExecutorBinding) -> bool {
+            let mut current = self.binding.lock();
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(binding);
+            true
+        }
+
+        fn unbind(&self, binding: super::ExecutorBinding) {
+            let mut current = self.binding.lock();
+            if *current == Some(binding) {
+                *current = None;
+            }
+        }
+
+        fn deliver_exact(&self, token: ExecutorKickToken) -> bool {
+            self.entered.wait();
+            self.resume.wait();
+            let current = self.binding.lock();
+            if (*current).map(super::ExecutorBinding::token) != Some(token) {
+                return false;
+            }
+            self.tokens.lock().push(token);
+            true
+        }
+
+        fn current_binding(&self) -> Option<super::ExecutorBinding> {
+            *self.binding.lock()
         }
     }
 
@@ -1008,6 +1278,70 @@ mod tests {
         let next = scheduler.take(&executor).unwrap();
         assert_eq!(next.generation().raw(), first.raw() + 2);
         scheduler.settle_exited(next).unwrap();
+    }
+
+    #[test]
+    fn close_between_blocked_transition_and_enqueue_cannot_strand_runnable_generation() {
+        let (kernel, context) = bootstrap(12_115);
+        publish(&context, 20);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let executor = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+        scheduler
+            .settle_blocked(running, BlockedReason::HostWait)
+            .unwrap();
+
+        let pending = scheduler
+            .begin_wake(context.thread().key())
+            .expect("wake admission precedes thread transition");
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(1);
+        let close_scheduler = Arc::clone(&scheduler);
+        let close = thread::spawn(move || {
+            close_scheduler.close();
+            close_scheduler.wait_closed();
+            closed_tx.send(()).unwrap();
+        });
+        while !scheduler.is_closing() {
+            thread::yield_now();
+        }
+        assert!(matches!(
+            closed_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        assert_eq!(
+            scheduler.commit_wake(pending).unwrap(),
+            WakeDisposition::Queued
+        );
+        let resumed = scheduler.take(&executor).unwrap();
+        scheduler.settle_exited(resumed).unwrap();
+        closed_rx.recv().unwrap();
+        close.join().unwrap();
+    }
+
+    #[test]
+    fn post_close_blocked_wake_is_rejected_without_changing_blocked_state() {
+        let (kernel, context) = bootstrap(12_116);
+        publish(&context, 21);
+        let scheduler = Scheduler::new(kernel);
+        let executor = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+        scheduler
+            .settle_blocked(running, BlockedReason::HostWait)
+            .unwrap();
+        let blocked = context.thread().execution_state();
+        scheduler.close();
+        scheduler.wait_closed();
+
+        assert!(scheduler.wake(context.thread().key()).is_err());
+        assert_eq!(context.thread().execution_state(), blocked);
+        assert_eq!(scheduler.queued_len(), 0);
     }
 
     #[test]
@@ -1199,6 +1533,35 @@ mod tests {
     }
 
     #[test]
+    fn executor_rebind_between_directory_validation_and_delivery_never_interrupts_successor() {
+        let (kernel, context) = bootstrap(12_117);
+        publish(&context, 22);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let entered = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let kicks = Arc::new(BarrierKick {
+            entered: Arc::clone(&entered),
+            resume: Arc::clone(&resume),
+            binding: parking_lot::Mutex::new(None),
+            tokens: parking_lot::Mutex::new(Vec::new()),
+        });
+        let executor = scheduler.register_executor(kicks.clone()).unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        let first = scheduler.take(&executor).unwrap();
+        let delayed = scheduler.decide_wake(context.thread().key()).unwrap();
+        let delivery_scheduler = Arc::clone(&scheduler);
+        let delivery = thread::spawn(move || delivery_scheduler.deliver_wake(delayed));
+
+        entered.wait();
+        scheduler.settle_runnable(first).unwrap();
+        let successor = scheduler.take(&executor).unwrap();
+        resume.wait();
+        assert_eq!(delivery.join().unwrap().unwrap(), WakeDisposition::Pending);
+        assert!(kicks.tokens.lock().is_empty());
+        scheduler.settle_exited(successor).unwrap();
+    }
+
+    #[test]
     fn take_discards_stale_rows_and_claims_only_the_exact_current_generation() {
         let (kernel, context) = bootstrap(12_108);
         publish(&context, 10);
@@ -1249,9 +1612,11 @@ mod tests {
     #[test]
     fn close_wakes_all_waiters_rejects_new_roots_and_drains_recursive_publication() {
         let (kernel, root) = bootstrap(12_110);
-        let child = sibling(&kernel, &root, 22_110);
+        let child = process_child(&kernel, &root, 22_110, "scheduler child");
+        let grandchild = process_child(&kernel, &child, 22_111, "scheduler grandchild");
         publish(&root, 12);
         publish(&child, 13);
+        publish(&grandchild, 14);
         let scheduler = Arc::new(Scheduler::new(kernel));
         let root_generation = root.thread().execution_state().generation().unwrap();
         let root_authority = scheduler
@@ -1291,7 +1656,15 @@ mod tests {
             thread::yield_now();
         }
 
+        let observation_gate = Arc::new(Barrier::new(3));
+        scheduler.install_close_observation_gate(Arc::clone(&observation_gate));
         scheduler.close();
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(1);
+        let close_scheduler = Arc::clone(&scheduler);
+        let close_wait = thread::spawn(move || {
+            close_scheduler.wait_closed();
+            closed_tx.send(()).unwrap();
+        });
         assert!(scheduler.make_runnable(child.thread().key()).is_err());
         assert!(
             scheduler
@@ -1301,25 +1674,103 @@ mod tests {
                 )
                 .is_err()
         );
-        let descendant = root_authority
+        let child_authority = root_authority
             .admit_descendant(
                 child.thread().key(),
                 child.thread().execution_state().generation().unwrap(),
             )
             .unwrap();
-        descendant
+        let grandchild_authority = child_authority
+            .admit_descendant(
+                grandchild.thread().key(),
+                grandchild.thread().execution_state().generation().unwrap(),
+            )
+            .unwrap();
+        child_authority
             .publish(&scheduler, Arc::clone(child.thread()))
             .unwrap();
-        drop(descendant);
+        grandchild_authority
+            .publish(&scheduler, Arc::clone(grandchild.thread()))
+            .unwrap();
+        drop(grandchild_authority);
+        drop(child_authority);
         drop(root_authority);
-        scheduler.wait_closed();
+        assert!(matches!(
+            closed_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        observation_gate.wait();
+        closed_rx.recv().unwrap();
+        close_wait.join().unwrap();
         for waiter in waiters {
             waiter.join().unwrap();
         }
 
-        assert_eq!(claimed.load(Ordering::SeqCst), 1);
+        assert_eq!(claimed.load(Ordering::SeqCst), 2);
         assert_eq!(closed.load(Ordering::SeqCst), 2);
         assert_eq!(scheduler.closed_waiter_observations(), 2);
+    }
+
+    #[test]
+    fn exited_grant_cannot_authorize_a_descendant_during_close() {
+        let (kernel, root) = bootstrap(12_118);
+        let child = process_child(&kernel, &root, 22_118, "exited grant child");
+        publish(&root, 23);
+        publish(&child, 24);
+        let scheduler = Scheduler::new(kernel);
+        let authority = scheduler
+            .admit_root(
+                root.thread().key(),
+                root.thread().execution_state().generation().unwrap(),
+            )
+            .unwrap();
+        let executor = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        scheduler.make_runnable(root.thread().key()).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+        scheduler.settle_exited(running).unwrap();
+        scheduler.close();
+
+        assert!(
+            authority
+                .admit_descendant(
+                    child.thread().key(),
+                    child.thread().execution_state().generation().unwrap(),
+                )
+                .is_err()
+        );
+        drop(authority);
+        scheduler.wait_closed();
+    }
+
+    #[test]
+    fn live_unrelated_process_cannot_be_admitted_as_a_descendant() {
+        let (kernel, root) = bootstrap(12_119);
+        let grant = process_child(&kernel, &root, 22_119, "grant child");
+        let unrelated = process_child(&kernel, &root, 22_120, "unrelated child");
+        publish(&root, 25);
+        publish(&grant, 26);
+        publish(&unrelated, 27);
+        let scheduler = Scheduler::new(kernel);
+        let authority = scheduler
+            .admit_root(
+                grant.thread().key(),
+                grant.thread().execution_state().generation().unwrap(),
+            )
+            .unwrap();
+        scheduler.close();
+
+        assert!(
+            authority
+                .admit_descendant(
+                    unrelated.thread().key(),
+                    unrelated.thread().execution_state().generation().unwrap(),
+                )
+                .is_err()
+        );
+        drop(authority);
+        scheduler.wait_closed();
     }
 
     #[test]

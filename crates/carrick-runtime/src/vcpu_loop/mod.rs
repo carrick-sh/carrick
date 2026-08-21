@@ -640,16 +640,14 @@ impl HvpatchRuntimeEndpoint {
     fn wake_scheduler_exact(
         &self,
         snapshot: &crate::kernel::core::KernelTaskSignalSnapshot,
-    ) -> bool {
+    ) -> Result<bool, crate::kernel::scheduler::SchedulerError> {
         let Some(scheduler) = self.scheduler.as_ref() else {
-            return false;
+            return Ok(false);
         };
         for thread in snapshot.threads() {
-            if let Err(error) = scheduler.wake(thread.key()) {
-                tracing::debug!(thread = ?thread.key(), %error, "exact scheduler wake rejected");
-            }
+            scheduler.wake(thread.key())?;
         }
-        true
+        Ok(true)
     }
 }
 
@@ -699,6 +697,7 @@ impl crate::kernel::TaskWaker for HvpatchTaskWaker {
 #[derive(Default)]
 pub(crate) struct HvpatchRuntimeDirectory {
     endpoints: Mutex<BTreeMap<crate::kernel::TaskKey, HvpatchRuntimeEndpoint>>,
+    scheduler: Mutex<Option<Arc<crate::kernel::scheduler::Scheduler>>>,
     /// Process-child host threads are shared-VM topology, not members of the
     /// creating process's Linux thread group. The outer root run owns their
     /// eventual joins; per-process finalizers must never treat them as sibling
@@ -707,6 +706,45 @@ pub(crate) struct HvpatchRuntimeDirectory {
 }
 
 impl HvpatchRuntimeDirectory {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Task 4 installs the persistent executor scheduler through this packaged seam"
+        )
+    )]
+    pub(crate) fn install_scheduler(
+        &self,
+        scheduler: Arc<crate::kernel::scheduler::Scheduler>,
+    ) -> Result<(), RuntimeError> {
+        let mut installed = self.scheduler.lock();
+        if installed.is_some() || !self.endpoints.lock().is_empty() {
+            return Err(RuntimeError::Unsupported(
+                "HVPatch scheduler must be installed exactly once before endpoint publication"
+                    .to_owned(),
+            ));
+        }
+        *installed = Some(scheduler);
+        Ok(())
+    }
+
+    fn register_endpoint(
+        &self,
+        task: crate::kernel::TaskKey,
+        kernel: Weak<KernelState>,
+        task_binding: crate::kernel::KernelTaskBinding,
+    ) {
+        let scheduler = self.scheduler.lock().clone();
+        self.register(
+            task,
+            HvpatchRuntimeEndpoint {
+                kernel,
+                task_binding,
+                scheduler,
+            },
+        );
+    }
+
     fn register(&self, task: crate::kernel::TaskKey, endpoint: HvpatchRuntimeEndpoint) {
         self.endpoints.lock().insert(task, endpoint);
     }
@@ -763,7 +801,10 @@ impl HvpatchRuntimeDirectory {
                 .dispatcher
                 .mark_in_process_signal_pending(signal_context, signal);
         }
-        let _scheduler_authoritative = endpoint.wake_scheduler_exact(&signal_snapshot);
+        if let Err(error) = endpoint.wake_scheduler_exact(&signal_snapshot) {
+            tracing::error!(parent = ?parent, %error, "authoritative scheduler wake rejected");
+            return;
+        }
         // Child waitability is independent of SIGCHLD disposition. The Kernel
         // zombie is durable, but a parent can be between its initial wait query
         // and host-wait enrollment when publication occurs; always nudge every
@@ -1248,14 +1289,7 @@ impl KernelState {
             kicker,
             signal_arrival: Arc::clone(&self.signal_arrival),
         }));
-        directory.register(
-            process.task_key(),
-            HvpatchRuntimeEndpoint {
-                kernel: Arc::downgrade(self),
-                task_binding: binding,
-                scheduler: None,
-            },
-        );
+        directory.register_endpoint(process.task_key(), Arc::downgrade(self), binding);
     }
 
     fn enroll_hvpatch_process_thread(&self, handle: std::thread::JoinHandle<()>) {
@@ -6533,6 +6567,15 @@ mod tests {
         fn wake_all_waiters(&self) {}
     }
 
+    #[derive(Debug, Default)]
+    struct EndpointRecordingWaker(std::sync::atomic::AtomicUsize);
+
+    impl crate::kernel::TaskWaker for EndpointRecordingWaker {
+        fn wake_task(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     #[test]
     fn hvpatch_migration_endpoint_routes_task_wake_to_exact_scheduler_generation() {
         let dispatcher = SyscallDispatcher::new();
@@ -6579,6 +6622,10 @@ mod tests {
         let scheduler = Arc::new(crate::kernel::scheduler::Scheduler::new(Arc::clone(
             context.kernel(),
         )));
+        let directory = HvpatchRuntimeDirectory::default();
+        directory
+            .install_scheduler(Arc::clone(&scheduler))
+            .expect("install packaged scheduler route");
         let kernel = Arc::new(KernelState::new(
             dispatcher,
             Arc::new(EndpointTestForkCoordinator),
@@ -6587,22 +6634,64 @@ mod tests {
             None,
             None,
         ));
-        let endpoint = HvpatchRuntimeEndpoint {
-            kernel: Arc::downgrade(&kernel),
-            task_binding: context.task_binding(),
-            scheduler: Some(Arc::clone(&scheduler)),
-        };
-        let snapshot = context
-            .task_binding()
-            .capture_signal_snapshot()
-            .expect("signal snapshot");
+        directory.register_endpoint(
+            context.task().key(),
+            Arc::downgrade(&kernel),
+            context.task_binding(),
+        );
+        let compatibility_wake = Arc::new(EndpointRecordingWaker::default());
+        context.task().set_waker(compatibility_wake.clone());
 
-        assert!(endpoint.wake_scheduler_exact(&snapshot));
+        directory.notify_child_exit(context.task().key(), None);
         assert_eq!(scheduler.queued_len(), 1);
+        assert_eq!(
+            compatibility_wake
+                .0
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
         assert!(matches!(
             context.thread().execution_state(),
             crate::kernel::objects::ThreadExecutionState::Runnable { .. }
         ));
+    }
+
+    #[test]
+    fn installed_scheduler_rejection_never_falls_back_to_broad_task_wake_authority() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        let scheduler = Arc::new(crate::kernel::scheduler::Scheduler::new(Arc::clone(
+            context.kernel(),
+        )));
+        let directory = HvpatchRuntimeDirectory::default();
+        directory
+            .install_scheduler(scheduler)
+            .expect("install packaged scheduler route");
+        let kernel = Arc::new(KernelState::new(
+            dispatcher,
+            Arc::new(EndpointTestForkCoordinator),
+            Arc::new(EndpointTestSignalArrival),
+            None,
+            None,
+            None,
+        ));
+        directory.register_endpoint(
+            context.task().key(),
+            Arc::downgrade(&kernel),
+            context.task_binding(),
+        );
+        let compatibility_wake = Arc::new(EndpointRecordingWaker::default());
+        context.task().set_waker(compatibility_wake.clone());
+
+        directory.notify_child_exit(context.task().key(), None);
+
+        assert_eq!(
+            compatibility_wake
+                .0
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a broad compatibility nudge cannot replace rejected scheduler authority"
+        );
     }
 
     #[test]
