@@ -2931,6 +2931,60 @@ pub fn fork_vcpu_snapshot_is_empty_for_executor_boundary() -> bool {
     FORK_VCPU_SNAPSHOT.with(|snapshot| snapshot.borrow().is_none())
 }
 
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn install_fork_vcpu_snapshot_for_executor_boundary_test() {
+    let snapshot = VcpuSnapshot {
+        core: Aarch64VcpuSnapshot {
+            gprs: [0; 31],
+            pc: 0,
+            pstate: 0,
+            sp_el0: 0,
+            sp_el1: 0,
+            elr_el1: 0,
+            spsr_el1: 0,
+            ttbr0: 0,
+            ttbr1: 0,
+            tcr: 0,
+            sctlr: 0,
+            mair: 0,
+            vbar: 0,
+            cpacr: 0,
+            tpidr_el0: 0,
+            tpidrro_el0: 0,
+            tpidr_el1: 0,
+            contextidr_el1: 0,
+            actlr_el1: 0,
+            vregs: [0; 32],
+            fpsr: 0,
+            fpcr: 0,
+        },
+        last_exit_class: 0,
+    };
+    FORK_VCPU_SNAPSHOT.with(|current| {
+        assert!(current.borrow().is_none());
+        *current.borrow_mut() = Some(snapshot);
+    });
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn clear_fork_vcpu_snapshot_for_executor_boundary_test() {
+    FORK_VCPU_SNAPSHOT.with(|snapshot| {
+        snapshot.borrow_mut().take();
+    });
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod executor_boundary_audit_tests {
+    #[test]
+    fn fork_snapshot_getter_detects_real_dirty_tls_and_clear() {
+        assert!(super::fork_vcpu_snapshot_is_empty_for_executor_boundary());
+        super::install_fork_vcpu_snapshot_for_executor_boundary_test();
+        assert!(!super::fork_vcpu_snapshot_is_empty_for_executor_boundary());
+        super::clear_fork_vcpu_snapshot_for_executor_boundary_test();
+        assert!(super::fork_vcpu_snapshot_is_empty_for_executor_boundary());
+    }
+}
+
 /// Clear the published fork VM (child path; the child is single-threaded).
 pub fn clear_rebuilt_vm_for_fork() {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

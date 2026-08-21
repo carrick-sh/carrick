@@ -72,6 +72,62 @@ pub(crate) fn executor_boundary_is_clear() -> bool {
         && RETIRING_FILE_TABLES.with(|stack| stack.borrow().is_empty())
 }
 
+#[cfg(test)]
+pub(crate) fn with_dirty_captured_resources_for_executor_test<R>(
+    context: &crate::kernel::KernelContext,
+    operation: impl FnOnce() -> R,
+) -> R {
+    with_captured_resources(context, operation)
+}
+
+#[cfg(test)]
+pub(crate) fn with_dirty_retiring_resources_for_executor_test<R>(
+    files: Arc<crate::kernel::FileTable>,
+    operation: impl FnOnce() -> R,
+) -> R {
+    with_retiring_file_table(files, operation)
+}
+
+#[cfg(test)]
+pub(crate) struct ExecutorBoundaryResourcesTestGuard {
+    context: Box<crate::kernel::KernelContext>,
+}
+
+#[cfg(test)]
+impl Drop for ExecutorBoundaryResourcesTestGuard {
+    fn drop(&mut self) {
+        RETIRING_FILE_TABLES.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+        CAPTURED_RESOURCES.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+        ACTIVE_CONTEXT.with(|active| {
+            assert!(std::ptr::eq(active.get(), self.context.as_ref()));
+            active.set(std::ptr::null());
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn dirty_executor_boundary_resources_guard_for_test()
+-> ExecutorBoundaryResourcesTestGuard {
+    let dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let context = Box::new(
+        dispatcher
+            .capture_one_task_context()
+            .expect("capture test resource context"),
+    );
+    let resources = CapturedResources::from_context(&context);
+    let files = resources.files();
+    ACTIVE_CONTEXT.with(|active| {
+        assert!(active.replace(context.as_ref()).is_null());
+    });
+    CAPTURED_RESOURCES.with(|stack| stack.borrow_mut().push(resources));
+    RETIRING_FILE_TABLES.with(|stack| stack.borrow_mut().push(files));
+    ExecutorBoundaryResourcesTestGuard { context }
+}
+
 pub(super) fn with_captured_resources<R>(
     context: &crate::kernel::KernelContext,
     operation: impl FnOnce() -> R,
