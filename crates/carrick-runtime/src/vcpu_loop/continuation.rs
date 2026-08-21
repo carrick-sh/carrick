@@ -3568,6 +3568,8 @@ struct TransitionalRunnerPool {
     scheduler: Arc<Mutex<Option<Arc<Scheduler>>>>,
     reject_next_submission: AtomicBool,
     reject_next_activation: Arc<AtomicBool>,
+    #[cfg(test)]
+    next_activation_probe: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl TransitionalRunnerPool {
@@ -3954,6 +3956,8 @@ impl TransitionalDedicatedRunner {
             scheduler: Arc::new(Mutex::new(None)),
             reject_next_submission: AtomicBool::new(false),
             reject_next_activation: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            next_activation_probe: Mutex::new(None),
         });
         for _ in 0..worker_count {
             pool.spawn_worker();
@@ -3994,12 +3998,13 @@ impl TransitionalDedicatedRunner {
             .task
             .as_ref()
             .ok_or(TransitionalRunnerError::TaskFailed)?;
-        if let Some(scheduler) = task.scheduler.lock().as_ref() {
-            scheduler.request_preemption();
-        }
+        let scheduler = task.scheduler.lock().clone();
         let activated = dormant.activate()?;
         if !activated.is_runner_visible() {
             return Err(TransitionalRunnerError::TaskFailed);
+        }
+        if let Some(scheduler) = scheduler {
+            scheduler.request_preemption();
         }
         Ok(receipt)
     }
@@ -4025,13 +4030,22 @@ impl TransitionalDedicatedRunner {
             let value = future.await;
             let _ = sender.send(value);
         };
+        #[cfg(test)]
+        let activation_committed = self
+            .pool
+            .next_activation_probe
+            .lock()
+            .take()
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        #[cfg(not(test))]
+        let activation_committed = Arc::new(AtomicBool::new(false));
         let task = Arc::new(RunnerTask {
             future: Mutex::new(Some(Box::pin(future))),
             sender: self.pool.sender.clone(),
             queued: AtomicBool::new(false),
             completion: completion.clone(),
             scheduler: Arc::clone(&self.pool.scheduler),
-            activation_committed: Arc::new(AtomicBool::new(false)),
+            activation_committed,
         });
         Ok((
             LogicalTaskReceipt {
@@ -4057,6 +4071,13 @@ impl TransitionalDedicatedRunner {
         self.pool
             .reject_next_activation
             .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activation_probe_for_next_spawn_for_test(&self) -> Arc<AtomicBool> {
+        let probe = Arc::new(AtomicBool::new(false));
+        *self.pool.next_activation_probe.lock() = Some(Arc::clone(&probe));
+        probe
     }
 
     pub fn topology(&self) -> TransitionalRunnerTopology {
@@ -6725,6 +6746,201 @@ mod tests {
             first_second < 8,
             "one job must not monopolize the only worker"
         );
+    }
+
+    #[test]
+    fn general_try_spawn_activates_before_hardware_preemption_and_both_jobs_progress() {
+        #[derive(Clone)]
+        struct VisibilityKick {
+            kicks: Arc<AtomicUsize>,
+            probe: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+            observed_visible: Arc<AtomicBool>,
+        }
+        impl carrick_hal::VcpuKickDyn for VisibilityKick {
+            fn kick(&self) {
+                let visible = self
+                    .probe
+                    .lock()
+                    .as_ref()
+                    .expect("general try_spawn activation probe")
+                    .load(Ordering::Acquire);
+                self.observed_visible.store(visible, Ordering::Release);
+                self.kicks.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (kernel, context) = bootstrap(15_470);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let generation = publish(&context, 0x915);
+        enqueue_root(&scheduler, &context, generation);
+        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
+        runner.attach_scheduler(Arc::clone(&scheduler));
+        let kicks = Arc::new(AtomicUsize::new(0));
+        let observed_visible = Arc::new(AtomicBool::new(false));
+        let probe = Arc::new(Mutex::new(None));
+        let incumbent_kicks = Arc::clone(&kicks);
+        let incumbent_observed = Arc::clone(&observed_visible);
+        let incumbent_probe = Arc::clone(&probe);
+        let incumbent_scheduler = Arc::clone(&scheduler);
+        let (started_tx, started_rx) = mpsc::channel();
+        let incumbent = runner.spawn(async move {
+            let executor = TransitionalDedicatedRunner::current_executor_registration()
+                .expect("incumbent worker registration");
+            let running = incumbent_scheduler
+                .take(&executor)
+                .expect("claim incumbent compute task");
+            assert!(TransitionalDedicatedRunner::publish_current_hardware_kick(
+                Box::new(VisibilityKick {
+                    kicks: Arc::clone(&incumbent_kicks),
+                    probe: incumbent_probe,
+                    observed_visible: incumbent_observed,
+                })
+            ));
+            started_tx.send(()).expect("incumbent started");
+            while incumbent_kicks.load(Ordering::Acquire) == 0 {
+                std::hint::spin_loop();
+            }
+            incumbent_scheduler
+                .settle_runnable_successor(running)
+                .expect("incumbent yields after general spawn kick");
+            1_u8
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("incumbent is compute-bound");
+
+        let competitor_context = context
+            .kernel()
+            .reserve_fork(
+                &context,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                "general try_spawn competitor".to_owned(),
+                None,
+            )
+            .expect("reserve competitor")
+            .prepare_reference(ThreadId::synthetic_for_tests(15_472))
+            .expect("prepare competitor")
+            .commit()
+            .expect("publish competitor")
+            .into_parts()
+            .expect("start competitor")
+            .0;
+        let competitor_generation = publish(&competitor_context, 0x917);
+        scheduler
+            .wake(competitor_context.thread().key())
+            .expect("publish exact competing scheduler row");
+        assert!(scheduler.need_resched());
+        let activation_probe = runner.activation_probe_for_next_spawn_for_test();
+        *probe.lock() = Some(activation_probe);
+        let competitor_scheduler = Arc::clone(&scheduler);
+        let competitor = runner
+            .try_spawn(async move {
+                let executor = TransitionalDedicatedRunner::current_executor_registration()
+                    .expect("competitor worker registration");
+                let running = competitor_scheduler
+                    .take(&executor)
+                    .expect("claim general competitor");
+                competitor_scheduler
+                    .settle_runnable_successor(running)
+                    .expect("settle general competitor");
+                2_u8
+            })
+            .expect("general competitor submission");
+
+        assert_eq!(kicks.load(Ordering::SeqCst), 1);
+        assert!(
+            observed_visible.load(Ordering::Acquire),
+            "general try_spawn hardware kick raced ahead of runner visibility"
+        );
+        assert_eq!(incumbent.wait().expect("incumbent progress"), 1);
+        assert_eq!(competitor.wait().expect("competitor progress"), 2);
+        assert_eq!(competitor_generation.raw(), 1);
+    }
+
+    #[test]
+    fn general_try_spawn_activation_failure_never_kicks_or_polls() {
+        #[derive(Clone)]
+        struct CountingKick(Arc<AtomicUsize>);
+        impl carrick_hal::VcpuKickDyn for CountingKick {
+            fn kick(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (kernel, context) = bootstrap(15_471);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let generation = publish(&context, 0x916);
+        enqueue_root(&scheduler, &context, generation);
+        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
+        runner.attach_scheduler(Arc::clone(&scheduler));
+        let kicks = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let incumbent_release = Arc::clone(&release);
+        let incumbent_scheduler = Arc::clone(&scheduler);
+        let incumbent_kicks = Arc::clone(&kicks);
+        let (started_tx, started_rx) = mpsc::channel();
+        let incumbent = runner.spawn(async move {
+            let executor = TransitionalDedicatedRunner::current_executor_registration()
+                .expect("incumbent worker registration");
+            let running = incumbent_scheduler
+                .take(&executor)
+                .expect("claim incumbent compute task");
+            assert!(TransitionalDedicatedRunner::publish_current_hardware_kick(
+                Box::new(CountingKick(incumbent_kicks))
+            ));
+            started_tx.send(()).expect("incumbent started");
+            while !incumbent_release.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            incumbent_scheduler
+                .settle_runnable_successor(running)
+                .expect("settle incumbent after failed spawn");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("incumbent is compute-bound");
+
+        let failed_context = context
+            .kernel()
+            .reserve_fork(
+                &context,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                "failed general try_spawn competitor".to_owned(),
+                None,
+            )
+            .expect("reserve failed competitor")
+            .prepare_reference(ThreadId::synthetic_for_tests(15_473))
+            .expect("prepare failed competitor")
+            .commit()
+            .expect("publish failed competitor")
+            .into_parts()
+            .expect("start failed competitor")
+            .0;
+        let failed_generation = publish(&failed_context, 0x918);
+        scheduler
+            .wake(failed_context.thread().key())
+            .expect("publish exact failed competitor row");
+        assert!(scheduler.need_resched());
+        let polled = Arc::new(AtomicUsize::new(0));
+        let failed_polled = Arc::clone(&polled);
+        runner.reject_next_activation_for_test();
+        let result = runner.try_spawn(async move {
+            failed_polled.fetch_add(1, Ordering::SeqCst);
+        });
+        let kick_count = kicks.load(Ordering::SeqCst);
+        scheduler
+            .fail_runnable_exact(
+                failed_context.thread().key(),
+                failed_generation,
+                crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
+            )
+            .expect("retire exact failed competitor row");
+        release.store(true, Ordering::Release);
+        incumbent.wait().expect("incumbent exits");
+
+        assert!(matches!(result, Err(TransitionalRunnerError::TaskFailed)));
+        assert_eq!(kick_count, 0, "failed activation must not kick incumbent");
+        assert_eq!(polled.load(Ordering::SeqCst), 0);
     }
 
     #[test]
