@@ -3553,6 +3553,8 @@ impl Task {
             signal_pending_hint: AtomicU64::new(0),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
+            start_gate_open: AtomicBool::new(true),
+            start_gate_proof_generation: AtomicU64::new(0),
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
             cpu_accounting: Arc::new(ThreadCpuAccounting::default()),
             crash_vote: Mutex::new(None),
@@ -3578,6 +3580,8 @@ impl Task {
             signal_pending_hint: AtomicU64::new(0),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
+            start_gate_open: AtomicBool::new(false),
+            start_gate_proof_generation: AtomicU64::new(0),
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
             cpu_accounting: Arc::new(ThreadCpuAccounting::default()),
             crash_vote: Mutex::new(None),
@@ -3603,6 +3607,8 @@ impl Task {
             signal_pending_hint: AtomicU64::new(0),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
+            start_gate_open: AtomicBool::new(false),
+            start_gate_proof_generation: AtomicU64::new(0),
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
             cpu_accounting: Arc::new(ThreadCpuAccounting::default()),
             crash_vote: Mutex::new(None),
@@ -3628,6 +3634,8 @@ impl Task {
             signal_pending_hint: AtomicU64::new(caller.signal_pending_hint.load(Ordering::Acquire)),
             revision: ObjectRevision::new(),
             runner_gate: Arc::clone(&caller.runner_gate),
+            start_gate_open: AtomicBool::new(true),
+            start_gate_proof_generation: AtomicU64::new(0),
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
             // The syscall service scope that committed exec still holds the
             // predecessor context until its final charge. Sharing this exact
@@ -4032,6 +4040,10 @@ pub struct ExecutionGeneration(u64);
 impl ExecutionGeneration {
     const INITIAL: Self = Self(1);
 
+    pub(crate) const fn initial_for_prepared_publication() -> Self {
+        Self::INITIAL
+    }
+
     fn next(self) -> Option<Self> {
         self.0.checked_add(1).map(Self)
     }
@@ -4053,6 +4065,10 @@ impl ExecutorId {
     pub(super) const fn from_scheduler(raw: u32) -> Self {
         debug_assert!(raw != 0);
         Self(raw)
+    }
+
+    pub(crate) const fn raw_for_probe(self) -> u32 {
+        self.0
     }
 
     /// Transitional exact owner for the current welded-thread scheduler. Task 4
@@ -4224,6 +4240,7 @@ pub enum ThreadExecutionError {
 pub(crate) enum ThreadSchedulerAction {
     Queue {
         key: ThreadKey,
+        predecessor: Option<ExecutionGeneration>,
         generation: ExecutionGeneration,
         closing_authorized: bool,
     },
@@ -4465,6 +4482,8 @@ pub struct Thread {
     signal_pending_hint: AtomicU64,
     revision: ObjectRevision,
     runner_gate: Arc<RunnerGate>,
+    start_gate_open: AtomicBool,
+    start_gate_proof_generation: AtomicU64,
     execution: Mutex<ThreadExecutionRecord>,
     /// Guest USER time charged directly to this exact logical thread across
     /// every host execution interval. Executor slots are never identities.
@@ -4506,7 +4525,47 @@ struct ThreadCpuAccounting {
     system_ns: AtomicU64,
 }
 
+#[derive(Debug)]
+pub(crate) struct OpenedStartGate {
+    thread: ThreadKey,
+    generation: ExecutionGeneration,
+}
+
+impl OpenedStartGate {
+    pub(crate) const fn thread(&self) -> ThreadKey {
+        self.thread
+    }
+
+    pub(crate) const fn generation(&self) -> ExecutionGeneration {
+        self.generation
+    }
+}
+
 impl Thread {
+    pub(super) fn open_start_gate(&self) {
+        self.start_gate_open.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn take_opened_start_gate(
+        &self,
+        generation: ExecutionGeneration,
+    ) -> Option<OpenedStartGate> {
+        let execution = self.execution.lock();
+        if !self.start_gate_open.load(Ordering::Acquire)
+            || execution.state.generation() != Some(generation)
+            || self
+                .start_gate_proof_generation
+                .compare_exchange(0, generation.raw(), Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return None;
+        }
+        Some(OpenedStartGate {
+            thread: self.key,
+            generation,
+        })
+    }
+
     pub(crate) fn parked_task_state_authority(
         &self,
         generation: ExecutionGeneration,
@@ -4587,19 +4646,24 @@ impl Thread {
         }
         let mut execution = self.execution.lock();
         let action = match execution.state {
-            ThreadExecutionState::Blocked { generation, .. } => {
-                let generation = generation
+            ThreadExecutionState::Blocked {
+                generation: predecessor,
+                ..
+            } => {
+                let generation = predecessor
                     .next()
                     .ok_or(ThreadExecutionError::GenerationExhausted)?;
                 execution.state = ThreadExecutionState::Runnable { generation };
                 ThreadSchedulerAction::Queue {
                     key: self.key,
+                    predecessor: Some(predecessor),
                     generation,
                     closing_authorized: true,
                 }
             }
             ThreadExecutionState::Runnable { generation } => ThreadSchedulerAction::Queue {
                 key: self.key,
+                predecessor: None,
                 generation,
                 closing_authorized: false,
             },
@@ -4933,6 +4997,56 @@ impl Thread {
         Ok(())
     }
 
+    /// Fail the exact scheduler claim when a backend violated the scoped
+    /// lease-return contract. The non-cloneable `RunnableThread` claim is the
+    /// authority; no replacement lease is fabricated.
+    pub(crate) fn fail_claimed_execution(
+        &self,
+        generation: ExecutionGeneration,
+        executor: ExecutorId,
+        executor_epoch: u64,
+        reason: ExecutionFailure,
+    ) -> Result<ExecutionGeneration, ThreadExecutionError> {
+        let mut execution = self.execution.lock();
+        if !matches!(
+            execution.state,
+            ThreadExecutionState::Running {
+                generation: current,
+                executor: current_executor,
+                executor_epoch: current_epoch,
+                ..
+            } | ThreadExecutionState::SwitchingOut {
+                generation: current,
+                executor: current_executor,
+                executor_epoch: current_epoch,
+                ..
+            } if current == generation
+                && current_executor == executor
+                && current_epoch == executor_epoch
+        ) {
+            return Err(ThreadExecutionError::InvalidTransition {
+                operation: "fail_claimed_execution",
+                state: execution.state,
+            });
+        }
+        let successor = generation
+            .next()
+            .ok_or(ThreadExecutionError::GenerationExhausted)?;
+        execution.task_state = None;
+        cancel_continuation_slot(
+            &mut execution.blocked_continuation,
+            crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
+        );
+        execution.exec_invalidation_pending = false;
+        execution.state = ThreadExecutionState::Failed {
+            generation: successor,
+            reason,
+        };
+        drop(execution);
+        self.revision.publish();
+        Ok(successor)
+    }
+
     /// Fail a task whose first backend snapshot could not be captured before a
     /// lease existed. No guessed or empty state is published.
     pub fn fail_uninitialized_snapshot(&self, reason: ExecutionFailure) {
@@ -4982,6 +5096,40 @@ impl Thread {
         drop(execution);
         self.revision.publish();
         Ok(())
+    }
+
+    /// Fail an exact dormant scheduler generation during carrier shutdown.
+    /// A blocked task owns no executor lease, so this is the only typed path
+    /// that can consume its saved task state and continuation without
+    /// fabricating executor authority.
+    pub(crate) fn fail_blocked_generation(
+        &self,
+        expected: ExecutionGeneration,
+        reason: ExecutionFailure,
+    ) -> Result<ExecutionGeneration, ThreadExecutionError> {
+        let mut execution = self.execution.lock();
+        if !matches!(
+            execution.state,
+            ThreadExecutionState::Blocked { generation, .. } if generation == expected
+        ) {
+            return Err(ThreadExecutionError::InvalidTransition {
+                operation: "fail_blocked_generation",
+                state: execution.state,
+            });
+        }
+        let generation = expected
+            .next()
+            .ok_or(ThreadExecutionError::GenerationExhausted)?;
+        execution.task_state = None;
+        cancel_continuation_slot(
+            &mut execution.blocked_continuation,
+            crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
+        );
+        execution.exec_invalidation_pending = false;
+        execution.state = ThreadExecutionState::Failed { generation, reason };
+        drop(execution);
+        self.revision.publish();
+        Ok(generation)
     }
 
     fn settle_execution_lease(
@@ -5037,6 +5185,7 @@ impl Thread {
                     if scheduler_owned {
                         action = ThreadSchedulerAction::Queue {
                             key: self.key,
+                            predecessor: Some(lease.generation),
                             generation,
                             closing_authorized: true,
                         };
@@ -5049,6 +5198,7 @@ impl Thread {
                         execution.state = ThreadExecutionState::Runnable { generation };
                         action = ThreadSchedulerAction::Queue {
                             key: self.key,
+                            predecessor: Some(lease.generation),
                             generation,
                             closing_authorized: true,
                         };
@@ -5072,6 +5222,7 @@ impl Thread {
                         execution.state = ThreadExecutionState::Runnable { generation };
                         action = ThreadSchedulerAction::Queue {
                             key: self.key,
+                            predecessor: Some(lease.generation),
                             generation,
                             closing_authorized: true,
                         };

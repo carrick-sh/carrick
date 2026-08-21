@@ -88,6 +88,95 @@ pub fn topology_lock() -> &'static Mutex<()> {
     L.get_or_init(|| Mutex::new(()))
 }
 
+struct TopologyReleaseListener {
+    expected_generation: u64,
+    callback: Arc<dyn Fn(u64) + Send + Sync + 'static>,
+}
+
+#[derive(Default)]
+struct TopologyReleasePublication {
+    generation: u64,
+    listeners: BTreeMap<u64, TopologyReleaseListener>,
+}
+
+fn topology_release_publication() -> &'static Mutex<TopologyReleasePublication> {
+    static PUBLICATION: OnceLock<Mutex<TopologyReleasePublication>> = OnceLock::new();
+    PUBLICATION.get_or_init(|| Mutex::new(TopologyReleasePublication::default()))
+}
+
+static NEXT_TOPOLOGY_LISTENER: AtomicU64 = AtomicU64::new(1);
+
+pub struct TopologyReleaseSubscription {
+    id: u64,
+    expected_generation: u64,
+}
+
+impl Drop for TopologyReleaseSubscription {
+    fn drop(&mut self) {
+        let mut publication = topology_release_publication().lock().unwrap();
+        if publication
+            .listeners
+            .get(&self.id)
+            .is_some_and(|listener| listener.expected_generation == self.expected_generation)
+        {
+            publication.listeners.remove(&self.id);
+        }
+    }
+}
+
+pub enum TopologyReleaseEnrollment {
+    Ready(u64),
+    Subscribed(TopologyReleaseSubscription),
+}
+
+pub fn topology_release_generation() -> u64 {
+    topology_release_publication().lock().unwrap().generation
+}
+
+pub fn subscribe_topology_release(
+    expected_generation: u64,
+    callback: Arc<dyn Fn(u64) + Send + Sync + 'static>,
+) -> TopologyReleaseEnrollment {
+    let mut publication = topology_release_publication().lock().unwrap();
+    if publication.generation != expected_generation {
+        return TopologyReleaseEnrollment::Ready(publication.generation);
+    }
+    let id = NEXT_TOPOLOGY_LISTENER.fetch_add(1, Ordering::Relaxed);
+    if id == 0 || id == u64::MAX {
+        std::process::abort();
+    }
+    publication.listeners.insert(
+        id,
+        TopologyReleaseListener {
+            expected_generation,
+            callback,
+        },
+    );
+    TopologyReleaseEnrollment::Subscribed(TopologyReleaseSubscription {
+        id,
+        expected_generation,
+    })
+}
+
+fn publish_topology_release() {
+    let (generation, callbacks) = {
+        let mut publication = topology_release_publication().lock().unwrap();
+        publication.generation = publication
+            .generation
+            .checked_add(1)
+            .unwrap_or_else(|| std::process::abort());
+        let generation = publication.generation;
+        let callbacks = std::mem::take(&mut publication.listeners)
+            .into_values()
+            .map(|listener| listener.callback)
+            .collect::<Vec<_>>();
+        (generation, callbacks)
+    };
+    for callback in callbacks {
+        callback(generation);
+    }
+}
+
 thread_local! {
     /// How many topology-lock guards THIS thread currently holds.
     ///
@@ -162,6 +251,8 @@ impl Drop for TopologyLockGuard {
             self.guest_tid,
             topology_elapsed_ns(self.acquired_at),
         );
+        drop(self._guard.take());
+        publish_topology_release();
     }
 }
 
@@ -318,6 +409,33 @@ mod topology_probe_tests {
             "the outermost guard drop must release the mutex process-wide"
         );
     }
+
+    #[test]
+    fn topology_try_miss_subscribes_to_exact_release_without_blocking() {
+        let outer = acquire_topology_lock(HvpatchTopologyOperation::InProcessFork, 51, 52);
+        let observed = topology_release_generation();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            assert!(
+                try_acquire_topology_lock(HvpatchTopologyOperation::InProcessFork, 53, 54)
+                    .is_none()
+            );
+            match subscribe_topology_release(
+                observed,
+                Arc::new(move |generation| {
+                    let _ = tx.send(generation);
+                }),
+            ) {
+                TopologyReleaseEnrollment::Subscribed(subscription) => subscription,
+                TopologyReleaseEnrollment::Ready(_) => panic!("release raced test enrollment"),
+            }
+        });
+        let subscription = waiter.join().unwrap();
+        assert!(rx.try_recv().is_err());
+        drop(outer);
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap() > observed);
+        drop(subscription);
+    }
 }
 
 fn exec_owner() -> &'static AtomicI32 {
@@ -426,6 +544,46 @@ pub struct QuiesceSubscription {
     expected_generation: u64,
 }
 
+pub type QuiesceProgressCallback = Arc<dyn Fn(u64) + Send + Sync + 'static>;
+
+struct QuiesceProgressListener {
+    expected_generation: u64,
+    callback: QuiesceProgressCallback,
+}
+
+#[derive(Default)]
+struct QuiesceProgressPublication {
+    generation: u64,
+    listeners: BTreeMap<u64, QuiesceProgressListener>,
+}
+
+pub struct QuiesceProgressSubscription {
+    barrier: Weak<QuiesceBarrier>,
+    id: u64,
+    expected_generation: u64,
+}
+
+impl Drop for QuiesceProgressSubscription {
+    fn drop(&mut self) {
+        let Some(barrier) = self.barrier.upgrade() else {
+            return;
+        };
+        let mut progress = barrier.progress.lock().unwrap();
+        if progress
+            .listeners
+            .get(&self.id)
+            .is_some_and(|listener| listener.expected_generation == self.expected_generation)
+        {
+            progress.listeners.remove(&self.id);
+        }
+    }
+}
+
+pub enum QuiesceProgressEnrollment {
+    Ready(u64),
+    Subscribed(QuiesceProgressSubscription),
+}
+
 impl Drop for QuiesceSubscription {
     fn drop(&mut self) {
         let Some(barrier) = self.barrier.upgrade() else {
@@ -453,6 +611,7 @@ pub struct QuiesceBarrier {
     paused: Mutex<usize>,
     cv: Condvar,
     publication: Mutex<QuiescePublication>,
+    progress: Mutex<QuiesceProgressPublication>,
     next_listener: AtomicU64,
 }
 
@@ -485,6 +644,7 @@ impl QuiesceBarrier {
                 kind: QuiesceEventKind::Released,
                 listeners: BTreeMap::new(),
             }),
+            progress: Mutex::new(QuiesceProgressPublication::default()),
             next_listener: AtomicU64::new(1),
         }
     }
@@ -503,6 +663,7 @@ impl QuiesceBarrier {
     /// Release the fork serialization (every handle_fork exit path).
     pub fn end_fork(&self) {
         self.forking.store(false, Ordering::SeqCst);
+        self.publish_quiesce_event(QuiesceEventKind::Released);
     }
 
     /// Step 1 (forking thread): raise the quiesce flag. The caller then wakes
@@ -570,6 +731,59 @@ impl QuiesceBarrier {
         let _g = self.paused.lock().unwrap();
         self.cv.notify_all();
         self.publish_quiesce_event(QuiesceEventKind::Released);
+    }
+
+    /// Publish exact progress after a logical sibling has detached its worker
+    /// during process-fork quiesce. The coordinator subscribes instead of
+    /// polling a vCPU count while occupying a worker.
+    pub fn notify_quiesced_progress(&self) {
+        let (generation, callbacks) = {
+            let mut progress = self.progress.lock().unwrap();
+            progress.generation = progress
+                .generation
+                .checked_add(1)
+                .unwrap_or_else(|| std::process::abort());
+            let generation = progress.generation;
+            let callbacks = std::mem::take(&mut progress.listeners)
+                .into_values()
+                .map(|listener| listener.callback)
+                .collect::<Vec<_>>();
+            (generation, callbacks)
+        };
+        for callback in callbacks {
+            callback(generation);
+        }
+    }
+
+    pub fn progress_generation(&self) -> u64 {
+        self.progress.lock().unwrap().generation
+    }
+
+    pub fn subscribe_quiesced_progress(
+        self: &Arc<Self>,
+        expected_generation: u64,
+        callback: QuiesceProgressCallback,
+    ) -> QuiesceProgressEnrollment {
+        let mut progress = self.progress.lock().unwrap();
+        if progress.generation != expected_generation {
+            return QuiesceProgressEnrollment::Ready(progress.generation);
+        }
+        let id = self.next_listener.fetch_add(1, Ordering::Relaxed);
+        if id == 0 || id == u64::MAX {
+            std::process::abort();
+        }
+        progress.listeners.insert(
+            id,
+            QuiesceProgressListener {
+                expected_generation,
+                callback,
+            },
+        );
+        QuiesceProgressEnrollment::Subscribed(QuiesceProgressSubscription {
+            barrier: Arc::downgrade(self),
+            id,
+            expected_generation,
+        })
     }
 
     pub fn publication_generation(&self) -> u64 {
@@ -881,6 +1095,36 @@ mod tests {
         barrier.set_quiescing();
         barrier.end_quiesce();
         assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn logical_progress_wakes_coordinator_without_consuming_sibling_release() {
+        let barrier = Arc::new(QuiesceBarrier::new());
+        barrier.set_quiescing();
+        let release_events = Arc::new(Mutex::new(Vec::new()));
+        let release_capture = Arc::clone(&release_events);
+        let release = match barrier.subscribe_quiesce(
+            barrier.publication_generation(),
+            Arc::new(move |event| release_capture.lock().unwrap().push(event)),
+        ) {
+            QuiesceEnrollment::Subscribed(subscription) => subscription,
+            QuiesceEnrollment::Ready(_) => panic!("stable release generation"),
+        };
+        let progress_events = Arc::new(Mutex::new(Vec::new()));
+        let progress_capture = Arc::clone(&progress_events);
+        let progress = match barrier.subscribe_quiesced_progress(
+            barrier.progress_generation(),
+            Arc::new(move |generation| progress_capture.lock().unwrap().push(generation)),
+        ) {
+            QuiesceProgressEnrollment::Subscribed(subscription) => subscription,
+            QuiesceProgressEnrollment::Ready(_) => panic!("stable progress generation"),
+        };
+        barrier.notify_quiesced_progress();
+        assert_eq!(progress_events.lock().unwrap().as_slice(), &[1]);
+        assert!(release_events.lock().unwrap().is_empty());
+        barrier.end_quiesce();
+        assert_eq!(release_events.lock().unwrap().len(), 1);
+        drop((progress, release));
     }
 
     /// Hermetic stress of the REAL fork-quiesce protocol — the coordination that

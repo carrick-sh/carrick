@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use super::asid::AsidError;
+use super::asid::{AsidError, AsidResidencyError};
 use super::stage1_mm::{
     PreparedStage1Mm, Stage1MmBackend, Stage1MmError, Stage1MmLease, Stage1MmPool,
     Stage1MmRetirement,
@@ -13,6 +13,19 @@ use crate::kernel::{Stage1RootError, TaskKey};
 #[derive(Debug)]
 pub(crate) struct RetiredStage1Mm {
     retirement: Option<Stage1MmRetirement>,
+}
+
+impl RetiredStage1Mm {
+    pub(crate) fn retirement(&self) -> Option<&Stage1MmRetirement> {
+        self.retirement.as_ref()
+    }
+
+    pub(crate) fn complete(self) -> Result<(), MmResourcesError> {
+        match self.retirement {
+            Some(retirement) => retirement.complete().map_err(Into::into),
+            None => Ok(()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -31,6 +44,12 @@ pub(crate) enum MmResourcesError {
     Stage1Root(#[from] Stage1RootError),
     #[error("all hvpatch stage-1 root slots are live or awaiting TLB-safe reuse")]
     RootSlotExhausted,
+    #[error("hvpatch stage-1 mm retirement still awaits executor invalidation")]
+    RetirementIncomplete,
+    #[error("hvpatch stage-1 retirement belongs to another allocator")]
+    ForeignRetirement,
+    #[error(transparent)]
+    Residency(#[from] AsidResidencyError),
 }
 
 impl From<AsidError> for MmResourcesError {
@@ -49,6 +68,9 @@ impl From<Stage1MmError> for MmResourcesError {
             Stage1MmError::Asid(error) => Self::Asid(error),
             Stage1MmError::Stage1Root(error) => Self::Stage1Root(error),
             Stage1MmError::RootSlotExhausted | Stage1MmError::Retired => Self::RootSlotExhausted,
+            Stage1MmError::RetirementIncomplete => Self::RetirementIncomplete,
+            Stage1MmError::ForeignRetirement => Self::ForeignRetirement,
+            Stage1MmError::Residency(error) => Self::Residency(error),
         }
     }
 }
@@ -170,21 +192,39 @@ impl MmResources {
             .and_then(|lease| lease.root_slot())
     }
 
-    pub(crate) fn publish_exec(
-        &self,
-        task: TaskKey,
-        new_stage1_root: u64,
-    ) -> Result<crate::kernel::MmBinding, MmResourcesError> {
-        let lease = self
-            .state
+    pub(crate) fn lease(&self, task: TaskKey) -> Result<Arc<Stage1MmLease>, MmResourcesError> {
+        self.state
             .lock()
             .leases
             .get(&task)
             .cloned()
+            .ok_or(MmResourcesError::UnknownTask(task))
+    }
+
+    pub(crate) fn prepare_exec(&self, task: TaskKey) -> Result<PreparedStage1Mm, MmResourcesError> {
+        if !self.state.lock().leases.contains_key(&task) {
+            return Err(MmResourcesError::UnknownTask(task));
+        }
+        self.mm_pool.prepare_child().map_err(Into::into)
+    }
+
+    pub(crate) fn commit_exec(
+        &self,
+        task: TaskKey,
+        prepared: PreparedStage1Mm,
+        stage1_root: u64,
+    ) -> Result<(Arc<Stage1MmLease>, Stage1MmRetirement), MmResourcesError> {
+        let mut state = self.state.lock();
+        let predecessor = state
+            .leases
+            .get(&task)
+            .cloned()
             .ok_or(MmResourcesError::UnknownTask(task))?;
-        lease
-            .publish_stage1_root(new_stage1_root)
-            .map_err(Into::into)
+        prepared.publish_stage1_root(stage1_root)?;
+        let retirement = self.mm_pool.retire(&predecessor)?;
+        let replacement = prepared.commit();
+        state.leases.insert(task, Arc::clone(&replacement));
+        Ok((replacement, retirement))
     }
 
     /// Detach one exact task generation from its prototype mm. Shared-mm clones
@@ -297,14 +337,28 @@ mod tests {
     }
 
     #[test]
-    fn exec_publishes_a_new_binding_without_mutating_the_old_observer() {
+    fn exec_allocates_fresh_asid_and_root_without_mutating_the_old_observer() {
         let root = task(70, 1);
         let (resources, backend) = resources(root, 2);
         let old = backend.binding();
-        let replacement = resources.publish_exec(root, 0xc000).unwrap();
-        assert_eq!(replacement.asid, old.asid);
-        assert_eq!(replacement.stage1_root.gpa().raw(), 0xc000);
+        let prepared = resources.prepare_exec(root).unwrap();
+        let replacement_generation = prepared.asid_generation();
+        let replacement_root = prepared.root_slot().unwrap().base();
+        let (replacement, retired) = resources
+            .commit_exec(root, prepared, replacement_root)
+            .unwrap();
+        assert_ne!(replacement.binding().asid, old.asid);
+        assert_eq!(
+            replacement.binding().stage1_root.gpa().raw(),
+            replacement_root
+        );
+        assert_eq!(replacement.asid_generation(), replacement_generation);
         assert_eq!(backend.binding(), old);
+        resources
+            .acknowledge_tlb_flush(RetiredStage1Mm {
+                retirement: Some(retired),
+            })
+            .unwrap();
     }
 
     #[test]
@@ -330,7 +384,7 @@ mod tests {
         resources.acknowledge_tlb_flush(duplicate).unwrap();
         assert_eq!(replacement_backend.binding(), replacement_binding);
         assert!(matches!(
-            resources.publish_exec(old, 0xd000),
+            resources.prepare_exec(old),
             Err(MmResourcesError::UnknownTask(key)) if key == old
         ));
         assert_eq!(replacement_backend.binding(), replacement_binding);

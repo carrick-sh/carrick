@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use carrick_hal::{FrameEventCapacity, FrameInventoryReservation, ThreadId};
@@ -39,6 +40,34 @@ pub struct KernelContext {
 }
 
 impl KernelContext {
+    pub(crate) fn issue_hvpatch_child_token(
+        &self,
+        cow_authority: Arc<dyn carrick_hal::FrameCowAuthority>,
+        cow_identity: carrick_hal::FrameCowIdentity,
+        authority_identity: std::num::NonZeroU64,
+    ) -> Result<carrick_hal::HvpatchChildKernelToken, KernelError> {
+        let generation = self
+            .thread
+            .execution_state()
+            .generation()
+            .ok_or(KernelError::StaleTaskBinding(self.task.key().id))?;
+        if cow_identity.linux_pid != self.task.key().id.raw()
+            || cow_identity.linux_tid != self.thread.key().tid.raw()
+            || cow_identity.mm != self.shared.mm().id().raw()
+            || cow_identity.asid == 0
+        {
+            return Err(KernelError::StaleTaskBinding(self.task.key().id));
+        }
+        Ok(self.kernel.hvpatch_child_token_issuer.issue(
+            self.task.key().serial.raw(),
+            self.thread.key().serial.raw(),
+            generation.raw(),
+            cow_identity,
+            authority_identity,
+            cow_authority,
+        ))
+    }
+
     pub fn kernel(&self) -> &Arc<Kernel> {
         &self.kernel
     }
@@ -287,6 +316,9 @@ pub struct Kernel {
     ids: IdRegistry,
     object_ids: ObjectIdRegistry,
     frame_inventory: FrameInventoryAuthority,
+    hvpatch_child_token_issuer: Arc<carrick_hal::HvpatchChildTokenIssuer>,
+    #[allow(dead_code)] // consumed by the HVPatch carrier-directory publication slice
+    hvpatch_child_token_verifier: Arc<carrick_hal::HvpatchChildTokenVerifier>,
     pub(super) observations: Mutex<ObservationInventory>,
     pub(super) exit_subscribers: TaskExitSubscribers,
     pub(super) pending_file_closes: Mutex<Vec<FileCloseEvent>>,
@@ -437,14 +469,56 @@ impl ObservationInventory {
     }
 }
 
-#[derive(Debug, Default)]
+type ReservationSubscriber = Arc<dyn Fn() + Send + Sync + 'static>;
+type ReservationSubscribers = BTreeMap<u64, ReservationSubscriber>;
+
 struct ReservationGate {
     epoch: Mutex<u64>,
     changed: Condvar,
+    next_subscriber: AtomicU64,
+    subscribers: Arc<Mutex<ReservationSubscribers>>,
     #[cfg(test)]
     waiters: Mutex<usize>,
     #[cfg(test)]
     waiters_changed: Condvar,
+}
+
+impl Default for ReservationGate {
+    fn default() -> Self {
+        Self {
+            epoch: Mutex::new(0),
+            changed: Condvar::new(),
+            next_subscriber: AtomicU64::new(1),
+            subscribers: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(test)]
+            waiters: Mutex::new(0),
+            #[cfg(test)]
+            waiters_changed: Condvar::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ReservationGate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReservationGate")
+            .field("epoch", &*self.epoch.lock())
+            .field("subscribers", &self.subscribers.lock().len())
+            .finish()
+    }
+}
+
+pub(crate) struct ReservationChangeSubscription {
+    subscribers: std::sync::Weak<Mutex<ReservationSubscribers>>,
+    id: u64,
+}
+
+impl Drop for ReservationChangeSubscription {
+    fn drop(&mut self) {
+        if let Some(subscribers) = self.subscribers.upgrade() {
+            subscribers.lock().remove(&self.id);
+        }
+    }
 }
 
 impl ReservationGate {
@@ -455,7 +529,40 @@ impl ReservationGate {
     fn publish_change(&self) {
         let mut epoch = self.epoch.lock();
         *epoch = epoch.wrapping_add(1);
+        let callbacks = std::mem::take(&mut *self.subscribers.lock());
         self.changed.notify_all();
+        drop(epoch);
+        for callback in callbacks.into_values() {
+            callback();
+        }
+    }
+
+    fn subscribe(
+        &self,
+        observed: u64,
+        callback: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) -> Option<ReservationChangeSubscription> {
+        let epoch = self.epoch.lock();
+        if *epoch != observed {
+            drop(epoch);
+            callback();
+            return None;
+        }
+        let id = self
+            .next_subscriber
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .unwrap_or_else(|_| std::process::abort());
+        if id == 0 {
+            std::process::abort();
+        }
+        self.subscribers.lock().insert(id, callback);
+        drop(epoch);
+        Some(ReservationChangeSubscription {
+            subscribers: Arc::downgrade(&self.subscribers),
+            id,
+        })
     }
 
     fn wait_for_change(&self, observed: u64) {
@@ -769,12 +876,16 @@ impl Kernel {
             &leader.resources(),
             TaskRevision::INITIAL,
         );
+        let (hvpatch_child_token_issuer, hvpatch_child_token_verifier) =
+            carrick_hal::HvpatchChildTokenIssuer::new_pair();
         let kernel = Arc::new(Self {
             domain: Arc::new(KernelDomain),
             registry,
             ids,
             object_ids,
             frame_inventory: FrameInventoryAuthority::new(),
+            hvpatch_child_token_issuer,
+            hvpatch_child_token_verifier,
             observations: Mutex::new(observations),
             exit_subscribers: TaskExitSubscribers::default(),
             pending_file_closes: Mutex::new(Vec::new()),
@@ -892,6 +1003,13 @@ impl Kernel {
         &self.frame_inventory
     }
 
+    #[allow(dead_code)] // consumed by the HVPatch carrier-directory publication slice
+    pub(crate) fn hvpatch_child_token_verifier(
+        &self,
+    ) -> Arc<carrick_hal::HvpatchChildTokenVerifier> {
+        Arc::clone(&self.hvpatch_child_token_verifier)
+    }
+
     /// Allocate every candidate ID and all batch storage before entering a
     /// backend topology lock. Unclaimed candidates intentionally burn.
     pub fn reserve_frame_inventory(
@@ -914,6 +1032,14 @@ impl Kernel {
 
     pub(crate) fn publish_reservation_change(&self) {
         self.reservation_gate.publish_change();
+    }
+
+    pub(crate) fn subscribe_reservation_change(
+        &self,
+        observed: u64,
+        callback: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) -> Option<ReservationChangeSubscription> {
+        self.reservation_gate.subscribe(observed, callback)
     }
 
     pub(crate) fn wait_for_reservation_change(&self, observed: u64) {

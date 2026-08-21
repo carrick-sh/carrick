@@ -39,6 +39,7 @@ pub use crash_capture::{
 pub use foreign_mm::ForeignMmAccess;
 pub use mm_transaction::{MmTransaction, StagedMmOp};
 
+pub(crate) use core::ReservationChangeSubscription;
 pub use core::{
     Kernel, KernelContext, KernelError, KernelTaskBinding, Registry, RegistryInvariantError,
     RootBootstrap, TaskExitSubscriber, TaskRevision, VforkParentWait, VforkReleaseReason,
@@ -76,7 +77,7 @@ pub use operations::{
     PreparedFork, PreparedTaskExit, PreparedThreadClone, ProcessIdentity, ProcessState,
     PublishedFork, PublishedThreadClone, ReservedPidfdSubscription, SignalTargetAuthorization,
     StartedFork, StartedThreadClone, TaskIdentity, TaskOperationReservation,
-    ThreadCloneReservation, WaitMode, WaitOutcome,
+    ThreadCloneReservation, ThreadPublicationReservationAttempt, WaitMode, WaitOutcome,
 };
 pub(crate) use operations::{ExactSignalTargetAuthorization, ExactThreadSignalPost};
 pub use registry::{

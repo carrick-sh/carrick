@@ -1629,6 +1629,31 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_final_thread_withdrawals_choose_exactly_one_last_thread() {
+        let main = ThreadId::synthetic_for_tests(1_010);
+        let sibling = ThreadId::synthetic_for_tests(1_011);
+        let registry = Arc::new(ThreadRegistry::new(main));
+        registry.register_child_with_tid(sibling, 0);
+        let barrier = Arc::new(Barrier::new(3));
+
+        let retire = |tid| {
+            let registry = Arc::clone(&registry);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                registry.exit(tid)
+            })
+        };
+        let first = retire(main);
+        let second = retire(sibling);
+        barrier.wait();
+
+        let outcomes = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(outcomes.into_iter().filter(|last| *last).count(), 1);
+        assert_eq!(registry.live_count(), 0);
+    }
+
+    #[test]
     fn tracks_guest_visible_thread_state() {
         let reg = ThreadRegistry::new(ThreadId::synthetic_for_tests(1000));
         let t = reg.register_child(0);

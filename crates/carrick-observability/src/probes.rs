@@ -247,6 +247,26 @@ impl HvpatchCloneThreadPhase {
     }
 }
 
+/// Persistent HVPatch executor lifecycle. These ordinals are a stable DTrace
+/// ABI: append only. `Switch` is emitted after one task is fully saved/cleared
+/// and before the successor load begins on the same executor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchExecutorLifecyclePhase {
+    Create = 0,
+    Load = 1,
+    Save = 2,
+    Switch = 3,
+    Destroy = 4,
+    InvalidateAsid = 5,
+}
+
+impl HvpatchExecutorLifecyclePhase {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
 /// Why one HVPatch host vCPU loop stopped representing a Linux thread.
 ///
 /// The Linux TID and Carrick `ThreadRegistry` ID are deliberately separate in
@@ -2442,6 +2462,26 @@ mod hvpatch_guest_probe_abi {
     }
 
     #[test]
+    fn hvpatch_executor_lifecycle_provider_keeps_exact_generation_identity() {
+        assert_eq!(HvpatchExecutorLifecyclePhase::Create.raw(), 0);
+        assert_eq!(HvpatchExecutorLifecyclePhase::Load.raw(), 1);
+        assert_eq!(HvpatchExecutorLifecyclePhase::Save.raw(), 2);
+        assert_eq!(HvpatchExecutorLifecyclePhase::Switch.raw(), 3);
+        assert_eq!(HvpatchExecutorLifecyclePhase::Destroy.raw(), 4);
+        assert_eq!(HvpatchExecutorLifecyclePhase::InvalidateAsid.raw(), 5);
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__executor__lifecycle(_: u32, _: u32, _: u64, _: u64, _: u64) {}",
+            "stub!(hvpatch_executor_lifecycle(",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing HVPatch executor lifecycle ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
     fn hvpatch_thread_terminal_provider_keeps_runtime_and_linux_identity_distinct() {
         assert_eq!(HvpatchThreadTerminalReason::GuestThreadExit.raw(), 0);
         assert_eq!(
@@ -4564,6 +4604,9 @@ mod real {
         /// HVPatch thread-clone outcome: Linux tid, stable
         /// `HvpatchCloneThreadPhase` ordinal, and Linux errno (zero on success).
         fn mn__clone__outcome(_: i32, _: u32, _: i32) {}
+        /// Persistent executor identity and exact task/ASID generation at one
+        /// owner-thread lifecycle boundary.
+        fn hvpatch__executor__lifecycle(_: u32, _: u32, _: u64, _: u64, _: u64) {}
         /// Linux clone TID-output publication: reserved tid, stable output-role
         /// ordinal, guest address, and stable backend memory-result ordinal.
         fn mn__clone__tid__output(_: i32, _: u32, _: u64, _: u32) {}
@@ -5212,6 +5255,22 @@ mod real {
 
     pub fn mn_clone_outcome(tid: i32, phase: super::HvpatchCloneThreadPhase, errno: i32) {
         carrick_usdt::mn__clone__outcome!(|| (tid, phase.raw(), errno));
+    }
+
+    pub fn hvpatch_executor_lifecycle(
+        executor: u32,
+        phase: super::HvpatchExecutorLifecyclePhase,
+        thread_serial: u64,
+        execution_generation: u64,
+        asid_generation: u64,
+    ) {
+        carrick_usdt::hvpatch__executor__lifecycle!(|| (
+            executor,
+            phase.raw(),
+            thread_serial,
+            execution_generation,
+            asid_generation
+        ));
     }
 
     #[inline(never)]
@@ -7052,6 +7111,13 @@ mod stub {
     stub!(mn_admit(tid: i32, slot: u32, budget: u32));
     stub!(mn_reclaim(tid: i32, old_slot: u32, new_slot: u32, kind: i32));
     stub!(mn_clone_outcome(tid: i32, phase: super::HvpatchCloneThreadPhase, errno: i32));
+    stub!(hvpatch_executor_lifecycle(
+        executor: u32,
+        phase: super::HvpatchExecutorLifecyclePhase,
+        thread_serial: u64,
+        execution_generation: u64,
+        asid_generation: u64
+    ));
     stub!(hvpatch_thread_terminal(pid: i32, linux_tid: i32, registry_tid: i32, reason: super::HvpatchThreadTerminalReason, detail: i32));
     stub!(mn_clone_tid_output(
         tid: i32,

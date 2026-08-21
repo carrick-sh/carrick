@@ -43,6 +43,15 @@ use crate::vmm::{
     Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy, FrameCowWriteIntent,
 };
 
+/// HVPatch installs this scoped-ASID routine into the existing EL1 maintenance
+/// page's NOP tail. Other AArch64 backends do not invoke it until they install
+/// the same backend completion sequence at this address.
+pub const HVPATCH_EL1_ASID_MAINT_BASE: u64 = carrick_mem::memory::LINUX_EL1_ASID_MAINT_BASE;
+
+pub fn asid_maintenance_bytes() -> Vec<u8> {
+    carrick_mem::memory::el1_asid_maintenance_bytes()
+}
+
 /// Remove Carrick's HVPatch root/global-frame aperture from an AArch64
 /// stage-1 image before it is published for an HvPatch process.
 ///
@@ -150,6 +159,225 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// fault per page as the copy touches it, and a `munmap`/`madvise` on drop.
     /// A successful commit hands the buffer back here instead of freeing it.
     pt_snapshot_scratch: Option<PageTableManager>,
+}
+
+pub struct Aarch64TaskEngineState<V: Aarch64Vmm> {
+    vm: V,
+    pending_resume_pc: Option<u64>,
+    last_syscall_nr: Option<u64>,
+    last_syscall_orig_x0: u64,
+    last_fault_esr: u64,
+    last_exit_class: u64,
+    is_forked_child: bool,
+    process_asid: Option<u16>,
+    mm_generation: u64,
+    asid_generation: u64,
+    pending_guest_run_receipt_ns: u64,
+    page_tables: Arc<Mutex<Option<PageTableManager>>>,
+    protections: Arc<MemoryProtections>,
+    fork_arena_high_water: u64,
+    pending_process_fork: Option<ParentForkCowRollback>,
+    pt_snapshot_scratch: Option<PageTableManager>,
+}
+unsafe impl<V: Aarch64Vmm> Send for Aarch64TaskEngineState<V> {}
+
+impl<V: Aarch64Vmm> Aarch64TaskEngineState<V> {
+    pub fn backend_mut(&mut self) -> &mut V {
+        &mut self.vm
+    }
+}
+
+impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
+    /// Borrow the VM-bearing backend while preparing a persistent executor
+    /// factory. Task state extraction below remains the only consuming split.
+    pub fn backend(&self) -> &V {
+        &self.vm
+    }
+
+    /// Attach one task-only HVPatch binding to a worker-injected backend/vCPU.
+    /// The binding contributes only shared logical task state; VM/vCPU owner
+    /// identity comes from the worker for this resident interval.
+    pub fn from_injected_task_only_backend(
+        mut vm: V,
+        vcpu: V::Vcpu,
+        page_tables: Arc<Mutex<Option<PageTableManager>>>,
+        protections: Arc<MemoryProtections>,
+        process_asid: Option<u16>,
+        mm_generation: u64,
+        asid_generation: u64,
+    ) -> Self {
+        vm.bind_stage1_page_tables(Arc::clone(&page_tables));
+        Self {
+            vm,
+            vcpu,
+            pending_resume_pc: None,
+            last_syscall_nr: None,
+            last_syscall_orig_x0: 0,
+            last_fault_esr: 0,
+            last_exit_class: 0,
+            is_forked_child: false,
+            process_asid,
+            mm_generation,
+            asid_generation,
+            pending_guest_run_receipt_ns: 0,
+            page_tables,
+            protections,
+            fork_arena_high_water: u64::MAX,
+            pending_process_fork: None,
+            pt_snapshot_scratch: None,
+        }
+    }
+
+    pub fn into_injected_task_only_backend(self) -> (V, V::Vcpu) {
+        (self.vm, self.vcpu)
+    }
+
+    pub fn overlay_task_state_on_live_executor(
+        &mut self,
+        state: &GuestCpuState,
+    ) -> Result<(), TrapError> {
+        let GuestCpuState::Aarch64V1(state) = state else {
+            return Err(TrapError::Hypervisor(
+                "AArch64 persistent executor rejected non-AArch64 V1 state".to_owned(),
+            ));
+        };
+        self.validate_task_metadata(state)?;
+        let destination = self.vcpu.snapshot()?;
+        let restored = restore_aarch64_task_state(&destination, state)?;
+        self.vcpu.restore(&restored)?;
+        self.vm.install_task_continuation_for_executor_switch(
+            &mut self.vcpu,
+            state.syscall_continuation,
+        )?;
+        self.apply_task_metadata(state);
+        Ok(())
+    }
+
+    pub fn snapshot_task_state_from_live_executor(&mut self) -> Result<GuestCpuState, TrapError> {
+        require_migratable_fpsimd_authority(self.vm.fpsimd_enabled())?;
+        let continuation = self
+            .vm
+            .take_task_continuation_for_executor_switch(&mut self.vcpu)?;
+        let snapshot = self.vcpu.snapshot()?;
+        Ok(GuestCpuState::from_aarch64_v1(
+            aarch64_task_state_from_snapshot(
+                &snapshot,
+                self.pending_resume_pc,
+                self.last_syscall_nr,
+                self.last_syscall_orig_x0,
+                self.last_fault_esr,
+                self.last_exit_class,
+                self.is_forked_child,
+                continuation,
+                self.mm_generation,
+                self.asid_generation,
+            )?,
+        ))
+    }
+
+    pub fn into_task_state_and_vcpu(self) -> (Aarch64TaskEngineState<V>, V::Vcpu) {
+        let Self {
+            vm,
+            vcpu,
+            pending_resume_pc,
+            last_syscall_nr,
+            last_syscall_orig_x0,
+            last_fault_esr,
+            last_exit_class,
+            is_forked_child,
+            process_asid,
+            mm_generation,
+            asid_generation,
+            pending_guest_run_receipt_ns,
+            page_tables,
+            protections,
+            fork_arena_high_water,
+            pending_process_fork,
+            pt_snapshot_scratch,
+        } = self;
+        (
+            Aarch64TaskEngineState {
+                vm,
+                pending_resume_pc,
+                last_syscall_nr,
+                last_syscall_orig_x0,
+                last_fault_esr,
+                last_exit_class,
+                is_forked_child,
+                process_asid,
+                mm_generation,
+                asid_generation,
+                pending_guest_run_receipt_ns,
+                page_tables,
+                protections,
+                fork_arena_high_water,
+                pending_process_fork,
+                pt_snapshot_scratch,
+            },
+            vcpu,
+        )
+    }
+
+    pub fn from_task_state_and_vcpu(state: Aarch64TaskEngineState<V>, vcpu: V::Vcpu) -> Self {
+        let Aarch64TaskEngineState {
+            vm,
+            pending_resume_pc,
+            last_syscall_nr,
+            last_syscall_orig_x0,
+            last_fault_esr,
+            last_exit_class,
+            is_forked_child,
+            process_asid,
+            mm_generation,
+            asid_generation,
+            pending_guest_run_receipt_ns,
+            page_tables,
+            protections,
+            fork_arena_high_water,
+            pending_process_fork,
+            pt_snapshot_scratch,
+        } = state;
+        Self {
+            vm,
+            vcpu,
+            pending_resume_pc,
+            last_syscall_nr,
+            last_syscall_orig_x0,
+            last_fault_esr,
+            last_exit_class,
+            is_forked_child,
+            process_asid,
+            mm_generation,
+            asid_generation,
+            pending_guest_run_receipt_ns,
+            page_tables,
+            protections,
+            fork_arena_high_water,
+            pending_process_fork,
+            pt_snapshot_scratch,
+        }
+    }
+}
+
+pub fn sibling_task_cpu_state(
+    snapshot: &Aarch64VcpuSnapshot,
+    mm_generation: u64,
+    asid_generation: u64,
+) -> Result<GuestCpuState, TrapError> {
+    Ok(GuestCpuState::from_aarch64_v1(
+        aarch64_task_state_from_snapshot(
+            snapshot,
+            None,
+            None,
+            0,
+            0,
+            0,
+            false,
+            None,
+            mm_generation,
+            asid_generation,
+        )?,
+    ))
 }
 
 /// Bootstrap the live stage-1 editor only when persistent exec left it absent.
@@ -630,7 +858,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             // write happened, so there is no stale TLB entry to flush.
             return Ok(());
         }
-        self.run_el1_maintenance()
+        self.run_stage1_maintenance()
             .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))
     }
 
@@ -738,8 +966,95 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         result
     }
 
+    /// Invalidate one numeric ASID on this exact owner-thread vCPU. The strong
+    /// software generation is authenticated by the runtime command; hardware
+    /// consumes only the architectural 16-bit ASID operand in x0[63:48].
+    pub fn invalidate_asid_on_vcpu(vcpu: &mut V::Vcpu, asid: u16) -> Result<(), TrapError> {
+        if asid == 0 {
+            return Err(TrapError::Hypervisor(
+                "refusing to invalidate reserved ASID zero".to_owned(),
+            ));
+        }
+        const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
+        let saved_pc = vcpu.get_reg(Reg::Pc)?;
+        let saved_pstate = vcpu.get_reg(Reg::Pstate)?;
+        let saved_elr = vcpu.get_reg(Reg::ElrEl1)?;
+        let saved_spsr = vcpu.get_reg(Reg::SpsrEl1)?;
+        let saved_x0 = vcpu.get_reg(Reg::X(0))?;
+
+        vcpu.set_reg(Reg::X(0), u64::from(asid) << 48)?;
+        vcpu.set_reg(Reg::Pc, HVPATCH_EL1_ASID_MAINT_BASE)?;
+        vcpu.set_reg(Reg::Pstate, AARCH64_PSTATE_EL1H_DAIF_MASKED)?;
+        let result = loop {
+            match vcpu.run() {
+                Ok(Aarch64Exit::MaintenanceDone) => break Ok(()),
+                Ok(Aarch64Exit::Kicked) => continue,
+                Ok(other) => {
+                    break Err(TrapError::UnexpectedExit {
+                        reason: format!(
+                            "{} during scoped EL1 ASID maintenance",
+                            exit_variant_name(&other)
+                        ),
+                    });
+                }
+                Err(error) => break Err(error),
+            }
+        };
+
+        vcpu.set_reg(Reg::Pc, saved_pc)?;
+        vcpu.set_reg(Reg::Pstate, saved_pstate)?;
+        vcpu.set_reg(Reg::ElrEl1, saved_elr)?;
+        vcpu.set_reg(Reg::SpsrEl1, saved_spsr)?;
+        vcpu.set_reg(Reg::X(0), saved_x0)?;
+        result
+    }
+
+    pub fn complete_task_load_on_vcpu(vcpu: &mut V::Vcpu) -> Result<(), TrapError> {
+        const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
+        let saved_pc = vcpu.get_reg(Reg::Pc)?;
+        let saved_pstate = vcpu.get_reg(Reg::Pstate)?;
+        let saved_elr = vcpu.get_reg(Reg::ElrEl1)?;
+        let saved_spsr = vcpu.get_reg(Reg::SpsrEl1)?;
+        vcpu.set_reg(Reg::Pc, carrick_mem::memory::LINUX_EL1_LOAD_BARRIER_BASE)?;
+        vcpu.set_reg(Reg::Pstate, AARCH64_PSTATE_EL1H_DAIF_MASKED)?;
+        let result = loop {
+            match vcpu.run() {
+                Ok(Aarch64Exit::MaintenanceDone) => break Ok(()),
+                Ok(Aarch64Exit::Kicked) => continue,
+                Ok(other) => {
+                    break Err(TrapError::UnexpectedExit {
+                        reason: format!(
+                            "{} during EL1 task-load barrier",
+                            exit_variant_name(&other)
+                        ),
+                    });
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        vcpu.set_reg(Reg::Pc, saved_pc)?;
+        vcpu.set_reg(Reg::Pstate, saved_pstate)?;
+        vcpu.set_reg(Reg::ElrEl1, saved_elr)?;
+        vcpu.set_reg(Reg::SpsrEl1, saved_spsr)?;
+        result
+    }
+
     fn run_el1_maintenance(&mut self) -> Result<(), TrapError> {
         Self::run_el1_maintenance_on(&mut self.vcpu)
+    }
+
+    fn run_stage1_maintenance_on(
+        vcpu: &mut V::Vcpu,
+        process_asid: Option<u16>,
+    ) -> Result<(), TrapError> {
+        match process_asid {
+            Some(asid) => Self::invalidate_asid_on_vcpu(vcpu, asid),
+            None => Self::run_el1_maintenance_on(vcpu),
+        }
+    }
+
+    fn run_stage1_maintenance(&mut self) -> Result<(), TrapError> {
+        Self::run_stage1_maintenance_on(&mut self.vcpu, self.process_asid)
     }
 
     fn ensure_frame_cow_write(
@@ -751,7 +1066,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         self.ensure_sparse_mmap_backing(va, len)?;
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;
-        let mut flush = || Self::run_el1_maintenance_on(vcpu);
+        let process_asid = self.process_asid;
+        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid);
         vm.ensure_frame_cow_write(va, len, intent, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch frame COW: {error}")))
     }
@@ -779,7 +1095,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         ensure_sparse_page_table_editor(editor_present, || self.pt_edit(|_| Ok(false)))?;
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;
-        let mut flush = || Self::run_el1_maintenance_on(vcpu);
+        let process_asid = self.process_asid;
+        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid);
         vm.ensure_sparse_mmap_backing(va, len, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch sparse mmap backing: {error}")))
     }
@@ -1233,7 +1550,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         if !changed {
             return Ok(());
         }
-        classify_private_repoint_tlbi(self.run_el1_maintenance())?;
+        classify_private_repoint_tlbi(self.run_stage1_maintenance())?;
         self.vm
             .publish_private_repoint(va, overlay_ipa, len)
             .map_err(|error| {
@@ -1858,6 +2175,46 @@ pub struct Aarch64ProcessSpec<V: Aarch64Vmm> {
     process_asid: u16,
 }
 
+pub struct Aarch64SiblingTaskOnlyParts<V: Aarch64Vmm> {
+    pub builder: V::SiblingBuilder,
+    pub snapshot: Aarch64VcpuSnapshot,
+    pub page_tables: Arc<Mutex<Option<PageTableManager>>>,
+    pub protections: Arc<MemoryProtections>,
+    pub process_asid: Option<u16>,
+}
+
+pub struct Aarch64ProcessTaskOnlyParts<V: Aarch64Vmm> {
+    pub builder: V::ProcessBuilder,
+    pub snapshot: Aarch64VcpuSnapshot,
+    pub page_tables: Arc<Mutex<Option<PageTableManager>>>,
+    pub protections: Arc<MemoryProtections>,
+    pub process_asid: u16,
+}
+
+impl<V: Aarch64Vmm> Aarch64SiblingSpec<V> {
+    pub fn into_task_only_parts(self) -> Aarch64SiblingTaskOnlyParts<V> {
+        Aarch64SiblingTaskOnlyParts {
+            builder: self.builder,
+            snapshot: self.snapshot,
+            page_tables: self.page_tables,
+            protections: self.protections,
+            process_asid: self.process_asid,
+        }
+    }
+}
+
+impl<V: Aarch64Vmm> Aarch64ProcessSpec<V> {
+    pub fn into_task_only_parts(self) -> Aarch64ProcessTaskOnlyParts<V> {
+        Aarch64ProcessTaskOnlyParts {
+            builder: self.builder,
+            snapshot: self.snapshot,
+            page_tables: self.page_tables,
+            protections: self.protections,
+            process_asid: self.process_asid,
+        }
+    }
+}
+
 unsafe impl<V: Aarch64Vmm> Send for Aarch64ProcessSpec<V> where V::ProcessBuilder: Send {}
 
 // SAFETY: the snapshot is POD; the page-table / protections `Arc`s are Send+Sync;
@@ -1939,7 +2296,8 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     fn refresh_fork_process_state(&mut self) -> Result<(), TrapError> {
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;
-        let mut flush = || Self::run_el1_maintenance_on(vcpu);
+        let process_asid = self.process_asid;
+        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid);
         vm.refresh_fork_process_state(&mut flush)?;
         vm.refresh_vcpu_after_frame_cow(vcpu)
     }
@@ -1962,7 +2320,8 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         }
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;
-        let mut flush = || Self::run_el1_maintenance_on(vcpu);
+        let process_asid = self.process_asid;
+        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid);
         let ttbr0 = fault_page_tables.map_or(0, |(ttbr, _)| ttbr);
         let handled = vm.resolve_frame_cow_fault(syndrome, far, ttbr0, &mut flush)?;
         if handled {
@@ -2152,6 +2511,27 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         Ok(())
     }
 
+    fn prepare_exec_address_space(
+        &mut self,
+        root_slot_base: u64,
+        root_slot_size: u64,
+        asid: u16,
+    ) -> Result<(), TrapError> {
+        if asid == 0 {
+            return Err(TrapError::Hypervisor(
+                "HVPatch exec ASID zero is reserved".to_owned(),
+            ));
+        }
+        self.vm
+            .prepare_exec_address_space(root_slot_base, root_slot_size, asid)?;
+        self.process_asid = Some(asid);
+        Ok(())
+    }
+
+    fn complete_task_load_barrier(&mut self) -> Result<(), TrapError> {
+        Self::complete_task_load_on_vcpu(&mut self.vcpu)
+    }
+
     fn supports_in_process_fork(&self) -> bool {
         self.process_asid.is_some()
     }
@@ -2169,6 +2549,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         })?;
         self.vm.destroy_vcpu_on_thread_exit(&mut self.vcpu);
         Ok(())
+    }
+
+    fn retire_task_address_space(&mut self) -> Result<(), TrapError> {
+        self.vm.process_exit_cleanup()
     }
 
     fn build_process_spec(
@@ -2979,6 +3363,79 @@ mod tests {
             result,
             Err(RepointPrivateError::Indeterminate(MemoryError::HostMap(_)))
         ));
+    }
+
+    #[test]
+    fn asid_retirement_maintenance_is_exactly_scoped_and_ordered() {
+        let bytes = super::asid_maintenance_bytes();
+        let opcode = |index: usize| {
+            let mut word = [0_u8; 4];
+            word.copy_from_slice(&bytes[index * 4..index * 4 + 4]);
+            u32::from_le_bytes(word)
+        };
+        assert_eq!(opcode(0), 0xd503_3f9f, "dsb sy");
+        assert_eq!(opcode(1), 0xd508_8340, "tlbi aside1is, x0");
+        assert_eq!(opcode(2), 0xd503_3f9f, "dsb sy");
+        assert_eq!(opcode(3), 0xd503_3fdf, "isb");
+        assert_eq!(opcode(4), 0xd400_0022, "hvc #1");
+        assert!(
+            !bytes
+                .windows(4)
+                .any(|word| word == 0xd508_831f_u32.to_le_bytes())
+        );
+    }
+
+    #[test]
+    fn live_hvpatch_stage1_edits_are_asid_scoped() {
+        let source = include_str!("engine.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production AArch64 engine source");
+        assert_eq!(
+            production.matches("self.run_el1_maintenance()").count(),
+            1,
+            "only the isolated compatibility retirement may issue VMALLE1IS"
+        );
+        let compatibility_retirement = production
+            .split("fn retire_in_process_address_space")
+            .nth(1)
+            .and_then(|tail| tail.split("fn retire_task_address_space").next())
+            .expect("compatibility process retirement");
+        assert!(compatibility_retirement.contains("self.run_el1_maintenance()"));
+
+        for live_path in [
+            "fn pt_edit_and_flush",
+            "fn ensure_frame_cow_write",
+            "fn ensure_sparse_mmap_backing",
+            "fn repoint_private",
+            "fn refresh_fork_process_state",
+            "fn resolve_frame_cow_fault",
+        ] {
+            let body = production
+                .split(live_path)
+                .nth(1)
+                .and_then(|tail| tail.split("\n    fn ").next())
+                .unwrap_or_else(|| panic!("production live mutation path {live_path}"));
+            assert!(
+                body.contains("run_stage1_maintenance"),
+                "{live_path} must select ASIDE1IS for a bound process ASID"
+            );
+            assert!(!body.contains("run_el1_maintenance"));
+        }
+    }
+
+    #[test]
+    fn task_only_terminal_cleanup_never_flushes_all_asids_or_destroys_worker_vcpu() {
+        let source = include_str!("engine.rs");
+        let cleanup = source
+            .split("fn retire_task_address_space")
+            .nth(1)
+            .and_then(|tail| tail.split("fn build_process_spec").next())
+            .expect("task-only terminal cleanup");
+        assert!(cleanup.contains("self.vm.process_exit_cleanup()"));
+        assert!(!cleanup.contains("run_el1_maintenance"));
+        assert!(!cleanup.contains("destroy_vcpu_on_thread_exit"));
     }
 
     #[test]

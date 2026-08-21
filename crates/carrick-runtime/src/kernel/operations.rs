@@ -301,6 +301,9 @@ impl PublishedFork {
     }
 
     pub fn start_child(mut self) -> Result<StartedFork, KernelOperationError> {
+        if let Some(started) = self.started.as_ref() {
+            started.context.thread().open_start_gate();
+        }
         self.start_release.start();
         drop(self.start_wait.take());
         self.started
@@ -317,6 +320,9 @@ impl PublishedFork {
 
 impl Drop for PublishedFork {
     fn drop(&mut self) {
+        if let Some(started) = self.started.as_ref() {
+            started.context.thread().open_start_gate();
+        }
         self.start_release.start();
         drop(self.start_wait.take());
     }
@@ -634,6 +640,22 @@ impl PreparedFork {
         self.child.key()
     }
 
+    pub(crate) fn prepared_execution_identity(
+        &self,
+    ) -> (
+        TaskKey,
+        ThreadKey,
+        MmId,
+        super::objects::ExecutionGeneration,
+    ) {
+        (
+            self.child.key(),
+            self.leader.key(),
+            self.child_shared.mm().id(),
+            super::objects::ExecutionGeneration::initial_for_prepared_publication(),
+        )
+    }
+
     /// Transfer the unique wait handle to a materialized child before commit.
     /// Dropping this preparation wakes it with `Cancelled`; a published child
     /// remains blocked until `PublishedFork::start_child`.
@@ -818,6 +840,9 @@ impl PublishedThreadClone {
     }
 
     pub fn start_thread(mut self) -> Result<StartedThreadClone, KernelOperationError> {
+        if let Some(started) = self.started.as_ref() {
+            started.context.thread().open_start_gate();
+        }
         self.start_release.start();
         drop(self.start_wait.take());
         self.started
@@ -832,6 +857,9 @@ impl PublishedThreadClone {
 
 impl Drop for PublishedThreadClone {
     fn drop(&mut self) {
+        if let Some(started) = self.started.as_ref() {
+            started.context.thread().open_start_gate();
+        }
         self.start_release.start();
         drop(self.start_wait.take());
     }
@@ -897,9 +925,30 @@ pub struct PreparedThreadClone {
     start_release: ChildStartRelease,
 }
 
+pub enum ThreadPublicationReservationAttempt {
+    Reserved(PreparedThreadClone),
+    Busy(PreparedThreadClone),
+}
+
 impl PreparedThreadClone {
     pub const fn tid(&self) -> LinuxTid {
         self.reservation.tid
+    }
+
+    pub(crate) fn prepared_execution_identity(
+        &self,
+    ) -> (
+        TaskKey,
+        ThreadKey,
+        MmId,
+        super::objects::ExecutionGeneration,
+    ) {
+        (
+            self.reservation.task.key(),
+            self.thread.key(),
+            self.reservation.shared.mm().id(),
+            super::objects::ExecutionGeneration::initial_for_prepared_publication(),
+        )
     }
 
     pub fn take_child_start_wait(&mut self) -> Result<ChildStartWait, KernelOperationError> {
@@ -938,6 +987,35 @@ impl PreparedThreadClone {
                 }
                 Err(error) => return Err(error),
             }
+        }
+    }
+
+    pub fn try_reserve_publication(
+        mut self,
+    ) -> Result<ThreadPublicationReservationAttempt, KernelOperationError> {
+        let kernel = Arc::clone(&self.reservation.kernel);
+        let task = self.reservation.task.key();
+        let task_id = task.id;
+        let transaction = kernel.object_ids().transaction_id()?;
+        let mut state = kernel.registry().state.write();
+        if state
+            .tasks
+            .get(&task_id)
+            .is_none_or(|record| record.task.key() != task)
+        {
+            return Err(KernelOperationError::ParentExited);
+        }
+        match TaskSetReservation::acquired(&kernel, &mut state, vec![task_id], transaction) {
+            Ok(publication) => {
+                drop(state);
+                self.publication = Some(publication);
+                Ok(ThreadPublicationReservationAttempt::Reserved(self))
+            }
+            Err(KernelOperationError::TaskBusy(_)) => {
+                drop(state);
+                Ok(ThreadPublicationReservationAttempt::Busy(self))
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -1842,7 +1920,7 @@ impl Kernel {
         };
         let (grant_task, grant_thread) = resolve(grant)?;
         let (target_task, target_thread) = resolve(target)?;
-        if target_task == grant_task {
+        if target_task == grant_task || target.tid != LinuxTid::for_task_leader(target_task.id) {
             return None;
         }
 
@@ -1868,6 +1946,95 @@ impl Kernel {
                 .and_then(|record| record.task.parent());
         }
         if !is_descendant {
+            return None;
+        }
+        grant_thread
+            .with_active_execution_generation(grant_generation, || {
+                target_thread.with_active_execution_generation(target_generation, commit)
+            })
+            .flatten()
+    }
+
+    pub(crate) fn with_live_scheduler_same_task_sibling<R>(
+        &self,
+        grant: ThreadKey,
+        grant_generation: super::objects::ExecutionGeneration,
+        target: ThreadKey,
+        target_generation: super::objects::ExecutionGeneration,
+        commit: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let state = self.registry().state.read();
+        let resolve = |key: ThreadKey| {
+            state.tasks.values().find_map(|record| {
+                if record.task.lifecycle() != TaskLifecycle::Live {
+                    return None;
+                }
+                let thread = record.task.thread(key.tid)?;
+                (thread.key() == key).then_some((record.task.key(), thread))
+            })
+        };
+        let (grant_task, grant_thread) = resolve(grant)?;
+        let (target_task, target_thread) = resolve(target)?;
+        if grant_task != target_task
+            || grant == target
+            || target.tid == LinuxTid::for_task_leader(target_task.id)
+        {
+            return None;
+        }
+        grant_thread
+            .with_active_execution_generation(grant_generation, || {
+                target_thread.with_active_execution_generation(target_generation, commit)
+            })
+            .flatten()
+    }
+
+    pub(crate) fn with_live_scheduler_process_root<R>(
+        &self,
+        target: ThreadKey,
+        target_generation: super::objects::ExecutionGeneration,
+        commit: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let state = self.registry().state.read();
+        let record = state.tasks.values().find(|record| {
+            record.task.lifecycle() == TaskLifecycle::Live
+                && record.task.parent().is_none()
+                && target.tid == LinuxTid::for_task_leader(record.task.key().id)
+                && record
+                    .task
+                    .thread(target.tid)
+                    .is_some_and(|thread| thread.key() == target)
+        })?;
+        record
+            .task
+            .thread(target.tid)?
+            .with_active_execution_generation(target_generation, commit)
+    }
+
+    pub(crate) fn with_live_scheduler_peer_root<R>(
+        &self,
+        grant: ThreadKey,
+        grant_generation: super::objects::ExecutionGeneration,
+        target: ThreadKey,
+        target_generation: super::objects::ExecutionGeneration,
+        commit: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let state = self.registry().state.read();
+        let resolve = |key: ThreadKey| {
+            state.tasks.values().find_map(|record| {
+                if record.task.lifecycle() != TaskLifecycle::Live {
+                    return None;
+                }
+                let thread = record.task.thread(key.tid)?;
+                (thread.key() == key).then_some((record.task.key(), record.task.parent(), thread))
+            })
+        };
+        let (grant_task, grant_parent, grant_thread) = resolve(grant)?;
+        let (target_task, target_parent, target_thread) = resolve(target)?;
+        if grant_task == target_task
+            || grant_parent != target_parent
+            || grant.tid != LinuxTid::for_task_leader(grant_task.id)
+            || target.tid != LinuxTid::for_task_leader(target_task.id)
+        {
             return None;
         }
         grant_thread
@@ -7139,6 +7306,56 @@ mod tests {
             2
         );
         assert_eq!(kernel.validate_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn prepared_thread_publication_busy_is_nonblocking_and_exactly_woken() {
+        let (kernel, root) = bootstrap(339);
+        let thread_plan = ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+        )
+        .unwrap();
+        let prepared_thread = kernel
+            .reserve_thread_clone(&root, thread_plan, None)
+            .unwrap()
+            .prepare(ThreadId::synthetic_for_tests(340))
+            .unwrap();
+        let prepared_exit = kernel
+            .prepare_task_exit(
+                root.task.key().id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .unwrap();
+        let observed = kernel.reservation_epoch();
+        let prepared_thread = match prepared_thread.try_reserve_publication().unwrap() {
+            ThreadPublicationReservationAttempt::Busy(prepared) => prepared,
+            ThreadPublicationReservationAttempt::Reserved(_) => {
+                panic!("overlapping task transaction was not observed")
+            }
+        };
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_wakes = Arc::clone(&wakes);
+        let subscription = kernel
+            .subscribe_reservation_change(
+                observed,
+                Arc::new(move || {
+                    callback_wakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }),
+            )
+            .expect("unchanged reservation epoch enrolls exact wake");
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(prepared_exit);
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(subscription);
+        let prepared_thread = match prepared_thread.try_reserve_publication().unwrap() {
+            ThreadPublicationReservationAttempt::Reserved(prepared) => prepared,
+            ThreadPublicationReservationAttempt::Busy(_) => {
+                panic!("released task transaction remained busy")
+            }
+        };
+        let published = prepared_thread.commit().unwrap();
+        assert_eq!(published.context().unwrap().task().live_thread_count(), 2);
     }
 
     #[test]

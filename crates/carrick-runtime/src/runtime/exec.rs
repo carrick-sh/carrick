@@ -37,7 +37,7 @@ fn finalize_hvf_exec_base(
     staged
         .with_el0_trampoline_bytes(HvfArch::entry_trampoline_bytes())
         .and_then(with_hvf_syscall_mailbox)
-        .and_then(|address_space| address_space.with_stage1_page_tables())
+        .and_then(|address_space| address_space.with_hvpatch_stage1_page_tables())
         .and_then(with_optional_vdso::<HvfArch>)
         .map_err(|_| LINUX_ENOENT)
 }
@@ -210,5 +210,56 @@ mod tests {
 
         assert_eq!(first, expected);
         assert_eq!(reused, expected);
+    }
+
+    #[test]
+    fn production_hvpatch_exec_builder_emits_only_asid_scoped_leaves() {
+        const NON_GLOBAL: u64 = 1 << 11;
+        let permissions = carrick_mem::elf::SegmentPerms {
+            read: true,
+            write: false,
+            execute: true,
+        };
+        let raw = AddressSpace::from_segments(
+            0x0040_0000,
+            [(
+                0x0040_0000,
+                permissions,
+                0xd503_201f_u32.to_le_bytes().to_vec(),
+                0x4000,
+            )],
+        )
+        .expect("synthetic exec image");
+        let image = finalize_hvf_exec_base(&SyscallDispatcher::new(), raw, false, false)
+            .expect("production HVPatch exec builder");
+        let tables = image
+            .regions()
+            .iter()
+            .find(|region| region.start == carrick_mem::memory::LINUX_PAGE_TABLES_BASE)
+            .expect("exec stage-1 table region");
+        for va in [
+            0x0040_0000,
+            carrick_mem::memory::LINUX_HEAP_BASE,
+            carrick_mem::memory::LINUX_MMAP_BASE,
+            carrick_mem::memory::LINUX_SHARED_FILE_BASE,
+            carrick_mem::memory::LINUX_STACK_TOP - 0x4000,
+            carrick_mem::memory::LINUX_EL1_MAINT_BASE,
+            carrick_mem::memory::LINUX_IDENTITY_PAGE_BASE,
+            carrick_mem::memory::LINUX_SYSCALL_MAILBOX_BASE,
+            carrick_mem::memory::LINUX_ROSETTA_VA_BASE,
+        ] {
+            let leaf = carrick_mem::page_table::terminal_descriptor(
+                carrick_mem::page_table::walk_descriptors(
+                    tables.bytes(),
+                    carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+                    va,
+                ),
+            );
+            assert_ne!(
+                leaf & NON_GLOBAL,
+                0,
+                "production exec leaf at {va:#x} escaped its ASID"
+            );
+        }
     }
 }

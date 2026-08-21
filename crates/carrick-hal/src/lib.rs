@@ -24,9 +24,10 @@ pub mod hypervisor;
 pub use hypervisor::{HvVcpu, HvVm, VcpuExit};
 pub mod kernel;
 pub use kernel::{
-    FrameEventCapacity, FrameId, FrameInventoryBatch, FrameInventoryBatchError,
-    FrameInventoryCommit, FrameInventoryEvent, FrameInventoryProvenance, FrameInventoryReservation,
-    FrameInventoryReservationError, FrameLength, KernelTransactionId,
+    FrameEventCapacity, FrameId, FrameInventoryApplyReceipt, FrameInventoryBatch,
+    FrameInventoryBatchError, FrameInventoryCommit, FrameInventoryEvent, FrameInventoryProvenance,
+    FrameInventoryReceiptChallenge, FrameInventoryReservation, FrameInventoryReservationError,
+    FrameInventoryRetirementReceipt, FrameLength, KernelTransactionId,
     MAX_FRAME_INVENTORY_EVENTS_PER_BATCH, MappingGeneration, MappingId,
 };
 pub mod event;
@@ -39,10 +40,11 @@ pub mod threaded;
 pub use threaded::{
     Aarch64CoreRegisters, FrameCowAuthority, FrameCowIdentity, FrameCowQuiesce, FutexOutcome,
     GenericVcpuRegistry, GuestEntryRegs, GuestWaitRegisters, HostForkCoordinator, HostVa,
-    InGuestFlag, PlatformFutex, PreparedHostFork, ProcessForkRequest, RegAccess,
-    SharedFutexLocation, ThreadId, ThreadedEngine, VcpuKick, VcpuKickDyn, VcpuRegistry,
-    X86SignalXstate, X86XstateCapabilities, X86XstateComponent, aarch64_signal_pstate_source,
-    read_aarch64_syscall_frame,
+    HvpatchChildKernelToken, HvpatchChildTokenIssuer, HvpatchChildTokenVerifier,
+    HvpatchVerifiedChildKernelBinding, InGuestFlag, PlatformFutex, PreparedHostFork,
+    ProcessForkRequest, RegAccess, SharedFutexLocation, ThreadId, ThreadedEngine, VcpuKick,
+    VcpuKickDyn, VcpuRegistry, X86SignalXstate, X86XstateCapabilities, X86XstateComponent,
+    aarch64_signal_pstate_source, read_aarch64_syscall_frame,
 };
 pub mod sigframe;
 pub mod signal_arrival;

@@ -175,6 +175,8 @@ pub const LINUX_PAGE_TABLES_SIZE: u64 = 0x1C0000;
 // PXN=0/UXN=1). 0x20000 (PT base) + 0x1C0000 (PT size) = 0x1E0000.
 pub const LINUX_EL1_MAINT_BASE: u64 = LINUX_KERNEL_REGION_BASE + 0x1E0000;
 pub const LINUX_EL1_MAINT_SIZE: u64 = 0x4000;
+pub const LINUX_EL1_ASID_MAINT_BASE: u64 = LINUX_EL1_MAINT_BASE + 0x100;
+pub const LINUX_EL1_LOAD_BARRIER_BASE: u64 = LINUX_EL1_MAINT_BASE + 0x200;
 // Layout invariant: the page tables + the maintenance trampoline must both sit
 // inside the kernel hole's first 2 MiB block (mapped kernel-only EL1-RWX by the
 // single KERNEL_BLOCK_FLAGS 2 MiB block in `stage1_identity_page_tables`).
@@ -345,6 +347,7 @@ const AARCH64_LDAR_W16_X17_OPCODE: u32 = 0x88df_fe30;
 // executed the MSR itself, so the TLB may contain stale identity
 // translations from the pre-MMU bootstrap.
 const AARCH64_TLBI_VMALLE1IS_OPCODE: u32 = 0xd508_831f;
+const AARCH64_TLBI_ASIDE1IS_X0_OPCODE: u32 = 0xd508_8340;
 // AArch64 `ic ialluis` — invalidate instruction cache, all entries,
 // inner-shareable. Same reason: instruction fetches after enabling
 // stage-1 must see fresh translations, not pre-MMU cached lines.
@@ -1665,13 +1668,28 @@ impl AddressSpace {
     /// the runtime `PageTableManager` is later rebuilt from these live bytes
     /// and re-discovers its bump cursor from the last non-zero spare page.
     pub fn with_stage1_page_tables(self) -> Result<Self, AddressSpaceError> {
+        self.with_stage1_page_tables_from(stage1_identity_page_tables())
+    }
+
+    /// Append HVPatch's ASID-scoped stage-1 image.
+    ///
+    /// This has the same translation and protection layout as
+    /// [`Self::with_stage1_page_tables`], but every terminal descriptor is nG
+    /// so `TLBI ASIDE1IS` can retire the exact logical mm without flushing
+    /// compatibility mappings or unrelated HVPatch ASIDs.
+    pub fn with_hvpatch_stage1_page_tables(self) -> Result<Self, AddressSpaceError> {
+        self.with_stage1_page_tables_from(stage1_hvpatch_page_tables())
+    }
+
+    fn with_stage1_page_tables_from(
+        self,
+        initial_tables: Vec<u8>,
+    ) -> Result<Self, AddressSpaceError> {
         let bytes = if self.ro_spans.is_empty() {
-            stage1_identity_page_tables()
+            initial_tables
         } else {
-            let mut mgr = crate::page_table::PageTableManager::new(
-                stage1_identity_page_tables(),
-                LINUX_PAGE_TABLES_BASE,
-            );
+            let mut mgr =
+                crate::page_table::PageTableManager::new(initial_tables, LINUX_PAGE_TABLES_BASE);
             mgr.set_multi_vcpu(true); // no coalesce: keep spare allocation sequential
             for span in &self.ro_spans {
                 // Clamp below the null guard (never mapped; nothing to protect).
@@ -2670,6 +2688,59 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
     bytes
 }
 
+/// Build the per-mm HVPatch stage-1 image.
+///
+/// HVPatch assigns each logical address space a strong ASID generation and
+/// retires that generation with `TLBI ASIDE1IS`. Every leaf in that address
+/// space must therefore carry nG; a global leaf is outside ASID matching and
+/// would survive the scoped invalidation. This transformation is deliberately
+/// separate from [`stage1_identity_page_tables`], whose mature compatibility
+/// users retain their historical global identity mappings.
+pub fn stage1_hvpatch_page_tables() -> Vec<u8> {
+    const NON_GLOBAL: u64 = 1 << 11;
+    const TABLE_OR_PAGE: u64 = 0b11;
+    const TABLE_ADDRESS_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+    const TABLE_BYTES: usize = 0x1000;
+
+    fn scope_table(bytes: &mut [u8], table_offset: usize, level: usize, visited: &mut [bool]) {
+        let table_index = table_offset / TABLE_BYTES;
+        if visited.get(table_index).copied().unwrap_or(true) {
+            return;
+        }
+        visited[table_index] = true;
+        for index in 0..512_usize {
+            let offset = table_offset + index * 8;
+            let Some(raw) = bytes.get(offset..offset + 8) else {
+                return;
+            };
+            let mut word = [0_u8; 8];
+            word.copy_from_slice(raw);
+            let descriptor = u64::from_le_bytes(word);
+            if descriptor & 1 == 0 {
+                continue;
+            }
+            if level < 3 && descriptor & 0b11 == TABLE_OR_PAGE {
+                let child_pa = descriptor & TABLE_ADDRESS_MASK;
+                let Some(child_offset) = child_pa
+                    .checked_sub(LINUX_PAGE_TABLES_BASE)
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .filter(|offset| *offset + TABLE_BYTES <= bytes.len())
+                else {
+                    continue;
+                };
+                scope_table(bytes, child_offset, level + 1, visited);
+            } else {
+                bytes[offset..offset + 8].copy_from_slice(&(descriptor | NON_GLOBAL).to_le_bytes());
+            }
+        }
+    }
+
+    let mut bytes = stage1_identity_page_tables();
+    let mut visited = vec![false; bytes.len() / TABLE_BYTES];
+    scope_table(&mut bytes, 0, 0, &mut visited);
+    bytes
+}
+
 pub fn el0_trampoline_bytes() -> Vec<u8> {
     let size = LINUX_EL0_TRAMPOLINE_SIZE as usize;
     let mut bytes = vec![0_u8; size];
@@ -2733,7 +2804,39 @@ pub fn el1_maintenance_bytes() -> Vec<u8> {
         bytes[offset..offset + nop.len()].copy_from_slice(&nop);
         offset += nop.len();
     }
+    let asid_offset = usize::try_from(LINUX_EL1_ASID_MAINT_BASE - LINUX_EL1_MAINT_BASE)
+        .unwrap_or_else(|_| std::process::abort());
+    let asid = el1_asid_maintenance_bytes();
+    bytes[asid_offset..asid_offset + asid.len()].copy_from_slice(&asid);
+    let load_offset = usize::try_from(LINUX_EL1_LOAD_BARRIER_BASE - LINUX_EL1_MAINT_BASE)
+        .unwrap_or_else(|_| std::process::abort());
+    let load = el1_load_barrier_bytes();
+    bytes[load_offset..load_offset + load.len()].copy_from_slice(&load);
     bytes
+}
+
+pub fn el1_asid_maintenance_bytes() -> Vec<u8> {
+    [
+        AARCH64_DSB_SY_OPCODE,
+        AARCH64_TLBI_ASIDE1IS_X0_OPCODE,
+        AARCH64_DSB_SY_OPCODE,
+        AARCH64_ISB_OPCODE,
+        AARCH64_HVC1_OPCODE,
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect()
+}
+
+pub fn el1_load_barrier_bytes() -> Vec<u8> {
+    [
+        AARCH64_DSB_SY_OPCODE,
+        AARCH64_ISB_OPCODE,
+        AARCH64_HVC1_OPCODE,
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect()
 }
 
 pub fn sigreturn_trampoline_bytes() -> Vec<u8> {
@@ -4568,6 +4671,48 @@ mod stage1_tests {
     }
 
     #[test]
+    fn hvpatch_stage1_tables_scope_every_representative_leaf_to_its_asid() {
+        const NON_GLOBAL: u64 = 1 << 11;
+        let bytes = stage1_hvpatch_page_tables();
+        for (name, va) in [
+            ("user text", 0x0040_0000),
+            ("heap", LINUX_HEAP_BASE),
+            ("mmap", LINUX_MMAP_BASE),
+            ("shared aperture", LINUX_SHARED_FILE_BASE),
+            ("stack", LINUX_STACK_TOP - 0x4000),
+            ("EL1 maintenance", LINUX_EL1_MAINT_BASE),
+            ("identity control", LINUX_IDENTITY_PAGE_BASE),
+            ("syscall mailbox", LINUX_SYSCALL_MAILBOX_BASE),
+            ("Rosetta alias", LINUX_ROSETTA_VA_BASE),
+        ] {
+            let leaf = crate::page_table::terminal_descriptor(crate::page_table::walk_descriptors(
+                &bytes,
+                LINUX_PAGE_TABLES_BASE,
+                va,
+            ));
+            assert_ne!(leaf & 0b11, 0, "{name} leaf at {va:#x} is not mapped");
+            assert_ne!(
+                leaf & NON_GLOBAL,
+                0,
+                "{name} leaf at {va:#x} is global and ASIDE1IS cannot invalidate it"
+            );
+        }
+
+        let compatibility = stage1_identity_page_tables();
+        let compatibility_text =
+            crate::page_table::terminal_descriptor(crate::page_table::walk_descriptors(
+                &compatibility,
+                LINUX_PAGE_TABLES_BASE,
+                0x0040_0000,
+            ));
+        assert_eq!(
+            compatibility_text & NON_GLOBAL,
+            0,
+            "the mature compatibility identity table must retain global leaves"
+        );
+    }
+
+    #[test]
     fn el1_maintenance_bytes_emit_tlbi_then_hvc1() {
         let bytes = el1_maintenance_bytes();
         assert_eq!(bytes.len() as u64, LINUX_EL1_MAINT_SIZE);
@@ -4588,6 +4733,26 @@ mod stage1_tests {
         assert!(end_off <= 0x200000);
         // ...and does not overlap the page-table region just below it.
         const { assert!(LINUX_EL1_MAINT_BASE >= LINUX_PAGE_TABLES_BASE + LINUX_PAGE_TABLES_SIZE) };
+    }
+
+    #[test]
+    fn canonical_maintenance_image_contains_scoped_asid_and_load_barrier_routines() {
+        let bytes = el1_maintenance_bytes();
+        let opcode = |address: u64, index: usize| {
+            let offset = usize::try_from(address - LINUX_EL1_MAINT_BASE).unwrap() + index * 4;
+            u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+        };
+        assert_eq!(opcode(LINUX_EL1_ASID_MAINT_BASE, 0), AARCH64_DSB_SY_OPCODE);
+        assert_eq!(opcode(LINUX_EL1_ASID_MAINT_BASE, 1), 0xd508_8340);
+        assert_eq!(opcode(LINUX_EL1_ASID_MAINT_BASE, 2), AARCH64_DSB_SY_OPCODE);
+        assert_eq!(opcode(LINUX_EL1_ASID_MAINT_BASE, 3), AARCH64_ISB_OPCODE);
+        assert_eq!(opcode(LINUX_EL1_ASID_MAINT_BASE, 4), AARCH64_HVC1_OPCODE);
+        assert_eq!(
+            opcode(LINUX_EL1_LOAD_BARRIER_BASE, 0),
+            AARCH64_DSB_SY_OPCODE
+        );
+        assert_eq!(opcode(LINUX_EL1_LOAD_BARRIER_BASE, 1), AARCH64_ISB_OPCODE);
+        assert_eq!(opcode(LINUX_EL1_LOAD_BARRIER_BASE, 2), AARCH64_HVC1_OPCODE);
     }
 
     #[test]

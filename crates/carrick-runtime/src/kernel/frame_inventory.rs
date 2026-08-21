@@ -11,9 +11,10 @@ use std::time::Instant;
 
 use carrick_guest_mem::Gpa;
 use carrick_hal::{
-    FrameEventCapacity, FrameId, FrameInventoryBatch, FrameInventoryBatchError,
-    FrameInventoryCommit, FrameInventoryEvent, FrameInventoryProvenance, FrameInventoryReservation,
-    FrameLength, KernelTransactionId, MappingGeneration, MappingId, MemPerms,
+    FrameEventCapacity, FrameId, FrameInventoryApplyReceipt, FrameInventoryBatch,
+    FrameInventoryBatchError, FrameInventoryCommit, FrameInventoryEvent, FrameInventoryProvenance,
+    FrameInventoryReservation, FrameInventoryRetirementReceipt, FrameLength, KernelTransactionId,
+    MappingGeneration, MappingId, MemPerms,
 };
 use parking_lot::Mutex;
 
@@ -215,6 +216,91 @@ impl FrameInventoryAuthority {
         commit: FrameInventoryCommit<T>,
     ) -> Result<(T, u64), FrameInventoryError> {
         self.apply_inner(mm, commit, None)
+    }
+
+    /// Apply and issue an opaque provenance-authenticated receipt in the same
+    /// Kernel owner operation. The backend retains the commit challenge and
+    /// cannot fabricate this receipt from a dropped/unapplied commit.
+    pub fn apply_with_receipt<T>(
+        &self,
+        mm: MmId,
+        commit: FrameInventoryCommit<T>,
+    ) -> Result<(T, FrameInventoryApplyReceipt), FrameInventoryError> {
+        let transaction = commit.batch().transaction();
+        let provenance = self
+            .state
+            .lock()
+            .reservations
+            .get(&transaction)
+            .map(|reservation| reservation.provenance)
+            .ok_or(FrameInventoryError::UnreservedTransaction(transaction))?;
+        let mut mappings = Vec::new();
+        for event in commit.batch().events() {
+            if let FrameInventoryEvent::PrepareMapping { mapping, frame, .. } = *event
+                && !mappings.contains(&(mapping, frame))
+            {
+                mappings.push((mapping, frame));
+            }
+        }
+        let mm_id = mm;
+        let (outcome, revision) = self.apply_inner(mm_id, commit, None)?;
+        let mm = NonZeroU64::new(mm.raw()).unwrap_or_else(|| std::process::abort());
+        Ok((
+            outcome,
+            FrameInventoryApplyReceipt::from_kernel_authority(
+                provenance,
+                transaction,
+                mm,
+                revision,
+                mappings,
+            ),
+        ))
+    }
+
+    pub fn apply_retirement_with_receipt<T>(
+        &self,
+        mm: MmId,
+        commit: FrameInventoryCommit<T>,
+    ) -> Result<(T, FrameInventoryRetirementReceipt), FrameInventoryError> {
+        let transaction = commit.batch().transaction();
+        let state = self.state.lock();
+        let provenance = state
+            .reservations
+            .get(&transaction)
+            .map(|reservation| reservation.provenance)
+            .ok_or(FrameInventoryError::UnreservedTransaction(transaction))?;
+        let mut mappings = Vec::new();
+        for event in commit.batch().events() {
+            if let FrameInventoryEvent::UnmapMapping { mapping, .. } = *event {
+                let frame = state
+                    .mappings
+                    .get(&mapping)
+                    .map(|entry| entry.frame)
+                    .ok_or(FrameInventoryError::NonliveMapping(mapping))?;
+                if !mappings.contains(&(mapping, frame)) {
+                    mappings.push((mapping, frame));
+                }
+            }
+        }
+        drop(state);
+        let mm_id = mm;
+        let (outcome, revision) = self.apply_inner(mm_id, commit, None)?;
+        let mm = NonZeroU64::new(mm.raw()).unwrap_or_else(|| std::process::abort());
+        let receipt = FrameInventoryApplyReceipt::from_kernel_authority(
+            provenance,
+            transaction,
+            mm,
+            revision,
+            mappings,
+        );
+        let state = self.state.lock();
+        let mm_empty_at_revision = state.revision == revision
+            && state.mappings.values().all(|mapping| mapping.mm != mm_id);
+        drop(state);
+        Ok((
+            outcome,
+            FrameInventoryRetirementReceipt::from_kernel_authority(receipt, mm_empty_at_revision),
+        ))
     }
 
     fn apply_inner<T>(
@@ -867,6 +953,55 @@ mod tests {
                 generation: generation(1),
             })
             .expect("publish");
+    }
+
+    #[test]
+    fn kernel_apply_receipt_is_opaque_mm_and_mapping_frame_exact() {
+        let fixture = Fixture::new();
+        let mut expected = None;
+        let batch = fixture.batch(2, |transaction, reservation| {
+            let frame = reservation.claim_frame().unwrap();
+            let mapping = reservation.claim_mapping().unwrap();
+            expected = Some((mapping, frame));
+            prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);
+        });
+        let challenge = batch.receipt_challenge();
+        let (_, receipt) = fixture
+            .authority
+            .apply_with_receipt(fixture.mm1, batch)
+            .unwrap();
+        let (mapping, frame) = expected.unwrap();
+        assert!(receipt.authorizes(mapping, frame));
+        assert!(!receipt.authorizes(fixture.ids.mapping_id().unwrap(), frame));
+        assert!(challenge.authenticate_apply(&receipt, nz(fixture.mm1.raw())));
+
+        let retirement = fixture.batch(2, |transaction, reservation| {
+            reservation
+                .push(FrameInventoryEvent::UnmapMapping {
+                    transaction,
+                    mapping,
+                    generation: generation(2),
+                })
+                .unwrap();
+            reservation
+                .push(FrameInventoryEvent::RetireFrame {
+                    transaction,
+                    frame,
+                    generation: generation(2),
+                })
+                .unwrap();
+        });
+        let retirement_challenge = retirement.receipt_challenge();
+        let (_, retirement_receipt) = fixture
+            .authority
+            .apply_retirement_with_receipt(fixture.mm1, retirement)
+            .unwrap();
+        assert!(retirement_receipt.authorizes(mapping, frame));
+        assert!(retirement_receipt.mm_empty_at_revision());
+        assert!(
+            retirement_challenge
+                .authenticate_retirement(&retirement_receipt, nz(fixture.mm1.raw()))
+        );
     }
 
     #[test]

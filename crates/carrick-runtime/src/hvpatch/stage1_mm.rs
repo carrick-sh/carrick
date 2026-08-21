@@ -5,10 +5,13 @@ use std::time::Instant;
 
 use parking_lot::{Mutex, RwLock};
 
-use super::asid::{AsidAllocator, AsidError, RetiredAsid};
+use super::asid::{
+    AsidAllocator, AsidError, AsidGeneration, AsidLoad, AsidResidency, AsidResidencyError,
+    AsidRetirement, InvalidationAck, RetiredAsid,
+};
 use crate::kernel::{
-    Asid, MmBackend, MmBackendSnapshot, MmBinding, SharedVmaSnapshotSource, SnapshotError,
-    SnapshotTable, Stage1Root, Stage1RootError, Ttbr0, VmaRevision,
+    MmBackend, MmBackendSnapshot, MmBinding, SharedVmaSnapshotSource, SnapshotError, SnapshotTable,
+    Stage1Root, Stage1RootError, Ttbr0, VmaRevision,
 };
 
 /// Per-mm stage-1 table backing. Guest frames never live in this slot.
@@ -33,12 +36,14 @@ impl Stage1RootSlot {
 #[derive(Debug)]
 pub(crate) struct Stage1MmState {
     binding: RwLock<MmBinding>,
+    asid_generation: AsidGeneration,
 }
 
 impl Stage1MmState {
-    fn new(binding: MmBinding) -> Self {
+    fn new(binding: MmBinding, asid_generation: AsidGeneration) -> Self {
         Self {
             binding: RwLock::new(binding),
+            asid_generation,
         }
     }
 
@@ -55,23 +60,32 @@ impl Stage1MmState {
 pub(crate) struct Stage1MmLease {
     state: Arc<Stage1MmState>,
     backend: Arc<Stage1MmBackend>,
-    asid: Asid,
+    asid: AsidGeneration,
+    residency: AsidResidency,
     root_slot: Option<Stage1RootSlot>,
     retired: AtomicBool,
 }
 
 impl Stage1MmLease {
-    fn new(asid: Asid, stage1_root: Stage1Root, root_slot: Option<Stage1RootSlot>) -> Self {
-        let state = Arc::new(Stage1MmState::new(MmBinding {
+    fn new(
+        asid: AsidGeneration,
+        stage1_root: Stage1Root,
+        root_slot: Option<Stage1RootSlot>,
+    ) -> Self {
+        let state = Arc::new(Stage1MmState::new(
+            MmBinding {
+                asid: asid.asid(),
+                stage1_root,
+                ttbr0: Ttbr0::for_aarch64(asid.asid(), stage1_root),
+            },
             asid,
-            stage1_root,
-            ttbr0: Ttbr0::for_aarch64(asid, stage1_root),
-        }));
+        ));
         let backend = Arc::new(Stage1MmBackend::new(Arc::clone(&state)));
         Self {
             state,
             backend,
             asid,
+            residency: AsidResidency::new(asid),
             root_slot,
             retired: AtomicBool::new(false),
         }
@@ -89,15 +103,26 @@ impl Stage1MmLease {
         Arc::clone(&self.backend)
     }
 
+    pub(crate) const fn asid_generation(&self) -> AsidGeneration {
+        self.asid
+    }
+
+    pub(crate) fn begin_asid_load(
+        &self,
+        executor: crate::kernel::objects::ExecutorId,
+    ) -> Result<AsidLoad, AsidResidencyError> {
+        self.residency.begin_load(executor)
+    }
+
     pub(crate) fn publish_stage1_root(&self, stage1_root: u64) -> Result<MmBinding, Stage1MmError> {
         if self.retired.load(Ordering::Acquire) {
             return Err(Stage1MmError::Retired);
         }
         let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(stage1_root))?;
         let binding = MmBinding {
-            asid: self.asid,
+            asid: self.asid.asid(),
             stage1_root,
-            ttbr0: Ttbr0::for_aarch64(self.asid, stage1_root),
+            ttbr0: Ttbr0::for_aarch64(self.asid.asid(), stage1_root),
         };
         self.state.publish_binding(binding);
         Ok(binding)
@@ -193,16 +218,18 @@ impl Stage1MmPool {
             .retired
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| Stage1MmError::Retired)?;
+        let residency = lease.residency.begin_retirement()?;
         let mut inner = self.inner.lock();
         let asid = match inner.asids.retire(lease.asid) {
             Ok(asid) => asid,
             Err(error) => {
-                lease.retired.store(false, Ordering::Release);
                 return Err(error.into());
             }
         };
         Ok(Stage1MmRetirement {
+            pool: self.clone(),
             asid,
+            residency,
             root_slot: lease.root_slot,
         })
     }
@@ -211,12 +238,10 @@ impl Stage1MmPool {
         &self,
         retirement: Stage1MmRetirement,
     ) -> Result<(), Stage1MmError> {
-        let mut inner = self.inner.lock();
-        inner.asids.acknowledge_tlb_flush(retirement.asid)?;
-        if let Some(root_slot) = retirement.root_slot {
-            inner.free_root_slots.insert(root_slot);
+        if !Arc::ptr_eq(&self.inner, &retirement.pool.inner) {
+            return Err(Stage1MmError::ForeignRetirement);
         }
-        Ok(())
+        retirement.complete()
     }
 }
 
@@ -240,6 +265,21 @@ impl PreparedStage1Mm {
         self.lease.backend()
     }
 
+    pub(crate) fn publish_stage1_root(&self, stage1_root: u64) -> Result<MmBinding, Stage1MmError> {
+        self.lease.publish_stage1_root(stage1_root)
+    }
+
+    pub(crate) fn asid_generation(&self) -> AsidGeneration {
+        self.lease.asid_generation()
+    }
+
+    pub(crate) fn begin_asid_load(
+        &self,
+        executor: crate::kernel::objects::ExecutorId,
+    ) -> Result<AsidLoad, AsidResidencyError> {
+        self.lease.begin_asid_load(executor)
+    }
+
     pub(crate) fn commit(mut self) -> Arc<Stage1MmLease> {
         self.committed = true;
         Arc::clone(&self.lease)
@@ -257,10 +297,38 @@ impl Drop for PreparedStage1Mm {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct Stage1MmRetirement {
+    pool: Stage1MmPool,
     asid: RetiredAsid,
+    residency: AsidRetirement,
     root_slot: Option<Stage1RootSlot>,
+}
+
+impl Stage1MmRetirement {
+    pub(crate) fn asid_generation(&self) -> AsidGeneration {
+        self.residency.generation()
+    }
+
+    pub(crate) fn pending(&self) -> Vec<crate::kernel::objects::ExecutorId> {
+        self.residency.pending()
+    }
+
+    pub(crate) fn acknowledge(&self, ack: InvalidationAck) -> Result<(), AsidResidencyError> {
+        self.residency.acknowledge(ack)
+    }
+
+    pub(crate) fn complete(self) -> Result<(), Stage1MmError> {
+        if !self.residency.is_complete() {
+            return Err(Stage1MmError::RetirementIncomplete);
+        }
+        let mut inner = self.pool.inner.lock();
+        inner.asids.acknowledge_tlb_flush(self.asid)?;
+        if let Some(root_slot) = self.root_slot {
+            inner.free_root_slots.insert(root_slot);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -275,6 +343,12 @@ pub(crate) enum Stage1MmError {
     RootSlotExhausted,
     #[error("hvpatch stage-1 mm is already retired")]
     Retired,
+    #[error("hvpatch stage-1 mm retirement still awaits executor invalidation")]
+    RetirementIncomplete,
+    #[error("hvpatch stage-1 retirement belongs to another allocator")]
+    ForeignRetirement,
+    #[error(transparent)]
+    Residency(#[from] AsidResidencyError),
 }
 
 impl From<AsidError> for Stage1MmError {
@@ -293,6 +367,7 @@ impl From<AsidError> for Stage1MmError {
 #[derive(Debug)]
 pub(crate) struct Stage1MmBackend {
     binding: RwLock<MmBinding>,
+    asid_generation: AsidGeneration,
     inventory: RwLock<Option<InventoryBinding>>,
     vma_source: RwLock<Option<SharedVmaSnapshotSource>>,
     revision: AtomicU64,
@@ -306,20 +381,21 @@ struct InventoryBinding {
 
 impl Stage1MmBackend {
     pub(crate) fn new(state: Arc<Stage1MmState>) -> Self {
-        Self::for_binding(state.binding())
+        Self::for_binding(state.binding(), state.asid_generation)
     }
 
-    fn for_binding(binding: MmBinding) -> Self {
+    fn for_binding(binding: MmBinding, asid_generation: AsidGeneration) -> Self {
         Self {
             binding: RwLock::new(binding),
+            asid_generation,
             inventory: RwLock::new(None),
             vma_source: RwLock::new(None),
             revision: AtomicU64::new(1),
         }
     }
 
-    pub(crate) fn exec_observer(&self) -> Arc<Self> {
-        Arc::new(Self::for_binding(self.binding()))
+    pub(crate) fn asid_generation(&self) -> AsidGeneration {
+        self.asid_generation
     }
 
     pub(crate) fn publish_binding(&self, binding: MmBinding) {
@@ -558,6 +634,13 @@ mod tests {
         }
     }
 
+    fn executor(raw: i32) -> crate::kernel::objects::ExecutorId {
+        crate::kernel::objects::ExecutorId::for_transitional_thread(
+            crate::thread::ThreadId::synthetic_for_tests(raw),
+        )
+        .expect("test executor id")
+    }
+
     #[test]
     fn old_observer_keeps_its_binding_after_exec_and_retirement() {
         let task = root_key();
@@ -565,16 +648,22 @@ mod tests {
         table.publish_root(task).expect("publish root");
         let initial = backend.binding();
 
-        let replaced = table.publish_exec(task, 0xc000).expect("replace root");
-        let retired = table.retire(task).expect("retire");
-        assert_eq!(replaced.asid, initial.asid);
-        assert_ne!(replaced.stage1_root, initial.stage1_root);
+        let prepared = table.prepare_exec(task).expect("prepare replacement");
+        let replacement_root = prepared.root_slot().expect("root slot").base();
+        let (replacement, retired) = table
+            .commit_exec(task, prepared, replacement_root)
+            .expect("commit replacement");
+        assert_ne!(replacement.binding().asid, initial.asid);
+        assert_ne!(replacement.binding().stage1_root, initial.stage1_root);
         assert_eq!(
-            replaced.ttbr0,
-            crate::kernel::Ttbr0::for_aarch64(replaced.asid, replaced.stage1_root)
+            replacement.binding().ttbr0,
+            crate::kernel::Ttbr0::for_aarch64(
+                replacement.binding().asid,
+                replacement.binding().stage1_root,
+            )
         );
         assert_eq!(backend.binding(), initial);
-        table.acknowledge_tlb_flush(retired).expect("ack retire");
+        retired.complete().expect("ack retire");
         assert_eq!(backend.binding(), initial);
     }
 
@@ -594,6 +683,86 @@ mod tests {
         let retirement = pool.retire(&lease).expect("retire committed lease");
         pool.acknowledge_tlb_flush(retirement)
             .expect("acknowledge retirement");
+    }
+
+    #[test]
+    fn committed_mm_reuses_neither_asid_nor_root_until_all_residency_acks() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let prepared = pool.prepare_child().expect("child preparation");
+        let binding = prepared.binding();
+        let root_slot = prepared.root_slot();
+        let lease = prepared.commit();
+        lease
+            .begin_asid_load(executor(20))
+            .expect("executor load")
+            .mark_resident()
+            .expect("executor resident");
+        let retirement = pool.retire(&lease).expect("retire live mm");
+
+        assert_eq!(retirement.pending(), vec![executor(20)]);
+        assert_eq!(
+            pool.prepare_child().unwrap_err(),
+            Stage1MmError::AsidExhausted,
+            "numeric ASID and root slot stay quarantined"
+        );
+        retirement
+            .acknowledge(super::super::asid::InvalidationAck::new(
+                executor(20),
+                retirement.asid_generation(),
+            ))
+            .expect("owner-thread invalidation ack");
+        pool.acknowledge_tlb_flush(retirement)
+            .expect("complete retirement");
+
+        let replacement = pool.prepare_child().expect("replacement child");
+        assert_eq!(replacement.binding().asid, binding.asid);
+        assert_eq!(replacement.root_slot(), root_slot);
+        assert_ne!(
+            replacement.asid_generation(),
+            lease.asid_generation(),
+            "numeric reuse must mint a new strong generation"
+        );
+    }
+
+    #[test]
+    fn hvpatch_task_binding_carries_the_exact_shared_mm_residency_authority() {
+        struct ExitJob;
+        impl crate::vcpu_loop::continuation::PersistentQuantumJob for ExitJob {
+            fn poll_quantum_with_engine(
+                &mut self,
+                _engine: &mut dyn std::any::Any,
+                _control: &mut crate::vcpu_loop::executor::HvpatchQuantumControl<'_, '_>,
+            ) -> crate::vcpu_loop::executor::ExecutorExit {
+                crate::vcpu_loop::executor::ExecutorExit::Exited
+            }
+        }
+
+        let (pool, lease) = Stage1MmPool::new_root_for_tests(0x8000, 1).expect("root pool");
+        let generation = lease.asid_generation();
+        let binding = crate::vcpu_loop::continuation::HvpatchTaskBinding::new_with_stage1_mm(
+            crate::vcpu_loop::executor::TaskLoadIdentity {
+                abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                version: 1,
+                mm: crate::kernel::MmId::from_registry_allocation(NonZeroU64::new(91).unwrap()),
+                asid_generation: generation.generation(),
+            },
+            Arc::new(crate::vcpu_loop::continuation::HvpatchTaskQuantum::new(
+                Box::new(ExitJob),
+                crate::vcpu_loop::continuation::LogicalJobCompletion::pending(),
+            )),
+            Box::new(7_u64),
+            Arc::clone(&lease),
+        )
+        .expect("binding owns exact stage-1 lease");
+        binding
+            .begin_asid_load(executor(21))
+            .expect("binding load authority")
+            .mark_resident()
+            .expect("binding resident");
+
+        let retirement = pool.retire(&lease).expect("retirement");
+        assert_eq!(retirement.pending(), vec![executor(21)]);
+        assert_eq!(retirement.asid_generation(), generation);
     }
 
     #[test]

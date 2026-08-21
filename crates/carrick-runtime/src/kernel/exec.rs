@@ -88,6 +88,72 @@ pub struct PreparedExec {
     thread_set: PreparedThreadSet,
 }
 
+/// Kernel-minted proof of one committed exec cutover. It is deliberately not
+/// `Clone`; the scheduler consumes it exactly once when transferring the live
+/// worker claim and combined binding/authority record to the replacement.
+pub(crate) struct CommittedExecTransition {
+    context: KernelContext,
+    task: TaskKey,
+    predecessor_thread: ThreadKey,
+    predecessor_mm: MmId,
+    successor_thread: ThreadKey,
+    successor_mm: MmId,
+    successor_asid_generation: Option<u64>,
+}
+
+impl CommittedExecTransition {
+    pub(crate) fn context(&self) -> &KernelContext {
+        &self.context
+    }
+
+    #[cfg(test)]
+    pub(crate) fn thread(&self) -> &ThreadRef {
+        self.context.thread()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared(&self) -> &Arc<TaskShared> {
+        self.context.shared()
+    }
+
+    pub(crate) fn attach_successor_asid_generation(
+        mut self,
+        mm: MmId,
+        generation: u64,
+    ) -> Result<Self, ExecError> {
+        if mm != self.successor_mm || generation == 0 {
+            return Err(ExecError::StalePreparation);
+        }
+        self.successor_asid_generation = Some(generation);
+        Ok(self)
+    }
+
+    pub(crate) fn into_scheduler_parts(self) -> Result<CommittedExecSchedulerParts, ExecError> {
+        let successor_asid_generation = self
+            .successor_asid_generation
+            .ok_or(ExecError::StalePreparation)?;
+        Ok(CommittedExecSchedulerParts {
+            context: self.context,
+            task: self.task,
+            predecessor_thread: self.predecessor_thread,
+            predecessor_mm: self.predecessor_mm,
+            successor_thread: self.successor_thread,
+            successor_mm: self.successor_mm,
+            successor_asid_generation,
+        })
+    }
+}
+
+pub(crate) struct CommittedExecSchedulerParts {
+    pub(crate) context: KernelContext,
+    pub(crate) task: TaskKey,
+    pub(crate) predecessor_thread: ThreadKey,
+    pub(crate) predecessor_mm: MmId,
+    pub(crate) successor_thread: ThreadKey,
+    pub(crate) successor_mm: MmId,
+    pub(crate) successor_asid_generation: u64,
+}
+
 impl PreparedExec {
     /// Exact currently published address-space identity captured by this
     /// preparation. Destructive backend retirement must be routed here.
@@ -266,9 +332,21 @@ impl Kernel {
 
     pub fn commit_exec(
         self: &Arc<Self>,
-        mut prepared: PreparedExec,
+        prepared: PreparedExec,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<KernelContext, ExecError> {
+        self.commit_exec_transition(prepared, failpoint)
+            .map(|transition| transition.context)
+    }
+
+    pub(crate) fn commit_exec_transition(
+        self: &Arc<Self>,
+        mut prepared: PreparedExec,
+        failpoint: Option<KernelFailpoint>,
+    ) -> Result<CommittedExecTransition, ExecError> {
+        let predecessor_thread = prepared.caller;
+        let predecessor_mm = prepared.old_mm.id();
+        let task_key = prepared.task;
         let old_files = prepared.old_file_table();
         let Some(reservation) = prepared.guard.reservation.as_ref() else {
             return Err(ExecError::ReservationLost);
@@ -383,14 +461,23 @@ impl Kernel {
             release.release(VforkReleaseReason::Exec);
         }
 
-        Ok(KernelContext::from_parts(
+        let context = KernelContext::from_parts(
             self.clone(),
             task,
             prepared.replacement,
             prepared.shared,
             prepared.resources,
             revision,
-        ))
+        );
+        Ok(CommittedExecTransition {
+            task: task_key,
+            predecessor_thread,
+            predecessor_mm,
+            successor_thread: context.thread().key(),
+            successor_mm: context.shared().mm().id(),
+            context,
+            successor_asid_generation: None,
+        })
     }
 
     /// Release retired thread IDs after runner/context references drain. Every

@@ -1,6 +1,7 @@
 //! The minimal hypervisor-specific surface the shared threaded run-loop drives.
 //! `SyscallTrap` (per-syscall) stays separate; this carries the per-thread /
 //! fork / kick / futex lifecycle so single-threaded backends are unaffected.
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -1191,6 +1192,118 @@ pub struct FrameCowIdentity {
     pub asid: u16,
 }
 
+/// Opaque Kernel-issued authority for activating one exact HVPatch child.
+/// The embedded COW authority owns the exact runtime kicker/tid binding; safe
+/// consumers can inspect identity but cannot replace any component.
+pub struct HvpatchChildKernelToken {
+    seal: Arc<HvpatchChildTokenSeal>,
+    task_serial: u64,
+    thread_serial: u64,
+    execution_generation: u64,
+    cow_identity: FrameCowIdentity,
+    authority_identity: NonZeroU64,
+    cow_authority: Arc<dyn FrameCowAuthority>,
+}
+
+#[derive(Debug)]
+pub struct HvpatchChildTokenIssuer {
+    seal: Arc<HvpatchChildTokenSeal>,
+}
+
+#[derive(Debug)]
+pub struct HvpatchChildTokenVerifier {
+    seal: Arc<HvpatchChildTokenSeal>,
+}
+
+#[derive(Debug)]
+struct HvpatchChildTokenSeal;
+
+pub struct HvpatchVerifiedChildKernelBinding {
+    task_serial: u64,
+    thread_serial: u64,
+    execution_generation: u64,
+    cow_identity: FrameCowIdentity,
+    authority_identity: NonZeroU64,
+    cow_authority: Arc<dyn FrameCowAuthority>,
+}
+
+impl HvpatchChildTokenIssuer {
+    pub fn new_pair() -> (Arc<Self>, Arc<HvpatchChildTokenVerifier>) {
+        let seal = Arc::new(HvpatchChildTokenSeal);
+        (
+            Arc::new(Self {
+                seal: Arc::clone(&seal),
+            }),
+            Arc::new(HvpatchChildTokenVerifier { seal }),
+        )
+    }
+
+    pub fn issue(
+        &self,
+        task_serial: u64,
+        thread_serial: u64,
+        execution_generation: u64,
+        cow_identity: FrameCowIdentity,
+        authority_identity: NonZeroU64,
+        cow_authority: Arc<dyn FrameCowAuthority>,
+    ) -> HvpatchChildKernelToken {
+        HvpatchChildKernelToken {
+            seal: Arc::clone(&self.seal),
+            task_serial,
+            thread_serial,
+            execution_generation,
+            cow_identity,
+            authority_identity,
+            cow_authority,
+        }
+    }
+}
+
+impl HvpatchChildTokenVerifier {
+    pub fn verify_and_open(
+        &self,
+        token: HvpatchChildKernelToken,
+    ) -> Option<HvpatchVerifiedChildKernelBinding> {
+        if !Arc::ptr_eq(&token.seal, &self.seal) {
+            return None;
+        }
+        Some(HvpatchVerifiedChildKernelBinding {
+            task_serial: token.task_serial,
+            thread_serial: token.thread_serial,
+            execution_generation: token.execution_generation,
+            cow_identity: token.cow_identity,
+            authority_identity: token.authority_identity,
+            cow_authority: token.cow_authority,
+        })
+    }
+}
+
+impl HvpatchVerifiedChildKernelBinding {
+    pub const fn task_serial(&self) -> u64 {
+        self.task_serial
+    }
+
+    pub const fn thread_serial(&self) -> u64 {
+        self.thread_serial
+    }
+
+    pub const fn execution_generation(&self) -> u64 {
+        self.execution_generation
+    }
+
+    pub const fn cow_identity(&self) -> FrameCowIdentity {
+        self.cow_identity
+    }
+
+    pub const fn authority_identity(&self) -> NonZeroU64 {
+        self.authority_identity
+    }
+
+    pub fn into_cow_authority(self) -> Arc<dyn FrameCowAuthority> {
+        self.cow_authority
+    }
+}
+
 pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     /// Fail-closed backend-owned executor boundary audit. Transitional M:N
     /// workers call this only while the task is fully saved and owns no live
@@ -1334,6 +1447,23 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
         Ok(())
     }
 
+    fn prepare_exec_address_space(
+        &mut self,
+        _root_slot_base: u64,
+        _root_slot_size: u64,
+        _asid: u16,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend does not accept an exact HVPatch exec address-space lease".to_owned(),
+        ))
+    }
+
+    fn complete_task_load_barrier(&mut self) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend does not expose the required task-load DSB/ISB barrier".to_owned(),
+        ))
+    }
+
     /// True only for a backend that represents Linux fork as another vCPU plus
     /// another stage-1 address space inside the current host VM.
     fn supports_in_process_fork(&self) -> bool {
@@ -1348,6 +1478,15 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
         self.process_exit_cleanup()?;
         self.destroy_vcpu_on_thread_exit();
         Ok(())
+    }
+
+    /// Retire only the loaded logical task's stage-2/mapping authority while
+    /// preserving the persistent worker vCPU. ASID TLBI is a later owner-worker
+    /// command after save/detach.
+    fn retire_task_address_space(&mut self) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend does not support task-only address-space retirement".to_owned(),
+        ))
     }
 
     fn build_process_spec(
