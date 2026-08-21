@@ -1907,6 +1907,7 @@ where
                 std::process::abort();
             }
         };
+        let child_key = child_context.task().key();
         let child_backend = match parent_process
             .mm_resources()
             .publish_child(child_context.task().key(), prepared_mm)
@@ -1977,22 +1978,48 @@ where
             child_pid,
         );
         if let Some(wait) = vfork_parent_wait {
-            loop {
-                if wait.wait_for_release(Duration::from_millis(1)).is_some() {
-                    break;
-                }
-                // A sibling exec replaces this suspended parent, and process
-                // exit retires it. Return the typed no-retval outcome so the run
-                // loop performs ordinary thread cleanup instead of completing
-                // the obsolete fork syscall or waiting forever for the child.
-                if kernel.process_exiting() || kernel.clone_admission_terminal_cancelled() {
+            let current = parent_context
+                .task_binding()
+                .capture(self.linux_tid)
+                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            self.service_kernel_context = Some(current.retain_exact());
+            let request = SyscallRequest::new(
+                220,
+                crate::compat::SyscallArgs([
+                    request.flags,
+                    request.child_stack,
+                    request.parent_tid_addr.unwrap_or(0),
+                    u64::from(request.exit_signal),
+                    request.child_tid_addr.unwrap_or(0),
+                    request.vfork.unwrap_or(0),
+                ]),
+            )
+            .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
+            .with_current_guest_sp(engine.get_reg(carrick_hal::Reg::Sp).ok());
+            match self.suspend_hvpatch_continuation(
+                kernel,
+                engine,
+                request,
+                HvpatchBlockInput::Vfork {
+                    child: child_key,
+                    wait,
+                },
+            )? {
+                Some(DispatchOutcome::Returned { .. }) => {}
+                Some(DispatchOutcome::ThreadExit { .. }) | None
+                    if kernel.process_exiting() || kernel.clone_admission_terminal_cancelled() =>
+                {
                     return Ok(None);
                 }
-                // A suspended vfork parent still owns a registered vCPU. Let a
-                // concurrent sibling fork drain it rather than waiting forever
-                // for the vfork child while that fork waits for this parent.
-                if process_barrier.is_quiescing() {
-                    self.release_and_park_vcpu_for_fork(engine)?;
+                Some(other) => {
+                    return Err(RuntimeError::Configuration(format!(
+                        "vfork continuation resumed with unexpected outcome: {other:?}"
+                    )));
+                }
+                None => {
+                    return Err(RuntimeError::Configuration(
+                        "vfork continuation requested syscall redispatch".to_owned(),
+                    ));
                 }
             }
         }

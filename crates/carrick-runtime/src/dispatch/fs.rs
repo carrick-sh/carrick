@@ -1065,6 +1065,10 @@ impl LogicalRecordLockWait {
     pub(crate) fn acquire(&self) -> Result<(), LinuxErrno> {
         self.locks.wait_set_interruptibly(&self.request, self.tid)
     }
+
+    pub(crate) fn try_acquire(&self) -> Result<(), LinuxErrno> {
+        self.locks.try_set(self.request.clone())
+    }
 }
 
 impl PartialEq for LogicalRecordLockWait {

@@ -1203,6 +1203,56 @@ pub(crate) fn drive_blocking_record_lock(lock: &BlockingRecordLock) -> DispatchO
     }
 }
 
+pub(crate) enum BlockingRecordLockStep {
+    Done(DispatchOutcome),
+    Wait,
+}
+
+/// Nonblocking record-lock progress for the shared continuation reactor.
+/// Unlike `drive_blocking_record_lock`, this never issues F_SETLKW and never
+/// parks the reactor thread behind a guest-owned lock.
+pub(crate) fn try_drive_blocking_record_lock(lock: &BlockingRecordLock) -> BlockingRecordLockStep {
+    if let Some(logical) = &lock.logical {
+        return match logical.try_acquire() {
+            Ok(()) => BlockingRecordLockStep::Done(DispatchOutcome::Returned { value: 0 }),
+            Err(errno) if errno == LINUX_EAGAIN => BlockingRecordLockStep::Wait,
+            Err(errno) => BlockingRecordLockStep::Done(DispatchOutcome::Errno { errno }),
+        };
+    }
+    let Some(host_fd) = &lock.host_fd else {
+        return BlockingRecordLockStep::Done(DispatchOutcome::errno(LINUX_EINVAL));
+    };
+    let mut fl: libc::flock = unsafe { core::mem::zeroed() };
+    fl.l_start = lock.l_start as libc::off_t;
+    fl.l_len = lock.l_len as libc::off_t;
+    fl.l_type = lock.l_type;
+    fl.l_whence = lock.l_whence;
+    let command = if lock.host_cmd == libc::F_SETLKW {
+        libc::F_SETLK
+    } else {
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            if lock.host_cmd == libc::F_OFD_SETLKW {
+                libc::F_OFD_SETLK
+            } else {
+                lock.host_cmd
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        {
+            lock.host_cmd
+        }
+    };
+    let rc = unsafe { libc::fcntl(host_fd.fd, command, &mut fl as *mut libc::flock) };
+    match rc.host_syscall_errno() {
+        Ok(_) => BlockingRecordLockStep::Done(DispatchOutcome::Returned { value: 0 }),
+        Err(errno) if errno == LINUX_EAGAIN || errno == crate::linux_abi::LINUX_EACCES => {
+            BlockingRecordLockStep::Wait
+        }
+        Err(errno) => BlockingRecordLockStep::Done(DispatchOutcome::Errno { errno }),
+    }
+}
+
 /// Typed handle for one dispatcher-to-runtime host-alias installation. The
 /// payload is intentionally opaque: exact VMA/SysV commit data stays owned by
 /// the dispatcher and is published only after the runtime reports success.

@@ -15,21 +15,30 @@ use std::time::{Duration, Instant};
 
 use carrick_abi::{SigBlockMask, SigSet, WaitSigMask};
 use carrick_guest_mem::{GuestVa, SharedFutexLocation};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use crate::dispatch::{
     BlockingHostWrite, BlockingRecordLock, DispatchOutcome, SyscallRequest, WaitFds,
 };
 use crate::kernel::objects::{ExecutionGeneration, ThreadKey};
 use crate::kernel::{
-    Kernel, KernelContext, MmId, Scheduler, TaskKey, TaskRevision, VforkParentWait,
+    Kernel, KernelContext, MmId, Scheduler, Task, TaskKey, TaskRevision, VforkParentWait,
 };
 use crate::linux_abi::{LINUX_EAGAIN, LINUX_EINTR, LINUX_ETIMEDOUT, LinuxErrno};
-use crate::thread::FutexWait;
+use crate::thread::{FutexTable, FutexWait, FutexWaitOutcome};
 
 static NEXT_CONTINUATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_REGISTRATION_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_RESOURCE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+struct FutexSource(Arc<FutexTable>);
+
+impl std::fmt::Debug for FutexSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FutexSource")
+    }
+}
 
 fn next_nonzero(source: &AtomicU64) -> u64 {
     let value = source.fetch_add(1, Ordering::Relaxed);
@@ -77,9 +86,11 @@ impl SyscallFrame {
 #[derive(Debug)]
 pub struct ContinuationCapture {
     kernel: Weak<Kernel>,
+    task_ref: Weak<Task>,
     thread: ThreadKey,
     task: TaskKey,
     task_revision: TaskRevision,
+    task_wake_generation: u64,
     mm: MmId,
     asid_generation: u64,
     persistent_signal_mask: SigSet,
@@ -91,6 +102,46 @@ pub struct ContinuationCapture {
 }
 
 impl ContinuationCapture {
+    pub fn from_lease(
+        context: &KernelContext,
+        lease: &crate::kernel::objects::ThreadExecutionLease,
+        request: SyscallRequest,
+        restart: RestartClass,
+        backend: ContinuationBackend,
+    ) -> Result<Self, ContinuationBuildError> {
+        if !context.exact_thread_is_live()
+            || lease.thread_key() != context.thread().key()
+            || context.thread().execution_state().generation() != Some(lease.generation())
+        {
+            return Err(ContinuationBuildError::StaleExecutionAuthority);
+        }
+        let (mm, asid_generation) = lease
+            .task_state_authority()
+            .map_err(|_| ContinuationBuildError::StaleExecutionAuthority)?;
+        if mm != context.shared().mm().id() {
+            return Err(ContinuationBuildError::StaleExecutionAuthority);
+        }
+        let signal_authority = context.signal_authority();
+        Ok(Self {
+            kernel: Arc::downgrade(context.kernel()),
+            task_ref: Arc::downgrade(context.task()),
+            thread: context.thread().key(),
+            task: context.task().key(),
+            task_revision: context.revision(),
+            task_wake_generation: context.task().wake_generation(),
+            mm,
+            asid_generation,
+            persistent_signal_mask: signal_authority.blocked(),
+            restore_after_signal: signal_authority.armed_restore_mask(),
+            execution: lease.generation(),
+            syscall: SyscallFrame { request },
+            restart,
+            backend,
+        })
+    }
+
+    /// Compatibility constructor for callers that have not crossed the Task 2
+    /// lease boundary. The HVPatch product path uses [`Self::from_lease`].
     pub fn new(
         context: &KernelContext,
         execution: ExecutionGeneration,
@@ -103,15 +154,23 @@ impl ContinuationCapture {
         {
             return Err(ContinuationBuildError::StaleExecutionAuthority);
         }
-        let mm = context.shared().mm().id();
+        let (mm, asid_generation) = context
+            .thread()
+            .parked_task_state_authority(execution)
+            .ok_or(ContinuationBuildError::StaleExecutionAuthority)?;
+        if mm != context.shared().mm().id() {
+            return Err(ContinuationBuildError::StaleExecutionAuthority);
+        }
         let signal_authority = context.signal_authority();
         Ok(Self {
             kernel: Arc::downgrade(context.kernel()),
+            task_ref: Arc::downgrade(context.task()),
             thread: context.thread().key(),
             task: context.task().key(),
             task_revision: context.revision(),
+            task_wake_generation: context.task().wake_generation(),
             mm,
-            asid_generation: mm.raw(),
+            asid_generation,
             persistent_signal_mask: signal_authority.blocked(),
             restore_after_signal: signal_authority.armed_restore_mask(),
             execution,
@@ -125,9 +184,11 @@ impl ContinuationCapture {
 #[derive(Debug)]
 pub struct ContinuationAuthority {
     kernel: Weak<Kernel>,
+    task_ref: Weak<Task>,
     thread: ThreadKey,
     task: TaskKey,
     task_revision: TaskRevision,
+    task_wake_generation: u64,
     execution: ExecutionGeneration,
     syscall: SyscallFrame,
     restart: RestartClass,
@@ -139,9 +200,11 @@ impl ContinuationAuthority {
     fn from_capture(capture: ContinuationCapture) -> Self {
         Self {
             kernel: capture.kernel,
+            task_ref: capture.task_ref,
             thread: capture.thread,
             task: capture.task,
             task_revision: capture.task_revision,
+            task_wake_generation: capture.task_wake_generation,
             execution: capture.execution,
             syscall: capture.syscall,
             restart: capture.restart,
@@ -258,10 +321,10 @@ pub enum ChildSelector {
     HostPid(i32),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct OwnedFdRegistration {
     #[allow(dead_code)]
-    fd: OwnedFd,
+    fd: Arc<OwnedFd>,
     #[allow(dead_code)]
     events: i16,
     #[allow(dead_code)]
@@ -276,7 +339,7 @@ fn own_wait_fds(fds: &WaitFds) -> Result<Vec<OwnedFdRegistration>, ContinuationB
                 return Err(ContinuationBuildError::FdPinFailed);
             }
             Ok(OwnedFdRegistration {
-                fd: unsafe { OwnedFd::from_raw_fd(owned) },
+                fd: Arc::new(unsafe { OwnedFd::from_raw_fd(owned) }),
                 events: fd.events(),
                 generation: next_nonzero(&NEXT_RESOURCE_GENERATION),
             })
@@ -313,8 +376,8 @@ enum ContinuationDetail {
         registrations: Vec<OwnedFdRegistration>,
         sig_mask: WaitSigMask,
     },
-    HostWrite(BlockingHostWrite),
-    RecordLock(BlockingRecordLock),
+    HostWrite(Arc<Mutex<BlockingHostWrite>>),
+    RecordLock(Arc<BlockingRecordLock>),
     Process {
         selector: ChildSelector,
         sig_mask: WaitSigMask,
@@ -374,6 +437,8 @@ pub struct ContinuationState {
     signal_masks: SignalMaskContinuationState,
     detail: ContinuationDetail,
     resource_generation: u64,
+    private_futex: Option<FutexSource>,
+    producer_completion: Arc<Mutex<Option<DispatchOutcome>>>,
     registration: Option<RegistrationBinding>,
     cleanup: CleanupState,
 }
@@ -383,7 +448,7 @@ impl Drop for ContinuationState {
         if let Some(binding) = self.registration.take()
             && let Some(service) = binding.service.upgrade()
         {
-            service.cancel_exact(binding.token);
+            service.finish_exact(binding.token);
         }
         let _ = self.cleanup.settle();
     }
@@ -429,6 +494,27 @@ pub enum ContinuationFamily {
     VforkParent,
 }
 
+pub const fn is_blocking_dispatch_outcome(outcome: &DispatchOutcome) -> bool {
+    matches!(
+        outcome,
+        DispatchOutcome::FutexWait { .. }
+            | DispatchOutcome::FutexWaitv { .. }
+            | DispatchOutcome::SharedFutexWait { .. }
+            | DispatchOutcome::SharedFutexWaitv { .. }
+            | DispatchOutcome::WaitOnSharedWord { .. }
+            | DispatchOutcome::WaitOnFds { .. }
+            | DispatchOutcome::WaitOnFdsSelect { .. }
+            | DispatchOutcome::WaitOnPollFds { .. }
+            | DispatchOutcome::BlockingHostWrite(_)
+            | DispatchOutcome::BlockingRecordLock(_)
+            | DispatchOutcome::WaitOnProcExit { .. }
+            | DispatchOutcome::WaitOnProcState { .. }
+            | DispatchOutcome::WaitOnHvpatchChild { .. }
+            | DispatchOutcome::WaitOnSignals { .. }
+            | DispatchOutcome::WaitOnSleep { .. }
+    )
+}
+
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ContinuationBuildError {
     #[error("continuation execution authority is stale")]
@@ -470,6 +556,8 @@ impl BlockedContinuation {
             },
             detail,
             resource_generation: next_nonzero(&NEXT_RESOURCE_GENERATION),
+            private_futex: None,
+            producer_completion: Arc::new(Mutex::new(None)),
             registration: None,
             cleanup: CleanupState::new(),
         };
@@ -606,13 +694,13 @@ impl BlockedContinuation {
                 None,
                 Vec::new(),
                 Some(WaitSigMask::NONE),
-                ContinuationDetail::HostWrite(write),
+                ContinuationDetail::HostWrite(Arc::new(Mutex::new(write))),
             )),
             DispatchOutcome::BlockingRecordLock(lock) => Self::BlockingRecordLock(new_state(
                 None,
                 Vec::new(),
                 Some(WaitSigMask::NONE),
-                ContinuationDetail::RecordLock(lock),
+                ContinuationDetail::RecordLock(Arc::new(lock)),
             )),
             DispatchOutcome::WaitOnProcExit { pid, sig_mask } => {
                 if backend == ContinuationBackend::Hvpatch {
@@ -756,6 +844,8 @@ impl BlockedContinuation {
             signal_masks,
             detail: ContinuationDetail::Vfork { child, wait },
             resource_generation: next_nonzero(&NEXT_RESOURCE_GENERATION),
+            private_futex: None,
+            producer_completion: Arc::new(Mutex::new(None)),
             registration: None,
             cleanup: CleanupState::new(),
         }))
@@ -859,6 +949,10 @@ impl BlockedContinuation {
         }
     }
 
+    pub(crate) fn bind_product_futex(&mut self, futex: &Arc<FutexTable>) {
+        self.state_mut().private_futex = Some(FutexSource(Arc::clone(futex)));
+    }
+
     fn resource_fingerprint(&self) -> u64 {
         let state = self.state();
         let mut fingerprint = state.resource_generation
@@ -921,6 +1015,7 @@ impl BlockedContinuation {
                 }
             }
             ContinuationDetail::HostWrite(write) => {
+                let write = write.lock();
                 fingerprint ^= write.host_fd() as u64 ^ write.offset() as u64;
             }
             ContinuationDetail::RecordLock(lock) => {
@@ -983,6 +1078,9 @@ impl BlockedContinuation {
         {
             return Err(ContinuationResumeError::StaleThread);
         }
+        if resume.task_revision != authority.task_revision() {
+            return Err(ContinuationResumeError::StaleTaskRevision);
+        }
         if resume.mm != authority.mm() || resume.asid_generation != authority.asid_generation() {
             return Err(ContinuationResumeError::StaleAddressSpace);
         }
@@ -997,6 +1095,15 @@ impl BlockedContinuation {
         {
             return Err(ContinuationResumeError::StaleThread);
         }
+        let current = kernel
+            .context(authority.task().id, authority.thread().tid)
+            .map_err(|_| ContinuationResumeError::StaleThread)?;
+        if current.task().key() != authority.task()
+            || current.thread().key() != authority.thread()
+            || current.revision() != authority.task_revision()
+        {
+            return Err(ContinuationResumeError::StaleTaskRevision);
+        }
         Ok(())
     }
 
@@ -1008,57 +1115,74 @@ impl BlockedContinuation {
         self.authorize_resume(ResumeContext {
             thread: context.thread().key(),
             task: context.task().key(),
+            task_revision: context.revision(),
             execution: self.authority().execution_generation(),
             mm: context.shared().mm().id(),
-            asid_generation: context.shared().mm().id().raw(),
+            asid_generation: self.authority().asid_generation(),
         })?;
+        if let Some(binding) = self.state_mut().registration.take()
+            && let Some(service) = binding.service.upgrade()
+        {
+            service.consume_ready_exact(binding.token)?;
+        }
+        if self.state().signal_masks.temporary.is_some() {
+            context
+                .signal_authority()
+                .set_blocked(self.state().signal_masks.persistent);
+        }
         let family = self.family();
         let restart_class = self.authority().restart_class();
+        let producer_completion = self.state().producer_completion.lock().take();
         let outcome = match event {
-            ContinuationEvent::Ready => match family {
-                ContinuationFamily::FutexWait => ContinuationCompletion::Return(0),
-                ContinuationFamily::FutexWaitv => {
-                    let index = match &self.state().detail {
-                        ContinuationDetail::Futex { index, .. }
-                        | ContinuationDetail::SharedFutex { index, .. } => index.unwrap_or(0),
-                        _ => 0,
-                    };
-                    ContinuationCompletion::Return(index)
-                }
-                ContinuationFamily::SharedFutexWait => ContinuationCompletion::Return(0),
-                ContinuationFamily::SharedFutexWaitv => {
-                    let index = match &self.state().detail {
-                        ContinuationDetail::SharedFutex { index, .. } => index.unwrap_or(0),
-                        _ => 0,
-                    };
-                    ContinuationCompletion::Return(index)
-                }
-                ContinuationFamily::BlockingHostWrite => {
-                    let offset = match &self.state().detail {
-                        ContinuationDetail::HostWrite(write) => write.offset() as i64,
-                        _ => 0,
-                    };
-                    ContinuationCompletion::RedispatchWithPartial(offset)
-                }
-                ContinuationFamily::VforkParent => {
-                    let child = self.vfork_child().map_or(0, |key| i64::from(key.id.raw()));
-                    ContinuationCompletion::Return(child)
-                }
-                ContinuationFamily::WaitOnSharedWord => match &self.state().detail {
-                    ContinuationDetail::SharedWord {
-                        sysv: Some(sysv), ..
-                    } => sysv.completion_after_wake().map_or(
-                        ContinuationCompletion::Redispatch,
-                        |outcome| match outcome {
-                            DispatchOutcome::Errno { errno } => {
-                                ContinuationCompletion::Errno(errno)
-                            }
-                            _ => ContinuationCompletion::Redispatch,
-                        },
-                    ),
+            ContinuationEvent::Ready => match producer_completion {
+                Some(DispatchOutcome::Returned { value }) => ContinuationCompletion::Return(value),
+                Some(DispatchOutcome::Errno { errno }) => ContinuationCompletion::Errno(errno),
+                Some(_) => ContinuationCompletion::Redispatch,
+                None => match family {
+                    ContinuationFamily::FutexWait => ContinuationCompletion::Return(0),
+                    ContinuationFamily::FutexWaitv => {
+                        let index = match &self.state().detail {
+                            ContinuationDetail::Futex { index, .. }
+                            | ContinuationDetail::SharedFutex { index, .. } => index.unwrap_or(0),
+                            _ => 0,
+                        };
+                        ContinuationCompletion::Return(index)
+                    }
+                    ContinuationFamily::SharedFutexWait => ContinuationCompletion::Return(0),
+                    ContinuationFamily::SharedFutexWaitv => {
+                        let index = match &self.state().detail {
+                            ContinuationDetail::SharedFutex { index, .. } => index.unwrap_or(0),
+                            _ => 0,
+                        };
+                        ContinuationCompletion::Return(index)
+                    }
+                    ContinuationFamily::BlockingHostWrite => {
+                        let offset = match &self.state().detail {
+                            ContinuationDetail::HostWrite(write) => write.lock().offset() as i64,
+                            _ => 0,
+                        };
+                        ContinuationCompletion::RedispatchWithPartial(offset)
+                    }
+                    ContinuationFamily::VforkParent => {
+                        let child = self.vfork_child().map_or(0, |key| i64::from(key.id.raw()));
+                        ContinuationCompletion::Return(child)
+                    }
+                    ContinuationFamily::WaitOnSharedWord => match &self.state().detail {
+                        ContinuationDetail::SharedWord {
+                            sysv: Some(sysv), ..
+                        } => sysv.completion_after_wake().map_or(
+                            ContinuationCompletion::Redispatch,
+                            |outcome| match outcome {
+                                DispatchOutcome::Errno { errno } => {
+                                    ContinuationCompletion::Errno(errno)
+                                }
+                                _ => ContinuationCompletion::Redispatch,
+                            },
+                        ),
+                        _ => ContinuationCompletion::Redispatch,
+                    },
                     _ => ContinuationCompletion::Redispatch,
                 },
-                _ => ContinuationCompletion::Redispatch,
             },
             ContinuationEvent::Timeout => match family {
                 ContinuationFamily::FutexWait
@@ -1080,24 +1204,37 @@ impl BlockedContinuation {
                 }
                 ContinuationFamily::BlockingHostWrite => {
                     let offset = match &self.state().detail {
-                        ContinuationDetail::HostWrite(write) => write.offset() as i64,
+                        ContinuationDetail::HostWrite(write) => write.lock().offset() as i64,
                         _ => 0,
                     };
                     ContinuationCompletion::Return(offset)
                 }
                 _ => ContinuationCompletion::Redispatch,
             },
-            ContinuationEvent::Signal { restart } => {
-                let restart = if family == ContinuationFamily::WaitOnSignals
-                    || restart_class == RestartClass::Never
+            ContinuationEvent::Signal => {
+                let signal_authority = context.signal_authority();
+                let deliverable = signal_authority
+                    .thread_pending()
+                    .union(signal_authority.task_pending())
+                    .difference(signal_authority.blocked());
+                let action_requests_restart = deliverable
+                    .lowest_signum()
+                    .and_then(|signum| crate::kernel::LinuxSignal::for_signal_number(signum).ok())
+                    .is_some_and(|signal| {
+                        signal_authority.action(signal).sa_flags & carrick_abi::LINUX_SA_RESTART
+                            != 0
+                    });
+                let restart = if family != ContinuationFamily::WaitOnSignals
+                    && restart_class != RestartClass::Never
+                    && action_requests_restart
                 {
-                    RestartDecision::NoRestart
+                    RestartDecision::Restart
                 } else {
-                    restart
+                    RestartDecision::NoRestart
                 };
                 let completion = if family == ContinuationFamily::BlockingHostWrite {
                     let offset = match &self.state().detail {
-                        ContinuationDetail::HostWrite(write) => write.offset() as i64,
+                        ContinuationDetail::HostWrite(write) => write.lock().offset() as i64,
                         _ => 0,
                     };
                     if offset != 0 {
@@ -1106,10 +1243,16 @@ impl BlockedContinuation {
                         ContinuationCompletion::Errno(LINUX_EINTR)
                     }
                 } else if family == ContinuationFamily::WaitOnSleep {
-                    ContinuationCompletion::ErrnoWithGuestWrites(
-                        LINUX_EINTR,
-                        self.guest_outputs().to_vec(),
-                    )
+                    ContinuationCompletion::InterruptedSleep {
+                        remaining: self.guest_outputs().first().copied().map(|range| {
+                            (
+                                range,
+                                self.deadline().map_or(Duration::ZERO, |deadline| {
+                                    deadline.saturating_duration_since(Instant::now())
+                                }),
+                            )
+                        }),
+                    }
                 } else {
                     ContinuationCompletion::Errno(LINUX_EINTR)
                 };
@@ -1174,6 +1317,14 @@ pub fn resume_continuation(
     if lease.thread_key() != continuation.authority().thread() || !valid_successor {
         return Err(ContinuationResumeError::StaleThread);
     }
+    let (current_mm, current_asid) = lease
+        .task_state_authority()
+        .map_err(|_| ContinuationResumeError::StaleAddressSpace)?;
+    if current_mm != continuation.authority().mm()
+        || current_asid != continuation.authority().asid_generation()
+    {
+        return Err(ContinuationResumeError::StaleAddressSpace);
+    }
     let continuation = lease
         .take_blocked_continuation()
         .ok_or(ContinuationResumeError::MissingContinuation)?;
@@ -1184,6 +1335,7 @@ pub fn resume_continuation(
 pub struct ResumeContext {
     thread: ThreadKey,
     task: TaskKey,
+    task_revision: TaskRevision,
     execution: ExecutionGeneration,
     mm: MmId,
     asid_generation: u64,
@@ -1194,6 +1346,7 @@ impl ResumeContext {
     fn for_test(
         thread: ThreadKey,
         task: TaskKey,
+        task_revision: TaskRevision,
         execution: ExecutionGeneration,
         mm: MmId,
         asid_generation: u64,
@@ -1201,6 +1354,7 @@ impl ResumeContext {
         Self {
             thread,
             task,
+            task_revision,
             execution,
             mm,
             asid_generation,
@@ -1211,6 +1365,7 @@ impl ResumeContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContinuationResumeError {
     StaleThread,
+    StaleTaskRevision,
     StaleAddressSpace,
     MissingContinuation,
 }
@@ -1225,7 +1380,7 @@ pub enum RestartDecision {
 pub enum ContinuationEvent {
     Ready,
     Timeout,
-    Signal { restart: RestartDecision },
+    Signal,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1236,6 +1391,9 @@ pub enum ContinuationCompletion {
     RedispatchWithPartial(i64),
     ReturnWithGuestWrites(i64, Vec<GuestOutputRange>),
     ErrnoWithGuestWrites(LinuxErrno, Vec<GuestOutputRange>),
+    InterruptedSleep {
+        remaining: Option<(GuestOutputRange, Duration)>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1366,12 +1524,218 @@ enum RegistrationState {
     Prepared,
     Enrolled,
     Ready,
+    Cancelled,
+    Consumed,
+}
+
+#[derive(Debug)]
+enum ReadinessProbe {
+    Futex {
+        table: FutexSource,
+        wait: FutexWait,
+        deadline: Option<Instant>,
+    },
+    Fds {
+        registrations: Vec<OwnedFdRegistration>,
+        deadline: Option<Instant>,
+    },
+    SharedWord {
+        location: SharedFutexLocation,
+        value: u32,
+        deadline: Option<Instant>,
+    },
+    HostWrite {
+        write: Arc<Mutex<BlockingHostWrite>>,
+        completion: Arc<Mutex<Option<DispatchOutcome>>>,
+    },
+    RecordLock {
+        lock: Arc<BlockingRecordLock>,
+        completion: Arc<Mutex<Option<DispatchOutcome>>>,
+    },
+    TaskWake {
+        task: Weak<Task>,
+        observed: u64,
+        deadline: Option<Instant>,
+    },
+    Vfork {
+        wait: VforkParentWait,
+    },
+    Timer {
+        deadline: Instant,
+    },
+    Passive {
+        deadline: Option<Instant>,
+    },
+}
+
+impl ReadinessProbe {
+    fn from_continuation(continuation: &BlockedContinuation) -> Self {
+        let state = continuation.state();
+        match &state.detail {
+            ContinuationDetail::Fds { registrations, .. }
+            | ContinuationDetail::Select { registrations, .. } => Self::Fds {
+                registrations: registrations.clone(),
+                deadline: state.deadline,
+            },
+            ContinuationDetail::SharedFutex {
+                location, value, ..
+            }
+            | ContinuationDetail::SharedWord {
+                location, value, ..
+            } => Self::SharedWord {
+                location: *location,
+                value: *value,
+                deadline: state.deadline,
+            },
+            ContinuationDetail::HostWrite(write) => Self::HostWrite {
+                write: Arc::clone(write),
+                completion: Arc::clone(&state.producer_completion),
+            },
+            ContinuationDetail::Process { .. } | ContinuationDetail::Signals { .. } => {
+                let task = state.authority.task_ref.clone();
+                let observed = state.authority.task_wake_generation;
+                Self::TaskWake {
+                    task,
+                    observed,
+                    deadline: state.deadline,
+                }
+            }
+            ContinuationDetail::Vfork { wait, .. } => Self::Vfork { wait: wait.clone() },
+            ContinuationDetail::Sleep => state
+                .deadline
+                .map_or(Self::Passive { deadline: None }, |deadline| Self::Timer {
+                    deadline,
+                }),
+            ContinuationDetail::Futex { wait, .. } => state.private_futex.as_ref().map_or(
+                Self::Passive {
+                    deadline: state.deadline,
+                },
+                |table| Self::Futex {
+                    table: table.clone(),
+                    wait: *wait,
+                    deadline: state.deadline,
+                },
+            ),
+            ContinuationDetail::RecordLock(lock) => Self::RecordLock {
+                lock: Arc::clone(lock),
+                completion: Arc::clone(&state.producer_completion),
+            },
+        }
+    }
+
+    fn poll(&mut self) -> Option<ContinuationEvent> {
+        let deadline_event = |deadline: Option<Instant>| {
+            deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+                .then_some(ContinuationEvent::Timeout)
+        };
+        match self {
+            Self::Futex {
+                table,
+                wait,
+                deadline,
+            } => {
+                if let Some(event) = deadline_event(*deadline) {
+                    return Some(event);
+                }
+                (table
+                    .0
+                    .wait_prepared(*wait, Some(Duration::ZERO), &|| false)
+                    == FutexWaitOutcome::Woken)
+                    .then_some(ContinuationEvent::Ready)
+            }
+            Self::Fds {
+                registrations,
+                deadline,
+            } => {
+                if let Some(event) = deadline_event(*deadline) {
+                    return Some(event);
+                }
+                if registrations.is_empty() {
+                    return None;
+                }
+                let mut pollfds = registrations
+                    .iter()
+                    .map(|registration| libc::pollfd {
+                        fd: registration.fd.as_raw_fd(),
+                        events: registration.events,
+                        revents: 0,
+                    })
+                    .collect::<Vec<_>>();
+                let ready =
+                    unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 0) };
+                (ready > 0).then_some(ContinuationEvent::Ready)
+            }
+            Self::SharedWord {
+                location,
+                value,
+                deadline,
+            } => {
+                if let Some(event) = deadline_event(*deadline) {
+                    return Some(event);
+                }
+                // SAFETY: the continuation pins the exact MM generation and
+                // owns the wait token; cancellation precedes MM teardown.
+                let current = unsafe {
+                    (location.wait_addr().raw() as *const std::sync::atomic::AtomicU32)
+                        .as_ref()
+                        .map(|word| word.load(Ordering::Acquire))
+                };
+                current
+                    .is_none_or(|current| current != *value)
+                    .then_some(ContinuationEvent::Ready)
+            }
+            Self::HostWrite { write, completion } => {
+                let mut write = write.lock();
+                match crate::dispatch::drive_blocking_host_write(&mut write) {
+                    crate::dispatch::BlockingHostWriteStep::Done(outcome) => {
+                        *completion.lock() = Some(outcome);
+                        Some(ContinuationEvent::Ready)
+                    }
+                    crate::dispatch::BlockingHostWriteStep::Wait => None,
+                }
+            }
+            Self::RecordLock { lock, completion } => {
+                match crate::dispatch::try_drive_blocking_record_lock(lock) {
+                    crate::dispatch::BlockingRecordLockStep::Done(outcome) => {
+                        *completion.lock() = Some(outcome);
+                        Some(ContinuationEvent::Ready)
+                    }
+                    crate::dispatch::BlockingRecordLockStep::Wait => None,
+                }
+            }
+            Self::TaskWake {
+                task,
+                observed,
+                deadline,
+            } => {
+                if let Some(event) = deadline_event(*deadline) {
+                    return Some(event);
+                }
+                let current = task
+                    .upgrade()
+                    .map_or(u64::MAX, |task| task.wake_generation());
+                (current != *observed).then_some(ContinuationEvent::Ready)
+            }
+            Self::Vfork { wait } => wait
+                .released_reason()
+                .is_some()
+                .then_some(ContinuationEvent::Ready),
+            Self::Timer { deadline } => {
+                (Instant::now() >= *deadline).then_some(ContinuationEvent::Timeout)
+            }
+            Self::Passive { deadline } => deadline_event(*deadline),
+        }
+    }
 }
 
 #[derive(Debug)]
 struct RegistrationEntry {
     token: ContinuationWakeToken,
     state: RegistrationState,
+    event: Option<ContinuationEvent>,
+    probe: ReadinessProbe,
+    interrupt: Option<(Weak<Task>, u64)>,
 }
 
 #[derive(Debug, Default)]
@@ -1385,20 +1749,139 @@ struct CarrierWaitState {
 struct CarrierWaitServiceInner {
     scheduler: Arc<Scheduler>,
     state: Mutex<CarrierWaitState>,
+    changed: Condvar,
+    shutdown: AtomicBool,
+    reactor: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl CarrierWaitServiceInner {
     fn cancel_exact(&self, token: ContinuationWakeToken) -> bool {
         let mut state = self.state.lock();
-        if state
-            .entries
-            .get(&token.continuation)
-            .is_none_or(|entry| entry.token != token)
+        let Some(entry) = state.entries.get_mut(&token.continuation) else {
+            return false;
+        };
+        if entry.token != token
+            || !matches!(
+                entry.state,
+                RegistrationState::Prepared | RegistrationState::Enrolled
+            )
         {
             return false;
         }
+        entry.state = RegistrationState::Cancelled;
         state.entries.remove(&token.continuation);
+        self.changed.notify_all();
         true
+    }
+
+    fn consume_ready_exact(
+        &self,
+        token: ContinuationWakeToken,
+    ) -> Result<(), ContinuationResumeError> {
+        let mut state = self.state.lock();
+        let entry = state
+            .entries
+            .get_mut(&token.continuation)
+            .filter(|entry| entry.token == token)
+            .ok_or(ContinuationResumeError::MissingContinuation)?;
+        if entry.state != RegistrationState::Ready {
+            return Err(ContinuationResumeError::MissingContinuation);
+        }
+        entry.state = RegistrationState::Consumed;
+        state.entries.remove(&token.continuation);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn finish_exact(&self, token: ContinuationWakeToken) {
+        let mut state = self.state.lock();
+        if state
+            .entries
+            .get(&token.continuation)
+            .is_some_and(|entry| entry.token == token)
+        {
+            state.entries.remove(&token.continuation);
+            self.changed.notify_all();
+        }
+    }
+
+    fn publish_event(
+        &self,
+        token: ContinuationWakeToken,
+        event: ContinuationEvent,
+    ) -> WakePublishReceipt {
+        let won = {
+            let mut state = self.state.lock();
+            let Some(entry) = state.entries.get_mut(&token.continuation) else {
+                return WakePublishReceipt::rejected();
+            };
+            if entry.token != token
+                || !matches!(
+                    entry.state,
+                    RegistrationState::Prepared | RegistrationState::Enrolled
+                )
+            {
+                return WakePublishReceipt::rejected();
+            }
+            entry.state = RegistrationState::Ready;
+            entry.event = Some(event);
+            self.changed.notify_all();
+            true
+        };
+        let _ = self.scheduler.wake(token.thread);
+        WakePublishReceipt {
+            accepted: won,
+            first: won,
+        }
+    }
+
+    fn run_reactor(weak: Weak<Self>) {
+        loop {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            if inner.shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            let ready = {
+                let mut state = inner.state.lock();
+                let ready = state
+                    .entries
+                    .values_mut()
+                    .filter(|entry| entry.state == RegistrationState::Enrolled)
+                    .filter_map(|entry| {
+                        let interrupted =
+                            entry.interrupt.as_ref().is_some_and(|(task, observed)| {
+                                task.upgrade()
+                                    .is_none_or(|task| task.wake_generation() != *observed)
+                            });
+                        interrupted
+                            .then_some(ContinuationEvent::Signal)
+                            .or_else(|| entry.probe.poll())
+                            .map(|event| (entry.token, event))
+                    })
+                    .collect::<Vec<_>>();
+                if ready.is_empty() && !inner.shutdown.load(Ordering::Acquire) {
+                    inner.changed.wait_for(&mut state, Duration::from_millis(2));
+                }
+                ready
+            };
+            for (token, event) in ready {
+                inner.publish_event(token, event);
+            }
+        }
+    }
+}
+
+impl Drop for CarrierWaitServiceInner {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.changed.notify_all();
+        if let Some(handle) = self.reactor.get_mut().take()
+            && handle.thread().id() != std::thread::current().id()
+        {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -1409,12 +1892,20 @@ pub struct CarrierWaitService {
 
 impl CarrierWaitService {
     pub fn new(scheduler: Arc<Scheduler>) -> Self {
-        Self {
-            inner: Arc::new(CarrierWaitServiceInner {
-                scheduler,
-                state: Mutex::new(CarrierWaitState::default()),
-            }),
-        }
+        let inner = Arc::new(CarrierWaitServiceInner {
+            scheduler,
+            state: Mutex::new(CarrierWaitState::default()),
+            changed: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+            reactor: Mutex::new(None),
+        });
+        let weak = Arc::downgrade(&inner);
+        let handle = std::thread::Builder::new()
+            .name("carrick-carrier-wait".to_owned())
+            .spawn(move || CarrierWaitServiceInner::run_reactor(weak))
+            .unwrap_or_else(|_| std::process::abort());
+        *inner.reactor.lock() = Some(handle);
+        Self { inner }
     }
 
     pub fn prepare_registration(
@@ -1434,12 +1925,30 @@ impl CarrierWaitService {
             registration_generation: next_nonzero(&NEXT_REGISTRATION_GENERATION),
         };
         let _resource_fingerprint = continuation.resource_fingerprint();
+        let probe = ReadinessProbe::from_continuation(continuation);
+        let interrupt = (!matches!(
+            continuation.family(),
+            ContinuationFamily::WaitOnProcExit
+                | ContinuationFamily::WaitOnProcState
+                | ContinuationFamily::WaitOnHvpatchChild
+                | ContinuationFamily::WaitOnSignals
+                | ContinuationFamily::VforkParent
+        ))
+        .then(|| {
+            (
+                continuation.authority().task_ref.clone(),
+                continuation.authority().task_wake_generation,
+            )
+        });
         let mut state = self.inner.state.lock();
         let replaced = state.entries.insert(
             token.continuation,
             RegistrationEntry {
                 token,
                 state: RegistrationState::Prepared,
+                event: None,
+                probe,
+                interrupt,
             },
         );
         if replaced.is_some() {
@@ -1476,24 +1985,76 @@ impl CarrierWaitService {
             entry.state = RegistrationState::Enrolled;
         }
         registration.enrolled = true;
+        self.inner.changed.notify_all();
         Ok(())
     }
 
-    pub fn publish_ready(&self, token: ContinuationWakeToken) -> WakePublishReceipt {
-        let first = {
+    /// Durable post-enrollment sample. The product path calls this before the
+    /// destructive backend save; the shared reactor repeats the same probe
+    /// afterward, closing both sides of the registration window.
+    pub fn recheck_registration(
+        &self,
+        registration: &ContinuationRegistration,
+    ) -> Result<Option<ContinuationEvent>, WaitServiceError> {
+        let event = {
             let mut state = self.inner.state.lock();
-            let Some(entry) = state.entries.get_mut(&token.continuation) else {
-                return WakePublishReceipt::rejected();
-            };
-            if entry.token != token {
-                return WakePublishReceipt::rejected();
+            let entry = state
+                .entries
+                .get_mut(&registration.token.continuation)
+                .filter(|entry| entry.token == registration.token)
+                .ok_or(WaitServiceError::StaleRegistration)?;
+            if !matches!(
+                entry.state,
+                RegistrationState::Enrolled | RegistrationState::Prepared
+            ) {
+                return Ok(entry.event);
             }
-            let first = entry.state != RegistrationState::Ready;
-            entry.state = RegistrationState::Ready;
-            first
+            let interrupted = entry.interrupt.as_ref().is_some_and(|(task, observed)| {
+                task.upgrade()
+                    .is_none_or(|task| task.wake_generation() != *observed)
+            });
+            interrupted
+                .then_some(ContinuationEvent::Signal)
+                .or_else(|| entry.probe.poll())
         };
-        let accepted = self.inner.scheduler.wake(token.thread).is_ok();
-        WakePublishReceipt { accepted, first }
+        if let Some(event) = event {
+            self.inner.publish_event(registration.token, event);
+        }
+        Ok(event)
+    }
+
+    pub fn publish_ready(&self, token: ContinuationWakeToken) -> WakePublishReceipt {
+        self.inner.publish_event(token, ContinuationEvent::Ready)
+    }
+
+    pub fn wait_for_event(
+        &self,
+        token: ContinuationWakeToken,
+        timeout: Duration,
+    ) -> Result<ContinuationEvent, WaitServiceError> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.inner.state.lock();
+        loop {
+            let entry = state
+                .entries
+                .get(&token.continuation)
+                .filter(|entry| entry.token == token)
+                .ok_or(WaitServiceError::StaleRegistration)?;
+            if entry.state == RegistrationState::Ready {
+                return entry.event.ok_or(WaitServiceError::StaleRegistration);
+            }
+            if matches!(
+                entry.state,
+                RegistrationState::Cancelled | RegistrationState::Consumed
+            ) {
+                return Err(WaitServiceError::StaleRegistration);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(WaitServiceError::TimedOut);
+            }
+            self.inner.changed.wait_for(&mut state, deadline - now);
+        }
     }
 
     pub fn cancel_registration(
@@ -1511,7 +2072,7 @@ impl CarrierWaitService {
 
     pub const fn topology(&self) -> WaitServiceTopology {
         WaitServiceTopology {
-            service_threads: 0,
+            service_threads: 1,
             shared_reactors: 1,
         }
     }
@@ -1546,6 +2107,8 @@ impl WaitServiceTopology {
 pub enum WaitServiceError {
     #[error("wait-service registration is stale")]
     StaleRegistration,
+    #[error("wait-service event did not arrive before the caller deadline")]
+    TimedOut,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1644,7 +2207,11 @@ impl TransitionalDedicatedRunner {
     }
 
     pub fn drive_quantum(&self, source: &mut impl TaskQuantumSource) -> QuantumExitKind {
-        run_task_quantum(source).kind()
+        self.run_task_quantum(source).kind()
+    }
+
+    pub fn run_task_quantum(&self, source: &mut impl TaskQuantumSource) -> QuantumExit {
+        run_task_quantum(source)
     }
 
     pub const fn is_task_5_only(&self) -> bool {
@@ -1685,6 +2252,14 @@ mod tests {
     }
 
     fn task_state(context: &KernelContext, marker: u64) -> MigratableTaskState {
+        task_state_with_asid(context, marker, context.shared().mm().id().raw())
+    }
+
+    fn task_state_with_asid(
+        context: &KernelContext,
+        marker: u64,
+        asid_generation: u64,
+    ) -> MigratableTaskState {
         let mm = context.shared().mm().id();
         MigratableTaskState {
             cpu: GuestCpuState::from_aarch64_v1(Aarch64TaskCpuStateV1 {
@@ -1714,10 +2289,10 @@ mod tests {
                 is_forked_child: false,
                 syscall_continuation: None,
                 mm_generation: mm.raw(),
-                asid_generation: mm.raw(),
+                asid_generation,
             }),
             mm,
-            asid_generation: mm.raw(),
+            asid_generation,
         }
     }
 
@@ -1955,8 +2530,12 @@ mod tests {
             .expect("publish vfork");
         let (child, wait) = published.into_parts().expect("start child");
         let wait = wait.expect("vfork parent wait");
+        let current = context
+            .task_binding()
+            .capture(context.thread().key().tid)
+            .expect("recapture parent after vfork publication");
         let continuation = BlockedContinuation::from_vfork_parent(
-            capture(&context, generation, ContinuationBackend::Hvpatch),
+            capture(&current, generation, ContinuationBackend::Hvpatch),
             child.task().key(),
             wait.clone(),
         )
@@ -1968,7 +2547,7 @@ mod tests {
         let probe = Arc::new(AtomicUsize::new(0));
         let make = || {
             let mut continuation = BlockedContinuation::from_vfork_parent(
-                capture(&context, generation, ContinuationBackend::Hvpatch),
+                capture(&current, generation, ContinuationBackend::Hvpatch),
                 child.task().key(),
                 wait.clone(),
             )
@@ -1977,7 +2556,7 @@ mod tests {
             continuation
         };
         let ready = make()
-            .resume(ContinuationEvent::Ready, &context)
+            .resume(ContinuationEvent::Ready, &current)
             .expect("vfork release result");
         assert_eq!(
             ready.completion,
@@ -2036,14 +2615,6 @@ mod tests {
     fn race_fixture(pid: i32) -> RaceFixture {
         let (kernel, context) = bootstrap(pid);
         let generation = publish(&context, pid as u64);
-        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
-        let executor = scheduler
-            .register_executor(Arc::new(TestKick::default()))
-            .expect("executor");
-        scheduler
-            .make_runnable(context.thread().key())
-            .expect("queue root");
-        let running = scheduler.take(&executor).expect("claim root");
         let continuation = BlockedContinuation::from_dispatch_outcome(
             DispatchOutcome::WaitOnSleep {
                 duration: Duration::from_secs(30),
@@ -2052,6 +2623,14 @@ mod tests {
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
         .expect("continuation");
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let executor = scheduler
+            .register_executor(Arc::new(TestKick::default()))
+            .expect("executor");
+        scheduler
+            .make_runnable(context.thread().key())
+            .expect("queue root");
+        let running = scheduler.take(&executor).expect("claim root");
         let service = Arc::new(CarrierWaitService::new(Arc::clone(&scheduler)));
         let registration = service.prepare_registration(&continuation);
         RaceFixture {
@@ -2247,8 +2826,26 @@ mod tests {
             .scheduler
             .take(&fixture.executor)
             .expect("destination load");
+        assert!(matches!(
+            fixture.context.thread().execution_state(),
+            ThreadExecutionState::Running {
+                wake_pending: false,
+                ..
+            }
+        ));
         let join = publish_with_real_barrier(Arc::clone(&fixture.service), token);
-        join.join().expect("publisher");
+        let duplicate = join.join().expect("publisher");
+        assert!(
+            !duplicate.accepted(),
+            "a consumed Ready registration must reject a stale duplicate without waking the successor"
+        );
+        assert!(matches!(
+            fixture.context.thread().execution_state(),
+            ThreadExecutionState::Running {
+                wake_pending: false,
+                ..
+            }
+        ));
         let continuation = destination
             .lease()
             .blocked_continuation()
@@ -2336,21 +2933,15 @@ mod tests {
                 other => panic!("unexpected timeout result: {other:?}"),
             }
             let interrupted = make()
-                .resume(
-                    ContinuationEvent::Signal {
-                        restart: RestartDecision::Restart,
-                    },
-                    &context,
-                )
+                .resume(ContinuationEvent::Signal, &context)
                 .expect("signal result");
             match (&family, &interrupted.completion) {
                 (ContinuationFamily::BlockingHostWrite, ContinuationCompletion::Return(2)) => {}
                 (
                     ContinuationFamily::WaitOnSleep,
-                    ContinuationCompletion::ErrnoWithGuestWrites(errno, writes),
+                    ContinuationCompletion::InterruptedSleep { remaining },
                 ) => {
-                    assert_eq!(*errno, LINUX_EINTR);
-                    assert_eq!(writes.len(), 1);
+                    assert!(remaining.is_some());
                 }
                 (_, ContinuationCompletion::Errno(errno)) => assert_eq!(*errno, LINUX_EINTR),
                 other => panic!("unexpected signal result: {other:?}"),
@@ -2422,6 +3013,7 @@ mod tests {
             let wrong = ResumeContext::for_test(
                 context.thread().key(),
                 context.task().key(),
+                context.revision(),
                 generation,
                 context.shared().mm().id(),
                 context.shared().mm().id().raw() + 1,
@@ -2510,7 +3102,7 @@ mod tests {
     fn shared_wait_service_is_bounded_and_blocked_tasks_own_no_executor() {
         let mut fixture = race_fixture(15_230);
         let topology = fixture.service.topology();
-        assert_eq!(topology.service_threads(), 0);
+        assert_eq!(topology.service_threads(), 1);
         assert_eq!(topology.shared_reactors(), 1);
         for _ in 0..256 {
             let continuation = BlockedContinuation::from_dispatch_outcome(
@@ -2518,11 +3110,14 @@ mod tests {
                     duration: Duration::from_secs(30),
                     remaining: None,
                 },
-                capture(
+                ContinuationCapture::from_lease(
                     &fixture.context,
-                    fixture.running.generation(),
+                    fixture.running.lease(),
+                    request(73),
+                    RestartClass::RestartSyscall,
                     ContinuationBackend::Hvpatch,
-                ),
+                )
+                .expect("running lease capture"),
             )
             .unwrap();
             let mut registration = fixture.service.prepare_registration(&continuation);
@@ -2556,6 +3151,234 @@ mod tests {
                 .scheduler
                 .binding_for_thread(fixture.context.thread().key())
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn shared_reactor_observes_real_fd_and_timer_readiness_without_private_waiters() {
+        let (kernel, context) = bootstrap(15_231);
+        let generation = publish(&context, 0x552);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let service = CarrierWaitService::new(Arc::clone(&scheduler));
+        let fds = pipe_pair();
+        let fd_continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::raw(vec![(fds[0], libc::POLLIN)]),
+                timeout: Some(Duration::from_secs(1)),
+                on_timeout: 0,
+                sig_mask: WaitSigMask::NONE,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("fd continuation");
+        let mut fd_registration = service.prepare_registration(&fd_continuation);
+        service.enroll(&mut fd_registration).expect("enroll fd");
+        let fd_token = fd_registration.wake_token();
+        assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
+        assert_eq!(
+            service
+                .wait_for_event(fd_token, Duration::from_secs(1))
+                .expect("fd event"),
+            ContinuationEvent::Ready
+        );
+        assert!(service.cancel_registration(fd_registration).is_err());
+        drop(fd_continuation);
+        close_pair(fds);
+
+        let timer = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnSleep {
+                duration: Duration::from_millis(5),
+                remaining: None,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("timer continuation");
+        let mut timer_registration = service.prepare_registration(&timer);
+        service
+            .enroll(&mut timer_registration)
+            .expect("enroll timer");
+        assert_eq!(
+            service
+                .wait_for_event(timer_registration.wake_token(), Duration::from_secs(1),)
+                .expect("timer event"),
+            ContinuationEvent::Timeout
+        );
+        assert_eq!(service.topology().service_threads(), 1);
+        assert_eq!(service.topology().shared_reactors(), 1);
+    }
+
+    #[test]
+    fn shared_reactor_rechecks_private_futex_and_shared_word_producer_state() {
+        let (kernel, context) = bootstrap(15_232);
+        let generation = publish(&context, 0x553);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let service = CarrierWaitService::new(scheduler);
+
+        let futex = Arc::new(FutexTable::new());
+        let wait = futex.prepare_wait(0xfeed);
+        futex.wake(0xfeed, 1);
+        let mut private = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::FutexWait {
+                wait,
+                timeout: Some(Duration::from_secs(1)),
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("private futex continuation");
+        private.bind_product_futex(&futex);
+        let mut registration = service.prepare_registration(&private);
+        service.enroll(&mut registration).expect("enroll futex");
+        assert_eq!(
+            service
+                .wait_for_event(registration.wake_token(), Duration::from_secs(1))
+                .expect("event-before-registration generation recheck"),
+            ContinuationEvent::Ready
+        );
+        drop(private);
+
+        let word = std::sync::atomic::AtomicU32::new(7);
+        let location = SharedFutexLocation::Direct {
+            word: HostVa((&word as *const std::sync::atomic::AtomicU32) as usize),
+            waiter_key: 0xbeef,
+        };
+        let shared = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnSharedWord {
+                location,
+                waiter_key: 0xbeef,
+                value: 7,
+                sysv: None,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("shared-word continuation");
+        let mut registration = service.prepare_registration(&shared);
+        service
+            .enroll(&mut registration)
+            .expect("enroll shared word");
+        word.store(8, Ordering::Release);
+        assert_eq!(
+            service
+                .wait_for_event(registration.wake_token(), Duration::from_secs(1))
+                .expect("shared word durable recheck"),
+            ContinuationEvent::Ready
+        );
+    }
+
+    #[test]
+    fn shared_reactor_drives_write_record_signal_and_vfork_sources() {
+        let (kernel, context) = bootstrap(15_233);
+        let generation = publish(&context, 0x554);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let service = CarrierWaitService::new(scheduler);
+
+        let pipe = pipe_pair();
+        let write = BlockingHostWrite::for_tests(
+            pipe[1],
+            vec![1, 2, 3, 4],
+            2,
+            context.thread().registry_id(),
+            false,
+        )
+        .expect("write state");
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::BlockingHostWrite(write),
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("write continuation");
+        let mut registration = service.prepare_registration(&continuation);
+        service.enroll(&mut registration).expect("enroll write");
+        assert_eq!(
+            service
+                .wait_for_event(registration.wake_token(), Duration::from_secs(1))
+                .expect("write completion"),
+            ContinuationEvent::Ready
+        );
+        continuation
+            .attach_registration(registration)
+            .expect("attach write registration");
+        assert_eq!(
+            continuation
+                .resume(ContinuationEvent::Ready, &context)
+                .expect("resume write")
+                .completion,
+            ContinuationCompletion::Return(4)
+        );
+        close_pair(pipe);
+
+        let pipe = pipe_pair();
+        let lock =
+            BlockingRecordLock::new(pipe[0], libc::F_SETLKW, 0, 1, 1, 0).expect("record state");
+        let lock_continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::BlockingRecordLock(lock),
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("record continuation");
+        let mut registration = service.prepare_registration(&lock_continuation);
+        service.enroll(&mut registration).expect("enroll record");
+        assert_eq!(
+            service
+                .wait_for_event(registration.wake_token(), Duration::from_secs(1))
+                .expect("record terminal result"),
+            ContinuationEvent::Ready
+        );
+        drop(lock_continuation);
+        close_pair(pipe);
+
+        let signal_continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnSignals {
+                wait_set: SigSet::from_raw(1 << 9),
+                block_mask: SigBlockMask::NONE,
+                timeout: None,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("signal continuation");
+        let mut registration = service.prepare_registration(&signal_continuation);
+        service.enroll(&mut registration).expect("enroll signal");
+        context.task().wake();
+        assert_eq!(
+            service
+                .wait_for_event(registration.wake_token(), Duration::from_secs(1))
+                .expect("task signal source"),
+            ContinuationEvent::Ready
+        );
+        drop(signal_continuation);
+
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::VFORK | LinuxCloneFlags::VM)
+            .expect("vfork plan");
+        let published = kernel
+            .reserve_fork(&context, plan, "reactor vfork".to_owned(), None)
+            .expect("reserve")
+            .prepare_reference(ThreadId::synthetic_for_tests(15_234))
+            .expect("prepare")
+            .commit()
+            .expect("commit");
+        let (child, wait) = published.into_parts().expect("child start");
+        let wait = wait.expect("parent wait");
+        let current = context
+            .task_binding()
+            .capture(context.thread().key().tid)
+            .expect("current parent");
+        let vfork = BlockedContinuation::from_vfork_parent(
+            capture(&current, generation, ContinuationBackend::Hvpatch),
+            child.task().key(),
+            wait,
+        )
+        .expect("vfork continuation");
+        let mut registration = service.prepare_registration(&vfork);
+        service.enroll(&mut registration).expect("enroll vfork");
+        kernel
+            .exit_task(
+                child.task().key().id,
+                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("exit vfork child");
+        assert_eq!(
+            service
+                .wait_for_event(registration.wake_token(), Duration::from_secs(1))
+                .expect("vfork release source"),
+            ContinuationEvent::Ready
         );
     }
 
@@ -2610,7 +3433,11 @@ mod tests {
             barrier.wait();
             let ready = publish.join().expect("ready publisher");
             let cancelled = cancel.join().expect("canceller");
-            assert!(cancelled.is_ok());
+            assert_ne!(
+                ready.accepted(),
+                cancelled.is_ok(),
+                "readiness and cancellation must have exactly one terminal winner"
+            );
             if ready.accepted() {
                 assert!(matches!(
                     fixture.context.thread().execution_state(),
@@ -2630,6 +3457,133 @@ mod tests {
             }
             drop(fixture.continuation);
         }
+    }
+
+    #[test]
+    fn duplicate_ready_and_cancel_after_ready_are_rejected_without_extra_wake() {
+        let fixture = race_fixture(15_365);
+        let token = fixture.registration.wake_token();
+        let first = fixture.service.publish_ready(token);
+        assert!(first.accepted());
+        assert!(first.first_publication());
+        let duplicate = fixture.service.publish_ready(token);
+        assert!(!duplicate.accepted());
+        assert!(!duplicate.first_publication());
+        assert!(
+            fixture
+                .service
+                .cancel_registration(fixture.registration)
+                .is_err()
+        );
+        assert!(matches!(
+            fixture.context.thread().execution_state(),
+            ThreadExecutionState::Running {
+                wake_pending: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn capture_uses_live_lease_mm_and_independent_asid_authority() {
+        let (_kernel, context) = bootstrap(15_366);
+        let mm = context.shared().mm().id();
+        let independent_asid = mm.raw().checked_add(0x4000).expect("test asid");
+        context
+            .thread()
+            .publish_initial_task_state(task_state_with_asid(&context, 0x701, independent_asid))
+            .expect("publish independent ASID snapshot");
+        let executor = crate::kernel::objects::ExecutorId::for_transitional_thread(
+            context.thread().registry_id(),
+        )
+        .expect("executor");
+        let lease = context.thread().claim_runnable(executor).expect("lease");
+        let capture = ContinuationCapture::from_lease(
+            &context,
+            &lease,
+            request(73),
+            RestartClass::RestartSyscall,
+            ContinuationBackend::Hvpatch,
+        )
+        .expect("lease-derived capture");
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnSleep {
+                duration: Duration::from_secs(1),
+                remaining: None,
+            },
+            capture,
+        )
+        .expect("continuation");
+        assert_eq!(continuation.authority().mm(), mm);
+        assert_eq!(continuation.authority().asid_generation(), independent_asid);
+        assert_eq!(continuation.authority().task_revision(), context.revision());
+        drop(lease);
+    }
+
+    #[test]
+    fn same_task_same_mm_revision_drift_is_rejected_on_resume() {
+        let (kernel, context) = bootstrap(15_367);
+        let generation = publish(&context, 0x702);
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnSleep {
+                duration: Duration::from_secs(1),
+                remaining: None,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("continuation");
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
+        let published = kernel
+            .reserve_fork(&context, plan, "revision drift child".to_owned(), None)
+            .expect("reserve fork")
+            .prepare_reference(ThreadId::synthetic_for_tests(15_368))
+            .expect("prepare fork")
+            .commit()
+            .expect("commit fork");
+        let (_child, no_vfork_wait) = published.into_parts().expect("start child");
+        assert!(no_vfork_wait.is_none());
+        let fresh = context
+            .task_binding()
+            .capture(context.thread().key().tid)
+            .expect("fresh same-task context");
+        assert_eq!(fresh.task().key(), context.task().key());
+        assert_eq!(fresh.shared().mm().id(), context.shared().mm().id());
+        assert_ne!(fresh.revision(), context.revision());
+        assert_eq!(
+            continuation.resume(ContinuationEvent::Ready, &fresh),
+            Err(ContinuationResumeError::StaleTaskRevision)
+        );
+    }
+
+    #[test]
+    fn signal_restart_is_derived_from_captured_kernel_action_not_event_input() {
+        let (_kernel, context) = bootstrap(15_369);
+        let generation = publish(&context, 0x703);
+        let signal = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+        let mut action = carrick_abi::LinuxSigaction::empty();
+        action.sa_handler = 0x1234;
+        action.sa_flags = carrick_abi::LINUX_SA_RESTART;
+        let authority = context.signal_authority();
+        authority.install_action(signal, action);
+        authority.enqueue_thread_standard(signal, None);
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::empty(),
+                timeout: None,
+                on_timeout: 0,
+                sig_mask: WaitSigMask::NONE,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("restartable continuation");
+        let result = continuation
+            .resume(ContinuationEvent::Signal, &context)
+            .expect("signal completion");
+        assert_eq!(result.restart(), RestartDecision::Restart);
+        assert_eq!(
+            result.completion,
+            ContinuationCompletion::Errno(LINUX_EINTR)
+        );
     }
 
     #[test]
@@ -2671,8 +3625,6 @@ mod tests {
             "libc::nanosleep",
             "ThreadWaiter",
             "make_readiness_pipe",
-            "std::thread::spawn",
-            "Builder::spawn",
         ] {
             assert!(
                 !source.contains(prohibited),
@@ -2682,12 +3634,64 @@ mod tests {
         assert_eq!(DISPATCH_FAMILIES.len() + 1, 16);
 
         let loop_source = include_str!("mod.rs");
+        let product = loop_source
+            .split("fn suspend_hvpatch_continuation")
+            .nth(1)
+            .and_then(|tail| tail.split("fn service_threaded_syscall").next())
+            .expect("real HVPatch continuation adapter body");
+        for required in [
+            "ContinuationCapture::from_lease",
+            "runner.run_task_quantum",
+            "prepare_registration",
+            ".enroll(",
+            "recheck_registration",
+            "save_shared_wait_state",
+            "settle_transitional_blocked_continuation",
+            "Yield::Blocked",
+            "wait_for_event",
+            "take_transitional_lease",
+            "resume_continuation",
+        ] {
+            assert!(
+                product.contains(required),
+                "missing product boundary: {required}"
+            );
+        }
+        for prohibited in [
+            "libc::wait",
+            "libc::waitpid",
+            "libc::kill",
+            "libc::nanosleep",
+            "ThreadWaiter",
+            "kqueue",
+            "vfork_release_fd",
+        ] {
+            assert!(
+                !product.contains(prohibited),
+                "product adapter retains {prohibited}"
+            );
+        }
+        let dispatch = loop_source
+            .split("fn service_threaded_syscall")
+            .nth(1)
+            .expect("dispatch service body");
+        let escape = dispatch
+            .find("continuation::is_blocking_dispatch_outcome(&outcome)")
+            .expect("HVPatch blocking escape");
+        let first_inline_wait = dispatch
+            .find("DispatchOutcome::BlockingHostWrite")
+            .expect("compatibility wait arm");
         assert!(
-            loop_source.contains(
-                "let _transitional_runner = continuation::TransitionalDedicatedRunner::new();"
-            ),
-            "Task 5 product path must remain explicitly marked until Task 7 removes the adapter"
+            escape < first_inline_wait,
+            "HVPatch must escape before compatibility waits"
         );
+        let quiesce = include_str!("quiesce.rs");
+        let hvpatch_fork = quiesce
+            .split("fn handle_in_process_fork")
+            .nth(1)
+            .expect("HVPatch fork body");
+        assert!(hvpatch_fork.contains("HvpatchBlockInput::Vfork"));
+        assert!(!hvpatch_fork.contains("wait.wait_for_release"));
     }
 
     struct TestQuantumSource {
