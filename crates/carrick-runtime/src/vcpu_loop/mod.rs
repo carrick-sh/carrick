@@ -5042,8 +5042,8 @@ where
             )
             .await
         };
-        let receipt = match runner.try_spawn(future) {
-            Ok(receipt) => receipt,
+        let (receipt, dormant) = match runner.try_spawn_dormant(future) {
+            Ok(submission) => submission,
             Err(error) => {
                 prepared.fail_exact();
                 return VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(format!(
@@ -5054,11 +5054,18 @@ where
         if let Err(error) = prepared.scheduler.wake(prepared.thread.key()) {
             prepared.fail_exact();
             gate.cancel();
+            drop(dormant);
             tracing::error!(%error, "initial scheduler publication failed after runner submit");
             return VcpuLoopLaunch::Job(receipt);
         }
-        prepared.disarm();
+        prepared.scheduler.request_preemption();
         gate.open();
+        if let Err(error) = dormant.activate() {
+            prepared.fail_exact();
+            tracing::error!(%error, "initial runner activation failed after scheduler publication");
+            return VcpuLoopLaunch::Job(receipt);
+        }
+        prepared.disarm();
         return VcpuLoopLaunch::Job(receipt);
     }
     let future = run_vcpu_until_exit_inner(
