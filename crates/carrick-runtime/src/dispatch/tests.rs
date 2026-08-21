@@ -927,7 +927,12 @@ mod overlay_dispatch_tests {
         let out = h.reserve(16);
         let outcome = h.call(22, [epfd as u64, out, 1, u64::MAX, 0, 0]);
         let authority = match outcome {
-            DispatchOutcome::WaitOnFds { fds, .. } => {
+            DispatchOutcome::WaitOnPollFds { fds, .. } => {
+                assert_eq!(
+                    fds.first().map(|(_, events)| events),
+                    Some(libc::POLLIN),
+                    "empty-interest wait subscribes to the shared epoll mutation source"
+                );
                 assert_eq!(
                     fds.logical_authorities_for_test().len(),
                     1,
@@ -954,6 +959,93 @@ mod overlay_dispatch_tests {
         assert!(
             !files.validate_slot_authority(authority),
             "old empty-epoll readiness cannot authorize a successor epfd"
+        );
+    }
+
+    #[test]
+    fn empty_epoll_interest_add_publishes_the_shared_mutation_source() {
+        let mut h = Harness::new();
+        let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as i32;
+        let out = h.reserve(16);
+        let kqueue_fd = match h.call(22, [epfd as u64, out, 1, u64::MAX, 0, 0]) {
+            DispatchOutcome::WaitOnPollFds { fds, .. } => {
+                fds.first().expect("epoll mutation source").0
+            }
+            other => panic!("expected shared epoll source, got {other:?}"),
+        };
+        let ready = returned(h.call(19, [1, 0, 0, 0, 0, 0])) as i32;
+        let event_addr = h.reserve(16);
+        let mut event = [0u8; 16];
+        event[0..4].copy_from_slice(&LINUX_EPOLLIN.to_le_bytes());
+        event[8..16].copy_from_slice(&0xbeef_u64.to_le_bytes());
+        h.memory.write_bytes(event_addr, &event).expect("event");
+        assert_eq!(
+            returned(h.call(
+                21,
+                [
+                    epfd as u64,
+                    LINUX_EPOLL_CTL_ADD,
+                    ready as u64,
+                    event_addr,
+                    0,
+                    0,
+                ],
+            )),
+            0
+        );
+        let mut pollfd = libc::pollfd {
+            fd: kqueue_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `kqueue_fd` is the live epoll instance source and `pollfd`
+        // names one initialized record. The zero timeout only performs the
+        // durable post-registration recheck used by the carrier reactor.
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
+        assert_ne!(pollfd.revents & libc::POLLIN, 0);
+    }
+
+    #[test]
+    fn epoll_watched_reuse_recomputes_registry_without_retargeting_successor() {
+        let mut h = Harness::new();
+        let watched = returned(h.call(19, [0, 0, 0, 0, 0, 0])) as i32;
+        let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as i32;
+        let event_addr = h.reserve(16);
+        let mut event = [0u8; 16];
+        event[0..4].copy_from_slice(&LINUX_EPOLLIN.to_le_bytes());
+        event[8..16].copy_from_slice(&(0xfeed_u64).to_le_bytes());
+        h.memory.write_bytes(event_addr, &event).expect("event");
+        assert_eq!(
+            returned(h.call(
+                21,
+                [
+                    epfd as u64,
+                    LINUX_EPOLL_CTL_ADD,
+                    watched as u64,
+                    event_addr,
+                    0,
+                    0,
+                ],
+            )),
+            0
+        );
+        let out = h.reserve(16);
+        let blocked = h.call(22, [epfd as u64, out, 1, u64::MAX, 0, 0]);
+        let fds = match blocked {
+            DispatchOutcome::WaitOnFds { fds, .. }
+            | DispatchOutcome::WaitOnPollFds { fds, .. } => fds,
+            other => panic!("expected blocked epoll, got {other:?}"),
+        };
+        assert_eq!(fds.logical_authorities_for_test().len(), 1);
+        assert_eq!(fds.watched_authorities_for_test().len(), 1);
+
+        assert_eq!(returned(h.call(57, [watched as u64, 0, 0, 0, 0, 0])), 0);
+        let successor = returned(h.call(19, [1, 0, 0, 0, 0, 0])) as i32;
+        assert_eq!(successor, watched, "numeric slot must be reused");
+        assert_eq!(
+            returned(h.call(22, [epfd as u64, out, 1, 0, 0, 0])),
+            0,
+            "old epoll interest was removed; ready successor is not retargeted"
         );
     }
 

@@ -4970,6 +4970,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn submit_prepared_vcpu_future<F>(
     runner: &continuation::TransitionalDedicatedRunner,
     future: F,
@@ -4998,12 +4999,12 @@ pub(crate) fn launch_vcpu_until_exit<E: ThreadedEngine + 'static>(
 where
     E::SiblingSpec: 'static,
 {
+    let mut engine = OwnerThreadEngine::new(engine);
     let runner = kernel.transitional_runner();
     if let Some(runner) = runner {
-        let mut engine = engine;
-        let prepared = match prepare_initial_runner_handoff(
+        let mut prepared = match prepare_initial_runner_handoff(
             &kernel,
-            &mut engine,
+            &mut *engine,
             &kicker,
             linux_tid,
             this_tid,
@@ -5011,24 +5012,56 @@ where
             Ok(prepared) => prepared,
             Err(error) => return VcpuLoopLaunch::Direct(Err(error)),
         };
-        let future = run_vcpu_until_exit_inner(
-            kernel,
-            engine,
-            registry,
-            futex,
-            platform_futex,
-            platform_futex_factory,
-            linux_tid,
-            this_tid,
-            threads,
-            kicker,
-            in_guest,
-            max_traps,
-            Some(prepared),
-        );
-        return submit_prepared_vcpu_future(&runner, future);
+        let gate = InitialRunnerStartGate::new();
+        let worker_gate = Arc::clone(&gate);
+        let task = prepared
+            .task
+            .take()
+            .unwrap_or_else(|| std::process::abort());
+        let future = async move {
+            if !worker_gate.wait().await {
+                return Err(RuntimeError::Configuration(
+                    "initial runner submission was cancelled before scheduler publication"
+                        .to_owned(),
+                ));
+            }
+            run_vcpu_until_exit_inner(
+                kernel,
+                engine,
+                registry,
+                futex,
+                platform_futex,
+                platform_futex_factory,
+                linux_tid,
+                this_tid,
+                threads,
+                kicker,
+                in_guest,
+                max_traps,
+                Some(task),
+            )
+            .await
+        };
+        let receipt = match runner.try_spawn(future) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                prepared.fail_exact();
+                return VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(format!(
+                    "initial runner submission failed: {error}"
+                ))));
+            }
+        };
+        if let Err(error) = prepared.scheduler.wake(prepared.thread.key()) {
+            prepared.fail_exact();
+            gate.cancel();
+            tracing::error!(%error, "initial scheduler publication failed after runner submit");
+            return VcpuLoopLaunch::Job(receipt);
+        }
+        prepared.disarm();
+        gate.open();
+        return VcpuLoopLaunch::Job(receipt);
     }
-    let future = run_vcpu_until_exit(
+    let future = run_vcpu_until_exit_inner(
         kernel,
         engine,
         registry,
@@ -5041,6 +5074,7 @@ where
         kicker,
         in_guest,
         max_traps,
+        None,
     );
     launch_compatibility_vcpu_future(future)
 }
@@ -5049,13 +5083,95 @@ struct PreparedInitialRunnerTask {
     context: crate::kernel::KernelContext,
 }
 
+struct PreparedInitialHandoff {
+    task: Option<PreparedInitialRunnerTask>,
+    scheduler: Arc<crate::kernel::Scheduler>,
+    thread: crate::kernel::ThreadRef,
+    generation: crate::kernel::objects::ExecutionGeneration,
+    armed: bool,
+}
+
+impl PreparedInitialHandoff {
+    fn fail_exact(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self.thread.fail_runnable_generation(
+            self.generation,
+            crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
+        );
+        self.armed = false;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PreparedInitialHandoff {
+    fn drop(&mut self) {
+        self.fail_exact();
+    }
+}
+
+struct InitialRunnerStartState {
+    terminal: Option<bool>,
+    waker: Option<std::task::Waker>,
+}
+
+struct InitialRunnerStartGate {
+    state: Mutex<InitialRunnerStartState>,
+}
+
+impl InitialRunnerStartGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(InitialRunnerStartState {
+                terminal: None,
+                waker: None,
+            }),
+        })
+    }
+
+    fn settle(&self, start: bool) {
+        let mut state = self.state.lock();
+        if state.terminal.is_none() {
+            state.terminal = Some(start);
+            if let Some(waker) = state.waker.take() {
+                waker.wake();
+            }
+        }
+    }
+
+    fn open(&self) {
+        self.settle(true);
+    }
+
+    fn cancel(&self) {
+        self.settle(false);
+    }
+
+    async fn wait(&self) -> bool {
+        std::future::poll_fn(|context| {
+            let mut state = self.state.lock();
+            if let Some(start) = state.terminal {
+                std::task::Poll::Ready(start)
+            } else {
+                state.waker = Some(context.waker().clone());
+                std::task::Poll::Pending
+            }
+        })
+        .await
+    }
+}
+
 fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
     kernel: &Kernel,
     engine: &mut E,
     kicker: &Arc<dyn VcpuRegistry>,
     linux_tid: crate::kernel::LinuxTid,
     this_tid: ThreadId,
-) -> Result<PreparedInitialRunnerTask, RuntimeError> {
+) -> Result<PreparedInitialHandoff, RuntimeError> {
     let context = kernel
         .dispatcher
         .capture_kernel_context(linux_tid)
@@ -5089,16 +5205,28 @@ fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
             },
         );
     }
+    let directory = kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
+        RuntimeError::Configuration("initial runner task has no runtime directory".to_owned())
+    })?;
+    let (scheduler, _service) = directory.continuation_services(context.kernel());
     let cpu = engine.save_guest_state().map_err(RuntimeError::Trap)?;
     let state = crate::kernel::objects::MigratableTaskState {
         cpu,
         mm,
         asid_generation,
     };
-    context
+    let generation = context
         .thread()
         .publish_initial_task_state(state)
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+    let thread = Arc::clone(context.thread());
+    let prepared = PreparedInitialHandoff {
+        task: Some(PreparedInitialRunnerTask { context }),
+        scheduler,
+        thread,
+        generation,
+        armed: true,
+    };
     kicker.unregister(this_tid);
     if let Some(lease) = carrick_hal::vcpu_sched::take_current_lease() {
         carrick_hal::vcpu_sched::global().release(lease, carrick_hal::Yield::Blocked);
@@ -5106,14 +5234,7 @@ fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
     engine
         .audit_executor_boundary()
         .map_err(RuntimeError::Trap)?;
-    let directory = kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
-        RuntimeError::Configuration("initial runner task has no runtime directory".to_owned())
-    })?;
-    let (scheduler, _service) = directory.continuation_services(context.kernel());
-    scheduler
-        .wake(context.thread().key())
-        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-    Ok(PreparedInitialRunnerTask { context })
+    Ok(prepared)
 }
 
 /// Decide what the progress-aware trap watchdog should do at one checkpoint.
@@ -5144,6 +5265,7 @@ fn trap_watchdog_decision(
 /// thread, or hits the trap limit. Holds NO lock during the vCPU run; takes the
 /// dispatcher lock only to dispatch + complete each syscall.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) async fn run_vcpu_until_exit<E: ThreadedEngine + 'static>(
     kernel: Kernel,
     engine: E,
@@ -5161,6 +5283,7 @@ pub(crate) async fn run_vcpu_until_exit<E: ThreadedEngine + 'static>(
 where
     E::SiblingSpec: 'static,
 {
+    let engine = OwnerThreadEngine::new(engine);
     run_vcpu_until_exit_inner(
         kernel,
         engine,
@@ -5182,7 +5305,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn run_vcpu_until_exit_inner<E: ThreadedEngine + 'static>(
     kernel: Kernel,
-    engine: E,
+    engine: OwnerThreadEngine<E>,
     registry: Arc<ThreadRegistry>,
     futex: Arc<FutexTable>,
     platform_futex: Arc<dyn PlatformFutex>,
@@ -5198,7 +5321,7 @@ async fn run_vcpu_until_exit_inner<E: ThreadedEngine + 'static>(
 where
     E::SiblingSpec: 'static,
 {
-    let mut engine = OwnerThreadEngine::new(engine);
+    let mut engine = engine;
     // This must wrap the whole run, not only clone-thread closures: an
     // hvpatch process leader may begin without a lease, park, acquire one on
     // wake, and then exit.  Before this guard those late leases leaked until
@@ -7809,6 +7932,150 @@ mod tests {
                 4,
                 "demand preemption must progress every prepared task"
             );
+        }
+    }
+
+    #[test]
+    fn bootstrap_owner_guard_cleans_same_thread_at_every_pretransfer_failpoint() {
+        #[derive(Clone, Copy)]
+        enum Failpoint {
+            Capture,
+            Asid,
+            Save,
+            PostPublication,
+            RunnerSubmit,
+            Panic,
+        }
+        struct Probe {
+            receipt: std::sync::mpsc::Sender<std::thread::ThreadId>,
+        }
+        fn cleanup(probe: &mut Probe) {
+            probe
+                .receipt
+                .send(std::thread::current().id())
+                .expect("cleanup receipt");
+        }
+        fn task_state(
+            context: &crate::kernel::KernelContext,
+        ) -> crate::kernel::objects::MigratableTaskState {
+            let mm = context.shared().mm().id();
+            let asid_generation = mm.raw();
+            crate::kernel::objects::MigratableTaskState {
+                cpu: carrick_hal::threaded::GuestCpuState::from_aarch64_v1(
+                    carrick_hal::threaded::Aarch64TaskCpuStateV1 {
+                        gprs: [0; 31],
+                        pc: 0,
+                        pstate: 0,
+                        trap_pc: 0,
+                        trap_pstate: 0,
+                        sp_el0: 0,
+                        elr_el1: 0,
+                        spsr_el1: 0,
+                        ttbr0: 0,
+                        ttbr1: 0,
+                        tcr: 0,
+                        actlr_el1: 0,
+                        tpidr_el0: 0,
+                        tpidrro_el0: 0,
+                        contextidr_el1: 0,
+                        vregs: [0; 32],
+                        fpsr: 0,
+                        fpcr: 0,
+                        pending_resume_pc: None,
+                        last_syscall_nr: None,
+                        last_syscall_orig_x0: 0,
+                        last_fault_esr: 0,
+                        last_exit_class: 0,
+                        is_forked_child: false,
+                        syscall_continuation: None,
+                        mm_generation: mm.raw(),
+                        asid_generation,
+                    },
+                ),
+                mm,
+                asid_generation,
+            }
+        }
+        for (case, failpoint) in [
+            Failpoint::Capture,
+            Failpoint::Asid,
+            Failpoint::Save,
+            Failpoint::PostPublication,
+            Failpoint::RunnerSubmit,
+            Failpoint::Panic,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let context = alias_context(67_200 + case as i32);
+            let kernel = Arc::clone(context.kernel());
+            let scheduler = Arc::new(crate::kernel::Scheduler::new(kernel));
+            let thread = Arc::clone(context.thread());
+            let owner = std::thread::current().id();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut engine = Some(OwnerThreadEngine::for_test(Probe { receipt: tx }, cleanup));
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match failpoint {
+                    Failpoint::Panic => panic!("bootstrap failpoint"),
+                    Failpoint::Capture | Failpoint::Asid | Failpoint::Save => Err::<(), ()>(()),
+                    Failpoint::PostPublication | Failpoint::RunnerSubmit => {
+                        let generation = thread
+                            .publish_initial_task_state(task_state(&context))
+                            .expect("publish exact bootstrap generation");
+                        let mut prepared = PreparedInitialHandoff {
+                            task: Some(PreparedInitialRunnerTask { context }),
+                            scheduler: Arc::clone(&scheduler),
+                            thread: Arc::clone(&thread),
+                            generation,
+                            armed: true,
+                        };
+                        if matches!(failpoint, Failpoint::RunnerSubmit) {
+                            let runner =
+                                continuation::TransitionalDedicatedRunner::with_worker_limit(1)
+                                    .expect("one runner worker");
+                            runner.reject_next_submission_for_test();
+                            let guarded = engine.take().expect("guarded engine");
+                            let task = prepared.task.take().expect("prepared task");
+                            assert!(
+                                runner
+                                    .try_spawn(async move {
+                                        drop(task);
+                                        drop(guarded);
+                                    })
+                                    .is_err()
+                            );
+                            prepared.fail_exact();
+                        }
+                        Err(())
+                    }
+                }));
+            drop(engine);
+            if matches!(failpoint, Failpoint::Panic) {
+                assert!(result.is_err());
+            } else {
+                assert!(matches!(result, Ok(Err(()))));
+            }
+            if matches!(
+                failpoint,
+                Failpoint::PostPublication | Failpoint::RunnerSubmit
+            ) {
+                assert!(matches!(
+                    thread.execution_state(),
+                    crate::kernel::objects::ThreadExecutionState::Failed { .. }
+                ));
+            } else {
+                assert_eq!(
+                    thread.execution_state(),
+                    crate::kernel::objects::ThreadExecutionState::Uninitialized
+                );
+            }
+            assert_eq!(scheduler.queued_len(), 0);
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(1))
+                    .expect("owner cleanup"),
+                owner
+            );
+            assert!(rx.try_recv().is_err(), "cleanup occurs exactly once");
         }
     }
 
