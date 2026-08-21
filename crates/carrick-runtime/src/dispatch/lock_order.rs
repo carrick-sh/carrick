@@ -36,6 +36,11 @@ thread_local! {
     static HELD_LOCKS: Cell<u16> = const { Cell::new(0) };
 }
 
+/// True only when this executor pthread owns no dispatch lock-order authority.
+pub(crate) fn executor_boundary_is_clear() -> bool {
+    HELD_LOCKS.with(|held| held.get() == 0)
+}
+
 #[allow(dead_code)]
 #[must_use = "lock guard must be held while the underlying lock is active"]
 pub struct LockOrderGuard {
