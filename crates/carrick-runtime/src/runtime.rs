@@ -1516,14 +1516,69 @@ where
                 last_syscall_retval = Some(retval);
             }
             DispatchOutcome::WaitOnSharedWord {
-                location: _,
-                waiter_key: _,
-                value: _,
-            } => {
-                return Err(RuntimeError::Unsupported(
-                    "WaitOnSharedWord escaped single-threaded syscall service".to_string(),
-                ));
-            }
+                mut location,
+                mut waiter_key,
+                mut value,
+                mut sysv,
+            } => loop {
+                let retval =
+                    shared_futex_wait(location.wait_addr(), waiter_key, value, None, this_tid);
+                if retval != 0 {
+                    runtime.complete_syscall(retval)?;
+                    last_syscall_retval = Some(retval);
+                    break;
+                }
+                if let Some(outcome) = sysv.as_ref().and_then(|wait| wait.completion_after_wake()) {
+                    let retval = match outcome {
+                        DispatchOutcome::Errno { errno } => errno.guest_retval(),
+                        DispatchOutcome::Returned { value } => value,
+                        _ => {
+                            return Err(RuntimeError::Unsupported(
+                                "SysV wait produced a non-terminal resume outcome".to_owned(),
+                            ));
+                        }
+                    };
+                    runtime.complete_syscall(retval)?;
+                    last_syscall_retval = Some(retval);
+                    break;
+                }
+                match dispatch_single_threaded_syscall(
+                    &mut dispatcher,
+                    &kernel_context,
+                    SyscallRequest::from_raw(frame),
+                    runtime,
+                    &reporter,
+                    &mut waiter,
+                )? {
+                    DispatchOutcome::WaitOnSharedWord {
+                        location: next_location,
+                        waiter_key: next_waiter_key,
+                        value: next_value,
+                        sysv: next_sysv,
+                    } => {
+                        location = next_location;
+                        waiter_key = next_waiter_key;
+                        value = next_value;
+                        sysv = next_sysv;
+                    }
+                    DispatchOutcome::Returned { value } => {
+                        runtime.complete_syscall(value)?;
+                        last_syscall_retval = Some(value);
+                        break;
+                    }
+                    DispatchOutcome::Errno { errno } => {
+                        let value = errno.guest_retval();
+                        runtime.complete_syscall(value)?;
+                        last_syscall_retval = Some(value);
+                        break;
+                    }
+                    _ => {
+                        return Err(RuntimeError::Unsupported(
+                            "SysV wait redispatch changed syscall class".to_owned(),
+                        ));
+                    }
+                }
+            },
             DispatchOutcome::SharedFutexWake {
                 location,
                 waiter_key,
@@ -1952,10 +2007,16 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                 location,
                 waiter_key,
                 value,
+                sysv,
             } => {
                 let retval =
                     shared_futex_wait(location.wait_addr(), waiter_key, value, None, waiter.tid());
                 if retval == 0 {
+                    if let Some(outcome) =
+                        sysv.as_ref().and_then(|wait| wait.completion_after_wake())
+                    {
+                        return Ok(outcome);
+                    }
                     continue;
                 }
                 return Ok(DispatchOutcome::Returned { value: retval });

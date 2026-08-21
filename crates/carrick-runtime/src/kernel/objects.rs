@@ -3840,6 +3840,7 @@ pub enum ThreadExecutionState {
     Blocked {
         generation: ExecutionGeneration,
         reason: BlockedReason,
+        continuation: Option<crate::vcpu_loop::continuation::ContinuationId>,
     },
     Exited {
         generation: ExecutionGeneration,
@@ -3940,6 +3941,7 @@ pub(crate) enum ThreadSchedulerAction {
 struct ThreadExecutionRecord {
     state: ThreadExecutionState,
     task_state: Option<Box<MigratableTaskState>>,
+    blocked_continuation: Option<Box<crate::vcpu_loop::continuation::BlockedContinuation>>,
     next_executor_epoch: u64,
     exec_invalidation_pending: bool,
 }
@@ -3949,6 +3951,7 @@ impl ThreadExecutionRecord {
         Self {
             state: ThreadExecutionState::Uninitialized,
             task_state: None,
+            blocked_continuation: None,
             next_executor_epoch: 1,
             exec_invalidation_pending: false,
         }
@@ -3966,6 +3969,7 @@ pub struct ThreadExecutionLease {
     executor: ExecutorId,
     executor_epoch: u64,
     task_state: Option<Box<MigratableTaskState>>,
+    blocked_continuation: Option<Box<crate::vcpu_loop::continuation::BlockedContinuation>>,
     settled: bool,
 }
 
@@ -3989,6 +3993,10 @@ impl std::fmt::Debug for ThreadExecutionLease {
 }
 
 impl ThreadExecutionLease {
+    pub const fn thread_key(&self) -> ThreadKey {
+        self.owner_key
+    }
+
     pub const fn generation(&self) -> ExecutionGeneration {
         self.generation
     }
@@ -4084,12 +4092,30 @@ impl ThreadExecutionLease {
         self.task_state = Some(Box::new(replacement));
         Ok(())
     }
+
+    pub fn blocked_continuation(
+        &self,
+    ) -> Option<&crate::vcpu_loop::continuation::BlockedContinuation> {
+        self.blocked_continuation.as_deref()
+    }
+
+    pub(crate) fn take_blocked_continuation(
+        &mut self,
+    ) -> Option<crate::vcpu_loop::continuation::BlockedContinuation> {
+        self.blocked_continuation
+            .take()
+            .map(|continuation| *continuation)
+    }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 enum ExecutionSettlement {
     Runnable,
     Blocked(BlockedReason),
+    BlockedContinuation(
+        BlockedReason,
+        Box<crate::vcpu_loop::continuation::BlockedContinuation>,
+    ),
     Exited,
 }
 
@@ -4304,6 +4330,7 @@ impl Thread {
         }
         let generation = ExecutionGeneration::INITIAL;
         execution.task_state = Some(Box::new(state));
+        execution.blocked_continuation = None;
         execution.exec_invalidation_pending = false;
         execution.state = ThreadExecutionState::Runnable { generation };
         drop(execution);
@@ -4336,6 +4363,7 @@ impl Thread {
                 state: execution.state,
             });
         };
+        let blocked_continuation = execution.blocked_continuation.take();
         execution.next_executor_epoch = next_executor_epoch;
         execution.state = ThreadExecutionState::Running {
             generation,
@@ -4352,6 +4380,7 @@ impl Thread {
             executor,
             executor_epoch,
             task_state: Some(task_state),
+            blocked_continuation,
             settled: false,
         })
     }
@@ -4383,6 +4412,7 @@ impl Thread {
                 state: execution.state,
             });
         };
+        let blocked_continuation = execution.blocked_continuation.take();
         execution.state = ThreadExecutionState::Running {
             generation,
             executor,
@@ -4398,6 +4428,7 @@ impl Thread {
             executor,
             executor_epoch,
             task_state: Some(task_state),
+            blocked_continuation,
             settled: false,
         })
     }
@@ -4498,6 +4529,19 @@ impl Thread {
         self.settle_execution_lease(lease, ExecutionSettlement::Blocked(reason), true)
     }
 
+    pub(crate) fn scheduler_park_continuation_from_executor(
+        &self,
+        lease: ThreadExecutionLease,
+        reason: BlockedReason,
+        continuation: crate::vcpu_loop::continuation::BlockedContinuation,
+    ) -> Result<ThreadSchedulerAction, (ThreadExecutionError, ThreadExecutionLease)> {
+        self.settle_execution_lease(
+            lease,
+            ExecutionSettlement::BlockedContinuation(reason, Box::new(continuation)),
+            true,
+        )
+    }
+
     pub fn fail_from_executor(
         &self,
         mut lease: ThreadExecutionLease,
@@ -4516,6 +4560,8 @@ impl Thread {
         };
         execution.task_state = None;
         let _ = lease.task_state.take();
+        execution.blocked_continuation = None;
+        let _ = lease.blocked_continuation.take();
         execution.exec_invalidation_pending = false;
         execution.state = ThreadExecutionState::Failed { generation, reason };
         lease.settled = true;
@@ -4532,6 +4578,7 @@ impl Thread {
             return;
         }
         execution.task_state = None;
+        execution.blocked_continuation = None;
         execution.exec_invalidation_pending = false;
         execution.state = ThreadExecutionState::Failed {
             generation: ExecutionGeneration::INITIAL,
@@ -4575,12 +4622,15 @@ impl Thread {
         if execution.exec_invalidation_pending {
             execution.task_state = None;
             let _ = lease.task_state.take();
+            execution.blocked_continuation = None;
+            let _ = lease.blocked_continuation.take();
             execution.state = ThreadExecutionState::Exited { generation };
             execution.exec_invalidation_pending = false;
         } else {
             match settlement {
                 ExecutionSettlement::Runnable => {
                     execution.task_state = lease.task_state.take();
+                    execution.blocked_continuation = lease.blocked_continuation.take();
                     execution.state = ThreadExecutionState::Runnable { generation };
                     if scheduler_owned {
                         action = ThreadSchedulerAction::Queue {
@@ -4592,6 +4642,7 @@ impl Thread {
                 }
                 ExecutionSettlement::Blocked(reason) => {
                     execution.task_state = lease.task_state.take();
+                    execution.blocked_continuation = lease.blocked_continuation.take();
                     if wake_pending {
                         execution.state = ThreadExecutionState::Runnable { generation };
                         action = ThreadSchedulerAction::Queue {
@@ -4600,12 +4651,41 @@ impl Thread {
                             closing_authorized: true,
                         };
                     } else {
-                        execution.state = ThreadExecutionState::Blocked { generation, reason };
+                        execution.state = ThreadExecutionState::Blocked {
+                            generation,
+                            reason,
+                            continuation: execution
+                                .blocked_continuation
+                                .as_deref()
+                                .map(crate::vcpu_loop::continuation::BlockedContinuation::id),
+                        };
+                    }
+                }
+                ExecutionSettlement::BlockedContinuation(reason, continuation) => {
+                    execution.task_state = lease.task_state.take();
+                    let continuation_id = continuation.id();
+                    execution.blocked_continuation = Some(continuation);
+                    let _ = lease.blocked_continuation.take();
+                    if wake_pending {
+                        execution.state = ThreadExecutionState::Runnable { generation };
+                        action = ThreadSchedulerAction::Queue {
+                            key: self.key,
+                            generation,
+                            closing_authorized: true,
+                        };
+                    } else {
+                        execution.state = ThreadExecutionState::Blocked {
+                            generation,
+                            reason,
+                            continuation: Some(continuation_id),
+                        };
                     }
                 }
                 ExecutionSettlement::Exited => {
                     execution.task_state = None;
                     let _ = lease.task_state.take();
+                    execution.blocked_continuation = None;
+                    let _ = lease.blocked_continuation.take();
                     execution.state = ThreadExecutionState::Exited { generation };
                 }
             }
@@ -4669,6 +4749,7 @@ impl Thread {
             .next()
             .unwrap_or_else(|| std::process::abort());
         execution.task_state = None;
+        execution.blocked_continuation = None;
         execution.exec_invalidation_pending = false;
         execution.state = ThreadExecutionState::Failed {
             generation,
@@ -4699,6 +4780,7 @@ impl Thread {
             .next()
             .unwrap_or_else(|| std::process::abort());
         execution.task_state = None;
+        execution.blocked_continuation = None;
         execution.exec_invalidation_pending = false;
         execution.state = ThreadExecutionState::Exited { generation };
         drop(execution);

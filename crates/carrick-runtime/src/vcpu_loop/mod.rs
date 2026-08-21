@@ -56,6 +56,7 @@ use crate::run_result::{RunResult, RuntimeError};
 use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
 use crate::trap::{SyscallTrap, TrapError};
 
+pub mod continuation;
 pub mod executor;
 
 const SIGNAL_WAIT_SLICE: Duration = Duration::from_millis(50);
@@ -4046,6 +4047,7 @@ where
                     location,
                     waiter_key,
                     value,
+                    sysv,
                 } => match self.wait_on_shared_word(
                     kernel,
                     engine,
@@ -4055,7 +4057,14 @@ where
                         value,
                     },
                 )? {
-                    SharedWordWaitCompletion::Changed => continue,
+                    SharedWordWaitCompletion::Changed => {
+                        if let Some(outcome) =
+                            sysv.as_ref().and_then(|wait| wait.completion_after_wake())
+                        {
+                            break Ok(outcome);
+                        }
+                        continue;
+                    }
                     SharedWordWaitCompletion::Interrupted => {
                         if let Some(outcome) = self.exec_replaced_thread_exit() {
                             break Ok(outcome);
@@ -4308,6 +4317,7 @@ pub(crate) fn run_vcpu_until_exit<E: ThreadedEngine + 'static>(
 where
     E::SiblingSpec: 'static,
 {
+    let _transitional_runner = continuation::TransitionalDedicatedRunner::new();
     // This must wrap the whole run, not only clone-thread closures: an
     // hvpatch process leader may begin without a lease, park, acquire one on
     // wake, and then exit.  Before this guard those late leases leaked until
@@ -5109,6 +5119,7 @@ where
                     location: _,
                     waiter_key: _,
                     value: _,
+                    sysv: _,
                 } => {
                     return Err(RuntimeError::Unsupported(
                         "WaitOnSharedWord escaped threaded syscall service".to_string(),
