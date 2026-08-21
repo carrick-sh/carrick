@@ -5058,13 +5058,21 @@ where
             tracing::error!(%error, "initial scheduler publication failed after runner submit");
             return VcpuLoopLaunch::Job(receipt);
         }
+        let activated = match dormant.activate() {
+            Ok(activated) if activated.is_runner_visible() => activated,
+            Ok(_) => {
+                prepared.fail_exact();
+                return VcpuLoopLaunch::Job(receipt);
+            }
+            Err(error) => {
+                prepared.fail_exact();
+                tracing::error!(%error, "initial runner activation failed after scheduler publication");
+                return VcpuLoopLaunch::Job(receipt);
+            }
+        };
         prepared.scheduler.request_preemption();
         gate.open();
-        if let Err(error) = dormant.activate() {
-            prepared.fail_exact();
-            tracing::error!(%error, "initial runner activation failed after scheduler publication");
-            return VcpuLoopLaunch::Job(receipt);
-        }
+        drop(activated);
         prepared.disarm();
         return VcpuLoopLaunch::Job(receipt);
     }
@@ -5103,7 +5111,8 @@ impl PreparedInitialHandoff {
         if !self.armed {
             return;
         }
-        let _ = self.thread.fail_runnable_generation(
+        let _ = self.scheduler.fail_runnable_exact(
+            self.thread.key(),
             self.generation,
             crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
         );
@@ -6291,9 +6300,15 @@ where
                 DispatchOutcome::SignalThread {
                     tid: target,
                     signum,
+                    kernel_target,
                 } => {
-                    last_syscall_retval =
-                        Some(state.complete_signal_thread(&mut engine, target, signum)?);
+                    last_syscall_retval = Some(state.complete_signal_thread(
+                        &kernel,
+                        &mut engine,
+                        target,
+                        signum,
+                        kernel_target,
+                    )?);
                 }
                 DispatchOutcome::Execve { path, argv, env } => {
                     crate::event_ring::rec(crate::event_ring::EXEC, 1, 0, 0);

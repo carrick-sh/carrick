@@ -71,7 +71,6 @@ pub use objects::{
     ThreadResources, ThreadRunner, ThreadSignalState, Zombie,
 };
 pub(crate) use objects::{FileDescriptionBacking, JobControlStopInvalidationGeneration};
-pub(crate) use operations::ExactSignalTargetAuthorization;
 pub use operations::{
     ChildStartOutcome, ChildStartWait, ForkReservation, KernelFailpoint, KernelOperationError,
     PreparedFork, PreparedTaskExit, PreparedThreadClone, ProcessIdentity, ProcessState,
@@ -79,6 +78,7 @@ pub use operations::{
     StartedFork, StartedThreadClone, TaskIdentity, TaskOperationReservation,
     ThreadCloneReservation, WaitMode, WaitOutcome,
 };
+pub(crate) use operations::{ExactSignalTargetAuthorization, ExactThreadSignalPost};
 pub use registry::{
     IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,
     TaskReservation, ThreadClaim, ThreadReservation,

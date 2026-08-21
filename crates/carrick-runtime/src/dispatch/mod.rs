@@ -964,7 +964,7 @@ impl std::ops::Deref for WaitFds {
 const MAX_GUEST_PATH: usize = 4096;
 
 fn threaded_independent_dispatch_supports(number: u64) -> bool {
-    matches!(number, 96 | 98 | 99 | 124 | 172 | 178 | 449)
+    matches!(number, 96 | 98 | 99 | 124 | 130 | 131 | 172 | 178 | 449)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1734,6 +1734,8 @@ pub enum DispatchOutcome {
     SignalThread {
         tid: crate::thread::ThreadId,
         signum: i32,
+        #[serde(skip)]
+        kernel_target: Option<crate::kernel::ThreadKey>,
     },
     /// `FUTEX_WAIT` whose value-check passed under the dispatcher lock: the
     /// guest word equals the expected value, so this thread must block.
@@ -5606,13 +5608,45 @@ impl SyscallDispatcher {
                 let target =
                     crate::thread::ThreadId::from_guest_supplied_tid(request.arg(0) as i32);
                 let signum = request.arg(1);
-                dispatch_threaded_signal_route(tid, registry, target, signum)?
+                if self.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch {
+                    let info = (signum != 0).then(|| {
+                        crate::linux_abi::LinuxSiginfo::kill(
+                            signum as i32,
+                            crate::linux_abi::LINUX_SI_TKILL,
+                            kernel.task().key().id.raw(),
+                            kernel.resources().credentials().ruid().raw(),
+                        )
+                    });
+                    self.hvpatch_specific_thread_signal(kernel, None, target.raw(), signum, info)
+                        .unwrap_or_else(|| DispatchOutcome::errno(LINUX_ESRCH))
+                } else {
+                    dispatch_threaded_signal_route(tid, registry, target, signum)?
+                }
             }
             131 => {
                 let target =
                     crate::thread::ThreadId::from_guest_supplied_tid(request.arg(1) as i32);
                 let signum = request.arg(2);
-                dispatch_threaded_signal_route(tid, registry, target, signum)?
+                if self.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch {
+                    let info = (signum != 0).then(|| {
+                        crate::linux_abi::LinuxSiginfo::kill(
+                            signum as i32,
+                            crate::linux_abi::LINUX_SI_TKILL,
+                            kernel.task().key().id.raw(),
+                            kernel.resources().credentials().ruid().raw(),
+                        )
+                    });
+                    self.hvpatch_specific_thread_signal(
+                        kernel,
+                        Some(request.arg(0) as i32),
+                        target.raw(),
+                        signum,
+                        info,
+                    )
+                    .unwrap_or_else(|| DispatchOutcome::errno(LINUX_ESRCH))
+                } else {
+                    dispatch_threaded_signal_route(tid, registry, target, signum)?
+                }
             }
             178 => DispatchOutcome::Returned {
                 value: i64::from(kernel.thread().key().tid.raw()),
@@ -6579,6 +6613,7 @@ fn dispatch_threaded_signal_route(
         return Some(DispatchOutcome::SignalThread {
             tid: target,
             signum: signum as i32,
+            kernel_target: None,
         });
     }
     None

@@ -86,6 +86,19 @@ pub(crate) enum ExactSignalTargetAuthorization {
     Missing,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExactThreadSignalPost {
+    Posted(Option<ThreadKey>),
+    Missing,
+    QueueFull,
+}
+
+impl ExactThreadSignalPost {
+    const fn is_posted(self) -> bool {
+        matches!(self, Self::Posted(_))
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct AuthorizedSignalTarget {
     domain: Arc<KernelDomain>,
@@ -1469,16 +1482,36 @@ impl Kernel {
         signal: LinuxSignal,
         siginfo: Option<LinuxSiginfo>,
     ) -> bool {
+        self.post_signal_to_authorized_target_inner(target, signal, siginfo, false)
+            .is_posted()
+    }
+
+    pub(crate) fn post_guest_thread_signal_to_authorized_target(
+        &self,
+        target: &AuthorizedSignalTarget,
+        signal: LinuxSignal,
+        siginfo: Option<LinuxSiginfo>,
+    ) -> ExactThreadSignalPost {
+        self.post_signal_to_authorized_target_inner(target, signal, siginfo, true)
+    }
+
+    fn post_signal_to_authorized_target_inner(
+        &self,
+        target: &AuthorizedSignalTarget,
+        signal: LinuxSignal,
+        siginfo: Option<LinuxSiginfo>,
+        enforce_thread_rt_limit: bool,
+    ) -> ExactThreadSignalPost {
         if !Arc::ptr_eq(self.domain(), &target.domain) {
-            return false;
+            return ExactThreadSignalPost::Missing;
         }
         let Some(task) = target.task.upgrade() else {
-            return false;
+            return ExactThreadSignalPost::Missing;
         };
         let thread = match &target.thread {
             Some(thread) => {
                 let Some(thread) = thread.upgrade() else {
-                    return false;
+                    return ExactThreadSignalPost::Missing;
                 };
                 Some(thread)
             }
@@ -1486,14 +1519,36 @@ impl Kernel {
         };
         let generation = task.lock_signal_generation();
         if task.lifecycle() != TaskLifecycle::Live {
-            return false;
+            return ExactThreadSignalPost::Missing;
         }
         if let Some(thread) = &thread
             && task
                 .thread(thread.key().tid)
                 .is_none_or(|current| !Arc::ptr_eq(&current, thread))
         {
-            return false;
+            return ExactThreadSignalPost::Missing;
+        }
+        if enforce_thread_rt_limit && signal.is_realtime() {
+            if thread.is_none() {
+                return ExactThreadSignalPost::Missing;
+            }
+            let limit = task.rlimit(carrick_abi::LinuxResource::Sigpending).rlim_cur;
+            if limit != carrick_abi::LINUX_RLIM_INFINITY {
+                let thread_pending = task
+                    .threads()
+                    .into_iter()
+                    .map(|thread| {
+                        u64::try_from(thread.signal_state().pending_count()).unwrap_or(u64::MAX)
+                    })
+                    .fold(0_u64, u64::saturating_add);
+                let pending = thread_pending.saturating_add(
+                    u64::try_from(task.shared().pending_signals().pending_count())
+                        .unwrap_or(u64::MAX),
+                );
+                if pending >= limit {
+                    return ExactThreadSignalPost::QueueFull;
+                }
+            }
         }
         task.discard_opposing_job_control_signals(signal);
         task.record_job_control_signal_generation(signal);
@@ -1539,11 +1594,15 @@ impl Kernel {
                 target.thread.as_ref().map(|_| "tid-directed")
             );
         }
-        task.wake();
+        if enforce_thread_rt_limit {
+            task.publish_wake_subscriptions();
+        } else {
+            task.wake();
+        }
         if let Some(parent) = parent {
             parent.wake();
         }
-        true
+        ExactThreadSignalPost::Posted(thread.as_ref().map(|thread| thread.key()))
     }
 
     /// Post `signal` into `target`'s process-directed pending queue and report
@@ -4129,6 +4188,71 @@ mod tests {
         let thread_pending = root.thread().signal_state().pending();
         assert!(thread_pending.contains(sigusr2.raw()));
         assert!(!thread_pending.contains(sigusr1.raw()));
+    }
+
+    #[test]
+    fn exact_thread_signal_admission_has_one_realtime_queue_winner() {
+        let (kernel, root) = bootstrap(81);
+        root.task()
+            .replace_rlimit(carrick_abi::LinuxResource::Sigpending, |_| {
+                Ok::<_, ()>(carrick_abi::LinuxRlimit::new(1, 1))
+            })
+            .expect("one pending RT slot");
+        let signal = LinuxSignal::for_signal_number(32).expect("SIGRTMIN");
+        let ticket = || match kernel.authorize_signal_target_exact(
+            &root,
+            root.task().key(),
+            Some(root.thread().key()),
+            Some(signal),
+        ) {
+            ExactSignalTargetAuthorization::Allowed(ticket) => ticket,
+            other => panic!("exact thread ticket: {other:?}"),
+        };
+        let first = ticket();
+        let second = ticket();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let results = std::thread::scope(|scope| {
+            let first_barrier = Arc::clone(&barrier);
+            let first_kernel = Arc::clone(&kernel);
+            let first = scope.spawn(move || {
+                first_barrier.wait();
+                first_kernel.post_guest_thread_signal_to_authorized_target(
+                    &first,
+                    signal,
+                    Some(LinuxSiginfo::kill(32, carrick_abi::LINUX_SI_TKILL, 81, 0)),
+                )
+            });
+            let second_barrier = Arc::clone(&barrier);
+            let second_kernel = Arc::clone(&kernel);
+            let second = scope.spawn(move || {
+                second_barrier.wait();
+                second_kernel.post_guest_thread_signal_to_authorized_target(
+                    &second,
+                    signal,
+                    Some(LinuxSiginfo::kill(32, carrick_abi::LINUX_SI_TKILL, 81, 0)),
+                )
+            });
+            barrier.wait();
+            [
+                first.join().expect("first post"),
+                second.join().expect("second post"),
+            ]
+        });
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(**result, ExactThreadSignalPost::Posted(Some(_))))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == ExactThreadSignalPost::QueueFull)
+                .count(),
+            1
+        );
+        assert_eq!(root.thread().signal_state().pending_count(), 1);
     }
 
     #[test]

@@ -329,11 +329,32 @@ where
 {
     pub(super) fn complete_signal_thread(
         &self,
+        kernel: &Kernel,
         engine: &mut E,
         target: ThreadId,
         signum: i32,
+        kernel_target: Option<crate::kernel::ThreadKey>,
     ) -> Result<i64, RuntimeError> {
-        let retval: i64 = if self.registry.is_live(target) {
+        let retval: i64 = if let Some(exact) = kernel_target {
+            if exact.tid.raw() != target.raw() {
+                return Err(RuntimeError::Configuration(
+                    "Kernel-native thread signal target identity mismatch".to_owned(),
+                ));
+            }
+            let context = self.service_kernel_context.as_ref().ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "Kernel-native thread signal lost caller context".to_owned(),
+                )
+            })?;
+            let directory = kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "Kernel-native thread signal has no runtime directory".to_owned(),
+                )
+            })?;
+            let (scheduler, _service) = directory.continuation_services(context.kernel());
+            let _ = scheduler.wake(exact);
+            0
+        } else if self.registry.is_live(target) {
             crate::host_signal::publish_pending_for(target.raw(), signum);
             self.kicker.kick(target);
             0
