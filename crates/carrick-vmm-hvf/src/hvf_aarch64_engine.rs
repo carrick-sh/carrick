@@ -1843,7 +1843,6 @@ mod task_only_materializer_tests {
             .and_then(|tail| tail.split("struct ProcessMappingDesc").next())
             .expect("VM-only persistent executor spec");
         for forbidden in [
-            "mappings",
             "page_tables",
             "mm_root_slot",
             "frame_inventory",
@@ -1856,6 +1855,10 @@ mod task_only_materializer_tests {
                 "factory retained {forbidden}"
             );
         }
+        assert!(
+            factory_shape.contains("carrier_mappings"),
+            "factory must retain only the VM-global executor control projection"
+        );
 
         let root_task = crate::trap::hvpatch_task_state_test_fixture(7, 0x7000, 707);
         let idle_worker = crate::trap::hvpatch_neutral_task_state_for_test();
