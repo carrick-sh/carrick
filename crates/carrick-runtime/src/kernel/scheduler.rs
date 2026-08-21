@@ -1171,6 +1171,61 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Task-5 bridge for the welded HVPatch loop. The real execution lease is
+    /// settled through the same Kernel state machine and run queue as a Task-4
+    /// executor, while the legacy host thread temporarily retains the engine.
+    pub(crate) fn settle_transitional_blocked_continuation(
+        &self,
+        thread: &Arc<Thread>,
+        lease: ThreadExecutionLease,
+        mut continuation: crate::vcpu_loop::continuation::BlockedContinuation,
+        registration: crate::vcpu_loop::continuation::ContinuationRegistration,
+    ) -> Result<(), (SchedulerError, ThreadExecutionLease)> {
+        if continuation.authority().thread() != thread.key()
+            || continuation.authority().execution_generation() != lease.generation()
+            || lease.thread_key() != thread.key()
+        {
+            return Err((RunQueueError::AuthorityMismatch.into(), lease));
+        }
+        if continuation.attach_registration(registration).is_err() {
+            return Err((RunQueueError::AuthorityMismatch.into(), lease));
+        }
+        let binding = ExecutorBinding {
+            executor: lease.executor(),
+            executor_epoch: lease.executor_epoch(),
+            thread: lease.thread_key(),
+            generation: lease.generation(),
+        };
+        let action = match thread.scheduler_park_continuation_from_executor(
+            lease,
+            BlockedReason::HostWait,
+            continuation,
+        ) {
+            Ok(action) => action,
+            Err((error, returned)) => return Err((error.into(), returned)),
+        };
+        self.executors.unbind(binding);
+        if self.apply_settlement_action(thread, action).is_err() {
+            // The lease is already settled in the Kernel record; there is no
+            // valid execution authority to return after a queue publication
+            // failure, so fail closed through the process abort policy.
+            std::process::abort();
+        }
+        Ok(())
+    }
+
+    /// Claim the exact runnable successor for the Task-5 welded adapter while
+    /// retaining the scheduler's executor binding until its next settlement.
+    pub(crate) fn take_transitional_lease(
+        &self,
+        executor: &ExecutorRegistration,
+    ) -> Result<ThreadExecutionLease, SchedulerError> {
+        let mut running = self.take(executor)?;
+        let lease = running.take_lease();
+        running.finish_claim();
+        Ok(lease)
+    }
+
     pub(crate) fn begin_switch_out(&self, running: &RunnableThread) -> Result<(), SchedulerError> {
         running.thread.begin_switch_out(running.lease())?;
         Ok(())

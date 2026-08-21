@@ -3211,6 +3211,9 @@ impl Kernel {
         let mut exiting_file_tables = Vec::new();
         for thread_key in exiting_record.task.thread_keys() {
             if let Some(thread) = exiting_record.task.thread(thread_key.tid) {
+                let _ = thread.cancel_kernel_owned_continuation(
+                    crate::vcpu_loop::continuation::CancellationCause::ProcessExit,
+                );
                 let files = thread.resources().files();
                 if !exiting_file_tables
                     .iter()

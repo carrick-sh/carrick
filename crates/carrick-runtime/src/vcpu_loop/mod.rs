@@ -703,6 +703,7 @@ impl crate::kernel::TaskWaker for HvpatchTaskWaker {
 #[derive(Default)]
 pub(crate) struct HvpatchRuntimeDirectory {
     endpoints: Mutex<BTreeMap<crate::kernel::TaskKey, HvpatchRuntimeEndpoint>>,
+    continuation_wait_service: Mutex<Option<Arc<continuation::CarrierWaitService>>>,
     scheduler: Mutex<Option<Arc<crate::kernel::scheduler::Scheduler>>>,
     /// Process-child host threads are shared-VM topology, not members of the
     /// creating process's Linux thread group. The outer root run owns their
@@ -712,6 +713,36 @@ pub(crate) struct HvpatchRuntimeDirectory {
 }
 
 impl HvpatchRuntimeDirectory {
+    fn continuation_services(
+        &self,
+        kernel: &Arc<crate::kernel::Kernel>,
+    ) -> (
+        Arc<crate::kernel::Scheduler>,
+        Arc<continuation::CarrierWaitService>,
+    ) {
+        let scheduler =
+            {
+                let mut slot = self.scheduler.lock();
+                Arc::clone(slot.get_or_insert_with(|| {
+                    Arc::new(crate::kernel::Scheduler::new(Arc::clone(kernel)))
+                }))
+            };
+        for endpoint in self.endpoints.lock().values_mut() {
+            if endpoint.scheduler.is_none() {
+                endpoint.scheduler = Some(Arc::clone(&scheduler));
+            }
+        }
+        let service = {
+            let mut slot = self.continuation_wait_service.lock();
+            Arc::clone(slot.get_or_insert_with(|| {
+                Arc::new(continuation::CarrierWaitService::new(Arc::clone(
+                    &scheduler,
+                )))
+            }))
+        };
+        (scheduler, service)
+    }
+
     #[cfg_attr(
         not(test),
         expect(
@@ -1742,9 +1773,11 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
     crash_capture: Option<Arc<crate::kernel::CrashCaptureAuthority>>,
     kernel_thread: Option<crate::kernel::ThreadRef>,
+    guest_execution: Option<crate::kernel::GuestExecutorParticipation>,
     /// Exact Task 1 execution authority while this logical thread is running.
     /// Empty only before its first reclaim snapshot and while blocked.
     execution_lease: Mutex<Option<crate::kernel::objects::ThreadExecutionLease>>,
+    continuation_executor: Option<crate::kernel::ExecutorRegistration>,
     /// Authoritative Linux TGID for a task multiplexed by HVPatch. `None` on
     /// the one-host-process-per-task native/VMM lanes.
     hvpatch_task_pid: Option<i32>,
@@ -1791,6 +1824,14 @@ struct BlockingWaitReclaim {
     single_threaded_process: bool,
 }
 
+enum HvpatchBlockInput {
+    Dispatch(DispatchOutcome),
+    Vfork {
+        child: crate::kernel::TaskKey,
+        wait: crate::kernel::VforkParentWait,
+    },
+}
+
 struct PreparedCorePublication {
     snapshot: crate::dispatch::CoreProcessSnapshot,
     bytes: Vec<u8>,
@@ -1812,6 +1853,42 @@ impl Drop for VcpuLeaseGuard {
             carrick_hal::vcpu_sched::global()
                 .release(lease, carrick_hal::vcpu_sched::Yield::Exited);
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct TransitionalSchedulerKick {
+    binding: Mutex<Option<crate::kernel::ExecutorBinding>>,
+}
+
+impl crate::kernel::ExecutorKick for TransitionalSchedulerKick {
+    fn try_bind(&self, binding: crate::kernel::ExecutorBinding) -> bool {
+        let mut current = self.binding.lock();
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(binding);
+        true
+    }
+
+    fn unbind(&self, binding: crate::kernel::ExecutorBinding) {
+        let mut current = self.binding.lock();
+        if *current == Some(binding) {
+            *current = None;
+        }
+    }
+
+    fn deliver_exact(&self, token: crate::kernel::ExecutorKickToken) -> bool {
+        self.binding.lock().is_some_and(|binding| {
+            binding.executor() == token.executor()
+                && binding.executor_epoch() == token.executor_epoch()
+                && binding.thread() == token.thread()
+                && binding.generation() == token.generation()
+        })
+    }
+
+    fn current_binding(&self) -> Option<crate::kernel::ExecutorBinding> {
+        *self.binding.lock()
     }
 }
 
@@ -1891,7 +1968,9 @@ where
             process_fork_barrier,
             crash_capture,
             kernel_thread,
+            guest_execution: None,
             execution_lease: Mutex::new(None),
+            continuation_executor: None,
             hvpatch_task_pid,
             linux_tid,
             fatal_image_generation,
@@ -1927,7 +2006,6 @@ where
             )
         })?;
         let mm = context.shared().mm().id();
-        let generation = mm.raw();
         let (cpu_mm, cpu_asid) = match &cpu {
             carrick_hal::threaded::GuestCpuState::Aarch64V1(state) => {
                 (state.mm_generation, state.asid_generation)
@@ -1936,16 +2014,17 @@ where
                 (state.mm_generation(), state.asid_generation())
             }
         };
-        if cpu_mm != generation || cpu_asid != generation {
+        if cpu_mm != mm.raw() {
             return Err(RuntimeError::Configuration(format!(
                 "typed reclaim generation mismatch: cpu mm/asid={cpu_mm}/{cpu_asid} \
-                 Kernel mm/asid={generation}/{generation}"
+                 Kernel mm={}",
+                mm.raw()
             )));
         }
         Ok(crate::kernel::objects::MigratableTaskState {
             cpu,
             mm,
-            asid_generation: generation,
+            asid_generation: cpu_asid,
         })
     }
 
@@ -2058,7 +2137,10 @@ where
                     "typed reclaim restore lost current Kernel MM authority".to_owned(),
                 )
             })?;
-        let current_asid_generation = current_mm.raw();
+        let current_asid_generation = lease
+            .task_state_authority()
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?
+            .1;
         let state = match lease.task_state_for_restore(abi, 1, current_mm, current_asid_generation)
         {
             Ok(state) => state.clone(),
@@ -3079,6 +3161,227 @@ where
         }
     }
 
+    fn suspend_hvpatch_continuation(
+        &mut self,
+        kernel: &Kernel,
+        engine: &mut E,
+        request: SyscallRequest,
+        input: HvpatchBlockInput,
+    ) -> Result<Option<DispatchOutcome>, RuntimeError> {
+        let directory = kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "HVPatch blocking continuation has no shared runtime directory".to_owned(),
+            )
+        })?;
+        let context = self.service_kernel_context.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "HVPatch blocking continuation lost syscall Kernel context".to_owned(),
+            )
+        })?;
+        let (scheduler, service) = directory.continuation_services(context.kernel());
+        if self.continuation_executor.is_none() {
+            self.continuation_executor = Some(
+                scheduler
+                    .register_executor(Arc::new(TransitionalSchedulerKick::default()))
+                    .map_err(|error| RuntimeError::Configuration(error.to_string()))?,
+            );
+        }
+
+        let capture = {
+            let lease = self.execution_lease.lock();
+            let lease = lease.as_ref().ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "HVPatch block has no exact Task 2 execution lease".to_owned(),
+                )
+            })?;
+            continuation::ContinuationCapture::from_lease(
+                context,
+                lease,
+                request,
+                if is_restartable_syscall(request.number.raw()) {
+                    continuation::RestartClass::RestartSyscall
+                } else {
+                    continuation::RestartClass::Never
+                },
+                continuation::ContinuationBackend::Hvpatch,
+            )
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?
+        };
+        let mut continuation = match input {
+            HvpatchBlockInput::Dispatch(outcome) => {
+                continuation::BlockedContinuation::from_dispatch_outcome(outcome, capture)
+            }
+            HvpatchBlockInput::Vfork { child, wait } => {
+                continuation::BlockedContinuation::from_vfork_parent(capture, child, wait)
+            }
+        }
+        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        continuation.bind_product_futex(&self.futex);
+        struct OneBlock(Option<continuation::BlockedContinuation>);
+        impl continuation::TaskQuantumSource for OneBlock {
+            fn next_boundary(&mut self) -> continuation::QuantumBoundary {
+                continuation::QuantumBoundary::Block(Box::new(
+                    self.0.take().unwrap_or_else(|| std::process::abort()),
+                ))
+            }
+        }
+        let runner = continuation::TransitionalDedicatedRunner::new();
+        let continuation = match runner.run_task_quantum(&mut OneBlock(Some(continuation))) {
+            continuation::QuantumExit::Blocked(continuation) => *continuation,
+            _ => std::process::abort(),
+        };
+
+        let thread = self.kernel_thread.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("HVPatch continuation lost Kernel thread".to_owned())
+        })?;
+        {
+            let lease = self.execution_lease.lock();
+            thread
+                .begin_switch_out(lease.as_ref().ok_or_else(|| {
+                    RuntimeError::Configuration("continuation save lost execution lease".to_owned())
+                })?)
+                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        }
+        let mut registration = service.prepare_registration(&continuation);
+        service
+            .enroll(&mut registration)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let token = registration.wake_token();
+        let _ = service
+            .recheck_registration(&registration)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+
+        if !engine.reclaims() {
+            return Err(RuntimeError::Configuration(
+                "HVPatch continuation requires a reclaimable backend snapshot".to_owned(),
+            ));
+        }
+        let single_threaded_process =
+            self.registry.live_count() == 1 && self.process_fork_barrier.is_none();
+        let cpu = if single_threaded_process {
+            let _ = self
+                .registry
+                .park_vcpu_classified(self.this_tid, crate::thread::VcpuParkClass::ReleaseSafe);
+            let cpu = engine
+                .save_shared_wait_state()
+                .map_err(RuntimeError::Trap)?;
+            self.registry.set_vm_released(true);
+            cpu
+        } else {
+            let cpu = engine.save_guest_state().map_err(RuntimeError::Trap)?;
+            let _ = self
+                .registry
+                .park_vcpu_classified(self.this_tid, crate::thread::VcpuParkClass::ReleaseSafe);
+            cpu
+        };
+        let saved = self.current_migratable_binding(cpu)?;
+        let mut lease = self.execution_lease.lock().take().ok_or_else(|| {
+            RuntimeError::Configuration("continuation settlement lost execution lease".to_owned())
+        })?;
+        lease
+            .replace_task_state(saved)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        scheduler
+            .settle_transitional_blocked_continuation(thread, lease, continuation, registration)
+            .map_err(|(error, _lease)| RuntimeError::Configuration(error.to_string()))?;
+        if let Some(vcpu_lease) = carrick_hal::vcpu_sched::take_current_lease() {
+            carrick_hal::vcpu_sched::global()
+                .release(vcpu_lease, carrick_hal::vcpu_sched::Yield::Blocked);
+        }
+        if engine.reclaim_refreshes_kicker() {
+            self.kicker.unregister(self.this_tid);
+        }
+        drop(self.guest_execution.take());
+        debug_assert!(scheduler.binding_for_thread(thread.key()).is_none());
+
+        let event = service
+            .wait_for_event(token, Duration::from_secs(24 * 60 * 60))
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        self.guest_execution = Some(
+            kernel
+                .guest_executors
+                .enter(self.kernel_thread.as_ref().map(Arc::clone)),
+        );
+        let new_vcpu_lease = loop {
+            if let Some(lease) = carrick_hal::vcpu_sched::global().acquire_timeout(
+                self.this_tid.raw() as u64,
+                None,
+                Duration::from_millis(50),
+            ) {
+                break lease;
+            }
+            if self.fork_is_quiescing() {
+                self.park_if_fork_quiescing();
+            }
+        };
+        carrick_hal::vcpu_sched::set_current_lease(new_vcpu_lease);
+        let executor = self.continuation_executor.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("continuation executor vanished".to_owned())
+        })?;
+        let mut lease = scheduler
+            .take_transitional_lease(executor)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let (current_mm, current_asid) = lease
+            .task_state_authority()
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let abi = <E::Arch as carrick_hal::GuestArch>::linux_guest_abi();
+        let cpu = lease
+            .task_state_for_restore(abi, 1, current_mm, current_asid)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?
+            .cpu
+            .clone();
+        if engine.reclaim_refreshes_kicker() {
+            let claimed = self.registry.unpark_vcpu(self.this_tid);
+            let restore = if single_threaded_process || claimed {
+                engine.rebind_shared_wait_state(new_vcpu_lease.slot, &cpu)
+            } else {
+                engine.rebind_to_slot(new_vcpu_lease.slot, &cpu)
+            };
+            restore.map_err(RuntimeError::Trap)?;
+            self.register_vcpu(engine);
+        } else {
+            engine
+                .rebind_to_slot(new_vcpu_lease.slot, &cpu)
+                .map_err(RuntimeError::Trap)?;
+            let _ = self.registry.unpark_vcpu(self.this_tid);
+        }
+        let fresh = context
+            .task_binding()
+            .capture(self.linux_tid)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let result =
+            continuation::resume_continuation(&mut lease, event, &fresh).map_err(|error| {
+                RuntimeError::Configuration(format!("resume continuation: {error:?}"))
+            })?;
+        *self.execution_lease.lock() = Some(lease);
+
+        use continuation::ContinuationCompletion as Completion;
+        Ok(match result.completion {
+            Completion::Return(value) => Some(DispatchOutcome::Returned { value }),
+            Completion::Errno(errno) => Some(DispatchOutcome::Errno { errno }),
+            Completion::Redispatch => None,
+            Completion::RedispatchWithPartial(value) => Some(DispatchOutcome::Returned { value }),
+            Completion::ReturnWithGuestWrites(value, writes) => {
+                for range in writes {
+                    engine
+                        .zero_guest_range(range.start().raw(), range.len())
+                        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+                }
+                Some(DispatchOutcome::Returned { value })
+            }
+            Completion::ErrnoWithGuestWrites(errno, _writes) => {
+                Some(DispatchOutcome::Errno { errno })
+            }
+            Completion::InterruptedSleep { remaining } => {
+                Some(crate::dispatch::complete_interrupted_sleep(
+                    engine,
+                    remaining.map(|(range, _)| crate::dispatch::GuestPtr(range.start().raw())),
+                    remaining.map_or(Duration::ZERO, |(_, duration)| duration),
+                ))
+            }
+        })
+    }
+
     fn service_threaded_syscall(
         &mut self,
         kernel: &Kernel,
@@ -3210,6 +3513,15 @@ where
                         &self.futex,
                     )
                 })?;
+            if kernel.dispatcher.execution_backend()
+                == crate::page_profile::ExecutionBackend::HvPatch
+                && continuation::is_blocking_dispatch_outcome(&outcome)
+            {
+                // The HVPatch product path converts this exact owned outcome
+                // at `run_vcpu_until_exit`'s quantum boundary. Compatibility
+                // lanes below retain their historical host-wait adapters.
+                return Ok(outcome);
+            }
             if !matches!(&outcome, DispatchOutcome::WaitOnHvpatchChild { .. }) {
                 if let Some((_, trace)) = hvpatch_child_wait_trace.take() {
                     trace_hvpatch_wait_end(kernel, self.this_tid, 6, 2, 0, trace);
@@ -4347,7 +4659,7 @@ where
     //
     // Entered BEFORE `register_vcpu` below, so a thread is a census member for
     // strictly longer than it holds a vCPU lease — the whole point.
-    let _guest_execution = kernel.guest_executors.enter(kernel_thread.clone());
+    let guest_execution = kernel.guest_executors.enter(kernel_thread.clone());
     let mut state = ThreadRuntimeState::new(
         registry,
         futex,
@@ -4365,6 +4677,7 @@ where
         in_guest,
         max_traps,
     );
+    state.guest_execution = Some(guest_execution);
     let task_snapshot_context = kernel
         .dispatcher
         .capture_kernel_context(state.linux_tid)
@@ -4372,7 +4685,12 @@ where
             RuntimeError::Configuration(format!("bind task snapshot authority: {error}"))
         })?;
     let mm_generation = task_snapshot_context.shared().mm().id().raw();
-    engine.bind_task_snapshot_identity(mm_generation, mm_generation);
+    let asid_generation = kernel
+        .hvpatch_process
+        .as_ref()
+        .and_then(crate::hvpatch::ProcessContext::mm_binding)
+        .map_or(mm_generation, |binding| u64::from(binding.asid.raw()));
+    engine.bind_task_snapshot_identity(mm_generation, asid_generation);
     if let Some(process) = kernel.hvpatch_process.as_ref() {
         let context = &task_snapshot_context;
         let binding = process.mm_binding().ok_or_else(|| {
@@ -4833,7 +5151,24 @@ where
                 });
 
             // ---- syscall service: no dispatcher-wide lock held ----
-            let outcome = state.service_threaded_syscall(&kernel, &mut engine, frame)?;
+            let mut outcome = state.service_threaded_syscall(&kernel, &mut engine, frame)?;
+            while kernel.dispatcher.execution_backend()
+                == crate::page_profile::ExecutionBackend::HvPatch
+                && continuation::is_blocking_dispatch_outcome(&outcome)
+            {
+                let continuation_request = SyscallRequest::from_raw(frame)
+                    .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
+                    .with_current_guest_sp(engine.get_reg(carrick_hal::Reg::Sp).ok());
+                outcome = match state.suspend_hvpatch_continuation(
+                    &kernel,
+                    &mut engine,
+                    continuation_request,
+                    HvpatchBlockInput::Dispatch(outcome),
+                )? {
+                    Some(completed) => completed,
+                    None => state.service_threaded_syscall(&kernel, &mut engine, frame)?,
+                };
+            }
 
             let mut last_syscall_retval: Option<i64> = None;
             let mut signal_interrupted_pc: Option<u64> = None;

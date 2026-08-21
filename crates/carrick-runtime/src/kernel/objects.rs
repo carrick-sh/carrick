@@ -3467,6 +3467,9 @@ impl Task {
         // one, so a process that has retired threads would otherwise appear to
         // lose the CPU they burned.
         if let Some(thread) = retired.as_ref() {
+            let _ = thread.cancel_kernel_owned_continuation(
+                crate::vcpu_loop::continuation::CancellationCause::ThreadExit,
+            );
             self.retain_exited_thread_cpu(thread);
             // A retired thread has left the graph and can never reach another
             // safe point. Say so at the source rather than leaving a fatal
@@ -3946,6 +3949,15 @@ struct ThreadExecutionRecord {
     exec_invalidation_pending: bool,
 }
 
+fn cancel_continuation_slot(
+    slot: &mut Option<Box<crate::vcpu_loop::continuation::BlockedContinuation>>,
+    cause: crate::vcpu_loop::continuation::CancellationCause,
+) {
+    if let Some(continuation) = slot.take() {
+        let _ = continuation.cancel(cause);
+    }
+}
+
 impl ThreadExecutionRecord {
     const fn uninitialized() -> Self {
         Self {
@@ -4007,6 +4019,22 @@ impl ThreadExecutionLease {
 
     pub const fn executor_epoch(&self) -> u64 {
         self.executor_epoch
+    }
+
+    /// Exact address-space authority carried by the architectural snapshot.
+    ///
+    /// Continuations must derive MM and ASID generations from this non-cloneable
+    /// lease, not from a caller-supplied context or from the accidental numeric
+    /// equality some backends currently use for their initial ASID.
+    pub(crate) fn task_state_authority(&self) -> Result<(MmId, u64), ThreadExecutionError> {
+        let state = self
+            .task_state
+            .as_ref()
+            .ok_or(ThreadExecutionError::MissingCpuState {
+                generation: self.generation,
+            })?;
+        state.validate_identity()?;
+        Ok((state.mm, state.asid_generation))
     }
 
     /// Return the typed snapshot only when the restoring backend names the
@@ -4183,6 +4211,17 @@ struct ThreadCpuAccounting {
 }
 
 impl Thread {
+    pub(crate) fn parked_task_state_authority(
+        &self,
+        generation: ExecutionGeneration,
+    ) -> Option<(MmId, u64)> {
+        let execution = self.execution.lock();
+        (execution.state.generation() == Some(generation))
+            .then(|| execution.task_state.as_ref())
+            .flatten()
+            .map(|state| (state.mm, state.asid_generation))
+    }
+
     pub const fn key(&self) -> ThreadKey {
         self.key
     }
@@ -4514,6 +4553,28 @@ impl Thread {
             .map(|_| ())
     }
 
+    pub(super) fn cancel_kernel_owned_continuation(
+        &self,
+        cause: crate::vcpu_loop::continuation::CancellationCause,
+    ) -> Option<crate::vcpu_loop::continuation::CancellationReceipt> {
+        let mut execution = self.execution.lock();
+        let continuation = execution.blocked_continuation.take()?;
+        let receipt = continuation.cancel(cause);
+        if let ThreadExecutionState::Blocked {
+            generation, reason, ..
+        } = execution.state
+        {
+            execution.state = ThreadExecutionState::Blocked {
+                generation,
+                reason,
+                continuation: None,
+            };
+        }
+        drop(execution);
+        self.revision.publish();
+        Some(receipt)
+    }
+
     pub(crate) fn scheduler_yield_from_executor(
         &self,
         lease: ThreadExecutionLease,
@@ -4560,8 +4621,14 @@ impl Thread {
         };
         execution.task_state = None;
         let _ = lease.task_state.take();
-        execution.blocked_continuation = None;
-        let _ = lease.blocked_continuation.take();
+        cancel_continuation_slot(
+            &mut execution.blocked_continuation,
+            crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
+        );
+        cancel_continuation_slot(
+            &mut lease.blocked_continuation,
+            crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
+        );
         execution.exec_invalidation_pending = false;
         execution.state = ThreadExecutionState::Failed { generation, reason };
         lease.settled = true;
@@ -4622,8 +4689,14 @@ impl Thread {
         if execution.exec_invalidation_pending {
             execution.task_state = None;
             let _ = lease.task_state.take();
-            execution.blocked_continuation = None;
-            let _ = lease.blocked_continuation.take();
+            cancel_continuation_slot(
+                &mut execution.blocked_continuation,
+                crate::vcpu_loop::continuation::CancellationCause::Exec,
+            );
+            cancel_continuation_slot(
+                &mut lease.blocked_continuation,
+                crate::vcpu_loop::continuation::CancellationCause::Exec,
+            );
             execution.state = ThreadExecutionState::Exited { generation };
             execution.exec_invalidation_pending = false;
         } else {
@@ -4684,8 +4757,14 @@ impl Thread {
                 ExecutionSettlement::Exited => {
                     execution.task_state = None;
                     let _ = lease.task_state.take();
-                    execution.blocked_continuation = None;
-                    let _ = lease.blocked_continuation.take();
+                    cancel_continuation_slot(
+                        &mut execution.blocked_continuation,
+                        crate::vcpu_loop::continuation::CancellationCause::ThreadExit,
+                    );
+                    cancel_continuation_slot(
+                        &mut lease.blocked_continuation,
+                        crate::vcpu_loop::continuation::CancellationCause::ThreadExit,
+                    );
                     execution.state = ThreadExecutionState::Exited { generation };
                 }
             }
@@ -4749,7 +4828,10 @@ impl Thread {
             .next()
             .unwrap_or_else(|| std::process::abort());
         execution.task_state = None;
-        execution.blocked_continuation = None;
+        cancel_continuation_slot(
+            &mut execution.blocked_continuation,
+            crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
+        );
         execution.exec_invalidation_pending = false;
         execution.state = ThreadExecutionState::Failed {
             generation,
@@ -4780,7 +4862,10 @@ impl Thread {
             .next()
             .unwrap_or_else(|| std::process::abort());
         execution.task_state = None;
-        execution.blocked_continuation = None;
+        cancel_continuation_slot(
+            &mut execution.blocked_continuation,
+            crate::vcpu_loop::continuation::CancellationCause::Exec,
+        );
         execution.exec_invalidation_pending = false;
         execution.state = ThreadExecutionState::Exited { generation };
         drop(execution);
