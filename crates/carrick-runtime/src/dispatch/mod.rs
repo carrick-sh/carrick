@@ -723,6 +723,7 @@ pub(crate) mod lock_order;
 mod mount_api;
 mod mqueue;
 mod sysv;
+pub use sysv::SysvWaitState;
 #[macro_use]
 mod time;
 
@@ -1598,6 +1599,11 @@ pub enum DispatchOutcome {
         location: carrick_guest_mem::SharedFutexLocation,
         waiter_key: usize,
         value: u32,
+        /// Owned SysV message-queue wait authority. This keeps the exact
+        /// wait-word mmap/fd and blocked queue id alive across executor
+        /// suspension; `None` is reserved for non-SysV runtime-owned words.
+        #[serde(skip_serializing)]
+        sysv: Option<SysvWaitState>,
     },
     /// A blocking-mode I/O syscall (ppoll/pselect/poll/select with no fd ready,
     /// or — later — recvfrom/accept/read that would block) needs to wait for

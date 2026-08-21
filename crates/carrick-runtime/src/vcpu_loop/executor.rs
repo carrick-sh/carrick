@@ -264,10 +264,11 @@ impl<B: PersistentTaskBinding> RunnableTask<'_, B> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum ExecutorExit {
     Syscall,
     Blocked(BlockedReason),
+    BlockedContinuation(Box<crate::vcpu_loop::continuation::BlockedContinuation>),
     Yielded,
     Preempted,
     Quiesced,
@@ -407,14 +408,6 @@ const BOUNDARY_INVENTORY: &[ExecutorBoundaryInventoryEntry] = &[
         disposition: ExecutorStateDisposition::BoundaryReset,
     },
     ExecutorBoundaryInventoryEntry {
-        name: "sysv-mq-wait-cache",
-        disposition: ExecutorStateDisposition::BoundaryReset,
-    },
-    ExecutorBoundaryInventoryEntry {
-        name: "sysv-mq-blocked-ids",
-        disposition: ExecutorStateDisposition::BoundaryReset,
-    },
-    ExecutorBoundaryInventoryEntry {
         name: "fanotify-internal-open-depth",
         disposition: ExecutorStateDisposition::BoundaryReset,
     },
@@ -485,9 +478,7 @@ impl WorkerBoundaryAudit {
         if crate::fanotify::internal_open_in_progress() {
             return Err(boundary_error("fanotify-internal-open-depth"));
         }
-        if !SyscallDispatcher::reset_sysv_executor_boundary_state() {
-            return Err(boundary_error("sysv-mq-blocked-ids"));
-        }
+        let _ = SyscallDispatcher::reset_sysv_executor_boundary_state();
         let _previous_signal_progress = super::reset_signal_progress_for_executor_boundary();
         if !super::signal_progress_is_zero_for_executor_boundary() {
             return Err(boundary_error("signal-progress"));
@@ -753,13 +744,15 @@ struct WorkerRuntime<'a> {
 struct PoolControl {
     usable_workers: std::sync::atomic::AtomicUsize,
     authorities: SubmissionAuthorityDirectory,
+    wait_service: crate::vcpu_loop::continuation::CarrierWaitService,
 }
 
 impl PoolControl {
-    fn new(workers: usize) -> Self {
+    fn new(workers: usize, scheduler: Arc<Scheduler>) -> Self {
         Self {
             usable_workers: std::sync::atomic::AtomicUsize::new(workers),
             authorities: SubmissionAuthorityDirectory::default(),
+            wait_service: crate::vcpu_loop::continuation::CarrierWaitService::new(scheduler),
         }
     }
 
@@ -877,7 +870,7 @@ where
                     message: error.to_string(),
                 })?;
         let receipts = Arc::new(ReceiptLog::default());
-        let control = Arc::new(PoolControl::new(configured_workers));
+        let control = Arc::new(PoolControl::new(configured_workers, Arc::clone(&scheduler)));
         let (startup_tx, startup_rx) = mpsc::channel();
         let mut handles: Vec<WorkerHandle> = Vec::with_capacity(configured_workers);
         for index in 0..configured_workers {
@@ -1379,7 +1372,7 @@ where
                     ));
                 }
             };
-            if exit == ExecutorExit::Syscall {
+            if matches!(exit, ExecutorExit::Syscall) {
                 scheduler.note_syscall_boundary(&running);
                 receipts.record(
                     executor_id,
@@ -1389,7 +1382,7 @@ where
             }
             break exit;
         };
-        if exit == ExecutorExit::InvalidState {
+        if matches!(exit, ExecutorExit::InvalidState) {
             let settlement = fail_running(
                 scheduler,
                 running,
@@ -1450,6 +1443,17 @@ where
                 drop(submission_authority);
                 scheduler
                     .settle_blocked(running, reason)
+                    .map(|()| ExecutorPoolEvent::SettledBlocked { thread, generation })
+            }
+            ExecutorExit::BlockedContinuation(continuation) => {
+                let mut registration = control.wait_service.prepare_registration(&continuation);
+                control
+                    .wait_service
+                    .enroll(&mut registration)
+                    .map_err(|error| error.to_string())?;
+                drop(submission_authority);
+                scheduler
+                    .settle_blocked_continuation(running, *continuation, registration)
                     .map(|()| ExecutorPoolEvent::SettledBlocked { thread, generation })
             }
             ExecutorExit::Yielded | ExecutorExit::Preempted | ExecutorExit::Quiesced => control
@@ -1549,7 +1553,8 @@ mod tests {
         PersistentTaskBinding, ReceiptLog, RunnableTask, SavedRunnable, TaskBindingResolver,
         TaskLoadIdentity, WorkerBoundaryAudit, WorkerKick,
     };
-    use crate::dispatch::SyscallDispatcher;
+    use crate::compat::SyscallArgs;
+    use crate::dispatch::{DispatchOutcome, SyscallDispatcher, SyscallRequest};
     use crate::kernel::objects::{
         BlockedReason, ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState,
         ThreadExecutionLease, ThreadExecutionState,
@@ -1592,6 +1597,8 @@ mod tests {
         progress: AtomicUsize,
         load_identity: parking_lot::Mutex<Option<TaskLoadIdentity>>,
         required_continuation_sequence: parking_lot::Mutex<Option<u64>>,
+        blocked_continuation:
+            parking_lot::Mutex<Option<crate::vcpu_loop::continuation::BlockedContinuation>>,
         descendant: parking_lot::Mutex<Option<DescendantPublication>>,
     }
 
@@ -1608,6 +1615,7 @@ mod tests {
                 progress: AtomicUsize::new(0),
                 load_identity: parking_lot::Mutex::new(None),
                 required_continuation_sequence: parking_lot::Mutex::new(None),
+                blocked_continuation: parking_lot::Mutex::new(None),
                 descendant: parking_lot::Mutex::new(None),
             })
         }
@@ -1646,6 +1654,13 @@ mod tests {
 
         fn require_continuation_sequence(&self, sequence: u64) {
             *self.required_continuation_sequence.lock() = Some(sequence);
+        }
+
+        fn block_with_continuation(
+            &self,
+            continuation: crate::vcpu_loop::continuation::BlockedContinuation,
+        ) {
+            *self.blocked_continuation.lock() = Some(continuation);
         }
     }
 
@@ -2051,7 +2066,12 @@ mod tests {
                         ))
                     }
                 }
-                Step::Block => Ok(ExecutorExit::Blocked(BlockedReason::HostWait)),
+                Step::Block => match binding.blocked_continuation.lock().take() {
+                    Some(continuation) => {
+                        Ok(ExecutorExit::BlockedContinuation(Box::new(continuation)))
+                    }
+                    None => Ok(ExecutorExit::Blocked(BlockedReason::HostWait)),
+                },
                 Step::Yield => Ok(ExecutorExit::Yielded),
                 Step::Preempt => Ok(ExecutorExit::Preempted),
                 Step::Exit => Ok(ExecutorExit::Exited),
@@ -2838,6 +2858,62 @@ mod tests {
     }
 
     #[test]
+    fn pool_drives_owned_blocked_continuation_into_kernel_state() {
+        use crate::vcpu_loop::continuation::{
+            BlockedContinuation, ContinuationBackend, ContinuationCapture, RestartClass,
+        };
+
+        let (kernel, blocked) = bootstrap(14_045);
+        let runnable = sibling(&kernel, &blocked, 24_045);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let factory = Arc::new(FakeFactory::default());
+        let blocked_generation = publish(&blocked, 61);
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnSleep {
+                duration: Duration::from_secs(30),
+                remaining: None,
+            },
+            ContinuationCapture::new(
+                &blocked,
+                blocked_generation,
+                SyscallRequest::new(101, SyscallArgs([0; 6])),
+                RestartClass::Never,
+                ContinuationBackend::Hvpatch,
+            )
+            .expect("capture continuation"),
+        )
+        .expect("owned continuation");
+        let continuation_id = continuation.id();
+        let blocked_binding = FakeBinding::new(61, [Step::Block]);
+        blocked_binding.block_with_continuation(continuation);
+        factory.install(&blocked, blocked_binding);
+        factory.install(&runnable, FakeBinding::new(71, [Step::Exit]));
+        let runnable_generation = publish(&runnable, 71);
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        let blocked_authority = enqueue_root(&scheduler, &blocked, blocked_generation);
+        let runnable_authority = enqueue_root(&scheduler, &runnable, runnable_generation);
+        drop((blocked_authority, runnable_authority));
+        pool.shutdown().expect("clean shutdown");
+
+        assert!(matches!(
+            blocked.thread().execution_state(),
+            ThreadExecutionState::Blocked {
+                continuation: Some(actual),
+                ..
+            } if actual == continuation_id
+        ));
+        assert!(
+            scheduler
+                .binding_for_thread(blocked.thread().key())
+                .is_none()
+        );
+        assert!(matches!(
+            runnable.thread().execution_state(),
+            ThreadExecutionState::Exited { .. }
+        ));
+    }
+
+    #[test]
     fn load_save_run_panic_audit_and_invalid_state_fail_exact_task_and_retire_worker() {
         for (case, step) in [
             ("run", Step::FailRun),
@@ -3266,7 +3342,7 @@ mod tests {
             "signal-progress",
             "active-kernel-context",
             "sysv-mq-fd-cache",
-            "sysv-mq-wait-cache",
+            "logical-mq-wait-state",
             "fanotify-internal-open-depth",
             "dispatch-lock-order-depth",
             "path-resolution-depth",
@@ -3280,6 +3356,13 @@ mod tests {
                 "{required}"
             );
         }
+        assert!(
+            inventory
+                .iter()
+                .all(|entry| entry.name != "sysv-mq-wait-cache"
+                    && entry.name != "sysv-mq-blocked-ids"),
+            "SysV wait-word and blocked-id state belongs to the continuation, not executor TLS"
+        );
 
         let (kernel, context) = bootstrap(14_500);
         let scheduler = Arc::new(Scheduler::new(kernel));
@@ -3408,7 +3491,9 @@ mod tests {
 
         let (cached_fd, wait_word_fd) =
             SyscallDispatcher::dirty_sysv_executor_boundary_state_for_test();
-        assert!(boundary.audit_runtime(&mut backend).is_err());
+        boundary
+            .audit_runtime(&mut backend)
+            .expect("SysV host-fd cache is resettable executor state");
         assert_eq!(unsafe { libc::fcntl(cached_fd, libc::F_GETFD) }, -1);
         assert_eq!(unsafe { libc::fcntl(wait_word_fd, libc::F_GETFD) }, -1);
         assert!(SyscallDispatcher::sysv_executor_boundary_state_is_clear_for_test());
@@ -3438,7 +3523,7 @@ mod tests {
 
     #[test]
     fn prohibited_real_owner_state_retires_worker_and_cleanup_leaves_no_inherited_state() {
-        for mode in 1..=7 {
+        for mode in 1..=6 {
             let (kernel, context) = bootstrap(14_560 + mode as i32);
             let scheduler = Arc::new(Scheduler::new(kernel));
             let factory = Arc::new(FakeFactory::default());

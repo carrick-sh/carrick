@@ -722,7 +722,6 @@ struct SysvIpcService;
 impl SysvIpcService {
     fn after_fork_child() {
         MSG_QUEUE_FD_CACHE.with(|cache| cache.borrow_mut().refresh_for_current_process());
-        MSG_QUEUE_WAIT_WORD_CACHE.with(|cache| cache.borrow_mut().refresh_for_current_process());
     }
 
     fn cleanup_process_exit(state: &mut SysvShmState) {
@@ -1311,27 +1310,16 @@ thread_local! {
 }
 
 impl SyscallDispatcher {
-    /// Clear host-fd and wait-word caches before an executor pthread changes
-    /// task identity. A live blocked-id is not recoverable here: it represents
-    /// logical wait state that Task 5 must migrate into a continuation, so the
-    /// caller retires the executor after this function reports `false`.
+    /// Clear the host-fd cache before an executor pthread changes task
+    /// identity. Wait-word mappings and blocked queue ids are owned by
+    /// `SysvWaitState` inside the Kernel continuation and never live in TLS.
     pub(crate) fn reset_sysv_executor_boundary_state() -> bool {
         MSG_QUEUE_FD_CACHE.with(|cache| {
             for (_, entry) in cache.borrow_mut().entries.drain() {
                 unsafe { libc::close(entry.fd) };
             }
         });
-        MSG_QUEUE_WAIT_WORD_CACHE.with(|cache| cache.borrow_mut().entries.clear());
-        let blocked_was_empty = MSG_QUEUE_BLOCKED_IDS.with(|ids| {
-            let mut ids = ids.borrow_mut();
-            let was_empty = ids.is_empty();
-            ids.clear();
-            was_empty
-        });
-        blocked_was_empty
-            && MSG_QUEUE_FD_CACHE.with(|cache| cache.borrow().entries.is_empty())
-            && MSG_QUEUE_WAIT_WORD_CACHE.with(|cache| cache.borrow().entries.is_empty())
-            && MSG_QUEUE_BLOCKED_IDS.with(|ids| ids.borrow().is_empty())
+        MSG_QUEUE_FD_CACHE.with(|cache| cache.borrow().entries.is_empty())
     }
 
     #[cfg(test)]
@@ -1355,32 +1343,14 @@ impl SyscallDispatcher {
                 },
             );
         });
-        let mapped = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                MSG_QUEUE_WAIT_WORD_BYTES,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(mapped, libc::MAP_FAILED);
-        let ptr = std::ptr::NonNull::new(mapped.cast::<std::sync::atomic::AtomicU32>())
-            .expect("test wait-word mapping");
-        MSG_QUEUE_WAIT_WORD_CACHE.with(|cache| {
+        MSG_QUEUE_FD_CACHE.with(|cache| {
             cache.borrow_mut().entries.insert(
-                PathBuf::from("executor-boundary-wait-test"),
-                MsgQueueWaitWord {
-                    ptr,
-                    len: MSG_QUEUE_WAIT_WORD_BYTES,
+                PathBuf::from("executor-boundary-second-fd-test"),
+                CachedMsgQueueFd {
                     fd: wait_word_fd,
-                    queue_identity: identity,
+                    identity,
                 },
             );
-        });
-        MSG_QUEUE_BLOCKED_IDS.with(|ids| {
-            ids.borrow_mut().insert(0x5a5a);
         });
         (cached_fd, wait_word_fd)
     }
@@ -1388,8 +1358,6 @@ impl SyscallDispatcher {
     #[cfg(test)]
     pub(crate) fn sysv_executor_boundary_state_is_clear_for_test() -> bool {
         MSG_QUEUE_FD_CACHE.with(|cache| cache.borrow().entries.is_empty())
-            && MSG_QUEUE_WAIT_WORD_CACHE.with(|cache| cache.borrow().entries.is_empty())
-            && MSG_QUEUE_BLOCKED_IDS.with(|ids| ids.borrow().is_empty())
     }
 }
 
@@ -1722,6 +1690,12 @@ struct MsgQueueWaitWord {
     queue_identity: CachedMsgQueueIdentity,
 }
 
+// The mapping is owned until the last Arc drops, the pointed-to object is an
+// AtomicU32, and every access uses atomic ordering. Moving the owner between
+// executor pthreads therefore cannot race unmap or a non-atomic access.
+unsafe impl Send for MsgQueueWaitWord {}
+unsafe impl Sync for MsgQueueWaitWord {}
+
 impl MsgQueueWaitWord {
     fn open(queue_path: &Path) -> Result<Self, LinuxErrno> {
         let queue_identity = msg_queue_identity(queue_path)?;
@@ -1789,111 +1763,84 @@ impl Drop for MsgQueueWaitWord {
     }
 }
 
-#[derive(Debug)]
-struct MsgQueueWaitWordCache {
-    host_pid: libc::pid_t,
-    entries: HashMap<PathBuf, MsgQueueWaitWord>,
+#[derive(Clone, serde::Serialize)]
+pub struct SysvWaitState {
+    blocked_id: i32,
+    queue_path: PathBuf,
+    #[serde(skip_serializing)]
+    word: Arc<MsgQueueWaitWord>,
 }
 
-impl MsgQueueWaitWordCache {
-    fn new() -> Self {
-        Self {
-            host_pid: unsafe { libc::getpid() },
-            entries: HashMap::new(),
-        }
-    }
-
-    fn refresh_for_current_process(&mut self) {
-        let host_pid = unsafe { libc::getpid() };
-        if self.host_pid == host_pid {
-            return;
-        }
-        self.entries.clear();
-        self.host_pid = host_pid;
-    }
-
-    fn get(&mut self, queue_path: &Path) -> Result<&MsgQueueWaitWord, LinuxErrno> {
-        self.refresh_for_current_process();
-        let queue_identity = msg_queue_identity(queue_path)?;
-        let wait_path = msg_queue_wait_path(queue_path);
-        let needs_open = self
-            .entries
-            .get(&wait_path)
-            .is_none_or(|entry| entry.queue_identity != queue_identity);
-        if needs_open {
-            self.entries
-                .insert(wait_path.clone(), MsgQueueWaitWord::open(queue_path)?);
-        }
-        self.entries.get(&wait_path).ok_or(LINUX_EINVAL)
-    }
-
-    fn remove(&mut self, queue_path: &Path) {
-        self.entries.remove(&msg_queue_wait_path(queue_path));
+impl std::fmt::Debug for SysvWaitState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SysvWaitState")
+            .field("blocked_id", &self.blocked_id)
+            .field("queue_path", &self.queue_path)
+            .field("waiter_key", &(self.blocked_id as usize))
+            .finish_non_exhaustive()
     }
 }
 
-thread_local! {
-    static MSG_QUEUE_WAIT_WORD_CACHE: RefCell<MsgQueueWaitWordCache> =
-        RefCell::new(MsgQueueWaitWordCache::new());
-    static MSG_QUEUE_BLOCKED_IDS: RefCell<HashSet<i32>> = RefCell::new(HashSet::new());
+impl PartialEq for SysvWaitState {
+    fn eq(&self, other: &Self) -> bool {
+        self.blocked_id == other.blocked_id
+            && self.queue_path == other.queue_path
+            && self.word.queue_identity == other.word.queue_identity
+    }
 }
 
-fn with_cached_msg_queue_wait_word<R>(
-    queue_path: &Path,
-    f: impl FnOnce(&MsgQueueWaitWord) -> R,
-) -> Result<R, LinuxErrno> {
-    MSG_QUEUE_WAIT_WORD_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        cache.get(queue_path).map(f)
-    })
-}
+impl Eq for SysvWaitState {}
 
-fn remove_cached_msg_queue_wait_word(queue_path: &Path) {
-    MSG_QUEUE_WAIT_WORD_CACHE.with(|cache| cache.borrow_mut().remove(queue_path));
-}
-
-fn remember_msg_queue_block(id: MsgQueueId) {
-    MSG_QUEUE_BLOCKED_IDS.with(|ids| {
-        ids.borrow_mut().insert(id.raw());
-    });
-}
-
-fn clear_msg_queue_block(id: MsgQueueId) {
-    MSG_QUEUE_BLOCKED_IDS.with(|ids| {
-        ids.borrow_mut().remove(&id.raw());
-    });
-}
-
-fn take_msg_queue_block(id: MsgQueueId) -> bool {
-    MSG_QUEUE_BLOCKED_IDS.with(|ids| ids.borrow_mut().remove(&id.raw()))
-}
-
-struct MsgQueueWaitToken {
-    location: carrick_guest_mem::SharedFutexLocation,
-    waiter_key: usize,
-    observed: u32,
-}
-
-impl MsgQueueWaitToken {
+impl SysvWaitState {
     fn for_queue(id: MsgQueueId) -> Result<Self, LinuxErrno> {
-        let path = lookup_msg_queue_path(id)?;
-        remember_msg_queue_block(id);
-        with_cached_msg_queue_wait_word(&path, |word| Self {
-            location: carrick_guest_mem::SharedFutexLocation::Direct {
-                word: carrick_guest_mem::HostVa(word.addr()),
-                waiter_key: id.raw() as usize,
-            },
-            waiter_key: id.raw() as usize,
-            observed: word.load(),
+        let queue_path = lookup_msg_queue_path(id)?;
+        let word = Arc::new(MsgQueueWaitWord::open(&queue_path)?);
+        Ok(Self {
+            blocked_id: id.raw(),
+            queue_path,
+            word,
         })
     }
 
-    fn wait_outcome(&self) -> DispatchOutcome {
-        DispatchOutcome::WaitOnSharedWord {
-            location: self.location,
-            waiter_key: self.waiter_key,
-            value: self.observed,
+    pub(crate) const fn blocked_id(&self) -> i32 {
+        self.blocked_id
+    }
+
+    pub(crate) fn wait_word_fd(&self) -> i32 {
+        self.word.fd
+    }
+
+    pub(crate) fn completion_after_wake(&self) -> Option<DispatchOutcome> {
+        match msg_queue_identity(&self.queue_path) {
+            Ok(identity) if identity == self.word.queue_identity => None,
+            Ok(_) | Err(_) => Some(DispatchOutcome::errno(crate::linux_abi::LINUX_EIDRM)),
         }
+    }
+
+    fn wait_outcome(self) -> DispatchOutcome {
+        DispatchOutcome::WaitOnSharedWord {
+            location: carrick_guest_mem::SharedFutexLocation::Direct {
+                word: carrick_guest_mem::HostVa(self.word.addr()),
+                waiter_key: self.blocked_id as usize,
+            },
+            waiter_key: self.blocked_id as usize,
+            value: self.word.load(),
+            sysv: Some(self),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_tests(blocked_id: i32) -> Result<Self, LinuxErrno> {
+        let file = tempfile::NamedTempFile::new().map_err(|_| LINUX_EINVAL)?;
+        let queue_path = file.path().to_path_buf();
+        std::fs::write(&queue_path, vec![0u8; MSG_QUEUE_HEADER_SIZE]).map_err(|_| LINUX_EINVAL)?;
+        let word = Arc::new(MsgQueueWaitWord::open(&queue_path)?);
+        Ok(Self {
+            blocked_id,
+            queue_path,
+            word,
+        })
     }
 }
 
@@ -1903,8 +1850,8 @@ impl MsgQueueWaitToken {
 ///
 /// The word bump is what a waiter re-validates, and it propagates on its own:
 /// the wait word is a `MAP_SHARED` file mapping, so every thread's mapping sees
-/// the same physical page even though `MSG_QUEUE_WAIT_WORD_CACHE` is
-/// thread-local and hands each thread a different host VA.
+/// the same physical page even though each owned `SysvWaitState` maps it at a
+/// potentially different host VA.
 ///
 /// The WAKE does not propagate that way. A blocked `msgrcv`/`msgsnd` parks via
 /// `DispatchOutcome::WaitOnSharedWord`, which since `a1bd418d8` lands in the
@@ -1923,7 +1870,9 @@ impl MsgQueueWaitToken {
 /// The host wake is kept for the DSR native lanes, which really do run separate
 /// host processes and still rendezvous on the physical page.
 fn wake_msg_queue_waiters(path: &Path, id: MsgQueueId) {
-    let _ = with_cached_msg_queue_wait_word(path, MsgQueueWaitWord::wake_all);
+    if let Ok(word) = MsgQueueWaitWord::open(path) {
+        word.wake_all();
+    }
     carrick_thread::platform_futex::carrier_shared_futex_table().wake(id.raw() as u64, u32::MAX);
 }
 
@@ -2853,7 +2802,6 @@ impl SyscallDispatcher {
             loop {
                 match SysvIpcService::msgsnd(msqid, &creds, msg_type, &payload, operator) {
                     Ok(true) => {
-                        clear_msg_queue_block(msqid);
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
                     Ok(false) => {
@@ -2864,10 +2812,9 @@ impl SyscallDispatcher {
                         if sysv_msg_wait_interrupted(this, cx.kernel, tid) {
                             return Ok(DispatchOutcome::errno(LINUX_EINTR));
                         }
-                        if let Ok(token) = MsgQueueWaitToken::for_queue(msqid) {
+                        if let Ok(token) = SysvWaitState::for_queue(msqid) {
                             match SysvIpcService::msgsnd(msqid, &creds, msg_type, &payload, operator) {
                                 Ok(true) => {
-                                    clear_msg_queue_block(msqid);
                                     return Ok(DispatchOutcome::Returned { value: 0 });
                                 }
                                 Ok(false) => {
@@ -2887,10 +2834,7 @@ impl SyscallDispatcher {
                             std::thread::yield_now();
                         }
                     }
-                    Err(errno)
-                        if errno == LINUX_EINVAL
-                            && (saw_would_block || take_msg_queue_block(msqid)) =>
-                    {
+                    Err(errno) if errno == LINUX_EINVAL && saw_would_block => {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIDRM));
                     }
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
@@ -2930,7 +2874,6 @@ impl SyscallDispatcher {
             loop {
                 match SysvIpcService::msgrcv(cx, msqid, &creds, msgp.0, sz, msgtyp, flags, operator) {
                     Ok(Some(received)) => {
-                        clear_msg_queue_block(msqid);
                         return Ok(DispatchOutcome::Returned { value: received as i64 });
                     }
                     Ok(None) => {
@@ -2941,11 +2884,10 @@ impl SyscallDispatcher {
                         if sysv_msg_wait_interrupted(this, cx.kernel, tid) {
                             return Ok(DispatchOutcome::errno(LINUX_EINTR));
                         }
-                        if let Ok(token) = MsgQueueWaitToken::for_queue(msqid) {
+                        if let Ok(token) = SysvWaitState::for_queue(msqid) {
                             match SysvIpcService::msgrcv(cx, msqid, &creds, msgp.0, sz, msgtyp, flags, operator)
                             {
                                 Ok(Some(received)) => {
-                                    clear_msg_queue_block(msqid);
                                     return Ok(DispatchOutcome::Returned {
                                         value: received as i64,
                                     });
@@ -2967,10 +2909,7 @@ impl SyscallDispatcher {
                             std::thread::yield_now();
                         }
                     }
-                    Err(errno)
-                        if errno == LINUX_EINVAL
-                            && (saw_would_block || take_msg_queue_block(msqid)) =>
-                    {
+                    Err(errno) if errno == LINUX_EINVAL && saw_would_block => {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIDRM));
                     }
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
@@ -3489,7 +3428,6 @@ fn sysv_msgctl<M: GuestMemory>(
                 }
             }
             wake_msg_queue_waiters(&path, msqid);
-            remove_cached_msg_queue_wait_word(&path);
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(msg_queue_wait_path(&path));
             this.sysv.lock().message_queues.remove(&msqid);
@@ -4219,6 +4157,30 @@ impl SyscallDispatcher {
 mod ipc_set_tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn msg_queue_wait_outcome_owns_send_state_without_executor_tls() {
+        fn assert_send_static<T: Send + 'static>(_: &T) {}
+
+        let wait = SysvWaitState::for_tests(0x5a5a).expect("owned SysV wait state");
+        assert_send_static(&wait);
+        let owned_fd = wait.wait_word_fd();
+        let outcome = wait.wait_outcome();
+        match outcome {
+            DispatchOutcome::WaitOnSharedWord {
+                waiter_key,
+                sysv: Some(wait),
+                ..
+            } => {
+                assert_eq!(waiter_key, 0x5a5a);
+                assert_eq!(wait.blocked_id(), 0x5a5a);
+                assert!(wait.wait_word_fd() >= 0);
+            }
+            other => panic!("expected owned SysV continuation outcome, got {other:?}"),
+        }
+        assert_eq!(unsafe { libc::fcntl(owned_fd, libc::F_GETFD) }, -1);
+        assert!(SyscallDispatcher::sysv_executor_boundary_state_is_clear_for_test());
+    }
 
     struct FailingUnmapMemory {
         inner: LinearMemory,

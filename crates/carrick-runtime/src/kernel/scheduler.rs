@@ -864,6 +864,11 @@ impl RunnableThread {
         self.lease.as_ref().unwrap_or_else(|| std::process::abort())
     }
 
+    #[cfg(test)]
+    pub(crate) fn lease_mut(&mut self) -> &mut ThreadExecutionLease {
+        self.lease.as_mut().unwrap_or_else(|| std::process::abort())
+    }
+
     pub(crate) fn thread(&self) -> &Arc<Thread> {
         &self.thread
     }
@@ -935,6 +940,9 @@ pub struct Scheduler {
     executors: ExecutorDirectory,
     need_resched: AtomicBool,
     snapshot_count: AtomicU64,
+    #[cfg(test)]
+    continuation_settlement_barriers:
+        Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
 }
 
 impl Scheduler {
@@ -945,6 +953,8 @@ impl Scheduler {
             executors: ExecutorDirectory::default(),
             need_resched: AtomicBool::new(false),
             snapshot_count: AtomicU64::new(0),
+            #[cfg(test)]
+            continuation_settlement_barriers: Mutex::new(None),
         }
     }
 
@@ -1131,6 +1141,36 @@ impl Scheduler {
         Ok(())
     }
 
+    pub fn settle_blocked_continuation(
+        &self,
+        mut running: RunnableThread,
+        mut continuation: crate::vcpu_loop::continuation::BlockedContinuation,
+        registration: crate::vcpu_loop::continuation::ContinuationRegistration,
+    ) -> Result<(), SchedulerError> {
+        if continuation.authority().thread() != running.thread_key()
+            || continuation.authority().execution_generation() != running.generation()
+        {
+            return Err(RunQueueError::AuthorityMismatch.into());
+        }
+        continuation
+            .attach_registration(registration)
+            .map_err(|_| RunQueueError::AuthorityMismatch)?;
+        let lease = running.take_lease();
+        let action = running
+            .thread
+            .scheduler_park_continuation_from_executor(lease, BlockedReason::HostWait, continuation)
+            .map_err(|(error, _lease)| error)?;
+        self.executors.unbind(running.binding);
+        #[cfg(test)]
+        if let Some((at_clear, release)) = self.continuation_settlement_barriers.lock().clone() {
+            at_clear.wait();
+            release.wait();
+        }
+        self.apply_settlement_action(&running.thread, action)?;
+        running.finish_claim();
+        Ok(())
+    }
+
     pub(crate) fn begin_switch_out(&self, running: &RunnableThread) -> Result<(), SchedulerError> {
         running.thread.begin_switch_out(running.lease())?;
         Ok(())
@@ -1278,6 +1318,15 @@ impl Scheduler {
     #[cfg(test)]
     pub(crate) fn install_close_started_gate(&self, gate: Arc<std::sync::Barrier>) {
         self.queue.install_close_started_gate(gate);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_continuation_settlement_barriers(
+        &self,
+        at_clear: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        *self.continuation_settlement_barriers.lock() = Some((at_clear, release));
     }
 
     #[cfg(test)]
