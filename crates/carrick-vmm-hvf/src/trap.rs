@@ -7964,26 +7964,128 @@ unsafe impl Send for ThreadSpec {}
 pub struct ThreadSpec;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PersistentExecutorInvariantRegister {
+    VbarEl1,
+    SctlrEl1,
+    MairEl1,
+    CpacrEl1,
+    CntkctlEl1,
+    TpidrEl1,
+    SpEl1,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PERSISTENT_EXECUTOR_CONFIGURED_REGISTERS: [PersistentExecutorInvariantRegister; 6] = [
+    PersistentExecutorInvariantRegister::VbarEl1,
+    PersistentExecutorInvariantRegister::SctlrEl1,
+    PersistentExecutorInvariantRegister::MairEl1,
+    PersistentExecutorInvariantRegister::CpacrEl1,
+    PersistentExecutorInvariantRegister::CntkctlEl1,
+    PersistentExecutorInvariantRegister::TpidrEl1,
+];
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PERSISTENT_EXECUTOR_INVARIANT_REGISTERS: [PersistentExecutorInvariantRegister; 7] = [
+    PersistentExecutorInvariantRegister::VbarEl1,
+    PersistentExecutorInvariantRegister::SctlrEl1,
+    PersistentExecutorInvariantRegister::MairEl1,
+    PersistentExecutorInvariantRegister::CpacrEl1,
+    PersistentExecutorInvariantRegister::CntkctlEl1,
+    PersistentExecutorInvariantRegister::TpidrEl1,
+    PersistentExecutorInvariantRegister::SpEl1,
+];
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn persistent_executor_invariant_value(
+    register: PersistentExecutorInvariantRegister,
+    mailbox_sp: u64,
+) -> u64 {
+    use carrick_hal::GuestArch as _;
+
+    let boot = <HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch::bootstrap_sysregs();
+    match register {
+        PersistentExecutorInvariantRegister::VbarEl1 => carrick_mem::memory::LINUX_EL1_VECTORS_BASE,
+        PersistentExecutorInvariantRegister::SctlrEl1 => boot.sctlr_el1,
+        PersistentExecutorInvariantRegister::MairEl1 => boot.mair_el1,
+        PersistentExecutorInvariantRegister::CpacrEl1 => boot.cpacr_el1,
+        PersistentExecutorInvariantRegister::CntkctlEl1 => (1 << 1) | (1 << 0),
+        // The EL1 vector uses TPIDR_EL1 only as transient executor-local x16
+        // scratch. A newly published worker must not inherit task residue.
+        PersistentExecutorInvariantRegister::TpidrEl1 => 0,
+        PersistentExecutorInvariantRegister::SpEl1 => mailbox_sp,
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn configure_persistent_executor_invariant_registers(
+    mut write: impl FnMut(PersistentExecutorInvariantRegister, u64) -> Result<(), TrapError>,
+) -> Result<(), TrapError> {
+    for register in PERSISTENT_EXECUTOR_CONFIGURED_REGISTERS {
+        write(register, persistent_executor_invariant_value(register, 0))?;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn audit_persistent_executor_invariant_registers(
+    mut read: impl FnMut(PersistentExecutorInvariantRegister) -> Result<u64, TrapError>,
+    mailbox_sp: u64,
+) -> Result<(), TrapError> {
+    for register in PERSISTENT_EXECUTOR_INVARIANT_REGISTERS {
+        let actual = read(register)?;
+        let expected = persistent_executor_invariant_value(register, mailbox_sp);
+        if actual != expected {
+            return Err(TrapError::Hypervisor(format!(
+                "persistent executor invariant {register:?} mismatch: {actual:#x}/{expected:#x}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
     fn configure_executor_invariants(vcpu: &applevisor::vcpu::Vcpu) -> Result<(), TrapError> {
         use applevisor::prelude::SysReg;
-        use carrick_hal::GuestArch as _;
 
-        let boot = <HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch::bootstrap_sysregs();
-        vcpu.set_sys_reg(
-            SysReg::VBAR_EL1,
-            carrick_mem::memory::LINUX_EL1_VECTORS_BASE,
+        configure_persistent_executor_invariant_registers(|register, value| {
+            let register = match register {
+                PersistentExecutorInvariantRegister::VbarEl1 => SysReg::VBAR_EL1,
+                PersistentExecutorInvariantRegister::SctlrEl1 => SysReg::SCTLR_EL1,
+                PersistentExecutorInvariantRegister::MairEl1 => SysReg::MAIR_EL1,
+                PersistentExecutorInvariantRegister::CpacrEl1 => SysReg::CPACR_EL1,
+                PersistentExecutorInvariantRegister::CntkctlEl1 => SysReg::CNTKCTL_EL1,
+                PersistentExecutorInvariantRegister::TpidrEl1 => SysReg::TPIDR_EL1,
+                PersistentExecutorInvariantRegister::SpEl1 => {
+                    unreachable!("SP_EL1 is mailbox-owned")
+                }
+            };
+            vcpu.set_sys_reg(register, value).map_err(hvf_error)
+        })
+    }
+
+    fn audit_executor_invariants(
+        vcpu: &applevisor::vcpu::Vcpu,
+        mailbox_sp: u64,
+    ) -> Result<(), TrapError> {
+        use applevisor::prelude::SysReg;
+
+        audit_persistent_executor_invariant_registers(
+            |register| {
+                let register = match register {
+                    PersistentExecutorInvariantRegister::VbarEl1 => SysReg::VBAR_EL1,
+                    PersistentExecutorInvariantRegister::SctlrEl1 => SysReg::SCTLR_EL1,
+                    PersistentExecutorInvariantRegister::MairEl1 => SysReg::MAIR_EL1,
+                    PersistentExecutorInvariantRegister::CpacrEl1 => SysReg::CPACR_EL1,
+                    PersistentExecutorInvariantRegister::CntkctlEl1 => SysReg::CNTKCTL_EL1,
+                    PersistentExecutorInvariantRegister::TpidrEl1 => SysReg::TPIDR_EL1,
+                    PersistentExecutorInvariantRegister::SpEl1 => SysReg::SP_EL1,
+                };
+                vcpu.get_sys_reg(register).map_err(hvf_error)
+            },
+            mailbox_sp,
         )
-        .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::SCTLR_EL1, boot.sctlr_el1)
-            .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::MAIR_EL1, boot.mair_el1)
-            .map_err(hvf_error)?;
-        vcpu.set_sys_reg(SysReg::CPACR_EL1, boot.cpacr_el1)
-            .map_err(hvf_error)?;
-        const CNTKCTL_EL1_EL0_COUNTER_ACCESS: u64 = (1 << 1) | (1 << 0);
-        vcpu.set_sys_reg(SysReg::CNTKCTL_EL1, CNTKCTL_EL1_EL0_COUNTER_ACCESS)
-            .map_err(hvf_error)
     }
 
     fn exec_authority_fingerprint(&self) -> ExecAuthorityFingerprint {
@@ -14658,7 +14760,9 @@ impl HvfVmState {
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
         };
+        Self::configure_executor_invariants(&vcpu)?;
         let mailbox = Self::allocate_persistent_mailbox_for_vcpu(spec, &vcpu)?;
+        Self::audit_executor_invariants(&vcpu, mailbox.slot().guest_address())?;
         state.task.audit_neutral()?;
         Ok((state, vcpu, mailbox))
     }
@@ -20642,6 +20746,60 @@ mod thread_sibling_tests {
         )
         .expect("slot zero resolves from executor-local carrier metadata");
         assert_eq!(pointer.as_ptr() as usize, 0x1400_0000);
+    }
+
+    #[test]
+    fn persistent_worker_invariant_configuration_is_complete_and_audited() {
+        let mailbox_sp = crate::memory::LINUX_SYSCALL_MAILBOX_BASE;
+        let mut registers = std::collections::HashMap::new();
+        configure_persistent_executor_invariant_registers(|register, value| {
+            registers.insert(register, value);
+            Ok(())
+        })
+        .expect("fake executor invariant configuration");
+        registers.insert(PersistentExecutorInvariantRegister::SpEl1, mailbox_sp);
+
+        audit_persistent_executor_invariant_registers(
+            |register| Ok(*registers.get(&register).unwrap_or(&0)),
+            mailbox_sp,
+        )
+        .expect("complete fake executor invariant image");
+
+        for missing in PERSISTENT_EXECUTOR_INVARIANT_REGISTERS {
+            let mut partial = registers.clone();
+            partial.remove(&missing);
+            assert!(
+                audit_persistent_executor_invariant_registers(
+                    |register| {
+                        partial.get(&register).copied().ok_or_else(|| {
+                            TrapError::Hypervisor(format!("fake executor omitted {register:?}"))
+                        })
+                    },
+                    mailbox_sp,
+                )
+                .is_err(),
+                "missing {missing:?} must fail closed",
+            );
+        }
+
+        let factory = include_str!("trap.rs")
+            .split("pub(crate) fn from_persistent_executor_spec")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("pub(crate) fn audit_persistent_executor_idle")
+                    .next()
+            })
+            .expect("persistent factory body");
+        let configure = factory
+            .find("Self::configure_executor_invariants(&vcpu)")
+            .expect("factory configures the fresh owner-thread vCPU");
+        let allocate = factory
+            .find("Self::allocate_persistent_mailbox_for_vcpu")
+            .expect("factory binds executor-local SP_EL1");
+        let audit = factory
+            .find("Self::audit_executor_invariants(&vcpu, mailbox.slot().guest_address())")
+            .expect("factory audits invariants and mailbox SP before publication");
+        assert!(configure < allocate && allocate < audit);
     }
 }
 
