@@ -1739,6 +1739,65 @@ impl Kernel {
         })
     }
 
+    /// Revalidate an exact granting generation and prove that `target` is a
+    /// current process descendant in the Kernel parent graph. Thread-group
+    /// siblings are intentionally excluded: scheduler shutdown inheritance is
+    /// process lineage, never same-task membership or numeric ancestry.
+    pub(crate) fn with_live_scheduler_descendant<R>(
+        &self,
+        grant: ThreadKey,
+        grant_generation: super::objects::ExecutionGeneration,
+        target: ThreadKey,
+        target_generation: super::objects::ExecutionGeneration,
+        commit: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let state = self.registry().state.read();
+        let resolve = |key: ThreadKey| {
+            state.tasks.values().find_map(|record| {
+                if record.task.lifecycle() != TaskLifecycle::Live {
+                    return None;
+                }
+                let thread = record.task.thread(key.tid)?;
+                (thread.key() == key).then_some((record.task.key(), thread))
+            })
+        };
+        let (grant_task, grant_thread) = resolve(grant)?;
+        let (target_task, target_thread) = resolve(target)?;
+        if target_task == grant_task {
+            return None;
+        }
+
+        let mut parent = state
+            .tasks
+            .get(&target_task.id)
+            .filter(|record| record.task.key() == target_task)
+            .and_then(|record| record.task.parent());
+        let mut visited = BTreeSet::new();
+        let mut is_descendant = false;
+        while let Some(key) = parent {
+            if !visited.insert(key) {
+                return None;
+            }
+            if key == grant_task {
+                is_descendant = true;
+                break;
+            }
+            parent = state
+                .tasks
+                .get(&key.id)
+                .filter(|record| record.task.key() == key)
+                .and_then(|record| record.task.parent());
+        }
+        if !is_descendant {
+            return None;
+        }
+        grant_thread
+            .with_execution_generation(grant_generation, || {
+                target_thread.with_execution_generation(target_generation, commit)
+            })
+            .flatten()
+    }
+
     /// Post one thread-directed signal to an exact live `(tgid, tid)` pair.
     /// The pending queue is published before the task wake, matching the
     /// process-directed ordering in [`Self::post_signal_to_task`].

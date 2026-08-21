@@ -4165,6 +4165,18 @@ impl Thread {
         self.execution.lock().state
     }
 
+    /// Hold this exact execution generation stable while a scheduler commits
+    /// dependent authority. The callback may acquire run-queue state; callers
+    /// must never call it from a queue-held path.
+    pub(crate) fn with_execution_generation<R>(
+        &self,
+        generation: ExecutionGeneration,
+        commit: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let execution = self.execution.lock();
+        (execution.state.generation() == Some(generation)).then(commit)
+    }
+
     /// Minimal Linux run-state projection consumed by `/proc` wiring in a
     /// later task. Executor identity is deliberately absent from the answer.
     pub const fn linux_run_state_from_execution(state: ThreadExecutionState) -> Option<char> {
