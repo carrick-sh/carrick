@@ -362,6 +362,7 @@ impl<S: NativeSharedFutex> PlatformFutex for FutexTableNativeFutex<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thread::FutexGenerationEnrollment;
     use carrick_hal::HostVa;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -401,6 +402,34 @@ mod tests {
             "the wake must report the waiter it released"
         );
         assert_eq!(waiter.join().unwrap(), 0, "a woken FUTEX_WAIT returns 0");
+    }
+
+    #[test]
+    fn shared_wake_publishes_exact_carrier_generation_callback() {
+        let _guard = crate::thread::current_futex_table_test_guard();
+        let word = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(7)));
+        let addr = std::ptr::from_ref(word) as usize;
+        let key = addr ^ 0x5a5a;
+        let location = SharedFutexLocation::Direct {
+            word: HostVa(addr),
+            waiter_key: key,
+        };
+        let table = carrier_shared_futex_table();
+        let generation = table.prepare_wait(key as u64);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let _subscription = match table.subscribe_generation(
+            generation,
+            Arc::new(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }),
+        ) {
+            FutexGenerationEnrollment::Subscribed(subscription) => subscription,
+            FutexGenerationEnrollment::Ready(_) => panic!("stable generation must subscribe"),
+        };
+        let futex = FutexTableFutex::new(Arc::new(FutexTable::default()));
+        assert_eq!(futex.shared_wake(location, key, 1), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// The value re-check happens AFTER enrollment, so a word that already

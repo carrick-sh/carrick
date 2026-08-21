@@ -973,6 +973,11 @@ impl Scheduler {
         self.executors.unregister(registration)
     }
 
+    #[cfg(test)]
+    pub(crate) fn registered_executor_count(&self) -> usize {
+        self.executors.state.lock().entries.len()
+    }
+
     pub(crate) fn clear_executor_binding(
         &self,
         registration: &ExecutorRegistration,
@@ -1422,7 +1427,8 @@ mod tests {
     use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 
     use super::{
-        ExecutorKick, ExecutorKickToken, QueueKey, RunQueueError, Scheduler, WakeDisposition,
+        ExecutorBinding, ExecutorKick, ExecutorKickToken, QueueKey, RunQueueError, Scheduler,
+        WakeDisposition,
     };
     use crate::kernel::objects::{BlockedReason, MigratableTaskState, ThreadExecutionState};
     use crate::kernel::{ClonePlan, Kernel, KernelContext, RootBootstrap};
@@ -2349,6 +2355,36 @@ mod tests {
             WakeDisposition::Queued
         );
         assert!(scheduler.queued_len() >= 2);
+    }
+
+    #[test]
+    fn unregister_clears_live_binding_and_preemption_authority() {
+        let (kernel, context) = bootstrap(12_121);
+        publish(&context, 29);
+        let scheduler = Scheduler::new(kernel);
+        for _ in 0..256 {
+            let executor = scheduler
+                .register_executor(Arc::new(RecordingKick::default()))
+                .unwrap();
+            let generation = context.thread().execution_state().generation().unwrap();
+            scheduler
+                .executors
+                .bind(
+                    &executor,
+                    ExecutorBinding {
+                        executor: executor.id(),
+                        executor_epoch: 1,
+                        thread: context.thread().key(),
+                        generation,
+                    },
+                )
+                .unwrap();
+            assert!(scheduler.executors.has_running());
+            scheduler.unregister_executor(&executor).unwrap();
+            assert!(!scheduler.executors.has_running());
+            assert_eq!(scheduler.request_preemption(), 0);
+            assert_eq!(scheduler.registered_executor_count(), 0);
+        }
     }
 
     #[test]

@@ -742,4 +742,57 @@ mod tests {
         assert_eq!(action.term_signal, None);
         assert_eq!(action.stop_signal, None);
     }
+
+    #[test]
+    fn initially_blocked_write_then_reader_close_returns_epipe_and_queues_sigpipe() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.exact_signal_context_for_test();
+        let tid = context.thread().registry_id();
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let flags = unsafe { libc::fcntl(fds[1], libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let fill = [0u8; 4096];
+        loop {
+            let written = unsafe { libc::write(fds[1], fill.as_ptr().cast(), fill.len()) };
+            if written < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EAGAIN)
+                );
+                break;
+            }
+        }
+        let mut write =
+            crate::dispatch::BlockingHostWrite::for_tests(fds[1], vec![0x5a], 0, tid, true)
+                .expect("pin blocked pipe writer");
+        assert!(matches!(
+            crate::dispatch::drive_blocking_host_write(&mut write),
+            crate::dispatch::BlockingHostWriteStep::Wait
+        ));
+        assert_eq!(unsafe { libc::close(fds[0]) }, 0);
+        let crate::dispatch::BlockingHostWriteStep::Done(outcome) =
+            crate::dispatch::drive_blocking_host_write(&mut write)
+        else {
+            panic!("closed reader must complete the blocked write");
+        };
+        let outcome = raise_sigpipe_for_blocking_write(&dispatcher, &context, &write, outcome);
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Errno {
+                errno: crate::linux_abi::LINUX_EPIPE
+            }
+        );
+        assert!(
+            context
+                .signal_authority()
+                .thread_pending()
+                .contains(crate::linux_abi::LINUX_SIGPIPE)
+        );
+        assert_eq!(unsafe { libc::close(fds[1]) }, 0);
+    }
 }

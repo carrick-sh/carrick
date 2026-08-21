@@ -1487,6 +1487,7 @@ where
             DispatchOutcome::SharedFutexWait {
                 location,
                 waiter_key,
+                generation,
                 value,
                 timeout,
             } => {
@@ -1497,20 +1498,33 @@ where
                 // legacy `dispatch_threaded`-only short-circuit was the
                 // root cause of LTP pause01 TBROKing on
                 // `tst_checkpoint_wake ETIMEDOUT`.
-                let retval =
-                    shared_futex_wait(location.wait_addr(), waiter_key, value, timeout, this_tid);
+                let prewoken = carrick_thread::platform_futex::carrier_shared_futex_table()
+                    .wait_prepared(generation, Some(Duration::ZERO), &|| false)
+                    == crate::thread::FutexWaitOutcome::Woken;
+                let retval = if prewoken {
+                    0
+                } else {
+                    shared_futex_wait(location.wait_addr(), waiter_key, value, timeout, this_tid)
+                };
                 runtime.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }
             DispatchOutcome::SharedFutexWaitv {
                 location,
                 waiter_key,
+                generation,
                 value,
                 timeout,
                 index,
             } => {
-                let retval =
-                    shared_futex_wait(location.wait_addr(), waiter_key, value, timeout, this_tid);
+                let prewoken = carrick_thread::platform_futex::carrier_shared_futex_table()
+                    .wait_prepared(generation, Some(Duration::ZERO), &|| false)
+                    == crate::thread::FutexWaitOutcome::Woken;
+                let retval = if prewoken {
+                    0
+                } else {
+                    shared_futex_wait(location.wait_addr(), waiter_key, value, timeout, this_tid)
+                };
                 let retval = if retval == 0 { index } else { retval };
                 runtime.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
@@ -1518,11 +1532,18 @@ where
             DispatchOutcome::WaitOnSharedWord {
                 mut location,
                 mut waiter_key,
+                mut generation,
                 mut value,
                 mut sysv,
             } => loop {
-                let retval =
-                    shared_futex_wait(location.wait_addr(), waiter_key, value, None, this_tid);
+                let prewoken = carrick_thread::platform_futex::carrier_shared_futex_table()
+                    .wait_prepared(generation, Some(Duration::ZERO), &|| false)
+                    == crate::thread::FutexWaitOutcome::Woken;
+                let retval = if prewoken {
+                    0
+                } else {
+                    shared_futex_wait(location.wait_addr(), waiter_key, value, None, this_tid)
+                };
                 if retval != 0 {
                     runtime.complete_syscall(retval)?;
                     last_syscall_retval = Some(retval);
@@ -1553,11 +1574,13 @@ where
                     DispatchOutcome::WaitOnSharedWord {
                         location: next_location,
                         waiter_key: next_waiter_key,
+                        generation: next_generation,
                         value: next_value,
                         sysv: next_sysv,
                     } => {
                         location = next_location;
                         waiter_key = next_waiter_key;
+                        generation = next_generation;
                         value = next_value;
                         sysv = next_sysv;
                     }
@@ -2006,11 +2029,18 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
             DispatchOutcome::WaitOnSharedWord {
                 location,
                 waiter_key,
+                generation,
                 value,
                 sysv,
             } => {
-                let retval =
-                    shared_futex_wait(location.wait_addr(), waiter_key, value, None, waiter.tid());
+                let prewoken = carrick_thread::platform_futex::carrier_shared_futex_table()
+                    .wait_prepared(generation, Some(Duration::ZERO), &|| false)
+                    == crate::thread::FutexWaitOutcome::Woken;
+                let retval = if prewoken {
+                    0
+                } else {
+                    shared_futex_wait(location.wait_addr(), waiter_key, value, None, waiter.tid())
+                };
                 if retval == 0 {
                     if let Some(outcome) =
                         sysv.as_ref().and_then(|wait| wait.completion_after_wake())

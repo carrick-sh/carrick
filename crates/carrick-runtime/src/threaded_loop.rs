@@ -200,9 +200,7 @@ where
         RuntimeError::Configuration(format!("activate per-run FileAuthority: {error}"))
     })?;
     use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
-    use crate::vcpu_loop::{
-        KernelState, PlatformFutexFactory, VcpuLoopOutcome, run_vcpu_until_exit,
-    };
+    use crate::vcpu_loop::{KernelState, PlatformFutexFactory, VcpuLoopOutcome};
     use std::sync::Arc;
 
     // Host-specific pre-loop setup (HVF: install default cross-process signal
@@ -340,7 +338,7 @@ where
     }));
     // Track spawned sibling threads so the process doesn't tear down while a
     // worker is mid-flight; joined after the main thread finishes.
-    let threads: Arc<parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>> =
+    let threads: Arc<parking_lot::Mutex<Vec<crate::vcpu_loop::VcpuThreadHandle>>> =
         Arc::new(parking_lot::Mutex::new(Vec::new()));
     // Install the kick handler / start the host's signal pump up front via the
     // coordinator, so a process-directed signal is observable regardless of
@@ -359,7 +357,7 @@ where
         host_for_factory.make_timer_delivery(Arc::clone(&kicker), main_tid),
     );
 
-    let outcome = run_vcpu_until_exit(
+    let outcome = crate::vcpu_loop::launch_vcpu_until_exit(
         Arc::clone(&kernel),
         engine,
         Arc::clone(&registry),
@@ -373,7 +371,8 @@ where
         // The main guest thread's lifetime in-guest handshake flag.
         carrick_hal::InGuestFlag::for_guest_thread(),
         max_traps,
-    );
+    )
+    .wait();
     // Process children are not Linux thread-group siblings of their creator.
     // The outer root run, which owns the shared HVPatch VM lifetime, joins the
     // global process topology after its own terminal loop even when that loop

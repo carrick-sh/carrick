@@ -2323,6 +2323,40 @@ pub trait TaskWaker: Send + Sync + std::fmt::Debug {
     fn wake_task(&self);
 }
 
+type TaskWakeCallback = Arc<dyn Fn(u64) + Send + Sync + 'static>;
+
+struct TaskWakeListener {
+    expected_generation: u64,
+    callback: TaskWakeCallback,
+}
+
+impl std::fmt::Debug for TaskWakeListener {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TaskWakeListener")
+            .field("expected_generation", &self.expected_generation)
+            .finish_non_exhaustive()
+    }
+}
+
+pub struct TaskWakeSubscription {
+    listeners: Weak<Mutex<BTreeMap<u64, TaskWakeListener>>>,
+    id: u64,
+}
+
+impl Drop for TaskWakeSubscription {
+    fn drop(&mut self) {
+        if let Some(listeners) = self.listeners.upgrade() {
+            listeners.lock().remove(&self.id);
+        }
+    }
+}
+
+pub enum TaskWakeEnrollment {
+    Ready(u64),
+    Subscribed(TaskWakeSubscription),
+}
+
 #[derive(Debug)]
 pub struct Task {
     key: TaskKey,
@@ -2351,6 +2385,8 @@ pub struct Task {
     /// the generation lets that same boundary reconcile the authoritative
     /// pending state before it enters guest code.
     wake_generation: AtomicU64,
+    wake_listeners: Arc<Mutex<BTreeMap<u64, TaskWakeListener>>>,
+    next_wake_listener: AtomicU64,
     /// Linux's per-process OOM-killer bias, `/proc/<pid>/oom_score_adj`
     /// (proc(5)): inherited at fork, independent of the parent afterwards, and
     /// shared by every thread of the process.
@@ -2548,6 +2584,8 @@ impl Task {
             cpu: TaskCpu::default(),
             waker: Mutex::new(None),
             wake_generation: AtomicU64::new(0),
+            wake_listeners: Arc::new(Mutex::new(BTreeMap::new())),
+            next_wake_listener: AtomicU64::new(1),
             oom_score_adj: AtomicI32::new(0),
             nice: AtomicI32::new(0),
             ioprio: AtomicU32::new(Task::DEFAULT_IOPRIO),
@@ -2770,25 +2808,79 @@ impl Task {
     /// slower but not wrong. Waking is always a hint: nothing is consumed here
     /// and the woken task decides for itself what it found, so a spurious call
     /// is harmless.
-    pub fn wake(&self) {
-        if self
+    pub fn wake(&self) -> bool {
+        self.publish_wake(true)
+    }
+
+    pub(crate) fn publish_wake_subscriptions(&self) -> bool {
+        self.publish_wake(false)
+    }
+
+    fn publish_wake(&self, wake_vehicle: bool) -> bool {
+        let previous = self
             .wake_generation
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
                 generation.checked_add(1)
             })
-            .is_err()
-        {
-            tracing::error!(task = ?self.key, "task wake generation exhausted");
-            std::process::abort();
+            .unwrap_or_else(|_| {
+                tracing::error!(task = ?self.key, "task wake generation exhausted");
+                std::process::abort();
+            });
+        let generation = previous + 1;
+        let callbacks = {
+            let mut listeners = self.wake_listeners.lock();
+            listeners
+                .values_mut()
+                .filter_map(|listener| {
+                    (listener.expected_generation != generation).then(|| {
+                        listener.expected_generation = generation;
+                        Arc::clone(&listener.callback)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let published_to_subscription = !callbacks.is_empty();
+        for callback in callbacks {
+            callback(generation);
         }
-        let waker = self.waker.lock().clone();
-        if let Some(waker) = waker {
-            waker.wake_task();
+        if wake_vehicle {
+            let waker = self.waker.lock().clone();
+            if let Some(waker) = waker {
+                waker.wake_task();
+            }
         }
+        published_to_subscription
     }
 
     pub fn wake_generation(&self) -> u64 {
         self.wake_generation.load(Ordering::Acquire)
+    }
+
+    pub fn subscribe_wake(
+        &self,
+        expected_generation: u64,
+        callback: TaskWakeCallback,
+    ) -> TaskWakeEnrollment {
+        let mut listeners = self.wake_listeners.lock();
+        let current = self.wake_generation();
+        if current != expected_generation {
+            return TaskWakeEnrollment::Ready(current);
+        }
+        let id = self.next_wake_listener.fetch_add(1, Ordering::Relaxed);
+        if id == 0 || id == u64::MAX {
+            std::process::abort();
+        }
+        listeners.insert(
+            id,
+            TaskWakeListener {
+                expected_generation,
+                callback,
+            },
+        );
+        TaskWakeEnrollment::Subscribed(TaskWakeSubscription {
+            listeners: Arc::downgrade(&self.wake_listeners),
+            id,
+        })
     }
 
     /// This task's own CPU (µs): its live threads plus the threads it has
@@ -5655,6 +5747,34 @@ mod tests {
         assert_eq!(fixture.task.wake_generation(), 1);
         fixture.task.wake();
         assert_eq!(fixture.task.wake_generation(), 2);
+    }
+
+    #[test]
+    fn task_wake_subscription_publishes_before_lane_waker_and_unregisters_on_drop() {
+        let fixture = Fixture::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let callback_order = Arc::clone(&order);
+        let subscription = match fixture.task.subscribe_wake(
+            fixture.task.wake_generation(),
+            Arc::new(move |generation| callback_order.lock().push(("callback", generation))),
+        ) {
+            TaskWakeEnrollment::Subscribed(subscription) => subscription,
+            TaskWakeEnrollment::Ready(_) => panic!("unchanged task is not ready"),
+        };
+        fixture.task.wake();
+        assert_eq!(order.lock().as_slice(), &[("callback", 1)]);
+        drop(subscription);
+        fixture.task.wake();
+        assert_eq!(order.lock().len(), 1);
+
+        let stale = fixture.task.wake_generation();
+        fixture.task.wake();
+        assert!(matches!(
+            fixture
+                .task
+                .subscribe_wake(stale, Arc::new(|_| panic!("stale callback"))),
+            TaskWakeEnrollment::Ready(3)
+        ));
     }
 
     #[test]

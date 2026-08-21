@@ -622,6 +622,54 @@ pub struct FutexWait {
     generation: u64,
 }
 
+impl FutexWait {
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FutexGenerationEvent {
+    addr: u64,
+    generation: u64,
+}
+
+impl FutexGenerationEvent {
+    pub const fn addr(self) -> u64 {
+        self.addr
+    }
+
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+type FutexGenerationCallback = Arc<dyn Fn(FutexGenerationEvent) + Send + Sync + 'static>;
+
+struct FutexGenerationListener {
+    addr: u64,
+    expected_generation: u64,
+    callback: FutexGenerationCallback,
+}
+
+pub struct FutexGenerationSubscription {
+    listeners: Weak<ParkingMutex<HashMap<u64, FutexGenerationListener>>>,
+    id: u64,
+}
+
+impl Drop for FutexGenerationSubscription {
+    fn drop(&mut self) {
+        if let Some(listeners) = self.listeners.upgrade() {
+            listeners.lock().remove(&self.id);
+        }
+    }
+}
+
+pub enum FutexGenerationEnrollment {
+    Ready(FutexGenerationEvent),
+    Subscribed(FutexGenerationSubscription),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FutexInterruptGeneration(u64);
 
@@ -872,6 +920,8 @@ pub struct FutexTable {
     /// completing in 420 s to timing out at 600 s. Requeues are rare; this makes
     /// the common answer a single relaxed load.
     outstanding_redirects: AtomicUsize,
+    generation_listeners: Arc<ParkingMutex<HashMap<u64, FutexGenerationListener>>>,
+    next_generation_listener: AtomicU64,
 }
 
 impl FutexTable {
@@ -881,6 +931,62 @@ impl FutexTable {
             interrupt_generation: AtomicU64::new(0),
             requeue_redirects: ParkingMutex::new(HashMap::new()),
             outstanding_redirects: AtomicUsize::new(0),
+            generation_listeners: Arc::new(ParkingMutex::new(HashMap::new())),
+            next_generation_listener: AtomicU64::new(1),
+        }
+    }
+
+    pub fn subscribe_generation(
+        &self,
+        wait: FutexWait,
+        callback: FutexGenerationCallback,
+    ) -> FutexGenerationEnrollment {
+        let bucket = self.bucket(wait.addr);
+        let mut listeners = self.generation_listeners.lock();
+        let current = bucket.generation.load(Ordering::Acquire);
+        if current != wait.generation {
+            return FutexGenerationEnrollment::Ready(FutexGenerationEvent {
+                addr: wait.addr,
+                generation: current,
+            });
+        }
+        let id = self
+            .next_generation_listener
+            .fetch_add(1, Ordering::Relaxed);
+        if id == 0 || id == u64::MAX {
+            std::process::abort();
+        }
+        listeners.insert(
+            id,
+            FutexGenerationListener {
+                addr: wait.addr,
+                expected_generation: wait.generation,
+                callback,
+            },
+        );
+        FutexGenerationEnrollment::Subscribed(FutexGenerationSubscription {
+            listeners: Arc::downgrade(&self.generation_listeners),
+            id,
+        })
+    }
+
+    fn publish_generation(&self, addr: u64, generation: u64) {
+        let callbacks = {
+            let mut listeners = self.generation_listeners.lock();
+            let ids = listeners
+                .iter()
+                .filter_map(|(id, listener)| {
+                    (listener.addr == addr && listener.expected_generation != generation)
+                        .then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| listeners.remove(&id).map(|listener| listener.callback))
+                .collect::<Vec<_>>()
+        };
+        let event = FutexGenerationEvent { addr, generation };
+        for callback in callbacks {
+            callback(event);
         }
     }
 
@@ -1288,7 +1394,8 @@ impl FutexTable {
             return 0;
         }
         let bucket = self.bucket(addr);
-        bucket.generation.fetch_add(1, Ordering::AcqRel);
+        let generation = bucket.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.publish_generation(addr, generation);
         let key = Self::bucket_key(&bucket);
         let mut remaining = n as usize;
         let mut owed = 0u32;
@@ -1356,7 +1463,8 @@ impl FutexTable {
         // Waking advances the source generation so woken threads observe a
         // change; requeued threads are carried by their redirect instead.
         if nr_wake > 0 {
-            from_bucket.generation.fetch_add(1, Ordering::AcqRel);
+            let generation = from_bucket.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            self.publish_generation(from, generation);
         }
 
         // Pass 1, in FIFO order under the bucket lock: wake the first `nr_wake`,
@@ -2212,5 +2320,69 @@ mod wake_durability_tests {
                 "round {round}: wake must report the waiter it released"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod generation_subscription_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn exact_generation_subscription_publishes_once_and_drop_unregisters() {
+        let table = FutexTable::new();
+        let addr = 0x7abc_0000;
+        let first = table.prepare_wait(addr);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let subscription = match table.subscribe_generation(
+            first,
+            Arc::new(move |event| {
+                assert_eq!(event.addr(), addr);
+                assert!(event.generation() > first.generation());
+                observed.fetch_add(1, Ordering::SeqCst);
+            }),
+        ) {
+            FutexGenerationEnrollment::Subscribed(subscription) => subscription,
+            FutexGenerationEnrollment::Ready(_) => panic!("unchanged generation is not ready"),
+        };
+        table.wake(addr, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        table.wake(addr, 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one subscription fires once"
+        );
+        drop(subscription);
+
+        let stale = table.prepare_wait(addr);
+        table.wake(addr, 1);
+        assert!(matches!(
+            table.subscribe_generation(stale, Arc::new(|_| panic!("stale callback"))),
+            FutexGenerationEnrollment::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn dropped_subscription_never_receives_later_generation() {
+        let table = FutexTable::new();
+        let addr = 0x7abd_0000;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let wait = table.prepare_wait(addr);
+        let subscription = match table.subscribe_generation(
+            wait,
+            Arc::new(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }),
+        ) {
+            FutexGenerationEnrollment::Subscribed(subscription) => subscription,
+            FutexGenerationEnrollment::Ready(_) => panic!("unexpected ready"),
+        };
+        drop(subscription);
+        table.wake(addr, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

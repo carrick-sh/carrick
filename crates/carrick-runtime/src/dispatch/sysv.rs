@@ -1819,12 +1819,15 @@ impl SysvWaitState {
     }
 
     fn wait_outcome(self) -> DispatchOutcome {
+        let waiter_key = self.blocked_id as usize;
         DispatchOutcome::WaitOnSharedWord {
             location: carrick_guest_mem::SharedFutexLocation::Direct {
                 word: carrick_guest_mem::HostVa(self.word.addr()),
-                waiter_key: self.blocked_id as usize,
+                waiter_key,
             },
-            waiter_key: self.blocked_id as usize,
+            waiter_key,
+            generation: carrick_thread::platform_futex::carrier_shared_futex_table()
+                .prepare_wait(waiter_key as u64),
             value: self.word.load(),
             sysv: Some(self),
         }
