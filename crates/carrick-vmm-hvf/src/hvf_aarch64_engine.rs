@@ -66,7 +66,12 @@ pub fn persistent_vcpu_identity(vcpu: &HvfAarch64Vcpu) -> u64 {
 pub fn persistent_hardware_kick(
     engine: &HvfAarch64Engine,
 ) -> (crate::vcpu_kick::VcpuKickHandle, u64, u32) {
-    let vcpu = engine.vcpu();
+    persistent_vcpu_hardware_kick(engine.vcpu())
+}
+
+pub fn persistent_vcpu_hardware_kick(
+    vcpu: &HvfAarch64Vcpu,
+) -> (crate::vcpu_kick::VcpuKickHandle, u64, u32) {
     let raw_vcpu_id = vcpu.inner.id();
     let handle = crate::vcpu_kick::VcpuKickHandle::new(vcpu.inner.get_handle());
     let owner_thread_port = unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) };

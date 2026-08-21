@@ -209,7 +209,7 @@ impl ExactHardwareKick {
         raw_vcpu_id: u64,
         owner_thread_port: u32,
     ) -> Result<Self, TrapError> {
-        if raw_vcpu_id == 0 || owner_thread_port == 0 {
+        if owner_thread_port == 0 {
             return Err(TrapError::Hypervisor(
                 "hardware kick lacks exact vCPU/Mach owner identity".to_owned(),
             ));
@@ -365,11 +365,15 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
     }
 
     fn hardware_kick(&self) -> Result<ExactHardwareKick, TrapError> {
-        let engine = self.current.as_ref().ok_or_else(|| {
-            TrapError::Hypervisor("HVPatch hardware kick requested without live vCPU".into())
-        })?;
-        let (handle, raw_vcpu_id, owner_thread_port) =
-            carrick_vmm_hvf::hvf_aarch64_engine::persistent_hardware_kick(engine);
+        let (handle, raw_vcpu_id, owner_thread_port) = if let Some(engine) = self.current.as_ref() {
+            carrick_vmm_hvf::hvf_aarch64_engine::persistent_hardware_kick(engine)
+        } else if let Some(vcpu) = self.vcpu.as_ref() {
+            carrick_vmm_hvf::hvf_aarch64_engine::persistent_vcpu_hardware_kick(vcpu)
+        } else {
+            return Err(TrapError::Hypervisor(
+                "HVPatch hardware kick requested without worker vCPU".into(),
+            ));
+        };
         if raw_vcpu_id != self.raw_vcpu_id || owner_thread_port != self.owner_thread_port {
             return Err(TrapError::Hypervisor(
                 "HVPatch hardware kick identity drifted from worker owner".into(),
@@ -1628,6 +1632,14 @@ fn boundary_error(name: &str) -> TrapError {
     TrapError::Hypervisor(format!("persistent executor boundary audit failed: {name}"))
 }
 
+fn audit_backend_hardware<E: PersistentExecutor>(
+    backend: &E,
+    kick: &WorkerKick,
+) -> Result<(), TrapError> {
+    let observed = backend.hardware_kick()?;
+    kick.audit_hardware(&observed)
+}
+
 fn current_signal_mask() -> Result<Vec<bool>, TrapError> {
     let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
     let result = unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask) };
@@ -1777,9 +1789,7 @@ impl WorkerKick {
     }
 
     fn publish_hardware(&self, hardware: ExactHardwareKick) -> bool {
-        let binding = self.binding.lock();
-        if binding.is_none()
-            || hardware.owner_thread_port != current_owner_thread_port()
+        if hardware.owner_thread_port != current_owner_thread_port()
             || self.hardware.lock().is_some()
         {
             return false;
@@ -1791,6 +1801,26 @@ impl WorkerKick {
             hardware.handle.kick();
         }
         true
+    }
+
+    fn audit_hardware(&self, observed: &ExactHardwareKick) -> Result<(), TrapError> {
+        if observed.owner_thread_port != current_owner_thread_port() {
+            return Err(TrapError::Hypervisor(
+                "hardware kick moved off its exact Mach owner".to_owned(),
+            ));
+        }
+        let hardware = self.hardware.lock();
+        let published = hardware.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor("worker hardware kick was never published".to_owned())
+        })?;
+        if published.raw_vcpu_id != observed.raw_vcpu_id
+            || published.owner_thread_port != observed.owner_thread_port
+        {
+            return Err(TrapError::Hypervisor(
+                "worker hardware kick identity mismatched its created vCPU".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn poke_control(&self) {
@@ -1827,7 +1857,6 @@ impl ExecutorKick for WorkerKick {
         if *current == Some(binding) {
             *current = None;
             self.need_resched.store(false, Ordering::Release);
-            self.hardware.lock().take();
         }
     }
 
@@ -2518,6 +2547,10 @@ where
             None,
             0,
         );
+        let hardware = backend.hardware_kick().map_err(|error| error.to_string())?;
+        if !kick.publish_hardware(hardware) {
+            return Err("backend failed to publish exact created hardware kick".to_owned());
+        }
         let boundary = WorkerBoundaryAudit::capture()
             .and_then(|boundary| {
                 boundary.audit_clean(&mut backend, &kick)?;
@@ -2591,7 +2624,7 @@ where
         }
     }
     if let Some(destroy_error) =
-        destroy_and_unregister(backend, &scheduler, &registration, &receipts)
+        destroy_and_unregister(backend, &scheduler, &registration, &kick, &receipts)
     {
         retired = true;
         if let Some(existing) = &mut failure {
@@ -2736,20 +2769,7 @@ where
             );
             return Err(with_settlement_error(error.to_string(), settlement));
         }
-        let hardware = match backend.hardware_kick() {
-            Ok(hardware) => hardware,
-            Err(error) => {
-                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                    resolver.as_ref(),
-                    scheduler,
-                    running,
-                    ExecutionFailure::SnapshotRestoreFailed,
-                    receipts,
-                );
-                return Err(with_settlement_error(error.to_string(), settlement));
-            }
-        };
-        if !kick.publish_hardware(hardware) {
+        if let Err(error) = audit_backend_hardware(backend, kick) {
             let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                 resolver.as_ref(),
                 scheduler,
@@ -2757,10 +2777,7 @@ where
                 ExecutionFailure::SnapshotRestoreFailed,
                 receipts,
             );
-            return Err(with_settlement_error(
-                "backend failed to publish exact live hardware kick".to_owned(),
-                settlement,
-            ));
+            return Err(with_settlement_error(error.to_string(), settlement));
         }
         receipts.record(
             executor_id,
@@ -3001,6 +3018,16 @@ where
             return Err(with_settlement_error(error.to_string(), settlement));
         }
         if let Err(error) = boundary.audit_runtime(backend) {
+            let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                resolver.as_ref(),
+                scheduler,
+                running,
+                ExecutionFailure::SnapshotRestoreFailed,
+                receipts,
+            );
+            return Err(with_settlement_error(error.to_string(), settlement));
+        }
+        if let Err(error) = audit_backend_hardware(backend, kick) {
             let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                 resolver.as_ref(),
                 scheduler,
@@ -3263,9 +3290,21 @@ fn destroy_and_unregister<E: PersistentExecutor>(
     backend: E,
     scheduler: &Scheduler,
     registration: &ExecutorRegistration,
+    kick: &WorkerKick,
     receipts: &ReceiptLog,
 ) -> Option<String> {
     let executor = registration.id();
+    let observed_hardware = catch_unwind(AssertUnwindSafe(|| backend.hardware_kick()));
+    let hardware_error = match &observed_hardware {
+        Ok(Ok(observed)) => kick
+            .audit_hardware(observed)
+            .err()
+            .map(|error| format!("executor shutdown hardware audit failed: {error}")),
+        Ok(Err(error)) => Some(format!(
+            "executor shutdown hardware observation failed: {error}"
+        )),
+        Err(_) => Some("executor shutdown hardware observation panicked".to_owned()),
+    };
     let destroy = catch_unwind(AssertUnwindSafe(|| backend.destroy()));
     let destroy_error = match destroy {
         Ok(Ok(())) => {
@@ -3282,19 +3321,27 @@ fn destroy_and_unregister<E: PersistentExecutor>(
         Ok(Err(error)) => Some(format!("executor destroy failed: {error}")),
         Err(_) => Some("executor destroy panicked".to_owned()),
     };
+    let retired_hardware = kick.hardware.lock().take();
+    let retirement_error = match (&observed_hardware, retired_hardware.as_ref()) {
+        (Ok(Ok(observed)), Some(published))
+            if observed.raw_vcpu_id == published.raw_vcpu_id
+                && observed.owner_thread_port == published.owner_thread_port =>
+        {
+            None
+        }
+        (_, Some(_)) => Some("executor shutdown cleared mismatched hardware identity".to_owned()),
+        (_, None) => Some("executor shutdown found no published hardware identity".to_owned()),
+    };
     let unregister_error = scheduler
         .unregister_executor(registration)
         .err()
         .map(|error| format!("executor unregister failed: {error}"));
-    match (destroy_error, unregister_error) {
-        (None, None) => None,
-        (Some(error), None) | (None, Some(error)) => Some(error),
-        (Some(mut first), Some(second)) => {
-            first.push_str("; ");
-            first.push_str(&second);
-            Some(first)
-        }
-    }
+    let mut failures = Vec::new();
+    failures.extend(hardware_error);
+    failures.extend(destroy_error);
+    failures.extend(retirement_error);
+    failures.extend(unregister_error);
+    (!failures.is_empty()).then(|| failures.join("; "))
 }
 
 #[cfg(test)]
@@ -3508,6 +3555,8 @@ pub(crate) mod tests {
         initial_audit_gate: Arc<parking_lot::Mutex<Option<Arc<Barrier>>>>,
         fail_invalidation_generation: Arc<AtomicU64>,
         fail_hardware_kick: Arc<AtomicBool>,
+        drift_hardware_on_load: Arc<AtomicBool>,
+        hardware_vcpu_offset: Arc<AtomicU64>,
         owner_dirty_mode: Arc<AtomicUsize>,
         owner_dirty_fds: Arc<parking_lot::Mutex<Vec<(i32, i32)>>>,
         destroy_mode: Arc<AtomicUsize>,
@@ -3952,6 +4001,9 @@ pub(crate) mod tests {
             self.mailbox = binding.marker + 3;
             self.tls = binding.marker + 4;
             self.current = Some((key.0, key.1, Arc::clone(&binding)));
+            if self.factory.drift_hardware_on_load.load(Ordering::SeqCst) {
+                self.factory.hardware_vcpu_offset.store(1, Ordering::SeqCst);
+            }
             self.factory
                 .record(BackendEventKind::Load, self.id, Some(key));
             Ok(())
@@ -4064,7 +4116,10 @@ pub(crate) mod tests {
                     "injected missing exact hardware identity".to_owned(),
                 ));
             }
-            Ok(test_hardware_kick(u64::from(self.id.raw_for_probe())))
+            Ok(test_hardware_kick(
+                u64::from(self.id.raw_for_probe())
+                    + self.factory.hardware_vcpu_offset.load(Ordering::SeqCst),
+            ))
         }
 
         fn save(
@@ -6030,6 +6085,94 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn worker_hardware_identity_is_create_owned_across_idle_load_save_and_shutdown() {
+        #[derive(Clone)]
+        struct CountingKick(Arc<AtomicUsize>);
+        impl carrick_hal::VcpuKick for CountingKick {
+            fn kick(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (kernel, context) = bootstrap(14_249);
+        publish(&context, 97);
+        let scheduler = Scheduler::new(kernel);
+        let worker = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
+        let owner = super::current_owner_thread_port();
+        let kicks = Arc::new(AtomicUsize::new(0));
+
+        // HVF's first valid hv_vcpu_t is zero. Absence is represented by the
+        // Option/result capability, never by rejecting that numeric identity.
+        let hardware =
+            super::ExactHardwareKick::new(Box::new(CountingKick(Arc::clone(&kicks))), 0, owner)
+                .expect("raw HVF vCPU zero is an exact live identity");
+        assert!(
+            worker.publish_hardware(hardware),
+            "factory publishes hardware while the worker is still idle"
+        );
+
+        let registration = scheduler.register_executor(worker.clone()).unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        let first = scheduler.take(&registration).unwrap();
+        assert_eq!(worker.hardware.lock().as_ref().unwrap().raw_vcpu_id, 0);
+        scheduler.settle_runnable(first).unwrap();
+        assert_eq!(
+            worker.hardware.lock().as_ref().unwrap().raw_vcpu_id,
+            0,
+            "save/unbind must retain worker-owned hardware"
+        );
+
+        let second = scheduler.take(&registration).unwrap();
+        assert_eq!(worker.hardware.lock().as_ref().unwrap().raw_vcpu_id, 0);
+        scheduler.settle_exited(second).unwrap();
+        assert_eq!(
+            worker.hardware.lock().as_ref().unwrap().raw_vcpu_id,
+            0,
+            "idle worker retains the same kick until shutdown"
+        );
+        assert!(
+            super::ExactHardwareKick::new(Box::new(CountingKick(kicks)), 0, 0).is_err(),
+            "a missing Mach owner identity still fails closed"
+        );
+
+        let source = include_str!("executor.rs");
+        let worker_main = source
+            .split("fn executor_worker")
+            .nth(1)
+            .and_then(|tail| tail.split("fn terminal_drain").next())
+            .expect("worker lifecycle");
+        assert!(
+            worker_main.find("backend.hardware_kick()").unwrap()
+                < worker_main.find("boundary.audit_clean").unwrap(),
+            "hardware must publish once at create before the idle audit"
+        );
+        let run_loop = source
+            .split("fn run_executor_loop")
+            .nth(1)
+            .and_then(|tail| tail.split("fn service_owner_thread_commands").next())
+            .expect("worker run loop");
+        assert_eq!(
+            run_loop.matches("publish_hardware").count(),
+            0,
+            "task load must not republish worker-owned hardware"
+        );
+        let unbind = source
+            .split("fn unbind(&self, binding: ExecutorBinding)")
+            .nth(1)
+            .and_then(|tail| tail.split("fn rebind_exact_with").next())
+            .expect("kick unbind");
+        assert!(
+            !unbind.contains("hardware.lock().take()"),
+            "task save/unbind must not clear worker hardware"
+        );
+
+        worker.hardware.lock().take().expect("shutdown owns kick");
+        scheduler.unregister_executor(&registration).unwrap();
+        scheduler.close();
+        scheduler.wait_closed();
+    }
+
+    #[test]
     fn terminal_settlement_retires_the_exact_binding_before_worker_destroy() {
         let (kernel, context) = bootstrap(14_013);
         let scheduler = Arc::new(Scheduler::new(kernel));
@@ -6630,19 +6773,59 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn missing_exact_hardware_identity_fails_and_retires_loaded_claim() {
+    fn missing_exact_hardware_identity_fails_pool_start_before_any_task_claim() {
         let (kernel, context) = bootstrap(14_248);
         let scheduler = Arc::new(Scheduler::new(kernel));
         let factory = Arc::new(FakeFactory::default());
         factory.fail_hardware_kick.store(true, Ordering::SeqCst);
         factory.install(&context, FakeBinding::new(96, [Step::Exit]));
-        let generation = publish(&context, 96);
+        publish(&context, 96);
+        let error = ExecutorPool::start(
+            config(1),
+            scheduler,
+            Arc::clone(&factory),
+            Arc::clone(&factory),
+            ExecutorBoundaryAudit::production(),
+        );
+        assert!(
+            error.is_err(),
+            "missing hardware must fail before pool publication"
+        );
+        let events = factory.events.lock();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == BackendEventKind::Create)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == BackendEventKind::Destroy)
+                .count(),
+            1
+        );
+        assert!(
+            events.iter().all(|event| event.task.is_none()),
+            "startup failure must never claim or load a task"
+        );
+    }
+
+    #[test]
+    fn mismatched_hardware_identity_fails_exact_loaded_claim() {
+        let (kernel, context) = bootstrap(14_250);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let factory = Arc::new(FakeFactory::default());
+        factory.drift_hardware_on_load.store(true, Ordering::SeqCst);
+        factory.install(&context, FakeBinding::new(98, [Step::Exit]));
+        let generation = publish(&context, 98);
         let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
         let authority = enqueue_root(&scheduler, &context, generation);
         drop(authority);
 
         pool.shutdown()
-            .expect_err("missing exact hardware identity must retire worker");
+            .expect_err("changed vCPU identity must retire the loaded worker");
         assert!(matches!(
             context.thread().execution_state(),
             ThreadExecutionState::Failed { .. }
