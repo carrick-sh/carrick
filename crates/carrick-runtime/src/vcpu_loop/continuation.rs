@@ -20,7 +20,8 @@ use carrick_guest_mem::{GuestVa, SharedFutexLocation};
 use parking_lot::Mutex;
 
 use crate::dispatch::{
-    BlockingHostWrite, BlockingRecordLock, DispatchOutcome, SyscallRequest, WaitFds,
+    BlockingHostWrite, BlockingRecordLock, DispatchOutcome, SyscallRequest, WaitFdAuthority,
+    WaitFds,
 };
 use crate::kernel::objects::{ExecutionGeneration, ThreadKey};
 use crate::kernel::{
@@ -36,6 +37,7 @@ static NEXT_RUNNER_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
     static CURRENT_RUNNER_JOB: std::cell::Cell<Option<JobId>> = const { std::cell::Cell::new(None) };
+    static CURRENT_RUNNER_WORKER: std::cell::RefCell<Option<Arc<TransitionalWorkerContext>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Clone)]
@@ -404,7 +406,7 @@ enum ContinuationDetail {
         #[allow(dead_code)]
         registrations: Vec<OwnedFdRegistration>,
         file_table: Arc<crate::kernel::objects::FileTable>,
-        slot_authorities: Vec<crate::kernel::objects::FileSlotAuthority>,
+        fd_authority: WaitFdAuthority,
         on_timeout: i64,
         sig_mask: WaitSigMask,
     },
@@ -412,7 +414,7 @@ enum ContinuationDetail {
         #[allow(dead_code)]
         registrations: Vec<OwnedFdRegistration>,
         file_table: Arc<crate::kernel::objects::FileTable>,
-        slot_authorities: Vec<crate::kernel::objects::FileSlotAuthority>,
+        fd_authority: WaitFdAuthority,
         sig_mask: WaitSigMask,
     },
     HostWrite(Arc<Mutex<BlockingHostWrite>>),
@@ -582,18 +584,15 @@ impl BlockedContinuation {
         let kernel = capture.kernel.upgrade();
         let authority = ContinuationAuthority::from_capture(capture);
         let file_table = Arc::clone(&authority.file_table);
-        let fallback_fd = i32::try_from(authority.syscall.request().arg(0)).ok();
-        let exact_slot_authorities = |fds: &WaitFds| {
-            if !fds.slot_authorities().is_empty() || fds.is_empty() {
-                return Ok(fds.slot_authorities().to_vec());
+        let exact_slot_authorities = |fds: &WaitFds| match fds.authority() {
+            WaitFdAuthority::Empty if fds.is_empty() => Ok(WaitFdAuthority::Empty),
+            WaitFdAuthority::Logical(authorities) if !authorities.is_empty() => {
+                Ok(WaitFdAuthority::Logical(authorities.clone()))
             }
-            let number = fallback_fd
-                .and_then(|fd| crate::kernel::FileSlotNumber::for_open_fd(fd).ok())
-                .ok_or(ContinuationBuildError::FdPinFailed)?;
-            file_table
-                .capture_slot_authority(number)
-                .map(|authority| vec![authority])
-                .ok_or(ContinuationBuildError::FdPinFailed)
+            WaitFdAuthority::Internal(authority) => Ok(WaitFdAuthority::Internal(*authority)),
+            WaitFdAuthority::Empty | WaitFdAuthority::Missing | WaitFdAuthority::Logical(_) => {
+                Err(ContinuationBuildError::FdPinFailed)
+            }
         };
         let mm = authority.mm();
         let asid_generation = authority.asid_generation();
@@ -697,7 +696,7 @@ impl BlockedContinuation {
                 sig_mask,
             } => {
                 let registrations = own_wait_fds(&fds)?;
-                let slot_authorities = exact_slot_authorities(&fds)?;
+                let fd_authority = exact_slot_authorities(&fds)?;
                 Self::WaitOnFds(new_state(
                     deadline(timeout),
                     Vec::new(),
@@ -705,7 +704,7 @@ impl BlockedContinuation {
                     ContinuationDetail::Fds {
                         registrations,
                         file_table: Arc::clone(&file_table),
-                        slot_authorities,
+                        fd_authority,
                         on_timeout,
                         sig_mask,
                     },
@@ -718,7 +717,7 @@ impl BlockedContinuation {
                 clear_on_timeout,
             } => {
                 let registrations = own_wait_fds(&fds)?;
-                let slot_authorities = exact_slot_authorities(&fds)?;
+                let fd_authority = exact_slot_authorities(&fds)?;
                 let outputs = clear_on_timeout
                     .into_iter()
                     .map(|(address, len)| {
@@ -732,7 +731,7 @@ impl BlockedContinuation {
                     ContinuationDetail::Select {
                         registrations,
                         file_table: Arc::clone(&file_table),
-                        slot_authorities,
+                        fd_authority,
                         sig_mask,
                     },
                 ))
@@ -744,7 +743,7 @@ impl BlockedContinuation {
                 sig_mask,
             } => {
                 let registrations = own_wait_fds(&fds)?;
-                let slot_authorities = exact_slot_authorities(&fds)?;
+                let fd_authority = exact_slot_authorities(&fds)?;
                 Self::WaitOnPollFds(new_state(
                     deadline(timeout),
                     Vec::new(),
@@ -752,7 +751,7 @@ impl BlockedContinuation {
                     ContinuationDetail::Fds {
                         registrations,
                         file_table,
-                        slot_authorities,
+                        fd_authority,
                         on_timeout,
                         sig_mask,
                     },
@@ -1210,16 +1209,20 @@ impl BlockedContinuation {
         let exact_file_slots_live = match &self.state().detail {
             ContinuationDetail::Fds {
                 file_table,
-                slot_authorities,
+                fd_authority,
                 ..
             }
             | ContinuationDetail::Select {
                 file_table,
-                slot_authorities,
+                fd_authority,
                 ..
-            } => slot_authorities
-                .iter()
-                .all(|authority| file_table.validate_slot_authority(*authority)),
+            } => match fd_authority {
+                WaitFdAuthority::Logical(authorities) => authorities
+                    .iter()
+                    .all(|authority| file_table.validate_slot_authority(*authority)),
+                WaitFdAuthority::Empty | WaitFdAuthority::Internal(_) => true,
+                WaitFdAuthority::Missing => false,
+            },
             _ => true,
         };
         if !exact_file_slots_live {
@@ -1355,7 +1358,12 @@ impl BlockedContinuation {
                 let action_requests_restart = caught_handler
                     && deliverable_action
                         .is_some_and(|action| action.sa_flags & carrick_abi::LINUX_SA_RESTART != 0);
+                let partial_write_progress = match &self.state().detail {
+                    ContinuationDetail::HostWrite(write) => write.lock().offset() != 0,
+                    _ => false,
+                };
                 let restart = if family != ContinuationFamily::WaitOnSignals
+                    && !partial_write_progress
                     && restart_class != RestartClass::Never
                     && action_requests_restart
                 {
@@ -1718,7 +1726,7 @@ enum ReadinessProbe {
     Fds {
         registrations: Vec<OwnedFdRegistration>,
         file_table: Arc<crate::kernel::objects::FileTable>,
-        slot_authorities: Vec<crate::kernel::objects::FileSlotAuthority>,
+        fd_authority: WaitFdAuthority,
         deadline: Option<Instant>,
     },
     SharedWord {
@@ -1850,18 +1858,18 @@ impl ReadinessProbe {
             ContinuationDetail::Fds {
                 registrations,
                 file_table,
-                slot_authorities,
+                fd_authority,
                 ..
             }
             | ContinuationDetail::Select {
                 registrations,
                 file_table,
-                slot_authorities,
+                fd_authority,
                 ..
             } => Self::Fds {
                 registrations: registrations.clone(),
                 file_table: Arc::clone(file_table),
-                slot_authorities: slot_authorities.clone(),
+                fd_authority: fd_authority.clone(),
                 deadline: state.deadline,
             },
             ContinuationDetail::SharedFutex {
@@ -2613,9 +2621,10 @@ impl CarrierWaitService {
         }
         if let ReadinessProbe::Fds {
             file_table,
-            slot_authorities,
+            fd_authority,
             ..
         } = &probe
+            && let WaitFdAuthority::Logical(slot_authorities) = fd_authority
         {
             for authority in slot_authorities {
                 let callback_weak = weak.clone();
@@ -3034,6 +3043,109 @@ pub enum QuantumExit {
     Failed,
 }
 
+struct TransitionalWorkerKick {
+    binding: Mutex<Option<crate::kernel::ExecutorBinding>>,
+    hardware: Mutex<Option<Box<dyn carrick_hal::VcpuKickDyn>>>,
+    pending: AtomicBool,
+}
+
+impl std::fmt::Debug for TransitionalWorkerKick {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TransitionalWorkerKick")
+            .field("binding", &*self.binding.lock())
+            .field("hardware_published", &self.hardware.lock().is_some())
+            .field("pending", &self.pending.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+impl crate::kernel::ExecutorKick for TransitionalWorkerKick {
+    fn try_bind(&self, binding: crate::kernel::ExecutorBinding) -> bool {
+        let mut current = self.binding.lock();
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(binding);
+        true
+    }
+
+    fn unbind(&self, binding: crate::kernel::ExecutorBinding) {
+        let mut current = self.binding.lock();
+        if *current == Some(binding) {
+            *current = None;
+            self.pending.store(false, Ordering::Release);
+            self.hardware.lock().take();
+        }
+    }
+
+    fn deliver_exact(&self, token: crate::kernel::ExecutorKickToken) -> bool {
+        let current = self.binding.lock();
+        let exact = current.is_some_and(|binding| {
+            binding.executor() == token.executor()
+                && binding.executor_epoch() == token.executor_epoch()
+                && binding.thread() == token.thread()
+                && binding.generation() == token.generation()
+        });
+        if !exact {
+            return false;
+        }
+        self.pending.store(true, Ordering::Release);
+        if let Some(hardware) = self.hardware.lock().as_ref() {
+            hardware.kick();
+        }
+        true
+    }
+
+    fn current_binding(&self) -> Option<crate::kernel::ExecutorBinding> {
+        *self.binding.lock()
+    }
+}
+
+struct TransitionalWorkerContext {
+    scheduler: Arc<Scheduler>,
+    registration: crate::kernel::ExecutorRegistration,
+    kick: Arc<TransitionalWorkerKick>,
+}
+
+impl TransitionalWorkerContext {
+    fn register(scheduler: Arc<Scheduler>) -> Result<Arc<Self>, TransitionalRunnerError> {
+        let kick = Arc::new(TransitionalWorkerKick {
+            binding: Mutex::new(None),
+            hardware: Mutex::new(None),
+            pending: AtomicBool::new(false),
+        });
+        let registration = scheduler
+            .register_executor(Arc::clone(&kick) as Arc<dyn crate::kernel::ExecutorKick>)
+            .map_err(|_| TransitionalRunnerError::TaskFailed)?;
+        Ok(Arc::new(Self {
+            scheduler,
+            registration,
+            kick,
+        }))
+    }
+
+    fn publish_hardware_kick(&self, kick: Box<dyn carrick_hal::VcpuKickDyn>) -> bool {
+        let binding = self.kick.binding.lock();
+        if binding.is_none() {
+            return false;
+        }
+        *self.kick.hardware.lock() = Some(kick);
+        if self.kick.pending.swap(false, Ordering::AcqRel)
+            && let Some(kick) = self.kick.hardware.lock().as_ref()
+        {
+            kick.kick();
+        }
+        true
+    }
+}
+
+impl Drop for TransitionalWorkerContext {
+    fn drop(&mut self) {
+        let _ = self.scheduler.unregister_executor(&self.registration);
+    }
+}
+
 /// Task-5-only adapter preserving the current welded runner until Task 6 wires
 /// the real HVF executor backend.  It delegates all state decisions to the
 /// Kernel/scheduler continuation APIs and owns no parallel task state machine.
@@ -3047,12 +3159,16 @@ pub(crate) struct RunnerTask {
     sender: mpsc::Sender<RunnerWork>,
     queued: AtomicBool,
     completion: LogicalJobCompletion,
+    scheduler: Arc<Mutex<Option<Arc<Scheduler>>>>,
 }
 
 impl RunnerTask {
     fn enqueue(self: &Arc<Self>) {
         if !self.queued.swap(true, Ordering::AcqRel) {
             let _ = self.sender.send(RunnerWork::Poll(Arc::clone(self)));
+            if let Some(scheduler) = self.scheduler.lock().as_ref() {
+                scheduler.request_preemption();
+            }
         }
     }
 
@@ -3121,6 +3237,7 @@ struct TransitionalRunnerPool {
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     worker_count: usize,
     next_worker: AtomicUsize,
+    scheduler: Arc<Mutex<Option<Arc<Scheduler>>>>,
 }
 
 impl TransitionalRunnerPool {
@@ -3133,10 +3250,18 @@ impl TransitionalRunnerPool {
             .spawn(move || {
                 let boundary = crate::vcpu_loop::executor::WorkerBoundaryAudit::capture()
                     .unwrap_or_else(|_| std::process::abort());
+                let mut worker_context: Option<Arc<TransitionalWorkerContext>> = None;
                 loop {
                     let work = receiver.lock().recv();
                     match work {
                         Ok(RunnerWork::Poll(task)) => {
+                            if worker_context.is_none()
+                                && let Some(pool) = weak.upgrade()
+                                && let Some(scheduler) = pool.scheduler.lock().clone()
+                            {
+                                worker_context =
+                                    TransitionalWorkerContext::register(scheduler).ok();
+                            }
                             if boundary.audit_runtime_owned().is_err() {
                                 task.fail_boundary();
                                 if let Some(pool) = weak.upgrade() {
@@ -3144,9 +3269,27 @@ impl TransitionalRunnerPool {
                                 }
                                 return;
                             }
-                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                run_task_quantum(&task)
-                            }));
+                            CURRENT_RUNNER_WORKER.with(|current| {
+                                *current.borrow_mut() = worker_context.clone();
+                            });
+                            let exit =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    run_task_quantum(&task)
+                                }));
+                            CURRENT_RUNNER_WORKER.with(|current| current.borrow_mut().take());
+                            if !matches!(
+                                exit,
+                                Ok(QuantumExit::Runnable
+                                    | QuantumExit::Blocked
+                                    | QuantumExit::Exited)
+                            ) {
+                                task.fail_boundary();
+                                drop(worker_context.take());
+                                if let Some(pool) = weak.upgrade() {
+                                    pool.spawn_worker();
+                                }
+                                return;
+                            }
                             if boundary.audit_runtime_owned().is_err() {
                                 task.fail_boundary();
                                 if let Some(pool) = weak.upgrade() {
@@ -3428,6 +3571,7 @@ impl TransitionalDedicatedRunner {
             workers: Mutex::new(Vec::with_capacity(worker_count)),
             worker_count,
             next_worker: AtomicUsize::new(0),
+            scheduler: Arc::new(Mutex::new(None)),
         });
         for _ in 0..worker_count {
             pool.spawn_worker();
@@ -3451,6 +3595,7 @@ impl TransitionalDedicatedRunner {
             sender: self.pool.sender.clone(),
             queued: AtomicBool::new(false),
             completion: completion.clone(),
+            scheduler: Arc::clone(&self.pool.scheduler),
         });
         task.enqueue();
         LogicalTaskReceipt {
@@ -3463,6 +3608,46 @@ impl TransitionalDedicatedRunner {
         TransitionalRunnerTopology {
             worker_threads: self.pool.worker_count,
         }
+    }
+
+    pub(crate) fn attach_scheduler(&self, scheduler: Arc<Scheduler>) {
+        let mut slot = self.pool.scheduler.lock();
+        if let Some(installed) = slot.as_ref() {
+            if !Arc::ptr_eq(installed, &scheduler) {
+                std::process::abort();
+            }
+            return;
+        }
+        *slot = Some(scheduler);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_executor_id() -> Option<crate::kernel::objects::ExecutorId> {
+        CURRENT_RUNNER_WORKER.with(|current| {
+            current
+                .borrow()
+                .as_ref()
+                .map(|worker| worker.registration.id())
+        })
+    }
+
+    pub(crate) fn current_executor_registration() -> Option<crate::kernel::ExecutorRegistration> {
+        CURRENT_RUNNER_WORKER.with(|current| {
+            current
+                .borrow()
+                .as_ref()
+                .map(|worker| worker.registration.clone())
+        })
+    }
+
+    pub(crate) fn publish_current_hardware_kick(kick: Box<dyn carrick_hal::VcpuKickDyn>) -> bool {
+        CURRENT_RUNNER_WORKER.with(|current| {
+            let current = current.borrow();
+            let Some(worker) = current.as_ref() else {
+                return false;
+            };
+            worker.publish_hardware_kick(kick)
+        })
     }
 
     pub fn current_job() -> Option<LogicalJobCompletion> {
@@ -3576,6 +3761,18 @@ mod tests {
             .thread()
             .publish_initial_task_state(task_state(context, marker))
             .expect("publish task state")
+    }
+
+    fn enqueue_root(
+        scheduler: &Arc<Scheduler>,
+        context: &KernelContext,
+        generation: ExecutionGeneration,
+    ) {
+        scheduler
+            .admit_root(context.thread().key(), generation)
+            .expect("admit root")
+            .publish(scheduler, Arc::clone(context.thread()))
+            .expect("publish root");
     }
 
     fn request(number: u64) -> SyscallRequest {
@@ -4464,6 +4661,25 @@ mod tests {
     }
 
     #[test]
+    fn hvpatch_fd_wait_without_explicit_slot_authority_fails_closed() {
+        let (_kernel, context) = bootstrap(15_227);
+        let generation = publish(&context, 0x554);
+        let _fallback_would_have_matched = install_test_fd_authority(&context, 0);
+        let fds = pipe_pair();
+        let result = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::raw_one(fds[0], libc::POLLIN),
+                timeout: None,
+                on_timeout: 0,
+                sig_mask: WaitSigMask::NONE,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        );
+        assert!(matches!(result, Err(ContinuationBuildError::FdPinFailed)));
+        close_pair(fds);
+    }
+
+    #[test]
     fn shared_wait_service_is_bounded_and_blocked_tasks_own_no_executor() {
         let mut fixture = race_fixture(15_230);
         let topology = fixture.service.topology();
@@ -5045,6 +5261,40 @@ mod tests {
     }
 
     #[test]
+    fn partial_blocking_write_never_restarts_after_caught_sa_restart_signal() {
+        let (_kernel, context) = bootstrap(15_369_1);
+        let generation = publish(&context, 0x706);
+        let signal = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+        let mut action = carrick_abi::LinuxSigaction::empty();
+        action.sa_handler = 0x1234;
+        action.sa_flags = carrick_abi::LINUX_SA_RESTART;
+        context.signal_authority().install_action(signal, action);
+        context
+            .signal_authority()
+            .enqueue_thread_standard(signal, None);
+        let fds = pipe_pair();
+        let write = BlockingHostWrite::for_tests(
+            fds[1],
+            vec![1, 2, 3, 4],
+            2,
+            ThreadId::synthetic_for_tests(15_369_1),
+            false,
+        )
+        .expect("partial blocking write");
+        close_pair(fds);
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::BlockingHostWrite(write),
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("partial write continuation");
+        let result = continuation
+            .resume(ContinuationEvent::Signal, &context)
+            .expect("partial signal result");
+        assert_eq!(result.restart(), RestartDecision::NoRestart);
+        assert_eq!(result.completion, ContinuationCompletion::Return(2));
+    }
+
+    #[test]
     fn signal_readiness_honors_replace_additive_ignore_and_live_restart_action() {
         let (kernel, context) = bootstrap(15_370);
         let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
@@ -5383,7 +5633,18 @@ mod tests {
 
     #[test]
     fn dirty_transitional_worker_fails_exact_job_and_replacement_is_clean() {
-        struct DirtyBoundary;
+        struct DirtyEngineProbe {
+            cleanup_tx: mpsc::Sender<std::thread::ThreadId>,
+        }
+        fn cleanup(probe: &mut DirtyEngineProbe) {
+            probe
+                .cleanup_tx
+                .send(std::thread::current().id())
+                .expect("dirty cleanup receipt");
+        }
+        struct DirtyBoundary {
+            _engine: super::super::OwnerThreadEngine<DirtyEngineProbe>,
+        }
         impl Future for DirtyBoundary {
             type Output = ();
 
@@ -5397,17 +5658,27 @@ mod tests {
         }
 
         let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
-        assert_eq!(
-            runner.spawn(DirtyBoundary).wait(),
-            Err(TransitionalRunnerError::TaskFailed)
-        );
+        let (cleanup_tx, cleanup_rx) = mpsc::channel();
         assert_eq!(
             runner
-                .spawn(async { 73_u8 })
-                .wait()
-                .expect("clean replacement"),
-            73
+                .spawn(DirtyBoundary {
+                    _engine: super::super::OwnerThreadEngine::for_test(
+                        DirtyEngineProbe { cleanup_tx },
+                        cleanup,
+                    ),
+                })
+                .wait(),
+            Err(TransitionalRunnerError::TaskFailed)
         );
+        let dirty_worker = cleanup_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dirty task cleanup");
+        let (value, clean_worker) = runner
+            .spawn(async { (73_u8, std::thread::current().id()) })
+            .wait()
+            .expect("clean replacement");
+        assert_eq!(value, 73);
+        assert_ne!(dirty_worker, clean_worker);
         assert_eq!(runner.topology().worker_threads(), 1);
     }
 
@@ -5443,6 +5714,111 @@ mod tests {
     }
 
     #[test]
+    fn executor_identity_is_owned_by_worker_not_logical_job() {
+        let (kernel, _context) = bootstrap(15_453);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
+        runner.attach_scheduler(Arc::clone(&scheduler));
+        let first = runner
+            .spawn(async {
+                TransitionalDedicatedRunner::current_executor_id()
+                    .expect("worker executor while polling")
+            })
+            .wait()
+            .expect("first job");
+        let second = runner
+            .spawn(async {
+                TransitionalDedicatedRunner::current_executor_id()
+                    .expect("same worker executor while polling")
+            })
+            .wait()
+            .expect("second job");
+        assert_eq!(first, second);
+        assert_eq!(scheduler.registered_executor_count(), 1);
+    }
+
+    #[test]
+    fn worker_exact_wake_uses_live_hardware_kick_and_unbinds_before_successor() {
+        #[derive(Clone)]
+        struct CountingKick(Arc<AtomicUsize>);
+        impl carrick_hal::VcpuKickDyn for CountingKick {
+            fn kick(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (kernel, context) = bootstrap(15_454);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let generation = publish(&context, 0x707);
+        enqueue_root(&scheduler, &context, generation);
+        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
+        runner.attach_scheduler(Arc::clone(&scheduler));
+        let kicks = Arc::new(AtomicUsize::new(0));
+        let task_kicks = Arc::clone(&kicks);
+        let task_scheduler = Arc::clone(&scheduler);
+        let thread = Arc::clone(context.thread());
+        runner
+            .spawn(async move {
+                let executor = TransitionalDedicatedRunner::current_executor_registration()
+                    .expect("worker registration");
+                let running = task_scheduler.take(&executor).expect("claim exact task");
+                assert!(TransitionalDedicatedRunner::publish_current_hardware_kick(
+                    Box::new(CountingKick(task_kicks))
+                ));
+                task_scheduler
+                    .wake(thread.key())
+                    .expect("exact running wake");
+                task_scheduler
+                    .settle_runnable_successor(running)
+                    .expect("unbind predecessor");
+            })
+            .wait()
+            .expect("worker job");
+        assert_eq!(kicks.load(Ordering::SeqCst), 1);
+        assert!(
+            scheduler
+                .binding_for_thread(context.thread().key())
+                .is_none()
+        );
+        scheduler
+            .wake(context.thread().key())
+            .expect("successor already runnable");
+        assert_eq!(kicks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn live_task_panic_cleans_up_on_owner_worker_and_retires_it() {
+        struct PanicEngineProbe {
+            cleanup_tx: mpsc::Sender<std::thread::ThreadId>,
+        }
+        fn cleanup(probe: &mut PanicEngineProbe) {
+            probe
+                .cleanup_tx
+                .send(std::thread::current().id())
+                .expect("cleanup receipt");
+        }
+        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
+        let (cleanup_tx, cleanup_rx) = mpsc::channel();
+        let panic_receipt = runner.spawn(async move {
+            let _engine =
+                super::super::OwnerThreadEngine::for_test(PanicEngineProbe { cleanup_tx }, cleanup);
+            panic!("injected live engine panic");
+        });
+        assert_eq!(
+            panic_receipt.wait(),
+            Err(TransitionalRunnerError::TaskFailed)
+        );
+        let cleanup_thread = cleanup_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("owner cleanup ran");
+        let successor_thread = runner
+            .spawn(async { std::thread::current().id() })
+            .wait()
+            .expect("replacement worker");
+        assert_ne!(cleanup_thread, successor_thread);
+    }
+
+    #[test]
     fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
         let continuation_source = include_str!("continuation.rs")
             .split("#[cfg(test)]\nmod tests")
@@ -5467,6 +5843,18 @@ mod tests {
         assert_eq!(DISPATCH_FAMILIES.len() + 1, 16);
         assert!(continuation_source.contains("run_task_quantum(&task)"));
         assert!(!continuation_source.contains("TaskQuantumSource"));
+        assert!(!continuation_source.contains("fallback_fd"));
+        for required in [
+            "TransitionalWorkerContext::register",
+            "publish_current_hardware_kick",
+            "scheduler.request_preemption()",
+            "drop(worker_context.take())",
+        ] {
+            assert!(
+                continuation_source.contains(required),
+                "worker-owned executor path misses {required}"
+            );
+        }
 
         let loop_source = include_str!("mod.rs");
         let suspend = loop_source
@@ -5602,11 +5990,32 @@ mod tests {
         assert!(loop_source.contains("continuation.install_temporary_signal_mask(context)"));
         assert!(loop_source.contains("self.continuation_restart = Some(result.restart())"));
         assert!(loop_source.contains("ContinuationResumeError::StaleFileSlot"));
+        assert!(loop_source.contains("OwnerThreadEngine::new(engine)"));
+        assert!(loop_source.contains("engine.disarm()"));
+        assert!(!loop_source.contains("TransitionalSchedulerKick"));
+        assert!(!loop_source.contains("continuation_executor"));
 
         let net_source = include_str!("../dispatch/net.rs");
         assert!(
             net_source.matches("with_guest_slots(&files").count() >= 2,
             "pselect/ppoll must capture every exact guest fd slot at dispatch"
         );
+        let io_uring_source = include_str!("../dispatch/ioring.rs");
+        assert!(io_uring_source.contains("with_guest_slots(&files, [sqe.fd])"));
+        let proc_source = include_str!("../dispatch/proc.rs");
+        assert!(proc_source.contains("with_guest_slots(&files, [id as i32])"));
+        let fs_source = include_str!("../dispatch/fs.rs");
+        assert!(!fs_source.contains("WaitFdAuthority::Missing"));
+        for required in [
+            "captured_slot_authority(guest_fd)",
+            "captured_slot_authority(fd)",
+            "captured_slot_authority(fd.0)",
+            "WaitFdAuthority::logical",
+        ] {
+            assert!(
+                fs_source.contains(required),
+                "fd producer misses {required}"
+            );
+        }
     }
 }

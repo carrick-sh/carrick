@@ -3230,8 +3230,15 @@ impl SyscallDispatcher {
                         if this.pidfd_is_nonblocking(id as i32) {
                             return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                         }
+                        let files = this.captured_file_table();
+                        let fds = match WaitFds::raw_one(host_fd.get(), libc::POLLIN)
+                            .with_guest_slots(&files, [id as i32])
+                        {
+                            Ok(fds) => fds,
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        };
                         return Ok(DispatchOutcome::WaitOnPollFds {
-                            fds: WaitFds::raw_one(host_fd.get(), libc::POLLIN),
+                            fds,
                             timeout: None,
                             on_timeout: 0,
                             sig_mask: carrick_abi::WaitSigMask::NONE,

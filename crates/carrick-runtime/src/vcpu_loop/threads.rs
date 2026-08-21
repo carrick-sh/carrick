@@ -1578,13 +1578,15 @@ where
                 engine
                     .audit_executor_boundary()
                     .map_err(RuntimeError::Trap)?;
-                let executor = self.continuation_executor.as_ref().ok_or_else(|| {
-                    RuntimeError::Configuration(
-                        "HVPatch exec drain lost transitional executor".to_owned(),
-                    )
-                })?;
+                let executor =
+                    continuation::TransitionalDedicatedRunner::current_executor_registration()
+                        .ok_or_else(|| {
+                            RuntimeError::Configuration(
+                                "HVPatch exec drain resumed outside a bounded worker".to_owned(),
+                            )
+                        })?;
                 let lease = scheduler
-                    .take_transitional_lease(executor.registration(), thread.key())
+                    .take_transitional_lease(&executor, thread.key())
                     .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
                 let (current_mm, current_asid) = lease
                     .task_state_authority()
@@ -1609,6 +1611,13 @@ where
                 let _ = self.registry.unpark_vcpu(self.this_tid);
                 if engine.reclaim_refreshes_kicker() {
                     self.register_vcpu(engine);
+                }
+                if !continuation::TransitionalDedicatedRunner::publish_current_hardware_kick(
+                    Box::new(engine.kick_handle()),
+                ) {
+                    return Err(RuntimeError::Configuration(
+                        "HVPatch exec resume has no worker-owned kick destination".to_owned(),
+                    ));
                 }
                 *self.execution_lease.lock() = Some(lease);
                 drain_result?;

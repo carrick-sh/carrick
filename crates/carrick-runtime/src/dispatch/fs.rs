@@ -5301,6 +5301,7 @@ impl SyscallDispatcher {
         host_fd: i32,
         host_fd_owner: Option<HostFdRef>,
         nonblocking: bool,
+        authority: WaitFdAuthority,
     ) -> DispatchOutcome {
         let mut total = 0i64;
         for iov in iovecs {
@@ -5318,6 +5319,7 @@ impl SyscallDispatcher {
                 host_fd,
                 host_fd_owner.clone(),
                 nonblocking,
+                authority.clone(),
             ) {
                 DispatchOutcome::Returned { value } => {
                     total += value;
@@ -5450,6 +5452,9 @@ impl SyscallDispatcher {
                     libc::POLLIN,
                     nonblocking,
                     host_fd_owner,
+                    WaitFdAuthority::logical(
+                        self.captured_slot_authority(guest_fd).ok_or(LINUX_EBADF)?,
+                    ),
                 )));
             }
             Err(errno) => return Err(DispatchError::Errno(errno)),
@@ -5547,13 +5552,30 @@ impl SyscallDispatcher {
             }
         });
         match target {
-            Some((host_fd, owner)) => {
-                super::would_block_outcome(host_fd, libc::POLLOUT, nonblocking, owner)
-            }
+            Some((host_fd, owner)) => self.splice_host_output_wait(fd, host_fd, owner, nonblocking),
             // No host readiness source to park on (in-memory pipe destination):
             // report the condition rather than parking on nothing.
             None => DispatchOutcome::errno(LINUX_EAGAIN),
         }
+    }
+
+    fn splice_host_output_wait(
+        &self,
+        fd: i32,
+        host_fd: i32,
+        owner: Option<HostFdRef>,
+        nonblocking: bool,
+    ) -> DispatchOutcome {
+        let Some(authority) = self.captured_slot_authority(fd) else {
+            return DispatchOutcome::errno(LINUX_EBADF);
+        };
+        super::would_block_outcome(
+            host_fd,
+            libc::POLLOUT,
+            nonblocking,
+            owner,
+            WaitFdAuthority::logical(authority),
+        )
     }
 
     fn restore_splice_pipe_bytes(&self, guest_fd: i32, bytes: &[u8]) {
@@ -5626,7 +5648,15 @@ impl SyscallDispatcher {
                 let mut open = open_file.description.write();
                 match &mut *open {
                     OpenDescription::PipeWriter { base, pipe } => {
-                        return write_pipe(bytes, pipe, base.status_flags(), fd);
+                        return write_pipe(
+                            bytes,
+                            pipe,
+                            base.status_flags(),
+                            fd,
+                            self.captured_slot_authority(fd)
+                                .map(WaitFdAuthority::logical)
+                                .unwrap_or_else(|| std::process::abort()),
+                        );
                     }
                     OpenDescription::HostPipe {
                         base,
@@ -5668,6 +5698,10 @@ impl SyscallDispatcher {
                                     ),
                                     tid,
                                     sigpipe_on_epipe: false,
+                                    authority: self
+                                        .captured_slot_authority(fd)
+                                        .map(WaitFdAuthority::logical)
+                                        .unwrap_or_else(|| std::process::abort()),
                                 },
                             )
                         };
@@ -5683,6 +5717,10 @@ impl SyscallDispatcher {
                                 pipe_state: None,
                                 tid,
                                 sigpipe_on_epipe: false,
+                                authority: self
+                                    .captured_slot_authority(fd)
+                                    .map(WaitFdAuthority::logical)
+                                    .unwrap_or_else(|| std::process::abort()),
                             },
                         );
                     }
@@ -5729,6 +5767,10 @@ impl SyscallDispatcher {
                                 pipe_state: None,
                                 tid,
                                 sigpipe_on_epipe: false,
+                                authority: self
+                                    .captured_slot_authority(fd)
+                                    .map(WaitFdAuthority::logical)
+                                    .unwrap_or_else(|| std::process::abort()),
                             },
                         );
                     }
@@ -9743,6 +9785,7 @@ impl SyscallDispatcher {
                     0,
                     None,
                     nonblocking,
+                    WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
                 ));
             }
             let Some(open_file) = this.open_file(fd.0) else {
@@ -9867,6 +9910,9 @@ impl SyscallDispatcher {
                         &state,
                         semaphore,
                         nonblocking,
+                        WaitFdAuthority::logical(
+                            this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                        ),
                     ));
                 }
                 OpenDescription::TimerFd { base, state } => {
@@ -9923,13 +9969,24 @@ impl SyscallDispatcher {
                         length,
                         &group,
                         nonblocking,
+                        fd.0,
                     );
                 }
                 OpenDescription::PipeReader { base, pipe } => {
                     let pipe = Arc::clone(pipe);
                     let flags = base.status_flags();
                     drop(open);
-                    return Ok(read_pipe(memory, address, length, &pipe, flags, fd.0));
+                    return Ok(read_pipe(
+                        memory,
+                        address,
+                        length,
+                        &pipe,
+                        flags,
+                        fd.0,
+                        this.captured_slot_authority(fd.0)
+                            .map(WaitFdAuthority::logical)
+                            .unwrap_or_else(|| std::process::abort()),
+                    ));
                 }
                 OpenDescription::HostPipe {
                     host_fd,
@@ -9963,6 +10020,9 @@ impl SyscallDispatcher {
                         host_fd_raw,
                         Some(host_fd_owner),
                         nonblocking,
+                        WaitFdAuthority::logical(
+                            this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                        ),
                     ));
                 }
                 OpenDescription::Directory { .. } => {
@@ -10004,6 +10064,9 @@ impl SyscallDispatcher {
                         host_fd.raw(),
                         Some(host_fd.clone()),
                         nonblocking,
+                        WaitFdAuthority::logical(
+                            this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                        ),
                     ));
                 }
                 // Netlink: drain whatever a prior dump request queued. A bare
@@ -10026,6 +10089,9 @@ impl SyscallDispatcher {
                         host_fd.raw(),
                         Some(host_fd.clone()),
                         nonblocking,
+                        WaitFdAuthority::logical(
+                            this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                        ),
                     ));
                 }
             };
@@ -10088,6 +10154,7 @@ impl SyscallDispatcher {
                         hfd,
                         None,
                         /*nonblocking=*/ false,
+                        WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
                     ) {
                         DispatchOutcome::Returned { value } => {
                             total += value;
@@ -10141,6 +10208,9 @@ impl SyscallDispatcher {
                         hfd,
                         owner,
                         nonblocking,
+                        WaitFdAuthority::logical(
+                            this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                        ),
                     ));
                 }
                 OpenDescription::HostSocket { host_fd, .. } => {
@@ -10153,6 +10223,9 @@ impl SyscallDispatcher {
                         hfd,
                         owner,
                         nonblocking,
+                        WaitFdAuthority::logical(
+                            this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                        ),
                     ));
                 }
                 OpenDescription::PipeReader { base, pipe } => {
@@ -10166,7 +10239,17 @@ impl SyscallDispatcher {
                         if len == 0 {
                             continue;
                         }
-                        match read_pipe(memory, iov.iov_base, len, &pipe, flags, fd.0) {
+                        match read_pipe(
+                            memory,
+                            iov.iov_base,
+                            len,
+                            &pipe,
+                            flags,
+                            fd.0,
+                            this.captured_slot_authority(fd.0)
+                                .map(WaitFdAuthority::logical)
+                                .unwrap_or_else(|| std::process::abort()),
+                        ) {
                             DispatchOutcome::Returned { value } => {
                                 total += value;
                                 if (value as usize) < len {
@@ -10929,7 +11012,15 @@ impl SyscallDispatcher {
                             DispatchOutcome::errno(LINUX_EAGAIN)
                         } else {
                             DispatchOutcome::WaitOnFds {
-                                fds: WaitFds::raw_one(sock_fd.get(), libc::POLLOUT),
+                                fds: match WaitFds::raw_one(sock_fd.get(), libc::POLLOUT)
+                                    .with_guest_slots(
+                                        &this.captured_file_table(),
+                                        [out_fd.0],
+                                    )
+                                {
+                                    Ok(fds) => fds,
+                                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                                },
                                 timeout: None,
                                 on_timeout: LINUX_EAGAIN.guest_retval(),
                                 sig_mask: carrick_abi::WaitSigMask::NONE,
@@ -11653,6 +11744,9 @@ impl SyscallDispatcher {
                     hfd.get(),
                     owner,
                     nonblocking,
+                    WaitFdAuthority::logical(
+                        this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
+                    ),
                 )),
                 VmDir::ReadMem => {
                     let Some((pipe, status_flags)) = this.pipe_reader(fd.0) else {
@@ -12331,7 +12425,15 @@ impl SyscallDispatcher {
                             let pipe = Arc::clone(pipe);
                             let flags = base.status_flags();
                             drop(open);
-                            let outcome = write_pipe(&bytes, &pipe, flags, fd);
+                            let outcome = write_pipe(
+                                &bytes,
+                                &pipe,
+                                flags,
+                                fd,
+                                this.captured_slot_authority(fd)
+                                    .map(WaitFdAuthority::logical)
+                                    .unwrap_or_else(|| std::process::abort()),
+                            );
                             if let DispatchOutcome::Returned { value } = outcome {
                                 if value > 0 {
                                     this.notify_inmem_epoll();
@@ -12382,6 +12484,10 @@ impl SyscallDispatcher {
                                     ),
                                     tid: cx.tid(),
                                     sigpipe_on_epipe: true,
+                                    authority: this
+                                        .captured_slot_authority(fd)
+                                        .map(WaitFdAuthority::logical)
+                                        .unwrap_or_else(|| std::process::abort()),
                                 },
                             );
                             // Signal-driven I/O: a write that added bytes makes the
@@ -12411,6 +12517,10 @@ impl SyscallDispatcher {
                                     pipe_state: None,
                                     tid: cx.tid(),
                                     sigpipe_on_epipe: false,
+                                    authority: this
+                                        .captured_slot_authority(fd)
+                                        .map(WaitFdAuthority::logical)
+                                        .unwrap_or_else(|| std::process::abort()),
                                 },
                             );
                             // Signal-driven I/O readiness edge on the socket peer.
@@ -12465,6 +12575,10 @@ impl SyscallDispatcher {
                                     pipe_state: None,
                                     tid: cx.tid(),
                                     sigpipe_on_epipe: false,
+                                    authority: this
+                                        .captured_slot_authority(fd)
+                                        .map(WaitFdAuthority::logical)
+                                        .unwrap_or_else(|| std::process::abort()),
                                 },
                             ));
                         }
@@ -12759,6 +12873,10 @@ impl SyscallDispatcher {
                         pipe_state: target.pipe_state,
                         tid: cx.tid(),
                         sigpipe_on_epipe: target.sigpipe_on_epipe,
+                        authority: this
+                            .captured_slot_authority(fd)
+                            .map(WaitFdAuthority::logical)
+                            .unwrap_or_else(|| std::process::abort()),
                     },
                 );
                 return if target.sigpipe_on_epipe {
@@ -12825,7 +12943,15 @@ impl SyscallDispatcher {
                                 }
                             }
                             OpenDescription::PipeWriter { base, pipe } => {
-                                outcome = write_pipe(&bytes, pipe, base.status_flags(), fd);
+                                outcome = write_pipe(
+                                    &bytes,
+                                    pipe,
+                                    base.status_flags(),
+                                    fd,
+                                    this.captured_slot_authority(fd)
+                                        .map(WaitFdAuthority::logical)
+                                        .unwrap_or_else(|| std::process::abort()),
+                                );
                                 writeback = None;
                             }
                             OpenDescription::HostPipe {
@@ -12859,6 +12985,10 @@ impl SyscallDispatcher {
                                         ),
                                         tid: cx.tid(),
                                         sigpipe_on_epipe: true,
+                                        authority: this
+                                            .captured_slot_authority(fd)
+                                            .map(WaitFdAuthority::logical)
+                                            .unwrap_or_else(|| std::process::abort()),
                                     },
                                 );
                                 writeback = None;
@@ -12874,6 +13004,10 @@ impl SyscallDispatcher {
                                         pipe_state: None,
                                         tid: cx.tid(),
                                         sigpipe_on_epipe: false,
+                                        authority: this
+                                            .captured_slot_authority(fd)
+                                            .map(WaitFdAuthority::logical)
+                                            .unwrap_or_else(|| std::process::abort()),
                                     },
                                 );
                                 writeback = None;
@@ -12904,6 +13038,10 @@ impl SyscallDispatcher {
                                         pipe_state: None,
                                         tid: cx.tid(),
                                         sigpipe_on_epipe: false,
+                                        authority: this
+                                            .captured_slot_authority(fd)
+                                            .map(WaitFdAuthority::logical)
+                                            .unwrap_or_else(|| std::process::abort()),
                                     },
                                 );
                                 writeback = None;
@@ -14703,6 +14841,7 @@ fn read_fanotify<M: GuestMemory>(
     length: usize,
     group: &Arc<crate::fanotify::FanotifyGroup>,
     nonblocking: bool,
+    guest_fd: i32,
 ) -> Result<DispatchOutcome, DispatchError> {
     // A buffer too small for even one record can never make progress.
     if length < carrick_abi::LINUX_FANOTIFY_EVENT_METADATA_LEN {
@@ -14720,6 +14859,7 @@ fn read_fanotify<M: GuestMemory>(
             libc::POLLIN,
             nonblocking,
             None,
+            WaitFdAuthority::logical(this.captured_slot_authority(guest_fd).ok_or(LINUX_EBADF)?),
         ));
     }
     let mut bytes =

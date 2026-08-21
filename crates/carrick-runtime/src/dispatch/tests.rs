@@ -143,6 +143,7 @@ mod overlay_dispatch_tests {
                 pipe_state: None,
                 tid: crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0101),
                 sigpipe_on_epipe: true,
+                authority: WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
             },
         );
 
@@ -199,6 +200,7 @@ mod overlay_dispatch_tests {
                 pipe_state: None,
                 tid: crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0103),
                 sigpipe_on_epipe: false,
+                authority: WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
             },
         );
 
@@ -256,6 +258,7 @@ mod overlay_dispatch_tests {
                 pipe_state: None,
                 tid: crate::thread::ThreadId::synthetic_for_tests(0x7FFE_0104),
                 sigpipe_on_epipe: false,
+                authority: WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
             },
         );
 

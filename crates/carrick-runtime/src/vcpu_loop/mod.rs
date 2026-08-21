@@ -746,6 +746,8 @@ impl HvpatchRuntimeDirectory {
                 endpoint.scheduler = Some(Arc::clone(&scheduler));
             }
         }
+        self.transitional_runner
+            .attach_scheduler(Arc::clone(&scheduler));
         let service = {
             let mut slot = self.continuation_wait_service.lock();
             Arc::clone(slot.get_or_insert_with(|| {
@@ -1831,7 +1833,6 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// Exact Task 1 execution authority while this logical thread is running.
     /// Empty only before its first reclaim snapshot and while blocked.
     execution_lease: Mutex<Option<crate::kernel::objects::ThreadExecutionLease>>,
-    continuation_executor: Option<TransitionalExecutorRegistration>,
     /// Authoritative Linux TGID for a task multiplexed by HVPatch. `None` on
     /// the one-host-process-per-task native/VMM lanes.
     hvpatch_task_pid: Option<i32>,
@@ -1913,23 +1914,6 @@ impl std::ops::DerefMut for CompatibilityThreadWaiter {
     }
 }
 
-struct TransitionalExecutorRegistration {
-    scheduler: Arc<crate::kernel::Scheduler>,
-    registration: crate::kernel::ExecutorRegistration,
-}
-
-impl TransitionalExecutorRegistration {
-    fn registration(&self) -> &crate::kernel::ExecutorRegistration {
-        &self.registration
-    }
-}
-
-impl Drop for TransitionalExecutorRegistration {
-    fn drop(&mut self) {
-        let _ = self.scheduler.unregister_executor(&self.registration);
-    }
-}
-
 struct BlockingWaitReclaim {
     old_slot: Option<carrick_hal::SlotId>,
     single_threaded_process: bool,
@@ -1967,39 +1951,56 @@ impl Drop for VcpuLeaseGuard {
     }
 }
 
-#[derive(Debug, Default)]
-struct TransitionalSchedulerKick {
-    binding: Mutex<Option<crate::kernel::ExecutorBinding>>,
+struct OwnerThreadEngine<E> {
+    engine: E,
+    armed: bool,
+    cleanup: fn(&mut E),
 }
 
-impl crate::kernel::ExecutorKick for TransitionalSchedulerKick {
-    fn try_bind(&self, binding: crate::kernel::ExecutorBinding) -> bool {
-        let mut current = self.binding.lock();
-        if current.is_some() {
-            return false;
-        }
-        *current = Some(binding);
-        true
-    }
-
-    fn unbind(&self, binding: crate::kernel::ExecutorBinding) {
-        let mut current = self.binding.lock();
-        if *current == Some(binding) {
-            *current = None;
+impl<E: ThreadedEngine> OwnerThreadEngine<E> {
+    fn new(engine: E) -> Self {
+        Self {
+            engine,
+            armed: true,
+            cleanup: ThreadedEngine::destroy_vcpu_on_thread_exit,
         }
     }
+}
 
-    fn deliver_exact(&self, token: crate::kernel::ExecutorKickToken) -> bool {
-        self.binding.lock().is_some_and(|binding| {
-            binding.executor() == token.executor()
-                && binding.executor_epoch() == token.executor_epoch()
-                && binding.thread() == token.thread()
-                && binding.generation() == token.generation()
-        })
+impl<E> OwnerThreadEngine<E> {
+    #[cfg(test)]
+    fn for_test(engine: E, cleanup: fn(&mut E)) -> Self {
+        Self {
+            engine,
+            armed: true,
+            cleanup,
+        }
     }
 
-    fn current_binding(&self) -> Option<crate::kernel::ExecutorBinding> {
-        *self.binding.lock()
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<E> std::ops::Deref for OwnerThreadEngine<E> {
+    type Target = E;
+
+    fn deref(&self) -> &Self::Target {
+        &self.engine
+    }
+}
+
+impl<E> std::ops::DerefMut for OwnerThreadEngine<E> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.engine
+    }
+}
+
+impl<E> Drop for OwnerThreadEngine<E> {
+    fn drop(&mut self) {
+        if self.armed {
+            (self.cleanup)(&mut self.engine);
+        }
     }
 }
 
@@ -2082,7 +2083,6 @@ where
             kernel_thread,
             guest_execution: None,
             execution_lease: Mutex::new(None),
-            continuation_executor: None,
             hvpatch_task_pid,
             linux_tid,
             fatal_image_generation,
@@ -3292,15 +3292,6 @@ where
             )
         })?;
         let (scheduler, service) = directory.continuation_services(context.kernel());
-        if self.continuation_executor.is_none() {
-            let registration = scheduler
-                .register_executor(Arc::new(TransitionalSchedulerKick::default()))
-                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-            self.continuation_executor = Some(TransitionalExecutorRegistration {
-                scheduler: Arc::clone(&scheduler),
-                registration,
-            });
-        }
 
         let capture = {
             let lease = self.execution_lease.lock();
@@ -3441,11 +3432,14 @@ where
             }
         };
         carrick_hal::vcpu_sched::set_current_lease(new_vcpu_lease);
-        let executor = self.continuation_executor.as_ref().ok_or_else(|| {
-            RuntimeError::Configuration("continuation executor vanished".to_owned())
+        let executor = continuation::TransitionalDedicatedRunner::current_executor_registration()
+            .ok_or_else(|| {
+            RuntimeError::Configuration(
+                "continuation resumed outside a bounded runner worker".to_owned(),
+            )
         })?;
         let mut lease = scheduler
-            .take_transitional_lease(executor.registration(), thread.key())
+            .take_transitional_lease(&executor, thread.key())
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let (current_mm, current_asid) = lease
             .task_state_authority()
@@ -3470,6 +3464,13 @@ where
                 .rebind_to_slot(new_vcpu_lease.slot, &cpu)
                 .map_err(RuntimeError::Trap)?;
             let _ = self.registry.unpark_vcpu(self.this_tid);
+        }
+        if !continuation::TransitionalDedicatedRunner::publish_current_hardware_kick(Box::new(
+            engine.kick_handle(),
+        )) {
+            return Err(RuntimeError::Configuration(
+                "resumed continuation has no worker-owned kick destination".to_owned(),
+            ));
         }
         let fresh = context
             .task_binding()
@@ -3549,15 +3550,6 @@ where
             RuntimeError::Configuration("HVPatch quantum yield lost Kernel context".to_owned())
         })?;
         let (scheduler, _service) = directory.continuation_services(context.kernel());
-        if self.continuation_executor.is_none() {
-            let registration = scheduler
-                .register_executor(Arc::new(TransitionalSchedulerKick::default()))
-                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-            self.continuation_executor = Some(TransitionalExecutorRegistration {
-                scheduler: Arc::clone(&scheduler),
-                registration,
-            });
-        }
         let thread = self.kernel_thread.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("HVPatch quantum lost Kernel thread".to_owned())
         })?;
@@ -3612,12 +3604,14 @@ where
         engine
             .audit_executor_boundary()
             .map_err(RuntimeError::Trap)?;
-        let executor = self
-            .continuation_executor
-            .as_ref()
-            .ok_or_else(|| RuntimeError::Configuration("quantum executor vanished".to_owned()))?;
+        let executor = continuation::TransitionalDedicatedRunner::current_executor_registration()
+            .ok_or_else(|| {
+            RuntimeError::Configuration(
+                "quantum resumed outside a bounded runner worker".to_owned(),
+            )
+        })?;
         let lease = scheduler
-            .take_transitional_lease(executor.registration(), thread.key())
+            .take_transitional_lease(&executor, thread.key())
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         if kernel.process_exiting() || kernel.clone_admission_terminal_cancelled() {
             *self.execution_lease.lock() = Some(lease);
@@ -3668,6 +3662,13 @@ where
                 .rebind_to_slot(new_vcpu_lease.slot, &cpu)
                 .map_err(RuntimeError::Trap)?;
             let _ = self.registry.unpark_vcpu(self.this_tid);
+        }
+        if !continuation::TransitionalDedicatedRunner::publish_current_hardware_kick(Box::new(
+            engine.kick_handle(),
+        )) {
+            return Err(RuntimeError::Configuration(
+                "quantum resume has no worker-owned kick destination".to_owned(),
+            ));
         }
         *self.execution_lease.lock() = Some(lease);
         Ok(true)
@@ -5041,7 +5042,7 @@ fn trap_watchdog_decision(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_vcpu_until_exit<E: ThreadedEngine + 'static>(
     kernel: Kernel,
-    mut engine: E,
+    engine: E,
     registry: Arc<ThreadRegistry>,
     futex: Arc<FutexTable>,
     platform_futex: Arc<dyn PlatformFutex>,
@@ -5056,6 +5057,7 @@ pub(crate) async fn run_vcpu_until_exit<E: ThreadedEngine + 'static>(
 where
     E::SiblingSpec: 'static,
 {
+    let mut engine = OwnerThreadEngine::new(engine);
     // This must wrap the whole run, not only clone-thread closures: an
     // hvpatch process leader may begin without a lease, park, acquire one on
     // wake, and then exit.  Before this guard those late leases leaked until
@@ -5086,7 +5088,7 @@ where
     // Entered BEFORE `register_vcpu` below, so a thread is a census member for
     // strictly longer than it holds a vCPU lease — the whole point.
     let guest_execution = kernel.guest_executors.enter(kernel_thread.clone());
-    let mut state = ThreadRuntimeState::new(
+    let mut state: ThreadRuntimeState<E> = ThreadRuntimeState::new(
         registry,
         futex,
         platform_futex,
@@ -5151,7 +5153,7 @@ where
     // Stamp this thread's tid into TPIDR_EL1 for the EL1 gettid fast path (main
     // thread at boot; each worker at spawn). Re-stamped after fork/exec below.
     stamp_guest_tid(
-        &engine,
+        &*engine,
         state.this_tid,
         &state.registry,
         kernel.hvpatch_process.as_ref().map(|_| state.linux_tid),
@@ -5236,7 +5238,7 @@ where
                     if let Some(outcome) = service_signals_threaded(
                         &kernel,
                         signal_context,
-                        &mut engine,
+                        &mut *engine,
                         state.this_tid,
                         state.fatal_image_generation,
                         None,
@@ -5277,7 +5279,7 @@ where
                     if let Some(outcome) = service_signals_threaded(
                         &kernel,
                         signal_context,
-                        &mut engine,
+                        &mut *engine,
                         state.this_tid,
                         state.fatal_image_generation,
                         guest_entry_syscall_retval,
@@ -5347,7 +5349,7 @@ where
                     if let Some(outcome) = service_signals_threaded(
                         &kernel,
                         &signal_context,
-                        &mut engine,
+                        &mut *engine,
                         state.this_tid,
                         state.fatal_image_generation,
                         None,
@@ -5463,7 +5465,7 @@ where
                         // Upgrade from the shared protection metadata (LTP
                         // mmap05 / roprotect probe).
                         let si_code =
-                            signal::upgrade_protection_si_code(&engine, signum, si_code, si_addr);
+                            signal::upgrade_protection_si_code(&*engine, signum, si_code, si_addr);
                         let interrupted_pc = if from_el0_direct { Some(elr) } else { None };
                         let fault_context = kernel
                             .dispatcher
@@ -5476,7 +5478,7 @@ where
                         if let Some(outcome) = deliver_fault_signal(
                             &kernel,
                             &fault_context,
-                            &mut engine,
+                            &mut *engine,
                             state.this_tid,
                             state.fatal_image_generation,
                             signum,
@@ -5535,7 +5537,7 @@ where
                     // live VMA denying the access. Upgrade from the shared
                     // protection metadata (LTP mmap05 / roprotect probe).
                     let si_code =
-                        signal::upgrade_protection_si_code(&engine, signum, si_code, fault_addr);
+                        signal::upgrade_protection_si_code(&*engine, signum, si_code, fault_addr);
                     let interrupted_pc = Some(engine.current_pc()?);
                     let fault_context = kernel
                         .dispatcher
@@ -5548,7 +5550,7 @@ where
                     if let Some(outcome) = deliver_fault_signal(
                         &kernel,
                         &fault_context,
-                        &mut engine,
+                        &mut *engine,
                         state.this_tid,
                         state.fatal_image_generation,
                         signum,
@@ -6189,7 +6191,7 @@ where
             if let Some(outcome) = service_signals_threaded(
                 &kernel,
                 signal_context,
-                &mut engine,
+                &mut *engine,
                 state.this_tid,
                 state.fatal_image_generation,
                 last_syscall_retval,
@@ -6685,6 +6687,7 @@ where
         engine.destroy_vcpu_on_thread_exit();
     }
     trace_hvpatch_thread_teardown(&kernel, state.this_tid, 7);
+    engine.disarm();
     result
 }
 
@@ -7509,21 +7512,24 @@ mod tests {
     }
 
     #[test]
-    fn transitional_executor_registration_unregisters_on_repeated_drop() {
+    fn transitional_worker_registration_unregisters_on_repeated_drop() {
         let dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().expect("task context");
         let scheduler = Arc::new(crate::kernel::Scheduler::new(Arc::clone(context.kernel())));
         let baseline = scheduler.registered_executor_count();
-        for _ in 0..256 {
-            let registration = scheduler
-                .register_executor(Arc::new(TransitionalSchedulerKick::default()))
-                .expect("register transitional executor");
-            let owned = TransitionalExecutorRegistration {
-                scheduler: Arc::clone(&scheduler),
-                registration,
-            };
+        for _ in 0..64 {
+            let runner = continuation::TransitionalDedicatedRunner::with_worker_limit(1)
+                .expect("one transitional worker");
+            runner.attach_scheduler(Arc::clone(&scheduler));
+            runner
+                .spawn(async {
+                    continuation::TransitionalDedicatedRunner::current_executor_id()
+                        .expect("worker executor")
+                })
+                .wait()
+                .expect("logical job");
             assert_eq!(scheduler.registered_executor_count(), baseline + 1);
-            drop(owned);
+            drop(runner);
             assert_eq!(scheduler.registered_executor_count(), baseline);
         }
     }

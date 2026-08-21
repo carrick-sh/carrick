@@ -2246,3 +2246,37 @@ fn hvpatch_flock_shared_and_exclusive_semantics() {
     // Now OFD 1 can acquire exclusive
     assert_eq!(locks.try_flock(file.clone(), 0x1000, true), Ok(()));
 }
+
+#[test]
+fn splice_block_captures_output_slot_and_rejects_same_number_reuse() {
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().expect("context");
+    let files = context.resources().files();
+    let ids = crate::kernel::ObjectIdRegistry::new();
+    let number = crate::kernel::FileSlotNumber::for_open_fd(8).expect("fd 8");
+    files.install(
+        number,
+        Arc::new(crate::kernel::FileDescription::regular(
+            ids.file_description_id().expect("old description"),
+        )),
+        false,
+    );
+    let outcome = super::super::resources::with_captured_resources(&context, || {
+        dispatcher.splice_host_output_wait(8, -1, None, false)
+    });
+    let authority = match outcome {
+        DispatchOutcome::WaitOnFds { fds, .. } => {
+            assert_eq!(fds.logical_authorities_for_test().len(), 1);
+            fds.logical_authorities_for_test()[0]
+        }
+        other => panic!("expected splice wait, got {other:?}"),
+    };
+    files.install(
+        number,
+        Arc::new(crate::kernel::FileDescription::regular(
+            ids.file_description_id().expect("successor description"),
+        )),
+        false,
+    );
+    assert!(!files.validate_slot_authority(authority));
+}

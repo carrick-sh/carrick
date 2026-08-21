@@ -738,12 +738,56 @@ use fd_table::*;
 #[derive(Debug, Clone)]
 pub struct WaitFdGuard(#[allow(dead_code)] HostFdRef);
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InternalWaitKind {
+    CarrierControl,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InternalWaitAuthority {
+    kind: InternalWaitKind,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WaitFdAuthority {
+    Empty,
+    Missing,
+    Logical(Vec<crate::kernel::objects::FileSlotAuthority>),
+    Internal(InternalWaitAuthority),
+}
+
+impl WaitFdAuthority {
+    pub(crate) fn logical(authority: crate::kernel::objects::FileSlotAuthority) -> Self {
+        Self::Logical(vec![authority])
+    }
+
+    pub(crate) fn internal(kind: InternalWaitKind) -> Self {
+        static NEXT_INTERNAL_WAIT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        Self::Internal(InternalWaitAuthority {
+            kind,
+            generation: NEXT_INTERNAL_WAIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct WaitFds {
     fds: Vec<crate::io_wait::WaitFd>,
     #[allow(dead_code)]
     guards: Vec<WaitFdGuard>,
-    slot_authorities: Vec<crate::kernel::objects::FileSlotAuthority>,
+    authority: WaitFdAuthority,
+}
+
+impl Default for WaitFds {
+    fn default() -> Self {
+        Self {
+            fds: Vec::new(),
+            guards: Vec::new(),
+            authority: WaitFdAuthority::Empty,
+        }
+    }
 }
 
 impl WaitFds {
@@ -758,12 +802,20 @@ impl WaitFds {
                 .map(|(fd, events)| crate::io_wait::WaitFd::raw(fd, events))
                 .collect(),
             guards: Vec::new(),
-            slot_authorities: Vec::new(),
+            authority: WaitFdAuthority::Missing,
         }
     }
 
     pub fn raw_one(fd: i32, events: i16) -> Self {
         Self::raw(vec![(fd, events)])
+    }
+
+    pub(in crate::dispatch) fn authorized_raw_one(
+        fd: i32,
+        events: i16,
+        authority: WaitFdAuthority,
+    ) -> Self {
+        Self::raw_one(fd, events).with_authority(authority)
     }
 
     pub(in crate::dispatch) fn anchored_one(
@@ -775,7 +827,7 @@ impl WaitFds {
             Some(owner) => Self {
                 fds: vec![crate::io_wait::WaitFd::anchored(fd, events)],
                 guards: vec![WaitFdGuard(owner)],
-                slot_authorities: Vec::new(),
+                authority: WaitFdAuthority::Missing,
             },
             None => Self::raw_one(fd, events),
         }
@@ -790,12 +842,27 @@ impl WaitFds {
         mut self,
         slot_authorities: Vec<crate::kernel::objects::FileSlotAuthority>,
     ) -> Self {
-        self.slot_authorities = slot_authorities;
+        self.authority = WaitFdAuthority::Logical(slot_authorities);
         self
     }
 
-    pub(crate) fn slot_authorities(&self) -> &[crate::kernel::objects::FileSlotAuthority] {
-        &self.slot_authorities
+    pub(crate) fn with_authority(mut self, authority: WaitFdAuthority) -> Self {
+        self.authority = authority;
+        self
+    }
+
+    pub(crate) fn authority(&self) -> &WaitFdAuthority {
+        &self.authority
+    }
+
+    #[cfg(test)]
+    pub(crate) fn logical_authorities_for_test(
+        &self,
+    ) -> &[crate::kernel::objects::FileSlotAuthority] {
+        match &self.authority {
+            WaitFdAuthority::Logical(authorities) => authorities,
+            _ => &[],
+        }
     }
 
     pub(in crate::dispatch) fn with_guest_slots(
@@ -803,7 +870,7 @@ impl WaitFds {
         files: &crate::kernel::objects::FileTable,
         guest_fds: impl IntoIterator<Item = i32>,
     ) -> Result<Self, LinuxErrno> {
-        self.slot_authorities = guest_fds
+        let slot_authorities = guest_fds
             .into_iter()
             .filter(|fd| *fd >= 0)
             .map(|fd| {
@@ -812,6 +879,10 @@ impl WaitFds {
                 files.capture_slot_authority(number).ok_or(LINUX_EBADF)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if slot_authorities.is_empty() && !self.fds.is_empty() {
+            return Err(LINUX_EBADF);
+        }
+        self.authority = WaitFdAuthority::Logical(slot_authorities);
         Ok(self)
     }
 }
@@ -4866,6 +4937,14 @@ impl SyscallDispatcher {
         }
     }
 
+    pub(in crate::dispatch) fn captured_slot_authority(
+        &self,
+        fd: i32,
+    ) -> Option<crate::kernel::objects::FileSlotAuthority> {
+        let number = crate::kernel::FileSlotNumber::for_open_fd(fd).ok()?;
+        self.captured_file_table().capture_slot_authority(number)
+    }
+
     pub(crate) fn file_table_for_context(
         &self,
         context: &crate::kernel::KernelContext,
@@ -7351,6 +7430,7 @@ fn read_eventfd(
     state: &EventFdState,
     semaphore: bool,
     nonblocking: bool,
+    authority: WaitFdAuthority,
 ) -> DispatchOutcome {
     if length < core::mem::size_of::<LinuxEventfdValue>() {
         return DispatchOutcome::Errno {
@@ -7363,7 +7443,7 @@ fn read_eventfd(
         if current == 0 {
             let host_fd = state.read_fd.as_ref().map(|r| r.raw()).unwrap_or(-1);
             let owner = state.read_fd.clone();
-            return would_block_outcome(host_fd, libc::POLLIN, nonblocking, owner);
+            return would_block_outcome(host_fd, libc::POLLIN, nonblocking, owner, authority);
         }
         let taken = if semaphore { 1 } else { current };
         if counter
@@ -8353,6 +8433,7 @@ fn read_host_pipe_into(
     host_fd_owner: Option<HostFdRef>,
     nonblocking: bool,
     buf: &mut [u8],
+    authority: WaitFdAuthority,
 ) -> DispatchOutcome {
     // BLOCKING-IO-OK: host-backed descriptions are made O_NONBLOCK at creation
     // or adoption sites; EAGAIN becomes WaitOnFds for blocking guest fds.
@@ -8367,7 +8448,13 @@ fn read_host_pipe_into(
         // guest signal is actually pending (has_pending_for). Same discipline as
         // host_sleep_interruptible.
         if e == LINUX_EAGAIN || e == LINUX_EINTR {
-            return would_block_outcome(host_fd, libc::POLLIN, nonblocking, host_fd_owner);
+            return would_block_outcome(
+                host_fd,
+                libc::POLLIN,
+                nonblocking,
+                host_fd_owner,
+                authority,
+            );
         }
         return DispatchOutcome::Errno { errno: e };
     }
@@ -8400,6 +8487,7 @@ fn read_host_pipe(
     host_fd: i32,
     host_fd_owner: Option<HostFdRef>,
     nonblocking: bool,
+    authority: WaitFdAuthority,
 ) -> DispatchOutcome {
     if length == 0 {
         return DispatchOutcome::Returned { value: 0 };
@@ -8416,6 +8504,7 @@ fn read_host_pipe(
             host_fd_owner,
             nonblocking,
             &mut buf[..length],
+            authority,
         )
     } else {
         let mut buf = vec![0u8; length];
@@ -8426,6 +8515,7 @@ fn read_host_pipe(
             host_fd_owner,
             nonblocking,
             &mut buf,
+            authority,
         )
     }
 }
@@ -8444,6 +8534,7 @@ struct HostPipeWriteTarget {
     pipe_state: Option<(i64, usize)>,
     tid: crate::thread::ThreadId,
     sigpipe_on_epipe: bool,
+    authority: WaitFdAuthority,
 }
 
 impl<'a> HostWritePayload<'a> {
@@ -8509,6 +8600,7 @@ fn write_host_pipe_payload(
         pipe_state,
         tid,
         sigpipe_on_epipe,
+        authority,
     } = target;
 
     // Always-on, near-zero-cost detector for archive corruption. The predicate
@@ -8649,6 +8741,7 @@ fn write_host_pipe_payload(
                         libc::POLLOUT,
                         nonblocking,
                         host_fd_owner.clone(),
+                        authority.clone(),
                     );
                 }
                 if nonblocking && offset == 0 && len <= 4096 && len > room {
@@ -8657,6 +8750,7 @@ fn write_host_pipe_payload(
                         libc::POLLOUT,
                         nonblocking,
                         host_fd_owner.clone(),
+                        authority.clone(),
                     );
                 }
                 len = len.min(room);
@@ -8689,6 +8783,7 @@ fn write_host_pipe_payload(
                     libc::POLLOUT,
                     nonblocking,
                     host_fd_owner.clone(),
+                    authority.clone(),
                 );
             }
             // EINTR: interrupted by an internal host signal (e.g. SIGURG vCPU kick).
@@ -8735,6 +8830,7 @@ fn write_host_pipe_payload(
                     libc::POLLOUT,
                     nonblocking,
                     host_fd_owner.clone(),
+                    authority.clone(),
                 );
             }
             return DispatchOutcome::Errno { errno: e };
@@ -8811,6 +8907,7 @@ fn would_block_outcome(
     events: i16,
     nonblocking: bool,
     host_fd_owner: Option<HostFdRef>,
+    authority: WaitFdAuthority,
 ) -> DispatchOutcome {
     if nonblocking {
         DispatchOutcome::Errno {
@@ -8818,7 +8915,7 @@ fn would_block_outcome(
         }
     } else {
         DispatchOutcome::WaitOnFds {
-            fds: WaitFds::anchored_one(host_fd, events, host_fd_owner),
+            fds: WaitFds::anchored_one(host_fd, events, host_fd_owner).with_authority(authority),
             timeout: None,
             on_timeout: LINUX_EAGAIN.guest_retval(),
             sig_mask: carrick_abi::WaitSigMask::NONE,
