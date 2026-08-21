@@ -441,7 +441,12 @@ where
             "reserved signal was already consumed".to_owned(),
         ));
     }
-    deliver_signal_with_restart(
+    let caught = {
+        let action = reserved.action();
+        action.sa_handler != carrick_abi::LINUX_SIG_DFL
+            && action.sa_handler != carrick_abi::LINUX_SIG_IGN
+    };
+    let result = deliver_signal_with_restart(
         trap,
         dispatcher,
         context,
@@ -450,7 +455,11 @@ where
         interrupted_pc,
         continuation_restart,
         Some(&reserved),
-    )
+    );
+    if !caught {
+        reserved.restore_persistent_after_default_action();
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -503,7 +512,7 @@ where
     crate::probes::signal_deliver(tid.raw(), pending);
     // A blocked signal must not be delivered — hold it pending until the guest
     // unblocks it.
-    if dispatcher.signal_blocked(context, tid, pending) {
+    if reserved.is_none() && dispatcher.signal_blocked(context, tid, pending) {
         dispatcher.mark_signal_pending(context, tid, pending);
         return Ok(Some(PendingSignalAction::ignored()));
     }
@@ -526,7 +535,7 @@ where
                 None
             }
         });
-    if action.is_none() && dispatcher.signal_is_ignored(context, pending) {
+    if reserved.is_none() && action.is_none() && dispatcher.signal_is_ignored(context, pending) {
         return Ok(Some(PendingSignalAction::ignored()));
     }
     match action {
@@ -585,46 +594,54 @@ where
             // signum), hand it to inject_signal. Dispatcher-owned pending
             // dequeues already carried the exact payload; host-slot delivery
             // consumes only the matching per-thread queue.
-            let queued_siginfo = dequeued_siginfo
-                .or_else(|| {
-                    (!from_dispatcher)
-                        .then(|| dispatcher.take_pending_siginfo(context, tid, pending))
-                        .flatten()
-                })
-                .or_else(|| {
-                    crate::host_signal::take_child_exit_siginfo(tid.raw(), pending).map(|info| {
-                        const CLD_EXITED: i32 = 1;
-                        let ns_pid =
-                            crate::namespace::pid::host_to_ns_or_self(info.host_pid as u32) as i32;
-                        let linux_status = if info.si_code == CLD_EXITED {
-                            info.host_status
-                        } else {
-                            crate::host_signal::host_to_linux_signum(info.host_status)
-                        };
-                        crate::linux_abi::LinuxSiginfo::child_exit(
-                            pending,
-                            ns_pid,
-                            info.host_uid,
-                            info.si_code,
-                            linux_status,
+            let queued_siginfo = if reserved.is_some() {
+                dequeued_siginfo
+            } else {
+                dequeued_siginfo
+                    .or_else(|| {
+                        (!from_dispatcher)
+                            .then(|| dispatcher.take_pending_siginfo(context, tid, pending))
+                            .flatten()
+                    })
+                    .or_else(|| {
+                        crate::host_signal::take_child_exit_siginfo(tid.raw(), pending).map(
+                            |info| {
+                                const CLD_EXITED: i32 = 1;
+                                let ns_pid =
+                                    crate::namespace::pid::host_to_ns_or_self(info.host_pid as u32)
+                                        as i32;
+                                let linux_status = if info.si_code == CLD_EXITED {
+                                    info.host_status
+                                } else {
+                                    crate::host_signal::host_to_linux_signum(info.host_status)
+                                };
+                                crate::linux_abi::LinuxSiginfo::child_exit(
+                                    pending,
+                                    ns_pid,
+                                    info.host_uid,
+                                    info.si_code,
+                                    linux_status,
+                                )
+                            },
                         )
                     })
-                })
-                .or_else(|| {
-                    let sender_host = crate::host_signal::last_sender_for(pending);
-                    (sender_host > 0).then(|| {
-                        let ns_pid =
-                            crate::namespace::pid::host_to_ns_or_self(sender_host as u32) as i32;
-                        let uid = crate::cred_ipc::read_target(sender_host)
-                            .unwrap_or(carrick_abi::NsUid::ROOT);
-                        crate::linux_abi::LinuxSiginfo::kill(
-                            pending,
-                            crate::linux_abi::LINUX_SI_USER,
-                            ns_pid,
-                            uid.raw(),
-                        )
+                    .or_else(|| {
+                        let sender_host = crate::host_signal::last_sender_for(pending);
+                        (sender_host > 0).then(|| {
+                            let ns_pid =
+                                crate::namespace::pid::host_to_ns_or_self(sender_host as u32)
+                                    as i32;
+                            let uid = crate::cred_ipc::read_target(sender_host)
+                                .unwrap_or(carrick_abi::NsUid::ROOT);
+                            crate::linux_abi::LinuxSiginfo::kill(
+                                pending,
+                                crate::linux_abi::LINUX_SI_USER,
+                                ns_pid,
+                                uid.raw(),
+                            )
+                        })
                     })
-                });
+            };
             match trap.inject_signal(
                 pending,
                 action.sa_handler,
@@ -788,6 +805,97 @@ mod tests {
                 .raw(),
             12
         );
+    }
+
+    #[test]
+    fn reserved_ppoll_pselect_default_terminate_and_stop_ignore_restored_persistent_block() {
+        for (pid, signum, expect_terminate) in [(15_466, 10, true), (15_467, 20, false)] {
+            let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+                pid,
+                ThreadId::synthetic_for_tests(pid),
+                "reserved default action".to_owned(),
+            )
+            .expect("bootstrap input");
+            let (_kernel, context) =
+                crate::kernel::Kernel::bootstrap_root(bootstrap).expect("reserved default kernel");
+            let dispatcher = SyscallDispatcher::new();
+            let authority = context.signal_authority();
+            let signal = crate::kernel::LinuxSignal::for_signal_number(signum).expect("signal");
+            let persistent = carrick_abi::SigSet::EMPTY.with(signum);
+            authority.set_blocked(carrick_abi::SigSet::EMPTY);
+            authority.enqueue_thread_standard(signal, None);
+            let dequeued = authority
+                .take_lowest_in(carrick_abi::SigSet::EMPTY.with(signum))
+                .expect("temporary mask reserves default signal");
+            let (action_generation, action) = authority.action_with_generation(signal);
+            let reserved = crate::vcpu_loop::continuation::ReservedSignal::kernel(
+                authority.clone(),
+                dequeued,
+                action_generation,
+                action,
+                persistent,
+            );
+            authority.set_blocked(persistent);
+
+            let action = deliver_reserved_signal_with_restart(
+                &mut NoopTrap::default(),
+                &dispatcher,
+                &context,
+                Some(crate::linux_abi::LINUX_EINTR.guest_retval()),
+                ThreadId::synthetic_for_tests(pid),
+                None,
+                Some(false),
+                reserved,
+            )
+            .expect("reserved default delivery")
+            .expect("default action");
+            if expect_terminate {
+                assert_eq!(action.term_signal, Some(signum));
+                assert_eq!(action.stop_signal, None);
+            } else {
+                assert_eq!(action.term_signal, None);
+                assert_eq!(action.stop_signal, Some(signum));
+            }
+            assert_eq!(authority.blocked(), persistent);
+        }
+    }
+
+    #[test]
+    fn reserved_default_action_wins_over_concurrent_sigaction_change() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("context");
+        let authority = context.signal_authority();
+        let signum = 10;
+        let signal = crate::kernel::LinuxSignal::for_signal_number(signum).expect("SIGUSR1");
+        authority.enqueue_thread_standard(signal, None);
+        let dequeued = authority
+            .take_lowest_in(carrick_abi::SigSet::EMPTY.with(signum))
+            .expect("reserve default SIGUSR1");
+        let (action_generation, action) = authority.action_with_generation(signal);
+        let reserved = crate::vcpu_loop::continuation::ReservedSignal::kernel(
+            authority.clone(),
+            dequeued,
+            action_generation,
+            action,
+            carrick_abi::SigSet::EMPTY,
+        );
+        let mut ignored = carrick_abi::LinuxSigaction::empty();
+        ignored.sa_handler = carrick_abi::LINUX_SIG_IGN;
+        authority.install_action(signal, ignored);
+
+        let action = deliver_reserved_signal_with_restart(
+            &mut NoopTrap::default(),
+            &dispatcher,
+            &context,
+            Some(crate::linux_abi::LINUX_EINTR.guest_retval()),
+            ThreadId::synthetic_for_tests(context.thread().key().tid.raw()),
+            None,
+            Some(false),
+            reserved,
+        )
+        .expect("reserved default delivery")
+        .expect("captured default action");
+        assert_eq!(action.term_signal, Some(signum));
     }
 
     fn native_geometry() -> crate::page_profile::PageGeometry {

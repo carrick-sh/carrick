@@ -1189,7 +1189,9 @@ impl BlockedContinuation {
             WaitSigMask::Additive(extra) => masks.persistent.union(extra),
             WaitSigMask::Replace(replacement) => replacement,
         };
-        context.signal_authority().set_blocked(effective);
+        let authority = context.signal_authority();
+        authority.arm_restore_mask(Some(masks.restore_after_signal.unwrap_or(masks.persistent)));
+        authority.set_blocked(effective);
     }
 
     pub fn resume(
@@ -1405,7 +1407,10 @@ impl BlockedContinuation {
                     ContinuationCompletion::Errno(LINUX_EINTR)
                 };
                 if signal_masks.temporary.is_some() {
-                    if caught_handler {
+                    if let Some(reserved) = reserved_signal.as_ref() {
+                        signal_authority.set_blocked(reserved.effective_mask());
+                        signal_authority.arm_restore_mask(Some(reserved.persistent_restore()));
+                    } else if caught_handler {
                         signal_authority.arm_restore_mask(Some(
                             signal_masks
                                 .restore_after_signal
@@ -1549,7 +1554,10 @@ pub enum RestartDecision {
 #[derive(Clone, Copy, Debug)]
 enum ReservedSignalSource {
     Kernel(crate::kernel::objects::SignalDequeue),
-    HostSlot { tid: i32 },
+    HostSlot {
+        tid: i32,
+        dequeued: crate::kernel::objects::SignalDequeue,
+    },
 }
 
 struct ReservedSignalInner {
@@ -1576,8 +1584,8 @@ impl Drop for ReservedSignalInner {
             ReservedSignalSource::Kernel(dequeued) => {
                 self.authority.requeue_reserved(dequeued);
             }
-            ReservedSignalSource::HostSlot { tid } => {
-                crate::host_signal::publish_pending_for(tid, self.signum);
+            ReservedSignalSource::HostSlot { dequeued, .. } => {
+                self.authority.requeue_reserved(dequeued);
             }
         }
     }
@@ -1600,6 +1608,7 @@ impl std::fmt::Debug for ReservedSignal {
             .debug_struct("ReservedSignal")
             .field("signum", &self.signum())
             .field("action_generation", &self.action_generation())
+            .field("host_slot_tid", &self.host_slot_tid())
             .finish_non_exhaustive()
     }
 }
@@ -1641,7 +1650,10 @@ impl ReservedSignal {
                 ReservedSignalSource::Kernel(dequeue)
             }
             crate::kernel::objects::SignalReservationOrigin::HostSlot { tid } => {
-                ReservedSignalSource::HostSlot { tid }
+                ReservedSignalSource::HostSlot {
+                    tid,
+                    dequeued: dequeue,
+                }
             }
         };
         Self(Arc::new(ReservedSignalInner {
@@ -1690,6 +1702,18 @@ impl ReservedSignal {
 
     pub fn temporary_mask(&self) -> WaitSigMask {
         self.0.temporary
+    }
+
+    pub fn host_slot_tid(&self) -> Option<i32> {
+        match self.0.source {
+            ReservedSignalSource::HostSlot { tid, .. } => Some(tid),
+            ReservedSignalSource::Kernel(_) => None,
+        }
+    }
+
+    pub(crate) fn restore_persistent_after_default_action(&self) {
+        self.0.authority.set_blocked(self.0.persistent_restore);
+        self.0.authority.arm_restore_mask(None);
     }
 
     pub(crate) fn job_control_generation(
@@ -3344,7 +3368,7 @@ pub(crate) struct RunnerTask {
 }
 
 impl RunnerTask {
-    fn enqueue(self: &Arc<Self>) -> bool {
+    fn enqueue_inner(self: &Arc<Self>, request_preemption: bool) -> bool {
         if !self.queued.swap(true, Ordering::AcqRel) {
             if self
                 .sender
@@ -3354,11 +3378,19 @@ impl RunnerTask {
                 self.queued.store(false, Ordering::Release);
                 return false;
             }
-            if let Some(scheduler) = self.scheduler.lock().as_ref() {
+            if request_preemption && let Some(scheduler) = self.scheduler.lock().as_ref() {
                 scheduler.request_preemption();
             }
         }
         true
+    }
+
+    fn enqueue(self: &Arc<Self>) -> bool {
+        self.enqueue_inner(true)
+    }
+
+    fn enqueue_without_preemption(self: &Arc<Self>) -> bool {
+        self.enqueue_inner(false)
     }
 
     fn poll(self: &Arc<Self>) -> QuantumExit {
@@ -3628,6 +3660,33 @@ impl Drop for TransitionalRunnerPool {
 #[derive(Clone, Debug)]
 pub struct TransitionalDedicatedRunner {
     pool: Arc<TransitionalRunnerPool>,
+}
+
+pub(crate) struct DormantRunnerSubmission {
+    task: Option<Arc<RunnerTask>>,
+}
+
+impl DormantRunnerSubmission {
+    pub(crate) fn activate(mut self) -> Result<(), TransitionalRunnerError> {
+        let task = self
+            .task
+            .take()
+            .ok_or(TransitionalRunnerError::TaskFailed)?;
+        if task.enqueue_without_preemption() {
+            Ok(())
+        } else {
+            task.fail_boundary();
+            Err(TransitionalRunnerError::TaskFailed)
+        }
+    }
+}
+
+impl Drop for DormantRunnerSubmission {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.fail_boundary();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -3904,6 +3963,26 @@ impl TransitionalDedicatedRunner {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
+        let (receipt, dormant) = self.try_spawn_dormant(future)?;
+        let task = dormant
+            .task
+            .as_ref()
+            .ok_or(TransitionalRunnerError::TaskFailed)?;
+        if let Some(scheduler) = task.scheduler.lock().as_ref() {
+            scheduler.request_preemption();
+        }
+        dormant.activate()?;
+        Ok(receipt)
+    }
+
+    pub(crate) fn try_spawn_dormant<F, T>(
+        &self,
+        future: F,
+    ) -> Result<(LogicalTaskReceipt<T>, DormantRunnerSubmission), TransitionalRunnerError>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
         if self
             .pool
             .reject_next_submission
@@ -3924,13 +4003,13 @@ impl TransitionalDedicatedRunner {
             completion: completion.clone(),
             scheduler: Arc::clone(&self.pool.scheduler),
         });
-        if !task.enqueue() {
-            return Err(TransitionalRunnerError::TaskFailed);
-        }
-        Ok(LogicalTaskReceipt {
-            receiver,
-            completion,
-        })
+        Ok((
+            LogicalTaskReceipt {
+                receiver,
+                completion,
+            },
+            DormantRunnerSubmission { task: Some(task) },
+        ))
     }
 
     #[cfg(test)]
@@ -5699,7 +5778,7 @@ mod tests {
     }
 
     #[test]
-    fn host_slot_signal_is_reserved_under_replace_mask_and_requeued_if_abandoned() {
+    fn host_slot_signal_is_reserved_and_cancelled_into_exact_kernel_ownership() {
         let (_kernel, context) = bootstrap(15_369_3);
         let generation = publish(&context, 0x708);
         let signal = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
@@ -5727,8 +5806,109 @@ mod tests {
         drop(event);
         assert_eq!(
             crate::host_signal::take_pending_for(tid),
-            10,
-            "abandoned exact reservation returns to its host slot"
+            0,
+            "imported host ownership is not duplicated back into the lossy host bitmask"
+        );
+        let replay = context
+            .signal_authority()
+            .reserve_deliverable_for_wait(WaitSigMask::Replace(SigSet::EMPTY))
+            .expect("abandoned reservation remains exact in Kernel pending state");
+        assert_eq!(replay.signum(), 10);
+        assert_eq!(replay.action(), action);
+    }
+
+    #[test]
+    fn realtime_host_slot_import_preserves_fifo_multiplicity_and_exact_cancellation_requeue() {
+        let (kernel, context) = bootstrap(15_468);
+        let generation = publish(&context, 0x913);
+        drop(kernel);
+        let rt_a = crate::kernel::LinuxSignal::for_signal_number(32).expect("SIGRTMIN");
+        let rt_b = crate::kernel::LinuxSignal::for_signal_number(33).expect("SIGRTMIN+1");
+        for signal in [rt_a, rt_b] {
+            let mut action = carrick_abi::LinuxSigaction::empty();
+            action.sa_handler = 0x9000 + signal.raw() as u64;
+            context.signal_authority().install_action(signal, action);
+        }
+        let first =
+            crate::linux_abi::LinuxSiginfo::kill(32, crate::linux_abi::LINUX_SI_TKILL, 101, 201);
+        let second =
+            crate::linux_abi::LinuxSiginfo::kill(32, crate::linux_abi::LINUX_SI_TKILL, 102, 202);
+        let other =
+            crate::linux_abi::LinuxSiginfo::kill(33, crate::linux_abi::LINUX_SI_TKILL, 103, 203);
+        let action_a = context.signal_authority().action(rt_a);
+        let action_b = context.signal_authority().action(rt_b);
+        context.thread().update_signal_state(|state| {
+            state.record_routed_siginfo(rt_a, first);
+            state.record_routed_siginfo(rt_a, second);
+            state.record_routed_siginfo(rt_b, other);
+            state.record_pending_action(rt_a, action_a);
+            state.record_pending_action(rt_a, action_a);
+            state.record_pending_action(rt_b, action_b);
+        });
+        let tid = context.thread().key().tid.raw();
+        crate::host_signal::publish_pending_for(tid, 32);
+        crate::host_signal::publish_pending_for(tid, 32);
+        crate::host_signal::publish_pending_for(tid, 33);
+
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::empty(),
+                timeout: None,
+                on_timeout: 0,
+                sig_mask: WaitSigMask::NONE,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("suspended RT continuation");
+        let event = SignalReadinessProbe::from_continuation(&continuation)
+            .event()
+            .expect("first RT readiness");
+        let reserved = event.reserved_signal().expect("first RT reservation");
+        assert_eq!(reserved.signum(), 32);
+        assert_eq!(reserved.siginfo(), Some(first));
+        assert_eq!(reserved.host_slot_tid(), Some(tid));
+        let result = continuation
+            .resume(event, &context)
+            .expect("resume first RT interruption");
+        drop(result);
+
+        let replay = context
+            .signal_authority()
+            .reserve_deliverable_for_wait(WaitSigMask::NONE)
+            .expect("cancelled first RT requeues exactly");
+        let replay = ReservedSignal::from_kernel_reservation(context.signal_authority(), replay);
+        assert_eq!(replay.siginfo(), Some(first));
+        assert!(replay.consume());
+        let second_reserved = context
+            .signal_authority()
+            .reserve_deliverable_for_wait(WaitSigMask::NONE)
+            .expect("second same-signum RT instance remains queued");
+        let second_reserved =
+            ReservedSignal::from_kernel_reservation(context.signal_authority(), second_reserved);
+        assert_eq!(second_reserved.signum(), 32);
+        assert_eq!(second_reserved.siginfo(), Some(second));
+        assert!(second_reserved.consume());
+
+        let next = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::empty(),
+                timeout: None,
+                on_timeout: 0,
+                sig_mask: WaitSigMask::NONE,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("next suspended RT continuation");
+        let next_event = SignalReadinessProbe::from_continuation(&next)
+            .event()
+            .expect("other RT signum readiness");
+        let next_reserved = next_event.reserved_signal().expect("other RT reservation");
+        assert_eq!(next_reserved.signum(), 33);
+        assert_eq!(next_reserved.siginfo(), Some(other));
+        assert!(
+            context
+                .thread()
+                .update_signal_state(|state| state.pending_actions().is_empty())
         );
     }
 
@@ -5954,6 +6134,15 @@ mod tests {
             .resume(event, &context)
             .expect("replacement resume");
         assert_eq!(result.restart(), RestartDecision::NoRestart);
+        assert_eq!(context.signal_authority().blocked(), SigSet::EMPTY);
+        assert_eq!(
+            context.signal_authority().armed_restore_mask(),
+            Some(usr1_set)
+        );
+        result
+            .reserved_signal()
+            .expect("reserved default delivery")
+            .restore_persistent_after_default_action();
         assert_eq!(context.signal_authority().blocked(), usr1_set);
 
         let (kernel, context) = bootstrap(15_371);
@@ -6415,6 +6604,177 @@ mod tests {
     }
 
     #[test]
+    fn dormant_bootstrap_preempts_only_after_scheduler_publication_and_both_jobs_progress() {
+        #[derive(Clone)]
+        struct CountingKick(Arc<AtomicUsize>);
+        impl carrick_hal::VcpuKickDyn for CountingKick {
+            fn kick(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (kernel, incumbent_context) = bootstrap(15_463);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let incumbent_generation = publish(&incumbent_context, 0x910);
+        enqueue_root(&scheduler, &incumbent_context, incumbent_generation);
+        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
+        runner.attach_scheduler(Arc::clone(&scheduler));
+        let kicks = Arc::new(AtomicUsize::new(0));
+        let incumbent_kicks = Arc::clone(&kicks);
+        let incumbent_scheduler = Arc::clone(&scheduler);
+        let (started_tx, started_rx) = mpsc::channel();
+        let incumbent = runner.spawn(async move {
+            let executor = TransitionalDedicatedRunner::current_executor_registration()
+                .expect("incumbent worker registration");
+            let running = incumbent_scheduler
+                .take(&executor)
+                .expect("claim incumbent compute task");
+            assert!(TransitionalDedicatedRunner::publish_current_hardware_kick(
+                Box::new(CountingKick(incumbent_kicks.clone()))
+            ));
+            started_tx.send(()).expect("incumbent started");
+            while incumbent_kicks.load(Ordering::Acquire) == 0 {
+                std::hint::spin_loop();
+            }
+            incumbent_scheduler
+                .settle_runnable_successor(running)
+                .expect("incumbent yields after exact hardware kick");
+            1_u8
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("incumbent is running");
+
+        let bootstrap = incumbent_context
+            .kernel()
+            .reserve_fork(
+                &incumbent_context,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                "bootstrap competitor".to_owned(),
+                None,
+            )
+            .expect("reserve bootstrap competitor")
+            .prepare_reference(ThreadId::synthetic_for_tests(15_464))
+            .expect("prepare bootstrap competitor")
+            .commit()
+            .expect("publish bootstrap competitor")
+            .into_parts()
+            .expect("start bootstrap competitor")
+            .0;
+        let bootstrap_generation = publish(&bootstrap, 0x911);
+        let bootstrap_scheduler = Arc::clone(&scheduler);
+        let (receipt, dormant) = runner
+            .try_spawn_dormant(async move {
+                let executor = TransitionalDedicatedRunner::current_executor_registration()
+                    .expect("bootstrap worker registration");
+                let running = bootstrap_scheduler
+                    .take(&executor)
+                    .expect("claim published bootstrap task");
+                bootstrap_scheduler
+                    .settle_runnable_successor(running)
+                    .expect("settle bootstrap quantum");
+                2_u8
+            })
+            .expect("dormant bootstrap submission");
+        assert_eq!(kicks.load(Ordering::SeqCst), 0);
+        scheduler
+            .wake(bootstrap.thread().key())
+            .expect("publish exact bootstrap scheduler row");
+        scheduler.request_preemption();
+        assert_eq!(
+            kicks.load(Ordering::SeqCst),
+            1,
+            "the now-visible bootstrap competitor kicks the exact incumbent"
+        );
+        dormant.activate().expect("activate published bootstrap");
+        assert_eq!(incumbent.wait().expect("incumbent progress"), 1);
+        assert_eq!(receipt.wait().expect("bootstrap progress"), 2);
+        assert_eq!(bootstrap_generation.raw(), 1);
+    }
+
+    #[test]
+    fn failed_bootstrap_publication_drops_dormant_job_without_preemption() {
+        #[derive(Clone)]
+        struct CountingKick(Arc<AtomicUsize>);
+        impl carrick_hal::VcpuKickDyn for CountingKick {
+            fn kick(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (kernel, incumbent_context) = bootstrap(15_465);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let incumbent_generation = publish(&incumbent_context, 0x912);
+        enqueue_root(&scheduler, &incumbent_context, incumbent_generation);
+        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
+        runner.attach_scheduler(Arc::clone(&scheduler));
+        let kicks = Arc::new(AtomicUsize::new(0));
+        let incumbent_kicks = Arc::clone(&kicks);
+        let release = Arc::new(AtomicBool::new(false));
+        let incumbent_release = Arc::clone(&release);
+        let incumbent_scheduler = Arc::clone(&scheduler);
+        let (started_tx, started_rx) = mpsc::channel();
+        let incumbent = runner.spawn(async move {
+            let executor = TransitionalDedicatedRunner::current_executor_registration()
+                .expect("incumbent worker registration");
+            let running = incumbent_scheduler
+                .take(&executor)
+                .expect("claim incumbent");
+            assert!(TransitionalDedicatedRunner::publish_current_hardware_kick(
+                Box::new(CountingKick(incumbent_kicks))
+            ));
+            started_tx.send(()).expect("incumbent started");
+            while !incumbent_release.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            incumbent_scheduler
+                .settle_runnable_successor(running)
+                .expect("settle incumbent");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("incumbent running with hardware kick");
+        let context = incumbent_context
+            .kernel()
+            .reserve_fork(
+                &incumbent_context,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                "failed bootstrap competitor".to_owned(),
+                None,
+            )
+            .expect("reserve failed competitor")
+            .prepare_reference(ThreadId::synthetic_for_tests(15_466))
+            .expect("prepare failed competitor")
+            .commit()
+            .expect("publish failed competitor")
+            .into_parts()
+            .expect("start failed competitor")
+            .0;
+        let polled = Arc::new(AtomicUsize::new(0));
+        let task_polled = Arc::clone(&polled);
+        let (_receipt, dormant) = runner
+            .try_spawn_dormant(async move {
+                task_polled.fetch_add(1, Ordering::SeqCst);
+            })
+            .expect("dormant submission");
+        let generation = publish(&context, 0x912);
+        context
+            .thread()
+            .fail_runnable_generation(
+                generation,
+                crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
+            )
+            .expect("publication failpoint");
+        assert!(scheduler.wake(context.thread().key()).is_err());
+        drop(dormant);
+        assert_eq!(polled.load(Ordering::SeqCst), 0);
+        assert_eq!(kicks.load(Ordering::SeqCst), 0);
+        assert!(!scheduler.need_resched());
+        release.store(true, Ordering::Release);
+        incumbent.wait().expect("incumbent exits without a kick");
+    }
+
+    #[test]
     fn executor_identity_is_owned_by_worker_not_logical_job() {
         let (kernel, _context) = bootstrap(15_453);
         let scheduler = Arc::new(Scheduler::new(kernel));
@@ -6633,17 +6993,31 @@ mod tests {
             .expect("runner lookup");
         assert!(bootstrap_guard < runner_lookup);
         for required in [
-            "runner.try_spawn(future)",
+            "runner.try_spawn_dormant(future)",
             "prepared.fail_exact()",
             "prepared.scheduler.wake",
+            "prepared.scheduler.request_preemption()",
             "prepared.disarm()",
             "gate.open()",
+            "dormant.activate()",
+            "drop(dormant)",
         ] {
             assert!(
                 launch.contains(required),
                 "bootstrap handoff misses {required}"
             );
         }
+        let publish = launch
+            .find("prepared.scheduler.wake")
+            .expect("scheduler publication");
+        let preempt = launch
+            .find("prepared.scheduler.request_preemption()")
+            .expect("post-publication preemption");
+        let gate = launch.find("gate.open()").expect("runner gate open");
+        let activate = launch
+            .find("dormant.activate()")
+            .expect("dormant activation");
+        assert!(publish < preempt && preempt < gate && gate < activate);
         assert!(
             !launch.contains("future.as_mut().poll"),
             "bootstrap pthread must never poll the guest execution future"

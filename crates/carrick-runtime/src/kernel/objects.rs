@@ -2325,6 +2325,12 @@ impl ThreadSignalState {
         siginfo
     }
 
+    fn take_all_routed_siginfos(&mut self, signal: LinuxSignal) -> Vec<LinuxSiginfo> {
+        self.routed_siginfos
+            .remove(&signal)
+            .map_or_else(Vec::new, |entries| entries.into_iter().collect())
+    }
+
     pub fn record_pending_action(&mut self, signal: LinuxSignal, action: LinuxSigaction) {
         self.pending_actions
             .entry(signal)
@@ -5651,16 +5657,38 @@ impl SignalAuthority {
         let actions = self.sighand.actions.lock();
         let host_inserted = host_slot.and_then(|(tid, signum)| {
             let signal = LinuxSignal::for_signal_number(signum).ok()?;
-            let inserted = !thread.pending().contains(signum);
-            thread.enqueue_standard(signal, None);
+            let inserted = if signum >= 32 {
+                let siginfos = thread.take_all_routed_siginfos(signal);
+                if siginfos.is_empty() {
+                    let _ = thread.take_pending_action(signal);
+                    thread.enqueue_realtime(signal, None);
+                } else {
+                    for siginfo in siginfos {
+                        let _ = thread.take_pending_action(signal);
+                        thread.enqueue_realtime(signal, Some(siginfo));
+                    }
+                }
+                true
+            } else {
+                let inserted = !thread.pending().contains(signum);
+                let siginfo = thread.take_routed_siginfo(signal);
+                let _ = thread.take_pending_action(signal);
+                thread.enqueue_standard(signal, siginfo);
+                inserted
+            };
             self.thread.publish_signal_state(&thread);
             inserted.then_some((tid, signum))
         });
-        let persistent_restore = thread.blocked();
-        let effective_mask = match temporary {
-            WaitSigMask::Additive(extra) => persistent_restore.union(extra),
-            WaitSigMask::Replace(replacement) => replacement,
-        };
+        let live_mask = thread.blocked();
+        let armed_restore = thread.armed_restore_mask();
+        let persistent_restore = armed_restore.unwrap_or(live_mask);
+        let effective_mask = armed_restore.map_or_else(
+            || match temporary {
+                WaitSigMask::Additive(extra) => persistent_restore.union(extra),
+                WaitSigMask::Replace(replacement) => replacement,
+            },
+            |_| live_mask,
+        );
         let mask_generation = self.thread.revision.load();
         let action_generation = self.sighand.revision.load();
         loop {
