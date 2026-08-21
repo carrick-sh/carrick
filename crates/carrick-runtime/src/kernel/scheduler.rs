@@ -495,6 +495,14 @@ pub struct SubmissionAuthority {
 }
 
 impl SubmissionAuthority {
+    pub(crate) const fn thread_key(&self) -> ThreadKey {
+        self.key.thread
+    }
+
+    pub(crate) const fn generation(&self) -> ExecutionGeneration {
+        self.key.generation
+    }
+
     pub fn admit_descendant(
         &self,
         thread: ThreadKey,

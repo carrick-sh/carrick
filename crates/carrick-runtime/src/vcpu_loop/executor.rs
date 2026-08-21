@@ -17,7 +17,7 @@ use crate::kernel::objects::{
 };
 use crate::kernel::{
     ExecutorBinding, ExecutorKick, ExecutorKickToken, ExecutorRegistration, MmId, RunnableThread,
-    Scheduler,
+    Scheduler, SchedulerError, SubmissionAuthority,
 };
 use crate::trap::TrapError;
 
@@ -55,7 +55,11 @@ pub trait PersistentExecutor: 'static {
 
     fn load(&mut self, task: &RunnableTask<'_, Self::TaskBinding>) -> Result<(), TrapError>;
 
-    fn run_until_boundary(&mut self, need_resched: &AtomicBool) -> Result<ExecutorExit, TrapError>;
+    fn run_until_boundary(
+        &mut self,
+        need_resched: &AtomicBool,
+        submission: &ExecutorSubmissionContext<'_>,
+    ) -> Result<ExecutorExit, TrapError>;
 
     fn take_cpu_receipt(&mut self) -> ExecutorCpuReceipt;
 
@@ -83,6 +87,98 @@ pub trait PersistentTaskBinding {
     fn load_identity(&self) -> TaskLoadIdentity;
 
     fn validate_task_state(&self, state: &MigratableTaskState) -> Result<(), TrapError>;
+
+    /// Move any legacy binding-retained scheduler authority into the worker
+    /// before the backend sees this binding. New callers should publish roots
+    /// through `ExecutorPool::submit_root`, which is pool-owned from the start.
+    fn take_submission_authority(&self) -> Option<SubmissionAuthority> {
+        None
+    }
+}
+
+#[derive(Debug)]
+struct RetainedSubmissionAuthority {
+    thread: ThreadKey,
+    generation: ExecutionGeneration,
+    authority: SubmissionAuthority,
+}
+
+#[derive(Debug, Default)]
+struct SubmissionAuthorityDirectory(Mutex<Vec<RetainedSubmissionAuthority>>);
+
+impl SubmissionAuthorityDirectory {
+    fn publish(
+        &self,
+        scheduler: &Scheduler,
+        thread: Arc<crate::kernel::Thread>,
+        authority: SubmissionAuthority,
+    ) -> Result<(), SchedulerError> {
+        let key = (authority.thread_key(), authority.generation());
+        let mut entries = self.0.lock();
+        if entries
+            .iter()
+            .any(|entry| (entry.thread, entry.generation) == key)
+        {
+            return Err(crate::kernel::RunQueueError::SubmissionRejected.into());
+        }
+        authority.publish(scheduler, thread)?;
+        entries.push(RetainedSubmissionAuthority {
+            thread: key.0,
+            generation: key.1,
+            authority,
+        });
+        Ok(())
+    }
+
+    fn publish_descendant(
+        &self,
+        scheduler: &Scheduler,
+        parent: &SubmissionAuthority,
+        thread: Arc<crate::kernel::Thread>,
+        generation: ExecutionGeneration,
+    ) -> Result<(), SchedulerError> {
+        let authority = parent.admit_descendant(thread.key(), generation)?;
+        self.publish(scheduler, thread, authority)
+    }
+
+    fn take(
+        &self,
+        thread: ThreadKey,
+        generation: ExecutionGeneration,
+    ) -> Option<SubmissionAuthority> {
+        let mut entries = self.0.lock();
+        let index = entries
+            .iter()
+            .position(|entry| entry.thread == thread && entry.generation == generation)?;
+        Some(entries.swap_remove(index).authority)
+    }
+
+    fn retire_all(&self) {
+        self.0.lock().clear();
+    }
+}
+
+pub struct ExecutorSubmissionContext<'a> {
+    scheduler: &'a Scheduler,
+    authorities: &'a SubmissionAuthorityDirectory,
+    current: Option<&'a SubmissionAuthority>,
+}
+
+impl ExecutorSubmissionContext<'_> {
+    pub fn publish_descendant(
+        &self,
+        thread: Arc<crate::kernel::Thread>,
+        generation: ExecutionGeneration,
+    ) -> Result<(), TrapError> {
+        let current = self.current.ok_or_else(|| {
+            TrapError::Hypervisor(
+                "running task has no exact descendant-submission authority".to_owned(),
+            )
+        })?;
+        self.authorities
+            .publish_descendant(self.scheduler, current, thread, generation)
+            .map_err(|error| TrapError::Hypervisor(error.to_string()))
+    }
 }
 
 pub trait TaskBindingResolver<B>: Send + Sync + 'static {
@@ -505,6 +601,8 @@ struct WorkerKick {
     receipts: Arc<ReceiptLog>,
     #[cfg(test)]
     delivery_validation_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    delivery_receipt_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 impl WorkerKick {
@@ -515,12 +613,19 @@ impl WorkerKick {
             receipts,
             #[cfg(test)]
             delivery_validation_gate: Mutex::new(None),
+            #[cfg(test)]
+            delivery_receipt_gate: Mutex::new(None),
         }
     }
 
     #[cfg(test)]
     fn install_delivery_validation_gate(&self, gate: Arc<std::sync::Barrier>) {
         *self.delivery_validation_gate.lock() = Some(gate);
+    }
+
+    #[cfg(test)]
+    fn install_delivery_receipt_gate(&self, gate: Arc<std::sync::Barrier>) {
+        *self.delivery_receipt_gate.lock() = Some(gate);
     }
 }
 
@@ -554,7 +659,11 @@ impl ExecutorKick for WorkerKick {
             gate.wait();
         }
         self.need_resched.store(true, Ordering::Release);
-        drop(current);
+        #[cfg(test)]
+        if let Some(gate) = self.delivery_receipt_gate.lock().clone() {
+            gate.wait();
+            gate.wait();
+        }
         self.receipts.record(
             token.executor(),
             ExecutorPoolEvent::KickDelivered {
@@ -562,6 +671,7 @@ impl ExecutorKick for WorkerKick {
                 generation: token.generation(),
             },
         );
+        drop(current);
         true
     }
 
@@ -602,15 +712,25 @@ struct WorkerChannels {
     startup: mpsc::Sender<StartupStatus>,
 }
 
+struct WorkerRuntime<'a> {
+    registration: &'a ExecutorRegistration,
+    kick: &'a Arc<WorkerKick>,
+    boundary: &'a WorkerBoundaryAudit,
+    receipts: &'a Arc<ReceiptLog>,
+    control: &'a PoolControl,
+}
+
 #[derive(Debug)]
 struct PoolControl {
     usable_workers: std::sync::atomic::AtomicUsize,
+    authorities: SubmissionAuthorityDirectory,
 }
 
 impl PoolControl {
     fn new(workers: usize) -> Self {
         Self {
             usable_workers: std::sync::atomic::AtomicUsize::new(workers),
+            authorities: SubmissionAuthorityDirectory::default(),
         }
     }
 
@@ -627,6 +747,7 @@ where
     >,
 {
     scheduler: Arc<Scheduler>,
+    control: Arc<PoolControl>,
     handles: Vec<WorkerHandle>,
     receipts: Arc<ReceiptLog>,
     _factory: std::marker::PhantomData<F>,
@@ -816,6 +937,7 @@ where
 
         Ok(Self {
             scheduler,
+            control,
             handles,
             receipts,
             _factory: std::marker::PhantomData,
@@ -873,6 +995,17 @@ where
                 message: failures.join("; "),
             })
         }
+    }
+
+    pub fn submit_root(
+        &self,
+        thread: Arc<crate::kernel::Thread>,
+        generation: ExecutionGeneration,
+    ) -> Result<(), SchedulerError> {
+        let authority = self.scheduler.admit_root(thread.key(), generation)?;
+        self.control
+            .authorities
+            .publish(&self.scheduler, thread, authority)
     }
 }
 
@@ -988,10 +1121,13 @@ where
                 &scheduler,
                 &resolver,
                 &mut backend,
-                &registration,
-                &kick,
-                &boundary,
-                &receipts,
+                WorkerRuntime {
+                    registration: &registration,
+                    kick: &kick,
+                    boundary: &boundary,
+                    receipts: &receipts,
+                    control: &control,
+                },
             ),
             Ok(WorkerCommand::Stop) | Err(_) => Ok(()),
             Ok(WorkerCommand::Initialize) => {
@@ -1023,7 +1159,7 @@ where
     if startup_sent
         && failure.is_some()
         && control.retire_failed_worker()
-        && let Err(drain_error) = terminal_drain(&scheduler, &registration, &receipts)
+        && let Err(drain_error) = terminal_drain(&scheduler, &registration, &receipts, &control)
     {
         if let Some(existing) = &mut failure {
             existing.push_str("; ");
@@ -1054,7 +1190,9 @@ fn terminal_drain(
     scheduler: &Scheduler,
     registration: &ExecutorRegistration,
     receipts: &ReceiptLog,
+    control: &PoolControl,
 ) -> Result<(), String> {
+    control.authorities.retire_all();
     scheduler
         .clear_executor_binding(registration)
         .map_err(|error| error.to_string())?;
@@ -1081,15 +1219,19 @@ fn run_executor_loop<F, R>(
     scheduler: &Arc<Scheduler>,
     resolver: &Arc<R>,
     backend: &mut F,
-    registration: &ExecutorRegistration,
-    kick: &Arc<WorkerKick>,
-    boundary: &WorkerBoundaryAudit,
-    receipts: &Arc<ReceiptLog>,
+    runtime: WorkerRuntime<'_>,
 ) -> Result<(), String>
 where
     F: PersistentExecutor,
     R: TaskBindingResolver<F::TaskBinding>,
 {
+    let WorkerRuntime {
+        registration,
+        kick,
+        boundary,
+        receipts,
+        control,
+    } = runtime;
     loop {
         let mut running = match scheduler.take(registration) {
             Ok(running) => running,
@@ -1122,6 +1264,24 @@ where
                     receipts,
                 );
                 return Err(with_settlement_error(error.to_string(), settlement));
+            }
+        };
+        let directory_authority = control.authorities.take(thread, generation);
+        let binding_authority = binding.take_submission_authority();
+        let submission_authority = match (directory_authority, binding_authority) {
+            (Some(authority), None) | (None, Some(authority)) => Some(authority),
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                let settlement = fail_running(
+                    scheduler,
+                    running,
+                    ExecutionFailure::SnapshotRestoreFailed,
+                    receipts,
+                );
+                return Err(with_settlement_error(
+                    "duplicate exact submission authority at worker claim".to_owned(),
+                    settlement,
+                ));
             }
         };
         let task = RunnableTask {
@@ -1172,8 +1332,13 @@ where
         );
 
         let exit = loop {
+            let submission = ExecutorSubmissionContext {
+                scheduler,
+                authorities: &control.authorities,
+                current: submission_authority.as_ref(),
+            };
             let attempted = catch_unwind(AssertUnwindSafe(|| {
-                backend.run_until_boundary(&kick.need_resched)
+                backend.run_until_boundary(&kick.need_resched, &submission)
             }));
             let cpu = backend.take_cpu_receipt();
             running.thread().charge_user_ns(cpu.user_ns);
@@ -1389,10 +1554,8 @@ mod tests {
 
     #[derive(Debug)]
     struct DescendantPublication {
-        scheduler: Arc<Scheduler>,
         child_thread: Arc<crate::kernel::Thread>,
         child_generation: ExecutionGeneration,
-        child_binding: Arc<FakeBinding>,
     }
 
     #[derive(Debug)]
@@ -1403,10 +1566,12 @@ mod tests {
         save_fails: AtomicBool,
         audit_fails: AtomicBool,
         entered: parking_lot::Mutex<Option<Arc<Barrier>>>,
+        resume: parking_lot::Mutex<Option<Arc<Barrier>>>,
         progress: AtomicUsize,
         load_identity: parking_lot::Mutex<Option<TaskLoadIdentity>>,
         required_continuation_sequence: parking_lot::Mutex<Option<u64>>,
         lineage_authority: parking_lot::Mutex<Option<SubmissionAuthority>>,
+        retain_lineage_authority_in_backend: AtomicBool,
         descendant: parking_lot::Mutex<Option<DescendantPublication>>,
     }
 
@@ -1419,10 +1584,12 @@ mod tests {
                 save_fails: AtomicBool::new(false),
                 audit_fails: AtomicBool::new(false),
                 entered: parking_lot::Mutex::new(None),
+                resume: parking_lot::Mutex::new(None),
                 progress: AtomicUsize::new(0),
                 load_identity: parking_lot::Mutex::new(None),
                 required_continuation_sequence: parking_lot::Mutex::new(None),
                 lineage_authority: parking_lot::Mutex::new(None),
+                retain_lineage_authority_in_backend: AtomicBool::new(false),
                 descendant: parking_lot::Mutex::new(None),
             })
         }
@@ -1487,6 +1654,10 @@ mod tests {
                 )));
             }
             Ok(())
+        }
+
+        fn take_submission_authority(&self) -> Option<SubmissionAuthority> {
+            self.lineage_authority.lock().take()
         }
     }
 
@@ -1571,6 +1742,7 @@ mod tests {
         owner: HostThreadId,
         create_call: usize,
         current: Option<(ThreadKey, ExecutionGeneration, Arc<FakeBinding>)>,
+        retained_lineage_authority: Option<SubmissionAuthority>,
         owner_dirty_cleanup: Option<Box<dyn FnOnce()>>,
         credentials: u64,
         restart_state: u64,
@@ -1592,6 +1764,7 @@ mod tests {
         fn run_until_boundary(
             &mut self,
             _need_resched: &AtomicBool,
+            _submission: &super::ExecutorSubmissionContext<'_>,
         ) -> Result<ExecutorExit, TrapError> {
             panic!("audit-only backend cannot run a task")
         }
@@ -1635,6 +1808,7 @@ mod tests {
                 owner: thread::current().id(),
                 create_call: call,
                 current: None,
+                retained_lineage_authority: None,
                 owner_dirty_cleanup: None,
                 credentials: 0,
                 restart_state: 0,
@@ -1674,6 +1848,12 @@ mod tests {
             self.restart_state = binding.marker + 2;
             self.mailbox = binding.marker + 3;
             self.tls = binding.marker + 4;
+            if binding
+                .retain_lineage_authority_in_backend
+                .load(Ordering::SeqCst)
+            {
+                self.retained_lineage_authority = binding.lineage_authority.lock().take();
+            }
             self.current = Some((key.0, key.1, Arc::clone(&binding)));
             self.factory
                 .record(BackendEventKind::Load, self.id, Some(key));
@@ -1683,6 +1863,7 @@ mod tests {
         fn run_until_boundary(
             &mut self,
             need_resched: &AtomicBool,
+            submission: &super::ExecutorSubmissionContext<'_>,
         ) -> Result<ExecutorExit, TrapError> {
             assert_eq!(thread::current().id(), self.owner);
             let (thread, generation, binding) = self.current.as_ref().expect("loaded task");
@@ -1692,25 +1873,16 @@ mod tests {
             if let Some(gate) = binding.entered.lock().take() {
                 gate.wait();
             }
+            if let Some(gate) = binding.resume.lock().take() {
+                gate.wait();
+            }
             if let Some(publication) = binding.descendant.lock().take() {
-                let authority = binding
-                    .lineage_authority
-                    .lock()
-                    .take()
-                    .expect("live authority");
-                let descendant = authority
-                    .admit_descendant(publication.child_thread.key(), publication.child_generation)
-                    .expect("admit descendant during closing");
-                descendant
-                    .publish(
-                        &publication.scheduler,
+                submission
+                    .publish_descendant(
                         Arc::clone(&publication.child_thread),
+                        publication.child_generation,
                     )
                     .expect("publish descendant during closing");
-                *publication.child_binding.lineage_authority.lock() = Some(descendant);
-                drop(authority);
-            } else {
-                drop(binding.lineage_authority.lock().take());
             }
             let step = {
                 let mut steps = binding.steps.lock();
@@ -2382,53 +2554,132 @@ mod tests {
         let stale_generation = running.generation();
         let gate = Arc::new(Barrier::new(2));
         kick.install_delivery_validation_gate(Arc::clone(&gate));
+        let receipt_gate = Arc::new(Barrier::new(2));
+        kick.install_delivery_receipt_gate(Arc::clone(&receipt_gate));
 
         let wake_scheduler = Arc::clone(&scheduler);
         let thread_key = context.thread().key();
         let delivery = thread::spawn(move || wake_scheduler.wake(thread_key));
         gate.wait();
 
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let probe_kick = Arc::clone(&kick);
+        let probe_ready = Arc::new(Barrier::new(2));
+        let probe_ready_thread = Arc::clone(&probe_ready);
+        let probe = thread::spawn(move || {
+            probe_ready_thread.wait();
+            probe_tx
+                .send(probe_kick.binding.try_lock().is_none())
+                .expect("publish binding-lock probe");
+        });
+        probe_ready.wait();
+        assert_eq!(
+            probe_rx.recv().expect("receive binding-lock probe"),
+            true,
+            "settlement/unbind must be blocked while delivery holds validated binding"
+        );
+        probe.join().expect("join binding-lock probe");
+
         let (successor_tx, successor_rx) = std::sync::mpsc::channel();
+        let successor_attempt = Arc::new(Barrier::new(2));
+        let successor_attempt_thread = Arc::clone(&successor_attempt);
         let settle_scheduler = Arc::clone(&scheduler);
         let settle_registration = registration.clone();
+        let settle_receipts = Arc::clone(&receipts);
         let settlement = thread::spawn(move || {
+            successor_attempt_thread.wait();
             settle_scheduler
                 .settle_runnable(running)
                 .expect("unbind and publish successor");
             let successor = settle_scheduler
                 .take(&settle_registration)
                 .expect("bind exact successor generation");
+            settle_receipts.record(
+                successor.executor(),
+                ExecutorPoolEvent::Loaded {
+                    thread: successor.thread_key(),
+                    generation: successor.generation(),
+                },
+            );
+            let successor_generation = successor.generation();
+            let successor_executor = successor.executor();
+            let successor_thread = successor.thread_key();
+            settle_scheduler
+                .settle_exited(successor)
+                .expect("settle exact successor generation");
+            settle_receipts.record(
+                successor_executor,
+                ExecutorPoolEvent::SettledExited {
+                    thread: successor_thread,
+                    generation: successor_generation,
+                },
+            );
             successor_tx
-                .send(successor)
-                .expect("publish exact successor claim");
+                .send(successor_generation)
+                .expect("publish exact successor generation");
         });
-        assert!(
-            matches!(
-                successor_rx.recv_timeout(Duration::from_millis(50)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ),
-            "settlement/rebind must serialize behind validation through flag mutation"
-        );
         gate.wait();
+        receipt_gate.wait();
+        let receipt_lock_held = kick.binding.try_lock().is_none();
+        successor_attempt.wait();
+        let early_successor = if receipt_lock_held {
+            receipt_gate.wait();
+            None
+        } else {
+            let successor = successor_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("old implementation permits successor before stale kick receipt");
+            receipt_gate.wait();
+            Some(successor)
+        };
         let disposition = delivery.join().expect("join delayed delivery").unwrap();
-        let successor = successor_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("successor claim after exact delivery mutation");
+        let successor_generation = early_successor.unwrap_or_else(|| {
+            successor_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("successor claim after exact delivery mutation")
+        });
         settlement.join().expect("join successor settlement");
 
+        assert!(
+            receipt_lock_held,
+            "causal kick receipt must publish while the exact binding lock is retained"
+        );
         assert_eq!(disposition, crate::kernel::WakeDisposition::Kicked);
-        assert_ne!(successor.generation(), stale_generation);
+        assert_ne!(successor_generation, stale_generation);
         assert!(!kick.need_resched.load(Ordering::Acquire));
-        assert!(!receipts.snapshot().iter().any(|receipt| {
-            matches!(
-                receipt.event,
-                ExecutorPoolEvent::KickDelivered { generation, .. }
-                    if generation == successor.generation()
-            )
-        }));
-        scheduler
-            .settle_exited(successor)
-            .expect("settle successor");
+        let events = receipts.snapshot();
+        let old_kick = events
+            .iter()
+            .position(|receipt| {
+                matches!(
+                    receipt.event,
+                    ExecutorPoolEvent::KickDelivered { generation, .. }
+                        if generation == stale_generation
+                )
+            })
+            .expect("old exact kick receipt");
+        let successor_loaded = events
+            .iter()
+            .position(|receipt| {
+                matches!(
+                    receipt.event,
+                    ExecutorPoolEvent::Loaded { generation, .. }
+                        if generation == successor_generation
+                )
+            })
+            .expect("successor load receipt");
+        let successor_settled = events
+            .iter()
+            .position(|receipt| {
+                matches!(
+                    receipt.event,
+                    ExecutorPoolEvent::SettledExited { generation, .. }
+                        if generation == successor_generation
+                )
+            })
+            .expect("successor settlement receipt");
+        assert!(old_kick < successor_loaded);
+        assert!(old_kick < successor_settled);
     }
 
     #[test]
@@ -2526,6 +2777,58 @@ mod tests {
             .expect("last-worker failure must not strand queued generations");
         let error = result.expect_err("backend failure remains reported");
         shutdown.join().expect("join shutdown observer");
+
+        assert!(matches!(
+            first.thread().execution_state(),
+            ThreadExecutionState::Failed { .. }
+        ));
+        assert!(matches!(
+            second.thread().execution_state(),
+            ThreadExecutionState::Failed { .. }
+        ));
+        assert_eq!(error.report().created(), 1);
+        assert_eq!(error.report().destroyed(), 1);
+        assert_eq!(error.report().joined(), 1);
+    }
+
+    #[test]
+    fn last_worker_failure_revokes_backend_retained_root_authority_before_terminal_drain() {
+        let (kernel, first) = bootstrap(14_242);
+        let second = sibling(&kernel, &first, 24_242);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let factory = Arc::new(FakeFactory::default());
+        let first_binding = FakeBinding::new(92, [Step::FailRun]);
+        let entered = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        *first_binding.entered.lock() = Some(Arc::clone(&entered));
+        *first_binding.resume.lock() = Some(Arc::clone(&resume));
+        first_binding
+            .retain_lineage_authority_in_backend
+            .store(true, Ordering::SeqCst);
+        let second_binding = FakeBinding::new(93, [Step::Exit]);
+        factory.install(&first, Arc::clone(&first_binding));
+        factory.install(&second, second_binding);
+        let first_generation = publish(&first, 92);
+        let second_generation = publish(&second, 93);
+        let first_authority = enqueue_root(&scheduler, &first, first_generation);
+        *first_binding.lineage_authority.lock() = Some(first_authority);
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        entered.wait();
+        pool.submit_root(Arc::clone(second.thread()), second_generation)
+            .expect("pool owns queued second-root authority before failure");
+        resume.wait();
+
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let shutdown = thread::spawn(move || {
+            shutdown_tx
+                .send(pool.shutdown())
+                .expect("publish retained-authority shutdown result");
+        });
+        let result = shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("failure cleanup must revoke its exact authority before terminal drain");
+        let error = result.expect_err("backend failure remains reported");
+        shutdown.join().expect("join retained-authority shutdown");
 
         assert!(matches!(
             first.thread().execution_state(),
@@ -2690,23 +2993,17 @@ mod tests {
         let root_generation = publish(&root, 100);
         let child_generation = publish(&child, 110);
         let grandchild_generation = publish(&grandchild, 120);
-        let root_authority = enqueue_root(&scheduler, &root, root_generation);
-        *root_binding.lineage_authority.lock() = Some(root_authority);
         *root_binding.descendant.lock() = Some(DescendantPublication {
-            scheduler: Arc::clone(&scheduler),
             child_thread: Arc::clone(child.thread()),
             child_generation,
-            child_binding: Arc::clone(&child_binding),
         });
-        // Child picks up its retained authority from the fake worker and uses it
-        // to publish the real process-lineage grandchild while Closing.
         *child_binding.descendant.lock() = Some(DescendantPublication {
-            scheduler: Arc::clone(&scheduler),
             child_thread: Arc::clone(grandchild.thread()),
             child_generation: grandchild_generation,
-            child_binding: Arc::clone(&grandchild_binding),
         });
         let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        pool.submit_root(Arc::clone(root.thread()), root_generation)
+            .expect("pool retains root authority before publication");
         let report = pool.shutdown().expect("recursive drain");
         assert!(matches!(
             root.thread().execution_state(),
