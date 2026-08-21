@@ -753,13 +753,19 @@ pub(crate) struct InternalWaitAuthority {
 pub(crate) enum WaitFdAuthority {
     Empty,
     Missing,
-    Logical(Vec<crate::kernel::objects::FileSlotAuthority>),
+    Logical {
+        strict: Vec<crate::kernel::objects::FileSlotAuthority>,
+        watched: Vec<crate::kernel::objects::FileSlotAuthority>,
+    },
     Internal(InternalWaitAuthority),
 }
 
 impl WaitFdAuthority {
     pub(crate) fn logical(authority: crate::kernel::objects::FileSlotAuthority) -> Self {
-        Self::Logical(vec![authority])
+        Self::Logical {
+            strict: vec![authority],
+            watched: Vec::new(),
+        }
     }
 
     pub(crate) fn internal(kind: InternalWaitKind) -> Self {
@@ -842,7 +848,10 @@ impl WaitFds {
         mut self,
         slot_authorities: Vec<crate::kernel::objects::FileSlotAuthority>,
     ) -> Self {
-        self.authority = WaitFdAuthority::Logical(slot_authorities);
+        self.authority = WaitFdAuthority::Logical {
+            strict: slot_authorities,
+            watched: Vec::new(),
+        };
         self
     }
 
@@ -860,7 +869,17 @@ impl WaitFds {
         &self,
     ) -> &[crate::kernel::objects::FileSlotAuthority] {
         match &self.authority {
-            WaitFdAuthority::Logical(authorities) => authorities,
+            WaitFdAuthority::Logical { strict, .. } => strict,
+            _ => &[],
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn watched_authorities_for_test(
+        &self,
+    ) -> &[crate::kernel::objects::FileSlotAuthority] {
+        match &self.authority {
+            WaitFdAuthority::Logical { watched, .. } => watched,
             _ => &[],
         }
     }
@@ -882,7 +901,35 @@ impl WaitFds {
         if slot_authorities.is_empty() && !self.fds.is_empty() {
             return Err(LINUX_EBADF);
         }
-        self.authority = WaitFdAuthority::Logical(slot_authorities);
+        self.authority = WaitFdAuthority::Logical {
+            strict: slot_authorities,
+            watched: Vec::new(),
+        };
+        Ok(self)
+    }
+
+    pub(crate) fn with_redispatch_and_watched_slots(
+        mut self,
+        files: &crate::kernel::objects::FileTable,
+        strict_fds: impl IntoIterator<Item = i32>,
+        watched_fds: impl IntoIterator<Item = i32>,
+    ) -> Result<Self, LinuxErrno> {
+        let capture = |fds: Vec<i32>| {
+            fds.into_iter()
+                .filter(|fd| *fd >= 0)
+                .map(|fd| {
+                    let number =
+                        crate::kernel::FileSlotNumber::for_open_fd(fd).map_err(|_| LINUX_EBADF)?;
+                    files.capture_slot_authority(number).ok_or(LINUX_EBADF)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let strict = capture(strict_fds.into_iter().collect())?;
+        let watched = capture(watched_fds.into_iter().collect())?;
+        if strict.is_empty() {
+            return Err(LINUX_EBADF);
+        }
+        self.authority = WaitFdAuthority::Logical { strict, watched };
         Ok(self)
     }
 }

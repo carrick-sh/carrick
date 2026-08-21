@@ -9,7 +9,7 @@ use arc_swap::ArcSwap;
 use carrick_abi::keyring::{KeyRequestDefault, KeySerial};
 use carrick_abi::{
     LINUX_RLIM_INFINITY, LinuxGuestAbi, LinuxResource, LinuxRlimit, LinuxSigaction,
-    LinuxSigaltstack, LinuxSiginfo, NsGid, NsUid, SigSet,
+    LinuxSigaltstack, LinuxSiginfo, NsGid, NsUid, SigSet, WaitSigMask,
 };
 use carrick_hal::ThreadId;
 use carrick_hal::threaded::GuestCpuState;
@@ -4945,6 +4945,39 @@ impl Thread {
         self.revision.publish();
     }
 
+    /// Fail the exact initial Runnable generation when bootstrap ownership
+    /// cannot be transferred to a runner. This path has no executor lease and
+    /// is valid only before scheduler publication.
+    pub fn fail_runnable_generation(
+        &self,
+        expected: ExecutionGeneration,
+        reason: ExecutionFailure,
+    ) -> Result<(), ThreadExecutionError> {
+        let mut execution = self.execution.lock();
+        if !matches!(
+            execution.state,
+            ThreadExecutionState::Runnable { generation } if generation == expected
+        ) {
+            return Err(ThreadExecutionError::InvalidTransition {
+                operation: "fail_runnable_generation",
+                state: execution.state,
+            });
+        }
+        execution.task_state = None;
+        cancel_continuation_slot(
+            &mut execution.blocked_continuation,
+            crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
+        );
+        execution.exec_invalidation_pending = false;
+        execution.state = ThreadExecutionState::Failed {
+            generation: expected,
+            reason,
+        };
+        drop(execution);
+        self.revision.publish();
+        Ok(())
+    }
+
     fn settle_execution_lease(
         &self,
         mut lease: ThreadExecutionLease,
@@ -5370,6 +5403,71 @@ pub struct SignalDequeue {
     pub(crate) job_control_generation: Option<JobControlStopInvalidationGeneration>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalWaitReservation {
+    dequeue: SignalDequeue,
+    action: LinuxSigaction,
+    action_generation: u64,
+    effective_mask: SigSet,
+    persistent_restore: SigSet,
+    mask_generation: u64,
+    temporary: WaitSigMask,
+    origin: SignalReservationOrigin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalReservationOrigin {
+    Kernel,
+    HostSlot { tid: i32 },
+}
+
+fn is_default_ignored_signal(signum: i32) -> bool {
+    matches!(
+        signum,
+        crate::linux_abi::LINUX_SIGCHLD
+            | crate::linux_abi::LINUX_SIGURG
+            | crate::linux_abi::LINUX_SIGWINCH
+    )
+}
+
+impl SignalWaitReservation {
+    pub const fn signum(self) -> i32 {
+        self.dequeue.pending.signal.raw()
+    }
+
+    pub const fn action(self) -> LinuxSigaction {
+        self.action
+    }
+
+    pub const fn action_generation(self) -> u64 {
+        self.action_generation
+    }
+
+    pub const fn effective_mask(self) -> SigSet {
+        self.effective_mask
+    }
+
+    pub const fn persistent_restore(self) -> SigSet {
+        self.persistent_restore
+    }
+
+    pub const fn mask_generation(self) -> u64 {
+        self.mask_generation
+    }
+
+    pub const fn temporary(self) -> WaitSigMask {
+        self.temporary
+    }
+
+    pub const fn origin(self) -> SignalReservationOrigin {
+        self.origin
+    }
+
+    pub(crate) const fn dequeue(self) -> SignalDequeue {
+        self.dequeue
+    }
+}
+
 /// Exact signal leaf bundle captured from one [`super::core::KernelContext`].
 /// The facade contains operations only; all state and revisions remain in the
 /// referenced Kernel objects.
@@ -5508,6 +5606,126 @@ impl SignalAuthority {
             pending,
             job_control_generation,
         })
+    }
+
+    pub fn has_pending_in(&self, wanted: SigSet) -> bool {
+        let _generation_guard = self.task.lock_signal_generation();
+        let thread = self.thread.signal_state.lock();
+        let task = self.task_pending.queue.lock();
+        !thread
+            .pending()
+            .union(task.present())
+            .intersect(wanted)
+            .is_empty()
+    }
+
+    /// Atomically choose and reserve one signal for an interruptible wait.
+    /// Pending ownership, the live effective mask, exact action and both
+    /// generations are sampled under one canonical lock transaction. Ignored
+    /// candidates are discarded in-place and the transaction continues to the
+    /// next deliverable instance without relying on another wake edge.
+    pub fn reserve_deliverable_for_wait(
+        &self,
+        temporary: WaitSigMask,
+    ) -> Option<SignalWaitReservation> {
+        self.reserve_deliverable_for_wait_inner(temporary, None)
+    }
+
+    pub fn reserve_deliverable_for_wait_with_host_slot(
+        &self,
+        temporary: WaitSigMask,
+        tid: i32,
+        signum: i32,
+    ) -> Option<SignalWaitReservation> {
+        self.reserve_deliverable_for_wait_inner(temporary, Some((tid, signum)))
+    }
+
+    fn reserve_deliverable_for_wait_inner(
+        &self,
+        temporary: WaitSigMask,
+        host_slot: Option<(i32, i32)>,
+    ) -> Option<SignalWaitReservation> {
+        let generation_guard = self.task.lock_signal_generation();
+        let mut thread = self.thread.signal_state.lock();
+        let mut task = self.task_pending.queue.lock();
+        let actions = self.sighand.actions.lock();
+        let host_inserted = host_slot.and_then(|(tid, signum)| {
+            let signal = LinuxSignal::for_signal_number(signum).ok()?;
+            let inserted = !thread.pending().contains(signum);
+            thread.enqueue_standard(signal, None);
+            self.thread.publish_signal_state(&thread);
+            inserted.then_some((tid, signum))
+        });
+        let persistent_restore = thread.blocked();
+        let effective_mask = match temporary {
+            WaitSigMask::Additive(extra) => persistent_restore.union(extra),
+            WaitSigMask::Replace(replacement) => replacement,
+        };
+        let mask_generation = self.thread.revision.load();
+        let action_generation = self.sighand.revision.load();
+        loop {
+            let candidates = thread
+                .pending()
+                .union(task.present())
+                .difference(effective_mask);
+            let signum = candidates.lowest_signum()?;
+            let signal = LinuxSignal::for_signal_number(signum).ok()?;
+            let action = actions
+                .get(&signal)
+                .copied()
+                .unwrap_or_else(LinuxSigaction::empty);
+            let ignored = action.sa_handler == crate::linux_abi::LINUX_SIG_IGN
+                || action.sa_handler == crate::linux_abi::LINUX_SIG_DFL
+                    && is_default_ignored_signal(signum);
+            let thread_has = thread.pending().contains(signum);
+            let dequeue = if thread_has {
+                let mut pending = thread.take_lowest_in(SigSet::EMPTY.with(signum))?;
+                if pending.siginfo.is_none() {
+                    pending.siginfo = thread.take_routed_siginfo(pending.signal);
+                }
+                self.thread.publish_signal_state(&thread);
+                SignalDequeue {
+                    owner: SignalPendingOwner::Thread,
+                    pending,
+                    job_control_generation: self
+                        .task
+                        .job_control_generation_for_dequeue(pending.signal),
+                }
+            } else {
+                let pending = task.take_lowest_in(SigSet::EMPTY.with(signum))?;
+                self.task_pending.publish_queue(&task);
+                SignalDequeue {
+                    owner: SignalPendingOwner::Task,
+                    pending,
+                    job_control_generation: self
+                        .task
+                        .job_control_generation_for_dequeue(pending.signal),
+                }
+            };
+            if ignored {
+                continue;
+            }
+            drop(actions);
+            drop(task);
+            drop(thread);
+            drop(generation_guard);
+            return Some(SignalWaitReservation {
+                dequeue,
+                action,
+                action_generation,
+                effective_mask,
+                persistent_restore,
+                mask_generation,
+                temporary,
+                origin: host_inserted.map_or(SignalReservationOrigin::Kernel, |(tid, signum)| {
+                    if signum == dequeue.pending.signal.raw() {
+                        SignalReservationOrigin::HostSlot { tid }
+                    } else {
+                        SignalReservationOrigin::Kernel
+                    }
+                }),
+            });
+        }
     }
 
     /// Return an unconsumed exact reservation to the same pending owner. The

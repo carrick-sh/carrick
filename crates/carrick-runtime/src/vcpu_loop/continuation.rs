@@ -586,11 +586,14 @@ impl BlockedContinuation {
         let file_table = Arc::clone(&authority.file_table);
         let exact_slot_authorities = |fds: &WaitFds| match fds.authority() {
             WaitFdAuthority::Empty if fds.is_empty() => Ok(WaitFdAuthority::Empty),
-            WaitFdAuthority::Logical(authorities) if !authorities.is_empty() => {
-                Ok(WaitFdAuthority::Logical(authorities.clone()))
+            WaitFdAuthority::Logical { strict, watched } if !strict.is_empty() => {
+                Ok(WaitFdAuthority::Logical {
+                    strict: strict.clone(),
+                    watched: watched.clone(),
+                })
             }
             WaitFdAuthority::Internal(authority) => Ok(WaitFdAuthority::Internal(*authority)),
-            WaitFdAuthority::Empty | WaitFdAuthority::Missing | WaitFdAuthority::Logical(_) => {
+            WaitFdAuthority::Empty | WaitFdAuthority::Missing | WaitFdAuthority::Logical { .. } => {
                 Err(ContinuationBuildError::FdPinFailed)
             }
         };
@@ -1217,7 +1220,7 @@ impl BlockedContinuation {
                 fd_authority,
                 ..
             } => match fd_authority {
-                WaitFdAuthority::Logical(authorities) => authorities
+                WaitFdAuthority::Logical { strict, .. } => strict
                     .iter()
                     .all(|authority| file_table.validate_slot_authority(*authority)),
                 WaitFdAuthority::Empty | WaitFdAuthority::Internal(_) => true,
@@ -1557,7 +1560,9 @@ struct ReservedSignalInner {
     action_generation: u64,
     mask_generation: u64,
     action: carrick_abi::LinuxSigaction,
+    effective_mask: SigSet,
     persistent_restore: SigSet,
+    temporary: WaitSigMask,
     source: ReservedSignalSource,
     settlement: AtomicU8,
 }
@@ -1600,6 +1605,7 @@ impl std::fmt::Debug for ReservedSignal {
 }
 
 impl ReservedSignal {
+    #[cfg(test)]
     pub(crate) fn kernel(
         authority: crate::kernel::objects::SignalAuthority,
         dequeued: crate::kernel::objects::SignalDequeue,
@@ -1608,6 +1614,7 @@ impl ReservedSignal {
         persistent_restore: SigSet,
     ) -> Self {
         let mask_generation = authority.signal_state_generation();
+        let effective_mask = authority.blocked();
         Self(Arc::new(ReservedSignalInner {
             authority,
             signum: dequeued.pending.signal.raw(),
@@ -1616,31 +1623,39 @@ impl ReservedSignal {
             action_generation,
             mask_generation,
             action,
+            effective_mask,
             persistent_restore,
+            temporary: WaitSigMask::NONE,
             source: ReservedSignalSource::Kernel(dequeued),
             settlement: AtomicU8::new(0),
         }))
     }
 
-    fn host_slot(
+    fn from_kernel_reservation(
         authority: crate::kernel::objects::SignalAuthority,
-        tid: i32,
-        signum: i32,
-        action_generation: u64,
-        action: carrick_abi::LinuxSigaction,
-        persistent_restore: SigSet,
+        reservation: crate::kernel::objects::SignalWaitReservation,
     ) -> Self {
-        let mask_generation = authority.signal_state_generation();
+        let dequeue = reservation.dequeue();
+        let source = match reservation.origin() {
+            crate::kernel::objects::SignalReservationOrigin::Kernel => {
+                ReservedSignalSource::Kernel(dequeue)
+            }
+            crate::kernel::objects::SignalReservationOrigin::HostSlot { tid } => {
+                ReservedSignalSource::HostSlot { tid }
+            }
+        };
         Self(Arc::new(ReservedSignalInner {
             authority,
-            signum,
-            siginfo: None,
-            job_control_generation: None,
-            action_generation,
-            mask_generation,
-            action,
-            persistent_restore,
-            source: ReservedSignalSource::HostSlot { tid },
+            signum: reservation.signum(),
+            siginfo: dequeue.pending.siginfo,
+            job_control_generation: dequeue.job_control_generation,
+            action_generation: reservation.action_generation(),
+            mask_generation: reservation.mask_generation(),
+            action: reservation.action(),
+            effective_mask: reservation.effective_mask(),
+            persistent_restore: reservation.persistent_restore(),
+            temporary: reservation.temporary(),
+            source,
             settlement: AtomicU8::new(0),
         }))
     }
@@ -1667,6 +1682,14 @@ impl ReservedSignal {
 
     pub fn persistent_restore(&self) -> SigSet {
         self.0.persistent_restore
+    }
+
+    pub fn effective_mask(&self) -> SigSet {
+        self.0.effective_mask
+    }
+
+    pub fn temporary_mask(&self) -> WaitSigMask {
+        self.0.temporary
     }
 
     pub(crate) fn job_control_generation(
@@ -1935,7 +1958,6 @@ struct SignalReadinessProbe {
     observed_task_wake: u64,
     task: TaskKey,
     thread: ThreadKey,
-    persistent: SigSet,
     temporary: Option<WaitSigMask>,
     family: ContinuationFamily,
     wait_set: Option<SigSet>,
@@ -1958,7 +1980,6 @@ impl SignalReadinessProbe {
             observed_task_wake: state.authority.task_wake_generation,
             task: state.authority.task,
             thread: state.authority.thread,
-            persistent: state.signal_masks.persistent,
             temporary: state.signal_masks.temporary,
             family: continuation.family(),
             wait_set,
@@ -1981,87 +2002,49 @@ impl SignalReadinessProbe {
             return None;
         }
         let authority = context.signal_authority();
-        let pending = authority.thread_pending().union(authority.task_pending());
-        let reserve = |mut candidates: SigSet| loop {
-            let signum = candidates.lowest_signum()?;
-            let signal = crate::kernel::LinuxSignal::for_signal_number(signum).ok()?;
-            let (action_generation, action) = authority.action_with_generation(signal);
-            let disposition = match action.sa_handler {
-                carrick_abi::LINUX_SIG_IGN => crate::kernel::SignalDisposition::Ignore,
-                carrick_abi::LINUX_SIG_DFL => crate::kernel::SignalDisposition::Default,
-                _ => crate::kernel::SignalDisposition::Caught,
-            };
-            if matches!(disposition, crate::kernel::SignalDisposition::Ignore)
-                || matches!(disposition, crate::kernel::SignalDisposition::Default)
-                    && super::is_default_ignore_signal(signum)
-            {
-                let _ = authority.take_lowest_in(SigSet::EMPTY.with(signum));
-                candidates = candidates.without(signum);
-                continue;
-            }
-            let dequeued = authority.take_lowest_in(SigSet::EMPTY.with(signum))?;
-            break Some(ContinuationEvent::ReservedSignal(ReservedSignal::kernel(
-                authority.clone(),
-                dequeued,
-                action_generation,
-                action,
-                self.persistent,
-            )));
-        };
-
         let host_signum = crate::host_signal::take_pending_for(self.thread.tid.raw());
-        if host_signum != 0 {
-            let blocked = if let Some(wait_set) = self.wait_set {
-                if wait_set.contains(host_signum) {
-                    crate::host_signal::publish_pending_for(self.thread.tid.raw(), host_signum);
-                    return Some(ContinuationEvent::Ready);
-                }
-                SigSet::from_raw(self.signal_wait_block.unwrap_or(SigBlockMask::NONE).raw())
-                    .contains(host_signum)
-            } else {
-                let effective = match self.temporary {
-                    Some(WaitSigMask::Additive(extra)) => self.persistent.union(extra),
-                    Some(WaitSigMask::Replace(replacement)) => replacement,
-                    None => self.persistent,
-                };
-                effective.contains(host_signum)
-            };
-            if blocked {
-                crate::host_signal::publish_pending_for(self.thread.tid.raw(), host_signum);
-            } else if let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(host_signum) {
-                let (action_generation, action) = authority.action_with_generation(signal);
-                let ignored = action.sa_handler == carrick_abi::LINUX_SIG_IGN
-                    || action.sa_handler == carrick_abi::LINUX_SIG_DFL
-                        && super::is_default_ignore_signal(host_signum);
-                if !ignored {
-                    return Some(ContinuationEvent::ReservedSignal(
-                        ReservedSignal::host_slot(
-                            authority.clone(),
-                            self.thread.tid.raw(),
-                            host_signum,
-                            action_generation,
-                            action,
-                            self.persistent,
-                        ),
-                    ));
-                }
-            }
-        }
-
         if let Some(wait_set) = self.wait_set {
-            if pending.intersect(wait_set).lowest_signum().is_some() {
+            if host_signum != 0 && wait_set.contains(host_signum) {
+                crate::host_signal::publish_pending_for(self.thread.tid.raw(), host_signum);
+                return Some(ContinuationEvent::Ready);
+            }
+            if authority.has_pending_in(wait_set) {
                 return Some(ContinuationEvent::Ready);
             }
             let blocked =
                 SigSet::from_raw(self.signal_wait_block.unwrap_or(SigBlockMask::NONE).raw());
-            return reserve(pending.difference(blocked));
+            let reservation = if host_signum == 0 {
+                authority.reserve_deliverable_for_wait(WaitSigMask::Replace(blocked))
+            } else {
+                authority.reserve_deliverable_for_wait_with_host_slot(
+                    WaitSigMask::Replace(blocked),
+                    self.thread.tid.raw(),
+                    host_signum,
+                )
+            };
+            return reservation.map(|reservation| {
+                ContinuationEvent::ReservedSignal(ReservedSignal::from_kernel_reservation(
+                    authority,
+                    reservation,
+                ))
+            });
         }
-        let effective = match self.temporary {
-            Some(WaitSigMask::Additive(extra)) => self.persistent.union(extra),
-            Some(WaitSigMask::Replace(replacement)) => replacement,
-            None => self.persistent,
+        let temporary = self.temporary.unwrap_or(WaitSigMask::NONE);
+        let reservation = if host_signum == 0 {
+            authority.reserve_deliverable_for_wait(temporary)
+        } else {
+            authority.reserve_deliverable_for_wait_with_host_slot(
+                temporary,
+                self.thread.tid.raw(),
+                host_signum,
+            )
         };
-        reserve(pending.difference(effective))
+        reservation.map(|reservation| {
+            ContinuationEvent::ReservedSignal(ReservedSignal::from_kernel_reservation(
+                authority,
+                reservation,
+            ))
+        })
     }
 }
 
@@ -2822,9 +2805,9 @@ impl CarrierWaitService {
             fd_authority,
             ..
         } = &probe
-            && let WaitFdAuthority::Logical(slot_authorities) = fd_authority
+            && let WaitFdAuthority::Logical { strict, watched } = fd_authority
         {
-            for authority in slot_authorities {
+            for authority in strict.iter().chain(watched) {
                 let callback_weak = weak.clone();
                 let Some(subscription) = file_table.subscribe_slot_authority(
                     *authority,
@@ -3361,13 +3344,21 @@ pub(crate) struct RunnerTask {
 }
 
 impl RunnerTask {
-    fn enqueue(self: &Arc<Self>) {
+    fn enqueue(self: &Arc<Self>) -> bool {
         if !self.queued.swap(true, Ordering::AcqRel) {
-            let _ = self.sender.send(RunnerWork::Poll(Arc::clone(self)));
+            if self
+                .sender
+                .send(RunnerWork::Poll(Arc::clone(self)))
+                .is_err()
+            {
+                self.queued.store(false, Ordering::Release);
+                return false;
+            }
             if let Some(scheduler) = self.scheduler.lock().as_ref() {
                 scheduler.request_preemption();
             }
         }
+        true
     }
 
     fn poll(self: &Arc<Self>) -> QuantumExit {
@@ -3527,11 +3518,11 @@ pub(crate) fn await_vcpu_admission(
 
 impl Wake for RunnerTask {
     fn wake(self: Arc<Self>) {
-        self.enqueue();
+        let _ = self.enqueue();
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        self.enqueue();
+        let _ = self.enqueue();
     }
 }
 
@@ -3542,6 +3533,7 @@ struct TransitionalRunnerPool {
     worker_count: usize,
     next_worker: AtomicUsize,
     scheduler: Arc<Mutex<Option<Arc<Scheduler>>>>,
+    reject_next_submission: AtomicBool,
 }
 
 impl TransitionalRunnerPool {
@@ -3876,6 +3868,7 @@ impl TransitionalDedicatedRunner {
             worker_count,
             next_worker: AtomicUsize::new(0),
             scheduler: Arc::new(Mutex::new(None)),
+            reject_next_submission: AtomicBool::new(false),
         });
         for _ in 0..worker_count {
             pool.spawn_worker();
@@ -3888,6 +3881,36 @@ impl TransitionalDedicatedRunner {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
+        match self.try_spawn(future) {
+            Ok(receipt) => receipt,
+            Err(_) => {
+                let (sender, receiver) = mpsc::channel();
+                drop(sender);
+                let completion = LogicalJobCompletion::pending();
+                completion.publish();
+                LogicalTaskReceipt {
+                    receiver,
+                    completion,
+                }
+            }
+        }
+    }
+
+    pub fn try_spawn<F, T>(
+        &self,
+        future: F,
+    ) -> Result<LogicalTaskReceipt<T>, TransitionalRunnerError>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        if self
+            .pool
+            .reject_next_submission
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(TransitionalRunnerError::TaskFailed);
+        }
         let (sender, receiver) = mpsc::channel();
         let completion = LogicalJobCompletion::pending();
         let future = async move {
@@ -3901,11 +3924,20 @@ impl TransitionalDedicatedRunner {
             completion: completion.clone(),
             scheduler: Arc::clone(&self.pool.scheduler),
         });
-        task.enqueue();
-        LogicalTaskReceipt {
+        if !task.enqueue() {
+            return Err(TransitionalRunnerError::TaskFailed);
+        }
+        Ok(LogicalTaskReceipt {
             receiver,
             completion,
-        }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reject_next_submission_for_test(&self) {
+        self.pool
+            .reject_next_submission
+            .store(true, Ordering::Release);
     }
 
     pub fn topology(&self) -> TransitionalRunnerTopology {
@@ -4965,6 +4997,61 @@ mod tests {
     }
 
     #[test]
+    fn epoll_strict_owner_and_watched_source_authority_have_distinct_resume_results() {
+        let run_case = |pid: i32, replace_epfd: bool| {
+            let (kernel, context) = bootstrap(pid);
+            let generation = publish(&context, 0xa00);
+            let files = context.resources().files();
+            let epfd = install_test_fd_authority(&context, 40);
+            let watched = install_test_fd_authority(&context, 41);
+            let fds = WaitFds::empty()
+                .with_redispatch_and_watched_slots(&files, [40], [41])
+                .expect("split epoll authority");
+            let continuation = BlockedContinuation::from_dispatch_outcome(
+                DispatchOutcome::WaitOnFds {
+                    fds,
+                    timeout: None,
+                    on_timeout: 0,
+                    sig_mask: WaitSigMask::NONE,
+                },
+                capture(&context, generation, ContinuationBackend::Hvpatch),
+            )
+            .expect("epoll continuation");
+            let scheduler = Arc::new(Scheduler::new(kernel));
+            let service = CarrierWaitService::new(scheduler);
+            let mut registration = service.prepare_registration(&continuation);
+            service
+                .enroll(&mut registration)
+                .expect("enroll epoll wait");
+            let replacement = if replace_epfd { epfd } else { watched };
+            let number =
+                crate::kernel::FileSlotNumber::for_open_fd(if replace_epfd { 40 } else { 41 })
+                    .expect("replacement slot");
+            let ids = crate::kernel::ObjectIdRegistry::new();
+            files.install(
+                number,
+                Arc::new(crate::kernel::FileDescription::regular(
+                    ids.file_description_id().expect("successor description"),
+                )),
+                false,
+            );
+            let event = await_event(&service, registration.wake_token())
+                .expect("slot generation publication");
+            assert_eq!(event, ContinuationEvent::Ready);
+            assert!(!files.validate_slot_authority(replacement));
+            continuation.resume(event, &context)
+        };
+
+        let watched = run_case(15_461, false).expect("watched change recomputes epoll");
+        assert_eq!(watched.completion, ContinuationCompletion::Redispatch);
+        assert_eq!(
+            run_case(15_462, true),
+            Err(ContinuationResumeError::StaleFileSlot),
+            "strict epfd reuse is EBADF authority failure"
+        );
+    }
+
+    #[test]
     fn hvpatch_fd_wait_without_explicit_slot_authority_fails_closed() {
         let (_kernel, context) = bootstrap(15_227);
         let generation = publish(&context, 0x554);
@@ -5677,6 +5764,125 @@ mod tests {
     }
 
     #[test]
+    fn kernel_signal_reservation_is_atomic_across_two_waiters_and_two_instances() {
+        let (_kernel, context) = bootstrap(15_369_5);
+        let authority = context.signal_authority();
+        for signum in [10, 12] {
+            let signal = crate::kernel::LinuxSignal::for_signal_number(signum).expect("signal");
+            let mut action = carrick_abi::LinuxSigaction::empty();
+            action.sa_handler = 0x5000 + signum as u64;
+            authority.install_action(signal, action);
+            authority.enqueue_thread_standard(signal, None);
+        }
+        let barrier = Arc::new(Barrier::new(3));
+        let mut waiters = Vec::new();
+        for _ in 0..2 {
+            let authority = authority.clone();
+            let barrier = Arc::clone(&barrier);
+            waiters.push(thread::spawn(move || {
+                barrier.wait();
+                authority
+                    .reserve_deliverable_for_wait(WaitSigMask::NONE)
+                    .expect("one exact reservation")
+            }));
+        }
+        barrier.wait();
+        let mut reserved = waiters
+            .into_iter()
+            .map(|waiter| waiter.join().expect("reservation waiter"))
+            .collect::<Vec<_>>();
+        reserved.sort_unstable_by_key(|reservation| reservation.signum());
+        assert_eq!(
+            reserved
+                .iter()
+                .map(|reservation| reservation.signum())
+                .collect::<Vec<_>>(),
+            vec![10, 12]
+        );
+        for reservation in reserved {
+            let delivery = ReservedSignal::from_kernel_reservation(authority.clone(), reservation);
+            assert!(delivery.consume(), "exact signal delivers once");
+            assert!(!delivery.consume(), "duplicate delivery is rejected");
+        }
+        assert!(authority.thread_pending().is_empty());
+    }
+
+    #[test]
+    fn kernel_signal_reservation_linearizes_disposition_and_mask_changes() {
+        for (pid, initial_handler, replacement_handler) in [
+            (15_369_6, 0x6000, carrick_abi::LINUX_SIG_IGN),
+            (15_369_7, carrick_abi::LINUX_SIG_IGN, 0x7000),
+        ] {
+            let (_kernel, context) = bootstrap(pid);
+            let authority = context.signal_authority();
+            let signal = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+            let mut initial = carrick_abi::LinuxSigaction::empty();
+            initial.sa_handler = initial_handler;
+            authority.install_action(signal, initial);
+            authority.enqueue_thread_standard(signal, None);
+            let barrier = Arc::new(Barrier::new(3));
+            let reserve_authority = authority.clone();
+            let reserve_barrier = Arc::clone(&barrier);
+            let reserver = thread::spawn(move || {
+                reserve_barrier.wait();
+                reserve_authority.reserve_deliverable_for_wait(WaitSigMask::NONE)
+            });
+            let action_authority = authority.clone();
+            let action_barrier = Arc::clone(&barrier);
+            let changer = thread::spawn(move || {
+                action_barrier.wait();
+                let mut replacement = carrick_abi::LinuxSigaction::empty();
+                replacement.sa_handler = replacement_handler;
+                action_authority.install_action(signal, replacement);
+            });
+            barrier.wait();
+            changer.join().expect("action changer");
+            if let Some(reservation) = reserver.join().expect("reserver") {
+                let handler = reservation.action().sa_handler;
+                assert_ne!(handler, carrick_abi::LINUX_SIG_IGN);
+                assert!(handler == initial_handler || handler == replacement_handler);
+            }
+            assert!(
+                authority.thread_pending().is_empty(),
+                "the transaction either reserves the caught instance or discards the ignored instance"
+            );
+        }
+
+        let (_kernel, context) = bootstrap(15_369_8);
+        let authority = context.signal_authority();
+        let signal = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+        let mut action = carrick_abi::LinuxSigaction::empty();
+        action.sa_handler = 0x8000;
+        authority.install_action(signal, action);
+        authority.enqueue_thread_standard(signal, None);
+        let barrier = Arc::new(Barrier::new(3));
+        let reserve_authority = authority.clone();
+        let reserve_barrier = Arc::clone(&barrier);
+        let reserver = thread::spawn(move || {
+            reserve_barrier.wait();
+            reserve_authority.reserve_deliverable_for_wait(WaitSigMask::NONE)
+        });
+        let mask_authority = authority.clone();
+        let mask_barrier = Arc::clone(&barrier);
+        let masker = thread::spawn(move || {
+            mask_barrier.wait();
+            mask_authority.set_blocked(SigSet::EMPTY.with(10));
+        });
+        barrier.wait();
+        masker.join().expect("mask changer");
+        match reserver.join().expect("mask reserver") {
+            Some(reservation) => {
+                assert!(!reservation.effective_mask().contains(10));
+                assert!(authority.thread_pending().is_empty());
+            }
+            None => {
+                assert!(authority.thread_pending().contains(10));
+                assert!(authority.blocked().contains(10));
+            }
+        }
+    }
+
+    #[test]
     fn partial_blocking_write_never_restarts_after_caught_sa_restart_signal() {
         let (_kernel, context) = bootstrap(15_369_1);
         let generation = publish(&context, 0x706);
@@ -5911,6 +6117,57 @@ mod tests {
         );
         carrick_hal::VcpuScheduler::release(admission, held, carrick_hal::Yield::Blocked);
         assert_eq!(a.wait().expect("released job A"), 2);
+    }
+
+    #[test]
+    fn rejected_initial_submission_drops_engine_guard_on_bootstrap_thread() {
+        struct BootstrapProbe {
+            cleanup: mpsc::Sender<std::thread::ThreadId>,
+        }
+        fn cleanup(probe: &mut BootstrapProbe) {
+            probe
+                .cleanup
+                .send(std::thread::current().id())
+                .expect("cleanup receipt");
+        }
+        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("runner");
+        runner.reject_next_submission_for_test();
+        let bootstrap = std::thread::current().id();
+        let (tx, rx) = mpsc::channel();
+        let guarded =
+            super::super::OwnerThreadEngine::for_test(BootstrapProbe { cleanup: tx }, cleanup);
+        let result = runner.try_spawn(async move {
+            drop(guarded);
+        });
+        assert!(matches!(result, Err(TransitionalRunnerError::TaskFailed)));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("same-thread cleanup"),
+            bootstrap
+        );
+    }
+
+    #[test]
+    fn failed_initial_submission_retires_exact_runnable_without_queue_row() {
+        let (kernel, context) = bootstrap(15_460);
+        let scheduler = Scheduler::new(kernel);
+        let generation = publish(&context, 0x900);
+        assert_eq!(scheduler.queued_len(), 0);
+        context
+            .thread()
+            .fail_runnable_generation(
+                generation,
+                crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
+            )
+            .expect("exact bootstrap failure");
+        assert!(matches!(
+            context.thread().execution_state(),
+            ThreadExecutionState::Failed {
+                generation: failed,
+                reason: crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
+            } if failed == generation
+        ));
+        assert_eq!(scheduler.queued_len(), 0);
     }
 
     #[test]
@@ -6368,7 +6625,25 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("pub(crate) async fn run_vcpu_until_exit").next())
             .expect("bounded launch adapter");
-        assert!(launch.contains("submit_prepared_vcpu_future(&runner, future)"));
+        let bootstrap_guard = launch
+            .find("OwnerThreadEngine::new(engine)")
+            .expect("immediate bootstrap owner guard");
+        let runner_lookup = launch
+            .find("kernel.transitional_runner()")
+            .expect("runner lookup");
+        assert!(bootstrap_guard < runner_lookup);
+        for required in [
+            "runner.try_spawn(future)",
+            "prepared.fail_exact()",
+            "prepared.scheduler.wake",
+            "prepared.disarm()",
+            "gate.open()",
+        ] {
+            assert!(
+                launch.contains(required),
+                "bootstrap handoff misses {required}"
+            );
+        }
         assert!(
             !launch.contains("future.as_mut().poll"),
             "bootstrap pthread must never poll the guest execution future"
