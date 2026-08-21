@@ -603,10 +603,10 @@ mod threads;
 pub(crate) use quiesce::{fork_barrier, pt_barrier};
 // The threaded loop owns its backend-specific fault resolution. Native Darwin
 // reuses the architecture lowering and Linux signal-frame half below.
-use signal::deliver_fault_signal;
 pub(crate) use signal::is_default_ignore_signal;
 #[cfg(test)]
 pub(crate) use signal::upgrade_protection_si_code;
+use signal::{deliver_fault_signal, deliver_pending_signal_with_restart};
 pub(crate) use signal::{
     deliver_pending_signal, lower_el0_fault, partial_write_interrupt_outcome,
     raise_sigpipe_for_blocking_write, signal_progress_count, signal_wait_expired,
@@ -719,6 +719,13 @@ pub(crate) struct HvpatchRuntimeDirectory {
 impl HvpatchRuntimeDirectory {
     fn transitional_runner(&self) -> continuation::TransitionalDedicatedRunner {
         self.transitional_runner.clone()
+    }
+
+    fn need_resched(&self) -> bool {
+        self.scheduler
+            .lock()
+            .as_ref()
+            .is_some_and(|scheduler| scheduler.need_resched())
     }
     fn continuation_services(
         &self,
@@ -1294,6 +1301,12 @@ impl KernelState {
             .as_ref()
             .map(|directory| directory.transitional_runner())
     }
+
+    fn transitional_need_resched(&self) -> bool {
+        self.hvpatch_runtime
+            .as_ref()
+            .is_some_and(|directory| directory.need_resched())
+    }
     pub(crate) fn new(
         dispatcher: SyscallDispatcher,
         fork: Arc<dyn HostForkCoordinator>,
@@ -1835,6 +1848,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// kicks remain the prompt path; this closes the host-side/rebind interval
     /// where no vCPU run exists yet to consume one.
     observed_task_wake_generation: u64,
+    continuation_restart: Option<continuation::RestartDecision>,
     this_tid: ThreadId,
     threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
     /// The object-safe vCPU registry (the kicker). The shared loop never names
@@ -2074,6 +2088,7 @@ where
             fatal_image_generation,
             service_kernel_context: None,
             observed_task_wake_generation: 0,
+            continuation_restart: None,
             this_tid,
             threads,
             kicker,
@@ -3317,6 +3332,7 @@ where
         }
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         continuation.bind_product_futex(&self.futex);
+        continuation.install_temporary_signal_mask(context);
         let thread = self.kernel_thread.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("HVPatch continuation lost Kernel thread".to_owned())
         })?;
@@ -3378,6 +3394,9 @@ where
             self.kicker.unregister(self.this_tid);
         }
         drop(self.guest_execution.take());
+        engine
+            .audit_executor_boundary()
+            .map_err(RuntimeError::Trap)?;
         debug_assert!(scheduler.binding_for_thread(thread.key()).is_none());
 
         let event = match service
@@ -3393,6 +3412,9 @@ where
             )) => return Ok(Some(DispatchOutcome::ThreadExit { code: 0 })),
             Err(error) => return Err(RuntimeError::Configuration(error.to_string())),
         };
+        engine
+            .audit_executor_boundary()
+            .map_err(RuntimeError::Trap)?;
         if kernel.process_exiting() || kernel.clone_admission_terminal_cancelled() {
             service.retire_terminal(token);
             return Ok(Some(DispatchOutcome::ThreadExit { code: 0 }));
@@ -3423,7 +3445,7 @@ where
             RuntimeError::Configuration("continuation executor vanished".to_owned())
         })?;
         let mut lease = scheduler
-            .take_transitional_lease(executor.registration())
+            .take_transitional_lease(executor.registration(), thread.key())
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let (current_mm, current_asid) = lease
             .task_state_authority()
@@ -3453,11 +3475,22 @@ where
             .task_binding()
             .capture(self.linux_tid)
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        let result =
-            continuation::resume_continuation(&mut lease, event, &fresh).map_err(|error| {
-                RuntimeError::Configuration(format!("resume continuation: {error:?}"))
-            })?;
+        let result = match continuation::resume_continuation(&mut lease, event, &fresh) {
+            Ok(result) => result,
+            Err(continuation::ContinuationResumeError::StaleFileSlot) => {
+                *self.execution_lease.lock() = Some(lease);
+                return Ok(Some(DispatchOutcome::Errno {
+                    errno: crate::linux_abi::LINUX_EBADF,
+                }));
+            }
+            Err(error) => {
+                return Err(RuntimeError::Configuration(format!(
+                    "resume continuation: {error:?}"
+                )));
+            }
+        };
         *self.execution_lease.lock() = Some(lease);
+        self.continuation_restart = Some(result.restart());
 
         use continuation::ContinuationCompletion as Completion;
         Ok(match result.completion {
@@ -3500,6 +3533,144 @@ where
                 ))
             }
         })
+    }
+
+    async fn yield_hvpatch_quantum(
+        &mut self,
+        kernel: &Kernel,
+        engine: &mut E,
+    ) -> Result<bool, RuntimeError> {
+        let directory = kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "HVPatch quantum yield has no shared runtime directory".to_owned(),
+            )
+        })?;
+        let context = self.service_kernel_context.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("HVPatch quantum yield lost Kernel context".to_owned())
+        })?;
+        let (scheduler, _service) = directory.continuation_services(context.kernel());
+        if self.continuation_executor.is_none() {
+            let registration = scheduler
+                .register_executor(Arc::new(TransitionalSchedulerKick::default()))
+                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            self.continuation_executor = Some(TransitionalExecutorRegistration {
+                scheduler: Arc::clone(&scheduler),
+                registration,
+            });
+        }
+        let thread = self.kernel_thread.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("HVPatch quantum lost Kernel thread".to_owned())
+        })?;
+        {
+            let lease = self.execution_lease.lock();
+            thread
+                .begin_switch_out(lease.as_ref().ok_or_else(|| {
+                    RuntimeError::Configuration("quantum save lost execution lease".to_owned())
+                })?)
+                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        }
+        let single_threaded_process =
+            self.registry.live_count() == 1 && self.process_fork_barrier.is_none();
+        let cpu = if single_threaded_process {
+            let _ = self
+                .registry
+                .park_vcpu_classified(self.this_tid, crate::thread::VcpuParkClass::ReleaseSafe);
+            let cpu = engine
+                .save_shared_wait_state()
+                .map_err(RuntimeError::Trap)?;
+            self.registry.set_vm_released(true);
+            cpu
+        } else {
+            let cpu = engine.save_guest_state().map_err(RuntimeError::Trap)?;
+            let _ = self
+                .registry
+                .park_vcpu_classified(self.this_tid, crate::thread::VcpuParkClass::ReleaseSafe);
+            cpu
+        };
+        let saved = self.current_migratable_binding(cpu)?;
+        let mut lease = self.execution_lease.lock().take().ok_or_else(|| {
+            RuntimeError::Configuration("quantum settlement lost execution lease".to_owned())
+        })?;
+        lease
+            .replace_task_state(saved)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        scheduler
+            .settle_transitional_runnable(thread, lease)
+            .map_err(|(error, _lease)| RuntimeError::Configuration(error.to_string()))?;
+        if let Some(vcpu_lease) = carrick_hal::vcpu_sched::take_current_lease() {
+            carrick_hal::vcpu_sched::global()
+                .release(vcpu_lease, carrick_hal::vcpu_sched::Yield::Blocked);
+        }
+        if engine.reclaim_refreshes_kicker() {
+            self.kicker.unregister(self.this_tid);
+        }
+        drop(self.guest_execution.take());
+        engine
+            .audit_executor_boundary()
+            .map_err(RuntimeError::Trap)?;
+        continuation::yield_runner_quantum().await;
+        engine
+            .audit_executor_boundary()
+            .map_err(RuntimeError::Trap)?;
+        let executor = self
+            .continuation_executor
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Configuration("quantum executor vanished".to_owned()))?;
+        let lease = scheduler
+            .take_transitional_lease(executor.registration(), thread.key())
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        if kernel.process_exiting() || kernel.clone_admission_terminal_cancelled() {
+            *self.execution_lease.lock() = Some(lease);
+            return Ok(false);
+        }
+        if self.exec_replaced_thread_exit().is_some() {
+            *self.execution_lease.lock() = Some(lease);
+            return Ok(false);
+        }
+        self.guest_execution = Some(
+            kernel
+                .guest_executors
+                .enter(self.kernel_thread.as_ref().map(Arc::clone)),
+        );
+        let new_vcpu_lease = loop {
+            if let Some(lease) = carrick_hal::vcpu_sched::global().acquire_timeout(
+                self.this_tid.raw() as u64,
+                None,
+                Duration::from_millis(50),
+            ) {
+                break lease;
+            }
+            if self.fork_is_quiescing() {
+                self.park_if_fork_quiescing();
+            }
+        };
+        carrick_hal::vcpu_sched::set_current_lease(new_vcpu_lease);
+        let (current_mm, current_asid) = lease
+            .task_state_authority()
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let abi = <E::Arch as carrick_hal::GuestArch>::linux_guest_abi();
+        let cpu = lease
+            .task_state_for_restore(abi, 1, current_mm, current_asid)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?
+            .cpu
+            .clone();
+        if engine.reclaim_refreshes_kicker() {
+            let claimed = self.registry.unpark_vcpu(self.this_tid);
+            let restore = if single_threaded_process || claimed {
+                engine.rebind_shared_wait_state(new_vcpu_lease.slot, &cpu)
+            } else {
+                engine.rebind_to_slot(new_vcpu_lease.slot, &cpu)
+            };
+            restore.map_err(RuntimeError::Trap)?;
+            self.register_vcpu(engine);
+        } else {
+            engine
+                .rebind_to_slot(new_vcpu_lease.slot, &cpu)
+                .map_err(RuntimeError::Trap)?;
+            let _ = self.registry.unpark_vcpu(self.this_tid);
+        }
+        *self.execution_lease.lock() = Some(lease);
+        Ok(true)
     }
 
     fn service_threaded_syscall(
@@ -4711,41 +4882,66 @@ pub(crate) enum VcpuLoopLaunch {
 }
 
 pub(crate) enum VcpuThreadHandle {
-    Host(std::thread::JoinHandle<()>),
+    Host {
+        handle: std::thread::JoinHandle<()>,
+        completion: continuation::LogicalJobCompletion,
+    },
     Job(continuation::LogicalTaskReceipt<Result<VcpuLoopOutcome, RuntimeError>>),
 }
 
 impl VcpuThreadHandle {
     fn is_finished(&self) -> bool {
         match self {
-            Self::Host(handle) => handle.is_finished(),
+            Self::Host { completion, .. } => completion.is_finished(),
             Self::Job(receipt) => receipt.is_finished(),
         }
     }
 
     fn host_thread_id(&self) -> Option<std::thread::ThreadId> {
         match self {
-            Self::Host(handle) => Some(handle.thread().id()),
+            Self::Host { handle, .. } => Some(handle.thread().id()),
             Self::Job(_) => None,
         }
     }
 
     fn diagnostic_name(&self) -> String {
         match self {
-            Self::Host(handle) => handle.thread().name().unwrap_or("<unnamed>").to_owned(),
+            Self::Host { handle, .. } => handle.thread().name().unwrap_or("<unnamed>").to_owned(),
             Self::Job(_) => "transitional-vcpu-job".to_owned(),
         }
     }
 
     fn join(self) -> Result<(), RuntimeError> {
         match self {
-            Self::Host(handle) => handle.join().map_err(|_| {
+            Self::Host { handle, .. } => handle.join().map_err(|_| {
                 RuntimeError::Trap(TrapError::Hypervisor(
                     "HVPatch vCPU bootstrap pthread panicked".to_owned(),
                 ))
             }),
             Self::Job(receipt) => receipt
                 .wait()
+                .map_err(|error| {
+                    RuntimeError::Trap(TrapError::Hypervisor(format!(
+                        "HVPatch logical vCPU job failed: {error}"
+                    )))
+                })?
+                .map(|_| ()),
+        }
+    }
+
+    fn completion(&self) -> continuation::LogicalJobCompletion {
+        match self {
+            Self::Host { completion, .. } => completion.clone(),
+            Self::Job(receipt) => receipt.completion(),
+        }
+    }
+
+    fn finish_completed(self, current: continuation::JobId) -> Result<(), RuntimeError> {
+        match self {
+            Self::Host { .. } => Ok(()),
+            Self::Job(receipt) if receipt.completion().id() == current => Ok(()),
+            Self::Job(receipt) => receipt
+                .try_take()
                 .map_err(|error| {
                     RuntimeError::Trap(TrapError::Hypervisor(format!(
                         "HVPatch logical vCPU job failed: {error}"
@@ -5045,6 +5241,7 @@ where
                         state.fatal_image_generation,
                         None,
                         Some(interrupted_pc),
+                        None,
                         traps,
                     )? {
                         return Ok(outcome);
@@ -5084,6 +5281,7 @@ where
                         state.this_tid,
                         state.fatal_image_generation,
                         guest_entry_syscall_retval,
+                        None,
                         None,
                         traps,
                     )? {
@@ -5154,6 +5352,7 @@ where
                         state.fatal_image_generation,
                         None,
                         Some(pc),
+                        None,
                         traps,
                     )? {
                         return Ok(outcome);
@@ -5529,18 +5728,13 @@ where
                     last_syscall_retval = Some(state.complete_returned(&mut engine, value)?);
                 }
                 DispatchOutcome::SchedulerYield => {
-                    // Preserve Linux's runnable-thread semantics under a
-                    // bounded M:N backend: surrender the scarce vCPU lease to
-                    // an already-queued guest before competing to reacquire it.
-                    // `park_vcpu_for_blocking_wait` is a no-op for unbounded
-                    // backends, retaining their historical host-only yield.
-                    let reclaim = state.park_vcpu_for_blocking_wait(
-                        &mut engine,
-                        crate::thread::VcpuParkClass::ReleaseSafe,
-                    )?;
-                    std::thread::yield_now();
-                    state.resume_vcpu_after_blocking_wait(&mut engine, reclaim)?;
                     last_syscall_retval = Some(state.complete_returned(&mut engine, 0)?);
+                    if kernel.dispatcher.execution_backend()
+                        == crate::page_profile::ExecutionBackend::HvPatch
+                        && !state.yield_hvpatch_quantum(&kernel, &mut engine).await?
+                    {
+                        return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
+                    }
                 }
                 DispatchOutcome::Errno { errno } => {
                     last_syscall_retval = Some(state.complete_errno(&mut engine, errno)?);
@@ -5783,7 +5977,7 @@ where
                         path,
                         argv,
                         env,
-                    )? {
+                    ).await? {
                         return Ok(outcome);
                     }
                 }
@@ -5986,6 +6180,7 @@ where
             // Signal delivery. A signal targeted at THIS tid (guest tgkill/tkill)
             // takes priority; otherwise a process-directed signal in the global
             // slot is deliverable by any thread.
+            let continuation_restart = state.continuation_restart.take();
             let signal_context = state.service_kernel_context.as_ref().ok_or_else(|| {
                 RuntimeError::Configuration(
                     "post-syscall signal delivery lost its exact Kernel context".to_owned(),
@@ -5999,9 +6194,15 @@ where
                 state.fatal_image_generation,
                 last_syscall_retval,
                 signal_interrupted_pc,
+                continuation_restart,
                 traps,
             )? {
                 return Ok(outcome);
+            }
+            if kernel.transitional_need_resched()
+                && !state.yield_hvpatch_quantum(&kernel, &mut engine).await?
+            {
+                return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
             }
             guest_entry_syscall_retval = last_syscall_retval;
         }
@@ -6084,9 +6285,30 @@ where
                 None => None,
             };
 
-            if let Err(error) = state.terminate_siblings_for_process_exit(&kernel) {
+            let yielded_terminal_worker =
+                continuation::TransitionalDedicatedRunner::current_job().is_some();
+            if yielded_terminal_worker {
+                let _ = engine.save_guest_state().map_err(RuntimeError::Trap)?;
+                if let Some(vcpu_lease) = carrick_hal::vcpu_sched::take_current_lease() {
+                    carrick_hal::vcpu_sched::global()
+                        .release(vcpu_lease, carrick_hal::vcpu_sched::Yield::Exited);
+                }
+                if engine.reclaim_refreshes_kicker() {
+                    state.kicker.unregister(state.this_tid);
+                }
+                drop(state.guest_execution.take());
+                engine
+                    .audit_executor_boundary()
+                    .map_err(RuntimeError::Trap)?;
+            }
+            if let Err(error) = state.terminate_siblings_for_process_exit(&kernel).await {
                 tracing::error!(%error, "terminal owner could not drain sibling vCPUs");
                 std::process::abort();
+            }
+            if yielded_terminal_worker {
+                engine
+                    .audit_executor_boundary()
+                    .map_err(RuntimeError::Trap)?;
             }
             if std::env::var_os("CARRICK_CORE_FAILPOINT")
                 .is_some_and(|value| value == "sibling-drain")
@@ -6625,16 +6847,18 @@ fn service_signals_threaded<E: ThreadedEngine>(
     fatal_image_generation: u64,
     last_syscall_retval: Option<i64>,
     interrupted_pc: Option<u64>,
+    continuation_restart: Option<continuation::RestartDecision>,
     traps: usize,
 ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
     {
-        if let Some(action) = deliver_pending_signal(
+        if let Some(action) = deliver_pending_signal_with_restart(
             engine,
             &kernel.dispatcher,
             context,
             last_syscall_retval,
             this_tid,
             interrupted_pc,
+            continuation_restart.map(|decision| decision == continuation::RestartDecision::Restart),
         )? {
             if let Some(signum) = action.stop_signal {
                 if kernel.hvpatch_process.is_some() {

@@ -387,6 +387,29 @@ pub(crate) fn deliver_pending_signal<T>(
 where
     T: SyscallTrap,
 {
+    deliver_pending_signal_with_restart(
+        trap,
+        dispatcher,
+        context,
+        last_syscall_retval,
+        tid,
+        interrupted_pc,
+        None,
+    )
+}
+
+pub(crate) fn deliver_pending_signal_with_restart<T>(
+    trap: &mut T,
+    dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
+    last_syscall_retval: Option<i64>,
+    tid: ThreadId,
+    interrupted_pc: Option<u64>,
+    continuation_restart: Option<bool>,
+) -> Result<Option<PendingSignalAction>, RuntimeError>
+where
+    T: SyscallTrap,
+{
     // Drain the cross-process explicit-signal ring into pending state, so the
     // normal delivery below runs each with the sender's identity.
     dispatcher.drain_xsignals_process_directed(context);
@@ -452,10 +475,12 @@ where
                 last_syscall_retval == Some(crate::linux_abi::LINUX_EINTR.guest_retval());
             let handler_wants_restart = sa_flags.contains(carrick_abi::LinuxSaFlags::RESTART);
             let syscall_restartable = trap.last_syscall_nr().is_some_and(is_restartable_syscall);
-            let restart_syscall = at_syscall_boundary
-                && retval_is_eintr
-                && handler_wants_restart
-                && syscall_restartable;
+            let restart_syscall = continuation_restart.unwrap_or({
+                at_syscall_boundary
+                    && retval_is_eintr
+                    && handler_wants_restart
+                    && syscall_restartable
+            });
             // Publish WHICH predicate decided. All four live in one boolean, so
             // from outside "the guest saw EINTR under SA_RESTART" is otherwise a
             // dead end — you cannot tell a missing syscall from the restartable
@@ -572,7 +597,10 @@ mod tests {
 
     static PTRACE_SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    struct NoopTrap;
+    #[derive(Default)]
+    struct NoopTrap {
+        restart: bool,
+    }
 
     impl crate::trap::SyscallTrap for NoopTrap {
         fn next_syscall(&mut self) -> Result<Option<crate::trap::RawSyscall>, TrapError> {
@@ -609,9 +637,10 @@ mod tests {
             _saved_sigmask: u64,
             _fault_siginfo: Option<(i32, u64)>,
             _queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
-            _restart_syscall: bool,
+            restart_syscall: bool,
         ) -> Result<(), TrapError> {
-            Err(TrapError::UnsupportedPlatform)
+            self.restart = restart_syscall;
+            Ok(())
         }
 
         fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
@@ -651,7 +680,7 @@ mod tests {
                 tid,
                 crate::linux_abi::LINUX_SIGUSR2,
             );
-            let mut trap = NoopTrap;
+            let mut trap = NoopTrap::default();
             if deliver_pending_signal(
                 &mut trap,
                 &dispatcher,
@@ -708,7 +737,7 @@ mod tests {
                 tid,
                 crate::linux_abi::LINUX_SIGKILL,
             );
-            let mut trap = NoopTrap;
+            let mut trap = NoopTrap::default();
             let _ = deliver_pending_signal(
                 &mut trap,
                 &dispatcher,
@@ -735,9 +764,16 @@ mod tests {
         let tid = ThreadId::main_from_host_pid();
         dispatcher.mark_signal_pending(&context, tid, crate::linux_abi::LINUX_SIGCONT);
 
-        let action = deliver_pending_signal(&mut NoopTrap, &dispatcher, &context, None, tid, None)
-            .expect("deliver default SIGCONT")
-            .expect("SIGCONT produces an explicit nonterminal action");
+        let action = deliver_pending_signal(
+            &mut NoopTrap::default(),
+            &dispatcher,
+            &context,
+            None,
+            tid,
+            None,
+        )
+        .expect("deliver default SIGCONT")
+        .expect("SIGCONT produces an explicit nonterminal action");
 
         assert_eq!(action.term_signal, None);
         assert_eq!(action.stop_signal, None);
@@ -794,5 +830,35 @@ mod tests {
                 .contains(crate::linux_abi::LINUX_SIGPIPE)
         );
         assert_eq!(unsafe { libc::close(fds[1]) }, 0);
+    }
+
+    #[test]
+    fn continuation_restart_decision_controls_real_handler_injection() {
+        for expected in [false, true] {
+            let dispatcher = SyscallDispatcher::new();
+            let context = dispatcher.exact_signal_context_for_test();
+            let tid = ThreadId::main_from_host_pid();
+            let signal =
+                crate::kernel::LinuxSignal::for_signal_number(crate::linux_abi::LINUX_SIGUSR1)
+                    .expect("SIGUSR1");
+            let mut action = carrick_abi::LinuxSigaction::empty();
+            action.sa_handler = 0x1234;
+            context.signal_authority().install_action(signal, action);
+            dispatcher.mark_signal_pending(&context, tid, crate::linux_abi::LINUX_SIGUSR1);
+            let mut trap = NoopTrap::default();
+            let delivered = deliver_pending_signal_with_restart(
+                &mut trap,
+                &dispatcher,
+                &context,
+                Some(crate::linux_abi::LINUX_EINTR.guest_retval()),
+                tid,
+                None,
+                Some(expected),
+            )
+            .expect("handler injection")
+            .expect("pending handler");
+            assert_eq!(delivered.term_signal, None);
+            assert_eq!(trap.restart, expected);
+        }
     }
 }

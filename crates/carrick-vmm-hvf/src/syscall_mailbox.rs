@@ -209,6 +209,9 @@ pub struct MailboxDiagnostics {
 unsafe impl Send for MailboxBinding {}
 
 impl MailboxBinding {
+    pub(crate) fn is_released_for_executor_boundary(&self) -> bool {
+        self.lease.is_none()
+    }
     pub fn diagnostics(&self) -> MailboxDiagnostics {
         let mailbox = self.host.as_ptr();
         // SAFETY: the binding owns a live complete mailbox slot. Diagnostics are
@@ -1017,6 +1020,7 @@ mod tests {
         let old_pointer = NonNull::from(old_mailbox.as_mut());
         let mut binding =
             unsafe { MailboxBinding::new(lease, old_pointer, HvfSyscallTransport::Mailbox) };
+        assert!(!binding.is_released_for_executor_boundary());
         publish_valid_request(&binding, &mut old_mailbox);
         binding.take_request().expect("protocol").expect("request");
 
@@ -1025,6 +1029,7 @@ mod tests {
             .unwrap()
             .expect("task continuation");
         binding.release_for_reclaim().expect("park mailbox");
+        assert!(binding.is_released_for_executor_boundary());
         assert_eq!(binding.sequence(), 0, "source retains no task sequence");
         assert!(matches!(
             binding.export_task_continuation(),
@@ -1063,6 +1068,7 @@ mod tests {
             binding.reacquire_after_reclaim(resumed_lease, resumed_pointer, Some(continuation))
         }
         .expect("move outstanding request");
+        assert!(!binding.is_released_for_executor_boundary());
 
         assert_eq!(binding.slot().raw(), 1);
         assert_eq!(resumed_mailbox.sequence, 1);

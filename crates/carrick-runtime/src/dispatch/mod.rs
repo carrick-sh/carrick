@@ -703,6 +703,8 @@ mod fifo_beacon;
 pub(crate) mod ioring;
 #[macro_use]
 mod fs;
+#[cfg(test)]
+pub(crate) use fs::RecordLockContentionFixture;
 mod keys;
 pub(crate) use fs::{LegacyAioContextId, SplicePushback};
 #[macro_use]
@@ -741,6 +743,7 @@ pub struct WaitFds {
     fds: Vec<crate::io_wait::WaitFd>,
     #[allow(dead_code)]
     guards: Vec<WaitFdGuard>,
+    slot_authorities: Vec<crate::kernel::objects::FileSlotAuthority>,
 }
 
 impl WaitFds {
@@ -755,6 +758,7 @@ impl WaitFds {
                 .map(|(fd, events)| crate::io_wait::WaitFd::raw(fd, events))
                 .collect(),
             guards: Vec::new(),
+            slot_authorities: Vec::new(),
         }
     }
 
@@ -771,6 +775,7 @@ impl WaitFds {
             Some(owner) => Self {
                 fds: vec![crate::io_wait::WaitFd::anchored(fd, events)],
                 guards: vec![WaitFdGuard(owner)],
+                slot_authorities: Vec::new(),
             },
             None => Self::raw_one(fd, events),
         }
@@ -778,6 +783,36 @@ impl WaitFds {
 
     pub fn first(&self) -> Option<(i32, i16)> {
         self.fds.first().map(|fd| (fd.fd(), fd.events()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_slot_authorities(
+        mut self,
+        slot_authorities: Vec<crate::kernel::objects::FileSlotAuthority>,
+    ) -> Self {
+        self.slot_authorities = slot_authorities;
+        self
+    }
+
+    pub(crate) fn slot_authorities(&self) -> &[crate::kernel::objects::FileSlotAuthority] {
+        &self.slot_authorities
+    }
+
+    pub(in crate::dispatch) fn with_guest_slots(
+        mut self,
+        files: &crate::kernel::objects::FileTable,
+        guest_fds: impl IntoIterator<Item = i32>,
+    ) -> Result<Self, LinuxErrno> {
+        self.slot_authorities = guest_fds
+            .into_iter()
+            .filter(|fd| *fd >= 0)
+            .map(|fd| {
+                let number =
+                    crate::kernel::FileSlotNumber::for_open_fd(fd).map_err(|_| LINUX_EBADF)?;
+                files.capture_slot_authority(number).ok_or(LINUX_EBADF)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self)
     }
 }
 

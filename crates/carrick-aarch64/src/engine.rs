@@ -1893,6 +1893,10 @@ fn seed_sibling_snapshot(
 }
 
 impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
+    fn audit_executor_boundary(&mut self) -> Result<(), TrapError> {
+        self.vm.audit_executor_boundary(&mut self.vcpu)
+    }
+
     fn bind_task_snapshot_identity(&mut self, mm_generation: u64, asid_generation: u64) {
         self.mm_generation = mm_generation;
         self.asid_generation = asid_generation;

@@ -427,6 +427,10 @@ impl GuestVmBackend for HvfAarch64Vmm {
 }
 
 impl Aarch64Vmm for HvfAarch64Vmm {
+    fn audit_executor_boundary(&mut self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
+        crate::trap::audit_hvpatch_executor_boundary(&self.state, &vcpu.mailbox)
+    }
+
     fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {
         self.state.set_persistent_vm_lifecycle(enabled);
     }
