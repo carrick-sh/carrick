@@ -451,18 +451,18 @@ impl ExecutorBoundaryAudit {
 }
 
 #[derive(Debug)]
-struct WorkerBoundaryAudit {
+pub(crate) struct WorkerBoundaryAudit {
     baseline_signal_mask: Vec<bool>,
 }
 
 impl WorkerBoundaryAudit {
-    fn capture() -> Result<Self, TrapError> {
+    pub(crate) fn capture() -> Result<Self, TrapError> {
         Ok(Self {
             baseline_signal_mask: current_signal_mask()?,
         })
     }
 
-    fn audit_runtime<E: PersistentExecutor>(&self, backend: &mut E) -> Result<(), TrapError> {
+    pub(crate) fn audit_runtime_owned(&self) -> Result<(), TrapError> {
         if !carrick_thread::fork_quiesce::topology_depth_is_zero_for_executor_boundary() {
             return Err(boundary_error("topology-depth"));
         }
@@ -486,6 +486,11 @@ impl WorkerBoundaryAudit {
         if current_signal_mask()? != self.baseline_signal_mask {
             return Err(boundary_error("host-signal-mask"));
         }
+        Ok(())
+    }
+
+    fn audit_runtime<E: PersistentExecutor>(&self, backend: &mut E) -> Result<(), TrapError> {
+        self.audit_runtime_owned()?;
         backend.audit_boundary()
     }
 

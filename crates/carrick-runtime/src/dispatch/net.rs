@@ -5099,8 +5099,15 @@ impl SyscallDispatcher {
                     if let Some(s) = &except_set {
                         clear_on_timeout.push((exceptfds_addr, s.len()));
                     }
+                    let files = this.captured_file_table();
+                    let wait_fds = match WaitFds::raw(wait_fds)
+                        .with_guest_slots(&files, owners.iter().map(|(fd, _)| *fd))
+                    {
+                        Ok(wait_fds) => wait_fds,
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    };
                     return Ok(DispatchOutcome::WaitOnFdsSelect {
-                        fds: WaitFds::raw(wait_fds),
+                        fds: wait_fds,
                         timeout,
                         sig_mask,
                         clear_on_timeout,
@@ -5424,8 +5431,15 @@ impl SyscallDispatcher {
                 };
                 let wait_fds: Vec<(i32, i16)> = sys_pollfds.iter().map(|p| (p.fd, p.events)).collect();
                 // poll/ppoll: a timeout means "no fds ready" → return 0.
+                let files = this.captured_file_table();
+                let wait_fds = match WaitFds::raw(wait_fds)
+                    .with_guest_slots(&files, fds.iter().map(|pollfd| pollfd.fd))
+                {
+                    Ok(wait_fds) => wait_fds,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
                 return Ok(DispatchOutcome::WaitOnFds {
-                    fds: WaitFds::raw(wait_fds),
+                    fds: wait_fds,
                     timeout,
                     on_timeout: 0,
                     sig_mask,

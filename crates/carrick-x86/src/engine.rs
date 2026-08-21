@@ -1603,6 +1603,12 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
     type SiblingSpec = X86SiblingSpec<V>;
     type ProcessSpec = ();
 
+    fn audit_executor_boundary(&mut self) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "x86 threaded backend does not expose executor boundary audit authority".to_owned(),
+        ))
+    }
+
     fn bind_task_snapshot_identity(&mut self, mm_generation: u64, asid_generation: u64) {
         self.mm_generation = mm_generation;
         self.asid_generation = asid_generation;

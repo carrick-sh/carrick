@@ -341,6 +341,12 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     type SiblingBuilder: Send;
     type ProcessBuilder: Send;
 
+    fn audit_executor_boundary(&mut self, _vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "AArch64 VMM does not expose executor boundary audit authority".to_owned(),
+        ))
+    }
+
     /// Retain the host VM across guest process lifecycle operations. HVF's
     /// hvpatch lane overrides this; ordinary VMM and non-HVF backends preserve
     /// their established rebuild behavior.

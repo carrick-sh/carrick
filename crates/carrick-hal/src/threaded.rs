@@ -1192,6 +1192,15 @@ pub struct FrameCowIdentity {
 }
 
 pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
+    /// Fail-closed backend-owned executor boundary audit. Transitional M:N
+    /// workers call this only while the task is fully saved and owns no live
+    /// executor/vCPU authority.
+    fn audit_executor_boundary(&mut self) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "threaded backend does not implement executor boundary audit".to_owned(),
+        ))
+    }
+
     /// Bind the exact Kernel MM and ASID allocation generations that authorize
     /// scheduler snapshots produced by this engine.
     fn bind_task_snapshot_identity(&mut self, _mm_generation: u64, _asid_generation: u64) {}

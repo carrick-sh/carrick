@@ -9,9 +9,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::pin::Pin;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Wake, Waker};
@@ -34,6 +32,11 @@ use crate::thread::{FutexTable, FutexWait, FutexWaitOutcome};
 static NEXT_CONTINUATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_REGISTRATION_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_RESOURCE_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_RUNNER_JOB_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static CURRENT_RUNNER_JOB: std::cell::Cell<Option<JobId>> = const { std::cell::Cell::new(None) };
+}
 
 #[derive(Clone)]
 struct FutexSource(Arc<FutexTable>);
@@ -112,6 +115,7 @@ impl SyscallFrame {
 pub struct ContinuationCapture {
     kernel: Weak<Kernel>,
     task_ref: Weak<Task>,
+    file_table: Arc<crate::kernel::objects::FileTable>,
     thread: ThreadKey,
     task: TaskKey,
     task_revision: TaskRevision,
@@ -150,6 +154,7 @@ impl ContinuationCapture {
         Ok(Self {
             kernel: Arc::downgrade(context.kernel()),
             task_ref: Arc::downgrade(context.task()),
+            file_table: context.resources().files(),
             thread: context.thread().key(),
             task: context.task().key(),
             task_revision: context.revision(),
@@ -190,6 +195,7 @@ impl ContinuationCapture {
         Ok(Self {
             kernel: Arc::downgrade(context.kernel()),
             task_ref: Arc::downgrade(context.task()),
+            file_table: context.resources().files(),
             thread: context.thread().key(),
             task: context.task().key(),
             task_revision: context.revision(),
@@ -210,6 +216,7 @@ impl ContinuationCapture {
 pub struct ContinuationAuthority {
     kernel: Weak<Kernel>,
     task_ref: Weak<Task>,
+    file_table: Arc<crate::kernel::objects::FileTable>,
     thread: ThreadKey,
     task: TaskKey,
     task_revision: TaskRevision,
@@ -226,6 +233,7 @@ impl ContinuationAuthority {
         Self {
             kernel: capture.kernel,
             task_ref: capture.task_ref,
+            file_table: capture.file_table,
             thread: capture.thread,
             task: capture.task,
             task_revision: capture.task_revision,
@@ -395,12 +403,16 @@ enum ContinuationDetail {
     Fds {
         #[allow(dead_code)]
         registrations: Vec<OwnedFdRegistration>,
+        file_table: Arc<crate::kernel::objects::FileTable>,
+        slot_authorities: Vec<crate::kernel::objects::FileSlotAuthority>,
         on_timeout: i64,
         sig_mask: WaitSigMask,
     },
     Select {
         #[allow(dead_code)]
         registrations: Vec<OwnedFdRegistration>,
+        file_table: Arc<crate::kernel::objects::FileTable>,
+        slot_authorities: Vec<crate::kernel::objects::FileSlotAuthority>,
         sig_mask: WaitSigMask,
     },
     HostWrite(Arc<Mutex<BlockingHostWrite>>),
@@ -569,6 +581,20 @@ impl BlockedContinuation {
         let restore_after_signal = capture.restore_after_signal;
         let kernel = capture.kernel.upgrade();
         let authority = ContinuationAuthority::from_capture(capture);
+        let file_table = Arc::clone(&authority.file_table);
+        let fallback_fd = i32::try_from(authority.syscall.request().arg(0)).ok();
+        let exact_slot_authorities = |fds: &WaitFds| {
+            if !fds.slot_authorities().is_empty() || fds.is_empty() {
+                return Ok(fds.slot_authorities().to_vec());
+            }
+            let number = fallback_fd
+                .and_then(|fd| crate::kernel::FileSlotNumber::for_open_fd(fd).ok())
+                .ok_or(ContinuationBuildError::FdPinFailed)?;
+            file_table
+                .capture_slot_authority(number)
+                .map(|authority| vec![authority])
+                .ok_or(ContinuationBuildError::FdPinFailed)
+        };
         let mm = authority.mm();
         let asid_generation = authority.asid_generation();
         let new_state = |deadline, outputs, temporary_signal_mask, detail| ContinuationState {
@@ -671,12 +697,15 @@ impl BlockedContinuation {
                 sig_mask,
             } => {
                 let registrations = own_wait_fds(&fds)?;
+                let slot_authorities = exact_slot_authorities(&fds)?;
                 Self::WaitOnFds(new_state(
                     deadline(timeout),
                     Vec::new(),
                     Some(sig_mask),
                     ContinuationDetail::Fds {
                         registrations,
+                        file_table: Arc::clone(&file_table),
+                        slot_authorities,
                         on_timeout,
                         sig_mask,
                     },
@@ -689,6 +718,7 @@ impl BlockedContinuation {
                 clear_on_timeout,
             } => {
                 let registrations = own_wait_fds(&fds)?;
+                let slot_authorities = exact_slot_authorities(&fds)?;
                 let outputs = clear_on_timeout
                     .into_iter()
                     .map(|(address, len)| {
@@ -701,6 +731,8 @@ impl BlockedContinuation {
                     Some(sig_mask),
                     ContinuationDetail::Select {
                         registrations,
+                        file_table: Arc::clone(&file_table),
+                        slot_authorities,
                         sig_mask,
                     },
                 ))
@@ -712,12 +744,15 @@ impl BlockedContinuation {
                 sig_mask,
             } => {
                 let registrations = own_wait_fds(&fds)?;
+                let slot_authorities = exact_slot_authorities(&fds)?;
                 Self::WaitOnPollFds(new_state(
                     deadline(timeout),
                     Vec::new(),
                     Some(sig_mask),
                     ContinuationDetail::Fds {
                         registrations,
+                        file_table,
+                        slot_authorities,
                         on_timeout,
                         sig_mask,
                     },
@@ -1032,6 +1067,7 @@ impl BlockedContinuation {
                 registrations,
                 on_timeout,
                 sig_mask,
+                ..
             } => {
                 fingerprint ^= *on_timeout as u64 ^ sig_mask.block_mask().raw();
                 for registration in registrations {
@@ -1043,6 +1079,7 @@ impl BlockedContinuation {
             ContinuationDetail::Select {
                 registrations,
                 sig_mask,
+                ..
             } => {
                 fingerprint ^= sig_mask.block_mask().raw();
                 for registration in registrations {
@@ -1141,6 +1178,18 @@ impl BlockedContinuation {
         Ok(())
     }
 
+    pub(crate) fn install_temporary_signal_mask(&self, context: &KernelContext) {
+        let masks = self.state().signal_masks;
+        let Some(temporary) = masks.temporary else {
+            return;
+        };
+        let effective = match temporary {
+            WaitSigMask::Additive(extra) => masks.persistent.union(extra),
+            WaitSigMask::Replace(replacement) => replacement,
+        };
+        context.signal_authority().set_blocked(effective);
+    }
+
     pub fn resume(
         mut self,
         event: ContinuationEvent,
@@ -1157,6 +1206,31 @@ impl BlockedContinuation {
             && let Some(service) = binding.service.upgrade()
         {
             service.consume_ready_exact(binding.token)?;
+        }
+        let exact_file_slots_live = match &self.state().detail {
+            ContinuationDetail::Fds {
+                file_table,
+                slot_authorities,
+                ..
+            }
+            | ContinuationDetail::Select {
+                file_table,
+                slot_authorities,
+                ..
+            } => slot_authorities
+                .iter()
+                .all(|authority| file_table.validate_slot_authority(*authority)),
+            _ => true,
+        };
+        if !exact_file_slots_live {
+            let masks = self.state().signal_masks;
+            if masks.temporary.is_some() {
+                let authority = context.signal_authority();
+                authority.set_blocked(masks.persistent);
+                authority.arm_restore_mask(masks.restore_after_signal);
+            }
+            self.state_mut().cleanup.settle();
+            return Err(ContinuationResumeError::StaleFileSlot);
         }
         let signal_masks = self.state().signal_masks;
         let family = self.family();
@@ -1269,13 +1343,18 @@ impl BlockedContinuation {
                     .thread_pending()
                     .union(signal_authority.task_pending())
                     .difference(effective_mask);
-                let action_requests_restart = deliverable
-                    .lowest_signum()
-                    .and_then(|signum| crate::kernel::LinuxSignal::for_signal_number(signum).ok())
-                    .is_some_and(|signal| {
-                        signal_authority.action(signal).sa_flags & carrick_abi::LINUX_SA_RESTART
-                            != 0
-                    });
+                let deliverable_action = deliverable.lowest_signum().and_then(|signum| {
+                    crate::kernel::LinuxSignal::for_signal_number(signum)
+                        .ok()
+                        .map(|signal| signal_authority.action(signal))
+                });
+                let caught_handler = deliverable_action.is_some_and(|action| {
+                    action.sa_handler != carrick_abi::LINUX_SIG_DFL
+                        && action.sa_handler != carrick_abi::LINUX_SIG_IGN
+                });
+                let action_requests_restart = caught_handler
+                    && deliverable_action
+                        .is_some_and(|action| action.sa_flags & carrick_abi::LINUX_SA_RESTART != 0);
                 let restart = if family != ContinuationFamily::WaitOnSignals
                     && restart_class != RestartClass::Never
                     && action_requests_restart
@@ -1309,7 +1388,16 @@ impl BlockedContinuation {
                     ContinuationCompletion::Errno(LINUX_EINTR)
                 };
                 if signal_masks.temporary.is_some() {
-                    signal_authority.set_blocked(signal_masks.persistent);
+                    if caught_handler {
+                        signal_authority.arm_restore_mask(Some(
+                            signal_masks
+                                .restore_after_signal
+                                .unwrap_or(signal_masks.persistent),
+                        ));
+                    } else {
+                        signal_authority.set_blocked(signal_masks.persistent);
+                        signal_authority.arm_restore_mask(signal_masks.restore_after_signal);
+                    }
                 }
                 self.state_mut().cleanup.settle();
                 return Ok(ContinuationResult {
@@ -1319,9 +1407,9 @@ impl BlockedContinuation {
             }
         };
         if signal_masks.temporary.is_some() {
-            context
-                .signal_authority()
-                .set_blocked(signal_masks.persistent);
+            let authority = context.signal_authority();
+            authority.set_blocked(signal_masks.persistent);
+            authority.arm_restore_mask(signal_masks.restore_after_signal);
         }
         self.state_mut().cleanup.settle();
         Ok(ContinuationResult {
@@ -1430,6 +1518,7 @@ pub enum ContinuationResumeError {
     StaleTaskRevision,
     StaleAddressSpace,
     MissingContinuation,
+    StaleFileSlot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1605,6 +1694,7 @@ enum ProducerSubscription {
     Futex(carrick_thread::thread::FutexGenerationSubscription),
     Task(crate::kernel::objects::TaskWakeSubscription),
     Vfork(crate::kernel::core::VforkReleaseSubscription),
+    FileSlot(crate::kernel::objects::FileSlotSubscription),
 }
 
 impl std::fmt::Debug for ProducerSubscription {
@@ -1613,6 +1703,7 @@ impl std::fmt::Debug for ProducerSubscription {
             Self::Futex(_) => formatter.write_str("FutexGenerationSubscription"),
             Self::Task(_) => formatter.write_str("TaskWakeSubscription"),
             Self::Vfork(_) => formatter.write_str("VforkReleaseSubscription"),
+            Self::FileSlot(_) => formatter.write_str("FileSlotSubscription"),
         }
     }
 }
@@ -1626,6 +1717,8 @@ enum ReadinessProbe {
     },
     Fds {
         registrations: Vec<OwnedFdRegistration>,
+        file_table: Arc<crate::kernel::objects::FileTable>,
+        slot_authorities: Vec<crate::kernel::objects::FileSlotAuthority>,
         deadline: Option<Instant>,
     },
     SharedWord {
@@ -1754,9 +1847,21 @@ impl ReadinessProbe {
     fn from_continuation(continuation: &BlockedContinuation) -> Self {
         let state = continuation.state();
         match &state.detail {
-            ContinuationDetail::Fds { registrations, .. }
-            | ContinuationDetail::Select { registrations, .. } => Self::Fds {
+            ContinuationDetail::Fds {
+                registrations,
+                file_table,
+                slot_authorities,
+                ..
+            }
+            | ContinuationDetail::Select {
+                registrations,
+                file_table,
+                slot_authorities,
+                ..
+            } => Self::Fds {
                 registrations: registrations.clone(),
+                file_table: Arc::clone(file_table),
+                slot_authorities: slot_authorities.clone(),
                 deadline: state.deadline,
             },
             ContinuationDetail::SharedFutex {
@@ -1836,6 +1941,7 @@ impl ReadinessProbe {
             Self::Fds {
                 registrations,
                 deadline,
+                ..
             } => {
                 if let Some(event) = deadline_event(*deadline) {
                     return Some(event);
@@ -1951,7 +2057,6 @@ struct CarrierWaitServiceInner {
     reactor_poll_calls: AtomicU64,
     #[cfg(test)]
     reactor_poll_observer: Mutex<Option<Arc<std::sync::Barrier>>>,
-    record_lock_runner: TransitionalDedicatedRunner,
 }
 
 impl CarrierWaitServiceInner {
@@ -2160,6 +2265,11 @@ impl CarrierWaitServiceInner {
                                 Arc::clone(completion),
                             ));
                         }
+                        ReadinessProbe::RecordLock { .. } => {
+                            let retry = Instant::now() + Duration::from_millis(10);
+                            nearest_deadline =
+                                Some(nearest_deadline.map_or(retry, |current| current.min(retry)));
+                        }
                         _ => {}
                     }
                 }
@@ -2235,6 +2345,30 @@ impl CarrierWaitServiceInner {
             };
             for token in expired {
                 inner.publish_event(token, ContinuationEvent::Timeout);
+            }
+            let record_locks = {
+                let state = inner.state.lock();
+                state
+                    .entries
+                    .values()
+                    .filter_map(|entry| {
+                        if entry.state != RegistrationState::Enrolled {
+                            return None;
+                        }
+                        let ReadinessProbe::RecordLock { lock, completion } = &entry.probe else {
+                            return None;
+                        };
+                        Some((entry.token, Arc::clone(lock), Arc::clone(completion)))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for (token, lock, completion) in record_locks {
+                if let crate::dispatch::BlockingRecordLockStep::Done(outcome) =
+                    crate::dispatch::try_drive_blocking_record_lock(&lock)
+                {
+                    *completion.lock() = Some(outcome);
+                    inner.publish_event(token, ContinuationEvent::Ready);
+                }
             }
         }
     }
@@ -2317,8 +2451,6 @@ impl CarrierWaitService {
             reactor_poll_calls: AtomicU64::new(0),
             #[cfg(test)]
             reactor_poll_observer: Mutex::new(None),
-            record_lock_runner: TransitionalDedicatedRunner::with_worker_limit(2)
-                .unwrap_or_else(|_| std::process::abort()),
         });
         let weak = Arc::downgrade(&inner);
         let handle = std::thread::Builder::new()
@@ -2479,6 +2611,29 @@ impl CarrierWaitService {
                 }
             }
         }
+        if let ReadinessProbe::Fds {
+            file_table,
+            slot_authorities,
+            ..
+        } = &probe
+        {
+            for authority in slot_authorities {
+                let callback_weak = weak.clone();
+                let Some(subscription) = file_table.subscribe_slot_authority(
+                    *authority,
+                    Arc::new(move |_| {
+                        if let Some(inner) = callback_weak.upgrade() {
+                            inner.publish_event(token, ContinuationEvent::Ready);
+                        }
+                    }),
+                ) else {
+                    self.inner.publish_event(token, ContinuationEvent::Ready);
+                    continue;
+                };
+                self.inner
+                    .attach_subscription(token, ProducerSubscription::FileSlot(subscription));
+            }
+        }
         if let ReadinessProbe::Vfork { wait } = &probe {
             let wait = wait.clone();
             let callback_weak = weak;
@@ -2508,18 +2663,6 @@ impl CarrierWaitService {
             if current.is_none_or(|current| current != *value) {
                 self.inner.publish_event(token, ContinuationEvent::Ready);
             }
-        }
-        if let ReadinessProbe::RecordLock { lock, completion } = &probe {
-            let lock = Arc::clone(lock);
-            let completion = Arc::clone(completion);
-            let callback_weak = Arc::downgrade(&self.inner);
-            let _receipt = self.inner.record_lock_runner.spawn(async move {
-                let outcome = crate::dispatch::drive_blocking_record_lock(&lock);
-                *completion.lock() = Some(outcome);
-                if let Some(inner) = callback_weak.upgrade() {
-                    inner.publish_event(token, ContinuationEvent::Ready);
-                }
-            });
         }
         Ok(())
     }
@@ -2658,9 +2801,9 @@ impl CarrierWaitService {
 
     pub const fn topology(&self) -> WaitServiceTopology {
         WaitServiceTopology {
-            service_threads: 3,
+            service_threads: 1,
             shared_reactors: 1,
-            record_lock_workers: 2,
+            record_lock_workers: 0,
         }
     }
 
@@ -2865,60 +3008,30 @@ impl WakePublishReceipt {
     }
 }
 
-#[derive(Debug)]
-pub enum QuantumBoundary {
-    OrdinarySyscall,
-    Block(Box<BlockedContinuation>),
-    Yield,
-    Preempt,
-    Quiesce,
-    Exit,
-    Fail,
-}
+pub async fn yield_runner_quantum() {
+    struct YieldOnce(bool);
+    impl Future for YieldOnce {
+        type Output = ();
 
-pub trait TaskQuantumSource {
-    fn next_boundary(&mut self) -> QuantumBoundary;
-}
-
-#[derive(Debug)]
-pub enum QuantumExit {
-    Runnable,
-    Blocked(Box<BlockedContinuation>),
-    Exited,
-    Failed,
-}
-
-impl QuantumExit {
-    pub const fn kind(&self) -> QuantumExitKind {
-        match self {
-            Self::Runnable => QuantumExitKind::Runnable,
-            Self::Blocked(_) => QuantumExitKind::Blocked,
-            Self::Exited => QuantumExitKind::Exited,
-            Self::Failed => QuantumExitKind::Failed,
+        fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                context.waker().wake_by_ref();
+                Poll::Pending
+            }
         }
     }
+    YieldOnce(false).await;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QuantumExitKind {
+pub enum QuantumExit {
     Runnable,
     Blocked,
     Exited,
     Failed,
-}
-
-pub fn run_task_quantum(source: &mut impl TaskQuantumSource) -> QuantumExit {
-    loop {
-        match source.next_boundary() {
-            QuantumBoundary::OrdinarySyscall => {}
-            QuantumBoundary::Block(continuation) => return QuantumExit::Blocked(continuation),
-            QuantumBoundary::Yield | QuantumBoundary::Preempt | QuantumBoundary::Quiesce => {
-                return QuantumExit::Runnable;
-            }
-            QuantumBoundary::Exit => return QuantumExit::Exited,
-            QuantumBoundary::Fail => return QuantumExit::Failed,
-        }
-    }
 }
 
 /// Task-5-only adapter preserving the current welded runner until Task 6 wires
@@ -2929,11 +3042,11 @@ enum RunnerWork {
     Shutdown,
 }
 
-struct RunnerTask {
+pub(crate) struct RunnerTask {
     future: Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>>,
     sender: mpsc::Sender<RunnerWork>,
     queued: AtomicBool,
-    done: Arc<AtomicBool>,
+    completion: LogicalJobCompletion,
 }
 
 impl RunnerTask {
@@ -2943,28 +3056,53 @@ impl RunnerTask {
         }
     }
 
-    fn poll(self: &Arc<Self>) {
+    fn poll(self: &Arc<Self>) -> QuantumExit {
+        struct CurrentJobGuard;
+        impl Drop for CurrentJobGuard {
+            fn drop(&mut self) {
+                CURRENT_RUNNER_JOB.with(|current| current.set(None));
+            }
+        }
+        CURRENT_RUNNER_JOB.with(|current| {
+            if current.replace(Some(self.completion.id())).is_some() {
+                std::process::abort();
+            }
+        });
+        let _current_job = CurrentJobGuard;
         self.queued.store(false, Ordering::Release);
         let waker = Waker::from(Arc::clone(self));
         let mut context = Context::from_waker(&waker);
         let mut slot = self.future.lock();
         let Some(future) = slot.as_mut() else {
-            return;
+            return QuantumExit::Exited;
         };
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             future.as_mut().poll(&mut context)
         })) {
             Ok(Poll::Ready(())) => {
                 *slot = None;
-                self.done.store(true, Ordering::Release);
+                self.completion.publish();
+                QuantumExit::Exited
             }
-            Ok(Poll::Pending) => {}
+            Ok(Poll::Pending) if self.queued.load(Ordering::Acquire) => QuantumExit::Runnable,
+            Ok(Poll::Pending) => QuantumExit::Blocked,
             Err(_) => {
                 *slot = None;
-                self.done.store(true, Ordering::Release);
+                self.completion.publish();
+                QuantumExit::Failed
             }
         }
     }
+
+    fn fail_boundary(self: &Arc<Self>) {
+        let mut slot = self.future.lock();
+        *slot = None;
+        self.completion.publish();
+    }
+}
+
+pub(crate) fn run_task_quantum(task: &Arc<RunnerTask>) -> QuantumExit {
+    task.poll()
 }
 
 impl Wake for RunnerTask {
@@ -2979,8 +3117,51 @@ impl Wake for RunnerTask {
 
 struct TransitionalRunnerPool {
     sender: mpsc::Sender<RunnerWork>,
+    receiver: Arc<Mutex<mpsc::Receiver<RunnerWork>>>,
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     worker_count: usize,
+    next_worker: AtomicUsize,
+}
+
+impl TransitionalRunnerPool {
+    fn spawn_worker(self: &Arc<Self>) {
+        let receiver = Arc::clone(&self.receiver);
+        let weak = Arc::downgrade(self);
+        let index = self.next_worker.fetch_add(1, Ordering::Relaxed);
+        let worker = std::thread::Builder::new()
+            .name(format!("carrick-transitional-{index}"))
+            .spawn(move || {
+                let boundary = crate::vcpu_loop::executor::WorkerBoundaryAudit::capture()
+                    .unwrap_or_else(|_| std::process::abort());
+                loop {
+                    let work = receiver.lock().recv();
+                    match work {
+                        Ok(RunnerWork::Poll(task)) => {
+                            if boundary.audit_runtime_owned().is_err() {
+                                task.fail_boundary();
+                                if let Some(pool) = weak.upgrade() {
+                                    pool.spawn_worker();
+                                }
+                                return;
+                            }
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                run_task_quantum(&task)
+                            }));
+                            if boundary.audit_runtime_owned().is_err() {
+                                task.fail_boundary();
+                                if let Some(pool) = weak.upgrade() {
+                                    pool.spawn_worker();
+                                }
+                                return;
+                            }
+                        }
+                        Ok(RunnerWork::Shutdown) | Err(_) => return,
+                    }
+                }
+            })
+            .unwrap_or_else(|_| std::process::abort());
+        self.workers.lock().push(worker);
+    }
 }
 
 impl std::fmt::Debug for TransitionalRunnerPool {
@@ -3020,7 +3201,7 @@ pub enum TransitionalRunnerError {
 
 pub struct LogicalTaskReceipt<T> {
     receiver: mpsc::Receiver<T>,
-    done: Arc<AtomicBool>,
+    completion: LogicalJobCompletion,
 }
 
 impl<T> LogicalTaskReceipt<T> {
@@ -3031,7 +3212,188 @@ impl<T> LogicalTaskReceipt<T> {
     }
 
     pub fn is_finished(&self) -> bool {
-        self.done.load(Ordering::Acquire)
+        self.completion.is_finished()
+    }
+
+    pub fn completion(&self) -> LogicalJobCompletion {
+        self.completion.clone()
+    }
+
+    pub fn try_take(self) -> Result<T, TransitionalRunnerError> {
+        self.receiver
+            .try_recv()
+            .map_err(|_| TransitionalRunnerError::TaskFailed)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct JobId(u64);
+
+impl JobId {
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+type JobCompletionCallback = Arc<dyn Fn(JobId) + Send + Sync + 'static>;
+
+struct JobCompletionState {
+    done: AtomicBool,
+    next_listener: AtomicU64,
+    listeners: Mutex<BTreeMap<u64, JobCompletionCallback>>,
+}
+
+#[derive(Clone)]
+pub struct LogicalJobCompletion {
+    id: JobId,
+    state: Arc<JobCompletionState>,
+}
+
+impl std::fmt::Debug for LogicalJobCompletion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LogicalJobCompletion")
+            .field("id", &self.id)
+            .field("done", &self.is_finished())
+            .finish()
+    }
+}
+
+impl LogicalJobCompletion {
+    pub(crate) fn pending() -> Self {
+        Self {
+            id: JobId(next_nonzero(&NEXT_RUNNER_JOB_ID)),
+            state: Arc::new(JobCompletionState {
+                done: AtomicBool::new(false),
+                next_listener: AtomicU64::new(1),
+                listeners: Mutex::new(BTreeMap::new()),
+            }),
+        }
+    }
+
+    pub const fn id(&self) -> JobId {
+        self.id
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.state.done.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn publish(&self) {
+        if self.state.done.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let callbacks = std::mem::take(&mut *self.state.listeners.lock())
+            .into_values()
+            .collect::<Vec<_>>();
+        for callback in callbacks {
+            callback(self.id);
+        }
+    }
+
+    fn subscribe(&self, callback: JobCompletionCallback) -> Option<JobCompletionSubscription> {
+        let mut listeners = self.state.listeners.lock();
+        if self.is_finished() {
+            return None;
+        }
+        let listener = next_nonzero(&self.state.next_listener);
+        listeners.insert(listener, callback);
+        Some(JobCompletionSubscription {
+            completion: self.clone(),
+            listener,
+        })
+    }
+}
+
+pub(crate) struct LogicalJobCompletionGuard(LogicalJobCompletion);
+
+impl LogicalJobCompletionGuard {
+    pub(crate) fn new(completion: LogicalJobCompletion) -> Self {
+        Self(completion)
+    }
+}
+
+impl Drop for LogicalJobCompletionGuard {
+    fn drop(&mut self) {
+        self.0.publish();
+    }
+}
+
+struct JobCompletionSubscription {
+    completion: LogicalJobCompletion,
+    listener: u64,
+}
+
+impl Drop for JobCompletionSubscription {
+    fn drop(&mut self) {
+        self.completion
+            .state
+            .listeners
+            .lock()
+            .remove(&self.listener);
+    }
+}
+
+struct ProcessDrainState {
+    remaining: AtomicUsize,
+    waker: Mutex<Option<Waker>>,
+}
+
+pub struct ProcessDrain {
+    state: Arc<ProcessDrainState>,
+    _subscriptions: Vec<JobCompletionSubscription>,
+}
+
+impl ProcessDrain {
+    pub fn excluding(current: LogicalJobCompletion, jobs: Vec<LogicalJobCompletion>) -> Self {
+        let pending = jobs
+            .into_iter()
+            .filter(|job| job.id() != current.id() && !job.is_finished())
+            .collect::<Vec<_>>();
+        let state = Arc::new(ProcessDrainState {
+            remaining: AtomicUsize::new(pending.len()),
+            waker: Mutex::new(None),
+        });
+        let mut subscriptions = Vec::with_capacity(pending.len());
+        for job in pending {
+            let callback_state = Arc::clone(&state);
+            match job.subscribe(Arc::new(move |_| {
+                let previous = callback_state.remaining.fetch_sub(1, Ordering::AcqRel);
+                if previous == 0 {
+                    std::process::abort();
+                }
+                if previous == 1
+                    && let Some(waker) = callback_state.waker.lock().take()
+                {
+                    waker.wake();
+                }
+            })) {
+                Some(subscription) => subscriptions.push(subscription),
+                None => {
+                    state.remaining.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+        }
+        Self {
+            state,
+            _subscriptions: subscriptions,
+        }
+    }
+}
+
+impl Future for ProcessDrain {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+        if self.state.remaining.load(Ordering::Acquire) == 0 {
+            return Poll::Ready(());
+        }
+        *self.state.waker.lock() = Some(context.waker().clone());
+        if self.state.remaining.load(Ordering::Acquire) == 0 {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
     }
 }
 
@@ -3060,32 +3422,15 @@ impl TransitionalDedicatedRunner {
             return Err(TransitionalRunnerError::ZeroWorkers);
         }
         let (sender, receiver) = mpsc::channel();
-        let receiver = Arc::new(Mutex::new(receiver));
         let pool = Arc::new(TransitionalRunnerPool {
             sender,
+            receiver: Arc::new(Mutex::new(receiver)),
             workers: Mutex::new(Vec::with_capacity(worker_count)),
             worker_count,
+            next_worker: AtomicUsize::new(0),
         });
-        for index in 0..worker_count {
-            let receiver = Arc::clone(&receiver);
-            let worker = std::thread::Builder::new()
-                .name(format!("carrick-transitional-{index}"))
-                .spawn(move || {
-                    loop {
-                        let work = receiver.lock().recv();
-                        match work {
-                            Ok(RunnerWork::Poll(task)) => {
-                                let _ =
-                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        TransitionalDedicatedRunner::run_task_quantum(&task)
-                                    }));
-                            }
-                            Ok(RunnerWork::Shutdown) | Err(_) => return,
-                        }
-                    }
-                })
-                .unwrap_or_else(|_| std::process::abort());
-            pool.workers.lock().push(worker);
+        for _ in 0..worker_count {
+            pool.spawn_worker();
         }
         Ok(Self { pool })
     }
@@ -3096,7 +3441,7 @@ impl TransitionalDedicatedRunner {
         T: Send + 'static,
     {
         let (sender, receiver) = mpsc::channel();
-        let done = Arc::new(AtomicBool::new(false));
+        let completion = LogicalJobCompletion::pending();
         let future = async move {
             let value = future.await;
             let _ = sender.send(value);
@@ -3105,10 +3450,13 @@ impl TransitionalDedicatedRunner {
             future: Mutex::new(Some(Box::pin(future))),
             sender: self.pool.sender.clone(),
             queued: AtomicBool::new(false),
-            done: Arc::clone(&done),
+            completion: completion.clone(),
         });
         task.enqueue();
-        LogicalTaskReceipt { receiver, done }
+        LogicalTaskReceipt {
+            receiver,
+            completion,
+        }
     }
 
     pub fn topology(&self) -> TransitionalRunnerTopology {
@@ -3117,12 +3465,19 @@ impl TransitionalDedicatedRunner {
         }
     }
 
-    pub fn drive_quantum(&self, source: &mut impl TaskQuantumSource) -> QuantumExitKind {
-        run_task_quantum(source).kind()
-    }
-
-    fn run_task_quantum(task: &Arc<RunnerTask>) {
-        task.poll();
+    pub fn current_job() -> Option<LogicalJobCompletion> {
+        let id = CURRENT_RUNNER_JOB.with(std::cell::Cell::get)?;
+        // The exact completion handle is owned by RunnerTask. A process drain
+        // only needs the stable JobId for self-exclusion, so this detached
+        // handle is already terminal and is never subscribed.
+        Some(LogicalJobCompletion {
+            id,
+            state: Arc::new(JobCompletionState {
+                done: AtomicBool::new(true),
+                next_listener: AtomicU64::new(1),
+                listeners: Mutex::new(BTreeMap::new()),
+            }),
+        })
     }
 
     pub const fn is_task_5_only(&self) -> bool {
@@ -3255,6 +3610,25 @@ mod tests {
         for fd in fds {
             unsafe { libc::close(fd) };
         }
+    }
+
+    fn install_test_fd_authority(
+        context: &KernelContext,
+        guest_fd: i32,
+    ) -> crate::kernel::objects::FileSlotAuthority {
+        let files = context.resources().files();
+        let number = crate::kernel::FileSlotNumber::for_open_fd(guest_fd).expect("test guest fd");
+        let ids = crate::kernel::ObjectIdRegistry::new();
+        files.install(
+            number,
+            Arc::new(crate::kernel::FileDescription::regular(
+                ids.file_description_id().expect("test description"),
+            )),
+            false,
+        );
+        files
+            .capture_slot_authority(number)
+            .expect("test slot authority")
     }
 
     fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
@@ -4016,10 +4390,12 @@ mod tests {
     fn fd_wait_pins_exact_open_description_until_cleanup_and_rejects_reuse() {
         let (_kernel, context) = bootstrap(15_225);
         let generation = publish(&context, 0x551);
+        let authority = install_test_fd_authority(&context, 0);
         let fds = pipe_pair();
         let continuation = BlockedContinuation::from_dispatch_outcome(
             DispatchOutcome::WaitOnFds {
-                fds: WaitFds::raw(vec![(fds[0], libc::POLLIN)]),
+                fds: WaitFds::raw(vec![(fds[0], libc::POLLIN)])
+                    .with_slot_authorities(vec![authority]),
                 timeout: None,
                 on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
@@ -4036,12 +4412,64 @@ mod tests {
     }
 
     #[test]
+    fn fd_wait_subscription_rejects_close_reuse_before_redispatch() {
+        let (kernel, context) = bootstrap(15_226);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let service = CarrierWaitService::new(scheduler);
+        let generation = publish(&context, 0x552);
+        let files = context.resources().files();
+        let number = crate::kernel::FileSlotNumber::for_open_fd(0).expect("stdin slot");
+        let ids = crate::kernel::ObjectIdRegistry::new();
+        files.install(
+            number,
+            Arc::new(crate::kernel::FileDescription::regular(
+                ids.file_description_id().expect("original description"),
+            )),
+            false,
+        );
+        let authority = files
+            .capture_slot_authority(number)
+            .expect("exact stdin authority");
+        let fds = pipe_pair();
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::raw_one(fds[0], libc::POLLIN).with_slot_authorities(vec![authority]),
+                timeout: None,
+                on_timeout: 0,
+                sig_mask: WaitSigMask::NONE,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("fd-authorized continuation");
+        let mut registration = service.prepare_registration(&continuation);
+        service.enroll(&mut registration).expect("enroll fd slot");
+        let token = registration.wake_token();
+        continuation
+            .attach_registration(registration)
+            .expect("attach exact registration");
+
+        let successor = Arc::new(crate::kernel::FileDescription::regular(
+            ids.file_description_id().expect("successor description"),
+        ));
+        files.install(number, successor, false);
+        assert_eq!(
+            await_event(&service, token).expect("slot replacement readiness"),
+            ContinuationEvent::Ready
+        );
+        assert_eq!(
+            continuation.resume(ContinuationEvent::Ready, &context),
+            Err(ContinuationResumeError::StaleFileSlot)
+        );
+        close_pair(fds);
+    }
+
+    #[test]
     fn shared_wait_service_is_bounded_and_blocked_tasks_own_no_executor() {
         let mut fixture = race_fixture(15_230);
         let topology = fixture.service.topology();
-        assert_eq!(topology.service_threads(), 3);
+        assert_eq!(topology.service_threads(), 1);
         assert_eq!(topology.shared_reactors(), 1);
-        assert_eq!(topology.record_lock_workers(), 2);
+        assert_eq!(topology.record_lock_workers(), 0);
         for _ in 0..256 {
             let continuation = BlockedContinuation::from_dispatch_outcome(
                 DispatchOutcome::WaitOnSleep {
@@ -4093,15 +4521,75 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_contended_record_locks_do_not_consume_shared_worker_capacity() {
+        let (kernel, context) = bootstrap(15_231);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let service = CarrierWaitService::new(scheduler);
+        assert_eq!(service.topology().record_lock_workers(), 0);
+        let generation = publish(&context, 0x553);
+        let contention = crate::dispatch::RecordLockContentionFixture::new();
+
+        for serial in [2, 3] {
+            let mut continuation = BlockedContinuation::from_dispatch_outcome(
+                DispatchOutcome::BlockingRecordLock(
+                    contention.waiter(ThreadId::synthetic_for_tests(15_231), serial),
+                ),
+                capture(&context, generation, ContinuationBackend::Hvpatch),
+            )
+            .expect("contended record-lock continuation");
+            let mut registration = service.prepare_registration(&continuation);
+            service
+                .enroll(&mut registration)
+                .expect("enroll contention");
+            continuation
+                .attach_registration(registration)
+                .expect("attach contention");
+            let receipt = continuation.cancel(CancellationCause::ThreadExit);
+            assert_eq!(receipt.cleanup_count(), 1);
+        }
+
+        let mut successful = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::BlockingRecordLock(
+                contention.waiter(ThreadId::synthetic_for_tests(15_231), 4),
+            ),
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("third record-lock continuation");
+        let mut registration = service.prepare_registration(&successful);
+        service
+            .enroll(&mut registration)
+            .expect("enroll third lock");
+        let token = registration.wake_token();
+        successful
+            .attach_registration(registration)
+            .expect("attach third lock");
+        contention.release_blocker();
+        service.nudge_reactor_for_test();
+        assert_eq!(
+            await_event(&service, token).expect("third lock completes"),
+            ContinuationEvent::Ready
+        );
+        assert_eq!(
+            successful
+                .resume(ContinuationEvent::Ready, &context)
+                .expect("third lock resume")
+                .completion,
+            ContinuationCompletion::Return(0)
+        );
+    }
+
+    #[test]
     fn shared_reactor_observes_real_fd_and_timer_readiness_without_private_waiters() {
         let (kernel, context) = bootstrap(15_231);
         let generation = publish(&context, 0x552);
         let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
         let service = CarrierWaitService::new(Arc::clone(&scheduler));
+        let authority = install_test_fd_authority(&context, 0);
         let fds = pipe_pair();
         let fd_continuation = BlockedContinuation::from_dispatch_outcome(
             DispatchOutcome::WaitOnFds {
-                fds: WaitFds::raw(vec![(fds[0], libc::POLLIN)]),
+                fds: WaitFds::raw(vec![(fds[0], libc::POLLIN)])
+                    .with_slot_authorities(vec![authority]),
                 timeout: Some(Duration::from_secs(1)),
                 on_timeout: 0,
                 sig_mask: WaitSigMask::NONE,
@@ -4137,9 +4625,9 @@ mod tests {
             await_event(&service, timer_registration.wake_token()).expect("timer event"),
             ContinuationEvent::Timeout
         );
-        assert_eq!(service.topology().service_threads(), 3);
+        assert_eq!(service.topology().service_threads(), 1);
         assert_eq!(service.topology().shared_reactors(), 1);
-        assert_eq!(service.topology().record_lock_workers(), 2);
+        assert_eq!(service.topology().record_lock_workers(), 0);
     }
 
     #[test]
@@ -4522,6 +5010,8 @@ mod tests {
         let (_kernel, context) = bootstrap(15_369);
         let generation = publish(&context, 0x703);
         let signal = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+        let persistent = SigSet::EMPTY.with(10);
+        context.signal_authority().set_blocked(persistent);
         let mut action = carrick_abi::LinuxSigaction::empty();
         action.sa_handler = 0x1234;
         action.sa_flags = carrick_abi::LINUX_SA_RESTART;
@@ -4533,11 +5023,12 @@ mod tests {
                 fds: WaitFds::empty(),
                 timeout: None,
                 on_timeout: 0,
-                sig_mask: WaitSigMask::NONE,
+                sig_mask: WaitSigMask::Replace(SigSet::EMPTY),
             },
             capture(&context, generation, ContinuationBackend::Hvpatch),
         )
         .expect("restartable continuation");
+        continuation.install_temporary_signal_mask(&context);
         let result = continuation
             .resume(ContinuationEvent::Signal, &context)
             .expect("signal completion");
@@ -4545,6 +5036,11 @@ mod tests {
         assert_eq!(
             result.completion,
             ContinuationCompletion::Errno(LINUX_EINTR)
+        );
+        assert_eq!(context.signal_authority().blocked(), SigSet::EMPTY);
+        assert_eq!(
+            context.signal_authority().armed_restore_mask(),
+            Some(persistent)
         );
     }
 
@@ -4643,32 +5139,6 @@ mod tests {
         service
             .cancel_registration(additive_registration)
             .expect("cancel masked wait");
-    }
-
-    #[test]
-    fn quantum_and_transitional_adapter_keep_ordinary_syscalls_resident() {
-        let (_kernel, context) = bootstrap(15_240);
-        let generation = publish(&context, 0x600);
-        let continuation = BlockedContinuation::from_dispatch_outcome(
-            DispatchOutcome::WaitOnSleep {
-                duration: Duration::from_secs(1),
-                remaining: None,
-            },
-            capture(&context, generation, ContinuationBackend::Hvpatch),
-        )
-        .unwrap();
-        let mut source = TestQuantumSource::new(10_000, continuation);
-        let exit = run_task_quantum(&mut source);
-        assert!(matches!(exit, QuantumExit::Blocked(_)));
-        assert_eq!(source.completed_syscalls(), 10_000);
-        assert_eq!(source.snapshot_count(), 1, "only the real block snapshots");
-
-        let adapter = TransitionalDedicatedRunner::new();
-        assert!(adapter.is_task_5_only());
-        assert_eq!(
-            adapter.drive_quantum(&mut TestQuantumSource::yield_now()),
-            QuantumExitKind::Runnable
-        );
     }
 
     struct ManualGate {
@@ -4874,6 +5344,105 @@ mod tests {
     }
 
     #[test]
+    fn one_worker_process_drain_excludes_current_job_and_yields_for_siblings() {
+        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
+        let gate = ManualGate::new(Arc::new(AtomicUsize::new(0)));
+        let jobs = Arc::new(Mutex::new(Vec::new()));
+        let owner_jobs = Arc::clone(&jobs);
+        let owner_runner = runner.clone();
+        let owner_gate = Arc::clone(&gate);
+        let (done_tx, done_rx) = mpsc::channel();
+        let owner = runner.spawn(async move {
+            owner_gate.as_ref().await;
+            let current = TransitionalDedicatedRunner::current_job()
+                .expect("runner poll publishes exact current JobId");
+            let mut sibling_receipts = Vec::new();
+            for value in [11_u8, 22, 33] {
+                let receipt = owner_runner.spawn(async move { value });
+                owner_jobs.lock().push(receipt.completion());
+                sibling_receipts.push(receipt);
+            }
+            let completions = std::mem::take(&mut *owner_jobs.lock());
+            ProcessDrain::excluding(current, completions).await;
+            let values = sibling_receipts
+                .into_iter()
+                .map(|receipt| receipt.wait().expect("completed sibling receipt"))
+                .collect::<Vec<_>>();
+            done_tx.send(values).expect("publish drain completion");
+        });
+        jobs.lock().push(owner.completion());
+        drop(owner);
+        gate.open();
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("exit owner must yield the sole worker, not synchronously join"),
+            vec![11, 22, 33]
+        );
+    }
+
+    #[test]
+    fn dirty_transitional_worker_fails_exact_job_and_replacement_is_clean() {
+        struct DirtyBoundary;
+        impl Future for DirtyBoundary {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<()> {
+                let dirty = crate::dispatch::lock_order::LockOrderGuard::acquire(
+                    crate::dispatch::lock_order::LockLevel::Proc,
+                );
+                std::mem::forget(dirty);
+                Poll::Pending
+            }
+        }
+
+        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
+        assert_eq!(
+            runner.spawn(DirtyBoundary).wait(),
+            Err(TransitionalRunnerError::TaskFailed)
+        );
+        assert_eq!(
+            runner
+                .spawn(async { 73_u8 })
+                .wait()
+                .expect("clean replacement"),
+            73
+        );
+        assert_eq!(runner.topology().worker_threads(), 1);
+    }
+
+    #[test]
+    fn one_worker_two_real_runner_jobs_both_advance_at_quantum_boundaries() {
+        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let spawn_job = |id: u8| {
+            let progress = Arc::clone(&progress);
+            runner.spawn(async move {
+                for quantum in 0..8_u8 {
+                    progress.lock().push((id, quantum));
+                    yield_runner_quantum().await;
+                }
+                id
+            })
+        };
+        let first = spawn_job(1);
+        let second = spawn_job(2);
+        assert_eq!(first.wait().expect("first compute job"), 1);
+        assert_eq!(second.wait().expect("second compute job"), 2);
+        let progress = progress.lock();
+        assert_eq!(progress.iter().filter(|(id, _)| *id == 1).count(), 8);
+        assert_eq!(progress.iter().filter(|(id, _)| *id == 2).count(), 8);
+        let first_second = progress
+            .iter()
+            .position(|(id, _)| *id == 2)
+            .expect("second job advances");
+        assert!(
+            first_second < 8,
+            "one job must not monopolize the only worker"
+        );
+    }
+
+    #[test]
     fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
         let continuation_source = include_str!("continuation.rs")
             .split("#[cfg(test)]\nmod tests")
@@ -4896,9 +5465,8 @@ mod tests {
             );
         }
         assert_eq!(DISPATCH_FAMILIES.len() + 1, 16);
-        assert!(
-            continuation_source.contains("TransitionalDedicatedRunner::run_task_quantum(&task)")
-        );
+        assert!(continuation_source.contains("run_task_quantum(&task)"));
+        assert!(!continuation_source.contains("TaskQuantumSource"));
 
         let loop_source = include_str!("mod.rs");
         let suspend = loop_source
@@ -4982,62 +5550,63 @@ mod tests {
             .expect("HVPatch fork body");
         assert!(hvpatch_fork.contains("HvpatchBlockInput::Vfork"));
         assert!(!hvpatch_fork.contains("wait.wait_for_release"));
-    }
 
-    struct TestQuantumSource {
-        remaining: usize,
-        completed: usize,
-        snapshots: usize,
-        continuation: Option<BlockedContinuation>,
-        yield_only: bool,
-    }
-
-    impl TestQuantumSource {
-        fn new(remaining: usize, continuation: BlockedContinuation) -> Self {
-            Self {
-                remaining,
-                completed: 0,
-                snapshots: 0,
-                continuation: Some(continuation),
-                yield_only: false,
-            }
+        let threads = include_str!("threads.rs");
+        let exec_drain = threads
+            .split("if continuation::TransitionalDedicatedRunner::current_job().is_some()")
+            .nth(2)
+            .and_then(|tail| tail.split("let deadline =").next())
+            .expect("shared-runner exec drain branch");
+        for required in [
+            "engine.save_guest_state()",
+            "begin_switch_out",
+            "settle_transitional_runnable",
+            "Yield::Blocked",
+            "drop(self.guest_execution.take())",
+            "audit_executor_boundary()",
+            "await_hvpatch_sibling_jobs().await",
+            ".rebind_to_slot",
+            "take_transitional_lease",
+        ] {
+            assert!(
+                exec_drain.contains(required),
+                "exec drain misses {required}"
+            );
+        }
+        for prohibited in ["std::thread::sleep", "handle.join()", ".wait()"] {
+            assert!(
+                !exec_drain.contains(prohibited),
+                "shared-runner exec drain synchronously blocks on {prohibited}"
+            );
         }
 
-        fn yield_now() -> Self {
-            Self {
-                remaining: 0,
-                completed: 0,
-                snapshots: 0,
-                continuation: None,
-                yield_only: true,
-            }
+        let record_reactor = continuation_source
+            .split("ReadinessProbe::RecordLock")
+            .nth(2)
+            .and_then(|tail| tail.split("impl Drop for CarrierWaitServiceInner").next())
+            .expect("shared record-lock reactor path");
+        assert!(record_reactor.contains("try_drive_blocking_record_lock"));
+        for prohibited in [
+            "crate::dispatch::drive_blocking_record_lock(",
+            "F_SETLKW",
+            "Condvar",
+        ] {
+            assert!(
+                !record_reactor.contains(prohibited),
+                "record-lock reactor retains blocking authority {prohibited}"
+            );
         }
 
-        fn completed_syscalls(&self) -> usize {
-            self.completed
-        }
+        let signal_source = include_str!("signal.rs");
+        assert!(signal_source.contains("deliver_pending_signal_with_restart"));
+        assert!(loop_source.contains("continuation.install_temporary_signal_mask(context)"));
+        assert!(loop_source.contains("self.continuation_restart = Some(result.restart())"));
+        assert!(loop_source.contains("ContinuationResumeError::StaleFileSlot"));
 
-        fn snapshot_count(&self) -> usize {
-            self.snapshots
-        }
-    }
-
-    impl TaskQuantumSource for TestQuantumSource {
-        fn next_boundary(&mut self) -> QuantumBoundary {
-            if self.yield_only {
-                self.yield_only = false;
-                self.snapshots += 1;
-                return QuantumBoundary::Yield;
-            }
-            if self.remaining != 0 {
-                self.remaining -= 1;
-                self.completed += 1;
-                return QuantumBoundary::OrdinarySyscall;
-            }
-            self.snapshots += 1;
-            QuantumBoundary::Block(Box::new(
-                self.continuation.take().expect("one terminal continuation"),
-            ))
-        }
+        let net_source = include_str!("../dispatch/net.rs");
+        assert!(
+            net_source.matches("with_guest_slots(&files").count() >= 2,
+            "pselect/ppoll must capture every exact guest fd slot at dispatch"
+        );
     }
 }

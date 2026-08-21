@@ -29,6 +29,16 @@ use super::ids::{
 };
 use super::registry::{IdRegistry, ProcessGroupClaim, SessionClaim};
 
+static NEXT_FILE_SLOT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_file_slot_generation() -> u64 {
+    let generation = NEXT_FILE_SLOT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    if generation == 0 || generation == u64::MAX {
+        std::process::abort();
+    }
+    generation
+}
+
 #[derive(Default)]
 pub(super) struct ObjectRevision(AtomicU64);
 
@@ -771,6 +781,7 @@ impl FileDescription {
 pub struct FileSlot {
     pub(crate) description: Arc<FileDescription>,
     pub(crate) fd_flags: u64,
+    generation: u64,
 }
 
 impl FileSlot {
@@ -778,6 +789,7 @@ impl FileSlot {
         Self {
             description,
             fd_flags,
+            generation: next_file_slot_generation(),
         }
     }
 
@@ -788,6 +800,87 @@ impl FileSlot {
     pub fn close_on_exec(&self) -> bool {
         carrick_abi::LinuxFdFlags::from_bits_truncate(self.fd_flags)
             .contains(carrick_abi::LinuxFdFlags::CLOEXEC)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileSlotAuthority {
+    table: FileTableId,
+    number: FileSlotNumber,
+    slot_generation: u64,
+    description: FileDescriptionId,
+}
+
+impl FileSlotAuthority {
+    pub const fn table(self) -> FileTableId {
+        self.table
+    }
+
+    pub const fn number(self) -> FileSlotNumber {
+        self.number
+    }
+
+    pub const fn slot_generation(self) -> u64 {
+        self.slot_generation
+    }
+
+    pub const fn description(self) -> FileDescriptionId {
+        self.description
+    }
+}
+
+type FileSlotCallback = Arc<dyn Fn(FileSlotAuthority) + Send + Sync + 'static>;
+
+#[derive(Default)]
+struct FileSlotSubscriptions {
+    listeners: Mutex<BTreeMap<u64, (FileSlotAuthority, FileSlotCallback)>>,
+}
+
+impl std::fmt::Debug for FileSlotSubscriptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FileSlotSubscriptions")
+            .field("listeners", &self.listeners.lock().len())
+            .finish()
+    }
+}
+
+impl FileSlotSubscriptions {
+    fn publish_changes(&self, table: FileTableId, slots: &HashMap<i32, FileSlot>) {
+        let callbacks = {
+            let mut listeners = self.listeners.lock();
+            let stale = listeners
+                .iter()
+                .filter_map(|(id, (authority, _))| {
+                    let matches = authority.table == table
+                        && slots.get(&authority.number.raw()).is_some_and(|slot| {
+                            slot.generation == authority.slot_generation
+                                && slot.description.id() == authority.description
+                        });
+                    (!matches).then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            stale
+                .into_iter()
+                .filter_map(|id| listeners.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        for (authority, callback) in callbacks {
+            callback(authority);
+        }
+    }
+}
+
+pub struct FileSlotSubscription {
+    subscriptions: Weak<FileSlotSubscriptions>,
+    listener: u64,
+}
+
+impl Drop for FileSlotSubscription {
+    fn drop(&mut self) {
+        if let Some(subscriptions) = self.subscriptions.upgrade() {
+            subscriptions.listeners.lock().remove(&self.listener);
+        }
     }
 }
 
@@ -954,6 +1047,7 @@ pub struct FileTable {
     functional_gate: Arc<FileTableFunctionalGate>,
     functional_refs_active: AtomicBool,
     revision: ObjectRevision,
+    slot_subscriptions: Arc<FileSlotSubscriptions>,
 }
 
 impl FileTable {
@@ -971,6 +1065,7 @@ impl FileTable {
             functional_gate: Arc::new(FileTableFunctionalGate::new()),
             functional_refs_active: AtomicBool::new(true),
             revision: ObjectRevision::new(),
+            slot_subscriptions: Arc::new(FileSlotSubscriptions::default()),
         }
     }
 
@@ -998,6 +1093,7 @@ impl FileTable {
             functional_gate: Arc::new(FileTableFunctionalGate::new()),
             functional_refs_active: AtomicBool::new(true),
             revision: ObjectRevision::new(),
+            slot_subscriptions: Arc::new(FileSlotSubscriptions::default()),
         }
     }
 
@@ -1065,6 +1161,7 @@ impl FileTable {
             functional_gate: Arc::new(FileTableFunctionalGate::new()),
             functional_refs_active: AtomicBool::new(true),
             revision: ObjectRevision::new(),
+            slot_subscriptions: Arc::new(FileSlotSubscriptions::default()),
         }
     }
 
@@ -1088,7 +1185,56 @@ impl FileTable {
             ),
         );
         self.revision.publish();
+        self.slot_subscriptions
+            .publish_changes(self.id, &open_files);
         replaced
+    }
+
+    pub fn capture_slot_authority(&self, number: FileSlotNumber) -> Option<FileSlotAuthority> {
+        let slot = self.open_files.read().get(&number.raw()).cloned()?;
+        Some(FileSlotAuthority {
+            table: self.id,
+            number,
+            slot_generation: slot.generation,
+            description: slot.description.id(),
+        })
+    }
+
+    pub fn validate_slot_authority(&self, authority: FileSlotAuthority) -> bool {
+        authority.table == self.id
+            && self
+                .open_files
+                .read()
+                .get(&authority.number.raw())
+                .is_some_and(|slot| {
+                    slot.generation == authority.slot_generation
+                        && slot.description.id() == authority.description
+                })
+    }
+
+    pub fn subscribe_slot_authority(
+        self: &Arc<Self>,
+        authority: FileSlotAuthority,
+        callback: FileSlotCallback,
+    ) -> Option<FileSlotSubscription> {
+        let open_files = self.open_files.read();
+        if authority.table != self.id
+            || open_files.get(&authority.number.raw()).is_none_or(|slot| {
+                slot.generation != authority.slot_generation
+                    || slot.description.id() != authority.description
+            })
+        {
+            return None;
+        }
+        let listener = next_file_slot_generation();
+        self.slot_subscriptions
+            .listeners
+            .lock()
+            .insert(listener, (authority, callback));
+        Some(FileSlotSubscription {
+            subscriptions: Arc::downgrade(&self.slot_subscriptions),
+            listener,
+        })
     }
 
     pub fn slot(&self, number: FileSlotNumber) -> Option<FileSlot> {
@@ -1105,10 +1251,18 @@ impl FileTable {
 
     pub(crate) fn write_open_files(&self) -> FileTableWriteGuard<'_> {
         let mutation = self.mutation_lease();
+        let guard = self.open_files.write();
+        let original = guard
+            .iter()
+            .map(|(number, slot)| (*number, (slot.generation, slot.description.id())))
+            .collect();
         FileTableWriteGuard {
-            guard: self.open_files.write(),
+            guard,
             _mutation: mutation,
             revision: &self.revision,
+            table: self.id,
+            subscriptions: &self.slot_subscriptions,
+            original,
         }
     }
 
@@ -1285,6 +1439,9 @@ pub(crate) struct FileTableWriteGuard<'a> {
     guard: RwLockWriteGuard<'a, HashMap<i32, FileSlot>>,
     _mutation: FileTableMutationLease,
     revision: &'a ObjectRevision,
+    table: FileTableId,
+    subscriptions: &'a FileSlotSubscriptions,
+    original: HashMap<i32, (u64, FileDescriptionId)>,
 }
 
 impl Deref for FileTableWriteGuard<'_> {
@@ -1303,7 +1460,19 @@ impl DerefMut for FileTableWriteGuard<'_> {
 
 impl Drop for FileTableWriteGuard<'_> {
     fn drop(&mut self) {
+        for (number, slot) in self.guard.iter_mut() {
+            let unchanged = self
+                .original
+                .get(number)
+                .is_some_and(|(generation, description)| {
+                    *generation == slot.generation && *description == slot.description.id()
+                });
+            if !unchanged {
+                slot.generation = next_file_slot_generation();
+            }
+        }
         self.revision.publish();
+        self.subscriptions.publish_changes(self.table, &self.guard);
     }
 }
 
@@ -5563,6 +5732,8 @@ pub enum ObjectGraphError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use carrick_abi::LinuxCloneFlags;
 
     use super::*;
@@ -6138,6 +6309,42 @@ mod tests {
             .cloned()
             .expect("child pushback cell");
         assert!(Arc::ptr_eq(&queue, &child_queue));
+    }
+
+    #[test]
+    fn fd_slot_authority_rejects_close_and_same_number_reuse_before_successor_access() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table ID")));
+        let number = FileSlotNumber::for_open_fd(3).expect("fd");
+        let original = Arc::new(FileDescription::regular(
+            ids.file_description_id().expect("original description"),
+        ));
+        table.install(number, original, false);
+        let authority = table
+            .capture_slot_authority(number)
+            .expect("exact original slot authority");
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&callbacks);
+        let _subscription = table
+            .subscribe_slot_authority(
+                authority,
+                Arc::new(move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .expect("subscribe original slot");
+
+        let successor = Arc::new(FileDescription::regular(
+            ids.file_description_id().expect("successor description"),
+        ));
+        table.install(number, Arc::clone(&successor), false);
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+        assert!(!table.validate_slot_authority(authority));
+        let replacement = table
+            .capture_slot_authority(number)
+            .expect("replacement authority");
+        assert_eq!(replacement.description(), successor.id());
+        assert_ne!(replacement.slot_generation(), authority.slot_generation());
     }
 
     #[test]

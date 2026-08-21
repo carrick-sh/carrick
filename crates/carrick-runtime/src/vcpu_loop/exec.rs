@@ -642,7 +642,7 @@ where
     /// `Ok(None)` means the syscall finished — the image was replaced, or the
     /// exec failed with an errno and the caller is still running its old
     /// image. `Ok(Some(outcome))` means the process is terminating.
-    pub(super) fn handle_execve(
+    pub(super) async fn handle_execve(
         &mut self,
         kernel: &Kernel,
         kernel_context: &crate::kernel::KernelContext,
@@ -738,7 +738,7 @@ where
                 // A partial drain leaves a half-dead thread group, so even this
                 // step's OWN failure is past the line.
                 if self.registry.live_count() > 1
-                    && let Err(error) = self.terminate_siblings_for_exec(kernel, engine)
+                    && let Err(error) = self.terminate_siblings_for_exec(kernel, engine).await
                 {
                     return Self::exec_failed_past_no_return(
                         kernel,

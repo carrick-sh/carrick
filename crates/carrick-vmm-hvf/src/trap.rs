@@ -2931,6 +2931,29 @@ pub fn fork_vcpu_snapshot_is_empty_for_executor_boundary() -> bool {
     FORK_VCPU_SNAPSHOT.with(|snapshot| snapshot.borrow().is_none())
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn audit_hvpatch_executor_boundary(
+    state: &HvfVmState,
+    mailbox: &MailboxBinding,
+) -> Result<(), TrapError> {
+    if !fork_vcpu_snapshot_is_empty_for_executor_boundary() {
+        return Err(TrapError::Hypervisor(
+            "HVF executor boundary retained fork vCPU snapshot".to_owned(),
+        ));
+    }
+    if state.reclaim_authority == ReclaimParkAuthority::Live {
+        return Err(TrapError::Hypervisor(
+            "HVF executor boundary retained live vCPU authority".to_owned(),
+        ));
+    }
+    if !mailbox.is_released_for_executor_boundary() {
+        return Err(TrapError::Hypervisor(
+            "HVF executor boundary retained mailbox slot".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 fn install_fork_vcpu_snapshot_for_executor_boundary_test() {
     let snapshot = VcpuSnapshot {

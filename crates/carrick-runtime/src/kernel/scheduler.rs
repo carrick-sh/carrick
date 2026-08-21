@@ -44,6 +44,8 @@ pub enum RunQueueError {
     ExecutorBusy,
     #[error("executor registration is stale")]
     StaleExecutor,
+    #[error("exact runnable generation is not queued")]
+    QueueEmpty,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -742,6 +744,55 @@ impl RunQueue {
         }
     }
 
+    pub(crate) fn take_exact(
+        &self,
+        executor: &ExecutorRegistration,
+        expected: ThreadKey,
+    ) -> Result<QueueClaim, RunQueueError> {
+        loop {
+            let row = {
+                let mut state = self.inner.state.lock();
+                let Some(index) = state.rows.iter().position(|row| row.key.thread == expected)
+                else {
+                    return Err(RunQueueError::QueueEmpty);
+                };
+                let row = state
+                    .rows
+                    .remove(index)
+                    .unwrap_or_else(|| std::process::abort());
+                state.queued.remove(&row.key);
+                state.claimed = state
+                    .claimed
+                    .checked_add(1)
+                    .unwrap_or_else(|| std::process::abort());
+                row
+            };
+            if row.thread.key() != row.key.thread
+                || row.thread.execution_state().generation() != Some(row.key.generation)
+                || !matches!(
+                    row.thread.execution_state(),
+                    super::objects::ThreadExecutionState::Runnable { .. }
+                )
+            {
+                self.inner.finish_claim();
+                continue;
+            }
+            let lease = match row.thread.claim_runnable(executor.id) {
+                Ok(lease) if lease.generation() == row.key.generation => lease,
+                Ok(lease) => {
+                    drop(lease);
+                    self.inner.finish_claim();
+                    continue;
+                }
+                Err(_) => {
+                    self.inner.finish_claim();
+                    continue;
+                }
+            };
+            return Ok(QueueClaim { row, lease });
+        }
+    }
+
     pub fn close(&self) {
         self.inner.begin_close();
         let mut state = self.inner.state.lock();
@@ -1224,11 +1275,59 @@ impl Scheduler {
     pub(crate) fn take_transitional_lease(
         &self,
         executor: &ExecutorRegistration,
+        expected: ThreadKey,
     ) -> Result<ThreadExecutionLease, SchedulerError> {
-        let mut running = self.take(executor)?;
+        let QueueClaim { row, lease } = self.queue.take_exact(executor, expected)?;
+        let binding = ExecutorBinding {
+            executor: executor.id,
+            executor_epoch: lease.executor_epoch(),
+            thread: row.key.thread,
+            generation: row.key.generation,
+        };
+        if let Err(error) = self.executors.bind(executor, binding) {
+            drop(lease);
+            self.queue.inner.finish_claim();
+            return Err(error.into());
+        }
+        self.need_resched
+            .store(self.queue.len() != 0, Ordering::Release);
+        let mut running = RunnableThread {
+            thread: row.thread,
+            key: row.key,
+            binding,
+            lease: Some(lease),
+            queue: Arc::downgrade(&self.queue.inner),
+            active_claim: true,
+        };
         let lease = running.take_lease();
         running.finish_claim();
         Ok(lease)
+    }
+
+    pub(crate) fn settle_transitional_runnable(
+        &self,
+        thread: &Arc<Thread>,
+        lease: ThreadExecutionLease,
+    ) -> Result<(), (SchedulerError, ThreadExecutionLease)> {
+        if lease.thread_key() != thread.key() {
+            return Err((RunQueueError::AuthorityMismatch.into(), lease));
+        }
+        let binding = ExecutorBinding {
+            executor: lease.executor(),
+            executor_epoch: lease.executor_epoch(),
+            thread: lease.thread_key(),
+            generation: lease.generation(),
+        };
+        let action = match thread.scheduler_yield_from_executor(lease) {
+            Ok(action) => action,
+            Err((error, lease)) => return Err((error.into(), lease)),
+        };
+        self.executors.unbind(binding);
+        self.snapshot_count.fetch_add(1, Ordering::Relaxed);
+        if self.apply_settlement_action(thread, action).is_err() {
+            std::process::abort();
+        }
+        Ok(())
     }
 
     pub(crate) fn begin_switch_out(&self, running: &RunnableThread) -> Result<(), SchedulerError> {

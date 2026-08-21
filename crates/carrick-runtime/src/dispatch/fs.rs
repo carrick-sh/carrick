@@ -1071,6 +1071,62 @@ impl LogicalRecordLockWait {
     }
 }
 
+#[cfg(test)]
+pub(crate) struct RecordLockContentionFixture {
+    locks: Arc<LogicalRecordLocks>,
+    file: LeaseFileId,
+    range: LogicalRecordLockRange,
+    blocker: LogicalRecordLockOwner,
+}
+
+#[cfg(test)]
+impl RecordLockContentionFixture {
+    pub(crate) fn new() -> Self {
+        let locks = Arc::new(LogicalRecordLocks::default());
+        let file = LeaseFileId::Path("task5-record-lock".to_owned());
+        let range = LogicalRecordLockRange { start: 0, end: 1 };
+        let blocker = LogicalRecordLockOwner::Process { pid: 41, serial: 1 };
+        locks
+            .try_set(LogicalRecordLockRequest {
+                file: file.clone(),
+                owner: blocker,
+                range,
+                write: true,
+            })
+            .expect("seed blocking record lock");
+        Self {
+            locks,
+            file,
+            range,
+            blocker,
+        }
+    }
+
+    pub(crate) fn waiter(
+        &self,
+        tid: crate::thread::ThreadId,
+        serial: u64,
+    ) -> super::BlockingRecordLock {
+        super::BlockingRecordLock::logical(LogicalRecordLockWait::new(
+            Arc::clone(&self.locks),
+            LogicalRecordLockRequest {
+                file: self.file.clone(),
+                owner: LogicalRecordLockOwner::Process {
+                    pid: i32::try_from(serial).unwrap_or(i32::MAX),
+                    serial,
+                },
+                range: self.range,
+                write: true,
+            },
+            tid,
+        ))
+    }
+
+    pub(crate) fn release_blocker(&self) {
+        self.locks.unlock(&self.file, self.blocker, self.range);
+    }
+}
+
 impl PartialEq for LogicalRecordLockWait {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.locks, &other.locks)
