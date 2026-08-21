@@ -29,7 +29,11 @@ mod mm_resources;
 mod patcher;
 mod stage1_mm;
 
+pub(crate) use asid::{AsidGeneration, AsidLoad, InvalidationAck};
+pub(crate) use stage1_mm::{Stage1MmLease, Stage1MmRetirement};
+
 use mm_resources::MmResources;
+pub(crate) use mm_resources::RetiredStage1Mm;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessContext {
@@ -292,6 +296,7 @@ impl carrick_hal::TimerDelivery for ProcessTimerDelivery {
 pub(crate) struct PreparedProcessExec {
     kernel: crate::kernel::PreparedExec,
     backend: std::sync::Arc<stage1_mm::Stage1MmBackend>,
+    replacement_mm: stage1_mm::PreparedStage1Mm,
     old_vmas: stage1_mm::PreparedVmaFreeze,
 }
 
@@ -314,6 +319,55 @@ impl PreparedProcessExec {
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
             )
             .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn replacement_root_slot(&self) -> Option<stage1_mm::Stage1RootSlot> {
+        self.replacement_mm.root_slot()
+    }
+
+    pub(crate) fn replacement_asid_generation(&self) -> AsidGeneration {
+        self.replacement_mm.asid_generation()
+    }
+
+    pub(crate) fn begin_replacement_load(
+        &self,
+        executor: crate::kernel::objects::ExecutorId,
+    ) -> Result<AsidLoad, String> {
+        self.replacement_mm
+            .begin_asid_load(executor)
+            .map_err(|error| error.to_string())
+    }
+}
+
+pub(crate) struct CommittedProcessExec {
+    transition: crate::kernel::exec::CommittedExecTransition,
+    replacement_mm: std::sync::Arc<Stage1MmLease>,
+    retired_mm: Stage1MmRetirement,
+}
+
+impl CommittedProcessExec {
+    pub(crate) fn context(&self) -> &crate::kernel::KernelContext {
+        self.transition.context()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn thread(&self) -> &crate::kernel::ThreadRef {
+        self.transition.thread()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared(&self) -> &std::sync::Arc<crate::kernel::TaskShared> {
+        self.transition.shared()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::kernel::exec::CommittedExecTransition,
+        std::sync::Arc<Stage1MmLease>,
+        Stage1MmRetirement,
+    ) {
+        (self.transition, self.replacement_mm, self.retired_mm)
     }
 }
 
@@ -342,6 +396,29 @@ impl ChildExit {
 pub(crate) struct RetiredThreadResources {
     owner: crate::kernel::TaskKey,
     files: std::sync::Arc<crate::kernel::FileTable>,
+}
+
+pub struct PendingAddressSpaceRetirement {
+    retired: RetiredStage1Mm,
+    pid: i32,
+    tid: crate::thread::ThreadId,
+    exit_code: i32,
+    lifecycle_event: Option<carrick_observability::probes::HvpatchGuestLifecycle>,
+}
+
+impl PendingAddressSpaceRetirement {
+    pub(crate) fn retirement(&self) -> Option<&Stage1MmRetirement> {
+        self.retired.retirement()
+    }
+
+    pub(crate) fn complete(self) -> Result<(), String> {
+        self.retired.complete().map_err(|error| error.to_string())?;
+        crate::event_ring::rec_hvpatch_process_exit_end(self.pid, self.tid.raw(), self.exit_code);
+        if let Some(event) = self.lifecycle_event {
+            crate::probes::hvpatch_guest_lifecycle(event);
+        }
+        Ok(())
+    }
 }
 
 impl RetiredThreadResources {
@@ -471,6 +548,16 @@ impl ProcessContext {
     pub(crate) fn mm_binding(&self) -> Option<crate::kernel::MmBinding> {
         let backend = std::sync::Arc::clone(&self.mm_backend.read());
         Some(backend.binding())
+    }
+
+    pub(crate) fn asid_generation(&self) -> u64 {
+        self.mm_backend.read().asid_generation().generation()
+    }
+
+    pub(crate) fn stage1_mm_lease(&self) -> Result<std::sync::Arc<Stage1MmLease>, RuntimeError> {
+        self.resources
+            .lease(self.task_key())
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))
     }
 
     pub(crate) fn syscall_trace_identity(&self) -> Option<(i32, u32)> {
@@ -604,7 +691,11 @@ impl ProcessContext {
             return Err("exec context belongs to another HVPatch task generation".to_owned());
         }
         let current_backend = std::sync::Arc::clone(&self.mm_backend.read());
-        let backend = current_backend.exec_observer();
+        let replacement_mm = self
+            .resources
+            .prepare_exec(self.task_key())
+            .map_err(|error| error.to_string())?;
+        let backend = replacement_mm.backend();
         let kernel_backend: std::sync::Arc<dyn crate::kernel::MmBackend> = backend.clone();
         let kernel = self
             .kernel_graph()
@@ -616,6 +707,7 @@ impl ProcessContext {
         Ok(PreparedProcessExec {
             kernel,
             backend,
+            replacement_mm,
             old_vmas,
         })
     }
@@ -625,10 +717,11 @@ impl ProcessContext {
         prepared: PreparedProcessExec,
         stage1_root: u64,
         vma_source: crate::kernel::SharedVmaSnapshotSource,
-    ) -> Result<crate::kernel::KernelContext, String> {
+    ) -> Result<CommittedProcessExec, String> {
         let PreparedProcessExec {
             kernel,
             backend,
+            replacement_mm: prepared_mm,
             old_vmas,
         } = prepared;
         let current_backend = std::sync::Arc::clone(&self.mm_backend.read());
@@ -638,17 +731,18 @@ impl ProcessContext {
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
             )
             .map_err(|error| error.to_string())?;
-        let binding = self
+        let (replacement_lease, retired_mm) = self
             .resources
-            .publish_exec(self.task_key(), stage1_root)
+            .commit_exec(self.task_key(), prepared_mm, stage1_root)
             .map_err(|error| error.to_string())?;
+        let binding = replacement_lease.binding();
         let replacement_mm = kernel.replacement_mm_id();
         backend.publish_binding(binding);
         backend.bind_inventory(self.kernel_graph(), replacement_mm);
         backend.bind_vma_source(vma_source);
-        let context = self
+        let transition = self
             .kernel_graph()
-            .commit_exec(kernel, None)
+            .commit_exec_transition(kernel, None)
             .map_err(|error| error.to_string())?;
         // The caller invokes this method only after destructive engine
         // replacement. Freeze the detached historical observer after Kernel
@@ -661,7 +755,17 @@ impl ProcessContext {
             )
             .map_err(|error| error.to_string())?;
         *self.mm_backend.write() = backend;
-        Ok(context)
+        let transition = transition
+            .attach_successor_asid_generation(
+                replacement_mm,
+                self.mm_backend.read().asid_generation().generation(),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(CommittedProcessExec {
+            transition,
+            replacement_mm: replacement_lease,
+            retired_mm,
+        })
     }
 
     pub(crate) fn record_process_exit_begin(
@@ -725,20 +829,41 @@ impl ProcessContext {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn retire_address_space(
+    pub(crate) fn retire_address_space_with(
         &self,
         exit_code: i32,
         tid: crate::thread::ThreadId,
+        invalidate: impl FnOnce(&RetiredStage1Mm) -> Result<(), String>,
     ) -> Result<(), String> {
         let retired = self
             .resources
             .retire(self.task_key())
             .map_err(|error| error.to_string())?;
+        invalidate(&retired)?;
         self.resources
             .acknowledge_tlb_flush(retired)
             .map_err(|error| error.to_string())?;
         crate::event_ring::rec_hvpatch_process_exit_end(self.pid(), tid.raw(), exit_code);
         Ok(())
+    }
+
+    pub(crate) fn begin_address_space_retirement(
+        &self,
+        exit_code: i32,
+        tid: crate::thread::ThreadId,
+        lifecycle_event: Option<carrick_observability::probes::HvpatchGuestLifecycle>,
+    ) -> Result<PendingAddressSpaceRetirement, String> {
+        let retired = self
+            .resources
+            .retire(self.task_key())
+            .map_err(|error| error.to_string())?;
+        Ok(PendingAddressSpaceRetirement {
+            retired,
+            pid: self.pid(),
+            tid,
+            exit_code,
+            lifecycle_event,
+        })
     }
 
     pub(crate) fn exit_thread(
@@ -1465,7 +1590,15 @@ mod tests {
                 |_| {},
             )
             .unwrap();
-        process.retire_address_space(exit_code, tid).unwrap();
+        process
+            .retire_address_space_with(exit_code, tid, |retired| {
+                retired
+                    .retirement()
+                    .is_none_or(|retirement| retirement.pending().is_empty())
+                    .then_some(())
+                    .ok_or_else(|| "test retirement unexpectedly has resident executors".to_owned())
+            })
+            .unwrap();
         process.record_process_exit_commit(event);
     }
 
@@ -2527,5 +2660,34 @@ mod tests {
             u32::from_le_bytes(hvpatch_image.regions()[0].bytes()[0..4].try_into().unwrap()),
             SVC_ZERO,
         );
+    }
+
+    #[test]
+    fn process_mm_retirement_requires_external_invalidation_before_release() {
+        let source = include_str!("mod.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production HVPatch process source");
+        assert!(
+            !production.contains("pub(crate) fn retire_address_space("),
+            "there must be no no-op invalidation retirement bypass"
+        );
+        let retirement = production
+            .split("pub(crate) fn retire_address_space_with")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("pub(crate) fn begin_address_space_retirement")
+                    .next()
+            })
+            .expect("ProcessContext retirement transaction");
+        let invalidate = retirement
+            .find("invalidate(&retired)?")
+            .expect("external all-executor invalidation");
+        let release = retirement
+            .find("acknowledge_tlb_flush(retired)")
+            .expect("allocator/root release");
+        assert!(invalidate < release);
+        assert!(!retirement.contains("InvalidationAck::new"));
     }
 }

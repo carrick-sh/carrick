@@ -951,7 +951,7 @@ pub(crate) fn finish_and_run_image(
     // that vector; native DSR and the non-macOS VMM lifecycle never enter this
     // builder.
     let image = with_hvf_syscall_mailbox(image)?;
-    let image = image.with_stage1_page_tables()?;
+    let image = image.with_hvpatch_stage1_page_tables()?;
     let image = with_optional_vdso::<HvfArch>(image)?;
     if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
         eprintln!("debug state written: {}", p.display());

@@ -46,6 +46,8 @@ pub enum RunQueueError {
     StaleExecutor,
     #[error("exact runnable generation is not queued")]
     QueueEmpty,
+    #[error("executor was poked for owner-thread control work")]
+    ControlPoked,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -65,11 +67,37 @@ pub trait ExecutorKick: Send + Sync + std::fmt::Debug {
     /// Clear only the still-matching destination binding.
     fn unbind(&self, binding: ExecutorBinding);
 
+    /// Atomically replace one exact loaded task with its exec successor on
+    /// the same physical executor.
+    fn rebind_exact_with(
+        &self,
+        predecessor: ExecutorBinding,
+        successor: ExecutorBinding,
+        publish: &mut dyn FnMut() -> bool,
+    ) -> bool;
+
     /// Revalidate and consume the exact token at the destination. The host
     /// nudge may occur only inside the successful exact-binding branch.
     fn deliver_exact(&self, token: ExecutorKickToken) -> bool;
 
     fn current_binding(&self) -> Option<ExecutorBinding>;
+}
+
+pub(crate) trait SchedulerGenerationObserver: Send + Sync {
+    fn transition(
+        &self,
+        thread: ThreadKey,
+        predecessor: ExecutionGeneration,
+        successor: ExecutionGeneration,
+        kind: SchedulerGenerationTransition,
+    ) -> Result<(), RunQueueError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SchedulerGenerationTransition {
+    Runnable,
+    Blocked,
+    Terminal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -146,6 +174,7 @@ impl ExecutorBinding {
 pub struct ExecutorRegistration {
     id: ExecutorId,
     close_observation_epoch: Arc<AtomicU64>,
+    control_observation_epoch: Arc<AtomicU64>,
 }
 
 impl ExecutorRegistration {
@@ -194,6 +223,7 @@ impl ExecutorDirectory {
         Ok(ExecutorRegistration {
             id,
             close_observation_epoch: Arc::new(AtomicU64::new(0)),
+            control_observation_epoch: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -253,6 +283,21 @@ impl ExecutorDirectory {
             return;
         };
         kick.unbind(binding);
+    }
+
+    fn rebind_exact_with(
+        &self,
+        predecessor: ExecutorBinding,
+        successor: ExecutorBinding,
+        publish: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        let kick = self
+            .state
+            .lock()
+            .entries
+            .get(&predecessor.executor)
+            .map(|entry| Arc::clone(&entry.kick));
+        kick.is_some_and(|kick| kick.rebind_exact_with(predecessor, successor, publish))
     }
 
     fn binding_for_thread(&self, thread: ThreadKey) -> Option<ExecutorBinding> {
@@ -354,6 +399,7 @@ struct RunQueueInner {
     state: Mutex<RunQueueState>,
     changed: Condvar,
     wake_admissions: AtomicU64,
+    control_epoch: AtomicU64,
     #[cfg(test)]
     close_observation_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)]
@@ -364,6 +410,13 @@ struct RunQueueInner {
 
 impl RunQueueInner {
     const CLOSING_BIT: u64 = 1 << 63;
+
+    fn poke_control(&self) {
+        if self.control_epoch.fetch_add(1, Ordering::AcqRel) == u64::MAX {
+            std::process::abort();
+        }
+        self.changed.notify_all();
+    }
 
     fn try_admit_wake(self: &Arc<Self>) -> Result<WakeAdmission, RunQueueError> {
         let mut observed = self.wake_admissions.load(Ordering::Acquire);
@@ -507,6 +560,10 @@ impl SubmissionAuthority {
         self.key.generation
     }
 
+    pub(crate) const fn is_active(&self) -> bool {
+        self.active
+    }
+
     pub(crate) fn rollover_exact(
         mut self,
         scheduler: &Scheduler,
@@ -548,6 +605,98 @@ impl SubmissionAuthority {
         Ok(self)
     }
 
+    pub(crate) fn park_exact(
+        self,
+        scheduler: &Scheduler,
+        predecessor: ExecutionGeneration,
+        successor: ExecutionGeneration,
+    ) -> Result<Self, (RunQueueError, Self)> {
+        let thread = self.thread_key();
+        let mut authority =
+            self.rollover_exact(scheduler, thread, predecessor, thread, successor)?;
+        if let Some(queue) = authority.queue.upgrade() {
+            queue.release_authority();
+        }
+        authority.active = false;
+        Ok(authority)
+    }
+
+    pub(crate) fn replace_exec_exact(
+        mut self,
+        scheduler: &Scheduler,
+        predecessor_thread: ThreadKey,
+        predecessor_generation: ExecutionGeneration,
+        successor_thread: ThreadKey,
+        successor_generation: ExecutionGeneration,
+    ) -> Result<Self, (RunQueueError, Self)> {
+        if !self.active
+            || self.key.thread != predecessor_thread
+            || self.key.generation != predecessor_generation
+        {
+            return Err((RunQueueError::AuthorityMismatch, self));
+        }
+        let Some(queue) = self.queue.upgrade() else {
+            return Err((RunQueueError::Closed, self));
+        };
+        let Some(kernel) = self.kernel.upgrade() else {
+            return Err((RunQueueError::Closed, self));
+        };
+        if !Arc::ptr_eq(&queue, &scheduler.queue.inner)
+            || !Arc::ptr_eq(&kernel, &scheduler.kernel)
+            || kernel
+                .with_live_active_scheduler_thread(successor_thread, successor_generation, || ())
+                .is_none()
+        {
+            return Err((RunQueueError::AuthorityMismatch, self));
+        }
+        self.key = QueueKey {
+            thread: successor_thread,
+            generation: successor_generation,
+        };
+        Ok(self)
+    }
+
+    pub(crate) fn reactivate_exact(
+        mut self,
+        scheduler: &Scheduler,
+        predecessor: ExecutionGeneration,
+        successor: ExecutionGeneration,
+    ) -> Result<Self, (RunQueueError, Self)> {
+        if self.active
+            || self.generation() != predecessor
+            || predecessor.raw().checked_add(1) != Some(successor.raw())
+        {
+            return Err((RunQueueError::AuthorityMismatch, self));
+        }
+        let Some(queue) = self.queue.upgrade() else {
+            return Err((RunQueueError::Closed, self));
+        };
+        let Some(kernel) = self.kernel.upgrade() else {
+            return Err((RunQueueError::Closed, self));
+        };
+        if !Arc::ptr_eq(&queue, &scheduler.queue.inner)
+            || !Arc::ptr_eq(&kernel, &scheduler.kernel)
+            || kernel
+                .with_live_active_scheduler_thread(self.thread_key(), successor, || ())
+                .is_none()
+        {
+            return Err((RunQueueError::AuthorityMismatch, self));
+        }
+        let mut state = queue.state.lock();
+        if state.lifecycle == QueueLifecycle::Closed {
+            return Err((RunQueueError::Closed, self));
+        }
+        let Some(active_authorities) = state.active_authorities.checked_add(1) else {
+            drop(state);
+            return Err((RunQueueError::SubmissionRejected, self));
+        };
+        state.active_authorities = active_authorities;
+        drop(state);
+        self.key.generation = successor;
+        self.active = true;
+        Ok(self)
+    }
+
     pub(crate) fn admit_descendant(
         &self,
         thread: ThreadKey,
@@ -584,11 +733,97 @@ impl SubmissionAuthority {
             .unwrap_or(Err(RunQueueError::AuthorityMismatch))
     }
 
+    pub(crate) fn admit_same_task_sibling(
+        &self,
+        thread: ThreadKey,
+        generation: ExecutionGeneration,
+    ) -> Result<Self, RunQueueError> {
+        self.admit_related(thread, generation, |kernel, commit| {
+            kernel.with_live_scheduler_same_task_sibling(
+                self.key.thread,
+                self.key.generation,
+                thread,
+                generation,
+                commit,
+            )
+        })
+    }
+
+    pub(crate) fn admit_peer_root(
+        &self,
+        thread: ThreadKey,
+        generation: ExecutionGeneration,
+    ) -> Result<Self, RunQueueError> {
+        self.admit_related(thread, generation, |kernel, commit| {
+            kernel.with_live_scheduler_peer_root(
+                self.key.thread,
+                self.key.generation,
+                thread,
+                generation,
+                commit,
+            )
+        })
+    }
+
+    fn admit_related(
+        &self,
+        thread: ThreadKey,
+        generation: ExecutionGeneration,
+        validate: impl FnOnce(
+            &Kernel,
+            &mut dyn FnMut() -> Result<Self, RunQueueError>,
+        ) -> Option<Result<Self, RunQueueError>>,
+    ) -> Result<Self, RunQueueError> {
+        if !self.active {
+            return Err(RunQueueError::AuthorityMismatch);
+        }
+        let kernel = self.kernel.upgrade().ok_or(RunQueueError::Closed)?;
+        let queue = self.queue.upgrade().ok_or(RunQueueError::Closed)?;
+        let mut commit = || {
+            let mut state = queue.state.lock();
+            if state.lifecycle == QueueLifecycle::Closed {
+                return Err(RunQueueError::Closed);
+            }
+            state.active_authorities = state
+                .active_authorities
+                .checked_add(1)
+                .ok_or(RunQueueError::SubmissionRejected)?;
+            Ok(Self {
+                queue: Arc::downgrade(&queue),
+                kernel: Arc::downgrade(&kernel),
+                key: QueueKey { thread, generation },
+                active: true,
+            })
+        };
+        validate(&kernel, &mut commit).unwrap_or(Err(RunQueueError::AuthorityMismatch))
+    }
+
+    #[cfg(test)]
     pub(crate) fn publish(
         &self,
         scheduler: &Scheduler,
         thread: Arc<Thread>,
     ) -> Result<(), SchedulerError> {
+        self.publish_row(scheduler, thread).map(|_| ())
+    }
+
+    pub(crate) fn publish_unique(
+        &self,
+        scheduler: &Scheduler,
+        thread: Arc<Thread>,
+    ) -> Result<(), SchedulerError> {
+        if self.publish_row(scheduler, thread)? {
+            Ok(())
+        } else {
+            Err(RunQueueError::SubmissionRejected.into())
+        }
+    }
+
+    fn publish_row(
+        &self,
+        scheduler: &Scheduler,
+        thread: Arc<Thread>,
+    ) -> Result<bool, SchedulerError> {
         let queue = self.queue.upgrade().ok_or(RunQueueError::Closed)?;
         let exact = scheduler
             .kernel
@@ -601,8 +836,9 @@ impl SubmissionAuthority {
         {
             return Err(RunQueueError::AuthorityMismatch.into());
         }
-        scheduler.enqueue_exact(thread, self.key, true)?;
-        Ok(())
+        scheduler
+            .enqueue_exact(thread, self.key, true)
+            .map_err(Into::into)
     }
 }
 
@@ -670,6 +906,14 @@ impl RunQueue {
     fn take_row(&self, executor: &ExecutorRegistration) -> Result<QueueRow, RunQueueError> {
         let mut state = self.inner.state.lock();
         loop {
+            let control_epoch = self.inner.control_epoch.load(Ordering::Acquire);
+            if executor
+                .control_observation_epoch
+                .swap(control_epoch, Ordering::AcqRel)
+                != control_epoch
+            {
+                return Err(RunQueueError::ControlPoked);
+            }
             if let Some(row) = state.rows.pop_front() {
                 state.queued.remove(&row.key);
                 state.claimed = state
@@ -996,16 +1240,27 @@ struct PendingWake {
     _admission: WakeAdmission,
 }
 
-#[derive(Debug)]
 pub struct Scheduler {
     kernel: Arc<Kernel>,
     queue: RunQueue,
     executors: ExecutorDirectory,
     need_resched: AtomicBool,
     snapshot_count: AtomicU64,
+    generation_transition: Mutex<()>,
+    generation_observer: Mutex<Option<Arc<dyn SchedulerGenerationObserver>>>,
     #[cfg(test)]
     continuation_settlement_barriers:
         Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+}
+
+impl std::fmt::Debug for Scheduler {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Scheduler")
+            .field("queued", &self.queue.len())
+            .field("need_resched", &self.need_resched.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
 }
 
 impl Scheduler {
@@ -1016,9 +1271,42 @@ impl Scheduler {
             executors: ExecutorDirectory::default(),
             need_resched: AtomicBool::new(false),
             snapshot_count: AtomicU64::new(0),
+            generation_transition: Mutex::new(()),
+            generation_observer: Mutex::new(None),
             #[cfg(test)]
             continuation_settlement_barriers: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn install_generation_observer(
+        &self,
+        observer: Arc<dyn SchedulerGenerationObserver>,
+    ) -> Result<(), RunQueueError> {
+        let mut slot = self.generation_observer.lock();
+        if slot.is_some() {
+            return Err(RunQueueError::SubmissionRejected);
+        }
+        *slot = Some(observer);
+        Ok(())
+    }
+
+    fn observe_generation_transition(
+        &self,
+        thread: ThreadKey,
+        predecessor: ExecutionGeneration,
+        successor: ExecutionGeneration,
+        kind: SchedulerGenerationTransition,
+    ) -> Result<(), SchedulerError> {
+        if let Some(observer) = self.generation_observer.lock().as_ref()
+            && let Err(error) = observer.transition(thread, predecessor, successor, kind)
+        {
+            // The Kernel execution state has already advanced. Returning an
+            // ordinary error would strand the successor outside the combined
+            // binding/authority directory and bypass logical completion.
+            tracing::error!(?thread, ?predecessor, ?successor, ?kind, %error, "scheduler generation observer lost exact transition");
+            std::process::abort();
+        }
+        Ok(())
     }
 
     pub fn register_executor(
@@ -1048,6 +1336,7 @@ impl Scheduler {
         self.executors.clear_binding(registration)
     }
 
+    #[cfg(test)]
     pub(crate) fn admit_root(
         &self,
         thread: ThreadKey,
@@ -1055,6 +1344,20 @@ impl Scheduler {
     ) -> Result<SubmissionAuthority, SchedulerError> {
         self.kernel
             .with_live_active_scheduler_thread(thread, generation, || {
+                self.queue
+                    .admit_root(&self.kernel, QueueKey { thread, generation })
+            })
+            .unwrap_or(Err(RunQueueError::AuthorityMismatch))
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn admit_process_root(
+        &self,
+        thread: ThreadKey,
+        generation: ExecutionGeneration,
+    ) -> Result<SubmissionAuthority, SchedulerError> {
+        self.kernel
+            .with_live_scheduler_process_root(thread, generation, || {
                 self.queue
                     .admit_root(&self.kernel, QueueKey { thread, generation })
             })
@@ -1087,7 +1390,41 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Cancel one exact dormant blocked generation without manufacturing a
+    /// lease. The combined binding/authority observer is retired in the same
+    /// serialized generation transaction before callers publish completion.
+    pub(crate) fn fail_blocked_exact(
+        &self,
+        key: ThreadKey,
+        generation: ExecutionGeneration,
+        reason: super::objects::ExecutionFailure,
+    ) -> Result<bool, SchedulerError> {
+        let _transition = self.generation_transition.lock();
+        let thread = self
+            .kernel
+            .exact_thread_for_scheduler(key)
+            .ok_or(SchedulerError::UnknownThread)?;
+        if !matches!(
+            thread.execution_state(),
+            super::objects::ThreadExecutionState::Blocked {
+                generation: current,
+                ..
+            } if current == generation
+        ) {
+            return Ok(false);
+        }
+        let successor = thread.fail_blocked_generation(generation, reason)?;
+        self.observe_generation_transition(
+            key,
+            generation,
+            successor,
+            SchedulerGenerationTransition::Terminal,
+        )?;
+        Ok(true)
+    }
+
     pub fn wake(&self, thread: ThreadKey) -> Result<WakeDisposition, SchedulerError> {
+        let _transition = self.generation_transition.lock();
         let pending = self.begin_wake(thread)?;
         self.commit_wake(pending)
     }
@@ -1126,16 +1463,27 @@ impl Scheduler {
         Ok(match action {
             ThreadSchedulerAction::Queue {
                 key,
+                predecessor,
                 generation,
                 closing_authorized,
-            } => WakeAction::Queue {
-                thread,
-                key: QueueKey {
-                    thread: key,
-                    generation,
-                },
-                closing_authorized,
-            },
+            } => {
+                if let Some(predecessor) = predecessor {
+                    self.observe_generation_transition(
+                        key,
+                        predecessor,
+                        generation,
+                        SchedulerGenerationTransition::Runnable,
+                    )?;
+                }
+                WakeAction::Queue {
+                    thread,
+                    key: QueueKey {
+                        thread: key,
+                        generation,
+                    },
+                    closing_authorized,
+                }
+            }
             ThreadSchedulerAction::Kick {
                 executor,
                 executor_epoch,
@@ -1157,6 +1505,7 @@ impl Scheduler {
                 thread,
                 key,
                 closing_authorized,
+                ..
             } => Ok(if self.enqueue_exact(thread, key, closing_authorized)? {
                 WakeDisposition::Queued
             } else {
@@ -1214,17 +1563,38 @@ impl Scheduler {
         })
     }
 
+    pub(crate) fn poke_executor_control(&self) {
+        self.queue.inner.poke_control();
+    }
+
     pub fn settle_blocked(
         &self,
         mut running: RunnableThread,
         reason: BlockedReason,
     ) -> Result<(), SchedulerError> {
+        let _transition = self.generation_transition.lock();
+        let predecessor = running.generation();
         let lease = running.take_lease();
         let action = running
             .thread
             .scheduler_park_from_executor(lease, reason)
             .map_err(|(error, _lease)| error)?;
+        let successor = running
+            .thread
+            .execution_state()
+            .generation()
+            .ok_or(RunQueueError::AuthorityMismatch)?;
+        let kind = if matches!(
+            running.thread.execution_state(),
+            super::objects::ThreadExecutionState::Blocked { .. }
+        ) {
+            SchedulerGenerationTransition::Blocked
+        } else {
+            SchedulerGenerationTransition::Runnable
+        };
+        self.observe_generation_transition(running.thread_key(), predecessor, successor, kind)?;
         self.executors.unbind(running.binding);
+        drop(_transition);
         self.apply_settlement_action(&running.thread, action)?;
         running.finish_claim();
         Ok(())
@@ -1236,6 +1606,8 @@ impl Scheduler {
         mut continuation: crate::vcpu_loop::continuation::BlockedContinuation,
         registration: crate::vcpu_loop::continuation::ContinuationRegistration,
     ) -> Result<(), SchedulerError> {
+        let _transition = self.generation_transition.lock();
+        let predecessor = running.generation();
         if continuation.authority().thread() != running.thread_key()
             || continuation.authority().execution_generation() != running.generation()
         {
@@ -1249,7 +1621,22 @@ impl Scheduler {
             .thread
             .scheduler_park_continuation_from_executor(lease, BlockedReason::HostWait, continuation)
             .map_err(|(error, _lease)| error)?;
+        let successor = running
+            .thread
+            .execution_state()
+            .generation()
+            .ok_or(RunQueueError::AuthorityMismatch)?;
+        let kind = if matches!(
+            running.thread.execution_state(),
+            super::objects::ThreadExecutionState::Blocked { .. }
+        ) {
+            SchedulerGenerationTransition::Blocked
+        } else {
+            SchedulerGenerationTransition::Runnable
+        };
+        self.observe_generation_transition(running.thread_key(), predecessor, successor, kind)?;
         self.executors.unbind(running.binding);
+        drop(_transition);
         #[cfg(test)]
         if let Some((at_clear, release)) = self.continuation_settlement_barriers.lock().clone() {
             at_clear.wait();
@@ -1378,20 +1765,131 @@ impl Scheduler {
             .map_err(|(error, lease)| (error.into(), lease))
     }
 
+    /// Transfer the current non-cloneable worker claim to an already-published
+    /// exec replacement. The caller's publication closure swaps the combined
+    /// binding/submission-authority record while this generation mutex is
+    /// held; only then does the exact kick token become the successor.
+    pub(crate) fn retarget_running_exec<T>(
+        &self,
+        running: &mut RunnableThread,
+        committed: super::exec::CommittedExecTransition,
+        lease: ThreadExecutionLease,
+        publish: impl FnOnce(&super::exec::CommittedExecSchedulerParts) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _transition = self.generation_transition.lock();
+        let committed = committed
+            .into_scheduler_parts()
+            .map_err(|error| error.to_string())?;
+        let replacement = Arc::clone(committed.context.thread());
+        let lease_identity = lease
+            .task_state_authority()
+            .map_err(|error| error.to_string())?;
+        if running.lease.is_some()
+            || lease.executor() != running.binding.executor
+            || lease.thread_key() != replacement.key()
+            || running.thread_key() != committed.predecessor_thread
+            || running.thread.task_key() != committed.task
+            || replacement.task_key() != committed.task
+            || replacement.key() != committed.successor_thread
+            || committed.context.shared().mm().id() != committed.successor_mm
+            || committed.predecessor_mm == committed.successor_mm
+            || lease_identity != (committed.successor_mm, committed.successor_asid_generation)
+        {
+            return Err(RunQueueError::AuthorityMismatch.to_string());
+        }
+        replacement
+            .validate_running_execution_lease(&lease)
+            .map_err(|error| error.to_string())?;
+        let successor = ExecutorBinding {
+            executor: lease.executor(),
+            executor_epoch: lease.executor_epoch(),
+            thread: replacement.key(),
+            generation: lease.generation(),
+        };
+        let mut published = None;
+        let mut publication_error = None;
+        let mut publish = Some(publish);
+        let mut publish_once =
+            || match publish.take().unwrap_or_else(|| std::process::abort())(&committed) {
+                Ok(value) => {
+                    published = Some(value);
+                    true
+                }
+                Err(error) => {
+                    publication_error = Some(error);
+                    false
+                }
+            };
+        if !self
+            .executors
+            .rebind_exact_with(running.binding, successor, &mut publish_once)
+        {
+            if let Some(error) = publication_error {
+                return Err(error);
+            }
+            // The Kernel replacement and combined record are already visible;
+            // continuing without the matching kick token would split worker
+            // authority. There is no safe predecessor rollback here.
+            std::process::abort();
+        }
+        let published = published.unwrap_or_else(|| std::process::abort());
+        running.thread = replacement;
+        running.key = QueueKey {
+            thread: successor.thread,
+            generation: successor.generation,
+        };
+        running.binding = successor;
+        running.lease = Some(lease);
+        Ok(published)
+    }
+
     pub(crate) fn settle_failed(
         &self,
         mut running: RunnableThread,
         reason: super::objects::ExecutionFailure,
     ) -> Result<(), SchedulerError> {
-        let lease = running.take_lease();
-        match running.thread.fail_from_executor(lease, reason) {
-            Ok(()) => {
+        let _transition = self.generation_transition.lock();
+        let predecessor = running.generation();
+        let failure = if let Some(lease) = running.lease.take() {
+            running
+                .thread
+                .fail_from_executor(lease, reason)
+                .map(|()| {
+                    running
+                        .thread
+                        .execution_state()
+                        .generation()
+                        .unwrap_or_else(|| std::process::abort())
+                })
+                .map_err(|(error, lease)| (error, Some(lease)))
+        } else {
+            running
+                .thread
+                .fail_claimed_execution(
+                    predecessor,
+                    running.binding.executor,
+                    running.binding.executor_epoch,
+                    reason,
+                )
+                .map_err(|error| (error, None))
+        };
+        match failure {
+            Ok(successor) => {
+                self.observe_generation_transition(
+                    running.thread_key(),
+                    predecessor,
+                    successor,
+                    SchedulerGenerationTransition::Terminal,
+                )?;
                 self.executors.unbind(running.binding);
+                drop(_transition);
                 running.finish_claim();
                 Ok(())
             }
             Err((error, lease)) => {
-                if let Err((_restore_error, lease)) = running.restore_lease(lease) {
+                if let Some(lease) = lease
+                    && let Err((_restore_error, lease)) = running.restore_lease(lease)
+                {
                     drop(lease);
                 }
                 Err(error.into())
@@ -1407,6 +1905,8 @@ impl Scheduler {
         &self,
         mut running: RunnableThread,
     ) -> Result<Option<ExecutionGeneration>, SchedulerError> {
+        let _transition = self.generation_transition.lock();
+        let predecessor = running.generation();
         let lease = running.take_lease();
         let action = running
             .thread
@@ -1420,7 +1920,16 @@ impl Scheduler {
             | ThreadSchedulerAction::Kick { .. }
             | ThreadSchedulerAction::None => None,
         };
+        if let Some(successor) = successor {
+            self.observe_generation_transition(
+                running.thread_key(),
+                predecessor,
+                successor,
+                SchedulerGenerationTransition::Runnable,
+            )?;
+        }
         self.executors.unbind(running.binding);
+        drop(_transition);
         self.snapshot_count.fetch_add(1, Ordering::Relaxed);
         self.apply_settlement_action(&running.thread, action)?;
         running.finish_claim();
@@ -1428,12 +1937,26 @@ impl Scheduler {
     }
 
     pub fn settle_exited(&self, mut running: RunnableThread) -> Result<(), SchedulerError> {
+        let _transition = self.generation_transition.lock();
+        let predecessor = running.generation();
         let lease = running.take_lease();
         running
             .thread
             .exit_from_executor(lease)
             .map_err(|(error, _lease)| error)?;
+        let successor = running
+            .thread
+            .execution_state()
+            .generation()
+            .ok_or(RunQueueError::AuthorityMismatch)?;
+        self.observe_generation_transition(
+            running.thread_key(),
+            predecessor,
+            successor,
+            SchedulerGenerationTransition::Terminal,
+        )?;
         self.executors.unbind(running.binding);
+        drop(_transition);
         running.finish_claim();
         Ok(())
     }
@@ -1446,6 +1969,7 @@ impl Scheduler {
         match action {
             ThreadSchedulerAction::Queue {
                 key,
+                predecessor: _,
                 generation,
                 closing_authorized,
             } => {
@@ -1676,6 +2200,23 @@ mod tests {
             }
         }
 
+        fn rebind_exact_with(
+            &self,
+            predecessor: super::ExecutorBinding,
+            successor: super::ExecutorBinding,
+            publish: &mut dyn FnMut() -> bool,
+        ) -> bool {
+            let mut current = self.binding.lock();
+            if *current != Some(predecessor) {
+                return false;
+            }
+            if !publish() {
+                return false;
+            }
+            *current = Some(successor);
+            true
+        }
+
         fn deliver_exact(&self, token: ExecutorKickToken) -> bool {
             let current = self.binding.lock();
             if (*current).map(super::ExecutorBinding::token) != Some(token) {
@@ -1713,6 +2254,23 @@ mod tests {
             if *current == Some(binding) {
                 *current = None;
             }
+        }
+
+        fn rebind_exact_with(
+            &self,
+            predecessor: super::ExecutorBinding,
+            successor: super::ExecutorBinding,
+            publish: &mut dyn FnMut() -> bool,
+        ) -> bool {
+            let mut current = self.binding.lock();
+            if *current != Some(predecessor) {
+                return false;
+            }
+            if !publish() {
+                return false;
+            }
+            *current = Some(successor);
+            true
         }
 
         fn deliver_exact(&self, token: ExecutorKickToken) -> bool {
@@ -2087,6 +2645,100 @@ mod tests {
         );
         assert!(kicks.tokens.lock().is_empty());
         scheduler.settle_exited(successor).unwrap();
+    }
+
+    #[test]
+    fn exec_rebind_rejects_old_full_token_and_accepts_successor_token() {
+        let (kernel, first) = bootstrap(11_074);
+        publish(&first, 74);
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let kick = Arc::new(RecordingKick::default());
+        let registration = scheduler.register_executor(kick.clone()).unwrap();
+        scheduler.make_runnable(first.thread().key()).unwrap();
+        let mut running = scheduler.take(&registration).unwrap();
+        let predecessor = running.binding;
+        let old_token = predecessor.token();
+        let prepared = kernel
+            .prepare_exec_with_registry_id(&first, ThreadId::synthetic_for_tests(21_074), None)
+            .unwrap();
+        let old_lease = running.take_lease();
+        first.thread().exit_from_executor(old_lease).unwrap();
+        let committed = kernel.commit_exec_transition(prepared, None).unwrap();
+        let replacement = committed.context().retain_exact();
+        let replacement_mm = replacement.shared().mm().id();
+        let committed = committed
+            .attach_successor_asid_generation(replacement_mm, replacement_mm.raw())
+            .unwrap();
+        replacement
+            .thread()
+            .publish_initial_task_state(task_state(&replacement, 75))
+            .unwrap();
+        let replacement_lease = replacement
+            .thread()
+            .claim_runnable(registration.id())
+            .unwrap();
+        scheduler
+            .retarget_running_exec(&mut running, committed, replacement_lease, |_| {
+                Ok::<_, String>(())
+            })
+            .unwrap();
+        let successor = running.binding;
+        let successor_token = successor.token();
+
+        assert_ne!(predecessor.thread, successor.thread);
+        assert!(!kick.deliver_exact(old_token));
+        assert!(kick.deliver_exact(successor_token));
+        assert_eq!(kick.tokens.lock().as_slice(), &[successor_token]);
+        scheduler.settle_exited(running).unwrap();
+        scheduler.unregister_executor(&registration).unwrap();
+    }
+
+    #[test]
+    fn exec_retarget_rejects_lease_asid_identity_not_minted_by_transition() {
+        let (kernel, first) = bootstrap(11_075);
+        publish(&first, 75);
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let kick = Arc::new(RecordingKick::default());
+        let registration = scheduler.register_executor(kick).unwrap();
+        scheduler.make_runnable(first.thread().key()).unwrap();
+        let mut running = scheduler.take(&registration).unwrap();
+        let prepared = kernel
+            .prepare_exec_with_registry_id(&first, ThreadId::synthetic_for_tests(21_075), None)
+            .unwrap();
+        let old_lease = running.take_lease();
+        first.thread().exit_from_executor(old_lease).unwrap();
+        let committed = kernel.commit_exec_transition(prepared, None).unwrap();
+        let replacement = committed.context().retain_exact();
+        let replacement_mm = replacement.shared().mm().id();
+        let wrong_asid = replacement_mm.raw().checked_add(1).unwrap();
+        let committed = committed
+            .attach_successor_asid_generation(replacement_mm, wrong_asid)
+            .unwrap();
+        replacement
+            .thread()
+            .publish_initial_task_state(task_state(&replacement, 76))
+            .unwrap();
+        let replacement_lease = replacement
+            .thread()
+            .claim_runnable(registration.id())
+            .unwrap();
+
+        assert!(
+            scheduler
+                .retarget_running_exec(&mut running, committed, replacement_lease, |_| Ok::<
+                    _,
+                    String,
+                >(
+                    ()
+                ),)
+                .is_err(),
+            "replacement lease MM/ASID/CPU identity must match the Kernel token"
+        );
+        assert!(matches!(
+            replacement.thread().execution_state(),
+            ThreadExecutionState::Failed { .. }
+        ));
+        scheduler.unregister_executor(&registration).unwrap();
     }
 
     #[test]

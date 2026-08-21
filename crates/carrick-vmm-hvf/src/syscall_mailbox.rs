@@ -92,6 +92,17 @@ pub struct MailboxSlotAllocator {
     used: parking_lot::Mutex<[bool; AARCH64_SYSCALL_MAILBOX_SLOTS]>,
 }
 
+pub(crate) static MAILBOX_SLOT_CLAIMS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    static THREAD_MAILBOX_SLOT_CLAIMS_TOTAL: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn current_thread_mailbox_slot_claims_total() -> u64 {
+    THREAD_MAILBOX_SLOT_CLAIMS_TOTAL.get()
+}
+
 impl MailboxSlotAllocator {
     pub fn new() -> Self {
         Self {
@@ -105,6 +116,9 @@ impl MailboxSlotAllocator {
             return Err(MailboxSlotError::Exhausted);
         };
         used[index] = true;
+        MAILBOX_SLOT_CLAIMS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        THREAD_MAILBOX_SLOT_CLAIMS_TOTAL
+            .set(THREAD_MAILBOX_SLOT_CLAIMS_TOTAL.get().saturating_add(1));
         let id = MailboxSlotId(u16::try_from(index).map_err(|_| MailboxSlotError::Exhausted)?);
         Ok(MailboxSlotLease {
             id,
@@ -436,6 +450,19 @@ impl MailboxBinding {
         self.last_sequence = continuation.sequence;
         self.restore_outstanding(continuation);
         Ok(())
+    }
+
+    pub fn take_task_continuation_for_executor_switch(
+        &mut self,
+    ) -> Result<Option<Aarch64SyscallContinuationV1>, MailboxConsumeError> {
+        if self.lease.is_none() {
+            return Err(MailboxConsumeError::AlreadyParked);
+        }
+        let continuation = self.export_task_continuation()?;
+        self.state()
+            .store(MailboxState::Idle.raw(), Ordering::Release);
+        self.last_sequence = 0;
+        Ok(continuation)
     }
 
     /// Snapshot the outstanding response vehicle and release this binding's

@@ -9,17 +9,124 @@ use std::thread::JoinHandle;
 use parking_lot::Mutex;
 
 use carrick_abi::LinuxGuestAbi;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use carrick_hal::ThreadedEngine as _;
 
 use crate::dispatch::SyscallDispatcher;
+#[cfg(test)]
+use crate::kernel::SchedulerError;
 use crate::kernel::objects::{
     BlockedReason, ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState,
     ThreadExecutionLease, ThreadKey,
 };
 use crate::kernel::{
     ExecutorBinding, ExecutorKick, ExecutorKickToken, ExecutorRegistration, MmId, RunnableThread,
-    Scheduler, SchedulerError, SubmissionAuthority,
+    Scheduler, SubmissionAuthority,
 };
 use crate::trap::TrapError;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct HvpatchPersistentExecutorFactory {
+    authority: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchPersistentExecutorFactoryAuthority,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchPersistentExecutorFactory {
+    pub(crate) fn new(
+        authority: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchPersistentExecutorFactoryAuthority,
+    ) -> Self {
+        Self { authority }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct HvpatchPersistentExecutor {
+    executor_id: ExecutorId,
+    lifecycle: Option<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vmm>,
+    vcpu: Option<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vcpu>,
+    current: Option<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine>,
+    binding: Option<Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>>,
+    loaded_task_only: Option<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchTaskOnlyEngineState>,
+    receipt: ExecutorCpuReceipt,
+    raw_vcpu_id: u64,
+    owner_thread_port: u32,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct HvpatchTaskEngineBindingState {
+    payload: HvpatchTaskEngineBindingPayload,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+enum HvpatchTaskEngineBindingPayload {
+    Resident(Box<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchTaskEngineState>),
+    TaskOnly(Box<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchTaskOnlyEngineState>),
+    #[cfg(test)]
+    Test,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchTaskEngineBindingState {
+    pub(crate) fn initial(
+        state: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchTaskEngineState,
+    ) -> Self {
+        Self {
+            payload: HvpatchTaskEngineBindingPayload::Resident(Box::new(state)),
+        }
+    }
+
+    pub(crate) fn task_only(
+        state: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchTaskOnlyEngineState,
+    ) -> Self {
+        Self {
+            payload: HvpatchTaskEngineBindingPayload::TaskOnly(Box::new(state)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_only() -> Self {
+        Self {
+            payload: HvpatchTaskEngineBindingPayload::Test,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl PersistentExecutorFactory for HvpatchPersistentExecutorFactory {
+    type Executor = HvpatchPersistentExecutor;
+    fn create(&self, executor: ExecutorId) -> Result<Self::Executor, TrapError> {
+        let (lifecycle, vcpu) = self.authority.create_executor_parts()?;
+        let raw_vcpu_id = carrick_vmm_hvf::hvf_aarch64_engine::persistent_vcpu_identity(&vcpu);
+        let owner_thread_port = current_owner_thread_port();
+        Ok(HvpatchPersistentExecutor {
+            executor_id: executor,
+            lifecycle: Some(lifecycle),
+            vcpu: Some(vcpu),
+            current: None,
+            binding: None,
+            loaded_task_only: None,
+            receipt: ExecutorCpuReceipt::default(),
+            raw_vcpu_id,
+            owner_thread_port,
+        })
+    }
+}
+
+fn probe_executor_lifecycle(
+    executor: ExecutorId,
+    phase: crate::probes::HvpatchExecutorLifecyclePhase,
+    thread: Option<ThreadKey>,
+    generation: Option<ExecutionGeneration>,
+    asid_generation: u64,
+) {
+    crate::probes::hvpatch_executor_lifecycle(
+        executor.raw_for_probe(),
+        phase,
+        thread.map_or(0, |key| key.serial.raw()),
+        generation.map_or(0, ExecutionGeneration::raw),
+        asid_generation,
+    );
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutorPoolConfig {
@@ -44,13 +151,13 @@ impl ExecutorPoolConfig {
     }
 }
 
-pub trait PersistentExecutorFactory: Send + Sync + 'static {
+pub(crate) trait PersistentExecutorFactory: Send + Sync + 'static {
     type Executor: PersistentExecutor;
 
     fn create(&self, executor: ExecutorId) -> Result<Self::Executor, TrapError>;
 }
 
-pub trait PersistentExecutor: 'static {
+pub(crate) trait PersistentExecutor: 'static {
     type TaskBinding: PersistentTaskBinding + Send + Sync + 'static;
 
     fn load(&mut self, task: &RunnableTask<'_, Self::TaskBinding>) -> Result<(), TrapError>;
@@ -58,14 +165,29 @@ pub trait PersistentExecutor: 'static {
     fn run_until_boundary(
         &mut self,
         need_resched: &AtomicBool,
-        submission: &ExecutorSubmissionContext<'_>,
+        submission: &mut ExecutorSubmissionContext<'_>,
     ) -> Result<ExecutorExit, TrapError>;
 
     fn take_cpu_receipt(&mut self) -> ExecutorCpuReceipt;
 
+    fn hardware_kick(&self) -> Result<ExactHardwareKick, TrapError>;
+
+    fn validate_loaded_hardware_identity(&self) -> Result<(), TrapError> {
+        Ok(())
+    }
+
+    fn retarget_loaded_task(&mut self, _binding: Arc<Self::TaskBinding>) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "persistent executor does not support loaded exec replacement".to_owned(),
+        ))
+    }
+
     fn save(&mut self, lease: ThreadExecutionLease) -> Result<SavedRunnable, ExecutorSaveError>;
 
-    fn invalidate_asid(&mut self, generation: u64) -> Result<(), TrapError>;
+    fn invalidate_asid(
+        &mut self,
+        generation: crate::hvpatch::AsidGeneration,
+    ) -> Result<(), TrapError>;
 
     /// Backend-owned state that the runtime crate cannot inspect (HVF fork
     /// snapshot, vCPU/mailbox owner identity, invariant EL1 state) is audited
@@ -73,6 +195,361 @@ pub trait PersistentExecutor: 'static {
     fn audit_boundary(&mut self) -> Result<(), TrapError>;
 
     fn destroy(self) -> Result<(), TrapError>;
+}
+
+pub struct ExactHardwareKick {
+    handle: Box<dyn carrick_hal::VcpuKickDyn>,
+    raw_vcpu_id: u64,
+    owner_thread_port: u32,
+}
+
+impl ExactHardwareKick {
+    fn new(
+        handle: Box<dyn carrick_hal::VcpuKickDyn>,
+        raw_vcpu_id: u64,
+        owner_thread_port: u32,
+    ) -> Result<Self, TrapError> {
+        if raw_vcpu_id == 0 || owner_thread_port == 0 {
+            return Err(TrapError::Hypervisor(
+                "hardware kick lacks exact vCPU/Mach owner identity".to_owned(),
+            ));
+        }
+        Ok(Self {
+            handle,
+            raw_vcpu_id,
+            owner_thread_port,
+        })
+    }
+}
+
+fn current_owner_thread_port() -> u32 {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        1
+    }
+}
+
+fn restore_worker_vcpu_before_binding_publication<V, B>(
+    worker_vcpu: &mut Option<V>,
+    vcpu: V,
+    backend: B,
+    publish: impl FnOnce(B, &Option<V>) -> Result<(), TrapError>,
+) -> Result<(), TrapError> {
+    if worker_vcpu.replace(vcpu).is_some() {
+        std::process::abort();
+    }
+    publish(backend, worker_vcpu)
+}
+
+pub(crate) fn retire_failed_hvpatch_clone_authority(
+    scheduler: &Scheduler,
+    kernel: &Arc<crate::kernel::Kernel>,
+    context: &crate::kernel::KernelContext,
+    generation: ExecutionGeneration,
+    retire_binding: impl FnOnce(ThreadKey, ExecutionGeneration),
+) -> Result<(), String> {
+    scheduler
+        .fail_runnable_exact(
+            context.thread().key(),
+            generation,
+            ExecutionFailure::SnapshotSaveFailed,
+        )
+        .map_err(|error| format!("fail exact HVPatch clone runnable: {error}"))?;
+    retire_binding(context.thread().key(), generation);
+    kernel
+        .exit_thread(context, None)
+        .map(|_| ())
+        .map_err(|error| format!("retire exact HVPatch clone Kernel thread: {error}"))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl PersistentExecutor for HvpatchPersistentExecutor {
+    type TaskBinding = crate::vcpu_loop::continuation::HvpatchTaskBinding;
+
+    fn load(&mut self, task: &RunnableTask<'_, Self::TaskBinding>) -> Result<(), TrapError> {
+        if self.current.is_some() || self.binding.is_some() {
+            return Err(TrapError::Hypervisor(
+                "HVPatch executor already has task authority".into(),
+            ));
+        }
+        let mut asid_load = task.binding().begin_asid_load(self.executor_id)?;
+        asid_load.arm_hardware_dirty().map_err(|error| {
+            TrapError::Hypervisor(format!("HVPatch ASID hardware arm failed: {error}"))
+        })?;
+        let state = task
+            .binding()
+            .take_backend::<HvpatchTaskEngineBindingState>()?;
+        let vcpu = self
+            .vcpu
+            .take()
+            .ok_or_else(|| TrapError::Hypervisor("HVPatch executor lost worker vCPU".into()))?;
+        let engine = match state.payload {
+            HvpatchTaskEngineBindingPayload::Resident(state) => {
+                let lifecycle = self.lifecycle.as_mut().ok_or_else(|| {
+                    TrapError::Hypervisor("HVPatch executor lost idle lifecycle".into())
+                })?;
+                carrick_vmm_hvf::hvf_aarch64_engine::attach_task_engine(*state, lifecycle, vcpu)
+            }
+            HvpatchTaskEngineBindingPayload::TaskOnly(state) => {
+                let lifecycle = self.lifecycle.take().ok_or_else(|| {
+                    TrapError::Hypervisor("HVPatch task-only load lost worker lifecycle".into())
+                })?;
+                let identity = task.binding().identity();
+                let engine = carrick_vmm_hvf::hvf_aarch64_engine::attach_task_only_engine(
+                    &state,
+                    lifecycle,
+                    vcpu,
+                    identity.mm.raw(),
+                    identity.asid_generation,
+                );
+                self.loaded_task_only = Some(*state);
+                engine
+            }
+            #[cfg(test)]
+            HvpatchTaskEngineBindingPayload::Test => {
+                self.vcpu = Some(vcpu);
+                let _ = task
+                    .binding()
+                    .put_backend(HvpatchTaskEngineBindingState::test_only());
+                return Err(TrapError::Hypervisor(
+                    "test-only HVPatch backend cannot load on hardware".into(),
+                ));
+            }
+        };
+        self.current = Some(engine);
+        self.binding = Some(Arc::clone(task.binding()));
+        let cpu = &task.validate_for_load()?.cpu;
+        self.current
+            .as_mut()
+            .ok_or_else(|| TrapError::Hypervisor("HVPatch load lost attached engine".into()))?
+            .overlay_task_state_on_live_executor(cpu)?;
+        self.current
+            .as_mut()
+            .ok_or_else(|| TrapError::Hypervisor("HVPatch load lost barrier engine".into()))?
+            .complete_task_load_barrier()?;
+        asid_load.mark_resident().map_err(|error| {
+            TrapError::Hypervisor(format!("HVPatch ASID residence commit failed: {error}"))
+        })
+    }
+
+    fn run_until_boundary(
+        &mut self,
+        need_resched: &AtomicBool,
+        submission: &mut ExecutorSubmissionContext<'_>,
+    ) -> Result<ExecutorExit, TrapError> {
+        let quantum = Arc::clone(
+            self.binding
+                .as_ref()
+                .ok_or_else(|| {
+                    TrapError::Hypervisor("HVPatch executor has no task binding".into())
+                })?
+                .quantum(),
+        );
+        let mut control = HvpatchQuantumControl {
+            need_resched,
+            submission,
+        };
+        let engine = self
+            .current
+            .as_mut()
+            .ok_or_else(|| TrapError::Hypervisor("HVPatch executor lost loaded engine".into()))?;
+        Ok(quantum.poll_quantum_with_engine(engine, &mut control))
+    }
+
+    fn take_cpu_receipt(&mut self) -> ExecutorCpuReceipt {
+        std::mem::take(&mut self.receipt)
+    }
+
+    fn hardware_kick(&self) -> Result<ExactHardwareKick, TrapError> {
+        let engine = self.current.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch hardware kick requested without live vCPU".into())
+        })?;
+        let (handle, raw_vcpu_id, owner_thread_port) =
+            carrick_vmm_hvf::hvf_aarch64_engine::persistent_hardware_kick(engine);
+        if raw_vcpu_id != self.raw_vcpu_id || owner_thread_port != self.owner_thread_port {
+            return Err(TrapError::Hypervisor(
+                "HVPatch hardware kick identity drifted from worker owner".into(),
+            ));
+        }
+        ExactHardwareKick::new(Box::new(handle), raw_vcpu_id, owner_thread_port)
+    }
+
+    fn retarget_loaded_task(&mut self, binding: Arc<Self::TaskBinding>) -> Result<(), TrapError> {
+        if self.current.is_none() || self.binding.is_none() {
+            return Err(TrapError::Hypervisor(
+                "HVPatch exec replacement has no loaded worker task".into(),
+            ));
+        }
+        self.validate_loaded_hardware_identity()?;
+        self.binding = Some(binding);
+        Ok(())
+    }
+
+    fn validate_loaded_hardware_identity(&self) -> Result<(), TrapError> {
+        let engine = self.current.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch loaded identity audit has no live vCPU".into())
+        })?;
+        let (_, raw_vcpu_id, owner_thread_port) =
+            carrick_vmm_hvf::hvf_aarch64_engine::persistent_hardware_kick(engine);
+        if raw_vcpu_id != self.raw_vcpu_id || owner_thread_port != self.owner_thread_port {
+            return Err(TrapError::Hypervisor(
+                "HVPatch loaded vCPU/Mach identity drifted before exec retarget".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn save(
+        &mut self,
+        mut lease: ThreadExecutionLease,
+    ) -> Result<SavedRunnable, ExecutorSaveError> {
+        let Some(engine) = self.current.as_mut() else {
+            return Err(ExecutorSaveError::new(
+                TrapError::Hypervisor("HVPatch save without loaded engine".into()),
+                lease,
+            ));
+        };
+        let cpu = match engine.snapshot_task_state_from_live_executor() {
+            Ok(cpu) => cpu,
+            Err(error) => return Err(ExecutorSaveError::new(error, lease)),
+        };
+        let (mm, asid_generation) = match lease.task_state_authority() {
+            Ok(authority) => authority,
+            Err(error) => {
+                return Err(ExecutorSaveError::new(
+                    TrapError::Hypervisor(error.to_string()),
+                    lease,
+                ));
+            }
+        };
+        if let Err(error) = lease.replace_task_state(MigratableTaskState {
+            cpu,
+            mm,
+            asid_generation,
+        }) {
+            return Err(ExecutorSaveError::new(
+                TrapError::Hypervisor(error.to_string()),
+                lease,
+            ));
+        }
+        let engine = self.current.take().unwrap_or_else(|| std::process::abort());
+        let Some(binding) = self.binding.take() else {
+            return Err(ExecutorSaveError::new(
+                TrapError::Hypervisor("HVPatch save lost task binding".into()),
+                lease,
+            ));
+        };
+        let (backend, vcpu) = if let Some(task_only) = self.loaded_task_only.take() {
+            let (lifecycle, vcpu) =
+                carrick_vmm_hvf::hvf_aarch64_engine::detach_task_only_engine(&task_only, engine);
+            if self.lifecycle.replace(lifecycle).is_some() {
+                std::process::abort();
+            }
+            (HvpatchTaskEngineBindingState::task_only(task_only), vcpu)
+        } else {
+            let lifecycle = self
+                .lifecycle
+                .as_mut()
+                .unwrap_or_else(|| std::process::abort());
+            let (state, vcpu) =
+                carrick_vmm_hvf::hvf_aarch64_engine::detach_task_engine(engine, lifecycle);
+            (HvpatchTaskEngineBindingState::initial(state), vcpu)
+        };
+        if let Err(error) = restore_worker_vcpu_before_binding_publication(
+            &mut self.vcpu,
+            vcpu,
+            backend,
+            |backend, _| binding.put_backend(backend),
+        ) {
+            return Err(ExecutorSaveError::new(error, lease));
+        }
+        Ok(SavedRunnable::new(lease))
+    }
+
+    fn invalidate_asid(
+        &mut self,
+        generation: crate::hvpatch::AsidGeneration,
+    ) -> Result<(), TrapError> {
+        let lifecycle = self.lifecycle.as_mut().ok_or_else(|| {
+            TrapError::Hypervisor("ASID invalidation lost idle worker lifecycle".into())
+        })?;
+        let vcpu = self.vcpu.as_mut().ok_or_else(|| {
+            TrapError::Hypervisor("ASID invalidation lost idle worker vCPU".into())
+        })?;
+        carrick_vmm_hvf::hvf_aarch64_engine::invalidate_worker_asid(
+            lifecycle,
+            vcpu,
+            generation.raw(),
+        )
+    }
+    fn audit_boundary(&mut self) -> Result<(), TrapError> {
+        if self.current.is_some()
+            || self.binding.is_some()
+            || self.loaded_task_only.is_some()
+            || self.lifecycle.is_none()
+            || self.vcpu.is_none()
+        {
+            return Err(TrapError::Hypervisor(
+                "dirty HVPatch executor boundary".into(),
+            ));
+        }
+        let vcpu = self.vcpu.as_ref().unwrap_or_else(|| std::process::abort());
+        if carrick_vmm_hvf::hvf_aarch64_engine::persistent_vcpu_identity(vcpu) != self.raw_vcpu_id
+            || current_owner_thread_port() != self.owner_thread_port
+        {
+            return Err(TrapError::Hypervisor(
+                "HVPatch executor vCPU/Mach owner identity drifted".into(),
+            ));
+        }
+        self.lifecycle
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort())
+            .audit_persistent_executor_idle()?;
+        Ok(())
+    }
+    fn destroy(mut self) -> Result<(), TrapError> {
+        if let Some(mut engine) = self.current.take() {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                engine.snapshot_task_state_from_live_executor()
+            }));
+            let (backend, vcpu) = if let Some(task_only) = self.loaded_task_only.take() {
+                let (lifecycle, vcpu) =
+                    carrick_vmm_hvf::hvf_aarch64_engine::detach_task_only_engine(
+                        &task_only, engine,
+                    );
+                if self.lifecycle.replace(lifecycle).is_some() {
+                    std::process::abort();
+                }
+                (HvpatchTaskEngineBindingState::task_only(task_only), vcpu)
+            } else {
+                let lifecycle = self
+                    .lifecycle
+                    .as_mut()
+                    .unwrap_or_else(|| std::process::abort());
+                let (state, vcpu) =
+                    carrick_vmm_hvf::hvf_aarch64_engine::detach_task_engine(engine, lifecycle);
+                (HvpatchTaskEngineBindingState::initial(state), vcpu)
+            };
+            if let Some(binding) = self.binding.take() {
+                let _ = binding.put_backend(backend);
+            }
+            self.vcpu = Some(vcpu);
+        }
+        let mut vcpu = self
+            .vcpu
+            .take()
+            .ok_or_else(|| TrapError::Hypervisor("destroy missing worker vCPU".into()))?;
+        let lifecycle = self
+            .lifecycle
+            .as_mut()
+            .ok_or_else(|| TrapError::Hypervisor("destroy missing worker lifecycle".into()))?;
+        carrick_vmm_hvf::hvf_aarch64_engine::destroy_worker_vcpu(lifecycle, &mut vcpu);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,135 +564,775 @@ pub trait PersistentTaskBinding {
     fn load_identity(&self) -> TaskLoadIdentity;
 
     fn validate_task_state(&self, state: &MigratableTaskState) -> Result<(), TrapError>;
+
+    fn after_terminal_settlement(&self) {}
+
+    fn take_address_space_retirement(
+        &self,
+    ) -> Option<crate::hvpatch::PendingAddressSpaceRetirement> {
+        None
+    }
 }
 
-#[derive(Debug)]
-struct RetainedSubmissionAuthority {
-    thread: ThreadKey,
-    generation: ExecutionGeneration,
-    authority: SubmissionAuthority,
+impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBinding {
+    fn load_identity(&self) -> TaskLoadIdentity {
+        self.identity()
+    }
+
+    fn validate_task_state(&self, state: &MigratableTaskState) -> Result<(), TrapError> {
+        self.validate_state(state)
+    }
+
+    fn after_terminal_settlement(&self) {
+        crate::vcpu_loop::continuation::HvpatchTaskBinding::after_terminal_settlement(self);
+    }
+
+    fn take_address_space_retirement(
+        &self,
+    ) -> Option<crate::hvpatch::PendingAddressSpaceRetirement> {
+        crate::vcpu_loop::continuation::HvpatchTaskBinding::take_address_space_retirement(self)
+    }
 }
 
-#[derive(Debug, Default)]
-struct SubmissionAuthorityDirectory(Mutex<Vec<RetainedSubmissionAuthority>>);
+pub struct ExecutorSubmissionContext<'a> {
+    pub(super) scheduler: &'a Scheduler,
+    #[cfg(test)]
+    pub(super) publish_test_descendant:
+        &'a dyn Fn(Arc<crate::kernel::Thread>, ExecutionGeneration) -> Result<(), TrapError>,
+    pub(super) current: Option<&'a SubmissionAuthority>,
+    // The worker lends ownership, not an alias, for exactly one resident poll.
+    // This lets the HVPatch logical state machine consume and replace exec
+    // authority while making it impossible to retain a borrow across a
+    // Pending boundary. The worker takes the exact lease back before it saves
+    // or settles the task.
+    pub(super) lease: Option<ThreadExecutionLease>,
+    pub(super) exec_replacement: Option<PendingExecReplacement>,
+}
 
-impl SubmissionAuthorityDirectory {
-    fn publish(
+pub(crate) struct PendingExecReplacement {
+    pub(crate) transition: crate::kernel::exec::CommittedExecTransition,
+    pub(crate) replacement_mm: Arc<crate::hvpatch::Stage1MmLease>,
+    pub(crate) retired_mm: crate::hvpatch::Stage1MmRetirement,
+}
+
+/// Borrowed worker authority passed into one engine-resident logical quantum.
+/// It is deliberately non-owning: neither the job nor a continuation may
+/// retain an executor kick/preemption or descendant-publication capability
+/// after `run_until_boundary` returns.
+pub(crate) struct HvpatchQuantumControl<'a, 'lease> {
+    pub(super) need_resched: &'a AtomicBool,
+    pub(super) submission: &'a mut ExecutorSubmissionContext<'lease>,
+}
+
+impl HvpatchQuantumControl<'_, '_> {
+    pub(crate) fn need_resched(&self) -> bool {
+        self.need_resched.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn current_submission_key(
+        &self,
+    ) -> Result<(ThreadKey, ExecutionGeneration), TrapError> {
+        let current = self.submission.current.ok_or_else(|| {
+            TrapError::Hypervisor("resident task has no worker-held authority".to_owned())
+        })?;
+        Ok((current.thread_key(), current.generation()))
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn submission(&self) -> &ExecutorSubmissionContext<'_> {
+        self.submission
+    }
+
+    pub(crate) fn execution_lease_mut(&mut self) -> Result<&mut ThreadExecutionLease, TrapError> {
+        self.submission.execution_lease_mut()
+    }
+
+    pub(crate) const fn execution_lease_slot_mut(&mut self) -> &mut Option<ThreadExecutionLease> {
+        self.submission.execution_lease_slot_mut()
+    }
+
+    pub(crate) fn publish_exec_replacement(
+        &mut self,
+        replacement: PendingExecReplacement,
+    ) -> Result<(), TrapError> {
+        if self
+            .submission
+            .exec_replacement
+            .replace(replacement)
+            .is_some()
+        {
+            return Err(TrapError::Hypervisor(
+                "quantum published more than one exec replacement".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_hvpatch_submission(
+        &self,
+        directory: &Arc<HvpatchTaskBindingDirectory>,
+        shape: HvpatchSubmissionShape,
+        thread: Arc<crate::kernel::Thread>,
+        generation: ExecutionGeneration,
+        binding: Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
+    ) -> Result<PreparedHvpatchSubmission, TrapError> {
+        self.submission
+            .prepare_hvpatch_submission(directory, shape, thread, generation, binding)
+    }
+}
+
+impl ExecutorSubmissionContext<'_> {
+    pub(crate) fn execution_lease_mut(&mut self) -> Result<&mut ThreadExecutionLease, TrapError> {
+        self.lease.as_mut().ok_or_else(|| {
+            TrapError::Hypervisor("quantum has no mutable execution lease authority".to_owned())
+        })
+    }
+
+    pub(crate) const fn execution_lease_slot_mut(&mut self) -> &mut Option<ThreadExecutionLease> {
+        &mut self.lease
+    }
+
+    fn take_execution_lease(&mut self) -> Result<ThreadExecutionLease, TrapError> {
+        self.lease.take().ok_or_else(|| {
+            TrapError::Hypervisor("quantum returned without execution lease authority".to_owned())
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn prepare_hvpatch_submission(
+        &self,
+        directory: &Arc<HvpatchTaskBindingDirectory>,
+        shape: HvpatchSubmissionShape,
+        thread: Arc<crate::kernel::Thread>,
+        generation: ExecutionGeneration,
+        binding: Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
+    ) -> Result<PreparedHvpatchSubmission, TrapError> {
+        let current = self.current.ok_or_else(|| {
+            TrapError::Hypervisor(
+                "resident HVPatch task has no worker-held submission authority".to_owned(),
+            )
+        })?;
+        directory.prepare_submission(
+            self.scheduler,
+            shape,
+            Some(current),
+            thread,
+            generation,
+            binding,
+        )
+    }
+
+    #[cfg(test)]
+    pub fn publish_test_descendant(
+        &self,
+        thread: Arc<crate::kernel::Thread>,
+        generation: ExecutionGeneration,
+    ) -> Result<(), TrapError> {
+        (self.publish_test_descendant)(thread, generation)
+    }
+}
+
+pub(crate) struct ExecBindingTransition {
+    predecessor_thread: ThreadKey,
+    predecessor_generation: ExecutionGeneration,
+    successor_thread: ThreadKey,
+    successor_generation: ExecutionGeneration,
+    identity: TaskLoadIdentity,
+    replacement_mm: Option<Arc<crate::hvpatch::Stage1MmLease>>,
+    authority: Option<SubmissionAuthority>,
+}
+
+pub trait TaskBindingResolver<B>: Send + Sync + 'static {
+    fn install_scheduler(self: &Arc<Self>, _scheduler: &Arc<Scheduler>) -> Result<(), TrapError> {
+        Ok(())
+    }
+
+    fn resolve(
+        &self,
+        thread: ThreadKey,
+        generation: ExecutionGeneration,
+    ) -> Result<Arc<B>, TrapError>;
+
+    #[allow(private_interfaces)]
+    fn take_submission_authority(
+        &self,
+        _thread: ThreadKey,
+        _generation: ExecutionGeneration,
+    ) -> Option<SubmissionAuthority> {
+        None
+    }
+
+    #[allow(private_interfaces)]
+    fn restore_submission_authority(
+        &self,
+        authority: SubmissionAuthority,
+    ) -> Result<(), SubmissionAuthority> {
+        Err(authority)
+    }
+
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    fn publish_test_root(
+        &self,
+        _scheduler: &Scheduler,
+        _thread: Arc<crate::kernel::Thread>,
+        _authority: SubmissionAuthority,
+    ) -> Result<(), SchedulerError> {
+        Err(crate::kernel::RunQueueError::SubmissionRejected.into())
+    }
+
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    fn publish_test_descendant(
+        &self,
+        _scheduler: &Scheduler,
+        _parent: &SubmissionAuthority,
+        _thread: Arc<crate::kernel::Thread>,
+        _generation: ExecutionGeneration,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "resolver does not support test descendant publication".to_owned(),
+        ))
+    }
+
+    fn retire(&self, _thread: ThreadKey, _generation: ExecutionGeneration) {}
+
+    fn cancel_dormant(
+        &self,
+        _scheduler: &Scheduler,
+        _reason: ExecutionFailure,
+    ) -> Result<usize, TrapError> {
+        Ok(0)
+    }
+
+    #[allow(private_interfaces)]
+    fn replace_exec(
+        &self,
+        _scheduler: &Scheduler,
+        _transition: ExecBindingTransition,
+    ) -> Result<ExecBindingReplacement<B>, TrapError> {
+        Err(TrapError::Hypervisor(
+            "task binding resolver does not support exec replacement".to_owned(),
+        ))
+    }
+}
+
+pub(crate) struct ExecBindingReplacement<B> {
+    binding: Arc<B>,
+    authority: Option<SubmissionAuthority>,
+}
+
+#[derive(Default)]
+pub(crate) struct HvpatchTaskBindingDirectory {
+    bindings:
+        Mutex<std::collections::BTreeMap<(ThreadKey, ExecutionGeneration), HvpatchTaskRecord>>,
+    scheduler: Mutex<std::sync::Weak<Scheduler>>,
+}
+
+struct HvpatchTaskRecord {
+    binding: Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
+    authority: Option<SubmissionAuthority>,
+    active: bool,
+}
+
+impl HvpatchTaskBindingDirectory {
+    pub(super) fn install_scheduler(
+        self: &Arc<Self>,
+        scheduler: &Arc<Scheduler>,
+    ) -> Result<(), TrapError> {
+        let mut installed = self.scheduler.lock();
+        if installed.strong_count() != 0 {
+            return Ok(());
+        }
+        *installed = Arc::downgrade(scheduler);
+        drop(installed);
+        scheduler
+            .install_generation_observer(
+                Arc::clone(self) as Arc<dyn crate::kernel::scheduler::SchedulerGenerationObserver>
+            )
+            .map_err(|error| TrapError::Hypervisor(error.to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish(
+        &self,
+        thread: ThreadKey,
+        generation: ExecutionGeneration,
+        binding: Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
+    ) -> Result<(), TrapError> {
+        if self
+            .bindings
+            .lock()
+            .insert(
+                (thread, generation),
+                HvpatchTaskRecord {
+                    binding,
+                    authority: None,
+                    active: true,
+                },
+            )
+            .is_some()
+        {
+            return Err(TrapError::Hypervisor(
+                "duplicate exact HVPatch task binding publication".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retire(&self, thread: ThreadKey, generation: ExecutionGeneration) {
+        self.bindings.lock().remove(&(thread, generation));
+    }
+
+    pub(crate) fn prepare_submission(
+        self: &Arc<Self>,
+        scheduler: &Scheduler,
+        shape: HvpatchSubmissionShape,
+        grant_authority: Option<&SubmissionAuthority>,
+        thread: Arc<crate::kernel::Thread>,
+        generation: ExecutionGeneration,
+        binding: Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
+    ) -> Result<PreparedHvpatchSubmission, TrapError> {
+        let key = (thread.key(), generation);
+        let mut bindings = self.bindings.lock();
+        if bindings.contains_key(&key) {
+            return Err(TrapError::Hypervisor(
+                "duplicate exact dormant HVPatch submission".to_owned(),
+            ));
+        }
+        let authority = match (shape, grant_authority) {
+            (HvpatchSubmissionShape::Root, None) => scheduler
+                .admit_process_root(key.0, key.1)
+                .map_err(|error| TrapError::Hypervisor(error.to_string()))?,
+            (HvpatchSubmissionShape::Descendant { grant }, Some(authority))
+                if (authority.thread_key(), authority.generation()) == grant =>
+            {
+                authority
+                    .admit_descendant(key.0, key.1)
+                    .map_err(|error| TrapError::Hypervisor(error.to_string()))?
+            }
+            (HvpatchSubmissionShape::SameTaskSibling { grant }, Some(authority))
+                if (authority.thread_key(), authority.generation()) == grant =>
+            {
+                authority
+                    .admit_same_task_sibling(key.0, key.1)
+                    .map_err(|error| TrapError::Hypervisor(error.to_string()))?
+            }
+            (HvpatchSubmissionShape::PeerRoot { grant }, Some(authority))
+                if (authority.thread_key(), authority.generation()) == grant =>
+            {
+                authority
+                    .admit_peer_root(key.0, key.1)
+                    .map_err(|error| TrapError::Hypervisor(error.to_string()))?
+            }
+            _ => {
+                return Err(TrapError::Hypervisor(
+                    "HVPatch submission shape does not match worker-held authority".to_owned(),
+                ));
+            }
+        };
+        bindings.insert(
+            key,
+            HvpatchTaskRecord {
+                binding,
+                authority: Some(authority),
+                active: false,
+            },
+        );
+        Ok(PreparedHvpatchSubmission {
+            directory: Arc::clone(self),
+            key,
+            armed: true,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_root_authority(
         &self,
         scheduler: &Scheduler,
         thread: Arc<crate::kernel::Thread>,
         authority: SubmissionAuthority,
     ) -> Result<(), SchedulerError> {
         let key = (authority.thread_key(), authority.generation());
-        let mut entries = self.0.lock();
-        if entries
-            .iter()
-            .any(|entry| (entry.thread, entry.generation) == key)
-        {
+        let mut bindings = self.bindings.lock();
+        let record = bindings
+            .get_mut(&key)
+            .ok_or(crate::kernel::RunQueueError::AuthorityMismatch)?;
+        if record.authority.is_some() {
             return Err(crate::kernel::RunQueueError::SubmissionRejected.into());
         }
-        authority.publish(scheduler, thread)?;
-        entries.push(RetainedSubmissionAuthority {
-            thread: key.0,
-            generation: key.1,
-            authority,
-        });
-        Ok(())
+        record.authority = Some(authority);
+        match record
+            .authority
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort())
+            .publish(scheduler, thread)
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                record.authority.take();
+                Err(error)
+            }
+        }
     }
 
-    fn publish_descendant(
-        &self,
-        scheduler: &Scheduler,
-        parent: &SubmissionAuthority,
-        thread: Arc<crate::kernel::Thread>,
-        generation: ExecutionGeneration,
-    ) -> Result<(), SchedulerError> {
-        let authority = parent.admit_descendant(thread.key(), generation)?;
-        self.publish(scheduler, thread, authority)
-    }
-
-    fn take(
+    #[cfg(test)]
+    fn rollover_exact(
         &self,
         thread: ThreadKey,
-        generation: ExecutionGeneration,
-    ) -> Option<SubmissionAuthority> {
-        let mut entries = self.0.lock();
-        let index = entries
-            .iter()
-            .position(|entry| entry.thread == thread && entry.generation == generation)?;
-        Some(entries.swap_remove(index).authority)
-    }
-
-    fn settle_runnable_with_rollover(
-        &self,
-        scheduler: &Scheduler,
-        running: RunnableThread,
-        authority: Option<SubmissionAuthority>,
-    ) -> Result<(), SchedulerError> {
-        let predecessor_thread = running.thread_key();
-        let predecessor_generation = running.generation();
-        let mut entries = self.0.lock();
-        let successor_generation = scheduler.settle_runnable_successor(running)?;
-        let (Some(authority), Some(successor_generation)) = (authority, successor_generation)
-        else {
-            return Ok(());
-        };
-        let authority = authority
-            .rollover_exact(
-                scheduler,
-                predecessor_thread,
-                predecessor_generation,
-                predecessor_thread,
-                successor_generation,
-            )
-            .map_err(|(error, _authority)| SchedulerError::from(error))?;
-        if entries.iter().any(|entry| {
-            entry.thread == predecessor_thread && entry.generation == successor_generation
-        }) {
-            return Err(crate::kernel::RunQueueError::SubmissionRejected.into());
+        predecessor: ExecutionGeneration,
+        successor: ExecutionGeneration,
+    ) -> Result<(), TrapError> {
+        if predecessor.raw().checked_add(1) != Some(successor.raw()) {
+            return Err(TrapError::Hypervisor(
+                "HVPatch binding rollover rejected non-successor generation".to_owned(),
+            ));
         }
-        entries.push(RetainedSubmissionAuthority {
-            thread: predecessor_thread,
-            generation: successor_generation,
-            authority,
-        });
+        let mut bindings = self.bindings.lock();
+        if bindings.contains_key(&(thread, successor)) {
+            if !bindings.contains_key(&(thread, predecessor)) {
+                return Ok(());
+            }
+            return Err(TrapError::Hypervisor(
+                "HVPatch binding rollover found overlapping generations".to_owned(),
+            ));
+        }
+        let record = bindings.get(&(thread, predecessor)).ok_or_else(|| {
+            TrapError::Hypervisor("missing predecessor HVPatch binding".to_owned())
+        })?;
+        if record.authority.is_some() {
+            return Err(TrapError::Hypervisor(
+                "HVPatch binding rollover requires scheduler-owned authority transaction"
+                    .to_owned(),
+            ));
+        }
+        let record = bindings
+            .remove(&(thread, predecessor))
+            .unwrap_or_else(|| std::process::abort());
+        bindings.insert((thread, successor), record);
         Ok(())
     }
-
-    fn retire_all(&self) {
-        self.0.lock().clear();
-    }
 }
 
-pub struct ExecutorSubmissionContext<'a> {
-    scheduler: &'a Scheduler,
-    authorities: &'a SubmissionAuthorityDirectory,
-    current: Option<&'a SubmissionAuthority>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// Root is production-wired in this slice. The other shapes are intentionally
+// prepared now so the subsequent fork/clone conversion cannot fall back to a
+// generic descendant edge while it replaces the compatibility materializers.
+#[allow(dead_code)]
+pub(crate) enum HvpatchSubmissionShape {
+    Root,
+    Descendant {
+        grant: (ThreadKey, ExecutionGeneration),
+    },
+    SameTaskSibling {
+        grant: (ThreadKey, ExecutionGeneration),
+    },
+    PeerRoot {
+        grant: (ThreadKey, ExecutionGeneration),
+    },
 }
 
-impl ExecutorSubmissionContext<'_> {
-    pub fn publish_descendant(
-        &self,
-        thread: Arc<crate::kernel::Thread>,
+pub(crate) struct HvpatchActivationProof {
+    thread: ThreadKey,
+    generation: ExecutionGeneration,
+    identity: TaskLoadIdentity,
+}
+
+impl HvpatchActivationProof {
+    pub(crate) fn validate(
+        context: &crate::kernel::KernelContext,
+        state: &MigratableTaskState,
         generation: ExecutionGeneration,
-    ) -> Result<(), TrapError> {
-        let current = self.current.ok_or_else(|| {
-            TrapError::Hypervisor(
-                "running task has no exact descendant-submission authority".to_owned(),
-            )
-        })?;
-        self.authorities
-            .publish_descendant(self.scheduler, current, thread, generation)
-            .map_err(|error| TrapError::Hypervisor(error.to_string()))
+        identity: TaskLoadIdentity,
+        start_gate: crate::kernel::objects::OpenedStartGate,
+    ) -> Result<Self, TrapError> {
+        if start_gate.thread() != context.thread().key()
+            || start_gate.generation() != generation
+            || context.thread().execution_state().generation() != Some(generation)
+            || context.shared().mm().id() != state.mm
+            || identity.mm != state.mm
+            || identity.asid_generation != state.asid_generation
+            || state.cpu.task_identity() != (state.mm.raw(), state.asid_generation)
+            || state.cpu.guest_abi() != identity.abi
+            || state.cpu.version() != identity.version
+        {
+            return Err(TrapError::Hypervisor(
+                "HVPatch activation proof rejected Kernel/CPU/MM/ASID/start state".to_owned(),
+            ));
+        }
+        Ok(Self {
+            thread: context.thread().key(),
+            generation,
+            identity,
+        })
     }
 }
 
-pub trait TaskBindingResolver<B>: Send + Sync + 'static {
+pub(crate) struct PreparedHvpatchSubmission {
+    directory: Arc<HvpatchTaskBindingDirectory>,
+    key: (ThreadKey, ExecutionGeneration),
+    armed: bool,
+}
+
+impl PreparedHvpatchSubmission {
+    pub(crate) fn activate(
+        mut self,
+        scheduler: &Scheduler,
+        thread: Arc<crate::kernel::Thread>,
+        proof: HvpatchActivationProof,
+    ) -> Result<(), TrapError> {
+        if self.key != (proof.thread, proof.generation) || thread.key() != proof.thread {
+            return Err(TrapError::Hypervisor(
+                "HVPatch activation proof names a different submission".to_owned(),
+            ));
+        }
+        let mut bindings = self.directory.bindings.lock();
+        let record = bindings.get_mut(&self.key).ok_or_else(|| {
+            TrapError::Hypervisor("missing dormant HVPatch submission".to_owned())
+        })?;
+        if record.active || record.binding.identity() != proof.identity {
+            return Err(TrapError::Hypervisor(
+                "HVPatch dormant binding identity changed before activation".to_owned(),
+            ));
+        }
+        record
+            .authority
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("dormant authority missing".to_owned()))?
+            .publish_unique(scheduler, thread)
+            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+        record.active = true;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for PreparedHvpatchSubmission {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut bindings = self.directory.bindings.lock();
+            if bindings.get(&self.key).is_some_and(|record| !record.active) {
+                bindings.remove(&self.key);
+            }
+        }
+    }
+}
+
+impl crate::kernel::scheduler::SchedulerGenerationObserver for HvpatchTaskBindingDirectory {
+    fn transition(
+        &self,
+        thread: ThreadKey,
+        predecessor: ExecutionGeneration,
+        successor: ExecutionGeneration,
+        kind: crate::kernel::scheduler::SchedulerGenerationTransition,
+    ) -> Result<(), crate::kernel::RunQueueError> {
+        let scheduler = self
+            .scheduler
+            .lock()
+            .upgrade()
+            .ok_or(crate::kernel::RunQueueError::AuthorityMismatch)?;
+        let mut bindings = self.bindings.lock();
+        let mut record = bindings
+            .remove(&(thread, predecessor))
+            .ok_or(crate::kernel::RunQueueError::AuthorityMismatch)?;
+        if kind == crate::kernel::scheduler::SchedulerGenerationTransition::Terminal {
+            return Ok(());
+        }
+        if bindings.contains_key(&(thread, successor)) {
+            bindings.insert((thread, predecessor), record);
+            return Err(crate::kernel::RunQueueError::SubmissionRejected);
+        }
+        if let Some(authority) = record.authority.take() {
+            let transition = match kind {
+                crate::kernel::scheduler::SchedulerGenerationTransition::Runnable => {
+                    if authority.is_active() {
+                        authority.rollover_exact(&scheduler, thread, predecessor, thread, successor)
+                    } else {
+                        authority.reactivate_exact(&scheduler, predecessor, successor)
+                    }
+                }
+                crate::kernel::scheduler::SchedulerGenerationTransition::Blocked => {
+                    authority.park_exact(&scheduler, predecessor, successor)
+                }
+                crate::kernel::scheduler::SchedulerGenerationTransition::Terminal => {
+                    unreachable!()
+                }
+            };
+            match transition {
+                Ok(authority) => record.authority = Some(authority),
+                Err((error, authority)) => {
+                    record.authority = Some(authority);
+                    bindings.insert((thread, predecessor), record);
+                    return Err(error);
+                }
+            }
+        }
+        bindings.insert((thread, successor), record);
+        Ok(())
+    }
+}
+
+impl TaskBindingResolver<crate::vcpu_loop::continuation::HvpatchTaskBinding>
+    for HvpatchTaskBindingDirectory
+{
+    fn install_scheduler(self: &Arc<Self>, scheduler: &Arc<Scheduler>) -> Result<(), TrapError> {
+        HvpatchTaskBindingDirectory::install_scheduler(self, scheduler)
+    }
+
     fn resolve(
         &self,
         thread: ThreadKey,
         generation: ExecutionGeneration,
-    ) -> Result<Arc<B>, TrapError>;
+    ) -> Result<Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>, TrapError> {
+        let bindings = self.bindings.lock();
+        bindings
+            .get(&(thread, generation))
+            .filter(|record| record.active)
+            .map(|record| Arc::clone(&record.binding))
+            .ok_or_else(|| TrapError::Hypervisor("missing exact HVPatch task binding".to_owned()))
+    }
+    fn take_submission_authority(
+        &self,
+        thread: ThreadKey,
+        generation: ExecutionGeneration,
+    ) -> Option<SubmissionAuthority> {
+        let mut bindings = self.bindings.lock();
+        let record = bindings.get_mut(&(thread, generation))?;
+        record.active.then(|| record.authority.take()).flatten()
+    }
+
+    fn restore_submission_authority(
+        &self,
+        authority: SubmissionAuthority,
+    ) -> Result<(), SubmissionAuthority> {
+        let key = (authority.thread_key(), authority.generation());
+        let mut bindings = self.bindings.lock();
+        let Some(record) = bindings.get_mut(&key) else {
+            return Err(authority);
+        };
+        if !record.active || record.authority.is_some() {
+            return Err(authority);
+        }
+        record.authority = Some(authority);
+        Ok(())
+    }
+
+    fn retire(&self, thread: ThreadKey, generation: ExecutionGeneration) {
+        HvpatchTaskBindingDirectory::retire(self, thread, generation);
+    }
+
+    fn cancel_dormant(
+        &self,
+        scheduler: &Scheduler,
+        reason: ExecutionFailure,
+    ) -> Result<usize, TrapError> {
+        let candidates = self
+            .bindings
+            .lock()
+            .iter()
+            .map(|(&(thread, generation), record)| {
+                (thread, generation, Arc::clone(&record.binding))
+            })
+            .collect::<Vec<_>>();
+        let mut cancelled = 0usize;
+        for (thread, generation, binding) in candidates {
+            if scheduler
+                .fail_blocked_exact(thread, generation, reason)
+                .map_err(|error| TrapError::Hypervisor(error.to_string()))?
+            {
+                binding.after_terminal_settlement();
+                cancelled = cancelled
+                    .checked_add(1)
+                    .ok_or_else(|| TrapError::Hypervisor("dormant cancellation overflow".into()))?;
+            }
+        }
+        Ok(cancelled)
+    }
+
+    fn replace_exec(
+        &self,
+        scheduler: &Scheduler,
+        transition: ExecBindingTransition,
+    ) -> Result<ExecBindingReplacement<crate::vcpu_loop::continuation::HvpatchTaskBinding>, TrapError>
+    {
+        let ExecBindingTransition {
+            predecessor_thread,
+            predecessor_generation,
+            successor_thread,
+            successor_generation,
+            identity,
+            replacement_mm,
+            authority,
+        } = transition;
+        let mut bindings = self.bindings.lock();
+        if bindings.contains_key(&(successor_thread, successor_generation)) {
+            return Err(TrapError::Hypervisor(
+                "exec replacement binding already exists".to_owned(),
+            ));
+        }
+        let mut record = bindings
+            .remove(&(predecessor_thread, predecessor_generation))
+            .ok_or_else(|| TrapError::Hypervisor("missing predecessor exec binding".to_owned()))?;
+        if record.authority.is_some() {
+            bindings.insert((predecessor_thread, predecessor_generation), record);
+            return Err(TrapError::Hypervisor(
+                "exec replacement found authority outside running quantum".to_owned(),
+            ));
+        }
+        let replacement_result = match replacement_mm {
+            Some(replacement_mm) => record
+                .binding
+                .replacement_with_stage1_mm(identity, replacement_mm),
+            None => {
+                #[cfg(test)]
+                {
+                    Ok(record.binding.replacement(identity))
+                }
+                #[cfg(not(test))]
+                {
+                    Err(TrapError::Hypervisor(
+                        "production exec replacement omitted fresh stage-1/ASID lease".to_owned(),
+                    ))
+                }
+            }
+        };
+        let replacement = match replacement_result {
+            Ok(replacement) => Arc::new(replacement),
+            Err(error) => {
+                bindings.insert((predecessor_thread, predecessor_generation), record);
+                return Err(error);
+            }
+        };
+        let authority = match authority {
+            Some(authority) => match authority.replace_exec_exact(
+                scheduler,
+                predecessor_thread,
+                predecessor_generation,
+                successor_thread,
+                successor_generation,
+            ) {
+                Ok(authority) => Some(authority),
+                Err((error, authority)) => {
+                    record.authority = Some(authority);
+                    bindings.insert((predecessor_thread, predecessor_generation), record);
+                    return Err(TrapError::Hypervisor(error.to_string()));
+                }
+            },
+            None => None,
+        };
+        bindings.insert(
+            (successor_thread, successor_generation),
+            HvpatchTaskRecord {
+                binding: Arc::clone(&replacement),
+                authority: None,
+                active: true,
+            },
+        );
+        Ok(ExecBindingReplacement {
+            binding: replacement,
+            authority,
+        })
+    }
 }
 
 pub struct RunnableTask<'a, B> {
@@ -619,9 +1736,9 @@ impl ReceiptLog {
     }
 }
 
-#[derive(Debug)]
 struct WorkerKick {
     binding: Mutex<Option<ExecutorBinding>>,
+    hardware: Mutex<Option<ExactHardwareKick>>,
     need_resched: AtomicBool,
     receipts: Arc<ReceiptLog>,
     #[cfg(test)]
@@ -630,16 +1747,56 @@ struct WorkerKick {
     delivery_receipt_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
+impl std::fmt::Debug for WorkerKick {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkerKick")
+            .field("binding", &*self.binding.lock())
+            .field("hardware_published", &self.hardware.lock().is_some())
+            .field(
+                "hardware_vcpu_id",
+                &self.hardware.lock().as_ref().map(|kick| kick.raw_vcpu_id),
+            )
+            .field("need_resched", &self.need_resched.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
 impl WorkerKick {
     fn new(receipts: Arc<ReceiptLog>) -> Self {
         Self {
             binding: Mutex::new(None),
+            hardware: Mutex::new(None),
             need_resched: AtomicBool::new(false),
             receipts,
             #[cfg(test)]
             delivery_validation_gate: Mutex::new(None),
             #[cfg(test)]
             delivery_receipt_gate: Mutex::new(None),
+        }
+    }
+
+    fn publish_hardware(&self, hardware: ExactHardwareKick) -> bool {
+        let binding = self.binding.lock();
+        if binding.is_none()
+            || hardware.owner_thread_port != current_owner_thread_port()
+            || self.hardware.lock().is_some()
+        {
+            return false;
+        }
+        *self.hardware.lock() = Some(hardware);
+        if self.need_resched.load(Ordering::Acquire)
+            && let Some(hardware) = self.hardware.lock().as_ref()
+        {
+            hardware.handle.kick();
+        }
+        true
+    }
+
+    fn poke_control(&self) {
+        self.need_resched.store(true, Ordering::Release);
+        if let Some(hardware) = self.hardware.lock().as_ref() {
+            hardware.handle.kick();
         }
     }
 
@@ -670,7 +1827,25 @@ impl ExecutorKick for WorkerKick {
         if *current == Some(binding) {
             *current = None;
             self.need_resched.store(false, Ordering::Release);
+            self.hardware.lock().take();
         }
+    }
+
+    fn rebind_exact_with(
+        &self,
+        predecessor: ExecutorBinding,
+        successor: ExecutorBinding,
+        publish: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        let mut current = self.binding.lock();
+        if *current != Some(predecessor) || predecessor.executor() != successor.executor() {
+            return false;
+        }
+        if !publish() {
+            return false;
+        }
+        *current = Some(successor);
+        true
     }
 
     fn deliver_exact(&self, token: ExecutorKickToken) -> bool {
@@ -684,6 +1859,9 @@ impl ExecutorKick for WorkerKick {
             gate.wait();
         }
         self.need_resched.store(true, Ordering::Release);
+        if let Some(hardware) = self.hardware.lock().as_ref() {
+            hardware.handle.kick();
+        }
         #[cfg(test)]
         if let Some(gate) = self.delivery_receipt_gate.lock().clone() {
             gate.wait();
@@ -709,6 +1887,10 @@ impl ExecutorKick for WorkerKick {
 enum WorkerCommand {
     Initialize,
     Run,
+    InvalidateAsid {
+        generation: crate::hvpatch::AsidGeneration,
+        response: mpsc::SyncSender<Result<crate::hvpatch::InvalidationAck, String>>,
+    },
     Stop,
 }
 
@@ -716,6 +1898,8 @@ enum WorkerCommand {
 struct StartupStatus {
     index: usize,
     error: Option<String>,
+    executor: Option<ExecutorId>,
+    kick: Option<Arc<WorkerKick>>,
 }
 
 #[derive(Debug)]
@@ -729,6 +1913,8 @@ struct WorkerOutcome {
 struct WorkerHandle {
     command: mpsc::Sender<WorkerCommand>,
     join: JoinHandle<WorkerOutcome>,
+    executor: Option<ExecutorId>,
+    kick: Option<Arc<WorkerKick>>,
 }
 
 #[derive(Debug)]
@@ -748,25 +1934,150 @@ struct WorkerRuntime<'a> {
 #[derive(Debug)]
 struct PoolControl {
     usable_workers: std::sync::atomic::AtomicUsize,
-    authorities: SubmissionAuthorityDirectory,
     wait_service: crate::vcpu_loop::continuation::CarrierWaitService,
+    scheduler: Arc<Scheduler>,
+    workers: Mutex<std::collections::BTreeMap<ExecutorId, WorkerControlHandle>>,
 }
+
+#[derive(Clone, Debug)]
+struct WorkerControlHandle {
+    command: mpsc::Sender<WorkerCommand>,
+    kick: Arc<WorkerKick>,
+}
+
+type PendingAsidInvalidation = (
+    ExecutorId,
+    mpsc::Receiver<Result<crate::hvpatch::InvalidationAck, String>>,
+);
+type PendingAsidInvalidations = Vec<PendingAsidInvalidation>;
 
 impl PoolControl {
     fn new(workers: usize, scheduler: Arc<Scheduler>) -> Self {
         Self {
             usable_workers: std::sync::atomic::AtomicUsize::new(workers),
-            authorities: SubmissionAuthorityDirectory::default(),
-            wait_service: crate::vcpu_loop::continuation::CarrierWaitService::new(scheduler),
+            wait_service: crate::vcpu_loop::continuation::CarrierWaitService::new(Arc::clone(
+                &scheduler,
+            )),
+            scheduler,
+            workers: Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    fn register_worker(
+        &self,
+        executor: ExecutorId,
+        command: mpsc::Sender<WorkerCommand>,
+        kick: Arc<WorkerKick>,
+    ) {
+        if self
+            .workers
+            .lock()
+            .insert(executor, WorkerControlHandle { command, kick })
+            .is_some()
+        {
+            std::process::abort();
         }
     }
 
     fn retire_failed_worker(&self) -> bool {
         self.usable_workers.fetch_sub(1, Ordering::AcqRel) == 1
     }
+
+    fn dispatch_invalidation_commands(
+        &self,
+        generation: crate::hvpatch::AsidGeneration,
+        targets: impl IntoIterator<Item = ExecutorId>,
+    ) -> Result<PendingAsidInvalidations, String> {
+        let workers = self.workers.lock();
+        let mut pending = Vec::new();
+        for target in targets {
+            let worker = workers
+                .get(&target)
+                .ok_or_else(|| format!("ASID retirement resident executor {target:?} is absent"))?;
+            let (response_tx, response_rx) = mpsc::sync_channel(1);
+            worker
+                .command
+                .send(WorkerCommand::InvalidateAsid {
+                    generation,
+                    response: response_tx,
+                })
+                .map_err(|_| {
+                    format!("ASID retirement executor {target:?} command channel closed")
+                })?;
+            worker.kick.poke_control();
+            pending.push((target, response_rx));
+        }
+        drop(workers);
+        if !pending.is_empty() {
+            self.scheduler.poke_executor_control();
+        }
+        Ok(pending)
+    }
+
+    fn consume_invalidation_acks(
+        retirement: &crate::hvpatch::Stage1MmRetirement,
+        pending: Vec<(
+            ExecutorId,
+            mpsc::Receiver<Result<crate::hvpatch::InvalidationAck, String>>,
+        )>,
+    ) -> Result<(), String> {
+        for (target, response) in pending {
+            let ack = response.recv().map_err(|_| {
+                format!("ASID retirement executor {target:?} lost acknowledgement")
+            })??;
+            retirement
+                .acknowledge(ack)
+                .map_err(|error| format!("ASID retirement acknowledgement rejected: {error}"))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn invalidate_external(
+        &self,
+        retirement: &crate::hvpatch::Stage1MmRetirement,
+    ) -> Result<(), String> {
+        let pending = self
+            .dispatch_invalidation_commands(retirement.asid_generation(), retirement.pending())?;
+        Self::consume_invalidation_acks(retirement, pending)
+    }
+
+    fn invalidate_after_exec<E: PersistentExecutor>(
+        &self,
+        retirement: &crate::hvpatch::Stage1MmRetirement,
+        current: ExecutorId,
+        backend: &mut E,
+        boundary: &WorkerBoundaryAudit,
+        receipts: &ReceiptLog,
+    ) -> Result<(), String> {
+        let generation = retirement.asid_generation();
+        let targets = retirement.pending();
+        let pending = self.dispatch_invalidation_commands(
+            generation,
+            targets.iter().copied().filter(|target| *target != current),
+        )?;
+        if targets.contains(&current) {
+            boundary
+                .audit_runtime(backend)
+                .map_err(|error| error.to_string())?;
+            backend
+                .invalidate_asid(generation)
+                .map_err(|error| error.to_string())?;
+            receipts.record(
+                current,
+                ExecutorPoolEvent::InvalidatedAsid {
+                    generation: generation.generation(),
+                },
+            );
+            retirement
+                .acknowledge(crate::hvpatch::InvalidationAck::new(current, generation))
+                .map_err(|error| error.to_string())?;
+        }
+        Self::consume_invalidation_acks(retirement, pending)
+    }
 }
 
-pub struct ExecutorPool<F, R>
+pub(crate) struct ExecutorPool<F, R>
 where
     F: PersistentExecutorFactory,
     R: TaskBindingResolver<
@@ -774,11 +2085,12 @@ where
     >,
 {
     scheduler: Arc<Scheduler>,
-    control: Arc<PoolControl>,
     handles: Vec<WorkerHandle>,
     receipts: Arc<ReceiptLog>,
     _factory: std::marker::PhantomData<F>,
-    _resolver: std::marker::PhantomData<R>,
+    resolver: Arc<R>,
+    #[cfg(test)]
+    control: Arc<PoolControl>,
 }
 
 impl<F, R> std::fmt::Debug for ExecutorPool<F, R>
@@ -874,6 +2186,12 @@ where
                     configured_workers: 0,
                     message: error.to_string(),
                 })?;
+        resolver
+            .install_scheduler(&scheduler)
+            .map_err(|error| ExecutorPoolStartError {
+                configured_workers,
+                message: format!("install combined task resolver: {error}"),
+            })?;
         let receipts = Arc::new(ReceiptLog::default());
         let control = Arc::new(PoolControl::new(configured_workers, Arc::clone(&scheduler)));
         let (startup_tx, startup_rx) = mpsc::channel();
@@ -916,12 +2234,14 @@ where
             handles.push(WorkerHandle {
                 command: command_tx,
                 join,
+                executor: None,
+                kick: None,
             });
         }
         drop(startup_tx);
 
         let mut startup_failure = None;
-        for (index, handle) in handles.iter().enumerate() {
+        for (index, handle) in handles.iter_mut().enumerate() {
             if startup_failure.is_some() {
                 break;
             }
@@ -930,7 +2250,26 @@ where
                 break;
             }
             match startup_rx.recv() {
-                Ok(status) if status.index == index && status.error.is_none() => {}
+                Ok(status) if status.index == index && status.error.is_none() => {
+                    handle.executor = status.executor;
+                    handle.kick = status.kick;
+                    if handle.executor.is_none() || handle.kick.is_none() {
+                        startup_failure = Some(format!(
+                            "worker {index} omitted exact executor/kick startup identity"
+                        ));
+                    } else {
+                        control.register_worker(
+                            handle.executor.unwrap_or_else(|| std::process::abort()),
+                            handle.command.clone(),
+                            Arc::clone(
+                                handle
+                                    .kick
+                                    .as_ref()
+                                    .unwrap_or_else(|| std::process::abort()),
+                            ),
+                        );
+                    }
+                }
                 Ok(status) => {
                     startup_failure = Some(status.error.unwrap_or_else(|| {
                         format!(
@@ -964,17 +2303,40 @@ where
 
         Ok(Self {
             scheduler,
-            control,
             handles,
             receipts,
             _factory: std::marker::PhantomData,
-            _resolver: std::marker::PhantomData,
+            resolver,
+            #[cfg(test)]
+            control,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn executor_ids(&self) -> Vec<ExecutorId> {
+        self.handles
+            .iter()
+            .map(|handle| handle.executor.unwrap_or_else(|| std::process::abort()))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalidate_asid_retirement(
+        &self,
+        retirement: &crate::hvpatch::Stage1MmRetirement,
+    ) -> Result<(), String> {
+        self.control.invalidate_external(retirement)
     }
 
     pub fn shutdown(self) -> Result<ExecutorPoolReport, ExecutorPoolShutdownError> {
         self.scheduler.close();
         let mut failures = Vec::new();
+        if let Err(error) = self
+            .resolver
+            .cancel_dormant(&self.scheduler, ExecutionFailure::SnapshotRestoreFailed)
+        {
+            failures.push(format!("dormant task cancellation failed: {error}"));
+        }
         let mut retired_workers = 0;
         let mut joined = 0;
         for handle in self.handles {
@@ -996,6 +2358,17 @@ where
                     failures.push("executor worker panicked outside containment".to_owned());
                 }
             }
+        }
+        // A task can cross Running -> Blocked after the pre-join cancellation
+        // snapshot while its worker is completing save/settlement. Joined
+        // workers make the generation set stable; cancel that exact successor
+        // before waiting for queue closure or logical completion.
+        if let Err(error) = self
+            .resolver
+            .cancel_dormant(&self.scheduler, ExecutionFailure::SnapshotRestoreFailed)
+        {
+            tracing::error!(%error, "post-join exact dormant cancellation failed");
+            std::process::abort();
         }
         self.scheduler.wait_closed();
         let events = self.receipts.snapshot();
@@ -1024,15 +2397,15 @@ where
         }
     }
 
+    #[cfg(test)]
     pub fn submit_root(
         &self,
         thread: Arc<crate::kernel::Thread>,
         generation: ExecutionGeneration,
     ) -> Result<(), SchedulerError> {
         let authority = self.scheduler.admit_root(thread.key(), generation)?;
-        self.control
-            .authorities
-            .publish(&self.scheduler, thread, authority)
+        self.resolver
+            .publish_test_root(&self.scheduler, thread, authority)
     }
 }
 
@@ -1092,6 +2465,8 @@ where
             let _ = startup.send(StartupStatus {
                 index,
                 error: Some(error.to_string()),
+                executor: None,
+                kick: None,
             });
             return WorkerOutcome {
                 executor: None,
@@ -1108,6 +2483,8 @@ where
             let _ = startup.send(StartupStatus {
                 index,
                 error: Some(error.to_string()),
+                executor: Some(executor_id),
+                kick: None,
             });
             return WorkerOutcome {
                 executor: Some(executor_id),
@@ -1121,6 +2498,8 @@ where
             let _ = startup.send(StartupStatus {
                 index,
                 error: Some(message.clone()),
+                executor: Some(executor_id),
+                kick: None,
             });
             return WorkerOutcome {
                 executor: Some(executor_id),
@@ -1132,6 +2511,13 @@ where
     let mut startup_sent = false;
     let lifecycle = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
         receipts.record(executor_id, ExecutorPoolEvent::Created);
+        probe_executor_lifecycle(
+            executor_id,
+            crate::probes::HvpatchExecutorLifecyclePhase::Create,
+            None,
+            None,
+            0,
+        );
         let boundary = WorkerBoundaryAudit::capture()
             .and_then(|boundary| {
                 boundary.audit_clean(&mut backend, &kick)?;
@@ -1140,7 +2526,12 @@ where
             .map_err(|error| error.to_string())?;
         receipts.record(executor_id, ExecutorPoolEvent::AuditPassed);
         startup
-            .send(StartupStatus { index, error: None })
+            .send(StartupStatus {
+                index,
+                error: None,
+                executor: Some(executor_id),
+                kick: Some(Arc::clone(&kick)),
+            })
             .map_err(|error| format!("startup status publication failed: {error}"))?;
         startup_sent = true;
         match commands.recv() {
@@ -1155,9 +2546,10 @@ where
                     receipts: &receipts,
                     control: &control,
                 },
+                &commands,
             ),
             Ok(WorkerCommand::Stop) | Err(_) => Ok(()),
-            Ok(WorkerCommand::Initialize) => {
+            Ok(WorkerCommand::Initialize | WorkerCommand::InvalidateAsid { .. }) => {
                 Err("executor received duplicate initialize".to_owned())
             }
         }
@@ -1181,12 +2573,15 @@ where
         let _ = startup.send(StartupStatus {
             index,
             error: Some(message),
+            executor: Some(executor_id),
+            kick: None,
         });
     }
     if startup_sent
         && failure.is_some()
         && control.retire_failed_worker()
-        && let Err(drain_error) = terminal_drain(&scheduler, &registration, &receipts, &control)
+        && let Err(drain_error) =
+            terminal_drain(&scheduler, resolver.as_ref(), &registration, &receipts)
     {
         if let Some(existing) = &mut failure {
             existing.push_str("; ");
@@ -1213,17 +2608,23 @@ where
     }
 }
 
-fn terminal_drain(
+fn terminal_drain<B, R>(
     scheduler: &Scheduler,
+    resolver: &R,
     registration: &ExecutorRegistration,
     receipts: &ReceiptLog,
-    control: &PoolControl,
-) -> Result<(), String> {
-    control.authorities.retire_all();
+) -> Result<(), String>
+where
+    B: PersistentTaskBinding + Send + Sync + 'static,
+    R: TaskBindingResolver<B>,
+{
+    scheduler.close();
+    resolver
+        .cancel_dormant(scheduler, ExecutionFailure::SnapshotRestoreFailed)
+        .map_err(|error| error.to_string())?;
     scheduler
         .clear_executor_binding(registration)
         .map_err(|error| error.to_string())?;
-    scheduler.close();
     loop {
         let running = match scheduler.take(registration) {
             Ok(running) => running,
@@ -1234,11 +2635,15 @@ fn terminal_drain(
         let thread = running.thread_key();
         let generation = running.generation();
         receipts.record(executor, ExecutorPoolEvent::Claimed { thread, generation });
-        let settlement = scheduler
-            .settle_failed(running, ExecutionFailure::SnapshotRestoreFailed)
-            .map_err(|error| error.to_string());
-        receipts.record(executor, ExecutorPoolEvent::Failed { thread, generation });
-        settlement?;
+        if let Some(error) = fail_running_and_retire::<B, _>(
+            resolver,
+            scheduler,
+            running,
+            ExecutionFailure::SnapshotRestoreFailed,
+            receipts,
+        ) {
+            return Err(error);
+        }
     }
 }
 
@@ -1247,6 +2652,7 @@ fn run_executor_loop<F, R>(
     resolver: &Arc<R>,
     backend: &mut F,
     runtime: WorkerRuntime<'_>,
+    commands: &mpsc::Receiver<WorkerCommand>,
 ) -> Result<(), String>
 where
     F: PersistentExecutor,
@@ -1260,20 +2666,26 @@ where
         control,
     } = runtime;
     loop {
+        if service_owner_thread_commands(backend, registration.id(), commands, boundary, receipts)?
+        {
+            return Ok(());
+        }
         let mut running = match scheduler.take(registration) {
             Ok(running) => running,
+            Err(crate::kernel::RunQueueError::ControlPoked) => continue,
             Err(crate::kernel::RunQueueError::Closed) => return Ok(()),
             Err(error) => return Err(error.to_string()),
         };
         let executor_id = running.executor();
-        let thread = running.thread_key();
-        let generation = running.generation();
+        let mut thread = running.thread_key();
+        let mut generation = running.generation();
         receipts.record(
             executor_id,
             ExecutorPoolEvent::Claimed { thread, generation },
         );
         if let Err(error) = boundary.audit_runtime(backend) {
-            let settlement = fail_running(
+            let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                resolver.as_ref(),
                 scheduler,
                 running,
                 ExecutionFailure::SnapshotRestoreFailed,
@@ -1281,10 +2693,11 @@ where
             );
             return Err(with_settlement_error(error.to_string(), settlement));
         }
-        let binding = match resolver.resolve(thread, generation) {
+        let mut binding = match resolver.resolve(thread, generation) {
             Ok(binding) => binding,
             Err(error) => {
-                let settlement = fail_running(
+                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
                     scheduler,
                     running,
                     ExecutionFailure::SnapshotRestoreFailed,
@@ -1293,17 +2706,18 @@ where
                 return Err(with_settlement_error(error.to_string(), settlement));
             }
         };
-        let submission_authority = control.authorities.take(thread, generation);
+        let mut submission_authority = resolver.take_submission_authority(thread, generation);
         let task = RunnableTask {
             thread,
             generation,
             lease: running.lease(),
-            binding,
+            binding: Arc::clone(&binding),
         };
-        let asid_generation = match task.validate_for_load() {
+        let mut asid_generation = match task.validate_for_load() {
             Ok(state) => state.asid_generation,
             Err(error) => {
-                let settlement = fail_running(
+                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
                     scheduler,
                     running,
                     ExecutionFailure::SnapshotRestoreFailed,
@@ -1312,8 +2726,9 @@ where
                 return Err(with_settlement_error(error.to_string(), settlement));
             }
         };
-        if let Err(error) = backend.invalidate_asid(asid_generation) {
-            let settlement = fail_running(
+        if let Err(error) = backend.load(&task) {
+            let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                resolver.as_ref(),
                 scheduler,
                 running,
                 ExecutionFailure::SnapshotRestoreFailed,
@@ -1321,42 +2736,165 @@ where
             );
             return Err(with_settlement_error(error.to_string(), settlement));
         }
-        receipts.record(
-            executor_id,
-            ExecutorPoolEvent::InvalidatedAsid {
-                generation: asid_generation,
-            },
-        );
-        if let Err(error) = backend.load(&task) {
-            let settlement = fail_running(
+        let hardware = match backend.hardware_kick() {
+            Ok(hardware) => hardware,
+            Err(error) => {
+                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
+                    scheduler,
+                    running,
+                    ExecutionFailure::SnapshotRestoreFailed,
+                    receipts,
+                );
+                return Err(with_settlement_error(error.to_string(), settlement));
+            }
+        };
+        if !kick.publish_hardware(hardware) {
+            let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                resolver.as_ref(),
                 scheduler,
                 running,
                 ExecutionFailure::SnapshotRestoreFailed,
                 receipts,
             );
-            return Err(with_settlement_error(error.to_string(), settlement));
+            return Err(with_settlement_error(
+                "backend failed to publish exact live hardware kick".to_owned(),
+                settlement,
+            ));
         }
         receipts.record(
             executor_id,
             ExecutorPoolEvent::Loaded { thread, generation },
         );
+        probe_executor_lifecycle(
+            executor_id,
+            crate::probes::HvpatchExecutorLifecyclePhase::Load,
+            Some(thread),
+            Some(generation),
+            asid_generation,
+        );
 
+        let mut pending_exec_retirement = None;
         let exit = loop {
-            let submission = ExecutorSubmissionContext {
+            let lease = running.take_lease();
+            #[cfg(test)]
+            let publish_test_descendant = |child, child_generation| {
+                let parent = submission_authority.as_ref().ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "test descendant publication has no resolver authority".to_owned(),
+                    )
+                })?;
+                resolver.publish_test_descendant(scheduler, parent, child, child_generation)
+            };
+            let mut submission = ExecutorSubmissionContext {
                 scheduler,
-                authorities: &control.authorities,
+                #[cfg(test)]
+                publish_test_descendant: &publish_test_descendant,
                 current: submission_authority.as_ref(),
+                lease: Some(lease),
+                exec_replacement: None,
             };
             let attempted = catch_unwind(AssertUnwindSafe(|| {
-                backend.run_until_boundary(&kick.need_resched, &submission)
+                backend.run_until_boundary(&kick.need_resched, &mut submission)
             }));
+            let exec_replacement = submission.exec_replacement.take();
+            let lease = match submission.take_execution_lease() {
+                Ok(lease) => lease,
+                Err(error) => {
+                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    );
+                    return Err(with_settlement_error(error.to_string(), settlement));
+                }
+            };
+            if let Some(replacement) = exec_replacement {
+                let PendingExecReplacement {
+                    transition,
+                    replacement_mm,
+                    retired_mm,
+                } = replacement;
+                let predecessor_thread = thread;
+                let predecessor_generation = generation;
+                let successor_generation = lease.generation();
+                let authority = submission_authority.take();
+                let replacement_record =
+                    scheduler.retarget_running_exec(&mut running, transition, lease, |committed| {
+                        backend
+                            .validate_loaded_hardware_identity()
+                            .map_err(|error| error.to_string())?;
+                        let identity = TaskLoadIdentity {
+                            abi: binding.load_identity().abi,
+                            version: binding.load_identity().version,
+                            mm: committed.successor_mm,
+                            asid_generation: committed.successor_asid_generation,
+                        };
+                        let replacement_record = resolver
+                            .replace_exec(
+                                scheduler,
+                                ExecBindingTransition {
+                                    predecessor_thread,
+                                    predecessor_generation,
+                                    successor_thread: committed.successor_thread,
+                                    successor_generation,
+                                    identity,
+                                    replacement_mm: Some(Arc::clone(&replacement_mm)),
+                                    authority,
+                                },
+                            )
+                            .map_err(|error| error.to_string())?;
+                        if backend
+                            .retarget_loaded_task(Arc::clone(&replacement_record.binding))
+                            .is_err()
+                        {
+                            // The combined record now names the replacement;
+                            // allowing the old Arc to receive saved state would
+                            // split immutable MM/ASID identity.
+                            std::process::abort();
+                        }
+                        Ok(replacement_record)
+                    });
+                let replacement_record = match replacement_record {
+                    Ok(replacement) => replacement,
+                    Err(error) => {
+                        // Kernel exec has already published the replacement
+                        // image/thread. Returning through predecessor failure
+                        // cleanup would orphan the active successor and its
+                        // authority. This is a split-authority invariant loss,
+                        // so fail-stop the carrier rather than resume either
+                        // image.
+                        tracing::error!(%error, "worker-owned exec retarget failed after publication");
+                        std::process::abort();
+                    }
+                };
+                binding = replacement_record.binding;
+                pending_exec_retirement = Some(retired_mm);
+                submission_authority = replacement_record.authority;
+                thread = running.thread_key();
+                generation = successor_generation;
+                asid_generation = binding.load_identity().asid_generation;
+            } else if let Err((error, lease)) = running.restore_lease(lease) {
+                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
+                    scheduler,
+                    running,
+                    ExecutionFailure::SnapshotRestoreFailed,
+                    receipts,
+                );
+                drop(lease);
+                return Err(with_settlement_error(error.to_string(), settlement));
+            }
             let cpu = backend.take_cpu_receipt();
             running.thread().charge_user_ns(cpu.user_ns);
             running.thread().charge_system_ns(cpu.system_ns);
             let exit = match attempted {
                 Ok(Ok(exit)) => exit,
                 Ok(Err(error)) => {
-                    let settlement = fail_running(
+                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
                         scheduler,
                         running,
                         ExecutionFailure::SnapshotRestoreFailed,
@@ -1365,7 +2903,8 @@ where
                     return Err(with_settlement_error(error.to_string(), settlement));
                 }
                 Err(_) => {
-                    let settlement = fail_running(
+                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
                         scheduler,
                         running,
                         ExecutionFailure::SnapshotRestoreFailed,
@@ -1388,7 +2927,8 @@ where
             break exit;
         };
         if matches!(exit, ExecutorExit::InvalidState) {
-            let settlement = fail_running(
+            let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                resolver.as_ref(),
                 scheduler,
                 running,
                 ExecutionFailure::SnapshotRestoreFailed,
@@ -1400,7 +2940,8 @@ where
             ));
         }
         if let Err(error) = scheduler.begin_switch_out(&running) {
-            let settlement = fail_running(
+            let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                resolver.as_ref(),
                 scheduler,
                 running,
                 ExecutionFailure::SnapshotSaveFailed,
@@ -1416,10 +2957,21 @@ where
                 if let Err((restore_error, lease)) =
                     scheduler.restore_saved_lease(&mut running, lease)
                 {
+                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotSaveFailed,
+                        receipts,
+                    );
                     drop(lease);
-                    return Err(format!("{source}; lease restore failed: {restore_error}"));
+                    return Err(with_settlement_error(
+                        format!("{source}; lease restore failed: {restore_error}"),
+                        settlement,
+                    ));
                 }
-                let settlement = fail_running(
+                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
                     scheduler,
                     running,
                     ExecutionFailure::SnapshotSaveFailed,
@@ -1429,19 +2981,107 @@ where
             }
         };
         receipts.record(executor_id, ExecutorPoolEvent::Saved { thread, generation });
+        probe_executor_lifecycle(
+            executor_id,
+            crate::probes::HvpatchExecutorLifecyclePhase::Save,
+            Some(thread),
+            Some(generation),
+            asid_generation,
+        );
         if let Err((error, lease)) = scheduler.restore_saved_lease(&mut running, saved.into_lease())
         {
+            let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                resolver.as_ref(),
+                scheduler,
+                running,
+                ExecutionFailure::SnapshotRestoreFailed,
+                receipts,
+            );
             drop(lease);
-            return Err(error.to_string());
+            return Err(with_settlement_error(error.to_string(), settlement));
         }
         if let Err(error) = boundary.audit_runtime(backend) {
-            let settlement = fail_running(
+            let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                resolver.as_ref(),
                 scheduler,
                 running,
                 ExecutionFailure::SnapshotRestoreFailed,
                 receipts,
             );
             return Err(with_settlement_error(error.to_string(), settlement));
+        }
+        let terminal_retirement = binding.take_address_space_retirement();
+        if terminal_retirement.is_some() && pending_exec_retirement.is_some() {
+            std::process::abort();
+        }
+        if let Some(retirement) = pending_exec_retirement.take() {
+            if let Err(error) =
+                control.invalidate_after_exec(&retirement, executor_id, backend, boundary, receipts)
+            {
+                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
+                    scheduler,
+                    running,
+                    ExecutionFailure::SnapshotRestoreFailed,
+                    receipts,
+                );
+                return Err(with_settlement_error(
+                    format!("exec predecessor ASID retirement failed: {error}"),
+                    settlement,
+                ));
+            }
+            if let Err(error) = retirement.complete() {
+                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
+                    scheduler,
+                    running,
+                    ExecutionFailure::SnapshotRestoreFailed,
+                    receipts,
+                );
+                return Err(with_settlement_error(
+                    format!("exec predecessor ASID/root release failed: {error}"),
+                    settlement,
+                ));
+            }
+        }
+        if let Some(retirement) = terminal_retirement {
+            if let Some(stage1) = retirement.retirement()
+                && let Err(error) =
+                    control.invalidate_after_exec(stage1, executor_id, backend, boundary, receipts)
+            {
+                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
+                    scheduler,
+                    running,
+                    ExecutionFailure::SnapshotRestoreFailed,
+                    receipts,
+                );
+                return Err(with_settlement_error(
+                    format!("terminal ASID retirement failed: {error}"),
+                    settlement,
+                ));
+            }
+            if let Err(error) = retirement.complete() {
+                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
+                    scheduler,
+                    running,
+                    ExecutionFailure::SnapshotRestoreFailed,
+                    receipts,
+                );
+                return Err(with_settlement_error(
+                    format!("terminal ASID/root release failed: {error}"),
+                    settlement,
+                ));
+            }
+        }
+        if let Some(authority) = submission_authority.take() {
+            if let Err(authority) = resolver.restore_submission_authority(authority) {
+                drop(authority);
+                return Err(
+                    "combined task resolver rejected worker-held authority restoration".to_owned(),
+                );
+            }
         }
         let settlement = match exit {
             ExecutorExit::Blocked(reason) => {
@@ -1452,36 +3092,126 @@ where
             }
             ExecutorExit::BlockedContinuation(continuation) => {
                 let mut registration = control.wait_service.prepare_registration(&continuation);
-                control
-                    .wait_service
-                    .enroll(&mut registration)
-                    .map_err(|error| error.to_string())?;
+                if let Err(error) = control.wait_service.enroll(&mut registration) {
+                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    );
+                    return Err(with_settlement_error(error.to_string(), settlement));
+                }
                 drop(submission_authority);
                 scheduler
                     .settle_blocked_continuation(running, *continuation, registration)
                     .map(|()| ExecutorPoolEvent::SettledBlocked { thread, generation })
             }
-            ExecutorExit::Yielded | ExecutorExit::Preempted | ExecutorExit::Quiesced => control
-                .authorities
-                .settle_runnable_with_rollover(scheduler, running, submission_authority)
-                .map(|()| ExecutorPoolEvent::SettledRunnable { thread, generation }),
-            ExecutorExit::Exited => {
+            ExecutorExit::Yielded | ExecutorExit::Preempted => {
+                let successor = scheduler
+                    .settle_runnable_successor(running)
+                    .map_err(|error| error.to_string())?;
+                let _ = successor;
+                Ok(ExecutorPoolEvent::SettledRunnable { thread, generation })
+            }
+            ExecutorExit::Quiesced => {
                 drop(submission_authority);
                 scheduler
+                    .settle_blocked(running, BlockedReason::HostWait)
+                    .map(|()| ExecutorPoolEvent::SettledBlocked { thread, generation })
+            }
+            ExecutorExit::Exited => {
+                drop(submission_authority);
+                let settled = scheduler
                     .settle_exited(running)
-                    .map(|()| ExecutorPoolEvent::SettledExited { thread, generation })
+                    .map(|()| ExecutorPoolEvent::SettledExited { thread, generation });
+                if settled.is_ok() {
+                    resolver.retire(thread, generation);
+                }
+                settled
             }
             ExecutorExit::Syscall | ExecutorExit::InvalidState => unreachable!(),
         };
         match settlement {
-            Ok(event) => receipts.record(executor_id, event),
+            Ok(event) => {
+                if matches!(event, ExecutorPoolEvent::SettledExited { .. }) {
+                    binding.after_terminal_settlement();
+                }
+                receipts.record(executor_id, event);
+                probe_executor_lifecycle(
+                    executor_id,
+                    crate::probes::HvpatchExecutorLifecyclePhase::Switch,
+                    Some(thread),
+                    Some(generation),
+                    asid_generation,
+                );
+            }
             Err(error) => return Err(error.to_string()),
         }
-        if let Err(error) = boundary.audit_clean(backend, kick) {
-            return Err(error.to_string());
+        // All fallible owner/backend checks ran while `running` still carried
+        // the predecessor claim. Settlement then unbound the exact kick in the
+        // same scheduler transaction. A bound kick here is an internal
+        // invariant violation after successor publication; fail-stop instead
+        // of retrospectively failing a predecessor that no longer exists.
+        if kick.current_binding().is_some() {
+            std::process::abort();
         }
         receipts.record(executor_id, ExecutorPoolEvent::AuditPassed);
         std::thread::yield_now();
+    }
+}
+
+fn service_owner_thread_commands<E: PersistentExecutor>(
+    backend: &mut E,
+    executor: ExecutorId,
+    commands: &mpsc::Receiver<WorkerCommand>,
+    boundary: &WorkerBoundaryAudit,
+    receipts: &ReceiptLog,
+) -> Result<bool, String> {
+    loop {
+        match commands.try_recv() {
+            Ok(WorkerCommand::InvalidateAsid {
+                generation,
+                response,
+            }) => {
+                if let Err(error) = boundary.audit_runtime(backend) {
+                    let message = format!(
+                        "executor {executor:?} failed boundary audit before ASID invalidation: {error}"
+                    );
+                    let _ = response.send(Err(message.clone()));
+                    return Err(message);
+                }
+                if let Err(error) = backend.invalidate_asid(generation) {
+                    let message = format!(
+                        "executor {executor:?} failed ASID generation {} invalidation: {error}",
+                        generation.generation()
+                    );
+                    let _ = response.send(Err(message.clone()));
+                    return Err(message);
+                }
+                receipts.record(
+                    executor,
+                    ExecutorPoolEvent::InvalidatedAsid {
+                        generation: generation.generation(),
+                    },
+                );
+                probe_executor_lifecycle(
+                    executor,
+                    crate::probes::HvpatchExecutorLifecyclePhase::InvalidateAsid,
+                    None,
+                    None,
+                    generation.generation(),
+                );
+                let _ = response.send(Ok(crate::hvpatch::InvalidationAck::new(
+                    executor, generation,
+                )));
+            }
+            Ok(WorkerCommand::Stop) | Err(mpsc::TryRecvError::Disconnected) => return Ok(true),
+            Err(mpsc::TryRecvError::Empty) => return Ok(false),
+            Ok(WorkerCommand::Initialize | WorkerCommand::Run) => {
+                return Err("executor received an invalid owner-thread command".to_owned());
+            }
+        }
     }
 }
 
@@ -1497,6 +3227,28 @@ fn fail_running(
     let settlement_error = scheduler.settle_failed(running, reason).err();
     receipts.record(executor, ExecutorPoolEvent::Failed { thread, generation });
     settlement_error.map(|error| error.to_string())
+}
+
+fn fail_running_and_retire<B, R>(
+    resolver: &R,
+    scheduler: &Scheduler,
+    running: RunnableThread,
+    reason: ExecutionFailure,
+    receipts: &ReceiptLog,
+) -> Option<String>
+where
+    B: PersistentTaskBinding + Send + Sync + 'static,
+    R: TaskBindingResolver<B>,
+{
+    let thread = running.thread_key();
+    let generation = running.generation();
+    let binding = resolver.resolve(thread, generation).ok();
+    let result = fail_running(scheduler, running, reason, receipts);
+    resolver.retire(thread, generation);
+    if let Some(binding) = binding {
+        binding.after_terminal_settlement();
+    }
+    result
 }
 
 fn with_settlement_error(mut source: String, settlement: Option<String>) -> String {
@@ -1518,6 +3270,13 @@ fn destroy_and_unregister<E: PersistentExecutor>(
     let destroy_error = match destroy {
         Ok(Ok(())) => {
             receipts.record(executor, ExecutorPoolEvent::Destroyed);
+            probe_executor_lifecycle(
+                executor,
+                crate::probes::HvpatchExecutorLifecyclePhase::Destroy,
+                None,
+                None,
+                0,
+            );
             None
         }
         Ok(Err(error)) => Some(format!("executor destroy failed: {error}")),
@@ -1539,7 +3298,7 @@ fn destroy_and_unregister<E: PersistentExecutor>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
@@ -1553,10 +3312,13 @@ mod tests {
     };
 
     use super::{
-        ExecutorBoundaryAudit, ExecutorCpuReceipt, ExecutorExit, ExecutorPool, ExecutorPoolConfig,
-        ExecutorPoolEvent, ExecutorSaveError, PersistentExecutor, PersistentExecutorFactory,
-        PersistentTaskBinding, ReceiptLog, RunnableTask, SavedRunnable, TaskBindingResolver,
-        TaskLoadIdentity, WorkerBoundaryAudit, WorkerKick,
+        ExecBindingTransition, ExecutorBoundaryAudit, ExecutorCpuReceipt, ExecutorExit,
+        ExecutorPool, ExecutorPoolConfig, ExecutorPoolEvent, ExecutorSaveError,
+        ExecutorSubmissionContext, HvpatchActivationProof, HvpatchQuantumControl,
+        HvpatchSubmissionShape, HvpatchTaskBindingDirectory, PersistentExecutor,
+        PersistentExecutorFactory, PersistentTaskBinding, ReceiptLog, RunnableTask, SavedRunnable,
+        TaskBindingResolver, TaskLoadIdentity, WorkerBoundaryAudit, WorkerKick,
+        restore_worker_vcpu_before_binding_publication, retire_failed_hvpatch_clone_authority,
     };
     use crate::compat::SyscallArgs;
     use crate::dispatch::{DispatchOutcome, SyscallDispatcher, SyscallRequest};
@@ -1565,9 +3327,26 @@ mod tests {
         ThreadExecutionLease, ThreadExecutionState,
     };
     use crate::kernel::{
-        ClonePlan, Kernel, KernelContext, RootBootstrap, Scheduler, SubmissionAuthority, ThreadKey,
+        ClonePlan, Kernel, KernelContext, RootBootstrap, Scheduler, SchedulerError,
+        SubmissionAuthority, ThreadKey,
     };
     use crate::trap::TrapError;
+
+    #[derive(Clone)]
+    struct TestVcpuKick;
+
+    impl carrick_hal::VcpuKick for TestVcpuKick {
+        fn kick(&self) {}
+    }
+
+    fn test_hardware_kick(raw_vcpu_id: u64) -> super::ExactHardwareKick {
+        super::ExactHardwareKick::new(
+            Box::new(TestVcpuKick),
+            raw_vcpu_id.max(1),
+            super::current_owner_thread_port(),
+        )
+        .unwrap()
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Step {
@@ -1579,6 +3358,7 @@ mod tests {
         Exit,
         FailRun,
         PanicRun,
+        LoseLease,
         Invalid,
     }
 
@@ -1717,18 +3497,24 @@ mod tests {
     #[derive(Clone, Debug, Default)]
     struct FakeFactory {
         bindings: Arc<parking_lot::Mutex<BTreeMap<ThreadKey, Arc<FakeBinding>>>>,
+        authorities: Arc<
+            parking_lot::Mutex<BTreeMap<(ThreadKey, ExecutionGeneration), SubmissionAuthority>>,
+        >,
+        scheduler: Arc<parking_lot::Mutex<std::sync::Weak<Scheduler>>>,
         events: Arc<parking_lot::Mutex<Vec<BackendEvent>>>,
         create_calls: Arc<AtomicUsize>,
         fail_create_call: Arc<AtomicUsize>,
         panic_initial_audit_call: Arc<AtomicUsize>,
         initial_audit_gate: Arc<parking_lot::Mutex<Option<Arc<Barrier>>>>,
         fail_invalidation_generation: Arc<AtomicU64>,
+        fail_hardware_kick: Arc<AtomicBool>,
         owner_dirty_mode: Arc<AtomicUsize>,
         owner_dirty_fds: Arc<parking_lot::Mutex<Vec<(i32, i32)>>>,
         destroy_mode: Arc<AtomicUsize>,
         snapshot_count: Arc<AtomicUsize>,
         concurrent_loads: Arc<parking_lot::Mutex<BTreeSet<(ThreadKey, ExecutionGeneration)>>>,
         inherited_state: Arc<parking_lot::Mutex<Vec<(u64, u64, u64, u64, u64)>>>,
+        retired_bindings: Arc<parking_lot::Mutex<Vec<(ThreadKey, ExecutionGeneration)>>>,
     }
 
     impl FakeFactory {
@@ -1759,6 +3545,17 @@ mod tests {
     }
 
     impl TaskBindingResolver<FakeBinding> for FakeFactory {
+        fn install_scheduler(
+            self: &Arc<Self>,
+            scheduler: &Arc<Scheduler>,
+        ) -> Result<(), TrapError> {
+            *self.scheduler.lock() = Arc::downgrade(scheduler);
+            scheduler
+                .install_generation_observer(Arc::clone(self)
+                    as Arc<dyn crate::kernel::scheduler::SchedulerGenerationObserver>)
+                .map_err(|error| TrapError::Hypervisor(error.to_string()))
+        }
+
         fn resolve(
             &self,
             thread: ThreadKey,
@@ -1767,6 +3564,102 @@ mod tests {
             self.bindings.lock().get(&thread).cloned().ok_or_else(|| {
                 TrapError::Hypervisor(format!("missing fake binding for {thread:?}"))
             })
+        }
+
+        fn retire(&self, thread: ThreadKey, generation: ExecutionGeneration) {
+            self.authorities.lock().remove(&(thread, generation));
+            self.retired_bindings.lock().push((thread, generation));
+        }
+
+        fn take_submission_authority(
+            &self,
+            thread: ThreadKey,
+            generation: ExecutionGeneration,
+        ) -> Option<SubmissionAuthority> {
+            self.authorities.lock().remove(&(thread, generation))
+        }
+
+        fn restore_submission_authority(
+            &self,
+            authority: SubmissionAuthority,
+        ) -> Result<(), SubmissionAuthority> {
+            let key = (authority.thread_key(), authority.generation());
+            let mut authorities = self.authorities.lock();
+            if authorities.contains_key(&key) {
+                return Err(authority);
+            }
+            authorities.insert(key, authority);
+            Ok(())
+        }
+
+        fn publish_test_root(
+            &self,
+            scheduler: &Scheduler,
+            thread: Arc<crate::kernel::Thread>,
+            authority: SubmissionAuthority,
+        ) -> Result<(), SchedulerError> {
+            let key = (authority.thread_key(), authority.generation());
+            let mut authorities = self.authorities.lock();
+            if authorities.contains_key(&key) {
+                return Err(crate::kernel::RunQueueError::SubmissionRejected.into());
+            }
+            authority.publish(scheduler, thread)?;
+            authorities.insert(key, authority);
+            Ok(())
+        }
+
+        fn publish_test_descendant(
+            &self,
+            scheduler: &Scheduler,
+            parent: &SubmissionAuthority,
+            thread: Arc<crate::kernel::Thread>,
+            generation: ExecutionGeneration,
+        ) -> Result<(), TrapError> {
+            let authority = parent
+                .admit_descendant(thread.key(), generation)
+                .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+            self.publish_test_root(scheduler, thread, authority)
+                .map_err(|error| TrapError::Hypervisor(error.to_string()))
+        }
+    }
+
+    impl crate::kernel::scheduler::SchedulerGenerationObserver for FakeFactory {
+        fn transition(
+            &self,
+            thread: ThreadKey,
+            predecessor: ExecutionGeneration,
+            successor: ExecutionGeneration,
+            kind: crate::kernel::scheduler::SchedulerGenerationTransition,
+        ) -> Result<(), crate::kernel::RunQueueError> {
+            let Some(scheduler) = self.scheduler.lock().upgrade() else {
+                return Err(crate::kernel::RunQueueError::Closed);
+            };
+            let mut authorities = self.authorities.lock();
+            let Some(authority) = authorities.remove(&(thread, predecessor)) else {
+                return Ok(());
+            };
+            if kind == crate::kernel::scheduler::SchedulerGenerationTransition::Terminal {
+                return Ok(());
+            }
+            if authorities.contains_key(&(thread, successor)) {
+                return Err(crate::kernel::RunQueueError::SubmissionRejected);
+            }
+            let authority =
+                if kind == crate::kernel::scheduler::SchedulerGenerationTransition::Blocked {
+                    authority
+                        .park_exact(&scheduler, predecessor, successor)
+                        .map_err(|(error, _authority)| error)?
+                } else if authority.is_active() {
+                    authority
+                        .rollover_exact(&scheduler, thread, predecessor, thread, successor)
+                        .map_err(|(error, _authority)| error)?
+                } else {
+                    authority
+                        .reactivate_exact(&scheduler, predecessor, successor)
+                        .map_err(|(error, _authority)| error)?
+                };
+            authorities.insert((thread, successor), authority);
+            Ok(())
         }
     }
 
@@ -1807,6 +3700,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct MaliciousFactory {
         bindings: parking_lot::Mutex<BTreeMap<ThreadKey, Arc<MaliciousBinding>>>,
+        authorities:
+            parking_lot::Mutex<BTreeMap<(ThreadKey, ExecutionGeneration), SubmissionAuthority>>,
     }
 
     impl MaliciousFactory {
@@ -1840,17 +3735,62 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| TrapError::Hypervisor("missing malicious binding".to_owned()))
         }
+
+        fn take_submission_authority(
+            &self,
+            thread: ThreadKey,
+            generation: ExecutionGeneration,
+        ) -> Option<SubmissionAuthority> {
+            self.authorities.lock().remove(&(thread, generation))
+        }
+
+        fn restore_submission_authority(
+            &self,
+            authority: SubmissionAuthority,
+        ) -> Result<(), SubmissionAuthority> {
+            let key = (authority.thread_key(), authority.generation());
+            let mut authorities = self.authorities.lock();
+            if authorities.contains_key(&key) {
+                return Err(authority);
+            }
+            authorities.insert(key, authority);
+            Ok(())
+        }
+
+        fn publish_test_root(
+            &self,
+            scheduler: &Scheduler,
+            thread: Arc<crate::kernel::Thread>,
+            authority: SubmissionAuthority,
+        ) -> Result<(), SchedulerError> {
+            let key = (authority.thread_key(), authority.generation());
+            let mut authorities = self.authorities.lock();
+            if authorities.contains_key(&key) {
+                return Err(crate::kernel::RunQueueError::SubmissionRejected.into());
+            }
+            authority.publish(scheduler, thread)?;
+            authorities.insert(key, authority);
+            Ok(())
+        }
+
+        fn retire(&self, thread: ThreadKey, generation: ExecutionGeneration) {
+            self.authorities.lock().remove(&(thread, generation));
+        }
     }
 
     struct MaliciousExecutor {
+        id: ExecutorId,
         current: Option<Arc<MaliciousBinding>>,
     }
 
     impl PersistentExecutorFactory for MaliciousFactory {
         type Executor = MaliciousExecutor;
 
-        fn create(&self, _executor: ExecutorId) -> Result<Self::Executor, TrapError> {
-            Ok(MaliciousExecutor { current: None })
+        fn create(&self, executor: ExecutorId) -> Result<Self::Executor, TrapError> {
+            Ok(MaliciousExecutor {
+                id: executor,
+                current: None,
+            })
         }
     }
 
@@ -1866,7 +3806,7 @@ mod tests {
         fn run_until_boundary(
             &mut self,
             _need_resched: &AtomicBool,
-            _submission: &super::ExecutorSubmissionContext<'_>,
+            _submission: &mut super::ExecutorSubmissionContext<'_>,
         ) -> Result<ExecutorExit, TrapError> {
             let binding = self.current.as_ref().expect("malicious binding loaded");
             binding.entered.wait();
@@ -1880,6 +3820,10 @@ mod tests {
             ExecutorCpuReceipt::default()
         }
 
+        fn hardware_kick(&self) -> Result<super::ExactHardwareKick, TrapError> {
+            Ok(test_hardware_kick(u64::from(self.id.raw_for_probe())))
+        }
+
         fn save(
             &mut self,
             lease: ThreadExecutionLease,
@@ -1890,7 +3834,10 @@ mod tests {
             ))
         }
 
-        fn invalidate_asid(&mut self, _generation: u64) -> Result<(), TrapError> {
+        fn invalidate_asid(
+            &mut self,
+            _generation: crate::hvpatch::AsidGeneration,
+        ) -> Result<(), TrapError> {
             Ok(())
         }
 
@@ -1914,13 +3861,17 @@ mod tests {
         fn run_until_boundary(
             &mut self,
             _need_resched: &AtomicBool,
-            _submission: &super::ExecutorSubmissionContext<'_>,
+            _submission: &mut super::ExecutorSubmissionContext<'_>,
         ) -> Result<ExecutorExit, TrapError> {
             panic!("audit-only backend cannot run a task")
         }
 
         fn take_cpu_receipt(&mut self) -> ExecutorCpuReceipt {
             panic!("audit-only backend has no CPU receipt")
+        }
+
+        fn hardware_kick(&self) -> Result<super::ExactHardwareKick, TrapError> {
+            panic!("audit-only backend has no hardware kick")
         }
 
         fn save(
@@ -1930,7 +3881,10 @@ mod tests {
             panic!("audit-only backend cannot save a task")
         }
 
-        fn invalidate_asid(&mut self, _generation: u64) -> Result<(), TrapError> {
+        fn invalidate_asid(
+            &mut self,
+            _generation: crate::hvpatch::AsidGeneration,
+        ) -> Result<(), TrapError> {
             panic!("audit-only backend cannot invalidate an ASID")
         }
 
@@ -2006,7 +3960,7 @@ mod tests {
         fn run_until_boundary(
             &mut self,
             need_resched: &AtomicBool,
-            submission: &super::ExecutorSubmissionContext<'_>,
+            submission: &mut super::ExecutorSubmissionContext<'_>,
         ) -> Result<ExecutorExit, TrapError> {
             assert_eq!(thread::current().id(), self.owner);
             let (thread, generation, binding) = self.current.as_ref().expect("loaded task");
@@ -2033,7 +3987,7 @@ mod tests {
                     .take()
                     .expect("ready descendant publication");
                 submission
-                    .publish_descendant(
+                    .publish_test_descendant(
                         Arc::clone(&publication.child_thread),
                         publication.child_generation,
                     )
@@ -2082,6 +4036,14 @@ mod tests {
                 Step::Exit => Ok(ExecutorExit::Exited),
                 Step::FailRun => Err(TrapError::Hypervisor("injected run failure".to_owned())),
                 Step::PanicRun => panic!("injected executor panic"),
+                Step::LoseLease => {
+                    let lease = submission
+                        .execution_lease_slot_mut()
+                        .take()
+                        .expect("worker injected exact lease");
+                    std::mem::forget(lease);
+                    Ok(ExecutorExit::InvalidState)
+                }
                 Step::Invalid => Ok(ExecutorExit::InvalidState),
             }
         }
@@ -2094,6 +4056,15 @@ mod tests {
             self.user_ns = 0;
             self.system_ns = 0;
             receipt
+        }
+
+        fn hardware_kick(&self) -> Result<super::ExactHardwareKick, TrapError> {
+            if self.factory.fail_hardware_kick.load(Ordering::SeqCst) {
+                return Err(TrapError::Hypervisor(
+                    "injected missing exact hardware identity".to_owned(),
+                ));
+            }
+            Ok(test_hardware_kick(u64::from(self.id.raw_for_probe())))
         }
 
         fn save(
@@ -2185,13 +4156,16 @@ mod tests {
             Ok(SavedRunnable::new(lease))
         }
 
-        fn invalidate_asid(&mut self, generation: u64) -> Result<(), TrapError> {
+        fn invalidate_asid(
+            &mut self,
+            generation: crate::hvpatch::AsidGeneration,
+        ) -> Result<(), TrapError> {
             assert_eq!(thread::current().id(), self.owner);
             if self
                 .factory
                 .fail_invalidation_generation
                 .load(Ordering::SeqCst)
-                == generation
+                == generation.generation()
             {
                 return Err(TrapError::Hypervisor(
                     "injected ASID invalidation failure".to_owned(),
@@ -2256,6 +4230,175 @@ mod tests {
         Kernel::bootstrap_root(input).expect("kernel")
     }
 
+    #[test]
+    fn pre_fork_exec_hardware_and_shutdown_guards_are_fail_closed() {
+        let source = include_str!("executor.rs");
+        let concrete_load = source
+            .split("impl PersistentExecutor for HvpatchPersistentExecutor")
+            .nth(1)
+            .and_then(|tail| tail.split("fn run_until_boundary").next())
+            .expect("concrete HVPatch task load");
+        let begin_asid = concrete_load
+            .find("begin_asid_load")
+            .expect("strong ASID load admission");
+        let overlay = concrete_load
+            .find("overlay_task_state_on_live_executor")
+            .expect("live executor task overlay");
+        let resident = concrete_load
+            .find("mark_resident")
+            .expect("post-install ASID residence");
+        let dirty = concrete_load
+            .find("arm_hardware_dirty")
+            .expect("pre-mutation ASID load arm");
+        let barrier = concrete_load
+            .find("complete_task_load_barrier")
+            .expect("post-TTBR DSB/ISB load barrier");
+        assert!(begin_asid < dirty && dirty < overlay && overlay < barrier && barrier < resident);
+
+        let worker_loop = source
+            .split("fn run_executor_loop")
+            .nth(1)
+            .and_then(|tail| tail.split("fn service_owner_thread_commands").next())
+            .expect("persistent worker loop");
+        let save = worker_loop.find("backend.save(lease)").expect("task save");
+        let invalidate = worker_loop
+            .find("invalidate_after_exec")
+            .expect("post-save ASID invalidation");
+        let release = worker_loop
+            .find("retirement.complete()")
+            .expect("post-ack ASID/root release");
+        assert!(save < invalidate && invalidate < release);
+        let pre_load = worker_loop
+            .split("if let Err(error) = backend.load(&task)")
+            .next()
+            .expect("worker pre-load path");
+        assert!(
+            !pre_load.contains("invalidate_asid"),
+            "ordinary task load must never invalidate an ASID"
+        );
+
+        let concrete_retarget = source
+            .split(concat!("fn retarget_loaded_", "task(&mut self, binding:"))
+            .nth(1)
+            .and_then(|tail| tail.split("fn save(").next())
+            .expect("concrete HVPatch loaded retarget");
+        assert!(concrete_retarget.contains("validate_loaded_hardware_identity()?"));
+
+        let exec_cutover = source
+            .split("if let Some(replacement) = exec_replacement")
+            .nth(1)
+            .and_then(|tail| tail.split("} else if let Err").next())
+            .expect("worker-owned exec cutover");
+        let validate = exec_cutover
+            .find("validate_loaded_hardware_identity()")
+            .expect("live vCPU/Mach preflight");
+        let publish = exec_cutover
+            .find(".replace_exec(")
+            .expect("combined successor publication");
+        assert!(validate < publish);
+
+        let marker = source
+            .find(concat!("post-join exact dormant ", "cancellation failed"))
+            .expect("post-join cancellation boundary");
+        let cancel = source[..marker]
+            .rfind("cancel_dormant")
+            .expect("stable exact cancellation");
+        let fail_stop = source[marker..]
+            .find("std::process::abort()")
+            .map(|offset| marker + offset)
+            .expect("cancellation failure fail-stop");
+        let wait = source[fail_stop..]
+            .find("self.scheduler.wait_closed()")
+            .map(|offset| fail_stop + offset)
+            .expect("queue closure wait");
+        assert!(cancel < fail_stop && fail_stop < wait);
+    }
+
+    #[test]
+    fn hvpatch_quantum_borrows_a_fresh_injected_engine_at_every_boundary() {
+        #[derive(Default)]
+        struct InjectedEngine {
+            polls: usize,
+        }
+
+        struct SevenBoundaryJob {
+            exits: VecDeque<ExecutorExit>,
+            observed: Arc<parking_lot::Mutex<Vec<usize>>>,
+        }
+
+        impl crate::vcpu_loop::continuation::PersistentQuantumJob for SevenBoundaryJob {
+            fn poll_quantum_with_engine(
+                &mut self,
+                engine: &mut dyn std::any::Any,
+                control: &mut HvpatchQuantumControl<'_, '_>,
+            ) -> ExecutorExit {
+                let engine = engine
+                    .downcast_mut::<InjectedEngine>()
+                    .expect("exact injected engine type");
+                engine.polls += 1;
+                self.observed.lock().push(engine.polls);
+                assert!(!control.need_resched());
+                let _ = control.submission();
+                self.exits.pop_front().expect("scripted boundary")
+            }
+        }
+
+        let boundaries = [
+            ExecutorExit::Blocked(BlockedReason::HostWait),
+            ExecutorExit::Blocked(BlockedReason::ChildState),
+            ExecutorExit::Yielded,
+            ExecutorExit::Quiesced,
+            ExecutorExit::Preempted,
+            ExecutorExit::Yielded,
+            ExecutorExit::Exited,
+        ];
+        let expected_discriminants = boundaries
+            .iter()
+            .map(std::mem::discriminant)
+            .collect::<Vec<_>>();
+        let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let completion = crate::vcpu_loop::continuation::LogicalJobCompletion::pending();
+        let quantum = crate::vcpu_loop::continuation::HvpatchTaskQuantum::new(
+            Box::new(SevenBoundaryJob {
+                exits: boundaries.into_iter().collect(),
+                observed: Arc::clone(&observed),
+            }),
+            completion.clone(),
+        );
+        let (kernel, _) = bootstrap(13_991);
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let reject_descendant = |_, _| {
+            Err(TrapError::Hypervisor(
+                "seven-boundary test publishes no descendants".to_owned(),
+            ))
+        };
+        let mut submission = ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &reject_descendant,
+            current: None,
+            lease: None,
+            exec_replacement: None,
+        };
+        let need_resched = AtomicBool::new(false);
+        let mut control = HvpatchQuantumControl {
+            need_resched: &need_resched,
+            submission: &mut submission,
+        };
+
+        for (index, expected) in expected_discriminants.into_iter().enumerate() {
+            // This value represents the executor-owned engine after load. It is
+            // dropped after every returned boundary, exactly where the real
+            // backend's save path detaches its task state from the worker vCPU.
+            let mut engine = InjectedEngine::default();
+            let actual = quantum.poll_quantum_with_engine(&mut engine, &mut control);
+            assert_eq!(std::mem::discriminant(&actual), expected);
+            assert_eq!(engine.polls, 1, "boundary {index} reused a retained engine");
+        }
+        assert_eq!(*observed.lock(), vec![1; 7]);
+        quantum.after_terminal_settlement();
+        assert!(completion.is_finished());
+    }
+
     fn sibling(kernel: &Arc<Kernel>, parent: &KernelContext, host_tid: i32) -> KernelContext {
         let plan = ClonePlan::from_flags(
             LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
@@ -2297,7 +4440,7 @@ mod tests {
             .0
     }
 
-    fn task_state(context: &KernelContext, marker: u64) -> MigratableTaskState {
+    pub(crate) fn task_state(context: &KernelContext, marker: u64) -> MigratableTaskState {
         task_state_with_continuation(context, marker, None)
     }
 
@@ -2347,6 +4490,973 @@ mod tests {
             .thread()
             .publish_initial_task_state(task_state(context, marker))
             .expect("publish task state")
+    }
+
+    pub(crate) fn hvpatch_test_binding(
+        context: &KernelContext,
+        state: &MigratableTaskState,
+        marker: u64,
+    ) -> Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding> {
+        struct ExitJob;
+
+        impl crate::vcpu_loop::continuation::PersistentQuantumJob for ExitJob {
+            fn poll_quantum_with_engine(
+                &mut self,
+                _engine: &mut dyn std::any::Any,
+                _control: &mut HvpatchQuantumControl<'_, '_>,
+            ) -> ExecutorExit {
+                ExecutorExit::Exited
+            }
+        }
+
+        assert_eq!(context.shared().mm().id(), state.mm);
+        Arc::new(crate::vcpu_loop::continuation::HvpatchTaskBinding::new(
+            TaskLoadIdentity {
+                abi: state.cpu.guest_abi(),
+                version: state.cpu.version(),
+                mm: state.mm,
+                asid_generation: state.asid_generation,
+            },
+            Arc::new(crate::vcpu_loop::continuation::HvpatchTaskQuantum::new(
+                Box::new(ExitJob),
+                crate::vcpu_loop::continuation::LogicalJobCompletion::pending(),
+            )),
+            Box::new(marker),
+        ))
+    }
+
+    pub(crate) fn activate_hvpatch_test_submission(
+        dormant: super::PreparedHvpatchSubmission,
+        scheduler: &Scheduler,
+        context: &KernelContext,
+        state: &MigratableTaskState,
+        generation: ExecutionGeneration,
+        binding: &crate::vcpu_loop::continuation::HvpatchTaskBinding,
+    ) {
+        let start_gate = context
+            .thread()
+            .take_opened_start_gate(generation)
+            .expect("exact opened start gate");
+        let proof = HvpatchActivationProof::validate(
+            context,
+            state,
+            generation,
+            binding.identity(),
+            start_gate,
+        )
+        .expect("exact activation proof");
+        dormant
+            .activate(scheduler, Arc::clone(context.thread()), proof)
+            .expect("activate exact dormant submission");
+    }
+
+    #[test]
+    fn dormant_submission_is_invisible_until_exact_activation() {
+        let (kernel, context) = bootstrap(13_993);
+        let state = task_state(&context, 93);
+        let generation = context
+            .thread()
+            .publish_initial_task_state(state.clone())
+            .expect("publish root state");
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+        directory.install_scheduler(&scheduler).unwrap();
+        let binding = hvpatch_test_binding(&context, &state, 93);
+        let dormant = directory
+            .prepare_submission(
+                &scheduler,
+                HvpatchSubmissionShape::Root,
+                None,
+                Arc::clone(context.thread()),
+                generation,
+                Arc::clone(&binding),
+            )
+            .expect("prepare dormant root");
+
+        assert_eq!(scheduler.queued_len(), 0);
+        assert!(
+            <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+                directory.as_ref(),
+                context.thread().key(),
+                generation,
+            )
+            .is_err()
+        );
+        activate_hvpatch_test_submission(
+            dormant,
+            &scheduler,
+            &context,
+            &state,
+            generation,
+            binding.as_ref(),
+        );
+        assert_eq!(scheduler.queued_len(), 1);
+        let resolved = <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+            directory.as_ref(),
+            context.thread().key(),
+            generation,
+        )
+        .expect("binding visible only after activation");
+        assert!(Arc::ptr_eq(&resolved, &binding));
+    }
+
+    #[test]
+    fn opened_start_gate_is_kernel_minted_only_after_start_and_consumed_once() {
+        let (kernel, root) = bootstrap(13_989);
+        let published = kernel
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).unwrap(),
+                "start-gated".to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_reference(ThreadId::synthetic_for_tests(23_989))
+            .unwrap()
+            .commit()
+            .unwrap();
+        let before_start = published.context().expect("published child context");
+        let state = task_state(before_start, 89);
+        let generation = before_start
+            .thread()
+            .publish_initial_task_state(state)
+            .unwrap();
+        assert!(
+            before_start
+                .thread()
+                .take_opened_start_gate(generation)
+                .is_none()
+        );
+
+        let started = published.start_child().unwrap();
+        assert!(
+            started
+                .context()
+                .thread()
+                .take_opened_start_gate(generation)
+                .is_some()
+        );
+        assert!(
+            started
+                .context()
+                .thread()
+                .take_opened_start_gate(generation)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn same_task_clone_binding_stays_dormant_until_kernel_gate_opens() {
+        let (kernel, root) = bootstrap(13_988);
+        let root_state = task_state(&root, 88);
+        let root_generation = root
+            .thread()
+            .publish_initial_task_state(root_state.clone())
+            .unwrap();
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+        directory.install_scheduler(&scheduler).unwrap();
+        let root_binding = hvpatch_test_binding(&root, &root_state, 88);
+        let root_submission = directory
+            .prepare_submission(
+                &scheduler,
+                HvpatchSubmissionShape::Root,
+                None,
+                Arc::clone(root.thread()),
+                root_generation,
+                Arc::clone(&root_binding),
+            )
+            .unwrap();
+        activate_hvpatch_test_submission(
+            root_submission,
+            &scheduler,
+            &root,
+            &root_state,
+            root_generation,
+            root_binding.as_ref(),
+        );
+        let root_authority = directory
+            .take_submission_authority(root.thread().key(), root_generation)
+            .unwrap();
+
+        let published = kernel
+            .reserve_thread_clone(
+                &root,
+                ClonePlan::from_flags(
+                    LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(ThreadId::synthetic_for_tests(23_988))
+            .unwrap()
+            .reserve_publication_eventually()
+            .unwrap()
+            .commit()
+            .unwrap();
+        let child = published.context().unwrap().retain_exact();
+        let child_state = task_state(&child, 89);
+        let child_generation = child
+            .thread()
+            .publish_initial_task_state(child_state.clone())
+            .unwrap();
+        let child_binding = hvpatch_test_binding(&child, &child_state, 89);
+        let dormant = directory
+            .prepare_submission(
+                &scheduler,
+                HvpatchSubmissionShape::SameTaskSibling {
+                    grant: (root.thread().key(), root_generation),
+                },
+                Some(&root_authority),
+                Arc::clone(child.thread()),
+                child_generation,
+                Arc::clone(&child_binding),
+            )
+            .unwrap();
+        assert_eq!(scheduler.queued_len(), 1);
+        assert!(
+            directory
+                .resolve(child.thread().key(), child_generation)
+                .is_err()
+        );
+        assert!(
+            child
+                .thread()
+                .take_opened_start_gate(child_generation)
+                .is_none()
+        );
+
+        let started = published.start_thread().unwrap();
+        let gate = started
+            .context()
+            .thread()
+            .take_opened_start_gate(child_generation)
+            .unwrap();
+        let proof = HvpatchActivationProof::validate(
+            &child,
+            &child_state,
+            child_generation,
+            child_binding.identity(),
+            gate,
+        )
+        .unwrap();
+        dormant
+            .activate(&scheduler, Arc::clone(child.thread()), proof)
+            .unwrap();
+        assert_eq!(scheduler.queued_len(), 2);
+        assert!(
+            directory
+                .resolve(child.thread().key(), child_generation)
+                .is_ok()
+        );
+        directory
+            .restore_submission_authority(root_authority)
+            .unwrap();
+    }
+
+    #[test]
+    fn dormant_and_active_clone_directory_retirement_is_exact() {
+        #[derive(Clone, Copy, Eq, PartialEq)]
+        enum Phase {
+            TidCopyout,
+            BackendCommit,
+            TokenBind,
+            RegistryHandle,
+            StartProof,
+            Activation,
+        }
+        for (case, phase) in [
+            Phase::TidCopyout,
+            Phase::BackendCommit,
+            Phase::TokenBind,
+            Phase::RegistryHandle,
+            Phase::StartProof,
+            Phase::Activation,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (kernel, root) = bootstrap(13_980 + case as i32);
+            let root_state = task_state(&root, 80 + case as u64);
+            let root_generation = root
+                .thread()
+                .publish_initial_task_state(root_state.clone())
+                .unwrap();
+            let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+            let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+            directory.install_scheduler(&scheduler).unwrap();
+            let root_binding = hvpatch_test_binding(&root, &root_state, 80 + case as u64);
+            let root_submission = directory
+                .prepare_submission(
+                    &scheduler,
+                    HvpatchSubmissionShape::Root,
+                    None,
+                    Arc::clone(root.thread()),
+                    root_generation,
+                    Arc::clone(&root_binding),
+                )
+                .unwrap();
+            activate_hvpatch_test_submission(
+                root_submission,
+                &scheduler,
+                &root,
+                &root_state,
+                root_generation,
+                root_binding.as_ref(),
+            );
+            let root_authority = directory
+                .take_submission_authority(root.thread().key(), root_generation)
+                .unwrap();
+            let published = kernel
+                .reserve_thread_clone(
+                    &root,
+                    ClonePlan::from_flags(
+                        LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap()
+                .prepare(ThreadId::synthetic_for_tests(23_980 + case as i32))
+                .unwrap()
+                .commit()
+                .unwrap();
+            let child = published.context().unwrap().retain_exact();
+            let child_state = task_state(&child, 90 + case as u64);
+            let child_generation = child
+                .thread()
+                .publish_initial_task_state(child_state.clone())
+                .unwrap();
+            let has_logical_handle = matches!(
+                phase,
+                Phase::RegistryHandle | Phase::StartProof | Phase::Activation
+            );
+            let completion = has_logical_handle
+                .then(crate::vcpu_loop::continuation::LogicalJobCompletion::pending);
+            let child_binding = hvpatch_test_binding(&child, &child_state, 90 + case as u64);
+            let mut dormant = has_logical_handle.then(|| {
+                directory
+                    .prepare_submission(
+                        &scheduler,
+                        HvpatchSubmissionShape::SameTaskSibling {
+                            grant: (root.thread().key(), root_generation),
+                        },
+                        Some(&root_authority),
+                        Arc::clone(child.thread()),
+                        child_generation,
+                        Arc::clone(&child_binding),
+                    )
+                    .unwrap()
+            });
+            if matches!(phase, Phase::StartProof | Phase::Activation) {
+                let started = published.start_thread().unwrap();
+                let gate = started
+                    .context()
+                    .thread()
+                    .take_opened_start_gate(child_generation)
+                    .unwrap();
+                let proof = HvpatchActivationProof::validate(
+                    &child,
+                    &child_state,
+                    child_generation,
+                    child_binding.identity(),
+                    gate,
+                )
+                .unwrap();
+                if phase == Phase::Activation {
+                    dormant
+                        .take()
+                        .unwrap()
+                        .activate(&scheduler, Arc::clone(child.thread()), proof)
+                        .unwrap();
+                    assert!(
+                        directory
+                            .resolve(child.thread().key(), child_generation)
+                            .is_ok()
+                    );
+                }
+            }
+            drop(dormant);
+            retire_failed_hvpatch_clone_authority(
+                &scheduler,
+                &kernel,
+                &child,
+                child_generation,
+                |thread, generation| directory.retire(thread, generation),
+            )
+            .unwrap();
+            if let Some(completion) = &completion {
+                assert!(!completion.is_finished());
+                completion.publish();
+            }
+            assert!(completion.as_ref().is_none_or(|value| value.is_finished()));
+            assert!(
+                directory
+                    .resolve(child.thread().key(), child_generation)
+                    .is_err()
+            );
+            assert!(
+                kernel
+                    .context(root.task().key().id, child.thread().key().tid)
+                    .is_err()
+            );
+            assert_eq!(scheduler.queued_len(), 1);
+            directory
+                .restore_submission_authority(root_authority)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn task_only_save_restores_worker_vcpu_before_binding_publication_can_fail() {
+        let mut worker_vcpu = None;
+        let result = restore_worker_vcpu_before_binding_publication(
+            &mut worker_vcpu,
+            0xfeed_u64,
+            (),
+            |(), worker_vcpu| {
+                assert_eq!(*worker_vcpu, Some(0xfeed));
+                Err(TrapError::Hypervisor(
+                    "injected binding publication failure".to_owned(),
+                ))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(worker_vcpu, Some(0xfeed));
+    }
+
+    #[test]
+    fn clone_failure_retirement_is_scheduler_then_kernel_and_never_silent() {
+        let (kernel, root) = bootstrap(13_979);
+        let published = kernel
+            .reserve_thread_clone(
+                &root,
+                ClonePlan::from_flags(
+                    LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(ThreadId::synthetic_for_tests(23_979))
+            .unwrap()
+            .commit()
+            .unwrap();
+        let child = published.context().unwrap().retain_exact();
+        let state = task_state(&child, 79);
+        let generation = child
+            .thread()
+            .publish_initial_task_state(state)
+            .expect("publish child runnable");
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+
+        retire_failed_hvpatch_clone_authority(&scheduler, &kernel, &child, generation, |_, _| {})
+            .expect("exact child retirement");
+        assert!(matches!(
+            child.thread().execution_state(),
+            ThreadExecutionState::Failed { .. }
+        ));
+        assert!(
+            kernel
+                .context(child.task().key().id, child.thread().key().tid)
+                .is_err()
+        );
+        assert!(
+            retire_failed_hvpatch_clone_authority(
+                &scheduler,
+                &kernel,
+                &child,
+                generation,
+                |_, _| {},
+            )
+            .is_err(),
+            "a duplicate or stale retirement must remain observable"
+        );
+    }
+
+    #[test]
+    fn dormant_submission_drop_rolls_back_binding_and_queue_authority() {
+        let (kernel, context) = bootstrap(13_994);
+        let state = task_state(&context, 94);
+        let generation = context
+            .thread()
+            .publish_initial_task_state(state.clone())
+            .expect("publish root state");
+        let scheduler = Scheduler::new(kernel);
+        let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+        let binding = hvpatch_test_binding(&context, &state, 94);
+        let dormant = directory
+            .prepare_submission(
+                &scheduler,
+                HvpatchSubmissionShape::Root,
+                None,
+                Arc::clone(context.thread()),
+                generation,
+                Arc::clone(&binding),
+            )
+            .expect("prepare dormant root");
+        drop(dormant);
+
+        assert_eq!(scheduler.queued_len(), 0);
+        assert!(
+            <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+                directory.as_ref(),
+                context.thread().key(),
+                generation,
+            )
+            .is_err()
+        );
+        let retry = directory
+            .prepare_submission(
+                &scheduler,
+                HvpatchSubmissionShape::Root,
+                None,
+                Arc::clone(context.thread()),
+                generation,
+                binding,
+            )
+            .expect("rollback releases exact key and authority");
+        drop(retry);
+        scheduler.close();
+        scheduler.wait_closed();
+    }
+
+    #[test]
+    fn dormant_submission_rejects_duplicate_exact_key() {
+        let (kernel, context) = bootstrap(13_995);
+        let state = task_state(&context, 95);
+        let generation = context
+            .thread()
+            .publish_initial_task_state(state.clone())
+            .expect("publish root state");
+        let scheduler = Scheduler::new(kernel);
+        let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+        let binding = hvpatch_test_binding(&context, &state, 95);
+        let first = directory
+            .prepare_submission(
+                &scheduler,
+                HvpatchSubmissionShape::Root,
+                None,
+                Arc::clone(context.thread()),
+                generation,
+                Arc::clone(&binding),
+            )
+            .expect("prepare first exact row");
+        assert!(
+            directory
+                .prepare_submission(
+                    &scheduler,
+                    HvpatchSubmissionShape::Root,
+                    None,
+                    Arc::clone(context.thread()),
+                    generation,
+                    binding,
+                )
+                .is_err()
+        );
+        drop(first);
+    }
+
+    #[test]
+    fn dormant_activation_rejects_a_preexisting_exact_queue_row() {
+        let (kernel, context) = bootstrap(13_998);
+        let state = task_state(&context, 108);
+        let generation = context
+            .thread()
+            .publish_initial_task_state(state.clone())
+            .expect("publish root state");
+        let scheduler = Scheduler::new(kernel);
+        let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+        let binding = hvpatch_test_binding(&context, &state, 108);
+        let dormant = directory
+            .prepare_submission(
+                &scheduler,
+                HvpatchSubmissionShape::Root,
+                None,
+                Arc::clone(context.thread()),
+                generation,
+                Arc::clone(&binding),
+            )
+            .expect("prepare dormant root");
+        let foreign = scheduler
+            .admit_root(context.thread().key(), generation)
+            .expect("inject competing exact authority");
+        foreign
+            .publish(&scheduler, Arc::clone(context.thread()))
+            .expect("inject competing queue row");
+        let start_gate = context
+            .thread()
+            .take_opened_start_gate(generation)
+            .expect("opened root start gate");
+        let proof = HvpatchActivationProof::validate(
+            &context,
+            &state,
+            generation,
+            binding.identity(),
+            start_gate,
+        )
+        .unwrap();
+
+        assert!(
+            dormant
+                .activate(&scheduler, Arc::clone(context.thread()), proof)
+                .is_err()
+        );
+        assert!(
+            <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+                directory.as_ref(),
+                context.thread().key(),
+                generation,
+            )
+            .is_err()
+        );
+        assert_eq!(scheduler.queued_len(), 1);
+    }
+
+    #[test]
+    fn dormant_submission_activates_all_four_exact_authority_shapes() {
+        let (kernel, root) = bootstrap(13_996);
+        let sibling = sibling(&kernel, &root, 23_996);
+        let first_child = process_child(&kernel, &root, 33_996, "first-child");
+        let peer_child = process_child(&kernel, &root, 43_996, "peer-child");
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+        directory.install_scheduler(&scheduler).unwrap();
+
+        let root_state = task_state(&root, 96);
+        let sibling_state = task_state(&sibling, 97);
+        let first_child_state = task_state(&first_child, 98);
+        let peer_child_state = task_state(&peer_child, 99);
+        let root_generation = root
+            .thread()
+            .publish_initial_task_state(root_state.clone())
+            .unwrap();
+        let sibling_generation = sibling
+            .thread()
+            .publish_initial_task_state(sibling_state.clone())
+            .unwrap();
+        let first_child_generation = first_child
+            .thread()
+            .publish_initial_task_state(first_child_state.clone())
+            .unwrap();
+        let peer_child_generation = peer_child
+            .thread()
+            .publish_initial_task_state(peer_child_state.clone())
+            .unwrap();
+        let root_binding = hvpatch_test_binding(&root, &root_state, 96);
+        let sibling_binding = hvpatch_test_binding(&sibling, &sibling_state, 97);
+        let first_child_binding = hvpatch_test_binding(&first_child, &first_child_state, 98);
+        let peer_child_binding = hvpatch_test_binding(&peer_child, &peer_child_state, 99);
+
+        let root_submission = directory
+            .prepare_submission(
+                &scheduler,
+                HvpatchSubmissionShape::Root,
+                None,
+                Arc::clone(root.thread()),
+                root_generation,
+                Arc::clone(&root_binding),
+            )
+            .unwrap();
+        activate_hvpatch_test_submission(
+            root_submission,
+            &scheduler,
+            &root,
+            &root_state,
+            root_generation,
+            root_binding.as_ref(),
+        );
+        let root_grant = (root.thread().key(), root_generation);
+        let root_authority = directory
+            .take_submission_authority(root_grant.0, root_grant.1)
+            .expect("worker holds exact root authority during resident quantum");
+        assert!(
+            directory
+                .prepare_submission(
+                    &scheduler,
+                    HvpatchSubmissionShape::SameTaskSibling { grant: root_grant },
+                    None,
+                    Arc::clone(sibling.thread()),
+                    sibling_generation,
+                    Arc::clone(&sibling_binding),
+                )
+                .is_err()
+        );
+        let reject_descendant = |_, _| {
+            Err(TrapError::Hypervisor(
+                "worker-held grant test publishes no nested descendant".to_owned(),
+            ))
+        };
+        let worker_submission = ExecutorSubmissionContext {
+            scheduler: &scheduler,
+            publish_test_descendant: &reject_descendant,
+            current: Some(&root_authority),
+            lease: None,
+            exec_replacement: None,
+        };
+
+        let sibling_submission = worker_submission
+            .prepare_hvpatch_submission(
+                &directory,
+                HvpatchSubmissionShape::SameTaskSibling { grant: root_grant },
+                Arc::clone(sibling.thread()),
+                sibling_generation,
+                Arc::clone(&sibling_binding),
+            )
+            .unwrap();
+        activate_hvpatch_test_submission(
+            sibling_submission,
+            &scheduler,
+            &sibling,
+            &sibling_state,
+            sibling_generation,
+            sibling_binding.as_ref(),
+        );
+
+        let child_submission = directory
+            .prepare_submission(
+                &scheduler,
+                HvpatchSubmissionShape::Descendant { grant: root_grant },
+                Some(&root_authority),
+                Arc::clone(first_child.thread()),
+                first_child_generation,
+                Arc::clone(&first_child_binding),
+            )
+            .unwrap();
+        activate_hvpatch_test_submission(
+            child_submission,
+            &scheduler,
+            &first_child,
+            &first_child_state,
+            first_child_generation,
+            first_child_binding.as_ref(),
+        );
+        let first_child_authority = directory
+            .take_submission_authority(first_child.thread().key(), first_child_generation)
+            .expect("worker holds exact child authority during resident quantum");
+
+        let peer_submission = directory
+            .prepare_submission(
+                &scheduler,
+                HvpatchSubmissionShape::PeerRoot {
+                    grant: (first_child.thread().key(), first_child_generation),
+                },
+                Some(&first_child_authority),
+                Arc::clone(peer_child.thread()),
+                peer_child_generation,
+                Arc::clone(&peer_child_binding),
+            )
+            .unwrap();
+        activate_hvpatch_test_submission(
+            peer_submission,
+            &scheduler,
+            &peer_child,
+            &peer_child_state,
+            peer_child_generation,
+            peer_child_binding.as_ref(),
+        );
+
+        assert_eq!(scheduler.queued_len(), 4);
+        directory
+            .restore_submission_authority(root_authority)
+            .expect("restore root authority after resident quantum");
+        directory
+            .restore_submission_authority(first_child_authority)
+            .expect("restore child authority after resident quantum");
+    }
+
+    #[test]
+    fn dormant_submission_rejects_each_wrong_non_root_authority_shape() {
+        let (kernel, root) = bootstrap(13_997);
+        let root_sibling = sibling(&kernel, &root, 23_997);
+        let first_child = process_child(&kernel, &root, 33_997, "first-child");
+        let peer_child = process_child(&kernel, &root, 43_997, "peer-child");
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+        let root_state = task_state(&root, 100);
+        let root_generation = root
+            .thread()
+            .publish_initial_task_state(root_state.clone())
+            .unwrap();
+        let root_binding = hvpatch_test_binding(&root, &root_state, 100);
+        let root_submission = directory
+            .prepare_submission(
+                &scheduler,
+                HvpatchSubmissionShape::Root,
+                None,
+                Arc::clone(root.thread()),
+                root_generation,
+                Arc::clone(&root_binding),
+            )
+            .unwrap();
+        activate_hvpatch_test_submission(
+            root_submission,
+            &scheduler,
+            &root,
+            &root_state,
+            root_generation,
+            root_binding.as_ref(),
+        );
+        let root_grant = (root.thread().key(), root_generation);
+        let root_authority = directory
+            .take_submission_authority(root_grant.0, root_grant.1)
+            .expect("worker-held root grant");
+
+        let first_child_state = task_state(&first_child, 101);
+        let first_child_generation = first_child
+            .thread()
+            .publish_initial_task_state(first_child_state.clone())
+            .unwrap();
+        let sibling_state = task_state(&root_sibling, 102);
+        let sibling_generation = root_sibling
+            .thread()
+            .publish_initial_task_state(sibling_state.clone())
+            .unwrap();
+        assert!(
+            directory
+                .prepare_submission(
+                    &scheduler,
+                    HvpatchSubmissionShape::SameTaskSibling { grant: root_grant },
+                    Some(&root_authority),
+                    Arc::clone(first_child.thread()),
+                    first_child_generation,
+                    hvpatch_test_binding(&first_child, &first_child_state, 101),
+                )
+                .is_err()
+        );
+        for shape in [
+            HvpatchSubmissionShape::Descendant { grant: root_grant },
+            HvpatchSubmissionShape::PeerRoot { grant: root_grant },
+        ] {
+            assert!(
+                directory
+                    .prepare_submission(
+                        &scheduler,
+                        shape,
+                        Some(&root_authority),
+                        Arc::clone(root_sibling.thread()),
+                        sibling_generation,
+                        hvpatch_test_binding(&root_sibling, &sibling_state, 102),
+                    )
+                    .is_err()
+            );
+        }
+
+        let first_child_binding = hvpatch_test_binding(&first_child, &first_child_state, 101);
+        let first_child_submission = directory
+            .prepare_submission(
+                &scheduler,
+                HvpatchSubmissionShape::Descendant { grant: root_grant },
+                Some(&root_authority),
+                Arc::clone(first_child.thread()),
+                first_child_generation,
+                Arc::clone(&first_child_binding),
+            )
+            .expect("correct descendant shape remains usable after rejection");
+        activate_hvpatch_test_submission(
+            first_child_submission,
+            &scheduler,
+            &first_child,
+            &first_child_state,
+            first_child_generation,
+            first_child_binding.as_ref(),
+        );
+        let first_child_authority = directory
+            .take_submission_authority(first_child.thread().key(), first_child_generation)
+            .expect("worker-held child grant");
+
+        let child_sibling = sibling(&kernel, &first_child, 53_997);
+        let child_sibling_state = task_state(&child_sibling, 106);
+        let child_sibling_generation = child_sibling
+            .thread()
+            .publish_initial_task_state(child_sibling_state.clone())
+            .unwrap();
+        assert!(
+            directory
+                .prepare_submission(
+                    &scheduler,
+                    HvpatchSubmissionShape::Descendant { grant: root_grant },
+                    Some(&root_authority),
+                    Arc::clone(child_sibling.thread()),
+                    child_sibling_generation,
+                    hvpatch_test_binding(&child_sibling, &child_sibling_state, 106),
+                )
+                .is_err()
+        );
+
+        let peer_state = task_state(&peer_child, 105);
+        let peer_generation = peer_child
+            .thread()
+            .publish_initial_task_state(peer_state.clone())
+            .unwrap();
+        assert!(
+            directory
+                .prepare_submission(
+                    &scheduler,
+                    HvpatchSubmissionShape::Descendant {
+                        grant: (first_child.thread().key(), first_child_generation),
+                    },
+                    Some(&first_child_authority),
+                    Arc::clone(peer_child.thread()),
+                    peer_generation,
+                    hvpatch_test_binding(&peer_child, &peer_state, 105),
+                )
+                .is_err()
+        );
+        let peer_sibling = sibling(&kernel, &peer_child, 63_997);
+        let peer_sibling_state = task_state(&peer_sibling, 107);
+        let peer_sibling_generation = peer_sibling
+            .thread()
+            .publish_initial_task_state(peer_sibling_state.clone())
+            .unwrap();
+        assert!(
+            directory
+                .prepare_submission(
+                    &scheduler,
+                    HvpatchSubmissionShape::PeerRoot {
+                        grant: (first_child.thread().key(), first_child_generation),
+                    },
+                    Some(&first_child_authority),
+                    Arc::clone(peer_sibling.thread()),
+                    peer_sibling_generation,
+                    hvpatch_test_binding(&peer_sibling, &peer_sibling_state, 107),
+                )
+                .is_err()
+        );
+        directory
+            .restore_submission_authority(root_authority)
+            .expect("restore root authority");
+        directory
+            .restore_submission_authority(first_child_authority)
+            .expect("restore child authority");
+    }
+
+    #[test]
+    fn dormant_root_submission_rejects_a_process_child_authority_shape() {
+        let (kernel, root) = bootstrap(13_992);
+        let child = process_child(&kernel, &root, 23_992, "not-root");
+        let state = task_state(&child, 92);
+        let generation = child
+            .thread()
+            .publish_initial_task_state(state.clone())
+            .expect("publish child state");
+        let scheduler = Scheduler::new(kernel);
+        let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+        let binding = hvpatch_test_binding(&child, &state, 92);
+
+        assert!(
+            directory
+                .prepare_submission(
+                    &scheduler,
+                    HvpatchSubmissionShape::Root,
+                    None,
+                    Arc::clone(child.thread()),
+                    generation,
+                    binding,
+                )
+                .is_err()
+        );
     }
 
     fn enqueue_root(
@@ -2569,6 +5679,383 @@ mod tests {
             })
             .unwrap();
         assert!(save_position < reload_position);
+    }
+
+    #[test]
+    fn hvpatch_binding_rollover_publishes_exact_successor_before_retiring_predecessor() {
+        struct ExitJob;
+        impl crate::vcpu_loop::continuation::PersistentQuantumJob for ExitJob {
+            fn poll_quantum_with_engine(
+                &mut self,
+                _engine: &mut dyn std::any::Any,
+                _control: &mut HvpatchQuantumControl<'_, '_>,
+            ) -> ExecutorExit {
+                ExecutorExit::Exited
+            }
+        }
+
+        let (kernel, context) = bootstrap(14_011);
+        let first = publish(&context, 11);
+        let scheduler = Scheduler::new(kernel);
+        let executor = scheduler
+            .register_executor(Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))))
+            .unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+        scheduler.settle_runnable(running).unwrap();
+        let successor = context.thread().execution_state().generation().unwrap();
+        assert_eq!(successor.raw(), first.raw() + 1);
+
+        let completion = crate::vcpu_loop::continuation::LogicalJobCompletion::pending();
+        let binding = Arc::new(crate::vcpu_loop::continuation::HvpatchTaskBinding::new(
+            TaskLoadIdentity {
+                abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                version: 1,
+                mm: context.shared().mm().id(),
+                asid_generation: context.shared().mm().id().raw(),
+            },
+            Arc::new(crate::vcpu_loop::continuation::HvpatchTaskQuantum::new(
+                Box::new(ExitJob),
+                completion,
+            )),
+            Box::new(17_u64),
+        ));
+        let directory = HvpatchTaskBindingDirectory::default();
+        directory
+            .publish(context.thread().key(), first, Arc::clone(&binding))
+            .unwrap();
+        directory
+            .rollover_exact(context.thread().key(), first, successor)
+            .unwrap();
+        assert!(
+            <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+                &directory,
+                context.thread().key(),
+                first,
+            )
+            .is_err()
+        );
+        let resolved = <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+            &directory,
+            context.thread().key(),
+            successor,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&resolved, &binding));
+        let successor_running = scheduler.take(&executor).unwrap();
+        scheduler.settle_exited(successor_running).unwrap();
+        scheduler.unregister_executor(&executor).unwrap();
+        scheduler.close();
+        scheduler.wait_closed();
+    }
+
+    #[test]
+    fn shutdown_cancels_dormant_exact_binding_and_completes_once() {
+        struct BlockedJob;
+        impl crate::vcpu_loop::continuation::PersistentQuantumJob for BlockedJob {
+            fn poll_quantum_with_engine(
+                &mut self,
+                _engine: &mut dyn std::any::Any,
+                _control: &mut HvpatchQuantumControl<'_, '_>,
+            ) -> ExecutorExit {
+                ExecutorExit::Blocked(BlockedReason::HostWait)
+            }
+        }
+
+        let (kernel, context) = bootstrap(14_014);
+        let generation = publish(&context, 14);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+        directory.install_scheduler(&scheduler).unwrap();
+        let completion = crate::vcpu_loop::continuation::LogicalJobCompletion::pending();
+        let binding = Arc::new(crate::vcpu_loop::continuation::HvpatchTaskBinding::new(
+            TaskLoadIdentity {
+                abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                version: 1,
+                mm: context.shared().mm().id(),
+                asid_generation: context.shared().mm().id().raw(),
+            },
+            Arc::new(crate::vcpu_loop::continuation::HvpatchTaskQuantum::new(
+                Box::new(BlockedJob),
+                completion.clone(),
+            )),
+            Box::new(14_u64),
+        ));
+        directory
+            .publish(context.thread().key(), generation, binding)
+            .unwrap();
+        let authority = scheduler
+            .admit_root(context.thread().key(), generation)
+            .unwrap();
+        directory
+            .install_root_authority(&scheduler, Arc::clone(context.thread()), authority)
+            .unwrap();
+
+        let executor = scheduler
+            .register_executor(Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))))
+            .unwrap();
+        let running = scheduler.take(&executor).unwrap();
+        scheduler.close();
+        assert_eq!(
+            directory
+                .cancel_dormant(&scheduler, ExecutionFailure::SnapshotRestoreFailed)
+                .unwrap(),
+            0,
+            "pre-join cancellation may observe the still-running predecessor"
+        );
+        scheduler
+            .settle_blocked(running, BlockedReason::HostWait)
+            .unwrap();
+        let blocked_generation = context.thread().execution_state().generation().unwrap();
+        assert!(!completion.is_finished());
+        scheduler.unregister_executor(&executor).unwrap();
+
+        assert_eq!(
+            directory
+                .cancel_dormant(&scheduler, ExecutionFailure::SnapshotRestoreFailed)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            directory
+                .cancel_dormant(&scheduler, ExecutionFailure::SnapshotRestoreFailed)
+                .unwrap(),
+            0,
+            "terminal completion and retirement are exact-once"
+        );
+        scheduler.wait_closed();
+        assert!(completion.is_finished());
+        assert!(matches!(
+            context.thread().execution_state(),
+            ThreadExecutionState::Failed { .. }
+        ));
+        assert!(
+            <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+                directory.as_ref(),
+                context.thread().key(),
+                blocked_generation,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn exec_replacement_keeps_worker_identity_and_swaps_thread_mm_asid_binding() {
+        struct ExitJob;
+        impl crate::vcpu_loop::continuation::PersistentQuantumJob for ExitJob {
+            fn poll_quantum_with_engine(
+                &mut self,
+                _engine: &mut dyn std::any::Any,
+                _control: &mut HvpatchQuantumControl<'_, '_>,
+            ) -> ExecutorExit {
+                ExecutorExit::Exited
+            }
+        }
+
+        let (kernel, context) = bootstrap(14_016);
+        let old_mm = context.shared().mm().id();
+        let old_generation = publish(&context, 16);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+        directory.install_scheduler(&scheduler).unwrap();
+        let completion = crate::vcpu_loop::continuation::LogicalJobCompletion::pending();
+        let old_binding = Arc::new(crate::vcpu_loop::continuation::HvpatchTaskBinding::new(
+            TaskLoadIdentity {
+                abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                version: 1,
+                mm: old_mm,
+                asid_generation: old_mm.raw(),
+            },
+            Arc::new(crate::vcpu_loop::continuation::HvpatchTaskQuantum::new(
+                Box::new(ExitJob),
+                completion,
+            )),
+            Box::new(16_u64),
+        ));
+        directory
+            .publish(
+                context.thread().key(),
+                old_generation,
+                Arc::clone(&old_binding),
+            )
+            .unwrap();
+        let authority = scheduler
+            .admit_root(context.thread().key(), old_generation)
+            .unwrap();
+        directory
+            .install_root_authority(&scheduler, Arc::clone(context.thread()), authority)
+            .unwrap();
+        let worker = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
+        let registration = scheduler.register_executor(worker).unwrap();
+        let mut running = scheduler.take(&registration).unwrap();
+        let worker_id = running.executor();
+        let predecessor_authority = directory
+            .take_submission_authority(context.thread().key(), old_generation)
+            .expect("running generation authority");
+
+        let prepared = kernel
+            .prepare_exec_with_registry_id(&context, ThreadId::synthetic_for_tests(114_016), None)
+            .unwrap();
+        let old_lease = running.take_lease();
+        context.thread().exit_from_executor(old_lease).unwrap();
+        let committed = kernel.commit_exec_transition(prepared, None).unwrap();
+        let committed_context = committed.context().retain_exact();
+        let new_mm = committed_context.shared().mm().id();
+        let committed = committed
+            .attach_successor_asid_generation(new_mm, new_mm.raw())
+            .unwrap();
+        assert_ne!(new_mm, old_mm);
+        let new_generation = committed_context
+            .thread()
+            .publish_initial_task_state(task_state(&committed_context, 17))
+            .unwrap();
+        let new_lease = committed_context
+            .thread()
+            .claim_runnable(worker_id)
+            .unwrap();
+        let identity = TaskLoadIdentity {
+            abi: carrick_abi::LinuxGuestAbi::Aarch64,
+            version: 1,
+            mm: new_mm,
+            asid_generation: new_mm.raw(),
+        };
+        let replacement_record = scheduler
+            .retarget_running_exec(&mut running, committed, new_lease, |transition| {
+                directory
+                    .replace_exec(
+                        &scheduler,
+                        ExecBindingTransition {
+                            predecessor_thread: context.thread().key(),
+                            predecessor_generation: old_generation,
+                            successor_thread: transition.successor_thread,
+                            successor_generation: new_generation,
+                            identity,
+                            replacement_mm: None,
+                            authority: Some(predecessor_authority),
+                        },
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        let super::ExecBindingReplacement {
+            binding: replacement_binding,
+            authority: replacement_authority,
+        } = replacement_record;
+        directory
+            .restore_submission_authority(
+                replacement_authority.expect("exec retains exact successor authority"),
+            )
+            .unwrap();
+
+        assert_eq!(running.executor(), worker_id);
+        assert_eq!(running.thread_key(), committed_context.thread().key());
+        assert_eq!(running.generation(), new_generation);
+        assert_eq!(replacement_binding.identity(), identity);
+        assert!(!Arc::ptr_eq(&replacement_binding, &old_binding));
+        assert!(
+            directory
+                .resolve(context.thread().key(), old_generation)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(
+            &directory
+                .resolve(committed_context.thread().key(), new_generation)
+                .unwrap(),
+            &replacement_binding
+        ));
+        scheduler.settle_exited(running).unwrap();
+        scheduler.unregister_executor(&registration).unwrap();
+        scheduler.close();
+        scheduler.wait_closed();
+    }
+
+    #[test]
+    fn compute_bound_preemption_reaches_the_exact_live_hardware_kick() {
+        #[derive(Clone)]
+        struct CountingKick(Arc<AtomicUsize>);
+        impl carrick_hal::VcpuKick for CountingKick {
+            fn kick(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (kernel, first) = bootstrap(14_012);
+        let second = sibling(&kernel, &first, 24_012);
+        publish(&first, 12);
+        publish(&second, 13);
+        let scheduler = Scheduler::new(kernel);
+        let worker = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
+        let executor = scheduler.register_executor(worker.clone()).unwrap();
+        scheduler.make_runnable(first.thread().key()).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+        let kicks = Arc::new(AtomicUsize::new(0));
+        let owner = super::current_owner_thread_port();
+        let wrong_owner = owner.wrapping_add(1).max(1);
+        assert!(
+            !worker.publish_hardware(
+                super::ExactHardwareKick::new(
+                    Box::new(CountingKick(Arc::clone(&kicks))),
+                    12,
+                    wrong_owner,
+                )
+                .unwrap()
+            )
+        );
+        assert!(
+            worker.publish_hardware(
+                super::ExactHardwareKick::new(
+                    Box::new(CountingKick(Arc::clone(&kicks))),
+                    12,
+                    owner,
+                )
+                .unwrap()
+            )
+        );
+        assert!(
+            !worker.publish_hardware(
+                super::ExactHardwareKick::new(
+                    Box::new(CountingKick(Arc::clone(&kicks))),
+                    12,
+                    owner,
+                )
+                .unwrap()
+            ),
+            "exact hardware identity is publish-once for one loaded binding"
+        );
+        scheduler.make_runnable(second.thread().key()).unwrap();
+        assert_eq!(scheduler.request_preemption(), 1);
+        assert_eq!(kicks.load(Ordering::SeqCst), 1);
+        scheduler.settle_exited(running).unwrap();
+        scheduler.unregister_executor(&executor).unwrap();
+    }
+
+    #[test]
+    fn terminal_settlement_retires_the_exact_binding_before_worker_destroy() {
+        let (kernel, context) = bootstrap(14_013);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let factory = Arc::new(FakeFactory::default());
+        factory.install(&context, FakeBinding::new(13, [Step::Exit]));
+        let generation = publish(&context, 13);
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        let authority = enqueue_root(&scheduler, &context, generation);
+        drop(authority);
+        let report = pool.shutdown().expect("terminal settlement");
+        assert_eq!(
+            factory.retired_bindings.lock().as_slice(),
+            &[(context.thread().key(), generation)]
+        );
+        let events = factory.events.lock();
+        let destroy = events
+            .iter()
+            .position(|event| event.kind == BackendEventKind::Destroy)
+            .expect("worker destroy");
+        assert!(
+            events[..destroy]
+                .iter()
+                .any(|event| event.kind == BackendEventKind::Save),
+            "terminal binding retirement follows detach/save and precedes worker destroy"
+        );
+        assert_eq!(report.created(), report.destroyed());
     }
 
     #[test]
@@ -2935,6 +6422,18 @@ mod tests {
             drop(authority);
             let report = pool.shutdown().expect_err("worker failure must surface");
             assert_eq!(report.retired_workers(), 1, "{case}");
+            assert_eq!(report.report().created(), 1, "{case}");
+            assert_eq!(report.report().destroyed(), 1, "{case}");
+            let events = factory.events.lock();
+            let create = events
+                .iter()
+                .find(|event| event.kind == BackendEventKind::Create)
+                .expect("failed phase still creates one owner backend");
+            let destroy = events
+                .iter()
+                .find(|event| event.kind == BackendEventKind::Destroy)
+                .expect("failed phase destroys the owner backend");
+            assert_eq!(create.host_thread, destroy.host_thread, "{case}");
             assert!(matches!(
                 context.thread().execution_state(),
                 ThreadExecutionState::Failed { .. }
@@ -2955,6 +6454,18 @@ mod tests {
             drop(authority);
             let report = pool.shutdown().expect_err("worker failure must surface");
             assert_eq!(report.retired_workers(), 1, "{case}");
+            assert_eq!(report.report().created(), 1, "{case}");
+            assert_eq!(report.report().destroyed(), 1, "{case}");
+            let events = factory.events.lock();
+            let create = events
+                .iter()
+                .find(|event| event.kind == BackendEventKind::Create)
+                .expect("failed phase still creates one owner backend");
+            let destroy = events
+                .iter()
+                .find(|event| event.kind == BackendEventKind::Destroy)
+                .expect("failed phase destroys the owner backend");
+            assert_eq!(create.host_thread, destroy.host_thread, "{case}");
             assert!(matches!(
                 context.thread().execution_state(),
                 ThreadExecutionState::Failed { .. }
@@ -2974,8 +6485,10 @@ mod tests {
         factory.install(&first, first_binding);
         factory.install(&second, FakeBinding::new(92, [Step::Exit]));
         let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
-        let first_authority = enqueue_root(&scheduler, &first, publish(&first, 91));
-        let second_authority = enqueue_root(&scheduler, &second, publish(&second, 92));
+        let first_generation = publish(&first, 91);
+        let second_generation = publish(&second, 92);
+        let first_authority = enqueue_root(&scheduler, &first, first_generation);
+        let second_authority = enqueue_root(&scheduler, &second, second_generation);
         run_gate.wait();
         drop((first_authority, second_authority));
 
@@ -3002,6 +6515,17 @@ mod tests {
         assert_eq!(error.report().created(), 1);
         assert_eq!(error.report().destroyed(), 1);
         assert_eq!(error.report().joined(), 1);
+        let mut retired = factory.retired_bindings.lock().clone();
+        retired.sort();
+        let mut expected = vec![
+            (first.thread().key(), first_generation),
+            (second.thread().key(), second_generation),
+        ];
+        expected.sort();
+        assert_eq!(
+            retired, expected,
+            "queued terminal drain retires both exact rows"
+        );
     }
 
     #[test]
@@ -3080,6 +6604,53 @@ mod tests {
                 ThreadExecutionState::Failed { .. }
             ));
         }
+    }
+
+    #[test]
+    fn missing_scoped_lease_return_fails_and_retires_exact_claim() {
+        let (kernel, context) = bootstrap(14_247);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let factory = Arc::new(FakeFactory::default());
+        factory.install(&context, FakeBinding::new(95, [Step::LoseLease]));
+        let generation = publish(&context, 95);
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        let authority = enqueue_root(&scheduler, &context, generation);
+        drop(authority);
+
+        pool.shutdown()
+            .expect_err("missing scoped lease return must retire worker");
+        assert!(matches!(
+            context.thread().execution_state(),
+            ThreadExecutionState::Failed { .. }
+        ));
+        assert_eq!(
+            factory.retired_bindings.lock().as_slice(),
+            &[(context.thread().key(), generation)]
+        );
+    }
+
+    #[test]
+    fn missing_exact_hardware_identity_fails_and_retires_loaded_claim() {
+        let (kernel, context) = bootstrap(14_248);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let factory = Arc::new(FakeFactory::default());
+        factory.fail_hardware_kick.store(true, Ordering::SeqCst);
+        factory.install(&context, FakeBinding::new(96, [Step::Exit]));
+        let generation = publish(&context, 96);
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        let authority = enqueue_root(&scheduler, &context, generation);
+        drop(authority);
+
+        pool.shutdown()
+            .expect_err("missing exact hardware identity must retire worker");
+        assert!(matches!(
+            context.thread().execution_state(),
+            ThreadExecutionState::Failed { .. }
+        ));
+        assert_eq!(
+            factory.retired_bindings.lock().as_slice(),
+            &[(context.thread().key(), generation)]
+        );
     }
 
     #[test]
@@ -3166,11 +6737,106 @@ mod tests {
                 binding.require_continuation_sequence(7);
             },
         );
-        reject_case(14_253, None, |_kernel, context, _binding, factory| {
-            factory
-                .fail_invalidation_generation
-                .store(context.shared().mm().id().raw(), Ordering::SeqCst);
-        });
+    }
+
+    #[test]
+    fn retirement_command_invalidates_on_exact_resident_owner_worker_only() {
+        let (process, context) = crate::hvpatch::process_context_for_tests(14_254);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(context.kernel())));
+        let factory = Arc::new(FakeFactory::default());
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        let executor = pool.executor_ids()[0];
+        let lease = process.stage1_mm_lease().expect("exact MM lease");
+        lease
+            .begin_asid_load(executor)
+            .expect("load admission")
+            .mark_resident()
+            .expect("resident executor");
+        let retired = process
+            .mm_resources()
+            .retire(process.task_key())
+            .expect("retire process MM");
+        let retirement = retired
+            .retirement()
+            .expect("last MM owner retirement authority");
+
+        pool.invalidate_asid_retirement(retirement)
+            .expect("owner-thread invalidation and exact ack");
+
+        assert!(retirement.pending().is_empty());
+        let invalidations = factory
+            .events
+            .lock()
+            .iter()
+            .filter(|event| event.kind == BackendEventKind::Invalidate)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(invalidations.len(), 1);
+        assert_eq!(invalidations[0].executor, executor);
+        assert_ne!(invalidations[0].host_thread, thread::current().id());
+        process
+            .mm_resources()
+            .acknowledge_tlb_flush(retired)
+            .expect("release exact ASID/root only after all acks");
+        pool.shutdown().expect("pool shutdown");
+    }
+
+    #[test]
+    fn failed_owner_thread_invalidation_retires_worker_and_quarantines_generation() {
+        let (process, context) = crate::hvpatch::process_context_for_tests(14_256);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(context.kernel())));
+        let factory = Arc::new(FakeFactory::default());
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        let executor = pool.executor_ids()[0];
+        let lease = process.stage1_mm_lease().expect("exact MM lease");
+        lease
+            .begin_asid_load(executor)
+            .expect("load admission")
+            .mark_resident()
+            .expect("resident executor");
+        factory
+            .fail_invalidation_generation
+            .store(lease.asid_generation().generation(), Ordering::SeqCst);
+        let retired = process
+            .mm_resources()
+            .retire(process.task_key())
+            .expect("retire process MM");
+        let retirement = retired
+            .retirement()
+            .expect("last MM owner retirement authority");
+
+        assert!(pool.invalidate_asid_retirement(retirement).is_err());
+        assert_eq!(retirement.pending(), vec![executor]);
+        assert!(
+            process
+                .mm_resources()
+                .acknowledge_tlb_flush(retired)
+                .unwrap_err()
+                .to_string()
+                .contains("awaits executor invalidation")
+        );
+        assert!(pool.shutdown().is_err());
+    }
+
+    #[test]
+    fn ordinary_task_load_never_performs_an_asid_invalidation() {
+        let (kernel, context) = bootstrap(14_255);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let factory = Arc::new(FakeFactory::default());
+        factory.install(&context, FakeBinding::new(97, [Step::Exit]));
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        let authority = enqueue_root(&scheduler, &context, publish(&context, 97));
+        drop(authority);
+
+        pool.shutdown().expect("pool shutdown");
+
+        assert!(
+            !factory
+                .events
+                .lock()
+                .iter()
+                .any(|event| event.kind == BackendEventKind::Invalidate)
+        );
     }
 
     #[test]

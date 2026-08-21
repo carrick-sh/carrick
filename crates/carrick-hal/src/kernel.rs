@@ -310,6 +310,14 @@ pub struct FrameInventoryCommit<T> {
 }
 
 impl<T> FrameInventoryCommit<T> {
+    /// Opaque one-shot challenge retained by a backend while the exact commit
+    /// is consumed by the Kernel. The 256-bit provenance is never exposed.
+    pub fn receipt_challenge(&self) -> FrameInventoryReceiptChallenge {
+        FrameInventoryReceiptChallenge {
+            provenance: self.provenance,
+            transaction: self.batch.transaction(),
+        }
+    }
     pub fn provenance_matches(&self, expected: FrameInventoryProvenance) -> bool {
         self.provenance == expected
     }
@@ -324,6 +332,129 @@ impl<T> FrameInventoryCommit<T> {
 
     pub fn into_parts(self) -> (T, FrameInventoryBatch) {
         (self.outcome, self.batch)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct FrameInventoryReceiptChallenge {
+    provenance: FrameInventoryProvenance,
+    transaction: KernelTransactionId,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct FrameInventoryApplyReceipt {
+    provenance: FrameInventoryProvenance,
+    transaction: KernelTransactionId,
+    mm: NonZeroU64,
+    revision: u64,
+    mappings: Vec<(MappingId, FrameId)>,
+}
+
+impl FrameInventoryApplyReceipt {
+    /// Kernel-owner seam. Callers cannot authenticate a fabricated receipt
+    /// without the reservation's opaque provenance retained by the Kernel.
+    #[doc(hidden)]
+    pub fn from_kernel_authority(
+        provenance: FrameInventoryProvenance,
+        transaction: KernelTransactionId,
+        mm: NonZeroU64,
+        revision: u64,
+        mappings: Vec<(MappingId, FrameId)>,
+    ) -> Self {
+        Self {
+            provenance,
+            transaction,
+            mm,
+            revision,
+            mappings,
+        }
+    }
+
+    pub const fn transaction(&self) -> KernelTransactionId {
+        self.transaction
+    }
+
+    pub const fn mm(&self) -> NonZeroU64 {
+        self.mm
+    }
+
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn authorizes(&self, mapping: MappingId, frame: FrameId) -> bool {
+        self.mappings.contains(&(mapping, frame))
+    }
+
+    pub fn mapping_set(&self) -> &[(MappingId, FrameId)] {
+        &self.mappings
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct FrameInventoryRetirementReceipt {
+    apply: FrameInventoryApplyReceipt,
+    mm_empty_at_revision: bool,
+}
+
+impl FrameInventoryRetirementReceipt {
+    #[doc(hidden)]
+    pub fn from_kernel_authority(
+        receipt: FrameInventoryApplyReceipt,
+        mm_empty_at_revision: bool,
+    ) -> Self {
+        Self {
+            apply: receipt,
+            mm_empty_at_revision,
+        }
+    }
+
+    pub const fn transaction(&self) -> KernelTransactionId {
+        self.apply.transaction()
+    }
+
+    pub const fn mm(&self) -> NonZeroU64 {
+        self.apply.mm()
+    }
+
+    pub const fn revision(&self) -> u64 {
+        self.apply.revision()
+    }
+
+    pub fn authorizes(&self, mapping: MappingId, frame: FrameId) -> bool {
+        self.apply.authorizes(mapping, frame)
+    }
+
+    pub fn mapping_set(&self) -> &[(MappingId, FrameId)] {
+        self.apply.mapping_set()
+    }
+
+    pub const fn mm_empty_at_revision(&self) -> bool {
+        self.mm_empty_at_revision
+    }
+}
+
+impl FrameInventoryReceiptChallenge {
+    pub fn authenticate_apply(
+        self,
+        receipt: &FrameInventoryApplyReceipt,
+        expected_mm: NonZeroU64,
+    ) -> bool {
+        self.provenance == receipt.provenance
+            && self.transaction == receipt.transaction
+            && receipt.mm == expected_mm
+            && receipt.revision != 0
+    }
+
+    pub fn authenticate_retirement(
+        self,
+        receipt: &FrameInventoryRetirementReceipt,
+        expected_mm: NonZeroU64,
+    ) -> bool {
+        self.provenance == receipt.apply.provenance
+            && self.transaction == receipt.apply.transaction
+            && receipt.apply.mm == expected_mm
+            && receipt.apply.revision != 0
     }
 }
 

@@ -113,112 +113,10 @@ pub(super) fn inventory_capacity_for_extents(
     })
 }
 
-/// A scheduler lease reserved before HVPatch takes the shared-VM topology lock.
-/// It is transferred to the child host thread on successful spawn; every
-/// pre-spawn failure releases it through this guard.
-struct ReservedProcessVcpuLease {
-    scheduler: &'static dyn carrick_hal::VcpuScheduler,
-    lease: Option<carrick_hal::SlotLease>,
-}
-
-impl ReservedProcessVcpuLease {
-    fn install_for_current_thread(mut self) -> carrick_hal::SlotLease {
-        let Some(lease) = self.lease.take() else {
-            std::process::abort();
-        };
-        carrick_hal::vcpu_sched::set_current_lease(lease);
-        lease
-    }
-}
-
-impl Drop for ReservedProcessVcpuLease {
-    fn drop(&mut self) {
-        if let Some(lease) = self.lease.take() {
-            self.scheduler.release(lease, carrick_hal::Yield::Exited);
-        }
-    }
-}
-
-/// How long the process-fork coordinator may wait for its child's vCPU slot
-/// once it holds the fork barrier.
-///
-/// It MUST be bounded, and it must only ever be entered after
-/// [`carrick_hal::VcpuScheduler::has_spare_capacity`] says a slot exists.
-/// Waiting here unbounded is hold-and-wait against our own supply: the barrier
-/// parks every other guest thread, and those siblings are the only threads that
-/// can release capacity. Measured 2026-08-18 on the canonical host: four
-/// concurrent `go-net_http` guests took 1017 s against 51 s for one, with the
-/// coordinator parked in `Condvar::wait` inside this reservation while its
-/// siblings sat in `park_if_fork_quiescing`.
-///
-/// Two shapes that do NOT work, both measured before this one: bounding the
-/// wait alone still re-stops the world on every retry (livelock, 199% CPU and
-/// no progress at four guests), and reserving before the barrier makes every
-/// competing forker hold one slot while asking for a second, which deadlocks
-/// outright once as many threads fork as the pool has slots.
-const PROCESS_FORK_VCPU_RESERVE: Duration = Duration::from_millis(50);
-
-/// How long a fork attempt waits when the vCPU pool has no spare slot at all.
-/// Purely a spin brake on the caller's retry loop.
-const PROCESS_FORK_VCPU_BACKOFF: Duration = Duration::from_millis(1);
-
-/// Admit an HVPatch fork child to the same bounded vCPU pool as a clone-thread
-/// sibling before entering the topology transaction. HVPatch keeps every Linux
-/// process in one host process and one HVF VM, so process leaders consume the
-/// same finite `hv_vcpu_create` resource as threads do. Reserving outside the
-/// topology lock is load-bearing: a current slot owner may need that lock to
-/// reach a reclaim-safe wait and free capacity.
-fn reserve_hvpatch_process_vcpu_lease(
-    scheduler: &'static dyn carrick_hal::VcpuScheduler,
-    tid: ThreadId,
-) -> Option<ReservedProcessVcpuLease> {
-    scheduler
-        .acquire_timeout(tid.raw() as u64, None, PROCESS_FORK_VCPU_RESERVE)
-        .map(|lease| ReservedProcessVcpuLease {
-            scheduler,
-            lease: Some(lease),
-        })
-}
-
-/// Try to become the one process-fork coordinator and reserve its child's
-/// bounded vCPU admission. A losing concurrent forker must return before it
-/// can wait for scheduler capacity: it is itself one of the registered
-/// siblings that the winning coordinator must drain.
-fn try_begin_hvpatch_process_fork(
-    barrier: &crate::fork_quiesce::QuiesceBarrier,
-    scheduler: &'static dyn carrick_hal::VcpuScheduler,
-    tid: ThreadId,
-) -> Option<ReservedProcessVcpuLease> {
-    // Never stop the world without capacity already in sight. Winning the
-    // barrier parks every other guest thread, and those siblings are the only
-    // threads that can hand a slot back -- so waiting for one from behind the
-    // barrier is hold-and-wait against our own supply.
-    if !scheduler.has_spare_capacity() {
-        // Back off instead of returning straight into the caller's retry loop:
-        // with no slot to reserve there is nothing to stop the world for, and
-        // an instant retry turns the loop into a spin.
-        std::thread::sleep(PROCESS_FORK_VCPU_BACKOFF);
-        return None;
-    }
-    if !barrier.try_begin_fork() {
-        return None;
-    }
-    // Capacity was spare a moment ago, so this is expected to be immediate; the
-    // bound only covers a sibling that took the slot in between.
-    let Some(reserved) = reserve_hvpatch_process_vcpu_lease(scheduler, tid) else {
-        barrier.end_fork();
-        return None;
-    };
-    Some(reserved)
-}
-
-enum ProcessForkStart<'a> {
+enum ProcessForkStart {
     Busy,
     AdmissionClosed,
-    Admitted {
-        reserved_child_vcpu: ReservedProcessVcpuLease,
-        admission: CloneAdmissionPermit<'a>,
-    },
+    Admitted { admission: CloneAdmissionPermit },
 }
 
 /// Serialize process forks before enrolling the winner in clone admission.
@@ -227,23 +125,19 @@ enum ProcessForkStart<'a> {
 /// must therefore own no admission permit while it parks behind the process
 /// barrier; otherwise the winner's admission drain cancels the loser and leaks
 /// an internal arbitration event to Linux as `EAGAIN`.
-fn try_begin_hvpatch_process_fork_with_admission<'a>(
+fn try_begin_hvpatch_process_fork_with_admission(
     barrier: &crate::fork_quiesce::QuiesceBarrier,
-    scheduler: &'static dyn carrick_hal::VcpuScheduler,
     tid: ThreadId,
-    admission_gate: &'a CloneAdmissionGate,
-) -> ProcessForkStart<'a> {
-    let Some(reserved_child_vcpu) = try_begin_hvpatch_process_fork(barrier, scheduler, tid) else {
+    admission_gate: &Arc<CloneAdmissionGate>,
+) -> ProcessForkStart {
+    if !barrier.try_begin_fork() {
         return ProcessForkStart::Busy;
-    };
+    }
     let Some(admission) = admission_gate.try_enroll_process_fork(tid) else {
         barrier.end_fork();
         return ProcessForkStart::AdmissionClosed;
     };
-    ProcessForkStart::Admitted {
-        reserved_child_vcpu,
-        admission,
-    }
+    ProcessForkStart::Admitted { admission }
 }
 
 /// Process-wide fork quiesce barrier (defined in `fork_quiesce` so the blocking
@@ -367,6 +261,7 @@ pub(super) fn acquire_pt_pause(
     Ok(PtPauseGuard::new(barrier.pause_guard(tid)))
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct ForkRequest {
     pub(super) flags: u64,
     pub(super) pidfd_out: Option<u64>,
@@ -376,6 +271,91 @@ pub(super) struct ForkRequest {
     pub(super) exit_signal: u32,
     pub(super) child_stack: u64,
     pub(super) vfork: Option<u64>,
+}
+
+pub(super) struct ProcessForkAttempt {
+    pub(super) request: ForkRequest,
+    pub(super) coordinator: Option<ProcessForkCoordinator>,
+}
+
+pub(super) struct PreparedVforkSuspension {
+    pub(super) child_pid: i32,
+    pub(super) request: SyscallRequest,
+    pub(super) child: crate::kernel::TaskKey,
+    pub(super) wait: crate::kernel::VforkParentWait,
+}
+
+pub(super) enum PreparedInProcessFork {
+    Complete(Option<i64>),
+    SuspendVfork(PreparedVforkSuspension),
+    Retry {
+        request: ForkRequest,
+        coordinator: Option<ProcessForkCoordinator>,
+        _subscription: ProcessForkRetrySubscription,
+    },
+}
+
+pub(super) enum ProcessForkRetrySubscription {
+    Barrier {
+        _subscription: carrick_thread::fork_quiesce::QuiesceSubscription,
+    },
+    Progress {
+        _subscription: carrick_thread::fork_quiesce::QuiesceProgressSubscription,
+    },
+    Topology {
+        _subscription: carrick_thread::fork_quiesce::TopologyReleaseSubscription,
+    },
+    Reservation {
+        _subscription: Option<crate::kernel::ReservationChangeSubscription>,
+    },
+}
+
+pub(super) struct ProcessForkCoordinator {
+    barrier: Arc<crate::fork_quiesce::QuiesceBarrier>,
+    process_admission: Option<CloneAdmissionPermit>,
+    clone_admission: Option<ForkCloneAdmission>,
+    quiesced: bool,
+    active: bool,
+}
+
+impl ProcessForkCoordinator {
+    fn new(
+        barrier: Arc<crate::fork_quiesce::QuiesceBarrier>,
+        process_admission: CloneAdmissionPermit,
+    ) -> Self {
+        Self {
+            barrier,
+            process_admission: Some(process_admission),
+            clone_admission: None,
+            quiesced: false,
+            active: true,
+        }
+    }
+
+    fn into_parts(mut self) -> (CloneAdmissionPermit, ForkCloneAdmission, bool) {
+        self.active = false;
+        (
+            self.process_admission
+                .take()
+                .unwrap_or_else(|| std::process::abort()),
+            self.clone_admission
+                .take()
+                .unwrap_or_else(|| std::process::abort()),
+            self.quiesced,
+        )
+    }
+}
+
+impl Drop for ProcessForkCoordinator {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if self.quiesced {
+            self.barrier.end_quiesce();
+        }
+        self.barrier.end_fork();
+    }
 }
 
 impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
@@ -454,23 +434,9 @@ where
             vfork,
         } = request;
         if engine.supports_in_process_fork() {
-            return self
-                .handle_in_process_fork(
-                    kernel,
-                    kernel_context,
-                    engine,
-                    ForkRequest {
-                        flags,
-                        pidfd_out,
-                        clone_parent,
-                        parent_tid_addr,
-                        child_tid_addr,
-                        exit_signal,
-                        child_stack,
-                        vfork,
-                    },
-                )
-                .await;
+            return Err(RuntimeError::Configuration(
+                "HVPatch process fork requires the persistent executor transaction".to_owned(),
+            ));
         }
         if let Some(reason) = crate::dispatch::SyscallDispatcher::host_fork_file_authority_rejection(
             kernel_context,
@@ -1179,13 +1145,23 @@ where
         Ok(Some(retval))
     }
 
-    async fn handle_in_process_fork(
+    pub(super) fn prepare_in_process_fork<M, O>(
         &mut self,
         kernel: &Kernel,
         parent_context: &crate::kernel::KernelContext,
-        engine: &mut E,
-        request: ForkRequest,
-    ) -> Result<Option<i64>, RuntimeError> {
+        memory: &mut M,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        ops: &mut O,
+        attempt: ProcessForkAttempt,
+    ) -> Result<PreparedInProcessFork, RuntimeError>
+    where
+        M: GuestMemory + 'static,
+        O: HvpatchProcessBackendOps<E, M>,
+    {
+        let ProcessForkAttempt {
+            request,
+            coordinator,
+        } = attempt;
         let Some(parent_process) = kernel.hvpatch_process.as_ref() else {
             return Err(RuntimeError::Configuration(
                 "in-process fork requested without hvpatch process context".to_owned(),
@@ -1200,42 +1176,107 @@ where
         let clone_plan = match crate::kernel::ClonePlan::from_flags(clone_flags) {
             Ok(plan) => plan,
             Err(_) => {
-                return Ok(Some(crate::linux_abi::LINUX_EINVAL.guest_retval()));
+                return Ok(PreparedInProcessFork::Complete(Some(
+                    crate::linux_abi::LINUX_EINVAL.guest_retval(),
+                )));
             }
         };
-        // Serialize process forks BEFORE waiting for a child vCPU. A losing
-        // concurrent forker is itself one of the registered siblings the
-        // winner must drain; if it waits in scheduler admission first, it can
-        // never observe the winner's quiesce request and both forks deadlock.
-        // Only the coordinator winner enrolls in clone admission. A loser owns
-        // no permit while it parks, so the winner cannot turn ordinary fork
-        // concurrency into a guest-visible EAGAIN. The winner still reserves
-        // child capacity before quiescing or taking the shared-VM topology lock:
-        // an existing slot owner may need that lock to reach a reclaim-safe wait.
-        let (reserved_child_vcpu, process_fork_admission) = loop {
-            match try_begin_hvpatch_process_fork_with_admission(
+        let scheduler = kernel
+            .hvpatch_runtime
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort())
+            .continuation_services(parent_context.kernel())
+            .0;
+        let wake_thread = parent_context.thread().key();
+        let subscribe_barrier = || loop {
+            let observed = process_barrier.publication_generation();
+            let wake_scheduler = Arc::clone(&scheduler);
+            match process_barrier.subscribe_quiesce(
+                observed,
+                Arc::new(move |_| {
+                    let _ = wake_scheduler.wake(wake_thread);
+                }),
+            ) {
+                carrick_thread::fork_quiesce::QuiesceEnrollment::Ready(_) => continue,
+                carrick_thread::fork_quiesce::QuiesceEnrollment::Subscribed(subscription) => {
+                    break ProcessForkRetrySubscription::Barrier {
+                        _subscription: subscription,
+                    };
+                }
+            }
+        };
+        let subscribe_progress = || loop {
+            let observed = process_barrier.progress_generation();
+            let wake_scheduler = Arc::clone(&scheduler);
+            match process_barrier.subscribe_quiesced_progress(
+                observed,
+                Arc::new(move |_| {
+                    let _ = wake_scheduler.wake(wake_thread);
+                }),
+            ) {
+                carrick_thread::fork_quiesce::QuiesceProgressEnrollment::Ready(_) => continue,
+                carrick_thread::fork_quiesce::QuiesceProgressEnrollment::Subscribed(
+                    subscription,
+                ) => {
+                    break ProcessForkRetrySubscription::Progress {
+                        _subscription: subscription,
+                    };
+                }
+            }
+        };
+        // A losing process forker becomes a blocked logical task. It owns no
+        // admission permit, pthread, or vCPU while waiting for the current
+        // coordinator's exact barrier publication.
+        let mut coordinator = match coordinator {
+            Some(coordinator) => coordinator,
+            None => match try_begin_hvpatch_process_fork_with_admission(
                 process_barrier,
-                carrick_hal::vcpu_sched::global(),
                 self.this_tid,
                 &kernel.clone_admission,
             ) {
-                ProcessForkStart::Admitted {
-                    reserved_child_vcpu,
-                    admission,
-                } => break (reserved_child_vcpu, admission),
-                ProcessForkStart::AdmissionClosed => {
-                    return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
+                ProcessForkStart::Admitted { admission } => {
+                    ProcessForkCoordinator::new(Arc::clone(process_barrier), admission)
                 }
-                ProcessForkStart::Busy => {}
-            }
-            if process_barrier.is_quiescing() {
-                self.release_and_park_vcpu_for_fork(engine)?;
-            }
-            std::thread::yield_now();
+                ProcessForkStart::AdmissionClosed => {
+                    return Ok(PreparedInProcessFork::Complete(Some(
+                        crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                    )));
+                }
+                ProcessForkStart::Busy => {
+                    let subscription = subscribe_barrier();
+                    match try_begin_hvpatch_process_fork_with_admission(
+                        process_barrier,
+                        self.this_tid,
+                        &kernel.clone_admission,
+                    ) {
+                        ProcessForkStart::Admitted { admission } => {
+                            drop(subscription);
+                            ProcessForkCoordinator::new(Arc::clone(process_barrier), admission)
+                        }
+                        ProcessForkStart::AdmissionClosed => {
+                            return Ok(PreparedInProcessFork::Complete(Some(
+                                crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                            )));
+                        }
+                        ProcessForkStart::Busy => {
+                            return Ok(PreparedInProcessFork::Retry {
+                                request,
+                                coordinator: None,
+                                _subscription: subscription,
+                            });
+                        }
+                    }
+                }
+            },
         };
+        let process_fork_admission = coordinator
+            .process_admission
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort());
         if kernel.process_exiting() || process_fork_admission.is_cancelled() {
-            process_barrier.end_fork();
-            return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
+            return Ok(PreparedInProcessFork::Complete(Some(
+                crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+            )));
         }
         // The process-fork coordinator above serializes competing forks, but
         // thread clones can still enroll against the same parent task. Close
@@ -1244,14 +1285,34 @@ where
         // Otherwise a new clone can take the task reservation after this fork
         // starts and then remain registered while waiting for the reservation,
         // forming a circular wait with sibling quiescence.
-        let fork_clone_admission = match process_fork_admission.close_for_fork(self.this_tid) {
-            Ok(admission) => admission,
-            Err(error) => {
-                process_barrier.end_fork();
-                tracing::warn!(%error, "hvpatch fork lost clone-admission ownership; fork(2) = EAGAIN");
-                return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
+        if coordinator.clone_admission.is_none() {
+            let observed = parent_process.kernel_graph().reservation_epoch();
+            match process_fork_admission.try_close_for_fork(self.this_tid) {
+                Ok(Some(admission)) => coordinator.clone_admission = Some(admission),
+                Ok(None) => {
+                    let wake_scheduler = Arc::clone(&scheduler);
+                    let subscription = parent_process.kernel_graph().subscribe_reservation_change(
+                        observed,
+                        Arc::new(move || {
+                            let _ = wake_scheduler.wake(wake_thread);
+                        }),
+                    );
+                    return Ok(PreparedInProcessFork::Retry {
+                        request,
+                        coordinator: Some(coordinator),
+                        _subscription: ProcessForkRetrySubscription::Reservation {
+                            _subscription: subscription,
+                        },
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "hvpatch fork lost clone-admission ownership; fork(2) = EAGAIN");
+                    return Ok(PreparedInProcessFork::Complete(Some(
+                        crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                    )));
+                }
             }
-        };
+        }
         let parent_pid = parent_process.pid();
         let forking_tid = self.this_tid.raw();
         let emit_fork_runtime_stage =
@@ -1271,7 +1332,7 @@ where
             };
         let fork_total_started = Instant::now();
         let mut fork_stage_started = fork_total_started;
-        let mut quiesced = false;
+        let mut quiesced = coordinator.quiesced;
         // Raise the barrier whenever this process has ANOTHER thread that can
         // execute guest code. `kicker.count()` counts live vCPU LEASES, so
         // every sibling parked in a futex / epoll / fd wait had already
@@ -1286,58 +1347,40 @@ where
         // is satisfied immediately when the siblings were already parked. What
         // matters is that `quiescing` is now RAISED, so a sibling woken
         // mid-transaction parks at the barrier instead of resuming into it.
-        let initial_siblings = kernel.guest_executors.live().saturating_sub(1);
-        let mut quiesce_poll_iterations = 0_u64;
-        if initial_siblings > 0 {
+        // Kernel thread membership is durable across block/preempt/queue
+        // boundaries. The executor census is deliberately transient and can be
+        // zero while a same-task sibling is wakeable, so it cannot authorize
+        // skipping the COW barrier.
+        let initial_siblings = parent_context.task().threads().len().saturating_sub(1);
+        let quiesce_poll_iterations = 0_u64;
+        if initial_siblings > 0 && !quiesced {
             process_barrier.set_quiescing();
+            coordinator.quiesced = true;
+            quiesced = true;
             self.kicker.kick_all_except(self.this_tid);
             self.futex.notify_signal_pending();
             self.platform_futex.notify_signal_pending();
             kernel.signal_arrival.wake_all_waiters();
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while self.kicker.count() > 1 {
-                // Exec closes admission before draining its siblings. It may
-                // itself be one of the registered vCPUs this fork is waiting
-                // to quiesce, so do not wait for the normal fork deadline:
-                // abandon this pre-publication fork and release its permit.
-                if process_fork_admission.is_cancelled() {
-                    process_barrier.end_quiesce();
-                    process_barrier.end_fork();
-                    return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
-                }
-                quiesce_poll_iterations = quiesce_poll_iterations.saturating_add(1);
-                if Instant::now() >= deadline {
-                    let unfinished: Vec<_> = self
-                        .threads
-                        .lock()
-                        .iter()
-                        .filter(|handle| !handle.is_finished())
-                        .map(VcpuThreadHandle::diagnostic_name)
-                        .collect();
-                    let registered: Vec<_> = self
-                        .kicker
-                        .debug_registered_vcpus()
-                        .into_iter()
-                        .map(|(tid, in_guest)| (tid.raw(), in_guest))
-                        .collect();
-                    tracing::error!(
-                        pid = parent_process.pid(),
-                        forking_tid = self.this_tid.raw(),
-                        remaining = self.kicker.count().saturating_sub(1),
-                        ?registered,
-                        ?unfinished,
-                        "hvpatch in-process fork quiesce timed out"
-                    );
-                    std::process::abort();
-                }
-                self.kicker.kick_all_except(self.this_tid);
-                self.futex.notify_signal_pending();
-                self.platform_futex.notify_signal_pending();
-                kernel.signal_arrival.wake_all_waiters();
-                std::thread::sleep(Duration::from_micros(200));
-            }
-            quiesced = true;
         }
+        let progress_subscription = quiesced.then(&subscribe_progress);
+        if quiesced && self.kicker.count() > 1 {
+            if process_fork_admission.is_cancelled() {
+                return Ok(PreparedInProcessFork::Complete(Some(
+                    crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                )));
+            }
+            self.kicker.kick_all_except(self.this_tid);
+            self.futex.notify_signal_pending();
+            self.platform_futex.notify_signal_pending();
+            kernel.signal_arrival.wake_all_waiters();
+            return Ok(PreparedInProcessFork::Retry {
+                request,
+                coordinator: Some(coordinator),
+                _subscription: progress_subscription.unwrap_or_else(|| std::process::abort()),
+            });
+        }
+        drop(progress_subscription);
+        let (process_fork_admission, fork_clone_admission, quiesced) = coordinator.into_parts();
         let quiesce_elapsed_ns = fork_stage_started
             .elapsed()
             .as_nanos()
@@ -1367,7 +1410,9 @@ where
                 process_barrier.end_quiesce();
             }
             process_barrier.end_fork();
-            return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
+            return Ok(PreparedInProcessFork::Complete(Some(
+                crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+            )));
         }
         // Clone admission is closed and all previously enrolled clone
         // publications have drained before quiescence. Take the authoritative
@@ -1389,7 +1434,9 @@ where
                 }
                 process_barrier.end_fork();
                 tracing::warn!(%error, "hvpatch kernel child reservation failed; fork(2) = EAGAIN");
-                return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
+                return Ok(PreparedInProcessFork::Complete(Some(
+                    crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                )));
             }
         };
         let shares_mm = clone_plan.mm() == crate::kernel::CloneObjectMode::Share;
@@ -1403,7 +1450,9 @@ where
                 }
                 process_barrier.end_fork();
                 tracing::warn!(%error, "hvpatch stage-1 root-slot preparation failed; fork(2) = EAGAIN");
-                return Ok(Some(crate::linux_abi::LINUX_EAGAIN.guest_retval()));
+                return Ok(PreparedInProcessFork::Complete(Some(
+                    crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                )));
             }
         };
         let child_binding = prepared_mm.binding();
@@ -1439,7 +1488,7 @@ where
             }
         };
         let child_mm_id = prepared_fork.child_mm_id();
-        let inventory_extent_count = engine.frame_inventory_extent_count();
+        let inventory_extent_count = ops.inventory_extent_count(memory);
         let inventory_capacity = match inventory_capacity_for_extents(inventory_extent_count) {
             Ok(capacity) => capacity,
             Err(error) => {
@@ -1474,11 +1523,42 @@ where
         // The reservation and its complete bounded storage exist before this
         // topology lock. Keep it local until every guest-pointer/pidfd preflight
         // succeeds, so EFAULT cannot occupy the backend's one process slot.
-        let topology = crate::fork_quiesce::acquire_topology_lock(
-            carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
-            parent_process.pid(),
-            self.this_tid.raw(),
-        );
+        let topology = loop {
+            let observed = crate::fork_quiesce::topology_release_generation();
+            if let Some(topology) = crate::fork_quiesce::try_acquire_topology_lock(
+                carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
+                parent_process.pid(),
+                self.this_tid.raw(),
+            ) {
+                break topology;
+            }
+            let wake_scheduler = Arc::clone(&scheduler);
+            match crate::fork_quiesce::subscribe_topology_release(
+                observed,
+                Arc::new(move |_| {
+                    let _ = wake_scheduler.wake(wake_thread);
+                }),
+            ) {
+                carrick_thread::fork_quiesce::TopologyReleaseEnrollment::Ready(_) => continue,
+                carrick_thread::fork_quiesce::TopologyReleaseEnrollment::Subscribed(
+                    subscription,
+                ) => {
+                    if quiesced {
+                        process_barrier.end_quiesce();
+                    }
+                    process_barrier.end_fork();
+                    drop(fork_clone_admission);
+                    drop(process_fork_admission);
+                    return Ok(PreparedInProcessFork::Retry {
+                        request,
+                        coordinator: None,
+                        _subscription: ProcessForkRetrySubscription::Topology {
+                            _subscription: subscription,
+                        },
+                    });
+                }
+            }
+        };
         emit_fork_runtime_stage(
             carrick_observability::probes::HvpatchForkRuntimeStagePhase::ProcessAllocate,
             fork_stage_started,
@@ -1486,28 +1566,34 @@ where
         );
         let child_key = prepared_fork.child_key();
 
-        let Some(parent_tid_original) = read_optional_fork_output(engine, request.parent_tid_addr)
+        let Some(parent_tid_original) = read_optional_fork_output(memory, request.parent_tid_addr)
         else {
             if quiesced {
                 process_barrier.end_quiesce();
             }
             process_barrier.end_fork();
-            return Ok(Some(crate::linux_abi::LINUX_EFAULT.guest_retval()));
+            return Ok(PreparedInProcessFork::Complete(Some(
+                crate::linux_abi::LINUX_EFAULT.guest_retval(),
+            )));
         };
-        let Some(pidfd_original) = read_optional_fork_output(engine, request.pidfd_out) else {
+        let Some(pidfd_original) = read_optional_fork_output(memory, request.pidfd_out) else {
             if quiesced {
                 process_barrier.end_quiesce();
             }
             process_barrier.end_fork();
-            return Ok(Some(crate::linux_abi::LINUX_EFAULT.guest_retval()));
+            return Ok(PreparedInProcessFork::Complete(Some(
+                crate::linux_abi::LINUX_EFAULT.guest_retval(),
+            )));
         };
-        let Some(child_tid_original) = read_optional_fork_output(engine, request.child_tid_addr)
+        let Some(_child_tid_original) = read_optional_fork_output(memory, request.child_tid_addr)
         else {
             if quiesced {
                 process_barrier.end_quiesce();
             }
             process_barrier.end_fork();
-            return Ok(Some(crate::linux_abi::LINUX_EFAULT.guest_retval()));
+            return Ok(PreparedInProcessFork::Complete(Some(
+                crate::linux_abi::LINUX_EFAULT.guest_retval(),
+            )));
         };
         fork_stage_started = Instant::now();
         let installed_pidfd = if request.pidfd_out.is_some() {
@@ -1521,7 +1607,7 @@ where
                         process_barrier.end_quiesce();
                     }
                     process_barrier.end_fork();
-                    return Ok(Some(errno.guest_retval()));
+                    return Ok(PreparedInProcessFork::Complete(Some(errno.guest_retval())));
                 }
             }
         } else {
@@ -1542,45 +1628,45 @@ where
             child_pid,
         );
 
-        if let Err(error) = engine.begin_process_inventory(inventory_reservation) {
-            rollback_pidfd(installed_pidfd);
-            if quiesced {
-                process_barrier.end_quiesce();
-            }
-            process_barrier.end_fork();
-            return Err(RuntimeError::Trap(error));
-        }
-        let rollback_backend_fork = |engine: &mut E| {
-            let _ = engine.cancel_process_inventory();
-            engine.rollback_process_fork().unwrap_or_else(|error| {
-                tracing::error!(%error, "failed to roll back parent HVPatch fork transaction");
-                std::process::abort();
-            });
-        };
-
         fork_stage_started = Instant::now();
-        let spec = match engine.build_process_spec(carrick_hal::ProcessForkRequest {
-            entry: carrick_hal::GuestEntryRegs {
-                return_value: 0,
-                stack: (request.child_stack != 0).then_some(request.child_stack),
-                tls: None,
+        let (task_key, thread_key, _, generation) = prepared_fork.prepared_execution_identity();
+        let asid_generation = prepared_mm.backend().asid_generation().generation();
+        let identity = carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskIdentity {
+            task_serial: task_key.serial.raw(),
+            thread_serial: thread_key.serial.raw(),
+            execution_generation: generation.raw(),
+            linux_pid: child_pid,
+            linux_tid: child_pid,
+            asid: child_binding.asid.raw(),
+        };
+        let (prepared_backend, cpu, child_kicker) = match ops.prepare(
+            memory,
+            inventory_reservation,
+            carrick_hal::ProcessForkRequest {
+                entry: carrick_hal::GuestEntryRegs {
+                    return_value: 0,
+                    stack: (request.child_stack != 0).then_some(request.child_stack),
+                    tls: None,
+                },
+                child_ttbr0: child_binding.ttbr0.raw(),
+                root_slot_base: root_slot.base(),
+                root_slot_size: root_slot.size(),
+                shares_mm,
+                child_tid,
+                forking_tid: self.this_tid,
             },
-            child_ttbr0: child_binding.ttbr0.raw(),
-            root_slot_base: root_slot.base(),
-            root_slot_size: root_slot.size(),
-            shares_mm,
-            child_tid,
-            forking_tid: self.this_tid,
-        }) {
-            Ok(spec) => spec,
+            identity,
+            child_mm_id.raw(),
+            asid_generation,
+        ) {
+            Ok(prepared) => prepared,
             Err(error) => {
-                rollback_backend_fork(engine);
                 rollback_pidfd(installed_pidfd);
                 if quiesced {
                     process_barrier.end_quiesce();
                 }
                 process_barrier.end_fork();
-                return Err(RuntimeError::Trap(error));
+                return Err(error);
             }
         };
         emit_fork_runtime_stage(
@@ -1589,301 +1675,26 @@ where
             child_pid,
         );
 
-        fork_stage_started = Instant::now();
         let child_dispatcher = kernel.dispatcher.fork_clone_in_process(
             self.this_tid,
             child_tid,
             parent_process.pid() as u32,
             child_pid as u32,
         );
-        emit_fork_runtime_stage(
-            carrick_observability::probes::HvpatchForkRuntimeStagePhase::DispatcherClone,
-            fork_stage_started,
-            child_pid,
-        );
-
-        fork_stage_started = Instant::now();
         let child_exit_signal = i32::try_from(request.exit_signal)
             .ok()
             .filter(|signal| *signal != 0);
         let child_registry = Arc::new(ThreadRegistry::new(child_tid));
         let child_futex = Arc::new(crate::thread::FutexTable::new());
         let child_platform_futex = (self.platform_futex_factory)(Arc::clone(&child_futex));
-        let child_platform_futex_factory = Arc::clone(&self.platform_futex_factory);
-        let child_kicker = engine.fresh_fork_kicker();
-        let child_runtime_futex = Arc::clone(&child_futex);
-        let child_runtime_kicker = Arc::clone(&child_kicker);
         let child_threads = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let max_traps = self.max_traps;
-        let child_tid_addr = request.child_tid_addr;
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<
-            Result<carrick_hal::FrameInventoryCommit<()>, String>,
-        >(1);
-        let (start_tx, start_rx) = std::sync::mpsc::sync_channel::<
-            Option<(
-                Arc<KernelState>,
-                crate::hvpatch::ProcessContext,
-                crate::kernel::KernelContext,
-            )>,
-        >(1);
-        emit_fork_runtime_stage(
-            carrick_observability::probes::HvpatchForkRuntimeStagePhase::RuntimeState,
-            fork_stage_started,
-            child_pid,
-        );
-        fork_stage_started = Instant::now();
-        let handle = match std::thread::Builder::new()
-            .name(format!("guest-pid-{child_pid}"))
-            .spawn(move || {
-                // Transfer the pre-topology reservation onto the child host
-                // thread before `hv_vcpu_create`. The closure owns the RAII
-                // reservation, so a host-thread spawn failure also releases it.
-                let lease = reserved_child_vcpu.install_for_current_thread();
-                let _pre_loop_lease_guard = VcpuLeaseGuard;
-                crate::probes::mn_admit(
-                    child_tid.raw(),
-                    lease.slot,
-                    carrick_hal::vcpu_sched::global()
-                        .budget()
-                        .min(u32::MAX as usize) as u32,
-                );
-                let mut child_engine = match E::materialize_process(spec) {
-                    Ok(engine) => engine,
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(error.to_string()));
-                        return;
-                    }
-                };
-                let child_inventory_commit =
-                    child_engine.take_process_inventory().unwrap_or_else(|| {
-                        tracing::error!(
-                            child_pid,
-                            "HVPatch child materialized without its frame inventory commit"
-                        );
-                        std::process::abort();
-                    });
-                if ready_tx.send(Ok(child_inventory_commit)).is_err() {
-                    tracing::error!(
-                        child_pid,
-                        "HVPatch parent disappeared after child materialization commit"
-                    );
-                    std::process::abort();
-                }
-                let Ok(Some((child_kernel, child_process, child_context))) = start_rx.recv() else {
-                    tracing::error!(
-                        child_pid,
-                        "HVPatch child start gate disappeared after materialization commit"
-                    );
-                    std::process::abort();
-                };
-                let child_binding = child_process.mm_binding().unwrap_or_else(|| {
-                    tracing::error!(child_pid, "published HVPatch child has no mm binding");
-                    std::process::abort();
-                });
-                let child_mm = child_context.shared().mm().id();
-                let authority: Arc<dyn carrick_hal::FrameCowAuthority> =
-                    Arc::new(KernelFrameCowAuthority {
-                        kernel: Arc::clone(child_context.kernel()),
-                        mm: child_mm,
-                        // The CHILD's census: an HVPatch fork child owns its
-                        // own `KernelState`, so its executor population starts
-                        // from this thread alone.
-                        guest_executors: Arc::clone(&child_kernel.guest_executors),
-                        kicker: child_kicker.clone(),
-                        tid: child_tid,
-                    });
-                child_engine.bind_frame_cow(
-                    authority,
-                    carrick_hal::FrameCowIdentity {
-                        linux_pid: child_process.pid(),
-                        linux_tid: child_tid.raw(),
-                        mm: child_mm.raw(),
-                        asid: child_binding.asid.raw(),
-                    },
-                );
-                // The child inventory and exact MM/COW authority are now live,
-                // while the child remains behind the start gate and has never
-                // entered guest code. Refresh fork-private backend state here so
-                // any inherited COW frame is split from the parent first. A
-                // CLONE_VM child shares that state by definition and must not
-                // split it from the suspended parent.
-                if !shares_mm {
-                    if let Err(error) = child_engine.refresh_fork_process_state() {
-                        tracing::error!(child_pid, %error, "refresh materialized child process state");
-                        std::process::abort();
-                    }
-                }
-                // The child inventory is authoritative before this first
-                // kernel-originated write. If the address lies in a fork-COW
-                // frame, the copyout now splits only the child instead of
-                // corrupting the parent's still-shared frame.
-                if let Some(address) = child_tid_addr
-                    && let Err(error) = child_engine.write_bytes(address, &child_pid.to_le_bytes())
-                {
-                    tracing::error!(child_pid, %error, "materialized child TID copyout diverged from preflight");
-                    std::process::abort();
-                }
-                // The child leader thread's lifetime in-guest flag. It is
-                // created ONCE here, published with this bootstrap registration
-                // so the child is kickable before its loop starts, and then
-                // moved into `run_vcpu_until_exit` — the loop stores into the
-                // very cell the kicker holds.
-                let child_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
-                let handle: Box<dyn carrick_hal::VcpuKickDyn> =
-                    Box::new(child_engine.kick_handle());
-                child_kicker.register(child_tid, handle, &child_in_guest);
-                let _ = stamp_identity_page(
-                    &mut child_engine,
-                    &child_kernel.dispatcher,
-                    &child_context,
-                );
-                let child_linux_tid = child_context.thread().key().tid;
-                drop(child_context);
-                stamp_guest_tid(
-                    &child_engine,
-                    child_tid,
-                    &child_registry,
-                    Some(child_linux_tid),
-                );
-                match launch_vcpu_until_exit(
-                    Arc::clone(&child_kernel),
-                    child_engine,
-                    child_registry,
-                    child_futex,
-                    child_platform_futex,
-                    child_platform_futex_factory,
-                    crate::kernel::LinuxTid::for_task_leader(child_id),
-                    child_tid,
-                    child_threads,
-                    child_kicker,
-                    child_in_guest,
-                    max_traps,
-                ) {
-                    VcpuLoopLaunch::Job(receipt) => {
-                        child_kernel.enroll_hvpatch_process_job(receipt);
-                    }
-                    VcpuLoopLaunch::Direct(result) => match result {
-                    Ok(
-                        VcpuLoopOutcome::ProcessExit(_)
-                        | VcpuLoopOutcome::ThreadDone
-                        | VcpuLoopOutcome::TrapLimit(_),
-                    ) => {}
-                    Err(error) => {
-                        // The vCPU loop's single terminal owner already ran the
-                        // unified output/fd/Kernel/backend finalizer. This host
-                        // wrapper only reports the runtime failure.
-                        tracing::error!(child_pid, %error, "hvpatch child loop failed");
-                    }
-                    },
-                }
-            }) {
-            Ok(handle) => handle,
-            Err(error) => {
-                rollback_backend_fork(engine);
-                rollback_pidfd(installed_pidfd);
-                if quiesced {
-                    process_barrier.end_quiesce();
-                }
-                process_barrier.end_fork();
-                return Err(RuntimeError::Trap(TrapError::Hypervisor(format!(
-                    "spawn hvpatch process failed: {error}"
-                ))));
-            }
-        };
-        emit_fork_runtime_stage(
-            carrick_observability::probes::HvpatchForkRuntimeStagePhase::ThreadSpawn,
-            fork_stage_started,
-            child_pid,
-        );
-        let restore_outputs = |engine: &mut E| {
-            if let (Some(address), Some(bytes)) =
-                (request.parent_tid_addr, parent_tid_original.as_ref())
-            {
-                let _ = engine.write_bytes(address, bytes);
-            }
-            if let (Some(address), Some(bytes)) = (request.pidfd_out, pidfd_original.as_ref()) {
-                let _ = engine.write_bytes(address, bytes);
-            }
-            if shares_mm
-                && let (Some(address), Some(bytes)) =
-                    (request.child_tid_addr, child_tid_original.as_ref())
-            {
-                let _ = engine.write_bytes(address, bytes);
-            }
-        };
-        fork_stage_started = Instant::now();
-        let ready_deadline = Instant::now() + Duration::from_secs(10);
-        let child_inventory_commit = loop {
-            match ready_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(Ok(commit)) => break commit,
-                Ok(Err(error)) => {
-                    let _ = start_tx.send(None);
-                    let _ = handle.join();
-                    restore_outputs(engine);
-                    rollback_backend_fork(engine);
-                    rollback_pidfd(installed_pidfd);
-                    if quiesced {
-                        process_barrier.end_quiesce();
-                    }
-                    process_barrier.end_fork();
-                    return Err(RuntimeError::Trap(TrapError::Hypervisor(error)));
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    let _ = start_tx.send(None);
-                    let _ = handle.join();
-                    restore_outputs(engine);
-                    rollback_backend_fork(engine);
-                    rollback_pidfd(installed_pidfd);
-                    if quiesced {
-                        process_barrier.end_quiesce();
-                    }
-                    process_barrier.end_fork();
-                    return Err(RuntimeError::Trap(TrapError::Hypervisor(
-                        "hvpatch child startup channel disconnected".to_owned(),
-                    )));
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if Instant::now() >= ready_deadline {
-                        tracing::error!(
-                            parent_pid,
-                            child_pid,
-                            forking_tid,
-                            "hvpatch process materialization start gate timed out"
-                        );
-                        std::process::abort();
-                    }
-                }
-            }
-        };
-        engine.commit_process_fork().unwrap_or_else(|error| {
-            tracing::error!(%error, "commit parent HVPatch fork transaction");
-            std::process::abort();
-        });
-        // Child materialization has released its backend mapping locks. Release
-        // global topology serialization before entering runtime inventory
-        // authority, then publish to the exact prepared child Mm while its
-        // execution thread remains behind `start_rx`.
-        drop(topology);
-        if let Err(error) = parent_process
-            .kernel_graph()
-            .frame_inventory()
-            .apply(child_mm_id, child_inventory_commit)
-        {
-            tracing::error!(child_pid, ?child_mm_id, %error, "apply HVPatch child frame inventory");
-            std::process::abort();
-        }
-        emit_fork_runtime_stage(
-            carrick_observability::probes::HvpatchForkRuntimeStagePhase::ChildReady,
-            fork_stage_started,
-            child_pid,
-        );
 
         let parent_outputs_published = request.parent_tid_addr.is_none_or(|address| {
-            engine
+            memory
                 .write_bytes(address, &child_pid.to_le_bytes())
                 .is_ok()
         }) && match (request.pidfd_out, installed_pidfd) {
-            (Some(address), Some(fd)) => engine.write_bytes(address, &fd.to_le_bytes()).is_ok(),
+            (Some(address), Some(fd)) => memory.write_bytes(address, &fd.to_le_bytes()).is_ok(),
             (None, _) => true,
             (Some(_), None) => false,
         };
@@ -1895,6 +1706,85 @@ where
             );
             std::process::abort();
         }
+        if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::ParentCopyout)
+        {
+            if let (Some(address), Some(bytes)) =
+                (request.parent_tid_addr, parent_tid_original.as_ref())
+            {
+                memory.write_bytes(address, bytes).unwrap_or_else(|_| {
+                    std::process::abort();
+                });
+            }
+            if let (Some(address), Some(bytes)) = (request.pidfd_out, pidfd_original.as_ref()) {
+                memory.write_bytes(address, bytes).unwrap_or_else(|_| {
+                    std::process::abort();
+                });
+            }
+            ops.abort(prepared_backend)
+                .unwrap_or_else(|_| std::process::abort());
+            ops.rollback_parent(memory)
+                .unwrap_or_else(|_| std::process::abort());
+            rollback_pidfd(installed_pidfd);
+            if quiesced {
+                process_barrier.end_quiesce();
+            }
+            process_barrier.end_fork();
+            return Err(error);
+        }
+        if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::BackendCommit)
+        {
+            if let (Some(address), Some(bytes)) =
+                (request.parent_tid_addr, parent_tid_original.as_ref())
+            {
+                memory
+                    .write_bytes(address, bytes)
+                    .unwrap_or_else(|_| std::process::abort());
+            }
+            if let (Some(address), Some(bytes)) = (request.pidfd_out, pidfd_original.as_ref()) {
+                memory
+                    .write_bytes(address, bytes)
+                    .unwrap_or_else(|_| std::process::abort());
+            }
+            ops.abort(prepared_backend)
+                .unwrap_or_else(|_| std::process::abort());
+            ops.rollback_parent(memory)
+                .unwrap_or_else(|_| std::process::abort());
+            rollback_pidfd(installed_pidfd);
+            if quiesced {
+                process_barrier.end_quiesce();
+            }
+            process_barrier.end_fork();
+            return Err(error);
+        }
+        if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::KernelCommit) {
+            if let (Some(address), Some(bytes)) =
+                (request.parent_tid_addr, parent_tid_original.as_ref())
+            {
+                memory
+                    .write_bytes(address, bytes)
+                    .unwrap_or_else(|_| std::process::abort());
+            }
+            if let (Some(address), Some(bytes)) = (request.pidfd_out, pidfd_original.as_ref()) {
+                memory
+                    .write_bytes(address, bytes)
+                    .unwrap_or_else(|_| std::process::abort());
+            }
+            ops.abort(prepared_backend)
+                .unwrap_or_else(|_| std::process::abort());
+            ops.rollback_parent(memory)
+                .unwrap_or_else(|_| std::process::abort());
+            rollback_pidfd(installed_pidfd);
+            if quiesced {
+                process_barrier.end_quiesce();
+            }
+            process_barrier.end_fork();
+            return Err(error);
+        }
+        ops.commit_parent(memory).unwrap_or_else(|error| {
+            tracing::error!(%error, "commit parent HVPatch fork transaction");
+            std::process::abort();
+        });
+        drop(topology);
 
         fork_stage_started = Instant::now();
         let published = match prepared_fork.commit() {
@@ -1908,17 +1798,10 @@ where
                 std::process::abort();
             }
         };
-        let (child_context, vfork_parent_wait) = match published.into_parts() {
-            Ok(parts) => parts,
-            Err(error) => {
-                tracing::error!(
-                    child_pid,
-                    %error,
-                    "authoritative child start gate failed after publication"
-                );
-                std::process::abort();
-            }
-        };
+        let child_context = published
+            .context()
+            .unwrap_or_else(|| std::process::abort())
+            .retain_exact();
         let child_key = child_context.task().key();
         let child_backend = match parent_process
             .mm_resources()
@@ -1943,26 +1826,180 @@ where
             kernel.hvpatch_runtime.clone(),
             child_exit_signal,
         ));
-        child_kernel.register_hvpatch_runtime_endpoint(child_runtime_futex, child_runtime_kicker);
-        kernel.enroll_hvpatch_process_thread(handle);
-        if start_tx
-            .send(Some((
-                Arc::clone(&child_kernel),
-                child_process.clone(),
-                child_context,
-            )))
-            .is_err()
-        {
-            // Publication is already authoritative and cannot be represented to
-            // the guest as a failed fork. The receiver can disappear only after
-            // an internal host-thread failure; continuing would leave a live
-            // Kernel task with no execution owner, so fail closed.
-            tracing::error!(
-                child_pid,
-                "hvpatch child start gate disappeared after publication"
-            );
-            std::process::abort();
+        let task_state = crate::kernel::objects::MigratableTaskState {
+            cpu,
+            mm: child_mm_id,
+            asid_generation,
+        };
+        let generation = child_context
+            .thread()
+            .publish_initial_task_state(task_state.clone())
+            .unwrap_or_else(|error| {
+                tracing::error!(child_pid, %error, "publish process child task state");
+                std::process::abort();
+            });
+        let runtime = child_kernel
+            .hvpatch_runtime
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort());
+        let mut task_backend = ops
+            .commit(
+                prepared_backend,
+                runtime.carrier_tasks(child_context.kernel()),
+            )
+            .unwrap_or_else(|error| {
+                tracing::error!(child_pid, %error, "commit process child task backend");
+                std::process::abort();
+            });
+        let cow_identity = carrick_hal::FrameCowIdentity {
+            linux_pid: child_pid,
+            linux_tid: child_pid,
+            mm: child_mm_id.raw(),
+            asid: child_binding.asid.raw(),
+        };
+        let cow_authority = Arc::new(KernelFrameCowAuthority {
+            kernel: Arc::clone(child_context.kernel()),
+            mm: child_mm_id,
+            guest_executors: Arc::clone(&child_kernel.guest_executors),
+            kicker: Arc::clone(&child_kicker),
+            tid: child_tid,
+            identity: cow_identity,
+        });
+        let child_token = Arc::clone(&cow_authority)
+            .issue_hvpatch_child_token(&child_context)
+            .unwrap_or_else(|error| {
+                tracing::error!(child_pid, %error, "issue exact process child token");
+                std::process::abort();
+            });
+        ops.bind_child_kernel(&mut task_backend, child_token)
+            .unwrap_or_else(|error| {
+                tracing::error!(child_pid, %error, "bind exact process child token");
+                std::process::abort();
+            });
+        if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::TokenBind) {
+            return Err(ops.fail_stop(error));
         }
+        ops.apply_inventory(&task_backend, child_context.kernel(), child_mm_id)
+            .unwrap_or_else(|error| {
+                tracing::error!(child_pid, %error, "apply process child frame inventory");
+                std::process::abort();
+            });
+        ops.activate_child(&mut task_backend)
+            .unwrap_or_else(|error| {
+                tracing::error!(child_pid, %error, "activate process child task state");
+                std::process::abort();
+            });
+
+        type HvfEngine = carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine;
+        let (execution_lease, injected_lease) = ExecutionLeaseCell::injected();
+        let mut child_state = ThreadRuntimeState::<HvfEngine>::new(
+            Arc::clone(&child_registry),
+            Arc::clone(&child_futex),
+            child_platform_futex,
+            Arc::clone(&self.platform_futex_factory),
+            child_kernel.process_fork_barrier.clone(),
+            child_kernel.crash_capture.clone(),
+            Some(Arc::clone(child_context.thread())),
+            Some(child_pid),
+            crate::kernel::LinuxTid::for_task_leader(child_id),
+            child_kernel.fatal_signal.current_generation(),
+            child_tid,
+            child_threads,
+            Arc::clone(&child_kicker),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            self.max_traps,
+        );
+        child_state.execution_lease = execution_lease;
+        child_state.service_kernel_context = Some(child_context.retain_exact());
+        let mut logical = prepare_hvpatch_logical_job(HvpatchLogicalJobInput {
+            kernel: Arc::clone(&child_kernel),
+            state: child_state,
+            task_backend: ops.make_binding_state(task_backend),
+            context: child_context.retain_exact(),
+            cpu: task_state,
+            generation,
+            injected_lease,
+            bootstrap_process_child: Some((
+                shares_mm,
+                request.child_tid_addr.map(|address| (address, child_pid)),
+            )),
+        })
+        .unwrap_or_else(|error| {
+            tracing::error!(child_pid, %error, "prepare process child logical job");
+            std::process::abort();
+        });
+        let (grant_thread, grant_generation) =
+            control.current_submission_key().unwrap_or_else(|error| {
+                tracing::error!(child_pid, %error, "capture process-fork worker grant");
+                std::process::abort();
+            });
+        let shape = if request.clone_parent {
+            executor::HvpatchSubmissionShape::PeerRoot {
+                grant: (grant_thread, grant_generation),
+            }
+        } else {
+            executor::HvpatchSubmissionShape::Descendant {
+                grant: (grant_thread, grant_generation),
+            }
+        };
+        let dormant = control
+            .prepare_hvpatch_submission(
+                runtime.persistent_bindings(),
+                shape,
+                Arc::clone(child_context.thread()),
+                generation,
+                Arc::clone(&logical.binding),
+            )
+            .unwrap_or_else(|error| {
+                tracing::error!(child_pid, %error, "prepare dormant process child");
+                std::process::abort();
+            });
+        child_kernel
+            .register_hvpatch_runtime_endpoint(Arc::clone(&child_futex), Arc::clone(&child_kicker));
+        child_kernel.enroll_hvpatch_persistent_process_job(
+            logical.result.clone(),
+            logical.completion.clone(),
+        );
+        if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::DormantHandle)
+        {
+            return Err(ops.fail_stop(error));
+        }
+        let started = published.start_child().unwrap_or_else(|error| {
+            tracing::error!(child_pid, %error, "open process child start gate");
+            std::process::abort();
+        });
+        let start_gate = started
+            .context()
+            .thread()
+            .take_opened_start_gate(generation)
+            .unwrap_or_else(|| std::process::abort());
+        logical
+            .install_start_gate(start_gate)
+            .unwrap_or_else(|error| {
+                tracing::error!(child_pid, %error, "install process child start proof");
+                std::process::abort();
+            });
+        let proof = logical.activation_proof().unwrap_or_else(|error| {
+            tracing::error!(child_pid, %error, "validate process child activation proof");
+            std::process::abort();
+        });
+        if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::StartProof) {
+            return Err(ops.fail_stop(error));
+        }
+        dormant
+            .activate(
+                &runtime.continuation_services(child_context.kernel()).0,
+                Arc::clone(child_context.thread()),
+                proof,
+            )
+            .unwrap_or_else(|error| {
+                tracing::error!(child_pid, %error, "activate process child logical job");
+                std::process::abort();
+            });
+        if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::Activation) {
+            return Err(ops.fail_stop(error));
+        }
+        let (_, vfork_parent_wait) = started.into_parts();
         if quiesced {
             process_barrier.end_quiesce();
         }
@@ -2007,38 +2044,17 @@ where
                 ]),
             )
             .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
-            .with_current_guest_sp(engine.get_reg(carrick_hal::Reg::Sp).ok());
-            match self
-                .suspend_hvpatch_continuation(
-                    kernel,
-                    engine,
+            .with_current_guest_sp(ops.guest_sp(memory));
+            return Ok(PreparedInProcessFork::SuspendVfork(
+                PreparedVforkSuspension {
+                    child_pid,
                     request,
-                    HvpatchBlockInput::Vfork {
-                        child: child_key,
-                        wait,
-                    },
-                )
-                .await?
-            {
-                Some(DispatchOutcome::Returned { .. }) => {}
-                Some(DispatchOutcome::ThreadExit { .. }) | None
-                    if kernel.process_exiting() || kernel.clone_admission_terminal_cancelled() =>
-                {
-                    return Ok(None);
-                }
-                Some(other) => {
-                    return Err(RuntimeError::Configuration(format!(
-                        "vfork continuation resumed with unexpected outcome: {other:?}"
-                    )));
-                }
-                None => {
-                    return Err(RuntimeError::Configuration(
-                        "vfork continuation requested syscall redispatch".to_owned(),
-                    ));
-                }
-            }
+                    child: child_key,
+                    wait,
+                },
+            ));
         }
-        Ok(Some(i64::from(child_pid)))
+        Ok(PreparedInProcessFork::Complete(Some(i64::from(child_pid))))
     }
 }
 
@@ -2069,109 +2085,27 @@ mod pt_pause_tests {
     }
 
     #[test]
-    fn hvpatch_process_materialization_waits_for_a_vcpu_lease() {
-        use carrick_hal::VcpuScheduler;
-
-        let scheduler: &'static carrick_hal::vcpu_sched::HostCondvarScheduler = Box::leak(
-            Box::new(carrick_hal::vcpu_sched::HostCondvarScheduler::new(1)),
-        );
-        let first = scheduler.acquire(1601);
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let waiter = std::thread::spawn(move || {
-            let lease = reserve_hvpatch_process_vcpu_lease(scheduler, tid(1602));
-            tx.send(lease).unwrap();
-        });
-
-        assert!(
-            rx.recv_timeout(Duration::from_millis(20)).is_err(),
-            "a fork child must not materialize beyond the bounded vCPU pool"
-        );
-        // The wait is BOUNDED: an exhausted pool gives the attempt back rather
-        // than parking forever, which is what keeps the coordinator from
-        // hold-and-wait against the siblings its barrier parked.
-        assert!(
-            rx.recv_timeout(PROCESS_FORK_VCPU_RESERVE * 4)
-                .expect("the bounded reservation must return")
-                .is_none(),
-            "an exhausted pool must surrender the attempt, not block on it"
-        );
-        waiter.join().unwrap();
-        scheduler.release(first, carrick_hal::Yield::Exited);
-        let second = reserve_hvpatch_process_vcpu_lease(scheduler, tid(1604));
-        assert!(second.is_some(), "released capacity admits a fork child");
-        drop(second);
-        let third = scheduler.acquire(1603);
-        scheduler.release(third, carrick_hal::Yield::Exited);
-    }
-
-    /// The barrier stops every other guest thread, and those siblings are the
-    /// only threads that can release a vCPU slot. So a fork attempt that cannot
-    /// get capacity must leave the barrier CLOSED-free: if it stopped the world
-    /// first and waited afterwards, it would be waiting on its own supply. Live
-    /// shape this guards (2026-08-18): the coordinator parked in
-    /// `Condvar::wait` inside the reservation while its siblings sat in
-    /// `park_if_fork_quiescing`.
-    #[test]
-    fn an_exhausted_pool_never_leaves_the_fork_barrier_begun() {
-        use carrick_hal::VcpuScheduler;
-
-        let barrier: &'static crate::fork_quiesce::QuiesceBarrier =
-            Box::leak(Box::new(crate::fork_quiesce::QuiesceBarrier::new()));
-        let scheduler: &'static carrick_hal::vcpu_sched::HostCondvarScheduler = Box::leak(
-            Box::new(carrick_hal::vcpu_sched::HostCondvarScheduler::new(1)),
-        );
-        let occupied = scheduler.acquire(1_621);
-
-        assert!(
-            try_begin_hvpatch_process_fork(barrier, scheduler, tid(1_622)).is_none(),
-            "no capacity, so no fork may start"
-        );
-        assert!(
-            !barrier.is_quiescing(),
-            "a fork that could not reserve capacity must not have stopped the world"
-        );
-
-        scheduler.release(occupied, carrick_hal::Yield::Exited);
-        let started = try_begin_hvpatch_process_fork(barrier, scheduler, tid(1_623))
-            .expect("spare capacity admits the coordinator");
-        assert!(
-            !barrier.try_begin_fork(),
-            "the admitted coordinator holds the fork token"
-        );
-        drop(started);
-        barrier.end_fork();
-    }
-
-    #[test]
-    fn losing_hvpatch_fork_does_not_enroll_clone_admission_or_wait_for_capacity() {
-        use carrick_hal::VcpuScheduler;
-
+    fn losing_hvpatch_fork_does_not_enroll_clone_admission() {
         let barrier: &'static crate::fork_quiesce::QuiesceBarrier =
             Box::leak(Box::new(crate::fork_quiesce::QuiesceBarrier::new()));
         assert!(barrier.try_begin_fork(), "model winner owns the fork token");
-        let admission: &'static CloneAdmissionGate =
-            Box::leak(Box::new(CloneAdmissionGate::default()));
-        let scheduler: &'static carrick_hal::vcpu_sched::HostCondvarScheduler = Box::leak(
-            Box::new(carrick_hal::vcpu_sched::HostCondvarScheduler::new(1)),
-        );
-        let occupied = scheduler.acquire(1_611);
+        let admission = Arc::new(CloneAdmissionGate::default());
+        let waiter_admission = Arc::clone(&admission);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let waiter = std::thread::spawn(move || {
             tx.send(try_begin_hvpatch_process_fork_with_admission(
                 barrier,
-                scheduler,
                 tid(1_612),
-                admission,
+                &waiter_admission,
             ))
             .unwrap();
-            admission.state.lock().in_flight
+            waiter_admission.state.lock().in_flight
         });
 
         let outcome = rx
             .recv_timeout(Duration::from_millis(20))
             .expect("a losing forker must not wait behind the scheduler");
         assert!(matches!(outcome, ProcessForkStart::Busy));
-        scheduler.release(occupied, carrick_hal::Yield::Exited);
         assert_eq!(
             waiter.join().unwrap(),
             0,

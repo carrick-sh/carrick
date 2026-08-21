@@ -352,6 +352,17 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// their established rebuild behavior.
     fn set_persistent_vm_lifecycle(&mut self, _enabled: bool) {}
 
+    fn prepare_exec_address_space(
+        &mut self,
+        _root_slot_base: u64,
+        _root_slot_size: u64,
+        _asid: u16,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "AArch64 VMM does not support exact exec MM replacement".to_owned(),
+        ))
+    }
+
     /// Whether this backend keeps the hidden mmap arena as invalid stage-1
     /// coverage and materializes only committed VMA backing. HVPatch overrides;
     /// mature HVF VMM and KVM preserve their eager mappings.
@@ -709,6 +720,29 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         _vcpu: &Self::Vcpu,
     ) -> Result<Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>, TrapError> {
         Ok(None)
+    }
+
+    /// Remove task-owned mailbox continuation state at an executor switch
+    /// without releasing or replacing the executor's live mailbox slot/vCPU.
+    fn take_task_continuation_for_executor_switch(
+        &mut self,
+        _vcpu: &mut Self::Vcpu,
+    ) -> Result<Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>, TrapError> {
+        Err(TrapError::Hypervisor(
+            "aarch64 backend does not support persistent executor mailbox detach".to_owned(),
+        ))
+    }
+
+    /// Install task-owned continuation state into the already-live executor
+    /// mailbox. This must not allocate a slot or recreate the vCPU.
+    fn install_task_continuation_for_executor_switch(
+        &mut self,
+        _vcpu: &mut Self::Vcpu,
+        _continuation: Option<carrick_hal::threaded::Aarch64SyscallContinuationV1>,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "aarch64 backend does not support persistent executor mailbox attach".to_owned(),
+        ))
     }
 
     /// Backing-only fixed-size READ into `dst` whose stage-1 translation is `ipa`,

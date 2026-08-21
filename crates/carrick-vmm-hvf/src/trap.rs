@@ -231,6 +231,817 @@ pub enum TrapBackend {
     HypervisorFramework,
 }
 
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod task_only_carrier_directory_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(super) struct TestCowAuthority;
+
+    impl carrick_hal::FrameCowAuthority for TestCowAuthority {
+        fn quiesce(
+            &self,
+        ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok(Box::new(()))
+        }
+
+        fn reserve(
+            &self,
+            _frame_candidates: usize,
+            _mapping_candidates: usize,
+            _event_count: usize,
+        ) -> Result<carrick_hal::FrameInventoryReservation, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Err(Box::new(std::io::Error::other("unused test reserve")))
+        }
+
+        fn apply(
+            &self,
+            _commit: carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err(Box::new(std::io::Error::other("unused test apply")))
+        }
+
+        fn mapping_is_live(
+            &self,
+            _mapping: carrick_hal::MappingId,
+            _frame: carrick_hal::FrameId,
+            _gpa: carrick_guest_mem::Gpa,
+            _length: carrick_hal::FrameLength,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(false)
+        }
+
+        fn frame_mapping_count(
+            &self,
+            _frame: carrick_hal::FrameId,
+        ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
+        }
+    }
+
+    fn identity(generation: u64) -> HvpatchCarrierTaskIdentity {
+        HvpatchCarrierTaskIdentity {
+            task_serial: 41,
+            thread_serial: 73,
+            execution_generation: generation,
+            linux_pid: 41,
+            linux_tid: 73,
+            asid: 9,
+        }
+    }
+
+    fn test_state(rollbacks: &Arc<AtomicUsize>) -> HvpatchCarrierTaskState {
+        HvpatchCarrierTaskState::Test {
+            rollbacks: Arc::clone(rollbacks),
+            order: None,
+        }
+    }
+
+    fn owner_key(
+        directory: &HvpatchCarrierTaskStateDirectory,
+        generation: u64,
+        nonce: u64,
+    ) -> HvpatchCarrierTaskStateKey {
+        HvpatchCarrierTaskStateKey {
+            directory_instance: directory.instance,
+            task_serial: 41,
+            thread_serial: 73,
+            execution_generation: generation,
+            nonce: std::num::NonZeroU64::new(nonce).unwrap(),
+        }
+    }
+
+    #[test]
+    fn carrier_keys_are_exact_nonreused_and_terminal_retirement_rolls_back() {
+        let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let first = directory
+            .publish(
+                identity(1),
+                test_state(&rollbacks),
+                HvpatchPreparedTaskAuthority::default(),
+            )
+            .unwrap();
+        assert!(
+            directory
+                .publish(
+                    identity(1),
+                    test_state(&rollbacks),
+                    HvpatchPreparedTaskAuthority::default(),
+                )
+                .is_err()
+        );
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+        let first_key = first.registration.as_ref().unwrap().key;
+        drop(first);
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 2);
+        let successor = directory
+            .publish(
+                identity(2),
+                test_state(&rollbacks),
+                HvpatchPreparedTaskAuthority::default(),
+            )
+            .unwrap();
+        assert_ne!(first_key, successor.registration.as_ref().unwrap().key);
+        drop(successor);
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn injected_alias_and_directory_failures_rollback_before_visibility() {
+        for failpoint in [1, 2] {
+            let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
+            let rollbacks = Arc::new(AtomicUsize::new(0));
+            let preimage = alias(0x3333_0000 + usize::from(failpoint), 1);
+            let replacement = alias(0x4444_0000 + usize::from(failpoint), 3);
+            register_shared_alias(preimage);
+            assert!(
+                directory
+                    .publish_inner(
+                        identity(u64::from(failpoint)),
+                        test_state(&rollbacks),
+                        HvpatchPreparedTaskAuthority {
+                            pending_aliases: vec![replacement],
+                            ..HvpatchPreparedTaskAuthority::default()
+                        },
+                        failpoint
+                    )
+                    .is_err()
+            );
+            assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+            assert!(directory.inner.lock().states.is_empty());
+            assert!(alias_registry().lock().contains(&preimage));
+            assert!(!alias_registry().lock().contains(&replacement));
+            assert!(
+                replay_mappings()
+                    .lock()
+                    .contains(&replay_mapping_key(preimage))
+            );
+            alias_registry().lock().retain(|entry| {
+                !(entry.ipa == preimage.ipa && entry.ownership_scope == preimage.ownership_scope)
+            });
+            replay_mappings()
+                .lock()
+                .retain(|(ipa, _, _, _)| *ipa != preimage.physical_ipa);
+        }
+    }
+
+    fn alias(host: usize, perms: u64) -> AliasBacking {
+        AliasBacking {
+            start: 0x7fff_1000_0000,
+            ipa: 0x6fff_1000_0000,
+            host_addr: host,
+            size: 0x1000,
+            physical_ipa: 0x5fff_1000_0000,
+            physical_host_addr: host,
+            physical_size: 0x4000,
+            perms,
+            guest_writable: perms & 2 != 0,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: AliasOwnershipScope::MmRootSlot {
+                base: 0x4fff_1000_0000,
+                size: 0x4000,
+            },
+            inventory_backing: InventoryBackingIdentity::Private(0x41),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: 7,
+        }
+    }
+
+    #[test]
+    fn alias_receipt_restores_exact_registry_and_replay_preimages() {
+        let preimage = alias(0x1111_0000, 1);
+        let replacement = alias(0x2222_0000, 3);
+        register_shared_alias(preimage);
+
+        let directory = HvpatchCarrierTaskStateDirectory::default();
+        let receipt =
+            AliasPublicationReceipt::commit(owner_key(&directory, 1, 1), &[replacement]).unwrap();
+        assert!(alias_registry().lock().contains(&replacement));
+        assert!(
+            replay_mappings()
+                .lock()
+                .contains(&replay_mapping_key(replacement))
+        );
+
+        receipt.retire_exact();
+        assert!(alias_registry().lock().contains(&preimage));
+        assert!(!alias_registry().lock().contains(&replacement));
+        assert!(
+            replay_mappings()
+                .lock()
+                .contains(&replay_mapping_key(preimage))
+        );
+        assert!(
+            !replay_mappings()
+                .lock()
+                .contains(&replay_mapping_key(replacement))
+        );
+
+        alias_registry().lock().retain(|entry| {
+            !(entry.ipa == preimage.ipa && entry.ownership_scope == preimage.ownership_scope)
+        });
+        replay_mappings()
+            .lock()
+            .retain(|(ipa, _, _, _)| *ipa != preimage.physical_ipa);
+    }
+
+    #[test]
+    fn alias_retirement_never_restores_over_a_later_writer() {
+        let preimage = alias(0x5555_0000, 1);
+        let owned = alias(0x6666_0000, 3);
+        let later = alias(0x7777_0000, 5);
+        register_shared_alias(preimage);
+        let directory = HvpatchCarrierTaskStateDirectory::default();
+        let receipt =
+            AliasPublicationReceipt::commit(owner_key(&directory, 2, 1), &[owned]).unwrap();
+        register_shared_alias(later);
+        receipt.retire_exact();
+        assert!(alias_registry().lock().contains(&later));
+        assert!(!alias_registry().lock().contains(&preimage));
+        alias_registry().lock().retain(|entry| {
+            !(entry.ipa == later.ipa && entry.ownership_scope == later.ownership_scope)
+        });
+        replay_mappings()
+            .lock()
+            .retain(|(ipa, _, _, _)| *ipa != later.physical_ipa);
+    }
+
+    #[test]
+    fn buried_alias_owner_retires_without_clobbering_successor() {
+        let preimage = alias(0x8888_0000, 1);
+        let first_value = alias(0x9999_0000, 3);
+        let second_value = alias(0xaaaa_0000, 5);
+        register_shared_alias(preimage);
+        let directory = HvpatchCarrierTaskStateDirectory::default();
+        let first =
+            AliasPublicationReceipt::commit(owner_key(&directory, 3, 1), &[first_value]).unwrap();
+        let second =
+            AliasPublicationReceipt::commit(owner_key(&directory, 4, 2), &[second_value]).unwrap();
+        first.retire_exact();
+        assert!(alias_registry().lock().contains(&second_value));
+        second.retire_exact();
+        assert!(alias_registry().lock().contains(&preimage));
+        assert!(!alias_registry().lock().contains(&first_value));
+        alias_registry().lock().retain(|entry| {
+            !(entry.ipa == preimage.ipa && entry.ownership_scope == preimage.ownership_scope)
+        });
+        replay_mappings()
+            .lock()
+            .retain(|(ipa, _, _, _)| *ipa != preimage.physical_ipa);
+    }
+
+    #[test]
+    fn external_writer_between_owned_versions_becomes_effective_base() {
+        let preimage = alias(0xbbbb_0000, 1);
+        let first_value = alias(0xcccc_0000, 3);
+        let external = alias(0xdddd_0000, 5);
+        let second_value = alias(0xeeee_0000, 7);
+        register_shared_alias(preimage);
+        let directory = HvpatchCarrierTaskStateDirectory::default();
+        let first =
+            AliasPublicationReceipt::commit(owner_key(&directory, 5, 1), &[first_value]).unwrap();
+        register_shared_alias(external);
+        let second =
+            AliasPublicationReceipt::commit(owner_key(&directory, 6, 2), &[second_value]).unwrap();
+        first.retire_exact();
+        assert!(alias_registry().lock().contains(&second_value));
+        second.retire_exact();
+        assert!(alias_registry().lock().contains(&external));
+        alias_registry().lock().retain(|entry| {
+            !(entry.ipa == external.ipa && entry.ownership_scope == external.ownership_scope)
+        });
+        replay_mappings()
+            .lock()
+            .retain(|(ipa, _, _, _)| *ipa != external.physical_ipa);
+    }
+
+    #[test]
+    fn repeated_alias_key_exhaustion_is_preflighted_without_partial_publication() {
+        let preimage = alias(0xf111_0000, 1);
+        let first_value = alias(0xf222_0000, 3);
+        let second_value = alias(0xf333_0000, 5);
+        register_shared_alias(preimage);
+        {
+            let mut versions = alias_version_registry().lock();
+            let key = (preimage.ipa, preimage.ownership_scope);
+            versions
+                .alias_epochs
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == key)
+                .unwrap()
+                .1 = u64::MAX - 1;
+        }
+        let directory = HvpatchCarrierTaskStateDirectory::default();
+        assert!(
+            AliasPublicationReceipt::commit(
+                owner_key(&directory, 7, 1),
+                &[first_value, second_value]
+            )
+            .is_err()
+        );
+        assert!(alias_registry().lock().contains(&preimage));
+        assert!(!alias_registry().lock().contains(&first_value));
+        {
+            let mut versions = alias_version_registry().lock();
+            let key = (preimage.ipa, preimage.ownership_scope);
+            versions
+                .alias_epochs
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == key)
+                .unwrap()
+                .1 = 1;
+        }
+        alias_registry().lock().retain(|entry| {
+            !(entry.ipa == preimage.ipa && entry.ownership_scope == preimage.ownership_scope)
+        });
+        replay_mappings()
+            .lock()
+            .retain(|(ipa, _, _, _)| *ipa != preimage.physical_ipa);
+    }
+
+    #[test]
+    fn external_unregister_and_clear_invalidate_owned_versions() {
+        let preimage = alias(0xf666_0000, 1);
+        let owned = alias(0xf777_0000, 3);
+        register_shared_alias(preimage);
+        let directory = HvpatchCarrierTaskStateDirectory::default();
+        let receipt =
+            AliasPublicationReceipt::commit(owner_key(&directory, 8, 1), &[owned]).unwrap();
+        let scope = match owned.ownership_scope {
+            AliasOwnershipScope::MmRootSlot { base, size } => Some((base, size)),
+            _ => None,
+        };
+        unregister_alias(owned.start, owned.size, scope);
+        receipt.retire_exact();
+        assert!(!alias_registry().lock().contains(&preimage));
+        assert!(!alias_registry().lock().contains(&owned));
+
+        register_shared_alias(preimage);
+        let receipt =
+            AliasPublicationReceipt::commit(owner_key(&directory, 9, 2), &[owned]).unwrap();
+        clear_alias_registry();
+        clear_replay_mappings();
+        receipt.retire_exact();
+        assert!(alias_registry().lock().is_empty());
+        assert!(
+            replay_mappings()
+                .lock()
+                .iter()
+                .all(|(ipa, _, _, _)| *ipa != owned.physical_ipa)
+        );
+    }
+
+    fn empty_inventory_commit(raw: u64) -> carrick_hal::FrameInventoryCommit<()> {
+        let id = std::num::NonZeroU64::new(raw).unwrap();
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(1).unwrap();
+        carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+            carrick_hal::FrameInventoryProvenance::from_kernel_entropy([raw as u8; 32]),
+            carrick_hal::FrameInventoryBatch::prepare(
+                carrick_hal::KernelTransactionId::from_kernel_allocation(id),
+                capacity,
+            )
+            .unwrap(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .commit(())
+    }
+
+    fn retirement_inventory_commit(
+        raw: u64,
+        mappings: &[carrick_hal::MappingId],
+    ) -> carrick_hal::FrameInventoryCommit<()> {
+        let transaction = carrick_hal::KernelTransactionId::from_kernel_allocation(
+            std::num::NonZeroU64::new(raw).unwrap(),
+        );
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(mappings.len()).unwrap();
+        let mut reservation = carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+            carrick_hal::FrameInventoryProvenance::from_kernel_entropy([raw as u8; 32]),
+            carrick_hal::FrameInventoryBatch::prepare(transaction, capacity).unwrap(),
+            Vec::new(),
+            Vec::new(),
+        );
+        for &mapping in mappings {
+            reservation
+                .push(carrick_hal::FrameInventoryEvent::UnmapMapping {
+                    transaction,
+                    mapping,
+                    generation: carrick_hal::MappingGeneration::from_backend_counter(
+                        std::num::NonZeroU64::new(2).unwrap(),
+                    ),
+                })
+                .unwrap();
+        }
+        reservation.commit(())
+    }
+
+    fn test_kernel_apply(
+        commit: carrick_hal::FrameInventoryCommit<()>,
+        raw: u64,
+        mm: std::num::NonZeroU64,
+        revision: u64,
+        mappings: Vec<(carrick_hal::MappingId, carrick_hal::FrameId)>,
+    ) -> carrick_hal::FrameInventoryApplyReceipt {
+        carrick_hal::FrameInventoryApplyReceipt::from_kernel_authority(
+            carrick_hal::FrameInventoryProvenance::from_kernel_entropy([raw as u8; 32]),
+            commit.batch().transaction(),
+            mm,
+            revision,
+            mappings,
+        )
+    }
+
+    #[test]
+    fn inventory_phase_is_process_owned_and_exactly_ordered() {
+        let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+        let mut sibling = HvpatchTaskInventoryAuthority::SiblingShared {
+            ledger: Arc::clone(&ledger),
+        };
+        let mm = std::num::NonZeroU64::new(501).unwrap();
+        assert!(
+            sibling
+                .apply_process_inventory(|_| unreachable!(), mm)
+                .is_err()
+        );
+        assert_eq!(sibling.phase_name(), "sibling_shared");
+
+        let commit = empty_inventory_commit(91);
+        let challenge = commit.receipt_challenge();
+        let mut process = HvpatchTaskInventoryAuthority::ProcessPrepared {
+            ledger: Arc::clone(&ledger),
+            staged: Vec::new(),
+            commit: Some(commit),
+            challenge: Some(challenge),
+        };
+        let id = |raw| {
+            std::num::NonZeroU64::new(raw)
+                .map(carrick_hal::MappingId::from_kernel_allocation)
+                .unwrap()
+        };
+        let frame =
+            carrick_hal::FrameId::from_kernel_allocation(std::num::NonZeroU64::new(3).unwrap());
+        process
+            .apply_process_inventory(
+                |commit| Ok(test_kernel_apply(commit, 91, mm, 10, vec![(id(2), frame)])),
+                mm,
+            )
+            .unwrap();
+        assert_eq!(process.phase_name(), "inventory_published");
+        let expected_transaction = carrick_hal::KernelTransactionId::from_kernel_allocation(
+            std::num::NonZeroU64::new(91).unwrap(),
+        );
+        let mut pending = PendingForkFrameReceipt {
+            transaction: carrick_hal::KernelTransactionId::from_kernel_allocation(
+                std::num::NonZeroU64::new(92).unwrap(),
+            ),
+            kind: carrick_observability::probes::HvpatchForkFrameKind::PrivateCow,
+            parent_mapping: id(1),
+            child_mapping: id(2),
+            frame,
+            ipa: 0x4000,
+            length: 0x4000,
+        };
+        assert!(process.activate(&[pending]).is_err());
+        assert_eq!(process.phase_name(), "inventory_published");
+        pending.transaction = expected_transaction;
+        process.activate(&[pending]).unwrap();
+        assert_eq!(process.phase_name(), "active");
+        let frame5 =
+            carrick_hal::FrameId::from_kernel_allocation(std::num::NonZeroU64::new(5).unwrap());
+        let frame7 =
+            carrick_hal::FrameId::from_kernel_allocation(std::num::NonZeroU64::new(7).unwrap());
+        let mapping_pairs = [(id(2), frame), (id(4), frame5), (id(6), frame7)];
+        {
+            let mut current = ledger.lock();
+            for (index, &(mapping, frame)) in mapping_pairs.iter().enumerate() {
+                current.extents.insert(
+                    (0x4000 + index as u64 * 0x4000, 0x4000),
+                    InventoryExtent {
+                        frame,
+                        mapping,
+                        backing: InventoryBackingIdentity::Private(index as u64 + 1),
+                        stage2_base: 0x1000_0000 + index as u64 * 0x4000,
+                        stage2_length: 0x4000,
+                    },
+                );
+            }
+        }
+        assert!(
+            process
+                .prepare_retirement(retirement_inventory_commit(95, &[id(2)]))
+                .is_err()
+        );
+        // A post-activation munmap/COW retirement changed the exact live set.
+        ledger.lock().extents.remove(&(0x8000, 0x4000));
+        let expected_after_unmap = vec![mapping_pairs[0], mapping_pairs[2]];
+        let unrelated_commit = empty_inventory_commit(92);
+        let unrelated = carrick_hal::FrameInventoryRetirementReceipt::from_kernel_authority(
+            test_kernel_apply(unrelated_commit, 92, mm, 11, Vec::new()),
+            false,
+        );
+        assert!(!authenticate_pending_retirement(
+            &expected_after_unmap,
+            &[pending],
+            &unrelated
+        ));
+        let retirement_commit = retirement_inventory_commit(93, &[id(2), id(6)]);
+        process.prepare_retirement(retirement_commit).unwrap();
+        process
+            .apply_retirement(mm, &[pending], |retirement_commit| {
+                Ok(
+                    carrick_hal::FrameInventoryRetirementReceipt::from_kernel_authority(
+                        test_kernel_apply(
+                            retirement_commit,
+                            93,
+                            mm,
+                            11,
+                            expected_after_unmap.clone(),
+                        ),
+                        true,
+                    ),
+                )
+            })
+            .unwrap();
+        assert_eq!(process.phase_name(), "retired");
+
+        let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+        let rejected_commit = empty_inventory_commit(94);
+        let rejected_challenge = rejected_commit.receipt_challenge();
+        let mut rejected = HvpatchTaskInventoryAuthority::ProcessPrepared {
+            ledger,
+            staged: Vec::new(),
+            commit: Some(rejected_commit),
+            challenge: Some(rejected_challenge),
+        };
+        assert!(
+            rejected
+                .apply_process_inventory(
+                    |_| {
+                        Err(TrapError::Hypervisor(
+                            "injected kernel apply reject".to_owned(),
+                        ))
+                    },
+                    mm
+                )
+                .is_err()
+        );
+        assert_eq!(rejected.phase_name(), "retired");
+        assert!(rejected.activate(&[]).is_err());
+    }
+
+    #[test]
+    fn shared_mm_retires_carrier_before_final_task_authority() {
+        let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let alias_preimage = alias(0xf444_0000, 1);
+        let alias_owned = alias(0xf555_0000, 3);
+        register_shared_alias(alias_preimage);
+        let publish = |generation| {
+            directory
+                .publish(
+                    identity(generation),
+                    HvpatchCarrierTaskState::Test {
+                        rollbacks: Arc::clone(&rollbacks),
+                        order: Some(Arc::clone(&order)),
+                    },
+                    HvpatchPreparedTaskAuthority {
+                        pending_aliases: (generation == 21)
+                            .then_some(alias_owned)
+                            .into_iter()
+                            .collect(),
+                        drop_order: Some(Arc::clone(&order)),
+                        ..HvpatchPreparedTaskAuthority::default()
+                    },
+                )
+                .unwrap()
+        };
+        let first = publish(21);
+        let second = publish(22);
+        let first_mm = first
+            .registration
+            .as_ref()
+            .unwrap()
+            .task_mm
+            .as_ref()
+            .unwrap();
+        let second_mm = second
+            .registration
+            .as_ref()
+            .unwrap()
+            .task_mm
+            .as_ref()
+            .unwrap();
+        assert!(Arc::ptr_eq(first_mm, second_mm));
+        drop(first);
+        assert!(order.lock().is_empty());
+        assert!(alias_registry().lock().contains(&alias_owned));
+        drop(second);
+        assert_eq!(&*order.lock(), &["carrier", "task"]);
+        assert!(alias_registry().lock().contains(&alias_preimage));
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 2);
+        alias_registry().lock().retain(|entry| {
+            !(entry.ipa == alias_preimage.ipa
+                && entry.ownership_scope == alias_preimage.ownership_scope)
+        });
+        replay_mappings()
+            .lock()
+            .retain(|(ipa, _, _, _)| *ipa != alias_preimage.physical_ipa);
+    }
+
+    #[test]
+    fn process_descriptor_drops_real_lease_while_host_backing_is_live() {
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            0x4000,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .unwrap();
+        let host_addr = host.as_ptr();
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut lease = GlobalFrameStage2Lease::fixed(0x1234_0000, 0x4000);
+        lease.drop_backing_audit = Some((host_addr as usize, Arc::clone(&observed)));
+        let descriptor = ProcessMappingDesc {
+            start: 0x1000,
+            ipa: 0x1234_0000,
+            end: 0x5000,
+            stage2_lease: Some(lease),
+            host: ForkMappingHost::Owned(host),
+            size: 0x4000,
+            physical_ipa: 0x1234_0000,
+            physical_host_addr: host_addr,
+            physical_size: 0x4000,
+            inventory_backing: InventoryBackingIdentity::Private(1),
+            perms: applevisor::memory::MemPerms::ReadWrite,
+            is_dynamic_alias: false,
+            sharing: GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            inherited_frame: None,
+        };
+        drop(descriptor);
+        assert!(observed.load(Ordering::SeqCst));
+        assert!(!alias_backing_is_live(host_addr as usize));
+    }
+
+    #[test]
+    fn exhausted_nonce_aborts_prepared_authority_before_visibility() {
+        let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
+        directory.next.store(u64::MAX, Ordering::SeqCst);
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        assert!(
+            directory
+                .publish(
+                    identity(9),
+                    test_state(&rollbacks),
+                    HvpatchPreparedTaskAuthority::default(),
+                )
+                .is_err()
+        );
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+        assert!(directory.inner.lock().states.is_empty());
+    }
+
+    #[test]
+    fn carrier_token_is_rejected_by_a_different_directory_instance() {
+        let first = Arc::new(HvpatchCarrierTaskStateDirectory::default());
+        let second = Arc::new(HvpatchCarrierTaskStateDirectory::default());
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let binding = first
+            .publish(
+                identity(11),
+                test_state(&rollbacks),
+                HvpatchPreparedTaskAuthority::default(),
+            )
+            .unwrap();
+        let key = binding.registration.as_ref().unwrap().key;
+        assert!(second.retire(key).is_err());
+        assert!(first.inner.lock().states.contains_key(&key));
+        drop(binding);
+        assert!(first.inner.lock().states.is_empty());
+    }
+
+    #[test]
+    fn duplicate_core_key_rejects_different_linux_metadata() {
+        let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let binding = directory
+            .publish(
+                identity(12),
+                test_state(&rollbacks),
+                HvpatchPreparedTaskAuthority::default(),
+            )
+            .unwrap();
+        let mut mismatched = identity(12);
+        mismatched.linux_tid += 1;
+        mismatched.asid += 1;
+        assert!(
+            directory
+                .publish(
+                    mismatched,
+                    test_state(&rollbacks),
+                    HvpatchPreparedTaskAuthority::default(),
+                )
+                .is_err()
+        );
+        assert_eq!(directory.inner.lock().states.len(), 1);
+        drop(binding);
+    }
+
+    #[test]
+    fn committed_child_requires_fresh_exact_kernel_cow_binding() {
+        let (issuer, verifier) = carrick_hal::HvpatchChildTokenIssuer::new_pair();
+        let directory = Arc::new(HvpatchCarrierTaskStateDirectory::new(
+            std::num::NonZeroU64::new(0x881).unwrap(),
+            verifier,
+        ));
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let mut binding = directory
+            .publish(
+                identity(31),
+                test_state(&rollbacks),
+                HvpatchPreparedTaskAuthority {
+                    inventory: HvpatchTaskInventoryAuthority::SiblingShared {
+                        ledger: Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+                    },
+                    ..HvpatchPreparedTaskAuthority::default()
+                },
+            )
+            .unwrap();
+        assert!(binding.activate().is_err());
+        let mm = std::num::NonZeroU64::new(0x1234).unwrap();
+        let authority: Arc<dyn carrick_hal::FrameCowAuthority> = Arc::new(TestCowAuthority);
+        let cow_identity = carrick_hal::FrameCowIdentity {
+            linux_pid: 41,
+            linux_tid: 73,
+            mm: mm.get(),
+            asid: 9,
+        };
+        let token = |generation, cow_identity, authority_identity| {
+            issuer.issue(
+                41,
+                73,
+                generation,
+                cow_identity,
+                std::num::NonZeroU64::new(authority_identity).unwrap(),
+                Arc::clone(&authority),
+            )
+        };
+        let (foreign_issuer, _) = carrick_hal::HvpatchChildTokenIssuer::new_pair();
+        let foreign = foreign_issuer.issue(
+            41,
+            73,
+            31,
+            cow_identity,
+            std::num::NonZeroU64::new(9).unwrap(),
+            Arc::clone(&authority),
+        );
+        assert!(binding.bind_child_kernel(foreign).is_err());
+        let wrong = token(32, cow_identity, 1);
+        assert!(binding.bind_child_kernel(wrong).is_err());
+        let parent_tid = token(
+            31,
+            carrick_hal::FrameCowIdentity {
+                linux_tid: 72,
+                ..cow_identity
+            },
+            2,
+        );
+        assert!(binding.bind_child_kernel(parent_tid).is_err());
+        let stale_asid = token(
+            31,
+            carrick_hal::FrameCowIdentity {
+                asid: 8,
+                ..cow_identity
+            },
+            3,
+        );
+        assert!(binding.bind_child_kernel(stale_asid).is_err());
+        let exact = token(31, cow_identity, 4);
+        binding.bind_child_kernel(exact).unwrap();
+        binding.activate().unwrap();
+        assert_eq!(
+            *binding
+                .registration
+                .as_ref()
+                .unwrap()
+                .task_mm
+                .as_ref()
+                .unwrap()
+                .kernel_mm
+                .lock(),
+            Some(mm)
+        );
+        let duplicate = token(31, cow_identity, 5);
+        assert!(binding.bind_child_kernel(duplicate).is_err());
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct TrapCapabilities {
     pub backend: TrapBackend,
@@ -1073,14 +1884,14 @@ fn replay_mapping_key(backing: AliasBacking) -> ReplayMappingKey {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn forget_replay_extent(ipa: u64, size: usize) {
-    replay_mappings()
-        .lock()
-        .retain(|(mapped_ipa, mapped_size, _, _)| *mapped_ipa != ipa || *mapped_size != size);
+    mutate_external_alias_state(|replay, _| {
+        replay.retain(|(mapped_ipa, mapped_size, _, _)| *mapped_ipa != ipa || *mapped_size != size);
+    });
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn clear_replay_mappings() {
-    replay_mappings().lock().clear();
+    mutate_external_alias_state(|replay, _| replay.clear());
 }
 
 /// Diagnostic: lazy-alias re-map count (the `debug-stats` feature logs every 256th).
@@ -1094,19 +1905,18 @@ pub static ALIAS_REMAP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// replaces the entry.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn register_shared_alias(b: AliasBacking) {
-    let mut replay = replay_mappings().lock();
-    replay.retain(|(ipa, _, _, _)| *ipa != b.physical_ipa);
-    replay.insert(replay_mapping_key(b));
-    drop(replay);
-    let mut reg = alias_registry().lock();
-    if let Some(e) = reg
-        .iter_mut()
-        .find(|e| e.ipa == b.ipa && e.ownership_scope == b.ownership_scope)
-    {
-        *e = b;
-    } else {
-        reg.push(b);
-    }
+    mutate_external_alias_state(|replay, registry| {
+        replay.retain(|(ipa, _, _, _)| *ipa != b.physical_ipa);
+        replay.insert(replay_mapping_key(b));
+        if let Some(entry) = registry
+            .iter_mut()
+            .find(|entry| entry.ipa == b.ipa && entry.ownership_scope == b.ownership_scope)
+        {
+            *entry = b;
+        } else {
+            registry.push(b);
+        }
+    });
 }
 
 /// Is the host backing of an alias entry actually mapped in THIS process? The
@@ -1503,7 +2313,14 @@ fn unregister_alias(
     len: usize,
     mm_root_slot: Option<(u64, u64)>,
 ) -> std::collections::BTreeSet<(u64, u64)> {
-    unregister_alias_entries(&mut alias_registry().lock(), va, len, mm_root_slot)
+    mutate_external_alias_state(|_, registry| {
+        unregister_alias_entries(registry, va, len, mm_root_slot)
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn clear_alias_registry() {
+    mutate_external_alias_state(|_, registry| registry.clear());
 }
 
 /// Bounds lazy alias remaps per backing IPA, not per guest-run interval.
@@ -1609,10 +2426,24 @@ fn publish_sibling_fork_mappings(regions: &[HvfMappedRegion]) {
 /// shows exactly how many vCPUs are alive when the forker calls hv_vm_destroy.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub static VCPU_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) static VCPU_CREATED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+thread_local! {
+    static THREAD_VCPU_CREATED_TOTAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn current_thread_vcpu_created_total() -> u64 {
+    THREAD_VCPU_CREATED_TOTAL.get()
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn vcpu_created() {
     VCPU_LIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    VCPU_CREATED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    THREAD_VCPU_CREATED_TOTAL.set(THREAD_VCPU_CREATED_TOTAL.get().saturating_add(1));
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3685,14 +4516,36 @@ impl ReclaimParkAuthority {
 pub(crate) struct HvfVmState {
     _vm:
         std::mem::ManuallyDrop<applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>>,
+    pub(crate) task: HvfTaskState,
+    /// Executor-local lifecycle only. Task registers are owned exclusively by
+    /// the Kernel's typed execution lease and never stashed in this backend.
+    reclaim_authority: ReclaimParkAuthority,
+    /// Carrick-owned logical mailbox slots shared by every vCPU in this VM.
+    /// Slot identity is deliberately independent of opaque/recycled HVF ids.
+    mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
+    /// Internal diagnostic transport selection, parsed once before first entry
+    /// and inherited by every sibling/rebuild. This is not public CLI policy.
+    syscall_transport: HvfSyscallTransport,
+    /// Raw worker-local vCPU identity used by teardown and exact kick audit.
+    vcpu_id: applevisor_sys::hv_vcpu_t,
+    /// Cloneable worker-local handle for `hv_vcpus_exit`.
+    vcpu_handle: applevisor::vcpu::VcpuHandle,
+}
+
+/// Every backend field whose authority follows a logical HVPatch task rather
+/// than a Task4 worker. Keeping this as one value makes load/save a literal
+/// swap: the carrier VM, reclaim/mailbox transport, and live vCPU identity stay
+/// on the worker while MM mappings, stage-1, inventory, and per-thread COW
+/// authority move with the binding.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct HvfTaskState {
     mappings: Vec<HvfMappedRegion>,
     /// Per-mm stage-1 root-table slot. It contains page-table/control backing
     /// only; guest data frames live at stable global IPAs outside the slot.
     /// Ordinary VMM engines leave this unset.
     mm_root_slot: Option<(u64, u64)>,
-    /// Executor-local lifecycle only. Task registers are owned exclusively by
-    /// the Kernel's typed execution lease and never stashed in this backend.
-    reclaim_authority: ReclaimParkAuthority,
+    pending_exec_mm_root_slot: Option<(u64, u64)>,
+    pending_exec_asid: Option<u16>,
     /// The exception class of the most recent vCPU exit. We need to remember
     /// whether the trap came in via EL0 `svc` (`EC = 0x15`) or the EL1 vector
     /// stub's `hvc` (`EC = 0x16`) so `complete_syscall` knows whether to
@@ -3732,32 +4585,12 @@ pub(crate) struct HvfVmState {
     /// descriptor stores so a concurrent sibling hardware walk stays safe
     /// without quiescing.
     page_tables: std::sync::Arc<parking_lot::Mutex<Option<crate::page_table::PageTableManager>>>,
-    /// Carrick-owned logical mailbox slots shared by every vCPU in this VM.
-    /// Slot identity is deliberately independent of opaque/recycled HVF ids.
-    mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
-    /// Internal diagnostic transport selection, parsed once before first entry
-    /// and inherited by every sibling/rebuild. This is not public CLI policy.
-    syscall_transport: HvfSyscallTransport,
     /// The Linux syscall number (x8) and original arg0 (x0) of the most recent
     /// `svc` trap, captured before the dispatcher overwrites x0 with the retval.
     /// Used to restart an `EINTR`'d restartable syscall under SA_RESTART: the
     /// handler-injection path rewinds PC to the `svc` and restores this x0.
     last_syscall_nr: Option<u64>,
     last_syscall_orig_x0: u64,
-    /// The id of THIS thread's live vCPU, tracked because the shared engine's
-    /// `freeze_ram_for_fork` hook (`fork_prepare_and_teardown`) does NOT receive
-    /// the vCPU — yet the parent must `hv_vcpu_destroy` its vCPU BEFORE
-    /// `hv_vm_destroy` (and before `libc::fork`, or the child can't
-    /// `hv_vm_create`). Updated on every vCPU (re)create (boot/clone/fork/exec/
-    /// reclaim). NOT the applevisor wrapper — that lives in `HvfAarch64Vcpu`; this
-    /// is only the raw id for the pre-fork teardown.
-    vcpu_id: applevisor_sys::hv_vcpu_t,
-    /// A `Send`/`Sync`-able kick handle for THIS thread's live vCPU (a `Weak` to
-    /// the vCPU's liveness guard, so a kick after destroy is a safe no-op). The
-    /// engine's `ThreadedEngine::kick_handle` routes through `self.vm` (NOT the
-    /// vCPU), so HVF — whose kick mechanism is the vCPU's `hv_vcpus_exit` handle —
-    /// stashes the handle here, refreshed on every vCPU (re)create.
-    vcpu_handle: applevisor::vcpu::VcpuHandle,
     /// The vfork (`CLONE_VM`) flag for the NEXT fork: the child SHARES the
     /// parent's guest RAM instead of snapshotting private regions. Set by the
     /// engine's `set_vfork_share`, read by `fork_prepare_and_teardown`.
@@ -3797,6 +4630,239 @@ pub(crate) struct HvfVmState {
     /// COW and returned on success; a rollback consumes it (it becomes the live
     /// manager) and the next COW allocates one again.
     cow_rollback_scratch: Option<crate::page_table::PageTableManager>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::Deref for HvfVmState {
+    type Target = HvfTaskState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.task
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::ops::DerefMut for HvfVmState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.task
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn swap_hvpatch_task_state(live: &mut HvfTaskState, parked: &mut HvfTaskState) {
+    std::mem::swap(live, parked);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvfTaskState {
+    fn neutral() -> Self {
+        Self {
+            mappings: Vec::new(),
+            mm_root_slot: None,
+            pending_exec_mm_root_slot: None,
+            pending_exec_asid: None,
+            last_exit_class: 0,
+            last_fault_esr: 0,
+            is_forked_child: false,
+            forked_no_exec: false,
+            protections: std::sync::Arc::new(MemoryProtections::default()),
+            page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            last_syscall_nr: None,
+            last_syscall_orig_x0: 0,
+            vfork_share: false,
+            fork_mapping_descs: Vec::new(),
+            fork_child_descs: Vec::new(),
+            persistent_vm_lifecycle: false,
+            frame_inventory: HvpatchFrameInventoryState::new(std::sync::Arc::new(
+                parking_lot::Mutex::new(HvpatchFrameInventory::default()),
+            )),
+            cow_authority: None,
+            cow_identity: None,
+            cow_armed: std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            cow_deferred_publications: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+            pending_fork_frame_receipts: Vec::new(),
+            pending_process_aliases: Vec::new(),
+            cow_rollback_scratch: None,
+        }
+    }
+
+    fn audit_neutral(&self) -> Result<(), TrapError> {
+        let protections = self.protections.snapshot_all();
+        let inventory = self.frame_inventory.ledger.lock();
+        let frames = inventory.frames.lock();
+        let neutral = self.mappings.is_empty()
+            && self.mm_root_slot.is_none()
+            && self.last_exit_class == 0
+            && self.last_fault_esr == 0
+            && !self.is_forked_child
+            && !self.forked_no_exec
+            && protections.no_access.is_empty()
+            && protections.unmapped.is_empty()
+            && protections.no_write.is_empty()
+            && protections.executable.is_empty()
+            && protections.bus_fault.is_empty()
+            && protections.mutable_shared_backing.is_empty()
+            && self.page_tables.lock().is_none()
+            && self.last_syscall_nr.is_none()
+            && self.last_syscall_orig_x0 == 0
+            && !self.vfork_share
+            && self.fork_mapping_descs.is_empty()
+            && self.fork_child_descs.is_empty()
+            && !self.persistent_vm_lifecycle
+            && !inventory.initialized
+            && inventory.extents.is_empty()
+            && frames.shared.is_empty()
+            && frames.references.is_empty()
+            && frames.extent_references.is_empty()
+            && frames.stage2_references.is_empty()
+            && inventory.alias_reservation.is_none()
+            && inventory.alias_commit.is_none()
+            && inventory.alias_staged.is_empty()
+            && inventory.process_reservation.is_none()
+            && inventory.process_commit.is_none()
+            && inventory.retired_reservation.is_none()
+            && inventory.replacement_reservation.is_none()
+            && inventory.exec_commits.is_none()
+            && inventory.retirement_reservation.is_none()
+            && inventory.retirement_commit.is_none()
+            && self.cow_authority.is_none()
+            && self.cow_identity.is_none()
+            && self.cow_armed.lock().ranges.is_empty()
+            && self.cow_deferred_publications.lock().is_empty()
+            && self.pending_fork_frame_receipts.is_empty()
+            && self.pending_process_aliases.is_empty()
+            && self.cow_rollback_scratch.is_none();
+        drop(frames);
+        drop(inventory);
+        neutral.then_some(()).ok_or_else(|| {
+            TrapError::Hypervisor("idle HVPatch worker retained task authority".to_owned())
+        })
+    }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn hvpatch_task_state_test_fixture(
+    mm_slot: u64,
+    mapping_start: u64,
+    linux_tid: i32,
+) -> HvfTaskState {
+    let cow_authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority> =
+        std::sync::Arc::new(task_only_carrier_directory_tests::TestCowAuthority);
+    HvfTaskState {
+        mappings: vec![HvfMappedRegion {
+            start: mapping_start,
+            end: mapping_start + 0x1000,
+            ipa: mapping_start + 0x10_0000,
+            physical_ipa: mapping_start + 0x10_0000,
+            host_addr: std::ptr::null_mut(),
+            size: 0x1000,
+            physical_size: 0x1000,
+            perms: applevisor::memory::MemPerms::ReadWrite,
+            memory: None,
+            host_mapping: None,
+            stage2_lease: None,
+            is_dynamic_alias: false,
+            sharing: GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: mm_slot,
+        }],
+        mm_root_slot: Some((mm_slot << 20, 0x20_0000)),
+        pending_exec_mm_root_slot: None,
+        pending_exec_asid: None,
+        last_exit_class: 0,
+        last_fault_esr: 0,
+        is_forked_child: false,
+        forked_no_exec: false,
+        protections: std::sync::Arc::new(MemoryProtections::default()),
+        page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        last_syscall_nr: None,
+        last_syscall_orig_x0: 0,
+        vfork_share: false,
+        fork_mapping_descs: Vec::new(),
+        fork_child_descs: Vec::new(),
+        persistent_vm_lifecycle: true,
+        frame_inventory: HvpatchFrameInventoryState::new(std::sync::Arc::new(
+            parking_lot::Mutex::new(HvpatchFrameInventory::default()),
+        )),
+        cow_authority: Some(cow_authority),
+        cow_identity: Some(carrick_hal::FrameCowIdentity {
+            linux_pid: 7,
+            linux_tid,
+            mm: mm_slot,
+            asid: u16::try_from(mm_slot).unwrap(),
+        }),
+        cow_armed: std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+        cow_deferred_publications: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+        pending_fork_frame_receipts: Vec::new(),
+        pending_process_aliases: Vec::new(),
+        cow_rollback_scratch: None,
+    }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn hvpatch_task_state_test_identity(
+    state: &HvfTaskState,
+) -> (Option<(u64, u64)>, u64, i32, usize, usize, usize) {
+    let authority = state
+        .cow_authority
+        .as_ref()
+        .map(|authority| std::sync::Arc::as_ptr(authority) as *const () as usize)
+        .unwrap_or_default();
+    (
+        state.mm_root_slot,
+        state.mappings.first().map_or(0, |mapping| mapping.start),
+        state.cow_identity.map_or(0, |identity| identity.linux_tid),
+        std::sync::Arc::as_ptr(&state.page_tables) as usize,
+        std::sync::Arc::as_ptr(&state.frame_inventory.ledger) as usize,
+        authority,
+    )
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn hvpatch_neutral_task_state_for_test() -> HvfTaskState {
+    HvfTaskState::neutral()
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn audit_hvpatch_neutral_task_state_for_test(
+    state: &HvfTaskState,
+) -> Result<(), TrapError> {
+    state.audit_neutral()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvfVmState {
+    pub(crate) fn prepare_exec_address_space(
+        &mut self,
+        root_slot_base: u64,
+        root_slot_size: u64,
+        asid: u16,
+    ) -> Result<(), TrapError> {
+        if !root_slot_base.is_multiple_of(HVF_PAGE_SIZE) || root_slot_size == 0 || asid == 0 {
+            return Err(TrapError::Hypervisor(
+                "invalid exact HVPatch exec MM lease".to_owned(),
+            ));
+        }
+        if self.pending_exec_mm_root_slot.is_some() || self.pending_exec_asid.is_some() {
+            return Err(TrapError::Hypervisor(
+                "duplicate exact HVPatch exec MM lease".to_owned(),
+            ));
+        }
+        self.pending_exec_mm_root_slot = Some((root_slot_base, root_slot_size));
+        self.pending_exec_asid = Some(asid);
+        Ok(())
+    }
+
+    pub(crate) fn swap_persistent_executor_local(&mut self, other: &mut Self) {
+        std::mem::swap(&mut self._vm, &mut other._vm);
+        std::mem::swap(&mut self.reclaim_authority, &mut other.reclaim_authority);
+        std::mem::swap(&mut self.mailbox_slots, &mut other.mailbox_slots);
+        std::mem::swap(&mut self.syscall_transport, &mut other.syscall_transport);
+        std::mem::swap(&mut self.vcpu_id, &mut other.vcpu_id);
+        std::mem::swap(&mut self.vcpu_handle, &mut other.vcpu_handle);
+    }
 }
 
 /// Thread/process exit must LEAK the per-thread host backings, never `munmap`
@@ -4273,6 +5339,8 @@ struct GlobalFrameStage2Lease {
     mapped: bool,
     active: bool,
     release_ipa: bool,
+    #[cfg(test)]
+    drop_backing_audit: Option<(usize, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4285,6 +5353,8 @@ impl GlobalFrameStage2Lease {
             mapped: false,
             active: true,
             release_ipa: true,
+            #[cfg(test)]
+            drop_backing_audit: None,
         })
     }
 
@@ -4295,6 +5365,8 @@ impl GlobalFrameStage2Lease {
             mapped: false,
             active: true,
             release_ipa: false,
+            #[cfg(test)]
+            drop_backing_audit: None,
         }
     }
 
@@ -4314,6 +5386,13 @@ impl GlobalFrameStage2Lease {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for GlobalFrameStage2Lease {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some((host_addr, observed)) = &self.drop_backing_audit {
+            observed.store(
+                alias_backing_is_live(*host_addr),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
         if !self.active {
             return;
         }
@@ -4470,6 +5549,7 @@ impl ForkMappingHost {
 /// engine mapped; they are local syscall-path metadata only, because the
 /// stage-2 entries live on the shared HVF VM, not on each vCPU.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone)]
 pub struct ThreadSpec {
     vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     mappings: Vec<ThreadMappingDesc>,
@@ -4488,11 +5568,27 @@ pub struct ThreadSpec {
     cow_deferred_publications: std::sync::Arc<parking_lot::Mutex<Vec<PendingFrameCowPublication>>>,
 }
 
+/// Factory authority for one Task4 worker. It deliberately carries only the
+/// carrier VM and executor-local mailbox transport configuration; no task MM,
+/// stage-1 editor, mapping descriptor, frame inventory, or COW authority can be
+/// retained by the factory or copied into an idle worker.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone)]
+pub(crate) struct PersistentExecutorSpec {
+    vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+    mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
+    syscall_transport: HvfSyscallTransport,
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct ProcessMappingDesc {
     start: u64,
     ipa: u64,
     end: u64,
+    // Drop the stage-2 authority before the host owner on every implicit
+    // prepare-error path. Named initializers make declaration order otherwise
+    // invisible, but Rust field destruction follows this order.
+    stage2_lease: Option<GlobalFrameStage2Lease>,
     host: ForkMappingHost,
     size: usize,
     physical_ipa: u64,
@@ -4506,7 +5602,6 @@ struct ProcessMappingDesc {
     shared_key_base: u64,
     shared_key_offset: u64,
     inherited_frame: Option<carrick_hal::FrameId>,
-    stage2_lease: Option<GlobalFrameStage2Lease>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4572,12 +5667,47 @@ fn fork_mapping_requires_base_translation(start: u64, size: usize, is_dynamic_al
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Copy, Debug)]
 struct PendingForkFrameReceipt {
+    transaction: carrick_hal::KernelTransactionId,
     kind: carrick_observability::probes::HvpatchForkFrameKind,
     parent_mapping: carrick_hal::MappingId,
     child_mapping: carrick_hal::MappingId,
     frame: carrick_hal::FrameId,
     ipa: u64,
     length: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn authenticate_pending_fork_receipts(
+    receipts: &[PendingForkFrameReceipt],
+    receipt: &carrick_hal::FrameInventoryApplyReceipt,
+) -> bool {
+    receipts.iter().enumerate().all(|(index, pending)| {
+        pending.transaction == receipt.transaction()
+            && receipt.authorizes(pending.child_mapping, pending.frame)
+            && pending.length != 0
+            && pending.parent_mapping != pending.child_mapping
+            && !receipts[..index].iter().any(|prior| {
+                prior.child_mapping == pending.child_mapping
+                    || (prior.ipa, prior.length) == (pending.ipa, pending.length)
+            })
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn authenticate_pending_retirement(
+    expected: &[(carrick_hal::MappingId, carrick_hal::FrameId)],
+    pending: &[PendingForkFrameReceipt],
+    receipt: &carrick_hal::FrameInventoryRetirementReceipt,
+) -> bool {
+    receipt.mm_empty_at_revision()
+        && !expected.is_empty()
+        && expected.len() == receipt.mapping_set().len()
+        && expected
+            .iter()
+            .all(|&(mapping, frame)| receipt.authorizes(mapping, frame))
+        && pending
+            .iter()
+            .all(|pending| receipt.authorizes(pending.child_mapping, pending.frame))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4619,6 +5749,1666 @@ pub struct ProcessSpec {
     mm_root_slot: (u64, u64),
     frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
     cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
+}
+
+/// Deferred HVPatch task backend state. Its variants deliberately contain no
+/// vCPU, mailbox allocator/binding, vCPU handle/id, reclaim authority, or host
+/// owner identity; those belong exclusively to a Task4 worker pthread.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub struct HvpatchTaskOnlyBackendState {
+    registration: Option<HvpatchTaskRegistration>,
+}
+
+impl HvpatchTaskOnlyBackendState {
+    pub(crate) fn runtime_task_state(
+        &self,
+        page_tables: std::sync::Arc<
+            parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
+        >,
+        protections: std::sync::Arc<MemoryProtections>,
+    ) -> Result<HvfTaskState, TrapError> {
+        self.registration
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?
+            .runtime_task_state(page_tables, protections)
+    }
+
+    pub(crate) fn apply_inventory(
+        &self,
+        apply: impl FnOnce(
+            carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<carrick_hal::FrameInventoryApplyReceipt, TrapError>,
+    ) -> Result<(), TrapError> {
+        self.registration
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?
+            .apply_inventory(apply)
+    }
+
+    pub(crate) fn prepare_inventory_retirement(
+        &self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<(), TrapError> {
+        self.registration
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?
+            .prepare_inventory_retirement(commit)
+    }
+
+    pub(crate) fn apply_inventory_retirement(
+        &self,
+        apply: impl FnOnce(
+            carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
+    ) -> Result<(), TrapError> {
+        self.registration
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?
+            .apply_inventory_retirement(apply)
+    }
+
+    pub(crate) fn bind_child_kernel(
+        &mut self,
+        binding: HvpatchChildKernelBinding,
+    ) -> Result<(), TrapError> {
+        self.registration
+            .as_mut()
+            .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?
+            .bind_child_kernel(binding)
+    }
+
+    pub(crate) fn activate(&self) -> Result<(), TrapError> {
+        self.registration
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?
+            .activate()
+    }
+
+    fn cleanup_exact(&mut self) {
+        let Some(registration) = self.registration.take() else {
+            return;
+        };
+        registration.cleanup().unwrap_or_else(|error| {
+            eprintln!("carrick: FATAL: exact deferred HVPatch task cleanup: {error}");
+            std::process::abort();
+        });
+    }
+}
+
+impl Drop for HvpatchTaskOnlyBackendState {
+    fn drop(&mut self) {
+        self.cleanup_exact();
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct HvpatchCarrierTaskIdentity {
+    pub task_serial: u64,
+    pub thread_serial: u64,
+    pub execution_generation: u64,
+    pub linux_pid: i32,
+    pub linux_tid: i32,
+    pub asid: u16,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use carrick_hal::HvpatchChildKernelToken as HvpatchChildKernelBinding;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct HvpatchCarrierTaskStateKey {
+    directory_instance: std::num::NonZeroU64,
+    task_serial: u64,
+    thread_serial: u64,
+    execution_generation: u64,
+    nonce: std::num::NonZeroU64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(dead_code)]
+enum HvpatchCarrierTaskState {
+    Sibling {
+        vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+    },
+    Process {
+        vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+        stage2_leases: Vec<GlobalFrameStage2Lease>,
+    },
+    #[cfg(test)]
+    Test {
+        rollbacks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        order: Option<std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>>,
+    },
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+enum HvpatchCarrierMmAuthority {
+    Live {
+        // Rust drops fields in declaration order after `Drop::drop`: leases
+        // must issue every `hv_vm_unmap` while the carrier VM is still alive.
+        _stage2_leases: Vec<GlobalFrameStage2Lease>,
+        _vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+    },
+    #[cfg(test)]
+    Test {
+        order: std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>,
+    },
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for HvpatchCarrierMmAuthority {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Self::Test { order } = self {
+            order.lock().push("carrier");
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct HvpatchCarrierTaskRow {
+    _mm: Option<std::sync::Arc<HvpatchCarrierMmAuthority>>,
+    #[cfg(test)]
+    rollbacks: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct HvpatchMmAuthorityKey {
+    task_serial: u64,
+    mm_root_slot: Option<(u64, u64)>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(dead_code)] // consumed by the worker-side binding load transaction in the next slice
+struct HvpatchTaskMappingState {
+    start: u64,
+    ipa: u64,
+    physical_ipa: u64,
+    end: u64,
+    host_addr: *mut u8,
+    physical_host_addr: *mut u8,
+    size: usize,
+    physical_size: usize,
+    perms: applevisor::memory::MemPerms,
+    guest_writable: bool,
+    host_mapping: Option<crate::host_mapping::OwnedHostMapping>,
+    is_dynamic_alias: bool,
+    sharing: GuestMappingSharing,
+    shared_key_base: u64,
+    shared_key_offset: u64,
+    owner_generation: u64,
+}
+unsafe impl Send for HvpatchTaskMappingState {}
+// SAFETY: these pointers are immutable address metadata naming MM-owned host
+// mappings. Access is authenticated through the stage-1/frame authority and
+// synchronized by the worker transaction; the descriptor never dereferences
+// them on its own.
+unsafe impl Sync for HvpatchTaskMappingState {}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchTaskMappingState {
+    fn unowned_runtime_region(&self) -> HvfMappedRegion {
+        HvfMappedRegion {
+            start: self.start,
+            ipa: self.ipa,
+            physical_ipa: self.physical_ipa,
+            end: self.end,
+            host_addr: self.host_addr,
+            size: self.physical_size,
+            physical_size: self.physical_size,
+            perms: self.perms,
+            memory: None,
+            host_mapping: None,
+            stage2_lease: None,
+            is_dynamic_alias: self.is_dynamic_alias,
+            sharing: self.sharing,
+            guest_writable: self.guest_writable,
+            shared_key_base: self.shared_key_base,
+            shared_key_offset: self.shared_key_offset,
+            owner_generation: self.owner_generation,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default)]
+#[allow(dead_code)] // retained task authority; worker-side load consumes these fields
+struct HvpatchPreparedTaskAuthority {
+    mappings: Vec<HvpatchTaskMappingState>,
+    mm_root_slot: Option<(u64, u64)>,
+    inventory: HvpatchTaskInventoryAuthority,
+    cow_authority: Option<std::sync::Arc<dyn carrick_hal::FrameCowAuthority>>,
+    cow_identity: Option<carrick_hal::FrameCowIdentity>,
+    cow_armed: Option<std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>>,
+    cow_deferred_publications:
+        Option<std::sync::Arc<parking_lot::Mutex<Vec<PendingFrameCowPublication>>>>,
+    pending_receipts: Vec<PendingForkFrameReceipt>,
+    pending_aliases: Vec<AliasBacking>,
+    #[cfg(test)]
+    drop_order: Option<std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default)]
+#[allow(dead_code)] // publication/activation is consumed by the next runtime wiring slice
+enum HvpatchTaskInventoryAuthority {
+    #[default]
+    Absent,
+    SiblingShared {
+        ledger: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+    },
+    ProcessPrepared {
+        ledger: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+        staged: Vec<((u64, u64), InventoryExtent)>,
+        commit: Option<carrick_hal::FrameInventoryCommit<()>>,
+        challenge: Option<carrick_hal::FrameInventoryReceiptChallenge>,
+    },
+    InventoryPublished {
+        ledger: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+        staged: Vec<((u64, u64), InventoryExtent)>,
+        receipt: carrick_hal::FrameInventoryApplyReceipt,
+    },
+    Active {
+        ledger: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+        receipt: carrick_hal::FrameInventoryApplyReceipt,
+        retirement: Option<HvpatchPreparedInventoryRetirement>,
+    },
+    Retired,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct HvpatchPreparedInventoryRetirement {
+    commit: carrick_hal::FrameInventoryCommit<()>,
+    challenge: carrick_hal::FrameInventoryReceiptChallenge,
+    expected_mappings: Vec<(carrick_hal::MappingId, carrick_hal::FrameId)>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(dead_code)] // transitions are exposed to the next publication wiring slice
+impl HvpatchTaskInventoryAuthority {
+    fn shared_runtime_ledger(
+        &self,
+    ) -> Option<std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>> {
+        match self {
+            Self::SiblingShared { ledger }
+            | Self::ProcessPrepared { ledger, .. }
+            | Self::InventoryPublished { ledger, .. }
+            | Self::Active { ledger, .. } => Some(std::sync::Arc::clone(ledger)),
+            Self::Absent | Self::Retired => None,
+        }
+    }
+
+    fn apply_process_inventory(
+        &mut self,
+        apply: impl FnOnce(
+            carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<carrick_hal::FrameInventoryApplyReceipt, TrapError>,
+        expected_mm: std::num::NonZeroU64,
+    ) -> Result<(), TrapError> {
+        let current = std::mem::replace(self, Self::Retired);
+        match current {
+            Self::ProcessPrepared {
+                ledger,
+                staged,
+                mut commit,
+                mut challenge,
+            } => {
+                if let (Some(commit), Some(challenge)) = (commit.take(), challenge.take()) {
+                    match apply(commit) {
+                        Ok(receipt) if challenge.authenticate_apply(&receipt, expected_mm) => {
+                            *self = Self::InventoryPublished {
+                                ledger,
+                                staged,
+                                receipt,
+                            };
+                            Ok(())
+                        }
+                        Ok(_) => {
+                            eprintln!(
+                                "carrick: FATAL: Kernel returned a malformed successful HVPatch inventory receipt"
+                            );
+                            std::process::abort();
+                        }
+                        Err(_) => {
+                            let mut inventory = ledger.lock();
+                            HvfVmState::rollback_unpublished_mappings(&mut inventory, &staged)?;
+                            Err(TrapError::Hypervisor(
+                                "kernel rejected or mis-authenticated HVPatch inventory apply"
+                                    .to_owned(),
+                            ))
+                        }
+                    }
+                } else {
+                    *self = Self::ProcessPrepared {
+                        ledger,
+                        staged,
+                        commit,
+                        challenge,
+                    };
+                    Err(TrapError::Hypervisor(
+                        "prepared HVPatch process inventory lost its commit".to_owned(),
+                    ))
+                }
+            }
+            other => {
+                *self = other;
+                Err(TrapError::Hypervisor(
+                    "only a prepared process owner may publish HVPatch inventory".to_owned(),
+                ))
+            }
+        }
+    }
+
+    fn activate(&mut self, pending_receipts: &[PendingForkFrameReceipt]) -> Result<(), TrapError> {
+        let current = std::mem::replace(self, Self::Retired);
+        match current {
+            Self::SiblingShared { ledger } => {
+                *self = Self::SiblingShared { ledger };
+                Ok(())
+            }
+            Self::InventoryPublished {
+                ledger,
+                staged,
+                receipt,
+            } => {
+                if authenticate_pending_fork_receipts(pending_receipts, &receipt) {
+                    *self = Self::Active {
+                        ledger,
+                        receipt,
+                        retirement: None,
+                    };
+                    Ok(())
+                } else {
+                    *self = Self::InventoryPublished {
+                        ledger,
+                        staged,
+                        receipt,
+                    };
+                    Err(TrapError::Hypervisor(
+                        "HVPatch fork receipts failed inventory authentication".to_owned(),
+                    ))
+                }
+            }
+            other => {
+                *self = other;
+                Err(TrapError::Hypervisor(
+                    "HVPatch inventory activation requires published inventory".to_owned(),
+                ))
+            }
+        }
+    }
+
+    fn prepare_retirement(
+        &mut self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<(), TrapError> {
+        match self {
+            Self::Active {
+                ledger, retirement, ..
+            } if retirement.is_none() => {
+                let mut expected_mappings: Vec<_> = ledger
+                    .lock()
+                    .extents
+                    .values()
+                    .map(|extent| (extent.mapping, extent.frame))
+                    .collect();
+                expected_mappings.sort_unstable();
+                expected_mappings.dedup();
+                let mut committed_unmaps: Vec<_> = commit
+                    .batch()
+                    .events()
+                    .iter()
+                    .filter_map(|event| match *event {
+                        carrick_hal::FrameInventoryEvent::UnmapMapping { mapping, .. } => {
+                            Some(mapping)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                committed_unmaps.sort_unstable();
+                committed_unmaps.dedup();
+                let expected_ids: Vec<_> = expected_mappings
+                    .iter()
+                    .map(|(mapping, _)| *mapping)
+                    .collect();
+                if expected_mappings.is_empty() || committed_unmaps != expected_ids {
+                    return Err(TrapError::Hypervisor(
+                        "retirement commit does not cover exact current HVPatch MM ledger"
+                            .to_owned(),
+                    ));
+                }
+                let challenge = commit.receipt_challenge();
+                *retirement = Some(HvpatchPreparedInventoryRetirement {
+                    commit,
+                    challenge,
+                    expected_mappings,
+                });
+                Ok(())
+            }
+            _ => Err(TrapError::Hypervisor(
+                "HVPatch inventory retirement is duplicate or not active".to_owned(),
+            )),
+        }
+    }
+
+    fn apply_retirement(
+        &mut self,
+        expected_mm: std::num::NonZeroU64,
+        pending_receipts: &[PendingForkFrameReceipt],
+        apply: impl FnOnce(
+            carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
+    ) -> Result<(), TrapError> {
+        let current = std::mem::replace(self, Self::Retired);
+        match current {
+            Self::Active {
+                ledger,
+                receipt,
+                retirement: Some(retirement),
+            } => match apply(retirement.commit) {
+                Ok(retired)
+                    if retirement
+                        .challenge
+                        .authenticate_retirement(&retired, expected_mm)
+                        && retired.revision() > receipt.revision()
+                        && retired.transaction() != receipt.transaction()
+                        && authenticate_pending_retirement(
+                            &retirement.expected_mappings,
+                            pending_receipts,
+                            &retired,
+                        ) =>
+                {
+                    Ok(())
+                }
+                Ok(_) => {
+                    eprintln!(
+                        "carrick: FATAL: Kernel returned a malformed successful HVPatch retirement receipt"
+                    );
+                    std::process::abort();
+                }
+                Err(error) => {
+                    *self = Self::Active {
+                        ledger,
+                        receipt,
+                        retirement: None,
+                    };
+                    Err(error)
+                }
+            },
+            other => {
+                *self = other;
+                Err(TrapError::Hypervisor(
+                    "HVPatch inventory retirement lacks an owned prepared commit".to_owned(),
+                ))
+            }
+        }
+    }
+
+    fn rollback_unpublished(&mut self) -> Result<(), TrapError> {
+        match std::mem::replace(self, Self::Retired) {
+            Self::Absent | Self::SiblingShared { .. } | Self::Retired => Ok(()),
+            Self::ProcessPrepared {
+                ledger,
+                staged,
+                commit,
+                challenge: _,
+            } => {
+                let mut inventory = ledger.lock();
+                HvfVmState::rollback_unpublished_mappings(&mut inventory, &staged)?;
+                drop(commit);
+                Ok(())
+            }
+            Self::InventoryPublished { .. } | Self::Active { .. } => Err(TrapError::Hypervisor(
+                "published HVPatch inventory dropped before exact retirement".to_owned(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    fn phase_name(&self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::SiblingShared { .. } => "sibling_shared",
+            Self::ProcessPrepared { .. } => "prepared",
+            Self::InventoryPublished { .. } => "inventory_published",
+            Self::Active { .. } => "active",
+            Self::Retired => "retired",
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(dead_code)] // retained MM authority; worker-side load consumes these fields
+struct HvpatchTaskMmAuthority {
+    mappings: Vec<HvpatchTaskMappingState>,
+    mm_root_slot: Option<(u64, u64)>,
+    inventory: parking_lot::Mutex<HvpatchTaskInventoryAuthority>,
+    kernel_mm: parking_lot::Mutex<Option<std::num::NonZeroU64>>,
+    cow_armed: Option<std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>>,
+    cow_deferred_publications:
+        Option<std::sync::Arc<parking_lot::Mutex<Vec<PendingFrameCowPublication>>>>,
+    pending_receipts: Vec<PendingForkFrameReceipt>,
+    alias_receipts: parking_lot::Mutex<Vec<AliasPublicationReceipt>>,
+    #[cfg(test)]
+    drop_order: Option<std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(dead_code)] // next publication slice invokes these exact MM transitions
+impl HvpatchTaskMmAuthority {
+    fn from_prepared(
+        mut prepared: HvpatchPreparedTaskAuthority,
+        alias_receipt: AliasPublicationReceipt,
+    ) -> Self {
+        Self {
+            mappings: std::mem::take(&mut prepared.mappings),
+            mm_root_slot: prepared.mm_root_slot,
+            inventory: parking_lot::Mutex::new(std::mem::take(&mut prepared.inventory)),
+            kernel_mm: parking_lot::Mutex::new(None),
+            cow_armed: prepared.cow_armed.take(),
+            cow_deferred_publications: prepared.cow_deferred_publications.take(),
+            pending_receipts: std::mem::take(&mut prepared.pending_receipts),
+            alias_receipts: parking_lot::Mutex::new(vec![alias_receipt]),
+            #[cfg(test)]
+            drop_order: prepared.drop_order.take(),
+        }
+    }
+
+    fn apply_inventory(
+        &self,
+        apply: impl FnOnce(
+            carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<carrick_hal::FrameInventoryApplyReceipt, TrapError>,
+    ) -> Result<(), TrapError> {
+        let mm = (*self.kernel_mm.lock()).ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch MM has no exact Kernel binding".to_owned())
+        })?;
+        self.inventory.lock().apply_process_inventory(apply, mm)
+    }
+
+    fn activate(&self) -> Result<(), TrapError> {
+        self.inventory.lock().activate(&self.pending_receipts)
+    }
+
+    fn prepare_retirement(
+        &self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<(), TrapError> {
+        self.inventory.lock().prepare_retirement(commit)
+    }
+
+    fn apply_retirement(
+        &self,
+        apply: impl FnOnce(
+            carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
+    ) -> Result<(), TrapError> {
+        let mm = (*self.kernel_mm.lock()).ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch MM has no exact Kernel binding".to_owned())
+        })?;
+        self.inventory
+            .lock()
+            .apply_retirement(mm, &self.pending_receipts, apply)
+    }
+
+    fn bind_kernel_mm(&self, mm: std::num::NonZeroU64) -> Result<(), TrapError> {
+        let mut bound = self.kernel_mm.lock();
+        match *bound {
+            None => {
+                *bound = Some(mm);
+                Ok(())
+            }
+            Some(existing) if existing == mm => Ok(()),
+            Some(_) => Err(TrapError::Hypervisor(
+                "HVPatch MM binding changed across sibling registrations".to_owned(),
+            )),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for HvpatchTaskMmAuthority {
+    fn drop(&mut self) {
+        for receipt in self.alias_receipts.get_mut().drain(..).rev() {
+            receipt.retire_exact();
+        }
+        self.inventory
+            .get_mut()
+            .rollback_unpublished()
+            .unwrap_or_else(|error| {
+                eprintln!("carrick: FATAL: drop HVPatch MM authority: {error}");
+                std::process::abort();
+            });
+        #[cfg(test)]
+        if let Some(order) = &self.drop_order {
+            order.lock().push("task");
+        }
+        // `mappings` (and their host owners) drop only after the inventory is
+        // retired.  The registration removes the carrier MM first, so its
+        // stage-2 leases have already unmapped before this destructor runs.
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchPreparedTaskAuthority {
+    fn abort(self) -> Result<(), TrapError> {
+        let mut this = self;
+        // Pending aliases have never touched either global registry.  The
+        // publication receipt owns exact preimages only after commit.
+        this.inventory.rollback_unpublished()?;
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn abort_prepared_task_and_carrier(
+    task: HvpatchPreparedTaskAuthority,
+    state: HvpatchCarrierTaskState,
+) -> Result<(), TrapError> {
+    // Carrier teardown owns stage-2 and must complete before task teardown can
+    // release an owned host mapping backing that stage-2 entry.
+    let state_result = state.abort();
+    let task_result = task.abort();
+    state_result?;
+    task_result
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default)]
+struct AliasPublicationReceipt {
+    versions: Vec<AliasPublicationVersionId>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AliasPublicationVersionId {
+    owner: HvpatchCarrierTaskStateKey,
+    ordinal: u32,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct OwnedAliasVersion {
+    id: AliasPublicationVersionId,
+    value: AliasBacking,
+    epoch: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct AliasVersionChain {
+    ipa: u64,
+    scope: AliasOwnershipScope,
+    base: Option<AliasBacking>,
+    versions: Vec<OwnedAliasVersion>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct OwnedReplayVersion {
+    id: AliasPublicationVersionId,
+    value: ReplayMappingKey,
+    epoch: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct ReplayVersionChain {
+    physical_ipa: u64,
+    base: Vec<ReplayMappingKey>,
+    versions: Vec<OwnedReplayVersion>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default)]
+struct AliasVersionRegistry {
+    aliases: Vec<AliasVersionChain>,
+    replays: Vec<ReplayVersionChain>,
+    alias_epochs: Vec<((u64, AliasOwnershipScope), u64)>,
+    replay_epochs: Vec<(u64, u64)>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn alias_version_registry() -> &'static parking_lot::Mutex<AliasVersionRegistry> {
+    static CELL: std::sync::OnceLock<parking_lot::Mutex<AliasVersionRegistry>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| parking_lot::Mutex::new(AliasVersionRegistry::default()))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn bump_version_epoch<K: Copy + Eq>(epochs: &mut Vec<(K, u64)>, key: K) -> Option<u64> {
+    if let Some((_, epoch)) = epochs.iter_mut().find(|(candidate, _)| *candidate == key) {
+        *epoch = epoch.checked_add(1)?;
+        Some(*epoch)
+    } else {
+        epochs.push((key, 1));
+        Some(1)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mutate_external_alias_state<R>(
+    mutate: impl FnOnce(&mut std::collections::BTreeSet<ReplayMappingKey>, &mut Vec<AliasBacking>) -> R,
+) -> R {
+    // All external writers use the same replay -> alias -> version lock order
+    // as receipt publication/retirement. A mutation becomes the new effective
+    // base and invalidates every older receipt version for the touched key.
+    let mut replay = replay_mappings().lock();
+    let mut registry = alias_registry().lock();
+    let replay_before = replay.clone();
+    let registry_before = registry.clone();
+    let result = mutate(&mut replay, &mut registry);
+    let mut versions = alias_version_registry().lock();
+
+    let mut alias_keys = Vec::new();
+    for alias in registry_before.iter().chain(registry.iter()) {
+        let key = (alias.ipa, alias.ownership_scope);
+        if !alias_keys.contains(&key) {
+            alias_keys.push(key);
+        }
+    }
+    let mut affected_physical_ipas = Vec::new();
+    for key in alias_keys {
+        let before = registry_before
+            .iter()
+            .find(|entry| (entry.ipa, entry.ownership_scope) == key)
+            .copied();
+        let after = registry
+            .iter()
+            .find(|entry| (entry.ipa, entry.ownership_scope) == key)
+            .copied();
+        if before == after {
+            continue;
+        }
+        for alias in before.into_iter().chain(after) {
+            if !affected_physical_ipas.contains(&alias.physical_ipa) {
+                affected_physical_ipas.push(alias.physical_ipa);
+            }
+        }
+        bump_version_epoch(&mut versions.alias_epochs, key).unwrap_or_else(|| {
+            eprintln!("carrick: FATAL: external alias mutation epoch exhausted");
+            std::process::abort();
+        });
+        if let Some(chain) = versions
+            .aliases
+            .iter_mut()
+            .find(|chain| (chain.ipa, chain.scope) == key)
+        {
+            chain.base = after;
+            chain.versions.clear();
+        }
+    }
+    for (ipa, _, _, _) in replay_before.iter().chain(replay.iter()) {
+        if !affected_physical_ipas.contains(ipa) {
+            let before: Vec<_> = replay_before
+                .iter()
+                .filter(|(candidate, _, _, _)| candidate == ipa)
+                .copied()
+                .collect();
+            let after: Vec<_> = replay
+                .iter()
+                .filter(|(candidate, _, _, _)| candidate == ipa)
+                .copied()
+                .collect();
+            if before != after {
+                affected_physical_ipas.push(*ipa);
+            }
+        }
+    }
+    for physical_ipa in affected_physical_ipas {
+        bump_version_epoch(&mut versions.replay_epochs, physical_ipa).unwrap_or_else(|| {
+            eprintln!("carrick: FATAL: external replay mutation epoch exhausted");
+            std::process::abort();
+        });
+        if let Some(chain) = versions
+            .replays
+            .iter_mut()
+            .find(|chain| chain.physical_ipa == physical_ipa)
+        {
+            chain.base = replay
+                .iter()
+                .filter(|(ipa, _, _, _)| *ipa == physical_ipa)
+                .copied()
+                .collect();
+            chain.versions.clear();
+        }
+    }
+    result
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl AliasPublicationReceipt {
+    fn commit(
+        owner: HvpatchCarrierTaskStateKey,
+        aliases: &[AliasBacking],
+    ) -> Result<Self, TrapError> {
+        let mut replay = replay_mappings().lock();
+        let mut registry = alias_registry().lock();
+        let mut versions = alias_version_registry().lock();
+        let mut alias_increments = Vec::<((u64, AliasOwnershipScope), u64)>::new();
+        let mut replay_increments = Vec::<(u64, u64)>::new();
+        for alias in aliases {
+            let alias_key = (alias.ipa, alias.ownership_scope);
+            if let Some((_, count)) = alias_increments
+                .iter_mut()
+                .find(|(key, _)| *key == alias_key)
+            {
+                *count = count.checked_add(1).unwrap_or(u64::MAX);
+            } else {
+                alias_increments.push((alias_key, 1));
+            }
+            if let Some((_, count)) = replay_increments
+                .iter_mut()
+                .find(|(ipa, _)| *ipa == alias.physical_ipa)
+            {
+                *count = count.checked_add(1).unwrap_or(u64::MAX);
+            } else {
+                replay_increments.push((alias.physical_ipa, 1));
+            }
+        }
+        let alias_exhausted = alias_increments.iter().any(|(key, count)| {
+            let current = versions
+                .alias_epochs
+                .iter()
+                .find(|(candidate, _)| candidate == key)
+                .map_or(0, |(_, epoch)| *epoch);
+            current.checked_add(*count).is_none()
+        });
+        let replay_exhausted = replay_increments.iter().any(|(ipa, count)| {
+            let current = versions
+                .replay_epochs
+                .iter()
+                .find(|(candidate, _)| candidate == ipa)
+                .map_or(0, |(_, epoch)| *epoch);
+            current.checked_add(*count).is_none()
+        });
+        if aliases.len() > u32::MAX as usize || alias_exhausted || replay_exhausted {
+            return Err(TrapError::Hypervisor(
+                "alias publication version identity exhausted".to_owned(),
+            ));
+        }
+        let mut receipt = Self::default();
+        for (ordinal, alias) in aliases.iter().enumerate() {
+            let ordinal = u32::try_from(ordinal).map_err(|_| {
+                TrapError::Hypervisor("alias publication ordinal exhausted".to_owned())
+            })?;
+            let id = AliasPublicationVersionId { owner, ordinal };
+            let alias_key = (alias.ipa, alias.ownership_scope);
+            let alias_epoch = bump_version_epoch(&mut versions.alias_epochs, alias_key)
+                .ok_or_else(|| TrapError::Hypervisor("alias version epoch exhausted".to_owned()))?;
+            let replay_epoch = bump_version_epoch(&mut versions.replay_epochs, alias.physical_ipa)
+                .ok_or_else(|| {
+                    TrapError::Hypervisor("replay version epoch exhausted".to_owned())
+                })?;
+            let alias_chain_index = versions
+                .aliases
+                .iter()
+                .position(|chain| chain.ipa == alias.ipa && chain.scope == alias.ownership_scope)
+                .unwrap_or_else(|| {
+                    let base = registry
+                        .iter()
+                        .find(|entry| {
+                            entry.ipa == alias.ipa && entry.ownership_scope == alias.ownership_scope
+                        })
+                        .copied();
+                    versions.aliases.push(AliasVersionChain {
+                        ipa: alias.ipa,
+                        scope: alias.ownership_scope,
+                        base,
+                        versions: Vec::new(),
+                    });
+                    versions.aliases.len() - 1
+                });
+            versions.aliases[alias_chain_index]
+                .versions
+                .push(OwnedAliasVersion {
+                    id,
+                    value: *alias,
+                    epoch: alias_epoch,
+                });
+            let replay_chain_index = versions
+                .replays
+                .iter()
+                .position(|chain| chain.physical_ipa == alias.physical_ipa)
+                .unwrap_or_else(|| {
+                    let base = replay
+                        .iter()
+                        .filter(|(ipa, _, _, _)| *ipa == alias.physical_ipa)
+                        .copied()
+                        .collect();
+                    versions.replays.push(ReplayVersionChain {
+                        physical_ipa: alias.physical_ipa,
+                        base,
+                        versions: Vec::new(),
+                    });
+                    versions.replays.len() - 1
+                });
+            versions.replays[replay_chain_index]
+                .versions
+                .push(OwnedReplayVersion {
+                    id,
+                    value: replay_mapping_key(*alias),
+                    epoch: replay_epoch,
+                });
+            replay.retain(|(ipa, _, _, _)| *ipa != alias.physical_ipa);
+            replay.insert(replay_mapping_key(*alias));
+            if let Some(entry) = registry.iter_mut().find(|entry| {
+                entry.ipa == alias.ipa && entry.ownership_scope == alias.ownership_scope
+            }) {
+                *entry = *alias;
+            } else {
+                registry.push(*alias);
+            }
+            receipt.versions.push(id);
+        }
+        Ok(receipt)
+    }
+
+    fn retire_exact(self) {
+        let mut replay = replay_mappings().lock();
+        let mut registry = alias_registry().lock();
+        let mut versions = alias_version_registry().lock();
+        for id in self.versions.into_iter().rev() {
+            if let Some(chain_index) = versions
+                .aliases
+                .iter()
+                .position(|chain| chain.versions.iter().any(|version| version.id == id))
+            {
+                let (ipa, scope, base, removed, was_top, previous, empty) = {
+                    let chain = &mut versions.aliases[chain_index];
+                    let version_index = chain
+                        .versions
+                        .iter()
+                        .position(|version| version.id == id)
+                        .unwrap_or_else(|| std::process::abort());
+                    let was_top = version_index + 1 == chain.versions.len();
+                    let removed = chain.versions.remove(version_index);
+                    (
+                        chain.ipa,
+                        chain.scope,
+                        chain.base,
+                        removed,
+                        was_top,
+                        chain.versions.last().map(|version| version.value),
+                        chain.versions.is_empty(),
+                    )
+                };
+                let current_epoch = versions
+                    .alias_epochs
+                    .iter()
+                    .find(|(key, _)| *key == (ipa, scope))
+                    .map(|(_, epoch)| *epoch);
+                let current_value = registry
+                    .iter()
+                    .find(|entry| entry.ipa == ipa && entry.ownership_scope == scope)
+                    .copied();
+                if was_top
+                    && current_epoch == Some(removed.epoch)
+                    && current_value == Some(removed.value)
+                {
+                    registry.retain(|entry| !(entry.ipa == ipa && entry.ownership_scope == scope));
+                    if let Some(previous) = previous.or(base) {
+                        registry.push(previous);
+                    }
+                    bump_version_epoch(&mut versions.alias_epochs, (ipa, scope))
+                        .unwrap_or_else(|| std::process::abort());
+                }
+                if empty {
+                    versions.aliases.remove(chain_index);
+                }
+            }
+            if let Some(chain_index) = versions
+                .replays
+                .iter()
+                .position(|chain| chain.versions.iter().any(|version| version.id == id))
+            {
+                let (physical_ipa, base, removed, was_top, previous, empty) = {
+                    let chain = &mut versions.replays[chain_index];
+                    let version_index = chain
+                        .versions
+                        .iter()
+                        .position(|version| version.id == id)
+                        .unwrap_or_else(|| std::process::abort());
+                    let was_top = version_index + 1 == chain.versions.len();
+                    let removed = chain.versions.remove(version_index);
+                    (
+                        chain.physical_ipa,
+                        chain.base.clone(),
+                        removed,
+                        was_top,
+                        chain.versions.last().map(|version| version.value),
+                        chain.versions.is_empty(),
+                    )
+                };
+                let current_epoch = versions
+                    .replay_epochs
+                    .iter()
+                    .find(|(ipa, _)| *ipa == physical_ipa)
+                    .map(|(_, epoch)| *epoch);
+                let current: Vec<_> = replay
+                    .iter()
+                    .filter(|(ipa, _, _, _)| *ipa == physical_ipa)
+                    .copied()
+                    .collect();
+                if was_top && current_epoch == Some(removed.epoch) && current == vec![removed.value]
+                {
+                    replay.retain(|(ipa, _, _, _)| *ipa != physical_ipa);
+                    if let Some(previous) = previous {
+                        replay.insert(previous);
+                    } else {
+                        replay.extend(base);
+                    }
+                    bump_version_epoch(&mut versions.replay_epochs, physical_ipa)
+                        .unwrap_or_else(|| std::process::abort());
+                }
+                if empty {
+                    versions.replays.remove(chain_index);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub struct HvpatchCarrierTaskStateDirectory {
+    instance: std::num::NonZeroU64,
+    child_token_verifier: std::sync::Arc<carrick_hal::HvpatchChildTokenVerifier>,
+    next: std::sync::atomic::AtomicU64,
+    inner: parking_lot::Mutex<HvpatchCarrierTaskDirectoryInner>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default)]
+struct HvpatchCarrierTaskDirectoryInner {
+    states: std::collections::BTreeMap<HvpatchCarrierTaskStateKey, HvpatchCarrierTaskRow>,
+    carrier_mms: std::collections::BTreeMap<
+        HvpatchMmAuthorityKey,
+        std::sync::Weak<HvpatchCarrierMmAuthority>,
+    >,
+    task_mms:
+        std::collections::BTreeMap<HvpatchMmAuthorityKey, std::sync::Weak<HvpatchTaskMmAuthority>>,
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+impl Default for HvpatchCarrierTaskStateDirectory {
+    fn default() -> Self {
+        static NEXT_DIRECTORY_INSTANCE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let instance = NEXT_DIRECTORY_INSTANCE
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |current| current.checked_add(1),
+            )
+            .unwrap_or_else(|_| {
+                eprintln!("carrick: FATAL: HVPatch carrier directory identity exhausted");
+                std::process::abort();
+            });
+        let instance = std::num::NonZeroU64::new(instance).unwrap_or_else(|| {
+            eprintln!("carrick: FATAL: zero HVPatch carrier directory identity");
+            std::process::abort();
+        });
+        let (_, verifier) = carrick_hal::HvpatchChildTokenIssuer::new_pair();
+        Self::new(instance, verifier)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchCarrierTaskStateDirectory {
+    pub fn new(
+        instance: std::num::NonZeroU64,
+        child_token_verifier: std::sync::Arc<carrick_hal::HvpatchChildTokenVerifier>,
+    ) -> Self {
+        Self {
+            instance,
+            child_token_verifier,
+            next: std::sync::atomic::AtomicU64::new(1),
+            inner: parking_lot::Mutex::new(HvpatchCarrierTaskDirectoryInner::default()),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct HvpatchTaskRegistration {
+    directory: std::sync::Arc<HvpatchCarrierTaskStateDirectory>,
+    key: HvpatchCarrierTaskStateKey,
+    expected_identity: HvpatchCarrierTaskIdentity,
+    task_mm: Option<std::sync::Arc<HvpatchTaskMmAuthority>>,
+    cow_authority: Option<std::sync::Arc<dyn carrick_hal::FrameCowAuthority>>,
+    cow_identity: Option<carrick_hal::FrameCowIdentity>,
+    cow_authority_identity: Option<std::num::NonZeroU64>,
+    child_token_verifier: std::sync::Arc<carrick_hal::HvpatchChildTokenVerifier>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchTaskRegistration {
+    fn runtime_task_state(
+        &self,
+        page_tables: std::sync::Arc<
+            parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
+        >,
+        protections: std::sync::Arc<MemoryProtections>,
+    ) -> Result<HvfTaskState, TrapError> {
+        let task_mm = self
+            .task_mm
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?;
+        let ledger = task_mm
+            .inventory
+            .lock()
+            .shared_runtime_ledger()
+            .ok_or_else(|| TrapError::Hypervisor("inactive HVPatch task inventory".to_owned()))?;
+        let cow_authority = self.cow_authority.clone().ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch task lacks live COW authority".to_owned())
+        })?;
+        let cow_identity = self.cow_identity.ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch task lacks live COW identity".to_owned())
+        })?;
+        let cow_armed = task_mm.cow_armed.as_ref().cloned().ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch task lacks COW armed state".to_owned())
+        })?;
+        let cow_deferred_publications = task_mm
+            .cow_deferred_publications
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                TrapError::Hypervisor("HVPatch task lacks COW publication state".to_owned())
+            })?;
+        Ok(HvfTaskState {
+            mappings: task_mm
+                .mappings
+                .iter()
+                .map(HvpatchTaskMappingState::unowned_runtime_region)
+                .collect(),
+            mm_root_slot: task_mm.mm_root_slot,
+            pending_exec_mm_root_slot: None,
+            pending_exec_asid: None,
+            last_exit_class: 0,
+            last_fault_esr: 0,
+            is_forked_child: false,
+            forked_no_exec: false,
+            protections,
+            page_tables,
+            last_syscall_nr: None,
+            last_syscall_orig_x0: 0,
+            vfork_share: false,
+            fork_mapping_descs: Vec::new(),
+            fork_child_descs: Vec::new(),
+            persistent_vm_lifecycle: true,
+            frame_inventory: HvpatchFrameInventoryState::new(ledger),
+            cow_authority: Some(cow_authority),
+            cow_identity: Some(cow_identity),
+            cow_armed,
+            cow_deferred_publications,
+            pending_fork_frame_receipts: task_mm.pending_receipts.clone(),
+            pending_process_aliases: Vec::new(),
+            cow_rollback_scratch: None,
+        })
+    }
+
+    fn apply_inventory(
+        &self,
+        apply: impl FnOnce(
+            carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<carrick_hal::FrameInventoryApplyReceipt, TrapError>,
+    ) -> Result<(), TrapError> {
+        self.task_mm
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?
+            .apply_inventory(apply)
+    }
+
+    fn prepare_inventory_retirement(
+        &self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<(), TrapError> {
+        self.task_mm
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?
+            .prepare_retirement(commit)
+    }
+
+    fn apply_inventory_retirement(
+        &self,
+        apply: impl FnOnce(
+            carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
+    ) -> Result<(), TrapError> {
+        self.task_mm
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?
+            .apply_retirement(apply)
+    }
+
+    fn bind_child_kernel(&mut self, binding: HvpatchChildKernelBinding) -> Result<(), TrapError> {
+        let binding = self
+            .child_token_verifier
+            .verify_and_open(binding)
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "child Kernel token issuer does not match carrier verifier".to_owned(),
+                )
+            })?;
+        let cow_identity = binding.cow_identity();
+        if binding.task_serial() != self.key.task_serial
+            || binding.thread_serial() != self.key.thread_serial
+            || binding.execution_generation() != self.key.execution_generation
+            || cow_identity.linux_pid != self.expected_identity.linux_pid
+            || cow_identity.linux_tid != self.expected_identity.linux_tid
+            || cow_identity.asid != self.expected_identity.asid
+            || self.cow_authority.is_some()
+            || self.cow_identity.is_some()
+            || self.cow_authority_identity.is_some()
+        {
+            return Err(TrapError::Hypervisor(
+                "duplicate or mismatched exact child Kernel binding".to_owned(),
+            ));
+        }
+        let mm = std::num::NonZeroU64::new(cow_identity.mm).ok_or_else(|| {
+            TrapError::Hypervisor("child Kernel token contains zero MM".to_owned())
+        })?;
+        self.task_mm
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?
+            .bind_kernel_mm(mm)?;
+        self.cow_authority_identity = Some(binding.authority_identity());
+        self.cow_identity = Some(cow_identity);
+        self.cow_authority = Some(binding.into_cow_authority());
+        Ok(())
+    }
+
+    fn activate(&self) -> Result<(), TrapError> {
+        if self.cow_authority.is_none() || self.cow_identity.is_none() {
+            return Err(TrapError::Hypervisor(
+                "HVPatch child activation requires exact tid/kicker/COW authority".to_owned(),
+            ));
+        }
+        self.task_mm
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?
+            .activate()
+    }
+
+    fn cleanup(mut self) -> Result<(), TrapError> {
+        // Removing the carrier row drops this binding's carrier-MM reference.
+        // If it is the final MM binding, every stage-2 lease unmaps here, before
+        // the final task-MM Arc below releases any host mapping owner.
+        self.directory.retire(self.key)?;
+        drop(self.task_mm.take());
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct HvpatchPreparedCarrierTaskState {
+    identity: HvpatchCarrierTaskIdentity,
+    state: Option<HvpatchCarrierTaskState>,
+    task: Option<HvpatchPreparedTaskAuthority>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchPreparedCarrierTaskState {
+    fn new(
+        identity: HvpatchCarrierTaskIdentity,
+        state: HvpatchCarrierTaskState,
+        task: HvpatchPreparedTaskAuthority,
+    ) -> Self {
+        Self {
+            identity,
+            state: Some(state),
+            task: Some(task),
+        }
+    }
+
+    pub(crate) fn sibling(
+        identity: HvpatchCarrierTaskIdentity,
+        spec: ThreadSpec,
+    ) -> Result<Self, TrapError> {
+        if !spec.persistent_vm_lifecycle {
+            return Err(TrapError::Hypervisor(
+                "task-only sibling requires persistent HVPatch VM".to_owned(),
+            ));
+        }
+        let ThreadSpec {
+            vm,
+            mappings,
+            protections: _,
+            page_tables: _,
+            mailbox_slots: _,
+            syscall_transport: _,
+            persistent_vm_lifecycle: _,
+            mm_root_slot,
+            frame_inventory,
+            cow_authority: _,
+            cow_identity: _,
+            cow_armed,
+            cow_deferred_publications,
+        } = spec;
+        let mappings = mappings
+            .into_iter()
+            .map(|mapping| HvpatchTaskMappingState {
+                start: mapping.start,
+                ipa: mapping.ipa,
+                physical_ipa: mapping.physical_ipa,
+                end: mapping.end,
+                host_addr: mapping.host_addr,
+                physical_host_addr: mapping.physical_host_addr,
+                size: mapping.size,
+                physical_size: mapping.physical_size,
+                perms: mapping.perms,
+                guest_writable: mapping.guest_writable,
+                host_mapping: None,
+                is_dynamic_alias: mapping.is_dynamic_alias,
+                sharing: mapping.sharing,
+                shared_key_base: mapping.shared_key_base,
+                shared_key_offset: mapping.shared_key_offset,
+                owner_generation: global_frame_host_owner_generation(
+                    mapping.physical_ipa,
+                    mapping.physical_size as u64,
+                ),
+            })
+            .collect();
+        Ok(Self::new(
+            identity,
+            HvpatchCarrierTaskState::Sibling { vm },
+            HvpatchPreparedTaskAuthority {
+                mappings,
+                mm_root_slot,
+                inventory: HvpatchTaskInventoryAuthority::SiblingShared {
+                    ledger: frame_inventory,
+                },
+                cow_armed: Some(cow_armed),
+                cow_deferred_publications: Some(cow_deferred_publications),
+                ..HvpatchPreparedTaskAuthority::default()
+            },
+        ))
+    }
+
+    pub(crate) fn process(
+        identity: HvpatchCarrierTaskIdentity,
+        spec: ProcessSpec,
+    ) -> Result<Self, TrapError> {
+        if !spec.persistent_vm_lifecycle {
+            return Err(TrapError::Hypervisor(
+                "task-only process requires persistent HVPatch VM".to_owned(),
+            ));
+        }
+        let (state, task) = HvfVmState::prepare_task_only_process_spec(spec)?;
+        Ok(Self::new(identity, state, task))
+    }
+
+    pub(crate) fn commit(
+        mut self,
+        directory: std::sync::Arc<HvpatchCarrierTaskStateDirectory>,
+    ) -> Result<HvpatchTaskOnlyBackendState, TrapError> {
+        let state = self.state.take().unwrap_or_else(|| std::process::abort());
+        let task = self.task.take().unwrap_or_else(|| std::process::abort());
+        directory.publish(self.identity, state, task)
+    }
+
+    pub(crate) fn abort(mut self) -> Result<(), TrapError> {
+        if let Some(state) = self.state.take() {
+            let task = self.task.take().unwrap_or_else(|| std::process::abort());
+            abort_prepared_task_and_carrier(task, state)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for HvpatchPreparedCarrierTaskState {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            let task = self.task.take().unwrap_or_else(|| std::process::abort());
+            abort_prepared_task_and_carrier(task, state).unwrap_or_else(|error| {
+                eprintln!("carrick: FATAL: abort deferred HVPatch task/carrier state: {error}");
+                std::process::abort();
+            });
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchCarrierTaskStateDirectory {
+    fn publish(
+        self: &std::sync::Arc<Self>,
+        identity: HvpatchCarrierTaskIdentity,
+        state: HvpatchCarrierTaskState,
+        task: HvpatchPreparedTaskAuthority,
+    ) -> Result<HvpatchTaskOnlyBackendState, TrapError> {
+        self.publish_inner(identity, state, task, 0)
+    }
+
+    fn publish_inner(
+        self: &std::sync::Arc<Self>,
+        identity: HvpatchCarrierTaskIdentity,
+        state: HvpatchCarrierTaskState,
+        task: HvpatchPreparedTaskAuthority,
+        failpoint: u8,
+    ) -> Result<HvpatchTaskOnlyBackendState, TrapError> {
+        if identity.task_serial == 0
+            || identity.thread_serial == 0
+            || identity.execution_generation == 0
+        {
+            abort_prepared_task_and_carrier(task, state)?;
+            return Err(TrapError::Hypervisor(
+                "deferred HVPatch task identity contains zero".to_owned(),
+            ));
+        }
+        let nonce = match self.next.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |current| current.checked_add(1),
+        ) {
+            Ok(nonce) => nonce,
+            Err(_) => {
+                abort_prepared_task_and_carrier(task, state)?;
+                return Err(TrapError::Hypervisor(
+                    "carrier task-state key exhausted".to_owned(),
+                ));
+            }
+        };
+        let Some(nonce) = std::num::NonZeroU64::new(nonce) else {
+            abort_prepared_task_and_carrier(task, state)?;
+            return Err(TrapError::Hypervisor(
+                "carrier task-state key exhausted".to_owned(),
+            ));
+        };
+        let key = HvpatchCarrierTaskStateKey {
+            directory_instance: self.instance,
+            task_serial: identity.task_serial,
+            thread_serial: identity.thread_serial,
+            execution_generation: identity.execution_generation,
+            nonce,
+        };
+        let mut inner = self.inner.lock();
+        if inner.states.keys().any(|key| {
+            (key.task_serial, key.thread_serial, key.execution_generation)
+                == (
+                    identity.task_serial,
+                    identity.thread_serial,
+                    identity.execution_generation,
+                )
+        }) {
+            drop(inner);
+            abort_prepared_task_and_carrier(task, state)?;
+            return Err(TrapError::Hypervisor(
+                "duplicate exact carrier task-state publication".to_owned(),
+            ));
+        }
+        let alias_receipt = match AliasPublicationReceipt::commit(key, &task.pending_aliases) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                drop(inner);
+                abort_prepared_task_and_carrier(task, state)?;
+                return Err(error);
+            }
+        };
+        if failpoint == 1 {
+            alias_receipt.retire_exact();
+            drop(inner);
+            abort_prepared_task_and_carrier(task, state)?;
+            return Err(TrapError::Hypervisor(
+                "injected carrier task-state failure after alias commit".to_owned(),
+            ));
+        }
+        let mm_key = HvpatchMmAuthorityKey {
+            // A concrete root slot is the exact MM identity and is shared by
+            // every thread binding. Root/no-slot tasks fall back to the task
+            // serial so unrelated roots never alias one MM authority.
+            task_serial: task.mm_root_slot.map_or(identity.task_serial, |_| 0),
+            mm_root_slot: task.mm_root_slot,
+        };
+        let process_owner = matches!(
+            task.inventory,
+            HvpatchTaskInventoryAuthority::ProcessPrepared { .. }
+        );
+        let existing_carrier_mm = inner
+            .carrier_mms
+            .get(&mm_key)
+            .and_then(std::sync::Weak::upgrade);
+        let existing_task_mm = inner
+            .task_mms
+            .get(&mm_key)
+            .and_then(std::sync::Weak::upgrade);
+        if process_owner && (existing_carrier_mm.is_some() || existing_task_mm.is_some()) {
+            alias_receipt.retire_exact();
+            drop(inner);
+            abort_prepared_task_and_carrier(task, state)?;
+            return Err(TrapError::Hypervisor(
+                "duplicate process owner for exact HVPatch MM".to_owned(),
+            ));
+        }
+        if task.cow_authority.is_some() || task.cow_identity.is_some() {
+            alias_receipt.retire_exact();
+            drop(inner);
+            abort_prepared_task_and_carrier(task, state)?;
+            return Err(TrapError::Hypervisor(
+                "prepared HVPatch child retained parent COW authority".to_owned(),
+            ));
+        }
+        let (carrier_mm, test_rollbacks): (
+            Option<std::sync::Arc<HvpatchCarrierMmAuthority>>,
+            Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+        ) = match state {
+            HvpatchCarrierTaskState::Sibling { vm } => (
+                existing_carrier_mm.or_else(|| {
+                    Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
+                        _vm: vm,
+                        _stage2_leases: Vec::new(),
+                    }))
+                }),
+                None,
+            ),
+            HvpatchCarrierTaskState::Process { vm, stage2_leases } => (
+                Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
+                    _vm: vm,
+                    _stage2_leases: stage2_leases,
+                })),
+                None,
+            ),
+            #[cfg(test)]
+            HvpatchCarrierTaskState::Test { rollbacks, order } => (
+                existing_carrier_mm.or_else(|| {
+                    order
+                        .map(|order| std::sync::Arc::new(HvpatchCarrierMmAuthority::Test { order }))
+                }),
+                Some(rollbacks),
+            ),
+        };
+        #[cfg(not(test))]
+        let _ = &test_rollbacks;
+        let mut task = task;
+        task.pending_aliases.clear();
+        let task_mm = if let Some(existing) = existing_task_mm {
+            task.abort()?;
+            existing.alias_receipts.lock().push(alias_receipt);
+            existing
+        } else {
+            std::sync::Arc::new(HvpatchTaskMmAuthority::from_prepared(task, alias_receipt))
+        };
+        if inner
+            .states
+            .insert(
+                key,
+                HvpatchCarrierTaskRow {
+                    _mm: carrier_mm.clone(),
+                    #[cfg(test)]
+                    rollbacks: test_rollbacks,
+                },
+            )
+            .is_some()
+        {
+            std::process::abort();
+        }
+        if failpoint == 2 {
+            let row = inner
+                .states
+                .remove(&key)
+                .unwrap_or_else(|| std::process::abort());
+            #[cfg(test)]
+            if let Some(rollbacks) = &row.rollbacks {
+                rollbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            drop(row);
+            drop(carrier_mm);
+            drop(inner);
+            drop(task_mm);
+            return Err(TrapError::Hypervisor(
+                "injected carrier task-state failure after directory publication".to_owned(),
+            ));
+        }
+        if let Some(carrier_mm) = carrier_mm {
+            inner
+                .carrier_mms
+                .insert(mm_key, std::sync::Arc::downgrade(&carrier_mm));
+        }
+        inner
+            .task_mms
+            .insert(mm_key, std::sync::Arc::downgrade(&task_mm));
+        drop(inner);
+        Ok(HvpatchTaskOnlyBackendState {
+            registration: Some(HvpatchTaskRegistration {
+                directory: std::sync::Arc::clone(self),
+                key,
+                expected_identity: identity,
+                task_mm: Some(task_mm),
+                cow_authority: None,
+                cow_identity: None,
+                cow_authority_identity: None,
+                child_token_verifier: std::sync::Arc::clone(&self.child_token_verifier),
+            }),
+        })
+    }
+
+    pub(crate) fn retire(&self, key: HvpatchCarrierTaskStateKey) -> Result<(), TrapError> {
+        if key.directory_instance != self.instance {
+            return Err(TrapError::Hypervisor(
+                "cross-directory HVPatch carrier token rejected".to_owned(),
+            ));
+        }
+        let row = self.inner.lock().states.remove(&key).ok_or_else(|| {
+            TrapError::Hypervisor("missing exact carrier task-state retirement".to_owned())
+        })?;
+        #[cfg(test)]
+        if let Some(rollbacks) = &row.rollbacks {
+            rollbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        drop(row);
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchCarrierTaskState {
+    fn abort(self) -> Result<(), TrapError> {
+        match self {
+            Self::Sibling { .. } | Self::Process { .. } => Ok(()),
+            #[cfg(test)]
+            Self::Test { rollbacks, .. } => {
+                rollbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6332,9 +9122,11 @@ impl HvfVmState {
         for &(ipa, size) in &extents {
             self.retire_stage2_extent(ipa, size as u64)?;
         }
-        alias_registry().lock().retain(|alias| {
-            !alias_is_owned_by_process(alias.ownership_scope, self.mm_root_slot)
-                && !extents.contains(&(alias.physical_ipa, alias.physical_size))
+        mutate_external_alias_state(|_, registry| {
+            registry.retain(|alias| {
+                !alias_is_owned_by_process(alias.ownership_scope, self.mm_root_slot)
+                    && !extents.contains(&(alias.physical_ipa, alias.physical_size))
+            });
         });
 
         // A retained shared extent still points at its original host allocation.
@@ -6391,35 +9183,39 @@ impl HvfVmState {
             .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
-            mappings: Vec::new(),
-            mm_root_slot: None,
+            task: HvfTaskState {
+                mappings: Vec::new(),
+                mm_root_slot: None,
+                pending_exec_mm_root_slot: None,
+                pending_exec_asid: None,
+                last_exit_class: 0,
+                last_fault_esr: 0,
+                is_forked_child: false,
+                forked_no_exec: false,
+                protections: std::sync::Arc::new(MemoryProtections::default()),
+                page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+                last_syscall_nr: None,
+                last_syscall_orig_x0: 0,
+                vfork_share: false,
+                fork_mapping_descs: Vec::new(),
+                fork_child_descs: Vec::new(),
+                persistent_vm_lifecycle: false,
+                frame_inventory: HvpatchFrameInventoryState::new(std::sync::Arc::new(
+                    parking_lot::Mutex::new(HvpatchFrameInventory::default()),
+                )),
+                cow_authority: None,
+                cow_identity: None,
+                cow_armed: std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+                cow_deferred_publications: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+                pending_fork_frame_receipts: Vec::new(),
+                pending_process_aliases: Vec::new(),
+                cow_rollback_scratch: None,
+            },
             reclaim_authority: ReclaimParkAuthority::Live,
-            last_exit_class: 0,
-            last_fault_esr: 0,
-            is_forked_child: false,
-            forked_no_exec: false,
-            protections: std::sync::Arc::new(MemoryProtections::default()),
-            page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             mailbox_slots: std::sync::Arc::new(MailboxSlotAllocator::new()),
             syscall_transport,
-            last_syscall_nr: None,
-            last_syscall_orig_x0: 0,
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
-            vfork_share: false,
-            fork_mapping_descs: Vec::new(),
-            fork_child_descs: Vec::new(),
-            persistent_vm_lifecycle: false,
-            frame_inventory: HvpatchFrameInventoryState::new(std::sync::Arc::new(
-                parking_lot::Mutex::new(HvpatchFrameInventory::default()),
-            )),
-            cow_authority: None,
-            cow_identity: None,
-            cow_armed: std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
-            cow_deferred_publications: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
-            pending_fork_frame_receipts: Vec::new(),
-            pending_process_aliases: Vec::new(),
-            cow_rollback_scratch: None,
         };
         state.seed_readonly_spans_from_plan(plan);
 
@@ -8555,9 +11351,11 @@ impl HvfVmState {
                 split.old.stage2_base,
                 usize::try_from(split.old.stage2_length).unwrap_or_default(),
             );
-            alias_registry().lock().retain(|alias| {
-                (alias.physical_ipa, alias.physical_size as u64)
-                    != (split.old.stage2_base, split.old.stage2_length)
+            mutate_external_alias_state(|_, registry| {
+                registry.retain(|alias| {
+                    (alias.physical_ipa, alias.physical_size as u64)
+                        != (split.old.stage2_base, split.old.stage2_length)
+                });
             });
             self.mappings.retain(|mapping| {
                 (mapping.physical_ipa, mapping.physical_size as u64)
@@ -11718,6 +14516,41 @@ impl HvfVmState {
         Ok(())
     }
 
+    pub(crate) fn build_persistent_executor_spec(&self) -> PersistentExecutorSpec {
+        PersistentExecutorSpec {
+            vm: (*self._vm).clone(),
+            mailbox_slots: std::sync::Arc::clone(&self.mailbox_slots),
+            syscall_transport: self.syscall_transport,
+        }
+    }
+
+    pub(crate) fn from_persistent_executor_spec(
+        spec: &PersistentExecutorSpec,
+    ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu, MailboxBinding), TrapError> {
+        let vm = rebuilt_vm_cell()
+            .lock()
+            .clone()
+            .unwrap_or_else(|| spec.vm.clone());
+        let vcpu = create_vcpu(&vm)?;
+        enable_el0_counter_access(vcpu.id());
+        let state = HvfVmState {
+            _vm: std::mem::ManuallyDrop::new(vm),
+            task: HvfTaskState::neutral(),
+            reclaim_authority: ReclaimParkAuthority::Live,
+            mailbox_slots: std::sync::Arc::clone(&spec.mailbox_slots),
+            syscall_transport: spec.syscall_transport,
+            vcpu_id: vcpu.id(),
+            vcpu_handle: vcpu.get_handle(),
+        };
+        let mailbox = state.allocate_mailbox_for_vcpu(&vcpu)?;
+        state.task.audit_neutral()?;
+        Ok((state, vcpu, mailbox))
+    }
+
+    pub(crate) fn audit_persistent_executor_idle(&self) -> Result<(), TrapError> {
+        self.task.audit_neutral()
+    }
+
     /// Build a [`ThreadSpec`] for a thread-creating `clone(CLONE_THREAD)`: clone the
     /// SHARED VM handle (Arc-refcounted, so the new thread can `vcpu_create` against
     /// it) + the SHARED protections/page-table Arcs + a COPY of the mapping
@@ -11785,33 +14618,37 @@ impl HvfVmState {
 
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
-            mappings: Vec::with_capacity(mappings.len()),
-            mm_root_slot,
+            task: HvfTaskState {
+                mappings: Vec::with_capacity(mappings.len()),
+                mm_root_slot,
+                pending_exec_mm_root_slot: None,
+                pending_exec_asid: None,
+                last_exit_class: 0,
+                last_fault_esr: 0,
+                is_forked_child: false,
+                forked_no_exec: false,
+                protections,
+                page_tables,
+                last_syscall_nr: None,
+                last_syscall_orig_x0: 0,
+                vfork_share: false,
+                fork_mapping_descs: Vec::new(),
+                fork_child_descs: Vec::new(),
+                persistent_vm_lifecycle,
+                frame_inventory: HvpatchFrameInventoryState::new(frame_inventory),
+                cow_authority,
+                cow_identity,
+                cow_armed,
+                cow_deferred_publications,
+                pending_fork_frame_receipts: Vec::new(),
+                pending_process_aliases: Vec::new(),
+                cow_rollback_scratch: None,
+            },
             reclaim_authority: ReclaimParkAuthority::Live,
-            last_exit_class: 0,
-            last_fault_esr: 0,
-            is_forked_child: false,
-            forked_no_exec: false,
-            protections,
-            page_tables,
             mailbox_slots,
             syscall_transport,
-            last_syscall_nr: None,
-            last_syscall_orig_x0: 0,
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
-            vfork_share: false,
-            fork_mapping_descs: Vec::new(),
-            fork_child_descs: Vec::new(),
-            persistent_vm_lifecycle,
-            frame_inventory: HvpatchFrameInventoryState::new(frame_inventory),
-            cow_authority,
-            cow_identity,
-            cow_armed,
-            cow_deferred_publications,
-            pending_fork_frame_receipts: Vec::new(),
-            pending_process_aliases: Vec::new(),
-            cow_rollback_scratch: None,
         };
 
         for mapping in mappings {
@@ -12540,6 +15377,201 @@ impl HvfVmState {
         Ok(spec)
     }
 
+    fn prepare_task_only_process_spec(
+        spec: ProcessSpec,
+    ) -> Result<(HvpatchCarrierTaskState, HvpatchPreparedTaskAuthority), TrapError> {
+        let mut mapped = Vec::with_capacity(spec.mappings.len());
+        let mut stage2_leases = Vec::with_capacity(spec.mappings.len());
+        let inventory_mappings = spec.inventory_mappings;
+        let mut pending_aliases = Vec::new();
+        let mut pending_receipts = Vec::new();
+        for mut mapping in spec.mappings {
+            let semantic_physical_offset = mapping
+                .ipa
+                .checked_sub(mapping.physical_ipa)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .filter(|offset| {
+                    offset
+                        .checked_add(mapping.size)
+                        .is_some_and(|end| end <= mapping.physical_size)
+                })
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(format!(
+                        "task-only child alias IPA 0x{:x} escapes physical IPA 0x{:x}",
+                        mapping.ipa, mapping.physical_ipa
+                    ))
+                })?;
+            let host_addr = mapping
+                .physical_host_addr
+                .wrapping_add(semantic_physical_offset);
+            if process_mapping_needs_stage2_install(mapping.inherited_frame) {
+                let rc = unsafe {
+                    inventory_hv_vm_map(
+                        mapping.physical_host_addr.cast(),
+                        mapping.physical_ipa,
+                        mapping.physical_size,
+                        u64::from(mapping.perms),
+                    )
+                };
+                if rc != 0 {
+                    drop(mapping.stage2_lease.take());
+                    drop(stage2_leases);
+                    drop(mapped);
+                    return Err(TrapError::ChildMapFailed {
+                        host_addr: mapping.physical_host_addr as u64,
+                        guest_start: mapping.physical_ipa,
+                        size: mapping.physical_size,
+                        code: rc as u32,
+                    });
+                }
+                if let Some(lease) = mapping.stage2_lease.as_mut() {
+                    lease.mark_mapped();
+                }
+            }
+            if mapping.is_dynamic_alias {
+                let alias = AliasBacking {
+                    start: mapping.start,
+                    ipa: mapping.ipa,
+                    host_addr: host_addr as usize,
+                    size: mapping.size,
+                    physical_ipa: mapping.physical_ipa,
+                    physical_host_addr: mapping.physical_host_addr as usize,
+                    physical_size: mapping.physical_size,
+                    perms: u64::from(mapping.perms),
+                    guest_writable: mapping.guest_writable,
+                    sharing: mapping.sharing,
+                    ownership_scope: alias_ownership_scope(mapping.sharing, None),
+                    inventory_backing: mapping.inventory_backing,
+                    shared_key_base: mapping.shared_key_base,
+                    shared_key_offset: mapping.shared_key_offset,
+                    owner_generation: global_frame_host_owner_generation(
+                        mapping.physical_ipa,
+                        mapping.physical_size as u64,
+                    ),
+                };
+                pending_aliases.push(if mapping.sharing.uses_global_ipa() {
+                    alias
+                } else {
+                    rebind_inherited_alias_to_process(alias, spec.mm_root_slot)
+                });
+            }
+            if let Some(stage2_lease) = mapping.stage2_lease.take() {
+                stage2_leases.push(stage2_lease);
+            }
+            mapped.push(HvpatchTaskMappingState {
+                start: mapping.start,
+                ipa: mapping.ipa,
+                physical_ipa: mapping.physical_ipa,
+                end: mapping.end,
+                host_addr,
+                physical_host_addr: mapping.physical_host_addr,
+                size: mapping.size,
+                physical_size: mapping.physical_size,
+                perms: mapping.perms,
+                guest_writable: mapping.guest_writable,
+                host_mapping: mapping.host.into_owned(),
+                is_dynamic_alias: mapping.is_dynamic_alias,
+                sharing: mapping.sharing,
+                shared_key_base: mapping.shared_key_base,
+                shared_key_offset: mapping.shared_key_offset,
+                owner_generation: global_frame_host_owner_generation(
+                    mapping.physical_ipa,
+                    mapping.physical_size as u64,
+                ),
+            });
+        }
+        let mut process_reservation = spec
+            .frame_inventory
+            .lock()
+            .process_reservation
+            .take()
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "task-only child has no frame inventory reservation".to_owned(),
+                )
+            })?;
+        let process_transaction = process_reservation.transaction();
+        let mut staged_inventory_mappings = Vec::with_capacity(inventory_mappings.len());
+        let process_commit;
+        {
+            let mut inventory = spec.frame_inventory.lock();
+            for mapping in inventory_mappings {
+                let staged = match Self::stage_mapping(
+                    &mut inventory,
+                    &mut process_reservation,
+                    InventoryMappingStage {
+                        gpa: mapping.gpa,
+                        length: mapping.length,
+                        permissions: mapping.permissions,
+                        backing: mapping.backing,
+                        inherited_frame: mapping.inherited_frame,
+                        stage2_lease: Some(mapping.stage2_lease),
+                    },
+                ) {
+                    Ok(staged) => staged,
+                    Err(error) => {
+                        Self::rollback_unpublished_mappings(
+                            &mut inventory,
+                            &staged_inventory_mappings,
+                        )
+                            .unwrap_or_else(|rollback_error| {
+                                eprintln!(
+                                    "carrick: FATAL: rollback task-only child inventory: {rollback_error}"
+                                );
+                                std::process::abort();
+                        });
+                        drop(inventory);
+                        drop(stage2_leases);
+                        drop(mapped);
+                        return Err(error);
+                    }
+                };
+                staged_inventory_mappings.push(((mapping.gpa, mapping.length), staged));
+                if let (Some(parent_mapping), Some(frame)) =
+                    (mapping.inherited_mapping, mapping.inherited_frame)
+                    && (mapping.guest_writable || mapping.sharing.shares_across_fork())
+                {
+                    pending_receipts.push(PendingForkFrameReceipt {
+                        transaction: process_transaction,
+                        kind: if mapping.shared_mm || mapping.sharing.shares_across_fork() {
+                            carrick_observability::probes::HvpatchForkFrameKind::Shared
+                        } else {
+                            carrick_observability::probes::HvpatchForkFrameKind::PrivateCow
+                        },
+                        parent_mapping,
+                        child_mapping: staged.mapping,
+                        frame,
+                        ipa: mapping.gpa,
+                        length: mapping.length,
+                    });
+                }
+            }
+            inventory.initialized = true;
+            process_commit = process_reservation.commit(());
+        }
+        let process_challenge = process_commit.receipt_challenge();
+        Ok((
+            HvpatchCarrierTaskState::Process {
+                vm: spec.vm,
+                stage2_leases,
+            },
+            HvpatchPreparedTaskAuthority {
+                mappings: mapped,
+                mm_root_slot: Some(spec.mm_root_slot),
+                inventory: HvpatchTaskInventoryAuthority::ProcessPrepared {
+                    ledger: spec.frame_inventory,
+                    staged: staged_inventory_mappings,
+                    commit: Some(process_commit),
+                    challenge: Some(process_challenge),
+                },
+                cow_armed: Some(spec.cow_armed),
+                pending_receipts,
+                pending_aliases,
+                ..HvpatchPreparedTaskAuthority::default()
+            },
+        ))
+    }
+
     pub(crate) fn from_process_spec(
         spec: ProcessSpec,
     ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu, MailboxBinding), TrapError> {
@@ -12650,38 +15682,42 @@ impl HvfVmState {
                     "HVPatch child materialized without frame inventory reservation".to_owned(),
                 )
             })?;
+        let process_transaction = process_reservation.transaction();
         let mut state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(spec.vm),
-            mappings: mapped,
-            mm_root_slot: Some(spec.mm_root_slot),
+            task: HvfTaskState {
+                mappings: mapped,
+                mm_root_slot: Some(spec.mm_root_slot),
+                pending_exec_mm_root_slot: None,
+                pending_exec_asid: None,
+                last_exit_class: 0,
+                last_fault_esr: 0,
+                is_forked_child: false,
+                forked_no_exec: false,
+                protections: spec.protections,
+                // Empty until the shared engine's `bind_stage1_page_tables`
+                // installs the child's real manager.
+                page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+                last_syscall_nr: None,
+                last_syscall_orig_x0: 0,
+                vfork_share: false,
+                fork_mapping_descs: Vec::new(),
+                fork_child_descs: Vec::new(),
+                persistent_vm_lifecycle: spec.persistent_vm_lifecycle,
+                frame_inventory: HvpatchFrameInventoryState::new(spec.frame_inventory),
+                cow_authority: None,
+                cow_identity: None,
+                cow_armed: spec.cow_armed,
+                cow_deferred_publications: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+                pending_fork_frame_receipts: Vec::new(),
+                pending_process_aliases: aliases_to_publish,
+                cow_rollback_scratch: None,
+            },
             reclaim_authority: ReclaimParkAuthority::Live,
-            last_exit_class: 0,
-            last_fault_esr: 0,
-            is_forked_child: false,
-            forked_no_exec: false,
-            protections: spec.protections,
-            // Empty until the shared engine's `bind_stage1_page_tables` installs
-            // the child's real manager, exactly as `new_with_plan` does for a
-            // fresh VM. Nothing between here and that bind reads it.
-            page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             mailbox_slots: spec.mailbox_slots,
             syscall_transport: spec.syscall_transport,
-            last_syscall_nr: None,
-            last_syscall_orig_x0: 0,
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
-            vfork_share: false,
-            fork_mapping_descs: Vec::new(),
-            fork_child_descs: Vec::new(),
-            persistent_vm_lifecycle: spec.persistent_vm_lifecycle,
-            frame_inventory: HvpatchFrameInventoryState::new(spec.frame_inventory),
-            cow_authority: None,
-            cow_identity: None,
-            cow_armed: spec.cow_armed,
-            cow_deferred_publications: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
-            pending_fork_frame_receipts: Vec::new(),
-            pending_process_aliases: aliases_to_publish,
-            cow_rollback_scratch: None,
         };
         let mailbox = match state.allocate_mailbox_for_vcpu(&vcpu) {
             Ok(mailbox) => mailbox,
@@ -12737,6 +15773,7 @@ impl HvfVmState {
                         carrick_observability::probes::HvpatchForkFrameKind::PrivateCow
                     };
                     pending_fork_frame_receipts.push(PendingForkFrameReceipt {
+                        transaction: process_transaction,
                         kind,
                         parent_mapping,
                         child_mapping: staged.mapping,
@@ -12754,7 +15791,7 @@ impl HvfVmState {
     }
 
     fn global_frame_exec_plan(&self, plan: &GuestMappingPlan) -> Result<GlobalExecPlan, TrapError> {
-        prepare_global_exec_plan(plan, self.mm_root_slot)
+        prepare_global_exec_plan(plan, self.pending_exec_mm_root_slot.or(self.mm_root_slot))
     }
 
     /// `execve(2)` image replacement. Ordinary VMM tears down and rebuilds the
@@ -12768,6 +15805,23 @@ impl HvfVmState {
         plan: &GuestMappingPlan,
     ) -> Result<(), TrapError> {
         use applevisor::prelude::*;
+        let predecessor_mm_root_slot = self.mm_root_slot;
+        let replacement_mm_root_slot = if self.persistent_vm_lifecycle {
+            self.pending_exec_mm_root_slot.ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "HVPatch exec began without a fresh root-slot lease".to_owned(),
+                )
+            })?
+        } else {
+            self.mm_root_slot.unwrap_or((0, 0))
+        };
+        let replacement_asid = if self.persistent_vm_lifecycle {
+            self.pending_exec_asid.ok_or_else(|| {
+                TrapError::Hypervisor("HVPatch exec began without a fresh ASID lease".to_owned())
+            })?
+        } else {
+            0
+        };
         let mut inventory_reservations = if self.persistent_vm_lifecycle {
             let mut inventory = self.frame_inventory.lock();
             Some((
@@ -12791,6 +15845,8 @@ impl HvfVmState {
             plan: mut global_plan,
             mut stage2_leases,
         } = self.global_frame_exec_plan(plan)?;
+        self.pending_exec_mm_root_slot = None;
+        self.pending_exec_asid = None;
         let frame_plan_elapsed_ns = frame_plan_started
             .elapsed()
             .as_nanos()
@@ -12947,7 +16003,9 @@ impl HvfVmState {
                     if rc == 0
                         && let Some(replay_key) = extent.replay_key()
                     {
-                        replay_mappings().lock().insert(replay_key);
+                        mutate_external_alias_state(|replay, _| {
+                            replay.insert(replay_key);
+                        });
                     }
                     crate::probes::hvpatch_exec_stage2(
                         carrick_observability::probes::HvpatchExecStage2::new(
@@ -13021,13 +16079,15 @@ impl HvfVmState {
         // final logical references retired above.
         let alias_cleanup_started = std::time::Instant::now();
         if self.persistent_vm_lifecycle {
-            alias_registry().lock().retain(|alias| {
-                !alias_is_owned_by_process(alias.ownership_scope, self.mm_root_slot)
-                    && !retired_physical_extents
-                        .contains(&(alias.physical_ipa, alias.physical_size))
+            mutate_external_alias_state(|_, registry| {
+                registry.retain(|alias| {
+                    !alias_is_owned_by_process(alias.ownership_scope, predecessor_mm_root_slot)
+                        && !retired_physical_extents
+                            .contains(&(alias.physical_ipa, alias.physical_size))
+                });
             });
         } else {
-            alias_registry().lock().clear();
+            clear_alias_registry();
         }
         emit_replace_stage(
             carrick_observability::probes::HvpatchExecReplaceStagePhase::AliasCleanup,
@@ -13094,6 +16154,9 @@ impl HvfVmState {
         // Mailbox publication resolves its static boot mapping directly; an
         // in-process fork below explicitly materializes the manager on demand.
         // The =0 hatch restores the eager clone for schedule-identical ABBA.
+        if self.persistent_vm_lifecycle {
+            self.mm_root_slot = Some(replacement_mm_root_slot);
+        }
         let exec_page_tables = if lazy_exec_page_tables_enabled() {
             None
         } else {
@@ -13110,9 +16173,13 @@ impl HvfVmState {
             })
         };
         self.page_tables = std::sync::Arc::new(parking_lot::Mutex::new(exec_page_tables));
-        // execve is a fresh single-threaded image. Give it a fresh allocator and
-        // lease so no pre-exec logical-vCPU ownership can leak into the new VM.
-        self.mailbox_slots = std::sync::Arc::new(MailboxSlotAllocator::new());
+        // Mature one-process VMM exec gets a fresh VM-local allocator. A
+        // persistent HVPatch worker must retain its executor-local allocator
+        // on the owner pthread; `allocate_mailbox_for_vcpu` below gives the
+        // replacement task a fresh slot from that same bounded arena.
+        if !self.persistent_vm_lifecycle {
+            self.mailbox_slots = std::sync::Arc::new(MailboxSlotAllocator::new());
+        }
         self.last_syscall_nr = None;
         self.last_syscall_orig_x0 = 0;
         emit_replace_stage(
@@ -13218,10 +16285,11 @@ impl HvfVmState {
                 // (canonical rationale in carrick_mem::arch_sysregs).
                 vcpu.set_sys_reg(SysReg::TCR_EL1, boot.tcr_el1)
                     .map_err(hvf_error)?;
-                vcpu.set_sys_reg(SysReg::TTBR0_EL1, pt_base)
+                let ttbr = pt_base | (u64::from(replacement_asid) << 48);
+                vcpu.set_sys_reg(SysReg::TTBR0_EL1, ttbr)
                     .map_err(hvf_error)?;
                 // TTBR1 shares the same root (see the TCR comment above).
-                vcpu.set_sys_reg(SysReg::TTBR1_EL1, pt_base)
+                vcpu.set_sys_reg(SysReg::TTBR1_EL1, ttbr)
                     .map_err(hvf_error)?;
                 sctlr_el1 |= 1;
             }
@@ -13984,22 +17052,23 @@ fn emit_global_frame_stage2(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn inventory_hv_vm_map_replay(backing: AliasBacking) -> applevisor_sys::hv_return_t {
     let key = replay_mapping_key(backing);
-    let mut installed = replay_mappings().lock();
-    if installed.contains(&key) {
-        return 0;
-    }
-    let result = unsafe {
-        inventory_hv_vm_map(
-            backing.physical_host_addr as *mut std::ffi::c_void,
-            backing.physical_ipa,
-            backing.physical_size,
-            backing.perms,
-        )
-    };
-    if result == 0 {
-        installed.insert(key);
-    }
-    result
+    mutate_external_alias_state(|installed, _| {
+        if installed.contains(&key) {
+            return 0;
+        }
+        let result = unsafe {
+            inventory_hv_vm_map(
+                backing.physical_host_addr as *mut std::ffi::c_void,
+                backing.physical_ipa,
+                backing.physical_size,
+                backing.perms,
+            )
+        };
+        if result == 0 {
+            installed.insert(key);
+        }
+        result
+    })
 }
 
 /// Sole raw Hypervisor.framework stage-2 unmap boundary.
@@ -15476,7 +18545,7 @@ mod frame_inventory_backend_tests {
             crate::memory::LINUX_PAGE_TABLES_BASE,
             crate::memory::LINUX_PAGE_TABLES_SIZE,
         );
-        page_tables.image = std::sync::Arc::new(crate::memory::stage1_identity_page_tables());
+        page_tables.image = std::sync::Arc::new(carrick_mem::memory::stage1_hvpatch_page_tables());
         page_tables.payload_size = page_tables.image.len() as u64;
         let sparse = exec_mapping_for_order(
             crate::memory::LINUX_MMAP_BASE,
@@ -15540,6 +18609,99 @@ mod frame_inventory_backend_tests {
                 .all(|first| second_keys.iter().all(|second| first != second)),
             "a successor root image must not reuse a frame still retained by a child or predecessor"
         );
+    }
+
+    #[test]
+    fn exec_replacement_preserves_canonical_scoped_asid_and_load_barrier_code() {
+        let mut input = root_exec_test_plan();
+        let mut maintenance = exec_mapping_for_order(
+            carrick_mem::memory::LINUX_EL1_MAINT_BASE,
+            carrick_mem::memory::LINUX_EL1_MAINT_SIZE,
+        );
+        maintenance.image = std::sync::Arc::new(carrick_mem::memory::el1_maintenance_bytes());
+        maintenance.payload_size = maintenance.image.len() as u64;
+        maintenance.perms = carrick_mem::elf::SegmentPerms {
+            read: true,
+            write: false,
+            execute: true,
+        };
+        input.mappings.push(maintenance);
+
+        let GlobalExecPlan { plan, .. } =
+            prepare_global_exec_plan(&input, None).expect("global exec plan");
+        let mapping = plan
+            .mappings
+            .iter()
+            .find(|mapping| {
+                mapping.guest_start <= carrick_mem::memory::LINUX_EL1_MAINT_BASE
+                    && mapping.guest_start + mapping.mapped_size
+                        >= carrick_mem::memory::LINUX_EL1_MAINT_BASE
+                            + carrick_mem::memory::LINUX_EL1_MAINT_SIZE
+            })
+            .expect("exec kernel mapping contains maintenance image");
+        let bytes_at = |address: u64, expected: Vec<u8>| {
+            let offset = usize::try_from(address - mapping.guest_start).unwrap();
+            assert_eq!(
+                &mapping.image[offset..offset + expected.len()],
+                expected.as_slice()
+            );
+        };
+        bytes_at(
+            carrick_mem::memory::LINUX_EL1_ASID_MAINT_BASE,
+            carrick_mem::memory::el1_asid_maintenance_bytes(),
+        );
+        bytes_at(
+            carrick_mem::memory::LINUX_EL1_LOAD_BARRIER_BASE,
+            carrick_mem::memory::el1_load_barrier_bytes(),
+        );
+    }
+
+    #[test]
+    fn exec_replacement_keeps_every_representative_leaf_asid_scoped() {
+        const NON_GLOBAL: u64 = 1 << 11;
+        let GlobalExecPlan { plan, .. } =
+            prepare_global_exec_plan(&root_exec_test_plan(), None).expect("global exec plan");
+        let tables = plan
+            .mappings
+            .iter()
+            .find(|mapping| mapping.guest_start == carrick_mem::memory::LINUX_PAGE_TABLES_BASE)
+            .expect("exec stage-1 table mapping");
+        for (name, va) in [
+            ("user text", 0x0040_0000),
+            ("heap", carrick_mem::memory::LINUX_HEAP_BASE),
+            ("mmap", carrick_mem::memory::LINUX_MMAP_BASE),
+            (
+                "shared aperture",
+                carrick_mem::memory::LINUX_SHARED_FILE_BASE,
+            ),
+            ("stack", carrick_mem::memory::LINUX_STACK_TOP - 0x4000),
+            ("EL1 maintenance", carrick_mem::memory::LINUX_EL1_MAINT_BASE),
+            (
+                "identity control",
+                carrick_mem::memory::LINUX_IDENTITY_PAGE_BASE,
+            ),
+            (
+                "syscall mailbox",
+                carrick_mem::memory::LINUX_SYSCALL_MAILBOX_BASE,
+            ),
+            ("Rosetta alias", carrick_mem::memory::LINUX_ROSETTA_VA_BASE),
+        ] {
+            let leaf = carrick_mem::page_table::terminal_descriptor(
+                carrick_mem::page_table::walk_descriptors(
+                    tables.image.as_ref(),
+                    tables.ipa_start,
+                    va,
+                ),
+            );
+            if name != "mmap" {
+                assert_ne!(leaf & 0b11, 0, "{name} leaf at {va:#x} is not mapped");
+            }
+            assert_ne!(
+                leaf & NON_GLOBAL,
+                0,
+                "post-exec {name} leaf at {va:#x} escaped ASID scope"
+            );
+        }
     }
 
     #[test]

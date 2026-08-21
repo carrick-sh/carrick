@@ -235,6 +235,10 @@ pub struct PageTableManager {
     bytes: Vec<u8>,
     /// PA mapped at byte offset 0 (`LINUX_PAGE_TABLES_BASE`).
     base: u64,
+    /// New or rebuilt terminal descriptors must carry nG. Derived from the
+    /// canonical low user leaf so a rebased/cloned HVPatch table retains its
+    /// ASID-scoped construction mode without a second out-of-band authority.
+    asid_scoped_leaves: bool,
     /// Byte offset of the next free spare page (bump allocator).
     next_free: u64,
     /// PAs of spare sub-tables freed by coalescing, reused before bumping. Only
@@ -271,6 +275,7 @@ impl Clone for PageTableManager {
         Self {
             bytes: self.bytes.clone(),
             base: self.base,
+            asid_scoped_leaves: self.asid_scoped_leaves,
             next_free: self.next_free,
             free_tables: self.free_tables.clone(),
             multi_vcpu: self.multi_vcpu,
@@ -287,6 +292,7 @@ impl Clone for PageTableManager {
     fn clone_from(&mut self, source: &Self) {
         self.bytes.clone_from(&source.bytes);
         self.base = source.base;
+        self.asid_scoped_leaves = source.asid_scoped_leaves;
         self.next_free = source.next_free;
         self.free_tables.clone_from(&source.free_tables);
         self.multi_vcpu = source.multi_vcpu;
@@ -299,9 +305,16 @@ impl Clone for PageTableManager {
 impl PageTableManager {
     pub fn new(bytes: Vec<u8>, base: u64) -> Self {
         let next_free = discover_next_free_spare(&bytes);
+        let asid_scoped_leaves = terminal_descriptor(walk_descriptors(
+            &bytes,
+            base,
+            crate::memory::LINUX_NULL_GUARD_END,
+        )) & NON_GLOBAL
+            != 0;
         Self {
             bytes,
             base,
+            asid_scoped_leaves,
             next_free,
             free_tables: Vec::new(),
             multi_vcpu: false,
@@ -949,7 +962,7 @@ impl PageTableManager {
     }
 
     /// Build the leaf descriptor for `op` covering `base_pa` at `level`.
-    fn desc_for(op: PtOp, base_pa: u64, level: usize) -> u64 {
+    fn desc_for(&self, op: PtOp, base_pa: u64, level: usize) -> u64 {
         let (_, mask) = Self::level_span(level);
         // Block at L1/L2, page at L3 (type bit differs; USER_PAGE_FLAGS adds it).
         let kernel_only = matches!(op, PtOp::KernelReadOnly { .. });
@@ -965,32 +978,40 @@ impl PageTableManager {
             USER_BLOCK_FLAGS
         };
         let base = base_pa & mask;
+        let scope = if self.asid_scoped_leaves {
+            NON_GLOBAL
+        } else {
+            0
+        };
         // UXN (bit 54) is set for a non-exec leaf; cleared for an exec one.
         // USER_*_FLAGS start UXN-clear (executable), so OR in UXN when !exec.
         let uxn = |exec: bool| if exec { 0 } else { UXN };
         match op {
-            PtOp::Invalidate => base | (flags & !VALID),
-            PtOp::ReadWrite { exec } => base | flags | uxn(exec),
-            PtOp::ReadOnly { exec } => base | (flags & !AP_MASK) | AP_RO | uxn(exec),
+            PtOp::Invalidate => base | (flags & !VALID) | scope,
+            PtOp::ReadWrite { exec } => base | flags | uxn(exec) | scope,
+            PtOp::ReadOnly { exec } => base | (flags & !AP_MASK) | AP_RO | uxn(exec) | scope,
             PtOp::ForkReadOnly { exec } => {
                 // Fork arming is a permission restriction, not a remap: a
                 // PROT_NONE descriptor must remain invalid while gaining nG so
                 // a later mprotect-to-write still inherits ASID scoping.
                 base | (flags & !VALID & !AP_MASK) | AP_RO | NON_GLOBAL | uxn(exec)
             }
-            PtOp::KernelReadOnly { exec } => base | (flags & !AP_MASK) | AP_PRIV_RO | uxn(exec),
+            PtOp::KernelReadOnly { exec } => {
+                base | (flags & !AP_MASK) | AP_PRIV_RO | uxn(exec) | scope
+            }
         }
     }
 
     /// Does a leaf with `(valid, ap, uxn_set)` already satisfy `op`? Includes the
     /// UXN (execute) bit so a re-protect that only flips PROT_EXEC still applies.
-    fn satisfies(op: PtOp, valid: bool, ap: u64, uxn_set: bool, non_global: bool) -> bool {
+    fn satisfies(&self, op: PtOp, valid: bool, ap: u64, uxn_set: bool, non_global: bool) -> bool {
+        let scoped = !self.asid_scoped_leaves || non_global;
         match op {
-            PtOp::Invalidate => !valid,
-            PtOp::ReadWrite { exec } => valid && ap == AP_RW && uxn_set != exec,
-            PtOp::ReadOnly { exec } => valid && ap == AP_RO && uxn_set != exec,
+            PtOp::Invalidate => !valid && scoped,
+            PtOp::ReadWrite { exec } => valid && ap == AP_RW && uxn_set != exec && scoped,
+            PtOp::ReadOnly { exec } => valid && ap == AP_RO && uxn_set != exec && scoped,
             PtOp::ForkReadOnly { exec } => ap == AP_RO && uxn_set != exec && non_global,
-            PtOp::KernelReadOnly { exec } => valid && ap == AP_PRIV_RO && uxn_set != exec,
+            PtOp::KernelReadOnly { exec } => valid && ap == AP_PRIV_RO && uxn_set != exec && scoped,
         }
     }
 
@@ -1011,7 +1032,7 @@ impl PageTableManager {
             let block_start = cur & mask;
             let block_end = block_start + span;
             let desc = self.read_desc(off);
-            if Self::satisfies(
+            if self.satisfies(
                 op,
                 desc & VALID != 0,
                 desc & AP_MASK,
@@ -1038,7 +1059,14 @@ impl PageTableManager {
                 // is rebuilt from the identity VA, preserving the historical
                 // arena behaviour.
                 let new_desc = match op {
-                    PtOp::Invalidate => desc & !VALID,
+                    PtOp::Invalidate => {
+                        (desc & !VALID)
+                            | if self.asid_scoped_leaves {
+                                NON_GLOBAL
+                            } else {
+                                0
+                            }
+                    }
                     PtOp::ReadOnly { exec }
                     | PtOp::ForkReadOnly { exec }
                     | PtOp::ReadWrite { exec }
@@ -1051,11 +1079,12 @@ impl PageTableManager {
                             _ => AP_RW,
                         };
                         let uxn = if exec { 0 } else { UXN };
-                        let non_global = if matches!(op, PtOp::ForkReadOnly { .. }) {
-                            NON_GLOBAL
-                        } else {
-                            0
-                        };
+                        let non_global =
+                            if self.asid_scoped_leaves || matches!(op, PtOp::ForkReadOnly { .. }) {
+                                NON_GLOBAL
+                            } else {
+                                0
+                            };
                         let validity = if matches!(op, PtOp::ForkReadOnly { .. }) {
                             desc & VALID
                         } else {
@@ -1066,7 +1095,7 @@ impl PageTableManager {
                     PtOp::ReadOnly { .. }
                     | PtOp::ForkReadOnly { .. }
                     | PtOp::ReadWrite { .. }
-                    | PtOp::KernelReadOnly { .. } => Self::desc_for(op, block_start, level),
+                    | PtOp::KernelReadOnly { .. } => self.desc_for(op, block_start, level),
                 };
                 self.write_desc(off, new_desc);
                 changed = true;
@@ -1312,15 +1341,20 @@ impl PageTableManager {
         len: u64,
         writable: bool,
     ) -> Result<bool, PageTableError> {
-        let block_flags = if writable {
-            USER_BLOCK_FLAGS
+        let scope = if self.asid_scoped_leaves {
+            NON_GLOBAL
         } else {
-            (USER_BLOCK_FLAGS & !AP_MASK) | AP_RO
+            0
+        };
+        let block_flags = if writable {
+            USER_BLOCK_FLAGS | scope
+        } else {
+            (USER_BLOCK_FLAGS & !AP_MASK) | AP_RO | scope
         };
         let page_flags = if writable {
-            USER_PAGE_FLAGS
+            USER_PAGE_FLAGS | scope
         } else {
-            (USER_PAGE_FLAGS & !AP_MASK) | AP_RO
+            (USER_PAGE_FLAGS & !AP_MASK) | AP_RO | scope
         };
         self.map_aliased_with_flags(va, ipa, len, block_flags, page_flags)
     }
@@ -1603,7 +1637,7 @@ mod tests {
         LINUX_ALIAS_IPA_BASE, LINUX_HEAP_BASE, LINUX_HIGH_VA_THRESHOLD,
         LINUX_HVPATCH_GLOBAL_FRAME_BASE, LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE,
         LINUX_PRIVATE_OVERLAY_BASE, LINUX_SHARED_FILE_BASE, mmap_arena_size,
-        stage1_identity_page_tables,
+        stage1_hvpatch_page_tables, stage1_identity_page_tables,
     };
 
     fn manager() -> PageTableManager {
@@ -1611,6 +1645,65 @@ mod tests {
         let mut bytes = stage1_identity_page_tables();
         bytes.resize(0x40000, 0);
         PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE)
+    }
+
+    #[test]
+    fn hvpatch_editor_preserves_non_global_across_protect_alias_repoint_and_coalesce() {
+        let mut mgr = PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE);
+        let leaf = |manager: &PageTableManager, va| terminal_descriptor(manager.debug_walk(va));
+        let text = 0x0040_0000_u64;
+
+        mgr.set_readonly(text, 0x1000, true).expect("protect text");
+        assert_ne!(leaf(&mgr, text) & NON_GLOBAL, 0);
+        mgr.set_rw(text, 0x1000, true).expect("restore text");
+        let restored = mgr.debug_walk(text);
+        assert_ne!(terminal_descriptor(restored) & NON_GLOBAL, 0);
+        assert_ne!(
+            restored[2] & TYPE_BITS,
+            TYPE_TABLE_OR_PAGE,
+            "uniform HVPatch leaves should coalesce back to an nG block"
+        );
+
+        let shared_va = LINUX_SHARED_FILE_BASE;
+        let shared_ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x20_0000;
+        mgr.map_aliased(shared_va, shared_ipa, 0x4000, true)
+            .expect("publish physically shared per-mm alias");
+        assert_ne!(
+            leaf(&mgr, shared_va) & NON_GLOBAL,
+            0,
+            "physical sharing must not make a semantic per-mm translation global"
+        );
+
+        let private_va = LINUX_PRIVATE_OVERLAY_BASE;
+        let first_private_ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x40_0000;
+        mgr.map_private_aliased(private_va, first_private_ipa, 0x4000, true)
+            .expect("publish private alias");
+        let replacement_ipa = LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x60_0000;
+        mgr.repoint_preserving_attributes(private_va, replacement_ipa, 0x4000)
+            .expect("repoint private alias");
+        assert_ne!(leaf(&mgr, private_va) & NON_GLOBAL, 0);
+
+        let mut compatibility = manager();
+        compatibility
+            .map_aliased(shared_va, shared_ipa, 0x4000, true)
+            .expect("publish compatibility alias");
+        assert_eq!(
+            leaf(&compatibility, shared_va) & NON_GLOBAL,
+            0,
+            "HVPatch ASID scope must not blanket-change compatibility editors"
+        );
+
+        mgr.unmap_aliased(crate::memory::LINUX_NULL_GUARD_END, 0x1000)
+            .expect("remove the low detection leaf");
+        let mut reconstructed = PageTableManager::new(mgr.into_bytes(), LINUX_PAGE_TABLES_BASE);
+        reconstructed
+            .map_aliased(shared_va, shared_ipa, 0x4000, true)
+            .expect("publish alias after reconstructing the editor");
+        assert_ne!(
+            leaf(&reconstructed, shared_va) & NON_GLOBAL,
+            0,
+            "HVPatch mode must not depend on one mutable user leaf"
+        );
     }
 
     /// The in-place walk exists so the frame-COW fault path can stop copying
