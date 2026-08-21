@@ -1739,6 +1739,26 @@ impl Kernel {
         })
     }
 
+    /// Hold one exact live, active scheduler generation stable through an
+    /// authority commit. Exited, Failed, and Uninitialized records are not
+    /// admission authority even when their generation matches exactly.
+    pub(crate) fn with_live_active_scheduler_thread<R>(
+        &self,
+        key: ThreadKey,
+        generation: super::objects::ExecutionGeneration,
+        commit: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let state = self.registry().state.read();
+        let thread = state.tasks.values().find_map(|record| {
+            if record.task.lifecycle() != TaskLifecycle::Live {
+                return None;
+            }
+            let thread = record.task.thread(key.tid)?;
+            (thread.key() == key).then_some(thread)
+        })?;
+        thread.with_active_execution_generation(generation, commit)
+    }
+
     /// Revalidate an exact granting generation and prove that `target` is a
     /// current process descendant in the Kernel parent graph. Thread-group
     /// siblings are intentionally excluded: scheduler shutdown inheritance is
@@ -1792,8 +1812,8 @@ impl Kernel {
             return None;
         }
         grant_thread
-            .with_execution_generation(grant_generation, || {
-                target_thread.with_execution_generation(target_generation, commit)
+            .with_active_execution_generation(grant_generation, || {
+                target_thread.with_active_execution_generation(target_generation, commit)
             })
             .flatten()
     }

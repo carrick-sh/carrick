@@ -312,6 +312,8 @@ struct RunQueueInner {
     wake_admissions: AtomicU64,
     #[cfg(test)]
     close_observation_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    root_admission_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 impl RunQueueInner {
@@ -532,6 +534,14 @@ impl RunQueue {
         kernel: &Arc<Kernel>,
         key: QueueKey,
     ) -> Result<SubmissionAuthority, RunQueueError> {
+        #[cfg(test)]
+        if let Some(gate) = {
+            let configured = self.inner.root_admission_gate.lock();
+            configured.clone()
+        } {
+            gate.wait();
+            gate.wait();
+        }
         let mut state = self.inner.state.lock();
         if state.lifecycle != QueueLifecycle::Open
             || self.inner.wake_admissions.load(Ordering::Acquire) & RunQueueInner::CLOSING_BIT != 0
@@ -679,6 +689,11 @@ impl RunQueue {
     fn install_close_observation_gate(&self, gate: Arc<std::sync::Barrier>) {
         *self.inner.close_observation_gate.lock() = Some(gate);
     }
+
+    #[cfg(test)]
+    fn install_root_admission_gate(&self, gate: Arc<std::sync::Barrier>) {
+        *self.inner.root_admission_gate.lock() = Some(gate);
+    }
 }
 
 pub(crate) struct QueueClaim {
@@ -796,16 +811,13 @@ impl Scheduler {
         thread: ThreadKey,
         generation: ExecutionGeneration,
     ) -> Result<SubmissionAuthority, SchedulerError> {
-        let exact = self
-            .kernel
-            .exact_thread_for_scheduler(thread)
-            .ok_or(SchedulerError::UnknownThread)?;
-        if exact.execution_state().generation() != Some(generation) {
-            return Err(RunQueueError::AuthorityMismatch.into());
-        }
-        Ok(self
-            .queue
-            .admit_root(&self.kernel, QueueKey { thread, generation })?)
+        self.kernel
+            .with_live_active_scheduler_thread(thread, generation, || {
+                self.queue
+                    .admit_root(&self.kernel, QueueKey { thread, generation })
+            })
+            .unwrap_or(Err(RunQueueError::AuthorityMismatch))
+            .map_err(Into::into)
     }
 
     pub fn make_runnable(&self, thread: ThreadKey) -> Result<WakeDisposition, SchedulerError> {
@@ -1066,6 +1078,11 @@ impl Scheduler {
     #[cfg(test)]
     fn install_close_observation_gate(&self, gate: Arc<std::sync::Barrier>) {
         self.queue.install_close_observation_gate(gate);
+    }
+
+    #[cfg(test)]
+    fn install_root_admission_gate(&self, gate: Arc<std::sync::Barrier>) {
+        self.queue.install_root_admission_gate(gate);
     }
 }
 
@@ -1461,6 +1478,84 @@ mod tests {
             context.thread().execution_state(),
             ThreadExecutionState::Runnable { .. }
         ));
+    }
+
+    #[test]
+    fn current_exited_generation_cannot_admit_root_authority() {
+        let (kernel, context) = bootstrap(12_120);
+        publish(&context, 28);
+        let scheduler = Scheduler::new(kernel);
+        let executor = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+        scheduler.settle_exited(running).unwrap();
+        let exited_generation = context.thread().execution_state().generation().unwrap();
+
+        assert!(
+            scheduler
+                .admit_root(context.thread().key(), exited_generation)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn current_failed_generation_cannot_admit_root_authority() {
+        let (kernel, context) = bootstrap(12_121);
+        publish(&context, 29);
+        let scheduler = Scheduler::new(kernel);
+        let executor = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        let mut running = scheduler.take(&executor).unwrap();
+        let lease = running.take_lease();
+        context
+            .thread()
+            .fail_from_executor(
+                lease,
+                crate::kernel::objects::ExecutionFailure::SnapshotRestoreFailed,
+            )
+            .unwrap();
+        scheduler.executors.unbind(running.binding);
+        running.finish_claim();
+        let failed_generation = context.thread().execution_state().generation().unwrap();
+
+        assert!(
+            scheduler
+                .admit_root(context.thread().key(), failed_generation)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn close_winning_root_admission_race_publishes_no_stale_authority() {
+        let (kernel, context) = bootstrap(12_122);
+        publish(&context, 30);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let executor = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+        let generation = running.generation();
+        let gate = Arc::new(Barrier::new(2));
+        scheduler.install_root_admission_gate(Arc::clone(&gate));
+        let admission_scheduler = Arc::clone(&scheduler);
+        let key = context.thread().key();
+        let admission = thread::spawn(move || admission_scheduler.admit_root(key, generation));
+
+        gate.wait();
+        let exit_scheduler = Arc::clone(&scheduler);
+        let exit = thread::spawn(move || exit_scheduler.settle_exited(running));
+        scheduler.close();
+        assert!(scheduler.is_closing());
+        gate.wait();
+
+        assert!(admission.join().unwrap().is_err());
+        exit.join().unwrap().unwrap();
+        scheduler.wait_closed();
     }
 
     #[test]

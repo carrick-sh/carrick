@@ -4168,13 +4168,28 @@ impl Thread {
     /// Hold this exact execution generation stable while a scheduler commits
     /// dependent authority. The callback may acquire run-queue state; callers
     /// must never call it from a queue-held path.
-    pub(crate) fn with_execution_generation<R>(
+    pub(crate) fn with_active_execution_generation<R>(
         &self,
         generation: ExecutionGeneration,
         commit: impl FnOnce() -> R,
     ) -> Option<R> {
         let execution = self.execution.lock();
-        (execution.state.generation() == Some(generation)).then(commit)
+        matches!(
+            execution.state,
+            ThreadExecutionState::Runnable {
+                generation: active
+            } | ThreadExecutionState::Running {
+                generation: active,
+                ..
+            } | ThreadExecutionState::SwitchingOut {
+                generation: active,
+                ..
+            } | ThreadExecutionState::Blocked {
+                generation: active,
+                ..
+            } if active == generation
+        )
+        .then(commit)
     }
 
     /// Minimal Linux run-state projection consumed by `/proc` wiring in a
