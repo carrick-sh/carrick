@@ -7838,6 +7838,14 @@ pub(crate) enum VcpuLoopLaunch {
     },
 }
 
+/// The call that installed the shared carrier pool owns its one terminal
+/// shutdown. Logical guest parentage and host launch topology are unrelated:
+/// a DTrace-created root is still the pool creator, while a descendant that
+/// reuses the inherited directory is not.
+const fn persistent_pool_shutdown_on_wait(started_pool: bool) -> bool {
+    started_pool
+}
+
 pub(crate) enum VcpuThreadHandle {
     Host {
         handle: std::thread::JoinHandle<()>,
@@ -8419,10 +8427,7 @@ where
             result: logical.result,
             completion: logical.completion,
             directory: Arc::clone(directory),
-            shutdown_on_wait: kernel
-                .hvpatch_process
-                .as_ref()
-                .is_some_and(|process| !process.is_child()),
+            shutdown_on_wait: persistent_pool_shutdown_on_wait(started_pool),
         }
     }
 }
@@ -10659,6 +10664,26 @@ mod tests {
     use crate::vcpu_loop::executor::TaskBindingResolver;
     use std::num::NonZeroU64;
     use std::time::Duration;
+
+    #[test]
+    fn persistent_pool_creator_is_the_only_shutdown_owner() {
+        assert!(persistent_pool_shutdown_on_wait(true));
+        assert!(!persistent_pool_shutdown_on_wait(false));
+
+        let source = include_str!("mod.rs");
+        let launch = source
+            .split("fn launch_persistent_hvpatch_job")
+            .nth(1)
+            .and_then(|tail| tail.split("struct PreparedInitialRunnerTask").next())
+            .expect("persistent HVPatch root launch");
+        assert!(
+            launch.contains("shutdown_on_wait: persistent_pool_shutdown_on_wait(started_pool)")
+        );
+        assert!(
+            !launch.contains("process.is_child()"),
+            "host tracing/fork topology and logical child ancestry cannot select pool ownership"
+        );
+    }
 
     #[test]
     fn guest_run_accounting_uses_non_aliasing_engine_receipts() {
