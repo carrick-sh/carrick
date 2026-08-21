@@ -931,7 +931,7 @@ impl SyscallDispatcher {
                             cq_tail,
                             Ordering::Release,
                         );
-                        return self.io_uring_block_outcome(sqe, host_fd, events);
+                        return self.io_uring_block_outcome(fd, sqe, host_fd, events);
                     }
                 },
                 Some(sqe) => self.io_uring_run_op(memory, sqe),
@@ -1140,15 +1140,17 @@ impl SyscallDispatcher {
 
     fn io_uring_block_outcome(
         &self,
+        ring_fd: i32,
         sqe: &LinuxIoUringSqe,
         host_fd: i32,
         events: i16,
     ) -> DispatchOutcome {
         let files = self.captured_file_table();
-        let fds = match WaitFds::raw_one(host_fd, events).with_guest_slots(&files, [sqe.fd]) {
-            Ok(fds) => fds,
-            Err(errno) => return DispatchOutcome::errno(errno),
-        };
+        let fds =
+            match WaitFds::raw_one(host_fd, events).with_guest_slots(&files, [ring_fd, sqe.fd]) {
+                Ok(fds) => fds,
+                Err(errno) => return DispatchOutcome::errno(errno),
+            };
         DispatchOutcome::WaitOnFds {
             fds,
             timeout: None,
@@ -1395,6 +1397,14 @@ mod tests {
         let context = dispatcher.capture_one_task_context().expect("context");
         let files = context.resources().files();
         let ids = crate::kernel::ObjectIdRegistry::new();
+        let ring_number = crate::kernel::FileSlotNumber::for_open_fd(6).expect("fd 6");
+        files.install(
+            ring_number,
+            Arc::new(crate::kernel::FileDescription::regular(
+                ids.file_description_id().expect("ring description"),
+            )),
+            false,
+        );
         let number = crate::kernel::FileSlotNumber::for_open_fd(7).expect("fd 7");
         files.install(
             number,
@@ -1406,23 +1416,34 @@ mod tests {
         let mut request = sqe(LINUX_IORING_OP_READ, 0x77);
         request.fd = 7;
         let outcome = super::super::resources::with_captured_resources(&context, || {
-            dispatcher.io_uring_block_outcome(&request, -1, libc::POLLIN)
+            dispatcher.io_uring_block_outcome(6, &request, -1, libc::POLLIN)
         });
-        let authority = match outcome {
+        let authorities = match outcome {
             DispatchOutcome::WaitOnFds { fds, .. } => {
-                assert_eq!(fds.logical_authorities_for_test().len(), 1);
-                fds.logical_authorities_for_test()[0]
+                assert_eq!(fds.logical_authorities_for_test().len(), 2);
+                fds.logical_authorities_for_test().to_vec()
             }
             other => panic!("expected io_uring wait, got {other:?}"),
         };
+        assert!(
+            authorities
+                .iter()
+                .all(|authority| files.validate_slot_authority(*authority))
+        );
         files.install(
-            number,
+            ring_number,
             Arc::new(crate::kernel::FileDescription::regular(
-                ids.file_description_id().expect("successor description"),
+                ids.file_description_id()
+                    .expect("successor ring description"),
             )),
             false,
         );
-        assert!(!files.validate_slot_authority(authority));
+        assert!(
+            authorities
+                .iter()
+                .any(|authority| !files.validate_slot_authority(*authority)),
+            "ring-fd reuse invalidates a wait even while the SQE target is stable"
+        );
     }
 
     #[test]

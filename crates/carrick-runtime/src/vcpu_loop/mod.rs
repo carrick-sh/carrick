@@ -37,7 +37,6 @@
 //! [`run_vcpu_until_exit`].
 
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::os::fd::IntoRawFd;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -606,7 +605,9 @@ pub(crate) use quiesce::{fork_barrier, pt_barrier};
 pub(crate) use signal::is_default_ignore_signal;
 #[cfg(test)]
 pub(crate) use signal::upgrade_protection_si_code;
-use signal::{deliver_fault_signal, deliver_pending_signal_with_restart};
+use signal::{
+    deliver_fault_signal, deliver_pending_signal_with_restart, deliver_reserved_signal_with_restart,
+};
 pub(crate) use signal::{
     deliver_pending_signal, lower_el0_fault, partial_write_interrupt_outcome,
     raise_sigpipe_for_blocking_write, signal_progress_count, signal_wait_expired,
@@ -1850,6 +1851,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// where no vCPU run exists yet to consume one.
     observed_task_wake_generation: u64,
     continuation_restart: Option<continuation::RestartDecision>,
+    reserved_signal: Option<continuation::ReservedSignal>,
     this_tid: ThreadId,
     threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
     /// The object-safe vCPU registry (the kicker). The shared loop never names
@@ -2089,6 +2091,7 @@ where
             service_kernel_context: None,
             observed_task_wake_generation: 0,
             continuation_restart: None,
+            reserved_signal: None,
             this_tid,
             threads,
             kicker,
@@ -3414,23 +3417,12 @@ where
             service.retire_terminal(token);
             return Ok(Some(outcome));
         }
-        self.guest_execution = Some(
-            kernel
-                .guest_executors
-                .enter(self.kernel_thread.as_ref().map(Arc::clone)),
-        );
-        let new_vcpu_lease = loop {
-            if let Some(lease) = carrick_hal::vcpu_sched::global().acquire_timeout(
-                self.this_tid.raw() as u64,
-                None,
-                Duration::from_millis(50),
-            ) {
-                break lease;
-            }
-            if self.fork_is_quiescing() {
-                self.park_if_fork_quiescing();
-            }
-        };
+        let new_vcpu_lease = continuation::await_vcpu_admission(
+            carrick_hal::vcpu_sched::global(),
+            self.this_tid.raw() as u64,
+            None,
+        )
+        .await;
         carrick_hal::vcpu_sched::set_current_lease(new_vcpu_lease);
         let executor = continuation::TransitionalDedicatedRunner::current_executor_registration()
             .ok_or_else(|| {
@@ -3441,6 +3433,11 @@ where
         let mut lease = scheduler
             .take_transitional_lease(&executor, thread.key())
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        self.guest_execution = Some(
+            kernel
+                .guest_executors
+                .enter(self.kernel_thread.as_ref().map(Arc::clone)),
+        );
         let (current_mm, current_asid) = lease
             .task_state_authority()
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
@@ -3476,7 +3473,7 @@ where
             .task_binding()
             .capture(self.linux_tid)
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        let result = match continuation::resume_continuation(&mut lease, event, &fresh) {
+        let mut result = match continuation::resume_continuation(&mut lease, event, &fresh) {
             Ok(result) => result,
             Err(continuation::ContinuationResumeError::StaleFileSlot) => {
                 *self.execution_lease.lock() = Some(lease);
@@ -3492,6 +3489,7 @@ where
         };
         *self.execution_lease.lock() = Some(lease);
         self.continuation_restart = Some(result.restart());
+        self.reserved_signal = result.take_reserved_signal();
 
         use continuation::ContinuationCompletion as Completion;
         Ok(match result.completion {
@@ -3604,6 +3602,13 @@ where
         engine
             .audit_executor_boundary()
             .map_err(RuntimeError::Trap)?;
+        let new_vcpu_lease = continuation::await_vcpu_admission(
+            carrick_hal::vcpu_sched::global(),
+            self.this_tid.raw() as u64,
+            None,
+        )
+        .await;
+        carrick_hal::vcpu_sched::set_current_lease(new_vcpu_lease);
         let executor = continuation::TransitionalDedicatedRunner::current_executor_registration()
             .ok_or_else(|| {
             RuntimeError::Configuration(
@@ -3626,19 +3631,6 @@ where
                 .guest_executors
                 .enter(self.kernel_thread.as_ref().map(Arc::clone)),
         );
-        let new_vcpu_lease = loop {
-            if let Some(lease) = carrick_hal::vcpu_sched::global().acquire_timeout(
-                self.this_tid.raw() as u64,
-                None,
-                Duration::from_millis(50),
-            ) {
-                break lease;
-            }
-            if self.fork_is_quiescing() {
-                self.park_if_fork_quiescing();
-            }
-        };
-        carrick_hal::vcpu_sched::set_current_lease(new_vcpu_lease);
         let (current_mm, current_asid) = lease
             .task_state_authority()
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
@@ -4964,6 +4956,30 @@ impl VcpuLoopLaunch {
     }
 }
 
+fn launch_compatibility_vcpu_future<F>(future: F) -> VcpuLoopLaunch
+where
+    F: std::future::Future<Output = Result<VcpuLoopOutcome, RuntimeError>>,
+{
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut future = Box::pin(future);
+    match future.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(result) => VcpuLoopLaunch::Direct(result),
+        std::task::Poll::Pending => VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(
+            "compatibility vCPU unexpectedly suspended without a transitional runner".to_owned(),
+        ))),
+    }
+}
+
+fn submit_prepared_vcpu_future<F>(
+    runner: &continuation::TransitionalDedicatedRunner,
+    future: F,
+) -> VcpuLoopLaunch
+where
+    F: std::future::Future<Output = Result<VcpuLoopOutcome, RuntimeError>> + Send + 'static,
+{
+    VcpuLoopLaunch::Job(runner.spawn(future))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_vcpu_until_exit<E: ThreadedEngine + 'static>(
     kernel: Kernel,
@@ -4983,6 +4999,35 @@ where
     E::SiblingSpec: 'static,
 {
     let runner = kernel.transitional_runner();
+    if let Some(runner) = runner {
+        let mut engine = engine;
+        let prepared = match prepare_initial_runner_handoff(
+            &kernel,
+            &mut engine,
+            &kicker,
+            linux_tid,
+            this_tid,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => return VcpuLoopLaunch::Direct(Err(error)),
+        };
+        let future = run_vcpu_until_exit_inner(
+            kernel,
+            engine,
+            registry,
+            futex,
+            platform_futex,
+            platform_futex_factory,
+            linux_tid,
+            this_tid,
+            threads,
+            kicker,
+            in_guest,
+            max_traps,
+            Some(prepared),
+        );
+        return submit_prepared_vcpu_future(&runner, future);
+    }
     let future = run_vcpu_until_exit(
         kernel,
         engine,
@@ -4997,19 +5042,78 @@ where
         in_guest,
         max_traps,
     );
-    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-    let mut future = Box::pin(future);
-    match future.as_mut().poll(&mut context) {
-        std::task::Poll::Ready(result) => VcpuLoopLaunch::Direct(result),
-        std::task::Poll::Pending => runner.map_or_else(
-            || {
-                VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(
-                    "compatibility vCPU unexpectedly suspended on transitional runner".to_owned(),
-                )))
+    launch_compatibility_vcpu_future(future)
+}
+
+struct PreparedInitialRunnerTask {
+    context: crate::kernel::KernelContext,
+}
+
+fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
+    kernel: &Kernel,
+    engine: &mut E,
+    kicker: &Arc<dyn VcpuRegistry>,
+    linux_tid: crate::kernel::LinuxTid,
+    this_tid: ThreadId,
+) -> Result<PreparedInitialRunnerTask, RuntimeError> {
+    let context = kernel
+        .dispatcher
+        .capture_kernel_context(linux_tid)
+        .map_err(|error| {
+            RuntimeError::Configuration(format!("capture initial runner task authority: {error}"))
+        })?;
+    let mm = context.shared().mm().id();
+    let asid_generation = kernel
+        .hvpatch_process
+        .as_ref()
+        .and_then(crate::hvpatch::ProcessContext::mm_binding)
+        .map_or(mm.raw(), |binding| u64::from(binding.asid.raw()));
+    engine.bind_task_snapshot_identity(mm.raw(), asid_generation);
+    if let Some(process) = kernel.hvpatch_process.as_ref() {
+        let binding = process.mm_binding().ok_or_else(|| {
+            RuntimeError::Configuration("HVPatch initial runner task has no ASID".to_owned())
+        })?;
+        engine.bind_frame_cow(
+            Arc::new(KernelFrameCowAuthority {
+                kernel: Arc::clone(context.kernel()),
+                mm,
+                guest_executors: Arc::clone(&kernel.guest_executors),
+                kicker: Arc::clone(kicker),
+                tid: this_tid,
+            }),
+            carrick_hal::FrameCowIdentity {
+                linux_pid: process.pid(),
+                linux_tid: this_tid.raw(),
+                mm: mm.raw(),
+                asid: binding.asid.raw(),
             },
-            |runner| VcpuLoopLaunch::Job(runner.spawn(future)),
-        ),
+        );
     }
+    let cpu = engine.save_guest_state().map_err(RuntimeError::Trap)?;
+    let state = crate::kernel::objects::MigratableTaskState {
+        cpu,
+        mm,
+        asid_generation,
+    };
+    context
+        .thread()
+        .publish_initial_task_state(state)
+        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+    kicker.unregister(this_tid);
+    if let Some(lease) = carrick_hal::vcpu_sched::take_current_lease() {
+        carrick_hal::vcpu_sched::global().release(lease, carrick_hal::Yield::Blocked);
+    }
+    engine
+        .audit_executor_boundary()
+        .map_err(RuntimeError::Trap)?;
+    let directory = kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
+        RuntimeError::Configuration("initial runner task has no runtime directory".to_owned())
+    })?;
+    let (scheduler, _service) = directory.continuation_services(context.kernel());
+    scheduler
+        .wake(context.thread().key())
+        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+    Ok(PreparedInitialRunnerTask { context })
 }
 
 /// Decide what the progress-aware trap watchdog should do at one checkpoint.
@@ -5057,6 +5161,43 @@ pub(crate) async fn run_vcpu_until_exit<E: ThreadedEngine + 'static>(
 where
     E::SiblingSpec: 'static,
 {
+    run_vcpu_until_exit_inner(
+        kernel,
+        engine,
+        registry,
+        futex,
+        platform_futex,
+        platform_futex_factory,
+        linux_tid,
+        this_tid,
+        threads,
+        kicker,
+        in_guest,
+        max_traps,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_vcpu_until_exit_inner<E: ThreadedEngine + 'static>(
+    kernel: Kernel,
+    engine: E,
+    registry: Arc<ThreadRegistry>,
+    futex: Arc<FutexTable>,
+    platform_futex: Arc<dyn PlatformFutex>,
+    platform_futex_factory: PlatformFutexFactory,
+    linux_tid: crate::kernel::LinuxTid,
+    this_tid: ThreadId,
+    threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
+    kicker: Arc<dyn VcpuRegistry>,
+    in_guest: carrick_hal::InGuestFlag,
+    max_traps: usize,
+    prepared_initial: Option<PreparedInitialRunnerTask>,
+) -> Result<VcpuLoopOutcome, RuntimeError>
+where
+    E::SiblingSpec: 'static,
+{
     let mut engine = OwnerThreadEngine::new(engine);
     // This must wrap the whole run, not only clone-thread closures: an
     // hvpatch process leader may begin without a lease, park, acquire one on
@@ -5087,7 +5228,6 @@ where
     //
     // Entered BEFORE `register_vcpu` below, so a thread is a census member for
     // strictly longer than it holds a vCPU lease — the whole point.
-    let guest_execution = kernel.guest_executors.enter(kernel_thread.clone());
     let mut state: ThreadRuntimeState<E> = ThreadRuntimeState::new(
         registry,
         futex,
@@ -5105,13 +5245,16 @@ where
         in_guest,
         max_traps,
     );
-    state.guest_execution = Some(guest_execution);
-    let task_snapshot_context = kernel
-        .dispatcher
-        .capture_kernel_context(state.linux_tid)
-        .map_err(|error| {
-            RuntimeError::Configuration(format!("bind task snapshot authority: {error}"))
-        })?;
+    let task_snapshot_context = match prepared_initial {
+        Some(prepared) => prepared.context,
+        None => kernel
+            .dispatcher
+            .capture_kernel_context(state.linux_tid)
+            .map_err(|error| {
+                RuntimeError::Configuration(format!("bind task snapshot authority: {error}"))
+            })?,
+    };
+    state.service_kernel_context = Some(task_snapshot_context.retain_exact());
     let mm_generation = task_snapshot_context.shared().mm().id().raw();
     let asid_generation = kernel
         .hvpatch_process
@@ -5140,15 +5283,77 @@ where
             });
         engine.bind_frame_cow(authority, identity);
     }
-    let initial_cpu = engine
-        .snapshot_guest_state_for_publication()
-        .map_err(|error| {
-            state.fail_snapshot_boundary(
-                crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
-            );
-            RuntimeError::Trap(error)
+    if task_snapshot_context.thread().execution_state()
+        == crate::kernel::objects::ThreadExecutionState::Uninitialized
+    {
+        let initial_cpu = engine
+            .snapshot_guest_state_for_publication()
+            .map_err(|error| {
+                state.fail_snapshot_boundary(
+                    crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
+                );
+                RuntimeError::Trap(error)
+            })?;
+        state.publish_initial_execution_authority(initial_cpu)?;
+        state.guest_execution = Some(
+            kernel
+                .guest_executors
+                .enter(state.kernel_thread.as_ref().map(Arc::clone)),
+        );
+    } else {
+        engine
+            .audit_executor_boundary()
+            .map_err(RuntimeError::Trap)?;
+        let slot = continuation::await_vcpu_admission(
+            carrick_hal::vcpu_sched::global(),
+            state.this_tid.raw() as u64,
+            None,
+        )
+        .await;
+        carrick_hal::vcpu_sched::set_current_lease(slot);
+        let directory = kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("initial runner restore has no directory".to_owned())
         })?;
-    state.publish_initial_execution_authority(initial_cpu)?;
+        let (scheduler, _service) = directory.continuation_services(task_snapshot_context.kernel());
+        let executor = continuation::TransitionalDedicatedRunner::current_executor_registration()
+            .ok_or_else(|| {
+            RuntimeError::Configuration(
+                "initial task restored outside bounded runner worker".to_owned(),
+            )
+        })?;
+        let lease = scheduler
+            .take_transitional_lease(&executor, task_snapshot_context.thread().key())
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let (current_mm, current_asid) = lease
+            .task_state_authority()
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let cpu = lease
+            .task_state_for_restore(
+                <E::Arch as carrick_hal::GuestArch>::linux_guest_abi(),
+                1,
+                current_mm,
+                current_asid,
+            )
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?
+            .cpu
+            .clone();
+        engine
+            .rebind_to_slot(slot.slot, &cpu)
+            .map_err(RuntimeError::Trap)?;
+        if !continuation::TransitionalDedicatedRunner::publish_current_hardware_kick(Box::new(
+            engine.kick_handle(),
+        )) {
+            return Err(RuntimeError::Configuration(
+                "initial task has no worker-owned kick destination".to_owned(),
+            ));
+        }
+        *state.execution_lease.lock() = Some(lease);
+        state.guest_execution = Some(
+            kernel
+                .guest_executors
+                .enter(state.kernel_thread.as_ref().map(Arc::clone)),
+        );
+    }
     state.register_vcpu(&engine);
     // Stamp this thread's tid into TPIDR_EL1 for the EL1 gettid fast path (main
     // thread at boot; each worker at spawn). Re-stamped after fork/exec below.
@@ -5244,6 +5449,7 @@ where
                         None,
                         Some(interrupted_pc),
                         None,
+                        None,
                         traps,
                     )? {
                         return Ok(outcome);
@@ -5283,6 +5489,7 @@ where
                         state.this_tid,
                         state.fatal_image_generation,
                         guest_entry_syscall_retval,
+                        None,
                         None,
                         None,
                         traps,
@@ -5354,6 +5561,7 @@ where
                         state.fatal_image_generation,
                         None,
                         Some(pc),
+                        None,
                         None,
                         traps,
                     )? {
@@ -6183,6 +6391,7 @@ where
             // takes priority; otherwise a process-directed signal in the global
             // slot is deliverable by any thread.
             let continuation_restart = state.continuation_restart.take();
+            let reserved_signal = state.reserved_signal.take();
             let signal_context = state.service_kernel_context.as_ref().ok_or_else(|| {
                 RuntimeError::Configuration(
                     "post-syscall signal delivery lost its exact Kernel context".to_owned(),
@@ -6197,6 +6406,7 @@ where
                 last_syscall_retval,
                 signal_interrupted_pc,
                 continuation_restart,
+                reserved_signal,
                 traps,
             )? {
                 return Ok(outcome);
@@ -6851,18 +7061,34 @@ fn service_signals_threaded<E: ThreadedEngine>(
     last_syscall_retval: Option<i64>,
     interrupted_pc: Option<u64>,
     continuation_restart: Option<continuation::RestartDecision>,
+    reserved_signal: Option<continuation::ReservedSignal>,
     traps: usize,
 ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
     {
-        if let Some(action) = deliver_pending_signal_with_restart(
-            engine,
-            &kernel.dispatcher,
-            context,
-            last_syscall_retval,
-            this_tid,
-            interrupted_pc,
-            continuation_restart.map(|decision| decision == continuation::RestartDecision::Restart),
-        )? {
+        let restart =
+            continuation_restart.map(|decision| decision == continuation::RestartDecision::Restart);
+        let action = match reserved_signal {
+            Some(reserved) => deliver_reserved_signal_with_restart(
+                engine,
+                &kernel.dispatcher,
+                context,
+                last_syscall_retval,
+                this_tid,
+                interrupted_pc,
+                restart,
+                reserved,
+            )?,
+            None => deliver_pending_signal_with_restart(
+                engine,
+                &kernel.dispatcher,
+                context,
+                last_syscall_retval,
+                this_tid,
+                interrupted_pc,
+                restart,
+            )?,
+        };
+        if let Some(action) = action {
             if let Some(signum) = action.stop_signal {
                 if kernel.hvpatch_process.is_some() {
                     let signal = crate::kernel::LinuxSignal::for_signal_number(signum)
@@ -7531,6 +7757,58 @@ mod tests {
             assert_eq!(scheduler.registered_executor_count(), baseline + 1);
             drop(runner);
             assert_eq!(scheduler.registered_executor_count(), baseline);
+        }
+    }
+
+    #[test]
+    fn prepared_launches_run_compute_quanta_only_on_bounded_runner_workers() {
+        const TASKS: usize = 16;
+        let runner =
+            continuation::TransitionalDedicatedRunner::with_worker_limit(2).expect("two workers");
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let mut submitters = Vec::new();
+        for task in 0..TASKS {
+            let runner = runner.clone();
+            let progress = Arc::clone(&progress);
+            submitters.push(std::thread::spawn(move || {
+                let bootstrap = std::thread::current().id();
+                let launch = submit_prepared_vcpu_future(&runner, async move {
+                    for quantum in 0..4usize {
+                        progress
+                            .lock()
+                            .push((task, quantum, std::thread::current().id()));
+                        continuation::yield_runner_quantum().await;
+                    }
+                    Ok(VcpuLoopOutcome::ThreadDone)
+                });
+                (bootstrap, launch)
+            }));
+        }
+        let launched = submitters
+            .into_iter()
+            .map(|submitter| submitter.join().expect("bootstrap exits"))
+            .collect::<Vec<_>>();
+        let bootstrap_ids = launched
+            .iter()
+            .map(|(bootstrap, _)| *bootstrap)
+            .collect::<std::collections::HashSet<_>>();
+        for (_, launch) in launched {
+            assert!(matches!(launch.wait(), Ok(VcpuLoopOutcome::ThreadDone)));
+        }
+        let progress = progress.lock();
+        assert_eq!(progress.len(), TASKS * 4);
+        let worker_ids = progress
+            .iter()
+            .map(|(_, _, worker)| *worker)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(worker_ids.len() <= 2);
+        assert!(worker_ids.is_disjoint(&bootstrap_ids));
+        for task in 0..TASKS {
+            assert_eq!(
+                progress.iter().filter(|(id, _, _)| *id == task).count(),
+                4,
+                "demand preemption must progress every prepared task"
+            );
         }
     }
 

@@ -372,6 +372,15 @@ impl Sighand {
             .unwrap_or_else(LinuxSigaction::empty)
     }
 
+    fn action_with_revision(&self, signal: LinuxSignal) -> (u64, LinuxSigaction) {
+        let actions = self.actions.lock();
+        let action = actions
+            .get(&signal)
+            .copied()
+            .unwrap_or_else(LinuxSigaction::empty);
+        (self.revision.load(), action)
+    }
+
     pub fn action_entry(&self, signal: LinuxSignal) -> Option<LinuxSigaction> {
         self.actions.lock().get(&signal).copied()
     }
@@ -1906,6 +1915,22 @@ impl PendingQueue {
         Some(PendingSignal { signal, siginfo })
     }
 
+    fn requeue_front(&mut self, pending: PendingSignal) {
+        let signal = pending.signal;
+        if signal.raw() >= 32 {
+            self.realtime
+                .entry(signal)
+                .or_default()
+                .push_front(pending.siginfo);
+        } else if let Some(siginfo) = pending.siginfo {
+            self.standard_siginfos.insert(signal, siginfo);
+        } else {
+            self.standard_siginfos.remove(&signal);
+        }
+        self.present = self.present.with(signal.raw());
+        self.assert_invariants();
+    }
+
     fn assert_invariants(&self) {
         debug_assert!(self.realtime.iter().all(
             |(signal, instances)| !instances.is_empty() && self.present.contains(signal.raw())
@@ -2220,6 +2245,10 @@ impl ThreadSignalState {
 
     pub fn take_lowest_in(&mut self, wanted: SigSet) -> Option<PendingSignal> {
         self.pending.take_lowest_in(wanted)
+    }
+
+    fn requeue_front(&mut self, pending: PendingSignal) {
+        self.pending.requeue_front(pending);
     }
 
     pub(super) fn discard_pending(&mut self, signals: SigSet) {
@@ -5375,12 +5404,24 @@ impl SignalAuthority {
         self.sighand.action(signal)
     }
 
+    pub fn action_generation(&self) -> u64 {
+        self.sighand.revision()
+    }
+
+    pub fn action_with_generation(&self, signal: LinuxSignal) -> (u64, LinuxSigaction) {
+        self.sighand.action_with_revision(signal)
+    }
+
     pub fn install_action(&self, signal: LinuxSignal, action: LinuxSigaction) {
         self.sighand.install_action(signal, action);
     }
 
     pub fn blocked(&self) -> SigSet {
         self.thread.signal_state.lock().blocked()
+    }
+
+    pub fn signal_state_generation(&self) -> u64 {
+        self.thread.revision.load()
     }
 
     pub fn set_blocked(&self, blocked: SigSet) {
@@ -5467,6 +5508,25 @@ impl SignalAuthority {
             pending,
             job_control_generation,
         })
+    }
+
+    /// Return an unconsumed exact reservation to the same pending owner. The
+    /// canonical thread-then-task lock order matches dequeue, and real-time
+    /// payloads return to the front so cancellation cannot reorder them.
+    pub fn requeue_reserved(&self, dequeued: SignalDequeue) {
+        let _generation_guard = self.task.lock_signal_generation();
+        let mut thread = self.thread.signal_state.lock();
+        let mut task = self.task_pending.queue.lock();
+        match dequeued.owner {
+            SignalPendingOwner::Thread => {
+                thread.requeue_front(dequeued.pending);
+                self.thread.publish_signal_state(&thread);
+            }
+            SignalPendingOwner::Task => {
+                task.requeue_front(dequeued.pending);
+                self.task_pending.publish_queue(&task);
+            }
+        }
     }
 
     pub fn altstack(&self) -> Option<LinuxSigaltstack> {

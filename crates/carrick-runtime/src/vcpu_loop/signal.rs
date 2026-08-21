@@ -410,26 +410,96 @@ pub(crate) fn deliver_pending_signal_with_restart<T>(
 where
     T: SyscallTrap,
 {
+    deliver_signal_with_restart(
+        trap,
+        dispatcher,
+        context,
+        last_syscall_retval,
+        tid,
+        interrupted_pc,
+        continuation_restart,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deliver_reserved_signal_with_restart<T>(
+    trap: &mut T,
+    dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
+    last_syscall_retval: Option<i64>,
+    tid: ThreadId,
+    interrupted_pc: Option<u64>,
+    continuation_restart: Option<bool>,
+    reserved: crate::vcpu_loop::continuation::ReservedSignal,
+) -> Result<Option<PendingSignalAction>, RuntimeError>
+where
+    T: SyscallTrap,
+{
+    if !reserved.consume() {
+        return Err(RuntimeError::Configuration(
+            "reserved signal was already consumed".to_owned(),
+        ));
+    }
+    deliver_signal_with_restart(
+        trap,
+        dispatcher,
+        context,
+        last_syscall_retval,
+        tid,
+        interrupted_pc,
+        continuation_restart,
+        Some(&reserved),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deliver_signal_with_restart<T>(
+    trap: &mut T,
+    dispatcher: &SyscallDispatcher,
+    context: &crate::kernel::KernelContext,
+    last_syscall_retval: Option<i64>,
+    tid: ThreadId,
+    interrupted_pc: Option<u64>,
+    continuation_restart: Option<bool>,
+    reserved: Option<&crate::vcpu_loop::continuation::ReservedSignal>,
+) -> Result<Option<PendingSignalAction>, RuntimeError>
+where
+    T: SyscallTrap,
+{
     // Drain the cross-process explicit-signal ring into pending state, so the
     // normal delivery below runs each with the sender's identity.
-    dispatcher.drain_xsignals_process_directed(context);
+    if reserved.is_none() {
+        dispatcher.drain_xsignals_process_directed(context);
+    }
 
-    let pending = crate::host_signal::take_pending_for(tid.raw());
+    let pending = reserved.map_or_else(
+        || crate::host_signal::take_pending_for(tid.raw()),
+        crate::vcpu_loop::continuation::ReservedSignal::signum,
+    );
     // A dispatcher dequeue returns owner and payload atomically. A host-slot
     // signal remains thread-directed and consumes its per-thread payload below.
-    let (pending, dequeued_siginfo, from_dispatcher, job_control_generation) = if pending == 0 {
-        match dispatcher.take_deliverable_pending_from(context, tid) {
-            Some(pending) => (
-                pending.signum,
-                pending.siginfo,
+    let (pending, dequeued_siginfo, from_dispatcher, job_control_generation) =
+        if let Some(reserved) = reserved {
+            (
+                pending,
+                reserved.siginfo(),
                 true,
-                pending.job_control_generation,
-            ),
-            None => return Ok(None),
-        }
-    } else {
-        (pending, None, false, None)
-    };
+                reserved.job_control_generation(),
+            )
+        } else if pending == 0 {
+            match dispatcher.take_deliverable_pending_from(context, tid) {
+                Some(pending) => (
+                    pending.signum,
+                    pending.siginfo,
+                    true,
+                    pending.job_control_generation,
+                ),
+                None => return Ok(None),
+            }
+        } else {
+            (pending, None, false, None)
+        };
     crate::probes::signal_deliver(tid.raw(), pending);
     // A blocked signal must not be delivered — hold it pending until the guest
     // unblocks it.
@@ -441,9 +511,21 @@ where
         return Ok(Some(PendingSignalAction::ignored()));
     }
     crate::exec_helpers::stop_for_debug_signal(pending);
-    let action = dispatcher
-        .take_pending_signal_action(context, tid, pending)
-        .or_else(|| dispatcher.registered_signal_handler(context, pending));
+    let action = reserved
+        .map(crate::vcpu_loop::continuation::ReservedSignal::action)
+        .filter(|action| {
+            action.sa_handler != carrick_abi::LINUX_SIG_DFL
+                && action.sa_handler != carrick_abi::LINUX_SIG_IGN
+        })
+        .or_else(|| {
+            if reserved.is_none() {
+                dispatcher
+                    .take_pending_signal_action(context, tid, pending)
+                    .or_else(|| dispatcher.registered_signal_handler(context, pending))
+            } else {
+                None
+            }
+        });
     if action.is_none() && dispatcher.signal_is_ignored(context, pending) {
         return Ok(Some(PendingSignalAction::ignored()));
     }
@@ -600,6 +682,8 @@ mod tests {
     #[derive(Default)]
     struct NoopTrap {
         restart: bool,
+        delivered_signum: i32,
+        delivered_handler: u64,
     }
 
     impl crate::trap::SyscallTrap for NoopTrap {
@@ -628,8 +712,8 @@ mod tests {
 
         fn inject_signal(
             &mut self,
-            _signum: i32,
-            _handler: u64,
+            signum: i32,
+            handler: u64,
             _sa_restorer: u64,
             _pending_syscall_retval: Option<i64>,
             _interrupted_pc: Option<u64>,
@@ -640,12 +724,70 @@ mod tests {
             restart_syscall: bool,
         ) -> Result<(), TrapError> {
             self.restart = restart_syscall;
+            self.delivered_signum = signum;
+            self.delivered_handler = handler;
             Ok(())
         }
 
         fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
             Err(TrapError::UnsupportedPlatform)
         }
+    }
+
+    #[test]
+    fn reserved_delivery_cannot_borrow_later_signal_action_or_restart_class() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("context");
+        let authority = context.signal_authority();
+        let first = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+        let second = crate::kernel::LinuxSignal::for_signal_number(12).expect("SIGUSR2");
+        let mut restart = carrick_abi::LinuxSigaction::empty();
+        restart.sa_handler = 0x1110;
+        restart.sa_flags = carrick_abi::LINUX_SA_RESTART;
+        let mut no_restart = carrick_abi::LinuxSigaction::empty();
+        no_restart.sa_handler = 0x2220;
+        authority.install_action(first, restart);
+        authority.install_action(second, no_restart);
+        authority.enqueue_thread_standard(first, None);
+        let dequeued = authority
+            .take_lowest_in(carrick_abi::SigSet::EMPTY.with(10))
+            .expect("first reservation");
+        let (action_generation, action) = authority.action_with_generation(first);
+        let reserved = crate::vcpu_loop::continuation::ReservedSignal::kernel(
+            authority.clone(),
+            dequeued,
+            action_generation,
+            action,
+            carrick_abi::SigSet::EMPTY,
+        );
+        authority.enqueue_thread_standard(second, None);
+
+        let mut trap = NoopTrap::default();
+        deliver_reserved_signal_with_restart(
+            &mut trap,
+            &dispatcher,
+            &context,
+            Some(crate::linux_abi::LINUX_EINTR.guest_retval()),
+            ThreadId::synthetic_for_tests(context.thread().key().tid.raw()),
+            None,
+            Some(true),
+            reserved,
+        )
+        .expect("reserved delivery")
+        .expect("handler action");
+        assert_eq!(trap.delivered_signum, 10);
+        let restart_handler = restart.sa_handler;
+        assert_eq!(trap.delivered_handler, restart_handler);
+        assert!(trap.restart);
+        assert_eq!(
+            authority
+                .take_lowest_in(carrick_abi::SigSet::EMPTY.with(12))
+                .expect("second remains pending")
+                .pending
+                .signal
+                .raw(),
+            12
+        );
     }
 
     fn native_geometry() -> crate::page_profile::PageGeometry {

@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Wake, Waker};
@@ -1335,7 +1335,8 @@ impl BlockedContinuation {
                 }
                 _ => ContinuationCompletion::Redispatch,
             },
-            ContinuationEvent::Signal => {
+            event @ (ContinuationEvent::Signal | ContinuationEvent::ReservedSignal(_)) => {
+                let reserved_signal = event.reserved_signal().cloned();
                 let signal_authority = context.signal_authority();
                 let effective_mask = match signal_masks.temporary {
                     Some(WaitSigMask::Additive(extra)) => signal_masks.persistent.union(extra),
@@ -1346,11 +1347,16 @@ impl BlockedContinuation {
                     .thread_pending()
                     .union(signal_authority.task_pending())
                     .difference(effective_mask);
-                let deliverable_action = deliverable.lowest_signum().and_then(|signum| {
-                    crate::kernel::LinuxSignal::for_signal_number(signum)
-                        .ok()
-                        .map(|signal| signal_authority.action(signal))
-                });
+                let deliverable_action = reserved_signal
+                    .as_ref()
+                    .map(ReservedSignal::action)
+                    .or_else(|| {
+                        deliverable.lowest_signum().and_then(|signum| {
+                            crate::kernel::LinuxSignal::for_signal_number(signum)
+                                .ok()
+                                .map(|signal| signal_authority.action(signal))
+                        })
+                    });
                 let caught_handler = deliverable_action.is_some_and(|action| {
                     action.sa_handler != carrick_abi::LINUX_SIG_DFL
                         && action.sa_handler != carrick_abi::LINUX_SIG_IGN
@@ -1411,6 +1417,7 @@ impl BlockedContinuation {
                 return Ok(ContinuationResult {
                     completion,
                     restart,
+                    reserved_signal,
                 });
             }
         };
@@ -1423,6 +1430,7 @@ impl BlockedContinuation {
         Ok(ContinuationResult {
             completion: outcome,
             restart: RestartDecision::NoRestart,
+            reserved_signal: None,
         })
     }
 
@@ -1535,11 +1543,163 @@ pub enum RestartDecision {
     NoRestart,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
+enum ReservedSignalSource {
+    Kernel(crate::kernel::objects::SignalDequeue),
+    HostSlot { tid: i32 },
+}
+
+struct ReservedSignalInner {
+    authority: crate::kernel::objects::SignalAuthority,
+    signum: i32,
+    siginfo: Option<crate::linux_abi::LinuxSiginfo>,
+    job_control_generation: Option<crate::kernel::objects::JobControlStopInvalidationGeneration>,
+    action_generation: u64,
+    mask_generation: u64,
+    action: carrick_abi::LinuxSigaction,
+    persistent_restore: SigSet,
+    source: ReservedSignalSource,
+    settlement: AtomicU8,
+}
+
+impl Drop for ReservedSignalInner {
+    fn drop(&mut self) {
+        if self.settlement.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        match self.source {
+            ReservedSignalSource::Kernel(dequeued) => {
+                self.authority.requeue_reserved(dequeued);
+            }
+            ReservedSignalSource::HostSlot { tid } => {
+                crate::host_signal::publish_pending_for(tid, self.signum);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ReservedSignal(Arc<ReservedSignalInner>);
+
+impl PartialEq for ReservedSignal {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ReservedSignal {}
+
+impl std::fmt::Debug for ReservedSignal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReservedSignal")
+            .field("signum", &self.signum())
+            .field("action_generation", &self.action_generation())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReservedSignal {
+    pub(crate) fn kernel(
+        authority: crate::kernel::objects::SignalAuthority,
+        dequeued: crate::kernel::objects::SignalDequeue,
+        action_generation: u64,
+        action: carrick_abi::LinuxSigaction,
+        persistent_restore: SigSet,
+    ) -> Self {
+        let mask_generation = authority.signal_state_generation();
+        Self(Arc::new(ReservedSignalInner {
+            authority,
+            signum: dequeued.pending.signal.raw(),
+            siginfo: dequeued.pending.siginfo,
+            job_control_generation: dequeued.job_control_generation,
+            action_generation,
+            mask_generation,
+            action,
+            persistent_restore,
+            source: ReservedSignalSource::Kernel(dequeued),
+            settlement: AtomicU8::new(0),
+        }))
+    }
+
+    fn host_slot(
+        authority: crate::kernel::objects::SignalAuthority,
+        tid: i32,
+        signum: i32,
+        action_generation: u64,
+        action: carrick_abi::LinuxSigaction,
+        persistent_restore: SigSet,
+    ) -> Self {
+        let mask_generation = authority.signal_state_generation();
+        Self(Arc::new(ReservedSignalInner {
+            authority,
+            signum,
+            siginfo: None,
+            job_control_generation: None,
+            action_generation,
+            mask_generation,
+            action,
+            persistent_restore,
+            source: ReservedSignalSource::HostSlot { tid },
+            settlement: AtomicU8::new(0),
+        }))
+    }
+
+    pub fn signum(&self) -> i32 {
+        self.0.signum
+    }
+
+    pub fn action(&self) -> carrick_abi::LinuxSigaction {
+        self.0.action
+    }
+
+    pub fn action_generation(&self) -> u64 {
+        self.0.action_generation
+    }
+
+    pub fn mask_generation(&self) -> u64 {
+        self.0.mask_generation
+    }
+
+    pub fn siginfo(&self) -> Option<crate::linux_abi::LinuxSiginfo> {
+        self.0.siginfo
+    }
+
+    pub fn persistent_restore(&self) -> SigSet {
+        self.0.persistent_restore
+    }
+
+    pub(crate) fn job_control_generation(
+        &self,
+    ) -> Option<crate::kernel::objects::JobControlStopInvalidationGeneration> {
+        self.0.job_control_generation
+    }
+
+    /// Transfer the exact dequeued instance to guest delivery. Only the first
+    /// caller can consume it; cancellation/drop before this point requeues it.
+    pub fn consume(&self) -> bool {
+        self.0
+            .settlement
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContinuationEvent {
     Ready,
     Timeout,
     Signal,
+    ReservedSignal(ReservedSignal),
+}
+
+impl ContinuationEvent {
+    pub fn reserved_signal(&self) -> Option<&ReservedSignal> {
+        match self {
+            Self::ReservedSignal(signal) => Some(signal),
+            Self::Ready | Self::Timeout | Self::Signal => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1569,11 +1729,20 @@ pub enum BlockingWriteOutcome {
 pub struct ContinuationResult {
     pub completion: ContinuationCompletion,
     restart: RestartDecision,
+    reserved_signal: Option<ReservedSignal>,
 }
 
 impl ContinuationResult {
     pub const fn restart(&self) -> RestartDecision {
         self.restart
+    }
+
+    pub fn reserved_signal(&self) -> Option<&ReservedSignal> {
+        self.reserved_signal.as_ref()
+    }
+
+    pub fn take_reserved_signal(&mut self) -> Option<ReservedSignal> {
+        self.reserved_signal.take()
     }
 }
 
@@ -1813,41 +1982,86 @@ impl SignalReadinessProbe {
         }
         let authority = context.signal_authority();
         let pending = authority.thread_pending().union(authority.task_pending());
-        let is_deliverable = |signum: i32| {
+        let reserve = |mut candidates: SigSet| loop {
+            let signum = candidates.lowest_signum()?;
             let signal = crate::kernel::LinuxSignal::for_signal_number(signum).ok()?;
-            let action = authority.action(signal);
+            let (action_generation, action) = authority.action_with_generation(signal);
             let disposition = match action.sa_handler {
                 carrick_abi::LINUX_SIG_IGN => crate::kernel::SignalDisposition::Ignore,
                 carrick_abi::LINUX_SIG_DFL => crate::kernel::SignalDisposition::Default,
                 _ => crate::kernel::SignalDisposition::Caught,
             };
-            (!(matches!(disposition, crate::kernel::SignalDisposition::Ignore)
+            if matches!(disposition, crate::kernel::SignalDisposition::Ignore)
                 || matches!(disposition, crate::kernel::SignalDisposition::Default)
-                    && super::is_default_ignore_signal(signum)))
-            .then_some(signum)
+                    && super::is_default_ignore_signal(signum)
+            {
+                let _ = authority.take_lowest_in(SigSet::EMPTY.with(signum));
+                candidates = candidates.without(signum);
+                continue;
+            }
+            let dequeued = authority.take_lowest_in(SigSet::EMPTY.with(signum))?;
+            break Some(ContinuationEvent::ReservedSignal(ReservedSignal::kernel(
+                authority.clone(),
+                dequeued,
+                action_generation,
+                action,
+                self.persistent,
+            )));
         };
+
+        let host_signum = crate::host_signal::take_pending_for(self.thread.tid.raw());
+        if host_signum != 0 {
+            let blocked = if let Some(wait_set) = self.wait_set {
+                if wait_set.contains(host_signum) {
+                    crate::host_signal::publish_pending_for(self.thread.tid.raw(), host_signum);
+                    return Some(ContinuationEvent::Ready);
+                }
+                SigSet::from_raw(self.signal_wait_block.unwrap_or(SigBlockMask::NONE).raw())
+                    .contains(host_signum)
+            } else {
+                let effective = match self.temporary {
+                    Some(WaitSigMask::Additive(extra)) => self.persistent.union(extra),
+                    Some(WaitSigMask::Replace(replacement)) => replacement,
+                    None => self.persistent,
+                };
+                effective.contains(host_signum)
+            };
+            if blocked {
+                crate::host_signal::publish_pending_for(self.thread.tid.raw(), host_signum);
+            } else if let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(host_signum) {
+                let (action_generation, action) = authority.action_with_generation(signal);
+                let ignored = action.sa_handler == carrick_abi::LINUX_SIG_IGN
+                    || action.sa_handler == carrick_abi::LINUX_SIG_DFL
+                        && super::is_default_ignore_signal(host_signum);
+                if !ignored {
+                    return Some(ContinuationEvent::ReservedSignal(
+                        ReservedSignal::host_slot(
+                            authority.clone(),
+                            self.thread.tid.raw(),
+                            host_signum,
+                            action_generation,
+                            action,
+                            self.persistent,
+                        ),
+                    ));
+                }
+            }
+        }
+
         if let Some(wait_set) = self.wait_set {
             if pending.intersect(wait_set).lowest_signum().is_some() {
                 return Some(ContinuationEvent::Ready);
             }
             let blocked =
                 SigSet::from_raw(self.signal_wait_block.unwrap_or(SigBlockMask::NONE).raw());
-            return pending
-                .difference(blocked)
-                .lowest_signum()
-                .and_then(is_deliverable)
-                .map(|_| ContinuationEvent::Signal);
+            return reserve(pending.difference(blocked));
         }
         let effective = match self.temporary {
             Some(WaitSigMask::Additive(extra)) => self.persistent.union(extra),
             Some(WaitSigMask::Replace(replacement)) => replacement,
             None => self.persistent,
         };
-        pending
-            .difference(effective)
-            .lowest_signum()
-            .and_then(is_deliverable)
-            .map(|_| ContinuationEvent::Signal)
+        reserve(pending.difference(effective))
     }
 }
 
@@ -2039,7 +2253,6 @@ struct RegistrationEntry {
     state: RegistrationState,
     event: Option<ContinuationEvent>,
     probe: ReadinessProbe,
-    interrupt: Option<(Weak<Task>, u64)>,
     deadline: Option<Instant>,
     task_waker: Option<Waker>,
     subscriptions: Vec<ProducerSubscription>,
@@ -2488,20 +2701,6 @@ impl CarrierWaitService {
         let _resource_fingerprint = continuation.resource_fingerprint();
         let probe = ReadinessProbe::from_continuation(continuation);
         let signal_readiness = SignalReadinessProbe::from_continuation(continuation);
-        let interrupt = (!matches!(
-            continuation.family(),
-            ContinuationFamily::WaitOnProcExit
-                | ContinuationFamily::WaitOnProcState
-                | ContinuationFamily::WaitOnHvpatchChild
-                | ContinuationFamily::WaitOnSignals
-                | ContinuationFamily::VforkParent
-        ))
-        .then(|| {
-            (
-                continuation.authority().task_ref.clone(),
-                continuation.authority().task_wake_generation,
-            )
-        });
         let mut state = self.inner.state.lock();
         let replaced = state.entries.insert(
             token.continuation,
@@ -2510,7 +2709,6 @@ impl CarrierWaitService {
                 state: RegistrationState::Prepared,
                 event: None,
                 probe,
-                interrupt,
                 deadline: continuation.deadline(),
                 task_waker: None,
                 subscriptions: Vec::new(),
@@ -2694,18 +2892,15 @@ impl CarrierWaitService {
                 entry.state,
                 RegistrationState::Enrolled | RegistrationState::Prepared
             ) {
-                return Ok(entry.event);
+                return Ok(entry.event.clone());
             }
-            let interrupted = entry.interrupt.as_ref().is_some_and(|(task, observed)| {
-                task.upgrade()
-                    .is_none_or(|task| task.wake_generation() != *observed)
-            });
-            interrupted
-                .then_some(ContinuationEvent::Signal)
+            entry
+                .signal_readiness
+                .event()
                 .or_else(|| entry.probe.poll())
         };
-        if let Some(event) = event {
-            self.inner.publish_event(registration.token, event);
+        if let Some(event) = event.as_ref() {
+            self.inner.publish_event(registration.token, event.clone());
         }
         Ok(event)
     }
@@ -2922,9 +3117,12 @@ impl Future for ContinuationEventFuture {
             return Poll::Ready(Err(WaitServiceError::StaleRegistration));
         };
         match entry.state {
-            RegistrationState::Ready => {
-                Poll::Ready(entry.event.ok_or(WaitServiceError::StaleRegistration))
-            }
+            RegistrationState::Ready => Poll::Ready(
+                entry
+                    .event
+                    .clone()
+                    .ok_or(WaitServiceError::StaleRegistration),
+            ),
             RegistrationState::Cancelled(cause) => {
                 state.entries.remove(&self.token.continuation);
                 Poll::Ready(Err(WaitServiceError::Cancelled(cause)))
@@ -3219,6 +3417,112 @@ impl RunnerTask {
 
 pub(crate) fn run_task_quantum(task: &Arc<RunnerTask>) -> QuantumExit {
     task.poll()
+}
+
+struct VcpuAdmissionWait {
+    owner_alive: bool,
+    lease: Option<carrick_hal::SlotLease>,
+    waker: Option<Waker>,
+}
+
+struct VcpuAdmissionState {
+    wait: Mutex<VcpuAdmissionWait>,
+    scheduler: &'static dyn carrick_hal::VcpuScheduler,
+}
+
+struct VcpuAdmissionFuture {
+    scheduler: &'static dyn carrick_hal::VcpuScheduler,
+    tid: u64,
+    preferred: Option<carrick_hal::SlotId>,
+    ticket: Option<carrick_hal::vcpu_sched::AdmissionTicket>,
+    state: Arc<VcpuAdmissionState>,
+}
+
+impl Future for VcpuAdmissionFuture {
+    type Output = carrick_hal::SlotLease;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        {
+            let mut wait = self.state.wait.lock();
+            if let Some(lease) = wait.lease.take() {
+                wait.owner_alive = false;
+                return Poll::Ready(lease);
+            }
+            wait.waker = Some(context.waker().clone());
+        }
+        if self.ticket.is_none() {
+            let state = Arc::clone(&self.state);
+            match self.scheduler.acquire_or_subscribe(
+                self.tid,
+                self.preferred,
+                Arc::new(move |lease| {
+                    let mut wait = state.wait.lock();
+                    if !wait.owner_alive {
+                        drop(wait);
+                        state.scheduler.release(lease, carrick_hal::Yield::Blocked);
+                        return;
+                    }
+                    wait.lease = Some(lease);
+                    if let Some(waker) = wait.waker.take() {
+                        waker.wake();
+                    }
+                }),
+            ) {
+                carrick_hal::vcpu_sched::Admission::Granted(lease) => {
+                    self.state.wait.lock().owner_alive = false;
+                    return Poll::Ready(lease);
+                }
+                carrick_hal::vcpu_sched::Admission::Pending(ticket) => {
+                    self.ticket = Some(ticket);
+                }
+            }
+        }
+        let mut wait = self.state.wait.lock();
+        if let Some(lease) = wait.lease.take() {
+            wait.owner_alive = false;
+            Poll::Ready(lease)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for VcpuAdmissionFuture {
+    fn drop(&mut self) {
+        let lease = {
+            let mut wait = self.state.wait.lock();
+            wait.owner_alive = false;
+            wait.waker = None;
+            wait.lease.take()
+        };
+        if let Some(ticket) = self.ticket.take() {
+            let _ = self.scheduler.cancel_admission(ticket);
+        }
+        if let Some(lease) = lease {
+            self.scheduler.release(lease, carrick_hal::Yield::Blocked);
+        }
+    }
+}
+
+pub(crate) fn await_vcpu_admission(
+    scheduler: &'static dyn carrick_hal::VcpuScheduler,
+    tid: u64,
+    preferred: Option<carrick_hal::SlotId>,
+) -> impl Future<Output = carrick_hal::SlotLease> {
+    VcpuAdmissionFuture {
+        scheduler,
+        tid,
+        preferred,
+        ticket: None,
+        state: Arc::new(VcpuAdmissionState {
+            wait: Mutex::new(VcpuAdmissionWait {
+                owner_alive: true,
+                lease: None,
+                waker: None,
+            }),
+            scheduler,
+        }),
+    }
 }
 
 impl Wake for RunnerTask {
@@ -5261,6 +5565,118 @@ mod tests {
     }
 
     #[test]
+    fn reserved_signal_keeps_exact_action_when_opposite_restart_signal_arrives_before_resume() {
+        let (_kernel, context) = bootstrap(15_369_2);
+        let generation = publish(&context, 0x707);
+        let first = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+        let second = crate::kernel::LinuxSignal::for_signal_number(12).expect("SIGUSR2");
+        let mut restart = carrick_abi::LinuxSigaction::empty();
+        restart.sa_handler = 0x1110;
+        restart.sa_flags = carrick_abi::LINUX_SA_RESTART;
+        let mut no_restart = carrick_abi::LinuxSigaction::empty();
+        no_restart.sa_handler = 0x2220;
+        context.signal_authority().install_action(first, restart);
+        context
+            .signal_authority()
+            .install_action(second, no_restart);
+        context
+            .signal_authority()
+            .enqueue_thread_standard(first, None);
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::empty(),
+                timeout: None,
+                on_timeout: 0,
+                sig_mask: WaitSigMask::NONE,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("continuation");
+        let event = SignalReadinessProbe::from_continuation(&continuation)
+            .event()
+            .expect("first signal readiness");
+        assert_eq!(
+            event.reserved_signal().expect("exact reservation").signum(),
+            10
+        );
+
+        context
+            .signal_authority()
+            .enqueue_thread_standard(second, None);
+        let result = continuation.resume(event, &context).expect("resume");
+        assert_eq!(result.restart(), RestartDecision::Restart);
+        let reserved = result.reserved_signal().expect("reserved delivery");
+        assert_eq!(reserved.signum(), 10);
+        assert_eq!(reserved.action(), restart);
+        assert_ne!(reserved.action(), no_restart);
+    }
+
+    #[test]
+    fn host_slot_signal_is_reserved_under_replace_mask_and_requeued_if_abandoned() {
+        let (_kernel, context) = bootstrap(15_369_3);
+        let generation = publish(&context, 0x708);
+        let signal = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+        let persistent = SigSet::EMPTY.with(10);
+        context.signal_authority().set_blocked(persistent);
+        let mut action = carrick_abi::LinuxSigaction::empty();
+        action.sa_handler = 0x3330;
+        context.signal_authority().install_action(signal, action);
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::empty(),
+                timeout: None,
+                on_timeout: 0,
+                sig_mask: WaitSigMask::Replace(SigSet::EMPTY),
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("continuation");
+        let tid = context.thread().key().tid.raw();
+        crate::host_signal::publish_pending_for(tid, 10);
+        let event = SignalReadinessProbe::from_continuation(&continuation)
+            .event()
+            .expect("host-slot readiness reservation");
+        assert_eq!(event.reserved_signal().expect("reservation").signum(), 10);
+        drop(event);
+        assert_eq!(
+            crate::host_signal::take_pending_for(tid),
+            10,
+            "abandoned exact reservation returns to its host slot"
+        );
+    }
+
+    #[test]
+    fn ignored_lower_signal_does_not_hide_next_exact_deliverable_reservation() {
+        let (_kernel, context) = bootstrap(15_369_4);
+        let generation = publish(&context, 0x709);
+        let ignored = crate::kernel::LinuxSignal::for_signal_number(17).expect("SIGCHLD");
+        let caught = crate::kernel::LinuxSignal::for_signal_number(18).expect("signal 18");
+        let mut ignore_action = carrick_abi::LinuxSigaction::empty();
+        ignore_action.sa_handler = carrick_abi::LINUX_SIG_IGN;
+        let mut caught_action = carrick_abi::LinuxSigaction::empty();
+        caught_action.sa_handler = 0x4440;
+        let authority = context.signal_authority();
+        authority.install_action(ignored, ignore_action);
+        authority.install_action(caught, caught_action);
+        authority.enqueue_thread_standard(ignored, None);
+        authority.enqueue_thread_standard(caught, None);
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::empty(),
+                timeout: None,
+                on_timeout: 0,
+                sig_mask: WaitSigMask::NONE,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("continuation");
+        let event = SignalReadinessProbe::from_continuation(&continuation)
+            .event()
+            .expect("caught signal behind ignored SIGCHLD");
+        assert_eq!(event.reserved_signal().expect("reservation").signum(), 18);
+    }
+
+    #[test]
     fn partial_blocking_write_never_restarts_after_caught_sa_restart_signal() {
         let (_kernel, context) = bootstrap(15_369_1);
         let generation = publish(&context, 0x706);
@@ -5322,13 +5738,14 @@ mod tests {
             .signal_authority()
             .enqueue_thread_standard(usr1, None);
         context.task().wake();
+        let event = await_event(&service, replacement_registration.wake_token())
+            .expect("replacement mask unblocks SIGUSR1");
         assert_eq!(
-            await_event(&service, replacement_registration.wake_token())
-                .expect("replacement mask unblocks SIGUSR1"),
-            ContinuationEvent::Signal
+            event.reserved_signal().expect("reserved SIGUSR1").signum(),
+            10
         );
         let result = replacement
-            .resume(ContinuationEvent::Signal, &context)
+            .resume(event, &context)
             .expect("replacement resume");
         assert_eq!(result.restart(), RestartDecision::NoRestart);
         assert_eq!(context.signal_authority().blocked(), usr1_set);
@@ -5467,6 +5884,33 @@ mod tests {
         assert!(workers.len() <= 2);
         assert_eq!(runner.topology().worker_threads(), 2);
         assert_eq!(runner.topology().task_waiter_threads(), 0);
+    }
+
+    #[test]
+    fn slot_starved_job_yields_the_only_runner_worker_until_exact_release() {
+        let admission: &'static carrick_hal::vcpu_sched::HostCondvarScheduler = Box::leak(
+            Box::new(carrick_hal::vcpu_sched::HostCondvarScheduler::new(1)),
+        );
+        let held = carrick_hal::VcpuScheduler::acquire(admission, 1);
+        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
+        let a = runner.spawn(async move {
+            let lease = await_vcpu_admission(admission, 2, Some(held.slot)).await;
+            carrick_hal::VcpuScheduler::release(admission, lease, carrick_hal::Yield::Exited);
+            2usize
+        });
+        let b = runner.spawn(async { 1usize });
+
+        assert_eq!(
+            b.wait().expect("runnable job B"),
+            1,
+            "slot-starved A must not occupy the sole runner worker"
+        );
+        assert!(
+            !a.is_finished(),
+            "A remains suspended until its exact admission grant"
+        );
+        carrick_hal::VcpuScheduler::release(admission, held, carrick_hal::Yield::Blocked);
+        assert_eq!(a.wait().expect("released job A"), 2);
     }
 
     #[test]
@@ -5887,6 +6331,7 @@ mod tests {
             "ThreadWaiter",
             "kqueue",
             "vfork_release_fd",
+            "acquire_timeout",
         ] {
             assert!(
                 !suspend.contains(prohibited),
@@ -5923,14 +6368,12 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("pub(crate) async fn run_vcpu_until_exit").next())
             .expect("bounded launch adapter");
-        assert!(launch.contains("runner.spawn(future)"));
+        assert!(launch.contains("submit_prepared_vcpu_future(&runner, future)"));
         assert!(
-            launch
-                .find("future.as_mut().poll")
-                .expect("original quantum")
-                < launch.find("runner.spawn(future)").expect("inert handoff"),
-            "the original pthread must run through destructive save before the future is Send-handoff"
+            !launch.contains("future.as_mut().poll"),
+            "bootstrap pthread must never poll the guest execution future"
         );
+        assert!(launch.contains("prepare_initial_runner_handoff"));
         let quiesce = include_str!("quiesce.rs");
         let hvpatch_fork = quiesce
             .split("fn handle_in_process_fork")
@@ -5953,6 +6396,7 @@ mod tests {
             "drop(self.guest_execution.take())",
             "audit_executor_boundary()",
             "await_hvpatch_sibling_jobs().await",
+            "await_vcpu_admission",
             ".rebind_to_slot",
             "take_transitional_lease",
         ] {
@@ -5961,7 +6405,13 @@ mod tests {
                 "exec drain misses {required}"
             );
         }
-        for prohibited in ["std::thread::sleep", "handle.join()", ".wait()"] {
+        for prohibited in [
+            "std::thread::sleep",
+            "handle.join()",
+            ".wait()",
+            "vcpu_sched::global().acquire(",
+            "acquire_timeout",
+        ] {
             assert!(
                 !exec_drain.contains(prohibited),
                 "shared-runner exec drain synchronously blocks on {prohibited}"
@@ -6001,7 +6451,7 @@ mod tests {
             "pselect/ppoll must capture every exact guest fd slot at dispatch"
         );
         let io_uring_source = include_str!("../dispatch/ioring.rs");
-        assert!(io_uring_source.contains("with_guest_slots(&files, [sqe.fd])"));
+        assert!(io_uring_source.contains("with_guest_slots(&files, [ring_fd, sqe.fd])"));
         let proc_source = include_str!("../dispatch/proc.rs");
         assert!(proc_source.contains("with_guest_slots(&files, [id as i32])"));
         let fs_source = include_str!("../dispatch/fs.rs");
@@ -6011,6 +6461,8 @@ mod tests {
             "captured_slot_authority(fd)",
             "captured_slot_authority(fd.0)",
             "WaitFdAuthority::logical",
+            "[in_fd.0, out_fd.0]",
+            "complete_wait_fd_authority",
         ] {
             assert!(
                 fs_source.contains(required),
