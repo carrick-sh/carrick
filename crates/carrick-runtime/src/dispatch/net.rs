@@ -3651,6 +3651,9 @@ impl SyscallDispatcher {
                 )
             };
             let has_interests = !interests.is_empty();
+            let wait_guest_fds = std::iter::once(epfd)
+                .chain(interests.iter().map(|(fd, _)| *fd))
+                .collect::<Vec<_>>();
 
             // guest_fd -> (accumulated epoll events, epoll_data); read+write filters
             // for the same fd merge into one returned event.
@@ -4300,7 +4303,9 @@ impl SyscallDispatcher {
                     crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 2);
                     crate::event_ring::rec(crate::event_ring::EPWFD, kq_fd, 0, timeout_ms);
                     let files = self.captured_file_table();
-                    let fds = match WaitFds::raw_one(kq_fd, 0).with_guest_slots(&files, [epfd]) {
+                    let fds = match WaitFds::raw_one(kq_fd, 0)
+                        .with_guest_slots(&files, wait_guest_fds.iter().copied())
+                    {
                         Ok(fds) => fds,
                         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                     };
@@ -4317,8 +4322,15 @@ impl SyscallDispatcher {
                     // There is no instance-fd readiness to wait for.
                     crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 2);
                     crate::event_ring::rec(crate::event_ring::EPWFD, -1, 0, timeout_ms);
+                    let files = self.captured_file_table();
+                    let fds = match WaitFds::empty()
+                        .with_guest_slots(&files, wait_guest_fds.iter().copied())
+                    {
+                        Ok(fds) => fds,
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    };
                     return Ok(DispatchOutcome::WaitOnFds {
-                        fds: WaitFds::empty(),
+                        fds,
                         timeout,
                         on_timeout: 0,
                         sig_mask,
@@ -4337,11 +4349,12 @@ impl SyscallDispatcher {
                 // kevent() here it does not consume pending epoll events before the
                 // re-dispatched epoll_pwait can copy them out.
                 let files = self.captured_file_table();
-                let fds =
-                    match WaitFds::raw_one(kq_fd, libc::POLLIN).with_guest_slots(&files, [epfd]) {
-                        Ok(fds) => fds,
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                    };
+                let fds = match WaitFds::raw_one(kq_fd, libc::POLLIN)
+                    .with_guest_slots(&files, wait_guest_fds.iter().copied())
+                {
+                    Ok(fds) => fds,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
                 return Ok(DispatchOutcome::WaitOnPollFds {
                     fds,
                     timeout,

@@ -1578,6 +1578,13 @@ where
                 engine
                     .audit_executor_boundary()
                     .map_err(RuntimeError::Trap)?;
+                let vcpu_lease = continuation::await_vcpu_admission(
+                    carrick_hal::vcpu_sched::global(),
+                    self.this_tid.raw() as u64,
+                    None,
+                )
+                .await;
+                carrick_hal::vcpu_sched::set_current_lease(vcpu_lease);
                 let executor =
                     continuation::TransitionalDedicatedRunner::current_executor_registration()
                         .ok_or_else(|| {
@@ -1602,9 +1609,6 @@ where
                         .guest_executors
                         .enter(self.kernel_thread.as_ref().map(Arc::clone)),
                 );
-                let vcpu_lease =
-                    carrick_hal::vcpu_sched::global().acquire(self.this_tid.raw() as u64);
-                carrick_hal::vcpu_sched::set_current_lease(vcpu_lease);
                 engine
                     .rebind_to_slot(vcpu_lease.slot, &cpu)
                     .map_err(RuntimeError::Trap)?;

@@ -2253,6 +2253,14 @@ fn splice_block_captures_output_slot_and_rejects_same_number_reuse() {
     let context = dispatcher.capture_one_task_context().expect("context");
     let files = context.resources().files();
     let ids = crate::kernel::ObjectIdRegistry::new();
+    let input_number = crate::kernel::FileSlotNumber::for_open_fd(7).expect("fd 7");
+    files.install(
+        input_number,
+        Arc::new(crate::kernel::FileDescription::regular(
+            ids.file_description_id().expect("old input description"),
+        )),
+        false,
+    );
     let number = crate::kernel::FileSlotNumber::for_open_fd(8).expect("fd 8");
     files.install(
         number,
@@ -2262,21 +2270,31 @@ fn splice_block_captures_output_slot_and_rejects_same_number_reuse() {
         false,
     );
     let outcome = super::super::resources::with_captured_resources(&context, || {
-        dispatcher.splice_host_output_wait(8, -1, None, false)
+        dispatcher.complete_wait_fd_authority(
+            dispatcher.splice_host_output_wait(8, -1, None, false),
+            &files,
+            [7, 8],
+        )
     });
-    let authority = match outcome {
+    let authorities = match outcome {
         DispatchOutcome::WaitOnFds { fds, .. } => {
-            assert_eq!(fds.logical_authorities_for_test().len(), 1);
-            fds.logical_authorities_for_test()[0]
+            assert_eq!(fds.logical_authorities_for_test().len(), 2);
+            fds.logical_authorities_for_test().to_vec()
         }
         other => panic!("expected splice wait, got {other:?}"),
     };
     files.install(
-        number,
+        input_number,
         Arc::new(crate::kernel::FileDescription::regular(
-            ids.file_description_id().expect("successor description"),
+            ids.file_description_id()
+                .expect("successor input description"),
         )),
         false,
     );
-    assert!(!files.validate_slot_authority(authority));
+    assert!(
+        authorities
+            .iter()
+            .any(|authority| !files.validate_slot_authority(*authority)),
+        "input reuse invalidates the blocked splice while output stays stable"
+    );
 }

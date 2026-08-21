@@ -3,7 +3,8 @@
 //! reclaim-on-block. The default impl leans on a host Mutex+Condvar (generalizing
 //! the HVF `vcpu_gate`) and the host thread scheduler for the M.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
@@ -26,6 +27,22 @@ pub struct SlotLease {
     pub slot: SlotId,
     generation: u64,
 }
+
+/// Exact scheduler-owned place in the admission queue. A pending ticket is
+/// either granted once by the release path or cancelled once by its owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmissionTicket {
+    ticket: Ticket,
+}
+
+/// Result of a nonblocking admission attempt.
+#[derive(Clone, Copy, Debug)]
+pub enum Admission {
+    Granted(SlotLease),
+    Pending(AdmissionTicket),
+}
+
+type AdmissionCallback = Arc<dyn Fn(SlotLease) + Send + Sync + 'static>;
 
 impl SlotLease {
     /// Construct a lease from raw parts (test / fork-rebuild use only).
@@ -75,6 +92,23 @@ pub trait VcpuScheduler: Send + Sync + 'static {
             Some(p) => self.acquire_preferring(tid, p),
             None => self.acquire(tid),
         })
+    }
+    /// Join the exact FIFO admission order without parking the calling host
+    /// thread. A later slot release grants the ticket under the scheduler mutex
+    /// and invokes `ready` only after dropping that mutex.
+    fn acquire_or_subscribe(
+        &self,
+        tid: u64,
+        preferred: Option<SlotId>,
+        ready: AdmissionCallback,
+    ) -> Admission {
+        let _ = (tid, preferred, ready);
+        Admission::Granted(self.acquire(tid))
+    }
+    /// Cancel one still-pending nonblocking ticket. `false` means grant or an
+    /// earlier cancellation already won.
+    fn cancel_admission(&self, _ticket: AdmissionTicket) -> bool {
+        false
     }
     /// True if any thread is currently blocked waiting for a slot (contention).
     /// The runtime only reclaims-on-block when this holds — with spare slots a
@@ -126,11 +160,17 @@ struct PoolState {
     /// circulating briskly -- yet linux tids 25, 26 and 28 never got one and
     /// the parent's `ready` gate expired into `std::process::abort()`.
     queue: VecDeque<Ticket>,
+    subscribed: BTreeMap<Ticket, AdmissionRequest>,
     /// Next ticket to hand out.
     next_ticket: Ticket,
 }
 
 type Ticket = u64;
+
+struct AdmissionRequest {
+    preferred: Option<SlotId>,
+    ready: AdmissionCallback,
+}
 
 /// Default scheduler: an N-slot free-list behind a host Mutex+Condvar.
 pub struct HostCondvarScheduler {
@@ -152,6 +192,7 @@ impl HostCondvarScheduler {
                 free: (0..n as SlotId).rev().collect(),
                 generations: vec![0; n],
                 queue: VecDeque::new(),
+                subscribed: BTreeMap::new(),
                 next_ticket: 0,
             }),
             cv: Condvar::new(),
@@ -202,6 +243,31 @@ impl HostCondvarScheduler {
             st.queue.remove(pos);
         }
     }
+
+    fn take_subscribed_grants(&self, st: &mut PoolState) -> Vec<(AdmissionCallback, SlotLease)> {
+        let mut grants = Vec::new();
+        while let Some(ticket) = st.queue.front().copied() {
+            let Some(preferred) = st.subscribed.get(&ticket).map(|request| request.preferred)
+            else {
+                break;
+            };
+            let Some(lease) = self.try_take_at_head(st, ticket, preferred) else {
+                break;
+            };
+            let request = st
+                .subscribed
+                .remove(&ticket)
+                .unwrap_or_else(|| std::process::abort());
+            grants.push((request.ready, lease));
+        }
+        grants
+    }
+
+    fn publish_grants(grants: Vec<(AdmissionCallback, SlotLease)>) {
+        for (ready, lease) in grants {
+            ready(lease);
+        }
+    }
 }
 
 impl VcpuScheduler for HostCondvarScheduler {
@@ -210,8 +276,10 @@ impl VcpuScheduler for HostCondvarScheduler {
         let ticket = self.enqueue(&mut st);
         loop {
             if let Some(lease) = self.try_take_at_head(&mut st, ticket, None) {
+                let grants = self.take_subscribed_grants(&mut st);
                 drop(st);
                 self.cv.notify_all();
+                Self::publish_grants(grants);
                 return lease;
             }
             // 50ms backstop like HVF's gate — never miss a release wakeup.
@@ -227,6 +295,12 @@ impl VcpuScheduler for HostCondvarScheduler {
 
     fn has_waiters(&self) -> bool {
         self.blocked.load(Ordering::SeqCst) > 0
+            || !self
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .subscribed
+                .is_empty()
     }
 
     fn has_spare_capacity(&self) -> bool {
@@ -242,8 +316,10 @@ impl VcpuScheduler for HostCondvarScheduler {
         let ticket = self.enqueue(&mut st);
         loop {
             if let Some(lease) = self.try_take_at_head(&mut st, ticket, Some(preferred)) {
+                let grants = self.take_subscribed_grants(&mut st);
                 drop(st);
                 self.cv.notify_all();
+                Self::publish_grants(grants);
                 return lease;
             }
             self.blocked.fetch_add(1, Ordering::SeqCst);
@@ -267,16 +343,20 @@ impl VcpuScheduler for HostCondvarScheduler {
         let ticket = self.enqueue(&mut st);
         loop {
             if let Some(lease) = self.try_take_at_head(&mut st, ticket, preferred) {
+                let grants = self.take_subscribed_grants(&mut st);
                 drop(st);
                 self.cv.notify_all();
+                Self::publish_grants(grants);
                 return Some(lease);
             }
             let now = std::time::Instant::now();
             if now >= deadline {
                 // Give the place up so the thread behind us can reach the head.
                 self.abandon(&mut st, ticket);
+                let grants = self.take_subscribed_grants(&mut st);
                 drop(st);
                 self.cv.notify_all();
+                Self::publish_grants(grants);
                 return None;
             }
             // Count as a waiter (has_waiters drives siblings' reclaim-on-block
@@ -291,6 +371,39 @@ impl VcpuScheduler for HostCondvarScheduler {
         }
     }
 
+    fn acquire_or_subscribe(
+        &self,
+        _tid: u64,
+        preferred: Option<SlotId>,
+        ready: AdmissionCallback,
+    ) -> Admission {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let ticket = self.enqueue(&mut st);
+        if let Some(lease) = self.try_take_at_head(&mut st, ticket, preferred) {
+            let grants = self.take_subscribed_grants(&mut st);
+            drop(st);
+            self.cv.notify_all();
+            Self::publish_grants(grants);
+            return Admission::Granted(lease);
+        }
+        st.subscribed
+            .insert(ticket, AdmissionRequest { preferred, ready });
+        Admission::Pending(AdmissionTicket { ticket })
+    }
+
+    fn cancel_admission(&self, ticket: AdmissionTicket) -> bool {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.subscribed.remove(&ticket.ticket).is_none() {
+            return false;
+        }
+        self.abandon(&mut st, ticket.ticket);
+        let grants = self.take_subscribed_grants(&mut st);
+        drop(st);
+        self.cv.notify_all();
+        Self::publish_grants(grants);
+        true
+    }
+
     fn release(&self, lease: SlotLease, _why: Yield) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // Generation guard: only free the id if THIS lease is still the live grant.
@@ -301,10 +414,12 @@ impl VcpuScheduler for HostCondvarScheduler {
         if !st.free.contains(&lease.slot) {
             st.free.push(lease.slot);
         }
+        let grants = self.take_subscribed_grants(&mut st);
         drop(st);
         // notify_all, not notify_one: only the thread at the head of the queue
         // may take this id, and notify_one could wake anyone else.
         self.cv.notify_all();
+        Self::publish_grants(grants);
     }
 
     fn budget(&self) -> usize {
@@ -317,6 +432,7 @@ impl VcpuScheduler for HostCondvarScheduler {
         // re-acquires the child's main slot (0) afterward.
         st.free = (0..self.budget as SlotId).rev().collect();
         st.queue.clear();
+        st.subscribed.clear();
         st.generations.iter_mut().for_each(|g| *g = 0);
     }
 }
@@ -517,6 +633,65 @@ mod tests {
                 .is_some()
         );
         s.release(got, Yield::Exited);
+    }
+
+    #[test]
+    fn nonblocking_admission_grants_from_release_without_blocking_the_caller() {
+        let s = HostCondvarScheduler::new(1);
+        let held = s.acquire(1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let admission = s.acquire_or_subscribe(
+            2,
+            Some(held.slot),
+            std::sync::Arc::new(move |lease| {
+                tx.send(lease).expect("admission receiver");
+            }),
+        );
+        let ticket = match admission {
+            Admission::Granted(_) => panic!("exhausted pool cannot grant synchronously"),
+            Admission::Pending(ticket) => ticket,
+        };
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        s.release(held, Yield::Blocked);
+        let granted = rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("release callback must carry the exact lease");
+        assert_eq!(granted.slot, held.slot);
+        assert!(
+            !s.cancel_admission(ticket),
+            "a granted ticket is already terminal"
+        );
+        s.release(granted, Yield::Exited);
+    }
+
+    #[test]
+    fn cancelled_nonblocking_admission_never_consumes_released_capacity() {
+        let s = HostCondvarScheduler::new(1);
+        let held = s.acquire(1);
+        let callbacks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = std::sync::Arc::clone(&callbacks);
+        let ticket = match s.acquire_or_subscribe(
+            2,
+            None,
+            std::sync::Arc::new(move |_| {
+                callback_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        ) {
+            Admission::Granted(_) => panic!("exhausted pool cannot grant synchronously"),
+            Admission::Pending(ticket) => ticket,
+        };
+        assert!(s.cancel_admission(ticket));
+        assert!(!s.cancel_admission(ticket), "cancellation has one winner");
+
+        s.release(held, Yield::Blocked);
+        let successor = s.acquire(3);
+        assert_eq!(successor.slot, held.slot);
+        assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+        s.release(successor, Yield::Exited);
     }
 
     #[test]

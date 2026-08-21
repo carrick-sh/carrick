@@ -11015,7 +11015,7 @@ impl SyscallDispatcher {
                                 fds: match WaitFds::raw_one(sock_fd.get(), libc::POLLOUT)
                                     .with_guest_slots(
                                         &this.captured_file_table(),
-                                        [out_fd.0],
+                                        [in_fd.0, out_fd.0],
                                     )
                                 {
                                     Ok(fds) => fds,
@@ -11040,7 +11040,11 @@ impl SyscallDispatcher {
             }
 
             let bytes = this.sendfile_bytes(in_fd.0, offset, count)?;
-            let outcome = this.write_output_fd(out_fd.0, &bytes, tid);
+            let outcome = this.complete_wait_fd_authority(
+                this.write_output_fd(out_fd.0, &bytes, tid),
+                &this.captured_file_table(),
+                [in_fd.0, out_fd.0],
+            );
             let DispatchOutcome::Returned { value } = outcome else {
                 return Ok(outcome);
             };
@@ -11146,7 +11150,11 @@ impl SyscallDispatcher {
             // (the common case: cat to a pipe/stdout). Non-NULL → pwrite at the
             // given offset on a real host fd and advance *off_out.
             let written = if off_out_addr == 0 {
-                let outcome = this.write_output_fd(out_fd.0, &bytes, tid);
+                let outcome = this.complete_wait_fd_authority(
+                    this.write_output_fd(out_fd.0, &bytes, tid),
+                    &this.captured_file_table(),
+                    [in_fd.0, out_fd.0],
+                );
                 let DispatchOutcome::Returned { value } = outcome else {
                     return Ok(outcome);
                 };
@@ -11328,12 +11336,23 @@ impl SyscallDispatcher {
             // exactly like write(2) on the same fd.
             let out_nonblocking = splice_flags.contains(LinuxSpliceFlags::NONBLOCK)
                 || this.fd_is_nonblocking(out_fd.0);
+            let complete_wait = |outcome| {
+                this.complete_wait_fd_authority(
+                    outcome,
+                    &this.captured_file_table(),
+                    [in_fd.0, out_fd.0],
+                )
+            };
             // Never hand the destination more than it can take in one go. The
             // write path returns a SHORT count rather than parking (splice(2)'s
             // own contract), and bounding the SOURCE read by the same figure
             // keeps the undelivered tail out of carrick's hands entirely.
             let count = match this.splice_pipe_write_room(out_fd.0) {
-                Some(0) => return Ok(this.splice_output_would_block(out_fd.0, out_nonblocking)),
+                Some(0) => {
+                    return Ok(complete_wait(
+                        this.splice_output_would_block(out_fd.0, out_nonblocking),
+                    ));
+                }
                 Some(room) => count.min(room),
                 None => count,
             };
@@ -11352,7 +11371,7 @@ impl SyscallDispatcher {
                 let outcome = this.splice_write_out(out_fd.0, off_out_address, &bytes, cx.memory, tid, out_nonblocking);
                 let DispatchOutcome::Returned { value } = outcome else {
                     Self::restore_pipe_bytes(&pipe, &bytes);
-                    return Ok(outcome);
+                    return Ok(complete_wait(outcome));
                 };
                 let written = usize::try_from(value).unwrap_or(0).min(bytes.len());
                 if written < bytes.len() {
@@ -11394,7 +11413,7 @@ impl SyscallDispatcher {
                     in_nonblocking,
                 )? {
                     Ok(buf) => buf,
-                    Err(outcome) => return Ok(outcome),
+                    Err(outcome) => return Ok(complete_wait(outcome)),
                 };
                 if buf.is_empty() {
                     return Ok(DispatchOutcome::Returned { value: 0 });
@@ -11402,7 +11421,7 @@ impl SyscallDispatcher {
                 let outcome = this.splice_write_out(out_fd.0, off_out_address, &buf, cx.memory, tid, out_nonblocking);
                 let DispatchOutcome::Returned { value } = outcome else {
                     this.restore_splice_pipe_bytes(in_fd.0, &buf);
-                    return Ok(outcome);
+                    return Ok(complete_wait(outcome));
                 };
                 let written = if value <= 0 {
                     0
@@ -11524,7 +11543,7 @@ impl SyscallDispatcher {
                 let DispatchOutcome::Returned { value } = outcome else {
                     // EAGAIN / WaitOnFds / Errno on the destination — propagate
                     // WITHOUT consuming any socket bytes (the peek left them).
-                    return Ok(outcome);
+                    return Ok(complete_wait(outcome));
                 };
                 let written = usize::try_from(value).unwrap_or(0);
                 // Now drain EXACTLY `written` bytes from the socket — they are safely
@@ -11607,7 +11626,7 @@ impl SyscallDispatcher {
                 other => other,
             };
             let DispatchOutcome::Returned { value } = outcome else {
-                return Ok(outcome);
+                return Ok(complete_wait(outcome));
             };
             let written = usize::try_from(value).unwrap_or(0);
             offset = offset.saturating_add(written);

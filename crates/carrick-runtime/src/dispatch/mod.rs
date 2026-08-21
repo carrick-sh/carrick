@@ -3383,6 +3383,61 @@ pub(crate) fn hvpatch_lane_active() -> bool {
 }
 
 impl SyscallDispatcher {
+    pub(in crate::dispatch) fn complete_wait_fd_authority(
+        &self,
+        outcome: DispatchOutcome,
+        files: &crate::kernel::objects::FileTable,
+        guest_fds: impl IntoIterator<Item = i32>,
+    ) -> DispatchOutcome {
+        let guest_fds = guest_fds.into_iter().collect::<Vec<_>>();
+        let authorize = |fds: WaitFds| fds.with_guest_slots(files, guest_fds.iter().copied());
+        match outcome {
+            DispatchOutcome::WaitOnFds {
+                fds,
+                timeout,
+                on_timeout,
+                sig_mask,
+            } => match authorize(fds) {
+                Ok(fds) => DispatchOutcome::WaitOnFds {
+                    fds,
+                    timeout,
+                    on_timeout,
+                    sig_mask,
+                },
+                Err(errno) => DispatchOutcome::errno(errno),
+            },
+            DispatchOutcome::WaitOnPollFds {
+                fds,
+                timeout,
+                on_timeout,
+                sig_mask,
+            } => match authorize(fds) {
+                Ok(fds) => DispatchOutcome::WaitOnPollFds {
+                    fds,
+                    timeout,
+                    on_timeout,
+                    sig_mask,
+                },
+                Err(errno) => DispatchOutcome::errno(errno),
+            },
+            DispatchOutcome::WaitOnFdsSelect {
+                fds,
+                timeout,
+                sig_mask,
+                clear_on_timeout,
+            } => match authorize(fds) {
+                Ok(fds) => DispatchOutcome::WaitOnFdsSelect {
+                    fds,
+                    timeout,
+                    sig_mask,
+                    clear_on_timeout,
+                },
+                Err(errno) => DispatchOutcome::errno(errno),
+            },
+            outcome => outcome,
+        }
+    }
+
     pub(crate) fn launch_fs_context_for_hvpatch_bind(
         &self,
     ) -> Result<Option<(String, Option<String>)>, crate::kernel::KernelError> {

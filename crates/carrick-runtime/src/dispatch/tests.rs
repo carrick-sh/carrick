@@ -921,6 +921,104 @@ mod overlay_dispatch_tests {
     }
 
     #[test]
+    fn empty_epoll_wait_captures_epfd_and_rejects_same_number_reuse() {
+        let mut h = Harness::new();
+        let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as i32;
+        let out = h.reserve(16);
+        let outcome = h.call(22, [epfd as u64, out, 1, u64::MAX, 0, 0]);
+        let authority = match outcome {
+            DispatchOutcome::WaitOnFds { fds, .. } => {
+                assert_eq!(
+                    fds.logical_authorities_for_test().len(),
+                    1,
+                    "empty-interest wait still re-resolves epfd on redispatch"
+                );
+                fds.logical_authorities_for_test()[0]
+            }
+            other => panic!("expected empty epoll wait, got {other:?}"),
+        };
+        let context = h
+            .dispatcher
+            .capture_one_task_context()
+            .expect("context");
+        let files = context.resources().files();
+        let number = crate::kernel::FileSlotNumber::for_open_fd(epfd).expect("epfd slot");
+        let ids = crate::kernel::ObjectIdRegistry::new();
+        files.install(
+            number,
+            Arc::new(crate::kernel::FileDescription::regular(
+                ids.file_description_id().expect("successor description"),
+            )),
+            false,
+        );
+        assert!(
+            !files.validate_slot_authority(authority),
+            "old empty-epoll readiness cannot authorize a successor epfd"
+        );
+    }
+
+    #[test]
+    fn blocked_sendfile_captures_input_and_output_before_input_reuse() {
+        let mut h = Harness::new();
+        let path = h.put_str("/sendfile-authority");
+        let input = returned(h.call(
+            56,
+            [
+                (-100i64) as u64,
+                path,
+                (O_CREAT | 2) as u64,
+                0o600,
+                0,
+                0,
+            ],
+        )) as i32;
+        let byte = h.put_bytes(b"x");
+        assert_eq!(returned(h.call(64, [input as u64, byte, 1, 0, 0, 0])), 1);
+        assert_eq!(returned(h.call(62, [input as u64, 0, 0, 0, 0, 0])), 0);
+
+        let pair = h.reserve(8);
+        assert_eq!(returned(h.call(59, [pair, 0, 0, 0, 0, 0])), 0);
+        let pair_bytes = h.memory.read_bytes(pair, 8).expect("pipe pair");
+        let output = i32::from_le_bytes(pair_bytes[4..8].try_into().expect("writer"));
+        let fill = h.put_bytes(&vec![0x5au8; 4096]);
+        for _ in 0..16 {
+            assert_eq!(
+                returned(h.call(64, [output as u64, fill, 4096, 0, 0, 0])),
+                4096
+            );
+        }
+
+        let outcome = h.call(71, [output as u64, input as u64, 0, 1, 0, 0]);
+        let authorities = match outcome {
+            DispatchOutcome::WaitOnFds { fds, .. } => {
+                assert_eq!(fds.logical_authorities_for_test().len(), 2);
+                fds.logical_authorities_for_test().to_vec()
+            }
+            other => panic!("expected blocked sendfile, got {other:?}"),
+        };
+        let context = h
+            .dispatcher
+            .capture_one_task_context()
+            .expect("context");
+        let files = context.resources().files();
+        let input_slot = crate::kernel::FileSlotNumber::for_open_fd(input).expect("input slot");
+        let ids = crate::kernel::ObjectIdRegistry::new();
+        files.install(
+            input_slot,
+            Arc::new(crate::kernel::FileDescription::regular(
+                ids.file_description_id().expect("successor input"),
+            )),
+            false,
+        );
+        assert!(
+            authorities
+                .iter()
+                .any(|authority| !files.validate_slot_authority(*authority)),
+            "old blocked sendfile cannot re-resolve a reused input slot"
+        );
+    }
+
+    #[test]
     fn epoll_et_delivers_new_host_edge_while_level_still_ready() {
         let mut h = Harness::new();
         let epfd = returned(h.call(20, [0, 0, 0, 0, 0, 0])) as u64;
