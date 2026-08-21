@@ -372,13 +372,16 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let task_id = context.task().key().id.raw() as u64;
+    let thread_id = context.thread().key().tid.raw() as u64;
 
     // kill(1, 0) -> existence check, success.
     assert_eq!(
         dispatcher
             .dispatch(
                 &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(129, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
+                SyscallRequest::new(129, SyscallArgs::from([task_id, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
             )
@@ -402,7 +405,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
         dispatcher
             .dispatch(
                 &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(129, SyscallArgs::from([1, 65, 0, 0, 0, 0])),
+                SyscallRequest::new(129, SyscallArgs::from([task_id, 65, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
             )
@@ -423,29 +426,30 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_ESRCH }
     );
-    // kill(1, SIGTERM=15) -> success; the signal is queued in the
-    // host pending slot for the runtime to deliver on the next pass.
+    // kill(self, SIGTERM=15) -> success; process-directed delivery retains the
+    // legacy host carrier slot. The thread-directed cases below must not use it.
     assert_eq!(
         dispatcher
             .dispatch(
                 &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(129, SyscallArgs::from([1, 15, 0, 0, 0, 0])),
+                SyscallRequest::new(129, SyscallArgs::from([task_id, 15, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
     );
-    // Drain the pending slot so subsequent tests aren't surprised by
-    // a leftover SIGTERM.
-    let _ = carrick_runtime::host_signal::take_pending();
+    assert_eq!(
+        carrick_runtime::host_signal::take_pending_for(thread_id as i32),
+        15
+    );
 
     // tkill(1, 0) -> success; tkill(0, 0) -> EINVAL (Linux rejects non-positive tids).
     assert_eq!(
         dispatcher
             .dispatch(
                 &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(130, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
+                SyscallRequest::new(130, SyscallArgs::from([thread_id, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
             )
@@ -470,7 +474,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
         dispatcher
             .dispatch(
                 &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(130, SyscallArgs::from([1, 65, 0, 0, 0, 0])),
+                SyscallRequest::new(130, SyscallArgs::from([thread_id, 65, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
             )
@@ -490,26 +494,30 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_ESRCH }
     );
-    // tkill(1, 1) -> success (SIGHUP queued for self-delivery).
-    assert_eq!(
+    // tkill(self, 1) queues an exact Kernel instance and carries the exact key.
+    assert!(matches!(
         dispatcher
             .dispatch(
-                &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(130, SyscallArgs::from([1, 1, 0, 0, 0, 0])),
+                &context,
+                SyscallRequest::new(130, SyscallArgs::from([thread_id, 1, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
+        DispatchOutcome::SignalThread { kernel_target: Some(exact), .. }
+            if exact == context.thread().key()
+    ));
+    assert_eq!(
+        dispatcher.take_deliverable_pending(&context, context.thread().registry_id()),
+        Some(1)
     );
-    let _ = carrick_runtime::host_signal::take_pending();
 
     // tgkill(1, 1, 0) -> success.
     assert_eq!(
         dispatcher
             .dispatch(
                 &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(131, SyscallArgs::from([1, 1, 0, 0, 0, 0])),
+                SyscallRequest::new(131, SyscallArgs::from([task_id, thread_id, 0, 0, 0, 0]),),
                 &mut memory,
                 &reporter,
             )
@@ -521,7 +529,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
         dispatcher
             .dispatch(
                 &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(131, SyscallArgs::from([1, 1, 65, 0, 0, 0])),
+                SyscallRequest::new(131, SyscallArgs::from([task_id, thread_id, 65, 0, 0, 0]),),
                 &mut memory,
                 &reporter,
             )
@@ -535,7 +543,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
         dispatcher
             .dispatch(
                 &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(131, SyscallArgs::from([99, 1, 0, 0, 0, 0])),
+                SyscallRequest::new(131, SyscallArgs::from([99, thread_id, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
             )
@@ -546,26 +554,37 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
         dispatcher
             .dispatch(
                 &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(131, SyscallArgs::from([1, 99, 0, 0, 0, 0])),
+                SyscallRequest::new(131, SyscallArgs::from([task_id, 99, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_ESRCH }
     );
-    // tgkill(1, 1, 1) -> success; SIGHUP queued for self-delivery.
-    assert_eq!(
+    // tgkill(self, self, 1) also carries the exact Kernel thread key.
+    assert!(matches!(
         dispatcher
             .dispatch(
-                &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(131, SyscallArgs::from([1, 1, 1, 0, 0, 0])),
+                &context,
+                SyscallRequest::new(
+                    131,
+                    SyscallArgs::from([task_id, thread_id, 1, 0, 0, 0]),
+                ),
                 &mut memory,
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
+        DispatchOutcome::SignalThread { kernel_target: Some(exact), .. }
+            if exact == context.thread().key()
+    ));
+    assert_eq!(
+        dispatcher.take_deliverable_pending(&context, context.thread().registry_id()),
+        Some(1)
     );
-    let _ = carrick_runtime::host_signal::take_pending();
+    assert_eq!(
+        carrick_runtime::host_signal::take_pending_for(thread_id as i32),
+        0
+    );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }

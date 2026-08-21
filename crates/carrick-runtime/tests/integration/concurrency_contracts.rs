@@ -214,7 +214,7 @@ fn shared_dispatcher_routes_sibling_thread_signals() {
         | carrick_abi::LinuxCloneFlags::SIGHAND
         | carrick_abi::LinuxCloneFlags::THREAD;
     let plan = carrick_runtime::kernel::ClonePlan::from_flags(flags).unwrap();
-    let _started = initial
+    let sibling_context = initial
         .kernel()
         .reserve_thread_clone(&initial, plan, None)
         .unwrap()
@@ -223,7 +223,8 @@ fn shared_dispatcher_routes_sibling_thread_signals() {
         .commit()
         .unwrap()
         .start_thread()
-        .unwrap();
+        .unwrap()
+        .into_context();
     let context = dispatcher.capture_one_task_context().unwrap();
 
     let routed = dispatcher
@@ -244,7 +245,8 @@ fn shared_dispatcher_routes_sibling_thread_signals() {
         routed,
         DispatchOutcome::SignalThread {
             tid: target,
-            signum: 10
+            signum: 10,
+            kernel_target: Some(sibling_context.thread().key()),
         }
     );
 }

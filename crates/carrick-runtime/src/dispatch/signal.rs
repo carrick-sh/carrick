@@ -1304,15 +1304,15 @@ impl SyscallDispatcher {
 
     /// Route a HVPatch thread target by Linux `(tgid, tid)` identity. With no
     /// tgid this is `tkill`'s globally unique tid lookup.
-    fn hvpatch_specific_thread_signal<M: GuestMemory>(
+    pub(in crate::dispatch) fn hvpatch_specific_thread_signal(
         &self,
-        ctx: &SyscallCtx<M>,
+        context: &crate::kernel::KernelContext,
         tgid: Option<i32>,
         tid: i32,
         signum: u64,
         siginfo: Option<LinuxSiginfo>,
     ) -> Option<DispatchOutcome> {
-        if !hvpatch_owns_specific_thread_signal(crate::dispatch::hvpatch_lane_active()) {
+        if self.execution_backend() != crate::page_profile::ExecutionBackend::HvPatch {
             return None;
         }
         let tid = match crate::kernel::LinuxTid::from_abi_positive(tid) {
@@ -1326,7 +1326,7 @@ impl SyscallDispatcher {
             },
             None => None,
         };
-        let kernel = ctx.kernel.kernel();
+        let kernel = context.kernel();
         let Some((target_task, target_thread)) = kernel.live_keys_for_thread(required_task, tid)
         else {
             return Some(DispatchOutcome::errno(LINUX_ESRCH));
@@ -1339,30 +1339,34 @@ impl SyscallDispatcher {
                 Err(_) => return Some(DispatchOutcome::errno(LINUX_EINVAL)),
             }
         };
-        // RLIMIT_SIGPENDING caps the number of QUEUED real-time signals;
-        // tgkill(2)/sigqueue(3) report EAGAIN once it is reached. The check
-        // already exists and its own comment cites LTP tgkill02, but its only
-        // callers were `route_thread_signal` (the non-HVPatch route) and
-        // `sigqueueinfo_common` — the HVPatch branch returned before reaching
-        // either, so the limit was simply never enforced on this lane.
-        if signum != 0 && is_rt_signal(signum as i32) && self.sigpending_limit_exceeded(ctx.kernel)
-        {
-            return Some(DispatchOutcome::errno(crate::linux_abi::LINUX_EAGAIN));
-        }
         Some(
             match kernel.authorize_signal_target_exact(
-                ctx.kernel,
+                context,
                 target_task,
                 Some(target_thread),
                 signal,
             ) {
                 crate::kernel::ExactSignalTargetAuthorization::Allowed(ticket) => {
-                    if signal.is_none_or(|signal| {
-                        kernel.post_signal_to_authorized_target(&ticket, signal, siginfo)
-                    }) {
-                        DispatchOutcome::Returned { value: 0 }
-                    } else {
-                        DispatchOutcome::errno(LINUX_ESRCH)
+                    let Some(signal) = signal else {
+                        return Some(DispatchOutcome::Returned { value: 0 });
+                    };
+                    match kernel
+                        .post_guest_thread_signal_to_authorized_target(&ticket, signal, siginfo)
+                    {
+                        crate::kernel::ExactThreadSignalPost::Posted(Some(exact)) => {
+                            DispatchOutcome::SignalThread {
+                                tid: crate::thread::ThreadId::from_wire_key(exact.tid.raw()),
+                                signum: signal.raw(),
+                                kernel_target: Some(exact),
+                            }
+                        }
+                        crate::kernel::ExactThreadSignalPost::Posted(None)
+                        | crate::kernel::ExactThreadSignalPost::Missing => {
+                            DispatchOutcome::errno(LINUX_ESRCH)
+                        }
+                        crate::kernel::ExactThreadSignalPost::QueueFull => {
+                            DispatchOutcome::errno(LINUX_EAGAIN)
+                        }
                     }
                 }
                 crate::kernel::ExactSignalTargetAuthorization::DropProtectedInit => {
@@ -1402,7 +1406,11 @@ impl SyscallDispatcher {
                     continue;
                 }
                 if !self.signal_blocked(ctx.kernel, tid, s) {
-                    return DispatchOutcome::SignalThread { tid, signum: s };
+                    return DispatchOutcome::SignalThread {
+                        tid,
+                        signum: s,
+                        kernel_target: None,
+                    };
                 }
             }
         }
@@ -1616,7 +1624,7 @@ impl SyscallDispatcher {
             if !is_valid_signum(signum) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if crate::dispatch::hvpatch_lane_active() {
+            if this.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch {
                 let info = (signum != 0).then(|| {
                     crate::linux_abi::LinuxSiginfo::kill(
                         signum as i32,
@@ -1626,7 +1634,7 @@ impl SyscallDispatcher {
                     )
                 });
                 return Ok(this
-                    .hvpatch_specific_thread_signal(cx, None, tid as i32, signum, info)
+                    .hvpatch_specific_thread_signal(cx.kernel, None, tid as i32, signum, info)
                     .unwrap_or_else(|| DispatchOutcome::errno(LINUX_ESRCH)));
             }
             if let Some((routed, _target)) = this.route_thread_signal(cx, tid, signum, true) {
@@ -1660,7 +1668,7 @@ impl SyscallDispatcher {
             if !is_valid_signum(signum) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if crate::dispatch::hvpatch_lane_active() {
+            if this.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch {
                 let info = (signum != 0).then(|| {
                     crate::linux_abi::LinuxSiginfo::kill(
                         signum as i32,
@@ -1670,7 +1678,7 @@ impl SyscallDispatcher {
                     )
                 });
                 if let Some(outcome) = this.hvpatch_specific_thread_signal(
-                    cx,
+                    cx.kernel,
                     Some(tgid as i32),
                     tid as i32,
                     signum,
@@ -2181,6 +2189,7 @@ impl SyscallDispatcher {
                 DispatchOutcome::SignalThread {
                     tid: target,
                     signum: signum_i32,
+                    kernel_target: None,
                 },
                 target,
             ));
@@ -2244,13 +2253,16 @@ impl SyscallDispatcher {
         // is kernel identity. The mature route below publishes through host-
         // process globals and `SignalThread`, which are shared by unrelated
         // HVPatch tasks and bypass task-wide signal generation ordering.
-        if crate::dispatch::hvpatch_lane_active() {
+        if crate::dispatch::hvpatch_lane_active()
+            || (tid_directed
+                && self.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch)
+        {
             if is_rt_signal(s) && self.sigpending_limit_exceeded(ctx.kernel) {
                 return DispatchOutcome::errno(LINUX_EAGAIN);
             }
             return if tid_directed {
                 self.hvpatch_specific_thread_signal(
-                    ctx,
+                    ctx.kernel,
                     Some(ns_target as i32),
                     route_target as i32,
                     signum,
@@ -2589,6 +2601,7 @@ fn hvpatch_signal_observes_zombie(kernel: &crate::kernel::Kernel, pid: i32) -> b
         .is_some_and(|target| kernel.registry().zombie(target).is_some())
 }
 
+#[cfg(test)]
 fn hvpatch_owns_specific_thread_signal(hvpatch_lane: bool) -> bool {
     hvpatch_lane
 }
@@ -4265,7 +4278,7 @@ mod tests {
         SyscallDispatcher::install_signal_action(&d.exact_signal_context_for_test(), 34, caught);
         let routed = d.route_thread_signal(&cx, i64::from(target.raw()), 34, true);
         assert!(
-            matches!(routed, Some((crate::dispatch::DispatchOutcome::SignalThread { tid, signum }, resolved)) if tid == target && signum == 34 && resolved == target)
+            matches!(routed, Some((crate::dispatch::DispatchOutcome::SignalThread { tid, signum, .. }, resolved)) if tid == target && signum == 34 && resolved == target)
         );
         let mut ignored = LinuxSigaction::empty();
         ignored.sa_handler = crate::linux_abi::LINUX_SIG_IGN;
@@ -4274,6 +4287,135 @@ mod tests {
             .take_pending_signal_action(&d.exact_signal_context_for_test(), target, 34)
             .unwrap();
         assert_eq!(delivered, caught);
+    }
+
+    #[test]
+    fn hvpatch_threaded_tkill_is_kernel_native_fifo_coalesced_and_exact() {
+        let mut d = SyscallDispatcher::new();
+        d.set_execution_backend(crate::page_profile::ExecutionBackend::HvPatch);
+        assert_eq!(
+            d.execution_backend(),
+            crate::page_profile::ExecutionBackend::HvPatch
+        );
+        let caller_context = d.capture_one_task_context().expect("caller context");
+        let caller = caller_context.thread().registry_id();
+        let registry = crate::thread::ThreadRegistry::new(caller);
+        let target = registry.register_child(0);
+        let target_tid = d
+            .register_one_task_thread(&caller_context, target)
+            .expect("Kernel target thread");
+        let target_context = d
+            .capture_kernel_context(target_tid)
+            .expect("target context");
+        let futex = crate::thread::FutexTable::new();
+        let reporter = crate::compat::CompatReporter::default();
+        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 4096]);
+        let mut send = |number: u64, signum: u64| {
+            let args = if number == 130 {
+                [target.raw() as u64, signum, 0, 0, 0, 0]
+            } else {
+                [
+                    caller_context.task().key().id.raw() as u64,
+                    target.raw() as u64,
+                    signum,
+                    0,
+                    0,
+                    0,
+                ]
+            };
+            d.dispatch_threaded(
+                &caller_context,
+                SyscallRequest::new(number, SyscallArgs::from(args)),
+                &mut memory,
+                &reporter,
+                caller,
+                &registry,
+                &futex,
+            )
+            .expect("threaded tkill dispatch")
+        };
+
+        for (number, signum) in [(130, 32), (131, 32), (131, 33)] {
+            assert!(matches!(
+                send(number, signum),
+                DispatchOutcome::SignalThread {
+                    tid,
+                    signum: posted,
+                    kernel_target: Some(exact),
+                } if tid == target && posted == signum as i32 && exact == target_context.thread().key()
+            ));
+        }
+        assert_eq!(
+            crate::host_signal::take_pending_for(target.raw()),
+            0,
+            "guest-originated HVPatch signals never enter the host pending bitmask"
+        );
+        let authority = target_context.signal_authority();
+        let mut delivered = Vec::new();
+        for _ in 0..3 {
+            let pending = authority
+                .take_lowest_in(SigSet::EMPTY.complement())
+                .expect("one exact RT instance");
+            delivered.push((pending.pending.signal.raw(), pending.pending.siginfo));
+        }
+        assert_eq!(
+            delivered
+                .iter()
+                .map(|(signum, _)| *signum)
+                .collect::<Vec<_>>(),
+            vec![32, 32, 33]
+        );
+        let sender_pid = caller_context.task().key().id.raw();
+        let sender_uid = caller_context.resources().credentials().ruid().raw();
+        for (signum, info) in delivered {
+            let info = info.expect("SI_TKILL provenance");
+            let si_signo = info.si_signo;
+            let si_code = info.si_code;
+            let si_addr = info.si_addr;
+            assert_eq!(si_signo, signum);
+            assert_eq!(si_code, crate::linux_abi::LINUX_SI_TKILL);
+            assert_eq!(si_addr as u32 as i32, sender_pid);
+            assert_eq!((si_addr >> 32) as u32, sender_uid);
+        }
+
+        assert!(matches!(
+            send(130, 10),
+            DispatchOutcome::SignalThread {
+                kernel_target: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            send(131, 10),
+            DispatchOutcome::SignalThread {
+                kernel_target: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            authority
+                .take_lowest_in(SigSet::EMPTY.with(10))
+                .expect("coalesced standard signal")
+                .pending
+                .signal
+                .raw(),
+            10
+        );
+        assert!(authority.take_lowest_in(SigSet::EMPTY.with(10)).is_none());
+
+        caller_context
+            .task()
+            .replace_rlimit(carrick_abi::LinuxResource::Sigpending, |_| {
+                Ok::<_, ()>(carrick_abi::LinuxRlimit::new(0, 0))
+            })
+            .expect("lower SIGPENDING limit");
+        assert_eq!(send(130, 32), DispatchOutcome::errno(LINUX_EAGAIN));
+
+        target_context
+            .kernel()
+            .exit_thread(&target_context, None)
+            .expect("retire exact target generation");
+        assert_eq!(send(131, 33), DispatchOutcome::errno(LINUX_ESRCH));
     }
 
     #[test]
@@ -4309,7 +4451,7 @@ mod tests {
         SyscallDispatcher::install_signal_action(&d.exact_signal_context_for_test(), 34, caught);
         let routed = d.route_thread_signal(&cx, guest_main_tid, 34, true);
         assert!(
-            matches!(routed, Some((crate::dispatch::DispatchOutcome::SignalThread { tid, signum }, resolved)) if tid == main && signum == 34 && resolved == main)
+            matches!(routed, Some((crate::dispatch::DispatchOutcome::SignalThread { tid, signum, .. }, resolved)) if tid == main && signum == 34 && resolved == main)
         );
         assert!(
             d.take_pending_signal_action(&d.exact_signal_context_for_test(), main, 34)
@@ -4355,7 +4497,7 @@ mod tests {
             false,
         );
         assert!(
-            matches!(routed, crate::dispatch::DispatchOutcome::SignalThread { tid, signum } if tid == main && signum == 34)
+            matches!(routed, crate::dispatch::DispatchOutcome::SignalThread { tid, signum, .. } if tid == main && signum == 34)
         );
         let queued = d
             .take_pending_siginfo(&d.exact_signal_context_for_test(), main, 34)

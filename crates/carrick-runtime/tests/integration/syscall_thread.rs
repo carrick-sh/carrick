@@ -89,7 +89,6 @@ fn clone_fork_flags_still_fork() {
 
 // --- Sub-task B: per-thread tid + real futex via dispatch_threaded ---
 
-use carrick_runtime::linux_abi::{LINUX_SI_TKILL, LinuxSiginfo};
 use carrick_runtime::thread::{FutexTable, ThreadRegistry};
 use std::sync::Arc;
 
@@ -518,11 +517,6 @@ const LINUX_SIG_BLOCK: u64 = 0;
 const LINUX_SIG_UNBLOCK: u64 = 1;
 const SIGUSR1: u64 = 10;
 
-fn read_siginfo_i32(info: &LinuxSiginfo, offset: usize) -> i32 {
-    let bytes = info.as_bytes();
-    i32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-}
-
 #[test]
 fn tgkill_to_sibling_emits_signalthread() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
@@ -539,7 +533,7 @@ fn tgkill_to_sibling_emits_signalthread() {
         | carrick_abi::LinuxCloneFlags::SIGHAND
         | carrick_abi::LinuxCloneFlags::THREAD;
     let plan = carrick_runtime::kernel::ClonePlan::from_flags(flags).unwrap();
-    let _started = initial
+    let sibling_context = initial
         .kernel()
         .reserve_thread_clone(&initial, plan, None)
         .unwrap()
@@ -548,7 +542,8 @@ fn tgkill_to_sibling_emits_signalthread() {
         .commit()
         .unwrap()
         .start_thread()
-        .unwrap();
+        .unwrap()
+        .into_context();
     let context = dispatcher.capture_one_task_context().unwrap();
     let outcome = dispatcher
         .dispatch_threaded(
@@ -568,13 +563,14 @@ fn tgkill_to_sibling_emits_signalthread() {
         outcome,
         DispatchOutcome::SignalThread {
             tid: sibling,
-            signum: SIGUSR1 as i32
+            signum: SIGUSR1 as i32,
+            kernel_target: Some(sibling_context.thread().key()),
         }
     );
 }
 
 #[test]
-fn tgkill_to_sibling_queues_si_tkill_siginfo() {
+fn tgkill_to_sibling_uses_kernel_pending_without_siginfo_sidecar() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
@@ -589,7 +585,7 @@ fn tgkill_to_sibling_queues_si_tkill_siginfo() {
         | carrick_abi::LinuxCloneFlags::SIGHAND
         | carrick_abi::LinuxCloneFlags::THREAD;
     let plan = carrick_runtime::kernel::ClonePlan::from_flags(flags).unwrap();
-    let _started = initial
+    let sibling_context = initial
         .kernel()
         .reserve_thread_clone(&initial, plan, None)
         .unwrap()
@@ -598,7 +594,8 @@ fn tgkill_to_sibling_queues_si_tkill_siginfo() {
         .commit()
         .unwrap()
         .start_thread()
-        .unwrap();
+        .unwrap()
+        .into_context();
     let context = dispatcher.capture_one_task_context().unwrap();
     let outcome = dispatcher
         .dispatch_threaded(
@@ -618,22 +615,18 @@ fn tgkill_to_sibling_queues_si_tkill_siginfo() {
         outcome,
         DispatchOutcome::SignalThread {
             tid: sibling,
-            signum: SIGUSR1 as i32
+            signum: SIGUSR1 as i32,
+            kernel_target: Some(sibling_context.thread().key()),
         }
     );
-    let info = dispatcher
-        .take_pending_siginfo(
-            &dispatcher.capture_one_task_context().unwrap(),
-            sibling,
-            SIGUSR1 as i32,
-        )
-        .expect("tgkill should queue SI_TKILL siginfo for the target thread");
-    assert_eq!(read_siginfo_i32(&info, 0), SIGUSR1 as i32);
-    assert_eq!(read_siginfo_i32(&info, 8), LINUX_SI_TKILL);
     assert_eq!(
-        read_siginfo_i32(&info, 16),
-        std::process::id() as i32,
-        "sender pid"
+        dispatcher.take_pending_siginfo(&context, sibling, SIGUSR1 as i32),
+        None,
+        "HVPatch must not retain the legacy routed-siginfo sidecar"
+    );
+    assert_eq!(
+        dispatcher.take_deliverable_pending(&sibling_context, sibling),
+        Some(SIGUSR1 as i32)
     );
 }
 
@@ -661,13 +654,24 @@ fn tgkill_to_self_raises_locally() {
             &futex,
         )
         .unwrap();
-    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    assert_eq!(
+        outcome,
+        DispatchOutcome::SignalThread {
+            tid: main,
+            signum: SIGUSR1 as i32,
+            kernel_target: Some(context.thread().key()),
+        }
+    );
     assert_eq!(carrick_runtime::host_signal::take_pending_for(2000), 0);
     assert_eq!(
         carrick_runtime::host_signal::take_pending_for(main.raw()),
-        SIGUSR1 as i32
+        0
     );
     assert_eq!(carrick_runtime::host_signal::take_pending(), 0);
+    assert_eq!(
+        dispatcher.take_deliverable_pending(&context, main),
+        Some(SIGUSR1 as i32)
+    );
 }
 
 #[test]
@@ -734,7 +738,14 @@ fn tgkill_to_masked_sibling_queues_without_signalthread() {
             &futex,
         )
         .unwrap();
-    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    assert_eq!(
+        outcome,
+        DispatchOutcome::SignalThread {
+            tid: sibling,
+            signum: SIGUSR1 as i32,
+            kernel_target: Some(sibling_context.thread().key()),
+        }
+    );
     assert_eq!(
         dispatcher
             .take_deliverable_pending(&dispatcher.capture_one_task_context().unwrap(), sibling),

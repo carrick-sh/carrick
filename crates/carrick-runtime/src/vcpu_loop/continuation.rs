@@ -3365,6 +3365,7 @@ pub(crate) struct RunnerTask {
     queued: AtomicBool,
     completion: LogicalJobCompletion,
     scheduler: Arc<Mutex<Option<Arc<Scheduler>>>>,
+    activation_committed: Arc<AtomicBool>,
 }
 
 impl RunnerTask {
@@ -3566,6 +3567,7 @@ struct TransitionalRunnerPool {
     next_worker: AtomicUsize,
     scheduler: Arc<Mutex<Option<Arc<Scheduler>>>>,
     reject_next_submission: AtomicBool,
+    reject_next_activation: Arc<AtomicBool>,
 }
 
 impl TransitionalRunnerPool {
@@ -3664,17 +3666,40 @@ pub struct TransitionalDedicatedRunner {
 
 pub(crate) struct DormantRunnerSubmission {
     task: Option<Arc<RunnerTask>>,
+    reject_activation: Arc<AtomicBool>,
+}
+
+pub(crate) struct ActivatedRunnerSubmission {
+    activation_committed: Arc<AtomicBool>,
+}
+
+impl ActivatedRunnerSubmission {
+    pub(crate) fn is_runner_visible(&self) -> bool {
+        self.activation_committed.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visibility_token_for_test(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.activation_committed)
+    }
 }
 
 impl DormantRunnerSubmission {
-    pub(crate) fn activate(mut self) -> Result<(), TransitionalRunnerError> {
+    pub(crate) fn activate(mut self) -> Result<ActivatedRunnerSubmission, TransitionalRunnerError> {
+        if self.reject_activation.swap(false, Ordering::AcqRel) {
+            return Err(TransitionalRunnerError::TaskFailed);
+        }
         let task = self
             .task
             .take()
             .ok_or(TransitionalRunnerError::TaskFailed)?;
+        task.activation_committed.store(true, Ordering::Release);
         if task.enqueue_without_preemption() {
-            Ok(())
+            Ok(ActivatedRunnerSubmission {
+                activation_committed: Arc::clone(&task.activation_committed),
+            })
         } else {
+            task.activation_committed.store(false, Ordering::Release);
             task.fail_boundary();
             Err(TransitionalRunnerError::TaskFailed)
         }
@@ -3928,6 +3953,7 @@ impl TransitionalDedicatedRunner {
             next_worker: AtomicUsize::new(0),
             scheduler: Arc::new(Mutex::new(None)),
             reject_next_submission: AtomicBool::new(false),
+            reject_next_activation: Arc::new(AtomicBool::new(false)),
         });
         for _ in 0..worker_count {
             pool.spawn_worker();
@@ -3971,7 +3997,10 @@ impl TransitionalDedicatedRunner {
         if let Some(scheduler) = task.scheduler.lock().as_ref() {
             scheduler.request_preemption();
         }
-        dormant.activate()?;
+        let activated = dormant.activate()?;
+        if !activated.is_runner_visible() {
+            return Err(TransitionalRunnerError::TaskFailed);
+        }
         Ok(receipt)
     }
 
@@ -4002,13 +4031,17 @@ impl TransitionalDedicatedRunner {
             queued: AtomicBool::new(false),
             completion: completion.clone(),
             scheduler: Arc::clone(&self.pool.scheduler),
+            activation_committed: Arc::new(AtomicBool::new(false)),
         });
         Ok((
             LogicalTaskReceipt {
                 receiver,
                 completion,
             },
-            DormantRunnerSubmission { task: Some(task) },
+            DormantRunnerSubmission {
+                task: Some(task),
+                reject_activation: Arc::clone(&self.pool.reject_next_activation),
+            },
         ))
     }
 
@@ -4016,6 +4049,13 @@ impl TransitionalDedicatedRunner {
     pub(crate) fn reject_next_submission_for_test(&self) {
         self.pool
             .reject_next_submission
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reject_next_activation_for_test(&self) {
+        self.pool
+            .reject_next_activation
             .store(true, Ordering::Release);
     }
 
@@ -5913,6 +5953,90 @@ mod tests {
     }
 
     #[test]
+    fn kernel_native_guest_signal_continuation_cancels_and_delivers_without_host_sidecars() {
+        let (kernel, context) = bootstrap(15_469);
+        let generation = publish(&context, 0x914);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let service = CarrierWaitService::new(scheduler);
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::empty(),
+                timeout: None,
+                on_timeout: 0,
+                sig_mask: WaitSigMask::NONE,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("guest-signal continuation");
+        let mut registration = service.prepare_registration(&continuation);
+        service
+            .enroll(&mut registration)
+            .expect("enroll guest-signal continuation");
+        let wake_token = registration.wake_token();
+        continuation
+            .attach_registration(registration)
+            .expect("attach guest-signal registration");
+        let signal = crate::kernel::LinuxSignal::for_signal_number(32).expect("SIGRTMIN");
+        let info = crate::linux_abi::LinuxSiginfo::kill(
+            32,
+            crate::linux_abi::LINUX_SI_TKILL,
+            context.task().key().id.raw(),
+            context.resources().credentials().ruid().raw(),
+        );
+        let ticket = match kernel.authorize_signal_target_exact(
+            &context,
+            context.task().key(),
+            Some(context.thread().key()),
+            Some(signal),
+        ) {
+            crate::kernel::ExactSignalTargetAuthorization::Allowed(ticket) => ticket,
+            other => panic!("exact guest signal ticket: {other:?}"),
+        };
+        assert_eq!(
+            kernel.post_guest_thread_signal_to_authorized_target(&ticket, signal, Some(info)),
+            crate::kernel::ExactThreadSignalPost::Posted(Some(context.thread().key()))
+        );
+        assert_eq!(
+            crate::host_signal::take_pending_for(context.thread().key().tid.raw()),
+            0
+        );
+        let event =
+            await_event(&service, wake_token).expect("Kernel-native guest signal readiness");
+        let reserved = event.reserved_signal().expect("exact guest reservation");
+        assert_eq!(reserved.siginfo(), Some(info));
+        assert_eq!(reserved.host_slot_tid(), None);
+        let mut result = continuation
+            .resume(event, &context)
+            .expect("guest signal resume");
+        let cancelled = result
+            .take_reserved_signal()
+            .expect("continuation owns exact reservation");
+        drop(result);
+        drop(cancelled);
+        assert!(context.signal_authority().thread_pending().contains(32));
+
+        let replay = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::empty(),
+                timeout: None,
+                on_timeout: 0,
+                sig_mask: WaitSigMask::NONE,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("replay continuation");
+        let replay_event = SignalReadinessProbe::from_continuation(&replay)
+            .event()
+            .expect("cancelled exact instance replays");
+        let replay_reserved = replay_event
+            .reserved_signal()
+            .expect("replayed reservation");
+        assert_eq!(replay_reserved.siginfo(), Some(info));
+        assert!(replay_reserved.consume());
+        assert!(!replay_reserved.consume());
+    }
+
+    #[test]
     fn ignored_lower_signal_does_not_hide_next_exact_deliverable_reservation() {
         let (_kernel, context) = bootstrap(15_369_4);
         let generation = publish(&context, 0x709);
@@ -6606,10 +6730,20 @@ mod tests {
     #[test]
     fn dormant_bootstrap_preempts_only_after_scheduler_publication_and_both_jobs_progress() {
         #[derive(Clone)]
-        struct CountingKick(Arc<AtomicUsize>);
+        struct CountingKick {
+            kicks: Arc<AtomicUsize>,
+            competitor_visibility: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+        }
         impl carrick_hal::VcpuKickDyn for CountingKick {
             fn kick(&self) {
-                self.0.fetch_add(1, Ordering::SeqCst);
+                let visible = self
+                    .competitor_visibility
+                    .lock()
+                    .as_ref()
+                    .expect("competitor activation published before kick")
+                    .load(Ordering::Acquire);
+                assert!(visible, "kick raced ahead of runner visibility");
+                self.kicks.fetch_add(1, Ordering::SeqCst);
             }
         }
 
@@ -6621,6 +6755,8 @@ mod tests {
         runner.attach_scheduler(Arc::clone(&scheduler));
         let kicks = Arc::new(AtomicUsize::new(0));
         let incumbent_kicks = Arc::clone(&kicks);
+        let competitor_visibility = Arc::new(Mutex::new(None));
+        let incumbent_visibility = Arc::clone(&competitor_visibility);
         let incumbent_scheduler = Arc::clone(&scheduler);
         let (started_tx, started_rx) = mpsc::channel();
         let incumbent = runner.spawn(async move {
@@ -6630,7 +6766,10 @@ mod tests {
                 .take(&executor)
                 .expect("claim incumbent compute task");
             assert!(TransitionalDedicatedRunner::publish_current_hardware_kick(
-                Box::new(CountingKick(incumbent_kicks.clone()))
+                Box::new(CountingKick {
+                    kicks: incumbent_kicks.clone(),
+                    competitor_visibility: incumbent_visibility,
+                })
             ));
             started_tx.send(()).expect("incumbent started");
             while incumbent_kicks.load(Ordering::Acquire) == 0 {
@@ -6680,20 +6819,21 @@ mod tests {
         scheduler
             .wake(bootstrap.thread().key())
             .expect("publish exact bootstrap scheduler row");
+        let activated = dormant.activate().expect("activate published bootstrap");
+        *competitor_visibility.lock() = Some(activated.visibility_token_for_test());
         scheduler.request_preemption();
         assert_eq!(
             kicks.load(Ordering::SeqCst),
             1,
             "the now-visible bootstrap competitor kicks the exact incumbent"
         );
-        dormant.activate().expect("activate published bootstrap");
         assert_eq!(incumbent.wait().expect("incumbent progress"), 1);
         assert_eq!(receipt.wait().expect("bootstrap progress"), 2);
         assert_eq!(bootstrap_generation.raw(), 1);
     }
 
     #[test]
-    fn failed_bootstrap_publication_drops_dormant_job_without_preemption() {
+    fn failed_bootstrap_activation_retires_row_without_preemption() {
         #[derive(Clone)]
         struct CountingKick(Arc<AtomicUsize>);
         impl carrick_hal::VcpuKickDyn for CountingKick {
@@ -6758,17 +6898,24 @@ mod tests {
             })
             .expect("dormant submission");
         let generation = publish(&context, 0x912);
-        context
-            .thread()
-            .fail_runnable_generation(
+        scheduler
+            .wake(context.thread().key())
+            .expect("publish exact competitor row");
+        runner.reject_next_activation_for_test();
+        assert!(matches!(
+            dormant.activate(),
+            Err(TransitionalRunnerError::TaskFailed)
+        ));
+        scheduler
+            .fail_runnable_exact(
+                context.thread().key(),
                 generation,
                 crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
             )
-            .expect("publication failpoint");
-        assert!(scheduler.wake(context.thread().key()).is_err());
-        drop(dormant);
+            .expect("retire failed activation row");
         assert_eq!(polled.load(Ordering::SeqCst), 0);
         assert_eq!(kicks.load(Ordering::SeqCst), 0);
+        assert_eq!(scheduler.queued_len(), 0);
         assert!(!scheduler.need_resched());
         release.store(true, Ordering::Release);
         incumbent.wait().expect("incumbent exits without a kick");
@@ -7017,7 +7164,7 @@ mod tests {
         let activate = launch
             .find("dormant.activate()")
             .expect("dormant activation");
-        assert!(publish < preempt && preempt < gate && gate < activate);
+        assert!(publish < activate && activate < preempt && preempt < gate);
         assert!(
             !launch.contains("future.as_mut().poll"),
             "bootstrap pthread must never poll the guest execution future"

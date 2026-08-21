@@ -624,6 +624,18 @@ pub struct RunQueue {
 }
 
 impl RunQueue {
+    fn remove_exact(&self, key: QueueKey) -> bool {
+        let mut state = self.inner.state.lock();
+        let Some(index) = state.rows.iter().position(|row| row.key == key) else {
+            return false;
+        };
+        state.rows.remove(index);
+        state.queued.remove(&key);
+        self.inner.maybe_finish_close(&mut state);
+        self.inner.changed.notify_all();
+        true
+    }
+
     fn admit_root(
         &self,
         kernel: &Arc<Kernel>,
@@ -1052,6 +1064,27 @@ impl Scheduler {
 
     pub fn make_runnable(&self, thread: ThreadKey) -> Result<WakeDisposition, SchedulerError> {
         self.wake(thread)
+    }
+
+    pub(crate) fn fail_runnable_exact(
+        &self,
+        key: ThreadKey,
+        generation: ExecutionGeneration,
+        reason: super::objects::ExecutionFailure,
+    ) -> Result<(), SchedulerError> {
+        let thread = self
+            .kernel
+            .exact_thread_for_scheduler(key)
+            .ok_or(SchedulerError::UnknownThread)?;
+        thread.fail_runnable_generation(generation, reason)?;
+        self.queue.remove_exact(QueueKey {
+            thread: key,
+            generation,
+        });
+        if self.queue.len() == 0 {
+            self.need_resched.store(false, Ordering::Release);
+        }
+        Ok(())
     }
 
     pub fn wake(&self, thread: ThreadKey) -> Result<WakeDisposition, SchedulerError> {
