@@ -5500,6 +5500,76 @@ impl ThreadMappingDesc {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn persistent_executor_carrier_mappings(mappings: &[HvfMappedRegion]) -> Vec<ThreadMappingDesc> {
+    let is_carrier = |mapping: &HvfMappedRegion| {
+        matches!(
+            mapping.start,
+            carrick_mem::memory::LINUX_EL0_TRAMPOLINE_BASE
+                | carrick_mem::memory::LINUX_EL1_VECTORS_BASE
+                | carrick_mem::memory::LINUX_EL1_MAINT_BASE
+                | carrick_mem::memory::LINUX_SYSCALL_MAILBOX_BASE
+        )
+    };
+    mappings
+        .iter()
+        .filter(|mapping| is_carrier(mapping))
+        .map(ThreadMappingDesc::from_region)
+        .collect()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn persistent_carrier_host_pointer(
+    mappings: &[ThreadMappingDesc],
+    address: u64,
+    length: usize,
+) -> Option<std::ptr::NonNull<u8>> {
+    let end = address.checked_add(u64::try_from(length).ok()?)?;
+    let mapping = mappings
+        .iter()
+        .find(|mapping| address >= mapping.start && end <= mapping.end)?;
+    let offset = usize::try_from(address.checked_sub(mapping.start)?).ok()?;
+    std::ptr::NonNull::new(unsafe { mapping.host_addr.add(offset) })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn audit_persistent_executor_carrier_mappings(
+    mappings: &[ThreadMappingDesc],
+) -> Result<(), TrapError> {
+    for (name, start, size) in [
+        (
+            "EL0 trampoline",
+            carrick_mem::memory::LINUX_EL0_TRAMPOLINE_BASE,
+            carrick_mem::memory::LINUX_EL0_TRAMPOLINE_SIZE,
+        ),
+        (
+            "EL1 vectors",
+            carrick_mem::memory::LINUX_EL1_VECTORS_BASE,
+            carrick_mem::memory::LINUX_EL1_VECTORS_SIZE,
+        ),
+        (
+            "EL1 maintenance",
+            carrick_mem::memory::LINUX_EL1_MAINT_BASE,
+            carrick_mem::memory::LINUX_EL1_MAINT_SIZE,
+        ),
+        (
+            "syscall mailbox",
+            carrick_mem::memory::LINUX_SYSCALL_MAILBOX_BASE,
+            carrick_mem::memory::LINUX_SYSCALL_MAILBOX_ARENA_SIZE,
+        ),
+    ] {
+        let size = usize::try_from(size).map_err(|_| {
+            TrapError::Hypervisor(format!("persistent executor {name} extent is too large"))
+        })?;
+        if persistent_carrier_host_pointer(mappings, start, size).is_none() {
+            return Err(TrapError::Hypervisor(format!(
+                "persistent executor carrier {name} mapping is absent"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct ForkMappingDesc {
     start: u64,
     ipa: u64,
@@ -5576,9 +5646,22 @@ pub struct ThreadSpec {
 #[derive(Clone)]
 pub(crate) struct PersistentExecutorSpec {
     vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+    /// VM-global Carrick control mappings needed before any task projection is
+    /// loaded: entry trampoline, EL1 vectors/scratch path, maintenance code,
+    /// and the executor mailbox arena. These are unowned metadata only; task
+    /// mappings, page tables, MM/root, inventory, and COW authority stay out of
+    /// the factory.
+    carrier_mappings: Vec<ThreadMappingDesc>,
     mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
     syscall_transport: HvfSyscallTransport,
 }
+
+// SAFETY: carrier mappings contain process-address-space host pointers to the
+// same VM-global buffers the root engine already mapped. The factory carries no
+// ownership transfer and uses them only on the worker thread to bind its own
+// mailbox pointer before running the vCPU.
+unsafe impl Send for PersistentExecutorSpec {}
+unsafe impl Sync for PersistentExecutorSpec {}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct ProcessMappingDesc {
@@ -14519,14 +14602,47 @@ impl HvfVmState {
     pub(crate) fn build_persistent_executor_spec(&self) -> PersistentExecutorSpec {
         PersistentExecutorSpec {
             vm: (*self._vm).clone(),
+            carrier_mappings: persistent_executor_carrier_mappings(&self.mappings),
             mailbox_slots: std::sync::Arc::clone(&self.mailbox_slots),
             syscall_transport: self.syscall_transport,
         }
     }
 
+    fn allocate_persistent_mailbox_for_vcpu(
+        spec: &PersistentExecutorSpec,
+        vcpu: &applevisor::vcpu::Vcpu,
+    ) -> Result<MailboxBinding, TrapError> {
+        use applevisor::prelude::SysReg;
+
+        let lease = spec
+            .mailbox_slots
+            .allocate()
+            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+        let address = lease.id().guest_address();
+        let pointer = persistent_carrier_host_pointer(
+            &spec.carrier_mappings,
+            address,
+            carrick_aarch64::mailbox::AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+        )
+        .ok_or_else(|| {
+            TrapError::Hypervisor(format!(
+                "persistent executor syscall mailbox slot {} at {address:#x} is not mapped",
+                lease.id().raw()
+            ))
+        })?
+        .cast::<carrick_aarch64::mailbox::Aarch64SyscallMailbox>();
+        // SAFETY: the carrier projection was validated to contain the complete
+        // fixed mailbox arena, and the lease uniquely owns this slot.
+        let binding = unsafe { MailboxBinding::new(lease, pointer, spec.syscall_transport) };
+        vcpu.set_sys_reg(SysReg::SP_EL1, address)
+            .map_err(hvf_error)?;
+        Ok(binding)
+    }
+
     pub(crate) fn from_persistent_executor_spec(
         spec: &PersistentExecutorSpec,
     ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu, MailboxBinding), TrapError> {
+        audit_persistent_executor_carrier_mappings(&spec.carrier_mappings)?;
         let vm = rebuilt_vm_cell()
             .lock()
             .clone()
@@ -14542,7 +14658,7 @@ impl HvfVmState {
             vcpu_id: vcpu.id(),
             vcpu_handle: vcpu.get_handle(),
         };
-        let mailbox = state.allocate_mailbox_for_vcpu(&vcpu)?;
+        let mailbox = Self::allocate_persistent_mailbox_for_vcpu(spec, &vcpu)?;
         state.task.audit_neutral()?;
         Ok((state, vcpu, mailbox))
     }
@@ -20462,6 +20578,70 @@ mod thread_sibling_tests {
             "mailbox lookup must preserve semantic VA while authenticating the translated IPA",
         );
         assert_eq!(selected.host_addr as usize, 0x1177_bc000);
+    }
+
+    #[test]
+    fn neutral_persistent_worker_resolves_slot_zero_only_from_carrier_mappings() {
+        let carrier_region = |start: u64, size: u64, host: usize| {
+            let mut region = mapped_region(start, start + size, start);
+            region.host_addr = host as *mut u8;
+            region
+        };
+        let mappings = vec![
+            carrier_region(
+                crate::memory::LINUX_EL0_TRAMPOLINE_BASE,
+                crate::memory::LINUX_EL0_TRAMPOLINE_SIZE,
+                0x1100_0000,
+            ),
+            carrier_region(
+                crate::memory::LINUX_EL1_VECTORS_BASE,
+                crate::memory::LINUX_EL1_VECTORS_SIZE,
+                0x1200_0000,
+            ),
+            carrier_region(
+                crate::memory::LINUX_EL1_MAINT_BASE,
+                crate::memory::LINUX_EL1_MAINT_SIZE,
+                0x1300_0000,
+            ),
+            carrier_region(
+                crate::memory::LINUX_SYSCALL_MAILBOX_BASE,
+                crate::memory::LINUX_SYSCALL_MAILBOX_ARENA_SIZE,
+                0x1400_0000,
+            ),
+            mapped_region(0x0040_0000, 0x0040_4000, 0x0040_0000),
+            mapped_region(
+                crate::memory::LINUX_PAGE_TABLES_BASE,
+                crate::memory::LINUX_PAGE_TABLES_BASE + crate::memory::LINUX_PAGE_TABLES_SIZE,
+                crate::memory::LINUX_PAGE_TABLES_BASE,
+            ),
+        ];
+        let carrier = persistent_executor_carrier_mappings(&mappings);
+        assert_eq!(
+            carrier.len(),
+            4,
+            "task image and stage-1 root stay task-owned"
+        );
+
+        let neutral = HvfTaskState::neutral();
+        neutral
+            .audit_neutral()
+            .expect("idle worker stays task-neutral");
+        assert!(
+            persistent_carrier_host_pointer(
+                &[],
+                crate::memory::LINUX_SYSCALL_MAILBOX_BASE,
+                carrick_aarch64::mailbox::AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+            )
+            .is_none(),
+            "the signed startup failure had no carrier mapping projection"
+        );
+        let pointer = persistent_carrier_host_pointer(
+            &carrier,
+            crate::memory::LINUX_SYSCALL_MAILBOX_BASE,
+            carrick_aarch64::mailbox::AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+        )
+        .expect("slot zero resolves from executor-local carrier metadata");
+        assert_eq!(pointer.as_ptr() as usize, 0x1400_0000);
     }
 }
 
