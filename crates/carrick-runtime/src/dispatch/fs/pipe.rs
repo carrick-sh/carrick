@@ -95,6 +95,7 @@ pub(crate) fn read_pipe<M: GuestMemory>(
     pipe: &PipeRef,
     status_flags: u64,
     fd: i32,
+    authority: super::WaitFdAuthority,
 ) -> DispatchOutcome {
     if length == 0 {
         return DispatchOutcome::Returned { value: 0 };
@@ -121,7 +122,7 @@ pub(crate) fn read_pipe<M: GuestMemory>(
         DispatchOutcome::errno(LINUX_EAGAIN)
     } else {
         DispatchOutcome::WaitOnFds {
-            fds: WaitFds::raw_one(fd, libc::POLLIN),
+            fds: WaitFds::authorized_raw_one(fd, libc::POLLIN, authority),
             timeout: None,
             on_timeout: LINUX_EAGAIN.guest_retval(),
             sig_mask: carrick_abi::WaitSigMask::NONE,
@@ -200,6 +201,7 @@ pub(crate) fn write_pipe(
     pipe: &PipeRef,
     status_flags: u64,
     fd: i32,
+    authority: super::WaitFdAuthority,
 ) -> DispatchOutcome {
     let nonblocking = status_flags & LINUX_O_NONBLOCK != 0;
     let length = bytes.len();
@@ -230,7 +232,7 @@ pub(crate) fn write_pipe(
         DispatchOutcome::errno(LINUX_EAGAIN)
     } else {
         DispatchOutcome::WaitOnFds {
-            fds: WaitFds::raw_one(fd, libc::POLLOUT),
+            fds: WaitFds::authorized_raw_one(fd, libc::POLLOUT, authority),
             timeout: None,
             on_timeout: LINUX_EAGAIN.guest_retval(),
             sig_mask: carrick_abi::WaitSigMask::NONE,
@@ -241,6 +243,7 @@ pub(crate) fn write_pipe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::{InternalWaitKind, WaitFdAuthority};
 
     #[test]
     fn in_memory_pipe_basic_read_write() {
@@ -248,7 +251,13 @@ mod tests {
         let tid = crate::thread::ThreadId::synthetic_for_tests(1);
 
         let data = b"hello, in-memory pipe!";
-        let out = write_pipe(data, &pipe, 0, 4);
+        let out = write_pipe(
+            data,
+            &pipe,
+            0,
+            4,
+            WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+        );
         assert_eq!(
             out,
             DispatchOutcome::Returned {
@@ -272,7 +281,13 @@ mod tests {
 
         // Fill 5000 bytes
         let data = vec![0x42u8; 5000];
-        let out = write_pipe(&data, &pipe, 0, 4);
+        let out = write_pipe(
+            &data,
+            &pipe,
+            0,
+            4,
+            WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+        );
         assert_eq!(out, DispatchOutcome::Returned { value: 5000 });
 
         // Shrinking below buffered bytes must return EBUSY
@@ -289,7 +304,13 @@ mod tests {
 
         // Close all readers
         pipe.state.lock().readers = 0;
-        let out = write_pipe(b"test", &pipe, 0, 4);
+        let out = write_pipe(
+            b"test",
+            &pipe,
+            0,
+            4,
+            WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+        );
         assert_eq!(out, DispatchOutcome::errno(LINUX_EPIPE));
 
         // Restore reader, close all writers
@@ -315,13 +336,25 @@ mod tests {
         // Fill pipe to capacity
         let data = vec![0xaa; 4096];
         assert_eq!(
-            write_pipe(&data, &pipe, LINUX_O_NONBLOCK, 4),
+            write_pipe(
+                &data,
+                &pipe,
+                LINUX_O_NONBLOCK,
+                4,
+                WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+            ),
             DispatchOutcome::Returned { value: 4096 }
         );
 
         // Write to full nonblocking pipe -> EAGAIN
         assert_eq!(
-            write_pipe(b"more", &pipe, LINUX_O_NONBLOCK, 4),
+            write_pipe(
+                b"more",
+                &pipe,
+                LINUX_O_NONBLOCK,
+                4,
+                WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+            ),
             DispatchOutcome::errno(LINUX_EAGAIN)
         );
     }

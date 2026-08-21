@@ -931,12 +931,7 @@ impl SyscallDispatcher {
                             cq_tail,
                             Ordering::Release,
                         );
-                        return DispatchOutcome::WaitOnFds {
-                            fds: WaitFds::raw_one(host_fd, events),
-                            timeout: None,
-                            on_timeout: 0,
-                            sig_mask: carrick_abi::WaitSigMask::NONE,
-                        };
+                        return self.io_uring_block_outcome(sqe, host_fd, events);
                     }
                 },
                 Some(sqe) => self.io_uring_run_op(memory, sqe),
@@ -1140,6 +1135,25 @@ impl SyscallDispatcher {
                 }
             }
             _ => cqe_err(LINUX_EINVAL),
+        }
+    }
+
+    fn io_uring_block_outcome(
+        &self,
+        sqe: &LinuxIoUringSqe,
+        host_fd: i32,
+        events: i16,
+    ) -> DispatchOutcome {
+        let files = self.captured_file_table();
+        let fds = match WaitFds::raw_one(host_fd, events).with_guest_slots(&files, [sqe.fd]) {
+            Ok(fds) => fds,
+            Err(errno) => return DispatchOutcome::errno(errno),
+        };
+        DispatchOutcome::WaitOnFds {
+            fds,
+            timeout: None,
+            on_timeout: 0,
+            sig_mask: carrick_abi::WaitSigMask::NONE,
         }
     }
 
@@ -1373,6 +1387,42 @@ mod tests {
         super::super::resources::with_captured_resources(context, || {
             dispatcher.io_uring_run_op(memory, &close_sqe)
         })
+    }
+
+    #[test]
+    fn io_uring_block_captures_sqe_slot_and_rejects_same_number_reuse() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("context");
+        let files = context.resources().files();
+        let ids = crate::kernel::ObjectIdRegistry::new();
+        let number = crate::kernel::FileSlotNumber::for_open_fd(7).expect("fd 7");
+        files.install(
+            number,
+            Arc::new(crate::kernel::FileDescription::regular(
+                ids.file_description_id().expect("old description"),
+            )),
+            false,
+        );
+        let mut request = sqe(LINUX_IORING_OP_READ, 0x77);
+        request.fd = 7;
+        let outcome = super::super::resources::with_captured_resources(&context, || {
+            dispatcher.io_uring_block_outcome(&request, -1, libc::POLLIN)
+        });
+        let authority = match outcome {
+            DispatchOutcome::WaitOnFds { fds, .. } => {
+                assert_eq!(fds.logical_authorities_for_test().len(), 1);
+                fds.logical_authorities_for_test()[0]
+            }
+            other => panic!("expected io_uring wait, got {other:?}"),
+        };
+        files.install(
+            number,
+            Arc::new(crate::kernel::FileDescription::regular(
+                ids.file_description_id().expect("successor description"),
+            )),
+            false,
+        );
+        assert!(!files.validate_slot_authority(authority));
     }
 
     #[test]

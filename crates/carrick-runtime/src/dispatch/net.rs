@@ -1658,6 +1658,7 @@ impl SyscallDispatcher {
     /// starvation.
     fn blocking_io<F>(
         &self,
+        guest_fd: i32,
         host_fd: i32,
         dir: IoDir,
         nonblocking: bool,
@@ -1682,8 +1683,15 @@ impl SyscallDispatcher {
                     // interruptible); on WaitResult::TimedOut the run-loops
                     // return on_timeout = -EAGAIN, matching the Linux SO_*TIMEO
                     // recv/send result.
+                    let files = self.captured_file_table();
+                    let fds = match WaitFds::raw_one(host_fd, dir.events())
+                        .with_guest_slots(&files, [guest_fd])
+                    {
+                        Ok(fds) => fds,
+                        Err(errno) => return DispatchOutcome::errno(errno),
+                    };
                     DispatchOutcome::WaitOnFds {
-                        fds: WaitFds::raw_one(host_fd, dir.events()),
+                        fds,
                         timeout,
                         on_timeout: LINUX_EAGAIN.guest_retval(),
                         sig_mask: carrick_abi::WaitSigMask::NONE,
@@ -2630,12 +2638,17 @@ impl SyscallDispatcher {
         if self.io_is_nonblocking(fd, flags) {
             return DispatchOutcome::errno(LINUX_EAGAIN);
         }
+        let files = self.captured_file_table();
+        let fds = match WaitFds::raw_one(-1, 0).with_guest_slots(&files, [fd]) {
+            Ok(fds) => fds,
+            Err(errno) => return DispatchOutcome::errno(errno),
+        };
         DispatchOutcome::WaitOnPollFds {
             // Synthetic netlink sockets have no host fd to poll. A negative
             // pollfd is ignored by poll(2); enqueue_netlink_message publishes
             // queue state before waking the registered dispatcher-aware waiter,
             // which then re-samples this queue without a periodic timer.
-            fds: WaitFds::raw_one(-1, 0),
+            fds,
             timeout: None,
             on_timeout: 0,
             sig_mask: carrick_abi::WaitSigMask::NONE,
@@ -2810,7 +2823,7 @@ impl SyscallDispatcher {
         let accept_targets: Vec<i32> = std::iter::once(host_fd)
             .chain(reuseport::steal_targets(host_fd))
             .collect();
-        let outcome = self.blocking_io(host_fd, IoDir::Read, nonblocking, None, || {
+        let outcome = self.blocking_io(fd, host_fd, IoDir::Read, nonblocking, None, || {
             let mut last = Err(LINUX_EAGAIN);
             for target in accept_targets {
                 let mut sa_storage = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
@@ -3025,8 +3038,15 @@ impl SyscallDispatcher {
         }
         if e == LINUX_EINPROGRESS || e == LINUX_EALREADY || e == LINUX_EAGAIN {
             self.set_socket_connect_in_progress(fd, true);
+            let files = self.captured_file_table();
+            let fds = match WaitFds::raw_one(host_fd.get(), libc::POLLOUT)
+                .with_guest_slots(&files, [fd])
+            {
+                Ok(fds) => fds,
+                Err(errno) => return DispatchOutcome::errno(errno),
+            };
             return DispatchOutcome::WaitOnFds {
-                fds: WaitFds::raw_one(host_fd.get(), libc::POLLOUT),
+                fds,
                 timeout: None,
                 on_timeout: LINUX_EINPROGRESS.guest_retval(),
                 sig_mask: carrick_abi::WaitSigMask::NONE,
@@ -4279,8 +4299,13 @@ impl SyscallDispatcher {
                     // observing a concurrent epoll_ctl MOD or a later HUP/ERR.
                     crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 2);
                     crate::event_ring::rec(crate::event_ring::EPWFD, kq_fd, 0, timeout_ms);
+                    let files = self.captured_file_table();
+                    let fds = match WaitFds::raw_one(kq_fd, 0).with_guest_slots(&files, [epfd]) {
+                        Ok(fds) => fds,
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    };
                     return Ok(DispatchOutcome::WaitOnPollFds {
-                        fds: WaitFds::raw_one(kq_fd, 0),
+                        fds,
                         timeout,
                         on_timeout: 0,
                         sig_mask,
@@ -4311,8 +4336,14 @@ impl SyscallDispatcher {
                 // the epoll kqueue inside the per-thread kqueue, and unlike calling
                 // kevent() here it does not consume pending epoll events before the
                 // re-dispatched epoll_pwait can copy them out.
+                let files = self.captured_file_table();
+                let fds =
+                    match WaitFds::raw_one(kq_fd, libc::POLLIN).with_guest_slots(&files, [epfd]) {
+                        Ok(fds) => fds,
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    };
                 return Ok(DispatchOutcome::WaitOnPollFds {
-                    fds: WaitFds::raw_one(kq_fd, libc::POLLIN),
+                    fds,
                     timeout,
                     on_timeout: 0,
                     sig_mask,
@@ -6236,8 +6267,15 @@ impl SyscallDispatcher {
                 // real connect error. Mark the connect as deferred so the EISCONN
                 // we expect on re-dispatch is recognised as async-completion above.
                 this.set_socket_connect_in_progress(fd, true);
+                let files = this.captured_file_table();
+                let fds = match WaitFds::raw_one(host_fd.get(), libc::POLLOUT)
+                    .with_guest_slots(&files, [fd])
+                {
+                    Ok(fds) => fds,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
                 return Ok(DispatchOutcome::WaitOnFds {
-                    fds: WaitFds::raw_one(host_fd.get(), libc::POLLOUT),
+                    fds,
                     timeout: None,
                     on_timeout: LINUX_EINPROGRESS.guest_retval(),
                     sig_mask: carrick_abi::WaitSigMask::NONE,
@@ -6529,7 +6567,7 @@ impl SyscallDispatcher {
             if std::env::var_os("CARRICK_NET_DEBUG").is_some() {
                 eprintln!("NETDBG sendto pre-io fd={fd} nonblocking={nonblocking}");
             }
-            let outcome = this.blocking_io(host_fd.get(), IoDir::Write, nonblocking, send_to, || {
+            let outcome = this.blocking_io(fd, host_fd.get(), IoDir::Write, nonblocking, send_to, || {
                 // Re-stated locally (idempotent) so the non-blocking guarantee
                 // is visible at every send site below: both the real socket and
                 // the error-queue shadow are O_NONBLOCK, and MSG_DONTWAIT keeps
@@ -6702,7 +6740,7 @@ impl SyscallDispatcher {
             let recv_targets: Vec<i32> = std::iter::once(host_fd.get())
                 .chain(reuseport::steal_targets(host_fd.get()))
                 .collect();
-            let outcome = this.blocking_io(host_fd.get(), IoDir::Read, nonblocking, recv_to, || {
+            let outcome = this.blocking_io(fd, host_fd.get(), IoDir::Read, nonblocking, recv_to, || {
                 let host_write_ranges = [(buf_addr, len)];
                 let host_write = zero_copy.then(|| {
                     carrick_guest_mem::HostWriteGuard::new(memory, &host_write_ranges)
@@ -7622,47 +7660,54 @@ impl SyscallDispatcher {
                 .and_then(|local| recverr::shadow_for_send(host_fd.get(), &local, dest)),
             _ => None,
         };
-        let outcome = self.blocking_io(host_fd.get(), IoDir::Write, nonblocking, send_to, || {
-            // Use a real sendmsg so the host control buffer (SCM_RIGHTS) is
-            // delivered. A single iovec over the assembled `data` is fine —
-            // the byte stream is identical to the guest's scattered iovecs.
-            let mut hiov = libc::iovec {
-                iov_base: data.as_ptr() as *mut libc::c_void,
-                iov_len: data.len(),
-            };
-            let mut hmsg: libc::msghdr = unsafe { std::mem::zeroed() };
-            // The shadow is already CONNECTED to this destination, and Darwin
-            // answers EISCONN for a send that names an address on a connected
-            // socket — so address it implicitly there.
-            if let Some(a) = &host_addr
-                && recverr_send_fd.is_none()
-            {
-                hmsg.msg_name = a.as_ptr() as *mut libc::c_void;
-                hmsg.msg_namelen = a.len() as libc::socklen_t;
-            }
-            hmsg.msg_iov = &mut hiov as *mut _;
-            hmsg.msg_iovlen = 1;
-            if !host_control.is_empty() {
-                hmsg.msg_control = host_control.as_ptr() as *mut libc::c_void;
-                hmsg.msg_controllen = host_control.len() as _;
-            }
-            let send_fd = recverr_send_fd.unwrap_or_else(|| host_fd.get());
-            // Re-stated locally (idempotent): both the real socket and the
-            // error-queue shadow are O_NONBLOCK, and MSG_DONTWAIT keeps this
-            // call non-blocking regardless.
-            let host_flags = host_flags | libc::MSG_DONTWAIT;
-            let pending_sctp = if is_sctp_stream {
-                sctp::begin_send(send_fd, payload_len)
-            } else {
-                None
-            };
-            let n = unsafe { libc::sendmsg(send_fd, &hmsg as *const _, host_flags) };
-            let result = n.host_syscall_errno().map(|value| value as i64);
-            if let Some(pending) = pending_sctp {
-                pending.settle(result.ok().map(|sent| sent.max(0) as usize));
-            }
-            result
-        });
+        let outcome = self.blocking_io(
+            fd,
+            host_fd.get(),
+            IoDir::Write,
+            nonblocking,
+            send_to,
+            || {
+                // Use a real sendmsg so the host control buffer (SCM_RIGHTS) is
+                // delivered. A single iovec over the assembled `data` is fine —
+                // the byte stream is identical to the guest's scattered iovecs.
+                let mut hiov = libc::iovec {
+                    iov_base: data.as_ptr() as *mut libc::c_void,
+                    iov_len: data.len(),
+                };
+                let mut hmsg: libc::msghdr = unsafe { std::mem::zeroed() };
+                // The shadow is already CONNECTED to this destination, and Darwin
+                // answers EISCONN for a send that names an address on a connected
+                // socket — so address it implicitly there.
+                if let Some(a) = &host_addr
+                    && recverr_send_fd.is_none()
+                {
+                    hmsg.msg_name = a.as_ptr() as *mut libc::c_void;
+                    hmsg.msg_namelen = a.len() as libc::socklen_t;
+                }
+                hmsg.msg_iov = &mut hiov as *mut _;
+                hmsg.msg_iovlen = 1;
+                if !host_control.is_empty() {
+                    hmsg.msg_control = host_control.as_ptr() as *mut libc::c_void;
+                    hmsg.msg_controllen = host_control.len() as _;
+                }
+                let send_fd = recverr_send_fd.unwrap_or_else(|| host_fd.get());
+                // Re-stated locally (idempotent): both the real socket and the
+                // error-queue shadow are O_NONBLOCK, and MSG_DONTWAIT keeps this
+                // call non-blocking regardless.
+                let host_flags = host_flags | libc::MSG_DONTWAIT;
+                let pending_sctp = if is_sctp_stream {
+                    sctp::begin_send(send_fd, payload_len)
+                } else {
+                    None
+                };
+                let n = unsafe { libc::sendmsg(send_fd, &hmsg as *const _, host_flags) };
+                let result = n.host_syscall_errno().map(|value| value as i64);
+                if let Some(pending) = pending_sctp {
+                    pending.settle(result.ok().map(|sent| sent.max(0) as usize));
+                }
+                result
+            },
+        );
         Ok(outcome)
     }
 
@@ -7924,148 +7969,150 @@ impl SyscallDispatcher {
         let recvmsg_targets: Vec<i32> = std::iter::once(host_fd.get())
             .chain(reuseport::steal_targets(host_fd.get()))
             .collect();
-        let outcome = self.blocking_io(host_fd.get(), IoDir::Read, nonblocking, recv_to, || {
-            // A retry must not leak fds from a prior partial attempt.
-            for stale in received_host_fds.borrow_mut().drain(..) {
-                unsafe { libc::close(stale) };
-            }
-            let capped = if is_sctp_stream {
-                sctp::read_limit(host_fd.get(), total)
-            } else {
-                total
-            };
-            let mut buf = vec![0u8; if zero_len_datagram_read { 1 } else { capped }];
-            let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
-            // A host control buffer sized to hold the guest's requested
-            // controllen (SCM_RIGHTS fd array). CMSG_SPACE for that many fds is
-            // >= the Linux size, so this never under-provisions.
-            let mut hcontrol: Vec<u8> = if want_control {
-                let max_fds = (msg.controllen as usize / 4).max(1);
-                vec![0u8; unsafe { libc::CMSG_SPACE((max_fds * 4) as u32) } as usize]
-            } else {
-                Vec::new()
-            };
-            // Use the host recvmsg (not recvfrom) so the kernel can report
-            // MSG_TRUNC/MSG_CTRUNC/MSG_EOR in the returned msg_flags. macOS/XNU
-            // sets MSG_TRUNC on truncated atomic (PR_ATOMIC) records exactly
-            // like Linux, so translating those flags back is a faithful match.
-            let mut hiov = libc::iovec {
-                iov_base: buf.as_mut_ptr() as *mut _,
-                iov_len: buf.len(),
-            };
-            let mut hmsg: libc::msghdr = unsafe { std::mem::zeroed() };
-            if msg.name != 0 {
-                hmsg.msg_name = sa.as_mut_ptr() as *mut _;
-                hmsg.msg_namelen = sa.len() as libc::socklen_t;
-            }
-            hmsg.msg_iov = &mut hiov as *mut _;
-            hmsg.msg_iovlen = 1; // c_int on macOS
-            if !hcontrol.is_empty() {
-                hmsg.msg_control = hcontrol.as_mut_ptr() as *mut libc::c_void;
-                hmsg.msg_controllen = hcontrol.len() as _;
-            }
-            // host_flags carries MSG_DONTWAIT and this runs inside blocking_io
-            // (host_fd is O_NONBLOCK; EAGAIN -> WaitOnFds with the dispatcher lock
-            // released), so this recvmsg never blocks under the lock.
-            // SO_REUSEPORT: Darwin delivers every datagram to the last socket
-            // that bound the addr:port, so take from the sibling holding the
-            // group's work when this member's own socket is empty. Without
-            // this the member whose TURN it is can never drain the group and
-            // the readiness gate silences the others — a deadlock, not just a
-            // skew. `recvmsg_targets` is just this fd unless it is in a
-            // multi-member group.
-            let mut n = -1isize;
-            let mut last_errno = None;
-            for target in &recvmsg_targets {
+        let outcome =
+            self.blocking_io(fd, host_fd.get(), IoDir::Read, nonblocking, recv_to, || {
+                // A retry must not leak fds from a prior partial attempt.
+                for stale in received_host_fds.borrow_mut().drain(..) {
+                    unsafe { libc::close(stale) };
+                }
+                let capped = if is_sctp_stream {
+                    sctp::read_limit(host_fd.get(), total)
+                } else {
+                    total
+                };
+                let mut buf = vec![0u8; if zero_len_datagram_read { 1 } else { capped }];
+                let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
+                // A host control buffer sized to hold the guest's requested
+                // controllen (SCM_RIGHTS fd array). CMSG_SPACE for that many fds is
+                // >= the Linux size, so this never under-provisions.
+                let mut hcontrol: Vec<u8> = if want_control {
+                    let max_fds = (msg.controllen as usize / 4).max(1);
+                    vec![0u8; unsafe { libc::CMSG_SPACE((max_fds * 4) as u32) } as usize]
+                } else {
+                    Vec::new()
+                };
+                // Use the host recvmsg (not recvfrom) so the kernel can report
+                // MSG_TRUNC/MSG_CTRUNC/MSG_EOR in the returned msg_flags. macOS/XNU
+                // sets MSG_TRUNC on truncated atomic (PR_ATOMIC) records exactly
+                // like Linux, so translating those flags back is a faithful match.
+                let mut hiov = libc::iovec {
+                    iov_base: buf.as_mut_ptr() as *mut _,
+                    iov_len: buf.len(),
+                };
+                let mut hmsg: libc::msghdr = unsafe { std::mem::zeroed() };
                 if msg.name != 0 {
+                    hmsg.msg_name = sa.as_mut_ptr() as *mut _;
                     hmsg.msg_namelen = sa.len() as libc::socklen_t;
                 }
-                if want_control {
+                hmsg.msg_iov = &mut hiov as *mut _;
+                hmsg.msg_iovlen = 1; // c_int on macOS
+                if !hcontrol.is_empty() {
+                    hmsg.msg_control = hcontrol.as_mut_ptr() as *mut libc::c_void;
                     hmsg.msg_controllen = hcontrol.len() as _;
                 }
-                let attempt = unsafe { libc::recvmsg(*target, &mut hmsg as *mut _, host_flags) };
-                match attempt.host_syscall_errno() {
-                    Ok(_) => {
-                        n = attempt;
-                        last_errno = None;
-                        break;
+                // host_flags carries MSG_DONTWAIT and this runs inside blocking_io
+                // (host_fd is O_NONBLOCK; EAGAIN -> WaitOnFds with the dispatcher lock
+                // released), so this recvmsg never blocks under the lock.
+                // SO_REUSEPORT: Darwin delivers every datagram to the last socket
+                // that bound the addr:port, so take from the sibling holding the
+                // group's work when this member's own socket is empty. Without
+                // this the member whose TURN it is can never drain the group and
+                // the readiness gate silences the others — a deadlock, not just a
+                // skew. `recvmsg_targets` is just this fd unless it is in a
+                // multi-member group.
+                let mut n = -1isize;
+                let mut last_errno = None;
+                for target in &recvmsg_targets {
+                    if msg.name != 0 {
+                        hmsg.msg_namelen = sa.len() as libc::socklen_t;
                     }
-                    Err(e) if e == LINUX_EAGAIN => last_errno = Some(e),
-                    Err(e) => {
-                        last_errno = Some(e);
-                        break;
+                    if want_control {
+                        hmsg.msg_controllen = hcontrol.len() as _;
+                    }
+                    let attempt =
+                        unsafe { libc::recvmsg(*target, &mut hmsg as *mut _, host_flags) };
+                    match attempt.host_syscall_errno() {
+                        Ok(_) => {
+                            n = attempt;
+                            last_errno = None;
+                            break;
+                        }
+                        Err(e) if e == LINUX_EAGAIN => last_errno = Some(e),
+                        Err(e) => {
+                            last_errno = Some(e);
+                            break;
+                        }
                     }
                 }
-            }
-            if let Some(e) = last_errno {
-                return Err(e);
-            }
-            let n = n.host_syscall_errno()?;
-            // Stash any received fds (host-layout cmsg) for installation after
-            // the closure returns; the guest-facing rewrite happens below.
-            if want_control && hmsg.msg_controllen as usize > 0 {
-                let got = parse_host_scm_rights_fds(&hcontrol, hmsg.msg_controllen as usize);
-                *received_host_fds.borrow_mut() = got;
-                *received_ipv6_cmsgs.borrow_mut() =
-                    parse_host_ipv6_cmsgs(&hcontrol, hmsg.msg_controllen as usize);
-            }
-            // Scatter the received bytes back into the guest's iovecs.
-            let mut remaining = n as usize;
-            let mut cursor = 0usize;
-            for iov in &iovecs {
-                if remaining == 0 {
-                    break;
+                if let Some(e) = last_errno {
+                    return Err(e);
                 }
-                let chunk = remaining.min(iov.iov_len as usize);
-                if chunk > 0 {
+                let n = n.host_syscall_errno()?;
+                // Stash any received fds (host-layout cmsg) for installation after
+                // the closure returns; the guest-facing rewrite happens below.
+                if want_control && hmsg.msg_controllen as usize > 0 {
+                    let got = parse_host_scm_rights_fds(&hcontrol, hmsg.msg_controllen as usize);
+                    *received_host_fds.borrow_mut() = got;
+                    *received_ipv6_cmsgs.borrow_mut() =
+                        parse_host_ipv6_cmsgs(&hcontrol, hmsg.msg_controllen as usize);
+                }
+                // Scatter the received bytes back into the guest's iovecs.
+                let mut remaining = n as usize;
+                let mut cursor = 0usize;
+                for iov in &iovecs {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let chunk = remaining.min(iov.iov_len as usize);
+                    if chunk > 0 {
+                        if memory
+                            .write_bytes(iov.iov_base, &buf[cursor..cursor + chunk])
+                            .is_err()
+                        {
+                            return Err(LINUX_EFAULT);
+                        }
+                        cursor += chunk;
+                        remaining -= chunk;
+                    }
+                }
+                if msg.name != 0 && msg.namelen != 0 {
+                    let used = (hmsg.msg_namelen as usize).min(sa.len());
+                    let linux_bytes = host_to_linux_sockaddr(&sa[..used], family, true);
+                    let write_len = (linux_bytes.len() as u32).min(msg.namelen);
+                    if write_len > 0
+                        && memory
+                            .write_bytes(msg.name, &linux_bytes[..write_len as usize])
+                            .is_err()
+                    {
+                        return Err(LINUX_EFAULT);
+                    }
+                    // namelen lives at offset 8 (after the 8-byte name pointer).
                     if memory
-                        .write_bytes(iov.iov_base, &buf[cursor..cursor + chunk])
+                        .write_bytes(
+                            msg_addr + core::mem::offset_of!(LinuxMsghdr, namelen) as u64,
+                            &(linux_bytes.len() as u32).to_ne_bytes(),
+                        )
                         .is_err()
                     {
                         return Err(LINUX_EFAULT);
                     }
-                    cursor += chunk;
-                    remaining -= chunk;
                 }
-            }
-            if msg.name != 0 && msg.namelen != 0 {
-                let used = (hmsg.msg_namelen as usize).min(sa.len());
-                let linux_bytes = host_to_linux_sockaddr(&sa[..used], family, true);
-                let write_len = (linux_bytes.len() as u32).min(msg.namelen);
-                if write_len > 0
-                    && memory
-                        .write_bytes(msg.name, &linux_bytes[..write_len as usize])
-                        .is_err()
-                {
-                    return Err(LINUX_EFAULT);
+                // Remember the host msg_flags; the guest controllen + final flags
+                // (incl. a possible MSG_CTRUNC) are written after fd install below.
+                let n = if zero_len_datagram_read {
+                    // The guest asked for no bytes; anything the scratch caught only
+                    // tells us the datagram was non-empty.
+                    scratch_saw_payload.set(n > 0);
+                    0
+                } else {
+                    n
+                };
+                guest_msg_flags.set(host_to_linux_msg_flags(hmsg.msg_flags));
+                if is_sctp_stream {
+                    sctp_eor.set(sctp::complete_read(host_fd.get(), n as usize, sctp_peek));
                 }
-                // namelen lives at offset 8 (after the 8-byte name pointer).
-                if memory
-                    .write_bytes(
-                        msg_addr + core::mem::offset_of!(LinuxMsghdr, namelen) as u64,
-                        &(linux_bytes.len() as u32).to_ne_bytes(),
-                    )
-                    .is_err()
-                {
-                    return Err(LINUX_EFAULT);
-                }
-            }
-            // Remember the host msg_flags; the guest controllen + final flags
-            // (incl. a possible MSG_CTRUNC) are written after fd install below.
-            let n = if zero_len_datagram_read {
-                // The guest asked for no bytes; anything the scratch caught only
-                // tells us the datagram was non-empty.
-                scratch_saw_payload.set(n > 0);
-                0
-            } else {
-                n
-            };
-            guest_msg_flags.set(host_to_linux_msg_flags(hmsg.msg_flags));
-            if is_sctp_stream {
-                sctp_eor.set(sctp::complete_read(host_fd.get(), n as usize, sctp_peek));
-            }
-            Ok(n as i64)
-        });
+                Ok(n as i64)
+            });
         // Install any received fds as fresh guest fds, then write the guest
         // (Linux-layout) control buffer + the controllen/flags fields. Done
         // OUTSIDE the I/O closure so it happens exactly once on success.
