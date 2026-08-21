@@ -1413,6 +1413,24 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
             "backend does not support complete typed guest-state snapshots".to_owned(),
         ))
     }
+    /// Save a freshly materialized task before it has executed one guest
+    /// instruction so production can transfer it to a persistent executor.
+    /// This is deliberately distinct from blocking-wait reclaim: an initial
+    /// task has no outstanding syscall/mailbox continuation to preserve.
+    fn save_initial_runner_state(&mut self) -> Result<GuestCpuState, TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend does not support idle initial-runner state transfer".to_owned(),
+        ))
+    }
+    fn rebind_initial_runner_state(
+        &mut self,
+        _slot: crate::SlotId,
+        _state: &GuestCpuState,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "backend does not support idle initial-runner restore".to_owned(),
+        ))
+    }
     /// Save state for a process-shared futex wait. Backends that can release
     /// stronger host resources while parked may override this separately from
     /// the generic private-futex reclaim path.

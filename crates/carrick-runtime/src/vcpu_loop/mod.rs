@@ -5225,7 +5225,9 @@ fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
         RuntimeError::Configuration("initial runner task has no runtime directory".to_owned())
     })?;
     let (scheduler, _service) = directory.continuation_services(context.kernel());
-    let cpu = engine.save_guest_state().map_err(RuntimeError::Trap)?;
+    let cpu = engine
+        .save_initial_runner_state()
+        .map_err(RuntimeError::Trap)?;
     let state = crate::kernel::objects::MigratableTaskState {
         cpu,
         mm,
@@ -5384,6 +5386,7 @@ where
         in_guest,
         max_traps,
     );
+    let is_initial_runner_restore = prepared_initial.is_some();
     let task_snapshot_context = match prepared_initial {
         Some(prepared) => prepared.context,
         None => kernel
@@ -5476,9 +5479,15 @@ where
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?
             .cpu
             .clone();
-        engine
-            .rebind_to_slot(slot.slot, &cpu)
-            .map_err(RuntimeError::Trap)?;
+        if is_initial_runner_restore {
+            engine
+                .rebind_initial_runner_state(slot.slot, &cpu)
+                .map_err(RuntimeError::Trap)?;
+        } else {
+            engine
+                .rebind_to_slot(slot.slot, &cpu)
+                .map_err(RuntimeError::Trap)?;
+        }
         if !continuation::TransitionalDedicatedRunner::publish_current_hardware_kick(Box::new(
             engine.kick_handle(),
         )) {

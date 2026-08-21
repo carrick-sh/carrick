@@ -873,6 +873,35 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         Ok(snapshot)
     }
 
+    fn save_initial_runner_state(
+        &mut self,
+        vcpu: &mut Self::Vcpu,
+    ) -> Result<Aarch64VcpuSnapshot, TrapError> {
+        let snapshot = vcpu.snapshot().map_err(|error| {
+            TrapError::Hypervisor(format!("HVF initial-runner snapshot capture: {error}"))
+        })?;
+        self.state
+            .initial_runner_park(&mut vcpu.inner, &mut vcpu.mailbox)?;
+        Ok(snapshot)
+    }
+
+    fn rebind_initial_runner_state(
+        &mut self,
+        state: &Aarch64TaskCpuStateV1,
+        vcpu: &mut Self::Vcpu,
+    ) -> Result<(), TrapError> {
+        if state.syscall_continuation.is_some() {
+            return Err(TrapError::Hypervisor(
+                "HVF initial runner restore rejected syscall continuation".to_owned(),
+            ));
+        }
+        self.state
+            .initial_runner_resume(&mut vcpu.inner, &mut vcpu.mailbox)?;
+        let destination = vcpu.snapshot()?;
+        let restored = restore_aarch64_task_state(&destination, state)?;
+        vcpu.restore(&restored)
+    }
+
     fn save_shared_wait_state(
         &mut self,
         vcpu: &mut Self::Vcpu,

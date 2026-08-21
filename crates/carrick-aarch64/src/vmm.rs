@@ -858,6 +858,28 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         ))
     }
 
+    /// Destroy/release a newly materialized, still-idle vCPU before its first
+    /// guest instruction. Backends must not route this through syscall-block
+    /// reclaim, whose mailbox contract requires an outstanding continuation.
+    fn save_initial_runner_state(
+        &mut self,
+        _vcpu: &mut Self::Vcpu,
+    ) -> Result<Aarch64VcpuSnapshot, TrapError> {
+        Err(TrapError::Hypervisor(
+            "aarch64 backend does not support idle initial-runner transfer".into(),
+        ))
+    }
+
+    fn rebind_initial_runner_state(
+        &mut self,
+        _state: &Aarch64TaskCpuStateV1,
+        _vcpu: &mut Self::Vcpu,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "aarch64 backend does not support idle initial-runner restore".into(),
+        ))
+    }
+
     /// Save state for a process-shared futex wait. Defaults to the generic
     /// vCPU-only reclaim; HVF overrides this for single-threaded process waits
     /// so it can tear down the whole VM while the process is parked.

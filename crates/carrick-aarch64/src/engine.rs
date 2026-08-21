@@ -2571,6 +2571,51 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         ))
     }
 
+    fn save_initial_runner_state(&mut self) -> Result<GuestCpuState, TrapError> {
+        require_migratable_fpsimd_authority(self.vm.fpsimd_enabled())?;
+        if self.vm.task_continuation(&self.vcpu)?.is_some() {
+            return Err(TrapError::Hypervisor(
+                "initial AArch64 runner unexpectedly owns a syscall continuation".to_owned(),
+            ));
+        }
+        let snapshot = self
+            .vm
+            .save_initial_runner_state(&mut self.vcpu)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("save initial AArch64 runner state: {error}"))
+            })?;
+        Ok(GuestCpuState::from_aarch64_v1(
+            aarch64_task_state_from_snapshot(
+                &snapshot,
+                self.pending_resume_pc,
+                self.last_syscall_nr,
+                self.last_syscall_orig_x0,
+                self.last_fault_esr,
+                self.last_exit_class,
+                self.is_forked_child,
+                None,
+                self.mm_generation,
+                self.asid_generation,
+            )?,
+        ))
+    }
+
+    fn rebind_initial_runner_state(
+        &mut self,
+        _slot: SlotId,
+        state: &GuestCpuState,
+    ) -> Result<(), TrapError> {
+        let GuestCpuState::Aarch64V1(state) = state else {
+            return Err(TrapError::Hypervisor(
+                "AArch64 initial restore rejected non-AArch64 V1 state".to_owned(),
+            ));
+        };
+        self.validate_task_metadata(state)?;
+        self.vm.rebind_initial_runner_state(state, &mut self.vcpu)?;
+        self.apply_task_metadata(state);
+        Ok(())
+    }
+
     fn save_shared_wait_state(&mut self) -> Result<GuestCpuState, TrapError> {
         require_migratable_fpsimd_authority(self.vm.fpsimd_enabled())?;
         let continuation = self.vm.task_continuation(&self.vcpu)?;
