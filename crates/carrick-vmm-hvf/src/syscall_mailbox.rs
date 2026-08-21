@@ -458,6 +458,27 @@ impl MailboxBinding {
         Ok(())
     }
 
+    /// Release the executor-local mailbox slot for the zero-instruction
+    /// initial-runner handoff. Unlike blocking reclaim, this path accepts only
+    /// `Idle`: it never invents a syscall request or continuation authority.
+    pub fn release_idle_for_initial_handoff(&mut self) -> Result<(), MailboxConsumeError> {
+        if self.lease.is_none() {
+            return Err(MailboxConsumeError::AlreadyParked);
+        }
+        let state = self.state().load(Ordering::Acquire);
+        if state != MailboxState::Idle.raw() {
+            return Err(MailboxConsumeError::Protocol(
+                MailboxProtocolError::UnexpectedState {
+                    expected: MailboxState::Idle,
+                    actual: state,
+                },
+            ));
+        }
+        drop(self.lease.take());
+        self.last_sequence = 0;
+        Ok(())
+    }
+
     /// Attach a newly allocated arena slot after reclaim and restore the exact
     /// outstanding continuation captured by [`Self::release_for_reclaim`].
     ///

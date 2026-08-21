@@ -3627,12 +3627,23 @@ fn final_exec_physical_extents(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReclaimParkAuthority {
     Live,
+    InitialRunnerParked,
     VcpuParked,
     VmParked,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl ReclaimParkAuthority {
+    fn mark_initial_runner_parked(&mut self) -> Result<(), TrapError> {
+        if *self != Self::Live {
+            return Err(TrapError::Hypervisor(
+                "initial runner park attempted without live executor authority".to_owned(),
+            ));
+        }
+        *self = Self::InitialRunnerParked;
+        Ok(())
+    }
+
     fn mark_vcpu_parked(&mut self) -> Result<(), TrapError> {
         if *self != Self::Live {
             return Err(TrapError::Hypervisor(
@@ -5081,6 +5092,27 @@ pub struct ThreadSpec;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
+    fn configure_executor_invariants(vcpu: &applevisor::vcpu::Vcpu) -> Result<(), TrapError> {
+        use applevisor::prelude::SysReg;
+        use carrick_hal::GuestArch as _;
+
+        let boot = <HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch::bootstrap_sysregs();
+        vcpu.set_sys_reg(
+            SysReg::VBAR_EL1,
+            carrick_mem::memory::LINUX_EL1_VECTORS_BASE,
+        )
+        .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::SCTLR_EL1, boot.sctlr_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::MAIR_EL1, boot.mair_el1)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::CPACR_EL1, boot.cpacr_el1)
+            .map_err(hvf_error)?;
+        const CNTKCTL_EL1_EL0_COUNTER_ACCESS: u64 = (1 << 1) | (1 << 0);
+        vcpu.set_sys_reg(SysReg::CNTKCTL_EL1, CNTKCTL_EL1_EL0_COUNTER_ACCESS)
+            .map_err(hvf_error)
+    }
+
     fn exec_authority_fingerprint(&self) -> ExecAuthorityFingerprint {
         let inventory = self.frame_inventory.lock();
         let backend_extents = inventory
@@ -10756,6 +10788,56 @@ impl HvfVmState {
         Ok(())
     }
 
+    /// Owner-thread zero-instruction handoff. The initial mailbox must still be
+    /// idle; validate before destroying the vCPU so an incompatible protocol
+    /// state fails without partially relinquishing hardware authority.
+    pub(crate) fn initial_runner_park(
+        &mut self,
+        vcpu: &mut applevisor::vcpu::Vcpu,
+        mailbox: &mut MailboxBinding,
+    ) -> Result<(), TrapError> {
+        let diagnostics = mailbox.diagnostics();
+        if diagnostics.state != carrick_aarch64::mailbox::MailboxState::Idle.raw() {
+            return Err(TrapError::Hypervisor(format!(
+                "initial runner mailbox is not idle: diagnostics={diagnostics:?}"
+            )));
+        }
+        let vcpu_id = vcpu.id();
+        let rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu_id) };
+        if rc == 0 {
+            vcpu_destroyed(vcpu_id);
+        }
+        if rc != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "initial_runner_park: hv_vcpu_destroy rc={rc:#x}"
+            )));
+        }
+        self.reclaim_authority.mark_initial_runner_parked()?;
+        mailbox
+            .release_idle_for_initial_handoff()
+            .map_err(|error| TrapError::Hypervisor(format!("release initial mailbox: {error}")))
+    }
+
+    pub(crate) fn initial_runner_resume(
+        &mut self,
+        vcpu: &mut applevisor::vcpu::Vcpu,
+        mailbox: &mut MailboxBinding,
+    ) -> Result<(), TrapError> {
+        if self.reclaim_authority != ReclaimParkAuthority::InitialRunnerParked {
+            return Err(TrapError::Hypervisor(
+                "initial_runner_resume: no idle initial-runner authority".to_owned(),
+            ));
+        }
+        let new_vcpu = create_vcpu(&self._vm)?;
+        enable_el0_counter_access(new_vcpu.id());
+        Self::configure_executor_invariants(&new_vcpu)?;
+        self.vcpu_id = new_vcpu.id();
+        self.vcpu_handle = new_vcpu.get_handle();
+        std::mem::forget(std::mem::replace(vcpu, new_vcpu));
+        self.reacquire_mailbox_after_vcpu_create(vcpu, mailbox, None)?;
+        self.reclaim_authority.mark_live_after_recreate()
+    }
+
     /// M:N reclaim — WAKE side. Recreate this executor's vCPU in the EXISTING VM
     /// when it was locally parked. A live destination executor is retained as-is;
     /// the caller overlays only Kernel-owned typed task state. The CALLER must hold
@@ -10798,6 +10880,7 @@ impl HvfVmState {
         })?;
         let new_vcpu = create_vcpu(&self._vm)?;
         enable_el0_counter_access(new_vcpu.id());
+        Self::configure_executor_invariants(&new_vcpu)?;
         self.vcpu_id = new_vcpu.id();
         self.vcpu_handle = new_vcpu.get_handle();
         // Replace the destroyed handle WITHOUT running applevisor's panicky Drop on
@@ -10911,6 +10994,7 @@ impl HvfVmState {
         let (new_vm, permit) = create_vm_with_admission(VmCreateAdmission::SharedWaitResume)?;
         let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
         enable_el0_counter_access(new_vcpu.id());
+        Self::configure_executor_invariants(&new_vcpu)?;
         self.vcpu_id = new_vcpu.id();
         self.vcpu_handle = new_vcpu.get_handle();
         std::mem::forget(std::mem::replace(vcpu, new_vcpu));
