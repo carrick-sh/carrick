@@ -1333,6 +1333,64 @@ impl SyscallDispatcher {
             && MSG_QUEUE_WAIT_WORD_CACHE.with(|cache| cache.borrow().entries.is_empty())
             && MSG_QUEUE_BLOCKED_IDS.with(|ids| ids.borrow().is_empty())
     }
+
+    #[cfg(test)]
+    pub(crate) fn dirty_sysv_executor_boundary_state_for_test() -> (i32, i32) {
+        fn pipe_read_end() -> i32 {
+            let mut fds = [-1; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            unsafe { libc::close(fds[1]) };
+            fds[0]
+        }
+
+        let cached_fd = pipe_read_end();
+        let wait_word_fd = pipe_read_end();
+        let identity = CachedMsgQueueIdentity { dev: 0, ino: 0 };
+        MSG_QUEUE_FD_CACHE.with(|cache| {
+            cache.borrow_mut().entries.insert(
+                PathBuf::from("executor-boundary-fd-test"),
+                CachedMsgQueueFd {
+                    fd: cached_fd,
+                    identity,
+                },
+            );
+        });
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                MSG_QUEUE_WAIT_WORD_BYTES,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapped, libc::MAP_FAILED);
+        let ptr = std::ptr::NonNull::new(mapped.cast::<std::sync::atomic::AtomicU32>())
+            .expect("test wait-word mapping");
+        MSG_QUEUE_WAIT_WORD_CACHE.with(|cache| {
+            cache.borrow_mut().entries.insert(
+                PathBuf::from("executor-boundary-wait-test"),
+                MsgQueueWaitWord {
+                    ptr,
+                    len: MSG_QUEUE_WAIT_WORD_BYTES,
+                    fd: wait_word_fd,
+                    queue_identity: identity,
+                },
+            );
+        });
+        MSG_QUEUE_BLOCKED_IDS.with(|ids| {
+            ids.borrow_mut().insert(0x5a5a);
+        });
+        (cached_fd, wait_word_fd)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sysv_executor_boundary_state_is_clear_for_test() -> bool {
+        MSG_QUEUE_FD_CACHE.with(|cache| cache.borrow().entries.is_empty())
+            && MSG_QUEUE_WAIT_WORD_CACHE.with(|cache| cache.borrow().entries.is_empty())
+            && MSG_QUEUE_BLOCKED_IDS.with(|ids| ids.borrow().is_empty())
+    }
 }
 
 fn msg_queue_identity(path: &Path) -> Result<CachedMsgQueueIdentity, LinuxErrno> {

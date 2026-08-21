@@ -41,11 +41,29 @@ impl Drop for DotdotDepthGuard {
     }
 }
 
+#[cfg(test)]
+pub(crate) struct ExecutorBoundaryPathTestGuard(DotdotDepthGuard);
+
 impl SyscallDispatcher {
     /// True only after every recursive path-resolution guard on the current
     /// executor pthread has unwound.
     pub(crate) fn executor_boundary_path_resolution_is_clear() -> bool {
         DOTDOT_RESOLVE_DEPTH.with(|depth| depth.get() == 0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_dirty_executor_boundary_path_resolution_for_test<R>(
+        operation: impl FnOnce() -> R,
+    ) -> R {
+        let _guard = DotdotDepthGuard::enter().expect("enter test path-resolution depth");
+        operation()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dirty_executor_boundary_path_guard_for_test() -> ExecutorBoundaryPathTestGuard {
+        ExecutorBoundaryPathTestGuard(
+            DotdotDepthGuard::enter().expect("enter persistent test path-resolution depth"),
+        )
     }
 
     /// Layered "is this a directory?" probe used by mkdirat / openat

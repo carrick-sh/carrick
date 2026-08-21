@@ -8,13 +8,15 @@ use std::thread::JoinHandle;
 
 use parking_lot::Mutex;
 
+use carrick_abi::LinuxGuestAbi;
+
 use crate::dispatch::SyscallDispatcher;
 use crate::kernel::objects::{
-    BlockedReason, ExecutionFailure, ExecutionGeneration, ExecutorId, ThreadExecutionLease,
-    ThreadKey,
+    BlockedReason, ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState,
+    ThreadExecutionLease, ThreadKey,
 };
 use crate::kernel::{
-    ExecutorBinding, ExecutorKick, ExecutorKickToken, ExecutorRegistration, RunnableThread,
+    ExecutorBinding, ExecutorKick, ExecutorKickToken, ExecutorRegistration, MmId, RunnableThread,
     Scheduler,
 };
 use crate::trap::TrapError;
@@ -49,7 +51,7 @@ pub trait PersistentExecutorFactory: Send + Sync + 'static {
 }
 
 pub trait PersistentExecutor: 'static {
-    type TaskBinding: Send + Sync + 'static;
+    type TaskBinding: PersistentTaskBinding + Send + Sync + 'static;
 
     fn load(&mut self, task: &RunnableTask<'_, Self::TaskBinding>) -> Result<(), TrapError>;
 
@@ -67,6 +69,20 @@ pub trait PersistentExecutor: 'static {
     fn audit_boundary(&mut self) -> Result<(), TrapError>;
 
     fn destroy(self) -> Result<(), TrapError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskLoadIdentity {
+    pub abi: LinuxGuestAbi,
+    pub version: u16,
+    pub mm: MmId,
+    pub asid_generation: u64,
+}
+
+pub trait PersistentTaskBinding {
+    fn load_identity(&self) -> TaskLoadIdentity;
+
+    fn validate_task_state(&self, state: &MigratableTaskState) -> Result<(), TrapError>;
 }
 
 pub trait TaskBindingResolver<B>: Send + Sync + 'static {
@@ -99,6 +115,27 @@ impl<B> RunnableTask<'_, B> {
 
     pub const fn binding(&self) -> &Arc<B> {
         &self.binding
+    }
+}
+
+impl<B: PersistentTaskBinding> RunnableTask<'_, B> {
+    pub fn validate_for_load(&self) -> Result<&MigratableTaskState, TrapError> {
+        let identity = self.binding.load_identity();
+        let state = self
+            .lease
+            .task_state_for_restore(
+                identity.abi,
+                identity.version,
+                identity.mm,
+                identity.asid_generation,
+            )
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "persistent executor rejected task migration authority: {error}"
+                ))
+            })?;
+        self.binding.validate_task_state(state)?;
+        Ok(state)
     }
 }
 
@@ -390,6 +427,9 @@ pub enum ExecutorPoolEvent {
         thread: ThreadKey,
         generation: ExecutionGeneration,
     },
+    InvalidatedAsid {
+        generation: u64,
+    },
     OrdinarySyscall {
         thread: ThreadKey,
         generation: ExecutionGeneration,
@@ -463,6 +503,8 @@ struct WorkerKick {
     binding: Mutex<Option<ExecutorBinding>>,
     need_resched: AtomicBool,
     receipts: Arc<ReceiptLog>,
+    #[cfg(test)]
+    delivery_validation_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 impl WorkerKick {
@@ -471,7 +513,14 @@ impl WorkerKick {
             binding: Mutex::new(None),
             need_resched: AtomicBool::new(false),
             receipts,
+            #[cfg(test)]
+            delivery_validation_gate: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    fn install_delivery_validation_gate(&self, gate: Arc<std::sync::Barrier>) {
+        *self.delivery_validation_gate.lock() = Some(gate);
     }
 }
 
@@ -495,11 +544,17 @@ impl ExecutorKick for WorkerKick {
     }
 
     fn deliver_exact(&self, token: ExecutorKickToken) -> bool {
-        let current = *self.binding.lock();
-        if current != Some(token.binding()) {
+        let current = self.binding.lock();
+        if *current != Some(token.binding()) {
             return false;
         }
+        #[cfg(test)]
+        if let Some(gate) = self.delivery_validation_gate.lock().clone() {
+            gate.wait();
+            gate.wait();
+        }
         self.need_resched.store(true, Ordering::Release);
+        drop(current);
         self.receipts.record(
             token.executor(),
             ExecutorPoolEvent::KickDelivered {
@@ -539,6 +594,29 @@ struct WorkerOutcome {
 struct WorkerHandle {
     command: mpsc::Sender<WorkerCommand>,
     join: JoinHandle<WorkerOutcome>,
+}
+
+#[derive(Debug)]
+struct WorkerChannels {
+    commands: mpsc::Receiver<WorkerCommand>,
+    startup: mpsc::Sender<StartupStatus>,
+}
+
+#[derive(Debug)]
+struct PoolControl {
+    usable_workers: std::sync::atomic::AtomicUsize,
+}
+
+impl PoolControl {
+    fn new(workers: usize) -> Self {
+        Self {
+            usable_workers: std::sync::atomic::AtomicUsize::new(workers),
+        }
+    }
+
+    fn retire_failed_worker(&self) -> bool {
+        self.usable_workers.fetch_sub(1, Ordering::AcqRel) == 1
+    }
 }
 
 pub struct ExecutorPool<F, R>
@@ -649,6 +727,7 @@ where
                     message: error.to_string(),
                 })?;
         let receipts = Arc::new(ReceiptLog::default());
+        let control = Arc::new(PoolControl::new(configured_workers));
         let (startup_tx, startup_rx) = mpsc::channel();
         let mut handles: Vec<WorkerHandle> = Vec::with_capacity(configured_workers);
         for index in 0..configured_workers {
@@ -657,6 +736,7 @@ where
             let factory = Arc::clone(&factory);
             let resolver = Arc::clone(&resolver);
             let receipts_for_worker = Arc::clone(&receipts);
+            let control_for_worker = Arc::clone(&control);
             let startup_tx = startup_tx.clone();
             let join = match std::thread::Builder::new()
                 .name(format!("carrick-executor-{index}"))
@@ -667,8 +747,11 @@ where
                         factory,
                         resolver,
                         receipts_for_worker,
-                        command_rx,
-                        startup_tx,
+                        control_for_worker,
+                        WorkerChannels {
+                            commands: command_rx,
+                            startup: startup_tx,
+                        },
                     )
                 }) {
                 Ok(join) => join,
@@ -824,8 +907,8 @@ fn executor_worker<F, R>(
     factory: Arc<F>,
     resolver: Arc<R>,
     receipts: Arc<ReceiptLog>,
-    commands: mpsc::Receiver<WorkerCommand>,
-    startup: mpsc::Sender<StartupStatus>,
+    control: Arc<PoolControl>,
+    channels: WorkerChannels,
 ) -> WorkerOutcome
 where
     F: PersistentExecutorFactory,
@@ -833,6 +916,7 @@ where
         <<F as PersistentExecutorFactory>::Executor as PersistentExecutor>::TaskBinding,
     >,
 {
+    let WorkerChannels { commands, startup } = channels;
     if !matches!(commands.recv(), Ok(WorkerCommand::Initialize)) {
         return WorkerOutcome {
             executor: None,
@@ -885,66 +969,38 @@ where
             };
         }
     };
-    receipts.record(executor_id, ExecutorPoolEvent::Created);
-    let boundary = match WorkerBoundaryAudit::capture().and_then(|boundary| {
-        boundary.audit_clean(&mut backend, &kick)?;
-        Ok(boundary)
-    }) {
-        Ok(boundary) => boundary,
-        Err(error) => {
-            let mut message = error.to_string();
-            if let Some(destroy_error) =
-                destroy_and_unregister(backend, &scheduler, &registration, &receipts)
-            {
-                append_failures(&mut message, vec![destroy_error]);
+    let mut startup_sent = false;
+    let lifecycle = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
+        receipts.record(executor_id, ExecutorPoolEvent::Created);
+        let boundary = WorkerBoundaryAudit::capture()
+            .and_then(|boundary| {
+                boundary.audit_clean(&mut backend, &kick)?;
+                Ok(boundary)
+            })
+            .map_err(|error| error.to_string())?;
+        receipts.record(executor_id, ExecutorPoolEvent::AuditPassed);
+        startup
+            .send(StartupStatus { index, error: None })
+            .map_err(|error| format!("startup status publication failed: {error}"))?;
+        startup_sent = true;
+        match commands.recv() {
+            Ok(WorkerCommand::Run) => run_executor_loop(
+                &scheduler,
+                &resolver,
+                &mut backend,
+                &registration,
+                &kick,
+                &boundary,
+                &receipts,
+            ),
+            Ok(WorkerCommand::Stop) | Err(_) => Ok(()),
+            Ok(WorkerCommand::Initialize) => {
+                Err("executor received duplicate initialize".to_owned())
             }
-            let _ = startup.send(StartupStatus {
-                index,
-                error: Some(message.clone()),
-            });
-            return WorkerOutcome {
-                executor: Some(executor_id),
-                failure: Some(message),
-                retired: true,
-            };
         }
-    };
-    receipts.record(executor_id, ExecutorPoolEvent::AuditPassed);
-    let _ = startup.send(StartupStatus { index, error: None });
-    match commands.recv() {
-        Ok(WorkerCommand::Run) => {}
-        Ok(WorkerCommand::Stop) | Err(_) => {
-            let failure = destroy_and_unregister(backend, &scheduler, &registration, &receipts);
-            return WorkerOutcome {
-                executor: Some(executor_id),
-                retired: failure.is_some(),
-                failure,
-            };
-        }
-        Ok(WorkerCommand::Initialize) => {
-            let failure = Some("executor received duplicate initialize".to_owned());
-            let _ = destroy_and_unregister(backend, &scheduler, &registration, &receipts);
-            return WorkerOutcome {
-                executor: Some(executor_id),
-                failure,
-                retired: true,
-            };
-        }
-    }
-
-    let run_result = catch_unwind(AssertUnwindSafe(|| {
-        run_executor_loop(
-            &scheduler,
-            &resolver,
-            &mut backend,
-            &registration,
-            &kick,
-            &boundary,
-            &receipts,
-        )
     }));
     let mut retired = false;
-    let mut failure = match run_result {
+    let mut failure = match lifecycle {
         Ok(Ok(())) => None,
         Ok(Err(error)) => {
             retired = true;
@@ -952,9 +1008,30 @@ where
         }
         Err(_) => {
             retired = true;
-            Some("executor worker/backend panicked; exact lease failed closed".to_owned())
+            Some("executor post-create lifecycle panicked; exact lease failed closed".to_owned())
         }
     };
+    if !startup_sent {
+        let message = failure
+            .clone()
+            .unwrap_or_else(|| "executor stopped before startup publication".to_owned());
+        let _ = startup.send(StartupStatus {
+            index,
+            error: Some(message),
+        });
+    }
+    if startup_sent
+        && failure.is_some()
+        && control.retire_failed_worker()
+        && let Err(drain_error) = terminal_drain(&scheduler, &registration, &receipts)
+    {
+        if let Some(existing) = &mut failure {
+            existing.push_str("; ");
+            existing.push_str(&drain_error);
+        } else {
+            failure = Some(drain_error);
+        }
+    }
     if let Some(destroy_error) =
         destroy_and_unregister(backend, &scheduler, &registration, &receipts)
     {
@@ -970,6 +1047,33 @@ where
         executor: Some(executor_id),
         failure,
         retired,
+    }
+}
+
+fn terminal_drain(
+    scheduler: &Scheduler,
+    registration: &ExecutorRegistration,
+    receipts: &ReceiptLog,
+) -> Result<(), String> {
+    scheduler
+        .clear_executor_binding(registration)
+        .map_err(|error| error.to_string())?;
+    scheduler.close();
+    loop {
+        let running = match scheduler.take(registration) {
+            Ok(running) => running,
+            Err(crate::kernel::RunQueueError::Closed) => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        let executor = running.executor();
+        let thread = running.thread_key();
+        let generation = running.generation();
+        receipts.record(executor, ExecutorPoolEvent::Claimed { thread, generation });
+        let settlement = scheduler
+            .settle_failed(running, ExecutionFailure::SnapshotRestoreFailed)
+            .map_err(|error| error.to_string());
+        receipts.record(executor, ExecutorPoolEvent::Failed { thread, generation });
+        settlement?;
     }
 }
 
@@ -1026,6 +1130,33 @@ where
             lease: running.lease(),
             binding,
         };
+        let asid_generation = match task.validate_for_load() {
+            Ok(state) => state.asid_generation,
+            Err(error) => {
+                let settlement = fail_running(
+                    scheduler,
+                    running,
+                    ExecutionFailure::SnapshotRestoreFailed,
+                    receipts,
+                );
+                return Err(with_settlement_error(error.to_string(), settlement));
+            }
+        };
+        if let Err(error) = backend.invalidate_asid(asid_generation) {
+            let settlement = fail_running(
+                scheduler,
+                running,
+                ExecutionFailure::SnapshotRestoreFailed,
+                receipts,
+            );
+            return Err(with_settlement_error(error.to_string(), settlement));
+        }
+        receipts.record(
+            executor_id,
+            ExecutorPoolEvent::InvalidatedAsid {
+                generation: asid_generation,
+            },
+        );
         if let Err(error) = backend.load(&task) {
             let settlement = fail_running(
                 scheduler,
@@ -1041,9 +1172,15 @@ where
         );
 
         let exit = loop {
-            let exit = match backend.run_until_boundary(&kick.need_resched) {
-                Ok(exit) => exit,
-                Err(error) => {
+            let attempted = catch_unwind(AssertUnwindSafe(|| {
+                backend.run_until_boundary(&kick.need_resched)
+            }));
+            let cpu = backend.take_cpu_receipt();
+            running.thread().charge_user_ns(cpu.user_ns);
+            running.thread().charge_system_ns(cpu.system_ns);
+            let exit = match attempted {
+                Ok(Ok(exit)) => exit,
+                Ok(Err(error)) => {
                     let settlement = fail_running(
                         scheduler,
                         running,
@@ -1052,10 +1189,19 @@ where
                     );
                     return Err(with_settlement_error(error.to_string(), settlement));
                 }
+                Err(_) => {
+                    let settlement = fail_running(
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    );
+                    return Err(with_settlement_error(
+                        "backend run panicked after publishing its exact CPU receipt".to_owned(),
+                        settlement,
+                    ));
+                }
             };
-            let cpu = backend.take_cpu_receipt();
-            running.thread().charge_user_ns(cpu.user_ns);
-            running.thread().charge_system_ns(cpu.system_ns);
             if exit == ExecutorExit::Syscall {
                 scheduler.note_syscall_boundary(&running);
                 receipts.record(
@@ -1202,20 +1348,24 @@ fn destroy_and_unregister<E: PersistentExecutor>(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread::{self, ThreadId as HostThreadId};
     use std::time::{Duration, Instant};
 
     use carrick_abi::LinuxCloneFlags;
     use carrick_hal::ThreadId;
-    use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
+    use carrick_hal::threaded::{
+        Aarch64SyscallContinuationV1, Aarch64TaskCpuStateV1, GuestCpuState,
+    };
 
     use super::{
         ExecutorBoundaryAudit, ExecutorCpuReceipt, ExecutorExit, ExecutorPool, ExecutorPoolConfig,
         ExecutorPoolEvent, ExecutorSaveError, PersistentExecutor, PersistentExecutorFactory,
-        RunnableTask, SavedRunnable, TaskBindingResolver,
+        PersistentTaskBinding, ReceiptLog, RunnableTask, SavedRunnable, TaskBindingResolver,
+        TaskLoadIdentity, WorkerBoundaryAudit, WorkerKick,
     };
+    use crate::dispatch::SyscallDispatcher;
     use crate::kernel::objects::{
         BlockedReason, ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState,
         ThreadExecutionLease, ThreadExecutionState,
@@ -1254,6 +1404,8 @@ mod tests {
         audit_fails: AtomicBool,
         entered: parking_lot::Mutex<Option<Arc<Barrier>>>,
         progress: AtomicUsize,
+        load_identity: parking_lot::Mutex<Option<TaskLoadIdentity>>,
+        required_continuation_sequence: parking_lot::Mutex<Option<u64>>,
         lineage_authority: parking_lot::Mutex<Option<SubmissionAuthority>>,
         descendant: parking_lot::Mutex<Option<DescendantPublication>>,
     }
@@ -1268,9 +1420,73 @@ mod tests {
                 audit_fails: AtomicBool::new(false),
                 entered: parking_lot::Mutex::new(None),
                 progress: AtomicUsize::new(0),
+                load_identity: parking_lot::Mutex::new(None),
+                required_continuation_sequence: parking_lot::Mutex::new(None),
                 lineage_authority: parking_lot::Mutex::new(None),
                 descendant: parking_lot::Mutex::new(None),
             })
+        }
+
+        fn override_expected_abi(&self, abi: carrick_abi::LinuxGuestAbi) {
+            self.load_identity
+                .lock()
+                .as_mut()
+                .expect("installed load identity")
+                .abi = abi;
+        }
+
+        fn override_expected_version(&self, version: u16) {
+            self.load_identity
+                .lock()
+                .as_mut()
+                .expect("installed load identity")
+                .version = version;
+        }
+
+        fn override_expected_mm(&self, mm: crate::kernel::MmId) {
+            self.load_identity
+                .lock()
+                .as_mut()
+                .expect("installed load identity")
+                .mm = mm;
+        }
+
+        fn override_expected_asid_generation(&self, asid_generation: u64) {
+            self.load_identity
+                .lock()
+                .as_mut()
+                .expect("installed load identity")
+                .asid_generation = asid_generation;
+        }
+
+        fn require_continuation_sequence(&self, sequence: u64) {
+            *self.required_continuation_sequence.lock() = Some(sequence);
+        }
+    }
+
+    impl PersistentTaskBinding for FakeBinding {
+        fn load_identity(&self) -> TaskLoadIdentity {
+            self.load_identity
+                .lock()
+                .expect("fake binding installed before publication")
+        }
+
+        fn validate_task_state(&self, state: &MigratableTaskState) -> Result<(), TrapError> {
+            let Some(expected) = *self.required_continuation_sequence.lock() else {
+                return Ok(());
+            };
+            let actual = match &state.cpu {
+                GuestCpuState::Aarch64V1(state) => state
+                    .syscall_continuation
+                    .map(|continuation| continuation.sequence),
+                GuestCpuState::X86_64V1(_) => None,
+            };
+            if actual != Some(expected) || expected == 0 {
+                return Err(TrapError::Hypervisor(format!(
+                    "fake task continuation mismatch: expected {expected}, got {actual:?}"
+                )));
+            }
+            Ok(())
         }
     }
 
@@ -1282,6 +1498,7 @@ mod tests {
         Save,
         Run,
         Audit,
+        Invalidate,
     }
 
     #[derive(Clone, Debug)]
@@ -1298,6 +1515,11 @@ mod tests {
         events: Arc<parking_lot::Mutex<Vec<BackendEvent>>>,
         create_calls: Arc<AtomicUsize>,
         fail_create_call: Arc<AtomicUsize>,
+        panic_initial_audit_call: Arc<AtomicUsize>,
+        initial_audit_gate: Arc<parking_lot::Mutex<Option<Arc<Barrier>>>>,
+        fail_invalidation_generation: Arc<AtomicU64>,
+        owner_dirty_mode: Arc<AtomicUsize>,
+        owner_dirty_fds: Arc<parking_lot::Mutex<Vec<(i32, i32)>>>,
         destroy_mode: Arc<AtomicUsize>,
         snapshot_count: Arc<AtomicUsize>,
         concurrent_loads: Arc<parking_lot::Mutex<BTreeSet<(ThreadKey, ExecutionGeneration)>>>,
@@ -1306,6 +1528,13 @@ mod tests {
 
     impl FakeFactory {
         fn install(&self, context: &KernelContext, binding: Arc<FakeBinding>) {
+            let mm = context.shared().mm().id();
+            *binding.load_identity.lock() = Some(TaskLoadIdentity {
+                abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                version: 1,
+                mm,
+                asid_generation: mm.raw(),
+            });
             self.bindings.lock().insert(context.thread().key(), binding);
         }
 
@@ -1340,13 +1569,55 @@ mod tests {
         id: ExecutorId,
         factory: FakeFactory,
         owner: HostThreadId,
+        create_call: usize,
         current: Option<(ThreadKey, ExecutionGeneration, Arc<FakeBinding>)>,
+        owner_dirty_cleanup: Option<Box<dyn FnOnce()>>,
         credentials: u64,
         restart_state: u64,
         mailbox: u64,
         tls: u64,
         user_ns: u64,
         system_ns: u64,
+    }
+
+    struct BoundaryAuditProbe;
+
+    impl PersistentExecutor for BoundaryAuditProbe {
+        type TaskBinding = FakeBinding;
+
+        fn load(&mut self, _task: &RunnableTask<'_, Self::TaskBinding>) -> Result<(), TrapError> {
+            panic!("audit-only backend cannot load a task")
+        }
+
+        fn run_until_boundary(
+            &mut self,
+            _need_resched: &AtomicBool,
+        ) -> Result<ExecutorExit, TrapError> {
+            panic!("audit-only backend cannot run a task")
+        }
+
+        fn take_cpu_receipt(&mut self) -> ExecutorCpuReceipt {
+            panic!("audit-only backend has no CPU receipt")
+        }
+
+        fn save(
+            &mut self,
+            _lease: ThreadExecutionLease,
+        ) -> Result<SavedRunnable, ExecutorSaveError> {
+            panic!("audit-only backend cannot save a task")
+        }
+
+        fn invalidate_asid(&mut self, _generation: u64) -> Result<(), TrapError> {
+            panic!("audit-only backend cannot invalidate an ASID")
+        }
+
+        fn audit_boundary(&mut self) -> Result<(), TrapError> {
+            Ok(())
+        }
+
+        fn destroy(self) -> Result<(), TrapError> {
+            Ok(())
+        }
     }
 
     impl PersistentExecutorFactory for FakeFactory {
@@ -1362,7 +1633,9 @@ mod tests {
                 id: executor,
                 factory: self.clone(),
                 owner: thread::current().id(),
+                create_call: call,
                 current: None,
+                owner_dirty_cleanup: None,
                 credentials: 0,
                 restart_state: 0,
                 mailbox: 0,
@@ -1378,6 +1651,7 @@ mod tests {
 
         fn load(&mut self, task: &RunnableTask<'_, Self::TaskBinding>) -> Result<(), TrapError> {
             assert_eq!(thread::current().id(), self.owner);
+            task.validate_for_load()?;
             let key = (task.thread_key(), task.generation());
             assert_eq!(task.lease().generation(), task.generation());
             assert_eq!(task.lease().executor(), self.id);
@@ -1516,17 +1790,93 @@ mod tests {
                 self.mailbox = 0;
                 self.tls = 0;
             }
+            match self.factory.owner_dirty_mode.load(Ordering::SeqCst) {
+                1 => {
+                    let guard = carrick_thread::fork_quiesce::acquire_topology_lock(
+                        carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
+                        1,
+                        1,
+                    );
+                    self.owner_dirty_cleanup = Some(Box::new(move || drop(guard)));
+                }
+                2 => {
+                    let guard = crate::dispatch::lock_order::LockOrderGuard::acquire(
+                        crate::dispatch::lock_order::LockLevel::Proc,
+                    );
+                    self.owner_dirty_cleanup = Some(Box::new(move || drop(guard)));
+                }
+                3 => {
+                    let guard = SyscallDispatcher::dirty_executor_boundary_path_guard_for_test();
+                    self.owner_dirty_cleanup = Some(Box::new(move || drop(guard)));
+                }
+                4 => {
+                    let guard =
+                        crate::dispatch::resources::dirty_executor_boundary_resources_guard_for_test();
+                    self.owner_dirty_cleanup = Some(Box::new(move || drop(guard)));
+                }
+                5 => {
+                    let guard = crate::fanotify::InternalOpenGuard::enter();
+                    self.owner_dirty_cleanup = Some(Box::new(move || drop(guard)));
+                }
+                6 => {
+                    let mut blocked = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+                    let mut previous = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+                    assert_eq!(unsafe { libc::sigemptyset(&mut blocked) }, 0);
+                    assert_eq!(unsafe { libc::sigaddset(&mut blocked, libc::SIGUSR1) }, 0);
+                    assert_eq!(
+                        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous) },
+                        0
+                    );
+                    self.owner_dirty_cleanup = Some(Box::new(move || {
+                        assert_eq!(
+                            unsafe {
+                                libc::pthread_sigmask(
+                                    libc::SIG_SETMASK,
+                                    &previous,
+                                    std::ptr::null_mut(),
+                                )
+                            },
+                            0
+                        );
+                    }));
+                }
+                7 => {
+                    let fds = SyscallDispatcher::dirty_sysv_executor_boundary_state_for_test();
+                    self.factory.owner_dirty_fds.lock().push(fds);
+                }
+                _ => {}
+            }
             Ok(SavedRunnable::new(lease))
         }
 
-        fn invalidate_asid(&mut self, _generation: u64) -> Result<(), TrapError> {
+        fn invalidate_asid(&mut self, generation: u64) -> Result<(), TrapError> {
             assert_eq!(thread::current().id(), self.owner);
+            if self
+                .factory
+                .fail_invalidation_generation
+                .load(Ordering::SeqCst)
+                == generation
+            {
+                return Err(TrapError::Hypervisor(
+                    "injected ASID invalidation failure".to_owned(),
+                ));
+            }
+            self.factory
+                .record(BackendEventKind::Invalidate, self.id, None);
             Ok(())
         }
 
         fn audit_boundary(&mut self) -> Result<(), TrapError> {
             assert_eq!(thread::current().id(), self.owner);
             self.factory.record(BackendEventKind::Audit, self.id, None);
+            if self.current.is_none()
+                && self.factory.panic_initial_audit_call.load(Ordering::SeqCst) == self.create_call
+            {
+                if let Some(gate) = self.factory.initial_audit_gate.lock().take() {
+                    gate.wait();
+                }
+                panic!("injected initial boundary audit panic");
+            }
             if self
                 .current
                 .as_ref()
@@ -1543,8 +1893,11 @@ mod tests {
             Ok(())
         }
 
-        fn destroy(self) -> Result<(), TrapError> {
+        fn destroy(mut self) -> Result<(), TrapError> {
             assert_eq!(thread::current().id(), self.owner);
+            if let Some(cleanup) = self.owner_dirty_cleanup.take() {
+                cleanup();
+            }
             self.factory
                 .record(BackendEventKind::Destroy, self.id, None);
             match self.factory.destroy_mode.load(Ordering::SeqCst) {
@@ -1609,6 +1962,14 @@ mod tests {
     }
 
     fn task_state(context: &KernelContext, marker: u64) -> MigratableTaskState {
+        task_state_with_continuation(context, marker, None)
+    }
+
+    fn task_state_with_continuation(
+        context: &KernelContext,
+        marker: u64,
+        syscall_continuation: Option<Aarch64SyscallContinuationV1>,
+    ) -> MigratableTaskState {
         let mm = context.shared().mm().id();
         MigratableTaskState {
             cpu: GuestCpuState::from_aarch64_v1(Aarch64TaskCpuStateV1 {
@@ -1636,7 +1997,7 @@ mod tests {
                 last_fault_esr: marker + 3,
                 last_exit_class: marker,
                 is_forked_child: false,
-                syscall_continuation: None,
+                syscall_continuation,
                 mm_generation: mm.raw(),
                 asid_generation: mm.raw(),
             }),
@@ -1755,6 +2116,59 @@ mod tests {
                 .iter()
                 .find(|event| event.executor == destroy.executor)
                 .expect("matching create");
+            assert_eq!(create.host_thread, destroy.host_thread);
+        }
+    }
+
+    #[test]
+    fn multi_worker_initial_audit_panic_returns_transactionally_and_destroys_every_created_backend()
+    {
+        let caller = thread::current().id();
+        let (kernel, _) = bootstrap(14_005);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let factory = Arc::new(FakeFactory::default());
+        factory.panic_initial_audit_call.store(2, Ordering::SeqCst);
+        let gate = Arc::new(Barrier::new(2));
+        *factory.initial_audit_gate.lock() = Some(Arc::clone(&gate));
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let start_factory = Arc::clone(&factory);
+        let starter = thread::spawn(move || {
+            let result = ExecutorPool::start(
+                config(3),
+                scheduler,
+                Arc::clone(&start_factory),
+                start_factory,
+                ExecutorBoundaryAudit::production(),
+            );
+            result_tx
+                .send(result.is_err())
+                .expect("publish startup result");
+        });
+        gate.wait();
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(true),
+            "initial audit panic must not strand startup behind other worker senders"
+        );
+        starter.join().expect("join pool starter");
+
+        let events = factory.events.lock().clone();
+        let creates: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == BackendEventKind::Create)
+            .collect();
+        let destroys: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == BackendEventKind::Destroy)
+            .collect();
+        assert_eq!(creates.len(), 2);
+        assert_eq!(destroys.len(), 2);
+        assert!(creates.iter().all(|event| event.host_thread != caller));
+        for create in creates {
+            let destroy = destroys
+                .iter()
+                .find(|event| event.executor == create.executor)
+                .expect("created backend must be destroyed during rollback");
             assert_eq!(create.host_thread, destroy.host_thread);
         }
     }
@@ -1952,6 +2366,72 @@ mod tests {
     }
 
     #[test]
+    fn rebind_in_delivery_validation_to_mutation_window_cannot_flag_or_receipt_successor() {
+        let (kernel, context) = bootstrap(14_035);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let receipts = Arc::new(ReceiptLog::default());
+        let kick = Arc::new(WorkerKick::new(Arc::clone(&receipts)));
+        let registration = scheduler
+            .register_executor(Arc::clone(&kick) as Arc<dyn crate::kernel::ExecutorKick>)
+            .expect("register exact worker kick");
+        let authority = enqueue_root(&scheduler, &context, publish(&context, 55));
+        drop(authority);
+        let running = scheduler
+            .take(&registration)
+            .expect("claim first generation");
+        let stale_generation = running.generation();
+        let gate = Arc::new(Barrier::new(2));
+        kick.install_delivery_validation_gate(Arc::clone(&gate));
+
+        let wake_scheduler = Arc::clone(&scheduler);
+        let thread_key = context.thread().key();
+        let delivery = thread::spawn(move || wake_scheduler.wake(thread_key));
+        gate.wait();
+
+        let (successor_tx, successor_rx) = std::sync::mpsc::channel();
+        let settle_scheduler = Arc::clone(&scheduler);
+        let settle_registration = registration.clone();
+        let settlement = thread::spawn(move || {
+            settle_scheduler
+                .settle_runnable(running)
+                .expect("unbind and publish successor");
+            let successor = settle_scheduler
+                .take(&settle_registration)
+                .expect("bind exact successor generation");
+            successor_tx
+                .send(successor)
+                .expect("publish exact successor claim");
+        });
+        assert!(
+            matches!(
+                successor_rx.recv_timeout(Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "settlement/rebind must serialize behind validation through flag mutation"
+        );
+        gate.wait();
+        let disposition = delivery.join().expect("join delayed delivery").unwrap();
+        let successor = successor_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("successor claim after exact delivery mutation");
+        settlement.join().expect("join successor settlement");
+
+        assert_eq!(disposition, crate::kernel::WakeDisposition::Kicked);
+        assert_ne!(successor.generation(), stale_generation);
+        assert!(!kick.need_resched.load(Ordering::Acquire));
+        assert!(!receipts.snapshot().iter().any(|receipt| {
+            matches!(
+                receipt.event,
+                ExecutorPoolEvent::KickDelivered { generation, .. }
+                    if generation == successor.generation()
+            )
+        }));
+        scheduler
+            .settle_exited(successor)
+            .expect("settle successor");
+    }
+
+    #[test]
     fn blocked_task_releases_the_only_worker_immediately() {
         let (kernel, blocked) = bootstrap(14_040);
         let runnable = sibling(&kernel, &blocked, 24_040);
@@ -2016,6 +2496,161 @@ mod tests {
                 ThreadExecutionState::Failed { .. }
             ));
         }
+    }
+
+    #[test]
+    fn last_worker_failure_fails_queued_exact_generation_and_shutdown_returns() {
+        let (kernel, first) = bootstrap(14_240);
+        let second = sibling(&kernel, &first, 24_240);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let factory = Arc::new(FakeFactory::default());
+        let run_gate = Arc::new(Barrier::new(2));
+        let first_binding = FakeBinding::new(91, [Step::FailRun]);
+        *first_binding.entered.lock() = Some(Arc::clone(&run_gate));
+        factory.install(&first, first_binding);
+        factory.install(&second, FakeBinding::new(92, [Step::Exit]));
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        let first_authority = enqueue_root(&scheduler, &first, publish(&first, 91));
+        let second_authority = enqueue_root(&scheduler, &second, publish(&second, 92));
+        run_gate.wait();
+        drop((first_authority, second_authority));
+
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let shutdown = thread::spawn(move || {
+            shutdown_tx
+                .send(pool.shutdown())
+                .expect("publish shutdown result");
+        });
+        let result = shutdown_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("last-worker failure must not strand queued generations");
+        let error = result.expect_err("backend failure remains reported");
+        shutdown.join().expect("join shutdown observer");
+
+        assert!(matches!(
+            first.thread().execution_state(),
+            ThreadExecutionState::Failed { .. }
+        ));
+        assert!(matches!(
+            second.thread().execution_state(),
+            ThreadExecutionState::Failed { .. }
+        ));
+        assert_eq!(error.report().created(), 1);
+        assert_eq!(error.report().destroyed(), 1);
+        assert_eq!(error.report().joined(), 1);
+    }
+
+    #[test]
+    fn run_error_and_panic_charge_exact_cpu_receipt_once_before_failure() {
+        for (offset, step) in [Step::FailRun, Step::PanicRun].into_iter().enumerate() {
+            let (kernel, context) = bootstrap(14_245 + i32::try_from(offset).unwrap());
+            let scheduler = Arc::new(Scheduler::new(kernel));
+            let factory = Arc::new(FakeFactory::default());
+            factory.install(&context, FakeBinding::new(93, [step]));
+            let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+            let authority = enqueue_root(&scheduler, &context, publish(&context, 93));
+            drop(authority);
+            pool.shutdown()
+                .expect_err("failed run must retire and report worker");
+
+            assert_eq!(context.thread().cpu_us(), 7);
+            assert_eq!(context.thread().system_cpu_us(), 3);
+            assert!(matches!(
+                context.thread().execution_state(),
+                ThreadExecutionState::Failed { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_migration_authority_and_invalidation_failure_never_load_or_run_backend() {
+        fn reject_case(
+            pid: i32,
+            continuation: Option<Aarch64SyscallContinuationV1>,
+            configure: impl FnOnce(&Arc<Kernel>, &KernelContext, &Arc<FakeBinding>, &Arc<FakeFactory>),
+        ) {
+            let (kernel, context) = bootstrap(pid);
+            let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+            let factory = Arc::new(FakeFactory::default());
+            let binding = FakeBinding::new(94, [Step::Exit]);
+            factory.install(&context, Arc::clone(&binding));
+            configure(&kernel, &context, &binding, &factory);
+            let generation = context
+                .thread()
+                .publish_initial_task_state(task_state_with_continuation(
+                    &context,
+                    94,
+                    continuation,
+                ))
+                .expect("publish migration test state");
+            let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+            let authority = enqueue_root(&scheduler, &context, generation);
+            drop(authority);
+            let error = pool
+                .shutdown()
+                .expect_err("invalid migration authority must retire worker");
+
+            assert_eq!(error.retired_workers(), 1);
+            assert!(matches!(
+                context.thread().execution_state(),
+                ThreadExecutionState::Failed { .. }
+            ));
+            assert!(!factory.events.lock().iter().any(|event| {
+                matches!(
+                    event.kind,
+                    BackendEventKind::Invalidate | BackendEventKind::Load | BackendEventKind::Run
+                )
+            }));
+            assert!(factory.inherited_state.lock().is_empty());
+            assert!(factory.concurrent_loads.lock().is_empty());
+        }
+
+        reject_case(14_247, None, |_kernel, _context, binding, _factory| {
+            binding.override_expected_abi(carrick_abi::LinuxGuestAbi::X86_64);
+        });
+        reject_case(14_248, None, |_kernel, _context, binding, _factory| {
+            binding.override_expected_version(2);
+        });
+        reject_case(14_249, None, |kernel, context, binding, _factory| {
+            let other = process_child(kernel, context, 24_249, "stale-mm");
+            binding.override_expected_mm(other.shared().mm().id());
+        });
+        reject_case(14_250, None, |_kernel, _context, binding, _factory| {
+            binding.override_expected_asid_generation(u64::MAX - 1);
+        });
+        reject_case(14_251, None, |_kernel, _context, binding, _factory| {
+            binding.require_continuation_sequence(7);
+        });
+        reject_case(
+            14_252,
+            Some(Aarch64SyscallContinuationV1 {
+                sequence: 0,
+                state: 0,
+                trap_kind: 0,
+                response_action: 0,
+                flags: 0,
+                native_nr: 0,
+                args: [0; 6],
+                x8: 0,
+                resume_pc: 0,
+                spsr: 0,
+                fp: 0,
+                lr: 0,
+                sp: 0,
+                esr: 0,
+                return_value: 0,
+                resume_x16: 0,
+                resume_x17: 0,
+            }),
+            |_kernel, _context, binding, _factory| {
+                binding.require_continuation_sequence(7);
+            },
+        );
+        reject_case(14_253, None, |_kernel, context, _binding, factory| {
+            factory
+                .fail_invalidation_generation
+                .store(context.shared().mm().id().raw(), Ordering::SeqCst);
+        });
     }
 
     #[test]
@@ -2178,6 +2813,158 @@ mod tests {
             ExecutorPoolEvent::Joined,
         ] {
             assert!(report.events().iter().any(|event| event.event == expected));
+        }
+    }
+
+    #[test]
+    fn real_owner_boundary_state_fails_or_resets_and_successor_observes_clean_state() {
+        let (kernel, context) = bootstrap(14_550);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let receipts = Arc::new(ReceiptLog::default());
+        let kick = Arc::new(WorkerKick::new(Arc::clone(&receipts)));
+        let registration = scheduler
+            .register_executor(Arc::clone(&kick) as Arc<dyn crate::kernel::ExecutorKick>)
+            .expect("register audit executor");
+        let mut backend = BoundaryAuditProbe;
+        let boundary = WorkerBoundaryAudit::capture().expect("capture host signal mask baseline");
+
+        let topology = carrick_thread::fork_quiesce::acquire_topology_lock(
+            carrick_observability::probes::HvpatchTopologyOperation::AliasMap,
+            1,
+            1,
+        );
+        assert!(boundary.audit_runtime(&mut backend).is_err());
+        drop(topology);
+        boundary
+            .audit_runtime(&mut backend)
+            .expect("topology unwound");
+
+        let lock = crate::dispatch::lock_order::LockOrderGuard::acquire(
+            crate::dispatch::lock_order::LockLevel::Proc,
+        );
+        assert!(boundary.audit_runtime(&mut backend).is_err());
+        drop(lock);
+        boundary
+            .audit_runtime(&mut backend)
+            .expect("lock order unwound");
+
+        SyscallDispatcher::with_dirty_executor_boundary_path_resolution_for_test(|| {
+            assert!(boundary.audit_runtime(&mut backend).is_err());
+        });
+        boundary
+            .audit_runtime(&mut backend)
+            .expect("path depth unwound");
+
+        crate::dispatch::resources::with_dirty_captured_resources_for_executor_test(
+            &context,
+            || assert!(boundary.audit_runtime(&mut backend).is_err()),
+        );
+        boundary
+            .audit_runtime(&mut backend)
+            .expect("active/captured resources unwound");
+        crate::dispatch::resources::with_dirty_retiring_resources_for_executor_test(
+            context.resources().files(),
+            || assert!(boundary.audit_runtime(&mut backend).is_err()),
+        );
+        boundary
+            .audit_runtime(&mut backend)
+            .expect("retiring resources unwound");
+
+        let fanotify = crate::fanotify::InternalOpenGuard::enter();
+        assert!(boundary.audit_runtime(&mut backend).is_err());
+        drop(fanotify);
+        boundary
+            .audit_runtime(&mut backend)
+            .expect("fanotify unwound");
+
+        crate::vcpu_loop::signal::note_signal_progress();
+        assert_ne!(crate::vcpu_loop::signal::signal_progress_count(), 0);
+        boundary
+            .audit_runtime(&mut backend)
+            .expect("signal progress is resettable executor state");
+        assert_eq!(crate::vcpu_loop::signal::signal_progress_count(), 0);
+
+        struct RestoreSignalMask(libc::sigset_t);
+        impl Drop for RestoreSignalMask {
+            fn drop(&mut self) {
+                let result = unsafe {
+                    libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut())
+                };
+                assert_eq!(result, 0);
+            }
+        }
+        let mut blocked = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        let mut previous = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        assert_eq!(unsafe { libc::sigemptyset(&mut blocked) }, 0);
+        assert_eq!(unsafe { libc::sigaddset(&mut blocked, libc::SIGUSR1) }, 0);
+        assert_eq!(
+            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous) },
+            0
+        );
+        let restore = RestoreSignalMask(previous);
+        assert!(boundary.audit_runtime(&mut backend).is_err());
+        drop(restore);
+        boundary
+            .audit_runtime(&mut backend)
+            .expect("host signal mask restored");
+
+        let (cached_fd, wait_word_fd) =
+            SyscallDispatcher::dirty_sysv_executor_boundary_state_for_test();
+        assert!(boundary.audit_runtime(&mut backend).is_err());
+        assert_eq!(unsafe { libc::fcntl(cached_fd, libc::F_GETFD) }, -1);
+        assert_eq!(unsafe { libc::fcntl(wait_word_fd, libc::F_GETFD) }, -1);
+        assert!(SyscallDispatcher::sysv_executor_boundary_state_is_clear_for_test());
+        boundary
+            .audit_runtime(&mut backend)
+            .expect("SysV reset leaves successor clean");
+
+        let generation = publish(&context, 155);
+        let authority = enqueue_root(&scheduler, &context, generation);
+        drop(authority);
+        let running = scheduler
+            .take(&registration)
+            .expect("bind exact kick state");
+        assert!(boundary.audit_clean(&mut backend, &kick).is_err());
+        scheduler
+            .settle_exited(running)
+            .expect("clear exact kick binding");
+        boundary
+            .audit_clean(&mut backend, &kick)
+            .expect("successor observes no kick identity");
+
+        drop(backend);
+        scheduler
+            .unregister_executor(&registration)
+            .expect("unregister audit executor");
+    }
+
+    #[test]
+    fn prohibited_real_owner_state_retires_worker_and_cleanup_leaves_no_inherited_state() {
+        for mode in 1..=7 {
+            let (kernel, context) = bootstrap(14_560 + mode as i32);
+            let scheduler = Arc::new(Scheduler::new(kernel));
+            let factory = Arc::new(FakeFactory::default());
+            factory.owner_dirty_mode.store(mode, Ordering::SeqCst);
+            factory.install(&context, FakeBinding::new(156, [Step::Yield]));
+            let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+            let authority = enqueue_root(&scheduler, &context, publish(&context, 156));
+            drop(authority);
+            let error = pool
+                .shutdown()
+                .expect_err("dirty real owner state must retire worker");
+
+            assert_eq!(error.retired_workers(), 1, "dirty owner mode {mode}");
+            assert!(matches!(
+                context.thread().execution_state(),
+                ThreadExecutionState::Failed { .. }
+            ));
+            assert_eq!(error.report().created(), 1);
+            assert_eq!(error.report().destroyed(), 1);
+            assert_eq!(error.report().joined(), 1);
+            for (cached_fd, wait_word_fd) in factory.owner_dirty_fds.lock().iter().copied() {
+                assert_eq!(unsafe { libc::fcntl(cached_fd, libc::F_GETFD) }, -1);
+                assert_eq!(unsafe { libc::fcntl(wait_word_fd, libc::F_GETFD) }, -1);
+            }
         }
     }
 

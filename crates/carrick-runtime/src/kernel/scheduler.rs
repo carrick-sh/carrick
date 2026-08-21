@@ -226,6 +226,20 @@ impl ExecutorDirectory {
         Ok(())
     }
 
+    fn clear_binding(&self, registration: &ExecutorRegistration) -> Result<(), RunQueueError> {
+        let kick = self
+            .state
+            .lock()
+            .entries
+            .get(&registration.id)
+            .map(|entry| Arc::clone(&entry.kick))
+            .ok_or(RunQueueError::StaleExecutor)?;
+        if let Some(binding) = kick.current_binding() {
+            kick.unbind(binding);
+        }
+        Ok(())
+    }
+
     fn unbind(&self, binding: ExecutorBinding) {
         let kick = self
             .state
@@ -879,6 +893,13 @@ impl Scheduler {
     ) -> Result<(), RunQueueError> {
         self.queue.retire_executor(registration);
         self.executors.unregister(registration)
+    }
+
+    pub(crate) fn clear_executor_binding(
+        &self,
+        registration: &ExecutorRegistration,
+    ) -> Result<(), RunQueueError> {
+        self.executors.clear_binding(registration)
     }
 
     pub fn admit_root(
