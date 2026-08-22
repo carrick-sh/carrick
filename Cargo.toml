@@ -30,6 +30,17 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 
+# The host-authority catalog in `clippy.toml` is a CENSUS input, not a build
+# gate. `scripts/migrate/check-host-authority-transitions.py` (run by
+# `just lint-domains`) is the semantic authority for every reviewed host-facility
+# use, and it captures them with `--force-warn clippy::disallowed_methods`, which
+# pierces this level — so allowing the lint here hides nothing from the census.
+# Left at its warn default, `just clippy -- -D warnings` instead promoted all
+# ~682 catalogued product uses to errors. Because `just ci` is SEQUENTIAL, it died
+# at clippy, so lint-domains/deny/check-matrix/check/doc/test/test-integration
+# never ran at all: the gate reported red while gating nothing.
+disallowed_methods = "allow"
+
 # Build-speed tuning that does NOT touch the linker or DTrace (see
 # docs/archive/build-decomposition-design.md and .cargo/config.toml for why lld is off).
 # macOS defaults to bundling debuginfo into a .dSYM via dsymutil on every link;

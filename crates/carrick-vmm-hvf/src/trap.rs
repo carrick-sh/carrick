@@ -1815,6 +1815,49 @@ fn global_frame_host_owners()
     CELL.get_or_init(|| parking_lot::Mutex::new(std::collections::BTreeMap::new()))
 }
 
+/// Global-frame stage-2 leases owned by a CARRIER MM rather than by a mapping
+/// row or a host-owner registration.
+///
+/// A forked process's fresh kernel-state frames are reserved by the fork path
+/// and must outlive every per-task mapping projection, which are `unowned` and
+/// carry no lease. Parking them in the carrier alone made them invisible to
+/// `retire_stage2_extent_from_mappings`, whose fallback then released the IPA
+/// while the lease was still live — and the lease's own `Drop` released it a
+/// second time, tripping the allocator's exact-extent check and aborting the
+/// carrier. Keying them here makes the owner findable, so the extent is
+/// released exactly once, by whichever of retirement or carrier teardown
+/// reaches it first.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn carrier_stage2_leases()
+-> &'static parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), GlobalFrameStage2Lease>> {
+    static CELL: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), GlobalFrameStage2Lease>>,
+    > = std::sync::OnceLock::new();
+    CELL.get_or_init(|| parking_lot::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Publish a carrier-owned lease and return its key. Fails closed on a
+/// duplicate: two owners for one extent is the double-release shape itself.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn register_carrier_stage2_lease(lease: GlobalFrameStage2Lease) -> Result<(u64, u64), TrapError> {
+    let key = lease.key();
+    let mut leases = carrier_stage2_leases().lock();
+    if leases.contains_key(&key) {
+        return Err(TrapError::Hypervisor(format!(
+            "carrier stage-2 lease collision at IPA 0x{:x} size {}",
+            key.0, key.1
+        )));
+    }
+    leases.insert(key, lease);
+    Ok(key)
+}
+
+/// Take the carrier-owned lease for an exact extent, if one is published.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn take_carrier_stage2_lease(ipa: u64, length: u64) -> Option<GlobalFrameStage2Lease> {
+    carrier_stage2_leases().lock().remove(&(ipa, length))
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn register_global_frame_host_owner(
     lease: GlobalFrameStage2Lease,
@@ -6336,9 +6379,11 @@ enum HvpatchCarrierTaskState {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 enum HvpatchCarrierMmAuthority {
     Live {
-        // Rust drops fields in declaration order after `Drop::drop`: leases
-        // must issue every `hv_vm_unmap` while the carrier VM is still alive.
-        _stage2_leases: Vec<GlobalFrameStage2Lease>,
+        // Keys into `carrier_stage2_leases()`. `Drop::drop` runs BEFORE any
+        // field drops, so releasing them there still issues every
+        // `hv_vm_unmap` while the carrier VM below is alive. Retirement may
+        // have taken some already; this is the backstop for the rest.
+        stage2_lease_keys: Vec<(u64, u64)>,
         _vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     },
     #[cfg(test)]
@@ -6350,9 +6395,18 @@ enum HvpatchCarrierMmAuthority {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for HvpatchCarrierMmAuthority {
     fn drop(&mut self) {
-        #[cfg(test)]
-        if let Self::Test { order } = self {
-            order.lock().push("carrier");
+        match self {
+            Self::Live {
+                stage2_lease_keys, ..
+            } => {
+                for key in std::mem::take(stage2_lease_keys) {
+                    drop(take_carrier_stage2_lease(key.0, key.1));
+                }
+            }
+            #[cfg(test)]
+            Self::Test { order } => {
+                order.lock().push("carrier");
+            }
         }
     }
 }
@@ -7828,7 +7882,7 @@ impl HvpatchCarrierTaskStateDirectory {
                 existing_carrier_mm.or_else(|| {
                     Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
                         _vm: vm,
-                        _stage2_leases: Vec::new(),
+                        stage2_lease_keys: Vec::new(),
                     }))
                 }),
                 None,
@@ -7837,18 +7891,39 @@ impl HvpatchCarrierTaskStateDirectory {
                 existing_carrier_mm.or_else(|| {
                     Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
                         _vm: vm,
-                        _stage2_leases: Vec::new(),
+                        stage2_lease_keys: Vec::new(),
                     }))
                 }),
                 None,
             ),
-            HvpatchCarrierTaskState::Process { vm, stage2_leases } => (
-                Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
-                    _vm: vm,
-                    _stage2_leases: stage2_leases,
-                })),
-                None,
-            ),
+            HvpatchCarrierTaskState::Process { vm, stage2_leases } => {
+                let mut stage2_lease_keys = Vec::with_capacity(stage2_leases.len());
+                for lease in stage2_leases {
+                    match register_carrier_stage2_lease(lease) {
+                        Ok(key) => stage2_lease_keys.push(key),
+                        Err(error) => {
+                            for key in stage2_lease_keys {
+                                drop(take_carrier_stage2_lease(key.0, key.1));
+                            }
+                            abort_prepared_task_and_carrier(
+                                task,
+                                HvpatchCarrierTaskState::Process {
+                                    vm,
+                                    stage2_leases: Vec::new(),
+                                },
+                            )?;
+                            return Err(error);
+                        }
+                    }
+                }
+                (
+                    Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
+                        _vm: vm,
+                        stage2_lease_keys,
+                    })),
+                    None,
+                )
+            }
             #[cfg(test)]
             HvpatchCarrierTaskState::Test { rollbacks, order } => (
                 existing_carrier_mm.or_else(|| {
@@ -8679,6 +8754,14 @@ impl HvfVmState {
             .then(|| mapping.stage2_lease.take())
             .flatten()
         }) {
+            drop(lease);
+            return Ok(());
+        }
+        // A forked process parks its fresh kernel-state leases on the carrier,
+        // not on a mapping row. Without this the fallback below released an IPA
+        // whose lease was still live, and the lease's `Drop` then released it
+        // again.
+        if let Some(lease) = take_carrier_stage2_lease(ipa, length) {
             drop(lease);
             return Ok(());
         }
