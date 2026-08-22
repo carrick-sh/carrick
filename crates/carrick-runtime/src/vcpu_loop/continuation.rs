@@ -5585,7 +5585,7 @@ mod tests {
             for range in continuation.guest_outputs() {
                 assert_eq!(range.mm(), context.shared().mm().id());
                 assert_eq!(range.asid_generation(), context.shared().mm().id().raw());
-                assert!(range.len() != 0);
+                assert!(!range.is_empty());
             }
         }
         drop(kernel);
@@ -6913,7 +6913,7 @@ mod tests {
 
     #[test]
     fn reserved_signal_keeps_exact_action_when_opposite_restart_signal_arrives_before_resume() {
-        let (_kernel, context) = bootstrap(15_369_2);
+        let (_kernel, context) = bootstrap(153_692);
         let generation = publish(&context, 0x707);
         let first = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
         let second = crate::kernel::LinuxSignal::for_signal_number(12).expect("SIGUSR2");
@@ -6960,7 +6960,7 @@ mod tests {
 
     #[test]
     fn host_slot_signal_is_reserved_and_cancelled_into_exact_kernel_ownership() {
-        let (_kernel, context) = bootstrap(15_369_3);
+        let (_kernel, context) = bootstrap(153_693);
         let generation = publish(&context, 0x708);
         let signal = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
         let persistent = SigSet::EMPTY.with(10);
@@ -7179,7 +7179,7 @@ mod tests {
 
     #[test]
     fn ignored_lower_signal_does_not_hide_next_exact_deliverable_reservation() {
-        let (_kernel, context) = bootstrap(15_369_4);
+        let (_kernel, context) = bootstrap(153_694);
         let generation = publish(&context, 0x709);
         let ignored = crate::kernel::LinuxSignal::for_signal_number(17).expect("SIGCHLD");
         let caught = crate::kernel::LinuxSignal::for_signal_number(18).expect("signal 18");
@@ -7210,7 +7210,7 @@ mod tests {
 
     #[test]
     fn kernel_signal_reservation_is_atomic_across_two_waiters_and_two_instances() {
-        let (_kernel, context) = bootstrap(15_369_5);
+        let (_kernel, context) = bootstrap(153_695);
         let authority = context.signal_authority();
         for signum in [10, 12] {
             let signal = crate::kernel::LinuxSignal::for_signal_number(signum).expect("signal");
@@ -7255,8 +7255,8 @@ mod tests {
     #[test]
     fn kernel_signal_reservation_linearizes_disposition_and_mask_changes() {
         for (pid, initial_handler, replacement_handler) in [
-            (15_369_6, 0x6000, carrick_abi::LINUX_SIG_IGN),
-            (15_369_7, carrick_abi::LINUX_SIG_IGN, 0x7000),
+            (153_696, 0x6000, carrick_abi::LINUX_SIG_IGN),
+            (153_697, carrick_abi::LINUX_SIG_IGN, 0x7000),
         ] {
             let (_kernel, context) = bootstrap(pid);
             let authority = context.signal_authority();
@@ -7293,7 +7293,7 @@ mod tests {
             );
         }
 
-        let (_kernel, context) = bootstrap(15_369_8);
+        let (_kernel, context) = bootstrap(153_698);
         let authority = context.signal_authority();
         let signal = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
         let mut action = carrick_abi::LinuxSigaction::empty();
@@ -7329,7 +7329,7 @@ mod tests {
 
     #[test]
     fn partial_blocking_write_never_restarts_after_caught_sa_restart_signal() {
-        let (_kernel, context) = bootstrap(15_369_1);
+        let (_kernel, context) = bootstrap(153_691);
         let generation = publish(&context, 0x706);
         let signal = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
         let mut action = carrick_abi::LinuxSigaction::empty();
@@ -7344,7 +7344,7 @@ mod tests {
             fds[1],
             vec![1, 2, 3, 4],
             2,
-            ThreadId::synthetic_for_tests(15_369_1),
+            ThreadId::synthetic_for_tests(153_691),
             false,
         )
         .expect("partial blocking write");

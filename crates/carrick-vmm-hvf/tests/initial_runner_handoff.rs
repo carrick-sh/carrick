@@ -1,4 +1,8 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+// This whole target IS test code, but clippy's `allow-expect-in-tests`
+// exempts only `#[test]` functions, so a shared fixture helper here is
+// linted as production.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::ptr::NonNull;
 use std::sync::Arc;
