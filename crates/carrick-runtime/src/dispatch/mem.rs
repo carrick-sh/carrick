@@ -2849,11 +2849,7 @@ impl SyscallDispatcher {
                     ));
                 };
                 let fixed_va = map_flags.contains(LinuxMmapFlags::FIXED);
-                let Some(ipa) = alloc_alias_ipa_for_publication(
-                    this.execution_backend(),
-                    length,
-                    fixed_va,
-                ) else {
+                let Some(ipa) = alloc_alias_ipa_for_publication(length, fixed_va) else {
                     return Ok(request.refused(
                         MmapRefusal::Internal("alias IPA arena exhausted (io_uring mapping)"),
                         LINUX_ENOMEM,
@@ -3590,7 +3586,6 @@ impl SyscallDispatcher {
             let layout = this.mem.lock().layout;
             let in_arena = range_within(address, length, layout.mmap_base, layout.mmap_size);
             let address_uses_alias = mmap_request_uses_alias(
-                this.execution_backend(),
                 map_flags.contains(LinuxMmapFlags::FIXED),
                 mmap_address_uses_alias(address, length, layout),
                 memory.read_bytes_raw(address, 1).is_ok(),
@@ -3991,11 +3986,7 @@ impl SyscallDispatcher {
                 // alias IPA; HVPatch supplies a sentinel that its reusable
                 // GlobalFrameStage2Lease replaces before stage-2 publication.
                 // Stage-1 still covers exactly the guest page-aligned length.
-                let Some(ipa) = alloc_alias_ipa_for_publication(
-                    this.execution_backend(),
-                    length,
-                    true,
-                ) else {
+                let Some(ipa) = alloc_alias_ipa_for_publication(length, true) else {
                     return Ok(request.refused(
                         MmapRefusal::Internal("alias IPA arena exhausted (guest-chosen VA)"),
                         LINUX_ENOMEM,
@@ -5678,11 +5669,7 @@ impl SyscallDispatcher {
                 if !metadata_says_unmapped
                     && !prot_flags.is_empty()
                     && address_is_alias_vma
-                    && let Some(ipa) = alloc_alias_ipa_for_publication(
-                        this.execution_backend(),
-                        length,
-                        true,
-                    )
+                    && let Some(ipa) = alloc_alias_ipa_for_publication(length, true)
                 {
                     // The reservation's VMA is the source of truth. `mprotect`
                     // replaces only its committed subrange; it must not
@@ -6527,23 +6514,17 @@ fn mmap_address_uses_alias(address: u64, length: u64, layout: MemoryLayout) -> b
 
 /// HVPatch cannot create a new identity stage-2 mapping at a low arbitrary VA
 /// after vCPU creation. A `MAP_FIXED` request outside the boot backing must use
-/// the same global-frame alias path as high VAs. Other backends retain their
-/// address-shaped policy. An already-backed HVPatch range stays identity, as
-/// does its semantic mmap arena: sparse HVPatch deliberately leaves that arena
-/// physically absent until protection commits pages on demand, so a raw-backing
-/// miss there is not a low fixed hole.
+/// the same global-frame alias path as high VAs. An already-backed range stays
+/// identity, as does the semantic mmap arena: sparse HVPatch deliberately leaves
+/// that arena physically absent until protection commits pages on demand, so a
+/// raw-backing miss there is not a low fixed hole.
 fn mmap_request_uses_alias(
-    backend: crate::page_profile::ExecutionBackend,
     fixed: bool,
     address_uses_alias: bool,
     has_identity_backing: bool,
     semantic_identity_range: bool,
 ) -> bool {
-    address_uses_alias
-        || (backend == crate::page_profile::ExecutionBackend::HvPatch
-            && fixed
-            && !has_identity_backing
-            && !semantic_identity_range)
+    address_uses_alias || (fixed && !has_identity_backing && !semantic_identity_range)
 }
 
 /// Select the legacy dispatcher IPA token for an alias publication.
@@ -6551,16 +6532,13 @@ fn mmap_request_uses_alias(
 /// HVPatch assigns the real, reusable global frame IPA in its backend after
 /// the guest VA is already fixed. Consuming the old process-tree-global,
 /// monotonic alias cursor in that case would leave a dead allocator as a
-/// 32,768-publication lifetime limit. Other backends still use the supplied
-/// IPA, and HVPatch still needs the legacy cursor when its offset selects a
-/// fresh guest VA.
+/// 32,768-publication lifetime limit. The legacy cursor is still needed when
+/// the offset selects a fresh guest VA.
 pub(super) fn alloc_alias_ipa_for_publication(
-    backend: crate::page_profile::ExecutionBackend,
     length: u64,
     guest_va_already_selected: bool,
 ) -> Option<u64> {
     alloc_alias_ipa_for_publication_with(
-        backend,
         length,
         guest_va_already_selected,
         crate::memory::alloc_alias_ipa,
@@ -6568,12 +6546,11 @@ pub(super) fn alloc_alias_ipa_for_publication(
 }
 
 fn alloc_alias_ipa_for_publication_with(
-    backend: crate::page_profile::ExecutionBackend,
     length: u64,
     guest_va_already_selected: bool,
     allocate: impl FnOnce(u64) -> Option<u64>,
 ) -> Option<u64> {
-    if backend == crate::page_profile::ExecutionBackend::HvPatch && guest_va_already_selected {
+    if guest_va_already_selected {
         // A deliberately non-authoritative, aligned sentinel. HVPatch replaces
         // it with its GlobalFrameStage2Lease before calling hv_vm_map.
         Some(crate::memory::LINUX_ALIAS_IPA_BASE)

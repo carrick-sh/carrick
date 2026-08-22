@@ -3517,8 +3517,7 @@ mod hvpatch_in_process_fork_tests {
 
     #[test]
     fn hvpatch_pi_futex_owner_uses_kernel_linux_tid() {
-        let mut parent = SyscallDispatcher::new();
-        parent.set_execution_backend(crate::page_profile::ExecutionBackend::HvPatch);
+        let parent = SyscallDispatcher::new();
         let parent_context = parent.capture_one_task_context().unwrap();
         let parent_tid = parent_context.thread().registry_id();
         let child_registry_id = crate::thread::ThreadId::synthetic_for_tests(4101);

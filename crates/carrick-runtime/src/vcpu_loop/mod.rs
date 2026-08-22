@@ -329,10 +329,13 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
     }
 }
 
+/// HVPatch multiplexes every Linux process inside one carrier, so no guest exit
+/// is ever a host-process exit: the terminal owner always unwinds. This was
+/// true only for the retired host-fork lanes, where a forked child had to
+/// `_exit` without running Drop over its parent's inherited fd table.
 pub(super) fn requires_no_unwind_host_exit(kernel: &Kernel, engine_is_forked_child: bool) -> bool {
-    !kernel.is_hvpatch_child()
-        && kernel.dispatcher.execution_backend() != crate::page_profile::ExecutionBackend::HvPatch
-        && (engine_is_forked_child || kernel.dispatcher.is_forked_guest_process())
+    let _ = (kernel, engine_is_forked_child);
+    false
 }
 
 /// MT whole-VM residency lease (E4 Track 3): when every thread of a
@@ -1606,15 +1609,6 @@ impl KernelState {
 
     fn end_exec_replacement(&self) {
         crate::fork_quiesce::end_exec_replacement();
-    }
-
-    /// True for a Linux child process multiplexed inside the current host
-    /// process.  These children must return a `ProcessExit` to the lifecycle
-    /// owner; the legacy fork-child paths below must never call host `_exit`.
-    fn is_hvpatch_child(&self) -> bool {
-        self.hvpatch_process
-            .as_ref()
-            .is_some_and(crate::hvpatch::ProcessContext::is_child)
     }
 
     fn begin_process_exit(&self) {
@@ -6991,10 +6985,7 @@ where
                         &self.futex,
                     )
                 })?;
-            if kernel.dispatcher.execution_backend()
-                == crate::page_profile::ExecutionBackend::HvPatch
-                && continuation::is_blocking_dispatch_outcome(&outcome)
-            {
+            if continuation::is_blocking_dispatch_outcome(&outcome) {
                 // The HVPatch product path converts this exact owned outcome
                 // at `run_vcpu_until_exit`'s quantum boundary. Compatibility
                 // lanes below retain their historical host-wait adapters.
@@ -8318,22 +8309,20 @@ pub(crate) fn launch_vcpu_until_exit<E: ThreadedEngine + 'static>(
 where
     E::SiblingSpec: 'static,
 {
-    if kernel.dispatcher.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch {
-        return launch_persistent_hvpatch_job(
-            kernel,
-            engine,
-            registry,
-            futex,
-            platform_futex,
-            platform_futex_factory,
-            linux_tid,
-            this_tid,
-            threads,
-            kicker,
-            in_guest,
-            max_traps,
-        );
-    }
+    return launch_persistent_hvpatch_job(
+        kernel,
+        engine,
+        registry,
+        futex,
+        platform_futex,
+        platform_futex_factory,
+        linux_tid,
+        this_tid,
+        threads,
+        kicker,
+        in_guest,
+        max_traps,
+    );
     let mut engine = OwnerThreadEngine::new(engine);
     let runner = kernel.transitional_runner();
     if let Some(runner) = runner {
@@ -9639,10 +9628,7 @@ where
 
             // ---- syscall service: no dispatcher-wide lock held ----
             let mut outcome = state.service_threaded_syscall(&kernel, &mut engine, frame)?;
-            while kernel.dispatcher.execution_backend()
-                == crate::page_profile::ExecutionBackend::HvPatch
-                && continuation::is_blocking_dispatch_outcome(&outcome)
-            {
+            while continuation::is_blocking_dispatch_outcome(&outcome) {
                 let continuation_request = SyscallRequest::from_raw(frame)
                     .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
                     .with_current_guest_sp(engine.get_reg(carrick_hal::Reg::Sp).ok());
@@ -9705,17 +9691,10 @@ where
                     }
                     // exit_group, or exit(2) as the last live thread. Tear the whole
                     // process down.
-                    let last = if kernel.is_hvpatch_child()
-                        || kernel.dispatcher.execution_backend()
-                            == crate::page_profile::ExecutionBackend::HvPatch
-                    {
-                        // HVPatch process cleanup first drains every sibling
-                        // vCPU, then removes this owner and unmaps its bank.
-                        // Removing the owner here would permit a second retire.
-                        true
-                    } else {
-                        state.registry.exit(state.this_tid)
-                    };
+                    // HVPatch process cleanup first drains every sibling vCPU,
+                    // then removes this owner and unmaps its bank. Removing the
+                    // owner here would permit a second retire.
+                    let last = true;
                     if !last {
                         // exit_group(94) or fatal process termination: flush shared
                         // buffers and terminate the entire host process.
@@ -9754,14 +9733,7 @@ where
                         );
                     }
                     let code = 128 + signum;
-                    let last = if kernel.is_hvpatch_child()
-                        || kernel.dispatcher.execution_backend()
-                            == crate::page_profile::ExecutionBackend::HvPatch
-                    {
-                        true
-                    } else {
-                        state.registry.exit(state.this_tid)
-                    };
+                    let last = true;
                     if !last {
                         let _ = std::io::Write::flush(&mut std::io::stdout());
                         let _ = std::io::Write::flush(&mut std::io::stderr());
@@ -9787,10 +9759,7 @@ where
                 }
                 DispatchOutcome::SchedulerYield => {
                     last_syscall_retval = Some(state.complete_returned(&mut engine, 0)?);
-                    if kernel.dispatcher.execution_backend()
-                        == crate::page_profile::ExecutionBackend::HvPatch
-                        && !state.yield_hvpatch_quantum(&kernel, &mut engine).await?
-                    {
+                    if !state.yield_hvpatch_quantum(&kernel, &mut engine).await? {
                         return Ok(state.handle_thread_exit(&kernel, &mut engine, 0, traps));
                     }
                 }
@@ -10286,12 +10255,10 @@ where
     // finalized before Linux exit publication; only after the zombie/pidfd and
     // current-parent signal are visible may the owner retire backend mappings,
     // bank, ASID, and current vCPU under the global topology lock.
-    let terminal_hvpatch_process = kernel.dispatcher.execution_backend()
-        == crate::page_profile::ExecutionBackend::HvPatch
-        && matches!(
-            &result,
-            Ok(VcpuLoopOutcome::ProcessExit(_) | VcpuLoopOutcome::TrapLimit(_)) | Err(_)
-        );
+    let terminal_hvpatch_process = matches!(
+        &result,
+        Ok(VcpuLoopOutcome::ProcessExit(_) | VcpuLoopOutcome::TrapLimit(_)) | Err(_)
+    );
     let mut vcpu_retired_by_hvpatch_cleanup = false;
     if terminal_hvpatch_process {
         if let Err(error) = &result {

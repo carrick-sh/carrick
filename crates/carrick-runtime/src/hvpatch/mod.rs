@@ -1175,14 +1175,10 @@ fn root_bootstrap_identity(_host_pid: u32) -> Result<RootBootstrapIdentity, Runt
 }
 
 /// Install the root in-process guest's nonzero ASID before its first entry.
-/// All other backends return `None` and retain their existing register values.
 pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     engine: &mut E,
     dispatcher: &SyscallDispatcher,
 ) -> Result<Option<ProcessContext>, RuntimeError> {
-    if dispatcher.execution_backend() != crate::page_profile::ExecutionBackend::HvPatch {
-        return Ok(None);
-    }
     const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
     let stage1_root = engine.get_sys_reg(SysReg::Ttbr0).map_err(|error| {
         RuntimeError::Trap(crate::trap::TrapError::Hypervisor(error.to_string()))
@@ -1415,16 +1411,13 @@ fn prepare_image(mut image: AddressSpace, info: InfoPage) -> Result<PreparedImag
     })
 }
 
-/// Preserve the selected backend across `execve`: the mature HVF reload path
-/// receives byte-identical guest text, while HvPatch replacement images are
-/// patched before the runtime adds its own executable trampoline/vector pages.
+/// Patch an `execve` replacement image before the runtime adds its own
+/// executable trampoline/vector pages.
 pub(crate) fn prepare_exec_image_for_dispatcher(
     image: AddressSpace,
     dispatcher: &SyscallDispatcher,
 ) -> Result<AddressSpace, PrepareError> {
-    if dispatcher.execution_backend() != crate::page_profile::ExecutionBackend::HvPatch {
-        return Ok(image);
-    }
+    let _ = dispatcher;
     Ok(prepare_image(image, InfoPage::default())?.image)
 }
 

@@ -5289,9 +5289,7 @@ mod tests {
         assert!(drain.is_ready());
     }
     use crate::compat::SyscallArgs;
-    use crate::dispatch::{
-        BlockingHostWrite, BlockingRecordLock, DispatchOutcome, SyscallRequest, WaitFds,
-    };
+    use crate::dispatch::{BlockingHostWrite, DispatchOutcome, SyscallRequest, WaitFds};
     use crate::kernel::objects::{ExecutionGeneration, MigratableTaskState, ThreadExecutionState};
     use crate::kernel::{ClonePlan, Kernel, KernelContext, RootBootstrap, Scheduler};
     use crate::thread::FutexTable;
@@ -5500,11 +5498,8 @@ mod tests {
                 DispatchOutcome::BlockingHostWrite(write)
             }
             ContinuationFamily::BlockingRecordLock => {
-                let fds = pipe_pair();
-                let lock = BlockingRecordLock::new(fds[0], libc::F_SETLKW, 0, 1, 1, 0)
-                    .expect("pinned record lock");
-                close_pair(fds);
-                DispatchOutcome::BlockingRecordLock(lock)
+                let contention = crate::dispatch::RecordLockContentionFixture::new();
+                DispatchOutcome::BlockingRecordLock(contention.waiter(tid, 1))
             }
             ContinuationFamily::WaitOnProcExit => DispatchOutcome::WaitOnProcExit {
                 pid: 9001,
@@ -6619,9 +6614,12 @@ mod tests {
         ));
         close_pair(pipe);
 
-        let pipe = pipe_pair();
-        let lock =
-            BlockingRecordLock::new(pipe[0], libc::F_SETLKW, 0, 1, 1, 0).expect("record state");
+        // The record-lock source is carrick's own logical table (the host
+        // `fcntl` transport is gone), so the reactor reaches its terminal
+        // result when the conflicting holder releases — not when a host
+        // descriptor errors out.
+        let record_contention = crate::dispatch::RecordLockContentionFixture::new();
+        let lock = record_contention.waiter(ThreadId::synthetic_for_tests(15_241), 7);
         let lock_continuation = BlockedContinuation::from_dispatch_outcome(
             DispatchOutcome::BlockingRecordLock(lock),
             capture(&context, generation, ContinuationBackend::Hvpatch),
@@ -6629,12 +6627,14 @@ mod tests {
         .expect("record continuation");
         let mut registration = service.prepare_registration(&lock_continuation);
         service.enroll(&mut registration).expect("enroll record");
+        let record_token = registration.wake_token();
+        record_contention.release_blocker();
+        service.nudge_reactor_for_test();
         assert_eq!(
-            await_event(&service, registration.wake_token()).expect("record terminal result"),
+            await_event(&service, record_token).expect("record terminal result"),
             ContinuationEvent::Ready
         );
         drop(lock_continuation);
-        close_pair(pipe);
 
         let signal_continuation = BlockedContinuation::from_dispatch_outcome(
             DispatchOutcome::WaitOnSignals {

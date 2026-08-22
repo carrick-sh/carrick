@@ -459,27 +459,29 @@ fn forward_record_lock<M: GuestMemory>(
     if !(0..=2).contains(&l_whence) {
         return DispatchOutcome::errno(LINUX_EINVAL);
     }
-    // struct flock.l_type is c_short (i16) on both OSes, but the libc F_*LCK
-    // constants are i16 on Darwin / i32 on Linux — narrow to the field width.
-    // (The LINUX_F_*LCK consts are i32, so widen the guest i16 for the match.)
-    #[allow(clippy::unnecessary_cast)] // libc F_*LCK: i16 on Darwin, i32 on Linux
-    let l_type_host: i16 = match i32::from(l_type_linux) {
-        LINUX_F_RDLCK => libc::F_RDLCK as i16,
-        LINUX_F_WRLCK => libc::F_WRLCK as i16,
-        LINUX_F_UNLCK => libc::F_UNLCK as i16,
-        _ => return DispatchOutcome::errno(LINUX_EINVAL),
-    };
-    let host_cmd: i32 = match linux_cmd {
-        LINUX_F_GETLK => libc::F_GETLK,
-        LINUX_F_SETLK => libc::F_SETLK,
-        LINUX_F_SETLKW => libc::F_SETLKW,
-        LINUX_F_OFD_GETLK => carrick_portable::F_OFD_GETLK,
-        LINUX_F_OFD_SETLK => carrick_portable::F_OFD_SETLK,
-        LINUX_F_OFD_SETLKW => carrick_portable::F_OFD_SETLKW,
-        _ => return DispatchOutcome::errno(LINUX_EINVAL),
-    };
+    // Linux rejects an out-of-range `l_type` with EINVAL in
+    // `flock_to_posix_lock`, before attempting the lock. The logical table below
+    // reads the field as RDLCK/WRLCK/UNLCK, so the range check must stay even
+    // though nothing translates it to a host `F_*LCK` any more.
+    if !matches!(
+        i32::from(l_type_linux),
+        LINUX_F_RDLCK | LINUX_F_WRLCK | LINUX_F_UNLCK
+    ) {
+        return DispatchOutcome::errno(LINUX_EINVAL);
+    }
+    if !matches!(
+        linux_cmd,
+        LINUX_F_GETLK
+            | LINUX_F_SETLK
+            | LINUX_F_SETLKW
+            | LINUX_F_OFD_GETLK
+            | LINUX_F_OFD_SETLK
+            | LINUX_F_OFD_SETLKW
+    ) {
+        return DispatchOutcome::errno(LINUX_EINVAL);
+    }
 
-    if this.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch {
+    {
         let file = match logical_record_lock_file(host_fd) {
             Ok(file) => file,
             Err(errno) => return DispatchOutcome::errno(errno),
@@ -526,83 +528,6 @@ fn forward_record_lock<M: GuestMemory>(
             }
         }
     }
-
-    if matches!(linux_cmd, LINUX_F_SETLKW | LINUX_F_OFD_SETLKW) {
-        return match BlockingRecordLock::new(
-            host_fd,
-            host_cmd,
-            l_start,
-            l_len,
-            l_type_host,
-            l_whence,
-        ) {
-            Ok(lock) => DispatchOutcome::BlockingRecordLock(lock),
-            Err(errno) => DispatchOutcome::errno(errno),
-        };
-    }
-
-    let mut fl: libc::flock = unsafe { core::mem::zeroed() };
-    fl.l_start = l_start as libc::off_t;
-    fl.l_len = l_len as libc::off_t;
-    fl.l_type = l_type_host;
-    fl.l_whence = l_whence;
-    let rc = unsafe { libc::fcntl(host_fd, host_cmd, &mut fl as *mut libc::flock) };
-    if let Err(errno) = rc.host_syscall_errno() {
-        return DispatchOutcome::errno(errno);
-    }
-
-    // F_GETLK / F_OFD_GETLK: write the (possibly conflicting) lock back in Linux
-    // layout.
-    if matches!(linux_cmd, LINUX_F_GETLK | LINUX_F_OFD_GETLK) {
-        let host_type = fl.l_type as i32;
-        if host_type == libc::F_UNLCK as i32 {
-            // No conflicting lock. Linux leaves the caller's struct UNCHANGED
-            // except l_type = F_UNLCK — in particular l_pid keeps the value the
-            // caller passed (LTP fcntl05 pre-sets l_pid = getpid() and checks it
-            // survives). carrick previously rewrote the whole struct from the
-            // macOS flock result, which zeroes l_pid. Touch only l_type@0
-            // (an i16 field, so narrow the i32 const to 2 wire bytes).
-            let mut flock: LinuxFlock64 = match cx.memory.read_struct(arg) {
-                Ok(f) => f,
-                Err(_) => return DispatchOutcome::errno(LINUX_EFAULT),
-            };
-            flock.l_type = LINUX_F_UNLCK as i16;
-            if cx.memory.write_struct(arg, &flock).is_err() {
-                return DispatchOutcome::errno(LINUX_EFAULT);
-            }
-        } else {
-            // Conflicting lock found: report its full details (Linux fills the
-            // whole struct, including the holder's l_pid).
-            let l_type_back: i16 = if host_type == libc::F_RDLCK as i32 {
-                LINUX_F_RDLCK as i16
-            } else {
-                LINUX_F_WRLCK as i16
-            };
-            // OFD locks are not process-owned: Linux reports a conflicting OFD
-            // lock's l_pid as -1. A classic lock's holder pid comes back from
-            // macOS flock as the HOST pid; present it in the caller's PID
-            // namespace (LTP fcntl11/17/19/20/21/31/32 assert l_pid == the
-            // holder's ns-pid, the same translation gettid/semctl(GETPID) use).
-            let l_pid_back: i32 = if is_ofd {
-                -1
-            } else {
-                crate::namespace::pid::host_to_ns_or_self(fl.l_pid as u32) as i32
-            };
-            let out = LinuxFlock64 {
-                l_type: l_type_back,
-                l_whence: fl.l_whence,
-                __pad1: [0; 4],
-                l_start: fl.l_start as i64,
-                l_len: fl.l_len as i64,
-                l_pid: l_pid_back,
-                __pad2: [0; 4],
-            };
-            if cx.memory.write_struct(arg, &out).is_err() {
-                return DispatchOutcome::errno(LINUX_EFAULT);
-            }
-        }
-    }
-    DispatchOutcome::Returned { value: 0 }
 }
 
 /// Front-door `struct flock` validation Linux performs for F_GETLK/F_SETLK/
@@ -1719,9 +1644,6 @@ impl SyscallDispatcher {
         owner: crate::kernel::TaskKey,
         open_file: &OpenFile,
     ) {
-        if self.execution_backend() != crate::page_profile::ExecutionBackend::HvPatch {
-            return;
-        }
         let file = {
             let description = open_file.description.read();
             Self::lease_file_identity(&description)
@@ -7861,14 +7783,6 @@ impl SyscallDispatcher {
                     let desc_ptr = this
                         .open_file(fd.0)
                         .map_or(0, |of| Arc::as_ptr(&of.description) as usize);
-                    if this.execution_backend() != crate::page_profile::ExecutionBackend::HvPatch
-                        && !carrick_portable::host_ofd_locks_supported()
-                    {
-                        return Ok(match validate_flock_arg(&*cx.memory, arg) {
-                            Ok(()) => DispatchOutcome::errno(LINUX_ENOTSUP),
-                            Err(errno) => DispatchOutcome::errno(errno),
-                        });
-                    }
                     match this.host_file_fd_for_flush(fd.0) {
                         Ok(Some(host_fd)) => {
                             forward_record_lock(this, cx, host_fd, desc_ptr, command, arg)

@@ -495,10 +495,8 @@ fn ptrace_wait_park_pid(target: PtraceWaitTarget) -> Option<i32> {
     }
 }
 
-fn hvpatch_reported_tid(hvpatch_lane: bool, kernel_tid: i32) -> Option<u32> {
-    hvpatch_lane
-        .then(|| u32::try_from(kernel_tid).ok())
-        .flatten()
+fn hvpatch_reported_tid(kernel_tid: i32) -> Option<u32> {
+    u32::try_from(kernel_tid).ok()
 }
 
 fn virtual_ptrace_stop_status(linux_signum: i32) -> i32 {
@@ -1824,10 +1822,7 @@ impl SyscallDispatcher {
                     value: i64::from(ns_tid),
                 });
             }
-            if let Some(tid) = hvpatch_reported_tid(
-                this.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch,
-                cx.kernel.thread().key().tid.raw(),
-            ) {
+            if let Some(tid) = hvpatch_reported_tid(cx.kernel.thread().key().tid.raw()) {
                 return Ok(DispatchOutcome::Returned {
                     value: i64::from(tid),
                 });
@@ -4879,9 +4874,10 @@ mod hvpatch_identity_tests {
     use super::{ProcState, hvpatch_reported_tid};
 
     #[test]
-    fn hvpatch_gettid_uses_the_kernel_thread_identity_only_on_that_lane() {
-        assert_eq!(hvpatch_reported_tid(true, 7), Some(7));
-        assert_eq!(hvpatch_reported_tid(false, 7), None);
+    fn hvpatch_gettid_reports_the_kernel_thread_identity() {
+        assert_eq!(hvpatch_reported_tid(7), Some(7));
+        // A negative kernel tid is not a Linux tid and must not be reported.
+        assert_eq!(hvpatch_reported_tid(-1), None);
     }
 
     #[test]

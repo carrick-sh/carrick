@@ -1,11 +1,9 @@
 //! Neutral page-geometry vocabulary for the native (DSR) execution backend.
 //!
-//! Peeled out of `carrick-runtime/src/page_profile.rs` (which retains the
-//! runtime-side backend-selection gate: `ExecutionBackend`, `ExecutionPlan`,
-//! `resolve_execution_plan*`). Everything here is pure data + classification
-//! policy shared by every native lane; the runtime re-exports these names
-//! under `crate::page_profile` so its call sites are unchanged while the
-//! extraction is in flight.
+//! Peeled out of `carrick-runtime/src/page_profile.rs` (which retains
+//! `ExecutionPlan` and `resolve_execution_plan*`). Everything here is pure data
+//! + classification policy; the runtime re-exports these names under
+//! `crate::page_profile` so its call sites read unchanged.
 
 use carrick_guest_mem::{NativePageGeometry, NativePageProfile};
 

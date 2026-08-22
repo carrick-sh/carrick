@@ -1312,9 +1312,6 @@ impl SyscallDispatcher {
         signum: u64,
         siginfo: Option<LinuxSiginfo>,
     ) -> Option<DispatchOutcome> {
-        if self.execution_backend() != crate::page_profile::ExecutionBackend::HvPatch {
-            return None;
-        }
         let tid = match crate::kernel::LinuxTid::from_abi_positive(tid) {
             Ok(tid) => tid,
             Err(_) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
@@ -1624,37 +1621,17 @@ impl SyscallDispatcher {
             if !is_valid_signum(signum) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if this.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch {
-                let info = (signum != 0).then(|| {
-                    crate::linux_abi::LinuxSiginfo::kill(
-                        signum as i32,
-                        crate::linux_abi::LINUX_SI_TKILL,
-                        cx.kernel.task().key().id.raw(),
-                        this.cred_snapshot().ruid.raw(),
-                    )
-                });
-                return Ok(this
-                    .hvpatch_specific_thread_signal(cx.kernel, None, tid as i32, signum, info)
-                    .unwrap_or_else(|| DispatchOutcome::errno(LINUX_ESRCH)));
-            }
-            if let Some((routed, _target)) = this.route_thread_signal(cx, tid, signum, true) {
-                return Ok(routed);
-            }
-            // raise()/pthread_kill name the caller as tkill(gettid()). Under a
-            // PID namespace gettid() reports the caller's ns-pid (the main thread
-            // reads as the process ns-pid), so a self-target arrives as that
-            // ns-pid — recognize it with the ns-aware `names_self_pid`, not
-            // `signal_is_self_target` (which only knows the host/bootstrap pid and
-            // would send the ns-pid to a nonexistent host tid → ESRCH). Mirrors
-            // tgkill below (LTP tkill01).
-            if names_self_pid(tid) {
-                let self_tid = Self::ctx_tid(cx);
-                return Ok(this.raise_self(cx.kernel, self_tid, signum));
-            }
-            Ok(bootstrap_signal_send(
-                SignalTarget::GuestTid(NsPid(tid as i32)),
-                signum,
-            ))
+            let info = (signum != 0).then(|| {
+                crate::linux_abi::LinuxSiginfo::kill(
+                    signum as i32,
+                    crate::linux_abi::LINUX_SI_TKILL,
+                    cx.kernel.task().key().id.raw(),
+                    this.cred_snapshot().ruid.raw(),
+                )
+            });
+            Ok(this
+                .hvpatch_specific_thread_signal(cx.kernel, None, tid as i32, signum, info)
+                .unwrap_or_else(|| DispatchOutcome::errno(LINUX_ESRCH)))
         }
 
         /// tgkill(tgid, tid, sig): send `sig` to thread `tid` in group `tgid`.
@@ -1668,50 +1645,23 @@ impl SyscallDispatcher {
             if !is_valid_signum(signum) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if this.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch {
-                let info = (signum != 0).then(|| {
-                    crate::linux_abi::LinuxSiginfo::kill(
-                        signum as i32,
-                        crate::linux_abi::LINUX_SI_TKILL,
-                        cx.kernel.task().key().id.raw(),
-                        this.cred_snapshot().ruid.raw(),
-                    )
-                });
-                if let Some(outcome) = this.hvpatch_specific_thread_signal(
+            let info = (signum != 0).then(|| {
+                crate::linux_abi::LinuxSiginfo::kill(
+                    signum as i32,
+                    crate::linux_abi::LINUX_SI_TKILL,
+                    cx.kernel.task().key().id.raw(),
+                    this.cred_snapshot().ruid.raw(),
+                )
+            });
+            Ok(this
+                .hvpatch_specific_thread_signal(
                     cx.kernel,
                     Some(tgid as i32),
                     tid as i32,
                     signum,
                     info,
-                ) {
-                    return Ok(outcome);
-                }
-                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-            }
-            // tgid-membership: `tid` must belong to thread group `tgid`. A guest
-            // process is one host process whose threads all share tgid == the
-            // process pid, and that is the only thread group tgkill can reach.
-            // So `tgid` must name THIS process — a (tgid, tid) pair where tid is
-            // a live thread but is NOT in tgid's group is ESRCH, even though a
-            // plain tkill(tid) would have succeeded (LTP tgkill03 "Defunct
-            // tgid": tgkill(defunct_tid, child_tid) with child_tid live).
-            if !names_current_thread_group(cx, tgid) {
-                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-            }
-            if let Some((routed, _target)) = this.route_thread_signal(cx, tid, signum, true) {
-                return Ok(routed);
-            }
-            // raise()/pthread_kill name the caller as tgkill(getpid(), gettid()).
-            // Under a PID namespace getpid()/gettid() report the ns-pid, so a
-            // self-target here is the caller's ns-pid — not just host-pid/
-            // bootstrap. (Sibling threads were already handled by
-            // route_thread_signal above.)
-            let valid_self = names_current_thread_group(cx, tgid) && names_self_pid(tid);
-            if !valid_self {
-                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-            }
-            let self_tid = Self::ctx_tid(cx);
-            Ok(this.raise_self(cx.kernel, self_tid, signum))
+                )
+                .unwrap_or_else(|| DispatchOutcome::errno(LINUX_ESRCH)))
         }
 
         /// sigaltstack(ss, old_ss): set/query alternate signal stack.
@@ -2253,10 +2203,7 @@ impl SyscallDispatcher {
         // is kernel identity. The mature route below publishes through host-
         // process globals and `SignalThread`, which are shared by unrelated
         // HVPatch tasks and bypass task-wide signal generation ordering.
-        if crate::dispatch::hvpatch_lane_active()
-            || (tid_directed
-                && self.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch)
-        {
+        if crate::dispatch::hvpatch_lane_active() || tid_directed {
             if is_rt_signal(s) && self.sigpending_limit_exceeded(ctx.kernel) {
                 return DispatchOutcome::errno(LINUX_EAGAIN);
             }
@@ -2489,13 +2436,6 @@ fn names_self_pid(x: i64) -> bool {
     NsPid(x as i32).names_self()
 }
 
-fn names_current_thread_group<M: GuestMemory>(ctx: &SyscallCtx<'_, M>, x: i64) -> bool {
-    names_self_pid(x)
-        || ctx.thread.as_ref().is_some_and(|t| {
-            t.registry.main_tid() == crate::thread::ThreadId::from_guest_supplied_tid(x as i32)
-        })
-}
-
 /// The target of a host-routed (cross-process) signal send — the typed
 /// replacement for the old `(target: i64, tid_required: bool)` convention,
 /// where a HOST pid, a kill(2) process-group/sentinel encoding, and a guest
@@ -2520,12 +2460,6 @@ pub(crate) enum SignalTarget {
     /// ns→host translation. Cross-process, a main-thread tid is the target
     /// process's host pid, which is how the host kill reaches it.
     HostThread(HostPid),
-    /// tkill(2)'s cross-process fallthrough: the tid exactly as the GUEST
-    /// passed it (ns domain, deliberately untranslated — the pre-enum
-    /// behaviour, kept bit-identical; cross-process it names another guest
-    /// process's main thread, whose tid equals its pid). Always `> 0` (tkill
-    /// rejects the rest with EINVAL before routing here).
-    GuestTid(NsPid),
 }
 
 impl SignalTarget {
@@ -2558,7 +2492,6 @@ impl SignalTarget {
             Self::HostProcessGroup(pg) => -i64::from(pg.0),
             Self::CallerProcessGroup => 0,
             Self::Broadcast => -1,
-            Self::GuestTid(t) => i64::from(t.0),
         }
     }
 }
@@ -2606,10 +2539,6 @@ fn hvpatch_owns_specific_thread_signal(hvpatch_lane: bool) -> bool {
     hvpatch_lane
 }
 
-pub(crate) fn bootstrap_signal_send(target: SignalTarget, signum: u64) -> DispatchOutcome {
-    bootstrap_signal_send_as(target, signum, /*caller_euid=*/ None)
-}
-
 /// Same as [`bootstrap_signal_send`] but the caller passes its own current
 /// euid so we can enforce Linux's kill(2) permission check across guest
 /// processes. `None` means "skip the check" (used by the self-target /
@@ -2622,15 +2551,11 @@ pub(crate) fn bootstrap_signal_send_as(
     if !is_valid_signum(signum) {
         return DispatchOutcome::errno(LINUX_EINVAL);
     }
-    // A `GuestTid` target names one specific thread (tkill's cross-process
-    // fallthrough); every other variant is process/group-directed. Captured
-    // BEFORE `host_kill_encoding` collapses the typed target to its raw kill(2)
-    // i64 (which cannot distinguish a tid from a pid), so the xsig ring send
-    // below can still carry it.
-    let target_ns_tid = match target {
-        SignalTarget::GuestTid(t) => t.0,
-        _ => 0,
-    };
+    // Every `SignalTarget` variant is process/group-directed: a thread-directed
+    // send never reaches the host transport, because HVPatch resolves it in the
+    // kernel graph (`hvpatch_specific_thread_signal`). The xsig ring's tid field
+    // therefore carries no target here.
+    let target_ns_tid = 0;
     let host_transport_allowed =
         host_signal_transport_allowed(crate::dispatch::hvpatch_lane_active(), target);
     // The raw kill(2) value this target denotes: every sign/sentinel test
@@ -2792,7 +2717,6 @@ mod tests {
             SignalTarget::CallerProcessGroup,
             SignalTarget::Broadcast,
             SignalTarget::HostThread(guest_one),
-            SignalTarget::GuestTid(NsPid(carrick_abi::LINUX_BOOTSTRAP_PID as i32)),
         ] {
             assert!(
                 !host_signal_transport_allowed(true, target),
@@ -4291,12 +4215,7 @@ mod tests {
 
     #[test]
     fn hvpatch_threaded_tkill_is_kernel_native_fifo_coalesced_and_exact() {
-        let mut d = SyscallDispatcher::new();
-        d.set_execution_backend(crate::page_profile::ExecutionBackend::HvPatch);
-        assert_eq!(
-            d.execution_backend(),
-            crate::page_profile::ExecutionBackend::HvPatch
-        );
+        let d = SyscallDispatcher::new();
         let caller_context = d.capture_one_task_context().expect("caller context");
         let caller = caller_context.thread().registry_id();
         let registry = crate::thread::ThreadRegistry::new(caller);
