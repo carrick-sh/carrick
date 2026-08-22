@@ -143,6 +143,8 @@ pub enum SysReg {
     Mair,
     Vbar,
     Cpacr,
+    /// `CNTKCTL_EL1` — per-vCPU EL0 physical/virtual counter access controls.
+    CntkctlEl1,
     /// `TPIDR_EL0` — the EL0 thread pointer (musl/glibc TLS base). Captured and
     /// restored across `fork(2)` so the child resumes with the correct thread
     /// pointer; otherwise the child's libc post-clone path computes thread-struct

@@ -3880,6 +3880,7 @@ fn install_fork_vcpu_snapshot_for_executor_boundary_test() {
             mair: 0,
             vbar: 0,
             cpacr: 0,
+            cntkctl_el1: 0,
             tpidr_el0: 0,
             tpidrro_el0: 0,
             tpidr_el1: 0,
@@ -8376,6 +8377,20 @@ fn configure_persistent_executor_invariant_registers(
 ) -> Result<(), TrapError> {
     for register in PERSISTENT_EXECUTOR_CONFIGURED_REGISTERS {
         write(register, persistent_executor_invariant_value(register, 0))?;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn restore_persistent_executor_invariant_registers(
+    mut write: impl FnMut(PersistentExecutorInvariantRegister, u64) -> Result<(), TrapError>,
+    mailbox_sp: u64,
+) -> Result<(), TrapError> {
+    for register in PERSISTENT_EXECUTOR_INVARIANT_REGISTERS {
+        write(
+            register,
+            persistent_executor_invariant_value(register, mailbox_sp),
+        )?;
     }
     Ok(())
 }
@@ -15153,6 +15168,31 @@ impl HvfVmState {
         Ok(())
     }
 
+    pub(crate) fn restore_persistent_worker_vcpu_boundary(
+        &self,
+        vcpu: &applevisor::vcpu::Vcpu,
+        mailbox: &MailboxBinding,
+    ) -> Result<(), TrapError> {
+        use applevisor::prelude::SysReg;
+
+        restore_persistent_executor_invariant_registers(
+            |register, value| {
+                let register = match register {
+                    PersistentExecutorInvariantRegister::VbarEl1 => SysReg::VBAR_EL1,
+                    PersistentExecutorInvariantRegister::SctlrEl1 => SysReg::SCTLR_EL1,
+                    PersistentExecutorInvariantRegister::MairEl1 => SysReg::MAIR_EL1,
+                    PersistentExecutorInvariantRegister::CpacrEl1 => SysReg::CPACR_EL1,
+                    PersistentExecutorInvariantRegister::CntkctlEl1 => SysReg::CNTKCTL_EL1,
+                    PersistentExecutorInvariantRegister::TpidrEl1 => SysReg::TPIDR_EL1,
+                    PersistentExecutorInvariantRegister::SpEl1 => SysReg::SP_EL1,
+                };
+                vcpu.set_sys_reg(register, value).map_err(hvf_error)
+            },
+            mailbox.slot().guest_address(),
+        )?;
+        Self::audit_executor_invariants(vcpu, mailbox.slot().guest_address())
+    }
+
     /// Build a [`ThreadSpec`] for a thread-creating `clone(CLONE_THREAD)`: clone the
     /// SHARED VM handle (Arc-refcounted, so the new thread can `vcpu_create` against
     /// it) + the SHARED protections/page-table Arcs + a COPY of the mapping
@@ -16985,6 +17025,7 @@ impl HvfInner {
                 mair: vcpu.get_sys_reg(SysReg::MAIR_EL1).map_err(hvf_error)?,
                 vbar: vcpu.get_sys_reg(SysReg::VBAR_EL1).map_err(hvf_error)?,
                 cpacr: vcpu.get_sys_reg(SysReg::CPACR_EL1).map_err(hvf_error)?,
+                cntkctl_el1: vcpu.get_sys_reg(SysReg::CNTKCTL_EL1).map_err(hvf_error)?,
                 tpidr_el0: vcpu.get_sys_reg(SysReg::TPIDR_EL0).map_err(hvf_error)?,
                 tpidrro_el0: vcpu.get_sys_reg(SysReg::TPIDRRO_EL0).map_err(hvf_error)?,
                 tpidr_el1: vcpu.get_sys_reg(SysReg::TPIDR_EL1).map_err(hvf_error)?,
@@ -17032,6 +17073,8 @@ impl HvfInner {
         vcpu.set_sys_reg(SysReg::ACTLR_EL1, snap.core.actlr_el1)
             .map_err(hvf_error)?;
         vcpu.set_sys_reg(SysReg::CPACR_EL1, snap.core.cpacr)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::CNTKCTL_EL1, snap.core.cntkctl_el1)
             .map_err(hvf_error)?;
         vcpu.set_sys_reg(SysReg::VBAR_EL1, snap.core.vbar)
             .map_err(hvf_error)?;
@@ -17127,6 +17170,8 @@ impl HvfInner {
         vcpu.set_sys_reg(SysReg::ACTLR_EL1, snap.core.actlr_el1)
             .map_err(hvf_error)?;
         vcpu.set_sys_reg(SysReg::CPACR_EL1, snap.core.cpacr)
+            .map_err(hvf_error)?;
+        vcpu.set_sys_reg(SysReg::CNTKCTL_EL1, snap.core.cntkctl_el1)
             .map_err(hvf_error)?;
         vcpu.set_sys_reg(SysReg::VBAR_EL1, snap.core.vbar)
             .map_err(hvf_error)?;
@@ -21322,6 +21367,23 @@ mod thread_sibling_tests {
             mailbox_sp,
         )
         .expect("complete fake executor invariant image");
+
+        for value in registers.values_mut() {
+            *value ^= 0x55aa_0000;
+        }
+        restore_persistent_executor_invariant_registers(
+            |register, value| {
+                registers.insert(register, value);
+                Ok(())
+            },
+            mailbox_sp,
+        )
+        .expect("detach restores every executor-local invariant");
+        audit_persistent_executor_invariant_registers(
+            |register| Ok(*registers.get(&register).unwrap_or(&0)),
+            mailbox_sp,
+        )
+        .expect("restored fake executor invariant image");
 
         for missing in PERSISTENT_EXECUTOR_INVARIANT_REGISTERS {
             let mut partial = registers.clone();

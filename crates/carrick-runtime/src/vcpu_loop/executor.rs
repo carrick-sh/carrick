@@ -474,6 +474,9 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 lease,
             ));
         }
+        if let Err(error) = engine.restore_persistent_executor_invariants() {
+            return Err(ExecutorSaveError::new(error, lease));
+        }
         let engine = self.current.take().unwrap_or_else(|| std::process::abort());
         let Some(binding) = self.binding.take() else {
             return Err(ExecutorSaveError::new(
@@ -4663,6 +4666,12 @@ pub(crate) mod tests {
                 ttbr0: marker + 0x4000,
                 ttbr1: marker + 0x5000,
                 tcr: marker + 0x6000,
+                sctlr_el1: marker + 0x6100,
+                mair_el1: marker + 0x6200,
+                vbar_el1: marker + 0x6300,
+                cpacr_el1: marker + 0x6400,
+                cntkctl_el1: marker + 0x6500,
+                tpidr_el1: marker + 0x6600,
                 actlr_el1: marker + 0x7000,
                 tpidr_el0: marker + 0x8000,
                 tpidrro_el0: marker + 0x9000,
@@ -6344,6 +6353,29 @@ pub(crate) mod tests {
             "terminal binding retirement follows detach/save and precedes worker destroy"
         );
         assert_eq!(report.created(), report.destroyed());
+    }
+
+    #[test]
+    fn persistent_save_restores_worker_controls_after_task_snapshot_before_detach() {
+        let source = include_str!("executor.rs");
+        let save = source
+            .split("fn save(\n        &mut self")
+            .nth(1)
+            .and_then(|tail| tail.split("fn take_pending_retirement").next())
+            .expect("persistent executor save body");
+        let snapshot = save
+            .find("snapshot_task_state_from_live_executor")
+            .expect("task snapshot and continuation export");
+        let publication = save
+            .find("lease.replace_task_state")
+            .expect("saved task state publication");
+        let neutralize = save
+            .find("engine.restore_persistent_executor_invariants")
+            .expect("worker control restore");
+        let detach = save.find("self.current.take()").expect("engine detach");
+        assert!(snapshot < publication);
+        assert!(publication < neutralize);
+        assert!(neutralize < detach);
     }
 
     #[test]
