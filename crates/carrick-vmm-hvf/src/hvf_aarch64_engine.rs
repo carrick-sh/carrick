@@ -600,6 +600,27 @@ pub fn materialize_hvpatch_process_without_vcpu(
         _not_send: std::marker::PhantomData,
     })
 }
+
+pub fn materialize_hvpatch_shared_process_without_vcpu(
+    identity: HvpatchCarrierTaskIdentity,
+    shared_kernel_mm: u64,
+    spec: Aarch64SiblingSpec<HvfAarch64Vmm>,
+) -> Result<HvpatchPreparedTaskOnlyEngineState, TrapError> {
+    let _no_executor_allocation = TaskOnlyNoExecutorAllocationGuard::capture();
+    let parts = spec.into_task_only_parts();
+    let carrier =
+        HvpatchPreparedCarrierTaskState::shared_process(identity, shared_kernel_mm, parts.builder)?;
+    #[cfg(test)]
+    TASK_ONLY_MATERIALIZATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(HvpatchPreparedTaskOnlyEngineState {
+        carrier,
+        snapshot: parts.snapshot,
+        page_tables: parts.page_tables,
+        protections: parts.protections,
+        process_asid: parts.process_asid,
+        _not_send: std::marker::PhantomData,
+    })
+}
 pub fn attach_task_engine(
     mut state: HvpatchTaskEngineState,
     executor: &mut HvfAarch64Vmm,

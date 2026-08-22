@@ -3624,6 +3624,29 @@ impl HvpatchTaskBinding {
         ))
     }
 
+    pub(crate) fn retire_detached_shared_mm_edge(&self) -> Result<(), crate::trap::TrapError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let backend = self.backend.lock().take().ok_or_else(|| {
+                crate::trap::TrapError::Hypervisor(
+                    "shared-MM edge cleanup has no saved backend".to_owned(),
+                )
+            })?;
+            backend
+                .downcast::<crate::vcpu_loop::executor::HvpatchTaskEngineBindingState>()
+                .map_err(|_| {
+                    crate::trap::TrapError::Hypervisor(
+                        "shared-MM edge cleanup backend type mismatch".to_owned(),
+                    )
+                })?;
+            Ok(())
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        Err(crate::trap::TrapError::Hypervisor(
+            "detached HVPatch cleanup requires macOS/aarch64 HVF".to_owned(),
+        ))
+    }
+
     pub(crate) fn retire_detached_exec_predecessor(&self) -> Result<(), crate::trap::TrapError> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {

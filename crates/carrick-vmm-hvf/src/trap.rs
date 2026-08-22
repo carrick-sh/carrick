@@ -795,6 +795,83 @@ mod task_only_carrier_directory_tests {
     }
 
     #[test]
+    fn shared_process_activation_has_no_process_inventory_transaction() {
+        let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+        let mut shared = HvpatchTaskInventoryAuthority::SharedProcess {
+            ledger: Arc::clone(&ledger),
+        };
+        let mm = std::num::NonZeroU64::new(777).unwrap();
+        assert!(
+            shared
+                .apply_process_inventory(|_| unreachable!(), mm)
+                .is_err()
+        );
+        assert_eq!(shared.phase_name(), "shared_process");
+        shared.activate(&[]).unwrap();
+        assert_eq!(shared.phase_name(), "shared_process");
+
+        let commit = empty_inventory_commit(778);
+        let challenge = commit.receipt_challenge();
+        let mut copied = HvpatchTaskInventoryAuthority::ProcessPrepared {
+            ledger,
+            staged: Vec::new(),
+            commit: Some(commit),
+            challenge: Some(challenge),
+        };
+        assert!(copied.activate(&[]).is_err());
+        assert_eq!(copied.phase_name(), "prepared");
+    }
+
+    #[test]
+    fn root_parent_shared_process_interns_by_exact_kernel_mm_without_parent_row() {
+        let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+        let publish = |task_serial, thread_serial, generation| {
+            directory
+                .publish(
+                    HvpatchCarrierTaskIdentity {
+                        task_serial,
+                        thread_serial,
+                        execution_generation: generation,
+                        linux_pid: task_serial as i32,
+                        linux_tid: thread_serial as i32,
+                        asid: 9,
+                    },
+                    test_state(&rollbacks),
+                    HvpatchPreparedTaskAuthority {
+                        shared_kernel_mm: Some(0xfeed),
+                        inventory: HvpatchTaskInventoryAuthority::SharedProcess {
+                            ledger: Arc::clone(&ledger),
+                        },
+                        ..HvpatchPreparedTaskAuthority::default()
+                    },
+                )
+                .unwrap()
+        };
+        let root_vfork_child = publish(101, 101, 1);
+        let nested_vfork_child = publish(202, 202, 1);
+        let first_mm = root_vfork_child
+            .registration
+            .as_ref()
+            .unwrap()
+            .task_mm
+            .as_ref()
+            .unwrap();
+        let second_mm = nested_vfork_child
+            .registration
+            .as_ref()
+            .unwrap()
+            .task_mm
+            .as_ref()
+            .unwrap();
+        assert!(Arc::ptr_eq(first_mm, second_mm));
+        drop(root_vfork_child);
+        drop(nested_vfork_child);
+        assert_eq!(rollbacks.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn shared_mm_retires_carrier_before_final_task_authority() {
         let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
         let rollbacks = Arc::new(AtomicUsize::new(0));
@@ -4551,6 +4628,9 @@ pub(crate) struct HvfTaskState {
     pending_exec_mm_root_slot: Option<(u64, u64)>,
     pending_exec_asid: Option<u16>,
     pending_exec_stage2_cleanup: Option<PendingExecStage2Cleanup>,
+    /// A distinct Linux process edge onto another process's live CLONE_VM MM.
+    /// Exit/exec drops this projection without retiring shared stage-2 state.
+    shared_process_mm: bool,
     /// The exception class of the most recent vCPU exit. We need to remember
     /// whether the trap came in via EL0 `svc` (`EC = 0x15`) or the EL1 vector
     /// stub's `hvc` (`EC = 0x16`) so `complete_syscall` knows whether to
@@ -4642,6 +4722,7 @@ struct PendingExecStage2Cleanup {
     mappings: Vec<HvfMappedRegion>,
     extents: std::collections::BTreeSet<(u64, usize)>,
     mm_root_slot: Option<(u64, u64)>,
+    shared_projection: bool,
     armed: bool,
 }
 
@@ -4654,6 +4735,14 @@ unsafe impl Send for PendingExecStage2Cleanup {}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PendingExecStage2Cleanup {
     fn retire(&mut self) -> Result<(), TrapError> {
+        if self.shared_projection {
+            // A CLONE_VM process edge owns only unowned descriptors into the
+            // parent's still-live MM. Exec drops that projection; it must not
+            // unmap stage-2, retire aliases, or release parent backing.
+            self.mappings.clear();
+            self.armed = false;
+            return Ok(());
+        }
         for &(ipa, size) in &self.extents {
             HvfVmState::retire_stage2_extent_from_mappings(&mut self.mappings, ipa, size as u64)?;
         }
@@ -4724,6 +4813,7 @@ impl HvfTaskState {
             pending_exec_mm_root_slot: None,
             pending_exec_asid: None,
             pending_exec_stage2_cleanup: None,
+            shared_process_mm: false,
             last_exit_class: 0,
             last_fault_esr: 0,
             is_forked_child: false,
@@ -4804,6 +4894,24 @@ impl HvfTaskState {
             TrapError::Hypervisor("idle HVPatch worker retained task authority".to_owned())
         })
     }
+
+    fn begin_exec_inventory(
+        &mut self,
+        retired: carrick_hal::FrameInventoryReservation,
+        replacement: carrick_hal::FrameInventoryReservation,
+    ) -> Result<(), TrapError> {
+        if self.shared_process_mm {
+            // The parent still owns this ledger. Exec starts a fresh backend
+            // ledger for the replacement MM; the retired commit is therefore
+            // intentionally empty and cannot remove the parent's mappings.
+            let frames = self.frame_inventory.lock().frames.clone();
+            self.frame_inventory = HvpatchFrameInventoryState::new(std::sync::Arc::new(
+                parking_lot::Mutex::new(HvpatchFrameInventory::with_frames(frames)),
+            ));
+        }
+        self.frame_inventory
+            .begin_exec_inventory(retired, replacement)
+    }
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
@@ -4838,6 +4946,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
         pending_exec_mm_root_slot: None,
         pending_exec_asid: None,
         pending_exec_stage2_cleanup: None,
+        shared_process_mm: false,
         last_exit_class: 0,
         last_fault_esr: 0,
         is_forked_child: false,
@@ -6121,6 +6230,12 @@ enum HvpatchCarrierTaskState {
     Sibling {
         vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     },
+    /// A distinct Linux process which retains an already-published MM.  The
+    /// existing carrier-MM row owns the VM/stage-2 lifecycle; this edge owns no
+    /// replacement carrier authority of its own.
+    SharedProcess {
+        vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+    },
     Process {
         vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
         stage2_leases: Vec<GlobalFrameStage2Lease>,
@@ -6168,6 +6283,7 @@ struct HvpatchCarrierTaskRow {
 struct HvpatchMmAuthorityKey {
     task_serial: u64,
     mm_root_slot: Option<(u64, u64)>,
+    shared_kernel_mm: Option<u64>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6228,6 +6344,9 @@ impl HvpatchTaskMappingState {
 struct HvpatchPreparedTaskAuthority {
     mappings: Vec<HvpatchTaskMappingState>,
     mm_root_slot: Option<(u64, u64)>,
+    /// Shared processes use the Kernel's exact MM identity to intern one MM
+    /// projection even when the root parent has no task-only directory row.
+    shared_kernel_mm: Option<u64>,
     inventory: HvpatchTaskInventoryAuthority,
     cow_authority: Option<std::sync::Arc<dyn carrick_hal::FrameCowAuthority>>,
     cow_identity: Option<carrick_hal::FrameCowIdentity>,
@@ -6247,6 +6366,9 @@ enum HvpatchTaskInventoryAuthority {
     #[default]
     Absent,
     SiblingShared {
+        ledger: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
+    },
+    SharedProcess {
         ledger: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
     },
     ProcessPrepared {
@@ -6283,6 +6405,7 @@ impl HvpatchTaskInventoryAuthority {
     ) -> Option<std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>> {
         match self {
             Self::SiblingShared { ledger }
+            | Self::SharedProcess { ledger }
             | Self::ProcessPrepared { ledger, .. }
             | Self::InventoryPublished { ledger, .. }
             | Self::Active { ledger, .. } => Some(std::sync::Arc::clone(ledger)),
@@ -6356,6 +6479,10 @@ impl HvpatchTaskInventoryAuthority {
         match current {
             Self::SiblingShared { ledger } => {
                 *self = Self::SiblingShared { ledger };
+                Ok(())
+            }
+            Self::SharedProcess { ledger } => {
+                *self = Self::SharedProcess { ledger };
                 Ok(())
             }
             Self::InventoryPublished {
@@ -6498,7 +6625,10 @@ impl HvpatchTaskInventoryAuthority {
 
     fn rollback_unpublished(&mut self) -> Result<(), TrapError> {
         match std::mem::replace(self, Self::Retired) {
-            Self::Absent | Self::SiblingShared { .. } | Self::Retired => Ok(()),
+            Self::Absent
+            | Self::SiblingShared { .. }
+            | Self::SharedProcess { .. }
+            | Self::Retired => Ok(()),
             Self::ProcessPrepared {
                 ledger,
                 staged,
@@ -6521,6 +6651,7 @@ impl HvpatchTaskInventoryAuthority {
         match self {
             Self::Absent => "absent",
             Self::SiblingShared { .. } => "sibling_shared",
+            Self::SharedProcess { .. } => "shared_process",
             Self::ProcessPrepared { .. } => "prepared",
             Self::InventoryPublished { .. } => "inventory_published",
             Self::Active { .. } => "active",
@@ -7141,11 +7272,15 @@ impl HvpatchTaskRegistration {
             .task_mm
             .as_ref()
             .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?;
-        let ledger = task_mm
-            .inventory
-            .lock()
+        let inventory = task_mm.inventory.lock();
+        let shared_process_mm = matches!(
+            *inventory,
+            HvpatchTaskInventoryAuthority::SharedProcess { .. }
+        );
+        let ledger = inventory
             .shared_runtime_ledger()
             .ok_or_else(|| TrapError::Hypervisor("inactive HVPatch task inventory".to_owned()))?;
+        drop(inventory);
         let cow_authority = self.cow_authority.clone().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch task lacks live COW authority".to_owned())
         })?;
@@ -7172,6 +7307,7 @@ impl HvpatchTaskRegistration {
             pending_exec_mm_root_slot: None,
             pending_exec_asid: None,
             pending_exec_stage2_cleanup: None,
+            shared_process_mm,
             last_exit_class: 0,
             last_fault_esr: 0,
             is_forked_child: false,
@@ -7313,9 +7449,30 @@ impl HvpatchPreparedCarrierTaskState {
         identity: HvpatchCarrierTaskIdentity,
         spec: ThreadSpec,
     ) -> Result<Self, TrapError> {
+        Self::shared_mm_projection(identity, None, spec)
+    }
+
+    pub(crate) fn shared_process(
+        identity: HvpatchCarrierTaskIdentity,
+        shared_kernel_mm: u64,
+        spec: ThreadSpec,
+    ) -> Result<Self, TrapError> {
+        if shared_kernel_mm == 0 {
+            return Err(TrapError::Hypervisor(
+                "shared-process HVPatch MM identity is invalid".to_owned(),
+            ));
+        }
+        Self::shared_mm_projection(identity, Some(shared_kernel_mm), spec)
+    }
+
+    fn shared_mm_projection(
+        identity: HvpatchCarrierTaskIdentity,
+        shared_kernel_mm: Option<u64>,
+        spec: ThreadSpec,
+    ) -> Result<Self, TrapError> {
         if !spec.persistent_vm_lifecycle {
             return Err(TrapError::Hypervisor(
-                "task-only sibling requires persistent HVPatch VM".to_owned(),
+                "task-only shared-MM projection requires persistent HVPatch VM".to_owned(),
             ));
         }
         let ThreadSpec {
@@ -7359,12 +7516,23 @@ impl HvpatchPreparedCarrierTaskState {
             .collect();
         Ok(Self::new(
             identity,
-            HvpatchCarrierTaskState::Sibling { vm },
+            if shared_kernel_mm.is_some() {
+                HvpatchCarrierTaskState::SharedProcess { vm }
+            } else {
+                HvpatchCarrierTaskState::Sibling { vm }
+            },
             HvpatchPreparedTaskAuthority {
                 mappings,
                 mm_root_slot,
-                inventory: HvpatchTaskInventoryAuthority::SiblingShared {
-                    ledger: frame_inventory,
+                shared_kernel_mm,
+                inventory: if shared_kernel_mm.is_some() {
+                    HvpatchTaskInventoryAuthority::SharedProcess {
+                        ledger: frame_inventory,
+                    }
+                } else {
+                    HvpatchTaskInventoryAuthority::SiblingShared {
+                        ledger: frame_inventory,
+                    }
                 },
                 cow_armed: Some(cow_armed),
                 cow_deferred_publications: Some(cow_deferred_publications),
@@ -7505,8 +7673,13 @@ impl HvpatchCarrierTaskStateDirectory {
             // A concrete root slot is the exact MM identity and is shared by
             // every thread binding. Root/no-slot tasks fall back to the task
             // serial so unrelated roots never alias one MM authority.
-            task_serial: task.mm_root_slot.map_or(identity.task_serial, |_| 0),
+            task_serial: if task.shared_kernel_mm.is_some() {
+                0
+            } else {
+                task.mm_root_slot.map_or(identity.task_serial, |_| 0)
+            },
             mm_root_slot: task.mm_root_slot,
+            shared_kernel_mm: task.shared_kernel_mm,
         };
         let process_owner = matches!(
             task.inventory,
@@ -7541,6 +7714,15 @@ impl HvpatchCarrierTaskStateDirectory {
             Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
         ) = match state {
             HvpatchCarrierTaskState::Sibling { vm } => (
+                existing_carrier_mm.or_else(|| {
+                    Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
+                        _vm: vm,
+                        _stage2_leases: Vec::new(),
+                    }))
+                }),
+                None,
+            ),
+            HvpatchCarrierTaskState::SharedProcess { vm } => (
                 existing_carrier_mm.or_else(|| {
                     Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
                         _vm: vm,
@@ -7652,7 +7834,7 @@ impl HvpatchCarrierTaskStateDirectory {
 impl HvpatchCarrierTaskState {
     fn abort(self) -> Result<(), TrapError> {
         match self {
-            Self::Sibling { .. } | Self::Process { .. } => Ok(()),
+            Self::Sibling { .. } | Self::SharedProcess { .. } | Self::Process { .. } => Ok(()),
             #[cfg(test)]
             Self::Test { rollbacks, .. } => {
                 rollbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -9151,8 +9333,7 @@ impl HvfVmState {
         retired: carrick_hal::FrameInventoryReservation,
         replacement: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
-        self.frame_inventory
-            .begin_exec_inventory(retired, replacement)
+        self.task.begin_exec_inventory(retired, replacement)
     }
 
     pub(crate) fn inject_next_begin_exec_inventory_failure(&mut self) {
@@ -9503,6 +9684,7 @@ impl HvfVmState {
                 pending_exec_mm_root_slot: None,
                 pending_exec_asid: None,
                 pending_exec_stage2_cleanup: None,
+                shared_process_mm: false,
                 last_exit_class: 0,
                 last_fault_esr: 0,
                 is_forked_child: false,
@@ -15044,6 +15226,7 @@ impl HvfVmState {
                 pending_exec_mm_root_slot: None,
                 pending_exec_asid: None,
                 pending_exec_stage2_cleanup: None,
+                shared_process_mm: false,
                 last_exit_class: 0,
                 last_fault_esr: 0,
                 is_forked_child: false,
@@ -16113,6 +16296,7 @@ impl HvfVmState {
                 pending_exec_mm_root_slot: None,
                 pending_exec_asid: None,
                 pending_exec_stage2_cleanup: None,
+                shared_process_mm: false,
                 last_exit_class: 0,
                 last_fault_esr: 0,
                 is_forked_child: false,
@@ -16519,12 +16703,14 @@ impl HvfVmState {
         let drop_backings_started = std::time::Instant::now();
         if self.persistent_vm_lifecycle {
             let predecessor_mappings = std::mem::take(&mut self.mappings);
+            let shared_projection = self.shared_process_mm;
             if self
                 .pending_exec_stage2_cleanup
                 .replace(PendingExecStage2Cleanup {
                     mappings: predecessor_mappings,
                     extents: retired_physical_extents.clone(),
                     mm_root_slot: predecessor_mm_root_slot,
+                    shared_projection,
                     armed: true,
                 })
                 .is_some()
@@ -16548,6 +16734,7 @@ impl HvfVmState {
         self.last_fault_esr = 0;
         self.is_forked_child = was_forked_child;
         self.forked_no_exec = false; // execve gives a fresh VM: no longer a live forked-no-exec child
+        self.shared_process_mm = false;
         // execve replaces the address space; any prior PROT_NONE ranges are gone.
         self.protections = std::sync::Arc::new(MemoryProtections::default());
         self.seed_readonly_spans_from_plan(plan);
@@ -19135,6 +19322,7 @@ mod frame_inventory_backend_tests {
             mappings: vec![mapping],
             extents: [(0x1234_0000, 0x4000)].into_iter().collect(),
             mm_root_slot: Some((7 << 20, 0x20_0000)),
+            shared_projection: false,
             armed: true,
         });
 
@@ -19144,6 +19332,26 @@ mod frame_inventory_backend_tests {
         assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!alias_backing_is_live(host_addr as usize));
         assert!(task.pending_exec_stage2_cleanup.is_none());
+    }
+
+    #[test]
+    fn shared_process_exec_splits_inventory_without_retiring_parent_ledger() {
+        let mut task = hvpatch_task_state_test_fixture(8, 0x8000, 8);
+        task.shared_process_mm = true;
+        let parent_ledger = task.frame_inventory.shared_ledger();
+        parent_ledger.lock().initialized = true;
+        let (retired, replacement) = inventory_pair(11);
+
+        task.begin_exec_inventory(retired, replacement)
+            .expect("arm shared-process exec inventory");
+
+        let replacement_ledger = task.frame_inventory.shared_ledger();
+        assert!(!std::sync::Arc::ptr_eq(&parent_ledger, &replacement_ledger));
+        assert!(parent_ledger.lock().initialized);
+        assert!(parent_ledger.lock().retired_reservation.is_none());
+        let replacement = replacement_ledger.lock();
+        assert!(replacement.retired_reservation.is_some());
+        assert!(replacement.replacement_reservation.is_some());
     }
 
     #[test]

@@ -617,6 +617,12 @@ pub trait PersistentTaskBinding {
         ))
     }
 
+    fn retire_detached_shared_mm_edge(&self) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "task binding has no detached shared-MM cleanup authority".to_owned(),
+        ))
+    }
+
     fn retire_detached_exec_predecessor(&self) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "task binding has no detached exec predecessor authority".to_owned(),
@@ -647,6 +653,10 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
         crate::vcpu_loop::continuation::HvpatchTaskBinding::retire_detached_address_space(self)
     }
 
+    fn retire_detached_shared_mm_edge(&self) -> Result<(), TrapError> {
+        crate::vcpu_loop::continuation::HvpatchTaskBinding::retire_detached_shared_mm_edge(self)
+    }
+
     fn retire_detached_exec_predecessor(&self) -> Result<(), TrapError> {
         crate::vcpu_loop::continuation::HvpatchTaskBinding::retire_detached_exec_predecessor(self)
     }
@@ -670,7 +680,7 @@ pub struct ExecutorSubmissionContext<'a> {
 pub(crate) struct PendingExecReplacement {
     pub(crate) transition: crate::kernel::exec::CommittedExecTransition,
     pub(crate) replacement_mm: Arc<crate::hvpatch::Stage1MmLease>,
-    pub(crate) retired_mm: crate::hvpatch::Stage1MmRetirement,
+    pub(crate) retired_mm: Option<crate::hvpatch::Stage1MmRetirement>,
 }
 
 /// Borrowed worker authority passed into one engine-resident logical quantum.
@@ -2846,6 +2856,7 @@ where
         );
 
         let mut pending_exec_retirement = None;
+        let mut pending_exec_cleanup = false;
         let exit = loop {
             let lease = running.take_lease();
             #[cfg(test)]
@@ -2942,7 +2953,8 @@ where
                     }
                 };
                 binding = replacement_record.binding;
-                pending_exec_retirement = Some(retired_mm);
+                pending_exec_retirement = retired_mm;
+                pending_exec_cleanup = true;
                 submission_authority = replacement_record.authority;
                 thread = running.thread_key();
                 generation = successor_generation;
@@ -3092,7 +3104,7 @@ where
             return Err(with_settlement_error(error.to_string(), settlement));
         }
         let terminal_retirement = binding.take_address_space_retirement();
-        if terminal_retirement.is_some() && pending_exec_retirement.is_some() {
+        if terminal_retirement.is_some() && pending_exec_cleanup {
             std::process::abort();
         }
         if let Some(retirement) = pending_exec_retirement.take() {
@@ -3137,12 +3149,10 @@ where
                     settlement,
                 ));
             }
+            pending_exec_cleanup = false;
         }
-        if let Some(retirement) = terminal_retirement {
-            if let Some(stage1) = retirement.retirement()
-                && let Err(error) =
-                    control.invalidate_after_exec(stage1, executor_id, backend, boundary, receipts)
-            {
+        if pending_exec_cleanup {
+            if let Err(error) = binding.retire_detached_exec_predecessor() {
                 let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                     resolver.as_ref(),
                     scheduler,
@@ -3151,11 +3161,33 @@ where
                     receipts,
                 );
                 return Err(with_settlement_error(
-                    format!("terminal ASID retirement failed: {error}"),
+                    format!("shared-MM exec detached predecessor cleanup failed: {error}"),
                     settlement,
                 ));
             }
-            if let Err(error) = binding.retire_detached_address_space() {
+        }
+        if let Some(retirement) = terminal_retirement {
+            let cleanup = if let Some(stage1) = retirement.retirement() {
+                if let Err(error) =
+                    control.invalidate_after_exec(stage1, executor_id, backend, boundary, receipts)
+                {
+                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    );
+                    return Err(with_settlement_error(
+                        format!("terminal ASID retirement failed: {error}"),
+                        settlement,
+                    ));
+                }
+                binding.retire_detached_address_space()
+            } else {
+                binding.retire_detached_shared_mm_edge()
+            };
+            if let Err(error) = cleanup {
                 let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                     resolver.as_ref(),
                     scheduler,

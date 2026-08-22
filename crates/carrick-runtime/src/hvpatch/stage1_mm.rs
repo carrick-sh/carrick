@@ -663,7 +663,10 @@ mod tests {
             )
         );
         assert_eq!(backend.binding(), initial);
-        retired.complete().expect("ack retire");
+        retired
+            .expect("unshared exec retirement")
+            .complete()
+            .expect("ack retire");
         assert_eq!(backend.binding(), initial);
     }
 

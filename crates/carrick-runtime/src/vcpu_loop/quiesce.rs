@@ -6,6 +6,32 @@
 
 use super::*;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+enum PreparedHvpatchProcessMm {
+    Copied(crate::hvpatch::PreparedStage1Mm),
+    Shared {
+        parent_task: crate::kernel::TaskKey,
+        lease: Arc<crate::hvpatch::Stage1MmLease>,
+    },
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl PreparedHvpatchProcessMm {
+    fn binding(&self) -> crate::kernel::MmBinding {
+        match self {
+            Self::Copied(mm) => mm.binding(),
+            Self::Shared { lease, .. } => lease.binding(),
+        }
+    }
+
+    fn asid_generation(&self) -> u64 {
+        match self {
+            Self::Copied(mm) => mm.asid_generation().generation(),
+            Self::Shared { lease, .. } => lease.asid_generation().generation(),
+        }
+    }
+}
+
 fn read_optional_fork_output(
     memory: &impl GuestMemory,
     address: Option<u64>,
@@ -1442,28 +1468,50 @@ where
         let shares_mm = clone_plan.mm() == crate::kernel::CloneObjectMode::Share;
         let child_id = reservation.child_id();
         let child_pid = child_id.raw();
-        let prepared_mm = match parent_process.mm_resources().prepare_child() {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                if quiesced {
-                    process_barrier.end_quiesce();
+        let parent_task = parent_context.task().key();
+        let prepared_mm = if shares_mm {
+            match parent_process.mm_resources().lease(parent_task) {
+                Ok(lease) => PreparedHvpatchProcessMm::Shared { parent_task, lease },
+                Err(error) => {
+                    if quiesced {
+                        process_barrier.end_quiesce();
+                    }
+                    process_barrier.end_fork();
+                    return Err(RuntimeError::Configuration(format!(
+                        "retain exact shared HVPatch MM for vfork: {error}"
+                    )));
                 }
-                process_barrier.end_fork();
-                tracing::warn!(%error, "hvpatch stage-1 root-slot preparation failed; fork(2) = EAGAIN");
-                return Ok(PreparedInProcessFork::Complete(Some(
-                    crate::linux_abi::LINUX_EAGAIN.guest_retval(),
-                )));
+            }
+        } else {
+            match parent_process.mm_resources().prepare_child() {
+                Ok(prepared) => PreparedHvpatchProcessMm::Copied(prepared),
+                Err(error) => {
+                    if quiesced {
+                        process_barrier.end_quiesce();
+                    }
+                    process_barrier.end_fork();
+                    tracing::warn!(%error, "hvpatch stage-1 root-slot preparation failed; fork(2) = EAGAIN");
+                    return Ok(PreparedInProcessFork::Complete(Some(
+                        crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                    )));
+                }
             }
         };
         let child_binding = prepared_mm.binding();
-        let Some(root_slot) = prepared_mm.root_slot() else {
-            if quiesced {
-                process_barrier.end_quiesce();
+        let root_slot = match &prepared_mm {
+            PreparedHvpatchProcessMm::Copied(prepared) => {
+                let Some(root_slot) = prepared.root_slot() else {
+                    if quiesced {
+                        process_barrier.end_quiesce();
+                    }
+                    process_barrier.end_fork();
+                    return Err(RuntimeError::Configuration(
+                        "hvpatch prepared child has no stage-1 root slot".to_owned(),
+                    ));
+                };
+                Some(root_slot)
             }
-            process_barrier.end_fork();
-            return Err(RuntimeError::Configuration(
-                "hvpatch prepared child has no stage-1 root slot".to_owned(),
-            ));
+            PreparedHvpatchProcessMm::Shared { .. } => None,
         };
         let child_tid = ThreadId::from_guest_supplied_tid(child_pid);
         // The kernel mm association follows Linux clone semantics even while
@@ -1473,7 +1521,10 @@ where
         let prepared_result = if clone_plan.mm() == crate::kernel::CloneObjectMode::Share {
             reservation.prepare_shared_mm(child_tid)
         } else {
-            reservation.prepare_with_mm_backend(prepared_mm.backend(), child_tid)
+            let PreparedHvpatchProcessMm::Copied(prepared) = &prepared_mm else {
+                std::process::abort();
+            };
+            reservation.prepare_with_mm_backend(prepared.backend(), child_tid)
         };
         let mut prepared_fork = match prepared_result {
             Ok(prepared) => prepared,
@@ -1488,38 +1539,50 @@ where
             }
         };
         let child_mm_id = prepared_fork.child_mm_id();
-        let inventory_extent_count = ops.inventory_extent_count(memory);
-        let inventory_capacity = match inventory_capacity_for_extents(inventory_extent_count) {
-            Ok(capacity) => capacity,
-            Err(error) => {
-                if quiesced {
-                    process_barrier.end_quiesce();
+        let (inventory_preparation, _inventory_abandon) = if shares_mm {
+            (
+                HvpatchProcessInventoryPreparation::SharedMm {
+                    kernel_mm: child_mm_id.raw(),
+                },
+                None,
+            )
+        } else {
+            let inventory_extent_count = ops.inventory_extent_count(memory);
+            let inventory_capacity = match inventory_capacity_for_extents(inventory_extent_count) {
+                Ok(capacity) => capacity,
+                Err(error) => {
+                    if quiesced {
+                        process_barrier.end_quiesce();
+                    }
+                    process_barrier.end_fork();
+                    return Err(error);
                 }
-                process_barrier.end_fork();
-                return Err(error);
-            }
-        };
-        let inventory_reservation = match parent_process.kernel_graph().reserve_frame_inventory(
-            inventory_extent_count,
-            inventory_extent_count,
-            inventory_capacity,
-        ) {
-            Ok(reservation) => reservation,
-            Err(error) => {
-                if quiesced {
-                    process_barrier.end_quiesce();
+            };
+            let inventory_reservation = match parent_process.kernel_graph().reserve_frame_inventory(
+                inventory_extent_count,
+                inventory_extent_count,
+                inventory_capacity,
+            ) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    if quiesced {
+                        process_barrier.end_quiesce();
+                    }
+                    process_barrier.end_fork();
+                    return Err(RuntimeError::Configuration(format!(
+                        "reserve HVPatch child frame inventory: {error}"
+                    )));
                 }
-                process_barrier.end_fork();
-                return Err(RuntimeError::Configuration(format!(
-                    "reserve HVPatch child frame inventory: {error}"
-                )));
-            }
+            };
+            let inventory_transaction = inventory_reservation.transaction();
+            (
+                HvpatchProcessInventoryPreparation::Copied(inventory_reservation),
+                Some(InventoryAbandon::new(
+                    parent_process.kernel_graph().frame_inventory(),
+                    [inventory_transaction],
+                )),
+            )
         };
-        let inventory_transaction = inventory_reservation.transaction();
-        let _inventory_abandon = InventoryAbandon::new(
-            parent_process.kernel_graph().frame_inventory(),
-            [inventory_transaction],
-        );
         // The reservation and its complete bounded storage exist before this
         // topology lock. Keep it local until every guest-pointer/pidfd preflight
         // succeeds, so EFAULT cannot occupy the backend's one process slot.
@@ -1630,7 +1693,7 @@ where
 
         fork_stage_started = Instant::now();
         let (task_key, thread_key, _, generation) = prepared_fork.prepared_execution_identity();
-        let asid_generation = prepared_mm.backend().asid_generation().generation();
+        let asid_generation = prepared_mm.asid_generation();
         let identity = carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskIdentity {
             task_serial: task_key.serial.raw(),
             thread_serial: thread_key.serial.raw(),
@@ -1641,7 +1704,7 @@ where
         };
         let (prepared_backend, cpu, child_kicker) = match ops.prepare(
             memory,
-            inventory_reservation,
+            inventory_preparation,
             carrick_hal::ProcessForkRequest {
                 entry: carrick_hal::GuestEntryRegs {
                     return_value: 0,
@@ -1649,8 +1712,8 @@ where
                     tls: None,
                 },
                 child_ttbr0: child_binding.ttbr0.raw(),
-                root_slot_base: root_slot.base(),
-                root_slot_size: root_slot.size(),
+                root_slot_base: root_slot.map_or(0, |slot| slot.base()),
+                root_slot_size: root_slot.map_or(0, |slot| slot.size()),
                 shares_mm,
                 child_tid,
                 forking_tid: self.this_tid,
@@ -1722,8 +1785,10 @@ where
             }
             ops.abort(prepared_backend)
                 .unwrap_or_else(|_| std::process::abort());
-            ops.rollback_parent(memory)
-                .unwrap_or_else(|_| std::process::abort());
+            if !shares_mm {
+                ops.rollback_parent(memory)
+                    .unwrap_or_else(|_| std::process::abort());
+            }
             rollback_pidfd(installed_pidfd);
             if quiesced {
                 process_barrier.end_quiesce();
@@ -1747,8 +1812,10 @@ where
             }
             ops.abort(prepared_backend)
                 .unwrap_or_else(|_| std::process::abort());
-            ops.rollback_parent(memory)
-                .unwrap_or_else(|_| std::process::abort());
+            if !shares_mm {
+                ops.rollback_parent(memory)
+                    .unwrap_or_else(|_| std::process::abort());
+            }
             rollback_pidfd(installed_pidfd);
             if quiesced {
                 process_barrier.end_quiesce();
@@ -1771,8 +1838,10 @@ where
             }
             ops.abort(prepared_backend)
                 .unwrap_or_else(|_| std::process::abort());
-            ops.rollback_parent(memory)
-                .unwrap_or_else(|_| std::process::abort());
+            if !shares_mm {
+                ops.rollback_parent(memory)
+                    .unwrap_or_else(|_| std::process::abort());
+            }
             rollback_pidfd(installed_pidfd);
             if quiesced {
                 process_barrier.end_quiesce();
@@ -1780,10 +1849,12 @@ where
             process_barrier.end_fork();
             return Err(error);
         }
-        ops.commit_parent(memory).unwrap_or_else(|error| {
-            tracing::error!(%error, "commit parent HVPatch fork transaction");
-            std::process::abort();
-        });
+        if !shares_mm {
+            ops.commit_parent(memory).unwrap_or_else(|error| {
+                tracing::error!(%error, "commit parent HVPatch fork transaction");
+                std::process::abort();
+            });
+        }
         drop(topology);
 
         fork_stage_started = Instant::now();
@@ -1803,10 +1874,15 @@ where
             .unwrap_or_else(|| std::process::abort())
             .retain_exact();
         let child_key = child_context.task().key();
-        let child_backend = match parent_process
-            .mm_resources()
-            .publish_child(child_context.task().key(), prepared_mm)
-        {
+        let child_backend_result = match prepared_mm {
+            PreparedHvpatchProcessMm::Copied(prepared) => parent_process
+                .mm_resources()
+                .publish_child(child_context.task().key(), prepared),
+            PreparedHvpatchProcessMm::Shared { parent_task, .. } => parent_process
+                .mm_resources()
+                .publish_shared_child(parent_task, child_context.task().key()),
+        };
+        let child_backend = match child_backend_result {
             Ok(backend) => backend,
             Err(error) => {
                 // Kernel publication is already authoritative; a backend root-slot
@@ -1879,11 +1955,13 @@ where
         if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::TokenBind) {
             return Err(ops.fail_stop(error));
         }
-        ops.apply_inventory(&task_backend, child_context.kernel(), child_mm_id)
-            .unwrap_or_else(|error| {
-                tracing::error!(child_pid, %error, "apply process child frame inventory");
-                std::process::abort();
-            });
+        if !shares_mm {
+            ops.apply_inventory(&task_backend, child_context.kernel(), child_mm_id)
+                .unwrap_or_else(|error| {
+                    tracing::error!(child_pid, %error, "apply process child frame inventory");
+                    std::process::abort();
+                });
+        }
         ops.activate_child(&mut task_backend)
             .unwrap_or_else(|error| {
                 tracing::error!(child_pid, %error, "activate process child task state");

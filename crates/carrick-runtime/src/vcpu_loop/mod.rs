@@ -2533,6 +2533,15 @@ type HvpatchProcessPreparation<P> = (
 );
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+enum HvpatchProcessInventoryPreparation {
+    /// A plain fork owns a new MM and must publish its staged frame inventory.
+    Copied(carrick_hal::FrameInventoryReservation),
+    /// `CLONE_VM`/vfork retains the parent's exact MM/inventory authority.  No
+    /// process inventory transaction exists for the child edge.
+    SharedMm { kernel_mm: u64 },
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 trait HvpatchProcessBackendOps<E: ThreadedEngine, M: GuestMemory> {
     type Prepared;
     type Backend;
@@ -2541,7 +2550,7 @@ trait HvpatchProcessBackendOps<E: ThreadedEngine, M: GuestMemory> {
     fn prepare(
         &mut self,
         memory: &mut M,
-        inventory: carrick_hal::FrameInventoryReservation,
+        inventory: HvpatchProcessInventoryPreparation,
         request: carrick_hal::ProcessForkRequest,
         identity: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskIdentity,
         mm_generation: u64,
@@ -2594,47 +2603,72 @@ where
     fn prepare(
         &mut self,
         memory: &mut E,
-        inventory: carrick_hal::FrameInventoryReservation,
+        inventory: HvpatchProcessInventoryPreparation,
         request: carrick_hal::ProcessForkRequest,
         identity: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskIdentity,
         mm_generation: u64,
         asid_generation: u64,
     ) -> Result<HvpatchProcessPreparation<Self::Prepared>, RuntimeError> {
         type HvfEngine = carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine;
-        memory
-            .begin_process_inventory(inventory)
-            .map_err(RuntimeError::Trap)?;
-        let spec = match memory.build_process_spec(request) {
-            Ok(spec) => spec,
-            Err(error) => {
-                let _ = memory.cancel_process_inventory();
-                memory.rollback_process_fork().map_err(RuntimeError::Trap)?;
-                return Err(RuntimeError::Trap(error));
-            }
-        };
-        let spec = match (Box::new(spec) as Box<dyn std::any::Any>)
-            .downcast::<<HvfEngine as ThreadedEngine>::ProcessSpec>()
-        {
-            Ok(spec) => spec,
-            Err(_) => {
-                let _ = memory.cancel_process_inventory();
-                memory.rollback_process_fork().map_err(RuntimeError::Trap)?;
-                return Err(RuntimeError::Configuration(
-                    "persistent HVPatch fork rejected non-HVF process spec".to_owned(),
-                ));
-            }
-        };
-        let prepared =
-            match carrick_vmm_hvf::hvf_aarch64_engine::materialize_hvpatch_process_without_vcpu(
-                identity, *spec,
-            ) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    let _ = memory.cancel_process_inventory();
-                    memory.rollback_process_fork().map_err(RuntimeError::Trap)?;
-                    return Err(RuntimeError::Trap(error));
+        let prepared = match inventory {
+            HvpatchProcessInventoryPreparation::Copied(inventory) => {
+                memory
+                    .begin_process_inventory(inventory)
+                    .map_err(RuntimeError::Trap)?;
+                let spec = match memory.build_process_spec(request) {
+                    Ok(spec) => spec,
+                    Err(error) => {
+                        let _ = memory.cancel_process_inventory();
+                        memory.rollback_process_fork().map_err(RuntimeError::Trap)?;
+                        return Err(RuntimeError::Trap(error));
+                    }
+                };
+                let spec = match (Box::new(spec) as Box<dyn std::any::Any>)
+                    .downcast::<<HvfEngine as ThreadedEngine>::ProcessSpec>()
+                {
+                    Ok(spec) => spec,
+                    Err(_) => {
+                        let _ = memory.cancel_process_inventory();
+                        memory.rollback_process_fork().map_err(RuntimeError::Trap)?;
+                        return Err(RuntimeError::Configuration(
+                            "persistent HVPatch fork rejected non-HVF process spec".to_owned(),
+                        ));
+                    }
+                };
+                match carrick_vmm_hvf::hvf_aarch64_engine::materialize_hvpatch_process_without_vcpu(
+                    identity, *spec,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        let _ = memory.cancel_process_inventory();
+                        memory.rollback_process_fork().map_err(RuntimeError::Trap)?;
+                        return Err(RuntimeError::Trap(error));
+                    }
                 }
-            };
+            }
+            HvpatchProcessInventoryPreparation::SharedMm { kernel_mm } => {
+                if !request.shares_mm {
+                    return Err(RuntimeError::Configuration(
+                        "shared HVPatch process preparation requires CLONE_VM".to_owned(),
+                    ));
+                }
+                let engine = (memory as &dyn std::any::Any)
+                    .downcast_ref::<HvfEngine>()
+                    .ok_or_else(|| {
+                        RuntimeError::Configuration(
+                            "persistent HVPatch shared process rejected non-HVF engine".to_owned(),
+                        )
+                    })?;
+                let spec = <HvfEngine as ThreadedEngine>::build_sibling_spec(engine, request.entry)
+                    .map_err(RuntimeError::Trap)?;
+                carrick_vmm_hvf::hvf_aarch64_engine::materialize_hvpatch_shared_process_without_vcpu(
+                    identity,
+                    kernel_mm,
+                    spec,
+                )
+                .map_err(RuntimeError::Trap)?
+            }
+        };
         let cpu = match prepared.initial_cpu_state(mm_generation, asid_generation) {
             Ok(cpu) => cpu,
             Err(error) => {
@@ -3083,7 +3117,17 @@ where
             }
         };
         let terminal_mm = terminal_context.shared().mm().id();
-        let extent_count = engine.frame_inventory_extent_count();
+        let owns_final_mm = process
+            .owns_final_mm_edge(terminal_context.task().key())
+            .unwrap_or_else(|failure| {
+                tracing::error!(%failure, "classify persistent terminal MM ownership");
+                std::process::abort();
+            });
+        let extent_count = if owns_final_mm {
+            engine.frame_inventory_extent_count()
+        } else {
+            0
+        };
         if extent_count > 0 {
             let capacity = carrick_hal::FrameEventCapacity::for_event_count(
                 extent_count
@@ -3139,12 +3183,14 @@ where
                 std::process::abort();
             });
         self.kernel.unregister_hvpatch_runtime_endpoint();
-        if self
-            .pending_terminal_inventory
-            .replace((Arc::clone(terminal_context.kernel()), terminal_mm))
-            .is_some()
-        {
-            std::process::abort();
+        if owns_final_mm {
+            if self
+                .pending_terminal_inventory
+                .replace((Arc::clone(terminal_context.kernel()), terminal_mm))
+                .is_some()
+            {
+                std::process::abort();
+            }
         }
         self.pending_terminal_retirement = Some(
             process
@@ -11874,6 +11920,9 @@ mod tests {
             parent_rollbacks: usize,
             fail_stops: usize,
             child_kernel_bound: bool,
+            copied_preparations: usize,
+            shared_preparations: usize,
+            inventory_applies: usize,
         }
 
         impl HvpatchProcessBackendOps<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine, Memory>
@@ -11889,7 +11938,7 @@ mod tests {
             fn prepare(
                 &mut self,
                 _memory: &mut Memory,
-                _inventory: carrick_hal::FrameInventoryReservation,
+                inventory: HvpatchProcessInventoryPreparation,
                 _request: carrick_hal::ProcessForkRequest,
                 _identity: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskIdentity,
                 mm_generation: u64,
@@ -11902,6 +11951,14 @@ mod tests {
                 ),
                 RuntimeError,
             > {
+                match inventory {
+                    HvpatchProcessInventoryPreparation::Copied(_) => {
+                        self.copied_preparations += 1;
+                    }
+                    HvpatchProcessInventoryPreparation::SharedMm { .. } => {
+                        self.shared_preparations += 1;
+                    }
+                }
                 Ok((
                     (),
                     carrick_hal::threaded::GuestCpuState::from_aarch64_v1(
@@ -11973,6 +12030,7 @@ mod tests {
                     self.child_kernel_bound,
                     "inventory must follow exact child Kernel/MM binding"
                 );
+                self.inventory_applies += 1;
                 Ok(())
             }
 
@@ -12048,13 +12106,14 @@ mod tests {
         }
 
         for (case, phase) in [
-            HvpatchProcessFailpoint::ParentCopyout,
-            HvpatchProcessFailpoint::BackendCommit,
-            HvpatchProcessFailpoint::KernelCommit,
-            HvpatchProcessFailpoint::TokenBind,
-            HvpatchProcessFailpoint::DormantHandle,
-            HvpatchProcessFailpoint::StartProof,
-            HvpatchProcessFailpoint::Activation,
+            Some(HvpatchProcessFailpoint::ParentCopyout),
+            Some(HvpatchProcessFailpoint::BackendCommit),
+            Some(HvpatchProcessFailpoint::KernelCommit),
+            Some(HvpatchProcessFailpoint::TokenBind),
+            Some(HvpatchProcessFailpoint::DormantHandle),
+            Some(HvpatchProcessFailpoint::StartProof),
+            Some(HvpatchProcessFailpoint::Activation),
+            None,
         ]
         .into_iter()
         .enumerate()
@@ -12149,7 +12208,9 @@ mod tests {
                 submission: &mut submission,
             };
             let mut ops = FakeBackendOps::default();
-            install_hvpatch_process_failpoint(phase);
+            if let Some(phase) = phase {
+                install_hvpatch_process_failpoint(phase);
+            }
             let result = state.prepare_in_process_fork(
                 &kernel,
                 &root,
@@ -12158,7 +12219,11 @@ mod tests {
                 &mut ops,
                 quiesce::ProcessForkAttempt {
                     request: quiesce::ForkRequest {
-                        flags: 0,
+                        flags: if phase.is_none() {
+                            carrick_abi::LinuxCloneFlags::VM.bits()
+                        } else {
+                            0
+                        },
                         pidfd_out: None,
                         clone_parent: false,
                         parent_tid_addr: Some(0x1000),
@@ -12170,8 +12235,23 @@ mod tests {
                     coordinator: None,
                 },
             );
+            let Some(phase) = phase else {
+                assert!(matches!(
+                    result,
+                    Ok(quiesce::PreparedInProcessFork::Complete(Some(_)))
+                ));
+                assert_eq!(ops.shared_preparations, 1);
+                assert_eq!(ops.copied_preparations, 0);
+                assert_eq!(ops.parent_commits, 0);
+                assert_eq!(ops.parent_rollbacks, 0);
+                assert_eq!(ops.inventory_applies, 0);
+                assert_eq!(root.kernel().registry().task_count(), 2);
+                continue;
+            };
             assert!(result.is_err());
             assert!(check_hvpatch_process_failpoint(phase).is_ok());
+            assert_eq!(ops.copied_preparations, 1);
+            assert_eq!(ops.shared_preparations, 0);
             if matches!(
                 phase,
                 HvpatchProcessFailpoint::ParentCopyout
