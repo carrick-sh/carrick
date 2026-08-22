@@ -16,6 +16,13 @@
  *   wrappers (`create_vcpu` and `create_vcpu_with_permit`); each successful
  *   wrapper calls `vcpu_created` once. `*vcpu_destroyed*` is Carrick's exact
  *   post-success hook after raw `hv_vcpu_destroy`.
+ * - proc:::exit records the DTrace-created target completion edge, but the
+ *   target may exit before its HVPatch carrier descendant. Termination is
+ *   therefore gated on exact executor Create/Destroy lifecycle closure.
+ * - Normal completion exits 0 only after target exit plus nonzero exact
+ *   executor lifecycle closure. The 300-second watchdog records
+ *   `watchdog_timeout` and exits nonzero, so truncation cannot look like a
+ *   valid census.
  *
  * The pid provider deliberately binds only the one HVPatch VM carrier. HVPatch
  * guest fork/clone must not create a Darwin child; syscall/USDT clauses retain
@@ -27,16 +34,20 @@
 BEGIN
 {
     secs = 0;
+    target_exited = 0;
+    executor_created = 0;
+    executor_destroyed = 0;
+    carrier_pid[$target] = 0;
 }
 
 syscall::bsdthread_create:entry
-/pid == $target || progenyof($target)/
+/carrier_pid[pid] || pid == $target || progenyof($target)/
 {
     @host_pthread_create = count();
 }
 
 syscall::bsdthread_terminate:entry
-/pid == $target || progenyof($target)/
+/carrier_pid[pid] || pid == $target || progenyof($target)/
 {
     @host_pthread_terminate = count();
 }
@@ -51,29 +62,44 @@ pid$target::*vcpu_destroyed*:entry
     @hvf_vcpu_destroy = count();
 }
 
+proc:::exit
+/pid == $target/
+{
+    target_exited = 1;
+}
+
 carrick*:::mn-admit
-/pid == $target || progenyof($target)/
+/carrier_pid[pid] || pid == $target || progenyof($target)/
 {
     @mn_admit = count();
 }
 
 carrick*:::mn-reclaim
-/pid == $target || progenyof($target)/
+/carrier_pid[pid] || pid == $target || progenyof($target)/
 {
     @mn_reclaim_kind[arg3] = count();
 }
 
 carrick*:::mn-clone-outcome
-/pid == $target || progenyof($target)/
+/carrier_pid[pid] || pid == $target || progenyof($target)/
 {
     @guest_clone_phase[arg1] = count();
     @guest_clone_errno[arg2] = count();
 }
 
 carrick*:::hvpatch-executor-lifecycle
-/pid == $target || progenyof($target)/
+/carrier_pid[pid] || pid == $target || progenyof($target)/
 {
+    carrier_pid[pid] = 1;
     @executor_lifecycle[arg0, arg1] = count();
+    executor_created += arg1 == 0;
+    executor_destroyed += arg1 == 4;
+}
+
+tick-1s
+/target_exited && executor_created > 0 && executor_created == executor_destroyed/
+{
+    exit(0);
 }
 
 tick-1s
@@ -82,9 +108,10 @@ tick-1s
 }
 
 tick-1s
-/secs >= 30/
+/secs >= 300/
 {
-    exit(0);
+    @watchdog_timeout = count();
+    exit(1);
 }
 
 END
