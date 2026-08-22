@@ -3416,6 +3416,15 @@ pub(crate) trait PersistentQuantumJob: Send + 'static {
     ) -> Option<crate::hvpatch::PendingAddressSpaceRetirement> {
         None
     }
+
+    fn apply_detached_address_space_retirement(
+        &mut self,
+        _commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<(), crate::trap::TrapError> {
+        Err(crate::trap::TrapError::Hypervisor(
+            "logical job has no detached address-space retirement authority".to_owned(),
+        ))
+    }
 }
 
 pub(crate) struct HvpatchTaskQuantum {
@@ -3451,6 +3460,15 @@ impl HvpatchTaskQuantum {
         &self,
     ) -> Option<crate::hvpatch::PendingAddressSpaceRetirement> {
         self.job.lock().take_address_space_retirement()
+    }
+
+    pub(crate) fn apply_detached_address_space_retirement(
+        &self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<(), crate::trap::TrapError> {
+        self.job
+            .lock()
+            .apply_detached_address_space_retirement(commit)
     }
 }
 
@@ -3577,6 +3595,33 @@ impl HvpatchTaskBinding {
         &self,
     ) -> Option<crate::hvpatch::PendingAddressSpaceRetirement> {
         self.quantum.take_address_space_retirement()
+    }
+
+    pub(crate) fn retire_detached_address_space(&self) -> Result<(), crate::trap::TrapError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let backend = self.backend.lock().take().ok_or_else(|| {
+                crate::trap::TrapError::Hypervisor(
+                    "detached address-space cleanup has no saved backend".to_owned(),
+                )
+            })?;
+            let mut backend = backend
+                .downcast::<crate::vcpu_loop::executor::HvpatchTaskEngineBindingState>()
+                .map_err(|_| {
+                    crate::trap::TrapError::Hypervisor(
+                        "detached address-space cleanup backend type mismatch".to_owned(),
+                    )
+                })?;
+            let commit = backend.retire_detached_address_space()?;
+            self.quantum
+                .apply_detached_address_space_retirement(commit)?;
+            drop(backend);
+            Ok(())
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        Err(crate::trap::TrapError::Hypervisor(
+            "detached HVPatch cleanup requires macOS/aarch64 HVF".to_owned(),
+        ))
     }
 
     pub(crate) fn take_backend<T: Send + 'static>(&self) -> Result<T, crate::trap::TrapError> {
@@ -4978,7 +5023,7 @@ mod tests {
             .expect("post-exec worker boundary");
         assert!(exec_resume.contains("ExecutorExit::Preempted"));
         assert!(exec_resume.contains("HvpatchLoopSuspension::Preemption"));
-        assert!(terminal_finalizer.contains("retire_task_address_space"));
+        assert!(!terminal_finalizer.contains("retire_task_address_space"));
         assert!(terminal_finalizer.contains("begin_address_space_retirement"));
         assert!(!terminal_finalizer.contains("retire_in_process_address_space"));
         let thread_exit = production

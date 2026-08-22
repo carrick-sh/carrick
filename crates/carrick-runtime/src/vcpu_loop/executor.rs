@@ -83,6 +83,23 @@ impl HvpatchTaskEngineBindingState {
         }
     }
 
+    pub(super) fn retire_detached_address_space(
+        &mut self,
+    ) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
+        match &mut self.payload {
+            HvpatchTaskEngineBindingPayload::Resident(state) => {
+                carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_engine(state)
+            }
+            HvpatchTaskEngineBindingPayload::TaskOnly(state) => {
+                carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_engine(state)
+            }
+            #[cfg(test)]
+            HvpatchTaskEngineBindingPayload::Test => Err(TrapError::Hypervisor(
+                "test-only backend has no detached address space".to_owned(),
+            )),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn test_only() -> Self {
         Self {
@@ -576,6 +593,12 @@ pub trait PersistentTaskBinding {
     ) -> Option<crate::hvpatch::PendingAddressSpaceRetirement> {
         None
     }
+
+    fn retire_detached_address_space(&self) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "task binding has no detached address-space cleanup authority".to_owned(),
+        ))
+    }
 }
 
 impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBinding {
@@ -595,6 +618,10 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
         &self,
     ) -> Option<crate::hvpatch::PendingAddressSpaceRetirement> {
         crate::vcpu_loop::continuation::HvpatchTaskBinding::take_address_space_retirement(self)
+    }
+
+    fn retire_detached_address_space(&self) -> Result<(), TrapError> {
+        crate::vcpu_loop::continuation::HvpatchTaskBinding::retire_detached_address_space(self)
     }
 }
 
@@ -3088,6 +3115,19 @@ where
                     settlement,
                 ));
             }
+            if let Err(error) = binding.retire_detached_address_space() {
+                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
+                    scheduler,
+                    running,
+                    ExecutionFailure::SnapshotRestoreFailed,
+                    receipts,
+                );
+                return Err(with_settlement_error(
+                    format!("terminal detached address-space cleanup failed: {error}"),
+                    settlement,
+                ));
+            }
             if let Err(error) = retirement.complete() {
                 let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                     resolver.as_ref(),
@@ -4323,6 +4363,21 @@ pub(crate) mod tests {
             .find("retirement.complete()")
             .expect("post-ack ASID/root release");
         assert!(save < invalidate && invalidate < release);
+        let terminal = worker_loop
+            .split("if let Some(retirement) = terminal_retirement")
+            .nth(1)
+            .and_then(|tail| tail.split("if let Some(authority)").next())
+            .expect("terminal retirement order");
+        let terminal_invalidate = terminal
+            .find("invalidate_after_exec")
+            .expect("terminal exact TLBI fanout");
+        let detached_cleanup = terminal
+            .find("retire_detached_address_space")
+            .expect("detached stage-2/inventory cleanup");
+        let terminal_release = terminal
+            .find("retirement.complete()")
+            .expect("terminal ASID/root release");
+        assert!(terminal_invalidate < detached_cleanup && detached_cleanup < terminal_release);
         let pre_load = worker_loop
             .split("if let Err(error) = backend.load(&task)")
             .next()

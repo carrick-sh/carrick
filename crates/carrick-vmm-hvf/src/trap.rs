@@ -8374,10 +8374,18 @@ impl HvfVmState {
     }
 
     fn retire_stage2_extent(&mut self, ipa: u64, length: u64) -> Result<(), TrapError> {
+        Self::retire_stage2_extent_from_mappings(&mut self.mappings, ipa, length)
+    }
+
+    fn retire_stage2_extent_from_mappings(
+        mappings: &mut [HvfMappedRegion],
+        ipa: u64,
+        length: u64,
+    ) -> Result<(), TrapError> {
         if retire_global_frame_host_owner(ipa, length) {
             return Ok(());
         }
-        if let Some(lease) = self.mappings.iter_mut().find_map(|mapping| {
+        if let Some(lease) = mappings.iter_mut().find_map(|mapping| {
             (mapping
                 .stage2_lease
                 .as_ref()
@@ -9393,10 +9401,16 @@ impl HvfVmState {
     }
 
     pub(crate) fn retire_process_mappings(&mut self) -> Result<(), TrapError> {
+        Self::retire_task_state_process_mappings(&mut self.task)
+    }
+
+    pub(crate) fn retire_task_state_process_mappings(
+        task: &mut HvfTaskState,
+    ) -> Result<(), TrapError> {
         // Mature VMM processes own a private VM and retain the historical
         // teardown path; only the persistent single-VM HVPatch lane publishes
         // per-process frame-inventory retirement.
-        if !self.persistent_vm_lifecycle {
+        if !task.persistent_vm_lifecycle {
             return Ok(());
         }
         // The runtime holds the process-wide HVPatch topology lock across this
@@ -9405,9 +9419,9 @@ impl HvfVmState {
         // owner rather than being omitted merely because they are globally
         // addressed outside this mm's stage-1 root slot.
         let extents = {
-            let inventory = self.frame_inventory.lock();
+            let inventory = task.frame_inventory.lock();
             if inventory.extents.is_empty() {
-                if self.mappings.is_empty() {
+                if task.mappings.is_empty() {
                     return Ok(());
                 }
                 return Err(TrapError::Hypervisor(
@@ -9424,11 +9438,11 @@ impl HvfVmState {
         };
 
         for &(ipa, size) in &extents {
-            self.retire_stage2_extent(ipa, size as u64)?;
+            Self::retire_stage2_extent_from_mappings(&mut task.mappings, ipa, size as u64)?;
         }
         mutate_external_alias_state(|_, registry| {
             registry.retain(|alias| {
-                !alias_is_owned_by_process(alias.ownership_scope, self.mm_root_slot)
+                !alias_is_owned_by_process(alias.ownership_scope, task.mm_root_slot)
                     && !extents.contains(&(alias.physical_ipa, alias.physical_size))
             });
         });
@@ -9437,7 +9451,7 @@ impl HvfVmState {
         // Reclaim only exact extents removed above and preserve the remaining
         // backing until the single VM is finally destroyed.
         let mut retained_backings = Vec::new();
-        for mapping in std::mem::take(&mut self.mappings) {
+        for mapping in std::mem::take(&mut task.mappings) {
             if extents.contains(&(mapping.physical_ipa, mapping.physical_size)) {
                 drop(mapping);
             } else {
@@ -9445,9 +9459,9 @@ impl HvfVmState {
             }
         }
         std::mem::forget(retained_backings);
-        self.mm_root_slot = None;
+        task.mm_root_slot = None;
 
-        let mut inventory = self.frame_inventory.lock();
+        let mut inventory = task.frame_inventory.lock();
         let mut reservation = inventory.retirement_reservation.take().unwrap_or_else(|| {
             eprintln!("carrick: FATAL: validated HVPatch retirement reservation disappeared");
             std::process::abort();
@@ -9458,6 +9472,12 @@ impl HvfVmState {
         }
         inventory.retirement_commit = Some(reservation.commit(()));
         Ok(())
+    }
+
+    pub(crate) fn take_task_state_retirement_inventory(
+        task: &mut HvfTaskState,
+    ) -> Option<carrick_hal::FrameInventoryCommit<()>> {
+        task.frame_inventory.lock().retirement_commit.take()
     }
 
     fn seed_readonly_spans_from_plan(&self, plan: &GuestMappingPlan) {
