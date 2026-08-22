@@ -78,349 +78,176 @@ Restore it verbatim once the objective above closes:
 > The goal is still active. Do not mark it complete, bless a baseline, weaken the
 > denominator, add an excuse, accept a retry, or start final performance work.
 
-## CURRENT ENGINEERING CHECKPOINT — 2026-08-22 Phase 1 collapse
+## CURRENT ENGINEERING CHECKPOINT — 2026-08-22, closure session
 
-Phase 1 of `docs/superpowers/plans/2026-08-22-hvpatch-fork-lifecycle-closure.md`
-is complete except Task 4, which is BLOCKED with its premise refuted. Nine
-commits on `main`, `862bcb9af..0d19ed2d7`. **~6,700 lines of the retired
-execution model are gone, and the runtime library suite is green for the first
-time (1620/1620).**
+**Two of the five objective criteria now hold. The other three are open, and
+each one's blocker is named with the evidence that names it.**
 
-Read `docs/superpowers/plans/2026-08-22-hvpatch-fork-lifecycle-closure.md`
-"Execution record — Phase 1" before doing anything: it records, with evidence,
-the four places the plan's task lists were WRONG about what is dead.
+### Criterion status — measured, not assumed
 
-### What landed
+| # | Criterion | State | Evidence |
+|---|---|---|---|
+| 1 | One execution path | **MET** | `ExecutionBackend` has 0 references. `run_vcpu_until_exit_inner`, `launch_vcpu_until_exit`, `OwnerThreadEngine`, `CompatibilityThreadWaiter` and `handle_fork` survive only inside comments and INVERTED `include_str!` gates that assert their absence (e.g. `continuation.rs` `hvpatch_launch_callgraph_never_constructs_the_compatibility_loop_future`). |
+| 2 | Process teardown correct | **NOT MET** | Three named defects below. All ten built fork probes reach zero carrier aborts (from ten of ten aborting); five exit 0. |
+| 3 | Shell reducer exits 0 | **MET** | `f250844d`. `/bin/sh -c '/bin/echo hi'` 10 of 10 clean, `/bin/bash -c` clean as the fork-not-vfork control. |
+| 4 | `just ci` green | **NOT MET** | `fmt-check`, `deny`, `check-matrix` PASS. `clippy` 97 -> 34 errors. `lint-domains` fails on census drift. `doc` fails on the same dead code as clippy. `test` 1605/1605. |
+| 5 | Closure probe gate | **NOT MEASURED** | Needs > 10 minutes; run it detached, not in a foreground shell with a timeout. |
 
-| commit | what |
-|---|---|
-| `202237b75` | Task 1 — deleted the single-variant `ExecutionBackend`, 52 sites |
-| `cf320a897` | repaired the runtime library suite (RED at HEAD, see below) |
-| `a2e7e959c` | Task 7 — corrected recipes naming the retired native backend |
-| `99daafe8d` | recorded the Phase 1 plan corrections |
-| `807174fa2` | Task 2 — deleted the welded loop; **ported guest fault delivery** |
-| `f2731ae13` | Task 3 — deleted the transitional dedicated runner pool |
-| `fa22757ad` | doc-lint fix unblocking `just clippy` |
-| `faf719600` | recorded that Task 4's premise is refuted |
-| `74f425289` | **unmasked defect 4's real cause** |
-| `0d19ed2d7` | restored the guest-fault probes the port dropped |
+### What landed this session
 
-### DEFECT 4 IS FIXED (`c74d9c7a1`)
-
-It was an ORDERING bug, not a missing authority transition. Peeled in three
-commits, each of which had to land before the next was visible:
-
-1. `74f425289` — the abort inside `HvpatchTaskMmAuthority::drop` was masking the
-   error that caused it. `retire_detached_address_space` propagates with `?`,
-   which drops the binding on the way out.
-2. `6661bd514` — "does not cover exact current HVPatch MM ledger" could not
-   distinguish an EMPTY ledger from a MISMATCHED one. Named, it read
-   `ledger=0 commit=16 ledger_only=[] commit_only=[MappingId(69), ...]`.
-3. `c74d9c7a1` — the fix. `stage_retirement` pushes one `UnmapMapping` per
-   extent and then does `inventory.extents.clear()`; the authority then
-   authenticates the commit against that same (now empty) ledger, because
-   `HvfTaskState::frame_inventory` and `Active { ledger }` share one `Arc`.
-   On the task-only path the check could never pass. `stage_retirement` now
-   records the owned set into `HvpatchFrameInventory::retirement_expected` in
-   the same critical section that clears it, and `prepare_retirement`
-   authenticates against that.
-
-Measured on a freshly signed binary, two uncontended samples agreeing:
-
-| | before | after |
-|---|---:|---:|
-| carrier aborts, 15-probe fork battery | 15/15 | **5/15** |
-| total guest output | 1 line | **55 lines** |
-
-`forkcow` now prints `data_isolated=true bss_isolated=true heap_isolated=true
-mmap_isolated=true` — COW fork isolation was already correct and simply never
-observable. `forkfiletable` 9 lines, `mqnotifycrossproc` 16, `clone3args` 14.
-
-**Beware contention when you measure this.** A battery run while two other
-compiles were live reported 7/15 aborts and 38 lines; uncontended it is 5/15 and
-55 twice over. Quote an uncontended sample.
-
-### The fork lifecycle: five defects fixed, no carrier aborts left
-
-`afb3e409..dbfffc6f`. **All ten built fork probes reached zero carrier aborts,
-from ten of ten aborting.** `forkcow`, `cloneexitsig`, `waitidsiuid` and
-`xthreadsig` exit 0; `clonebasic` passes intermittently. Everything else now
-fails on ordinary behaviour or in executor-pool shutdown, with the guest's own
-work completing first (`sigchld` reports all three of its assertions true).
+Nine fixes and three merged worker branches, `afb3e409..HEAD`.
 
 | commit | defect |
 |---|---|
 | `00131530` | identity-page rows on an unowned extent failed liveness |
 | `b2097fc5` | retirement re-charged for already-settled fork inheritances |
-| `a1eaad6a` | retirement emptiness decided after its lock was released |
+| `a1eaad6a` | retirement emptiness decided after its lock was released (TOCTOU) |
 | `d4ad1aaa` | SCTLR_EL1 readback compared against the bits carrick programs |
 | `dbfffc6f` | `SignalThread` never lowered in the persistent executor |
+| `f250844d` | a vfork child retired a ledger it does not own — **criterion 3** |
+| `3b44905a`, `a9b78fd3` | maintenance exits now carry syndrome and roots |
+| `9b5f1840` | the welded retry loop, and a re-export that was only test-only |
+| three merges | ~3,700 lines of retired machinery, via directed agy workers |
 
-Each of the first four was found by making the previous one's abort NAME ITS
-FAILING CLAUSE. That is the whole method and it is worth repeating: every one
-of these aborts reported a STATE ("malformed receipt", "out of bounds", "invariant
-mismatch") when what the next step needed was the CLAUSE. Two of them also
-reported the wrong operation — `MemoryError::OutOfBounds` renders as "read" for
-a failed write, and the address it named was a compile-time constant that was
-never out of bounds.
+**The method that found every one of these: make the abort name its FAILING
+CLAUSE, not its state.** Each of these failures reported a state — "malformed
+receipt", "out of bounds", "invariant mismatch", "duplicate or not active" —
+where the next step needed the clause. Two also reported the wrong operation
+(`MemoryError::OutOfBounds` renders as "read" for a failed write, and named a
+compile-time constant as out of bounds). Naming the clause turned each one from
+a guess into a diagnosis, usually in a single rebuild.
 
-The recurring root-cause shape is **two domains sharing one type**, exactly as
+The recurring root cause is **two domains sharing one type**, exactly as
 `docs/identity-and-scope-domains.md` predicts: the bits carrick programs vs the
 bits a register reads back; an obligation record vs the mapping it describes; a
-claim about revision N vs the revision current afterwards; the absence of an
-authority vs a rejection by one.
+claim about revision N vs the revision current afterwards; stage-1 ownership vs
+ledger ownership; the absence of an authority vs a rejection by one.
 
-### What is next, in order
+### Criterion 2 — the three remaining defects, each attributed
 
-1. **The executor-pool shutdown race.** Now the only thing between the fork
-   probes and green. It is nondeterministic — the same probe hangs to the
-   timeout, aborts, or returns one of several distinct shutdown errors across
-   runs (`stale or invalid child selector`, `dormant task cancellation failed:
-   exact thread generation is not live`, `executor ExecutorId...`). Sample any
-   verdict at least twice. Start by making `persistent executor pool shutdown
-   failed` name which executor and which phase, the same way the four fixes
-   above were found.
-2. **The `DispatchOutcome` catch-all is a structural hazard.** `service_outcome`
-   ends in `other => { tracing::error!("unlowered outcome"); InvalidState }`, so
-   a variant whose only handler died with the welded loop becomes a runtime HANG
-   instead of a compile error. Two have been found this way already —
-   `SigReturn` (`633d32a31`) and `SignalThread` (`dbfffc6f`). The blocking
-   variants return early via `is_blocking_dispatch_outcome`, so the match cannot
-   simply be made exhaustive; the fix is to route the early return through a
-   type that leaves only non-blocking variants for the match to cover.
-3. **The orphan triage** — `docs/hvpatch-orphan-triage-2026-08-22.md`, all 89
-   `dead_code` symbols classified with evidence. This is what unblocks
-   `just clippy` (still exiting 101 at ~97 errors) and therefore `just ci`.
-   Read its calibration warning: every row came back `certain` and none used
-   UNCERTAIN, so verify before acting. The core-dump cluster and the job-control
-   cluster are the two that would silently remove guest-visible behaviour.
-4. Task 4 (HVF `persistent_vm_lifecycle`) after its blocking analysis; Phase 2
-   Task 5 remainder; Phase 3 Tasks 10-12.
+**(a) ASID maintenance runs on a retired root.** `cloneexithandled`,
+intermittently:
 
+    EL0Fault(esr=0x82000086 elr=0x2d001e0100 far=0x2d001e0100
+             from_el0_direct=true) during scoped EL1 ASID maintenance
+    (asid=0x1 ttbr0=0x13009a00000000 ttbr1=0x13009a00000000 sctlr=0x3400d185)
 
-### THE ORIGINAL FINDING (kept for its method)
+`0x2d001e0100` is `LINUX_EL1_ASID_MAINT_BASE`; ESR is a level-2 translation
+fault on the instruction FETCH of the trampoline. `SCTLR` shows stage-1 enabled
+and the roots are live (ASID 0x13, BADDR 0x9a00000000) — so the executor is
+running maintenance through a root that no longer maps carrick's OWN EL1 kernel
+hole. Already ruled out: the entry state. A fail-closed check confirms `PC` and
+`PSTATE` are the intended EL1h values before `run()`, and it never fires.
 
-### THE FINDING THAT MATTERS MOST: defect 4's real cause
+`retire_task_state_process_mappings` unmaps every extent in the mm's ledger,
+kernel regions included, while a worker vCPU may still hold that root.
+`audit_persistent_worker_vcpu_boundary` checks SP_EL1, the mailbox, the reclaim
+authority and the fork snapshot — but **never TTBR**, so an idle worker carrying
+a retired root passes as pristine. Two candidate fixes, needing a decision:
+give the executor a neutral carrier root to install before maintenance (there is
+none today — `PersistentExecutorSpec` says "page tables, MM/root ... stay out of
+the factory"), or order the invalidation strictly before the tables go away and
+prove no issuer runs after. `dispatch_invalidation_commands` targets specific
+executors, so start by finding which issuer runs post-retirement.
 
-The previous checkpoint recorded defect 4 as "a forked child's terminal never
-runs". **That is wrong.** The terminal runs; the abort message was masking its
-own cause.
+**(b) An MM authority is dropped while still `Active`.** `clonebasic`,
+intermittently: `FATAL: drop HVPatch MM authority (phase=active ...)`. Same
+family as the fixed defect 4 — retirement did not run for a task that owns its
+inventory.
 
-`retire_detached_address_space` propagates a retirement failure with `?`, which
-drops the binding on the way out; the drop runs
-`HvpatchTaskMmAuthority::drop`, finds the inventory still `Active`, and aborts
-the carrier with the generic `published HVPatch inventory dropped before exact
-retirement` — before the executor can report what actually failed. `74f425289`
-reports the underlying error first. The real one is:
+**(c) A COW write grant fails BadAddress.** `execpipe`, `coredumpfile`,
+`childsubreaper`: `grant HVPatch COW semantic page write: BadAddress` from
+`set_writable_preserving_attributes` in the per-page loop after
+`repoint_preserving_attributes`. **Check the invocation before the code**: these
+probes were run as `run-elf --raw`, which has no rootfs, and `execpipe` reports
+`child_exit_code=127`. A probe that needs to exec a real binary cannot pass
+there, and `AGENTS.md` warns specifically about invoking a suite differently
+from how the harness does. Confirm under the closure gate first.
 
-```
-carrick: FATAL: detached address-space retirement failed (the MM-authority drop
-abort that follows is a CONSEQUENCE of this, not the cause): hypervisor
-operation failed: retirement commit does not cover exact current HVPatch MM ledger
-```
+### Criterion 4 — what is left is a PORT, not a cleanup
 
-That is `HvpatchTaskMmInventory::prepare_retirement` in
-`crates/carrick-vmm-hvf/src/trap.rs`:
+Three directed agy workers took clippy from 97 errors to 34, deleting ~3,700
+lines. **The remaining 34 are almost entirely two clusters that lost their
+callers in the collapse and must be PORTED into the persistent executor:**
 
-```rust
-if expected_mappings.is_empty() || committed_unmaps != expected_ids {
-    return Err(... "retirement commit does not cover exact current HVPatch MM ledger")
-}
-```
+- **Core dumps and crash capture** (~19 errors): `CoreProcessSnapshot`,
+  `CorePublication`, `CorePublicationError`, `PreparedCorePublication`,
+  `project_core_maps`, `boot_region_is_carrick_kernel_hole`,
+  `core_note_resume_pair`, `recorded_for`, `fatal_for_terminal_owner`,
+  `crash_capture`, `publish_crash_registers`, `withdraw_from_crash_capture`,
+  `core_process_snapshot`, `publish_core_atomic`, `take_signal_pump_request`,
+  `write_hvpatch_child_output`. If this reading is right, guest core dumps and
+  `WCOREDUMP` do not work at all today, and the port belongs in
+  `finalize_persistent_process_terminal` exactly as fault delivery did.
+- **Job control** (~4): `wait_until_job_control_resumed` (both `kernel/objects.rs`
+  and `hvpatch/mod.rs`), `stop_for_job_control`, `syscall_trace_identity`.
+- Plus `GuestBlockedGuard`/`publish` (the `/proc/[pid]/stat` run state a guest
+  and LTP's `TST_PROCESS_STATE_WAIT` read), `HvpatchSyscallServiceGuard`/`begin`
+  (USDT service probes), and the stage-1 `acknowledge_tlb_flush` contracts.
 
-**A forked child's retirement commit unmaps a set of mappings that is not
-exactly the set its own MM ledger holds.** Start there, not at the inventory
-authority and not at the scheduler-wake ordering the previous checkpoint named.
-`expected_mappings` comes from `ledger.lock().extents`; `committed_unmaps` comes
-from the `UnmapMapping` events in the commit produced by
-`retire_detached_task_only_engine`. Print both sets and diff them — the shape of
-the difference (child holds extents the commit does not unmap, or the reverse)
-decides whether the bug is in the fork's ledger seeding or in the retirement
-commit's coverage.
+**LOST INSTRUMENT — record this before it is forgotten.**
+`trace_hvpatch_wait_begin`, `trace_hvpatch_wait_end` and
+`hvpatch_wait_result_phase` wrote wait events into the event ring from the
+welded loop. They were deleted with it, and **the persistent executor has no
+equivalent: blocking-wait tracing does not exist on the surviving path.** Same
+shape as the guest-fault probes lost and restored earlier in this campaign —
+`AGENTS.md` is explicit that a port must carry its instruments. Re-add wait
+probes to the persistent blocking path.
 
-Reproducer, red today:
+`lint-domains` fails on host-authority census drift, and the drift is **96%
+positional**: 250 new against 265 removed, but keyed on (catalog_id, file,
+operation) only **3 genuinely new sites and 4 genuinely removed**. The inventory
+is byte/line-keyed, so any edit reshuffles it. The criterion forbids a bulk
+re-bless and the script agrees: `--refresh-candidate PATH` writes a candidate
+with unreviewed rows and exits nonzero unless all nine build profiles ran.
+Review those 7 semantic deltas, then refresh — do not hand-edit the inventory.
 
-```bash
-RID=d4; CARRICK_RUN_ID=$RID timeout 25 ./target/release/carrick run-elf --raw \
-  --exec-backend hvpatch \
-  conformance-probes/target/aarch64-unknown-linux-musl/release/forkcow
-./scripts/sudo/kill.sh $RID
-```
+### Operational notes earned this session
 
-Backtrace method that located it (the abort is in a `Drop`, so a plain error
-message never names the caller):
-
-```bash
-printf 'breakpoint set -n abort\nrun\nthread backtrace\nquit\n' > /tmp/c.txt
-sudo lldb -b -s /tmp/c.txt -- ./target/release/carrick run-elf --raw \
-  --exec-backend hvpatch <probe>
-```
-
-### The second finding: guest fault delivery did not exist
-
-Guest fault-signal delivery (SIGSEGV/SIGBUS/SIGTRAP from EL0 faults), lazy stack
-growdown, resident-fault commit, stage-1 COW resolution at the guest boundary,
-and forced-exit signal service existed ONLY inside the welded
-`run_vcpu_until_exit_inner`, which `launch_vcpu_until_exit` made unreachable at
-its first statement. The persistent executor turned every guest fault into a
-`RuntimeError` and killed the process. Proven red first:
-
-```
-faultaddr -> exit 1, no output,
-  "trap engine failed: EL0 fault not handled by trap path: esr=0x92000007"
-```
-
-Ported into `ProductionHvpatchLoopJob::poll_with_engine` in `807174fa2`;
-`faultaddr` now exits 0 with `si_addr_match=true fault_addr_match=true`, and
-`recursionguard` newly reports `deep_c_recursion_fits=true` (stack growdown
-works). This was already broken at HEAD — the collapse revealed it.
-
-`0d19ed2d7` then restored the `vcpu_fault_regs` / `vcpu_fault_gprs` /
-`pt_fault_walk` probes and both `CARRICK_FAULT_DEBUG` dumps, which the port had
-silently dropped. An independent adversarial review caught that; the lesson is
-that a port must carry its instruments, not just its logic.
-
-### `just test` had never run, and was RED
-
-`just ci` is sequential and had been dying at clippy — and since `4acd8cc9f` at
-`lint-domains` — so `RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib`
-had not executed in a long time. It was RED with five failures on unmodified
-HEAD `862bcb9af`, verified in a separate worktree before anything was attributed
-to the collapse. Both causes are fixed in `cf320a897`:
-
-- a stale `threaded_independent_dispatch_supports` expectation (tkill/tgkill
-  were added to the independent dispatcher in `64e3ed7ed` and the assertion was
-  never updated);
-- four cross-process signal tests order-dependent on `HVPATCH_LANE`, a
-  carrier-global `AtomicBool` that `bind_hvpatch_process` sets once and nothing
-  clears. A `#[cfg(test)] HvpatchLaneScope` now pins it.
-
-Also fixed (`807174fa2`): a lost-wakeup race in the carrier wait reactor's
-`#[cfg(test)]` poll observer — it was signalled BEFORE the control pipe was
-drained, so a nudge landing between the take and the drain was swallowed and the
-reactor parked in `poll(-1)` forever. Reproduced 3/3 as a full-suite hang at
-`idle_256_indefinite_waits`; green 3/3 after.
-
-### Gate state — measured, not assumed
-
-`RUST_TEST_THREADS=1 just ci` exits **101**, stopping at **clippy**, which
-reports **97 errors, almost all `dead_code`** produced by the deletion. Note that
-the `dispatch/**` dead-code sweep (`506ef7db`, 196 deletions) did NOT move that
-number and was never going to: everything it removed was already SUPPRESSED by an
-`#[allow(dead_code)]`, so deleting it changes hygiene, not the gate. The 97 live
-in `vcpu_loop/`, `kernel/` and `hvpatch/` — the orphans Phase 1 created. That is
-the next gate blocker and it is NOT a mechanical sweep — see below. Everything
-after clippy (lint-domains, deny, check-matrix, check, doc, test,
-test-integration) is still UNVERIFIED end to end, though the runtime library
-suite passes standalone at 1620/1620.
-
-### The orphan triage — do NOT bulk-delete
-
-The ~96 clippy `dead_code` errors are the same class as the fault-delivery
-near-miss: some are corpses of the retired model, others are live
-responsibilities that merely lost their only caller. Three independent
-read-only reviews (Google Antigravity `agy`, Gemini 3.5 Flash High) were run to
-triage them; their verdicts are HYPOTHESES to verify, not conclusions:
-
-- **Core-dump / crash-capture group** — reported almost entirely
-  LIVE-RESPONSIBILITY: `CoreProcessSnapshot`, `CorePublication`,
-  `CorePublicationError`, `project_core_maps`, `boot_region_is_carrick_kernel_hole`,
-  `PreparedCorePublication`, `core_note_resume_pair`, `fatal_for_terminal_owner`,
-  `publish_crash_registers`, `withdraw_from_crash_capture`. If that holds, guest
-  core dumps and `WCOREDUMP` currently do not work AT ALL and the machinery
-  needs porting into `finalize_persistent_process_terminal`, exactly as fault
-  delivery did. **Unverifiable until defect 4 is fixed** — `coredumpfile` forks,
-  so it aborts on defect 4 before it can tell you anything.
-- **Process-lifecycle / job-control group** — 11 CORPSE, 6 LIVE, 1 UNCERTAIN.
-  Reported LIVE: `stop_for_job_control`, `wait_until_job_control_resumed`
-  (both `kernel/objects.rs` and `hvpatch/mod.rs`), `stop_task_for_job_control`,
-  `syscall_trace_identity`. Reported CORPSE: `retire_address_space_with`,
-  `record_process_exit_commit`, `reset_for_forked_child`, the four
-  `transitional`/`take_exact` scheduler methods, `handle_execve`, `fork_barrier`,
-  `release_and_park_vcpu_for_fork`.
-  It also answered the exit-arbitration question directly: the persistent
-  terminal DOES claim the process exit via `try_claim_persistent_process_exit`.
-  That is consistent with the lldb evidence above and is why "the terminal never
-  runs" was the wrong diagnosis.
-- **Adversarial review of the deletion** — claims 1 and 3 UPHELD (the 866-line
-  blocking-wait arm removal, and the three `threads.rs` branch collapses); claim
-  2 REFUTED, which produced `0d19ed2d7`. Its headline claim — that post-syscall
-  signal delivery was removed — is REFUTED BY MEASUREMENT: a rebuilt
-  pre-campaign binary at `862bcb9af` produces byte-identical failures
-  (`pauseeintr` exit 1/0 lines, `procsignalmask`
-  `delivered_to_unblocked_thread=false`), so that weakness is pre-existing.
-  The comparison did surface one REAL regression the review missed, now fixed
-  in `633d32a31`: see below.
-
-### The third finding: `rt_sigreturn` was never lowered
-
-`DispatchOutcome::SigReturn` was handled in exactly one place — the welded
-`run_vcpu_until_exit_inner` — so the persistent executor returned
-`ExecutorExit::InvalidState` for it. Already true before the deletion, and
-invisible because nothing delivered a signal at a forced vCPU exit, so no guest
-ever returned from a handler. Porting forced-exit signal service exposed it:
-`preemptsigstorm` filled stderr with `unlowered outcome other=SigReturn` and
-lost all six stdout lines.
-
-Caught only by A/B against a rebuilt `862bcb9af` binary — both exit 1, only the
-OUTPUT COUNT differs. Fixed in `633d32a31`. **Keep that pre-campaign binary
-around** (`.worktrees/t1-attrib`); exit codes alone will not tell you whether
-this campaign is helping.
-
-### Task 4 is BLOCKED, premise refuted
-
-Task 4 assumes the HVF trap engine's `persistent_vm_lifecycle` guards are dead
-and its two `false` initializers are a hazard that disappears with the field.
-Flipping ONLY those two initializers to `true` and rebuilding signed made every
-probe fail with `idle HVPatch worker retained task authority`: `trap.rs:5003`
-asserts an idle executor worker's `HvfTaskState` is still pristine, and
-`!persistent_vm_lifecycle` is one of the pristine clauses. The field therefore
-carries at least two live values and distinguishes a task state BOUND to a
-persistent task from an unbound one. Reverted; `trap.rs` is untouched.
-
-Before Task 4 proceeds, establish with evidence which of the 46 remaining guards
-can run on an UNBOUND task state. If none, delete the field and drop the
-pristine clause. If some can, the field is MISNAMED, not dead, and the fix is a
-rename plus a typed distinction — a domain-modelling task of the kind
-`docs/identity-and-scope-domains.md` describes.
+- **Worktrees belong in `/Volumes/CaseSensitive/carrick/.worktrees/<name>`.**
+  The sudo NOPASSWD policy names `carrick*/*/*/*`, `carrick/*/*/*` and
+  `carrick/.worktrees/*/*/*` — sudoers wildcards do not match `/`, so a worktree
+  at a sibling path like `/Volumes/CaseSensitive/wt-foo` falls through to the
+  blanket `(ALL) ALL` rule and needs a password. It therefore cannot run
+  `scripts/sudo/kill.sh`, `carrick trace` (which auto-sudos), dtrace or lldb
+  against its own build: it cannot debug itself. `sudo -l <path>` does NOT test
+  this — it reports "allowed" for everything because of the blanket rule.
+- **`just conformance-probes-closure` needs more than 10 minutes.** A foreground
+  shell with a 10-minute cap SIGTERMs it mid-run (`terminated by signal 15`).
+  Run it detached and read the log.
+- **Directing agy workers works, and the refusals are the product.** Three
+  workers were given the same rule — bias toward UNCERTAIN, prove CORPSE — and
+  their refusals caught three symbols that an earlier automated pass had marked
+  "CORPSE, confidence: certain" and that are live production code:
+  `upgrade_protection_si_code` (called twice from the persistent fault-delivery
+  path), `service_threaded_syscall` (the persistent syscall entry point), and
+  the wait-trace probes. See the calibration warning at the top of
+  `docs/hvpatch-orphan-triage-2026-08-22.md`. Ask a worker for a count
+  ("deleted N, refused M") and for a named finding, and review the DIFF, never
+  the report: round 1 of one worker had replaced a variable with
+  `let needs_sibling_drain = false;`, leaving an unreachable branch where a
+  Linux guarantee used to be.
 
 ### Next work, in order
 
-1. **The child identity-bootstrap OOB** described above — it now blocks eight of
-   the fifteen fork probes.
-2. **The five remaining MM-authority aborts** (`clonebasic`, `waitexitstorm`,
-   `waitidsiuid`, `sigchld`, `execpipe`).
-3. **Then the two vfork+exec shutdown shapes**, and the `/bin/sh -c` reducer
-   (goal criterion 3).
-3. **Then the orphan triage**, symbol by symbol, verifying each agy verdict
-   rather than trusting it. Port what is live; delete what is a corpse. This is
-   what unblocks `just clippy` and therefore criterion 4.
-4. Task 4 only after its blocking analysis above.
-5. Phase 2 Tasks 5, 6, 8 are still open. Task 6's surface is LARGER than the
-   plan's line list — `--native-page-profile` reaches into
-   `carrick-cli/tests/conformance.rs` and `carrick-conformance/src/lane.rs`.
-
-### Method notes earned this session
-
-- **An abort inside a `Drop` will mask the error that caused it.** Two of this
-  session's findings were hidden that way. When a FATAL message names a state
-  rather than an action, suspect it is a consequence and report the cause first.
-- **`pkill -f carrick_runtime-` does not match the test binary**: the runtime
-  renames its own proctitle to `carrick: /bin/sh`, so orphaned test processes
-  survive cleanup and contaminate later runs. Reap with
-  `pkill -f "^carrick: /bin/sh"`.
-- **Never run two `cargo test` invocations against the same target dir**; they
-  contend and produce what looks exactly like a hang.
-- **`isolation: worktree` cannot be trusted to branch from HEAD.** A dispatched
-  worktree agent got a base 1,884 commits behind `main`, predating HVPatch
-  entirely, and its work was unmergeable. Pin and verify the base.
-- **`agy` jobs need `--add-dir /Volumes/CaseSensitive/carrick`** and the
-  absolute path stated in the prompt; `--sandbox` confines them to `$HOME` and
-  the repo is not under it. Read-only fan-out is genuinely useful for
-  "is this really dead?" judgement; verify every verdict.
-
-
----
+1. **Criterion 2 (a)** — the ASID root. Find which issuer sends
+   `InvalidateAsid` after the address space retires, then decide between a
+   neutral carrier root and a strict ordering.
+2. **Criterion 5** — run the closure gate detached and read the real number.
+   Re-check defect (c) there rather than under `run-elf --raw`.
+3. **Criterion 4** — port the core-dump/crash-capture cluster, then job control,
+   then re-add the lost wait probes. This is a feature workstream, not a sweep.
+   Then reconcile the census's 7 semantic deltas via `--refresh-candidate`.
+4. **The structural hazard behind two of this campaign's bugs.**
+   `service_outcome` ends in `other => { tracing::error!("unlowered outcome");
+   InvalidState }`, so a `DispatchOutcome` variant whose only handler died with
+   the welded loop becomes a runtime HANG instead of a compile error. Two were
+   found that way (`SigReturn`, `SignalThread`). The blocking variants return
+   early through `is_blocking_dispatch_outcome`, so the match cannot simply be
+   made exhaustive; route the early return through a type that leaves only
+   non-blocking variants for the match to cover.
+5. Task 4 (HVF `persistent_vm_lifecycle`) after its blocking analysis; Phase 2
+   Task 5 remainder; Phase 3 Tasks 10-12.
 
 ## SUPERSEDED CHECKPOINT — 2026-08-22 fork/exec defect peel
 
