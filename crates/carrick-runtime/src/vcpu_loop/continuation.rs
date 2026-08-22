@@ -10,9 +10,8 @@ use std::future::Future;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Weak};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use carrick_abi::{SigBlockMask, SigSet, WaitSigMask};
@@ -2400,23 +2399,6 @@ impl CarrierWaitServiceInner {
         Ok(())
     }
 
-    fn retire_terminal_exact(&self, token: ContinuationWakeToken) -> bool {
-        let mut state = self.state.lock();
-        let terminal = state.entries.get(&token.continuation).is_some_and(|entry| {
-            entry.token == token
-                && matches!(
-                    entry.state,
-                    RegistrationState::Ready
-                        | RegistrationState::Cancelled(_)
-                        | RegistrationState::Consumed
-                )
-        });
-        if terminal {
-            state.entries.remove(&token.continuation);
-        }
-        terminal
-    }
-
     fn publish_event(
         &self,
         token: ContinuationWakeToken,
@@ -2986,56 +2968,6 @@ impl CarrierWaitService {
         }
     }
 
-    pub(crate) async fn event_outside_quiesce(
-        &self,
-        token: ContinuationWakeToken,
-        barrier: Option<Arc<carrick_thread::fork_quiesce::QuiesceBarrier>>,
-    ) -> Result<ContinuationEvent, WaitServiceError> {
-        let Some(barrier) = barrier else {
-            return self.event(token).await;
-        };
-        enum Selected {
-            Readiness(Result<ContinuationEvent, WaitServiceError>),
-            Quiesce(carrick_thread::fork_quiesce::QuiesceEvent),
-        }
-        let mut readiness = Box::pin(self.event(token));
-        let mut observed = barrier.publication_generation();
-        let mut pending_readiness = None;
-        loop {
-            let mut quiesce_event = Box::pin(next_quiesce_event(&barrier, observed));
-            let selected = std::future::poll_fn(|context| {
-                if pending_readiness.is_none()
-                    && let Poll::Ready(event) = readiness.as_mut().poll(context)
-                {
-                    return Poll::Ready(Selected::Readiness(event));
-                }
-                quiesce_event.as_mut().poll(context).map(Selected::Quiesce)
-            })
-            .await;
-            match selected {
-                Selected::Readiness(event) if !barrier.is_quiescing() => {
-                    return event;
-                }
-                Selected::Readiness(event) => {
-                    observed = barrier.publication_generation();
-                    pending_readiness = Some(event);
-                }
-                Selected::Quiesce(event) => {
-                    observed = event.generation;
-                    if event.kind == carrick_thread::fork_quiesce::QuiesceEventKind::Released
-                        && let Some(event) = pending_readiness.take()
-                    {
-                        return event;
-                    }
-                }
-            }
-        }
-    }
-
-    pub(crate) fn retire_terminal(&self, token: ContinuationWakeToken) -> bool {
-        self.inner.retire_terminal_exact(token)
-    }
-
     pub const fn topology(&self) -> WaitServiceTopology {
         WaitServiceTopology {
             service_threads: 1,
@@ -3074,67 +3006,6 @@ impl CarrierWaitService {
 pub struct ContinuationEventFuture {
     service: Arc<CarrierWaitServiceInner>,
     token: ContinuationWakeToken,
-}
-
-struct QuiesceEventAwaitState {
-    event: Mutex<Option<carrick_thread::fork_quiesce::QuiesceEvent>>,
-    waker: Mutex<Option<Waker>>,
-}
-
-struct QuiesceEventFuture {
-    state: Arc<QuiesceEventAwaitState>,
-    _subscription: Option<carrick_thread::fork_quiesce::QuiesceSubscription>,
-}
-
-impl Future for QuiesceEventFuture {
-    type Output = carrick_thread::fork_quiesce::QuiesceEvent;
-
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(event) = self.state.event.lock().take() {
-            return Poll::Ready(event);
-        }
-        *self.state.waker.lock() = Some(context.waker().clone());
-        self.state
-            .event
-            .lock()
-            .take()
-            .map_or(Poll::Pending, Poll::Ready)
-    }
-}
-
-fn next_quiesce_event(
-    barrier: &Arc<carrick_thread::fork_quiesce::QuiesceBarrier>,
-    observed_generation: u64,
-) -> QuiesceEventFuture {
-    let state = Arc::new(QuiesceEventAwaitState {
-        event: Mutex::new(None),
-        waker: Mutex::new(None),
-    });
-    let callback_state = Arc::clone(&state);
-    let enrollment = barrier.subscribe_quiesce(
-        observed_generation,
-        Arc::new(move |event| {
-            *callback_state.event.lock() = Some(event);
-            if let Some(waker) = callback_state.waker.lock().take() {
-                waker.wake();
-            }
-        }),
-    );
-    match enrollment {
-        carrick_thread::fork_quiesce::QuiesceEnrollment::Ready(event) => {
-            *state.event.lock() = Some(event);
-            QuiesceEventFuture {
-                state,
-                _subscription: None,
-            }
-        }
-        carrick_thread::fork_quiesce::QuiesceEnrollment::Subscribed(subscription) => {
-            QuiesceEventFuture {
-                state,
-                _subscription: Some(subscription),
-            }
-        }
-    }
 }
 
 impl Future for ContinuationEventFuture {
@@ -3677,112 +3548,6 @@ impl HvpatchTaskBinding {
     }
 }
 
-struct VcpuAdmissionWait {
-    owner_alive: bool,
-    lease: Option<carrick_hal::SlotLease>,
-    waker: Option<Waker>,
-}
-
-struct VcpuAdmissionState {
-    wait: Mutex<VcpuAdmissionWait>,
-    scheduler: &'static dyn carrick_hal::VcpuScheduler,
-}
-
-struct VcpuAdmissionFuture {
-    scheduler: &'static dyn carrick_hal::VcpuScheduler,
-    tid: u64,
-    preferred: Option<carrick_hal::SlotId>,
-    ticket: Option<carrick_hal::vcpu_sched::AdmissionTicket>,
-    state: Arc<VcpuAdmissionState>,
-}
-
-impl Future for VcpuAdmissionFuture {
-    type Output = carrick_hal::SlotLease;
-
-    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        {
-            let mut wait = self.state.wait.lock();
-            if let Some(lease) = wait.lease.take() {
-                wait.owner_alive = false;
-                return Poll::Ready(lease);
-            }
-            wait.waker = Some(context.waker().clone());
-        }
-        if self.ticket.is_none() {
-            let state = Arc::clone(&self.state);
-            match self.scheduler.acquire_or_subscribe(
-                self.tid,
-                self.preferred,
-                Arc::new(move |lease| {
-                    let mut wait = state.wait.lock();
-                    if !wait.owner_alive {
-                        drop(wait);
-                        state.scheduler.release(lease, carrick_hal::Yield::Blocked);
-                        return;
-                    }
-                    wait.lease = Some(lease);
-                    if let Some(waker) = wait.waker.take() {
-                        waker.wake();
-                    }
-                }),
-            ) {
-                carrick_hal::vcpu_sched::Admission::Granted(lease) => {
-                    self.state.wait.lock().owner_alive = false;
-                    return Poll::Ready(lease);
-                }
-                carrick_hal::vcpu_sched::Admission::Pending(ticket) => {
-                    self.ticket = Some(ticket);
-                }
-            }
-        }
-        let mut wait = self.state.wait.lock();
-        if let Some(lease) = wait.lease.take() {
-            wait.owner_alive = false;
-            Poll::Ready(lease)
-        } else {
-            Poll::Pending
-        }
-    }
-}
-
-impl Drop for VcpuAdmissionFuture {
-    fn drop(&mut self) {
-        let lease = {
-            let mut wait = self.state.wait.lock();
-            wait.owner_alive = false;
-            wait.waker = None;
-            wait.lease.take()
-        };
-        if let Some(ticket) = self.ticket.take() {
-            let _ = self.scheduler.cancel_admission(ticket);
-        }
-        if let Some(lease) = lease {
-            self.scheduler.release(lease, carrick_hal::Yield::Blocked);
-        }
-    }
-}
-
-pub(crate) fn await_vcpu_admission(
-    scheduler: &'static dyn carrick_hal::VcpuScheduler,
-    tid: u64,
-    preferred: Option<carrick_hal::SlotId>,
-) -> impl Future<Output = carrick_hal::SlotLease> {
-    VcpuAdmissionFuture {
-        scheduler,
-        tid,
-        preferred,
-        ticket: None,
-        state: Arc::new(VcpuAdmissionState {
-            wait: Mutex::new(VcpuAdmissionWait {
-                owner_alive: true,
-                lease: None,
-                waker: None,
-            }),
-            scheduler,
-        }),
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct JobId(u64);
 
@@ -4018,7 +3783,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
-    use std::task::{Context, Poll, Waker};
+    use std::task::{Context, Poll, Wake, Waker};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -4968,18 +4733,6 @@ mod tests {
             .thread()
             .publish_initial_task_state(task_state(context, marker))
             .expect("publish task state")
-    }
-
-    fn enqueue_root(
-        scheduler: &Arc<Scheduler>,
-        context: &KernelContext,
-        generation: ExecutionGeneration,
-    ) {
-        scheduler
-            .admit_root(context.thread().key(), generation)
-            .expect("admit root")
-            .publish(scheduler, Arc::clone(context.thread()))
-            .expect("publish root");
     }
 
     fn request(number: u64) -> SyscallRequest {
@@ -7084,42 +6837,6 @@ mod tests {
         service
             .cancel_registration(additive_registration)
             .expect("cancel masked wait");
-    }
-
-    struct ManualGate {
-        open: std::sync::atomic::AtomicBool,
-        polled: Arc<AtomicUsize>,
-        waker: parking_lot::Mutex<Option<Waker>>,
-    }
-
-    impl ManualGate {
-        fn new(polled: Arc<AtomicUsize>) -> Arc<Self> {
-            Arc::new(Self {
-                open: std::sync::atomic::AtomicBool::new(false),
-                polled,
-                waker: parking_lot::Mutex::new(None),
-            })
-        }
-
-        fn open(&self) {
-            self.open.store(true, Ordering::Release);
-            if let Some(waker) = self.waker.lock().take() {
-                waker.wake();
-            }
-        }
-    }
-
-    impl Future for &ManualGate {
-        type Output = ();
-
-        fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
-            if self.open.load(Ordering::Acquire) {
-                return Poll::Ready(());
-            }
-            self.polled.fetch_add(1, Ordering::SeqCst);
-            *self.waker.lock() = Some(context.waker().clone());
-            Poll::Pending
-        }
     }
 
     #[test]

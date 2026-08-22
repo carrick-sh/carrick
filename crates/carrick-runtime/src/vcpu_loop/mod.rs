@@ -838,12 +838,6 @@ impl HvpatchRuntimeDirectory {
             .map_err(|error| RuntimeError::Configuration(error.to_string()))
     }
 
-    fn need_resched(&self) -> bool {
-        self.scheduler
-            .lock()
-            .as_ref()
-            .is_some_and(|scheduler| scheduler.need_resched())
-    }
     fn continuation_services(
         &self,
         kernel: &Arc<crate::kernel::Kernel>,
@@ -1483,11 +1477,6 @@ pub(crate) struct KernelState {
 }
 
 impl KernelState {
-    fn transitional_need_resched(&self) -> bool {
-        self.hvpatch_runtime
-            .as_ref()
-            .is_some_and(|directory| directory.need_resched())
-    }
     pub(crate) fn new(
         dispatcher: SyscallDispatcher,
         fork: Arc<dyn HostForkCoordinator>,
@@ -7589,57 +7578,6 @@ impl PreparedInitialHandoff {
 impl Drop for PreparedInitialHandoff {
     fn drop(&mut self) {
         self.fail_exact();
-    }
-}
-
-struct InitialRunnerStartState {
-    terminal: Option<bool>,
-    waker: Option<std::task::Waker>,
-}
-
-struct InitialRunnerStartGate {
-    state: Mutex<InitialRunnerStartState>,
-}
-
-impl InitialRunnerStartGate {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            state: Mutex::new(InitialRunnerStartState {
-                terminal: None,
-                waker: None,
-            }),
-        })
-    }
-
-    fn settle(&self, start: bool) {
-        let mut state = self.state.lock();
-        if state.terminal.is_none() {
-            state.terminal = Some(start);
-            if let Some(waker) = state.waker.take() {
-                waker.wake();
-            }
-        }
-    }
-
-    fn open(&self) {
-        self.settle(true);
-    }
-
-    fn cancel(&self) {
-        self.settle(false);
-    }
-
-    async fn wait(&self) -> bool {
-        std::future::poll_fn(|context| {
-            let mut state = self.state.lock();
-            if let Some(start) = state.terminal {
-                std::task::Poll::Ready(start)
-            } else {
-                state.waker = Some(context.waker().clone());
-                std::task::Poll::Pending
-            }
-        })
-        .await
     }
 }
 
