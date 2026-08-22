@@ -257,14 +257,16 @@ pub struct ThreadSignalSnapshotRow {
     pub pending_actions: Vec<(LinuxSignal, LinuxSigaction)>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+// Not `Copy`: `InvariantViolation` carries an owned message so a failing clause
+// can name the rows involved.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum KernelSnapshotError {
     #[error("kernel snapshot authority is busy")]
     Busy,
     #[error("kernel snapshot deadline expired")]
     TimedOut,
     #[error("kernel snapshot invariant violated: {0}")]
-    InvariantViolation(&'static str),
+    InvariantViolation(String),
     #[error("kernel snapshot authority unavailable for {0:?}")]
     AuthorityUnavailable(SnapshotTable),
 }
@@ -1067,7 +1069,9 @@ impl Kernel {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// Not `Copy`: it carries `KernelSnapshotError`, whose invariant message is
+// owned so a failing clause can name the rows involved.
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum AttemptError {
     Race,
     Public(KernelSnapshotError),
@@ -1094,9 +1098,15 @@ fn map_backend_error(error: SnapshotError) -> AttemptError {
     }
 }
 
-fn invariant<T>(message: &'static str) -> Result<T, AttemptError> {
+/// Fail the snapshot by NAME.
+///
+/// Takes an owned message so a clause can carry the identities that make it
+/// actionable — which mapping, which frame, which mm. A verdict that names only
+/// the family of failure ("a join is missing") costs a debugging cycle to turn
+/// into a diagnosis; one that names the row costs none.
+fn invariant<T>(message: impl Into<String>) -> Result<T, AttemptError> {
     Err(AttemptError::Public(
-        KernelSnapshotError::InvariantViolation(message),
+        KernelSnapshotError::InvariantViolation(message.into()),
     ))
 }
 
@@ -1634,15 +1644,18 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
     {
         return invariant("frame contains duplicate mapping aliases");
     }
-    let frame_lengths: BTreeMap<_, _> = snapshot
+    // Length and alias list travel together: two maps built from one iterator
+    // made "frame has no recorded length" an unreachable arm, and an
+    // unreachable arm is not a diagnosis.
+    let frames: BTreeMap<FrameId, (_, BTreeSet<MappingId>)> = snapshot
         .frames
         .iter()
-        .map(|row| (row.frame, row.length))
-        .collect();
-    let frames: BTreeMap<FrameId, BTreeSet<MappingId>> = snapshot
-        .frames
-        .iter()
-        .map(|row| (row.frame, row.mappings.iter().copied().collect()))
+        .map(|row| {
+            (
+                row.frame,
+                (row.length, row.mappings.iter().copied().collect()),
+            )
+        })
         .collect();
     if frames.len() != snapshot.frames.len() {
         return invariant("duplicate frame identity");
@@ -1652,18 +1665,39 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
         return invariant("duplicate mapping identity");
     }
     for mapping in &snapshot.mappings {
-        if !mm_ids.contains(&mapping.mm)
-            || frames
-                .get(&mapping.frame)
-                .is_none_or(|aliases| !aliases.contains(&mapping.mapping))
-            || frame_lengths
-                .get(&mapping.frame)
-                .is_none_or(|length| *length != mapping.length)
-        {
-            return invariant("mapping frame/mm/length join is missing");
+        // Three unrelated failures used to share one message here. They call
+        // for opposite fixes — an mm that retired out from under a live
+        // mapping, a frame whose alias list was never updated, and a length
+        // that drifted between the two records — so each one names itself and
+        // the rows involved.
+        if !mm_ids.contains(&mapping.mm) {
+            return invariant(format!(
+                "mapping {:?} names mm {:?}, which is not in the snapshot",
+                mapping.mapping, mapping.mm
+            ));
+        }
+        let Some((frame_length, aliases)) = frames.get(&mapping.frame) else {
+            return invariant(format!(
+                "mapping {:?} names frame {:?}, which is not in the snapshot",
+                mapping.mapping, mapping.frame
+            ));
+        };
+        if !aliases.contains(&mapping.mapping) {
+            return invariant(format!(
+                "frame {:?} does not list mapping {:?} among its {} alias(es)",
+                mapping.frame,
+                mapping.mapping,
+                aliases.len()
+            ));
+        }
+        if *frame_length != mapping.length {
+            return invariant(format!(
+                "mapping {:?} length {:?} disagrees with frame {:?} length {:?}",
+                mapping.mapping, mapping.length, mapping.frame, frame_length
+            ));
         }
     }
-    for (frame, aliases) in &frames {
+    for (frame, (_, aliases)) in &frames {
         let actual: BTreeSet<_> = snapshot
             .mappings
             .iter()
@@ -2140,9 +2174,8 @@ mod tests {
             .push(Arc::downgrade(&collision));
         assert!(matches!(
             kernel.snapshot(deadline()),
-            Err(KernelSnapshotError::InvariantViolation(
-                "pointer-distinct mms share one stable identity"
-            ))
+            Err(KernelSnapshotError::InvariantViolation(message))
+                if message == "pointer-distinct mms share one stable identity"
         ));
     }
 
@@ -2169,9 +2202,8 @@ mod tests {
             .push(Arc::downgrade(&collision));
         assert!(matches!(
             kernel.snapshot(deadline()),
-            Err(KernelSnapshotError::InvariantViolation(
-                "pointer-distinct task-shared bundles share one observation key"
-            ))
+            Err(KernelSnapshotError::InvariantViolation(message))
+                if message == "pointer-distinct task-shared bundles share one observation key"
         ));
     }
 
