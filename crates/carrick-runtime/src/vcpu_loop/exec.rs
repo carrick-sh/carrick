@@ -97,15 +97,6 @@ pub(super) enum ExecvePreparation {
     Prepared(Box<PreparedExecve>),
 }
 
-enum ExecveInput {
-    Fresh {
-        path: String,
-        argv: Vec<Vec<u8>>,
-        env: Vec<Vec<u8>>,
-    },
-    Prepared(Box<PreparedExecve>),
-}
-
 impl RuntimePreparedExec {
     fn old_mm_id(&self) -> crate::kernel::MmId {
         match self {
@@ -843,19 +834,8 @@ where
         kernel: &Kernel,
         kernel_context: &crate::kernel::KernelContext,
         engine: &mut E,
-        input: ExecveInput,
+        prepared: PreparedExecve,
     ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
-        let (prepared, needs_sibling_drain) = match input {
-            ExecveInput::Fresh { path, argv, env } => {
-                let prepared =
-                    match self.prepare_execve(kernel, kernel_context, engine, path, argv, env)? {
-                        ExecvePreparation::Complete(outcome) => return Ok(outcome),
-                        ExecvePreparation::Prepared(prepared) => *prepared,
-                    };
-                (prepared, true)
-            }
-            ExecveInput::Prepared(prepared) => (*prepared, false),
-        };
         let PreparedExecve {
             image: img,
             path,
@@ -883,23 +863,6 @@ where
                     );
                 }
             };
-        // THE POINT OF NO RETURN. Destroying the thread group cannot
-        // be undone, so from here `execve` must never return to the
-        // guest — the same place Linux puts it (`de_thread` inside
-        // `begin_new_exec`, after which Linux uses `force_sigsegv`).
-        // A partial drain leaves a half-dead thread group, so even this
-        // step's OWN failure is past the line.
-        if needs_sibling_drain
-            && self.registry.live_count() > 1
-            && let Err(error) = self.terminate_siblings_for_exec(kernel, engine).await
-        {
-            return Self::exec_failed_past_no_return(
-                kernel,
-                engine,
-                &format!("terminate siblings for exec: {error}"),
-            )
-            .map(Some);
-        }
         emit_runtime_stage(
             carrick_observability::probes::HvpatchExecRuntimeStagePhase::SiblingDrain,
             sibling_drain_started,
@@ -1443,24 +1406,6 @@ where
         Ok(None)
     }
 
-    pub(super) async fn handle_execve(
-        &mut self,
-        kernel: &Kernel,
-        kernel_context: &crate::kernel::KernelContext,
-        engine: &mut E,
-        path: String,
-        argv: Vec<Vec<u8>>,
-        env: Vec<Vec<u8>>,
-    ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
-        self.drive_execve(
-            kernel,
-            kernel_context,
-            engine,
-            ExecveInput::Fresh { path, argv, env },
-        )
-        .await
-    }
-
     /// Resume the destructive exec suffix after the persistent executor has
     /// loaded a fresh engine. `Prepared` bypasses the sole await arm in
     /// `drive_execve`; returning Pending is therefore a fail-closed state-machine
@@ -1472,12 +1417,7 @@ where
         engine: &mut E,
         prepared: PreparedExecve,
     ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
-        let mut future = Box::pin(self.drive_execve(
-            kernel,
-            kernel_context,
-            engine,
-            ExecveInput::Prepared(Box::new(prepared)),
-        ));
+        let mut future = Box::pin(self.drive_execve(kernel, kernel_context, engine, prepared));
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         match future.as_mut().poll(&mut context) {
             std::task::Poll::Ready(result) => result,
