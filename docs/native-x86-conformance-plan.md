@@ -1,5 +1,10 @@
 # FreeBSD/amd64 Native (DSR) Backend — Path to All 428 Conformance Probes
 
+> **Retired lane.** This document records work on the `native`/DSR execution
+> backend, which no longer exists: `hvpatch` is the only backend and the only
+> accepted `--exec-backend` value. Every command below names a retired flag
+> and will not run as written. Kept as the historical record of that campaign.
+
 > Status doc. Goal: every x86_64 musl conformance probe passing under
 > `--exec-backend native` on FreeBSD/amd64. This is the roadmap and the
 > running scoreboard.

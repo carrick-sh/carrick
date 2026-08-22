@@ -1,4 +1,10 @@
 /*
+ * The `--exec-backend native` in the recipe below is RETIRED: `hvpatch` is now
+ * the only execution backend and the only accepted value. The invocation is
+ * updated to the surviving form; whether this script's probe set still fires
+ * on the HVPatch lane has NOT been re-qualified, and the measurements it cites
+ * were taken on the native/DSR lane.
+ * 
  * guest-translation-census.d — how much of a workload's cost is TRANSLATION,
  * and how much of that translation is work we have already done before?
  *
@@ -29,7 +35,7 @@
  *
  * Run:
  *   target/release/carrick trace -s scripts/dtrace/guest-translation-census.d \
- *     -o /tmp/xlat.txt -- run --exec-backend native <image> <cmd>...
+ *     -o /tmp/xlat.txt -- run --exec-backend hvpatch <image> <cmd>...
  */
 #pragma D option quiet
 #pragma D option dynvarsize=256m

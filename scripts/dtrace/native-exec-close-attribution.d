@@ -1,4 +1,10 @@
 /*
+ * The `--exec-backend native` in the recipe below is RETIRED: `hvpatch` is now
+ * the only execution backend and the only accepted value. The invocation is
+ * updated to the surviving form; whether this script's probe set still fires
+ * on the HVPatch lane has NOT been re-qualified, and the measurements it cites
+ * were taken on the native/DSR lane.
+ * 
  * How many host close(2) does ONE guest execve cost, and is it really one
  * per-exec burst?  Native (DSR) lane.
  *
@@ -67,10 +73,10 @@
  * -----
  *   carrick trace --script scripts/dtrace/native-exec-close-attribution.d \
  *     -o target/perf/exec-close.raw \
- *     -- run --exec-backend native <image>@sha256:... /bin/sh -c '<workload>'
+ *     -- run --exec-backend hvpatch <image>@sha256:... /bin/sh -c '<workload>'
  *
  * Set `CARRICK_RUN_ID` and reap with `scripts/sudo/kill.sh "$CARRICK_RUN_ID"`.
- * The target must be `--exec-backend native`; under the VMM backend the service
+ * The target must be `--exec-backend hvpatch`; under the VMM backend the service
  * probes never fire and every section comes back empty, which is a wrong-backend
  * error and not a zero result.
  */

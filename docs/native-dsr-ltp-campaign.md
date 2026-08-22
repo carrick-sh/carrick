@@ -1,5 +1,10 @@
 # Native DSR correctness campaign — 2026-07-11
 
+> **Retired lane.** This document records work on the `native`/DSR execution
+> backend, which no longer exists: `hvpatch` is the only backend and the only
+> accepted `--exec-backend` value. Every command below names a retired flag
+> and will not run as written. Kept as the historical record of that campaign.
+
 This is the dated evidence ledger for the Darwin-native AArch64 dynamic syscall
 rewriter. Linux is the semantic oracle. The legacy native executor was neither
 a control lane nor part of this campaign and has since been removed; DSR is now

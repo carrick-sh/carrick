@@ -19,9 +19,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 CARRICK_RUN_ID="$run_id" \
-CARRICK_EXEC_BACKEND=native \
 CARRICK_MMAP_ARENA_GIB=1 \
-    "$carrick" run --pull never --platform linux/amd64 --exec-backend native \
+    "$carrick" run --pull never --platform linux/amd64 --exec-backend hvpatch \
     "$image" /bin/sh -c '/bin/sleep 30 & wait' >"$log" 2>&1 &
 driver_pid=$!
 

@@ -1,4 +1,10 @@
 /*
+ * The `--exec-backend native` in the recipe below is RETIRED: `hvpatch` is now
+ * the only execution backend and the only accepted value. The invocation is
+ * updated to the surviving form; whether this script's probe set still fires
+ * on the HVPatch lane has NOT been re-qualified, and the measurements it cites
+ * were taken on the native/DSR lane.
+ * 
  * native-cpu-attribution.d — what fraction of carrick's CPU is TRANSLATION?
  *
  * WHY SAMPLING, NOT BRACKETING. The obvious way to time translation is to
@@ -34,7 +40,7 @@
  *
  * Run:
  *   target/release/carrick trace -s scripts/dtrace/native-cpu-attribution.d \
- *     -o /tmp/cpu.txt -- run --exec-backend native <image> <cmd>...
+ *     -o /tmp/cpu.txt -- run --exec-backend hvpatch <image> <cmd>...
  * Or attach to a workload already in flight (arg0 = seconds, arg1 = window):
  *   sudo dtrace -q -s scripts/dtrace/native-cpu-attribution.d 60 10
  */

@@ -1,4 +1,10 @@
 /*
+ * The `--exec-backend native` in the recipe below is RETIRED: `hvpatch` is now
+ * the only execution backend and the only accepted value. The invocation is
+ * updated to the surviving form; whether this script's probe set still fires
+ * on the HVPatch lane has NOT been re-qualified, and the measurements it cites
+ * were taken on the native/DSR lane.
+ * 
  * Native translated-code ownership catalog wire trace.
  *
  * This is the narrow live check for the process-wide reset/add/ready USDT
@@ -18,7 +24,7 @@
  *   CARRICK_RUN_ID=<exact-id> timeout 120s target/release/carrick trace \
  *     --script scripts/dtrace/native-translated-range-catalog.d \
  *     --trace-out /tmp/native-translated-range-catalog.log -- \
- *     run --exec-backend native --pull never ubuntu:24.04 /bin/true
+ *     run --exec-backend hvpatch --pull never ubuntu:24.04 /bin/true
  */
 #pragma D option quiet
 #pragma D option bufsize=4m

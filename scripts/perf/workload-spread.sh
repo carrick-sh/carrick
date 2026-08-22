@@ -53,7 +53,7 @@ run() { # engine workload-name sample
   local eng=$1 name=$2 i=$3 rid="spread-$1-$2-$$-$3" out
   local script="set -eu; ${WL[$name]}"
   if [[ $eng == carrick ]]; then
-    out=$("$CARRICK_BIN" run --exec-backend native -e "CARRICK_RUN_ID=$rid" -w /tmp "$IMAGE" /bin/sh -c "$script" 2>/dev/null) || return 1
+    out=$("$CARRICK_BIN" run --exec-backend hvpatch -e "CARRICK_RUN_ID=$rid" -w /tmp "$IMAGE" /bin/sh -c "$script" 2>/dev/null) || return 1
   else
     out=$(docker run --rm --name "$rid" --platform linux/arm64 -e "CARRICK_RUN_ID=$rid" -w /tmp "$IMAGE" /bin/sh -c "$script" 2>/dev/null) || return 1
   fi
@@ -65,7 +65,7 @@ prime() {
   local eng=$1 rid="prime-$1-$$"
   local s="set -eu; cd /tmp; printf 'package main\nfunc main(){println(\"ok\")}\n' > b2.go; GOCACHE=/tmp/gcw /usr/local/go/bin/go build -o bx2 ./b2.go"
   if [[ $eng == carrick ]]; then
-    "$CARRICK_BIN" run --exec-backend native -e "CARRICK_RUN_ID=$rid" -w /tmp "$IMAGE" /bin/sh -c "$s" >/dev/null 2>&1 || true
+    "$CARRICK_BIN" run --exec-backend hvpatch -e "CARRICK_RUN_ID=$rid" -w /tmp "$IMAGE" /bin/sh -c "$s" >/dev/null 2>&1 || true
   else
     docker run --rm --name "$rid" --platform linux/arm64 -e "CARRICK_RUN_ID=$rid" -w /tmp "$IMAGE" /bin/sh -c "$s" >/dev/null 2>&1 || true
   fi

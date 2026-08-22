@@ -1,5 +1,10 @@
 # Native DSR Static Campaign
 
+> **Retired lane.** This document records work on the `native`/DSR execution
+> backend, which no longer exists: `hvpatch` is the only backend and the only
+> accepted `--exec-backend` value. Every command below names a retired flag
+> and will not run as written. Kept as the historical record of that campaign.
+
 This document records the Task 12 static-corpus campaign for the experimental
 Darwin-native same-ISA dynamic syscall rewriter (DSR). It is a correctness
 result, not a performance claim and not evidence that arbitrary AArch64 code is
