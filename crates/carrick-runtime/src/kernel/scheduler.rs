@@ -1351,10 +1351,9 @@ impl Scheduler {
         reason: super::objects::ExecutionFailure,
     ) -> Result<bool, SchedulerError> {
         let _transition = self.generation_transition.lock();
-        let thread = self
-            .kernel
-            .exact_thread_for_scheduler(key)
-            .ok_or(SchedulerError::UnknownThread)?;
+        let Some(thread) = self.kernel.exact_thread_for_scheduler(key) else {
+            return Ok(false);
+        };
         if !matches!(
             thread.execution_state(),
             super::objects::ThreadExecutionState::Blocked {
@@ -1364,7 +1363,13 @@ impl Scheduler {
         ) {
             return Ok(false);
         }
-        let successor = thread.fail_blocked_generation(generation, reason)?;
+        let successor = match thread.fail_blocked_generation(generation, reason) {
+            Ok(successor) => successor,
+            Err(super::objects::ThreadExecutionError::InvalidTransition { .. }) => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
         self.observe_generation_transition(
             key,
             generation,
