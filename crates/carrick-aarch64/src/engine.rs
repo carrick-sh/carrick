@@ -179,6 +179,17 @@ pub struct Aarch64TaskEngineState<V: Aarch64Vmm> {
     pending_process_fork: Option<ParentForkCowRollback>,
     pt_snapshot_scratch: Option<PageTableManager>,
 }
+
+/// Task-owned runtime authorities that must follow a logical HVPatch task
+/// across persistent-worker attach/detach boundaries.  Exec may replace all
+/// three while the task is loaded, so a task-only binding must republish the
+/// projection returned by the live engine rather than retaining immutable
+/// construction-time clones.
+pub struct Aarch64TaskRuntimeProjection {
+    pub page_tables: Arc<Mutex<Option<PageTableManager>>>,
+    pub protections: Arc<MemoryProtections>,
+    pub process_asid: Option<u16>,
+}
 unsafe impl<V: Aarch64Vmm> Send for Aarch64TaskEngineState<V> {}
 
 impl<V: Aarch64Vmm> Aarch64TaskEngineState<V> {
@@ -234,8 +245,24 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         }
     }
 
-    pub fn into_injected_task_only_backend(self) -> (V, V::Vcpu) {
-        (self.vm, self.vcpu)
+    pub fn into_injected_task_only_backend(self) -> (V, V::Vcpu, Aarch64TaskRuntimeProjection) {
+        let Self {
+            vm,
+            vcpu,
+            page_tables,
+            protections,
+            process_asid,
+            ..
+        } = self;
+        (
+            vm,
+            vcpu,
+            Aarch64TaskRuntimeProjection {
+                page_tables,
+                protections,
+                process_asid,
+            },
+        )
     }
 
     pub fn overlay_task_state_on_live_executor(
@@ -256,6 +283,31 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             state.syscall_continuation,
         )?;
         self.apply_task_metadata(state);
+        self.validate_loaded_task_runtime_projection()?;
+        Ok(())
+    }
+
+    fn validate_loaded_task_runtime_projection(&self) -> Result<(), TrapError> {
+        let Some(process_asid) = self.process_asid else {
+            return Ok(());
+        };
+        const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
+        let ttbr = self.vcpu.get_sys_reg(SysReg::Ttbr0)?;
+        let hardware_asid = (ttbr >> 48) as u16;
+        if hardware_asid != process_asid {
+            return Err(TrapError::Hypervisor(format!(
+                "loaded HVPatch projection ASID {process_asid} does not match TTBR ASID {hardware_asid}"
+            )));
+        }
+        let root = ttbr & TTBR_ROOT_MASK;
+        if let Some(manager) = self.page_tables.lock().as_ref()
+            && manager.base() != root
+        {
+            return Err(TrapError::Hypervisor(format!(
+                "loaded HVPatch page-table manager root 0x{:x} does not match TTBR root 0x{root:x}",
+                manager.base()
+            )));
+        }
         Ok(())
     }
 
@@ -1978,6 +2030,9 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // the old image before the hvpatch ASID configuration reserves its
         // per-mm root-slot aperture in the NEW tables.
         self.replace_page_tables(self.vm.exec_page_tables());
+        if let Some(protections) = self.vm.exec_protections() {
+            self.protections = protections;
+        }
         if let Some(asid) = self.process_asid {
             <Self as ThreadedEngine>::configure_process_asid(self, asid)?;
         }

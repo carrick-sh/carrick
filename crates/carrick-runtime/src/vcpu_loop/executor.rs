@@ -67,6 +67,20 @@ enum HvpatchTaskEngineBindingPayload {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvpatchTaskEngineBindingState {
+    fn preflight_runtime_projection(
+        &self,
+        cpu: &carrick_hal::threaded::GuestCpuState,
+    ) -> Result<(), TrapError> {
+        match &self.payload {
+            HvpatchTaskEngineBindingPayload::TaskOnly(state) => {
+                state.preflight_runtime_projection(cpu)
+            }
+            HvpatchTaskEngineBindingPayload::Resident(_) => Ok(()),
+            #[cfg(test)]
+            HvpatchTaskEngineBindingPayload::Test => Ok(()),
+        }
+    }
+
     pub(crate) fn initial(
         state: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchTaskEngineState,
     ) -> Self {
@@ -310,6 +324,14 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 "HVPatch executor already has task authority".into(),
             ));
         }
+        // Validate the exact Kernel CPU/MM/ASID image before taking backend,
+        // vCPU, ASID-residency, or task-projection authority. A malformed
+        // same-generation snapshot must leave the runnable task untouched.
+        let cpu = &task.validate_for_load()?.cpu;
+        task.binding()
+            .inspect_backend::<HvpatchTaskEngineBindingState, _>(|state| {
+                state.preflight_runtime_projection(cpu)
+            })?;
         let mut asid_load = task.binding().begin_asid_load(self.executor_id)?;
         asid_load.arm_hardware_dirty().map_err(|error| {
             TrapError::Hypervisor(format!("HVPatch ASID hardware arm failed: {error}"))
@@ -339,6 +361,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                     vcpu,
                     identity.mm.raw(),
                     identity.asid_generation,
+                    cpu,
                 );
                 self.loaded_task_only = Some(*state);
                 engine
@@ -356,7 +379,6 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         };
         self.current = Some(engine);
         self.binding = Some(Arc::clone(task.binding()));
-        let cpu = &task.validate_for_load()?.cpu;
         self.current
             .as_mut()
             .ok_or_else(|| TrapError::Hypervisor("HVPatch load lost attached engine".into()))?

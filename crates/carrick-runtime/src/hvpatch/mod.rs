@@ -30,6 +30,8 @@ mod patcher;
 mod stage1_mm;
 
 pub(crate) use asid::{AsidGeneration, AsidLoad, InvalidationAck};
+#[cfg(test)]
+pub(crate) use stage1_mm::Stage1MmPool;
 pub(crate) use stage1_mm::{PreparedStage1Mm, Stage1MmLease, Stage1MmRetirement};
 
 use mm_resources::MmResources;

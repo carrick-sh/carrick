@@ -875,6 +875,15 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         None
     }
 
+    /// Replacement PROT_NONE authority installed by the just-completed exec.
+    /// Backends whose protection gate lives entirely behind `GuestVmBackend`
+    /// keep the default; HVPatch returns the exact Arc owned by its new task
+    /// projection so a persistent detach/reload cannot resurrect the
+    /// predecessor's ranges.
+    fn exec_protections(&self) -> Option<Arc<MemoryProtections>> {
+        None
+    }
+
     // NOTE: `process_exit_cleanup` is inherited from the shared [`GuestVmBackend`]
     // supertrait (ISA-neutral hook, signature-identical with x86).
 

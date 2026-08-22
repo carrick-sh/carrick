@@ -401,9 +401,7 @@ pub type HvpatchTaskEngineState = carrick_aarch64::Aarch64TaskEngineState<HvfAar
 pub struct HvpatchTaskOnlyEngineState {
     _backend: HvpatchTaskOnlyBackendState,
     _snapshot: Aarch64VcpuSnapshot,
-    _page_tables: Arc<parking_lot::Mutex<Option<carrick_mem::page_table::PageTableManager>>>,
-    _protections: Arc<MemoryProtections>,
-    _process_asid: Option<u16>,
+    runtime_projection: TaskOnlyRuntimeProjectionSlot,
     parked_task: parking_lot::Mutex<Option<HvfTaskState>>,
 }
 // SAFETY: the task projection contains only task-owned Arc authorities and raw
@@ -411,7 +409,95 @@ pub struct HvpatchTaskOnlyEngineState {
 // no vCPU, mailbox binding, VM owner, or host-thread identity.
 unsafe impl Send for HvpatchTaskOnlyEngineState {}
 
+struct TaskOnlyRuntimeProjectionSlot {
+    projection: parking_lot::Mutex<Option<carrick_aarch64::Aarch64TaskRuntimeProjection>>,
+}
+
+type TaskOnlyRuntimeAuthorities = (
+    Arc<parking_lot::Mutex<Option<carrick_mem::page_table::PageTableManager>>>,
+    Arc<MemoryProtections>,
+);
+
+impl TaskOnlyRuntimeProjectionSlot {
+    fn new(projection: carrick_aarch64::Aarch64TaskRuntimeProjection) -> Self {
+        Self {
+            projection: parking_lot::Mutex::new(Some(projection)),
+        }
+    }
+
+    fn take(&self) -> Result<carrick_aarch64::Aarch64TaskRuntimeProjection, TrapError> {
+        self.projection.lock().take().ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch task runtime projection is already loaded".to_owned())
+        })
+    }
+
+    fn put(
+        &self,
+        projection: carrick_aarch64::Aarch64TaskRuntimeProjection,
+    ) -> Result<(), TrapError> {
+        let mut slot = self.projection.lock();
+        if slot.is_some() {
+            return Err(TrapError::Hypervisor(
+                "HVPatch task runtime projection was published twice".to_owned(),
+            ));
+        }
+        *slot = Some(projection);
+        Ok(())
+    }
+
+    fn clone_authorities(&self) -> Result<TaskOnlyRuntimeAuthorities, TrapError> {
+        let slot = self.projection.lock();
+        let projection = slot.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch task runtime projection is loaded".to_owned())
+        })?;
+        Ok((
+            Arc::clone(&projection.page_tables),
+            Arc::clone(&projection.protections),
+        ))
+    }
+
+    fn validate_cpu(&self, cpu: &carrick_hal::threaded::GuestCpuState) -> Result<(), TrapError> {
+        let slot = self.projection.lock();
+        let projection = slot.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch task runtime projection is loaded".to_owned())
+        })?;
+        validate_task_only_runtime_projection(projection, cpu)
+    }
+
+    #[cfg(test)]
+    fn validate_parked_task(&self, parked: &HvfTaskState) -> Result<(), TrapError> {
+        let slot = self.projection.lock();
+        let projection = slot.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch task runtime projection is loaded".to_owned())
+        })?;
+        if !parked.runtime_authorities_match(&projection.page_tables, &projection.protections) {
+            return Err(TrapError::Hypervisor(
+                "HVPatch task runtime projection does not match parked task state".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl HvpatchTaskOnlyEngineState {
+    pub fn preflight_runtime_projection(
+        &self,
+        cpu: &carrick_hal::threaded::GuestCpuState,
+    ) -> Result<(), TrapError> {
+        self.runtime_projection.validate_cpu(cpu)?;
+        let (page_tables, protections) = self.runtime_projection.clone_authorities()?;
+        let parked = self.parked_task.lock();
+        let parked = parked.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch task runtime state is already loaded".to_owned())
+        })?;
+        if !parked.runtime_authorities_match(&page_tables, &protections) {
+            return Err(TrapError::Hypervisor(
+                "HVPatch task runtime projection does not match parked task state".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn initial_cpu_state(
         &self,
         mm_generation: u64,
@@ -462,10 +548,8 @@ impl HvpatchTaskOnlyEngineState {
                 "HVPatch task runtime state was activated twice".to_owned(),
             ));
         }
-        let task = self._backend.runtime_task_state(
-            Arc::clone(&self._page_tables),
-            Arc::clone(&self._protections),
-        )?;
+        let (page_tables, protections) = self.runtime_projection.clone_authorities()?;
+        let task = self._backend.runtime_task_state(page_tables, protections)?;
         self._backend.activate()?;
         if self.parked_task.lock().replace(task).is_some() {
             std::process::abort();
@@ -519,9 +603,13 @@ impl HvpatchPreparedTaskOnlyEngineState {
         Ok(HvpatchTaskOnlyEngineState {
             _backend: backend,
             _snapshot: snapshot,
-            _page_tables: page_tables,
-            _protections: protections,
-            _process_asid: process_asid,
+            runtime_projection: TaskOnlyRuntimeProjectionSlot::new(
+                carrick_aarch64::Aarch64TaskRuntimeProjection {
+                    page_tables,
+                    protections,
+                    process_asid,
+                },
+            ),
             parked_task: parking_lot::Mutex::new(None),
         })
     }
@@ -635,7 +723,85 @@ pub fn attach_task_only_engine(
     vcpu: HvfAarch64Vcpu,
     mm_generation: u64,
     asid_generation: u64,
+    cpu: &carrick_hal::threaded::GuestCpuState,
 ) -> HvfAarch64Engine {
+    let projection = state
+        .runtime_projection
+        .take()
+        .unwrap_or_else(|_| std::process::abort());
+    if validate_task_only_runtime_projection(&projection, cpu).is_err() {
+        std::process::abort();
+    }
+    let mut parked = state
+        .parked_task
+        .lock()
+        .take()
+        .unwrap_or_else(|| std::process::abort());
+    swap_hvpatch_task_state(&mut executor.state.task, &mut parked);
+    if !executor
+        .state
+        .task_runtime_authorities_match(&projection.page_tables, &projection.protections)
+    {
+        std::process::abort();
+    }
+    if state.parked_task.lock().replace(parked).is_some() {
+        std::process::abort();
+    }
+    Aarch64EngineCore::from_injected_task_only_backend(
+        executor,
+        vcpu,
+        projection.page_tables,
+        projection.protections,
+        projection.process_asid,
+        mm_generation,
+        asid_generation,
+    )
+}
+
+fn validate_task_only_runtime_projection(
+    projection: &carrick_aarch64::Aarch64TaskRuntimeProjection,
+    cpu: &carrick_hal::threaded::GuestCpuState,
+) -> Result<(), TrapError> {
+    let carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu) = cpu else {
+        return Err(TrapError::Hypervisor(
+            "HVPatch AArch64 task projection rejected non-AArch64 CPU state".to_owned(),
+        ));
+    };
+    let Some(process_asid) = projection.process_asid else {
+        return Err(TrapError::Hypervisor(
+            "HVPatch task projection has no numeric process ASID".to_owned(),
+        ));
+    };
+    let cpu_asid = (cpu.ttbr0 >> 48) as u16;
+    if cpu.ttbr0 != cpu.ttbr1 || cpu_asid != process_asid {
+        return Err(TrapError::Hypervisor(format!(
+            "HVPatch task projection ASID {process_asid} does not match CPU TTBR pair 0x{:x}/0x{:x}",
+            cpu.ttbr0, cpu.ttbr1
+        )));
+    }
+    const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
+    let root = cpu.ttbr0 & TTBR_ROOT_MASK;
+    if let Some(manager) = projection.page_tables.lock().as_ref()
+        && manager.base() != root
+    {
+        return Err(TrapError::Hypervisor(format!(
+            "HVPatch task projection manager root 0x{:x} does not match CPU TTBR root 0x{root:x}",
+            manager.base()
+        )));
+    }
+    Ok(())
+}
+pub fn detach_task_only_engine(
+    state: &HvpatchTaskOnlyEngineState,
+    engine: HvfAarch64Engine,
+) -> (HvfAarch64Vmm, HvfAarch64Vcpu) {
+    let (mut executor, vcpu, projection) = engine.into_injected_task_only_backend();
+    if !executor
+        .state
+        .task_runtime_authorities_match(&projection.page_tables, &projection.protections)
+    {
+        std::process::abort();
+    }
     let mut parked = state
         .parked_task
         .lock()
@@ -645,28 +811,7 @@ pub fn attach_task_only_engine(
     if state.parked_task.lock().replace(parked).is_some() {
         std::process::abort();
     }
-    Aarch64EngineCore::from_injected_task_only_backend(
-        executor,
-        vcpu,
-        Arc::clone(&state._page_tables),
-        Arc::clone(&state._protections),
-        state._process_asid,
-        mm_generation,
-        asid_generation,
-    )
-}
-pub fn detach_task_only_engine(
-    state: &HvpatchTaskOnlyEngineState,
-    engine: HvfAarch64Engine,
-) -> (HvfAarch64Vmm, HvfAarch64Vcpu) {
-    let (mut executor, vcpu) = engine.into_injected_task_only_backend();
-    let mut parked = state
-        .parked_task
-        .lock()
-        .take()
-        .unwrap_or_else(|| std::process::abort());
-    swap_hvpatch_task_state(&mut executor.state.task, &mut parked);
-    if state.parked_task.lock().replace(parked).is_some() {
+    if state.runtime_projection.put(projection).is_err() {
         std::process::abort();
     }
     (executor, vcpu)
@@ -1271,6 +1416,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.page_tables_snapshot()
     }
 
+    fn exec_protections(&self) -> Option<Arc<MemoryProtections>> {
+        Some(self.state.task_protections_authority())
+    }
+
     // ── threaded sibling lifecycle ──
 
     fn kick_handle(&self) -> Self::KickHandle {
@@ -1562,6 +1711,222 @@ mod reclaim_hatch_tests {
 
 #[cfg(test)]
 mod task_only_materializer_tests {
+    fn cpu_state(ttbr: u64) -> carrick_hal::threaded::GuestCpuState {
+        carrick_hal::threaded::GuestCpuState::from_aarch64_v1(
+            carrick_hal::threaded::Aarch64TaskCpuStateV1 {
+                gprs: [0; 31],
+                pc: 0,
+                pstate: 0,
+                trap_pc: 0,
+                trap_pstate: 0,
+                sp_el0: 0,
+                elr_el1: 0,
+                spsr_el1: 0,
+                ttbr0: ttbr,
+                ttbr1: ttbr,
+                tcr: 0,
+                sctlr_el1: 0,
+                mair_el1: 0,
+                vbar_el1: 0,
+                cpacr_el1: 0,
+                cntkctl_el1: 0,
+                tpidr_el1: 0,
+                actlr_el1: 0,
+                tpidr_el0: 0,
+                tpidrro_el0: 0,
+                contextidr_el1: 0,
+                vregs: [0; 32],
+                fpsr: 0,
+                fpcr: 0,
+                pending_resume_pc: None,
+                last_syscall_nr: None,
+                last_syscall_orig_x0: 0,
+                last_fault_esr: 0,
+                last_exit_class: 0,
+                is_forked_child: false,
+                syscall_continuation: None,
+                mm_generation: 1,
+                asid_generation: 1,
+            },
+        )
+    }
+
+    fn runtime_projection(root: u64, asid: u16) -> carrick_aarch64::Aarch64TaskRuntimeProjection {
+        let initial_root = carrick_mem::memory::LINUX_PAGE_TABLES_BASE;
+        let mut manager = carrick_mem::page_table::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            initial_root,
+        );
+        if root != initial_root {
+            manager.rebase(root).expect("rebase test manager");
+        }
+        carrick_aarch64::Aarch64TaskRuntimeProjection {
+            page_tables: std::sync::Arc::new(parking_lot::Mutex::new(Some(manager))),
+            protections: std::sync::Arc::new(
+                carrick_guest_mem::protections::MemoryProtections::default(),
+            ),
+            process_asid: Some(asid),
+        }
+    }
+
+    #[test]
+    fn task_only_runtime_projection_slot_republishes_exec_replacement_exactly_once() {
+        let old_root = carrick_mem::memory::LINUX_PAGE_TABLES_BASE;
+        let replacement_root = 0x9a_0000_0000;
+        let slot = super::TaskOnlyRuntimeProjectionSlot::new(runtime_projection(old_root, 1));
+
+        let old = slot.take().expect("take predecessor projection");
+        assert_eq!(
+            old.page_tables
+                .lock()
+                .as_ref()
+                .map(|manager| manager.base()),
+            Some(old_root)
+        );
+        assert!(slot.take().is_err(), "a loaded projection is non-cloneable");
+
+        let replacement = runtime_projection(replacement_root, 2);
+        let replacement_protections = std::sync::Arc::clone(&replacement.protections);
+        slot.put(replacement).expect("publish exec replacement");
+        assert!(
+            slot.put(old).is_err(),
+            "detach cannot overwrite an already-published projection"
+        );
+
+        let reloaded = slot.take().expect("reload replacement projection");
+        assert_eq!(reloaded.process_asid, Some(2));
+        assert_eq!(
+            reloaded
+                .page_tables
+                .lock()
+                .as_ref()
+                .map(|manager| manager.base()),
+            Some(replacement_root)
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &reloaded.protections,
+            &replacement_protections
+        ));
+    }
+
+    #[test]
+    fn task_only_attach_and_detach_transfer_the_live_runtime_projection() {
+        let source = include_str!("hvf_aarch64_engine.rs");
+        let attach = source
+            .split_once("pub fn attach_task_only_engine")
+            .expect("task-only attach")
+            .1
+            .split_once("fn validate_task_only_runtime_projection")
+            .expect("end of attach")
+            .0;
+        assert!(attach.contains("runtime_projection\n        .take()"));
+        assert!(attach.contains("projection.page_tables"));
+        assert!(attach.contains("projection.protections"));
+        assert!(attach.contains("projection.process_asid"));
+        assert!(attach.contains("std::process::abort"));
+        assert!(!attach.contains("return Err"));
+
+        let detach = source
+            .split_once("pub fn detach_task_only_engine")
+            .expect("task-only detach")
+            .1
+            .split_once("pub fn detach_task_engine")
+            .expect("end of detach")
+            .0;
+        assert!(detach.contains("into_injected_task_only_backend"));
+        assert!(detach.contains("runtime_projection.put(projection)"));
+    }
+
+    #[test]
+    fn task_only_projection_preflight_rejects_root_or_numeric_asid_drift() {
+        let root = 0x9a_0000_0000;
+        let projection = runtime_projection(root, 2);
+        let exact_ttbr = (2_u64 << 48) | root;
+        let signed_failure_projection =
+            runtime_projection(carrick_mem::memory::LINUX_PAGE_TABLES_BASE, 1);
+        assert!(
+            super::validate_task_only_runtime_projection(
+                &signed_failure_projection,
+                &cpu_state(exact_ttbr),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("does not match CPU TTBR pair"),
+            "the exact signed old-projection/new-CPU state must fail before attach"
+        );
+        super::validate_task_only_runtime_projection(&projection, &cpu_state(exact_ttbr))
+            .expect("exact task-only projection");
+
+        let wrong_root = (2_u64 << 48) | (root + 0x4000);
+        assert!(
+            super::validate_task_only_runtime_projection(&projection, &cpu_state(wrong_root))
+                .unwrap_err()
+                .to_string()
+                .contains("manager root")
+        );
+        let wrong_asid = (3_u64 << 48) | root;
+        assert!(
+            super::validate_task_only_runtime_projection(&projection, &cpu_state(wrong_asid))
+                .unwrap_err()
+                .to_string()
+                .contains("does not match CPU TTBR pair")
+        );
+    }
+
+    #[test]
+    fn parked_task_projection_mismatch_rejects_without_consuming_projection() {
+        let root = 0x9a_0000_0000;
+        let slot = super::TaskOnlyRuntimeProjectionSlot::new(runtime_projection(root, 2));
+        let parked = crate::trap::hvpatch_task_state_test_fixture(2, 0x7000, 702);
+
+        assert!(
+            slot.validate_parked_task(&parked)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match parked task state")
+        );
+        let retained = slot
+            .take()
+            .expect("preflight mismatch must not consume task projection");
+        assert_eq!(retained.process_asid, Some(2));
+        assert_eq!(
+            retained
+                .page_tables
+                .lock()
+                .as_ref()
+                .map(|manager| manager.base()),
+            Some(root)
+        );
+    }
+
+    #[test]
+    fn executor_preflights_kernel_cpu_before_consuming_task_authority() {
+        let source = include_str!("../../carrick-runtime/src/vcpu_loop/executor.rs");
+        let load = source
+            .split_once("impl PersistentExecutor for HvpatchPersistentExecutor")
+            .expect("HVPatch executor implementation")
+            .1
+            .split_once("fn load(&mut self, task: &RunnableTask")
+            .expect("persistent HVPatch load")
+            .1
+            .split_once("fn run_until_boundary")
+            .expect("end of persistent HVPatch load")
+            .0;
+        let validate = load.find("task.validate_for_load()?").unwrap();
+        let projection = load.find("inspect_backend").unwrap();
+        let asid = load.find("begin_asid_load").unwrap();
+        let backend = load.find("take_backend").unwrap();
+        let vcpu = load.find("self.vcpu").unwrap();
+        let attach = load.find("attach_task_only_engine").unwrap();
+        assert!(
+            validate < projection
+                && projection < asid
+                && projection < backend
+                && projection < vcpu
+                && projection < attach
+        );
+    }
+
     #[test]
     fn hvpatch_task_only_materializers_are_structurally_vcpu_free() {
         let source = include_str!("hvf_aarch64_engine.rs");

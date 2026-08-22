@@ -3592,6 +3592,17 @@ impl HvpatchTaskBinding {
                 "HVPatch task binding rejected stale MM/ASID generation".to_owned(),
             ));
         }
+        if let (Some(stage1_mm), carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu)) =
+            (&self.stage1_mm, &state.cpu)
+        {
+            let expected = stage1_mm.binding().ttbr0.raw();
+            if cpu.ttbr0 != expected || cpu.ttbr1 != expected {
+                return Err(crate::trap::TrapError::Hypervisor(format!(
+                    "HVPatch task binding rejected CPU TTBR pair 0x{:x}/0x{:x}; expected 0x{expected:x}",
+                    cpu.ttbr0, cpu.ttbr1
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -3722,6 +3733,20 @@ impl HvpatchTaskBinding {
             .map_err(|_| {
                 crate::trap::TrapError::Hypervisor("task binding backend type mismatch".into())
             })?))
+    }
+
+    pub(crate) fn inspect_backend<T: Send + 'static, R>(
+        &self,
+        inspect: impl FnOnce(&T) -> Result<R, crate::trap::TrapError>,
+    ) -> Result<R, crate::trap::TrapError> {
+        let slot = self.backend.lock();
+        let backend = slot.as_ref().ok_or_else(|| {
+            crate::trap::TrapError::Hypervisor("task binding already loaded".into())
+        })?;
+        let backend = backend.downcast_ref::<T>().ok_or_else(|| {
+            crate::trap::TrapError::Hypervisor("task binding backend type mismatch".into())
+        })?;
+        inspect(backend)
     }
 
     pub(crate) fn put_backend<T: Send + 'static>(
@@ -4818,6 +4843,61 @@ mod tests {
         );
         successor.after_terminal_settlement();
         assert!(completion.is_finished());
+    }
+
+    #[test]
+    fn hvpatch_binding_rejects_aarch64_cpu_ttbr_drift_with_matching_generations() {
+        struct ExitJob;
+
+        impl PersistentQuantumJob for ExitJob {
+            fn poll_quantum_with_engine(
+                &mut self,
+                _engine: &mut dyn std::any::Any,
+                _control: &mut crate::vcpu_loop::executor::HvpatchQuantumControl<'_, '_>,
+            ) -> crate::vcpu_loop::executor::ExecutorExit {
+                crate::vcpu_loop::executor::ExecutorExit::Exited
+            }
+        }
+
+        let (_kernel, context) = bootstrap(15_475);
+        let mut state = crate::vcpu_loop::executor::tests::task_state(&context, 475);
+        let (_pool, stage1_mm) = crate::hvpatch::Stage1MmPool::new_root_for_tests(0x8000, 2)
+            .expect("stage-1 test lease");
+        let asid_generation = stage1_mm.asid_generation().generation();
+        let expected_ttbr = stage1_mm.binding().ttbr0.raw();
+        let GuestCpuState::Aarch64V1(cpu) = &state.cpu else {
+            panic!("test state must be AArch64");
+        };
+        let mut cpu = (**cpu).clone();
+        cpu.ttbr0 = expected_ttbr;
+        cpu.ttbr1 = expected_ttbr;
+        cpu.asid_generation = asid_generation;
+        state.cpu = GuestCpuState::from_aarch64_v1(cpu.clone());
+        state.asid_generation = asid_generation;
+
+        let binding = HvpatchTaskBinding::new_with_stage1_mm(
+            crate::vcpu_loop::executor::TaskLoadIdentity {
+                abi: state.cpu.guest_abi(),
+                version: state.cpu.version(),
+                mm: state.mm,
+                asid_generation,
+            },
+            Arc::new(HvpatchTaskQuantum::new(
+                Box::new(ExitJob),
+                LogicalJobCompletion::pending(),
+            )),
+            Box::new(()),
+            Arc::clone(&stage1_mm),
+        )
+        .expect("exact HVPatch binding");
+        binding.validate_state(&state).expect("exact TTBR pair");
+
+        cpu.ttbr1 ^= 0x1000;
+        state.cpu = GuestCpuState::from_aarch64_v1(cpu);
+        let error = binding
+            .validate_state(&state)
+            .expect_err("matching generations cannot authorize a stale TTBR");
+        assert!(error.to_string().contains("CPU TTBR pair"));
     }
 
     #[test]
