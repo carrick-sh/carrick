@@ -4271,6 +4271,15 @@ struct HvpatchFrameInventory {
     )>,
     retirement_reservation: Option<carrick_hal::FrameInventoryReservation>,
     retirement_commit: Option<carrick_hal::FrameInventoryCommit<()>>,
+    /// The mappings this mm owned at the instant its retirement was staged.
+    ///
+    /// `stage_retirement` pushes one `UnmapMapping` per extent and then CLEARS
+    /// `extents`, so by the time the MM authority authenticates the commit the
+    /// ledger it would compare against is already empty. Capturing the
+    /// expectation here — in the same critical section that drains it — is what
+    /// lets `HvpatchTaskInventoryAuthority::prepare_retirement` still check
+    /// exactness instead of reading a ledger the commit construction emptied.
+    retirement_expected: Vec<(carrick_hal::MappingId, carrick_hal::FrameId)>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6673,12 +6682,29 @@ impl HvpatchTaskInventoryAuthority {
             Self::Active {
                 ledger, retirement, ..
             } if retirement.is_none() => {
-                let mut expected_mappings: Vec<_> = ledger
-                    .lock()
-                    .extents
-                    .values()
-                    .map(|extent| (extent.mapping, extent.frame))
-                    .collect();
+                // ONE invariant: the commit must cover exactly what this mm
+                // owned WHEN ITS RETIREMENT WAS STAGED.
+                //
+                // `stage_retirement` pushes an `UnmapMapping` per extent and
+                // then clears `extents` in the same critical section, so on the
+                // production path the live ledger is empty by construction and
+                // the snapshot it recorded there is the only faithful statement
+                // of that set. A caller that has not staged yet still has its
+                // set in `extents`. Taking the snapshot also makes a duplicate
+                // retirement fail closed instead of silently passing.
+                let mut expected_mappings = {
+                    let mut ledger = ledger.lock();
+                    let staged = std::mem::take(&mut ledger.retirement_expected);
+                    if staged.is_empty() {
+                        ledger
+                            .extents
+                            .values()
+                            .map(|extent| (extent.mapping, extent.frame))
+                            .collect()
+                    } else {
+                        staged
+                    }
+                };
                 expected_mappings.sort_unstable();
                 expected_mappings.dedup();
                 let mut committed_unmaps: Vec<_> = commit
@@ -9493,6 +9519,16 @@ impl HvfVmState {
             }
         }
         drop(frames);
+        // Record what this mm owned BEFORE dropping it, so the authority can
+        // still authenticate the commit against the exact set it retires.
+        let mut expected: Vec<_> = inventory
+            .extents
+            .values()
+            .map(|extent| (extent.mapping, extent.frame))
+            .collect();
+        expected.sort_unstable();
+        expected.dedup();
+        inventory.retirement_expected = expected;
         inventory.extents.clear();
         Ok(())
     }
