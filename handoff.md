@@ -392,6 +392,43 @@ skip, which is why the criterion 3 reducer exits 0 while the ledger still leaks.
 Attribution against a pre-`f250844d` binary built at `dbfffc6f` confirms the
 leak itself is older.
 
+### IN FLIGHT AT THE PAUSE — pick this up first
+
+**An agy worker is mid-implementation of the execve authority fix.** It survives
+this session; collect it before starting anything else.
+
+    W=/Users/tjfontaine/.claude/local-marketplaces/agy-director/agy-director/scripts/agy_worker.py
+    AGY_RUN_ID=authority python3 "$W" status
+    AGY_RUN_ID=authority python3 "$W" result --name exec-authority   # when done
+    AGY_RUN_ID=authority python3 "$W" wait   --name exec-authority   # blocks
+    AGY_RUN_ID=authority python3 "$W" reap                           # if abandoning
+
+Its worktree is `.worktrees/exec-authority` on branch `agy/exec-authority`,
+based at `979dceaf`. Its brief is
+`/Users/tjfontaine/.claude/jobs/80da92aa/tmp/brief-execauth.md`; the spec it was
+given is `docs/hvpatch-exec-authority-routing-plan.md`.
+
+**Review the DIFF, not the report.** That has caught a bad patch in two of the
+three write workers used this session — one had replaced a variable with
+`let needs_sibling_drain = false;`, leaving an unreachable branch where a Linux
+guarantee used to be. Specifically for this one:
+
+- It is editing **seven** files, including `crates/carrick-aarch64/{engine,vmm}.rs`
+  and `crates/carrick-hal/src/threaded.rs`, which the brief did not name. That
+  may be a legitimate trait plumbing path or it may be scope creep — check.
+- **The one question that matters: did it avoid mutating the shared authority?**
+  A vfork child's `registration.task_mm` is the same `Arc` as its parent's, so
+  an in-place `SharedProcess -> ProcessPrepared` transition corrupts the parent
+  and still passes a naive test. Its `self_review` was required to state how it
+  avoided this and what evidence shows the parent untouched.
+- Re-run its verification yourself: the fork+exec+exit reducer's snapshot must
+  return JSON, the reducer must exit 0 ten times, and `forkcow`, `cloneexitsig`,
+  `waitidsiuid`, `xthreadsig`, `sigchld` must each exit 0.
+
+`.worktrees/attrib-mmleak` is a detached worktree at `dbfffc6f` holding a
+built, signed PRE-fix binary. It is what proved the ledger leak predates
+`f250844d`. Keep it while attributing; `git worktree remove` it when done.
+
 ### Next work, in order
 
 1. **The execve authority re-publication** above — it is the one change that
