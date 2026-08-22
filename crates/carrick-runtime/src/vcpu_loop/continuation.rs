@@ -35,11 +35,6 @@ static NEXT_REGISTRATION_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_RESOURCE_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_RUNNER_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
-thread_local! {
-    static CURRENT_RUNNER_JOB: std::cell::Cell<Option<JobId>> = const { std::cell::Cell::new(None) };
-    static CURRENT_RUNNER_WORKER: std::cell::RefCell<Option<Arc<TransitionalWorkerContext>>> = const { std::cell::RefCell::new(None) };
-}
-
 #[derive(Clone)]
 struct FutexSource(Arc<FutexTable>);
 
@@ -3279,134 +3274,6 @@ pub enum QuantumExit {
     Failed,
 }
 
-struct TransitionalWorkerKick {
-    binding: Mutex<Option<crate::kernel::ExecutorBinding>>,
-    hardware: Mutex<Option<Box<dyn carrick_hal::VcpuKickDyn>>>,
-    pending: AtomicBool,
-}
-
-impl std::fmt::Debug for TransitionalWorkerKick {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TransitionalWorkerKick")
-            .field("binding", &*self.binding.lock())
-            .field("hardware_published", &self.hardware.lock().is_some())
-            .field("pending", &self.pending.load(Ordering::Acquire))
-            .finish()
-    }
-}
-
-impl crate::kernel::ExecutorKick for TransitionalWorkerKick {
-    fn try_bind(&self, binding: crate::kernel::ExecutorBinding) -> bool {
-        let mut current = self.binding.lock();
-        if current.is_some() {
-            return false;
-        }
-        *current = Some(binding);
-        true
-    }
-
-    fn unbind(&self, binding: crate::kernel::ExecutorBinding) {
-        let mut current = self.binding.lock();
-        if *current == Some(binding) {
-            *current = None;
-            self.pending.store(false, Ordering::Release);
-            self.hardware.lock().take();
-        }
-    }
-
-    fn rebind_exact_with(
-        &self,
-        predecessor: crate::kernel::ExecutorBinding,
-        successor: crate::kernel::ExecutorBinding,
-        publish: &mut dyn FnMut() -> bool,
-    ) -> bool {
-        let mut current = self.binding.lock();
-        if *current != Some(predecessor) {
-            return false;
-        }
-        if !publish() {
-            return false;
-        }
-        *current = Some(successor);
-        true
-    }
-
-    fn deliver_exact(&self, token: crate::kernel::ExecutorKickToken) -> bool {
-        let current = self.binding.lock();
-        let exact = current.is_some_and(|binding| {
-            binding.executor() == token.executor()
-                && binding.executor_epoch() == token.executor_epoch()
-                && binding.thread() == token.thread()
-                && binding.generation() == token.generation()
-        });
-        if !exact {
-            return false;
-        }
-        self.pending.store(true, Ordering::Release);
-        if let Some(hardware) = self.hardware.lock().as_ref() {
-            hardware.kick();
-        }
-        true
-    }
-
-    fn current_binding(&self) -> Option<crate::kernel::ExecutorBinding> {
-        *self.binding.lock()
-    }
-}
-
-struct TransitionalWorkerContext {
-    scheduler: Arc<Scheduler>,
-    registration: crate::kernel::ExecutorRegistration,
-    kick: Arc<TransitionalWorkerKick>,
-}
-
-impl TransitionalWorkerContext {
-    fn register(scheduler: Arc<Scheduler>) -> Result<Arc<Self>, TransitionalRunnerError> {
-        let kick = Arc::new(TransitionalWorkerKick {
-            binding: Mutex::new(None),
-            hardware: Mutex::new(None),
-            pending: AtomicBool::new(false),
-        });
-        let registration = scheduler
-            .register_executor(Arc::clone(&kick) as Arc<dyn crate::kernel::ExecutorKick>)
-            .map_err(|_| TransitionalRunnerError::TaskFailed)?;
-        Ok(Arc::new(Self {
-            scheduler,
-            registration,
-            kick,
-        }))
-    }
-
-    fn publish_hardware_kick(&self, kick: Box<dyn carrick_hal::VcpuKickDyn>) -> bool {
-        let binding = self.kick.binding.lock();
-        if binding.is_none() {
-            return false;
-        }
-        *self.kick.hardware.lock() = Some(kick);
-        if self.kick.pending.swap(false, Ordering::AcqRel)
-            && let Some(kick) = self.kick.hardware.lock().as_ref()
-        {
-            kick.kick();
-        }
-        true
-    }
-}
-
-impl Drop for TransitionalWorkerContext {
-    fn drop(&mut self) {
-        let _ = self.scheduler.unregister_executor(&self.registration);
-    }
-}
-
-/// Task-5-only adapter preserving the current welded runner until Task 6 wires
-/// the real HVF executor backend.  It delegates all state decisions to the
-/// Kernel/scheduler continuation APIs and owns no parallel task state machine.
-enum RunnerWork {
-    Poll(Arc<RunnerTask>),
-    Shutdown,
-}
-
 /// Object-safe job state driven by the one authoritative Task 4 executor pool.
 /// Implementations own logical runtime/continuation state only; the executor
 /// argument owns the backend engine and physical vCPU for the duration of one
@@ -3795,90 +3662,6 @@ impl HvpatchTaskBinding {
     }
 }
 
-pub(crate) struct RunnerTask {
-    future: Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>>,
-    sender: mpsc::Sender<RunnerWork>,
-    queued: AtomicBool,
-    completion: LogicalJobCompletion,
-    scheduler: Arc<Mutex<Option<Arc<Scheduler>>>>,
-    activation_committed: Arc<AtomicBool>,
-}
-
-impl RunnerTask {
-    fn enqueue_inner(self: &Arc<Self>, request_preemption: bool) -> bool {
-        if !self.queued.swap(true, Ordering::AcqRel) {
-            if self
-                .sender
-                .send(RunnerWork::Poll(Arc::clone(self)))
-                .is_err()
-            {
-                self.queued.store(false, Ordering::Release);
-                return false;
-            }
-            if request_preemption && let Some(scheduler) = self.scheduler.lock().as_ref() {
-                scheduler.request_preemption();
-            }
-        }
-        true
-    }
-
-    fn enqueue(self: &Arc<Self>) -> bool {
-        self.enqueue_inner(true)
-    }
-
-    fn enqueue_without_preemption(self: &Arc<Self>) -> bool {
-        self.enqueue_inner(false)
-    }
-
-    fn poll(self: &Arc<Self>) -> QuantumExit {
-        struct CurrentJobGuard;
-        impl Drop for CurrentJobGuard {
-            fn drop(&mut self) {
-                CURRENT_RUNNER_JOB.with(|current| current.set(None));
-            }
-        }
-        CURRENT_RUNNER_JOB.with(|current| {
-            if current.replace(Some(self.completion.id())).is_some() {
-                std::process::abort();
-            }
-        });
-        let _current_job = CurrentJobGuard;
-        self.queued.store(false, Ordering::Release);
-        let waker = Waker::from(Arc::clone(self));
-        let mut context = Context::from_waker(&waker);
-        let mut slot = self.future.lock();
-        let Some(future) = slot.as_mut() else {
-            return QuantumExit::Exited;
-        };
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            future.as_mut().poll(&mut context)
-        })) {
-            Ok(Poll::Ready(())) => {
-                *slot = None;
-                self.completion.publish();
-                QuantumExit::Exited
-            }
-            Ok(Poll::Pending) if self.queued.load(Ordering::Acquire) => QuantumExit::Runnable,
-            Ok(Poll::Pending) => QuantumExit::Blocked,
-            Err(_) => {
-                *slot = None;
-                self.completion.publish();
-                QuantumExit::Failed
-            }
-        }
-    }
-
-    fn fail_boundary(self: &Arc<Self>) {
-        let mut slot = self.future.lock();
-        *slot = None;
-        self.completion.publish();
-    }
-}
-
-pub(crate) fn run_task_quantum(task: &Arc<RunnerTask>) -> QuantumExit {
-    task.poll()
-}
-
 struct VcpuAdmissionWait {
     owner_alive: bool,
     lease: Option<carrick_hal::SlotLease>,
@@ -3982,208 +3765,6 @@ pub(crate) fn await_vcpu_admission(
             }),
             scheduler,
         }),
-    }
-}
-
-impl Wake for RunnerTask {
-    fn wake(self: Arc<Self>) {
-        let _ = self.enqueue();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        let _ = self.enqueue();
-    }
-}
-
-struct TransitionalRunnerPool {
-    sender: mpsc::Sender<RunnerWork>,
-    receiver: Arc<Mutex<mpsc::Receiver<RunnerWork>>>,
-    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
-    worker_count: usize,
-    next_worker: AtomicUsize,
-    scheduler: Arc<Mutex<Option<Arc<Scheduler>>>>,
-    reject_next_submission: AtomicBool,
-    reject_next_activation: Arc<AtomicBool>,
-    #[cfg(test)]
-    next_activation_probe: Mutex<Option<Arc<AtomicBool>>>,
-}
-
-impl TransitionalRunnerPool {
-    fn spawn_worker(self: &Arc<Self>) {
-        let receiver = Arc::clone(&self.receiver);
-        let weak = Arc::downgrade(self);
-        let index = self.next_worker.fetch_add(1, Ordering::Relaxed);
-        let worker = std::thread::Builder::new()
-            .name(format!("carrick-transitional-{index}"))
-            .spawn(move || {
-                let boundary = crate::vcpu_loop::executor::WorkerBoundaryAudit::capture()
-                    .unwrap_or_else(|_| std::process::abort());
-                let mut worker_context: Option<Arc<TransitionalWorkerContext>> = None;
-                loop {
-                    let work = receiver.lock().recv();
-                    match work {
-                        Ok(RunnerWork::Poll(task)) => {
-                            if worker_context.is_none()
-                                && let Some(pool) = weak.upgrade()
-                                && let Some(scheduler) = pool.scheduler.lock().clone()
-                            {
-                                worker_context =
-                                    TransitionalWorkerContext::register(scheduler).ok();
-                            }
-                            if boundary.audit_runtime_owned().is_err() {
-                                task.fail_boundary();
-                                if let Some(pool) = weak.upgrade() {
-                                    pool.spawn_worker();
-                                }
-                                return;
-                            }
-                            CURRENT_RUNNER_WORKER.with(|current| {
-                                *current.borrow_mut() = worker_context.clone();
-                            });
-                            let exit =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    run_task_quantum(&task)
-                                }));
-                            CURRENT_RUNNER_WORKER.with(|current| current.borrow_mut().take());
-                            if !matches!(
-                                exit,
-                                Ok(QuantumExit::Runnable
-                                    | QuantumExit::Blocked
-                                    | QuantumExit::Exited)
-                            ) {
-                                task.fail_boundary();
-                                drop(worker_context.take());
-                                if let Some(pool) = weak.upgrade() {
-                                    pool.spawn_worker();
-                                }
-                                return;
-                            }
-                            if boundary.audit_runtime_owned().is_err() {
-                                task.fail_boundary();
-                                if let Some(pool) = weak.upgrade() {
-                                    pool.spawn_worker();
-                                }
-                                return;
-                            }
-                        }
-                        Ok(RunnerWork::Shutdown) | Err(_) => return,
-                    }
-                }
-            })
-            .unwrap_or_else(|_| std::process::abort());
-        self.workers.lock().push(worker);
-    }
-}
-
-impl std::fmt::Debug for TransitionalRunnerPool {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TransitionalRunnerPool")
-            .field("worker_count", &self.worker_count)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for TransitionalRunnerPool {
-    fn drop(&mut self) {
-        for _ in 0..self.worker_count {
-            let _ = self.sender.send(RunnerWork::Shutdown);
-        }
-        for worker in self.workers.get_mut().drain(..) {
-            if worker.thread().id() != std::thread::current().id() {
-                let _ = worker.join();
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct TransitionalDedicatedRunner {
-    pool: Arc<TransitionalRunnerPool>,
-}
-
-pub(crate) struct DormantRunnerSubmission {
-    task: Option<Arc<RunnerTask>>,
-    reject_activation: Arc<AtomicBool>,
-}
-
-pub(crate) struct ActivatedRunnerSubmission {
-    activation_committed: Arc<AtomicBool>,
-}
-
-impl ActivatedRunnerSubmission {
-    pub(crate) fn is_runner_visible(&self) -> bool {
-        self.activation_committed.load(Ordering::Acquire)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn visibility_token_for_test(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.activation_committed)
-    }
-}
-
-impl DormantRunnerSubmission {
-    pub(crate) fn activate(mut self) -> Result<ActivatedRunnerSubmission, TransitionalRunnerError> {
-        if self.reject_activation.swap(false, Ordering::AcqRel) {
-            return Err(TransitionalRunnerError::TaskFailed);
-        }
-        let task = self
-            .task
-            .take()
-            .ok_or(TransitionalRunnerError::TaskFailed)?;
-        task.activation_committed.store(true, Ordering::Release);
-        if task.enqueue_without_preemption() {
-            Ok(ActivatedRunnerSubmission {
-                activation_committed: Arc::clone(&task.activation_committed),
-            })
-        } else {
-            task.activation_committed.store(false, Ordering::Release);
-            task.fail_boundary();
-            Err(TransitionalRunnerError::TaskFailed)
-        }
-    }
-}
-
-impl Drop for DormantRunnerSubmission {
-    fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.fail_boundary();
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum TransitionalRunnerError {
-    #[error("transitional runner requires at least one worker")]
-    ZeroWorkers,
-    #[error("transitional runner task panicked or the runner stopped")]
-    TaskFailed,
-}
-
-pub struct LogicalTaskReceipt<T> {
-    receiver: mpsc::Receiver<T>,
-    completion: LogicalJobCompletion,
-}
-
-impl<T> LogicalTaskReceipt<T> {
-    pub fn wait(self) -> Result<T, TransitionalRunnerError> {
-        self.receiver
-            .recv()
-            .map_err(|_| TransitionalRunnerError::TaskFailed)
-    }
-
-    pub fn is_finished(&self) -> bool {
-        self.completion.is_finished()
-    }
-
-    pub fn completion(&self) -> LogicalJobCompletion {
-        self.completion.clone()
-    }
-
-    pub fn try_take(self) -> Result<T, TransitionalRunnerError> {
-        self.receiver
-            .try_recv()
-            .map_err(|_| TransitionalRunnerError::TaskFailed)
     }
 }
 
@@ -4415,236 +3996,6 @@ impl Future for ProcessDrain {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TransitionalRunnerTopology {
-    worker_threads: usize,
-}
-
-impl TransitionalRunnerTopology {
-    pub const fn worker_threads(self) -> usize {
-        self.worker_threads
-    }
-
-    pub const fn task_waiter_threads(self) -> usize {
-        0
-    }
-}
-
-impl TransitionalDedicatedRunner {
-    pub fn new() -> Self {
-        Self::with_worker_limit(1).unwrap_or_else(|_| std::process::abort())
-    }
-
-    pub fn with_worker_limit(worker_count: usize) -> Result<Self, TransitionalRunnerError> {
-        if worker_count == 0 {
-            return Err(TransitionalRunnerError::ZeroWorkers);
-        }
-        let (sender, receiver) = mpsc::channel();
-        let pool = Arc::new(TransitionalRunnerPool {
-            sender,
-            receiver: Arc::new(Mutex::new(receiver)),
-            workers: Mutex::new(Vec::with_capacity(worker_count)),
-            worker_count,
-            next_worker: AtomicUsize::new(0),
-            scheduler: Arc::new(Mutex::new(None)),
-            reject_next_submission: AtomicBool::new(false),
-            reject_next_activation: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            next_activation_probe: Mutex::new(None),
-        });
-        for _ in 0..worker_count {
-            pool.spawn_worker();
-        }
-        Ok(Self { pool })
-    }
-
-    pub fn spawn<F, T>(&self, future: F) -> LogicalTaskReceipt<T>
-    where
-        F: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        match self.try_spawn(future) {
-            Ok(receipt) => receipt,
-            Err(_) => {
-                let (sender, receiver) = mpsc::channel();
-                drop(sender);
-                let completion = LogicalJobCompletion::pending();
-                completion.publish();
-                LogicalTaskReceipt {
-                    receiver,
-                    completion,
-                }
-            }
-        }
-    }
-
-    pub fn try_spawn<F, T>(
-        &self,
-        future: F,
-    ) -> Result<LogicalTaskReceipt<T>, TransitionalRunnerError>
-    where
-        F: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let (receipt, dormant) = self.try_spawn_dormant(future)?;
-        let task = dormant
-            .task
-            .as_ref()
-            .ok_or(TransitionalRunnerError::TaskFailed)?;
-        let scheduler = task.scheduler.lock().clone();
-        let activated = dormant.activate()?;
-        if !activated.is_runner_visible() {
-            return Err(TransitionalRunnerError::TaskFailed);
-        }
-        if let Some(scheduler) = scheduler {
-            scheduler.request_preemption();
-        }
-        Ok(receipt)
-    }
-
-    pub(crate) fn try_spawn_dormant<F, T>(
-        &self,
-        future: F,
-    ) -> Result<(LogicalTaskReceipt<T>, DormantRunnerSubmission), TransitionalRunnerError>
-    where
-        F: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        if self
-            .pool
-            .reject_next_submission
-            .swap(false, Ordering::AcqRel)
-        {
-            return Err(TransitionalRunnerError::TaskFailed);
-        }
-        let (sender, receiver) = mpsc::channel();
-        let completion = LogicalJobCompletion::pending();
-        let future = async move {
-            let value = future.await;
-            let _ = sender.send(value);
-        };
-        #[cfg(test)]
-        let activation_committed = self
-            .pool
-            .next_activation_probe
-            .lock()
-            .take()
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        #[cfg(not(test))]
-        let activation_committed = Arc::new(AtomicBool::new(false));
-        let task = Arc::new(RunnerTask {
-            future: Mutex::new(Some(Box::pin(future))),
-            sender: self.pool.sender.clone(),
-            queued: AtomicBool::new(false),
-            completion: completion.clone(),
-            scheduler: Arc::clone(&self.pool.scheduler),
-            activation_committed,
-        });
-        Ok((
-            LogicalTaskReceipt {
-                receiver,
-                completion,
-            },
-            DormantRunnerSubmission {
-                task: Some(task),
-                reject_activation: Arc::clone(&self.pool.reject_next_activation),
-            },
-        ))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reject_next_submission_for_test(&self) {
-        self.pool
-            .reject_next_submission
-            .store(true, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reject_next_activation_for_test(&self) {
-        self.pool
-            .reject_next_activation
-            .store(true, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn activation_probe_for_next_spawn_for_test(&self) -> Arc<AtomicBool> {
-        let probe = Arc::new(AtomicBool::new(false));
-        *self.pool.next_activation_probe.lock() = Some(Arc::clone(&probe));
-        probe
-    }
-
-    pub fn topology(&self) -> TransitionalRunnerTopology {
-        TransitionalRunnerTopology {
-            worker_threads: self.pool.worker_count,
-        }
-    }
-
-    pub(crate) fn attach_scheduler(&self, scheduler: Arc<Scheduler>) {
-        let mut slot = self.pool.scheduler.lock();
-        if let Some(installed) = slot.as_ref() {
-            if !Arc::ptr_eq(installed, &scheduler) {
-                std::process::abort();
-            }
-            return;
-        }
-        *slot = Some(scheduler);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn current_executor_id() -> Option<crate::kernel::objects::ExecutorId> {
-        CURRENT_RUNNER_WORKER.with(|current| {
-            current
-                .borrow()
-                .as_ref()
-                .map(|worker| worker.registration.id())
-        })
-    }
-
-    pub(crate) fn current_executor_registration() -> Option<crate::kernel::ExecutorRegistration> {
-        CURRENT_RUNNER_WORKER.with(|current| {
-            current
-                .borrow()
-                .as_ref()
-                .map(|worker| worker.registration.clone())
-        })
-    }
-
-    pub(crate) fn publish_current_hardware_kick(kick: Box<dyn carrick_hal::VcpuKickDyn>) -> bool {
-        CURRENT_RUNNER_WORKER.with(|current| {
-            let current = current.borrow();
-            let Some(worker) = current.as_ref() else {
-                return false;
-            };
-            worker.publish_hardware_kick(kick)
-        })
-    }
-
-    pub fn current_job() -> Option<LogicalJobCompletion> {
-        let id = CURRENT_RUNNER_JOB.with(std::cell::Cell::get)?;
-        // The exact completion handle is owned by RunnerTask. A process drain
-        // only needs the stable JobId for self-exclusion, so this detached
-        // handle is already terminal and is never subscribed.
-        Some(LogicalJobCompletion {
-            id,
-            state: Arc::new(JobCompletionState {
-                done: AtomicBool::new(true),
-                next_listener: AtomicU64::new(1),
-                listeners: Mutex::new(BTreeMap::new()),
-            }),
-        })
-    }
-
-    pub const fn is_task_5_only(&self) -> bool {
-        true
-    }
-}
-
-impl Default for TransitionalDedicatedRunner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -4662,6 +4013,336 @@ mod tests {
     use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 
     use super::*;
+
+    /// Drive one future to completion on the calling test thread.
+    ///
+    /// This used to submit the future to the transitional runner pool, which is
+    /// retired. A test awaiting a single future needs no executor at all: park
+    /// the thread and let the waker unpark it. Parking here is a test-only host
+    /// wait and is outside the production source the host-blocking-authority
+    /// gate inspects.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        struct ThreadWaker(std::thread::Thread);
+        impl Wake for ThreadWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let mut future = std::pin::pin!(future);
+        let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return value;
+            }
+            std::thread::park();
+        }
+    }
+
+    fn await_event(
+        service: &CarrierWaitService,
+        token: ContinuationWakeToken,
+    ) -> Result<ContinuationEvent, WaitServiceError> {
+        let service = service.clone();
+        block_on(async move { service.event(token).await })
+    }
+
+    #[test]
+    fn hvpatch_launch_callgraph_never_constructs_the_compatibility_loop_future() {
+        let source = include_str!("mod.rs");
+        // INVERTED for the fork-closure deletion. This used to bound the launch
+        // entry between `launch_vcpu_until_exit` and `PreparedInitialRunnerTask`
+        // and assert the HVPatch arm came first. Both are deleted: there is no
+        // compatibility launch entry left to come second, so the invariant is
+        // now that none of that text exists at all. Asserting ABSENCE is the
+        // only form that keeps gating once the text is gone — a `split_once` on
+        // absent text would hand the whole file to the next assertion.
+        for deleted in [
+            "fn launch_vcpu_until_exit",
+            "fn launch_compatibility_vcpu_future",
+            "fn run_vcpu_until_exit",
+            "fn run_vcpu_until_exit_inner",
+        ] {
+            assert!(
+                !source.contains(deleted),
+                "the welded-thread vCPU loop is retired; `{deleted}` must not exist"
+            );
+        }
+        // `prepare_initial_runner_handoff` and its `PreparedInitialRunnerTask`
+        // are NOT part of that chain: `launch_persistent_hvpatch_job` calls them
+        // to publish the initial task state and claim its start gate. Deleting
+        // them with the welded loop was caught by the compiler, not by a test.
+        for shared in [
+            "fn prepare_initial_runner_handoff",
+            "struct PreparedInitialRunnerTask",
+        ] {
+            assert!(
+                source.contains(shared),
+                "the persistent launcher's initial handoff `{shared}` must survive"
+            );
+        }
+        let logical_job = source
+            .split_once("fn prepare_hvpatch_logical_job")
+            .expect("reusable logical-job constructor")
+            .1
+            .split_once("fn launch_persistent_hvpatch_job")
+            .expect("end of reusable logical-job constructor")
+            .0;
+        for required in [
+            "HvpatchLoopJob::production",
+            "HvpatchTaskBinding::new_with_stage1_mm",
+        ] {
+            assert!(
+                logical_job.contains(required),
+                "reusable HVPatch logical-job constructor omitted {required}"
+            );
+        }
+        let persistent = source
+            .split_once("fn launch_persistent_hvpatch_job")
+            .expect("persistent HVPatch launcher")
+            .1
+            .split_once("fn trap_watchdog_decision")
+            .expect("end of persistent launcher")
+            .0;
+        for prohibited in [
+            "run_vcpu_until_exit_inner",
+            "OwnerThreadEngine",
+            "std::thread::Builder",
+        ] {
+            assert!(
+                !persistent.contains(prohibited),
+                "persistent HVPatch launch retained compatibility authority {prohibited}"
+            );
+        }
+        for required in [
+            "prepare_hvpatch_logical_job",
+            "prepare_submission",
+            "start_persistent_pool",
+            "dormant.activate",
+        ] {
+            assert!(
+                persistent.contains(required),
+                "persistent HVPatch launch omitted production edge {required}"
+            );
+        }
+        let proof = persistent
+            .find("logical.activation_proof()")
+            .expect("consumed Kernel start-gate proof");
+        let start = persistent
+            .find("start_persistent_pool(")
+            .expect("pool start");
+        let activate = persistent
+            .find("dormant.activate")
+            .expect("queue activation");
+        let rollback = persistent
+            .find("if started_pool")
+            .expect("new-pool-only rollback guard");
+        let shutdown = persistent
+            .find("shutdown_persistent_pool()")
+            .expect("new pool close/join rollback");
+        assert!(proof < start && start < activate && activate < rollback && rollback < shutdown);
+
+        let executor_source = include_str!("executor.rs");
+        let worker_prepare = executor_source
+            .split_once("fn prepare_hvpatch_submission")
+            .expect("worker-held HVPatch preparation API")
+            .1
+            .split_once("pub trait TaskBindingResolver")
+            .expect("end of worker-held preparation API")
+            .0;
+        assert!(worker_prepare.contains("self.current"));
+        assert!(worker_prepare.contains("Some(current)"));
+        assert!(!worker_prepare.contains("bindings.get(&grant)"));
+    }
+
+    #[test]
+    fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
+        let continuation_source = include_str!("continuation.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production continuation source");
+        for prohibited in [
+            "libc::wait",
+            "libc::waitpid",
+            "libc::kill",
+            "libc::nanosleep",
+            "ThreadWaiter",
+            "make_readiness_pipe",
+            "wait_for_event",
+            "Duration::from_millis(2)",
+            "Duration::from_secs(24 * 60 * 60)",
+        ] {
+            assert!(
+                !continuation_source.contains(prohibited),
+                "HVPatch continuation path retains prohibited host-blocking authority: {prohibited}"
+            );
+        }
+        assert_eq!(DISPATCH_FAMILIES.len() + 1, 16);
+        // The transitional runner pool and its ambient thread-locals are gone.
+        // Nothing on the persistent executor ever published them, so every read
+        // already answered None/false; they are deleted rather than left as a
+        // second, silently-inert executor identity.
+        for deleted in [
+            "TransitionalDedicatedRunner",
+            "TransitionalRunnerPool",
+            "TransitionalWorkerContext",
+            "TransitionalWorkerKick",
+            "run_task_quantum",
+            "CURRENT_RUNNER_WORKER",
+            "CURRENT_RUNNER_JOB",
+            "LogicalTaskReceipt",
+        ] {
+            assert!(
+                !continuation_source.contains(deleted),
+                "the transitional runner pool is retired; `{deleted}` must not exist"
+            );
+        }
+        assert!(!continuation_source.contains("TaskQuantumSource"));
+        assert!(!continuation_source.contains("fallback_fd"));
+        // REPOINTED for the fork-closure deletion. `scheduler.request_preemption()`
+        // was the transitional pool's carrier-timer policy hook and its only
+        // production caller; the persistent executor owns preemption itself
+        // through its own `need_resched` flag, so the invariant is asserted
+        // where it now lives.
+        let executor_source = include_str!("executor.rs");
+        assert!(
+            executor_source.contains("self.need_resched.store(true, Ordering::Release);"),
+            "the persistent executor must own its own preemption request"
+        );
+
+        let loop_source = include_str!("mod.rs");
+        let prepare_suspend = loop_source
+            .split("fn prepare_hvpatch_continuation")
+            .nth(1)
+            .and_then(|tail| tail.split("fn persistent_block_exit").next())
+            .expect("engine-free HVPatch continuation preparation");
+        for required in [
+            "ContinuationCapture::from_lease",
+            "BlockedContinuation::from_dispatch_outcome",
+            "BlockedContinuation::from_vfork_parent",
+            "install_temporary_signal_mask",
+        ] {
+            assert!(
+                prepare_suspend.contains(required),
+                "engine-free continuation preparation misses {required}"
+            );
+        }
+        // INVERTED for the fork-closure deletion. The engine-owning welded loop
+        // and its `suspend_hvpatch_continuation` adapter used to be bounded and
+        // inspected here for product boundaries and prohibited host-blocking
+        // authority. `launch_vcpu_until_exit` returned unconditionally at its
+        // first statement, so none of that ran; the persistent executor reaches
+        // the same continuation through `persistent_block_exit`. The surviving
+        // invariant is that the welded chain does not exist at all.
+        for deleted in [
+            "fn suspend_hvpatch_continuation",
+            "async fn yield_hvpatch_quantum",
+            "fn run_vcpu_until_exit",
+            "fn launch_vcpu_until_exit",
+            "struct OwnerThreadEngine",
+            "enum CompatibilityThreadWaiter",
+        ] {
+            assert!(
+                !loop_source.contains(deleted),
+                "the welded-thread vCPU loop is retired; `{deleted}` must not exist"
+            );
+        }
+        let dispatch = loop_source
+            .split("fn service_threaded_syscall")
+            .nth(1)
+            .expect("dispatch service body");
+        assert!(
+            dispatch.contains("continuation::is_blocking_dispatch_outcome(&outcome)"),
+            "HVPatch must still escape a blocking outcome at the dispatch seam"
+        );
+        let quiesce = include_str!("quiesce.rs");
+        let hvpatch_fork = quiesce
+            .split("fn prepare_in_process_fork")
+            .nth(1)
+            .and_then(|tail| tail.split("#[cfg(test)]").next())
+            .expect("HVPatch fork body");
+        assert!(hvpatch_fork.contains("PreparedInProcessFork::SuspendVfork"));
+        assert!(!hvpatch_fork.contains(".await"));
+        assert!(!hvpatch_fork.contains("wait.wait_for_release"));
+        let fork_wrapper = loop_source
+            .split("fn complete_persistent_process_fork")
+            .nth(1)
+            .and_then(|tail| tail.split("fn finalize_persistent_process_failure").next())
+            .expect("persistent fork suspension wrapper");
+        assert!(fork_wrapper.contains("HvpatchBlockInput::Vfork"));
+
+        let threads = include_str!("threads.rs");
+        // INVERTED for the fork-closure deletion. This clause used to bound the
+        // exec drain by the retired pool's ambient job thread-local and inspect
+        // the executor-lease drain inside it. Only that pool ever published the
+        // thread-local — never the persistent executor — so the branch never
+        // ran, and the bounded drain beside it is the one that has always
+        // executed. The surviving invariant is that guest-thread teardown
+        // reacquires no retired runner identity.
+        for deleted in [
+            "TransitionalDedicatedRunner",
+            "TransitionalWorkerContext",
+            "await_hvpatch_sibling_jobs",
+        ] {
+            assert!(
+                !threads.contains(deleted),
+                "guest-thread teardown retains retired runner authority {deleted}"
+            );
+        }
+
+        let record_reactor = continuation_source
+            .split("ReadinessProbe::RecordLock")
+            .nth(2)
+            .and_then(|tail| tail.split("impl Drop for CarrierWaitServiceInner").next())
+            .expect("shared record-lock reactor path");
+        assert!(record_reactor.contains("try_drive_blocking_record_lock"));
+        for prohibited in [
+            "crate::dispatch::drive_blocking_record_lock(",
+            "F_SETLKW",
+            "Condvar",
+        ] {
+            assert!(
+                !record_reactor.contains(prohibited),
+                "record-lock reactor retains blocking authority {prohibited}"
+            );
+        }
+
+        let signal_source = include_str!("signal.rs");
+        assert!(signal_source.contains("deliver_pending_signal_with_restart"));
+        assert!(loop_source.contains("continuation.install_temporary_signal_mask(context)"));
+        assert!(loop_source.contains("self.continuation_restart = Some(result.restart())"));
+        assert!(loop_source.contains("ContinuationResumeError::StaleFileSlot"));
+        assert!(!loop_source.contains("TransitionalSchedulerKick"));
+        assert!(!loop_source.contains("continuation_executor"));
+
+        let net_source = include_str!("../dispatch/net.rs");
+        assert!(
+            net_source.matches("with_guest_slots(&files").count() >= 2,
+            "pselect/ppoll must capture every exact guest fd slot at dispatch"
+        );
+        let io_uring_source = include_str!("../dispatch/ioring.rs");
+        assert!(io_uring_source.contains("with_guest_slots(&files, [ring_fd, sqe.fd])"));
+        let proc_source = include_str!("../dispatch/proc.rs");
+        assert!(proc_source.contains("with_guest_slots(&files, [id as i32])"));
+        let fs_source = include_str!("../dispatch/fs.rs");
+        assert!(!fs_source.contains("WaitFdAuthority::Missing"));
+        for required in [
+            "captured_slot_authority(guest_fd)",
+            "captured_slot_authority(fd)",
+            "captured_slot_authority(fd.0)",
+            "WaitFdAuthority::logical",
+            "[in_fd.0, out_fd.0]",
+            "complete_wait_fd_authority",
+        ] {
+            assert!(
+                fs_source.contains(required),
+                "fd producer misses {required}"
+            );
+        }
+    }
 
     #[test]
     fn hvpatch_persistent_quantum_and_binding_exclude_executor_authority() {
@@ -4929,115 +4610,6 @@ mod tests {
             .validate_state(&state)
             .expect_err("matching generations cannot authorize a stale TTBR");
         assert!(error.to_string().contains("CPU TTBR pair"));
-    }
-
-    #[test]
-    fn hvpatch_launch_callgraph_never_constructs_the_compatibility_loop_future() {
-        let source = include_str!("mod.rs");
-        // INVERTED for the fork-closure deletion. This used to bound the launch
-        // entry between `launch_vcpu_until_exit` and `PreparedInitialRunnerTask`
-        // and assert the HVPatch arm came first. Both are deleted: there is no
-        // compatibility launch entry left to come second, so the invariant is
-        // now that none of that text exists at all. Asserting ABSENCE is the
-        // only form that keeps gating once the text is gone — a `split_once` on
-        // absent text would hand the whole file to the next assertion.
-        for deleted in [
-            "fn launch_vcpu_until_exit",
-            "fn launch_compatibility_vcpu_future",
-            "fn run_vcpu_until_exit",
-            "fn run_vcpu_until_exit_inner",
-        ] {
-            assert!(
-                !source.contains(deleted),
-                "the welded-thread vCPU loop is retired; `{deleted}` must not exist"
-            );
-        }
-        // `prepare_initial_runner_handoff` and its `PreparedInitialRunnerTask`
-        // are NOT part of that chain: `launch_persistent_hvpatch_job` calls them
-        // to publish the initial task state and claim its start gate. Deleting
-        // them with the welded loop was caught by the compiler, not by a test.
-        for shared in [
-            "fn prepare_initial_runner_handoff",
-            "struct PreparedInitialRunnerTask",
-        ] {
-            assert!(
-                source.contains(shared),
-                "the persistent launcher's initial handoff `{shared}` must survive"
-            );
-        }
-        let logical_job = source
-            .split_once("fn prepare_hvpatch_logical_job")
-            .expect("reusable logical-job constructor")
-            .1
-            .split_once("fn launch_persistent_hvpatch_job")
-            .expect("end of reusable logical-job constructor")
-            .0;
-        for required in [
-            "HvpatchLoopJob::production",
-            "HvpatchTaskBinding::new_with_stage1_mm",
-        ] {
-            assert!(
-                logical_job.contains(required),
-                "reusable HVPatch logical-job constructor omitted {required}"
-            );
-        }
-        let persistent = source
-            .split_once("fn launch_persistent_hvpatch_job")
-            .expect("persistent HVPatch launcher")
-            .1
-            .split_once("fn trap_watchdog_decision")
-            .expect("end of persistent launcher")
-            .0;
-        for prohibited in [
-            "run_vcpu_until_exit_inner",
-            "OwnerThreadEngine",
-            "TransitionalDedicatedRunner",
-            "std::thread::Builder",
-        ] {
-            assert!(
-                !persistent.contains(prohibited),
-                "persistent HVPatch launch retained compatibility authority {prohibited}"
-            );
-        }
-        for required in [
-            "prepare_hvpatch_logical_job",
-            "prepare_submission",
-            "start_persistent_pool",
-            "dormant.activate",
-        ] {
-            assert!(
-                persistent.contains(required),
-                "persistent HVPatch launch omitted production edge {required}"
-            );
-        }
-        let proof = persistent
-            .find("logical.activation_proof()")
-            .expect("consumed Kernel start-gate proof");
-        let start = persistent
-            .find("start_persistent_pool(")
-            .expect("pool start");
-        let activate = persistent
-            .find("dormant.activate")
-            .expect("queue activation");
-        let rollback = persistent
-            .find("if started_pool")
-            .expect("new-pool-only rollback guard");
-        let shutdown = persistent
-            .find("shutdown_persistent_pool()")
-            .expect("new pool close/join rollback");
-        assert!(proof < start && start < activate && activate < rollback && rollback < shutdown);
-
-        let executor_source = include_str!("executor.rs");
-        let worker_prepare = executor_source
-            .split_once("fn prepare_hvpatch_submission")
-            .expect("worker-held HVPatch preparation API")
-            .1
-            .split_once("pub trait TaskBindingResolver")
-            .expect("end of worker-held preparation API")
-            .0;
-        assert!(worker_prepare.contains("self.current"));
-        assert!(worker_prepare.contains("Some(current)"));
-        assert!(!worker_prepare.contains("bindings.get(&grant)"));
     }
 
     #[test]
@@ -5756,18 +5328,6 @@ mod tests {
             continuation,
             registration,
         }
-    }
-
-    fn await_event(
-        service: &CarrierWaitService,
-        token: ContinuationWakeToken,
-    ) -> Result<ContinuationEvent, WaitServiceError> {
-        let runner = TransitionalDedicatedRunner::new();
-        let service = service.clone();
-        runner
-            .spawn(async move { service.event(token).await })
-            .wait()
-            .expect("shared runner")
     }
 
     #[derive(Debug, Default)]
@@ -7548,75 +7108,6 @@ mod tests {
     }
 
     #[test]
-    fn bounded_transitional_runner_releases_submitter_threads_across_256_blocked_jobs() {
-        const JOBS: usize = 256;
-        let runner = TransitionalDedicatedRunner::with_worker_limit(2).expect("runner");
-        let polled = Arc::new(AtomicUsize::new(0));
-        let gates = (0..JOBS)
-            .map(|_| ManualGate::new(Arc::clone(&polled)))
-            .collect::<Vec<_>>();
-        let mut submitters = Vec::with_capacity(JOBS);
-        for gate in &gates {
-            let runner = runner.clone();
-            let gate = Arc::clone(gate);
-            submitters.push(thread::spawn(move || {
-                let submitter = thread::current().id();
-                let receipt = runner.spawn(async move {
-                    gate.as_ref().await;
-                    thread::current().id()
-                });
-                (submitter, receipt)
-            }));
-        }
-        let submitted = submitters
-            .into_iter()
-            .map(|thread| thread.join().expect("submitter exits"))
-            .collect::<Vec<_>>();
-        while polled.load(Ordering::Acquire) < JOBS {
-            thread::yield_now();
-        }
-        for gate in &gates {
-            gate.open();
-        }
-        let mut workers = std::collections::HashSet::new();
-        for (submitter, receipt) in submitted {
-            let worker = receipt.wait().expect("logical job completion");
-            assert_ne!(worker, submitter, "original task pthread must have exited");
-            workers.insert(worker);
-        }
-        assert!(workers.len() <= 2);
-        assert_eq!(runner.topology().worker_threads(), 2);
-        assert_eq!(runner.topology().task_waiter_threads(), 0);
-    }
-
-    #[test]
-    fn slot_starved_job_yields_the_only_runner_worker_until_exact_release() {
-        let admission: &'static carrick_hal::vcpu_sched::HostCondvarScheduler = Box::leak(
-            Box::new(carrick_hal::vcpu_sched::HostCondvarScheduler::new(1)),
-        );
-        let held = carrick_hal::VcpuScheduler::acquire(admission, 1);
-        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
-        let a = runner.spawn(async move {
-            let lease = await_vcpu_admission(admission, 2, Some(held.slot)).await;
-            carrick_hal::VcpuScheduler::release(admission, lease, carrick_hal::Yield::Exited);
-            2usize
-        });
-        let b = runner.spawn(async { 1usize });
-
-        assert_eq!(
-            b.wait().expect("runnable job B"),
-            1,
-            "slot-starved A must not occupy the sole runner worker"
-        );
-        assert!(
-            !a.is_finished(),
-            "A remains suspended until its exact admission grant"
-        );
-        carrick_hal::VcpuScheduler::release(admission, held, carrick_hal::Yield::Blocked);
-        assert_eq!(a.wait().expect("released job A"), 2);
-    }
-
-    #[test]
     fn failed_initial_submission_retires_exact_runnable_without_queue_row() {
         let (kernel, context) = bootstrap(15_460);
         let scheduler = Scheduler::new(kernel);
@@ -7705,771 +7196,5 @@ mod tests {
         assert_eq!(service.topology().shared_reactors(), 1);
         assert_eq!(service.topology().task_waiter_threads(), 0);
         drop(owned);
-    }
-
-    #[test]
-    fn quiesce_raise_defers_ready_job_until_release_without_occupying_shared_worker() {
-        let fixture = race_fixture(15_372);
-        let barrier = Arc::new(carrick_thread::fork_quiesce::QuiesceBarrier::new());
-        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
-        let service = Arc::clone(&fixture.service);
-        let token = fixture.registration.wake_token();
-        barrier.set_quiescing();
-        let wait_barrier = Arc::clone(&barrier);
-        let blocked = runner.spawn(async move {
-            service
-                .event_outside_quiesce(token, Some(wait_barrier))
-                .await
-        });
-        fixture.service.publish_ready(token).assert_accepted();
-        for _ in 0..128 {
-            thread::yield_now();
-        }
-        assert!(
-            !blocked.is_finished(),
-            "ready task cannot claim during quiesce"
-        );
-        assert_eq!(
-            runner
-                .spawn(async { 7_u8 })
-                .wait()
-                .expect("worker remains free"),
-            7
-        );
-        barrier.end_quiesce();
-        assert_eq!(
-            blocked
-                .wait()
-                .expect("logical task receipt")
-                .expect("readiness after release"),
-            ContinuationEvent::Ready
-        );
-    }
-
-    #[test]
-    fn wait_service_drop_finalizes_pending_job_with_typed_cancellation() {
-        let fixture = race_fixture(15_373);
-        let token = fixture.registration.wake_token();
-        let future = fixture.service.event(token);
-        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
-        let receipt = runner.spawn(future);
-        drop(fixture.registration);
-        drop(fixture.service);
-        assert_eq!(
-            receipt.wait().expect("logical receipt"),
-            Err(WaitServiceError::Cancelled(
-                CancellationCause::ServiceShutdown
-            ))
-        );
-    }
-
-    #[test]
-    fn one_worker_process_drain_excludes_current_job_and_yields_for_siblings() {
-        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
-        let gate = ManualGate::new(Arc::new(AtomicUsize::new(0)));
-        let jobs = Arc::new(Mutex::new(Vec::new()));
-        let owner_jobs = Arc::clone(&jobs);
-        let owner_runner = runner.clone();
-        let owner_gate = Arc::clone(&gate);
-        let (done_tx, done_rx) = mpsc::channel();
-        let owner = runner.spawn(async move {
-            owner_gate.as_ref().await;
-            let current = TransitionalDedicatedRunner::current_job()
-                .expect("runner poll publishes exact current JobId");
-            let mut sibling_receipts = Vec::new();
-            for value in [11_u8, 22, 33] {
-                let receipt = owner_runner.spawn(async move { value });
-                owner_jobs.lock().push(receipt.completion());
-                sibling_receipts.push(receipt);
-            }
-            let completions = std::mem::take(&mut *owner_jobs.lock());
-            ProcessDrain::excluding(current, completions).await;
-            let values = sibling_receipts
-                .into_iter()
-                .map(|receipt| receipt.wait().expect("completed sibling receipt"))
-                .collect::<Vec<_>>();
-            done_tx.send(values).expect("publish drain completion");
-        });
-        jobs.lock().push(owner.completion());
-        drop(owner);
-        gate.open();
-        assert_eq!(
-            done_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("exit owner must yield the sole worker, not synchronously join"),
-            vec![11, 22, 33]
-        );
-    }
-
-    #[test]
-    fn one_worker_two_real_runner_jobs_both_advance_at_quantum_boundaries() {
-        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
-        let progress = Arc::new(Mutex::new(Vec::new()));
-        let spawn_job = |id: u8| {
-            let progress = Arc::clone(&progress);
-            runner.spawn(async move {
-                for quantum in 0..8_u8 {
-                    progress.lock().push((id, quantum));
-                    yield_runner_quantum().await;
-                }
-                id
-            })
-        };
-        let first = spawn_job(1);
-        let second = spawn_job(2);
-        assert_eq!(first.wait().expect("first compute job"), 1);
-        assert_eq!(second.wait().expect("second compute job"), 2);
-        let progress = progress.lock();
-        assert_eq!(progress.iter().filter(|(id, _)| *id == 1).count(), 8);
-        assert_eq!(progress.iter().filter(|(id, _)| *id == 2).count(), 8);
-        let first_second = progress
-            .iter()
-            .position(|(id, _)| *id == 2)
-            .expect("second job advances");
-        assert!(
-            first_second < 8,
-            "one job must not monopolize the only worker"
-        );
-    }
-
-    #[test]
-    fn general_try_spawn_activates_before_hardware_preemption_and_both_jobs_progress() {
-        #[derive(Clone)]
-        struct VisibilityKick {
-            kicks: Arc<AtomicUsize>,
-            probe: Arc<Mutex<Option<Arc<AtomicBool>>>>,
-            observed_visible: Arc<AtomicBool>,
-        }
-        impl carrick_hal::VcpuKickDyn for VisibilityKick {
-            fn kick(&self) {
-                let visible = self
-                    .probe
-                    .lock()
-                    .as_ref()
-                    .expect("general try_spawn activation probe")
-                    .load(Ordering::Acquire);
-                self.observed_visible.store(visible, Ordering::Release);
-                self.kicks.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let (kernel, context) = bootstrap(15_470);
-        let scheduler = Arc::new(Scheduler::new(kernel));
-        let generation = publish(&context, 0x915);
-        enqueue_root(&scheduler, &context, generation);
-        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
-        runner.attach_scheduler(Arc::clone(&scheduler));
-        let kicks = Arc::new(AtomicUsize::new(0));
-        let observed_visible = Arc::new(AtomicBool::new(false));
-        let probe = Arc::new(Mutex::new(None));
-        let incumbent_kicks = Arc::clone(&kicks);
-        let incumbent_observed = Arc::clone(&observed_visible);
-        let incumbent_probe = Arc::clone(&probe);
-        let incumbent_scheduler = Arc::clone(&scheduler);
-        let (started_tx, started_rx) = mpsc::channel();
-        let incumbent = runner.spawn(async move {
-            let executor = TransitionalDedicatedRunner::current_executor_registration()
-                .expect("incumbent worker registration");
-            let running = incumbent_scheduler
-                .take(&executor)
-                .expect("claim incumbent compute task");
-            assert!(TransitionalDedicatedRunner::publish_current_hardware_kick(
-                Box::new(VisibilityKick {
-                    kicks: Arc::clone(&incumbent_kicks),
-                    probe: incumbent_probe,
-                    observed_visible: incumbent_observed,
-                })
-            ));
-            started_tx.send(()).expect("incumbent started");
-            while incumbent_kicks.load(Ordering::Acquire) == 0 {
-                std::hint::spin_loop();
-            }
-            incumbent_scheduler
-                .settle_runnable_successor(running)
-                .expect("incumbent yields after general spawn kick");
-            1_u8
-        });
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("incumbent is compute-bound");
-
-        let competitor_context = context
-            .kernel()
-            .reserve_fork(
-                &context,
-                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
-                "general try_spawn competitor".to_owned(),
-                None,
-            )
-            .expect("reserve competitor")
-            .prepare_reference(ThreadId::synthetic_for_tests(15_472))
-            .expect("prepare competitor")
-            .commit()
-            .expect("publish competitor")
-            .into_parts()
-            .expect("start competitor")
-            .0;
-        let competitor_generation = publish(&competitor_context, 0x917);
-        scheduler
-            .wake(competitor_context.thread().key())
-            .expect("publish exact competing scheduler row");
-        assert!(scheduler.need_resched());
-        let activation_probe = runner.activation_probe_for_next_spawn_for_test();
-        *probe.lock() = Some(activation_probe);
-        let competitor_scheduler = Arc::clone(&scheduler);
-        let competitor = runner
-            .try_spawn(async move {
-                let executor = TransitionalDedicatedRunner::current_executor_registration()
-                    .expect("competitor worker registration");
-                let running = competitor_scheduler
-                    .take(&executor)
-                    .expect("claim general competitor");
-                competitor_scheduler
-                    .settle_runnable_successor(running)
-                    .expect("settle general competitor");
-                2_u8
-            })
-            .expect("general competitor submission");
-
-        assert_eq!(kicks.load(Ordering::SeqCst), 1);
-        assert!(
-            observed_visible.load(Ordering::Acquire),
-            "general try_spawn hardware kick raced ahead of runner visibility"
-        );
-        assert_eq!(incumbent.wait().expect("incumbent progress"), 1);
-        assert_eq!(competitor.wait().expect("competitor progress"), 2);
-        assert_eq!(competitor_generation.raw(), 1);
-    }
-
-    #[test]
-    fn general_try_spawn_activation_failure_never_kicks_or_polls() {
-        #[derive(Clone)]
-        struct CountingKick(Arc<AtomicUsize>);
-        impl carrick_hal::VcpuKickDyn for CountingKick {
-            fn kick(&self) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let (kernel, context) = bootstrap(15_471);
-        let scheduler = Arc::new(Scheduler::new(kernel));
-        let generation = publish(&context, 0x916);
-        enqueue_root(&scheduler, &context, generation);
-        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
-        runner.attach_scheduler(Arc::clone(&scheduler));
-        let kicks = Arc::new(AtomicUsize::new(0));
-        let release = Arc::new(AtomicBool::new(false));
-        let incumbent_release = Arc::clone(&release);
-        let incumbent_scheduler = Arc::clone(&scheduler);
-        let incumbent_kicks = Arc::clone(&kicks);
-        let (started_tx, started_rx) = mpsc::channel();
-        let incumbent = runner.spawn(async move {
-            let executor = TransitionalDedicatedRunner::current_executor_registration()
-                .expect("incumbent worker registration");
-            let running = incumbent_scheduler
-                .take(&executor)
-                .expect("claim incumbent compute task");
-            assert!(TransitionalDedicatedRunner::publish_current_hardware_kick(
-                Box::new(CountingKick(incumbent_kicks))
-            ));
-            started_tx.send(()).expect("incumbent started");
-            while !incumbent_release.load(Ordering::Acquire) {
-                std::hint::spin_loop();
-            }
-            incumbent_scheduler
-                .settle_runnable_successor(running)
-                .expect("settle incumbent after failed spawn");
-        });
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("incumbent is compute-bound");
-
-        let failed_context = context
-            .kernel()
-            .reserve_fork(
-                &context,
-                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
-                "failed general try_spawn competitor".to_owned(),
-                None,
-            )
-            .expect("reserve failed competitor")
-            .prepare_reference(ThreadId::synthetic_for_tests(15_473))
-            .expect("prepare failed competitor")
-            .commit()
-            .expect("publish failed competitor")
-            .into_parts()
-            .expect("start failed competitor")
-            .0;
-        let failed_generation = publish(&failed_context, 0x918);
-        scheduler
-            .wake(failed_context.thread().key())
-            .expect("publish exact failed competitor row");
-        assert!(scheduler.need_resched());
-        let polled = Arc::new(AtomicUsize::new(0));
-        let failed_polled = Arc::clone(&polled);
-        runner.reject_next_activation_for_test();
-        let result = runner.try_spawn(async move {
-            failed_polled.fetch_add(1, Ordering::SeqCst);
-        });
-        let kick_count = kicks.load(Ordering::SeqCst);
-        scheduler
-            .fail_runnable_exact(
-                failed_context.thread().key(),
-                failed_generation,
-                crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
-            )
-            .expect("retire exact failed competitor row");
-        release.store(true, Ordering::Release);
-        incumbent.wait().expect("incumbent exits");
-
-        assert!(matches!(result, Err(TransitionalRunnerError::TaskFailed)));
-        assert_eq!(kick_count, 0, "failed activation must not kick incumbent");
-        assert_eq!(polled.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn dormant_bootstrap_preempts_only_after_scheduler_publication_and_both_jobs_progress() {
-        #[derive(Clone)]
-        struct CountingKick {
-            kicks: Arc<AtomicUsize>,
-            competitor_visibility: Arc<Mutex<Option<Arc<AtomicBool>>>>,
-        }
-        impl carrick_hal::VcpuKickDyn for CountingKick {
-            fn kick(&self) {
-                let visible = self
-                    .competitor_visibility
-                    .lock()
-                    .as_ref()
-                    .expect("competitor activation published before kick")
-                    .load(Ordering::Acquire);
-                assert!(visible, "kick raced ahead of runner visibility");
-                self.kicks.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let (kernel, incumbent_context) = bootstrap(15_463);
-        let scheduler = Arc::new(Scheduler::new(kernel));
-        let incumbent_generation = publish(&incumbent_context, 0x910);
-        enqueue_root(&scheduler, &incumbent_context, incumbent_generation);
-        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
-        runner.attach_scheduler(Arc::clone(&scheduler));
-        let kicks = Arc::new(AtomicUsize::new(0));
-        let incumbent_kicks = Arc::clone(&kicks);
-        let competitor_visibility = Arc::new(Mutex::new(None));
-        let incumbent_visibility = Arc::clone(&competitor_visibility);
-        let incumbent_scheduler = Arc::clone(&scheduler);
-        let (started_tx, started_rx) = mpsc::channel();
-        let incumbent = runner.spawn(async move {
-            let executor = TransitionalDedicatedRunner::current_executor_registration()
-                .expect("incumbent worker registration");
-            let running = incumbent_scheduler
-                .take(&executor)
-                .expect("claim incumbent compute task");
-            assert!(TransitionalDedicatedRunner::publish_current_hardware_kick(
-                Box::new(CountingKick {
-                    kicks: incumbent_kicks.clone(),
-                    competitor_visibility: incumbent_visibility,
-                })
-            ));
-            started_tx.send(()).expect("incumbent started");
-            while incumbent_kicks.load(Ordering::Acquire) == 0 {
-                std::hint::spin_loop();
-            }
-            incumbent_scheduler
-                .settle_runnable_successor(running)
-                .expect("incumbent yields after exact hardware kick");
-            1_u8
-        });
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("incumbent is running");
-
-        let bootstrap = incumbent_context
-            .kernel()
-            .reserve_fork(
-                &incumbent_context,
-                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
-                "bootstrap competitor".to_owned(),
-                None,
-            )
-            .expect("reserve bootstrap competitor")
-            .prepare_reference(ThreadId::synthetic_for_tests(15_464))
-            .expect("prepare bootstrap competitor")
-            .commit()
-            .expect("publish bootstrap competitor")
-            .into_parts()
-            .expect("start bootstrap competitor")
-            .0;
-        let bootstrap_generation = publish(&bootstrap, 0x911);
-        let bootstrap_scheduler = Arc::clone(&scheduler);
-        let (receipt, dormant) = runner
-            .try_spawn_dormant(async move {
-                let executor = TransitionalDedicatedRunner::current_executor_registration()
-                    .expect("bootstrap worker registration");
-                let running = bootstrap_scheduler
-                    .take(&executor)
-                    .expect("claim published bootstrap task");
-                bootstrap_scheduler
-                    .settle_runnable_successor(running)
-                    .expect("settle bootstrap quantum");
-                2_u8
-            })
-            .expect("dormant bootstrap submission");
-        assert_eq!(kicks.load(Ordering::SeqCst), 0);
-        scheduler
-            .wake(bootstrap.thread().key())
-            .expect("publish exact bootstrap scheduler row");
-        let activated = dormant.activate().expect("activate published bootstrap");
-        *competitor_visibility.lock() = Some(activated.visibility_token_for_test());
-        scheduler.request_preemption();
-        assert_eq!(
-            kicks.load(Ordering::SeqCst),
-            1,
-            "the now-visible bootstrap competitor kicks the exact incumbent"
-        );
-        assert_eq!(incumbent.wait().expect("incumbent progress"), 1);
-        assert_eq!(receipt.wait().expect("bootstrap progress"), 2);
-        assert_eq!(bootstrap_generation.raw(), 1);
-    }
-
-    #[test]
-    fn failed_bootstrap_activation_retires_row_without_preemption() {
-        #[derive(Clone)]
-        struct CountingKick(Arc<AtomicUsize>);
-        impl carrick_hal::VcpuKickDyn for CountingKick {
-            fn kick(&self) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let (kernel, incumbent_context) = bootstrap(15_465);
-        let scheduler = Arc::new(Scheduler::new(kernel));
-        let incumbent_generation = publish(&incumbent_context, 0x912);
-        enqueue_root(&scheduler, &incumbent_context, incumbent_generation);
-        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
-        runner.attach_scheduler(Arc::clone(&scheduler));
-        let kicks = Arc::new(AtomicUsize::new(0));
-        let incumbent_kicks = Arc::clone(&kicks);
-        let release = Arc::new(AtomicBool::new(false));
-        let incumbent_release = Arc::clone(&release);
-        let incumbent_scheduler = Arc::clone(&scheduler);
-        let (started_tx, started_rx) = mpsc::channel();
-        let incumbent = runner.spawn(async move {
-            let executor = TransitionalDedicatedRunner::current_executor_registration()
-                .expect("incumbent worker registration");
-            let running = incumbent_scheduler
-                .take(&executor)
-                .expect("claim incumbent");
-            assert!(TransitionalDedicatedRunner::publish_current_hardware_kick(
-                Box::new(CountingKick(incumbent_kicks))
-            ));
-            started_tx.send(()).expect("incumbent started");
-            while !incumbent_release.load(Ordering::Acquire) {
-                std::hint::spin_loop();
-            }
-            incumbent_scheduler
-                .settle_runnable_successor(running)
-                .expect("settle incumbent");
-        });
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("incumbent running with hardware kick");
-        let context = incumbent_context
-            .kernel()
-            .reserve_fork(
-                &incumbent_context,
-                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
-                "failed bootstrap competitor".to_owned(),
-                None,
-            )
-            .expect("reserve failed competitor")
-            .prepare_reference(ThreadId::synthetic_for_tests(15_466))
-            .expect("prepare failed competitor")
-            .commit()
-            .expect("publish failed competitor")
-            .into_parts()
-            .expect("start failed competitor")
-            .0;
-        let polled = Arc::new(AtomicUsize::new(0));
-        let task_polled = Arc::clone(&polled);
-        let (_receipt, dormant) = runner
-            .try_spawn_dormant(async move {
-                task_polled.fetch_add(1, Ordering::SeqCst);
-            })
-            .expect("dormant submission");
-        let generation = publish(&context, 0x912);
-        scheduler
-            .wake(context.thread().key())
-            .expect("publish exact competitor row");
-        runner.reject_next_activation_for_test();
-        assert!(matches!(
-            dormant.activate(),
-            Err(TransitionalRunnerError::TaskFailed)
-        ));
-        scheduler
-            .fail_runnable_exact(
-                context.thread().key(),
-                generation,
-                crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
-            )
-            .expect("retire failed activation row");
-        assert_eq!(polled.load(Ordering::SeqCst), 0);
-        assert_eq!(kicks.load(Ordering::SeqCst), 0);
-        assert_eq!(scheduler.queued_len(), 0);
-        assert!(!scheduler.need_resched());
-        release.store(true, Ordering::Release);
-        incumbent.wait().expect("incumbent exits without a kick");
-    }
-
-    #[test]
-    fn executor_identity_is_owned_by_worker_not_logical_job() {
-        let (kernel, _context) = bootstrap(15_453);
-        let scheduler = Arc::new(Scheduler::new(kernel));
-        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
-        runner.attach_scheduler(Arc::clone(&scheduler));
-        let first = runner
-            .spawn(async {
-                TransitionalDedicatedRunner::current_executor_id()
-                    .expect("worker executor while polling")
-            })
-            .wait()
-            .expect("first job");
-        let second = runner
-            .spawn(async {
-                TransitionalDedicatedRunner::current_executor_id()
-                    .expect("same worker executor while polling")
-            })
-            .wait()
-            .expect("second job");
-        assert_eq!(first, second);
-        assert_eq!(scheduler.registered_executor_count(), 1);
-    }
-
-    #[test]
-    fn worker_exact_wake_uses_live_hardware_kick_and_unbinds_before_successor() {
-        #[derive(Clone)]
-        struct CountingKick(Arc<AtomicUsize>);
-        impl carrick_hal::VcpuKickDyn for CountingKick {
-            fn kick(&self) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let (kernel, context) = bootstrap(15_454);
-        let scheduler = Arc::new(Scheduler::new(kernel));
-        let generation = publish(&context, 0x707);
-        enqueue_root(&scheduler, &context, generation);
-        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
-        runner.attach_scheduler(Arc::clone(&scheduler));
-        let kicks = Arc::new(AtomicUsize::new(0));
-        let task_kicks = Arc::clone(&kicks);
-        let task_scheduler = Arc::clone(&scheduler);
-        let thread = Arc::clone(context.thread());
-        runner
-            .spawn(async move {
-                let executor = TransitionalDedicatedRunner::current_executor_registration()
-                    .expect("worker registration");
-                let running = task_scheduler.take(&executor).expect("claim exact task");
-                assert!(TransitionalDedicatedRunner::publish_current_hardware_kick(
-                    Box::new(CountingKick(task_kicks))
-                ));
-                task_scheduler
-                    .wake(thread.key())
-                    .expect("exact running wake");
-                task_scheduler
-                    .settle_runnable_successor(running)
-                    .expect("unbind predecessor");
-            })
-            .wait()
-            .expect("worker job");
-        assert_eq!(kicks.load(Ordering::SeqCst), 1);
-        assert!(
-            scheduler
-                .binding_for_thread(context.thread().key())
-                .is_none()
-        );
-        scheduler
-            .wake(context.thread().key())
-            .expect("successor already runnable");
-        assert_eq!(kicks.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
-        let continuation_source = include_str!("continuation.rs")
-            .split("#[cfg(test)]\nmod tests")
-            .next()
-            .expect("production continuation source");
-        for prohibited in [
-            "libc::wait",
-            "libc::waitpid",
-            "libc::kill",
-            "libc::nanosleep",
-            "ThreadWaiter",
-            "make_readiness_pipe",
-            "wait_for_event",
-            "Duration::from_millis(2)",
-            "Duration::from_secs(24 * 60 * 60)",
-        ] {
-            assert!(
-                !continuation_source.contains(prohibited),
-                "HVPatch continuation path retains prohibited host-blocking authority: {prohibited}"
-            );
-        }
-        assert_eq!(DISPATCH_FAMILIES.len() + 1, 16);
-        assert!(continuation_source.contains("run_task_quantum(&task)"));
-        assert!(!continuation_source.contains("TaskQuantumSource"));
-        assert!(!continuation_source.contains("fallback_fd"));
-        assert!(
-            continuation_source.contains("scheduler.request_preemption()"),
-            "worker-owned executor path misses scheduler.request_preemption()"
-        );
-
-        let loop_source = include_str!("mod.rs");
-        let prepare_suspend = loop_source
-            .split("fn prepare_hvpatch_continuation")
-            .nth(1)
-            .and_then(|tail| tail.split("fn persistent_block_exit").next())
-            .expect("engine-free HVPatch continuation preparation");
-        for required in [
-            "ContinuationCapture::from_lease",
-            "BlockedContinuation::from_dispatch_outcome",
-            "BlockedContinuation::from_vfork_parent",
-            "install_temporary_signal_mask",
-        ] {
-            assert!(
-                prepare_suspend.contains(required),
-                "engine-free continuation preparation misses {required}"
-            );
-        }
-        // INVERTED for the fork-closure deletion. The engine-owning welded loop
-        // and its `suspend_hvpatch_continuation` adapter used to be bounded and
-        // inspected here for product boundaries and prohibited host-blocking
-        // authority. `launch_vcpu_until_exit` returned unconditionally at its
-        // first statement, so none of that ran; the persistent executor reaches
-        // the same continuation through `persistent_block_exit`. The surviving
-        // invariant is that the welded chain does not exist at all.
-        for deleted in [
-            "fn suspend_hvpatch_continuation",
-            "async fn yield_hvpatch_quantum",
-            "fn run_vcpu_until_exit",
-            "fn launch_vcpu_until_exit",
-            "struct OwnerThreadEngine",
-            "enum CompatibilityThreadWaiter",
-        ] {
-            assert!(
-                !loop_source.contains(deleted),
-                "the welded-thread vCPU loop is retired; `{deleted}` must not exist"
-            );
-        }
-        let dispatch = loop_source
-            .split("fn service_threaded_syscall")
-            .nth(1)
-            .expect("dispatch service body");
-        assert!(
-            dispatch.contains("continuation::is_blocking_dispatch_outcome(&outcome)"),
-            "HVPatch must still escape a blocking outcome at the dispatch seam"
-        );
-        let quiesce = include_str!("quiesce.rs");
-        let hvpatch_fork = quiesce
-            .split("fn prepare_in_process_fork")
-            .nth(1)
-            .and_then(|tail| tail.split("#[cfg(test)]").next())
-            .expect("HVPatch fork body");
-        assert!(hvpatch_fork.contains("PreparedInProcessFork::SuspendVfork"));
-        assert!(!hvpatch_fork.contains(".await"));
-        assert!(!hvpatch_fork.contains("wait.wait_for_release"));
-        let fork_wrapper = loop_source
-            .split("fn complete_persistent_process_fork")
-            .nth(1)
-            .and_then(|tail| tail.split("fn finalize_persistent_process_failure").next())
-            .expect("persistent fork suspension wrapper");
-        assert!(fork_wrapper.contains("HvpatchBlockInput::Vfork"));
-
-        let threads = include_str!("threads.rs");
-        let exec_drain = threads
-            .split("if continuation::TransitionalDedicatedRunner::current_job().is_some()")
-            .nth(2)
-            .and_then(|tail| tail.split("let deadline =").next())
-            .expect("shared-runner exec drain branch");
-        for required in [
-            "engine.save_guest_state()",
-            "begin_switch_out",
-            "settle_transitional_runnable",
-            "Yield::Blocked",
-            "drop(self.guest_execution.take())",
-            "audit_executor_boundary()",
-            "await_hvpatch_sibling_jobs().await",
-            "await_vcpu_admission",
-            ".rebind_to_slot",
-            "take_transitional_lease",
-        ] {
-            assert!(
-                exec_drain.contains(required),
-                "exec drain misses {required}"
-            );
-        }
-        for prohibited in [
-            "std::thread::sleep",
-            "handle.join()",
-            ".wait()",
-            "vcpu_sched::global().acquire(",
-            "acquire_timeout",
-        ] {
-            assert!(
-                !exec_drain.contains(prohibited),
-                "shared-runner exec drain synchronously blocks on {prohibited}"
-            );
-        }
-
-        let record_reactor = continuation_source
-            .split("ReadinessProbe::RecordLock")
-            .nth(2)
-            .and_then(|tail| tail.split("impl Drop for CarrierWaitServiceInner").next())
-            .expect("shared record-lock reactor path");
-        assert!(record_reactor.contains("try_drive_blocking_record_lock"));
-        for prohibited in [
-            "crate::dispatch::drive_blocking_record_lock(",
-            "F_SETLKW",
-            "Condvar",
-        ] {
-            assert!(
-                !record_reactor.contains(prohibited),
-                "record-lock reactor retains blocking authority {prohibited}"
-            );
-        }
-
-        let signal_source = include_str!("signal.rs");
-        assert!(signal_source.contains("deliver_pending_signal_with_restart"));
-        assert!(loop_source.contains("continuation.install_temporary_signal_mask(context)"));
-        assert!(loop_source.contains("self.continuation_restart = Some(result.restart())"));
-        assert!(loop_source.contains("ContinuationResumeError::StaleFileSlot"));
-        assert!(!loop_source.contains("TransitionalSchedulerKick"));
-        assert!(!loop_source.contains("continuation_executor"));
-
-        let net_source = include_str!("../dispatch/net.rs");
-        assert!(
-            net_source.matches("with_guest_slots(&files").count() >= 2,
-            "pselect/ppoll must capture every exact guest fd slot at dispatch"
-        );
-        let io_uring_source = include_str!("../dispatch/ioring.rs");
-        assert!(io_uring_source.contains("with_guest_slots(&files, [ring_fd, sqe.fd])"));
-        let proc_source = include_str!("../dispatch/proc.rs");
-        assert!(proc_source.contains("with_guest_slots(&files, [id as i32])"));
-        let fs_source = include_str!("../dispatch/fs.rs");
-        assert!(!fs_source.contains("WaitFdAuthority::Missing"));
-        for required in [
-            "captured_slot_authority(guest_fd)",
-            "captured_slot_authority(fd)",
-            "captured_slot_authority(fd.0)",
-            "WaitFdAuthority::logical",
-            "[in_fd.0, out_fd.0]",
-            "complete_wait_fd_authority",
-        ] {
-            assert!(
-                fs_source.contains(required),
-                "fd producer misses {required}"
-            );
-        }
     }
 }
