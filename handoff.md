@@ -32,11 +32,13 @@ denominator, add an excuse, accept a retry, or start final performance work.
 ## CURRENT ENGINEERING CHECKPOINT — 2026-08-21 Task 6 signed cutoff
 
 Task 6's persistent HVPatch executor implementation is integrated on branch
-`codex/authority-phase0` through exact clean HEAD
-`b2a58637a9d776d8e1b0379499d054c4762f4574`:
+`codex/authority-phase0` through merge HEAD
+`885767fbf8535770120d19def2ca15ca031e2548`:
 
 - `38ea64a40` — `fix(hvpatch): republish exec task runtime projection`
 - `b2a58637a` — `test(hvpatch): add bounded executor census fixture`
+- `4b569f25f` — `docs: hand off task 6 signed cutoff`
+- `885767fbf` — merge local `main` `aa3e9d4c4` into the topic
 
 The final signed blocker was a task-only exec authority split. The live CPU and
 backend used replacement root/ASID `0x9a.../2`, but detach/reload resurrected
@@ -61,7 +63,7 @@ Fresh local gates after final review:
 - isolated process-exit recovery: 1/1;
 - runtime library check, focused production clippy, fmt, and diff: GREEN.
 
-Exact clean-HEAD signed artifact:
+Pre-merge exact clean-HEAD signed artifact:
 
 - source HEAD: `b2a58637a9d776d8e1b0379499d054c4762f4574`
 - SHA-256: `27bf2dcca6b5e614be465cf243237bf73a81416fec4614482fc55fd97a158a66`
@@ -84,6 +86,54 @@ Exact signed receipts:
 - vfork/exec reducer: run ID `task6-handoff-vfork-b2a58637`, exit 0, stdout and
   stderr empty, cleanup 0. Receipts:
   `/tmp/task6-handoff-vfork-b2a58637.{out,err}`.
+
+### Local-main merge and exact post-merge artifact
+
+Merge `885767fbf8535770120d19def2ca15ca031e2548` has parents
+`4b569f25fb9c9b73e0abea9d7233cd3ced1018cc` and
+`aa3e9d4c4230a71567e4e45f556a2c236784f02c`. Conflict resolution preserved
+both sides' authority:
+
+- rtnetlink uses the calling task's typed `NetNs` view;
+- sysfs holds the live `Arc<NetNs>` and renders its typed link
+  index/MAC/flags/scope attributes;
+- procfs retains Task 1–6's logical CPU/rusage authority while using main's
+  Linux-plausible host-vs-isolated interface rendering;
+- the auto-merges in dispatcher and Kernel objects retain Task 1–6 execution
+  state alongside main's typed network/UTS namespace ownership.
+
+Focused pre-commit merge gates were GREEN: runtime compile and production
+clippy; network model 66, `NetNs` 4, UTS 1, procfs 66, sysfs 9, rtnetlink 28,
+cross-subsystem sysfs/NetNs 2, persistent executor 50, continuation 63, and
+runtime integration 300.
+
+Post-merge exact artifact:
+
+- source HEAD: `885767fbf8535770120d19def2ca15ca031e2548`
+- SHA-256: `d140ca910d5ca558dcba63da3055cb2679ec0260595d6986f3696be14989d25e`
+- codesign identifier: `carrick.tmp.67306`
+- CDHash: `86061f1538a950a777138a17e6c023b4664dc8ce`
+- LC_UUID: `6A2791ED-7A06-3C90-A4A7-FAFECAF075C6`
+- `com.apple.security.hypervisor = true`
+- `__TEXT,__dof_carrick` present.
+
+Post-merge signed receipts:
+
+- direct hello: run ID `task6-postmerge-hello-885767fb`, exit 0, exact stdout
+  `hello from carrick`, stderr empty, cleanup 0; receipts
+  `/tmp/task6-postmerge-hello-885767fb.{out,err}`;
+- fail-closed `carrick trace` hello: run ID
+  `task6-postmerge-trace-885767fb`, exit 0, executor lifecycle `10/10`, vCPU
+  create/destroy `11/11`, no watchdog/drop/error record, cleanup 0; receipt
+  `/tmp/task6-postmerge-trace-885767fb.log`;
+- vfork/exec reducer: run ID `task6-postmerge-vfork-885767fb`, exit 0, stdout
+  and stderr empty, cleanup 0; receipts
+  `/tmp/task6-postmerge-vfork-885767fb.{out,err}`.
+
+`RUST_TEST_THREADS=1 just ci` was attempted on the pre-fast-forward merge tree
+and is **RED** at the global clippy disallowed-method catalog across pre-existing
+owners. This is an explicit Task 7/8 gate: it was not waived, weakened, or
+represented as green, and no unrelated catalog repair was attempted here.
 
 The checked-in `fork_bench_10k.rs` is one carrier with an exact 10,000-count
 loop. It was built successfully and disassembly proved `mov x19,#0x2710`, two
