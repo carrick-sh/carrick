@@ -1959,6 +1959,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "sigstopjobcontrol": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "sigtimedwaitintr": {
     "class": "conformance",
     "excluded": false,
