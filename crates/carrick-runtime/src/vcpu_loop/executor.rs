@@ -100,6 +100,23 @@ impl HvpatchTaskEngineBindingState {
         }
     }
 
+    pub(super) fn retire_detached_exec_predecessor(&mut self) -> Result<(), TrapError> {
+        match &mut self.payload {
+            HvpatchTaskEngineBindingPayload::Resident(state) => {
+                carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_exec_predecessor(state)
+            }
+            HvpatchTaskEngineBindingPayload::TaskOnly(state) => {
+                carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_exec_predecessor(
+                    state,
+                )
+            }
+            #[cfg(test)]
+            HvpatchTaskEngineBindingPayload::Test => Err(TrapError::Hypervisor(
+                "test-only backend has no exec predecessor cleanup".to_owned(),
+            )),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn test_only() -> Self {
         Self {
@@ -599,6 +616,12 @@ pub trait PersistentTaskBinding {
             "task binding has no detached address-space cleanup authority".to_owned(),
         ))
     }
+
+    fn retire_detached_exec_predecessor(&self) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "task binding has no detached exec predecessor authority".to_owned(),
+        ))
+    }
 }
 
 impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBinding {
@@ -622,6 +645,10 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
 
     fn retire_detached_address_space(&self) -> Result<(), TrapError> {
         crate::vcpu_loop::continuation::HvpatchTaskBinding::retire_detached_address_space(self)
+    }
+
+    fn retire_detached_exec_predecessor(&self) -> Result<(), TrapError> {
+        crate::vcpu_loop::continuation::HvpatchTaskBinding::retire_detached_exec_predecessor(self)
     }
 }
 
@@ -3084,6 +3111,19 @@ where
                     settlement,
                 ));
             }
+            if let Err(error) = binding.retire_detached_exec_predecessor() {
+                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
+                    scheduler,
+                    running,
+                    ExecutionFailure::SnapshotRestoreFailed,
+                    receipts,
+                );
+                return Err(with_settlement_error(
+                    format!("exec detached predecessor cleanup failed: {error}"),
+                    settlement,
+                ));
+            }
             if let Err(error) = retirement.complete() {
                 let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                     resolver.as_ref(),
@@ -4363,6 +4403,24 @@ pub(crate) mod tests {
             .find("retirement.complete()")
             .expect("post-ack ASID/root release");
         assert!(save < invalidate && invalidate < release);
+        let exec_retirement = worker_loop
+            .split("if let Some(retirement) = pending_exec_retirement.take()")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("if let Some(retirement) = terminal_retirement")
+                    .next()
+            })
+            .expect("exec retirement order");
+        let exec_invalidate = exec_retirement
+            .find("invalidate_after_exec")
+            .expect("exec exact TLBI fanout");
+        let exec_cleanup = exec_retirement
+            .find("retire_detached_exec_predecessor")
+            .expect("detached exec predecessor cleanup");
+        let exec_release = exec_retirement
+            .find("retirement.complete()")
+            .expect("exec ASID/root release");
+        assert!(exec_invalidate < exec_cleanup && exec_cleanup < exec_release);
         let terminal = worker_loop
             .split("if let Some(retirement) = terminal_retirement")
             .nth(1)

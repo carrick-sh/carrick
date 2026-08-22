@@ -4550,6 +4550,7 @@ pub(crate) struct HvfTaskState {
     mm_root_slot: Option<(u64, u64)>,
     pending_exec_mm_root_slot: Option<(u64, u64)>,
     pending_exec_asid: Option<u16>,
+    pending_exec_stage2_cleanup: Option<PendingExecStage2Cleanup>,
     /// The exception class of the most recent vCPU exit. We need to remember
     /// whether the trap came in via EL0 `svc` (`EC = 0x15`) or the EL1 vector
     /// stub's `hvc` (`EC = 0x16`) so `complete_syscall` knows whether to
@@ -4637,6 +4638,63 @@ pub(crate) struct HvfTaskState {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct PendingExecStage2Cleanup {
+    mappings: Vec<HvfMappedRegion>,
+    extents: std::collections::BTreeSet<(u64, usize)>,
+    mm_root_slot: Option<(u64, u64)>,
+    armed: bool,
+}
+
+// SAFETY: cleanup moves with the stopped logical task and is consumed only on
+// a Task4 owner worker after save/detach. Its raw mapping pointers remain owned
+// by the contained HvfMappedRegion backings until cleanup runs.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Send for PendingExecStage2Cleanup {}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl PendingExecStage2Cleanup {
+    fn retire(&mut self) -> Result<(), TrapError> {
+        for &(ipa, size) in &self.extents {
+            HvfVmState::retire_stage2_extent_from_mappings(&mut self.mappings, ipa, size as u64)?;
+        }
+        mutate_external_alias_state(|_, registry| {
+            registry.retain(|alias| {
+                !alias_is_owned_by_process(alias.ownership_scope, self.mm_root_slot)
+                    && !self
+                        .extents
+                        .contains(&(alias.physical_ipa, alias.physical_size))
+            });
+        });
+        let mut retained_backings = Vec::new();
+        for mapping in self.mappings.drain(..) {
+            if self
+                .extents
+                .contains(&(mapping.physical_ipa, mapping.physical_size))
+            {
+                drop(mapping);
+            } else {
+                retained_backings.push(mapping);
+            }
+        }
+        std::mem::forget(retained_backings);
+        self.armed = false;
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for PendingExecStage2Cleanup {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = self.retire()
+        {
+            eprintln!("carrick: FATAL: drop detached exec predecessor cleanup: {error}");
+            std::process::abort();
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl std::ops::Deref for HvfVmState {
     type Target = HvfTaskState;
 
@@ -4665,6 +4723,7 @@ impl HvfTaskState {
             mm_root_slot: None,
             pending_exec_mm_root_slot: None,
             pending_exec_asid: None,
+            pending_exec_stage2_cleanup: None,
             last_exit_class: 0,
             last_fault_esr: 0,
             is_forked_child: false,
@@ -4696,6 +4755,9 @@ impl HvfTaskState {
         let frames = inventory.frames.lock();
         let neutral = self.mappings.is_empty()
             && self.mm_root_slot.is_none()
+            && self.pending_exec_mm_root_slot.is_none()
+            && self.pending_exec_asid.is_none()
+            && self.pending_exec_stage2_cleanup.is_none()
             && self.last_exit_class == 0
             && self.last_fault_esr == 0
             && !self.is_forked_child
@@ -4775,6 +4837,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
         mm_root_slot: Some((mm_slot << 20, 0x20_0000)),
         pending_exec_mm_root_slot: None,
         pending_exec_asid: None,
+        pending_exec_stage2_cleanup: None,
         last_exit_class: 0,
         last_fault_esr: 0,
         is_forked_child: false,
@@ -5377,10 +5440,6 @@ impl GlobalFrameStage2Lease {
 
     fn mark_mapped(&mut self) {
         self.mapped = true;
-    }
-
-    fn mark_unmapped(&mut self) {
-        self.mapped = false;
     }
 
     fn key(&self) -> (u64, u64) {
@@ -7112,6 +7171,7 @@ impl HvpatchTaskRegistration {
             mm_root_slot: task_mm.mm_root_slot,
             pending_exec_mm_root_slot: None,
             pending_exec_asid: None,
+            pending_exec_stage2_cleanup: None,
             last_exit_class: 0,
             last_fault_esr: 0,
             is_forked_child: false,
@@ -8292,87 +8352,6 @@ impl HvfVmState {
         }
     }
 
-    fn exec_predecessor_stage2_installs(
-        &self,
-        extents: &std::collections::BTreeSet<(u64, usize)>,
-    ) -> Result<Vec<ExecStage2Install>, TrapError> {
-        let owners = global_frame_host_owners().lock();
-        let replay = replay_mappings().lock();
-        let mut installs = Vec::with_capacity(extents.len());
-        for &(ipa, size) in extents {
-            if let Some(owner) = owners.get(&(ipa, size as u64)) {
-                installs.push(ExecStage2Install {
-                    ipa,
-                    size,
-                    host: owner._mapping.as_ptr(),
-                    perms: owner.perms,
-                    replay_registered: replay.contains(&(
-                        ipa,
-                        size,
-                        owner._mapping.as_ptr() as usize,
-                        owner.perms,
-                    )),
-                });
-                continue;
-            }
-            let mapping = self
-                .mappings
-                .iter()
-                .find(|mapping| mapping.physical_ipa == ipa && mapping.physical_size == size)
-                .ok_or_else(|| {
-                    TrapError::Hypervisor(format!(
-                        "HVPatch exec predecessor IPA 0x{ipa:x} size {size} has no live backing"
-                    ))
-                })?;
-            let offset = mapping.ipa.checked_sub(mapping.physical_ipa).ok_or_else(|| {
-                TrapError::Hypervisor(format!(
-                    "HVPatch exec predecessor semantic IPA 0x{:x} precedes physical IPA 0x{ipa:x}",
-                    mapping.ipa
-                ))
-            })?;
-            let offset = usize::try_from(offset).map_err(|_| TrapError::MappingTooLarge(offset))?;
-            let host = unsafe { mapping.host_addr.sub(offset) };
-            installs.push(ExecStage2Install {
-                ipa,
-                size,
-                host,
-                perms: u64::from(mapping.perms),
-                replay_registered: replay.contains(&(
-                    ipa,
-                    size,
-                    host as usize,
-                    u64::from(mapping.perms),
-                )),
-            });
-        }
-        Ok(installs)
-    }
-
-    fn finish_exec_predecessor_stage2_retirement(
-        &mut self,
-        ipa: u64,
-        length: u64,
-    ) -> Result<(), TrapError> {
-        if let Some(mut owner) = global_frame_host_owners().lock().remove(&(ipa, length)) {
-            owner._lease.mark_unmapped();
-            drop(owner);
-            return Ok(());
-        }
-        if let Some(mut lease) = self.mappings.iter_mut().find_map(|mapping| {
-            (mapping
-                .stage2_lease
-                .as_ref()
-                .is_some_and(|lease| lease.key() == (ipa, length)))
-            .then(|| mapping.stage2_lease.take())
-            .flatten()
-        }) {
-            lease.mark_unmapped();
-            drop(lease);
-            return Ok(());
-        }
-        release_retired_stage2_ipa(ipa, length)
-    }
-
     fn retire_stage2_extent(&mut self, ipa: u64, length: u64) -> Result<(), TrapError> {
         Self::retire_stage2_extent_from_mappings(&mut self.mappings, ipa, length)
     }
@@ -9480,6 +9459,17 @@ impl HvfVmState {
         task.frame_inventory.lock().retirement_commit.take()
     }
 
+    pub(crate) fn retire_task_state_exec_predecessor(
+        task: &mut HvfTaskState,
+    ) -> Result<(), TrapError> {
+        let mut cleanup = task.pending_exec_stage2_cleanup.take().ok_or_else(|| {
+            TrapError::Hypervisor(
+                "detached exec successor lost predecessor stage-2 cleanup authority".to_owned(),
+            )
+        })?;
+        cleanup.retire()
+    }
+
     fn seed_readonly_spans_from_plan(&self, plan: &GuestMappingPlan) {
         for span in &plan.ro_spans {
             let Ok(len) = usize::try_from(span.len) else {
@@ -9512,6 +9502,7 @@ impl HvfVmState {
                 mm_root_slot: None,
                 pending_exec_mm_root_slot: None,
                 pending_exec_asid: None,
+                pending_exec_stage2_cleanup: None,
                 last_exit_class: 0,
                 last_fault_esr: 0,
                 is_forked_child: false,
@@ -15052,6 +15043,7 @@ impl HvfVmState {
                 mm_root_slot,
                 pending_exec_mm_root_slot: None,
                 pending_exec_asid: None,
+                pending_exec_stage2_cleanup: None,
                 last_exit_class: 0,
                 last_fault_esr: 0,
                 is_forked_child: false,
@@ -16120,6 +16112,7 @@ impl HvfVmState {
                 mm_root_slot: Some(spec.mm_root_slot),
                 pending_exec_mm_root_slot: None,
                 pending_exec_asid: None,
+                pending_exec_stage2_cleanup: None,
                 last_exit_class: 0,
                 last_fault_esr: 0,
                 is_forked_child: false,
@@ -16376,7 +16369,6 @@ impl HvfVmState {
             // exact predecessor on every ordinary failure, so backend inventory,
             // owners and mapping rows remain unchanged until this succeeds.
             let extents = final_exec_physical_extents(&self.frame_inventory.lock())?;
-            let predecessor = self.exec_predecessor_stage2_installs(&extents)?;
             let replacement = plan
                 .mappings
                 .iter()
@@ -16389,7 +16381,7 @@ impl HvfVmState {
                 .collect::<Vec<_>>();
             let authority_before = self.exec_authority_fingerprint();
             let switch_result = switch_exec_stage2_transaction(
-                &predecessor,
+                &[],
                 &replacement,
                 exec_stage2_fail_after_maps(),
                 |extent| {
@@ -16517,15 +16509,7 @@ impl HvfVmState {
         // the whole VM; persistent HVPatch removes only physical extents whose
         // final logical references retired above.
         let alias_cleanup_started = std::time::Instant::now();
-        if self.persistent_vm_lifecycle {
-            mutate_external_alias_state(|_, registry| {
-                registry.retain(|alias| {
-                    !alias_is_owned_by_process(alias.ownership_scope, predecessor_mm_root_slot)
-                        && !retired_physical_extents
-                            .contains(&(alias.physical_ipa, alias.physical_size))
-                });
-            });
-        } else {
+        if !self.persistent_vm_lifecycle {
             clear_alias_registry();
         }
         emit_replace_stage(
@@ -16534,33 +16518,20 @@ impl HvfVmState {
         );
         let drop_backings_started = std::time::Instant::now();
         if self.persistent_vm_lifecycle {
-            for &(ipa, size) in &retired_physical_extents {
-                self.finish_exec_predecessor_stage2_retirement(ipa, size as u64)
-                    .unwrap_or_else(|error| {
-                        // `stage_retirement` above has already consumed the
-                        // predecessor backend inventory. Returning through the
-                        // ordinary exec failure path would present a rollback
-                        // that can no longer exist. Fail closed at this explicit
-                        // post-switch commit boundary instead.
-                        eprintln!(
-                            "carrick: FATAL: commit HVPatch exec predecessor retirement: {error}"
-                        );
-                        std::process::abort();
-                    });
+            let predecessor_mappings = std::mem::take(&mut self.mappings);
+            if self
+                .pending_exec_stage2_cleanup
+                .replace(PendingExecStage2Cleanup {
+                    mappings: predecessor_mappings,
+                    extents: retired_physical_extents.clone(),
+                    mm_root_slot: predecessor_mm_root_slot,
+                    armed: true,
+                })
+                .is_some()
+            {
+                eprintln!("carrick: FATAL: overlapping detached exec predecessor cleanup");
+                std::process::abort();
             }
-            // Reclaim only host mappings whose exact stage-2 extents were
-            // removed. A shared extent retained for another mm still points at
-            // this host allocation, so preserve that backing until VM teardown.
-            let mut retained_backings = Vec::new();
-            for mapping in std::mem::take(&mut self.mappings) {
-                if retired_physical_extents.contains(&(mapping.physical_ipa, mapping.physical_size))
-                {
-                    drop(mapping);
-                } else {
-                    retained_backings.push(mapping);
-                }
-            }
-            std::mem::forget(retained_backings);
         } else {
             // Preserve mature VMM's historical leak-until-process-exit discipline:
             // the old VM was raw-destroyed and sibling/alias projections may still
@@ -19144,6 +19115,38 @@ mod frame_inventory_backend_tests {
     }
 
     #[test]
+    fn exec_predecessor_backing_stays_live_until_detached_cleanup() {
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            0x4000,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .unwrap();
+        let host_addr = host.as_ptr();
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut lease = GlobalFrameStage2Lease::fixed(0x1234_0000, 0x4000);
+        lease.drop_backing_audit = Some((host_addr as usize, std::sync::Arc::clone(&observed)));
+        let mut mapping =
+            thread_sibling_tests::mapped_region(0x1234_0000, 0x1234_4000, 0x1234_0000);
+        mapping.host_addr = host_addr;
+        mapping.host_mapping = Some(host);
+        mapping.stage2_lease = Some(lease);
+        let mut task = hvpatch_task_state_test_fixture(7, 0x4000, 7);
+        task.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
+            mappings: vec![mapping],
+            extents: [(0x1234_0000, 0x4000)].into_iter().collect(),
+            mm_root_slot: Some((7 << 20, 0x20_0000)),
+            armed: true,
+        });
+
+        assert!(alias_backing_is_live(host_addr as usize));
+        HvfVmState::retire_task_state_exec_predecessor(&mut task)
+            .expect("post-TLBI detached cleanup");
+        assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!alias_backing_is_live(host_addr as usize));
+        assert!(task.pending_exec_stage2_cleanup.is_none());
+    }
+
+    #[test]
     fn exec_replacement_keeps_every_representative_leaf_asid_scoped() {
         const NON_GLOBAL: u64 = 1 << 11;
         let GlobalExecPlan { plan, .. } =
@@ -20550,7 +20553,7 @@ mod thread_sibling_tests {
         assert_eq!(location.waiter_key(), 0x1046_78004);
     }
 
-    fn mapped_region(start: u64, end: u64, ipa: u64) -> HvfMappedRegion {
+    pub(super) fn mapped_region(start: u64, end: u64, ipa: u64) -> HvfMappedRegion {
         HvfMappedRegion {
             start,
             ipa,

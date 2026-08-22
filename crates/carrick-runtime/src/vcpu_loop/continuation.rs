@@ -3624,6 +3624,30 @@ impl HvpatchTaskBinding {
         ))
     }
 
+    pub(crate) fn retire_detached_exec_predecessor(&self) -> Result<(), crate::trap::TrapError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let mut slot = self.backend.lock();
+            let backend = slot.as_mut().ok_or_else(|| {
+                crate::trap::TrapError::Hypervisor(
+                    "detached exec cleanup has no saved successor backend".to_owned(),
+                )
+            })?;
+            let backend = backend
+                .downcast_mut::<crate::vcpu_loop::executor::HvpatchTaskEngineBindingState>()
+                .ok_or_else(|| {
+                    crate::trap::TrapError::Hypervisor(
+                        "detached exec cleanup backend type mismatch".to_owned(),
+                    )
+                })?;
+            backend.retire_detached_exec_predecessor()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        Err(crate::trap::TrapError::Hypervisor(
+            "detached HVPatch exec cleanup requires macOS/aarch64 HVF".to_owned(),
+        ))
+    }
+
     pub(crate) fn take_backend<T: Send + 'static>(&self) -> Result<T, crate::trap::TrapError> {
         Ok(*(self
             .backend
