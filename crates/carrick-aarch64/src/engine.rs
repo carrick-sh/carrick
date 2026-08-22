@@ -2312,8 +2312,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
         identity: carrick_hal::FrameCowIdentity,
     ) {
-        self.mm_generation = identity.mm;
-        self.asid_generation = identity.mm;
+        if self.mm_generation != identity.mm {
+            std::process::abort();
+        }
+        // FrameCowIdentity carries the numeric hardware ASID, not the strong
+        // allocation generation. `bind_task_snapshot_identity` installed that
+        // generation immediately before this call; preserve it verbatim.
         self.vm.bind_frame_cow(authority, identity);
     }
 
@@ -3606,6 +3610,26 @@ mod tests {
         assert_eq!(task.mm_generation, 23);
         assert_eq!(task.asid_generation, 29);
         assert_eq!(task.syscall_continuation, Some(continuation()));
+    }
+
+    #[test]
+    fn frame_cow_binding_preserves_strong_asid_generation_distinct_from_mm() {
+        let source = include_str!("engine.rs");
+        let binding = source
+            .split("fn bind_frame_cow(\n        &mut self")
+            .nth(1)
+            .and_then(|tail| tail.split("fn refresh_fork_process_state").next())
+            .expect("AArch64 engine frame-COW binding");
+        assert!(binding.contains("self.mm_generation != identity.mm"));
+        assert!(!binding.contains("self.asid_generation = identity.mm"));
+        assert!(!binding.contains("self.mm_generation = identity.mm"));
+
+        let snapshot = sample();
+        let task =
+            aarch64_task_state_from_snapshot(&snapshot, None, None, 0, 0, 0, false, None, 64, 2)
+                .unwrap();
+        assert_eq!(task.mm_generation, 64);
+        assert_eq!(task.asid_generation, 2);
     }
 
     #[test]
