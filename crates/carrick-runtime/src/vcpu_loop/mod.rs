@@ -4351,6 +4351,51 @@ where
                 self.state.complete_returned(engine, 0)?;
                 executor::ExecutorExit::Syscall
             }
+            DispatchOutcome::SigReturn => {
+                // `rt_sigreturn`. This existed only in the welded loop, so on the
+                // persistent path it fell through to the unlowered-outcome arm —
+                // invisible until forced-exit signal service started actually
+                // delivering signals, at which point every guest that RETURNED
+                // from a handler produced one of these.
+                let restored_sigmask = match engine.restore_from_sigframe() {
+                    Ok(mask) => mask,
+                    // A guest-reachable bad `rt_sigreturn` frame (bad SP, or a
+                    // corrupt/forged frame) is `force_sigsegv` on Linux: kill
+                    // THIS process by SIGSEGV, never abort the carrier. Mirrors
+                    // the unclassified-EL0-fault path.
+                    Err(TrapError::SignalDeliveryFault) => {
+                        let result = assemble_run_result(
+                            &self.kernel,
+                            128 + 11,
+                            Some(crate::linux_abi::LINUX_SIGSEGV),
+                            self.traps,
+                            false,
+                        );
+                        return Ok(self.enter_terminal_with_outcome(
+                            engine,
+                            VcpuLoopOutcome::ProcessExit(Box::new(result)),
+                        ));
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let signal_context =
+                    self.state.service_kernel_context.as_ref().ok_or_else(|| {
+                        RuntimeError::Configuration(
+                            "sigreturn lost its exact Kernel context".to_owned(),
+                        )
+                    })?;
+                self.kernel.dispatcher.restore_signal_mask(
+                    signal_context,
+                    self.state.this_tid,
+                    carrick_abi::SigSet::from_raw(restored_sigmask),
+                );
+                // The guest resumes at the just-restored user PC. Do NOT complete
+                // a syscall return here: `rt_sigreturn` has no return value, and
+                // on x86 the frame restores RCX as an ordinary caller-clobbered
+                // register that a syscall-boundary completion would mistake for
+                // the resume address.
+                executor::ExecutorExit::Syscall
+            }
             other => {
                 tracing::error!(
                     ?other,
