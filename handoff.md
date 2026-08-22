@@ -163,23 +163,39 @@ idling for tens of seconds. That is a wake/scheduling or teardown-completion
 question, which is the same family as the criterion 2 defects above, and it is
 consistent with the gate having regressed from under ten minutes.
 
-**`carrick debug hvpatch-kernel` refuses on EVERY live run, and its refusal is
-itself a finding:**
+**`carrick debug hvpatch-kernel` refuses on EVERY live run — SPLIT (`733b4d8a`),
+and it now names a real defect.**
 
-    Error: runtime refused the kernel debug request: kernel snapshot invariant
-    violated: mapping frame/mm/length join is missing
+The refusal used to read `mapping frame/mm/length join is missing`, which covers
+three unrelated causes and names neither the clause nor the rows. Split into
+four named clauses carrying their identities, and the very first live run says,
+identically on three consecutive runs:
 
-Reproduced on four consecutive gate runs and for every requested table (the
-validator runs over the whole graph regardless of `--table`). The check is
-`crates/carrick-runtime/src/kernel/snapshot.rs:1663`, and like every other
-failure in this campaign it collapses THREE distinct causes into one message:
-the mapping's `mm` is not in the snapshot, the frame's alias list does not
-contain the mapping, or the frame's length disagrees with the mapping's. Split
-that condition so it names which — that is the single cheapest next step, and
-this whole session's evidence is that naming the clause turns these into
-one-rebuild diagnoses. It also means the live kernel graph is currently
-UNREADABLE, so the best instrument for the idle-carrier question is unavailable
-until it is fixed.
+    kernel snapshot invariant violated:
+    mapping MappingId(78) names mm MmId(55), which is not in the snapshot
+
+**A live mapping references an mm the snapshot does not contain**, at the same
+point in every run. The mechanism is a lifetime split between two tables:
+
+- `snapshot.mms` comes from `observations.mms` filtered through
+  `Weak::upgrade` (`kernel/snapshot.rs:990`), so an mm whose kernel object has
+  been dropped simply DISAPPEARS from the table.
+- `snapshot.mappings` is `frame_inventory.mappings` (`:815`), the HVF ledger's
+  own records, whose lifetime is independent of the kernel `Mm` object.
+
+So the kernel `Mm` for `MmId(55)` has no strong references left while the frame
+inventory still holds mappings for it. Note this is the KERNEL graph's
+`objects::Mm`, not the HVF-side `HvpatchTaskMmAuthority` whose `Drop` aborts on
+a live inventory — two objects, one `MmId`, independent lifetimes, which is
+precisely the address-space-ownership domain confusion
+`docs/identity-and-scope-domains.md` names.
+
+Next step: find what is supposed to retire the ledger's mappings when a kernel
+`Mm` drops, and whether anything does. If nothing does, this is a leak and the
+same family as the `clonebasic` `drop HVPatch MM authority (phase=active)` abort
+and the ASID-root defect above — an mm going away while things still reference
+it. Reading the tables to confirm needs the snapshot to succeed, so fix the
+retirement rather than trying to dump the graph first.
 
 **Attribute it with a controlled A/B, and do not run the build concurrently with
 a conformance measurement** — build the pre-campaign binary in a worktree under
