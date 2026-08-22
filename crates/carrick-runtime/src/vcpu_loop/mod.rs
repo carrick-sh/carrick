@@ -8286,21 +8286,6 @@ where
     {
         type HvfEngine = carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine;
 
-        let authority = match (&engine as &dyn std::any::Any).downcast_ref::<HvfEngine>() {
-            Some(engine) => {
-                match carrick_vmm_hvf::hvf_aarch64_engine::persistent_executor_factory_authority(
-                    engine,
-                ) {
-                    Ok(authority) => authority,
-                    Err(error) => return VcpuLoopLaunch::Direct(Err(RuntimeError::Trap(error))),
-                }
-            }
-            None => {
-                return VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(
-                    "HVPatch launch rejected a non-HVF engine".to_owned(),
-                )));
-            }
-        };
         let mut prepared = match prepare_initial_runner_handoff(
             &kernel,
             &mut engine,
@@ -8319,6 +8304,29 @@ where
         let exact_cpu = prepared_task.cpu;
         let start_gate = prepared_task.start_gate;
         let thread = Arc::clone(context.thread());
+
+        // Initial-runner park has stopped/destroyed its vCPU. Only now may the
+        // factory take the four owning carrier mappings: every failure below
+        // can drop them without unmapping stage-2 under a live bootstrap vCPU.
+        let authority = match (&mut engine as &mut dyn std::any::Any).downcast_mut::<HvfEngine>() {
+            Some(engine) => {
+                match carrick_vmm_hvf::hvf_aarch64_engine::persistent_executor_factory_authority(
+                    engine,
+                ) {
+                    Ok(authority) => authority,
+                    Err(error) => {
+                        prepared.fail_exact();
+                        return VcpuLoopLaunch::Direct(Err(RuntimeError::Trap(error)));
+                    }
+                }
+            }
+            None => {
+                prepared.fail_exact();
+                return VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(
+                    "HVPatch launch rejected a non-HVF engine".to_owned(),
+                )));
+            }
+        };
 
         let boxed: Box<dyn std::any::Any> = Box::new(engine);
         let hvf_engine = match boxed.downcast::<HvfEngine>() {
@@ -10682,6 +10690,19 @@ mod tests {
         assert!(
             !launch.contains("process.is_child()"),
             "host tracing/fork topology and logical child ancestry cannot select pool ownership"
+        );
+        let parked = launch
+            .find("prepare_initial_runner_handoff(")
+            .expect("initial vCPU park");
+        let extract = launch
+            .find("persistent_executor_factory_authority(")
+            .expect("carrier mapping authority extraction");
+        let split = launch
+            .find("split_initial_task_engine(hvf_engine)")
+            .expect("task-only handoff");
+        assert!(
+            parked < extract && extract < split,
+            "carrier stage-2 ownership moves only after the bootstrap vCPU is parked"
         );
     }
 

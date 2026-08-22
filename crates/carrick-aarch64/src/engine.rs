@@ -194,6 +194,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         &self.vm
     }
 
+    /// Mutably borrow the VM-bearing backend exactly once while transferring
+    /// carrier-only mapping ownership into the persistent executor factory.
+    pub fn backend_mut_for_persistent_factory(&mut self) -> &mut V {
+        &mut self.vm
+    }
+
     /// Attach one task-only HVPatch binding to a worker-injected backend/vCPU.
     /// The binding contributes only shared logical task state; VM/vCPU owner
     /// identity comes from the worker for this resident interval.
