@@ -671,6 +671,102 @@ git commit -m "docs: close the HVPatch fork lifecycle goal"
 
 ---
 
+## Execution record — Phase 1 (appended during execution, 2026-08-22)
+
+The plan is the controller, so where execution contradicted it the contradiction
+is recorded here rather than silently absorbed. Phase 1 was written as a pure
+deletion; it was not. Collapsing `ExecutionBackend` turned unreachable branches
+into build failures exactly as intended, and three of those failures were live
+responsibilities, not redundancy.
+
+### Corrections to the task lists
+
+- **Task 2 Step 3 is wrong to delete `prepare_initial_runner_handoff`.** It and
+  `PreparedInitialRunnerTask` / `PreparedInitialHandoff` /
+  `InitialRunnerStartGate` are called by `launch_persistent_hvpatch_job` to
+  publish the initial task state and claim its start gate. They were deleted,
+  the compiler rejected the tree, and they were restored. The gate that used to
+  bound the launch entry between `launch_vcpu_until_exit` and
+  `PreparedInitialRunnerTask` now asserts the first is ABSENT and the second is
+  PRESENT.
+- **Task 3's "Do NOT delete `RunnerTask`" is inverted.** `RunnerTask` is
+  constructed only inside `TransitionalDedicatedRunner::try_spawn_dormant` and
+  polled only by the pool worker, so it dies with the pool. `LogicalJobCompletion`
+  is the symbol that must survive — `executor.rs` builds one with
+  `LogicalJobCompletion::pending()` in five places.
+- **The pool's ambient state was already inert.** `CURRENT_RUNNER_JOB` and
+  `CURRENT_RUNNER_WORKER` are written only inside the transitional pool's worker
+  loop. The persistent executor registers its own `ExecutorRegistration` through
+  `scheduler.register_executor` and never publishes those thread-locals, so
+  `current_job()`, `current_executor_registration()` and
+  `publish_current_hardware_kick()` already answered `None`/`false` on the only
+  live path. Every read site must therefore collapse to its `None`/`false`
+  branch, not merely lose the symbol.
+
+### The live responsibility Phase 1 exposed: guest fault delivery
+
+`launch_vcpu_until_exit` returned unconditionally at its first statement, so
+`run_vcpu_until_exit_inner` never ran — and it was the ONLY implementation of:
+
+- synchronous EL0 fault classification (`lower_el0_fault`) and delivery of
+  SIGSEGV / SIGBUS / SIGTRAP to the guest via `deliver_fault_signal`;
+- lazy stack growdown (`mmap_growdown_fault_plan` / `commit_mmap_growdown`) and
+  resident fault commit (`resident_fault_plan` / `commit_resident_fault`);
+- `Stage1CowFault` resolution at the guest boundary;
+- forced-exit signal service (`next_syscall()` returning `Ok(None)`);
+- the unclassified-fault SIGSEGV default action.
+
+The persistent poll turned every one of these into `RuntimeError::Trap` and
+killed the process. Proven red first on the pre-change signed binary:
+
+    carrick run-elf --raw --exec-backend hvpatch .../faultaddr
+    -> exit 1, no guest output,
+       "trap engine failed: EL0 fault not handled by trap path: esr=0x92000007"
+
+This was already true at HEAD; the deletion did not cause it, it revealed it.
+Per Task 1 Step 3's own rule the responsibility was ported into
+`ProductionHvpatchLoopJob::poll_with_engine` before the deletion continued, with
+`ExecutorExit::Syscall` standing in for the welded loop's `continue` and a new
+`enter_terminal_with_outcome` routing a fatal outcome into the persistent
+terminal. After the port, on a freshly signed binary:
+
+    faultaddr      -> exit 0, "si_addr_match=true fault_addr_match=true DONE"
+    recursionguard -> now also reports "deep_c_recursion_fits=true"
+
+### Baseline shape table: one legitimate change
+
+Phase 1 deletion left all 22 fork-battery shapes byte-identical. The fault port
+then changed exactly one: `clonebasic` goes from 0 to 1 stdout lines, because it
+now gets further before hitting the Phase 3 teardown defect. That is progress,
+not drift, and every other row is unchanged.
+
+### The compatibility wait arms went with the loop
+
+`service_threaded_syscall` escapes every blocking outcome to the executor's
+continuation BEFORE its `match`, and `is_blocking_dispatch_outcome` covers
+exactly the eleven arms that followed. Those 866 lines were unreachable and are
+replaced by one arm that fails closed if the escape and the classifier ever
+drift apart. `CompatibilityThreadWaiter` and the per-syscall parked-slice /
+sleep-deadline / poll-deadline state went with them.
+
+### Gates: `just test` had never run
+
+`just ci` is sequential and has been dying at clippy — and since `4acd8cc9f` at
+`lint-domains` — so `RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib`
+had not executed in a long time and was RED with five failures on unmodified
+HEAD `862bcb9af` (verified in a separate worktree). A stale
+`threaded_independent_dispatch_supports` expectation and four cross-process
+signal tests order-dependent on the never-cleared carrier-global `HVPATCH_LANE`.
+Both repaired; the suite is green for the first time.
+
+### Task 7 was done in the primary tree, not a worktree
+
+The dispatched worktree was created 1,884 commits behind `main`, predating
+HVPatch entirely, so its result was not mergeable. Task 7 was redone in place.
+Treat `isolation: worktree` in this repo as requiring an explicit base check.
+
+---
+
 ## Self-Review
 
 **Spec coverage.** Goal criterion 1 → Tasks 1-4; criterion 2 → Task 9; criterion 3 → Task 10; criterion 4 → Tasks 11, 12 Step 2; criterion 5 → Task 12 Step 3. Phase 2 sweep → Tasks 5-8. Out-of-scope items appear in no task. Baseline → Task 0.
