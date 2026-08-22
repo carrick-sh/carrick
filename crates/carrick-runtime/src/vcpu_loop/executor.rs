@@ -97,15 +97,36 @@ impl HvpatchTaskEngineBindingState {
         }
     }
 
-    pub(super) fn retire_detached_address_space(
+    /// Retire the detached address space AND publish its inventory retirement.
+    ///
+    /// The two payloads differ in what owns the retirement, not in policy. A
+    /// task-only backend was published through the carrier directory and owns a
+    /// `HvpatchTaskMmAuthority` whose phase must advance `Active -> Retired`
+    /// through its authenticated receipt; dropping that authority while it is
+    /// still `Active` aborts the carrier, which is what every forked process
+    /// used to do. The initial resident engine has no such published authority,
+    /// so its commit is applied directly.
+    pub(super) fn retire_detached_address_space_with(
         &mut self,
-    ) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
+        apply_with_receipt: impl FnOnce(
+            carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<
+            carrick_hal::FrameInventoryRetirementReceipt,
+            TrapError,
+        >,
+        apply_commit: impl FnOnce(carrick_hal::FrameInventoryCommit<()>) -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
         match &mut self.payload {
             HvpatchTaskEngineBindingPayload::Resident(state) => {
-                carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_engine(state)
+                let commit =
+                    carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_engine(state)?;
+                apply_commit(commit)
             }
             HvpatchTaskEngineBindingPayload::TaskOnly(state) => {
-                carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_engine(state)
+                let commit =
+                    carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_engine(state)?;
+                state.prepare_inventory_retirement(commit)?;
+                state.apply_inventory_retirement(apply_with_receipt)
             }
             #[cfg(test)]
             HvpatchTaskEngineBindingPayload::Test => Err(TrapError::Hypervisor(

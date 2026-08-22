@@ -3102,12 +3102,29 @@ trait ProductionHvpatchLoopPoll: Send {
         &mut self,
         commit: carrick_hal::FrameInventoryCommit<()>,
     ) -> Result<(), TrapError>;
+
+    /// The same publication, returning the authenticated receipt a published
+    /// `HvpatchTaskMmAuthority` needs to leave its `Active` phase.
+    fn apply_detached_address_space_retirement_with_receipt(
+        &mut self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>;
 }
 
 impl<E: ThreadedEngine + 'static> ProductionHvpatchLoopJob<E>
 where
     E::SiblingSpec: 'static,
 {
+    fn take_terminal_inventory_authority(
+        &mut self,
+    ) -> Result<(Arc<crate::kernel::Kernel>, crate::kernel::MmId), TrapError> {
+        self.pending_terminal_inventory.take().ok_or_else(|| {
+            TrapError::Hypervisor(
+                "detached terminal cleanup lost its exact Kernel/MM authority".to_owned(),
+            )
+        })
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn complete_persistent_process_fork(
         &mut self,
@@ -4825,11 +4842,7 @@ where
         &mut self,
         commit: carrick_hal::FrameInventoryCommit<()>,
     ) -> Result<(), TrapError> {
-        let (kernel, mm) = self.pending_terminal_inventory.take().ok_or_else(|| {
-            TrapError::Hypervisor(
-                "detached terminal cleanup lost its exact Kernel/MM authority".to_owned(),
-            )
-        })?;
+        let (kernel, mm) = self.take_terminal_inventory_authority()?;
         kernel
             .frame_inventory()
             .apply(mm, commit)
@@ -4837,6 +4850,24 @@ where
             .map_err(|error| {
                 TrapError::Hypervisor(format!(
                     "publish detached terminal inventory retirement: {error}"
+                ))
+            })
+    }
+
+    /// The same publication, but returning the authenticated receipt a published
+    /// `HvpatchTaskMmAuthority` needs to leave its `Active` phase.
+    fn apply_detached_address_space_retirement_with_receipt(
+        &mut self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError> {
+        let (kernel, mm) = self.take_terminal_inventory_authority()?;
+        kernel
+            .frame_inventory()
+            .apply_retirement_with_receipt(mm, commit)
+            .map(|(_, receipt)| receipt)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "publish detached terminal inventory retirement receipt: {error}"
                 ))
             })
     }
@@ -5023,6 +5054,20 @@ impl<E: 'static> continuation::PersistentQuantumJob for HvpatchLoopJob<E> {
                 )
             })?
             .apply_detached_address_space_retirement(commit)
+    }
+
+    fn apply_detached_address_space_retirement_with_receipt(
+        &mut self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError> {
+        self.production
+            .as_mut()
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "scripted HVPatch job has no detached address-space authority".to_owned(),
+                )
+            })?
+            .apply_detached_address_space_retirement_with_receipt(commit)
     }
 }
 
