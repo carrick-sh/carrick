@@ -234,6 +234,8 @@ test-integration:
         # `test` describes. It needs no HVF, guest, or Docker: every case
         # parses fixtures or asserts on argument validation.
         cargo test -p carrick-cli --test trace_profile
+        cargo test -p carrick-cli --test fs_backend_flag
+        cargo test -p carrick-cli --test cli
         cargo test -p carrick-engine
         cargo test -p carrick-image
         exit 0
@@ -246,6 +248,8 @@ test-integration:
     cargo test -p carrick-runtime {{_platform_features}} --test integration
     cargo test -p carrick-runtime {{_platform_features}} --test syscall_process
     cargo test -p carrick-cli {{_platform_features}} --test trace_profile
+    cargo test -p carrick-cli {{_platform_features}} --test fs_backend_flag
+    cargo test -p carrick-cli {{_platform_features}} --test cli
     cargo test -p carrick-engine {{_platform_features}}
     cargo test -p carrick-image
 

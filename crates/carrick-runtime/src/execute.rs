@@ -793,8 +793,7 @@ mod exit_code_tests {
     use crate::runtime::RuntimeError;
     use camino::Utf8PathBuf;
     use carrick_spec::{
-        ExecBackendRequest, FsBackendKind, NativePageProfileRequest, NetworkNamespaceSpec, PidMode,
-        Platform, RunSpec,
+        ExecBackendRequest, FsBackendKind, NetworkNamespaceSpec, PidMode, Platform, RunSpec,
     };
     use std::io::{Error as IoError, ErrorKind};
 
@@ -822,7 +821,6 @@ mod exit_code_tests {
             debug_state_path: None,
             platform: Platform::Aarch64,
             exec_backend: ExecBackendRequest::HvPatch,
-            native_page_profile: NativePageProfileRequest::Auto,
             pid: PidMode::Host,
             hostname: None,
             network: NetworkNamespaceSpec::default(),

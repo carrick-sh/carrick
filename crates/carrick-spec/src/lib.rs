@@ -292,18 +292,6 @@ impl clap::ValueEnum for ExecBackendRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
-pub enum NativePageProfileRequest {
-    #[default]
-    Auto,
-    #[cfg_attr(feature = "clap", value(name = "native16k"))]
-    Native16k,
-    #[cfg_attr(feature = "clap", value(name = "linux4k"))]
-    Linux4k,
-}
-
 // Relocated to `carrick-guest-mem` (see the note there) so the extracted
 // native-DSR crates can embed these leaf types without inheriting this
 // crate's oci-client/reqwest graph; re-exported so every
@@ -852,10 +840,6 @@ pub struct RunSpec {
     /// platform default; explicit `Native` is experimental and trusted-code-only.
     #[serde(default)]
     pub exec_backend: ExecBackendRequest,
-    /// Native-only page profile request. Ignored by explicitly non-native
-    /// backends; explicit native profiles are validated by the runtime plan.
-    #[serde(default)]
-    pub native_page_profile: NativePageProfileRequest,
     /// PID namespace mode (`docker run --pid`). `Private` (default) gives the
     /// container its own pid ns (init == pid 1); `Host` shares the host pid ns.
     #[serde(default)]

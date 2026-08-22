@@ -162,12 +162,9 @@ where
 pub fn backend_args(backend: CarrickBackend, probe: &Path, guest_args: &[&str]) -> Vec<String> {
     let mut args = vec!["run-elf".to_owned(), "--raw".to_owned()];
     match backend {
-        CarrickBackend::Native16k => args.extend([
-            "--exec-backend".to_owned(),
-            "native".to_owned(),
-            "--native-page-profile".to_owned(),
-            "native16k".to_owned(),
-        ]),
+        CarrickBackend::Native16k => {
+            args.extend(["--exec-backend".to_owned(), "native".to_owned()])
+        }
         CarrickBackend::Hvf => {
             args.extend(["--exec-backend".to_owned(), "vmm".to_owned()]);
         }
@@ -283,15 +280,7 @@ pub fn run_carrick(
     if direct_native {
         let probe_path = probe.to_string_lossy().into_owned();
         let child = Command::new(bin)
-            .args([
-                "run-elf",
-                "--raw",
-                "--exec-backend",
-                "native",
-                "--native-page-profile",
-                "native16k",
-                &probe_path,
-            ])
+            .args(["run-elf", "--raw", "--exec-backend", "native", &probe_path])
             .env("CARRICK_RUN_ID", run_id)
             .env("CARRICK_EXPOSED_CPUS", CPU_PIN.to_string())
             .stdout(std::process::Stdio::piped())

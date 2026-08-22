@@ -446,7 +446,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 detach: false,
                 forward_env: vec![],
                 exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
-                native_page_profile: carrick_spec::NativePageProfileRequest::Auto,
                 command: vec!["/bin/sh".to_owned()],
             }
         }
@@ -541,7 +540,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             workdir,
             forward_env,
             exec_backend,
-            native_page_profile,
             security_opt,
             args,
         } => {
@@ -650,7 +648,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     max_traps,
                     debug_state_path: debug_state_path.as_ref(),
                     exec_backend,
-                    native_page_profile,
                 },
             )
             .with_context(|| format!("failed to run static ELF {}", path.display()))?;
@@ -848,7 +845,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             interactive,
             fs,
             exec_backend,
-            native_page_profile,
             network,
             network_alias,
             ip,
@@ -929,7 +925,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 debug_state_path: debug_state_path.map(|p| p.to_string_lossy().into_owned()),
                 fs,
                 exec_backend,
-                native_page_profile,
                 pid,
                 network: parsed_network.mode,
                 network_bridge: parsed_network.bridge,
@@ -1120,7 +1115,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             platform,
             fs,
             exec_backend,
-            native_page_profile,
             pid,
             network,
             network_alias,
@@ -1183,7 +1177,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 debug_state_path: None,
                 fs,
                 exec_backend,
-                native_page_profile,
                 pid,
                 network: parsed_network.mode,
                 network_bridge: parsed_network.bridge,

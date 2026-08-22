@@ -327,12 +327,6 @@ mod tests {
             !argv.iter().any(|argument| argument == "--exec-backend"),
             "no lane may select an execution backend: {argv:?}"
         );
-        assert!(
-            !argv
-                .iter()
-                .any(|argument| argument == "--native-page-profile"),
-            "no lane may select a native page profile: {argv:?}"
-        );
     }
 
     #[test]
