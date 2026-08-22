@@ -215,7 +215,8 @@ impl FrameInventoryAuthority {
         mm: MmId,
         commit: FrameInventoryCommit<T>,
     ) -> Result<(T, u64), FrameInventoryError> {
-        self.apply_inner(mm, commit, None)
+        let (outcome, revision, _) = self.apply_inner(mm, commit, None)?;
+        Ok((outcome, revision))
     }
 
     /// Apply and issue an opaque provenance-authenticated receipt in the same
@@ -243,7 +244,7 @@ impl FrameInventoryAuthority {
             }
         }
         let mm_id = mm;
-        let (outcome, revision) = self.apply_inner(mm_id, commit, None)?;
+        let (outcome, revision, _) = self.apply_inner(mm_id, commit, None)?;
         let mm = NonZeroU64::new(mm.raw()).unwrap_or_else(|| std::process::abort());
         Ok((
             outcome,
@@ -284,7 +285,7 @@ impl FrameInventoryAuthority {
         }
         drop(state);
         let mm_id = mm;
-        let (outcome, revision) = self.apply_inner(mm_id, commit, None)?;
+        let (outcome, revision, mm_empty_at_revision) = self.apply_inner(mm_id, commit, None)?;
         let mm = NonZeroU64::new(mm.raw()).unwrap_or_else(|| std::process::abort());
         let receipt = FrameInventoryApplyReceipt::from_kernel_authority(
             provenance,
@@ -293,10 +294,6 @@ impl FrameInventoryAuthority {
             revision,
             mappings,
         );
-        let state = self.state.lock();
-        let mm_empty_at_revision = state.revision == revision
-            && state.mappings.values().all(|mapping| mapping.mm != mm_id);
-        drop(state);
         Ok((
             outcome,
             FrameInventoryRetirementReceipt::from_kernel_authority(receipt, mm_empty_at_revision),
@@ -308,7 +305,7 @@ impl FrameInventoryAuthority {
         mm: MmId,
         commit: FrameInventoryCommit<T>,
         fail_before_event: Option<usize>,
-    ) -> Result<(T, u64), FrameInventoryError> {
+    ) -> Result<(T, u64, bool), FrameInventoryError> {
         let transaction = commit.batch().transaction();
         let mut state = self.state.lock();
         let reserved_provenance = state
@@ -368,7 +365,12 @@ impl FrameInventoryAuthority {
             }
         }
         state.revision = next_revision;
-        Ok((outcome, next_revision))
+        // Decided HERE, under the lock that produced `next_revision`, because
+        // this is a claim about that exact revision. Reading it after the lock
+        // drops makes it a claim about a later revision that a concurrent
+        // commit may already have moved.
+        let mm_empty_at_revision = state.mappings.values().all(|mapping| mapping.mm != mm);
+        Ok((outcome, next_revision, mm_empty_at_revision))
     }
 
     pub fn snapshot(&self) -> FrameInventorySnapshot {
@@ -444,7 +446,8 @@ impl FrameInventoryAuthority {
         commit: FrameInventoryCommit<T>,
         fail_before_event: usize,
     ) -> Result<(T, u64), FrameInventoryError> {
-        self.apply_inner(mm, commit, Some(fail_before_event))
+        let (outcome, revision, _) = self.apply_inner(mm, commit, Some(fail_before_event))?;
+        Ok((outcome, revision))
     }
 }
 
@@ -953,6 +956,38 @@ mod tests {
                 generation: generation(1),
             })
             .expect("publish");
+    }
+
+    #[test]
+    fn retirement_emptiness_is_decided_under_the_applying_lock() {
+        // `mm_empty_at_revision` is a claim ABOUT the revision the retirement
+        // produced, so it has to be evaluated at that revision. Computing it
+        // after `apply_inner` releases the state lock made it a claim about
+        // whatever revision happened to be current a moment later: any
+        // concurrent commit — a sibling process during fork teardown, which is
+        // the normal case — bumped `state.revision`, the `state.revision ==
+        // revision` conjunct went false, and an mm that really was empty
+        // reported non-empty and aborted the carrier. Measured on `forkcow` at
+        // roughly one run in four.
+        //
+        // The window is a few instructions wide, so a timing test would only
+        // ever false-pass. Pin the shape instead: nothing after `apply_inner`
+        // may re-read the state.
+        let body = include_str!("frame_inventory.rs")
+            .split("pub fn apply_retirement_with_receipt")
+            .nth(1)
+            .expect("retirement entry point");
+        let tail = body
+            .split("apply_inner(")
+            .nth(1)
+            .expect("the retirement applies through apply_inner");
+        let tail = tail.split("fn apply_inner").next().unwrap_or(tail);
+        assert!(
+            !tail.contains("self.state.lock()"),
+            "apply_retirement_with_receipt must not re-read inventory state after \
+             apply_inner: the emptiness verdict belongs to the revision the apply \
+             produced, not to whatever revision is current afterwards"
+        );
     }
 
     #[test]
