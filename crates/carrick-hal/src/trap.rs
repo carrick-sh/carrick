@@ -131,9 +131,15 @@ pub trait SyscallTrap {
     /// Arm independently applicable old-mm retirement and replacement-mm map
     /// transactions. Keeping them separate prevents an exec batch from being
     /// applied to the wrong `MmId`.
+    ///
+    /// `retired` is `None` when the exec retires nothing from the old mm
+    /// because another live task still owns it — a vfork/`CLONE_VM` child's
+    /// execve. That is absence, not an empty transaction: `FrameEventCapacity`
+    /// is non-zero by construction and the authority rejects a zero-event
+    /// commit, so a retirement that would carry no events must not be reserved.
     fn begin_exec_inventory(
         &mut self,
-        retired: crate::FrameInventoryReservation,
+        retired: Option<crate::FrameInventoryReservation>,
         replacement: crate::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
         drop((retired, replacement));
@@ -142,10 +148,12 @@ pub trait SyscallTrap {
         ))
     }
 
+    /// The replacement commit is mandatory; the retirement half mirrors the
+    /// `begin_exec_inventory` reservation and is absent for a retained old mm.
     fn take_exec_inventory(
         &mut self,
     ) -> Option<(
-        crate::FrameInventoryCommit<()>,
+        Option<crate::FrameInventoryCommit<()>>,
         crate::FrameInventoryCommit<()>,
     )> {
         None

@@ -103,15 +103,19 @@ impl Drop for PtPauseGuard {
 /// Keeps runtime provenance live while a non-cloneable reservation is owned
 /// by the backend. Every pre-publication return abandons the authority record;
 /// successful application has already consumed it, making Drop a no-op.
+///
+/// A slot is `None` when that half of the operation was never reserved — an
+/// exec whose old mm stays owned by a live sharer arms no retirement — so the
+/// guard covers a partially armed operation without inventing a transaction id.
 pub(super) struct InventoryAbandon<'a, const N: usize> {
     authority: &'a crate::kernel::FrameInventoryAuthority,
-    transactions: [carrick_hal::KernelTransactionId; N],
+    transactions: [Option<carrick_hal::KernelTransactionId>; N],
 }
 
 impl<'a, const N: usize> InventoryAbandon<'a, N> {
     pub(super) const fn new(
         authority: &'a crate::kernel::FrameInventoryAuthority,
-        transactions: [carrick_hal::KernelTransactionId; N],
+        transactions: [Option<carrick_hal::KernelTransactionId>; N],
     ) -> Self {
         Self {
             authority,
@@ -122,7 +126,7 @@ impl<'a, const N: usize> InventoryAbandon<'a, N> {
 
 impl<const N: usize> Drop for InventoryAbandon<'_, N> {
     fn drop(&mut self) {
-        for transaction in self.transactions {
+        for transaction in self.transactions.into_iter().flatten() {
             self.authority.abandon(transaction);
         }
     }
@@ -1579,7 +1583,7 @@ where
                 HvpatchProcessInventoryPreparation::Copied(inventory_reservation),
                 Some(InventoryAbandon::new(
                     parent_process.kernel_graph().frame_inventory(),
-                    [inventory_transaction],
+                    [Some(inventory_transaction)],
                 )),
             )
         };
@@ -2227,7 +2231,7 @@ mod pt_pause_tests {
         let transaction = reservation.transaction();
         let commit = reservation.commit(());
         {
-            let _guard = InventoryAbandon::new(kernel.frame_inventory(), [transaction]);
+            let _guard = InventoryAbandon::new(kernel.frame_inventory(), [Some(transaction)]);
         }
 
         assert!(matches!(

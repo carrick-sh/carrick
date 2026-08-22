@@ -451,7 +451,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
 
     fn begin_exec_inventory(
         &mut self,
-        retired: carrick_hal::FrameInventoryReservation,
+        retired: Option<carrick_hal::FrameInventoryReservation>,
         replacement: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
         drop((retired, replacement));
@@ -463,7 +463,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     fn take_exec_inventory(
         &mut self,
     ) -> Option<(
-        carrick_hal::FrameInventoryCommit<()>,
+        Option<carrick_hal::FrameInventoryCommit<()>>,
         carrick_hal::FrameInventoryCommit<()>,
     )> {
         None

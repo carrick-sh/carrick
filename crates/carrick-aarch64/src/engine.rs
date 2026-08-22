@@ -1733,7 +1733,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
 
     fn begin_exec_inventory(
         &mut self,
-        retired: carrick_hal::FrameInventoryReservation,
+        retired: Option<carrick_hal::FrameInventoryReservation>,
         replacement: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
         self.vm.begin_exec_inventory(retired, replacement)
@@ -1742,7 +1742,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
     fn take_exec_inventory(
         &mut self,
     ) -> Option<(
-        carrick_hal::FrameInventoryCommit<()>,
+        Option<carrick_hal::FrameInventoryCommit<()>>,
         carrick_hal::FrameInventoryCommit<()>,
     )> {
         self.vm.take_exec_inventory()

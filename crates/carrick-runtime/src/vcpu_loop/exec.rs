@@ -39,14 +39,23 @@ fn exec_regions_to_verify(
     exec_regions_to_verify_with_mappings(image, image.file_mappings())
 }
 
+/// Route the exec's two independent commits to their own `MmId`s.
+///
+/// `retired` is `None` when a live sharer still owns the old mm (a vfork /
+/// `CLONE_VM` child's execve): the exec retires nothing from it, so there is no
+/// retirement transaction to apply. Its reservation is released by the caller's
+/// `InventoryAbandon` guard. An absent retirement is not the same as an empty
+/// one — the authority rejects a zero-event commit outright.
 fn apply_exec_inventory<E>(
     old_mm: crate::kernel::MmId,
     replacement_mm: crate::kernel::MmId,
-    retired: carrick_hal::FrameInventoryCommit<()>,
+    retired: Option<carrick_hal::FrameInventoryCommit<()>>,
     replacement: carrick_hal::FrameInventoryCommit<()>,
     mut apply: impl FnMut(crate::kernel::MmId, carrick_hal::FrameInventoryCommit<()>) -> Result<(), E>,
 ) -> Result<(), E> {
-    apply(old_mm, retired)?;
+    if let Some(retired) = retired {
+        apply(old_mm, retired)?;
+    }
     apply(replacement_mm, replacement)
 }
 
@@ -621,13 +630,52 @@ mod exec_image_verification_tests {
             .unwrap()
             .commit(());
         let mut routed = Vec::new();
-        apply_exec_inventory(old_mm, replacement_mm, retired, replacement, |mm, _| {
+        apply_exec_inventory(
+            old_mm,
+            replacement_mm,
+            Some(retired),
+            replacement,
+            |mm, _| {
+                routed.push(mm);
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(routed, [old_mm, replacement_mm]);
+        drop(prepared);
+    }
+
+    /// A vfork/`CLONE_VM` child's execve leaves the old mm owned by the still
+    /// live sharer, so the exec retires nothing from it. The retirement half is
+    /// then absent rather than an empty batch: `FrameEventCapacity` is
+    /// non-zero by construction, and the authority rejects a zero-event commit.
+    #[test]
+    fn exec_inventory_applies_only_replacement_when_old_mm_is_retained() {
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            1_541,
+            carrick_hal::ThreadId::synthetic_for_tests(1_541),
+            "exec-inventory-retained-old-mm".to_owned(),
+        )
+        .unwrap();
+        let (kernel, context) = crate::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        let prepared = kernel.prepare_exec(&context, None).unwrap();
+        let old_mm = prepared.old_mm_id();
+        let replacement_mm = prepared.replacement_mm_id();
+
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(1).unwrap();
+        let replacement = kernel
+            .reserve_frame_inventory(0, 0, capacity)
+            .unwrap()
+            .commit(());
+        let mut routed = Vec::new();
+        apply_exec_inventory(old_mm, replacement_mm, None, replacement, |mm, _| {
             routed.push(mm);
             Ok::<(), ()>(())
         })
         .unwrap();
 
-        assert_eq!(routed, [old_mm, replacement_mm]);
+        assert_eq!(routed, [replacement_mm]);
         drop(prepared);
     }
 
@@ -917,9 +965,14 @@ where
             {
                 old_extent_count = carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH / 2 + 1;
             }
-            let old_capacity =
+            // Zero old extents means the exec retires nothing from the old mm
+            // (a live sharer still owns it). `FrameEventCapacity` is non-zero by
+            // construction, so that case has no capacity and no transaction.
+            let old_capacity = if old_extent_count == 0 {
+                None
+            } else {
                 match super::quiesce::inventory_capacity_for_extents(old_extent_count) {
-                    Ok(capacity) => capacity,
+                    Ok(capacity) => Some(capacity),
                     Err(error) => {
                         return Self::exec_failed_past_no_return(
                             kernel,
@@ -928,7 +981,8 @@ where
                         )
                         .map(Some);
                     }
-                };
+                }
+            };
             let replacement_capacity =
                 match super::quiesce::inventory_capacity_for_extents(replacement_extent_count) {
                     Ok(capacity) => capacity,
@@ -941,21 +995,26 @@ where
                         .map(Some);
                     }
                 };
-            let retired = match process
-                .kernel_graph()
-                .reserve_frame_inventory(0, 0, old_capacity)
-            {
-                Ok(reservation) => reservation,
-                Err(error) => {
-                    return Self::exec_failed_past_no_return(
-                        kernel,
-                        engine,
-                        &format!("reserve HVPatch exec retirement inventory: {error}"),
-                    )
-                    .map(Some);
+            let retired = match old_capacity {
+                None => None,
+                Some(old_capacity) => {
+                    match process
+                        .kernel_graph()
+                        .reserve_frame_inventory(0, 0, old_capacity)
+                    {
+                        Ok(reservation) => Some(reservation),
+                        Err(error) => {
+                            return Self::exec_failed_past_no_return(
+                                kernel,
+                                engine,
+                                &format!("reserve HVPatch exec retirement inventory: {error}"),
+                            )
+                            .map(Some);
+                        }
+                    }
                 }
             };
-            let retired_transaction = retired.transaction();
+            let retired_transaction = retired.as_ref().map(|retired| retired.transaction());
             let replacement_candidate_count = if inventory_failure_injection
                 == Some(HvpatchExecInventoryFailureInjection::ReplacementReservation)
             {
@@ -970,10 +1029,12 @@ where
             ) {
                 Ok(reservation) => reservation,
                 Err(error) => {
-                    process
-                        .kernel_graph()
-                        .frame_inventory()
-                        .abandon(retired_transaction);
+                    if let Some(retired_transaction) = retired_transaction {
+                        process
+                            .kernel_graph()
+                            .frame_inventory()
+                            .abandon(retired_transaction);
+                    }
                     return Self::exec_failed_past_no_return(
                         kernel,
                         engine,
@@ -985,7 +1046,7 @@ where
             let replacement_transaction = replacement.transaction();
             let abandon = super::quiesce::InventoryAbandon::new(
                 process.kernel_graph().frame_inventory(),
-                [retired_transaction, replacement_transaction],
+                [retired_transaction, Some(replacement_transaction)],
             );
             if inventory_failure_injection
                 == Some(HvpatchExecInventoryFailureInjection::BeginInventory)
