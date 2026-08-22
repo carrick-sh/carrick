@@ -285,7 +285,6 @@ pub struct RunStaticElfBackendOptions<'a> {
     pub max_traps: usize,
     pub debug_state_path: Option<&'a PathBuf>,
     pub exec_backend: carrick_spec::ExecBackendRequest,
-    pub native_page_profile: carrick_spec::NativePageProfileRequest,
 }
 
 pub fn run_static_elf_with_backend_args_and_dispatcher_debug<A, E>(
@@ -302,7 +301,6 @@ where
     let plan = crate::page_profile::resolve_execution_plan_for_request(
         carrick_spec::Platform::host_native(),
         options.exec_backend,
-        options.native_page_profile,
     )?;
     // Kept for its capability check: it refuses a non-macOS/AArch64 lane
     // before the guest is built. HVPatch is the only backend, so the plan

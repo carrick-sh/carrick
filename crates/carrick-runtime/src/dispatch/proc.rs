@@ -4914,7 +4914,7 @@ mod native_virtual_ptrace_tests {
     }
 
     #[test]
-    fn native_page_profiles_select_virtual_ptrace_transport() {
+    fn native_profiles_select_virtual_ptrace_transport() {
         assert_eq!(
             select_ptrace_transport(
                 geometry(Some(carrick_spec::NativePageProfile::Native16k)),

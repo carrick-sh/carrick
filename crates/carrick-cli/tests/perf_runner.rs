@@ -130,12 +130,9 @@ fn v8_backend_args(backend: CarrickBackend, immutable_image: &str) -> Vec<String
         V8_ENTRYPOINT.to_owned(),
     ];
     match backend {
-        CarrickBackend::Native16k => args.extend([
-            "--exec-backend".to_owned(),
-            "native".to_owned(),
-            "--native-page-profile".to_owned(),
-            "native16k".to_owned(),
-        ]),
+        CarrickBackend::Native16k => {
+            args.extend(["--exec-backend".to_owned(), "native".to_owned()])
+        }
         CarrickBackend::Hvf => {
             args.extend(["--exec-backend".to_owned(), "vmm".to_owned()]);
         }
@@ -163,10 +160,7 @@ fn backend_neutral_v8_args(arguments: &[String]) -> Vec<String> {
     let mut neutral = Vec::with_capacity(arguments.len());
     let mut index = 0;
     while index < arguments.len() {
-        if matches!(
-            arguments[index].as_str(),
-            "--exec-backend" | "--native-page-profile"
-        ) {
+        if arguments[index].as_str() == "--exec-backend" {
             index += 2;
         } else {
             neutral.push(arguments[index].clone());

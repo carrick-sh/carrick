@@ -1,9 +1,7 @@
 //! Backend selection + page-geometry plumbing for a run.
 
 use crate::runtime::RuntimeError;
-use carrick_spec::{
-    BackendCapabilities, ExecBackendRequest, HostOs, NativePageProfileRequest, Platform, RunSpec,
-};
+use carrick_spec::{BackendCapabilities, ExecBackendRequest, HostOs, Platform, RunSpec};
 
 pub(crate) use carrick_dsr::page_geometry::DEFAULT_LINUX_PAGE_SIZE;
 pub use carrick_dsr::page_geometry::{
@@ -29,7 +27,6 @@ pub(crate) fn resolve_execution_plan(spec: &RunSpec) -> Result<ExecutionPlan, Ru
     resolve_execution_plan_for_request_for_host(
         spec.platform,
         spec.exec_backend,
-        spec.native_page_profile,
         BackendCapabilities::current(),
         host_page_size(),
     )
@@ -38,12 +35,10 @@ pub(crate) fn resolve_execution_plan(spec: &RunSpec) -> Result<ExecutionPlan, Ru
 pub(crate) fn resolve_execution_plan_for_request(
     platform: Platform,
     exec_backend: ExecBackendRequest,
-    native_page_profile: NativePageProfileRequest,
 ) -> Result<ExecutionPlan, RuntimeError> {
     resolve_execution_plan_for_request_for_host(
         platform,
         exec_backend,
-        native_page_profile,
         BackendCapabilities::current(),
         host_page_size(),
     )
@@ -58,7 +53,6 @@ fn resolve_execution_plan_for_host(
     resolve_execution_plan_for_request_for_host(
         spec.platform,
         spec.exec_backend,
-        spec.native_page_profile,
         host_caps,
         host_page_size,
     )
@@ -67,16 +61,9 @@ fn resolve_execution_plan_for_host(
 fn resolve_execution_plan_for_request_for_host(
     platform: Platform,
     exec_backend: ExecBackendRequest,
-    native_page_profile: NativePageProfileRequest,
     host_caps: BackendCapabilities,
     _host_page_size: u64,
 ) -> Result<ExecutionPlan, RuntimeError> {
-    if native_page_profile != NativePageProfileRequest::Auto {
-        return Err(RuntimeError::Unsupported(
-            "native page profile is not supported (native backend retired)".to_string(),
-        ));
-    }
-
     match exec_backend {
         ExecBackendRequest::HvPatch => {
             if host_caps.host_os != HostOs::Macos
@@ -119,7 +106,6 @@ mod tests {
     fn spec_with_platform(
         platform: carrick_spec::Platform,
         exec_backend: ExecBackendRequest,
-        page: NativePageProfileRequest,
     ) -> RunSpec {
         RunSpec {
             cap_add: Vec::new(),
@@ -137,7 +123,6 @@ mod tests {
             debug_state_path: None,
             platform,
             exec_backend,
-            native_page_profile: page,
             pid: carrick_spec::PidMode::Private,
             hostname: None,
             network: carrick_spec::NetworkNamespaceSpec::default(),
@@ -148,8 +133,8 @@ mod tests {
         }
     }
 
-    fn spec(exec_backend: ExecBackendRequest, page: NativePageProfileRequest) -> RunSpec {
-        spec_with_platform(carrick_spec::Platform::Aarch64, exec_backend, page)
+    fn spec(exec_backend: ExecBackendRequest) -> RunSpec {
+        spec_with_platform(carrick_spec::Platform::Aarch64, exec_backend)
     }
 
     fn caps(host_os: HostOs, host_isa: Platform) -> BackendCapabilities {
@@ -159,7 +144,7 @@ mod tests {
     #[test]
     fn hvpatch_request_uses_linux_geometry_on_macos_aarch64() {
         let plan = resolve_execution_plan_for_host(
-            &spec(ExecBackendRequest::HvPatch, NativePageProfileRequest::Auto),
+            &spec(ExecBackendRequest::HvPatch),
             caps(HostOs::Macos, Platform::Aarch64),
             DARWIN_NATIVE_PAGE_SIZE,
         )
@@ -178,11 +163,7 @@ mod tests {
             (HostOs::Macos, Platform::Aarch64, Platform::Amd64),
         ] {
             let error = resolve_execution_plan_for_host(
-                &spec_with_platform(
-                    guest,
-                    ExecBackendRequest::HvPatch,
-                    NativePageProfileRequest::Auto,
-                ),
+                &spec_with_platform(guest, ExecBackendRequest::HvPatch),
                 caps(host_os, host_isa),
                 DARWIN_NATIVE_PAGE_SIZE,
             )
@@ -192,18 +173,5 @@ mod tests {
                 "unexpected hvpatch capability error: {error}"
             );
         }
-    }
-
-    #[test]
-    fn explicit_native_page_profile_rejected() {
-        let err = resolve_execution_plan(&spec(
-            ExecBackendRequest::HvPatch,
-            NativePageProfileRequest::Linux4k,
-        ))
-        .expect_err("explicit native page profile rejected");
-        assert!(
-            err.to_string()
-                .contains("native page profile is not supported")
-        );
     }
 }

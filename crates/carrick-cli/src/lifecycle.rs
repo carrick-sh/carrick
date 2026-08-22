@@ -186,7 +186,6 @@ fn build_created_state(
         config: RunConfig {
             platform: req.platform.clone(),
             exec_backend: req.exec_backend,
-            native_page_profile: req.native_page_profile,
             env: req.env_overrides.clone(),
             workdir: req.workdir.clone(),
             user: req.user.clone(),
@@ -382,7 +381,6 @@ fn rebuild_request_from_state(state: &ContainerState) -> carrick_engine::CliRunR
         debug_state_path: None,
         fs: c.fs,
         exec_backend: c.exec_backend,
-        native_page_profile: c.native_page_profile,
         pid: c.pid,
         network: effective_network.network,
         network_bridge: bridge_network_name(effective_network),
@@ -1181,7 +1179,6 @@ pub(crate) fn exec(
         debug_state_path: None,
         fs: Some(carrick_spec::FsBackendKind::Host),
         exec_backend: state.config.exec_backend,
-        native_page_profile: state.config.native_page_profile,
         pid: state.config.pid,
         network: state.config.network,
         network_bridge: bridge_network_name(effective_network),
@@ -1809,7 +1806,6 @@ mod tests {
                 user: Some("1000".into()),
                 hostname: None,
                 exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
-                native_page_profile: carrick_spec::NativePageProfileRequest::Linux4k,
                 pid: carrick_spec::PidMode::Private,
                 network: carrick_spec::NetworkMode::Host,
                 api_network_mode: Some("host".into()),
@@ -1862,10 +1858,6 @@ mod tests {
         assert!(req.tty);
         assert_eq!(req.max_traps, 4242);
         assert_eq!(req.exec_backend, carrick_spec::ExecBackendRequest::HvPatch);
-        assert_eq!(
-            req.native_page_profile,
-            carrick_spec::NativePageProfileRequest::Linux4k
-        );
         assert_eq!(req.pid, carrick_spec::PidMode::Private);
         assert_eq!(req.network_aliases, vec!["api".to_string()]);
         assert!(!req.rm);
