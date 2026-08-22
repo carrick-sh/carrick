@@ -1030,6 +1030,56 @@ mod task_only_carrier_directory_tests {
         drop(binding);
     }
 
+    /// COW arming and COW deferred publication are ONE authority. A task that
+    /// can arm a COW range must also own the slot its deferred publications
+    /// land in. Half the pair is exactly how every forked PROCESS reached a
+    /// worker with `cow_armed` set and no publication slot: the omission was
+    /// swallowed by `..Default::default()` and surfaced only at child
+    /// activation, after the child had already been published.
+    #[test]
+    fn prepared_task_authority_rejects_half_a_cow_authority() {
+        let armed = || Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
+        let publications = || Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        HvpatchPreparedTaskAuthority::default()
+            .validate_cow_authority_pairing()
+            .expect("neither half present is a complete, COW-less authority");
+
+        HvpatchPreparedTaskAuthority {
+            cow_armed: Some(armed()),
+            cow_deferred_publications: Some(publications()),
+            ..HvpatchPreparedTaskAuthority::default()
+        }
+        .validate_cow_authority_pairing()
+        .expect("both halves present is a complete COW authority");
+
+        let error = HvpatchPreparedTaskAuthority {
+            cow_armed: Some(armed()),
+            ..HvpatchPreparedTaskAuthority::default()
+        }
+        .validate_cow_authority_pairing()
+        .expect_err("arming without a publication slot must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("armed COW without publication state"),
+            "unexpected error: {error}"
+        );
+
+        let error = HvpatchPreparedTaskAuthority {
+            cow_deferred_publications: Some(publications()),
+            ..HvpatchPreparedTaskAuthority::default()
+        }
+        .validate_cow_authority_pairing()
+        .expect_err("a publication slot without arming must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("COW publication state without arming"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn committed_child_requires_fresh_exact_kernel_cow_binding() {
         let (issuer, verifier) = carrick_hal::HvpatchChildTokenIssuer::new_pair();
@@ -6810,6 +6860,27 @@ impl Drop for HvpatchTaskMmAuthority {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvpatchPreparedTaskAuthority {
+    /// COW arming and COW deferred publication are ONE authority: a task that
+    /// can arm a COW range must also own the slot its deferred publications
+    /// land in. Publication is the last boundary that can still reject a task
+    /// cheaply — past it the child is live and a missing half aborts the
+    /// carrier when a worker activates it.
+    fn validate_cow_authority_pairing(&self) -> Result<(), TrapError> {
+        match (
+            self.cow_armed.is_some(),
+            self.cow_deferred_publications.is_some(),
+        ) {
+            (true, true) | (false, false) => Ok(()),
+            (true, false) => Err(TrapError::Hypervisor(
+                "HVPatch prepared task authority armed COW without publication state".to_owned(),
+            )),
+            (false, true) => Err(TrapError::Hypervisor(
+                "HVPatch prepared task authority holds COW publication state without arming"
+                    .to_owned(),
+            )),
+        }
+    }
+
     fn abort(self) -> Result<(), TrapError> {
         let mut this = self;
         // Pending aliases have never touched either global registry.  The
@@ -7647,6 +7718,10 @@ impl HvpatchCarrierTaskStateDirectory {
             return Err(TrapError::Hypervisor(
                 "deferred HVPatch task identity contains zero".to_owned(),
             ));
+        }
+        if let Err(error) = task.validate_cow_authority_pairing() {
+            abort_prepared_task_and_carrier(task, state)?;
+            return Err(error);
         }
         let nonce = match self.next.fetch_update(
             std::sync::atomic::Ordering::AcqRel,
@@ -16260,6 +16335,13 @@ impl HvfVmState {
                     challenge: Some(process_challenge),
                 },
                 cow_armed: Some(spec.cow_armed),
+                // A freshly materialized process has no deferred COW
+                // publication yet, but it must own the slot they land in:
+                // `from_process_spec` gives the live state the same fresh
+                // vector, and arming without one is not a task authority.
+                cow_deferred_publications: Some(std::sync::Arc::new(parking_lot::Mutex::new(
+                    Vec::new(),
+                ))),
                 pending_receipts,
                 pending_aliases,
                 ..HvpatchPreparedTaskAuthority::default()
