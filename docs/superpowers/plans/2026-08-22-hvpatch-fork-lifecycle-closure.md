@@ -759,6 +759,41 @@ HEAD `862bcb9af` (verified in a separate worktree). A stale
 signal tests order-dependent on the never-cleared carrier-global `HVPATCH_LANE`.
 Both repaired; the suite is green for the first time.
 
+### Task 4's premise is REFUTED — `persistent_vm_lifecycle` is live state
+
+Task 4 says the HVF trap engine's 18 negated `persistent_vm_lifecycle` guards
+are dead because the sole production setter disappears with `ExecutionBackend`,
+and that the two `false` initializers "initialize the field to the DEAD value —
+that inversion is itself a hazard and disappears with the field."
+
+It does not disappear, because the field is not a lane selector any more. It
+distinguishes a task state that is BOUND to a persistent HVPatch task from one
+that is not. Proven by experiment rather than by reading: flipping only the two
+`false` initializers to `true`, changing nothing else, and rebuilding signed
+made EVERY probe fail identically —
+
+    Error: failed to run static ELF .../faultaddr
+    Caused by: configuration refused: persistent executor pool startup failed:
+      hypervisor operation failed: idle HVPatch worker retained task authority
+
+`trap.rs:5003` is a pristine-state assertion over `HvfTaskState`: an idle
+executor worker must hold a task state in which every field is still at its
+default, and `!self.persistent_vm_lifecycle` is one of the clauses. An idle
+worker legitimately carries `false`, so the field has at least two live values
+at runtime and collapsing its 46 remaining guards to the persistent arm is NOT
+behaviour-preserving. The experiment was reverted; `trap.rs` is untouched.
+
+Before Task 4 can proceed, someone must establish — with evidence, not
+inspection — which of those guards can ever run on an UNBOUND task state. If
+the answer is none, the field can be deleted and the pristine clause dropped.
+If some can, the field is misnamed rather than dead: it means
+"this task state owns a persistent task", and the honest fix is a rename plus a
+typed distinction, not a deletion. That is a Phase 1 task in name only; it is
+really a domain-modelling task of the kind
+`docs/identity-and-scope-domains.md` describes.
+
+Phase 1 is therefore complete except Task 4, which is BLOCKED on that analysis.
+
 ### Task 7 was done in the primary tree, not a worktree
 
 The dispatched worktree was created 1,884 commits behind `main`, predating
