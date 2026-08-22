@@ -170,7 +170,18 @@ Three directed agy workers took clippy from 97 errors to 34, deleting ~3,700
 lines. **The remaining 34 are almost entirely two clusters that lost their
 callers in the collapse and must be PORTED into the persistent executor:**
 
-- **Core dumps and crash capture** (~19 errors): `CoreProcessSnapshot`,
+- **Core dumps and crash capture** (~19 errors) — **now VERIFIED broken, with a
+  written port plan: `docs/hvpatch-core-dump-port-plan.md`.**
+  `finalize_persistent_process_terminal` calls `run.wait_status_encoding(false)`
+  at `vcpu_loop/mod.rs:2913`, the only call site in the tree, and
+  `run_result.rs:120` sets the `0x80` core bit only when that argument is true.
+  So `WCOREDUMP` is unconditionally 0 and no core file is ever written. This is
+  the third capability found to have lost its only caller in the collapse, and
+  the first that fails SILENTLY — nothing hangs or crashes; a guest just never
+  dumps. The plan carries the ordering hazards, which are the hard part: crash
+  registers must be captured while sibling threads are still live, and core
+  memory read before address-space retirement, or the port produces an empty
+  core file that reads as success. Symbols: `CoreProcessSnapshot`,
   `CorePublication`, `CorePublicationError`, `PreparedCorePublication`,
   `project_core_maps`, `boot_region_is_carrick_kernel_hole`,
   `core_note_resume_pair`, `recorded_for`, `fatal_for_terminal_owner`,
