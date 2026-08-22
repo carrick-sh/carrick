@@ -5965,6 +5965,7 @@ fn is_persistent_executor_carrier_address(address: u64) -> bool {
             | carrick_mem::memory::LINUX_EL1_VECTORS_BASE
             | carrick_mem::memory::LINUX_EL1_MAINT_BASE
             | carrick_mem::memory::LINUX_SYSCALL_MAILBOX_BASE
+            | carrick_mem::memory::LINUX_CARRIER_MAINT_ROOT_BASE
     )
 }
 
@@ -5977,7 +5978,7 @@ fn persistent_executor_carrier_mappings(mappings: &[HvfMappedRegion]) -> Vec<Thr
         .collect()
 }
 
-/// Owning carrier-wide lifetime for the four fixed HVPatch control mappings.
+/// Owning carrier-wide lifetime for the five fixed HVPatch control mappings.
 /// Logical MM/task cleanup never sees these rows. The last factory/worker Arc
 /// drops only after every worker vCPU has been joined and destroyed.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -5988,7 +5989,7 @@ struct PersistentCarrierMappings {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PersistentCarrierMappings {
     fn extract(task_mappings: &mut Vec<HvfMappedRegion>) -> Result<Self, TrapError> {
-        let mut carrier = Vec::with_capacity(4);
+        let mut carrier = Vec::with_capacity(5);
         let mut task = Vec::with_capacity(task_mappings.len());
         for mapping in std::mem::take(task_mappings) {
             if is_persistent_executor_carrier_mapping(&mapping) {
@@ -6000,13 +6001,19 @@ impl PersistentCarrierMappings {
         *task_mappings = task;
         let authority = Self { mappings: carrier };
         authority.audit()?;
-        if authority.mappings.len() != 4 {
+        if authority.mappings.len() != 5 {
             return Err(TrapError::Hypervisor(format!(
-                "persistent executor carrier owns {} mappings, expected 4",
+                "persistent executor carrier owns {} mappings, expected 5",
                 authority.mappings.len()
             )));
         }
         Ok(authority)
+    }
+
+    fn maintenance_root(&self) -> carrick_mem::memory::CarrierMaintenanceRoot {
+        carrick_mem::memory::CarrierMaintenanceRoot(carrick_guest_mem::Gpa(
+            carrick_mem::memory::LINUX_CARRIER_MAINT_ROOT_BASE,
+        ))
     }
 
     fn host_pointer(&self, address: u64, length: usize) -> Option<std::ptr::NonNull<u8>> {
@@ -6100,6 +6107,11 @@ fn audit_persistent_executor_carrier_mappings(
             "syscall mailbox",
             carrick_mem::memory::LINUX_SYSCALL_MAILBOX_BASE,
             carrick_mem::memory::LINUX_SYSCALL_MAILBOX_ARENA_SIZE,
+        ),
+        (
+            "carrier maintenance root",
+            carrick_mem::memory::LINUX_CARRIER_MAINT_ROOT_BASE,
+            carrick_mem::memory::LINUX_CARRIER_MAINT_ROOT_SIZE,
         ),
     ] {
         let size = usize::try_from(size).map_err(|_| {
@@ -15787,6 +15799,15 @@ impl HvfVmState {
             .audit()
     }
 
+    pub(crate) fn carrier_maintenance_root(
+        &self,
+    ) -> Result<carrick_mem::memory::CarrierMaintenanceRoot, TrapError> {
+        let carrier = self.carrier_mappings.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor("persistent executor lost carrier mapping authority".to_owned())
+        })?;
+        Ok(carrier.maintenance_root())
+    }
+
     pub(crate) fn audit_persistent_worker_vcpu_boundary(
         &self,
         vcpu: &applevisor::vcpu::Vcpu,
@@ -20086,6 +20107,10 @@ mod frame_inventory_backend_tests {
                 crate::memory::LINUX_SYSCALL_MAILBOX_BASE,
                 crate::memory::LINUX_SYSCALL_MAILBOX_ARENA_SIZE,
             ),
+            (
+                crate::memory::LINUX_CARRIER_MAINT_ROOT_BASE,
+                crate::memory::LINUX_CARRIER_MAINT_ROOT_SIZE,
+            ),
         ] {
             input.mappings.push(exec_mapping_for_order(start, size));
         }
@@ -20110,7 +20135,7 @@ mod frame_inventory_backend_tests {
                 .iter()
                 .filter(|mapping| is_persistent_executor_carrier_guest_mapping(mapping))
                 .count(),
-            4
+            5
         );
     }
 
@@ -22066,6 +22091,11 @@ mod thread_sibling_tests {
                 crate::memory::LINUX_SYSCALL_MAILBOX_ARENA_SIZE,
                 0x1400_0000,
             ),
+            carrier_region(
+                crate::memory::LINUX_CARRIER_MAINT_ROOT_BASE,
+                crate::memory::LINUX_CARRIER_MAINT_ROOT_SIZE,
+                0x1500_0000,
+            ),
             mapped_region(0x0040_0000, 0x0040_4000, 0x0040_0000),
             mapped_region(
                 crate::memory::LINUX_PAGE_TABLES_BASE,
@@ -22076,7 +22106,7 @@ mod thread_sibling_tests {
         let carrier = persistent_executor_carrier_mappings(&mappings);
         assert_eq!(
             carrier.len(),
-            4,
+            5,
             "task image and stage-1 root stay task-owned"
         );
 
@@ -22122,6 +22152,10 @@ mod thread_sibling_tests {
             (
                 crate::memory::LINUX_SYSCALL_MAILBOX_BASE,
                 crate::memory::LINUX_SYSCALL_MAILBOX_ARENA_SIZE,
+            ),
+            (
+                crate::memory::LINUX_CARRIER_MAINT_ROOT_BASE,
+                crate::memory::LINUX_CARRIER_MAINT_ROOT_SIZE,
             ),
         ] {
             let size = usize::try_from(size).unwrap();

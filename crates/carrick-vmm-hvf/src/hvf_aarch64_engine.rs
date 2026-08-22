@@ -921,7 +921,8 @@ pub fn invalidate_worker_asid(
 ) -> Result<(), TrapError> {
     vmm.state
         .audit_persistent_worker_vcpu_boundary(&vcpu.inner, &vcpu.mailbox)?;
-    Aarch64EngineCore::<HvfAarch64Vmm>::invalidate_asid_on_vcpu(vcpu, asid)
+    let carrier_root = vmm.state.carrier_maintenance_root()?;
+    Aarch64EngineCore::<HvfAarch64Vmm>::invalidate_asid_on_vcpu(vcpu, asid, carrier_root)
 }
 
 pub fn persistent_executor_factory_authority(
@@ -1029,6 +1030,12 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     ) -> Result<(), TrapError> {
         self.state
             .restore_persistent_worker_vcpu_boundary(&vcpu.inner, &vcpu.mailbox)
+    }
+
+    fn carrier_maintenance_root(
+        &self,
+    ) -> Result<carrick_mem::memory::CarrierMaintenanceRoot, TrapError> {
+        self.state.carrier_maintenance_root()
     }
 
     fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {

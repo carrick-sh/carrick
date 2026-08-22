@@ -357,6 +357,14 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         ))
     }
 
+    fn carrier_maintenance_root(
+        &self,
+    ) -> Result<carrick_mem::memory::CarrierMaintenanceRoot, TrapError> {
+        Err(TrapError::Hypervisor(
+            "AArch64 VMM does not expose a carrier maintenance root".to_owned(),
+        ))
+    }
+
     /// Retain the host VM across guest process lifecycle operations. HVF's
     /// hvpatch lane overrides this; ordinary VMM and non-HVF backends preserve
     /// their established rebuild behavior.
