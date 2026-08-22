@@ -140,78 +140,63 @@ observable. `forkfiletable` 9 lines, `mqnotifycrossproc` 16, `clone3args` 14.
 compiles were live reported 7/15 aborts and 38 lines; uncontended it is 5/15 and
 55 twice over. Quote an uncontended sample.
 
-### The NEXT defect — ROOT-CAUSED, fix deliberately not attempted
+### The fork lifecycle: five defects fixed, no carrier aborts left
 
-`stamp_identity_page` in `bootstrap_hvpatch_process_child` fails for every
-forked child. The reported error is a triple lie and cost a whole investigation:
+`afb3e409..dbfffc6f`. **All ten built fork probes reached zero carrier aborts,
+from ten of ten aborting.** `forkcow`, `cloneexitsig`, `waitidsiuid` and
+`xthreadsig` exit 0; `clonebasic` passes intermittently. Everything else now
+fails on ordinary behaviour or in executor-pool shutdown, with the guest's own
+work completing first (`sigchld` reports all three of its assertions true).
 
-    process child identity bootstrap: guest memory read is out of bounds
-    at 0x2d001e4000 for 4 bytes
+| commit | defect |
+|---|---|
+| `00131530` | identity-page rows on an unowned extent failed liveness |
+| `b2097fc5` | retirement re-charged for already-settled fork inheritances |
+| `a1eaad6a` | retirement emptiness decided after its lock was released |
+| `d4ad1aaa` | SCTLR_EL1 readback compared against the bits carrick programs |
+| `dbfffc6f` | `SignalThread` never lowered in the persistent executor |
 
-It is a WRITE, not a read (`MemoryError::OutOfBounds`'s Display says "read" and
-`write_bytes` returns it too). `0x2d001e4000` is not out of bounds — it is
-`LINUX_IDENTITY_PAGE_BASE`, a compile-time constant. And nothing is missing: a
-region covers it exactly.
+Each of the first four was found by making the previous one's abort NAME ITS
+FAILING CLAUSE. That is the whole method and it is worth repeating: every one
+of these aborts reported a STATE ("malformed receipt", "out of bounds", "invariant
+mismatch") when what the next step needed was the CLAUSE. Two of them also
+reported the wrong operation — `MemoryError::OutOfBounds` renders as "read" for
+a failed write, and the address it named was a compile-time constant that was
+never out of bounds.
 
-`cfa1c76b` makes the real reason permanent. On `forkcow`, under
-`RUST_LOG=carrick_vmm_hvf=error`:
+The recurring root-cause shape is **two domains sharing one type**, exactly as
+`docs/identity-and-scope-domains.md` predicts: the bits carrick programs vs the
+bits a register reads back; an obligation record vs the mapping it describes; a
+claim about revision N vs the revision current afterwards; the absence of an
+authority vs a rejection by one.
 
-    guest write rejected: a region covers this VA but failed the global-frame
-    owner-liveness check va="0x2d001e4000" len=4
-    region="[0x2d001e4000..0x2d001e8000)" physical_ipa="0x9b00408000"
-    reusable_global_frame=true owns_host_mapping=false owns_stage2_lease=false
-    owner_generation=0
+### What is next, in order
 
-**The chain, each step measured, not inferred:**
+1. **The executor-pool shutdown race.** Now the only thing between the fork
+   probes and green. It is nondeterministic — the same probe hangs to the
+   timeout, aborts, or returns one of several distinct shutdown errors across
+   runs (`stale or invalid child selector`, `dormant task cancellation failed:
+   exact thread generation is not live`, `executor ExecutorId...`). Sample any
+   verdict at least twice. Start by making `persistent executor pool shutdown
+   failed` name which executor and which phase, the same way the four fixes
+   above were found.
+2. **The `DispatchOutcome` catch-all is a structural hazard.** `service_outcome`
+   ends in `other => { tracing::error!("unlowered outcome"); InvalidState }`, so
+   a variant whose only handler died with the welded loop becomes a runtime HANG
+   instead of a compile error. Two have been found this way already —
+   `SigReturn` (`633d32a31`) and `SignalThread` (`dbfffc6f`). The blocking
+   variants return early via `is_blocking_dispatch_outcome`, so the match cannot
+   simply be made exhaustive; the fix is to route the early return through a
+   type that leaves only non-blocking variants for the match to cover.
+3. **The orphan triage** — `docs/hvpatch-orphan-triage-2026-08-22.md`, all 89
+   `dead_code` symbols classified with evidence. This is what unblocks
+   `just clippy` (still exiting 101 at ~97 errors) and therefore `just ci`.
+   Read its calibration warning: every row came back `certain` and none used
+   UNCERTAIN, so verify before acting. The core-dump cluster and the job-control
+   cluster are the two that would silently remove guest-visible behaviour.
+4. Task 4 (HVF `persistent_vm_lifecycle`) after its blocking analysis; Phase 2
+   Task 5 remainder; Phase 3 Tasks 10-12.
 
-1. The write reaches `HvfVmState::validate_guest_write_range`, which runs BEFORE
-   the copy loop and uses the IMMUTABLE `mapping_for_range`. Four other paths
-   return this same error and were each instrumented and cleared: the
-   `write_bytes` PROT_NONE gate, the `write_bytes_raw` write-denied gate,
-   `syscall_buffer_chunk`, and the copy loop's own `mapping_for_range_mut`.
-2. `mapping_for_range` finds the covering region but filters it as not live:
-   `persistent_vm_lifecycle` is true and the extent is a reusable global frame,
-   so liveness requires `global_frame_region_owner_matches`.
-3. That fails. The child's identity page is an INHERITED, non-owning region — no
-   `host_mapping`, no `stage2_lease` — so `locally_owned` is false and it falls
-   through to `global_frame_host_owner_matches`.
-4. There, no global-frame owner is registered for `(0x9b00408000, 0x4000)` at
-   all, so `owner_host_addr == 0` and the FIRST conjunct fails:
-
-       owner_host_addr != 0 && owner_host_addr == host_addr
-           && (generation == 0 || owner_generation == generation)
-
-   The row carries `generation = 0`, and the `generation == 0` escape is
-   documented as keeping "the historical pointer-only behaviour" for early rows
-   precisely because tightening them "unmapped the syscall mailbox and killed
-   the guest outright". **That escape is unreachable when no owner is
-   registered.** The comment's stated intent and the code disagree.
-
-**Why the fix was not attempted.** This is the predicate whose own comment says
-a wrong change killed the guest outright, and loosening it silently re-validates
-genuinely stale mappings — the exact global-frame-IPA-versus-owner-generation
-domain hazard `AGENTS.md` names. Decide it with evidence at the start of a
-session, not the end of one.
-
-**The two candidate readings to discriminate:**
-
-- (a) The predicate is wrong: an inherited non-owning row with `generation = 0`
-  and no registered owner is legitimate (that is what an inherited kernel
-  mapping IS), and the `generation == 0` escape should be reachable —
-  i.e. the `owner_host_addr != 0` conjunct is too strong for that case.
-- (b) The publication is wrong: a forked child's kernel-region rows should own
-  or re-register their global-frame extent, and `generation = 0` with no owner
-  means fork skipped a publication step.
-
-The parent succeeds at the identical stamp twice before the child fails once
-(`IDSTAMPMARKER` evidence), so whatever the parent has and the child lacks is
-the answer. Instrument the parent's region for the same VA and diff the four
-fields the new diagnostic prints.
-
-Five probes still abort — `clonebasic`, `waitexitstorm`, `waitidsiuid`,
-`sigchld`, `execpipe` — so at least one more retirement path reaches the drop
-with a live inventory. Their `kernel_mm` differs from the fixed path's, which is
-the thread to pull.
 
 ### THE ORIGINAL FINDING (kept for its method)
 
