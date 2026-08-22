@@ -745,11 +745,9 @@ mod task_only_carrier_directory_tests {
             test_kernel_apply(unrelated_commit, 92, mm, 11, Vec::new()),
             false,
         );
-        assert!(!authenticate_pending_retirement(
-            &expected_after_unmap,
-            &[pending],
-            &unrelated
-        ));
+        assert!(
+            !authenticate_pending_retirement(&expected_after_unmap, &[pending], &unrelated).ok()
+        );
         let retirement_commit = retirement_inventory_commit(93, &[id(2), id(6)]);
         process.prepare_retirement(retirement_commit).unwrap();
         process
@@ -1945,29 +1943,46 @@ fn global_frame_host_owner_matches(
     host_addr: usize,
     generation: u64,
 ) -> bool {
-    let (owner_host_addr, owner_generation) = global_frame_host_owners()
+    let owner = global_frame_host_owners()
         .lock()
         .get(&(ipa, length))
-        .map_or((0, 0), |owner| {
-            (owner._mapping.as_ptr() as usize, owner.generation)
-        });
+        .map(|owner| (owner._mapping.as_ptr() as usize, owner.generation));
     // The GENERATION is what turns this into an identity. Without it the triple
     // re-authenticates against a DIFFERENT incarnation of the same recycled
     // `(IPA, length, host VA)`, which is measured to happen every single time.
-    // A row stamped with 0 was published without a live global-frame owner for
-    // its extent (the mailbox and other early mappings are like this), so it
-    // keeps the historical pointer-only behaviour — tightening those to "no
-    // match" unmapped the syscall mailbox and killed the guest outright. Where a
-    // row DOES carry an incarnation, that incarnation must be the live one.
-    let matches = owner_host_addr != 0
-        && owner_host_addr == host_addr
-        && (generation == 0 || owner_generation == generation);
+    //
+    // A row stamped with 0 was published while NOTHING owned its extent
+    // (`global_frame_host_owner_generation` returns 0 when unowned), so it keeps
+    // the historical pointer-only behaviour — tightening those to "no match"
+    // unmapped the syscall mailbox and killed the guest outright. Where a row
+    // DOES carry an incarnation, that incarnation must be the live one.
+    let matches = match (owner, generation) {
+        // Owned extent: the row must name that exact host mapping, and — when
+        // it recorded an incarnation — that exact incarnation.
+        (Some((owner_host_addr, owner_generation)), _) => {
+            owner_host_addr != 0
+                && owner_host_addr == host_addr
+                && (generation == 0 || owner_generation == generation)
+        }
+        // Unowned extent and a row that recorded no incarnation either. This
+        // predicate has no owner to authenticate against, and absence of an
+        // authority is not a rejection: it is the same unowned state the row was
+        // published in. A forked child inherits its kernel regions — the
+        // identity page among them — exactly like this, and rejecting them here
+        // failed every child's identity stamp inside
+        // `validate_guest_write_range` as a spurious out-of-bounds.
+        (None, 0) => true,
+        // The row recorded an incarnation, so an owner existed when it was
+        // published and has since retired. macOS may have recycled the host VA
+        // under it, so the row is stale and must not authenticate.
+        (None, _) => false,
+    };
     if !matches {
         crate::probes::hvpatch_global_frame_owner_miss(
             ipa,
             length,
             host_addr as u64,
-            owner_host_addr as u64,
+            owner.map_or(0, |(owner_host_addr, _)| owner_host_addr) as u64,
         );
     }
     matches
@@ -6198,21 +6213,50 @@ fn authenticate_pending_fork_receipts(
     })
 }
 
+/// Why a retirement receipt did or did not authenticate, clause by clause.
+///
+/// The abort this feeds is unrecoverable, so it must name the failing clause: a
+/// receipt that leaves the mm non-empty, one that covers a different number of
+/// mappings, and one that omits a pending fork frame call for entirely different
+/// fixes, and a bare "malformed" verdict cannot tell them apart.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug)]
+struct PendingRetirementAudit {
+    mm_empty_at_revision: bool,
+    expected_non_empty: bool,
+    cardinality_matches: bool,
+    expected_authorized: bool,
+    pending_authorized: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl PendingRetirementAudit {
+    const fn ok(self) -> bool {
+        self.mm_empty_at_revision
+            && self.expected_non_empty
+            && self.cardinality_matches
+            && self.expected_authorized
+            && self.pending_authorized
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn authenticate_pending_retirement(
     expected: &[(carrick_hal::MappingId, carrick_hal::FrameId)],
     pending: &[PendingForkFrameReceipt],
     receipt: &carrick_hal::FrameInventoryRetirementReceipt,
-) -> bool {
-    receipt.mm_empty_at_revision()
-        && !expected.is_empty()
-        && expected.len() == receipt.mapping_set().len()
-        && expected
+) -> PendingRetirementAudit {
+    PendingRetirementAudit {
+        mm_empty_at_revision: receipt.mm_empty_at_revision(),
+        expected_non_empty: !expected.is_empty(),
+        cardinality_matches: expected.len() == receipt.mapping_set().len(),
+        expected_authorized: expected
             .iter()
-            .all(|&(mapping, frame)| receipt.authorizes(mapping, frame))
-        && pending
+            .all(|&(mapping, frame)| receipt.authorizes(mapping, frame)),
+        pending_authorized: pending
             .iter()
-            .all(|pending| receipt.authorizes(pending.child_mapping, pending.frame))
+            .all(|pending| receipt.authorizes(pending.child_mapping, pending.frame)),
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6773,23 +6817,33 @@ impl HvpatchTaskInventoryAuthority {
                 receipt,
                 retirement: Some(retirement),
             } => match apply(retirement.commit) {
-                Ok(retired)
-                    if retirement
+                Ok(retired) => {
+                    let challenge = retirement
                         .challenge
-                        .authenticate_retirement(&retired, expected_mm)
-                        && retired.revision() > receipt.revision()
-                        && retired.transaction() != receipt.transaction()
-                        && authenticate_pending_retirement(
-                            &retirement.expected_mappings,
-                            pending_receipts,
-                            &retired,
-                        ) =>
-                {
-                    Ok(())
-                }
-                Ok(_) => {
+                        .authenticate_retirement(&retired, expected_mm);
+                    let revision_advanced = retired.revision() > receipt.revision();
+                    let transaction_distinct = retired.transaction() != receipt.transaction();
+                    let audit = authenticate_pending_retirement(
+                        &retirement.expected_mappings,
+                        pending_receipts,
+                        &retired,
+                    );
+                    if challenge && revision_advanced && transaction_distinct && audit.ok() {
+                        return Ok(());
+                    }
+                    // Abort is unrecoverable, so name the exact clause that
+                    // rejected the receipt rather than only its verdict.
                     eprintln!(
-                        "carrick: FATAL: Kernel returned a malformed successful HVPatch retirement receipt"
+                        "carrick: FATAL: Kernel returned a malformed successful HVPatch retirement receipt\
+                         (challenge={challenge} revision_advanced={revision_advanced} \
+                         transaction_distinct={transaction_distinct} {audit:?} \
+                         receipt_revision={} retired_revision={} expected_mappings={} \
+                         receipt_mapping_set={} pending_receipts={})",
+                        receipt.revision(),
+                        retired.revision(),
+                        retirement.expected_mappings.len(),
+                        retired.mapping_set().len(),
+                        pending_receipts.len(),
                     );
                     std::process::abort();
                 }
@@ -20200,6 +20254,36 @@ mod frame_inventory_backend_tests {
         global_frame_host_owners()
             .lock()
             .remove(&(LIVE_IPA, LENGTH));
+    }
+
+    #[test]
+    fn an_unowned_extent_authenticates_a_row_that_recorded_no_incarnation() {
+        // A forked child inherits kernel regions — its identity page among them
+        // — as non-owning rows over an extent that no global-frame owner was
+        // ever registered for. Such a row stamps generation 0 by definition
+        // (`global_frame_host_owner_generation` returns 0 when unowned), so this
+        // predicate has no owner to authenticate it against and must not treat
+        // that absence as a rejection: doing so made every child's identity
+        // stamp fail `validate_guest_write_range` with a spurious out-of-bounds.
+        const UNOWNED_IPA: u64 = 0x7e00_0001_0000;
+        const LENGTH: u64 = 0x4000;
+        let host_addr = 0x1_0000usize;
+
+        assert_eq!(
+            global_frame_host_owner_generation(UNOWNED_IPA, LENGTH),
+            0,
+            "precondition: no owner is registered for this extent"
+        );
+        assert!(
+            global_frame_host_owner_matches(UNOWNED_IPA, LENGTH, host_addr, 0),
+            "a row published against an unowned extent keeps the historical \
+             pointer-only behaviour"
+        );
+        assert!(
+            !global_frame_host_owner_matches(UNOWNED_IPA, LENGTH, host_addr, 7),
+            "a row that DID record an incarnation must stay rejected once its \
+             owner is gone — macOS may have recycled the host VA"
+        );
     }
 
     #[test]
