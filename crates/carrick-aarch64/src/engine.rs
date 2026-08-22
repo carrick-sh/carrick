@@ -527,8 +527,13 @@ pub fn restore_aarch64_task_state(
 ) -> Result<Aarch64VcpuSnapshot, TrapError> {
     let boot = carrick_hal::Aarch64GuestArch::bootstrap_sysregs();
     let expected_vbar = carrick_mem::memory::LINUX_EL1_VECTORS_BASE;
+    // SCTLR_EL1 is compared through `is_bootstrap_sctlr_el1` rather than for
+    // equality: `boot.sctlr_el1` lists the bits carrick PROGRAMS, while
+    // `destination.sctlr` is what a vCPU reads BACK, which also carries the
+    // architecture's RES1 bits. Those are different domains and raw equality
+    // between them can never hold.
     if destination.vbar != expected_vbar
-        || destination.sctlr != boot.sctlr_el1
+        || !carrick_mem::arch_sysregs::is_bootstrap_sctlr_el1(destination.sctlr)
         || destination.mair != boot.mair_el1
         || destination.cpacr != boot.cpacr_el1
     {
@@ -3388,6 +3393,54 @@ mod tests {
             fpsr: 0x11,
             fpcr: 0x22,
         }
+    }
+
+    /// A vCPU reads SCTLR_EL1 back with the architecture's RES1 bits set, and
+    /// `SCTLR_EL1_BOOTSTRAP` deliberately lists only the bits carrick PROGRAMS.
+    /// Demanding raw equality between the two rejects a perfectly neutral
+    /// executor. Measured live at fork teardown on Apple HVF: the destination
+    /// reported `0x3400d185`, which is exactly `SCTLR_EL1_BOOTSTRAP`
+    /// (`0x0400d005`) OR the four RES1 bits ITD(7) and SED(8) — AArch32 at EL0
+    /// not implemented — and nTLSMD(28) and LSMAOE(29) — FEAT_LSMAOC not
+    /// implemented. That mismatch failed `cloneexithandled`,
+    /// `clone3exithandled` and `sigchld` in the persistent executor pool's
+    /// shutdown, after the guest itself had run correctly.
+    #[test]
+    fn a_hardware_readback_of_the_bootstrap_sctlr_is_still_neutral() {
+        let source = sample();
+        let readback = carrick_mem::arch_sysregs::SCTLR_EL1_BOOTSTRAP
+            | carrick_mem::arch_sysregs::SCTLR_EL1_RES1;
+        assert_eq!(
+            readback, 0x3400_d185,
+            "the value measured on a live executor"
+        );
+        let destination = Aarch64VcpuSnapshot {
+            sctlr: readback,
+            ..sample()
+        };
+        let task = aarch64_task_state_from_snapshot(
+            &source,
+            Some(source.elr_el1),
+            Some(172),
+            source.gprs[0],
+            0xdead_0001,
+            0x15,
+            false,
+            Some(continuation()),
+            23,
+            29,
+        )
+        .expect("complete snapshot");
+        restore_aarch64_task_state(&destination, &task)
+            .expect("a readback carrying only RES1 bits is the neutral bootstrap value");
+
+        // A FUNCTIONAL difference must still be rejected: SCTLR_EL1.WXN(19)
+        // is not RES1 and is not something carrick programs.
+        let reprogrammed = Aarch64VcpuSnapshot {
+            sctlr: readback | (1 << 19),
+            ..sample()
+        };
+        assert!(restore_aarch64_task_state(&reprogrammed, &task).is_err());
     }
 
     /// The thread-entry deltas are applied and nothing else drifts: the stage-1
