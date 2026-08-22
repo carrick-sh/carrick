@@ -1066,14 +1066,40 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         vcpu.set_reg(Reg::X(0), u64::from(asid) << 48)?;
         vcpu.set_reg(Reg::Pc, HVPATCH_EL1_ASID_MAINT_BASE)?;
         vcpu.set_reg(Reg::Pstate, AARCH64_PSTATE_EL1H_DAIF_MASKED)?;
+        // Fail closed if the entry state did not take. A live failure reported
+        // `EL0Fault(esr=0x82000086 elr=far=LINUX_EL1_ASID_MAINT_BASE)` — EC 0x20
+        // is "instruction abort from a LOWER EL", i.e. the trampoline was
+        // fetched at EL0, where the EL1-only kernel hole is not mapped. Reading
+        // the entry state back says whether the writes above landed, which
+        // separates "PSTATE never took" from "something reset it mid-run".
+        let entry_pc = vcpu.get_reg(Reg::Pc)?;
+        let entry_pstate = vcpu.get_reg(Reg::Pstate)?;
+        if entry_pc != HVPATCH_EL1_ASID_MAINT_BASE
+            || entry_pstate != AARCH64_PSTATE_EL1H_DAIF_MASKED
+        {
+            return Err(TrapError::Hypervisor(format!(
+                "scoped EL1 ASID maintenance entry state did not take: \
+                 pc={entry_pc:#x}/{HVPATCH_EL1_ASID_MAINT_BASE:#x} \
+                 pstate={entry_pstate:#x}/{AARCH64_PSTATE_EL1H_DAIF_MASKED:#x}"
+            )));
+        }
         let result = loop {
             match vcpu.run() {
                 Ok(Aarch64Exit::MaintenanceDone) => break Ok(()),
                 Ok(Aarch64Exit::Kicked) => continue,
                 Ok(other) => {
+                    // The entry state is verified above, so a fetch fault at the
+                    // trampoline base is about the TRANSLATION REGIME, not the
+                    // entry sequence. Name it: which roots was this vCPU using,
+                    // and was stage-1 even enabled.
+                    let sysreg = |reg| vcpu.get_sys_reg(reg).unwrap_or(u64::MAX);
+                    let ttbr0 = sysreg(carrick_hal::SysReg::Ttbr0);
+                    let ttbr1 = sysreg(carrick_hal::SysReg::Ttbr1);
+                    let sctlr = sysreg(carrick_hal::SysReg::Sctlr);
                     break Err(TrapError::UnexpectedExit {
                         reason: format!(
-                            "{} during scoped EL1 ASID maintenance",
+                            "{} during scoped EL1 ASID maintenance \
+                             (asid={asid:#x} ttbr0={ttbr0:#x} ttbr1={ttbr1:#x} sctlr={sctlr:#x})",
                             maintenance_exit_detail(&other)
                         ),
                     });
