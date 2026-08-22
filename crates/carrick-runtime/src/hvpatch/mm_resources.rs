@@ -164,7 +164,6 @@ impl MmResources {
         Ok(backend)
     }
 
-    #[cfg(test)]
     pub(crate) fn publish_shared_child(
         &self,
         parent: TaskKey,
@@ -201,6 +200,18 @@ impl MmResources {
             .ok_or(MmResourcesError::UnknownTask(task))
     }
 
+    pub(crate) fn is_final_owner(&self, task: TaskKey) -> Result<bool, MmResourcesError> {
+        let state = self.state.lock();
+        let lease = state
+            .leases
+            .get(&task)
+            .ok_or(MmResourcesError::UnknownTask(task))?;
+        Ok(!state
+            .leases
+            .iter()
+            .any(|(other, candidate)| *other != task && Arc::ptr_eq(candidate, lease)))
+    }
+
     pub(crate) fn prepare_exec(&self, task: TaskKey) -> Result<PreparedStage1Mm, MmResourcesError> {
         if !self.state.lock().leases.contains_key(&task) {
             return Err(MmResourcesError::UnknownTask(task));
@@ -213,7 +224,7 @@ impl MmResources {
         task: TaskKey,
         prepared: PreparedStage1Mm,
         stage1_root: u64,
-    ) -> Result<(Arc<Stage1MmLease>, Stage1MmRetirement), MmResourcesError> {
+    ) -> Result<(Arc<Stage1MmLease>, Option<Stage1MmRetirement>), MmResourcesError> {
         let mut state = self.state.lock();
         let predecessor = state
             .leases
@@ -221,7 +232,15 @@ impl MmResources {
             .cloned()
             .ok_or(MmResourcesError::UnknownTask(task))?;
         prepared.publish_stage1_root(stage1_root)?;
-        let retirement = self.mm_pool.retire(&predecessor)?;
+        let shared = state
+            .leases
+            .iter()
+            .any(|(other_task, other)| *other_task != task && Arc::ptr_eq(other, &predecessor));
+        let retirement = if shared {
+            None
+        } else {
+            Some(self.mm_pool.retire(&predecessor)?)
+        };
         let replacement = prepared.commit();
         state.leases.insert(task, Arc::clone(&replacement));
         Ok((replacement, retirement))
@@ -329,11 +348,32 @@ mod tests {
         let (resources, backend) = resources(parent, 2);
         let shared = resources.publish_shared_child(parent, child).unwrap();
         assert_eq!(shared.binding(), backend.binding());
+        assert!(!resources.is_final_owner(child).unwrap());
+        assert!(!resources.is_final_owner(parent).unwrap());
 
         let retired = resources.retire(child).unwrap();
         resources.acknowledge_tlb_flush(retired).unwrap();
+        assert!(resources.is_final_owner(parent).unwrap());
         assert_eq!(backend.binding().stage1_root.gpa().raw(), 0x4000);
         assert!(resources.prepare_child().is_ok());
+    }
+
+    #[test]
+    fn shared_mm_child_exec_replaces_only_its_edge() {
+        let parent = task(62, 1);
+        let child = task(63, 2);
+        let (resources, parent_backend) = resources(parent, 3);
+        let old = parent_backend.binding();
+        resources.publish_shared_child(parent, child).unwrap();
+
+        let prepared = resources.prepare_exec(child).unwrap();
+        let replacement_root = prepared.root_slot().unwrap().base();
+        let (replacement, retirement) = resources
+            .commit_exec(child, prepared, replacement_root)
+            .unwrap();
+        assert!(retirement.is_none(), "the parent still owns the shared MM");
+        assert_eq!(resources.lease(parent).unwrap().binding(), old);
+        assert_ne!(replacement.binding(), old);
     }
 
     #[test]
@@ -356,7 +396,7 @@ mod tests {
         assert_eq!(backend.binding(), old);
         resources
             .acknowledge_tlb_flush(RetiredStage1Mm {
-                retirement: Some(retired),
+                retirement: Some(retired.unwrap()),
             })
             .unwrap();
     }

@@ -30,7 +30,7 @@ mod patcher;
 mod stage1_mm;
 
 pub(crate) use asid::{AsidGeneration, AsidLoad, InvalidationAck};
-pub(crate) use stage1_mm::{Stage1MmLease, Stage1MmRetirement};
+pub(crate) use stage1_mm::{PreparedStage1Mm, Stage1MmLease, Stage1MmRetirement};
 
 use mm_resources::MmResources;
 pub(crate) use mm_resources::RetiredStage1Mm;
@@ -342,7 +342,7 @@ impl PreparedProcessExec {
 pub(crate) struct CommittedProcessExec {
     transition: crate::kernel::exec::CommittedExecTransition,
     replacement_mm: std::sync::Arc<Stage1MmLease>,
-    retired_mm: Stage1MmRetirement,
+    retired_mm: Option<Stage1MmRetirement>,
 }
 
 impl CommittedProcessExec {
@@ -365,7 +365,7 @@ impl CommittedProcessExec {
     ) -> (
         crate::kernel::exec::CommittedExecTransition,
         std::sync::Arc<Stage1MmLease>,
-        Stage1MmRetirement,
+        Option<Stage1MmRetirement>,
     ) {
         (self.transition, self.replacement_mm, self.retired_mm)
     }
@@ -514,6 +514,12 @@ impl ProcessContext {
 
     pub(crate) fn mm_resources(&self) -> &std::sync::Arc<MmResources> {
         &self.resources
+    }
+
+    pub(crate) fn owns_final_mm_edge(&self, task: crate::kernel::TaskKey) -> Result<bool, String> {
+        self.resources
+            .is_final_owner(task)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn context_for_linux_tid(
