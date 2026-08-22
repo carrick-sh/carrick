@@ -594,14 +594,16 @@ fn install_fs_backend(
     Ok(())
 }
 
-/// The guest's hostname under the current `--net=host` contract: the macOS
-/// host's short hostname (so the guest shares the host's network identity), or
-/// the `carrick` fallback when the host name is unavailable/empty. SINGLE
-/// accessor for `uname(2)` nodename, `/proc/sys/kernel/hostname`, and the
-/// `/etc/hosts` self-mapping — keeping them in lockstep and giving a future UTS
-/// namespace one place to override per-namespace instead of scattered literals.
-pub fn guest_hostname() -> &'static str {
-    carrick_host::host_facts::host_short_hostname().unwrap_or(crate::linux_abi::CARRICK_HOSTNAME)
+/// The nodename of the ROOT UTS namespace — what `uname(2)`,
+/// `/proc/sys/kernel/hostname` and the `/etc/hosts` self-mapping report.
+///
+/// It used to BE the host fact: a direct `gethostname(3)` on every call, which
+/// is a machine answer to a namespace question. The host's short hostname now
+/// only SEEDS the root namespace (see [`crate::kernel::netns`]) under the
+/// `--net host` contract, and every reader goes to the namespace, so a name set
+/// after startup is the name every reader sees.
+pub fn guest_hostname() -> String {
+    crate::kernel::root_uts_ns().nodename()
 }
 
 fn effective_guest_hostname(spec: &RunSpec) -> Cow<'_, str> {
@@ -609,7 +611,7 @@ fn effective_guest_hostname(spec: &RunSpec) -> Cow<'_, str> {
         .as_deref()
         .filter(|hostname| !hostname.is_empty())
         .map(Cow::Borrowed)
-        .unwrap_or_else(|| Cow::Borrowed(guest_hostname()))
+        .unwrap_or_else(|| Cow::Owned(guest_hostname()))
 }
 
 fn seed_guest_baseline(

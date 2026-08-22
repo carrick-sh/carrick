@@ -3364,21 +3364,16 @@ mod overlay_dispatch_tests {
         assert_eq!(String::from_utf8(contents).unwrap(), "3\n");
     }
 
+    /// Host mode gives the guest a LINUX namespace whose links mirror the host
+    /// wire — never the Mac's own interface list.
+    ///
+    /// This replaces `with_host_network_preserves_host_sys_class_net`, which
+    /// asserted the opposite and was the defect written down as a test: on the
+    /// default lane `/sys/class/net` listed `en0`, `awdl0`, `bridge0` and
+    /// `utun*` while the rtnetlink dump the same guest read advertised `lo` and
+    /// `eth0`.
     #[test]
-    fn with_host_network_preserves_host_sys_class_net() {
-        let default_dispatcher = SyscallDispatcher::new();
-        let default_sys = default_dispatcher
-            .fs
-            .vfs_mounts
-            .resolve("/sys/class/net")
-            .unwrap();
-        let expected = default_sys
-            .vfs
-            .readdir("/sys/class/net")
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect::<Vec<_>>();
+    fn with_host_network_shows_linux_link_names() {
         let network = std::sync::Arc::new(crate::network::RuntimeNetwork::host_default());
         let host_dispatcher = SyscallDispatcher::with_network(network);
         let host_sys = host_dispatcher
@@ -3387,7 +3382,7 @@ mod overlay_dispatch_tests {
             .resolve("/sys/class/net")
             .unwrap();
 
-        let actual = host_sys
+        let names = host_sys
             .vfs
             .readdir("/sys/class/net")
             .unwrap()
@@ -3395,7 +3390,14 @@ mod overlay_dispatch_tests {
             .map(|entry| entry.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(actual, expected);
+        assert!(names.contains(&"lo".to_string()), "{names:?}");
+        assert!(
+            names.iter().all(|name| name == "lo"
+                || name
+                    .strip_prefix("eth")
+                    .is_some_and(|n| n.parse::<u32>().is_ok())),
+            "host mode must still show a Linux namespace: {names:?}"
+        );
     }
 
     /// The Linux errno constants we publish must match the

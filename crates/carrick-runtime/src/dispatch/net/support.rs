@@ -53,14 +53,21 @@
 //!
 //! ## Synthetic rtnetlink
 //!
-//! macOS has no AF_NETLINK. `build_netlink_reply` is the synthetic rtnetlink
-//! "kernel": it inspects a guest's dump request and emits a well-formed,
-//! `NLM_F_MULTI`, `NLMSG_DONE`-terminated reply describing a loopback-only host
-//! — RTM_GETLINK→`lo`, RTM_GETADDR→`127.0.0.1/8`, RTM_GETROUTE→the connected
-//! route, everything else→an empty dump. `push_nlmsg` does the `NLMSG_ALIGNTO`
-//! framing; `drain_netlink_queue` is the read(2)-side that copies queued reply
-//! bytes into guest memory. This is enough for glibc's `__check_pf` and for
-//! `ip`/`ss` to function rather than abort on EAFNOSUPPORT.
+//! macOS has no AF_NETLINK. [`build_netlink_reply_for_snapshot`] is the
+//! synthetic rtnetlink "kernel": it inspects a guest's dump request and emits a
+//! well-formed, `NLM_F_MULTI`, `NLMSG_DONE`-terminated reply describing the
+//! network NAMESPACE the calling task belongs to — RTM_GETLINK→its links,
+//! RTM_GETADDR→their addresses, RTM_GETROUTE→its routes, everything else→an
+//! empty dump. `push_nlmsg` does the `NLMSG_ALIGNTO` framing;
+//! `drain_netlink_queue` is the read(2)-side that copies queued reply bytes into
+//! guest memory. This is enough for glibc's `__check_pf` and for `ip`/`ss` to
+//! function rather than abort on EAFNOSUPPORT.
+//!
+//! It is the ONLY encoder. There used to be a second, `build_netlink_reply`,
+//! which walked `getifaddrs(3)` itself and was the one the `--net host` default
+//! lane actually ran — so the accurate encoder was the one no gate exercised,
+//! and the two disagreed about `ifa_flags` and about emitting `IFA_LOCAL`/
+//! `IFA_LABEL` on IPv6 rows, a shape Linux never emits.
 //!
 //! ## fd-set and epoll helpers
 //!
@@ -75,9 +82,8 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use super::super::*;
 use crate::linux_abi::{
-    LINUX_ARPHRD_ETHER, LINUX_IFA_CACHEINFO, LINUX_IFA_F_PERMANENT, LINUX_IFA_FLAGS,
-    LINUX_IFA_INFINITY_LIFE_TIME, LINUX_IFF_BROADCAST, LINUX_IFF_MULTICAST, LINUX_RT_SCOPE_HOST,
-    LINUX_RT_SCOPE_LINK, LINUX_RT_SCOPE_UNIVERSE, LINUX_RT_TABLE_MAIN, LINUX_RTA_DST,
+    LINUX_IFA_CACHEINFO, LINUX_IFA_F_PERMANENT, LINUX_IFA_FLAGS, LINUX_IFA_INFINITY_LIFE_TIME,
+    LINUX_RT_SCOPE_HOST, LINUX_RT_SCOPE_UNIVERSE, LINUX_RT_TABLE_MAIN, LINUX_RTA_DST,
     LINUX_RTA_GATEWAY, LINUX_RTA_OIF, LINUX_RTM_GETNEIGH, LINUX_RTM_GETROUTE, LINUX_RTM_NEWROUTE,
     LINUX_RTN_UNICAST, LINUX_RTPROT_KERNEL, LinuxRtMsg,
 };
@@ -745,22 +751,6 @@ fn push_nlmsg_done(out: &mut Vec<u8>, seq: u32, pid: u32) {
 
 pub(super) type NetworkLinkSnapshot = crate::network::model::LinuxNetworkModel;
 
-/// Build the synthetic rtnetlink reply for a guest's request. We inspect
-/// the leading nlmsghdr's `nlmsg_type`:
-///   - RTM_GETLINK  -> one RTM_NEWLINK for `lo`, then NLMSG_DONE
-///   - RTM_GETADDR  -> one RTM_NEWADDR for `lo` (127.0.0.1/8), then NLMSG_DONE
-///   - anything else -> a bare NLMSG_DONE (the dump is "empty")
-///
-/// All replies are NLM_F_MULTI dumps terminated by NLMSG_DONE, which is
-/// what glibc's __check_pf and `ip` expect.
-#[cfg(test)]
-pub(super) fn build_netlink_reply(request: &[u8], pid: u32) -> Vec<u8> {
-    let model = crate::network::model::LinuxNetworkModel::from_spec(
-        &carrick_spec::NetworkNamespaceSpec::default(),
-    );
-    build_netlink_reply_for_snapshot(request, pid, &model)
-}
-
 pub(super) fn build_netlink_reply_for_snapshot(
     request: &[u8],
     pid: u32,
@@ -779,33 +769,26 @@ pub(super) fn build_netlink_reply_for_snapshot(
     let mut out = Vec::new();
     match req_type {
         LINUX_RTM_GETLINK => {
-            for (idx, link) in snapshot.links.iter().enumerate() {
-                let index = (idx + 1) as u32;
-                let is_loopback = link.name == "lo";
+            // Every attribute comes from the link the NAMESPACE holds. They
+            // used to be recomputed here from the link's name and position,
+            // which is why the same `eth0` could carry one hardware address
+            // over rtnetlink and none at all under `/sys/class/net`.
+            for link in &snapshot.links {
                 let mut payload = Vec::new();
                 let ifi = LinuxIfInfoMsg {
                     ifi_family: 0,
                     ifi_pad: 0,
-                    ifi_type: if is_loopback {
-                        LINUX_ARPHRD_LOOPBACK
-                    } else {
-                        LINUX_ARPHRD_ETHER
-                    },
-                    ifi_index: index as i32,
-                    ifi_flags: if is_loopback {
-                        LINUX_IFF_UP | LINUX_IFF_LOOPBACK | LINUX_IFF_RUNNING
-                    } else {
-                        LINUX_IFF_UP | LINUX_IFF_BROADCAST | LINUX_IFF_RUNNING | LINUX_IFF_MULTICAST
-                    },
+                    ifi_type: link.arphrd,
+                    ifi_index: link.index as i32,
+                    ifi_flags: link.flags,
                     ifi_change: 0,
                 };
                 payload.extend_from_slice(ifi.as_bytes());
                 let mut name = link.name.clone().into_bytes();
                 name.push(0);
                 push_rtattr(&mut payload, LINUX_IFLA_IFNAME, &name);
-                if !is_loopback {
-                    let hw_addr = vec![0x02, 0, 0, 0, 0, index as u8];
-                    push_rtattr(&mut payload, LINUX_IFLA_ADDRESS, &hw_addr);
+                if !link.hw_addr.is_empty() {
+                    push_rtattr(&mut payload, LINUX_IFLA_ADDRESS, &link.hw_addr);
                 }
                 push_nlmsg(&mut out, LINUX_RTM_NEWLINK, seq, pid, &payload);
             }
@@ -816,7 +799,7 @@ pub(super) fn build_netlink_reply_for_snapshot(
                 let Some((family, addr)) = ip_addr_bytes(address.addr) else {
                     continue;
                 };
-                let index = snapshot_link_index(snapshot, &address.link_name).unwrap_or(1);
+                let index = snapshot_link_index(snapshot, &address.link_name);
                 let mut payload = Vec::new();
                 let is_v6 = family == LINUX_AF_INET6 as u8;
                 let ifa = LinuxIfAddrMsg {
@@ -826,18 +809,11 @@ pub(super) fn build_netlink_reply_for_snapshot(
                     // configured. Reporting 0 here says "not permanent", which
                     // is not a shape Linux ever emits.
                     ifa_flags: LINUX_IFA_F_PERMANENT as u8,
-                    ifa_scope: if address.addr.is_loopback() {
-                        LINUX_RT_SCOPE_HOST
-                    } else if matches!(
-                        address.addr,
-                        std::net::IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80
-                    ) {
-                        // A real `fe80::` is link-scoped; calling it universe
-                        // misleads any address-selection logic that reads scope.
-                        LINUX_RT_SCOPE_LINK
-                    } else {
-                        LINUX_RT_SCOPE_UNIVERSE
-                    },
+                    // Carried by the address, not recomputed: glibc's
+                    // address selection reads `ifa_scope`, so a loopback
+                    // address labelled UNIVERSE changes which source address
+                    // the guest picks.
+                    ifa_scope: address.scope,
                     ifa_index: index,
                 };
                 payload.extend_from_slice(ifa.as_bytes());
@@ -905,7 +881,7 @@ pub(super) fn build_netlink_reply_for_snapshot(
                 if route.gateway.is_some() {
                     push_rtattr(&mut payload, LINUX_RTA_GATEWAY, &route_addr);
                 }
-                let oif = snapshot_link_index(snapshot, &route.link_name).unwrap_or(1);
+                let oif = snapshot_link_index(snapshot, &route.link_name);
                 push_rtattr(&mut payload, LINUX_RTA_OIF, &oif.to_ne_bytes());
                 push_nlmsg(&mut out, LINUX_RTM_NEWROUTE, seq, pid, &payload);
             }
@@ -917,12 +893,15 @@ pub(super) fn build_netlink_reply_for_snapshot(
     out
 }
 
-fn snapshot_link_index(snapshot: &NetworkLinkSnapshot, name: &str) -> Option<u32> {
-    snapshot
-        .links
-        .iter()
-        .position(|link| link.name == name)
-        .map(|idx| (idx + 1) as u32)
+/// The guest ifindex of a named link, or loopback's 1 when the namespace has no
+/// such link.
+///
+/// The index is the one the NAMESPACE assigned, not this link's position in the
+/// list — those agree today and were still two independent definitions, which is
+/// the shape that let `SIOCGIFINDEX` know only `lo` and `eth0` while the
+/// rtnetlink dump advertised `eth1` at 3.
+fn snapshot_link_index(snapshot: &NetworkLinkSnapshot, name: &str) -> u32 {
+    snapshot.link_by_name(name).map_or(1, |link| link.index)
 }
 
 fn ip_addr_bytes(addr: std::net::IpAddr) -> Option<(u8, Vec<u8>)> {
@@ -2935,7 +2914,9 @@ mod tests {
             nlmsg_seq: 7,
             nlmsg_pid: 0,
         };
-        let reply = build_netlink_reply(req.as_bytes(), 42);
+        let snapshot =
+            NetworkLinkSnapshot::from_spec(&carrick_spec::NetworkNamespaceSpec::default());
+        let reply = build_netlink_reply_for_snapshot(req.as_bytes(), 42, &snapshot);
         // Walk the multipart reply (each message 4-byte aligned): expect at least
         // one connected RTM_NEWROUTE, terminated by NLMSG_DONE, nothing else.
         let hdr_size = std::mem::size_of::<LinuxNlMsgHdr>();
