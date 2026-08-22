@@ -677,9 +677,11 @@ pub fn invalidate_worker_asid(
 }
 
 pub fn persistent_executor_factory_authority(
-    engine: &HvfAarch64Engine,
+    engine: &mut HvfAarch64Engine,
 ) -> Result<HvpatchPersistentExecutorFactoryAuthority, TrapError> {
-    engine.backend().persistent_executor_factory_authority()
+    engine
+        .backend_mut_for_persistent_factory()
+        .take_persistent_executor_factory_authority()
 }
 
 impl HvpatchPersistentExecutorFactoryAuthority {
@@ -690,11 +692,11 @@ impl HvpatchPersistentExecutorFactoryAuthority {
 }
 
 impl HvfAarch64Vmm {
-    pub fn persistent_executor_factory_authority(
-        &self,
+    pub fn take_persistent_executor_factory_authority(
+        &mut self,
     ) -> Result<HvpatchPersistentExecutorFactoryAuthority, TrapError> {
         Ok(HvpatchPersistentExecutorFactoryAuthority {
-            spec: self.state.build_persistent_executor_spec(),
+            spec: self.state.take_persistent_executor_spec()?,
         })
     }
 

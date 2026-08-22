@@ -4517,6 +4517,10 @@ pub(crate) struct HvfVmState {
     _vm:
         std::mem::ManuallyDrop<applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>>,
     pub(crate) task: HvfTaskState,
+    /// VM-global Carrick control mappings owned by the persistent carrier.
+    /// This is executor-local authority: load/save swaps it with the worker,
+    /// while a logical task binding always carries `None`.
+    carrier_mappings: Option<std::sync::Arc<PersistentCarrierMappings>>,
     /// Executor-local lifecycle only. Task registers are owned exclusively by
     /// the Kernel's typed execution lease and never stashed in this backend.
     reclaim_authority: ReclaimParkAuthority,
@@ -4857,6 +4861,7 @@ impl HvfVmState {
 
     pub(crate) fn swap_persistent_executor_local(&mut self, other: &mut Self) {
         std::mem::swap(&mut self._vm, &mut other._vm);
+        std::mem::swap(&mut self.carrier_mappings, &mut other.carrier_mappings);
         std::mem::swap(&mut self.reclaim_authority, &mut other.reclaim_authority);
         std::mem::swap(&mut self.mailbox_slots, &mut other.mailbox_slots);
         std::mem::swap(&mut self.syscall_transport, &mut other.syscall_transport);
@@ -5500,21 +5505,126 @@ impl ThreadMappingDesc {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn is_persistent_executor_carrier_mapping(mapping: &HvfMappedRegion) -> bool {
+    is_persistent_executor_carrier_address(mapping.start)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn is_persistent_executor_carrier_guest_mapping(mapping: &GuestMapping) -> bool {
+    is_persistent_executor_carrier_address(mapping.guest_start)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mapping_belongs_to_task_inventory(
+    persistent_vm_lifecycle: bool,
+    mapping: &HvfMappedRegion,
+) -> bool {
+    !persistent_vm_lifecycle || !is_persistent_executor_carrier_mapping(mapping)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn is_persistent_executor_carrier_address(address: u64) -> bool {
+    matches!(
+        address,
+        carrick_mem::memory::LINUX_EL0_TRAMPOLINE_BASE
+            | carrick_mem::memory::LINUX_EL1_VECTORS_BASE
+            | carrick_mem::memory::LINUX_EL1_MAINT_BASE
+            | carrick_mem::memory::LINUX_SYSCALL_MAILBOX_BASE
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn persistent_executor_carrier_mappings(mappings: &[HvfMappedRegion]) -> Vec<ThreadMappingDesc> {
-    let is_carrier = |mapping: &HvfMappedRegion| {
-        matches!(
-            mapping.start,
-            carrick_mem::memory::LINUX_EL0_TRAMPOLINE_BASE
-                | carrick_mem::memory::LINUX_EL1_VECTORS_BASE
-                | carrick_mem::memory::LINUX_EL1_MAINT_BASE
-                | carrick_mem::memory::LINUX_SYSCALL_MAILBOX_BASE
-        )
-    };
     mappings
         .iter()
-        .filter(|mapping| is_carrier(mapping))
+        .filter(|mapping| is_persistent_executor_carrier_mapping(mapping))
         .map(ThreadMappingDesc::from_region)
         .collect()
+}
+
+/// Owning carrier-wide lifetime for the four fixed HVPatch control mappings.
+/// Logical MM/task cleanup never sees these rows. The last factory/worker Arc
+/// drops only after every worker vCPU has been joined and destroyed.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct PersistentCarrierMappings {
+    mappings: Vec<HvfMappedRegion>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl PersistentCarrierMappings {
+    fn extract(task_mappings: &mut Vec<HvfMappedRegion>) -> Result<Self, TrapError> {
+        let mut carrier = Vec::with_capacity(4);
+        let mut task = Vec::with_capacity(task_mappings.len());
+        for mapping in std::mem::take(task_mappings) {
+            if is_persistent_executor_carrier_mapping(&mapping) {
+                carrier.push(mapping);
+            } else {
+                task.push(mapping);
+            }
+        }
+        *task_mappings = task;
+        let authority = Self { mappings: carrier };
+        authority.audit()?;
+        if authority.mappings.len() != 4 {
+            return Err(TrapError::Hypervisor(format!(
+                "persistent executor carrier owns {} mappings, expected 4",
+                authority.mappings.len()
+            )));
+        }
+        Ok(authority)
+    }
+
+    fn host_pointer(&self, address: u64, length: usize) -> Option<std::ptr::NonNull<u8>> {
+        let end = address.checked_add(u64::try_from(length).ok()?)?;
+        let mapping = self
+            .mappings
+            .iter()
+            .find(|mapping| address >= mapping.start && end <= mapping.end)?;
+        let offset = usize::try_from(address.checked_sub(mapping.start)?).ok()?;
+        std::ptr::NonNull::new(unsafe { mapping.host_addr.add(offset) })
+    }
+
+    fn host_pointer_for_ipa(&self, ipa: u64, length: usize) -> Option<*mut u8> {
+        let mapping = HvfVmState::mapping_for_ipa_range(&self.mappings, ipa, length.max(1))?;
+        let offset = usize::try_from(ipa.checked_sub(mapping.ipa)?).ok()?;
+        Some(unsafe { mapping.host_addr.add(offset) })
+    }
+
+    fn audit(&self) -> Result<(), TrapError> {
+        let descriptors = persistent_executor_carrier_mappings(&self.mappings);
+        audit_persistent_executor_carrier_mappings(&descriptors)
+    }
+}
+
+// SAFETY: the owning mappings name VM-global MAP_SHARED host allocations. The
+// carrier Arc is immutable after extraction; only its final Drop mutates the
+// mapping owners, after all worker threads have joined.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Send for PersistentCarrierMappings {}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Sync for PersistentCarrierMappings {}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for PersistentCarrierMappings {
+    fn drop(&mut self) {
+        for mut mapping in self.mappings.drain(..) {
+            if let Some(lease) = mapping.stage2_lease.take() {
+                drop(lease);
+            } else {
+                let rc =
+                    unsafe { inventory_hv_vm_unmap(mapping.physical_ipa, mapping.physical_size) };
+                if rc != 0 {
+                    eprintln!(
+                        "carrick: FATAL: retire persistent carrier stage-2 IPA 0x{:x} size {} failed: 0x{rc:x}",
+                        mapping.physical_ipa, mapping.physical_size
+                    );
+                    std::process::abort();
+                }
+            }
+            // Stage-2 is gone before OwnedHostMapping releases the backing.
+            drop(mapping);
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -5648,18 +5758,16 @@ pub(crate) struct PersistentExecutorSpec {
     vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     /// VM-global Carrick control mappings needed before any task projection is
     /// loaded: entry trampoline, EL1 vectors/scratch path, maintenance code,
-    /// and the executor mailbox arena. These are unowned metadata only; task
-    /// mappings, page tables, MM/root, inventory, and COW authority stay out of
-    /// the factory.
-    carrier_mappings: Vec<ThreadMappingDesc>,
+    /// and the executor mailbox arena. The Arc is their exact carrier-wide
+    /// stage-2/backing owner; task mappings, page tables, MM/root, inventory,
+    /// and COW authority stay out of the factory.
+    carrier_mappings: std::sync::Arc<PersistentCarrierMappings>,
     mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
     syscall_transport: HvfSyscallTransport,
 }
 
-// SAFETY: carrier mappings contain process-address-space host pointers to the
-// same VM-global buffers the root engine already mapped. The factory carries no
-// ownership transfer and uses them only on the worker thread to bind its own
-// mailbox pointer before running the vCPU.
+// SAFETY: PersistentCarrierMappings owns immutable VM-global MAP_SHARED
+// buffers. Worker threads only resolve pointers while their Arc is live.
 unsafe impl Send for PersistentExecutorSpec {}
 unsafe impl Sync for PersistentExecutorSpec {}
 
@@ -7704,7 +7812,10 @@ fn exec_stage2_fail_after_maps() -> Option<usize> {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn global_frame_exec_lease_order(mappings: &[GuestMapping], table_index: usize) -> Vec<usize> {
     let mut order: Vec<usize> = (0..mappings.len())
-        .filter(|&index| !is_sparse_hvpatch_mmap_mapping(&mappings[index]))
+        .filter(|&index| {
+            !is_sparse_hvpatch_mmap_mapping(&mappings[index])
+                && !is_persistent_executor_carrier_guest_mapping(&mappings[index])
+        })
         .collect();
     order.sort_by_key(|&index| {
         (
@@ -8986,7 +9097,12 @@ impl HvfVmState {
         if inventory.initialized {
             inventory.extents.len()
         } else {
-            self.mappings.len()
+            self.mappings
+                .iter()
+                .filter(|mapping| {
+                    mapping_belongs_to_task_inventory(self.persistent_vm_lifecycle, mapping)
+                })
+                .count()
         }
     }
 
@@ -8999,6 +9115,9 @@ impl HvfVmState {
             return Ok(reservation.commit(()));
         }
         for region in &self.mappings {
+            if !mapping_belongs_to_task_inventory(self.persistent_vm_lifecycle, region) {
+                continue;
+            }
             Self::stage_mapping(
                 &mut inventory,
                 &mut reservation,
@@ -9396,6 +9515,7 @@ impl HvfVmState {
                 pending_process_aliases: Vec::new(),
                 cow_rollback_scratch: None,
             },
+            carrier_mappings: None,
             reclaim_authority: ReclaimParkAuthority::Live,
             mailbox_slots: std::sync::Arc::new(MailboxSlotAllocator::new()),
             syscall_transport,
@@ -11969,6 +12089,12 @@ impl HvfVmState {
                 let offset = usize::try_from(address.checked_sub(mapping.start)?).ok()?;
                 Some(unsafe { mapping.host_addr.add(offset) })
             })
+            .or_else(|| {
+                self.carrier_mappings
+                    .as_ref()?
+                    .host_pointer(address, size)
+                    .map(std::ptr::NonNull::as_ptr)
+            })
             .ok_or_else(|| {
                 TrapError::Hypervisor(format!(
                     "AArch64 syscall mailbox slot {} at {address:#x} is not mapped",
@@ -12100,24 +12226,26 @@ impl HvfVmState {
     /// per-thread mapping walk (with the stage-1-IPA disambiguation) the
     /// syscall path uses.
     pub(crate) fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8> {
-        let mapping = Self::mapping_for_ipa_range(&self.mappings, gpa, len.max(1))?;
-        let offset = (gpa.wrapping_sub(mapping.ipa)) as usize;
-        Some(unsafe { mapping.host_addr.add(offset) })
+        if let Some(mapping) = Self::mapping_for_ipa_range(&self.mappings, gpa, len.max(1)) {
+            let offset = (gpa.wrapping_sub(mapping.ipa)) as usize;
+            return Some(unsafe { mapping.host_addr.add(offset) });
+        }
+        self.carrier_mappings
+            .as_ref()?
+            .host_pointer_for_ipa(gpa, len)
     }
 
     /// Copy `bytes` into guest physical memory at `gpa` (raw GPA, no PROT_NONE
     /// gate, no permission check — the engine's run-elf / page-table seed path).
     pub(crate) fn write_gpa(&self, gpa: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        let Some(mapping) = Self::mapping_for_ipa_range(&self.mappings, gpa, bytes.len().max(1))
-        else {
+        let Some(host) = self.host_ptr(gpa, bytes.len()) else {
             return Err(MemoryError::OutOfBounds {
                 address: gpa,
                 length: bytes.len(),
             });
         };
-        let offset = (gpa.wrapping_sub(mapping.ipa)) as usize;
         unsafe {
-            volatile_copy_to_guest(bytes.as_ptr(), mapping.host_addr.add(offset), bytes.len());
+            volatile_copy_to_guest(bytes.as_ptr(), host, bytes.len());
         }
         Ok(())
     }
@@ -12125,16 +12253,15 @@ impl HvfVmState {
     /// Read `len` bytes of live guest memory at guest-physical `gpa` (no VA
     /// translation, no PROT_NONE gate).
     pub(crate) fn read_gpa(&self, gpa: u64, len: usize) -> Result<Vec<u8>, MemoryError> {
-        let Some(mapping) = Self::mapping_for_ipa_range(&self.mappings, gpa, len.max(1)) else {
+        let Some(host) = self.host_ptr(gpa, len) else {
             return Err(MemoryError::OutOfBounds {
                 address: gpa,
                 length: len,
             });
         };
-        let offset = (gpa.wrapping_sub(mapping.ipa)) as usize;
         let mut out = vec![0u8; len];
         unsafe {
-            volatile_copy_from_guest(mapping.host_addr.add(offset), out.as_mut_ptr(), len);
+            volatile_copy_from_guest(host, out.as_mut_ptr(), len);
         }
         Ok(out)
     }
@@ -14701,13 +14828,22 @@ impl HvfVmState {
         Ok(())
     }
 
-    pub(crate) fn build_persistent_executor_spec(&self) -> PersistentExecutorSpec {
-        PersistentExecutorSpec {
+    pub(crate) fn take_persistent_executor_spec(
+        &mut self,
+    ) -> Result<PersistentExecutorSpec, TrapError> {
+        if self.carrier_mappings.is_some() {
+            return Err(TrapError::Hypervisor(
+                "persistent executor carrier authority was already extracted".to_owned(),
+            ));
+        }
+        let carrier_mappings =
+            std::sync::Arc::new(PersistentCarrierMappings::extract(&mut self.mappings)?);
+        Ok(PersistentExecutorSpec {
             vm: (*self._vm).clone(),
-            carrier_mappings: persistent_executor_carrier_mappings(&self.mappings),
+            carrier_mappings,
             mailbox_slots: std::sync::Arc::clone(&self.mailbox_slots),
             syscall_transport: self.syscall_transport,
-        }
+        })
     }
 
     fn allocate_persistent_mailbox_for_vcpu(
@@ -14721,18 +14857,19 @@ impl HvfVmState {
             .allocate()
             .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
         let address = lease.id().guest_address();
-        let pointer = persistent_carrier_host_pointer(
-            &spec.carrier_mappings,
-            address,
-            carrick_aarch64::mailbox::AARCH64_SYSCALL_MAILBOX_SIZE as usize,
-        )
-        .ok_or_else(|| {
-            TrapError::Hypervisor(format!(
-                "persistent executor syscall mailbox slot {} at {address:#x} is not mapped",
-                lease.id().raw()
-            ))
-        })?
-        .cast::<carrick_aarch64::mailbox::Aarch64SyscallMailbox>();
+        let pointer = spec
+            .carrier_mappings
+            .host_pointer(
+                address,
+                carrick_aarch64::mailbox::AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+            )
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "persistent executor syscall mailbox slot {} at {address:#x} is not mapped",
+                    lease.id().raw()
+                ))
+            })?
+            .cast::<carrick_aarch64::mailbox::Aarch64SyscallMailbox>();
         // SAFETY: the carrier projection was validated to contain the complete
         // fixed mailbox arena, and the lease uniquely owns this slot.
         let binding = unsafe { MailboxBinding::new(lease, pointer, spec.syscall_transport) };
@@ -14744,7 +14881,7 @@ impl HvfVmState {
     pub(crate) fn from_persistent_executor_spec(
         spec: &PersistentExecutorSpec,
     ) -> Result<(HvfVmState, applevisor::vcpu::Vcpu, MailboxBinding), TrapError> {
-        audit_persistent_executor_carrier_mappings(&spec.carrier_mappings)?;
+        spec.carrier_mappings.audit()?;
         let vm = rebuilt_vm_cell()
             .lock()
             .clone()
@@ -14754,6 +14891,7 @@ impl HvfVmState {
         let state = HvfVmState {
             _vm: std::mem::ManuallyDrop::new(vm),
             task: HvfTaskState::neutral(),
+            carrier_mappings: Some(std::sync::Arc::clone(&spec.carrier_mappings)),
             reclaim_authority: ReclaimParkAuthority::Live,
             mailbox_slots: std::sync::Arc::clone(&spec.mailbox_slots),
             syscall_transport: spec.syscall_transport,
@@ -14768,7 +14906,15 @@ impl HvfVmState {
     }
 
     pub(crate) fn audit_persistent_executor_idle(&self) -> Result<(), TrapError> {
-        self.task.audit_neutral()
+        self.task.audit_neutral()?;
+        self.carrier_mappings
+            .as_ref()
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "persistent executor lost carrier mapping authority".to_owned(),
+                )
+            })?
+            .audit()
     }
 
     /// Build a [`ThreadSpec`] for a thread-creating `clone(CLONE_THREAD)`: clone the
@@ -14864,6 +15010,7 @@ impl HvfVmState {
                 pending_process_aliases: Vec::new(),
                 cow_rollback_scratch: None,
             },
+            carrier_mappings: None,
             reclaim_authority: ReclaimParkAuthority::Live,
             mailbox_slots,
             syscall_transport,
@@ -15933,6 +16080,7 @@ impl HvfVmState {
                 pending_process_aliases: aliases_to_publish,
                 cow_rollback_scratch: None,
             },
+            carrier_mappings: None,
             reclaim_authority: ReclaimParkAuthority::Live,
             mailbox_slots: spec.mailbox_slots,
             syscall_transport: spec.syscall_transport,
@@ -16074,12 +16222,18 @@ impl HvfVmState {
         let replacement_mapping_count = global_plan
             .mappings
             .iter()
-            .filter(|mapping| !is_sparse_hvpatch_mmap_mapping(mapping))
+            .filter(|mapping| {
+                !is_sparse_hvpatch_mmap_mapping(mapping)
+                    && !is_persistent_executor_carrier_guest_mapping(mapping)
+            })
             .count() as u64;
         let replacement_mapped_bytes = global_plan
             .mappings
             .iter()
-            .filter(|mapping| !is_sparse_hvpatch_mmap_mapping(mapping))
+            .filter(|mapping| {
+                !is_sparse_hvpatch_mmap_mapping(mapping)
+                    && !is_persistent_executor_carrier_guest_mapping(mapping)
+            })
             .map(|mapping| mapping.mapped_size)
             .sum::<u64>();
         crate::probes::hvpatch_exec_replace_stage(
@@ -16102,11 +16256,10 @@ impl HvfVmState {
         let map_backings_started = std::time::Instant::now();
         let mut prepared_exec_regions = Vec::new();
         if self.persistent_vm_lifecycle {
-            for mapping in plan
-                .mappings
-                .iter()
-                .filter(|mapping| !is_sparse_hvpatch_mmap_mapping(mapping))
-            {
+            for mapping in plan.mappings.iter().filter(|mapping| {
+                !is_sparse_hvpatch_mmap_mapping(mapping)
+                    && !is_persistent_executor_carrier_guest_mapping(mapping)
+            }) {
                 let key = (mapping.ipa_start, mapping.mapped_size);
                 let lease = stage2_leases.remove(&key).ok_or_else(|| {
                     TrapError::Hypervisor(format!(
@@ -16164,7 +16317,10 @@ impl HvfVmState {
             let replacement = plan
                 .mappings
                 .iter()
-                .filter(|mapping| !is_sparse_hvpatch_mmap_mapping(mapping))
+                .filter(|mapping| {
+                    !is_sparse_hvpatch_mmap_mapping(mapping)
+                        && !is_persistent_executor_carrier_guest_mapping(mapping)
+                })
                 .zip(prepared_exec_regions.iter())
                 .map(|(mapping, (region, _))| exec_stage2_install(mapping, region))
                 .collect::<Vec<_>>();
@@ -18877,6 +19033,54 @@ mod frame_inventory_backend_tests {
     }
 
     #[test]
+    fn exec_reuses_carrier_control_stage2_without_allocating_task_leases() {
+        let mut input = root_exec_test_plan();
+        for (start, size) in [
+            (
+                crate::memory::LINUX_EL0_TRAMPOLINE_BASE,
+                crate::memory::LINUX_EL0_TRAMPOLINE_SIZE,
+            ),
+            (
+                crate::memory::LINUX_EL1_VECTORS_BASE,
+                crate::memory::LINUX_EL1_VECTORS_SIZE,
+            ),
+            (
+                crate::memory::LINUX_EL1_MAINT_BASE,
+                crate::memory::LINUX_EL1_MAINT_SIZE,
+            ),
+            (
+                crate::memory::LINUX_SYSCALL_MAILBOX_BASE,
+                crate::memory::LINUX_SYSCALL_MAILBOX_ARENA_SIZE,
+            ),
+        ] {
+            input.mappings.push(exec_mapping_for_order(start, size));
+        }
+
+        let GlobalExecPlan {
+            plan,
+            stage2_leases,
+        } = prepare_global_exec_plan(&input, None).expect("global exec plan");
+        for mapping in plan
+            .mappings
+            .iter()
+            .filter(|mapping| is_persistent_executor_carrier_guest_mapping(mapping))
+        {
+            assert_eq!(mapping.ipa_start, mapping.guest_start);
+            assert!(
+                !stage2_leases.contains_key(&(mapping.ipa_start, mapping.mapped_size)),
+                "exec must reuse carrier stage-2 rather than hand it to an MM retirement"
+            );
+        }
+        assert_eq!(
+            plan.mappings
+                .iter()
+                .filter(|mapping| is_persistent_executor_carrier_guest_mapping(mapping))
+                .count(),
+            4
+        );
+    }
+
+    #[test]
     fn exec_replacement_keeps_every_representative_leaf_asid_scoped() {
         const NON_GLOBAL: u64 = 1 << 11;
         let GlobalExecPlan { plan, .. } =
@@ -20746,6 +20950,86 @@ mod thread_sibling_tests {
         )
         .expect("slot zero resolves from executor-local carrier metadata");
         assert_eq!(pointer.as_ptr() as usize, 0x1400_0000);
+    }
+
+    #[test]
+    fn persistent_carrier_authority_outlives_terminal_task_cleanup_and_drops_stage2_first() {
+        let mut task_mappings = vec![mapped_region(0x0040_0000, 0x0040_4000, 0x0040_0000)];
+        let mut drop_observations = Vec::new();
+        for (start, size) in [
+            (
+                crate::memory::LINUX_EL0_TRAMPOLINE_BASE,
+                crate::memory::LINUX_EL0_TRAMPOLINE_SIZE,
+            ),
+            (
+                crate::memory::LINUX_EL1_VECTORS_BASE,
+                crate::memory::LINUX_EL1_VECTORS_SIZE,
+            ),
+            (
+                crate::memory::LINUX_EL1_MAINT_BASE,
+                crate::memory::LINUX_EL1_MAINT_SIZE,
+            ),
+            (
+                crate::memory::LINUX_SYSCALL_MAILBOX_BASE,
+                crate::memory::LINUX_SYSCALL_MAILBOX_ARENA_SIZE,
+            ),
+        ] {
+            let size = usize::try_from(size).unwrap();
+            let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                size,
+                crate::host_mapping::HostMappingKind::PrivateAnon,
+            )
+            .unwrap();
+            let host_addr = host.as_ptr();
+            let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut lease = GlobalFrameStage2Lease::fixed(start, size as u64);
+            lease.drop_backing_audit = Some((host_addr as usize, std::sync::Arc::clone(&observed)));
+            let mut region = mapped_region(start, start + size as u64, start);
+            region.host_addr = host_addr;
+            region.host_mapping = Some(host);
+            region.stage2_lease = Some(lease);
+            task_mappings.push(region);
+            drop_observations.push((host_addr as usize, observed));
+        }
+        assert_eq!(
+            task_mappings
+                .iter()
+                .filter(|mapping| mapping_belongs_to_task_inventory(true, mapping))
+                .count(),
+            1,
+            "Kernel MM inventory must never acquire carrier control extents"
+        );
+
+        let authority = PersistentCarrierMappings::extract(&mut task_mappings)
+            .expect("extract exact carrier mapping authority");
+        assert_eq!(
+            task_mappings.len(),
+            1,
+            "task retains only its own image mapping"
+        );
+        let worker = std::sync::Arc::new(authority);
+        let factory = std::sync::Arc::clone(&worker);
+        drop(task_mappings);
+
+        let mailbox = worker
+            .host_pointer(
+                crate::memory::LINUX_SYSCALL_MAILBOX_BASE,
+                carrick_aarch64::mailbox::AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+            )
+            .expect("terminal task cleanup cannot invalidate a live worker mailbox");
+        // SAFETY: the carrier authority owns the complete mailbox mapping.
+        unsafe { mailbox.as_ptr().write_volatile(0x5a) };
+        drop(worker);
+        assert!(
+            drop_observations
+                .iter()
+                .all(|(host, _)| alias_backing_is_live(*host))
+        );
+
+        drop(factory);
+        assert!(drop_observations.iter().all(|(host, observed)| {
+            observed.load(std::sync::atomic::Ordering::SeqCst) && !alias_backing_is_live(*host)
+        }));
     }
 
     #[test]
