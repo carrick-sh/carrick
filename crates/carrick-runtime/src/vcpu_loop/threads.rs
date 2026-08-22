@@ -1515,12 +1515,28 @@ where
         ))
     }
 
-    fn publish_persistent_sibling_stop(&self, kernel: &Kernel) {
-        let _ = self.registry.remove_all_except(self.this_tid);
+    fn publish_persistent_sibling_stop(&self, kernel: &Kernel) -> Result<(), RuntimeError> {
+        let removed = self.registry.remove_all_except(self.this_tid);
         self.kicker.kick_all_except(self.this_tid);
         self.futex.notify_signal_pending();
         self.platform_futex.notify_signal_pending();
         kernel.signal_arrival.wake_all_waiters();
+        let context = self.service_kernel_context.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "persistent sibling stop lost exact Kernel context".to_owned(),
+            )
+        })?;
+        let scheduler = kernel
+            .hvpatch_runtime
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "persistent sibling stop has no shared scheduler".to_owned(),
+                )
+            })?
+            .continuation_services(context.kernel())
+            .0;
+        wake_removed_persistent_sibling_threads(context, &scheduler, &removed)
     }
 
     pub(super) fn begin_persistent_exec_sibling_drain(
@@ -1528,7 +1544,7 @@ where
         kernel: &Kernel,
         current: continuation::JobId,
     ) -> Result<continuation::ProcessDrain, RuntimeError> {
-        self.publish_persistent_sibling_stop(kernel);
+        self.publish_persistent_sibling_stop(kernel)?;
         self.prepare_persistent_sibling_drain(kernel, current)
     }
 
@@ -1538,7 +1554,7 @@ where
         current: continuation::JobId,
     ) -> Result<continuation::ProcessDrain, RuntimeError> {
         kernel.begin_process_exit();
-        self.publish_persistent_sibling_stop(kernel);
+        self.publish_persistent_sibling_stop(kernel)?;
         self.prepare_persistent_sibling_drain(kernel, current)
     }
 
@@ -1546,11 +1562,7 @@ where
         &self,
         current: continuation::JobId,
     ) -> Result<(), RuntimeError> {
-        let handles = std::mem::take(&mut *self.threads.lock());
-        for handle in handles {
-            handle.finish_completed(current)?;
-        }
-        Ok(())
+        finish_persistent_process_handles(&self.threads, current)
     }
 
     pub(super) async fn terminate_siblings_for_process_exit(
@@ -2041,4 +2053,31 @@ where
         kernel.end_exec_replacement();
         Ok(())
     }
+}
+
+pub(super) fn wake_removed_persistent_sibling_threads(
+    context: &crate::kernel::KernelContext,
+    scheduler: &Arc<crate::kernel::Scheduler>,
+    removed: &[ThreadId],
+) -> Result<(), RuntimeError> {
+    for thread in context.task().threads() {
+        if !removed
+            .iter()
+            .any(|tid| tid.raw() == thread.key().tid.raw())
+        {
+            continue;
+        }
+        if let Err(error) = scheduler.wake(thread.key())
+            && !matches!(
+                thread.execution_state(),
+                crate::kernel::objects::ThreadExecutionState::Exited { .. }
+                    | crate::kernel::objects::ThreadExecutionState::Failed { .. }
+            )
+        {
+            return Err(RuntimeError::Configuration(format!(
+                "wake exact persistent sibling for terminal transition: {error}"
+            )));
+        }
+    }
+    Ok(())
 }

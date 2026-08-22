@@ -1982,7 +1982,7 @@ where
             crate::kernel::LinuxTid::for_task_leader(child_id),
             child_kernel.fatal_signal.current_generation(),
             child_tid,
-            child_threads,
+            Arc::clone(&child_threads),
             Arc::clone(&child_kicker),
             carrick_hal::InGuestFlag::for_guest_thread(),
             self.max_traps,
@@ -2064,6 +2064,11 @@ where
         if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::StartProof) {
             return Err(ops.fail_stop(error));
         }
+        let member_publication = PersistentProcessMemberPublication::new(
+            Arc::clone(&child_threads),
+            &logical.result,
+            &logical.completion,
+        );
         dormant
             .activate(
                 &runtime.continuation_services(child_context.kernel()).0,
@@ -2074,6 +2079,7 @@ where
                 tracing::error!(child_pid, %error, "activate process child logical job");
                 std::process::abort();
             });
+        member_publication.commit();
         if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::Activation) {
             return Err(ops.fail_stop(error));
         }
