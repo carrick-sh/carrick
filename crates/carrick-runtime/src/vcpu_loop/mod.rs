@@ -2186,7 +2186,10 @@ enum HvpatchProductionPhase {
 }
 
 enum PersistentTerminal {
-    Outcome(VcpuLoopOutcome),
+    Outcome {
+        outcome: VcpuLoopOutcome,
+        prepared_core: Option<PreparedCorePublication>,
+    },
     Error(RuntimeError),
 }
 
@@ -2197,9 +2200,16 @@ enum PersistentTerminalRuntimeState {
 }
 
 impl PersistentTerminal {
+    fn from_outcome(outcome: VcpuLoopOutcome) -> Self {
+        Self::Outcome {
+            outcome,
+            prepared_core: None,
+        }
+    }
+
     fn into_result(self) -> Result<VcpuLoopOutcome, RuntimeError> {
         match self {
-            Self::Outcome(outcome) => Ok(outcome),
+            Self::Outcome { outcome, .. } => Ok(outcome),
             Self::Error(error) => Err(error),
         }
     }
@@ -2782,7 +2792,7 @@ where
                 )));
                 Ok(self.begin_persistent_process_terminal(
                     engine,
-                    PersistentTerminal::Outcome(outcome),
+                    PersistentTerminal::from_outcome(outcome),
                     context,
                 ))
             }
@@ -2915,34 +2925,103 @@ where
                     std::process::abort();
                 });
         }
+        let prepared_core = match &terminal {
+            PersistentTerminal::Outcome { prepared_core, .. } => prepared_core.as_ref(),
+            _ => None,
+        };
+        let core_publication = match prepared_core {
+            Some(prepared) => {
+                match self.kernel.dispatcher.publish_core_atomic(
+                    &prepared.snapshot,
+                    prepared.generation,
+                    prepared.bytes.clone(),
+                ) {
+                    Ok(publ) => {
+                        crate::probes::hvpatch_core_lifecycle(
+                            4,
+                            process.pid(),
+                            prepared.fatal_tid,
+                            publ.generation,
+                            0,
+                        );
+                        Some(publ)
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "publish core atomic");
+                        crate::probes::hvpatch_core_lifecycle(
+                            6,
+                            process.pid(),
+                            prepared.fatal_tid,
+                            prepared.generation,
+                            1,
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let core_dumped = core_publication.is_some();
         let (exit_code, wait_encoding, terminal_publication) = match &terminal {
-            PersistentTerminal::Outcome(
-                VcpuLoopOutcome::ProcessExit(run) | VcpuLoopOutcome::TrapLimit(run),
-            ) => (
+            PersistentTerminal::Outcome {
+                outcome: VcpuLoopOutcome::ProcessExit(run) | VcpuLoopOutcome::TrapLimit(run),
+                ..
+            } => (
                 run.exit_code,
-                run.wait_status_encoding(false),
+                run.wait_status_encoding(core_dumped),
                 Ok((**run).clone()),
             ),
             PersistentTerminal::Error(_) => (127, 127 << 8, Err(())),
-            PersistentTerminal::Outcome(VcpuLoopOutcome::ThreadDone) => std::process::abort(),
+            PersistentTerminal::Outcome {
+                outcome: VcpuLoopOutcome::ThreadDone,
+                ..
+            } => std::process::abort(),
         };
         let process_exit_event = process.record_process_exit_begin(exit_code, self.state.this_tid);
         let child = process.is_child();
+        if child {
+            let out = self.kernel.dispatcher.stdout();
+            let err = self.kernel.dispatcher.stderr();
+            let _ = write_hvpatch_child_output(1, &out);
+            let _ = write_hvpatch_child_output(2, &err);
+        }
         let status = crate::kernel::LinuxWaitStatus::from_wait_encoding(wait_encoding);
         let orphan_adopter = self.kernel.dispatcher.hvpatch_orphan_adopter();
-        process
-            .publish_exit_status(status, orphan_adopter, |parent| {
-                self.kernel
-                    .dispatcher
-                    .retire_hvpatch_process_fds(&terminal_context);
-                if child {
-                    self.kernel.notify_hvpatch_parent_exit(parent);
-                }
-            })
-            .unwrap_or_else(|failure| {
-                tracing::error!(%failure, "publish persistent failure Kernel exit");
-                std::process::abort();
-            });
+        let publish_result = process.publish_exit_status(status, orphan_adopter, |parent| {
+            self.kernel
+                .dispatcher
+                .retire_hvpatch_process_fds(&terminal_context);
+            if child {
+                self.kernel.notify_hvpatch_parent_exit(parent);
+            }
+        });
+        if let Err(failure) = publish_result {
+            if let Some(publ) = &core_publication {
+                let _ = self.kernel.dispatcher.rollback_core_publication(publ);
+            }
+            if let Some(prepared) = prepared_core {
+                crate::probes::hvpatch_core_lifecycle(
+                    6,
+                    process.pid(),
+                    prepared.fatal_tid,
+                    prepared.generation,
+                    1,
+                );
+            }
+            tracing::error!(%failure, "publish persistent failure Kernel exit");
+            std::process::abort();
+        }
+        if let Some(prepared) = prepared_core {
+            if core_dumped {
+                crate::probes::hvpatch_core_lifecycle(
+                    5,
+                    process.pid(),
+                    prepared.fatal_tid,
+                    prepared.generation,
+                    0,
+                );
+            }
+        }
         self.kernel.unregister_hvpatch_runtime_endpoint();
         if owns_final_mm {
             if self
@@ -3028,6 +3107,39 @@ where
                     });
             }
         }
+        let mut terminal = terminal;
+        if let PersistentTerminal::Outcome {
+            ref outcome,
+            ref mut prepared_core,
+        } = terminal
+        {
+            let terminating_signal = match outcome {
+                VcpuLoopOutcome::ProcessExit(run) | VcpuLoopOutcome::TrapLimit(run) => {
+                    run.terminating_signal
+                }
+                VcpuLoopOutcome::ThreadDone => None,
+            };
+            if let Some(fatal) = fatal_for_terminal_owner(
+                self.kernel
+                    .fatal_signal
+                    .recorded_for(self.state.fatal_image_generation),
+                self.state.fatal_image_generation,
+                self.state.linux_tid,
+                terminating_signal,
+            ) {
+                *prepared_core =
+                    match self
+                        .state
+                        .capture_core_for_publication(&self.kernel, engine, fatal)
+                    {
+                        Ok(p) => p,
+                        Err(error) => {
+                            tracing::warn!(%error, "capture core for publication");
+                            None
+                        }
+                    };
+            }
+        }
         // Withdraw runtime execution immediately, but retain the exact Kernel
         // thread/generation through drain and topology retries. Their callbacks
         // wake this owner by that key; retiring it here loses the only wake.
@@ -3066,6 +3178,7 @@ where
 
     fn suspend_for_process_quiesce(
         &mut self,
+        engine: &E,
         _control: &executor::HvpatchQuantumControl<'_, '_>,
     ) -> Result<Option<executor::ExecutorExit>, RuntimeError> {
         let Some(barrier) = self.state.process_fork_barrier.as_ref().map(Arc::clone) else {
@@ -3073,6 +3186,13 @@ where
         };
         if !barrier.is_quiescing() {
             return Ok(None);
+        }
+        if self
+            .state
+            .publish_crash_registers_if_requested(engine)
+            .is_err()
+        {
+            self.state.withdraw_from_crash_capture();
         }
         let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("quiescing HVPatch task lost Kernel context".to_owned())
@@ -3852,10 +3972,51 @@ where
         Ok(match outcome {
             DispatchOutcome::Returned { value } => {
                 self.state.complete_returned(engine, value)?;
+                // Self-directed signals (e.g. raise(SIGABRT)) posted during syscall handling must be serviced before returning to guest EL0, otherwise the thread resumes execution and runs subsequent instructions (like _exit(99)) before any asynchronous kick can arrive.
+                let context = self
+                    .state
+                    .service_kernel_context
+                    .as_ref()
+                    .unwrap_or_else(|| std::process::abort())
+                    .retain_exact();
+                if let Some(outcome) = service_signals_threaded(
+                    &self.kernel,
+                    &context,
+                    engine,
+                    self.state.this_tid,
+                    self.state.fatal_image_generation,
+                    Some(value),
+                    None,
+                    None,
+                    None,
+                    self.traps,
+                )? {
+                    return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                }
                 executor::ExecutorExit::Syscall
             }
             DispatchOutcome::Errno { errno } => {
-                self.state.complete_errno(engine, errno)?;
+                let value = self.state.complete_errno(engine, errno)?;
+                let context = self
+                    .state
+                    .service_kernel_context
+                    .as_ref()
+                    .unwrap_or_else(|| std::process::abort())
+                    .retain_exact();
+                if let Some(outcome) = service_signals_threaded(
+                    &self.kernel,
+                    &context,
+                    engine,
+                    self.state.this_tid,
+                    self.state.fatal_image_generation,
+                    Some(value),
+                    None,
+                    None,
+                    None,
+                    self.traps,
+                )? {
+                    return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                }
                 executor::ExecutorExit::Syscall
             }
             DispatchOutcome::SchedulerYield => {
@@ -3883,7 +4044,7 @@ where
                         self.terminal_runtime = PersistentTerminalRuntimeState::Withdrawn;
                         self.begin_persistent_process_terminal(
                             engine,
-                            PersistentTerminal::Outcome(outcome),
+                            PersistentTerminal::from_outcome(outcome),
                             context,
                         )
                     }
@@ -3906,7 +4067,7 @@ where
                 )));
                 self.begin_persistent_process_terminal(
                     engine,
-                    PersistentTerminal::Outcome(outcome),
+                    PersistentTerminal::from_outcome(outcome),
                     context,
                 )
             }
@@ -4099,18 +4260,58 @@ where
                 // through to the catch-all below, which returns `InvalidState`
                 // and hangs the guest — `xthreadsig` timed out at
                 // `SignalThread { signum: 10 }`.
-                self.state.complete_signal_thread(
+                let value = self.state.complete_signal_thread(
                     &self.kernel,
                     engine,
                     tid,
                     signum,
                     kernel_target,
                 )?;
+                let context = self
+                    .state
+                    .service_kernel_context
+                    .as_ref()
+                    .unwrap_or_else(|| std::process::abort())
+                    .retain_exact();
+                if let Some(outcome) = service_signals_threaded(
+                    &self.kernel,
+                    &context,
+                    engine,
+                    self.state.this_tid,
+                    self.state.fatal_image_generation,
+                    Some(value),
+                    None,
+                    None,
+                    None,
+                    self.traps,
+                )? {
+                    return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                }
                 executor::ExecutorExit::Syscall
             }
             DispatchOutcome::SetMemoryModel { tso } => {
                 engine.set_memory_model(hardware_tso_for_debug(tso))?;
-                self.state.complete_returned(engine, 0)?;
+                let value = self.state.complete_returned(engine, 0)?;
+                let context = self
+                    .state
+                    .service_kernel_context
+                    .as_ref()
+                    .unwrap_or_else(|| std::process::abort())
+                    .retain_exact();
+                if let Some(outcome) = service_signals_threaded(
+                    &self.kernel,
+                    &context,
+                    engine,
+                    self.state.this_tid,
+                    self.state.fatal_image_generation,
+                    Some(value),
+                    None,
+                    None,
+                    None,
+                    self.traps,
+                )? {
+                    return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                }
                 executor::ExecutorExit::Syscall
             }
             DispatchOutcome::SigReturn => {
@@ -4151,6 +4352,21 @@ where
                     self.state.this_tid,
                     carrick_abi::SigSet::from_raw(restored_sigmask),
                 );
+                let context = signal_context.retain_exact();
+                if let Some(outcome) = service_signals_threaded(
+                    &self.kernel,
+                    &context,
+                    engine,
+                    self.state.this_tid,
+                    self.state.fatal_image_generation,
+                    None,
+                    None,
+                    None,
+                    None,
+                    self.traps,
+                )? {
+                    return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                }
                 // The guest resumes at the just-restored user PC. Do NOT complete
                 // a syscall return here: `rt_sigreturn` has no return value, and
                 // on x86 the frame restores RCX as an ordinary caller-clobbered
@@ -4184,7 +4400,7 @@ where
             .retain_exact();
         self.begin_persistent_process_terminal(
             engine,
-            PersistentTerminal::Outcome(outcome),
+            PersistentTerminal::from_outcome(outcome),
             context,
         )
     }
@@ -4364,6 +4580,11 @@ where
                             .service_threaded_syscall(&self.kernel, engine, frame)?
                     }
                 };
+                if self.kernel.dispatcher.take_signal_pump_request() {
+                    self.kernel
+                        .fork
+                        .start_signal_pump(&self.state.kicker, &self.state.platform_futex);
+                }
                 return self.service_outcome(engine, control, frame, outcome);
             }
             HvpatchProductionPhase::ExecSiblingDrain {
@@ -4443,7 +4664,7 @@ where
             HvpatchProductionPhase::Complete => return Ok(executor::ExecutorExit::Exited),
         }
 
-        if let Some(exit) = self.suspend_for_process_quiesce(control)? {
+        if let Some(exit) = self.suspend_for_process_quiesce(engine, control)? {
             return Ok(exit);
         }
 
@@ -4486,7 +4707,7 @@ where
                 )));
                 return Ok(self.begin_persistent_process_terminal(
                     engine,
-                    PersistentTerminal::Outcome(outcome),
+                    PersistentTerminal::from_outcome(outcome),
                     context,
                 ));
             }
@@ -4745,6 +4966,11 @@ where
         let outcome = self
             .state
             .service_threaded_syscall(&self.kernel, engine, frame)?;
+        if self.kernel.dispatcher.take_signal_pump_request() {
+            self.kernel
+                .fork
+                .start_signal_pump(&self.state.kicker, &self.state.platform_futex);
+        }
         self.service_outcome(engine, control, frame, outcome)
     }
 }
@@ -5717,6 +5943,7 @@ where
         request: SyscallRequest,
         input: HvpatchBlockInput,
     ) -> Result<continuation::BlockedContinuation, RuntimeError> {
+        self.withdraw_from_crash_capture();
         let directory = kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
             RuntimeError::Configuration(
                 "HVPatch blocking continuation has no shared runtime directory".to_owned(),
