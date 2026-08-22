@@ -685,6 +685,22 @@ pub fn retire_detached_task_only_engine(
         )
     })
 }
+
+pub fn retire_detached_exec_predecessor(
+    state: &mut HvpatchTaskEngineState,
+) -> Result<(), TrapError> {
+    HvfVmState::retire_task_state_exec_predecessor(&mut state.backend_mut().state.task)
+}
+
+pub fn retire_detached_task_only_exec_predecessor(
+    state: &HvpatchTaskOnlyEngineState,
+) -> Result<(), TrapError> {
+    let mut parked = state.parked_task.lock();
+    let task = parked.as_mut().ok_or_else(|| {
+        TrapError::Hypervisor("detached exec cleanup has no parked task state".to_owned())
+    })?;
+    HvfVmState::retire_task_state_exec_predecessor(task)
+}
 pub fn split_initial_task_engine(
     engine: HvfAarch64Engine,
 ) -> (HvpatchTaskEngineState, HvfAarch64Vcpu) {
