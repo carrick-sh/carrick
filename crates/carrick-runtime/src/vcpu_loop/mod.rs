@@ -2798,6 +2798,7 @@ struct ProductionHvpatchLoopJob<E: ThreadedEngine> {
     last_signal_progress: Instant,
     terminal_runtime: PersistentTerminalRuntimeState,
     pending_terminal_retirement: Option<crate::hvpatch::PendingAddressSpaceRetirement>,
+    pending_terminal_inventory: Option<(Arc<crate::kernel::Kernel>, crate::kernel::MmId)>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2946,6 +2947,11 @@ trait ProductionHvpatchLoopPoll: Send {
     fn take_address_space_retirement(
         &mut self,
     ) -> Option<crate::hvpatch::PendingAddressSpaceRetirement>;
+
+    fn apply_detached_address_space_retirement(
+        &mut self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<(), TrapError>;
 }
 
 impl<E: ThreadedEngine + 'static> ProductionHvpatchLoopJob<E>
@@ -3133,26 +3139,12 @@ where
                 std::process::abort();
             });
         self.kernel.unregister_hvpatch_runtime_endpoint();
-        engine
-            .retire_task_address_space()
-            .unwrap_or_else(|failure| {
-                tracing::error!(%failure, "retire persistent failure address space");
-                std::process::abort();
-            });
-        let retirement_commit = (extent_count > 0).then(|| {
-            engine
-                .take_retirement_inventory()
-                .unwrap_or_else(|| std::process::abort())
-        });
-        if let Some(commit) = retirement_commit {
-            terminal_context
-                .kernel()
-                .frame_inventory()
-                .apply(terminal_mm, commit)
-                .unwrap_or_else(|failure| {
-                    tracing::error!(%failure, "publish persistent failure inventory retirement");
-                    std::process::abort();
-                });
+        if self
+            .pending_terminal_inventory
+            .replace((Arc::clone(terminal_context.kernel()), terminal_mm))
+            .is_some()
+        {
+            std::process::abort();
         }
         self.pending_terminal_retirement = Some(
             process
@@ -4663,6 +4655,26 @@ where
     ) -> Option<crate::hvpatch::PendingAddressSpaceRetirement> {
         self.pending_terminal_retirement.take()
     }
+
+    fn apply_detached_address_space_retirement(
+        &mut self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<(), TrapError> {
+        let (kernel, mm) = self.pending_terminal_inventory.take().ok_or_else(|| {
+            TrapError::Hypervisor(
+                "detached terminal cleanup lost its exact Kernel/MM authority".to_owned(),
+            )
+        })?;
+        kernel
+            .frame_inventory()
+            .apply(mm, commit)
+            .map(|_| ())
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "publish detached terminal inventory retirement: {error}"
+                ))
+            })
+    }
 }
 
 /// Engine-free logical state for the HVPatch vCPU loop.  The backend engine is
@@ -4832,6 +4844,20 @@ impl<E: 'static> continuation::PersistentQuantumJob for HvpatchLoopJob<E> {
         self.production
             .as_mut()
             .and_then(|production| production.take_address_space_retirement())
+    }
+
+    fn apply_detached_address_space_retirement(
+        &mut self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<(), TrapError> {
+        self.production
+            .as_mut()
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "scripted HVPatch job has no detached address-space authority".to_owned(),
+                )
+            })?
+            .apply_detached_address_space_retirement(commit)
     }
 }
 
@@ -8220,6 +8246,7 @@ fn prepare_hvpatch_logical_job(
         last_signal_progress: Instant::now(),
         terminal_runtime: PersistentTerminalRuntimeState::Resident,
         pending_terminal_retirement: None,
+        pending_terminal_inventory: None,
     };
     let job = HvpatchLoopJob::production(production, injected_lease);
     let quantum = Arc::new(continuation::HvpatchTaskQuantum::new(
@@ -11771,6 +11798,7 @@ mod tests {
                 last_signal_progress: Instant::now(),
                 terminal_runtime: PersistentTerminalRuntimeState::Resident,
                 pending_terminal_retirement: None,
+                pending_terminal_inventory: None,
             };
             let mut memory = Memory::default();
             memory.0.insert(0x1000, 11_i32.to_le_bytes().to_vec());

@@ -658,6 +658,33 @@ pub fn detach_task_engine(
     state.backend_mut().swap_persistent_executor_local(executor);
     (state, vcpu)
 }
+
+pub fn retire_detached_task_engine(
+    state: &mut HvpatchTaskEngineState,
+) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
+    let backend = state.backend_mut();
+    backend.state.retire_process_mappings()?;
+    backend.state.take_retirement_inventory().ok_or_else(|| {
+        TrapError::Hypervisor(
+            "detached HVPatch task retirement produced no inventory commit".to_owned(),
+        )
+    })
+}
+
+pub fn retire_detached_task_only_engine(
+    state: &HvpatchTaskOnlyEngineState,
+) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
+    let mut parked = state.parked_task.lock();
+    let task = parked.as_mut().ok_or_else(|| {
+        TrapError::Hypervisor("detached task-only retirement has no parked task state".to_owned())
+    })?;
+    HvfVmState::retire_task_state_process_mappings(task)?;
+    HvfVmState::take_task_state_retirement_inventory(task).ok_or_else(|| {
+        TrapError::Hypervisor(
+            "detached task-only retirement produced no inventory commit".to_owned(),
+        )
+    })
+}
 pub fn split_initial_task_engine(
     engine: HvfAarch64Engine,
 ) -> (HvpatchTaskEngineState, HvfAarch64Vcpu) {
