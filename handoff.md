@@ -91,7 +91,7 @@ each one's blocker is named with the evidence that names it.**
 | 2 | Process teardown correct | **NOT MET** | Three named defects below. All ten built fork probes reach zero carrier aborts (from ten of ten aborting); five exit 0. |
 | 3 | Shell reducer exits 0 | **MET** | `f250844d`. `/bin/sh -c '/bin/echo hi'` 10 of 10 clean, `/bin/bash -c` clean as the fork-not-vfork control. |
 | 4 | `just ci` green | **NOT MET** | `fmt-check`, `deny`, `check-matrix` PASS. `clippy` 97 -> 34 errors. `lint-domains` fails on census drift. `doc` fails on the same dead code as clippy. `test` 1605/1605. |
-| 5 | Closure probe gate | **IN FLIGHT** | Started detached; log `target/perf/closure-run.log`. 461 probe sources x 2 libc lanes is ~920 guest runs at ~3/min, so budget ~5 HOURS. A foreground shell with a 10-minute cap SIGTERMs it mid-run (`terminated by signal 15`). |
+| 5 | Closure probe gate | **IN FLIGHT, AND SLOW — see below** | Started detached; log `target/perf/closure-run.log`. A foreground shell with a 10-minute cap SIGTERMs it mid-run (`terminated by signal 15`). |
 
 ### What landed this session
 
@@ -122,6 +122,43 @@ The recurring root cause is **two domains sharing one type**, exactly as
 bits a register reads back; an obligation record vs the mapping it describes; a
 claim about revision N vs the revision current afterwards; stage-1 ownership vs
 ledger ownership; the absence of an authority vs a rejection by one.
+
+### THE CLOSURE GATE HAS SLOWED DOWN — treat this as a defect, not a cost
+
+**It used to complete in under 10 minutes. It is now running at 8 probes/min
+with a tail of probes stuck at 34 seconds each**, projecting ~100 minutes for
+~920 runs (461 probe sources x 2 libc lanes). The owner confirms the historical
+figure; do not accept the new number as the price of the gate.
+
+The shape says hang, not slowness: most runs finish in about a second, while a
+minority sit for tens of seconds and each one occupies one of the 24 concurrent
+slots, so the tail sets the wall clock. That matches what was already observed
+directly — `cloneexithandled` and `clone3exithandled` intermittently hang to
+their timeout instead of returning an error, first noticed in `d4ad1aaa`.
+
+`AGENTS.md` is explicit that a pathological ratio is evidence of an INCORRECT
+implementation rather than a tuning problem, and that a hung suite reports as
+spectacularly "slow" because it sits on its deadline. So this is almost
+certainly the same fork/exec teardown defect family as criterion 2, seen through
+the gate instead of through one probe.
+
+**Attribute it with a controlled A/B, and do not run the build concurrently with
+a conformance measurement** — build the pre-campaign binary in a worktree under
+`.worktrees/`, then time the SAME probe set on each binary, serially. The
+candidates in order of suspicion:
+
+1. `d4ad1aaa` (SCTLR readback) — it lets executor restores PROCEED where they
+   previously failed fast, and its own commit message records that two probes
+   began hanging instead of erroring. A change that converts a clean error into
+   a wait is exactly what produces this profile.
+2. `f250844d` (shared-ledger routing) — it early-returns from
+   `retire_detached_address_space_with` for vfork children. If anything else was
+   depending on that path running, teardown could stall.
+3. Neither — a pre-existing hang that the earlier carrier aborts were masking by
+   killing the run before it could hang.
+
+Reading the finished gate log first is cheap and may name the stuck probes
+outright; do that before bisecting.
 
 ### Criterion 2 — the three remaining defects, each attributed
 
