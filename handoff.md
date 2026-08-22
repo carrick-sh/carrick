@@ -91,7 +91,7 @@ each one's blocker is named with the evidence that names it.**
 | 2 | Process teardown correct | **NOT MET** | Three named defects below. All ten built fork probes reach zero carrier aborts (from ten of ten aborting); five exit 0. |
 | 3 | Shell reducer exits 0 | **MET** | `f250844d`. `/bin/sh -c '/bin/echo hi'` 10 of 10 clean, `/bin/bash -c` clean as the fork-not-vfork control. |
 | 4 | `just ci` green | **NOT MET** | `fmt-check`, `deny`, `check-matrix` PASS. `clippy` 97 -> 34 errors. `lint-domains` fails on census drift. `doc` fails on the same dead code as clippy. `test` 1605/1605. |
-| 5 | Closure probe gate | **NOT MEASURED** | Needs > 10 minutes; run it detached, not in a foreground shell with a timeout. |
+| 5 | Closure probe gate | **IN FLIGHT** | Started detached; log `target/perf/closure-run.log`. 461 probe sources x 2 libc lanes is ~920 guest runs at ~3/min, so budget ~5 HOURS. A foreground shell with a 10-minute cap SIGTERMs it mid-run (`terminated by signal 15`). |
 
 ### What landed this session
 
@@ -147,8 +147,28 @@ a retired root passes as pristine. Two candidate fixes, needing a decision:
 give the executor a neutral carrier root to install before maintenance (there is
 none today — `PersistentExecutorSpec` says "page tables, MM/root ... stay out of
 the factory"), or order the invalidation strictly before the tables go away and
-prove no issuer runs after. `dispatch_invalidation_commands` targets specific
-executors, so start by finding which issuer runs post-retirement.
+prove no issuer runs after. Narrowed further this session, so do not
+re-walk it:
+
+- `invalidate_after_exec` targets exactly `retirement.pending()` — the
+  executors that still hold the ASID, i.e. the ones whose TTBR points at that
+  mm's root. So the target set is right; the problem is the root's CONTENT.
+- Taking a `Stage1MmRetirement` does NOT free the root slot: `complete()` does,
+  and it runs after the invalidation. So the tables are still allocated when the
+  fetch faults — they have been UNMAPPED, not freed.
+- In the terminal the order is already invalidate -> retire -> complete
+  (`executor.rs:3250,3263`), which is correct. Suspicion therefore falls on an
+  EARLIER retirement in the same terminal — the exec-predecessor path at
+  `executor.rs:3190` — having already unmapped a root the executor still
+  carries. Instrument which mm the faulting TTBR root belongs to versus which mm
+  is being retired; that one fact decides it.
+
+Note also that `Stage1MmPool::acknowledge_tlb_flush`
+(`hvpatch/stage1_mm.rs:237`) is a genuinely unused WRAPPER — the live path is
+`Stage1MmRetirement::complete()`, which calls
+`inner.asids.acknowledge_tlb_flush` directly. A worker refused to delete it as a
+"live contract"; that refusal was over-cautious, and the wrapper plus
+`Stage1MmError::ForeignRetirement` can go.
 
 **(b) An MM authority is dropped while still `Active`.** `clonebasic`,
 intermittently: `FATAL: drop HVPatch MM authority (phase=active ...)`. Same
