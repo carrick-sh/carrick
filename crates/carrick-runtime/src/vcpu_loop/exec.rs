@@ -928,6 +928,20 @@ where
             {
                 old_extent_count = carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH / 2 + 1;
             }
+            // `old_extent_count == 0` silently skips the retirement of the OLD
+            // mm's inventory, which is correct only when a live sharer still
+            // owns that ledger. Getting it wrong leaves the kernel graph with
+            // mappings naming an mm that no longer exists, and nothing else
+            // reports it. Name the numbers.
+            tracing::debug!(
+                target: "carrick::exec",
+                old_mm = ?old_mm_id,
+                replacement_mm = ?replacement_mm_id,
+                old_extent_count,
+                replacement_extent_count,
+                retires_old_mm = old_extent_count != 0,
+                "HVPatch exec inventory sizing",
+            );
             // Zero old extents means the exec retires nothing from the old mm
             // (a live sharer still owns it). `FrameEventCapacity` is non-zero by
             // construction, so that case has no capacity and no transaction.

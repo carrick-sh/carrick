@@ -136,6 +136,15 @@ impl HvpatchTaskEngineBindingState {
                 // (phase=shared_process)" after the guest had already run
                 // correctly.
                 if state.shares_another_process_inventory() {
+                    // Skipping is correct ONLY while the ledger really belongs
+                    // to someone else. If a task reaches here still marked
+                    // shared after an exec gave it a ledger of its own, this
+                    // silently abandons that ledger's rows and the kernel graph
+                    // ends up with mappings naming a dead mm.
+                    tracing::debug!(
+                        target: "carrick::exec",
+                        "detached retirement skipped: task shares another process's inventory",
+                    );
                     return Ok(());
                 }
                 let commit =
