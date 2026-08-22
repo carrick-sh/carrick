@@ -62,19 +62,39 @@ committed; the fourth is identified and open.
    retirement took the "nobody owns this" fallback and released an extent whose
    lease was still live. Carrier leases are now published in a keyed registry
    that retirement consults.
-4. **OPEN, root cause found** — the forking probes still abort on **"published
-   HVPatch inventory dropped before exact retirement"**: a forked child's
-   task-MM inventory is still `Active` when its authority drops.
-   **Process frame-inventory retirement was never ported to the persistent
-   executor path.** The ONLY site in the tree that takes a retirement commit and
-   applies it is `vcpu_loop/mod.rs:10579`, and that site is inside
-   `run_vcpu_until_exit_inner` — the welded-thread loop that
-   `launch_vcpu_until_exit` can no longer reach (see the audit below). So the
-   authority can never leave `Active`, and its `rollback_unpublished` correctly
-   refuses to drop a published inventory. This is not a small bug: it is Task 7
-   Step 2 work that a live responsibility was left behind in dead code.
+4. **OPEN** — the forking probes still abort on **"published HVPatch inventory
+   dropped before exact retirement"**: a forked child's task-MM inventory is
+   still `Active` when its authority drops.
+
+   **CORRECTION to an earlier reading in this file:** it is NOT true that
+   process inventory retirement lives only in the dead welded loop. The
+   persistent path has a complete chain —
+   `finalize_persistent_process_terminal` arms a retirement and stashes
+   `pending_terminal_inventory`; the executor terminal block calls
+   `binding.retire_detached_address_space*`; that reaches
+   `retire_detached_task_only_engine` and publishes the ledger commit. The
+   grep that suggested otherwise keyed on `take_retirement_inventory`, which
+   the persistent path does not call by that name.
+
+   What WAS missing: the backend's `prepare_inventory_retirement` /
+   `apply_inventory_retirement` pair — the only thing that advances the
+   authority `Active -> Retired` against an authenticated receipt — had ZERO
+   callers. `d0ed04105` wires it (`retire_detached_address_space_with`, payload
+   aware: task-only drives the authority, the initial resident engine has none).
+
+   That is necessary but NOT sufficient and is **not yet exercised**: `forkcow`
+   still aborts on the same mm in the same phase, so the child never reaches
+   the new code. The live signal to chase next is the ERROR that now precedes
+   the abort — "authoritative scheduler wake rejected parent=TaskKey { id:
+   TaskId(1), serial: TaskSerial(6) } ... invalid from Exited": the child
+   outlives its parent's exit even though `forkcow`'s parent `wait4`s it, which
+   says the child's terminal is not running at all.
+
    **fork-then-EXEC works** (the exec path retires through the owner registry);
    **fork-then-EXIT is the broken lane.**
+
+   Diagnostic now available: the MM-authority abort names `phase=`,
+   `mm_root_slot=` and `kernel_mm=`, which is what localized this.
 
 Also open, separate from the above: after a vfork+exec the guest output is
 correct but persistent-executor pool shutdown fails in two timing-dependent
@@ -172,8 +192,10 @@ the inverse of every other hatch.
 
 ### Next work
 
-1. Close defect 4 (fork-then-exit inventory retirement), then re-run the fork
-   battery; 15 probes are currently blocked on it.
+1. Close defect 4. The authority transition is wired; the remaining question is
+   why a forked child's terminal never runs — start from the "scheduler wake
+   rejected ... invalid from Exited" ordering, not from the inventory. Then
+   re-run the fork battery; 15 probes are currently blocked on it.
 2. Then the two vfork+exec shutdown shapes.
 3. Only then is the Task 6 signed battery meaningful — and it must run through
    the CONTAINER transport, not only `run-elf`, because `run-elf` is the lighter
