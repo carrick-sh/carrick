@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-19
+**Updated:** 2026-08-21
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -29,7 +29,94 @@ artifact.
 The goal is still active. Do not mark it complete, bless a baseline, weaken the
 denominator, add an excuse, accept a retry, or start final performance work.
 
-## CURRENT STATE — session 2026-08-19 (seventh). Read this section first.
+## CURRENT ENGINEERING CHECKPOINT — 2026-08-21 Task 6 signed cutoff
+
+Task 6's persistent HVPatch executor implementation is integrated on branch
+`codex/authority-phase0` through exact clean HEAD
+`b2a58637a9d776d8e1b0379499d054c4762f4574`:
+
+- `38ea64a40` — `fix(hvpatch): republish exec task runtime projection`
+- `b2a58637a` — `test(hvpatch): add bounded executor census fixture`
+
+The final signed blocker was a task-only exec authority split. The live CPU and
+backend used replacement root/ASID `0x9a.../2`, but detach/reload resurrected
+the predecessor immutable page-table/protection/ASID projection
+`0x2d.../1`. Sparse-mmap rollback then copied the old-base snapshot into the
+replacement root and the ASIDE1IS maintenance fetch faulted. The binding now
+owns a non-cloneable runtime-projection slot: attach consumes it; exec may
+replace page tables, protections, and numeric ASID; detach republishes the live
+projection. Before any ASID hardware arm, backend take, or worker vCPU/lifecycle
+movement, binding-held preflight checks the exact `Stage1MmLease` TTBR pair,
+projection root/ASID, and Arc identity against the parked backend. After
+by-value worker ownership is passed, attach is infallible; impossible internal
+drift fail-stops on the owner thread.
+
+Fresh local gates after final review:
+
+- AArch64 library: 29/29;
+- HVF library serialized with required host permission: 220/220;
+- persistent executor: 50/50;
+- continuation: 63/63;
+- runtime integration: 300/300;
+- isolated process-exit recovery: 1/1;
+- runtime library check, focused production clippy, fmt, and diff: GREEN.
+
+Exact clean-HEAD signed artifact:
+
+- source HEAD: `b2a58637a9d776d8e1b0379499d054c4762f4574`
+- SHA-256: `27bf2dcca6b5e614be465cf243237bf73a81416fec4614482fc55fd97a158a66`
+- codesign identifier: `carrick.tmp.63267`
+- CDHash: `46beba4623ba4f3ab993de26ebc029c3381cde78`
+- LC_UUID: `598C0C9B-0317-338C-ABEB-7F214A923136`
+- `com.apple.security.hypervisor = true`
+- `__TEXT,__dof_carrick` present.
+
+Exact signed receipts:
+
+- direct hello: run ID `task6-handoff-hello-b2a58637`, exit 0, stdout
+  `hello from carrick`, stderr empty, cleanup 0. Receipts:
+  `/tmp/task6-handoff-hello-b2a58637.{out,err}`;
+- fail-closed `carrick trace` hello: run ID
+  `task6-head-trace-b2a58637`, exit 0 in about five seconds, executor lifecycle
+  create/destroy `10/10`, vCPU create/destroy `11/11`, no watchdog record or
+  DTrace error, cleanup 0. Receipt:
+  `/tmp/task6-head-trace-b2a58637.log`;
+- vfork/exec reducer: run ID `task6-handoff-vfork-b2a58637`, exit 0, stdout and
+  stderr empty, cleanup 0. Receipts:
+  `/tmp/task6-handoff-vfork-b2a58637.{out,err}`.
+
+The checked-in `fork_bench_10k.rs` is one carrier with an exact 10,000-count
+loop. It was built successfully and disassembly proved `mov x19,#0x2710`, two
+negative syscall-return branches, the decrement/backedge, and fail-closed
+`exit_group(1)`. Its runtime/DTrace census is deliberately **UNRUN** at this
+cutoff.
+
+### Next work — do not skip or overclaim
+
+1. Finish Task 6's signed battery serially with unique `CARRICK_RUN_ID`s and
+   scoped cleanup: concurrent fork/fork-exit-wait, clone/futex/preemption,
+   `waitidsiuid`, `mqnotifycrossproc`, standard/RT/default/handler signals,
+   exec/vfork, and epoll readiness. Then run the single-carrier 10,000-fork
+   fixture under the committed fail-closed census and require exact guest clone
+   count, configured-fixed executor/vCPU creation, create/destroy closure, no
+   watchdog/drops/errors, and cleanup 0. Update the full Task 6 report with the
+   final exact artifact receipt; current partial signed evidence is not Task 6
+   completion.
+2. Task 7 remains pending: delete/isolate the welded/transitional HVPatch
+   adapter and close static callgraphs while preserving explicit non-HVPatch
+   backend paths. Run the required real cross-platform gates; cross-OS status is
+   currently user-deferred and **UNVERIFIED**.
+3. Task 8 remains pending: exact-artifact correctness, closure, containment,
+   full conformance, and performance. The last valid fork/wait measurement was
+   6.88x the native-arm64 Docker oracle; the required <=2.0x result is
+   **UNPROVEN**. Do not begin final performance acceptance until correctness and
+   gate integrity close.
+
+The full user objective remains active. No push was performed. Integration to
+local `main`, post-fast-forward gates, and the required `main...branch = 0 0`
+receipt are the immediate session cutoff after this handoff commit.
+
+## PREVIOUS STATE — session 2026-08-19 (seventh).
 
 **The probe gate is GREEN for the first time: 0 failures, was 3.** Three fixes
 landed this session, each red-first and each with `just ci` green.
