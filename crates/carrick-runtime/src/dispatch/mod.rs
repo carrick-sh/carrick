@@ -956,7 +956,6 @@ impl std::ops::Deref for WaitFds {
     }
 }
 
-#[allow(dead_code)]
 const MAX_GUEST_PATH: usize = 4096;
 
 fn threaded_independent_dispatch_supports(number: u64) -> bool {
@@ -3835,7 +3834,6 @@ impl SyscallDispatcher {
     /// Shared kernel objects (open descriptions, filesystem namespace, network)
     /// stay shared; fd numbers, signals, credentials, memory metadata, and
     /// process controls become independent child state.
-    #[allow(dead_code)]
     pub(crate) fn fork_clone_in_process(
         &self,
         _parent_tid: crate::thread::ThreadId,
@@ -8421,7 +8419,6 @@ impl HostSyscallResult for i64 {
         }
     }
 }
-#[allow(dead_code)]
 pub mod linux_errno {
     pub use crate::linux_abi::{
         LINUX_E2BIG as E2BIG, LINUX_EACCES as EACCES, LINUX_EADDRINUSE as EADDRINUSE,
@@ -8458,7 +8455,6 @@ pub mod linux_errno {
 
 // ----- AF_NETLINK (rtnetlink) synthesis -----------------------------------
 
-#[allow(dead_code)]
 /// Linux `NLMSG_ALIGNTO` — netlink messages and attributes are 4-byte aligned.
 const NLMSG_ALIGNTO: usize = 4;
 

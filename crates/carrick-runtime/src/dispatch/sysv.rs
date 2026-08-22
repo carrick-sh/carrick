@@ -4332,11 +4332,6 @@ mod ipc_set_tests {
             self.set.values.lock()[semnum as usize] += 1;
             self.set.changed.notify_all();
         }
-
-        #[allow(dead_code)]
-        fn remove(&self) {
-            self.set.changed.notify_all();
-        }
     }
 
     fn sembuf_bytes(sops: &[LinuxSembuf]) -> Vec<u8> {
