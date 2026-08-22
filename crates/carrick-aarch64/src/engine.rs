@@ -1798,12 +1798,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         self.vm.begin_exec_inventory(retired, replacement)
     }
 
-    fn take_exec_inventory(
-        &mut self,
-    ) -> Option<(
-        Option<carrick_hal::FrameInventoryCommit<()>>,
-        carrick_hal::FrameInventoryCommit<()>,
-    )> {
+    fn take_exec_inventory(&mut self) -> Option<carrick_hal::ExecInventoryCommits> {
         self.vm.take_exec_inventory()
     }
 
@@ -2497,6 +2492,21 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn take_retirement_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
         self.vm.take_retirement_inventory()
+    }
+
+    fn apply_exec_inventory(
+        &mut self,
+        replacement_mm: u64,
+        apply: &mut dyn FnMut(
+            carrick_hal::FrameInventoryCommit<()>,
+        )
+            -> Result<carrick_hal::FrameInventoryApplyReceipt, TrapError>,
+    ) -> Result<bool, TrapError> {
+        self.vm.apply_exec_inventory(replacement_mm, apply)
+    }
+
+    fn activate_exec_inventory(&mut self) -> Result<(), TrapError> {
+        self.vm.activate_exec_inventory()
     }
 
     type Arch = carrick_hal::Aarch64GuestArch;

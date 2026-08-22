@@ -46,6 +46,7 @@ fn exec_regions_to_verify(
 /// retirement transaction to apply. Its reservation is released by the caller's
 /// `InventoryAbandon` guard. An absent retirement is not the same as an empty
 /// one — the authority rejects a zero-event commit outright.
+#[cfg_attr(not(test), allow(dead_code))]
 fn apply_exec_inventory<E>(
     old_mm: crate::kernel::MmId,
     replacement_mm: crate::kernel::MmId,
@@ -1135,7 +1136,7 @@ where
         // frame-inventory authority lock.
         drop(_hvpatch_topology);
         if let Some(process) = kernel.hvpatch_process.as_ref() {
-            let Some((retired_commit, replacement_commit)) =
+            let Some((retired_commit, fallback_replacement_commit)) =
                 backend_publication_gate.take_after_replace(|| engine.take_exec_inventory())
             else {
                 return Self::exec_failed_past_no_return(
@@ -1145,27 +1146,66 @@ where
                 )
                 .map(Some);
             };
-            if let Err(error) = apply_exec_inventory(
-                old_mm_id,
-                replacement_mm_id,
-                retired_commit,
-                replacement_commit,
-                |mm, commit| {
+            if let Some(retired_commit) = retired_commit {
+                if let Err(error) = process
+                    .kernel_graph()
+                    .frame_inventory()
+                    .apply(old_mm_id, retired_commit)
+                {
+                    return Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        &format!(
+                            "apply HVPatch exec retirement frame inventory for old mm {old_mm_id:?}: {error}"
+                        ),
+                    )
+                    .map(Some);
+                }
+            }
+            let mut applied_by_authority = false;
+            if let Err(error) =
+                engine.apply_exec_inventory(replacement_mm_id.raw(), &mut |commit| {
+                    applied_by_authority = true;
                     process
                         .kernel_graph()
                         .frame_inventory()
-                        .apply(mm, commit)
-                        .map(|_| ())
-                },
-            ) {
+                        .apply_with_receipt(replacement_mm_id, commit)
+                        .map(|(_, receipt)| receipt)
+                        .map_err(|error| crate::trap::TrapError::Hypervisor(error.to_string()))
+                })
+            {
                 return Self::exec_failed_past_no_return(
-                            kernel,
-                            engine,
-                            &format!(
-                                "apply HVPatch exec frame inventory for old mm {old_mm_id:?} and replacement mm {replacement_mm_id:?}: {error}"
-                            ),
-                        )
-                        .map(Some);
+                    kernel,
+                    engine,
+                    &format!(
+                        "apply HVPatch exec replacement authority for replacement mm {replacement_mm_id:?}: {error}"
+                    ),
+                )
+                .map(Some);
+            }
+            if !applied_by_authority {
+                let Some(replacement_commit) = fallback_replacement_commit else {
+                    return Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        "HVPatch fallback replacement frame inventory commit missing",
+                    )
+                    .map(Some);
+                };
+                if let Err(error) = process
+                    .kernel_graph()
+                    .frame_inventory()
+                    .apply(replacement_mm_id, replacement_commit)
+                {
+                    return Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        &format!(
+                            "apply HVPatch exec replacement frame inventory for replacement mm {replacement_mm_id:?}: {error}"
+                        ),
+                    )
+                    .map(Some);
+                }
             }
         }
         let old_files = prepared_kernel_exec.old_file_table();
@@ -1318,6 +1358,14 @@ where
                     asid: binding.asid.raw(),
                 },
             );
+            if let Err(error) = engine.activate_exec_inventory() {
+                return Self::exec_failed_past_no_return(
+                    kernel,
+                    engine,
+                    &format!("activate HVPatch exec authority: {error}"),
+                )
+                .map(Some);
+            }
         }
         emit_runtime_stage(
             carrick_observability::probes::HvpatchExecRuntimeStagePhase::EngineReplace,

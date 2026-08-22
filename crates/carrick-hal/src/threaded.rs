@@ -1392,6 +1392,20 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     fn take_retirement_inventory(&mut self) -> Option<crate::FrameInventoryCommit<()>> {
         None
     }
+
+    fn apply_exec_inventory(
+        &mut self,
+        _replacement_mm: u64,
+        _apply: &mut dyn FnMut(
+            crate::FrameInventoryCommit<()>,
+        ) -> Result<crate::FrameInventoryApplyReceipt, TrapError>,
+    ) -> Result<bool, TrapError> {
+        Ok(false)
+    }
+
+    fn activate_exec_inventory(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
     /// The guest CPU ISA this engine runs. Fixed per process (the guest ISA
     /// equals the host ISA), so it is an associated type — monomorphized per
     /// ISA, no syscall-hot-path vtable. Aarch64 today; x86_64 in Phase 2.

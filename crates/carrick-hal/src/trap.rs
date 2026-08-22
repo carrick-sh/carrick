@@ -62,6 +62,13 @@ impl From<OsError> for TrapError {
     }
 }
 
+/// The replacement commit is mandatory; the retirement half mirrors the
+/// `begin_exec_inventory` reservation and is absent for a retained old mm.
+pub type ExecInventoryCommits = (
+    Option<crate::FrameInventoryCommit<()>>,
+    Option<crate::FrameInventoryCommit<()>>,
+);
+
 /// The trap-engine contract the runtime loop drives: run the vCPU until a
 /// syscall trap, complete/inject/restore around guest syscalls and signals,
 /// and fork/execve the guest address space. Implemented by `HvfTrapEngine`
@@ -150,12 +157,7 @@ pub trait SyscallTrap {
 
     /// The replacement commit is mandatory; the retirement half mirrors the
     /// `begin_exec_inventory` reservation and is absent for a retained old mm.
-    fn take_exec_inventory(
-        &mut self,
-    ) -> Option<(
-        Option<crate::FrameInventoryCommit<()>>,
-        crate::FrameInventoryCommit<()>,
-    )> {
+    fn take_exec_inventory(&mut self) -> Option<ExecInventoryCommits> {
         None
     }
     /// Run the vCPU until it traps. `Ok(Some(raw))` is a guest syscall, already
