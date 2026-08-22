@@ -607,10 +607,20 @@ impl HvpatchRuntimeEndpoint {
         let Some(scheduler) = self.scheduler.as_ref() else {
             return Ok(false);
         };
+        let mut delivered = false;
         for thread in snapshot.threads() {
-            scheduler.wake(thread.key())?;
+            match scheduler.wake(thread.key()) {
+                Ok(_) => delivered = true,
+                Err(
+                    crate::kernel::scheduler::SchedulerError::Thread(
+                        crate::kernel::objects::ThreadExecutionError::InvalidTransition { .. },
+                    )
+                    | crate::kernel::scheduler::SchedulerError::UnknownThread,
+                ) => {}
+                Err(error) => return Err(error),
+            }
         }
-        Ok(true)
+        Ok(delivered)
     }
 }
 
@@ -904,8 +914,8 @@ impl HvpatchRuntimeDirectory {
         // and host-wait enrollment when publication occurs; always nudge every
         // wait vehicle so it rechecks the authoritative graph even when SIGCHLD
         // is ignored or blocked.
-        let published = signal_context.task().publish_wake_subscriptions();
-        if !published && let Err(error) = endpoint.wake_scheduler_exact(&signal_snapshot) {
+        let _ = signal_context.task().publish_wake_subscriptions();
+        if let Err(error) = endpoint.wake_scheduler_exact(&signal_snapshot) {
             tracing::error!(parent = ?parent, %error, "authoritative scheduler wake rejected");
         }
     }

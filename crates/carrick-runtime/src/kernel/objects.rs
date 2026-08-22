@@ -4766,6 +4766,11 @@ impl Thread {
                 let generation = predecessor
                     .next()
                     .ok_or(ThreadExecutionError::GenerationExhausted)?;
+                if let Some(continuation) = execution.blocked_continuation.as_ref() {
+                    continuation.publish_ready_event(
+                        crate::vcpu_loop::continuation::ContinuationEvent::Ready,
+                    );
+                }
                 execution.state = ThreadExecutionState::Runnable { generation };
                 ThreadSchedulerAction::Queue {
                     key: self.key,
@@ -5308,6 +5313,11 @@ impl Thread {
                     execution.task_state = lease.task_state.take();
                     execution.blocked_continuation = lease.blocked_continuation.take();
                     if wake_pending {
+                        if let Some(continuation) = execution.blocked_continuation.as_ref() {
+                            continuation.publish_ready_event(
+                                crate::vcpu_loop::continuation::ContinuationEvent::Ready,
+                            );
+                        }
                         execution.state = ThreadExecutionState::Runnable { generation };
                         action = ThreadSchedulerAction::Queue {
                             key: self.key,
@@ -5329,9 +5339,10 @@ impl Thread {
                 ExecutionSettlement::BlockedContinuation(reason, continuation) => {
                     execution.task_state = lease.task_state.take();
                     let continuation_id = continuation.id();
-                    execution.blocked_continuation = Some(continuation);
-                    let _ = lease.blocked_continuation.take();
                     if wake_pending {
+                        continuation.publish_ready_event(
+                            crate::vcpu_loop::continuation::ContinuationEvent::Ready,
+                        );
                         execution.state = ThreadExecutionState::Runnable { generation };
                         action = ThreadSchedulerAction::Queue {
                             key: self.key,
@@ -5346,6 +5357,8 @@ impl Thread {
                             continuation: Some(continuation_id),
                         };
                     }
+                    execution.blocked_continuation = Some(continuation);
+                    let _ = lease.blocked_continuation.take();
                 }
                 ExecutionSettlement::Exited => {
                     execution.task_state = None;
