@@ -105,6 +105,63 @@ the four places the plan's task lists were WRONG about what is dead.
 | `74f425289` | **unmasked defect 4's real cause** |
 | `0d19ed2d7` | restored the guest-fault probes the port dropped |
 
+### DEFECT 4 IS FIXED (`c74d9c7a1`)
+
+It was an ORDERING bug, not a missing authority transition. Peeled in three
+commits, each of which had to land before the next was visible:
+
+1. `74f425289` — the abort inside `HvpatchTaskMmAuthority::drop` was masking the
+   error that caused it. `retire_detached_address_space` propagates with `?`,
+   which drops the binding on the way out.
+2. `6661bd514` — "does not cover exact current HVPatch MM ledger" could not
+   distinguish an EMPTY ledger from a MISMATCHED one. Named, it read
+   `ledger=0 commit=16 ledger_only=[] commit_only=[MappingId(69), ...]`.
+3. `c74d9c7a1` — the fix. `stage_retirement` pushes one `UnmapMapping` per
+   extent and then does `inventory.extents.clear()`; the authority then
+   authenticates the commit against that same (now empty) ledger, because
+   `HvfTaskState::frame_inventory` and `Active { ledger }` share one `Arc`.
+   On the task-only path the check could never pass. `stage_retirement` now
+   records the owned set into `HvpatchFrameInventory::retirement_expected` in
+   the same critical section that clears it, and `prepare_retirement`
+   authenticates against that.
+
+Measured on a freshly signed binary, two uncontended samples agreeing:
+
+| | before | after |
+|---|---:|---:|
+| carrier aborts, 15-probe fork battery | 15/15 | **5/15** |
+| total guest output | 1 line | **55 lines** |
+
+`forkcow` now prints `data_isolated=true bss_isolated=true heap_isolated=true
+mmap_isolated=true` — COW fork isolation was already correct and simply never
+observable. `forkfiletable` 9 lines, `mqnotifycrossproc` 16, `clone3args` 14.
+
+**Beware contention when you measure this.** A battery run while two other
+compiles were live reported 7/15 aborts and 38 lines; uncontended it is 5/15 and
+55 twice over. Quote an uncontended sample.
+
+### The NEXT defect, already isolated
+
+The eight probes that no longer abort fail later and reportably:
+
+    HVPatch process job failed error=trap engine failed: hypervisor operation
+    failed: process child identity bootstrap: guest memory read is out of bounds
+    at 0x2d001e4000 for 4 bytes
+
+That is `stamp_identity_page` inside `bootstrap_hvpatch_process_child`
+(`vcpu_loop/mod.rs:2941`). `0x2d001e4000` is a high address with the shape of a
+stage-1 / global-frame IPA rather than the child's semantic guest VA — i.e. the
+domain confusion `AGENTS.md` names ("never feed one domain back into a lookup
+for another; authenticate through the live stage-1 translation and the exact
+current owner generation"). Start there.
+
+Five probes still abort — `clonebasic`, `waitexitstorm`, `waitidsiuid`,
+`sigchld`, `execpipe` — so at least one more retirement path reaches the drop
+with a live inventory. Their `kernel_mm` differs from the fixed path's, which is
+the thread to pull.
+
+### THE ORIGINAL FINDING (kept for its method)
+
 ### THE FINDING THAT MATTERS MOST: defect 4's real cause
 
 The previous checkpoint recorded defect 4 as "a forked child's terminal never
@@ -208,8 +265,12 @@ reactor parked in `poll(-1)` forever. Reproduced 3/3 as a full-suite hang at
 
 ### Gate state — measured, not assumed
 
-`RUST_TEST_THREADS=1 just ci` exits **101**, stopping at **clippy**, which now
-reports **~96 errors, almost all `dead_code`** produced by the deletion. That is
+`RUST_TEST_THREADS=1 just ci` exits **101**, stopping at **clippy**, which
+reports **97 errors, almost all `dead_code`** produced by the deletion. Note that
+the `dispatch/**` dead-code sweep (`506ef7db`, 196 deletions) did NOT move that
+number and was never going to: everything it removed was already SUPPRESSED by an
+`#[allow(dead_code)]`, so deleting it changes hygiene, not the gate. The 97 live
+in `vcpu_loop/`, `kernel/` and `hvpatch/` — the orphans Phase 1 created. That is
 the next gate blocker and it is NOT a mechanical sweep — see below. Everything
 after clippy (lint-domains, deny, check-matrix, check, doc, test,
 test-integration) is still UNVERIFIED end to end, though the runtime library
@@ -287,11 +348,11 @@ rename plus a typed distinction — a domain-modelling task of the kind
 
 ### Next work, in order
 
-1. **Fix defect 4** from its real cause: diff `expected_mappings` against
-   `committed_unmaps` in `prepare_retirement` for a forked child. This gates
-   almost everything else — 15 fork probes, the two reducers, the core-dump
-   triage, and any meaningful conformance measurement.
-2. **Then the two vfork+exec shutdown shapes**, and the `/bin/sh -c` reducer
+1. **The child identity-bootstrap OOB** described above — it now blocks eight of
+   the fifteen fork probes.
+2. **The five remaining MM-authority aborts** (`clonebasic`, `waitexitstorm`,
+   `waitidsiuid`, `sigchld`, `execpipe`).
+3. **Then the two vfork+exec shutdown shapes**, and the `/bin/sh -c` reducer
    (goal criterion 3).
 3. **Then the orphan triage**, symbol by symbol, verifying each agy verdict
    rather than trusting it. Port what is live; delete what is a corpse. This is
