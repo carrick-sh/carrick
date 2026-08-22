@@ -2140,8 +2140,13 @@ mod task_only_materializer_tests {
         assert!(!token_shape.contains("secret:"));
         assert!(!token_shape.contains("proof:"));
         assert!(!token_shape.contains("HvpatchChildKernelToken::from_kernel_authority"));
+        // The Default impl must stay test-only. The cfg is spelled as two
+        // attributes rather than `cfg(all(test, ...))` because clippy's
+        // `allow-unwrap-in-tests` does not recognize the nested form and lints
+        // test code as production; the two spellings are equivalent since cfg
+        // attributes AND.
         assert!(include_str!("trap.rs").contains(
-            "#[cfg(all(test, target_os = \"macos\", target_arch = \"aarch64\"))]\nimpl Default for HvpatchCarrierTaskStateDirectory"
+            "#[cfg(test)]\n#[cfg(all(target_os = \"macos\", target_arch = \"aarch64\"))]\nimpl Default for HvpatchCarrierTaskStateDirectory"
         ));
         let kernel_core = include_str!("../../carrick-runtime/src/kernel/core.rs");
         assert!(

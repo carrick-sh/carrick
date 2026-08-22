@@ -6794,7 +6794,6 @@ impl HvpatchTaskInventoryAuthority {
         }
     }
 
-    #[cfg(test)]
     fn phase_name(&self) -> &'static str {
         match self {
             Self::Absent => "absent",
@@ -6903,11 +6902,17 @@ impl Drop for HvpatchTaskMmAuthority {
         for receipt in self.alias_receipts.get_mut().drain(..).rev() {
             receipt.retire_exact();
         }
+        let phase = self.inventory.get_mut().phase_name();
+        let mm_root_slot = self.mm_root_slot;
+        let kernel_mm = *self.kernel_mm.get_mut();
         self.inventory
             .get_mut()
             .rollback_unpublished()
             .unwrap_or_else(|error| {
-                eprintln!("carrick: FATAL: drop HVPatch MM authority: {error}");
+                eprintln!(
+                    "carrick: FATAL: drop HVPatch MM authority \
+                     (phase={phase} mm_root_slot={mm_root_slot:?} kernel_mm={kernel_mm:?}): {error}"
+                );
                 std::process::abort();
             });
         #[cfg(test)]

@@ -3425,6 +3425,15 @@ pub(crate) trait PersistentQuantumJob: Send + 'static {
             "logical job has no detached address-space retirement authority".to_owned(),
         ))
     }
+
+    fn apply_detached_address_space_retirement_with_receipt(
+        &mut self,
+        _commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, crate::trap::TrapError> {
+        Err(crate::trap::TrapError::Hypervisor(
+            "logical job has no detached address-space retirement authority".to_owned(),
+        ))
+    }
 }
 
 pub(crate) struct HvpatchTaskQuantum {
@@ -3469,6 +3478,15 @@ impl HvpatchTaskQuantum {
         self.job
             .lock()
             .apply_detached_address_space_retirement(commit)
+    }
+
+    pub(crate) fn apply_detached_address_space_retirement_with_receipt(
+        &self,
+        commit: carrick_hal::FrameInventoryCommit<()>,
+    ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, crate::trap::TrapError> {
+        self.job
+            .lock()
+            .apply_detached_address_space_retirement_with_receipt(commit)
     }
 }
 
@@ -3662,9 +3680,13 @@ impl HvpatchTaskBinding {
                         "detached address-space cleanup backend type mismatch".to_owned(),
                     )
                 })?;
-            let commit = backend.retire_detached_address_space()?;
-            self.quantum
-                .apply_detached_address_space_retirement(commit)?;
+            backend.retire_detached_address_space_with(
+                |commit| {
+                    self.quantum
+                        .apply_detached_address_space_retirement_with_receipt(commit)
+                },
+                |commit| self.quantum.apply_detached_address_space_retirement(commit),
+            )?;
             drop(backend);
             Ok(())
         }
