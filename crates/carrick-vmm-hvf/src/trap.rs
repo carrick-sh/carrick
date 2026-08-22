@@ -863,6 +863,42 @@ mod task_only_carrier_directory_tests {
     }
 
     #[test]
+    fn only_a_non_owning_authority_reports_a_shared_process_inventory() {
+        let ledger = || Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+        // vfork / CLONE_VM: the ledger belongs to the process whose kernel mm
+        // this task shares. Retirement is the owner's job.
+        for shared in [
+            HvpatchTaskInventoryAuthority::SharedProcess { ledger: ledger() },
+            HvpatchTaskInventoryAuthority::SiblingShared { ledger: ledger() },
+        ] {
+            assert!(
+                shared.shares_another_process_inventory(),
+                "{}",
+                shared.phase_name()
+            );
+        }
+        // Owning phases retire their own ledger, and `Retired`/`Absent` must NOT
+        // report as shared — a second retirement of an owned ledger has to keep
+        // failing in `prepare_retirement` rather than being skipped here.
+        for owning in [
+            HvpatchTaskInventoryAuthority::Absent,
+            HvpatchTaskInventoryAuthority::Retired,
+            HvpatchTaskInventoryAuthority::ProcessPrepared {
+                ledger: ledger(),
+                staged: Vec::new(),
+                commit: None,
+                challenge: None,
+            },
+        ] {
+            assert!(
+                !owning.shares_another_process_inventory(),
+                "{}",
+                owning.phase_name()
+            );
+        }
+    }
+
+    #[test]
     fn shared_process_activation_has_no_process_inventory_transaction() {
         let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
         let mut shared = HvpatchTaskInventoryAuthority::SharedProcess {
@@ -6420,6 +6456,12 @@ impl HvpatchTaskOnlyBackendState {
             .apply_inventory(apply)
     }
 
+    pub(crate) fn shares_another_process_inventory(&self) -> bool {
+        self.registration
+            .as_ref()
+            .is_some_and(|registration| registration.shares_another_process_inventory())
+    }
+
     pub(crate) fn prepare_inventory_retirement(
         &self,
         commit: carrick_hal::FrameInventoryCommit<()>,
@@ -6882,9 +6924,16 @@ impl HvpatchTaskInventoryAuthority {
                 });
                 Ok(())
             }
-            _ => Err(TrapError::Hypervisor(
-                "HVPatch inventory retirement is duplicate or not active".to_owned(),
-            )),
+            // Name the phase. "duplicate or not active" covers six distinct
+            // states that call for different fixes: `retired` means a second
+            // retirement path reached the same authority, while `prepared` or
+            // `inventory_published` means retirement raced ahead of activation.
+            other => {
+                let phase = other.phase_name();
+                Err(TrapError::Hypervisor(format!(
+                    "HVPatch inventory retirement is duplicate or not active (phase={phase})"
+                )))
+            }
         }
     }
 
@@ -7003,6 +7052,25 @@ impl HvpatchTaskInventoryAuthority {
         }
     }
 
+    /// Does this task merely SHARE another process's frame-inventory ledger?
+    ///
+    /// A vfork/`CLONE_VM` task is published `SharedProcess` (or `SiblingShared`)
+    /// because its kernel mm belongs to another process. `activate` and
+    /// `rollback_unpublished` already treat those phases as having nothing of
+    /// their own to publish or roll back, and retirement is the same: the OWNER
+    /// retires the ledger. Staging a retirement from a shared ledger would unmap
+    /// the owner's live mappings.
+    ///
+    /// `Retired` and `Absent` are deliberately NOT folded in here. A second
+    /// retirement of an OWNED ledger must keep being refused by
+    /// `prepare_retirement`, not silently skipped.
+    fn shares_another_process_inventory(&self) -> bool {
+        matches!(
+            self,
+            Self::SiblingShared { .. } | Self::SharedProcess { .. }
+        )
+    }
+
     fn phase_name(&self) -> &'static str {
         match self {
             Self::Absent => "absent",
@@ -7067,6 +7135,10 @@ impl HvpatchTaskMmAuthority {
 
     fn activate(&self) -> Result<(), TrapError> {
         self.inventory.lock().activate(&self.pending_receipts)
+    }
+
+    fn shares_another_process_inventory(&self) -> bool {
+        self.inventory.lock().shares_another_process_inventory()
     }
 
     fn prepare_retirement(
@@ -7725,6 +7797,12 @@ impl HvpatchTaskRegistration {
             .as_ref()
             .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?
             .apply_inventory(apply)
+    }
+
+    fn shares_another_process_inventory(&self) -> bool {
+        self.task_mm
+            .as_ref()
+            .is_some_and(|task_mm| task_mm.shares_another_process_inventory())
     }
 
     fn prepare_inventory_retirement(
