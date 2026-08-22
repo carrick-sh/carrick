@@ -1050,37 +1050,88 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// Invalidate one numeric ASID on this exact owner-thread vCPU. The strong
     /// software generation is authenticated by the runtime command; hardware
     /// consumes only the architectural 16-bit ASID operand in x0[63:48].
-    pub fn invalidate_asid_on_vcpu(vcpu: &mut V::Vcpu, asid: u16) -> Result<(), TrapError> {
+    pub fn invalidate_asid_on_vcpu(
+        vcpu: &mut V::Vcpu,
+        asid: u16,
+        carrier_maintenance_root: carrick_mem::memory::CarrierMaintenanceRoot,
+    ) -> Result<(), TrapError> {
         if asid == 0 {
             return Err(TrapError::Hypervisor(
                 "refusing to invalidate reserved ASID zero".to_owned(),
             ));
         }
         const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
-        let saved_pc = vcpu.get_reg(Reg::Pc)?;
-        let saved_pstate = vcpu.get_reg(Reg::Pstate)?;
-        let saved_elr = vcpu.get_reg(Reg::ElrEl1)?;
-        let saved_spsr = vcpu.get_reg(Reg::SpsrEl1)?;
-        let saved_x0 = vcpu.get_reg(Reg::X(0))?;
+        let saved_pc = vcpu.get_reg(Reg::Pc).map_err(|e| {
+            TrapError::Hypervisor(format!("save PC for scoped EL1 ASID maintenance: {e}"))
+        })?;
+        let saved_pstate = vcpu.get_reg(Reg::Pstate).map_err(|e| {
+            TrapError::Hypervisor(format!("save PSTATE for scoped EL1 ASID maintenance: {e}"))
+        })?;
+        let saved_elr = vcpu.get_reg(Reg::ElrEl1).map_err(|e| {
+            TrapError::Hypervisor(format!("save ELR_EL1 for scoped EL1 ASID maintenance: {e}"))
+        })?;
+        let saved_spsr = vcpu.get_reg(Reg::SpsrEl1).map_err(|e| {
+            TrapError::Hypervisor(format!(
+                "save SPSR_EL1 for scoped EL1 ASID maintenance: {e}"
+            ))
+        })?;
+        let saved_x0 = vcpu.get_reg(Reg::X(0)).map_err(|e| {
+            TrapError::Hypervisor(format!("save X0 for scoped EL1 ASID maintenance: {e}"))
+        })?;
+        let saved_ttbr0 = vcpu.get_sys_reg(carrick_hal::SysReg::Ttbr0).map_err(|e| {
+            TrapError::Hypervisor(format!("save TTBR0 for scoped EL1 ASID maintenance: {e}"))
+        })?;
 
-        vcpu.set_reg(Reg::X(0), u64::from(asid) << 48)?;
-        vcpu.set_reg(Reg::Pc, HVPATCH_EL1_ASID_MAINT_BASE)?;
-        vcpu.set_reg(Reg::Pstate, AARCH64_PSTATE_EL1H_DAIF_MASKED)?;
+        let maint_ttbr0 = carrier_maintenance_root.raw();
+        vcpu.set_sys_reg(carrick_hal::SysReg::Ttbr0, maint_ttbr0)
+            .map_err(|e| {
+                TrapError::Hypervisor(format!(
+                    "install carrier root into TTBR0 for scoped EL1 ASID maintenance: {e}"
+                ))
+            })?;
+        vcpu.set_reg(Reg::X(0), u64::from(asid) << 48)
+            .map_err(|e| {
+                TrapError::Hypervisor(format!("set X0 for scoped EL1 ASID maintenance: {e}"))
+            })?;
+        vcpu.set_reg(Reg::Pc, HVPATCH_EL1_ASID_MAINT_BASE)
+            .map_err(|e| {
+                TrapError::Hypervisor(format!("set PC for scoped EL1 ASID maintenance: {e}"))
+            })?;
+        vcpu.set_reg(Reg::Pstate, AARCH64_PSTATE_EL1H_DAIF_MASKED)
+            .map_err(|e| {
+                TrapError::Hypervisor(format!("set PSTATE for scoped EL1 ASID maintenance: {e}"))
+            })?;
+
         // Fail closed if the entry state did not take. A live failure reported
         // `EL0Fault(esr=0x82000086 elr=far=LINUX_EL1_ASID_MAINT_BASE)` — EC 0x20
         // is "instruction abort from a LOWER EL", i.e. the trampoline was
         // fetched at EL0, where the EL1-only kernel hole is not mapped. Reading
         // the entry state back says whether the writes above landed, which
         // separates "PSTATE never took" from "something reset it mid-run".
-        let entry_pc = vcpu.get_reg(Reg::Pc)?;
-        let entry_pstate = vcpu.get_reg(Reg::Pstate)?;
+        let entry_pc = vcpu.get_reg(Reg::Pc).map_err(|e| {
+            TrapError::Hypervisor(format!(
+                "verify entry PC for scoped EL1 ASID maintenance: {e}"
+            ))
+        })?;
+        let entry_pstate = vcpu.get_reg(Reg::Pstate).map_err(|e| {
+            TrapError::Hypervisor(format!(
+                "verify entry PSTATE for scoped EL1 ASID maintenance: {e}"
+            ))
+        })?;
+        let entry_ttbr0 = vcpu.get_sys_reg(carrick_hal::SysReg::Ttbr0).map_err(|e| {
+            TrapError::Hypervisor(format!(
+                "verify entry TTBR0 for scoped EL1 ASID maintenance: {e}"
+            ))
+        })?;
         if entry_pc != HVPATCH_EL1_ASID_MAINT_BASE
             || entry_pstate != AARCH64_PSTATE_EL1H_DAIF_MASKED
+            || entry_ttbr0 != maint_ttbr0
         {
             return Err(TrapError::Hypervisor(format!(
                 "scoped EL1 ASID maintenance entry state did not take: \
                  pc={entry_pc:#x}/{HVPATCH_EL1_ASID_MAINT_BASE:#x} \
-                 pstate={entry_pstate:#x}/{AARCH64_PSTATE_EL1H_DAIF_MASKED:#x}"
+                 pstate={entry_pstate:#x}/{AARCH64_PSTATE_EL1H_DAIF_MASKED:#x} \
+                 ttbr0={entry_ttbr0:#x}/{maint_ttbr0:#x}"
             )));
         }
         let result = loop {
@@ -1098,9 +1149,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     let sctlr = sysreg(carrick_hal::SysReg::Sctlr);
                     break Err(TrapError::UnexpectedExit {
                         reason: format!(
-                            "{} during scoped EL1 ASID maintenance \
-                             (asid={asid:#x} ttbr0={ttbr0:#x} ttbr1={ttbr1:#x} sctlr={sctlr:#x})",
-                            maintenance_exit_detail(&other)
+                            "{} during scoped EL1 ASID maintenance: EL1 maintenance faulted on the carrier maintenance root \
+                             (asid={asid:#x} carrier_root={:#x} ttbr0={ttbr0:#x} ttbr1={ttbr1:#x} sctlr={sctlr:#x})",
+                            maintenance_exit_detail(&other),
+                            carrier_maintenance_root.raw(),
                         ),
                     });
                 }
@@ -1108,11 +1160,42 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             }
         };
 
-        vcpu.set_reg(Reg::Pc, saved_pc)?;
-        vcpu.set_reg(Reg::Pstate, saved_pstate)?;
-        vcpu.set_reg(Reg::ElrEl1, saved_elr)?;
-        vcpu.set_reg(Reg::SpsrEl1, saved_spsr)?;
-        vcpu.set_reg(Reg::X(0), saved_x0)?;
+        let restore_ttbr0 = vcpu
+            .set_sys_reg(carrick_hal::SysReg::Ttbr0, saved_ttbr0)
+            .map_err(|e| {
+                TrapError::Hypervisor(format!(
+                    "restore TTBR0 after scoped EL1 ASID maintenance: {e}"
+                ))
+            });
+        let restore_pc = vcpu.set_reg(Reg::Pc, saved_pc).map_err(|e| {
+            TrapError::Hypervisor(format!("restore PC after scoped EL1 ASID maintenance: {e}"))
+        });
+        let restore_pstate = vcpu.set_reg(Reg::Pstate, saved_pstate).map_err(|e| {
+            TrapError::Hypervisor(format!(
+                "restore PSTATE after scoped EL1 ASID maintenance: {e}"
+            ))
+        });
+        let restore_elr = vcpu.set_reg(Reg::ElrEl1, saved_elr).map_err(|e| {
+            TrapError::Hypervisor(format!(
+                "restore ELR_EL1 after scoped EL1 ASID maintenance: {e}"
+            ))
+        });
+        let restore_spsr = vcpu.set_reg(Reg::SpsrEl1, saved_spsr).map_err(|e| {
+            TrapError::Hypervisor(format!(
+                "restore SPSR_EL1 after scoped EL1 ASID maintenance: {e}"
+            ))
+        });
+        let restore_x0 = vcpu.set_reg(Reg::X(0), saved_x0).map_err(|e| {
+            TrapError::Hypervisor(format!("restore X0 after scoped EL1 ASID maintenance: {e}"))
+        });
+
+        restore_ttbr0?;
+        restore_pc?;
+        restore_pstate?;
+        restore_elr?;
+        restore_spsr?;
+        restore_x0?;
+
         result
     }
 
@@ -1153,15 +1236,27 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     fn run_stage1_maintenance_on(
         vcpu: &mut V::Vcpu,
         process_asid: Option<u16>,
+        carrier_maintenance_root: Option<carrick_mem::memory::CarrierMaintenanceRoot>,
     ) -> Result<(), TrapError> {
         match process_asid {
-            Some(asid) => Self::invalidate_asid_on_vcpu(vcpu, asid),
+            Some(asid) => {
+                let root = carrier_maintenance_root.ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "AArch64 VMM does not expose a carrier maintenance root".to_owned(),
+                    )
+                })?;
+                Self::invalidate_asid_on_vcpu(vcpu, asid, root)
+            }
             None => Self::run_el1_maintenance_on(vcpu),
         }
     }
 
     fn run_stage1_maintenance(&mut self) -> Result<(), TrapError> {
-        Self::run_stage1_maintenance_on(&mut self.vcpu, self.process_asid)
+        Self::run_stage1_maintenance_on(
+            &mut self.vcpu,
+            self.process_asid,
+            self.vm.carrier_maintenance_root().ok(),
+        )
     }
 
     fn ensure_frame_cow_write(
@@ -1174,7 +1269,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;
         let process_asid = self.process_asid;
-        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid);
+        let carrier_root = vm.carrier_maintenance_root().ok();
+        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid, carrier_root);
         vm.ensure_frame_cow_write(va, len, intent, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch frame COW: {error}")))
     }
@@ -1203,7 +1299,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;
         let process_asid = self.process_asid;
-        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid);
+        let carrier_root = vm.carrier_maintenance_root().ok();
+        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid, carrier_root);
         vm.ensure_sparse_mmap_backing(va, len, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch sparse mmap backing: {error}")))
     }
@@ -2434,7 +2531,8 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;
         let process_asid = self.process_asid;
-        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid);
+        let carrier_root = vm.carrier_maintenance_root().ok();
+        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid, carrier_root);
         vm.refresh_fork_process_state(&mut flush)?;
         vm.refresh_vcpu_after_frame_cow(vcpu)
     }
@@ -2458,7 +2556,8 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let vm = &mut self.vm;
         let vcpu = &mut self.vcpu;
         let process_asid = self.process_asid;
-        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid);
+        let carrier_root = vm.carrier_maintenance_root().ok();
+        let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid, carrier_root);
         let ttbr0 = fault_page_tables.map_or(0, |(ttbr, _)| ttbr);
         let handled = vm.resolve_frame_cow_fault(syndrome, far, ttbr0, &mut flush)?;
         if handled {

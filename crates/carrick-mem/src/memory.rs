@@ -97,7 +97,7 @@ use crate::linux_abi::{
     LINUX_AT_SECURE, LINUX_AT_UID, LINUX_PAGE_SIZE, LinuxAuxvEntry, align_down_u64,
     align_down_usize, align_up_u64,
 };
-use carrick_guest_mem::{GuestMemory, MemoryError};
+use carrick_guest_mem::{Gpa, GuestMemory, MemoryError};
 use serde::Serialize;
 use thiserror::Error;
 use zerocopy::IntoBytes;
@@ -235,6 +235,36 @@ const _: () = assert!(
     (LINUX_SYSCALL_MAILBOX_BASE - LINUX_KERNEL_REGION_BASE) + LINUX_SYSCALL_MAILBOX_ARENA_SIZE
         <= 0x20_0000
 );
+
+/// Carrick's carrier-owned stage-1 root table for scoped EL1 ASID maintenance.
+/// Sits immediately following the syscall mailbox arena in the first 2 MiB kernel hole.
+pub const LINUX_CARRIER_MAINT_ROOT_BASE: u64 =
+    LINUX_SYSCALL_MAILBOX_BASE + LINUX_SYSCALL_MAILBOX_ARENA_SIZE;
+pub const LINUX_CARRIER_MAINT_ROOT_SIZE: u64 = 0x4000;
+const _: () = assert!(LINUX_CARRIER_MAINT_ROOT_BASE.is_multiple_of(0x4000));
+const _: () = assert!(
+    (LINUX_CARRIER_MAINT_ROOT_BASE - LINUX_KERNEL_REGION_BASE) + LINUX_CARRIER_MAINT_ROOT_SIZE
+        <= 0x20_0000,
+    "carrier maintenance root escapes the kernel-only first 2 MiB block",
+);
+
+/// A carrier-owned Stage-1 translation root dedicated to EL1 maintenance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CarrierMaintenanceRoot(pub Gpa);
+
+impl CarrierMaintenanceRoot {
+    pub const fn new(gpa: Gpa) -> Self {
+        Self(gpa)
+    }
+
+    pub const fn gpa(self) -> Gpa {
+        self.0
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0.0
+    }
+}
 // Field byte offsets within the per-process identity page (one little-endian
 // u32 each). Credentials are deliberately absent: Linux credentials may diverge
 // per thread, while this page is shared by every vCPU in the process.
@@ -1655,6 +1685,51 @@ impl AddressSpace {
         Ok(image)
     }
 
+    /// Append the carrier-owned stage-1 maintenance root page tables region.
+    pub fn with_carrier_maintenance_root(self) -> Result<Self, AddressSpaceError> {
+        let start = LINUX_CARRIER_MAINT_ROOT_BASE;
+        let end = start.checked_add(LINUX_CARRIER_MAINT_ROOT_SIZE).ok_or(
+            AddressSpaceError::RegionOverflow {
+                start,
+                size: LINUX_CARRIER_MAINT_ROOT_SIZE,
+            },
+        )?;
+        let region = MemoryRegion {
+            start,
+            end,
+            perms: SegmentPerms {
+                read: true,
+                write: true,
+                execute: false,
+            },
+            shared: false,
+            bytes: stage1_carrier_maintenance_page_tables().into(),
+        };
+
+        let AddressSpace {
+            entry,
+            regions,
+            initial_stack_pointer,
+            linux_auxv,
+            linux_auxv_image,
+            el0_trampoline_entry,
+            el1_vectors_base,
+            stage1_page_tables_base,
+            ro_spans,
+            file_mappings,
+        } = self;
+        let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        image.initial_stack_pointer = initial_stack_pointer;
+        image.linux_auxv = linux_auxv;
+        image.linux_auxv_image = linux_auxv_image;
+        image.el0_trampoline_entry = el0_trampoline_entry;
+        image.el1_vectors_base = el1_vectors_base;
+        image.stage1_page_tables_base = stage1_page_tables_base;
+        image.ro_spans = ro_spans;
+        image.file_mappings = file_mappings;
+        Ok(image)
+    }
+
     /// Append the stage-1 identity-mapping page tables region. The vCPU
     /// uses these so EL0/EL1 data accesses are tagged as Normal cacheable
     /// memory (required for `ldaxr`/`stlxr`).
@@ -2738,6 +2813,45 @@ pub fn stage1_hvpatch_page_tables() -> Vec<u8> {
     let mut bytes = stage1_identity_page_tables();
     let mut visited = vec![false; bytes.len() / TABLE_BYTES];
     scope_table(&mut bytes, 0, 0, &mut visited);
+    bytes
+}
+
+/// Build the carrier-owned stage-1 translation root for scoped EL1 maintenance.
+///
+/// Translates the kernel hole (`LINUX_KERNEL_REGION_BASE`, covering the EL1 maintenance
+/// trampoline, vectors, and mailbox) with `KERNEL_BLOCK_FLAGS | NON_GLOBAL`.
+pub fn stage1_carrier_maintenance_page_tables() -> Vec<u8> {
+    const NON_GLOBAL: u64 = 1 << 11;
+    const KERNEL_BLOCK_FLAGS: u64 = ((1u64 << 54) | (1 << 10) | (0b11 << 8)) | 0b01;
+    const PA_MASK_2MIB: u64 = 0x0000_FFFF_FFE0_0000;
+
+    let size = LINUX_CARRIER_MAINT_ROOT_SIZE as usize;
+    let mut bytes = vec![0_u8; size];
+
+    let root_pa = LINUX_CARRIER_MAINT_ROOT_BASE;
+    let l1_pa = root_pa + 0x1000;
+    let l2_pa = root_pa + 0x2000;
+
+    let table_descriptor = |next_pa: u64| -> u64 { (next_pa & 0x0000_FFFF_FFFF_F000) | 0b11 };
+
+    // Page 0 (0x0000..0x1000): L0 table.
+    // L0[0] covers 0..512 GiB, points to L1 table.
+    bytes[0..8].copy_from_slice(&table_descriptor(l1_pa).to_le_bytes());
+
+    // Page 1 (0x1000..0x2000): L1 table.
+    // Index 180 covers LINUX_KERNEL_REGION_BASE (0x2D_0000_0000, 180 GiB). Points to L2 table.
+    let kernel_l1_index = (LINUX_KERNEL_REGION_BASE >> 30) as usize; // 180
+    let l1_off = 0x1000 + kernel_l1_index * 8;
+    bytes[l1_off..l1_off + 8].copy_from_slice(&table_descriptor(l2_pa).to_le_bytes());
+
+    // Page 2 (0x2000..0x3000): L2 table.
+    // Index 0 covers 0x2D_0000_0000 .. 0x2D_0020_0000 (the 2 MiB kernel hole).
+    // Maps the 2 MiB kernel hole with KERNEL_BLOCK_FLAGS | NON_GLOBAL.
+    let kernel_block_desc =
+        (LINUX_KERNEL_REGION_BASE & PA_MASK_2MIB) | KERNEL_BLOCK_FLAGS | NON_GLOBAL;
+    let l2_off = 0x2000;
+    bytes[l2_off..l2_off + 8].copy_from_slice(&kernel_block_desc.to_le_bytes());
+
     bytes
 }
 
@@ -4753,6 +4867,53 @@ mod stage1_tests {
         );
         assert_eq!(opcode(LINUX_EL1_LOAD_BARRIER_BASE, 1), AARCH64_ISB_OPCODE);
         assert_eq!(opcode(LINUX_EL1_LOAD_BARRIER_BASE, 2), AARCH64_HVC1_OPCODE);
+    }
+
+    #[test]
+    fn carrier_maintenance_root_maps_only_kernel_hole() {
+        const NON_GLOBAL: u64 = 1 << 11;
+        let bytes = stage1_carrier_maintenance_page_tables();
+        assert_eq!(bytes.len() as u64, LINUX_CARRIER_MAINT_ROOT_SIZE);
+
+        for (name, va) in [
+            ("EL1 maintenance", LINUX_EL1_MAINT_BASE),
+            ("EL1 ASID maintenance", LINUX_EL1_ASID_MAINT_BASE),
+            ("EL1 vectors", LINUX_EL1_VECTORS_BASE),
+            ("EL0 trampoline", LINUX_EL0_TRAMPOLINE_BASE),
+            ("syscall mailbox", LINUX_SYSCALL_MAILBOX_BASE),
+        ] {
+            let leaf = crate::page_table::terminal_descriptor(crate::page_table::walk_descriptors(
+                &bytes,
+                LINUX_CARRIER_MAINT_ROOT_BASE,
+                va,
+            ));
+            assert_ne!(
+                leaf & 0b11,
+                0,
+                "{name} leaf at {va:#x} must be mapped in carrier root"
+            );
+            assert_ne!(leaf & NON_GLOBAL, 0, "{name} leaf must be non-global");
+        }
+
+        for (name, va) in [
+            ("user text", 0x0040_0000),
+            ("heap", LINUX_HEAP_BASE),
+            ("mmap", LINUX_MMAP_BASE),
+            ("shared aperture", LINUX_SHARED_FILE_BASE),
+            ("stack", LINUX_STACK_TOP - 0x4000),
+            ("Rosetta alias", LINUX_ROSETTA_VA_BASE),
+        ] {
+            let leaf = crate::page_table::terminal_descriptor(crate::page_table::walk_descriptors(
+                &bytes,
+                LINUX_CARRIER_MAINT_ROOT_BASE,
+                va,
+            ));
+            assert_eq!(
+                leaf & 0b11,
+                0,
+                "{name} leaf at {va:#x} must NOT be mapped in carrier root"
+            );
+        }
     }
 
     #[test]

@@ -861,7 +861,8 @@ fn with_hvf_syscall_mailbox(image: AddressSpace) -> Result<AddressSpace, Address
     } else {
         image
     };
-    image.with_syscall_mailbox_arena()
+    let image = image.with_syscall_mailbox_arena()?;
+    image.with_carrier_maintenance_root()
 }
 
 /// Finish a freshly-loaded image (its initial stack already set, if any) and
