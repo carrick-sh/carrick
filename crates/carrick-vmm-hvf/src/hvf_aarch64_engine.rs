@@ -672,7 +672,8 @@ pub fn invalidate_worker_asid(
     vcpu: &mut HvfAarch64Vcpu,
     asid: u16,
 ) -> Result<(), TrapError> {
-    vmm.audit_executor_boundary(vcpu)?;
+    vmm.state
+        .audit_persistent_worker_vcpu_boundary(&vcpu.inner, &vcpu.mailbox)?;
     Aarch64EngineCore::<HvfAarch64Vmm>::invalidate_asid_on_vcpu(vcpu, asid)
 }
 
@@ -1481,6 +1482,8 @@ mod reclaim_hatch_tests {
             })
             .expect("persistent scoped ASID invalidation");
         assert!(invalidate.contains("invalidate_asid_on_vcpu"));
+        assert!(invalidate.contains("audit_persistent_worker_vcpu_boundary"));
+        assert!(!invalidate.contains("audit_executor_boundary"));
         assert!(!invalidate.contains("vmalle1is"));
     }
 }

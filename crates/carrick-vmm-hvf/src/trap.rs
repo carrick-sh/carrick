@@ -14917,6 +14917,41 @@ impl HvfVmState {
             .audit()
     }
 
+    pub(crate) fn audit_persistent_worker_vcpu_boundary(
+        &self,
+        vcpu: &applevisor::vcpu::Vcpu,
+        mailbox: &MailboxBinding,
+    ) -> Result<(), TrapError> {
+        self.audit_persistent_executor_idle()?;
+        if !fork_vcpu_snapshot_is_empty_for_executor_boundary() {
+            return Err(TrapError::Hypervisor(
+                "persistent worker retained a legacy fork vCPU snapshot".to_owned(),
+            ));
+        }
+        if self.reclaim_authority != ReclaimParkAuthority::Live {
+            return Err(TrapError::Hypervisor(
+                "persistent worker lost its live owner-thread vCPU authority".to_owned(),
+            ));
+        }
+        if mailbox.is_released_for_executor_boundary() {
+            return Err(TrapError::Hypervisor(
+                "persistent worker released its executor-local mailbox".to_owned(),
+            ));
+        }
+        if mailbox
+            .export_task_continuation()
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("audit persistent worker mailbox boundary: {error}"))
+            })?
+            .is_some()
+        {
+            return Err(TrapError::Hypervisor(
+                "persistent worker retained a task syscall continuation".to_owned(),
+            ));
+        }
+        Self::audit_executor_invariants(vcpu, mailbox.slot().guest_address())
+    }
+
     /// Build a [`ThreadSpec`] for a thread-creating `clone(CLONE_THREAD)`: clone the
     /// SHARED VM handle (Arc-refcounted, so the new thread can `vcpu_create` against
     /// it) + the SHARED protections/page-table Arcs + a COPY of the mapping
