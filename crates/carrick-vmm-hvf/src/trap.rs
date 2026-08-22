@@ -6699,10 +6699,24 @@ impl HvpatchTaskInventoryAuthority {
                     .map(|(mapping, _)| *mapping)
                     .collect();
                 if expected_mappings.is_empty() || committed_unmaps != expected_ids {
-                    return Err(TrapError::Hypervisor(
-                        "retirement commit does not cover exact current HVPatch MM ledger"
-                            .to_owned(),
-                    ));
+                    // Name the exact disagreement. "does not cover" alone cannot
+                    // distinguish an empty ledger from a commit that unmaps a
+                    // different set, and those call for opposite fixes.
+                    let ledger_only: Vec<_> = expected_ids
+                        .iter()
+                        .filter(|id| !committed_unmaps.contains(id))
+                        .take(8)
+                        .collect();
+                    let commit_only: Vec<_> = committed_unmaps
+                        .iter()
+                        .filter(|id| !expected_ids.contains(id))
+                        .take(8)
+                        .collect();
+                    return Err(TrapError::Hypervisor(format!(
+                        "retirement commit does not cover exact current HVPatch MM ledger                          (ledger={} commit={} ledger_only={ledger_only:?} commit_only={commit_only:?})",
+                        expected_ids.len(),
+                        committed_unmaps.len(),
+                    )));
                 }
                 let challenge = commit.receipt_challenge();
                 *retirement = Some(HvpatchPreparedInventoryRetirement {
