@@ -91,7 +91,7 @@ each one's blocker is named with the evidence that names it.**
 | 2 | Process teardown correct | **NOT MET** | Three named defects below. All ten built fork probes reach zero carrier aborts (from ten of ten aborting); five exit 0. |
 | 3 | Shell reducer exits 0 | **MET** | `f250844d`. `/bin/sh -c '/bin/echo hi'` 10 of 10 clean, `/bin/bash -c` clean as the fork-not-vfork control. |
 | 4 | `just ci` green | **NOT MET** | `fmt-check`, `deny`, `check-matrix` PASS. `clippy` 97 -> 34 errors. `lint-domains` fails on census drift. `doc` fails on the same dead code as clippy. `test` 1605/1605. |
-| 5 | Closure probe gate | **IN FLIGHT, AND SLOW — see below** | Started detached; log `target/perf/closure-run.log`. A foreground shell with a 10-minute cap SIGTERMs it mid-run (`terminated by signal 15`). |
+| 5 | Closure probe gate | **STOPPED at ~470/920 — not worth finishing yet** | Log `target/perf/closure-run.log`. Every DIFF sampled is `carrick: <missing>` against real `linux:` lines, i.e. the probe produced NO output — the crash signature `AGENTS.md` names, not a wrong value. With the fork/exec teardown defects still open the gate is measuring those, so finish it AFTER they close. A foreground shell with a 10-minute cap SIGTERMs it mid-run (`terminated by signal 15`); run it detached. |
 
 ### What landed this session
 
