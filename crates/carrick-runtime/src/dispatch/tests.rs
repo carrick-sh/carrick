@@ -829,26 +829,6 @@ mod overlay_dispatch_tests {
         assert_eq!(libc::WTERMSIG(status), libc::SIGABRT);
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[allow(dead_code)]
-    fn host_alias_test_commit() -> HostAliasCommit {
-        HostAliasCommit::mmap(mem::HostAliasMmapCommit {
-            start: crate::memory::LINUX_HIGH_VA_THRESHOLD,
-            len: LINUX_PAGE_SIZE,
-            prot: LinuxProtFlags::READ,
-            sharing: ProcMapSharing::Private,
-            path: String::new(),
-            file_page_offset: None,
-            locked: None,
-            resident: false,
-            bus_fault: None,
-            write_sealed_shared: false,
-            read_only_shared_file: false,
-            secretmem: false,
-            writable_memfd: None,
-            shared_file_alias: None,
-        })
-    }
 
     #[test]
     fn epoll_et_repolls_host_level_when_mux_misses_wake() {

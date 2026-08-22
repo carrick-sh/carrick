@@ -580,123 +580,6 @@ pub(crate) enum HostWriteKind {
     Other,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[allow(dead_code)]
-pub(crate) struct NativeReexecFdTableV1 {
-    pub(crate) files: Vec<NativeReexecFdV1>,
-    pub(crate) descriptions: Vec<NativeReexecDescriptionV1>,
-    pub(crate) close_on_exec_host_fds: Vec<i32>,
-    pub(crate) closed_stdio: [bool; 3],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[allow(dead_code)]
-pub(crate) struct NativeReexecFdV1 {
-    pub(crate) guest_fd: i32,
-    pub(crate) fd_flags: u64,
-    pub(crate) description_id: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[allow(dead_code)]
-pub(crate) enum NativeReexecDescriptionV1 {
-    Pipe {
-        stable_id: u64,
-        host_fd: i32,
-        original_host_fd_flags: i32,
-        host_device: u64,
-        host_inode: u64,
-        host_mode: u32,
-        status_flags: u64,
-        pipe_capacity: i64,
-        is_read_end: bool,
-        pipe_id: u64,
-        bidirectional: bool,
-        write_kind: HostWriteKind,
-    },
-    File {
-        stable_id: u64,
-        host_fd: i32,
-        original_host_fd_flags: i32,
-        host_device: u64,
-        host_inode: u64,
-        host_mode: u32,
-        status_flags: u64,
-        guest_path: Vec<u8>,
-        guest_mode: u32,
-        guest_size: u64,
-        writable: bool,
-    },
-    Socket {
-        stable_id: u64,
-        host_fd: i32,
-        original_host_fd_flags: i32,
-        host_device: u64,
-        host_inode: u64,
-        host_mode: u32,
-        status_flags: u64,
-        family: i32,
-        type_: i32,
-        protocol: i32,
-    },
-    IoUring {
-        stable_id: u64,
-        data_fd: i32,
-        data_fd_flags: i32,
-        data_identity: crate::dispatch::ioring::HostBackingIdentity,
-        lock_fd: i32,
-        lock_fd_flags: i32,
-        lock_identity: crate::dispatch::ioring::HostBackingIdentity,
-        layout: crate::dispatch::ioring::IoUringLayoutSnapshot,
-        status_flags: u64,
-    },
-}
-
-impl NativeReexecDescriptionV1 {
-    #[allow(dead_code)]
-    pub(crate) const fn stable_id(&self) -> u64 {
-        match self {
-            Self::Pipe { stable_id, .. }
-            | Self::File { stable_id, .. }
-            | Self::Socket { stable_id, .. }
-            | Self::IoUring { stable_id, .. } => *stable_id,
-        }
-    }
-}
-
-impl NativeReexecFdTableV1 {
-    #[allow(dead_code)]
-    pub(crate) fn survivor_host_fds(&self) -> Vec<(i32, i32)> {
-        self.descriptions
-            .iter()
-            .flat_map(|description| match description {
-                NativeReexecDescriptionV1::Pipe {
-                    host_fd,
-                    original_host_fd_flags,
-                    ..
-                }
-                | NativeReexecDescriptionV1::File {
-                    host_fd,
-                    original_host_fd_flags,
-                    ..
-                }
-                | NativeReexecDescriptionV1::Socket {
-                    host_fd,
-                    original_host_fd_flags,
-                    ..
-                } => vec![(*host_fd, *original_host_fd_flags)],
-                NativeReexecDescriptionV1::IoUring {
-                    data_fd,
-                    data_fd_flags,
-                    lock_fd,
-                    lock_fd_flags,
-                    ..
-                } => vec![(*data_fd, *data_fd_flags), (*lock_fd, *lock_fd_flags)],
-            })
-            .collect()
-    }
-}
-
 impl HostWriteKind {
     pub(super) fn from_host_mode(mode: libc::mode_t) -> Self {
         match mode & libc::S_IFMT {
@@ -1135,12 +1018,10 @@ pub(super) enum OpenDescription {
     // full read/write/poll machinery (`PipeState`, `read_pipe`, `write_pipe`)
     // is kept wired as the portable, host-fd-free pipe model and is matched
     // throughout the fd handlers. Retained as deliberate API surface.
-    #[allow(dead_code)]
     PipeReader {
         base: OpenDescriptionBase,
         pipe: PipeRef,
     },
-    #[allow(dead_code)]
     PipeWriter {
         base: OpenDescriptionBase,
         pipe: PipeRef,
@@ -1226,7 +1107,6 @@ pub(super) enum OpenDescription {
     /// drains, terminated by NLMSG_DONE.
     Netlink {
         base: OpenDescriptionBase,
-        #[allow(dead_code)]
         protocol: i32,
         /// The guest socket type (SOCK_RAW or SOCK_DGRAM) this netlink socket was
         /// created with; reported by getsockopt(SO_TYPE). (audit M6)
@@ -1331,16 +1211,6 @@ pub(super) fn kernel_file_description(
     )
 }
 
-#[allow(dead_code)]
-pub(super) fn restored_kernel_file_description(
-    stable_id: u64,
-    description: OpenDescriptionRef,
-) -> Result<Arc<crate::kernel::FileDescription>, String> {
-    crate::kernel::FileDescription::concrete_restored(stable_id, description)
-        .map(Arc::new)
-        .map_err(|error| format!("restore file-description identity {stable_id}: {error}"))
-}
-
 impl crate::kernel::FileSlot {
     pub(super) fn from_open_description(description: OpenDescriptionRef, fd_flags: u64) -> Self {
         Self::new(kernel_file_description(description), fd_flags)
@@ -1348,20 +1218,6 @@ impl crate::kernel::FileSlot {
 }
 
 impl OpenDescription {
-    // Both methods below are only reached from `snapshot_native_reexec_fd_table`
-    // (`dispatch/mod.rs`), which carries the identical
-    // `#[cfg(any(test, ...))]` gate.
-    #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
-    #[allow(dead_code)]
-    pub(super) fn reexec_host_fd(&self) -> Option<i32> {
-        match self {
-            Self::HostPipe { host_fd, .. }
-            | Self::HostSocket { host_fd, .. }
-            | Self::HostFile { host_fd, .. } => Some(host_fd.raw()),
-            _ => None,
-        }
-    }
-
     #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
     #[allow(dead_code)]
     pub(super) fn reexec_kind_name(&self) -> &'static str {

@@ -618,11 +618,6 @@ pub(crate) enum LogicalRecordLockOwner {
 }
 
 impl LogicalRecordLockOwner {
-    #[allow(dead_code)]
-    pub(crate) fn is_ofd(&self) -> bool {
-        matches!(self, Self::Ofd(_))
-    }
-
     pub(crate) fn pid(&self) -> i32 {
         match self {
             Self::Process { pid, .. } => *pid,

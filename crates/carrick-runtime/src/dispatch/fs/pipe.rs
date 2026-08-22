@@ -60,7 +60,6 @@ impl PipeInner {
         pipe
     }
 
-    #[allow(dead_code)]
     pub(crate) fn pipe_id(&self) -> u64 {
         self.state.lock().pipe_id
     }

@@ -128,14 +128,6 @@ pub(super) fn epoll_interest_for(events: LinuxEpollEvents) -> carrick_hal::event
 }
 
 /// Edge (`EPOLLET`) vs level trigger mode for a multiplexer registration.
-#[cfg_attr(
-    any(
-        feature = "platform-macos",
-        feature = "platform-freebsd",
-        feature = "platform-netbsd"
-    ),
-    allow(dead_code)
-)]
 pub(super) fn epoll_trigger_mode(events: LinuxEpollEvents) -> carrick_hal::event::TriggerMode {
     if events.contains(LinuxEpollEvents::ET) {
         carrick_hal::event::TriggerMode::Edge
