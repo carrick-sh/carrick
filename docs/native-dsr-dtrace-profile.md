@@ -1,5 +1,10 @@
 # Native DSR DTrace profiles and measured baseline
 
+> **Retired lane.** This document records work on the `native`/DSR execution
+> backend, which no longer exists: `hvpatch` is the only backend and the only
+> accepted `--exec-backend` value. Every command below names a retired flag
+> and will not run as written. Kept as the historical record of that campaign.
+
 **Measured:** 2026-07-12
 
 **Scope:** Darwin-native AArch64, `native16k` (DSR-only)

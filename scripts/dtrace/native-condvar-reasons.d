@@ -22,7 +22,7 @@
  *
  *   CARRICK_RUN_ID=<unique> target/release/carrick trace \
  *     --script scripts/dtrace/native-condvar-reasons.d \
- *     --trace-out <raw.txt> -- run --exec-backend native ...
+ *     --trace-out <raw.txt> -- run --exec-backend hvpatch ...
  *
  * Branch-child service context is intentionally not reconstructed here. The
  * authoritative joined profile owns that machinery. This spike ranks caller

@@ -28,7 +28,7 @@
  *
  * Usage:
  *   target/release/carrick trace --script scripts/dtrace/guest-mmap-shape.d \
- *     --trace-out /tmp/mmap-shape.out -- run --exec-backend native ...
+ *     --trace-out /tmp/mmap-shape.out -- run --exec-backend hvpatch ...
  */
 
 dtrace:::BEGIN

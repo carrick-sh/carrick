@@ -1,4 +1,10 @@
 /*
+ * The `--exec-backend native` in the recipe below is RETIRED: `hvpatch` is now
+ * the only execution backend and the only accepted value. The invocation is
+ * updated to the surviving form; whether this script's probe set still fires
+ * on the HVPatch lane has NOT been re-qualified, and the measurements it cites
+ * were taken on the native/DSR lane.
+ * 
  * guest-process-census.d — what does a real workload's PROCESS shape cost us?
  *
  * A whole-run wall-clock ratio ("carrick is 15x Docker on go-build") cannot be
@@ -25,7 +31,7 @@
  *
  * Run (carrick trace owns the child, so the run is covered from pid 1):
  *   target/release/carrick trace -s scripts/dtrace/guest-process-census.d \
- *     -o /tmp/census.txt -- run --exec-backend native <image> <cmd>...
+ *     -o /tmp/census.txt -- run --exec-backend hvpatch <image> <cmd>...
  */
 #pragma D option quiet
 #pragma D option dynvarsize=64m

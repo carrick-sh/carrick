@@ -919,7 +919,7 @@ plan.
   ```bash
   cargo test -p carrick-runtime dsr_signal_fault --lib
   just build
-  target/release/carrick run-elf --exec-backend native \
+  target/release/carrick run-elf --exec-backend hvpatch \
     --native-page-profile native16k \
     conformance-probes/target/native-pie/aarch64-unknown-linux-musl/release/syscallregpreserve
   cargo test -p carrick-cli --test conformance native --no-fail-fast

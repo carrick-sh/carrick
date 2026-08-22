@@ -34,7 +34,7 @@ guest_script="w0=\$(date +%s%N); ${WORKLOAD} >/dev/null; w1=\$(date +%s%N); echo
 
 run_engine() { # $1=engine $2=script -> guest stdout
   if [ "$1" = carrick ]; then
-    target/release/carrick run --exec-backend native \
+    target/release/carrick run --exec-backend hvpatch \
       -e "CARRICK_RUN_ID=lifecycle-$$-$RANDOM" -w /tmp "$IMAGE" /bin/sh -c "$2" 2>/dev/null
   else
     docker run --rm --platform linux/arm64 -w /tmp "$IMAGE" /bin/sh -c "$2" 2>/dev/null

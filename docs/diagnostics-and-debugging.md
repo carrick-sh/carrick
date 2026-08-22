@@ -135,7 +135,7 @@ output is per-guest-op and never a kernel-stack family ranking.
 ```sh
 carrick trace --profile native-amplification --preflight-quiet-host \
   -o target/perf/amp1/baseline.raw \
-  -- run --exec-backend native <image>@sha256:… /bin/sh -c '<workload>'
+  -- run --exec-backend hvpatch <image>@sha256:… /bin/sh -c '<workload>'
 carrick debug amplification-ledger target/perf/amp1/baseline.raw \
   --output target/perf/amp1/baseline.ledger.json
 carrick debug amplification-compare baseline.ledger.json candidate.ledger.json

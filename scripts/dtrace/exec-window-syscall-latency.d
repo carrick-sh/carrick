@@ -35,7 +35,7 @@
  * Usage:
  *   target/release/carrick trace \
  *     --script scripts/dtrace/exec-window-syscall-latency.d \
- *     --trace-out /tmp/syscall-latency.out -- run --exec-backend native ...
+ *     --trace-out /tmp/syscall-latency.out -- run --exec-backend hvpatch ...
  */
 
 dtrace:::BEGIN
