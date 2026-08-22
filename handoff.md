@@ -29,7 +29,134 @@ artifact.
 The goal is still active. Do not mark it complete, bless a baseline, weaken the
 denominator, add an excuse, accept a retry, or start final performance work.
 
-## CURRENT ENGINEERING CHECKPOINT — 2026-08-21 Task 6 signed cutoff
+## CURRENT ENGINEERING CHECKPOINT — 2026-08-22 fork/exec defect peel
+
+**HVPatch process fork is broken on the default path, and the previous
+checkpoint's signed battery did not detect it.** Every Task 6 receipt was a
+single-process `run-elf --raw` fixture; each defect below is invisible with one
+live Linux process and deterministic with two. That is exactly the blind spot
+`docs/identity-and-scope-domains.md` names.
+
+Four distinct defects were found on the fork/exec path. Three are fixed and
+committed; the fourth is identified and open.
+
+1. **FIXED `f96aabdd4`** — a vfork/`CLONE_VM` child's `execve` died past its
+   point of no return on every run. `begin_exec_inventory` rebases a shared-mm
+   task onto a fresh ledger (correct — the live sharer still owns those
+   mappings), so retirement staged zero events, while the runtime had sized the
+   transaction from the OLD ledger and applied it unconditionally;
+   `FrameInventory::apply` rejects zero-event batches. "Retires nothing" was
+   encoded as an EMPTY transaction instead of an ABSENT one. Since Ubuntu's
+   `/bin/sh` is dash, which vforks for every simple command, this broke
+   essentially every shell command in a container — the faithful probe transport
+   returned empty guest output, which reads as "did not run" but was a crash.
+2. **FIXED `8709213ce`** — every forked PROCESS aborted the carrier at child
+   activation with "HVPatch task lacks COW publication state". The task-only
+   process path set `cow_armed: Some(..)` and let `cow_deferred_publications`
+   fall through `..Default::default()` to `None`.
+   `validate_cow_authority_pairing` now enforces the pair at publication.
+3. **FIXED `84e385655`** — a forked process's kernel-state stage-2 extent was
+   released TWICE ("global frame IPA release does not match a live exact
+   extent"). `GlobalFrameStage2Lease` had three holders and retirement could
+   search only two; fork parked its lease in a holder with ZERO readers, so
+   retirement took the "nobody owns this" fallback and released an extent whose
+   lease was still live. Carrier leases are now published in a keyed registry
+   that retirement consults.
+4. **OPEN, root cause found** — the forking probes still abort on **"published
+   HVPatch inventory dropped before exact retirement"**: a forked child's
+   task-MM inventory is still `Active` when its authority drops.
+   **Process frame-inventory retirement was never ported to the persistent
+   executor path.** The ONLY site in the tree that takes a retirement commit and
+   applies it is `vcpu_loop/mod.rs:10579`, and that site is inside
+   `run_vcpu_until_exit_inner` — the welded-thread loop that
+   `launch_vcpu_until_exit` can no longer reach (see the audit below). So the
+   authority can never leave `Active`, and its `rollback_unpublished` correctly
+   refuses to drop a published inventory. This is not a small bug: it is Task 7
+   Step 2 work that a live responsibility was left behind in dead code.
+   **fork-then-EXEC works** (the exec path retires through the owner registry);
+   **fork-then-EXIT is the broken lane.**
+
+Also open, separate from the above: after a vfork+exec the guest output is
+correct but persistent-executor pool shutdown fails in two timing-dependent
+shapes — a stale dormant binding (`fail_blocked_exact` → `UnknownThread` for a
+binding whose Thread was already reaped) and an `EL0Fault during scoped EL1 ASID
+maintenance`. `carrick run ubuntu:24.04 --raw --fs host /bin/sh -c '/bin/echo hi'`
+prints `hi` and exits 125.
+
+### `just ci` was RED and gating NOTHING — now peeled three layers
+
+The previous checkpoint recorded `just ci` as red at "the global host-authority
+`disallowed-methods` catalog". The real situation was worse: clippy is EARLY in
+the sequential gate, so lint-domains, deny, check-matrix, check, doc, test and
+test-integration never executed at all.
+
+Root cause: the `clippy.toml` host-authority catalog is a CENSUS input, not a
+build gate — `scripts/migrate/check-host-authority-transitions.py` is the
+semantic authority and captures uses with `--force-warn`, which pierces any
+level. Left at warn, `just clippy -- -D warnings` promoted all ~682 catalogued
+product uses to errors. `disallowed_methods = "allow"` is now set in
+`[workspace.lints.clippy]`; the census is unaffected.
+
+That unblocked two further layers that had never been linted because their
+crates were dependencies of the failing ones: 13 trivial lints in
+`carrick-runtime`, and 10 in `carrick-vmm-hvf` caused by
+`#[cfg(all(test, target_os = ..., target_arch = ...))]` — clippy's
+`allow-unwrap-in-tests` does not recognize that nested form, so 12 test modules
+were being linted as production. Split into `#[cfg(test)]` +
+`#[cfg(all(target_os = ..., target_arch = ...))]`, which is semantically
+identical.
+
+Fixed in `4acd8cc9f`. **clippy now passes workspace-wide for the first time**
+and the gate advances past it; it currently stops at `lint-domains`, whose
+host-authority census requires a clean tracked tree. Everything after clippy is
+therefore still UNVERIFIED — deny, check-matrix, check, doc, test and
+test-integration have not been observed passing.
+
+**Do not quote a `just ci` result from a pipeline.** `just ci | tail` reports
+`tail`'s status; redirect to a file and read `$?`.
+
+Note: the `[workspace.lints.clippy]` change is committed inside `84e385655`
+rather than `4acd8cc9f`, swept in by a broad `git add`; that commit's message
+does not mention it.
+
+### Deprecated-path audit — the headline is verified
+
+`ExecutionBackend` (`crates/carrick-runtime/src/page_profile.rs:14-19`) is a
+**single-variant enum**, so every "is this HVPatch?" test is a tautology and
+`launch_vcpu_until_exit` (`vcpu_loop/mod.rs:8276`) returns unconditionally at
+its first statement. Both facts independently verified. Everything after that
+return is unreachable: ~2,900 lines including `run_vcpu_until_exit_inner`
+(~1,744), the real `libc::fork` `handle_fork` (~732), `OwnerThreadEngine`, and
+the `TransitionalDedicatedRunner` pool — which still spawns one idle host
+pthread on every run. This is Task 7, still entirely unchecked.
+
+Deleting it has one hazard: several gates assert on the SOURCE TEXT of those
+functions via `include_str!` (`continuation.rs:8471/8482/8526/8542`,
+`mod.rs:11051/10970`). They must be inverted to assert absence in the same
+commit, not deleted.
+
+Also found: 13 default-OFF opt-in env mechanisms that violate "opt-OUT, not
+opt-in", including a second 1,397-line HVF syscall transport behind
+`CARRICK_HVF_SYSCALL_TRANSPORT`, `CARRICK_FS_OVERLAY` (whose every sibling is
+default-ON), and the `CARRICK_DSR_ARTIFACT_SPIKE` that AGENTS.md already names
+as abandoned. `CARRICK_NO_FPSIMD` fires on PRESENCE, so `=0` *disables* FPSIMD —
+the inverse of every other hatch.
+
+### Next work
+
+1. Close defect 4 (fork-then-exit inventory retirement), then re-run the fork
+   battery; 15 probes are currently blocked on it.
+2. Then the two vfork+exec shutdown shapes.
+3. Only then is the Task 6 signed battery meaningful — and it must run through
+   the CONTAINER transport, not only `run-elf`, because `run-elf` is the lighter
+   single-process path that hid all four defects.
+4. Task 7 deletion, sequenced as: collapse `ExecutionBackend` first (that turns
+   the dead block into a compile error rather than an assertion), then the
+   welded loop + inverted source-text gates.
+
+---
+
+## PREVIOUS CHECKPOINT — 2026-08-21 Task 6 signed cutoff
 
 Task 6's persistent HVPatch executor implementation is integrated on branch
 `codex/authority-phase0` through merge HEAD
