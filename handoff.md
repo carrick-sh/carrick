@@ -78,7 +78,117 @@ Restore it verbatim once the objective above closes:
 > The goal is still active. Do not mark it complete, bless a baseline, weaken the
 > denominator, add an excuse, accept a retry, or start final performance work.
 
-## CURRENT ENGINEERING CHECKPOINT — 2026-08-22, closure session
+## CURRENT ENGINEERING CHECKPOINT — 2026-08-22, session 3 (delegated closure)
+
+**The exec-authority stack is verified and UNMERGED, held on one defect: the
+lost-wake hang. Everything below was measured, not assumed.**
+
+### What happened this session
+
+1. **The exec-authority fix was split per review and verified.** Branch
+   `agy/exec-authority`, now TWO commits on a rebase over main:
+   - `3c9bfa7b` — the core execve authority re-publication, with the TTBR0
+     swap and the scheduler weakening REMOVED. Snapshot returns 9741-byte
+     JSON where it refused; all 5 fork probes exit 0; 1605/1605 + 225/225.
+   - `655247eb` — the `fail_blocked_exact` `Ok(false)` tolerance re-added
+     SEPARATELY after the revert experiment DEMONSTRATED it: reverted, the
+     reducer exits 125 ten of ten on "dormant task cancellation failed ...
+     exact thread generation is not live". The worker's story was true; now
+     it is proven and the commit message carries the proof.
+2. **Criterion 2(a) — the ASID-maintenance fault — is FIXED and verified,**
+   branch `agy/asid-root` (`5d29ae43`, stacked on exec-authority), by a
+   directed worker: a fifth carrier-owned mapping, a dedicated
+   `CarrierMaintenanceRoot` stage-1 root (0x2D001F8000, compile-time
+   aligned, unit-tested to map only the kernel hole, non-global leaves),
+   installed fail-closed around the maintenance trampoline with TTBR0 added
+   to the entry-state verification. Every register save/install/restore is a
+   named clause; no `let _`. Director re-verification: 10x sleep reducer =
+   8 pass / 2 HANG / **0 ASID / 0 other** (was 9/10 ASID aborts).
+   The mechanism, settled: an executor that completes a terminal PARKS with
+   the just-retired root in TTBR0 (invalidate→retire→complete order means
+   its own invalidation succeeded on live tables); a LATER InvalidateAsid
+   reaches it and the trampoline fetch faults. The faulting root belongs to
+   the ALREADY-RETIRED exec-child mm, not the mm being invalidated — that is
+   the one fact the previous checkpoint asked for. Root slots are pooled, so
+   a parked root can even be REUSED. Question 3 is also settled:
+   `LINUX_PAGE_TABLES_BASE` appears in per-mm fork dispositions, so it is
+   NOT provably carrier-lifetime and was rejected as the neutral root.
+3. **Why the stack is NOT merged: it widens the pre-existing lost-wake
+   hang.** With teardown genuinely running, the criterion-3 reducer
+   (`/bin/echo hi`) printed hi but HUNG at shutdown 2 of 3 runs under build
+   load on the stack binary, while unmodified main went 3 of 3 clean under
+   the same load. The hang family itself predates the stack (the closure
+   gate's 415 failures were ALL 45s timeouts on a main-lineage binary), but
+   merging now would regress criterion 3 statistically. Merge order is
+   therefore: wakefix → asid-root stack → coredump → jobcontrol.
+4. **The lost-wake defect is MAPPED: `docs/hvpatch-lost-wake-audit-2026-08-22.md`.**
+   A read-only worker produced two CONFIRMED-BY-READING windows and an
+   8-path cleared list: (1) `wake_pending` set while Running/SwitchingOut
+   makes `scheduler_park_continuation_from_executor` promote straight to
+   Runnable, bypassing `CarrierWaitService::publish_event`, so resume finds
+   the registration Enrolled-not-Ready → `MissingContinuation` → task failed
+   and retired with no exit published → carrier idles forever; (2)
+   `notify_child_exit` skips `wake_scheduler_exact` whenever
+   `publish_wake_subscriptions()` returned true, but that bool means "a
+   callback ran", not "a wake was delivered" — the two-domains bug shape
+   again. A live wedge corroborates: one guest thread parked in a sleep
+   continuation, executors in `Scheduler::take`, zero `hv_vcpu_run`; full
+   core at `target/perf/asid-wedge-24520-full.core` (12G) plus
+   `asid-wedge-sample.txt`. `carrick debug hvpatch-kernel` READ THE LIVE
+   WEDGED CARRIER — first payoff of the snapshot fix.
+5. **Core dumps are PORTED and verified,** branch `agy/coredump-port`
+   (`02b7723c`, based on pre-stack main), two review rounds: WCOREDUMP bits
+   correct for SIGABRT/SEGV/QUIT vs TERM/KILL, real ELF core file through
+   the container transport (child status 139, ELF magic verified), rollback
+   on failed exit publication, capture before sibling drain. Round 2 forced
+   an empirical justification of its one unrequested change — signal
+   servicing at syscall-completion sites — by reverting it: coredumpbit then
+   FAILS wholesale (a self-directed fatal signal lets the vCPU resume EL0
+   and run past the raise before any kick lands), so it stays, with the
+   constraint documented at the first site. Re-verify after rebasing onto
+   the asid stack; its shutdown intermittently hits the lost-wake hang like
+   everything else.
+6. **Job control port is IN FLIGHT** (worker `jobcontrol`, branch
+   `agy/jobcontrol` stacked on coredump-port), with the design decided in
+   the brief: park via the existing blocking-continuation machinery (never
+   hold the executor), group stop via kick, /proc 'T' from the kernel graph,
+   `GuestBlockedGuard` ported, the two corpses deleted, and a NEW red-first
+   probe `sigstopjobcontrol` whose key assertion is counter-equality while
+   stopped.
+7. **The lost instruments are inventoried:
+   `docs/hvpatch-lost-instruments-2026-08-22.md`** — 25 instruments from the
+   welded loop: 8 live, 14 LOST with port sites (wait-probe trio, syscall
+   service guard, syscall-return trace, thread-terminal probe, exec
+   event-ring record, futex wait/end ring events, DSR-fault ring events,
+   core-lifecycle probes — the last partially revived by the coredump port),
+   3 obsolete. This is criterion-4 feature work's checklist.
+
+### Worker board (AGY_RUN_ID=closure)
+
+`asid-root` done/verified; `coredump` done/verified (2 rounds); `wakeaudit`,
+`instruments` done (read-only). IN FLIGHT: `jobcontrol` (port), `wakefix`
+(the two lost-wake windows, 10x-echo red-first battery, based on
+agy/asid-root). Worktrees under `.worktrees/{exec-authority,asid-root,
+coredump-port,jobcontrol,wakefix}`; recover any worker with
+`AGY_RUN_ID=closure python3 <agy_worker.py> result --name <n>`.
+
+### Next work, in order
+
+1. `wakefix` lands → review the diff against the audit, re-run the echo
+   battery quiet AND under load, 20/20 required, plus cloneexithandled /
+   clone3exithandled 3x each.
+2. Merge to main in this order: agy/asid-root stack (ff — includes
+   exec-authority), then rebase+merge coredump-port, then jobcontrol.
+   Re-verify the full battery serially on the merged binary.
+3. Then the deletions this unblocks: `Stage1MmPool::acknowledge_tlb_flush`
+   wrapper + `ForeignRetirement`; `service_outcome` type-routing (item 5 of
+   the previous checkpoint); wait-probe port per the instruments doc.
+4. Criterion 4: clippy/doc to zero via the port/delete list, then the census
+   7 semantic deltas via `--refresh-candidate` — LAST, it is byte/line keyed.
+5. Criterion 5: closure gate detached AFTER wakefix merges — its 415
+   timeouts were this hang.
+
+## PREVIOUS CHECKPOINT — 2026-08-22, closure session (superseded where noted)
 
 **Two of the five objective criteria now hold. The other three are open, and
 each one's blocker is named with the evidence that names it.**
