@@ -7265,9 +7265,14 @@ impl SyscallDispatcher {
             .map(|process| {
                 let pid = process.key.id.raw() as u32;
                 let init = carrick_abi::LINUX_BOOTSTRAP_PID as u32;
-                let (user_cpu_us, system_cpu_us) =
-                    registry.task(process.key.id).map_or((0, 0), |task| {
-                        (task.self_cpu_us(), task.self_system_cpu_us())
+                let task_ref = registry.task(process.key.id);
+                let (user_cpu_us, system_cpu_us, is_stopped) =
+                    task_ref.as_ref().map_or((0, 0, false), |task| {
+                        (
+                            task.self_cpu_us(),
+                            task.self_system_cpu_us(),
+                            task.is_job_control_stopped(),
+                        )
                     });
                 crate::vfs::SyntheticProcProcess {
                     pid,
@@ -7287,8 +7292,13 @@ impl SyscallDispatcher {
                     // published yet reads as runnable, and one already inside
                     // its exit path reads `R` rather than `Z` — it becomes a
                     // zombie only when the registry moves it, which is when the
-                    // zombie arm takes over.
-                    state: crate::run_state::published_stat_char(pid).unwrap_or('R'),
+                    // zombie arm takes over. Stopped tasks query the kernel graph
+                    // directly to report 'T'.
+                    state: if is_stopped {
+                        'T'
+                    } else {
+                        crate::run_state::published_stat_char(pid).unwrap_or('R')
+                    },
                     tids: process.tids.iter().map(|tid| tid.raw() as u32).collect(),
                     // HONEST GAP: this is the registry's fork-time label, not
                     // the Linux `comm`. Linux's is the exec basename as later

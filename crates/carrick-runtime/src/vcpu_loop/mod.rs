@@ -2144,6 +2144,9 @@ enum HvpatchProductionPhase {
     ResumeForkQuiesce {
         _subscription: carrick_thread::fork_quiesce::QuiesceSubscription,
     },
+    ResumeJobControlStop {
+        _subscription: crate::kernel::objects::TaskWakeSubscription,
+    },
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     RetryProcessFork {
         frame: carrick_hal::RawSyscall,
@@ -3238,6 +3241,80 @@ where
         }
     }
 
+    fn suspend_for_job_control(
+        &mut self,
+        _engine: &E,
+        _control: &executor::HvpatchQuantumControl<'_, '_>,
+    ) -> Result<Option<executor::ExecutorExit>, RuntimeError> {
+        let context = match self.state.service_kernel_context.as_ref() {
+            Some(context) => context.retain_exact(),
+            None => {
+                let context = self
+                    .kernel
+                    .dispatcher
+                    .capture_kernel_context(self.state.linux_tid)
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "capture kernel context for job control: {error}"
+                        ))
+                    })?;
+                self.state.service_kernel_context = Some(context.retain_exact());
+                context
+            }
+        };
+        let task = context.task();
+        if !task.is_job_control_stopped() {
+            return Ok(None);
+        }
+        self.state.withdraw_from_crash_capture();
+        self.state
+            .publish_thread_run_state(crate::run_state::RunState::Blocked, 'T');
+
+        let scheduler = self
+            .kernel
+            .hvpatch_runtime
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort())
+            .continuation_services(context.kernel())
+            .0;
+        let thread = context.thread().key();
+
+        while task.is_job_control_stopped() {
+            let observed = task.wake_generation();
+            let wake_scheduler = Arc::clone(&scheduler);
+            let enrollment = task.subscribe_wake(
+                observed,
+                Arc::new(move |_| {
+                    let _ = wake_scheduler.wake(thread);
+                }),
+            );
+            match enrollment {
+                crate::kernel::objects::TaskWakeEnrollment::Ready(_) => {
+                    if !task.is_job_control_stopped() {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                crate::kernel::objects::TaskWakeEnrollment::Subscribed(subscription) => {
+                    if !task.is_job_control_stopped() {
+                        return Ok(None);
+                    }
+                    self.phase = HvpatchProductionPhase::ResumeJobControlStop {
+                        _subscription: subscription,
+                    };
+                    let exit = self.suspend(
+                        HvpatchLoopSuspension::BlockedContinuation,
+                        executor::ExecutorExit::Blocked(
+                            crate::kernel::objects::BlockedReason::HostWait,
+                        ),
+                    );
+                    return Ok(Some(exit));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[allow(clippy::too_many_arguments)]
     fn rollback_published_hvpatch_clone<M: threads::CloneTidMemory>(
@@ -3925,10 +4002,27 @@ where
 
     fn suspend(
         &mut self,
-        _suspension: HvpatchLoopSuspension,
+        suspension: HvpatchLoopSuspension,
         exit: executor::ExecutorExit,
     ) -> executor::ExecutorExit {
         self.leave_executor();
+        match suspension {
+            HvpatchLoopSuspension::BlockedContinuation | HvpatchLoopSuspension::VforkParent => {
+                let is_stopped = self
+                    .state
+                    .service_kernel_context
+                    .as_ref()
+                    .map_or(false, |cx| cx.task().is_job_control_stopped());
+                if is_stopped {
+                    self.state
+                        .publish_thread_run_state(crate::run_state::RunState::Blocked, 'T');
+                } else {
+                    self.state
+                        .publish_thread_run_state(crate::run_state::RunState::Blocked, 'S');
+                }
+            }
+            _ => {}
+        }
         exit
     }
 
@@ -3993,6 +4087,9 @@ where
                 )? {
                     return Ok(self.enter_terminal_with_outcome(engine, outcome));
                 }
+                if let Some(exit) = self.suspend_for_job_control(engine, control)? {
+                    return Ok(exit);
+                }
                 executor::ExecutorExit::Syscall
             }
             DispatchOutcome::Errno { errno } => {
@@ -4016,6 +4113,9 @@ where
                     self.traps,
                 )? {
                     return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                }
+                if let Some(exit) = self.suspend_for_job_control(engine, control)? {
+                    return Ok(exit);
                 }
                 executor::ExecutorExit::Syscall
             }
@@ -4437,6 +4537,9 @@ where
             return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
         }
 
+        self.state
+            .publish_thread_run_state(crate::run_state::RunState::Running, 'R');
+
         let phase = std::mem::replace(&mut self.phase, HvpatchProductionPhase::Resident);
         match phase {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4454,6 +4557,36 @@ where
             }
             HvpatchProductionPhase::ResumeForkQuiesce { _subscription } => {
                 drop(_subscription);
+            }
+            HvpatchProductionPhase::ResumeJobControlStop { _subscription } => {
+                drop(_subscription);
+                let context = match self.state.service_kernel_context.as_ref() {
+                    Some(context) => context.retain_exact(),
+                    None => self
+                        .kernel
+                        .dispatcher
+                        .capture_kernel_context(self.state.linux_tid)
+                        .map_err(|error| {
+                            RuntimeError::Configuration(format!(
+                                "resume from job control stop lost Kernel context: {error}"
+                            ))
+                        })?,
+                };
+                self.state.service_kernel_context = Some(context.retain_exact());
+                if let Some(outcome) = service_signals_threaded(
+                    &self.kernel,
+                    &context,
+                    engine,
+                    self.state.this_tid,
+                    self.state.fatal_image_generation,
+                    None,
+                    None,
+                    None,
+                    None,
+                    self.traps,
+                )? {
+                    return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                }
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             HvpatchProductionPhase::RetryProcessFork {
@@ -4668,6 +4801,10 @@ where
             return Ok(exit);
         }
 
+        if let Some(exit) = self.suspend_for_job_control(engine, control)? {
+            return Ok(exit);
+        }
+
         if control.need_resched() {
             return Ok(self.suspend(
                 HvpatchLoopSuspension::Preemption,
@@ -4759,6 +4896,9 @@ where
                     self.traps,
                 )? {
                     return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                }
+                if let Some(exit) = self.suspend_for_job_control(engine, control)? {
+                    return Ok(exit);
                 }
                 return Ok(executor::ExecutorExit::Syscall);
             }
@@ -5167,7 +5307,8 @@ impl<E: 'static> HvpatchLoopJob<E> {
         };
         let exit = production.poll(engine, control);
         job.suspended = match exit {
-            executor::ExecutorExit::BlockedContinuation(_) => {
+            executor::ExecutorExit::BlockedContinuation(_)
+            | executor::ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::HostWait) => {
                 Some(HvpatchLoopSuspension::BlockedContinuation)
             }
             executor::ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::ChildState) => {
@@ -6168,6 +6309,16 @@ where
         // consume this slot through `take_service_kernel_context`; ordinary
         // outcomes leave it available to signal delivery below.
         self.service_kernel_context = Some(kernel_context.retain_exact());
+        let _syscall_guard = kernel.hvpatch_process.as_ref().and_then(|proc| {
+            let (pid, asid) = proc.syscall_trace_identity()?;
+            HvpatchSyscallServiceGuard::begin(
+                pid,
+                self.linux_tid.raw(),
+                asid,
+                frame.number.raw(),
+                frame.args,
+            )
+        });
         let sync_shared_file_aliases = engine.needs_shared_file_alias_sync();
         'service: {
             if sync_shared_file_aliases && !matches!(frame.number.raw(), 260 | 95) {

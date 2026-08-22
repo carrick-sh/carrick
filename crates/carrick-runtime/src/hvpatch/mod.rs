@@ -481,19 +481,6 @@ impl ProcessContext {
         std::sync::Arc::new(ProcessTimerDelivery::new(self))
     }
 
-    pub(crate) fn wait_until_job_control_resumed(&self) -> bool {
-        if let Some(task) = self
-            .kernel_graph()
-            .registry()
-            .task(self.task_id())
-            .filter(|task| task.key() == self.task_key())
-        {
-            task.wait_until_job_control_resumed()
-        } else {
-            false
-        }
-    }
-
     pub(crate) fn stop_for_ptrace_signal(&self, signum: i32) -> bool {
         let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
             return false;
@@ -790,20 +777,6 @@ impl ProcessContext {
         .map(|(event, _)| event)
     }
 
-    /// Publish the guest-process terminal event only after Kernel status,
-    /// descriptor teardown, and backend root-slot/ASID retirement have all
-    /// committed. The event is prepared while the live task/mm identity is
-    /// still discoverable, but cannot fire until every terminal authority has
-    /// committed.
-    pub(crate) fn record_process_exit_commit(
-        &self,
-        event: Option<carrick_observability::probes::HvpatchGuestLifecycle>,
-    ) {
-        if let Some(event) = event {
-            crate::probes::hvpatch_guest_lifecycle(event);
-        }
-    }
-
     /// Publish Linux lifecycle state before any irreversible backend teardown.
     /// The callback runs after the zombie is durable and the exiting task is no
     /// longer live, but while the exit reservation still excludes waiters. The
@@ -835,24 +808,6 @@ impl ProcessContext {
             )
             .map(|zombie| zombie.parent)
             .map_err(|error| error.to_string())
-    }
-
-    pub(crate) fn retire_address_space_with(
-        &self,
-        exit_code: i32,
-        tid: crate::thread::ThreadId,
-        invalidate: impl FnOnce(&RetiredStage1Mm) -> Result<(), String>,
-    ) -> Result<(), String> {
-        let retired = self
-            .resources
-            .retire(self.task_key())
-            .map_err(|error| error.to_string())?;
-        invalidate(&retired)?;
-        self.resources
-            .acknowledge_tlb_flush(retired)
-            .map_err(|error| error.to_string())?;
-        crate::event_ring::rec_hvpatch_process_exit_end(self.pid(), tid.raw(), exit_code);
-        Ok(())
     }
 
     pub(crate) fn begin_address_space_retirement(
@@ -1591,16 +1546,15 @@ mod tests {
                 |_| {},
             )
             .unwrap();
-        process
-            .retire_address_space_with(exit_code, tid, |retired| {
-                retired
-                    .retirement()
-                    .is_none_or(|retirement| retirement.pending().is_empty())
-                    .then_some(())
-                    .ok_or_else(|| "test retirement unexpectedly has resident executors".to_owned())
-            })
+        let retirement = process
+            .begin_address_space_retirement(exit_code, tid, event)
             .unwrap();
-        process.record_process_exit_commit(event);
+        assert!(
+            retirement
+                .retirement()
+                .is_none_or(|r| r.pending().is_empty())
+        );
+        retirement.complete().unwrap();
     }
 
     /// A wait that overlaps a child's mid-flight exit reservation must NOT
@@ -2671,24 +2625,8 @@ mod tests {
             .next()
             .expect("production HVPatch process source");
         assert!(
-            !production.contains("pub(crate) fn retire_address_space("),
-            "there must be no no-op invalidation retirement bypass"
+            !production.contains("pub(crate) fn retire_address_space_with("),
+            "the welded retirement path is deleted in favor of begin_address_space_retirement"
         );
-        let retirement = production
-            .split("pub(crate) fn retire_address_space_with")
-            .nth(1)
-            .and_then(|tail| {
-                tail.split("pub(crate) fn begin_address_space_retirement")
-                    .next()
-            })
-            .expect("ProcessContext retirement transaction");
-        let invalidate = retirement
-            .find("invalidate(&retired)?")
-            .expect("external all-executor invalidation");
-        let release = retirement
-            .find("acknowledge_tlb_flush(retired)")
-            .expect("allocator/root release");
-        assert!(invalidate < release);
-        assert!(!retirement.contains("InvalidationAck::new"));
     }
 }
