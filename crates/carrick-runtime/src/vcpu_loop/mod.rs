@@ -2394,12 +2394,115 @@ impl HvpatchLoopResult {
         self.state.ready.notify_all();
     }
 
+    #[cfg(test)]
+    fn is_ready(&self) -> bool {
+        self.state.result.lock().is_some()
+    }
+
     fn wait(self) -> Result<VcpuLoopOutcome, RuntimeError> {
         let mut slot = self.state.result.lock();
         while slot.is_none() {
             self.state.ready.wait(&mut slot);
         }
         slot.take().unwrap_or_else(|| std::process::abort())
+    }
+}
+
+struct HvpatchExternalTerminalState {
+    published: bool,
+    role: HvpatchTerminalSettlementRole,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HvpatchTerminalSettlementRole {
+    Member,
+    ProcessOwner,
+}
+
+/// Acyclic one-shot result authority retained by a process-member handle.
+///
+/// The logical job and the handle both retain this cell, but it never points
+/// back to the binding, quantum, job, or process `threads` vector. Publishing
+/// the result and then completion under one mutex makes the ordering exact
+/// without creating `handle -> binding -> job -> handles` retention.
+#[derive(Clone)]
+pub(crate) struct HvpatchExternalTerminalSettlement {
+    result: HvpatchLoopResult,
+    completion: continuation::LogicalJobCompletion,
+    state: Arc<Mutex<HvpatchExternalTerminalState>>,
+}
+
+impl HvpatchExternalTerminalSettlement {
+    fn new(result: HvpatchLoopResult, completion: continuation::LogicalJobCompletion) -> Self {
+        Self {
+            result,
+            completion,
+            state: Arc::new(Mutex::new(HvpatchExternalTerminalState {
+                published: false,
+                role: HvpatchTerminalSettlementRole::Member,
+            })),
+        }
+    }
+
+    fn is_published(&self) -> bool {
+        self.state.lock().published
+    }
+
+    fn arm_process_owner(&self) -> Result<(), RuntimeError> {
+        let mut state = self.state.lock();
+        if state.published {
+            return Err(RuntimeError::Configuration(
+                "terminal owner armed after logical result publication".to_owned(),
+            ));
+        }
+        state.role = HvpatchTerminalSettlementRole::ProcessOwner;
+        Ok(())
+    }
+
+    fn publish_member(
+        &self,
+        outcome: Result<VcpuLoopOutcome, RuntimeError>,
+    ) -> Result<bool, RuntimeError> {
+        let mut state = self.state.lock();
+        if state.published {
+            return Ok(false);
+        }
+        if state.role != HvpatchTerminalSettlementRole::Member {
+            return Err(RuntimeError::Configuration(
+                "drained-member settlement attempted to replace process-owner outcome".to_owned(),
+            ));
+        }
+        self.result.publish(outcome);
+        state.published = true;
+        drop(state);
+        self.completion.publish();
+        Ok(true)
+    }
+
+    fn publish_terminal(&self, terminal: Option<Result<VcpuLoopOutcome, RuntimeError>>) -> bool {
+        let mut state = self.state.lock();
+        if state.published {
+            return false;
+        }
+        let outcome = terminal_result_for_publication(terminal, state.role);
+        self.result.publish(outcome);
+        state.published = true;
+        drop(state);
+        self.completion.publish();
+        true
+    }
+
+    fn completion(&self) -> continuation::LogicalJobCompletion {
+        self.completion.clone()
+    }
+
+    fn wait_result(&self) -> Result<VcpuLoopOutcome, RuntimeError> {
+        self.result.clone().wait()
+    }
+
+    #[cfg(test)]
+    fn result_is_ready(&self) -> bool {
+        self.result.is_ready()
     }
 }
 
@@ -2471,6 +2574,19 @@ impl PersistentTerminal {
             Self::Outcome(outcome) => Ok(outcome),
             Self::Error(error) => Err(error),
         }
+    }
+}
+
+fn terminal_result_for_publication(
+    terminal: Option<Result<VcpuLoopOutcome, RuntimeError>>,
+    role: HvpatchTerminalSettlementRole,
+) -> Result<VcpuLoopOutcome, RuntimeError> {
+    match (role, terminal) {
+        (_, Some(result)) => result,
+        (HvpatchTerminalSettlementRole::Member, None) => Ok(VcpuLoopOutcome::ThreadDone),
+        (HvpatchTerminalSettlementRole::ProcessOwner, None) => Err(RuntimeError::Configuration(
+            "persistent terminal settlement had no logical result".to_owned(),
+        )),
     }
 }
 
@@ -2823,7 +2939,7 @@ struct ProductionHvpatchLoopJob<E: ThreadedEngine> {
     kernel: Kernel,
     state: ThreadRuntimeState<E>,
     phase: HvpatchProductionPhase,
-    result: HvpatchLoopResult,
+    terminal_settlement: HvpatchExternalTerminalSettlement,
     terminal_result: Option<Result<VcpuLoopOutcome, RuntimeError>>,
     completion: continuation::LogicalJobCompletion,
     traps: usize,
@@ -3258,7 +3374,14 @@ where
                     ),
                 );
             }
-            ProcessExitClaim::Owner => {}
+            ProcessExitClaim::Owner => {
+                self.terminal_settlement
+                    .arm_process_owner()
+                    .unwrap_or_else(|failure| {
+                        tracing::error!(%failure, "arm persistent terminal result owner");
+                        std::process::abort();
+                    });
+            }
         }
         // Withdraw runtime execution immediately, but retain the exact Kernel
         // thread/generation through drain and topology retries. Their callbacks
@@ -3856,7 +3979,7 @@ where
         self.state
             .registry
             .register_child_with_tid(tid, clear_child_tid_addr);
-        enroll_persistent_process_member(&self.state.threads, &logical.result, &logical.completion);
+        enroll_persistent_process_member(&self.state.threads, &logical.terminal_settlement);
         if let Err(error) = check_hvpatch_clone_failpoint(HvpatchCloneFailpoint::RegistryHandle) {
             drop(dormant);
             self.rollback_published_hvpatch_clone(
@@ -4031,12 +4154,8 @@ where
     }
 
     fn publish_terminal_result(&mut self) {
-        let result = self.terminal_result.take().unwrap_or_else(|| {
-            Err(RuntimeError::Configuration(
-                "persistent terminal settlement had no logical result".to_owned(),
-            ))
-        });
-        self.result.publish(result);
+        self.terminal_settlement
+            .publish_terminal(self.terminal_result.take());
     }
 
     fn suspend(
@@ -4345,7 +4464,10 @@ where
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
     ) -> Result<executor::ExecutorExit, RuntimeError> {
-        if matches!(self.phase, HvpatchProductionPhase::Complete) {
+        if self.terminal_settlement.is_published()
+            || matches!(self.phase, HvpatchProductionPhase::Complete)
+        {
+            self.phase = HvpatchProductionPhase::Complete;
             return Ok(executor::ExecutorExit::Exited);
         }
         if self.state.guest_execution.is_none() {
@@ -7901,7 +8023,7 @@ pub(crate) enum VcpuLoopLaunch {
     Job(continuation::LogicalTaskReceipt<Result<VcpuLoopOutcome, RuntimeError>>),
     Persistent {
         result: HvpatchLoopResult,
-        completion: continuation::LogicalJobCompletion,
+        terminal_settlement: HvpatchExternalTerminalSettlement,
         directory: Arc<HvpatchRuntimeDirectory>,
         shutdown_on_wait: bool,
     },
@@ -7922,8 +8044,7 @@ pub(crate) enum VcpuThreadHandle {
     },
     Job(continuation::LogicalTaskReceipt<Result<VcpuLoopOutcome, RuntimeError>>),
     Persistent {
-        result: HvpatchLoopResult,
-        completion: continuation::LogicalJobCompletion,
+        terminal_settlement: HvpatchExternalTerminalSettlement,
     },
 }
 
@@ -7932,7 +8053,9 @@ impl VcpuThreadHandle {
         match self {
             Self::Host { completion, .. } => completion.is_finished(),
             Self::Job(receipt) => receipt.is_finished(),
-            Self::Persistent { completion, .. } => completion.is_finished(),
+            Self::Persistent {
+                terminal_settlement,
+            } => terminal_settlement.completion().is_finished(),
         }
     }
 
@@ -7966,7 +8089,9 @@ impl VcpuThreadHandle {
                     )))
                 })?
                 .map(|_| ()),
-            Self::Persistent { result, .. } => result.wait().map(|_| ()),
+            Self::Persistent {
+                terminal_settlement,
+            } => terminal_settlement.wait_result().map(|_| ()),
         }
     }
 
@@ -7974,7 +8099,9 @@ impl VcpuThreadHandle {
         match self {
             Self::Host { completion, .. } => completion.clone(),
             Self::Job(receipt) => receipt.completion(),
-            Self::Persistent { completion, .. } => completion.clone(),
+            Self::Persistent {
+                terminal_settlement,
+            } => terminal_settlement.completion(),
         }
     }
 
@@ -7991,29 +8118,39 @@ impl VcpuThreadHandle {
                 })?
                 .map(|_| ()),
             Self::Persistent {
-                result: _,
-                completion,
-            } if completion.id() == current => Ok(()),
-            Self::Persistent { result, .. } => result.wait().map(|_| ()),
+                terminal_settlement,
+            } if terminal_settlement.completion().id() == current => Ok(()),
+            Self::Persistent {
+                terminal_settlement,
+            } => {
+                terminal_settlement.publish_member(Ok(VcpuLoopOutcome::ThreadDone))?;
+                if !terminal_settlement.is_published()
+                    || !terminal_settlement.completion().is_finished()
+                {
+                    return Err(RuntimeError::Configuration(
+                        "external persistent terminal settlement violated result-before-completion"
+                            .to_owned(),
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 }
 
 fn enroll_persistent_process_member(
     threads: &Arc<Mutex<Vec<VcpuThreadHandle>>>,
-    result: &HvpatchLoopResult,
-    completion: &continuation::LogicalJobCompletion,
+    terminal_settlement: &HvpatchExternalTerminalSettlement,
 ) {
     let mut handles = threads.lock();
     if handles
         .iter()
-        .any(|handle| handle.completion().id() == completion.id())
+        .any(|handle| handle.completion().id() == terminal_settlement.completion().id())
     {
         std::process::abort();
     }
     handles.push(VcpuThreadHandle::Persistent {
-        result: result.clone(),
-        completion: completion.clone(),
+        terminal_settlement: terminal_settlement.clone(),
     });
 }
 
@@ -8046,13 +8183,12 @@ struct PersistentProcessMemberPublication {
 impl PersistentProcessMemberPublication {
     fn new(
         threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
-        result: &HvpatchLoopResult,
-        completion: &continuation::LogicalJobCompletion,
+        terminal_settlement: &HvpatchExternalTerminalSettlement,
     ) -> Self {
-        enroll_persistent_process_member(&threads, result, completion);
+        enroll_persistent_process_member(&threads, terminal_settlement);
         Self {
             threads,
-            completion: completion.id(),
+            completion: terminal_settlement.completion().id(),
             armed: true,
         }
     }
@@ -8253,6 +8389,7 @@ struct PreparedHvpatchLogicalJob {
     binding: Arc<continuation::HvpatchTaskBinding>,
     result: HvpatchLoopResult,
     completion: continuation::LogicalJobCompletion,
+    terminal_settlement: HvpatchExternalTerminalSettlement,
     context: crate::kernel::KernelContext,
     cpu: crate::kernel::objects::MigratableTaskState,
     generation: crate::kernel::objects::ExecutionGeneration,
@@ -8329,6 +8466,8 @@ fn prepare_hvpatch_logical_job(
     }
     let result = HvpatchLoopResult::pending();
     let completion = continuation::LogicalJobCompletion::pending();
+    let terminal_settlement =
+        HvpatchExternalTerminalSettlement::new(result.clone(), completion.clone());
     let identity = executor::TaskLoadIdentity {
         abi: cpu.cpu.guest_abi(),
         version: cpu.cpu.version(),
@@ -8351,7 +8490,7 @@ fn prepare_hvpatch_logical_job(
                 child_settid,
             },
         ),
-        result: result.clone(),
+        terminal_settlement: terminal_settlement.clone(),
         terminal_result: None,
         completion: completion.clone(),
         traps: 0,
@@ -8377,6 +8516,7 @@ fn prepare_hvpatch_logical_job(
         binding,
         result,
         completion,
+        terminal_settlement,
         context: context.retain_exact(),
         cpu,
         generation,
@@ -8551,11 +8691,8 @@ where
                 return VcpuLoopLaunch::Direct(Err(RuntimeError::Trap(error)));
             }
         };
-        let member_publication = PersistentProcessMemberPublication::new(
-            process_members,
-            &logical.result,
-            &logical.completion,
-        );
+        let member_publication =
+            PersistentProcessMemberPublication::new(process_members, &logical.terminal_settlement);
         let started_pool = match directory.start_persistent_pool(
             logical.context.kernel(),
             authority,
@@ -8585,7 +8722,7 @@ where
         prepared.disarm();
         VcpuLoopLaunch::Persistent {
             result: logical.result,
-            completion: logical.completion,
+            terminal_settlement: logical.terminal_settlement,
             directory: Arc::clone(directory),
             shutdown_on_wait: persistent_pool_shutdown_on_wait(started_pool),
         }
@@ -11928,13 +12065,18 @@ mod tests {
                     1_000,
                 );
             state.service_kernel_context = Some(root.retain_exact());
+            let job_result = HvpatchLoopResult::pending();
+            let job_completion = continuation::LogicalJobCompletion::pending();
             let mut job = ProductionHvpatchLoopJob {
                 kernel: Arc::clone(&kernel),
                 state,
                 phase: HvpatchProductionPhase::Resident,
-                result: HvpatchLoopResult::pending(),
+                terminal_settlement: HvpatchExternalTerminalSettlement::new(
+                    job_result,
+                    job_completion.clone(),
+                ),
                 terminal_result: None,
-                completion: continuation::LogicalJobCompletion::pending(),
+                completion: job_completion,
                 traps: 0,
                 budget_floor: 0,
                 seen_signal_progress: signal_progress_count(),
@@ -12927,9 +13069,15 @@ mod tests {
         let leader_completion = continuation::LogicalJobCompletion::pending();
         let exec_result = HvpatchLoopResult::pending();
         let exec_completion = continuation::LogicalJobCompletion::pending();
+        let leader_settlement = HvpatchExternalTerminalSettlement::new(
+            leader_result.clone(),
+            leader_completion.clone(),
+        );
+        let exec_settlement =
+            HvpatchExternalTerminalSettlement::new(exec_result, exec_completion.clone());
 
-        enroll_persistent_process_member(&handles, &leader_result, &leader_completion);
-        enroll_persistent_process_member(&handles, &exec_result, &exec_completion);
+        enroll_persistent_process_member(&handles, &leader_settlement);
+        enroll_persistent_process_member(&handles, &exec_settlement);
         let drain = continuation::ProcessDrain::for_scheduler(
             context.thread().key(),
             &scheduler,
@@ -12942,11 +13090,147 @@ mod tests {
         );
         assert!(!drain.is_ready(), "exec must wait for the suspended leader");
 
-        leader_result.publish(Ok(VcpuLoopOutcome::ThreadDone));
-        leader_completion.publish();
+        leader_settlement
+            .publish_member(Ok(VcpuLoopOutcome::ThreadDone))
+            .unwrap();
         assert!(drain.is_ready());
         finish_persistent_process_handles(&handles, exec_completion.id())
             .expect("drain exact leader result without synthesizing one");
+    }
+
+    #[test]
+    fn persistent_worker_drain_never_waits_for_a_removed_logical_job() {
+        let source = include_str!("mod.rs");
+        let finish = source
+            .split("fn finish_completed(self, current")
+            .nth(1)
+            .and_then(|tail| tail.split("fn enroll_persistent_process_member").next())
+            .expect("persistent handle settlement body");
+        assert!(
+            !finish.contains("result.wait()"),
+            "an executor worker must externally settle a removed persistent job, never wait"
+        );
+        let poll = source
+            .split("fn poll_with_engine(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("impl<E: ThreadedEngine + 'static> ProductionHvpatchLoopPoll")
+                    .next()
+            })
+            .expect("production job poll");
+        assert!(
+            poll.find("terminal_settlement.is_published()").unwrap()
+                < poll.find("guest_execution.is_none()").unwrap(),
+            "a late queued poll must observe external terminal settlement before re-entry"
+        );
+        let publication = source
+            .split("fn publish_terminal_result(&mut self)")
+            .nth(1)
+            .and_then(|tail| tail.split("fn suspend(").next())
+            .expect("production terminal result publication");
+        assert!(
+            publication.contains("publish_terminal(self.terminal_result.take())"),
+            "scheduler terminal settlement must consume the typed role/result pair"
+        );
+        assert!(
+            source.contains("ProcessExitClaim::Owner => {")
+                && source.contains("arm_process_owner()"),
+            "the exact terminal CAS winner must arm owner-result authority"
+        );
+    }
+
+    #[test]
+    fn removed_persistent_job_is_settled_once_without_repoll_or_binding_cycle() {
+        let (_process, context) = crate::hvpatch::process_context_for_tests(70_104);
+        let task_state = executor::tests::task_state(&context, 104);
+        let binding = executor::tests::hvpatch_test_binding(&context, &task_state, 104);
+        let quantum_strong_before = Arc::strong_count(binding.quantum());
+        let handles = Arc::new(Mutex::new(Vec::new()));
+        let removed_result = HvpatchLoopResult::pending();
+        let removed_completion = continuation::LogicalJobCompletion::pending();
+        let removed = HvpatchExternalTerminalSettlement::new(
+            removed_result.clone(),
+            removed_completion.clone(),
+        );
+        let owner = HvpatchExternalTerminalSettlement::new(
+            HvpatchLoopResult::pending(),
+            continuation::LogicalJobCompletion::pending(),
+        );
+        enroll_persistent_process_member(&handles, &removed);
+        enroll_persistent_process_member(&handles, &owner);
+        assert_eq!(
+            Arc::strong_count(binding.quantum()),
+            quantum_strong_before,
+            "process-member retention must not point back to binding/quantum/job"
+        );
+
+        finish_persistent_process_handles(&handles, owner.completion().id())
+            .expect("removed Kernel thread settles without a job repoll");
+        assert!(handles.lock().is_empty());
+        assert!(removed.result_is_ready());
+        assert!(removed_completion.is_finished());
+        assert!(matches!(
+            removed_result.wait(),
+            Ok(VcpuLoopOutcome::ThreadDone)
+        ));
+        assert!(
+            !removed
+                .publish_member(Ok(VcpuLoopOutcome::ThreadDone))
+                .unwrap(),
+            "external result authority is one-shot"
+        );
+        assert!(
+            !owner.is_published(),
+            "the exact current owner retains its separate outcome authority"
+        );
+
+        let consumed = HvpatchExternalTerminalSettlement::new(
+            HvpatchLoopResult::pending(),
+            continuation::LogicalJobCompletion::pending(),
+        );
+        consumed
+            .publish_member(Ok(VcpuLoopOutcome::ThreadDone))
+            .unwrap();
+        assert!(matches!(
+            consumed.wait_result(),
+            Ok(VcpuLoopOutcome::ThreadDone)
+        ));
+        let consumed_handles = Arc::new(Mutex::new(Vec::new()));
+        enroll_persistent_process_member(&consumed_handles, &consumed);
+        enroll_persistent_process_member(&consumed_handles, &owner);
+        finish_persistent_process_handles(&consumed_handles, owner.completion().id())
+            .expect("already-consumed result retains durable settlement proof");
+    }
+
+    #[test]
+    fn terminal_publication_synthesizes_thread_done_only_for_an_exact_removed_sibling() {
+        assert!(matches!(
+            terminal_result_for_publication(None, HvpatchTerminalSettlementRole::Member),
+            Ok(VcpuLoopOutcome::ThreadDone)
+        ));
+        assert!(matches!(
+            terminal_result_for_publication(None, HvpatchTerminalSettlementRole::ProcessOwner),
+            Err(RuntimeError::Configuration(_))
+        ));
+        assert!(matches!(
+            terminal_result_for_publication(
+                Some(Ok(VcpuLoopOutcome::ThreadDone)),
+                HvpatchTerminalSettlementRole::ProcessOwner
+            ),
+            Ok(VcpuLoopOutcome::ThreadDone)
+        ));
+
+        let owner_result = HvpatchLoopResult::pending();
+        let owner_completion = continuation::LogicalJobCompletion::pending();
+        let owner =
+            HvpatchExternalTerminalSettlement::new(owner_result.clone(), owner_completion.clone());
+        owner.arm_process_owner().unwrap();
+        assert!(owner.publish_terminal(None));
+        assert!(owner_completion.is_finished());
+        assert!(matches!(
+            owner_result.wait(),
+            Err(RuntimeError::Configuration(_))
+        ));
     }
 
     #[test]

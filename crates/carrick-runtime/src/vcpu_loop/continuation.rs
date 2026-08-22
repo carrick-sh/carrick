@@ -3477,6 +3477,14 @@ pub(crate) struct HvpatchTaskBinding {
     quantum: Arc<HvpatchTaskQuantum>,
     backend: Mutex<Option<Box<dyn std::any::Any + Send>>>,
     stage1_mm: Option<Arc<crate::hvpatch::Stage1MmLease>>,
+    terminal_generation: Mutex<HvpatchBindingTerminalGeneration>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HvpatchBindingTerminalGeneration {
+    Active,
+    ExecTransferred,
+    Settled,
 }
 
 impl HvpatchTaskBinding {
@@ -3491,6 +3499,7 @@ impl HvpatchTaskBinding {
             quantum,
             backend: Mutex::new(Some(backend)),
             stage1_mm: None,
+            terminal_generation: Mutex::new(HvpatchBindingTerminalGeneration::Active),
         }
     }
 
@@ -3510,6 +3519,7 @@ impl HvpatchTaskBinding {
             quantum,
             backend: Mutex::new(Some(backend)),
             stage1_mm: Some(stage1_mm),
+            terminal_generation: Mutex::new(HvpatchBindingTerminalGeneration::Active),
         })
     }
 
@@ -3527,6 +3537,7 @@ impl HvpatchTaskBinding {
             quantum: Arc::clone(&self.quantum),
             backend: Mutex::new(None),
             stage1_mm: self.stage1_mm.clone(),
+            terminal_generation: Mutex::new(HvpatchBindingTerminalGeneration::Active),
         }
     }
 
@@ -3545,6 +3556,7 @@ impl HvpatchTaskBinding {
             quantum: Arc::clone(&self.quantum),
             backend: Mutex::new(None),
             stage1_mm: Some(stage1_mm),
+            terminal_generation: Mutex::new(HvpatchBindingTerminalGeneration::Active),
         })
     }
 
@@ -3588,7 +3600,34 @@ impl HvpatchTaskBinding {
     }
 
     pub(crate) fn after_terminal_settlement(&self) {
-        self.quantum.after_terminal_settlement();
+        let publish_logical_result = {
+            let mut generation = self.terminal_generation.lock();
+            match *generation {
+                HvpatchBindingTerminalGeneration::Active => {
+                    *generation = HvpatchBindingTerminalGeneration::Settled;
+                    true
+                }
+                HvpatchBindingTerminalGeneration::ExecTransferred => {
+                    *generation = HvpatchBindingTerminalGeneration::Settled;
+                    false
+                }
+                HvpatchBindingTerminalGeneration::Settled => return,
+            }
+        };
+        if publish_logical_result {
+            self.quantum.after_terminal_settlement();
+        }
+    }
+
+    pub(crate) fn mark_exec_transferred(&self) -> Result<(), crate::trap::TrapError> {
+        let mut generation = self.terminal_generation.lock();
+        if *generation != HvpatchBindingTerminalGeneration::Active {
+            return Err(crate::trap::TrapError::Hypervisor(
+                "exec predecessor binding terminal role was already consumed".to_owned(),
+            ));
+        }
+        *generation = HvpatchBindingTerminalGeneration::ExecTransferred;
+        Ok(())
     }
 
     pub(crate) fn take_address_space_retirement(
@@ -4759,6 +4798,25 @@ mod tests {
             ExecutorExit::Exited
         ));
         quantum.after_terminal_settlement();
+        assert!(completion.is_finished());
+    }
+
+    #[test]
+    fn exec_predecessor_binding_settlement_never_completes_successor_logical_job() {
+        let (_kernel, context) = bootstrap(15_474);
+        let state = crate::vcpu_loop::executor::tests::task_state(&context, 474);
+        let predecessor =
+            crate::vcpu_loop::executor::tests::hvpatch_test_binding(&context, &state, 474);
+        let completion = predecessor.quantum().completion.clone();
+        let successor = predecessor.replacement(predecessor.identity());
+
+        predecessor.mark_exec_transferred().unwrap();
+        predecessor.after_terminal_settlement();
+        assert!(
+            !completion.is_finished(),
+            "exec predecessor retirement must not complete the shared logical job"
+        );
+        successor.after_terminal_settlement();
         assert!(completion.is_finished());
     }
 

@@ -608,6 +608,12 @@ pub trait PersistentTaskBinding {
 
     fn after_terminal_settlement(&self) {}
 
+    fn mark_exec_transferred(&self) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "task binding has no exec-transfer terminal authority".to_owned(),
+        ))
+    }
+
     fn take_address_space_retirement(
         &self,
     ) -> Option<crate::hvpatch::PendingAddressSpaceRetirement> {
@@ -644,6 +650,10 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
 
     fn after_terminal_settlement(&self) {
         crate::vcpu_loop::continuation::HvpatchTaskBinding::after_terminal_settlement(self);
+    }
+
+    fn mark_exec_transferred(&self) -> Result<(), TrapError> {
+        crate::vcpu_loop::continuation::HvpatchTaskBinding::mark_exec_transferred(self)
     }
 
     fn take_address_space_retirement(
@@ -2930,6 +2940,9 @@ where
                                     authority,
                                 },
                             )
+                            .map_err(|error| error.to_string())?;
+                        binding
+                            .mark_exec_transferred()
                             .map_err(|error| error.to_string())?;
                         if backend
                             .retarget_loaded_task(Arc::clone(&replacement_record.binding))

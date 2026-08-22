@@ -1207,13 +1207,11 @@ where
                                 return;
                             }
                             VcpuLoopLaunch::Persistent {
-                                result,
-                                completion,
+                                terminal_settlement,
                                 ..
                             } => {
                                 logical_threads.lock().push(VcpuThreadHandle::Persistent {
-                                    result,
-                                    completion,
+                                    terminal_settlement,
                                 });
                                 return;
                             }
