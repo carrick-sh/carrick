@@ -4169,7 +4169,7 @@ struct HvpatchFrameInventory {
     retired_reservation: Option<carrick_hal::FrameInventoryReservation>,
     replacement_reservation: Option<carrick_hal::FrameInventoryReservation>,
     exec_commits: Option<(
-        carrick_hal::FrameInventoryCommit<()>,
+        Option<carrick_hal::FrameInventoryCommit<()>>,
         carrick_hal::FrameInventoryCommit<()>,
     )>,
     retirement_reservation: Option<carrick_hal::FrameInventoryReservation>,
@@ -4477,7 +4477,7 @@ impl HvpatchFrameInventoryState {
 
     fn begin_exec_inventory(
         &mut self,
-        retired: carrick_hal::FrameInventoryReservation,
+        retired: Option<carrick_hal::FrameInventoryReservation>,
         replacement: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
         if std::mem::take(&mut self.fail_next_begin_exec_inventory) {
@@ -4494,7 +4494,7 @@ impl HvpatchFrameInventoryState {
                 "overlapping HVPatch exec inventory transaction".to_owned(),
             ));
         }
-        inventory.retired_reservation = Some(retired);
+        inventory.retired_reservation = retired;
         inventory.replacement_reservation = Some(replacement);
         Ok(())
     }
@@ -4907,15 +4907,39 @@ impl HvfTaskState {
         })
     }
 
+    /// Whether an execve on this task retires the old mm's extents.
+    ///
+    /// A vfork / `CLONE_VM` child shares its mm with a live sharer that keeps
+    /// every mapping, so its exec retires nothing: the replacement gets a fresh
+    /// ledger and the old one stays whole. Callers must arm no retirement
+    /// transaction in that case — a reservation filled with zero events is
+    /// rejected by the Kernel authority, and the exec is already past its point
+    /// of no return by the time the commit is applied.
+    pub(crate) fn exec_retires_old_mm(&self) -> bool {
+        !self.shared_process_mm
+    }
+
+    /// Extents this task's execve will retire from the old mm: none when a
+    /// live sharer still owns it.
+    pub(crate) fn exec_retired_extent_count(&self) -> usize {
+        if self.exec_retires_old_mm() {
+            self.frame_inventory.lock().extents.len()
+        } else {
+            0
+        }
+    }
+
     fn begin_exec_inventory(
         &mut self,
-        retired: carrick_hal::FrameInventoryReservation,
+        retired: Option<carrick_hal::FrameInventoryReservation>,
         replacement: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
         if self.shared_process_mm {
             // The parent still owns this ledger. Exec starts a fresh backend
-            // ledger for the replacement MM; the retired commit is therefore
-            // intentionally empty and cannot remove the parent's mappings.
+            // ledger for the replacement MM so it cannot remove the parent's
+            // mappings. Nothing is retired, so `retired` is `None` here:
+            // reserving a retirement would stage zero events against the fresh
+            // ledger, and the Kernel authority rejects a zero-event commit.
             let frames = self.frame_inventory.lock().frames.clone();
             self.frame_inventory = HvpatchFrameInventoryState::new(std::sync::Arc::new(
                 parking_lot::Mutex::new(HvpatchFrameInventory::with_frames(frames)),
@@ -9356,7 +9380,7 @@ impl HvfVmState {
 
     pub(crate) fn begin_exec_inventory(
         &mut self,
-        retired: carrick_hal::FrameInventoryReservation,
+        retired: Option<carrick_hal::FrameInventoryReservation>,
         replacement: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
         self.task.begin_exec_inventory(retired, replacement)
@@ -9379,13 +9403,13 @@ impl HvfVmState {
                     .count()
             })
             .unwrap_or(0);
-        (self.frame_inventory.lock().extents.len(), replacement)
+        (self.exec_retired_extent_count(), replacement)
     }
 
     pub(crate) fn take_exec_inventory(
         &mut self,
     ) -> Option<(
-        carrick_hal::FrameInventoryCommit<()>,
+        Option<carrick_hal::FrameInventoryCommit<()>>,
         carrick_hal::FrameInventoryCommit<()>,
     )> {
         self.frame_inventory.lock().exec_commits.take()
@@ -16498,19 +16522,15 @@ impl HvfVmState {
         };
         let mut inventory_reservations = if self.persistent_vm_lifecycle {
             let mut inventory = self.frame_inventory.lock();
-            Some((
-                inventory.retired_reservation.take().ok_or_else(|| {
-                    TrapError::Hypervisor(
-                        "HVPatch exec began without old-mm inventory reservation".to_owned(),
-                    )
-                })?,
-                inventory.replacement_reservation.take().ok_or_else(|| {
-                    TrapError::Hypervisor(
-                        "HVPatch exec began without replacement-mm inventory reservation"
-                            .to_owned(),
-                    )
-                })?,
-            ))
+            // The replacement transaction is mandatory. The retirement one is
+            // absent exactly when the old mm stays owned by a live sharer, so
+            // its absence here is the armed contract, not a missing reservation.
+            let replacement = inventory.replacement_reservation.take().ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "HVPatch exec began without replacement-mm inventory reservation".to_owned(),
+                )
+            })?;
+            Some((inventory.retired_reservation.take(), replacement))
         } else {
             None
         };
@@ -16720,7 +16740,7 @@ impl HvfVmState {
             for (_, lease) in &mut prepared_exec_regions {
                 lease.mark_mapped();
             }
-            if let Some((retired, _)) = inventory_reservations.as_mut() {
+            if let Some((Some(retired), _)) = inventory_reservations.as_mut() {
                 let mut inventory = self.frame_inventory.lock();
                 if let Err(error) = Self::stage_retirement(&mut inventory, retired) {
                     eprintln!("carrick: FATAL: stage inventory after HVPatch exec unmap: {error}");
@@ -16896,7 +16916,10 @@ impl HvfVmState {
                     std::process::abort();
                 }
             }
-            inventory.exec_commits = Some((retired.commit(()), replacement.commit(())));
+            inventory.exec_commits = Some((
+                retired.map(|retired| retired.commit(())),
+                replacement.commit(()),
+            ));
         }
         emit_replace_stage(
             carrick_observability::probes::HvpatchExecReplaceStagePhase::MapBackings,
@@ -19411,9 +19434,9 @@ mod frame_inventory_backend_tests {
         task.shared_process_mm = true;
         let parent_ledger = task.frame_inventory.shared_ledger();
         parent_ledger.lock().initialized = true;
-        let (retired, replacement) = inventory_pair(11);
+        let (_unused, replacement) = inventory_pair(11);
 
-        task.begin_exec_inventory(retired, replacement)
+        task.begin_exec_inventory(None, replacement)
             .expect("arm shared-process exec inventory");
 
         let replacement_ledger = task.frame_inventory.shared_ledger();
@@ -19421,8 +19444,41 @@ mod frame_inventory_backend_tests {
         assert!(parent_ledger.lock().initialized);
         assert!(parent_ledger.lock().retired_reservation.is_none());
         let replacement = replacement_ledger.lock();
-        assert!(replacement.retired_reservation.is_some());
+        // The replacement ledger is fresh, so a retirement armed against it
+        // could only ever stage zero events. It must not be armed at all.
+        assert!(replacement.retired_reservation.is_none());
         assert!(replacement.replacement_reservation.is_some());
+    }
+
+    /// The seam this pins: the runtime sizes the retirement transaction from
+    /// the count the backend reports, then the backend rebases onto a fresh
+    /// ledger and stages nothing into it. Reporting the old ledger's extents
+    /// for a retained mm made those two disagree, and every vfork+execve died
+    /// past its point of no return on the resulting zero-event commit.
+    #[test]
+    fn retained_old_mm_reports_no_exec_retirement_extents() {
+        let mut task = hvpatch_task_state_test_fixture(9, 0x9000, 9);
+        {
+            let mut ledger = task.frame_inventory.lock();
+            ledger.initialized = true;
+            ledger.extents.insert(
+                (0x9000_0000, 0x4000),
+                InventoryExtent {
+                    frame: carrick_hal::FrameId::from_kernel_allocation(id(41)),
+                    mapping: carrick_hal::MappingId::from_kernel_allocation(id(42)),
+                    backing: InventoryBackingIdentity::Private(9),
+                    stage2_base: 0x9000_0000,
+                    stage2_length: 0x4000,
+                },
+            );
+        }
+
+        assert!(task.exec_retires_old_mm());
+        assert_eq!(task.exec_retired_extent_count(), 1);
+
+        task.shared_process_mm = true;
+        assert!(!task.exec_retires_old_mm());
+        assert_eq!(task.exec_retired_extent_count(), 0);
     }
 
     #[test]
@@ -20116,7 +20172,7 @@ mod frame_inventory_backend_tests {
 
         let (b_retired, b_replacement) = inventory_pair(1);
         engine_b
-            .begin_exec_inventory(b_retired, b_replacement)
+            .begin_exec_inventory(Some(b_retired), b_replacement)
             .expect("unarmed engine B must not consume engine A's injection");
         {
             let mut ledger = ledger.lock();
@@ -20126,7 +20182,7 @@ mod frame_inventory_backend_tests {
 
         let (a_retired, a_replacement) = inventory_pair(3);
         let error = engine_a
-            .begin_exec_inventory(a_retired, a_replacement)
+            .begin_exec_inventory(Some(a_retired), a_replacement)
             .expect_err("armed engine A must receive its own injected error");
         assert!(
             error
@@ -20136,7 +20192,7 @@ mod frame_inventory_backend_tests {
 
         let (retry_retired, retry_replacement) = inventory_pair(5);
         engine_a
-            .begin_exec_inventory(retry_retired, retry_replacement)
+            .begin_exec_inventory(Some(retry_retired), retry_replacement)
             .expect("engine A injection must be consumed exactly once");
     }
 

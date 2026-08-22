@@ -1060,7 +1060,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn begin_exec_inventory(
         &mut self,
-        retired: carrick_hal::FrameInventoryReservation,
+        retired: Option<carrick_hal::FrameInventoryReservation>,
         replacement: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
         self.state.begin_exec_inventory(retired, replacement)
@@ -1069,7 +1069,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     fn take_exec_inventory(
         &mut self,
     ) -> Option<(
-        carrick_hal::FrameInventoryCommit<()>,
+        Option<carrick_hal::FrameInventoryCommit<()>>,
         carrick_hal::FrameInventoryCommit<()>,
     )> {
         self.state.take_exec_inventory()

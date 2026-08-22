@@ -1341,7 +1341,11 @@ impl TaskBindingResolver<crate::vcpu_loop::continuation::HvpatchTaskBinding>
         for (thread, generation, binding) in candidates {
             if scheduler
                 .fail_blocked_exact(thread, generation, reason)
-                .map_err(|error| TrapError::Hypervisor(error.to_string()))?
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "cancel dormant binding {thread:?} generation {generation:?}: {error}"
+                    ))
+                })?
             {
                 binding.after_terminal_settlement();
                 cancelled = cancelled
