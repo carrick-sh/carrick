@@ -1193,12 +1193,6 @@ where
                             max_traps,
                         );
                         let r = match launch {
-                            VcpuLoopLaunch::Job(receipt) => {
-                                logical_threads
-                                    .lock()
-                                    .push(VcpuThreadHandle::Job(receipt));
-                                return;
-                            }
                             VcpuLoopLaunch::Persistent {
                                 terminal_settlement,
                                 ..
@@ -1417,30 +1411,6 @@ where
         Ok(CloneThreadSpawn::Started(linux_tid))
     }
 
-    /// Stop every sibling vCPU belonging to this Linux process before its
-    /// mm's stage-1 root and final global frames are unmapped. The old
-    /// `VCPU_LIVE == 1` exec drain is
-    /// process-global and therefore cannot distinguish unrelated processes in
-    /// a shared VM; this path instead uses the process-private registry,
-    /// kicker, and sibling JoinHandles.
-    async fn await_hvpatch_sibling_jobs(&self) -> Result<(), RuntimeError> {
-        let Some(current) = continuation::TransitionalDedicatedRunner::current_job() else {
-            return Ok(());
-        };
-        let completions = self
-            .threads
-            .lock()
-            .iter()
-            .map(VcpuThreadHandle::completion)
-            .collect::<Vec<_>>();
-        continuation::ProcessDrain::excluding(current.clone(), completions).await;
-        let handles = std::mem::take(&mut *self.threads.lock());
-        for handle in handles {
-            handle.finish_completed(current.id())?;
-        }
-        Ok(())
-    }
-
     pub(super) fn prepare_persistent_sibling_drain(
         &self,
         kernel: &Kernel,
@@ -1531,20 +1501,10 @@ where
         kernel: &Kernel,
     ) -> Result<(), RuntimeError> {
         kernel.begin_process_exit();
-        if continuation::TransitionalDedicatedRunner::current_job().is_some() {
-            let _ = self.registry.remove_all_except(self.this_tid);
-            self.kicker.kick_all_except(self.this_tid);
-            self.futex.notify_signal_pending();
-            self.platform_futex.notify_signal_pending();
-            kernel.signal_arrival.wake_all_waiters();
-            self.await_hvpatch_sibling_jobs().await?;
-            if kernel.guest_executor_count() > 1 {
-                return Err(RuntimeError::Trap(TrapError::Hypervisor(
-                    "HVPatch logical sibling drain completed with live guest executors".to_owned(),
-                )));
-            }
-            return Ok(());
-        }
+        // The logical sibling drain that used to be selected here read the
+        // retired runner pool's ambient job thread-local. Only that pool ever
+        // published it — never the persistent executor — so it always answered
+        // `None` and this drain always ran the loop below.
         let current_host_thread = std::thread::current().id();
         // Give an attached debugger a bounded window to capture a stranded
         // sibling when fault diagnostics are explicitly enabled. Production
@@ -1825,122 +1785,10 @@ where
             self.platform_futex.notify_signal_pending();
             kernel.signal_arrival.wake_all_waiters();
 
-            if continuation::TransitionalDedicatedRunner::current_job().is_some() {
-                let directory = kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
-                    RuntimeError::Configuration(
-                        "HVPatch exec drain has no shared scheduler".to_owned(),
-                    )
-                })?;
-                let context = self.service_kernel_context.as_ref().ok_or_else(|| {
-                    RuntimeError::Configuration(
-                        "HVPatch exec drain lost exact Kernel context".to_owned(),
-                    )
-                })?;
-                let (scheduler, _service) = directory.continuation_services(context.kernel());
-                let thread = self.kernel_thread.as_ref().ok_or_else(|| {
-                    RuntimeError::Configuration(
-                        "HVPatch exec drain lost exact Kernel thread".to_owned(),
-                    )
-                })?;
-                {
-                    let lease = self.execution_lease.lock();
-                    thread
-                        .begin_switch_out(lease.as_ref().ok_or_else(|| {
-                            RuntimeError::Configuration(
-                                "HVPatch exec drain lost execution lease".to_owned(),
-                            )
-                        })?)
-                        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-                }
-                let cpu = engine.save_guest_state().map_err(RuntimeError::Trap)?;
-                let _ = self
-                    .registry
-                    .park_vcpu_classified(self.this_tid, crate::thread::VcpuParkClass::ReleaseSafe);
-                let saved = self.current_migratable_binding(cpu)?;
-                let mut lease = self.execution_lease.lock().take().ok_or_else(|| {
-                    RuntimeError::Configuration(
-                        "HVPatch exec drain settlement lost execution lease".to_owned(),
-                    )
-                })?;
-                lease
-                    .replace_task_state(saved)
-                    .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-                scheduler
-                    .settle_transitional_runnable(thread, lease)
-                    .map_err(|(error, _lease)| RuntimeError::Configuration(error.to_string()))?;
-                if let Some(vcpu_lease) = carrick_hal::vcpu_sched::take_current_lease() {
-                    carrick_hal::vcpu_sched::global()
-                        .release(vcpu_lease, carrick_hal::vcpu_sched::Yield::Blocked);
-                }
-                if engine.reclaim_refreshes_kicker() {
-                    self.kicker.unregister(self.this_tid);
-                }
-                drop(self.guest_execution.take());
-                engine
-                    .audit_executor_boundary()
-                    .map_err(RuntimeError::Trap)?;
-                debug_assert!(scheduler.binding_for_thread(thread.key()).is_none());
-
-                let drain_result = self.await_hvpatch_sibling_jobs().await;
-
-                engine
-                    .audit_executor_boundary()
-                    .map_err(RuntimeError::Trap)?;
-                let vcpu_lease = continuation::await_vcpu_admission(
-                    carrick_hal::vcpu_sched::global(),
-                    self.this_tid.raw() as u64,
-                    None,
-                )
-                .await;
-                carrick_hal::vcpu_sched::set_current_lease(vcpu_lease);
-                let executor =
-                    continuation::TransitionalDedicatedRunner::current_executor_registration()
-                        .ok_or_else(|| {
-                            RuntimeError::Configuration(
-                                "HVPatch exec drain resumed outside a bounded worker".to_owned(),
-                            )
-                        })?;
-                let lease = scheduler
-                    .take_transitional_lease(&executor, thread.key())
-                    .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-                let (current_mm, current_asid) = lease
-                    .task_state_authority()
-                    .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-                let abi = <E::Arch as carrick_hal::GuestArch>::linux_guest_abi();
-                let cpu = lease
-                    .task_state_for_restore(abi, 1, current_mm, current_asid)
-                    .map_err(|error| RuntimeError::Configuration(error.to_string()))?
-                    .cpu
-                    .clone();
-                self.guest_execution = Some(
-                    kernel
-                        .guest_executors
-                        .enter(self.kernel_thread.as_ref().map(Arc::clone)),
-                );
-                engine
-                    .rebind_to_slot(vcpu_lease.slot, &cpu)
-                    .map_err(RuntimeError::Trap)?;
-                let _ = self.registry.unpark_vcpu(self.this_tid);
-                if engine.reclaim_refreshes_kicker() {
-                    self.register_vcpu(engine);
-                }
-                if !continuation::TransitionalDedicatedRunner::publish_current_hardware_kick(
-                    Box::new(engine.kick_handle()),
-                ) {
-                    return Err(RuntimeError::Configuration(
-                        "HVPatch exec resume has no worker-owned kick destination".to_owned(),
-                    ));
-                }
-                *self.execution_lease.lock() = Some(lease);
-                drain_result?;
-                if kernel.guest_executor_count() > 1 {
-                    return Err(RuntimeError::Trap(TrapError::Hypervisor(
-                        "HVPatch exec drain completed with live guest executors".to_owned(),
-                    )));
-                }
-                return Ok(());
-            }
-
+            // The executor-lease exec drain that used to be selected here read
+            // the retired runner pool's ambient job thread-local, which only
+            // that pool ever published, so it never ran and the bounded drain
+            // below is the one that has always executed.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
                 let unfinished = self

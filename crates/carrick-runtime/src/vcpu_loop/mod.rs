@@ -739,7 +739,6 @@ pub(crate) struct HvpatchRuntimeDirectory {
     endpoints: Mutex<BTreeMap<crate::kernel::TaskKey, HvpatchRuntimeEndpoint>>,
     continuation_wait_service: Mutex<Option<Arc<continuation::CarrierWaitService>>>,
     scheduler: Mutex<Option<Arc<crate::kernel::scheduler::Scheduler>>>,
-    transitional_runner: continuation::TransitionalDedicatedRunner,
     persistent_bindings: Arc<executor::HvpatchTaskBindingDirectory>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     carrier_tasks:
@@ -794,10 +793,6 @@ impl HvpatchRuntimeDirectory {
             )
         }))
     }
-    fn transitional_runner(&self) -> continuation::TransitionalDedicatedRunner {
-        self.transitional_runner.clone()
-    }
-
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn start_persistent_pool(
         &self,
@@ -868,8 +863,6 @@ impl HvpatchRuntimeDirectory {
                 endpoint.scheduler = Some(Arc::clone(&scheduler));
             }
         }
-        self.transitional_runner
-            .attach_scheduler(Arc::clone(&scheduler));
         let service = {
             let mut slot = self.continuation_wait_service.lock();
             Arc::clone(slot.get_or_insert_with(|| {
@@ -1490,12 +1483,6 @@ pub(crate) struct KernelState {
 }
 
 impl KernelState {
-    pub(crate) fn transitional_runner(&self) -> Option<continuation::TransitionalDedicatedRunner> {
-        self.hvpatch_runtime
-            .as_ref()
-            .map(|directory| directory.transitional_runner())
-    }
-
     fn transitional_need_resched(&self) -> bool {
         self.hvpatch_runtime
             .as_ref()
@@ -6902,7 +6889,6 @@ enum TrapWatchdog {
 
 pub(crate) enum VcpuLoopLaunch {
     Direct(Result<VcpuLoopOutcome, RuntimeError>),
-    Job(continuation::LogicalTaskReceipt<Result<VcpuLoopOutcome, RuntimeError>>),
     Persistent {
         result: HvpatchLoopResult,
         terminal_settlement: HvpatchExternalTerminalSettlement,
@@ -6919,12 +6905,14 @@ const fn persistent_pool_shutdown_on_wait(started_pool: bool) -> bool {
     started_pool
 }
 
+/// A guest thread's handle in the process-private thread list. The retired
+/// `Job` variant carried a transitional-runner task receipt, which nothing on
+/// the persistent path ever produced.
 pub(crate) enum VcpuThreadHandle {
     Host {
         handle: std::thread::JoinHandle<()>,
         completion: continuation::LogicalJobCompletion,
     },
-    Job(continuation::LogicalTaskReceipt<Result<VcpuLoopOutcome, RuntimeError>>),
     Persistent {
         terminal_settlement: HvpatchExternalTerminalSettlement,
     },
@@ -6934,7 +6922,6 @@ impl VcpuThreadHandle {
     fn is_finished(&self) -> bool {
         match self {
             Self::Host { completion, .. } => completion.is_finished(),
-            Self::Job(receipt) => receipt.is_finished(),
             Self::Persistent {
                 terminal_settlement,
             } => terminal_settlement.completion().is_finished(),
@@ -6944,14 +6931,13 @@ impl VcpuThreadHandle {
     fn host_thread_id(&self) -> Option<std::thread::ThreadId> {
         match self {
             Self::Host { handle, .. } => Some(handle.thread().id()),
-            Self::Job(_) | Self::Persistent { .. } => None,
+            Self::Persistent { .. } => None,
         }
     }
 
     fn diagnostic_name(&self) -> String {
         match self {
             Self::Host { handle, .. } => handle.thread().name().unwrap_or("<unnamed>").to_owned(),
-            Self::Job(_) => "transitional-vcpu-job".to_owned(),
             Self::Persistent { .. } => "persistent-hvpatch-job".to_owned(),
         }
     }
@@ -6963,14 +6949,6 @@ impl VcpuThreadHandle {
                     "HVPatch vCPU bootstrap pthread panicked".to_owned(),
                 ))
             }),
-            Self::Job(receipt) => receipt
-                .wait()
-                .map_err(|error| {
-                    RuntimeError::Trap(TrapError::Hypervisor(format!(
-                        "HVPatch logical vCPU job failed: {error}"
-                    )))
-                })?
-                .map(|_| ()),
             Self::Persistent {
                 terminal_settlement,
             } => terminal_settlement.wait_result().map(|_| ()),
@@ -6980,7 +6958,6 @@ impl VcpuThreadHandle {
     fn completion(&self) -> continuation::LogicalJobCompletion {
         match self {
             Self::Host { completion, .. } => completion.clone(),
-            Self::Job(receipt) => receipt.completion(),
             Self::Persistent {
                 terminal_settlement,
             } => terminal_settlement.completion(),
@@ -6990,15 +6967,6 @@ impl VcpuThreadHandle {
     fn finish_completed(self, current: continuation::JobId) -> Result<(), RuntimeError> {
         match self {
             Self::Host { .. } => Ok(()),
-            Self::Job(receipt) if receipt.completion().id() == current => Ok(()),
-            Self::Job(receipt) => receipt
-                .try_take()
-                .map_err(|error| {
-                    RuntimeError::Trap(TrapError::Hypervisor(format!(
-                        "HVPatch logical vCPU job failed: {error}"
-                    )))
-                })?
-                .map(|_| ()),
             Self::Persistent {
                 terminal_settlement,
             } if terminal_settlement.completion().id() == current => Ok(()),
@@ -7092,9 +7060,6 @@ impl VcpuLoopLaunch {
     pub(crate) fn wait(self) -> Result<VcpuLoopOutcome, RuntimeError> {
         match self {
             Self::Direct(result) => result,
-            Self::Job(receipt) => receipt.wait().map_err(|error| {
-                RuntimeError::Unsupported(format!("transitional vCPU job failed: {error}"))
-            })?,
             Self::Persistent {
                 result,
                 directory,
@@ -7110,17 +7075,6 @@ impl VcpuLoopLaunch {
             }
         }
     }
-}
-
-#[cfg(test)]
-fn submit_prepared_vcpu_future<F>(
-    runner: &continuation::TransitionalDedicatedRunner,
-    future: F,
-) -> VcpuLoopLaunch
-where
-    F: std::future::Future<Output = Result<VcpuLoopOutcome, RuntimeError>> + Send + 'static,
-{
-    VcpuLoopLaunch::Job(runner.spawn(future))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -7914,39 +7868,6 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn persistent_pool_creator_is_the_only_shutdown_owner() {
-        assert!(persistent_pool_shutdown_on_wait(true));
-        assert!(!persistent_pool_shutdown_on_wait(false));
-
-        let source = include_str!("mod.rs");
-        let launch = source
-            .split("fn launch_persistent_hvpatch_job")
-            .nth(1)
-            .and_then(|tail| tail.split("struct PreparedInitialRunnerTask").next())
-            .expect("persistent HVPatch root launch");
-        assert!(
-            launch.contains("shutdown_on_wait: persistent_pool_shutdown_on_wait(started_pool)")
-        );
-        assert!(
-            !launch.contains("process.is_child()"),
-            "host tracing/fork topology and logical child ancestry cannot select pool ownership"
-        );
-        let parked = launch
-            .find("prepare_initial_runner_handoff(")
-            .expect("initial vCPU park");
-        let extract = launch
-            .find("persistent_executor_factory_authority(")
-            .expect("carrier mapping authority extraction");
-        let split = launch
-            .find("split_initial_task_engine(hvf_engine)")
-            .expect("task-only handoff");
-        assert!(
-            parked < extract && extract < split,
-            "carrier stage-2 ownership moves only after the bootstrap vCPU is parked"
-        );
-    }
-
-    #[test]
     fn guest_run_accounting_uses_non_aliasing_engine_receipts() {
         let source = include_str!("mod.rs");
         assert!(!source.contains(concat!("this_thread_", "slot")));
@@ -8537,81 +8458,6 @@ mod tests {
             0,
             "a broad compatibility nudge cannot replace rejected scheduler authority"
         );
-    }
-
-    #[test]
-    fn transitional_worker_registration_unregisters_on_repeated_drop() {
-        let dispatcher = SyscallDispatcher::new();
-        let context = dispatcher.capture_one_task_context().expect("task context");
-        let scheduler = Arc::new(crate::kernel::Scheduler::new(Arc::clone(context.kernel())));
-        let baseline = scheduler.registered_executor_count();
-        for _ in 0..64 {
-            let runner = continuation::TransitionalDedicatedRunner::with_worker_limit(1)
-                .expect("one transitional worker");
-            runner.attach_scheduler(Arc::clone(&scheduler));
-            runner
-                .spawn(async {
-                    continuation::TransitionalDedicatedRunner::current_executor_id()
-                        .expect("worker executor")
-                })
-                .wait()
-                .expect("logical job");
-            assert_eq!(scheduler.registered_executor_count(), baseline + 1);
-            drop(runner);
-            assert_eq!(scheduler.registered_executor_count(), baseline);
-        }
-    }
-
-    #[test]
-    fn prepared_launches_run_compute_quanta_only_on_bounded_runner_workers() {
-        const TASKS: usize = 16;
-        let runner =
-            continuation::TransitionalDedicatedRunner::with_worker_limit(2).expect("two workers");
-        let progress = Arc::new(Mutex::new(Vec::new()));
-        let mut submitters = Vec::new();
-        for task in 0..TASKS {
-            let runner = runner.clone();
-            let progress = Arc::clone(&progress);
-            submitters.push(std::thread::spawn(move || {
-                let bootstrap = std::thread::current().id();
-                let launch = submit_prepared_vcpu_future(&runner, async move {
-                    for quantum in 0..4usize {
-                        progress
-                            .lock()
-                            .push((task, quantum, std::thread::current().id()));
-                        continuation::yield_runner_quantum().await;
-                    }
-                    Ok(VcpuLoopOutcome::ThreadDone)
-                });
-                (bootstrap, launch)
-            }));
-        }
-        let launched = submitters
-            .into_iter()
-            .map(|submitter| submitter.join().expect("bootstrap exits"))
-            .collect::<Vec<_>>();
-        let bootstrap_ids = launched
-            .iter()
-            .map(|(bootstrap, _)| *bootstrap)
-            .collect::<std::collections::HashSet<_>>();
-        for (_, launch) in launched {
-            assert!(matches!(launch.wait(), Ok(VcpuLoopOutcome::ThreadDone)));
-        }
-        let progress = progress.lock();
-        assert_eq!(progress.len(), TASKS * 4);
-        let worker_ids = progress
-            .iter()
-            .map(|(_, _, worker)| *worker)
-            .collect::<std::collections::HashSet<_>>();
-        assert!(worker_ids.len() <= 2);
-        assert!(worker_ids.is_disjoint(&bootstrap_ids));
-        for task in 0..TASKS {
-            assert_eq!(
-                progress.iter().filter(|(id, _, _)| *id == task).count(),
-                4,
-                "demand preemption must progress every prepared task"
-            );
-        }
     }
 
     #[test]
