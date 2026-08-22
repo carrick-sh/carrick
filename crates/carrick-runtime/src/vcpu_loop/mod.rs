@@ -4764,6 +4764,50 @@ where
                 if engine.resolve_frame_cow_fault(syndrome, far)? {
                     return Ok(executor::ExecutorExit::Syscall);
                 }
+                // The fault probes are load-bearing instruments, not debug
+                // spam: `carrick trace` profiles and `scripts/dtrace/*.d` join
+                // on them, and a probe that never fires reads as "the fault did
+                // not happen". They were part of this handling before it was
+                // ported off the welded loop and stay part of it.
+                let instruction = engine
+                    .read_bytes(elr, 4)
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u32::from_le_bytes);
+                let (base_register, base_value) = instruction.map_or((u32::MAX, 0), |word| {
+                    let index = (word >> 5) & 0x1f;
+                    let value = (index < 31)
+                        .then(|| engine.get_reg(carrick_hal::Reg::X(index)).ok())
+                        .flatten()
+                        .unwrap_or(0);
+                    (index, value)
+                });
+                crate::probes::vcpu_fault_regs(
+                    syndrome,
+                    elr,
+                    far,
+                    instruction.map_or(u64::MAX, u64::from),
+                    base_register,
+                    base_value,
+                );
+                crate::probes::vcpu_fault_gprs(
+                    engine.get_reg(carrick_hal::Reg::X(0)).unwrap_or(0),
+                    engine.get_reg(carrick_hal::Reg::X(1)).unwrap_or(0),
+                    engine.get_reg(carrick_hal::Reg::X(2)).unwrap_or(0),
+                    engine.get_reg(carrick_hal::Reg::X(3)).unwrap_or(0),
+                    engine.get_reg(carrick_hal::Reg::X(4)).unwrap_or(0),
+                    engine.get_reg(carrick_hal::Reg::X(5)).unwrap_or(0),
+                );
+                if let Some((ttbr, descriptors)) = engine.diagnostic_fault_page_tables(far) {
+                    crate::probes::pt_fault_walk(
+                        far,
+                        descriptors[0],
+                        descriptors[1],
+                        descriptors[2],
+                        descriptors[3],
+                    );
+                    crate::probes::pt_fault_ttbr(far, ttbr);
+                }
                 if let Some(process) = self.kernel.hvpatch_process.as_ref() {
                     process.trace_fault(syndrome, elr, far, self.state.this_tid);
                 }
@@ -4777,6 +4821,13 @@ where
                 let Some((signum, si_code, si_addr)) = lower_el0_fault(syndrome, elr, far) else {
                     // Unclassified EL0 fault: Linux forces the default action
                     // (terminate by SIGSEGV).
+                    if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
+                        eprintln!(
+                            "[FAULTDBG tid={:?}] UNCLASSIFIED EL0 fault esr={syndrome:#x} ec={:#x} elr={elr:#x} far={far:#x} -> SIGSEGV terminate",
+                            self.state.this_tid,
+                            (syndrome >> 26) & 0x3f
+                        );
+                    }
                     self.kernel.record_fatal_signal(FatalSignalRecord {
                         image_generation: self.state.fatal_image_generation,
                         tid: self.state.linux_tid,
@@ -4796,6 +4847,23 @@ where
                         VcpuLoopOutcome::ProcessExit(Box::new(result)),
                     ));
                 };
+                if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
+                    let base =
+                        (base_register < 31).then(|| format!("x{base_register}={base_value:#x}"));
+                    let regs: Vec<_> = (0..=12)
+                        .map(|index| {
+                            engine
+                                .get_reg(carrick_hal::Reg::X(index))
+                                .map_or_else(|_| "?".to_owned(), |value| format!("{value:#x}"))
+                        })
+                        .collect();
+                    eprintln!(
+                        "[FAULTDBG tid={:?}] classified EL0 fault esr={syndrome:#x} ec={:#x} elr={elr:#x} far={far:#x} direct={from_el0_direct} last_syscall={:?} insn={instruction:?} base={base:?} x0..x12={regs:?}",
+                        self.state.this_tid,
+                        (syndrome >> 26) & 0x3f,
+                        engine.last_syscall_nr()
+                    );
+                }
                 // Raw hardware/host faults can decode as MAPERR even when
                 // Carrick tracks a live VMA denying the access. Upgrade from the
                 // shared protection metadata (LTP mmap05 / roprotect probe).
