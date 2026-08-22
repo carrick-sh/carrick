@@ -3695,6 +3695,10 @@ pub(crate) mod tests {
         task: Option<(ThreadKey, ExecutionGeneration)>,
     }
 
+    /// One recorded `(ttbr0, ttbr1, asid, tls, sp_el1)` row observed by the
+    /// fake backend when a task loads onto an executor.
+    type InheritedStateRow = (u64, u64, u64, u64, u64);
+
     #[derive(Clone, Debug, Default)]
     struct FakeFactory {
         bindings: Arc<parking_lot::Mutex<BTreeMap<ThreadKey, Arc<FakeBinding>>>>,
@@ -3716,7 +3720,7 @@ pub(crate) mod tests {
         destroy_mode: Arc<AtomicUsize>,
         snapshot_count: Arc<AtomicUsize>,
         concurrent_loads: Arc<parking_lot::Mutex<BTreeSet<(ThreadKey, ExecutionGeneration)>>>,
-        inherited_state: Arc<parking_lot::Mutex<Vec<(u64, u64, u64, u64, u64)>>>,
+        inherited_state: Arc<parking_lot::Mutex<Vec<InheritedStateRow>>>,
         retired_bindings: Arc<parking_lot::Mutex<Vec<(ThreadKey, ExecutionGeneration)>>>,
     }
 
@@ -7585,7 +7589,6 @@ pub(crate) mod tests {
             .audit_clean(&mut backend, &kick)
             .expect("successor observes no kick identity");
 
-        drop(backend);
         scheduler
             .unregister_executor(&registration)
             .expect("unregister audit executor");

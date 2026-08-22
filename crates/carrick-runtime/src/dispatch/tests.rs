@@ -1058,7 +1058,7 @@ mod overlay_dispatch_tests {
             [
                 (-100i64) as u64,
                 path,
-                (O_CREAT | 2) as u64,
+                O_CREAT | 2,
                 0o600,
                 0,
                 0,

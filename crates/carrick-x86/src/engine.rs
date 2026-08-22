@@ -1524,9 +1524,24 @@ fn encode_x86_resume_metadata<V: X86Vmm>(
     payload
 }
 
+/// The engine-resume fields carried in a V1 task-resume payload.
+///
+/// These were a five-field positional tuple whose members were read back as
+/// `metadata.0 .. metadata.4`. Every one of them is a distinct domain — a
+/// resume PC, a raw syscall number, a canonical syscall number, a sysret frame
+/// and a fork-child flag — so naming them is the same discipline the typed
+/// interfaces audit applies elsewhere.
+struct X86ResumeMetadata {
+    pending_resume_pc: Option<u64>,
+    last_orig_rax: u64,
+    last_syscall_canonical: Option<u64>,
+    sysret_resume: Option<SysretResume>,
+    is_forked_child: bool,
+}
+
 fn decode_x86_resume_metadata(
     payload: &[u8; X86_TASK_RESUME_PAYLOAD_LEN],
-) -> Result<(Option<u64>, u64, Option<u64>, Option<SysretResume>, bool), TrapError> {
+) -> Result<X86ResumeMetadata, TrapError> {
     let flags = read_resume_u64(payload, 0);
     if flags & !X86_RESUME_VALID_FLAGS != 0 || read_resume_u64(payload, 56) != X86_TASK_RESUME_MAGIC
     {
@@ -1542,13 +1557,13 @@ fn decode_x86_resume_metadata(
         user_pc: read_resume_u64(payload, 32),
         user_rflags: read_resume_u64(payload, 40),
     });
-    Ok((
+    Ok(X86ResumeMetadata {
         pending_resume_pc,
         last_orig_rax,
-        last_syscall,
+        last_syscall_canonical: last_syscall,
         sysret_resume,
-        flags & X86_RESUME_FORKED_CHILD != 0,
-    ))
+        is_forked_child: flags & X86_RESUME_FORKED_CHILD != 0,
+    })
 }
 
 fn x86_task_state_from_snapshot<V: X86Vmm>(
@@ -1685,11 +1700,11 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
         let snapshot = x86_snapshot_from_task(state);
         self.vm
             .rebind_to_slot(&mut self.vcpu, slot, self.layout, &snapshot)?;
-        self.pending_resume_pc = metadata.0;
-        self.last_orig_rax = metadata.1;
-        self.last_syscall_canonical = metadata.2;
-        self.sysret_resume = metadata.3;
-        self.is_forked_child = metadata.4;
+        self.pending_resume_pc = metadata.pending_resume_pc;
+        self.last_orig_rax = metadata.last_orig_rax;
+        self.last_syscall_canonical = metadata.last_syscall_canonical;
+        self.sysret_resume = metadata.sysret_resume;
+        self.is_forked_child = metadata.is_forked_child;
         Ok(())
     }
 

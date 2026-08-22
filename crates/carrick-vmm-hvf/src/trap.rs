@@ -231,7 +231,8 @@ pub enum TrapBackend {
     HypervisorFramework,
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod task_only_carrier_directory_tests {
     use super::*;
     use std::sync::Arc;
@@ -3955,7 +3956,8 @@ pub(crate) fn audit_hvpatch_executor_boundary(
     Ok(())
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn install_fork_vcpu_snapshot_for_executor_boundary_test() {
     let snapshot = VcpuSnapshot {
         core: Aarch64VcpuSnapshot {
@@ -3991,14 +3993,16 @@ fn install_fork_vcpu_snapshot_for_executor_boundary_test() {
     });
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn clear_fork_vcpu_snapshot_for_executor_boundary_test() {
     FORK_VCPU_SNAPSHOT.with(|snapshot| {
         snapshot.borrow_mut().take();
     });
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod executor_boundary_audit_tests {
     #[test]
     fn fork_snapshot_getter_detects_real_dirty_tls_and_clear() {
@@ -5043,7 +5047,8 @@ impl HvfTaskState {
     }
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn hvpatch_task_state_test_fixture(
     mm_slot: u64,
     mapping_start: u64,
@@ -5106,7 +5111,8 @@ pub(crate) fn hvpatch_task_state_test_fixture(
     }
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn hvpatch_task_state_test_identity(
     state: &HvfTaskState,
 ) -> (Option<(u64, u64)>, u64, i32, usize, usize, usize) {
@@ -5125,12 +5131,14 @@ pub(crate) fn hvpatch_task_state_test_identity(
     )
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn hvpatch_neutral_task_state_for_test() -> HvfTaskState {
     HvfTaskState::neutral()
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn audit_hvpatch_neutral_task_state_for_test(
     state: &HvfTaskState,
 ) -> Result<(), TrapError> {
@@ -7369,7 +7377,8 @@ struct HvpatchCarrierTaskDirectoryInner {
         std::collections::BTreeMap<HvpatchMmAuthorityKey, std::sync::Weak<HvpatchTaskMmAuthority>>,
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Default for HvpatchCarrierTaskStateDirectory {
     fn default() -> Self {
         static NEXT_DIRECTORY_INSTANCE: std::sync::atomic::AtomicU64 =
@@ -10184,7 +10193,8 @@ unsafe fn volatile_copy_to_guest(src: *const u8, dst: *mut u8, len: usize) {
     }
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod volatile_copy_tests {
     use super::{volatile_copy_from_guest, volatile_copy_to_guest};
 
@@ -10268,7 +10278,8 @@ fn resolve_guest_copy_mapping<T>(
         })
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod guest_copy_mapping_tests {
     use super::resolve_guest_copy_mapping;
 
@@ -21782,7 +21793,8 @@ pub(crate) fn hvf_set_sys_reg(
     vcpu.set_sys_reg(hvf_reg, v).map_err(hvf_os_error)
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod tag_strip_tests {
     use super::{
         AliasBacking, AliasOwnershipScope, CowArmedSpan, GuestMappingPlan, GuestMappingSharing,
