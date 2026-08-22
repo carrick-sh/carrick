@@ -162,9 +162,27 @@ cutoff.
    **UNPROVEN**. Do not begin final performance acceptance until correctness and
    gate integrity close.
 
-The full user objective remains active. No push was performed. Integration to
-local `main`, post-fast-forward gates, and the required `main...branch = 0 0`
-receipt are the immediate session cutoff after this handoff commit.
+The full user objective remains active. No push was performed.
+
+### Local-main integration receipt
+
+Local `main` was atomically fast-forwarded from `aa3e9d4c4` through the
+reviewed integration merge `885767fbf` and the docs-only cutoff tip
+`47063edb9`. The integration merge preserved both main's typed network/UTS
+namespace objects and the Task 1-6 persistent-kernel work. The worktree was
+then switched to `main`.
+
+Fresh post-integration gates on `main` are GREEN: task-only projection 2/2,
+executor 50/50, continuation 63/63, scheduler 27/27, network 60/60 (with the
+required host socket access), proc 63/63, sys 9/9, runtime integration 300/300,
+focused Task 6 clippy, fmt, and diff checks. The full serialized `just ci` was
+also attempted and remains explicitly RED at the global host-authority
+`disallowed-methods` catalog across pre-existing owners. That is a pending
+Task 7/8 migration gate; it was neither weakened nor reported green.
+
+After committing this receipt, advance `codex/authority-phase0` to the same
+docs-only tip and require `main...codex/authority-phase0 = 0 0`. Pause there;
+do not push.
 
 ## PREVIOUS STATE — session 2026-08-19 (seventh).
 
