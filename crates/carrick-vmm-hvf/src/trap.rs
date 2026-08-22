@@ -14949,7 +14949,15 @@ impl HvfVmState {
                 "persistent worker retained a task syscall continuation".to_owned(),
             ));
         }
-        Self::audit_executor_invariants(vcpu, mailbox.slot().guest_address())
+        use applevisor::prelude::SysReg;
+        let sp_el1 = vcpu.get_sys_reg(SysReg::SP_EL1).map_err(hvf_error)?;
+        if sp_el1 != mailbox.slot().guest_address() {
+            return Err(TrapError::Hypervisor(format!(
+                "persistent worker mailbox SP_EL1 drifted: {sp_el1:#x}/{:#x}",
+                mailbox.slot().guest_address()
+            )));
+        }
+        Ok(())
     }
 
     /// Build a [`ThreadSpec`] for a thread-creating `clone(CLONE_THREAD)`: clone the
