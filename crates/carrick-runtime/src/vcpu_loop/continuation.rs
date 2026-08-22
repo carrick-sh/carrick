@@ -1188,6 +1188,38 @@ impl BlockedContinuation {
         authority.set_blocked(effective);
     }
 
+    pub(crate) fn publish_ready_event(&self, event: ContinuationEvent) -> bool {
+        let Some(binding) = self.state().registration.as_ref() else {
+            return false;
+        };
+        let Some(service) = binding.service.upgrade() else {
+            return false;
+        };
+        let (won, task_waker) = {
+            let mut state = service.state.lock();
+            let Some(entry) = state.entries.get_mut(&binding.token.continuation) else {
+                return false;
+            };
+            if entry.token != binding.token
+                || !matches!(
+                    entry.state,
+                    RegistrationState::Prepared | RegistrationState::Enrolled
+                )
+            {
+                return false;
+            }
+            entry.state = RegistrationState::Ready;
+            entry.event = Some(event);
+            let task_waker = entry.task_waker.take();
+            (true, task_waker)
+        };
+        service.nudge_reactor();
+        if let Some(waker) = task_waker {
+            waker.wake();
+        }
+        won
+    }
+
     pub(crate) fn ready_event(&self) -> Result<ContinuationEvent, ContinuationResumeError> {
         let binding = self
             .state()
