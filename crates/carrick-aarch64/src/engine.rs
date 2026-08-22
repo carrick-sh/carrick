@@ -1028,7 +1028,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     break Err(TrapError::UnexpectedExit {
                         reason: format!(
                             "{} during EL1 stage-1 maintenance",
-                            exit_variant_name(&other)
+                            maintenance_exit_detail(&other)
                         ),
                     });
                 }
@@ -1074,7 +1074,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     break Err(TrapError::UnexpectedExit {
                         reason: format!(
                             "{} during scoped EL1 ASID maintenance",
-                            exit_variant_name(&other)
+                            maintenance_exit_detail(&other)
                         ),
                     });
                 }
@@ -1234,6 +1234,34 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 
 /// Name a non-MaintenanceDone exit for the EL1-maintenance error path (the
 /// `Aarch64Exit::Syscall` payload is not `Display`).
+/// Name an unexpected maintenance exit WITH the state that explains it.
+///
+/// `exit_variant_name` alone says only "EL0Fault", which for a host-driven EL1
+/// trampoline is the least useful half of the story: the question is always
+/// which address faulted and why. An unrecoverable maintenance failure must
+/// carry the syndrome, not just the variant.
+fn maintenance_exit_detail(exit: &Aarch64Exit) -> String {
+    match exit {
+        Aarch64Exit::EL0Fault {
+            syndrome,
+            elr,
+            far,
+            from_el0_direct,
+            ..
+        } => format!(
+            "EL0Fault(esr={syndrome:#x} elr={elr:#x} far={far:#x} \
+             from_el0_direct={from_el0_direct})"
+        ),
+        Aarch64Exit::Stage1CowFault { .. } | Aarch64Exit::Memory { .. } => {
+            format!(
+                "{} (guest memory exit inside an EL1 trampoline)",
+                exit_variant_name(exit)
+            )
+        }
+        other => exit_variant_name(other).to_owned(),
+    }
+}
+
 fn exit_variant_name(exit: &Aarch64Exit) -> &'static str {
     match exit {
         Aarch64Exit::Syscall { .. } => "Syscall",
