@@ -523,6 +523,11 @@ impl HvpatchTaskOnlyEngineState {
     /// a vfork/`CLONE_VM` task — and therefore has no inventory of its own to
     /// retire.
     pub fn shares_another_process_inventory(&self) -> bool {
+        if let Some(parked) = self.parked_task.lock().as_ref() {
+            if let Some(reg) = parked.registration.as_ref() {
+                return reg.shares_another_process_inventory();
+            }
+        }
         self._backend.shares_another_process_inventory()
     }
 
@@ -530,6 +535,11 @@ impl HvpatchTaskOnlyEngineState {
         &self,
         commit: carrick_hal::FrameInventoryCommit<()>,
     ) -> Result<(), TrapError> {
+        if let Some(parked) = self.parked_task.lock().as_ref() {
+            if let Some(reg) = parked.registration.as_ref() {
+                return reg.prepare_inventory_retirement(commit);
+            }
+        }
         self._backend.prepare_inventory_retirement(commit)
     }
 
@@ -539,6 +549,11 @@ impl HvpatchTaskOnlyEngineState {
             carrick_hal::FrameInventoryCommit<()>,
         ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
     ) -> Result<(), TrapError> {
+        if let Some(parked) = self.parked_task.lock().as_ref() {
+            if let Some(reg) = parked.registration.as_ref() {
+                return reg.apply_inventory_retirement(apply);
+            }
+        }
         self._backend.apply_inventory_retirement(apply)
     }
 
@@ -556,8 +571,9 @@ impl HvpatchTaskOnlyEngineState {
             ));
         }
         let (page_tables, protections) = self.runtime_projection.clone_authorities()?;
-        let task = self._backend.runtime_task_state(page_tables, protections)?;
+        let mut task = self._backend.runtime_task_state(page_tables, protections)?;
         self._backend.activate()?;
+        task.registration = self._backend.take_registration();
         if self.parked_task.lock().replace(task).is_some() {
             std::process::abort();
         }
@@ -569,6 +585,21 @@ impl HvpatchTaskOnlyEngineState {
         // cleanup cannot be redirected through a caller-supplied directory.
         drop(self);
         Ok(())
+    }
+}
+
+impl Drop for HvpatchTaskOnlyEngineState {
+    fn drop(&mut self) {
+        if let Some(mut parked) = self.parked_task.lock().take() {
+            if let Some(reg) = parked.registration.take() {
+                reg.cleanup().unwrap_or_else(|error| {
+                    eprintln!(
+                        "carrick: FATAL: exact task-only parked registration cleanup: {error}"
+                    );
+                    std::process::abort();
+                });
+            }
+        }
     }
 }
 
@@ -1077,7 +1108,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         &mut self,
     ) -> Option<(
         Option<carrick_hal::FrameInventoryCommit<()>>,
-        carrick_hal::FrameInventoryCommit<()>,
+        Option<carrick_hal::FrameInventoryCommit<()>>,
     )> {
         self.state.take_exec_inventory()
     }
@@ -1106,6 +1137,21 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn take_retirement_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
         self.state.take_retirement_inventory()
+    }
+
+    fn apply_exec_inventory(
+        &mut self,
+        replacement_mm: u64,
+        apply: &mut dyn FnMut(
+            carrick_hal::FrameInventoryCommit<()>,
+        )
+            -> Result<carrick_hal::FrameInventoryApplyReceipt, TrapError>,
+    ) -> Result<bool, TrapError> {
+        self.state.apply_exec_inventory(replacement_mm, apply)
+    }
+
+    fn activate_exec_inventory(&mut self) -> Result<(), TrapError> {
+        self.state.activate_exec_inventory()
     }
 
     type Vcpu = HvfAarch64Vcpu;

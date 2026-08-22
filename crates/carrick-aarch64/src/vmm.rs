@@ -460,13 +460,23 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         ))
     }
 
-    fn take_exec_inventory(
-        &mut self,
-    ) -> Option<(
-        Option<carrick_hal::FrameInventoryCommit<()>>,
-        carrick_hal::FrameInventoryCommit<()>,
-    )> {
+    fn take_exec_inventory(&mut self) -> Option<carrick_hal::ExecInventoryCommits> {
         None
+    }
+
+    fn apply_exec_inventory(
+        &mut self,
+        _replacement_mm: u64,
+        _apply: &mut dyn FnMut(
+            carrick_hal::FrameInventoryCommit<()>,
+        )
+            -> Result<carrick_hal::FrameInventoryApplyReceipt, TrapError>,
+    ) -> Result<bool, TrapError> {
+        Ok(false)
+    }
+
+    fn activate_exec_inventory(&mut self) -> Result<(), TrapError> {
+        Ok(())
     }
 
     fn begin_process_inventory(

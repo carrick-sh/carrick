@@ -17,7 +17,7 @@ pub use error::{MemPerms, OsError, Reg, SysReg};
 pub mod stage1_exclusive;
 
 pub mod trap;
-pub use trap::{ForkOutcome, RawSyscall, SyscallTrap, TrapError};
+pub use trap::{ExecInventoryCommits, ForkOutcome, RawSyscall, SyscallTrap, TrapError};
 pub mod vm_backend;
 pub use vm_backend::{ForkRamStrategy, GuestVmBackend};
 pub mod hypervisor;

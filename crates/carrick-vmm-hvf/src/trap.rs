@@ -4385,10 +4385,7 @@ struct HvpatchFrameInventory {
     process_commit: Option<carrick_hal::FrameInventoryCommit<()>>,
     retired_reservation: Option<carrick_hal::FrameInventoryReservation>,
     replacement_reservation: Option<carrick_hal::FrameInventoryReservation>,
-    exec_commits: Option<(
-        Option<carrick_hal::FrameInventoryCommit<()>>,
-        carrick_hal::FrameInventoryCommit<()>,
-    )>,
+    exec_commits: Option<carrick_hal::ExecInventoryCommits>,
     retirement_reservation: Option<carrick_hal::FrameInventoryReservation>,
     retirement_commit: Option<carrick_hal::FrameInventoryCommit<()>>,
     /// The mappings this mm owned at the instant its retirement was staged.
@@ -4942,6 +4939,7 @@ pub(crate) struct HvfTaskState {
     /// COW and returned on success; a rollback consumes it (it becomes the live
     /// manager) and the next COW allocates one again.
     cow_rollback_scratch: Option<crate::page_table::PageTableManager>,
+    pub(crate) registration: Option<HvpatchTaskRegistration>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -5074,6 +5072,7 @@ impl HvfTaskState {
             pending_fork_frame_receipts: Vec::new(),
             pending_process_aliases: Vec::new(),
             cow_rollback_scratch: None,
+            registration: None,
         }
     }
 
@@ -5125,7 +5124,8 @@ impl HvfTaskState {
             && self.cow_deferred_publications.lock().is_empty()
             && self.pending_fork_frame_receipts.is_empty()
             && self.pending_process_aliases.is_empty()
-            && self.cow_rollback_scratch.is_none();
+            && self.cow_rollback_scratch.is_none()
+            && self.registration.is_none();
         drop(frames);
         drop(inventory);
         neutral.then_some(()).ok_or_else(|| {
@@ -5237,6 +5237,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
         pending_fork_frame_receipts: Vec::new(),
         pending_process_aliases: Vec::new(),
         cow_rollback_scratch: None,
+        registration: None,
     }
 }
 
@@ -6431,6 +6432,10 @@ pub struct HvpatchTaskOnlyBackendState {
 }
 
 impl HvpatchTaskOnlyBackendState {
+    pub(crate) fn take_registration(&mut self) -> Option<HvpatchTaskRegistration> {
+        self.registration.take()
+    }
+
     pub(crate) fn runtime_task_state(
         &self,
         page_tables: std::sync::Arc<
@@ -6609,7 +6614,7 @@ struct HvpatchCarrierTaskRow {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct HvpatchMmAuthorityKey {
+pub(crate) struct HvpatchMmAuthorityKey {
     task_serial: u64,
     mm_root_slot: Option<(u64, u64)>,
     shared_kernel_mm: Option<u64>,
@@ -7086,7 +7091,7 @@ impl HvpatchTaskInventoryAuthority {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(dead_code)] // retained MM authority; worker-side load consumes these fields
-struct HvpatchTaskMmAuthority {
+pub(crate) struct HvpatchTaskMmAuthority {
     mappings: Vec<HvpatchTaskMappingState>,
     mm_root_slot: Option<(u64, u64)>,
     inventory: parking_lot::Mutex<HvpatchTaskInventoryAuthority>,
@@ -7701,10 +7706,63 @@ impl HvpatchCarrierTaskStateDirectory {
             inner: parking_lot::Mutex::new(HvpatchCarrierTaskDirectoryInner::default()),
         }
     }
+
+    pub(crate) fn rebind_exec_task_mm(
+        &self,
+        key: HvpatchCarrierTaskStateKey,
+        new_mm_key: HvpatchMmAuthorityKey,
+        task_mm: &std::sync::Arc<HvpatchTaskMmAuthority>,
+        stage2_lease_keys: Vec<(u64, u64)>,
+    ) -> Result<(), TrapError> {
+        if key.directory_instance != self.instance {
+            return Err(TrapError::Hypervisor(
+                "cross-directory HVPatch carrier token rejected".to_owned(),
+            ));
+        }
+        let mut inner = self.inner.lock();
+        if inner
+            .task_mms
+            .get(&new_mm_key)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some()
+        {
+            return Err(TrapError::Hypervisor(
+                "duplicate HVPatch MM authority key for exec replacement".to_owned(),
+            ));
+        }
+        let existing_carrier_mm = inner.states.get(&key).and_then(|row| row._mm.clone());
+        let new_carrier_mm = match existing_carrier_mm.as_deref() {
+            Some(HvpatchCarrierMmAuthority::Live { _vm, .. }) => {
+                Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
+                    stage2_lease_keys,
+                    _vm: _vm.clone(),
+                }))
+            }
+            #[cfg(test)]
+            Some(HvpatchCarrierMmAuthority::Test { order }) => {
+                Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Test {
+                    order: std::sync::Arc::clone(order),
+                }))
+            }
+            None => None,
+        };
+        if let Some(carrier_mm) = new_carrier_mm {
+            inner
+                .carrier_mms
+                .insert(new_mm_key, std::sync::Arc::downgrade(&carrier_mm));
+            if let Some(row) = inner.states.get_mut(&key) {
+                row._mm = Some(carrier_mm);
+            }
+        }
+        inner
+            .task_mms
+            .insert(new_mm_key, std::sync::Arc::downgrade(task_mm));
+        Ok(())
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-struct HvpatchTaskRegistration {
+pub(crate) struct HvpatchTaskRegistration {
     directory: std::sync::Arc<HvpatchCarrierTaskStateDirectory>,
     key: HvpatchCarrierTaskStateKey,
     expected_identity: HvpatchCarrierTaskIdentity,
@@ -7784,6 +7842,7 @@ impl HvpatchTaskRegistration {
             pending_fork_frame_receipts: task_mm.pending_receipts.clone(),
             pending_process_aliases: Vec::new(),
             cow_rollback_scratch: None,
+            registration: None,
         })
     }
 
@@ -7799,13 +7858,13 @@ impl HvpatchTaskRegistration {
             .apply_inventory(apply)
     }
 
-    fn shares_another_process_inventory(&self) -> bool {
+    pub(crate) fn shares_another_process_inventory(&self) -> bool {
         self.task_mm
             .as_ref()
             .is_some_and(|task_mm| task_mm.shares_another_process_inventory())
     }
 
-    fn prepare_inventory_retirement(
+    pub(crate) fn prepare_inventory_retirement(
         &self,
         commit: carrick_hal::FrameInventoryCommit<()>,
     ) -> Result<(), TrapError> {
@@ -7815,7 +7874,7 @@ impl HvpatchTaskRegistration {
             .prepare_retirement(commit)
     }
 
-    fn apply_inventory_retirement(
+    pub(crate) fn apply_inventory_retirement(
         &self,
         apply: impl FnOnce(
             carrick_hal::FrameInventoryCommit<()>,
@@ -7864,6 +7923,34 @@ impl HvpatchTaskRegistration {
         Ok(())
     }
 
+    fn bind_kernel_mm(&mut self, mm: std::num::NonZeroU64) -> Result<(), TrapError> {
+        self.task_mm
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?
+            .bind_kernel_mm(mm)
+    }
+
+    fn rebind_exec_authority(
+        &mut self,
+        new_task_mm: std::sync::Arc<HvpatchTaskMmAuthority>,
+        replacement_mm_root_slot: (u64, u64),
+        stage2_lease_keys: Vec<(u64, u64)>,
+    ) -> Result<(), TrapError> {
+        let new_mm_key = HvpatchMmAuthorityKey {
+            task_serial: 0,
+            mm_root_slot: Some(replacement_mm_root_slot),
+            shared_kernel_mm: None,
+        };
+        self.directory.rebind_exec_task_mm(
+            self.key,
+            new_mm_key,
+            &new_task_mm,
+            stage2_lease_keys,
+        )?;
+        self.task_mm = Some(new_task_mm);
+        Ok(())
+    }
+
     fn activate(&self) -> Result<(), TrapError> {
         if self.cow_authority.is_none() || self.cow_identity.is_none() {
             return Err(TrapError::Hypervisor(
@@ -7876,7 +7963,7 @@ impl HvpatchTaskRegistration {
             .activate()
     }
 
-    fn cleanup(mut self) -> Result<(), TrapError> {
+    pub(crate) fn cleanup(mut self) -> Result<(), TrapError> {
         // Removing the carrier row drops this binding's carrier-MM reference.
         // If it is the final MM binding, every stage-2 lease unmaps here, before
         // the final task-MM Arc below releases any host mapping owner.
@@ -9875,12 +9962,7 @@ impl HvfVmState {
         (self.exec_retired_extent_count(), replacement)
     }
 
-    pub(crate) fn take_exec_inventory(
-        &mut self,
-    ) -> Option<(
-        Option<carrick_hal::FrameInventoryCommit<()>>,
-        carrick_hal::FrameInventoryCommit<()>,
-    )> {
+    pub(crate) fn take_exec_inventory(&mut self) -> Option<carrick_hal::ExecInventoryCommits> {
         self.frame_inventory.lock().exec_commits.take()
     }
 
@@ -10241,6 +10323,7 @@ impl HvfVmState {
                 pending_fork_frame_receipts: Vec::new(),
                 pending_process_aliases: Vec::new(),
                 cow_rollback_scratch: None,
+                registration: None,
             },
             carrier_mappings: None,
             reclaim_authority: ReclaimParkAuthority::Live,
@@ -10880,8 +10963,39 @@ impl HvfVmState {
             });
             crate::probes::hvpatch_fork_frame_share(event);
         }
-        self.cow_authority = Some(authority);
+        self.cow_authority = Some(std::sync::Arc::clone(&authority));
         self.cow_identity = Some(identity);
+        if let Some(ref mut reg) = self.registration {
+            reg.cow_authority = Some(authority);
+            reg.cow_identity = Some(identity);
+            reg.cow_authority_identity = None;
+        }
+    }
+
+    pub(crate) fn apply_exec_inventory(
+        &mut self,
+        replacement_mm: u64,
+        apply: &mut dyn FnMut(
+            carrick_hal::FrameInventoryCommit<()>,
+        )
+            -> Result<carrick_hal::FrameInventoryApplyReceipt, TrapError>,
+    ) -> Result<bool, TrapError> {
+        let Some(ref mut reg) = self.registration else {
+            return Ok(false);
+        };
+        let mm = std::num::NonZeroU64::new(replacement_mm).ok_or_else(|| {
+            TrapError::Hypervisor("zero replacement MM for HVPatch exec".to_owned())
+        })?;
+        reg.bind_kernel_mm(mm)?;
+        reg.apply_inventory(apply)?;
+        Ok(true)
+    }
+
+    pub(crate) fn activate_exec_inventory(&mut self) -> Result<(), TrapError> {
+        let Some(ref mut reg) = self.registration else {
+            return Ok(());
+        };
+        reg.activate()
     }
 
     /// Whether the frame backing `ipa` is referenced by MORE than one extent in
@@ -15835,6 +15949,7 @@ impl HvfVmState {
                 pending_fork_frame_receipts: Vec::new(),
                 pending_process_aliases: Vec::new(),
                 cow_rollback_scratch: None,
+                registration: None,
             },
             carrier_mappings: None,
             reclaim_authority: ReclaimParkAuthority::Live,
@@ -16914,6 +17029,7 @@ impl HvfVmState {
                 pending_fork_frame_receipts: Vec::new(),
                 pending_process_aliases: aliases_to_publish,
                 cow_rollback_scratch: None,
+                registration: None,
             },
             carrier_mappings: None,
             reclaim_authority: ReclaimParkAuthority::Live,
@@ -17403,28 +17519,126 @@ impl HvfVmState {
             }
         }
         if let Some((retired, mut replacement)) = inventory_reservations.take() {
-            let mut inventory = self.frame_inventory.lock();
-            for region in &self.mappings {
-                if let Err(error) = Self::stage_mapping(
-                    &mut inventory,
-                    &mut replacement,
-                    InventoryMappingStage {
-                        gpa: region.physical_ipa,
-                        length: region.physical_size as u64,
-                        permissions: Self::region_permissions(region),
-                        backing: Self::private_backing_identity(),
-                        inherited_frame: None,
-                        stage2_lease: None,
-                    },
+            let staged_inventory_mappings = {
+                let mut inventory = self.frame_inventory.lock();
+                let mut staged_mappings = Vec::with_capacity(self.mappings.len());
+                for region in &self.mappings {
+                    let staged = match Self::stage_mapping(
+                        &mut inventory,
+                        &mut replacement,
+                        InventoryMappingStage {
+                            gpa: region.physical_ipa,
+                            length: region.physical_size as u64,
+                            permissions: Self::region_permissions(region),
+                            backing: Self::private_backing_identity(),
+                            inherited_frame: None,
+                            stage2_lease: None,
+                        },
+                    ) {
+                        Ok(staged) => staged,
+                        Err(error) => {
+                            eprintln!(
+                                "carrick: FATAL: stage inventory after HVPatch exec map: {error}"
+                            );
+                            std::process::abort();
+                        }
+                    };
+                    staged_mappings
+                        .push(((region.physical_ipa, region.physical_size as u64), staged));
+                }
+                staged_mappings
+            };
+            let replacement_commit = replacement.commit(());
+            let retired_commit = retired.map(|retired| retired.commit(()));
+            let fallback_replacement_commit = if self.registration.is_some() {
+                let replacement_challenge = replacement_commit.receipt_challenge();
+                let mut stage2_leases = Vec::new();
+                for region in &mut self.mappings {
+                    if let Some(stage2_lease) = region.stage2_lease.take() {
+                        stage2_leases.push(stage2_lease);
+                    }
+                }
+                let mut stage2_lease_keys = Vec::with_capacity(stage2_leases.len());
+                for lease in stage2_leases {
+                    match register_carrier_stage2_lease(lease) {
+                        Ok(key) => stage2_lease_keys.push(key),
+                        Err(error) => {
+                            for key in stage2_lease_keys {
+                                drop(take_carrier_stage2_lease(key.0, key.1));
+                            }
+                            eprintln!(
+                                "carrick: FATAL: register carrier stage2 lease for exec: {error}"
+                            );
+                            std::process::abort();
+                        }
+                    }
+                }
+                let mapped_task_mappings: Vec<HvpatchTaskMappingState> = self
+                    .mappings
+                    .iter()
+                    .map(|mapping| HvpatchTaskMappingState {
+                        start: mapping.start,
+                        ipa: mapping.ipa,
+                        physical_ipa: mapping.physical_ipa,
+                        end: mapping.end,
+                        host_addr: mapping.host_addr,
+                        physical_host_addr: mapping.host_addr,
+                        size: mapping.size,
+                        physical_size: mapping.physical_size,
+                        perms: mapping.perms,
+                        guest_writable: mapping.guest_writable,
+                        host_mapping: None,
+                        is_dynamic_alias: mapping.is_dynamic_alias,
+                        sharing: mapping.sharing,
+                        shared_key_base: mapping.shared_key_base,
+                        shared_key_offset: mapping.shared_key_offset,
+                        owner_generation: global_frame_host_owner_generation(
+                            mapping.physical_ipa,
+                            mapping.physical_size as u64,
+                        ),
+                    })
+                    .collect();
+
+                let new_authority = HvpatchTaskInventoryAuthority::ProcessPrepared {
+                    ledger: std::sync::Arc::clone(&self.frame_inventory.ledger),
+                    staged: staged_inventory_mappings,
+                    commit: Some(replacement_commit),
+                    challenge: Some(replacement_challenge),
+                };
+
+                let new_task_mm = std::sync::Arc::new(HvpatchTaskMmAuthority {
+                    mappings: mapped_task_mappings,
+                    mm_root_slot: Some(replacement_mm_root_slot),
+                    inventory: parking_lot::Mutex::new(new_authority),
+                    kernel_mm: parking_lot::Mutex::new(None),
+                    cow_armed: Some(std::sync::Arc::clone(&self.cow_armed)),
+                    cow_deferred_publications: Some(std::sync::Arc::clone(
+                        &self.cow_deferred_publications,
+                    )),
+                    pending_receipts: Vec::new(),
+                    alias_receipts: parking_lot::Mutex::new(Vec::new()),
+                    #[cfg(test)]
+                    drop_order: None,
+                });
+
+                let Some(ref mut reg) = self.registration else {
+                    eprintln!("carrick: FATAL: missing registration for HVPatch exec rebind");
+                    std::process::abort();
+                };
+                if let Err(error) = reg.rebind_exec_authority(
+                    new_task_mm,
+                    replacement_mm_root_slot,
+                    stage2_lease_keys,
                 ) {
-                    eprintln!("carrick: FATAL: stage inventory after HVPatch exec map: {error}");
+                    eprintln!("carrick: FATAL: rebind HVPatch exec MM authority: {error}");
                     std::process::abort();
                 }
-            }
-            inventory.exec_commits = Some((
-                retired.map(|retired| retired.commit(())),
-                replacement.commit(()),
-            ));
+                None
+            } else {
+                Some(replacement_commit)
+            };
+            self.frame_inventory.lock().exec_commits =
+                Some((retired_commit, fallback_replacement_commit));
         }
         emit_replace_stage(
             carrick_observability::probes::HvpatchExecReplaceStagePhase::MapBackings,
