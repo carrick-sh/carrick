@@ -60,7 +60,6 @@ pub mod continuation;
 pub mod executor;
 
 const SIGNAL_WAIT_SLICE: Duration = Duration::from_millis(50);
-const SHORT_TIMED_WAIT_RECLAIM_CUTOFF: Duration = Duration::from_millis(250);
 
 /// vCPU reclaim census.
 ///
@@ -79,19 +78,6 @@ pub(crate) static VCPU_RECLAIM_PARK_NS: std::sync::atomic::AtomicU64 =
 pub(crate) static VCPU_RECLAIM_RESUME_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Accumulates resume time on every exit path, including the early return
-/// when there was no reclaim (which contributes zero and costs one branch).
-struct ResumeCensusGuard(std::time::Instant);
-
-impl Drop for ResumeCensusGuard {
-    fn drop(&mut self) {
-        VCPU_RECLAIM_RESUME_NS.fetch_add(
-            u64::try_from(self.0.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-}
-
 /// Totals for this process: (reclaims, park ns, resume ns).
 pub(crate) fn vcpu_reclaim_census() -> (u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -100,13 +86,6 @@ pub(crate) fn vcpu_reclaim_census() -> (u64, u64, u64) {
         VCPU_RECLAIM_PARK_NS.load(Relaxed),
         VCPU_RECLAIM_RESUME_NS.load(Relaxed),
     )
-}
-
-fn should_reclaim_vcpu_for_timed_wait(timeout: Option<Duration>) -> bool {
-    match timeout {
-        None => true,
-        Some(timeout) => timeout > SHORT_TIMED_WAIT_RECLAIM_CUTOFF,
-    }
 }
 
 /// Whether this syscall must take the process-wide page-table pause BEFORE the
@@ -165,26 +144,6 @@ impl Drop for GuestBlockedGuard {
     fn drop(&mut self) {
         self.publish(crate::run_state::RunState::Running, 'R');
     }
-}
-
-fn should_keep_vcpu_for_blocking_wait(
-    force_reclaim: bool,
-    has_spare_capacity: bool,
-    has_waiters: bool,
-) -> bool {
-    !force_reclaim && has_spare_capacity && !has_waiters
-}
-
-fn threaded_fd_wait_should_interrupt(fork_quiescing: bool, dispatch_pending: bool) -> bool {
-    // Internal stop-the-world edges outrank guest-visible fd readiness. An
-    // always-ready host fd can otherwise make the wait return Ready forever,
-    // starving the run-loop-top quiesce check (captured in a go-build core as
-    // the sole still-registered vCPU while every sibling was barrier-parked).
-    fork_quiescing || dispatch_pending
-}
-
-fn should_destroy_departing_vcpu(process_exit: bool, thread_done: bool) -> bool {
-    !process_exit && !thread_done
 }
 
 fn apply_alias_frame_inventory(
@@ -336,47 +295,6 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
 pub(super) fn requires_no_unwind_host_exit(kernel: &Kernel, engine_is_forked_child: bool) -> bool {
     let _ = (kernel, engine_is_forked_child);
     false
-}
-
-/// MT whole-VM residency lease (E4 Track 3): when every thread of a
-/// multi-threaded process has been parked for a while, release the whole VM
-/// like single-threaded parks already do, so >127 blocked MT processes don't
-/// exhaust the per-VM slot budget. The release is DEFERRED — never taken on
-/// the common park path (hot blocking waits must not pay the release+rebuild
-/// round trip); a SLICING wait arm upgrades a vCPU-only park to a whole-VM
-/// release on its second ≥1 s parked slice
-/// (`try_upgrade_vm_release_on_slice_tick`).
-/// `CARRICK_MT_VM_LEASE=0` disables the MT upgrade for bisection.
-///
-/// Lock ordering (process-wide rule): `fork_quiesce::topology_lock` →
-/// registry lock is PERMITTED — the wake path claims the rebuild
-/// (`unpark_vcpu`) under the topology lock, and the MT release path re-checks
-/// the registry under a topology TRY-lock. Registry → topology is FORBIDDEN
-/// (no registry lock is ever held while acquiring the topology lock; the
-/// registry's own methods are self-contained critical sections). The park
-/// path never runs under an already-held `topology_lock` (its callers are the
-/// blocking-wait arms of the dispatch loop, which hold neither lock).
-fn mt_vm_lease_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("CARRICK_MT_VM_LEASE")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
-}
-
-/// TEST-ONLY: `CARRICK_MT_VM_LEASE_FDBACKED=1` swaps `try_release_vm_mt`'s
-/// re-check from the shipped class-aware `all_other_parked_release_safe`
-/// (fd-backed parks veto the release) to the class-blind `all_other_parked`
-/// — the reproducible form of the veto-neutered mutation that surfaced
-/// cluster B (b01e18e2). Default OFF (false); truthy only on the literal
-/// value `"1"`, mirroring `mt_vm_lease_enabled` above. This does not ship —
-/// it exists so the `procladder_epollmgr` probe can drive the same
-/// release-under-fd-waiters shape the cluster-B cores showed, without
-/// deleting the shipping veto.
-fn mt_vm_lease_fdbacked_release_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CARRICK_MT_VM_LEASE_FDBACKED").is_some_and(|v| v == "1"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,19 +1020,11 @@ impl CloneAdmissionGate {
         self.try_enroll_kind(CloneAdmissionKind::ThreadClone)
     }
 
-    fn try_enroll_process_fork(self: &Arc<Self>, owner: ThreadId) -> Option<CloneAdmissionPermit> {
+    pub(crate) fn try_enroll_process_fork(
+        self: &Arc<Self>,
+        owner: ThreadId,
+    ) -> Option<CloneAdmissionPermit> {
         self.try_enroll_kind(CloneAdmissionKind::ProcessFork { owner })
-    }
-
-    fn is_closing(&self) -> bool {
-        self.state.lock().closing.is_some()
-    }
-
-    fn is_terminal_closing(&self) -> bool {
-        matches!(
-            self.state.lock().closing,
-            Some(CloneAdmissionClose::Exec { .. } | CloneAdmissionClose::Exit)
-        )
     }
 
     fn close_for_exec(
@@ -1184,34 +1094,6 @@ impl CloneAdmissionGate {
             owner,
             generation,
         }))
-    }
-
-    fn claim_process_exit(&self) -> Result<ProcessExitClaim, RuntimeError> {
-        let mut state = self.state.lock();
-        match state.closing {
-            Some(CloneAdmissionClose::Exec { .. }) => return Ok(ProcessExitClaim::LostToExec),
-            Some(CloneAdmissionClose::Fork { .. }) => {
-                // Whole-process exit wins an ordinary fork. The fork permit
-                // observes Exit as cancellation and drains before teardown.
-                state.closing = Some(CloneAdmissionClose::Exit);
-            }
-            Some(CloneAdmissionClose::Exit) => return Ok(ProcessExitClaim::AlreadyOwned),
-            None => state.closing = Some(CloneAdmissionClose::Exit),
-        }
-        self.changed.notify_all();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while state.in_flight != 0 {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(RuntimeError::Unsupported(format!(
-                    "process-exit clone-admission drain timed out: in_flight={}",
-                    state.in_flight
-                )));
-            }
-            self.changed
-                .wait_for(&mut state, (deadline - now).min(Duration::from_millis(50)));
-        }
-        Ok(ProcessExitClaim::Owner)
     }
 
     fn try_claim_process_exit(&self) -> Result<ProcessExitClaim, RuntimeError> {
@@ -1581,29 +1463,9 @@ impl KernelState {
         }
     }
 
-    fn begin_exec_replacement(&self, owner: ThreadId) {
-        crate::fork_quiesce::begin_exec_replacement(owner);
-    }
-
-    fn end_exec_replacement(&self) {
-        crate::fork_quiesce::end_exec_replacement();
-    }
-
     fn begin_process_exit(&self) {
         self.process_exiting
             .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Arbitrate exec and whole-process exit under the same admission lock.
-    /// An exec owner drains terminal siblings as ordinary thread losers; an
-    /// exit owner permanently closes admission and becomes the sole process
-    /// finalizer. This prevents mutually waiting terminal drains.
-    fn claim_process_exit(&self) -> Result<ProcessExitClaim, RuntimeError> {
-        let claim = self.clone_admission.claim_process_exit()?;
-        if claim == ProcessExitClaim::Owner {
-            self.begin_process_exit();
-        }
-        Ok(claim)
     }
 
     fn try_claim_persistent_process_exit(
@@ -1635,14 +1497,6 @@ impl KernelState {
 
     fn try_enroll_thread_clone(&self) -> Option<CloneAdmissionPermit> {
         self.clone_admission.try_enroll_thread_clone()
-    }
-
-    fn clone_admission_cancelled(&self) -> bool {
-        self.clone_admission.is_closing()
-    }
-
-    fn clone_admission_terminal_cancelled(&self) -> bool {
-        self.clone_admission.is_terminal_closing()
     }
 
     fn close_clone_admission_for_exec(
@@ -1713,17 +1567,6 @@ pub(crate) enum VcpuLoopOutcome {
     TrapLimit(Box<RunResult>),
 }
 
-pub(super) enum BlockingWaitCompletion {
-    Retval(i64),
-    ExecReplacedThread,
-}
-
-pub(super) enum SharedWordWaitCompletion {
-    Changed,
-    Interrupted,
-    ExecReplacedThread,
-}
-
 fn thread_should_finish_for_exec_replacement(registry: &ThreadRegistry, tid: ThreadId) -> bool {
     // `exec_replacing_other_thread` is transient. A sibling that reclaimed its
     // vCPU can still be waking from a host wait after the execing thread has
@@ -1735,71 +1578,6 @@ fn thread_should_finish_for_exec_replacement(registry: &ThreadRegistry, tid: Thr
 fn trace_hvpatch_thread_teardown(kernel: &Kernel, tid: ThreadId, phase: i32) {
     if let Some(process) = kernel.hvpatch_process.as_ref() {
         crate::event_ring::rec_hvpatch_thread_teardown(process.pid(), tid.raw(), phase);
-    }
-}
-
-fn trace_hvpatch_wait_begin<E: ThreadedEngine>(
-    kernel: &Kernel,
-    tid: ThreadId,
-    wait_class: u8,
-    fds: &[crate::io_wait::WaitFd],
-    engine: &E,
-) -> Option<u32> {
-    let process = kernel.hvpatch_process.as_ref()?;
-    let Some(registers) = engine.diagnostic_wait_registers() else {
-        crate::event_ring::rec_hvpatch_wait(process.pid(), tid.raw(), wait_class, 1, fds.len());
-        return None;
-    };
-    Some(crate::event_ring::rec_hvpatch_wait_begin(
-        process.pid(),
-        tid.raw(),
-        wait_class,
-        fds.len(),
-        fds.first().map(|fd| (fd.fd(), fd.events())),
-        crate::event_ring::HvpatchWaitRegisters {
-            pc: registers.pc,
-            sp: registers.sp,
-            lr: registers.lr,
-        },
-    ))
-}
-
-fn trace_hvpatch_wait_end(
-    kernel: &Kernel,
-    tid: ThreadId,
-    wait_class: u8,
-    phase: u8,
-    fd_count: usize,
-    id: Option<u32>,
-) {
-    if let Some(process) = kernel.hvpatch_process.as_ref() {
-        if let Some(id) = id {
-            crate::event_ring::rec_hvpatch_wait_end(
-                process.pid(),
-                tid.raw(),
-                wait_class,
-                phase,
-                fd_count,
-                id,
-            );
-        } else {
-            crate::event_ring::rec_hvpatch_wait(
-                process.pid(),
-                tid.raw(),
-                wait_class,
-                phase,
-                fd_count,
-            );
-        }
-    }
-}
-
-fn hvpatch_wait_result_phase(result: &crate::io_wait::WaitResult) -> u8 {
-    match result {
-        crate::io_wait::WaitResult::Ready => 2,
-        crate::io_wait::WaitResult::TimedOut => 3,
-        crate::io_wait::WaitResult::Interrupted => 4,
-        crate::io_wait::WaitResult::Errno(_) => 5,
     }
 }
 
@@ -1916,19 +1694,6 @@ fn stamp_identity_values<M: GuestMemory>(
         &0_u64.to_le_bytes(),
     )?;
     Ok(())
-}
-
-/// Stamp the running guest thread's guest-visible tid into the vCPU sysreg that
-/// the EL1 shim returns for `gettid` without a VM exit (no-op unless the shim is
-/// enabled). Must run whenever the vCPU is (re)created — boot, clone, fork,
-/// exec — since vCPU sysregs reset.
-pub(crate) fn stamp_guest_tid<E: ThreadedEngine>(
-    engine: &E,
-    _this_tid: ThreadId,
-    _registry: &ThreadRegistry,
-    hvpatch_linux_tid: Option<crate::kernel::LinuxTid>,
-) {
-    let _ = stamp_guest_tid_checked(engine, _this_tid, _registry, hvpatch_linux_tid);
 }
 
 pub(crate) fn stamp_guest_tid_checked<E: ThreadedEngine>(
@@ -2185,11 +1950,6 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     _engine: std::marker::PhantomData<fn() -> E>,
 }
 
-struct BlockingWaitReclaim {
-    old_slot: Option<carrick_hal::SlotId>,
-    single_threaded_process: bool,
-}
-
 enum HvpatchBlockInput {
     Dispatch(DispatchOutcome),
     Vfork {
@@ -2203,23 +1963,6 @@ struct PreparedCorePublication {
     bytes: Vec<u8>,
     generation: u64,
     fatal_tid: i32,
-}
-
-/// Return whichever bounded-scheduler slot this host thread owns when its
-/// guest vCPU loop ends.  Process-leader threads created by hvpatch fork do
-/// not necessarily hold a lease at startup, but can acquire one later when a
-/// blocking wait resumes.  Keeping this guard at the loop boundary covers
-/// that late-acquire case as well as ordinary main and clone threads, on every
-/// return/error path.
-struct VcpuLeaseGuard;
-
-impl Drop for VcpuLeaseGuard {
-    fn drop(&mut self) {
-        if let Some(lease) = carrick_hal::vcpu_sched::take_current_lease() {
-            carrick_hal::vcpu_sched::global()
-                .release(lease, carrick_hal::vcpu_sched::Yield::Exited);
-        }
-    }
 }
 
 /// The only points at which the HVPatch logical loop may give its physical
@@ -2373,10 +2116,6 @@ impl HvpatchExternalTerminalSettlement {
 
     fn completion(&self) -> continuation::LogicalJobCompletion {
         self.completion.clone()
-    }
-
-    fn wait_result(&self) -> Result<VcpuLoopOutcome, RuntimeError> {
-        self.result.clone().wait()
     }
 
     #[cfg(test)]
@@ -5370,205 +5109,6 @@ where
         }
     }
 
-    fn fork_is_quiescing(&self) -> bool {
-        self.process_fork_barrier
-            .as_ref()
-            .map_or_else(crate::fork_quiesce::is_quiescing, |barrier| {
-                barrier.is_quiescing()
-            })
-    }
-
-    fn current_migratable_binding(
-        &self,
-        cpu: carrick_hal::threaded::GuestCpuState,
-    ) -> Result<crate::kernel::objects::MigratableTaskState, RuntimeError> {
-        let context = self.service_kernel_context.as_ref().ok_or_else(|| {
-            RuntimeError::Configuration(
-                "typed reclaim snapshot has no exact Kernel context".to_owned(),
-            )
-        })?;
-        let mm = context.shared().mm().id();
-        let (cpu_mm, cpu_asid) = match &cpu {
-            carrick_hal::threaded::GuestCpuState::Aarch64V1(state) => {
-                (state.mm_generation, state.asid_generation)
-            }
-            carrick_hal::threaded::GuestCpuState::X86_64V1(state) => {
-                (state.mm_generation(), state.asid_generation())
-            }
-        };
-        if cpu_mm != mm.raw() {
-            return Err(RuntimeError::Configuration(format!(
-                "typed reclaim generation mismatch: cpu mm/asid={cpu_mm}/{cpu_asid} \
-                 Kernel mm={}",
-                mm.raw()
-            )));
-        }
-        Ok(crate::kernel::objects::MigratableTaskState {
-            cpu,
-            mm,
-            asid_generation: cpu_asid,
-        })
-    }
-
-    fn fail_snapshot_boundary(&self, reason: crate::kernel::objects::ExecutionFailure) {
-        let Some(thread) = self.kernel_thread.as_ref() else {
-            return;
-        };
-        if let Some(lease) = self.execution_lease.lock().take() {
-            let _ = thread.fail_from_executor(lease, reason);
-        } else {
-            thread.fail_uninitialized_snapshot(reason);
-        }
-    }
-
-    fn publish_initial_execution_authority(
-        &self,
-        cpu: carrick_hal::threaded::GuestCpuState,
-    ) -> Result<(), RuntimeError> {
-        let thread = self.kernel_thread.as_ref().ok_or_else(|| {
-            RuntimeError::Configuration(
-                "initial execution publication lost Kernel thread".to_owned(),
-            )
-        })?;
-        let executor = crate::kernel::objects::ExecutorId::for_transitional_thread(self.this_tid)
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        let state = self.current_migratable_binding(cpu)?;
-        thread
-            .publish_initial_task_state(state)
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        let lease = thread
-            .claim_runnable(executor)
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        let mut slot = self.execution_lease.lock();
-        if slot.is_some() {
-            let _ = thread.fail_from_executor(
-                lease,
-                crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
-            );
-            return Err(RuntimeError::Configuration(
-                "initial execution publication found an existing lease".to_owned(),
-            ));
-        }
-        *slot = Some(lease);
-        Ok(())
-    }
-
-    fn begin_reclaim_snapshot_save(&self) -> Result<(), RuntimeError> {
-        let thread = self.kernel_thread.as_ref().ok_or_else(|| {
-            RuntimeError::Configuration("destructive save lost Kernel thread".to_owned())
-        })?;
-        let lease = self.execution_lease.lock();
-        let lease = lease.as_ref().ok_or_else(|| {
-            RuntimeError::Configuration(
-                "destructive save attempted without exact execution lease".to_owned(),
-            )
-        })?;
-        thread
-            .begin_switch_out(lease)
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))
-    }
-
-    fn settle_reclaim_snapshot(
-        &self,
-        state: &crate::kernel::objects::MigratableTaskState,
-    ) -> Result<(), RuntimeError> {
-        let Some(thread) = self.kernel_thread.as_ref() else {
-            return Ok(());
-        };
-        let mut lease = self.execution_lease.lock().take().ok_or_else(|| {
-            RuntimeError::Configuration(
-                "destructive save completed without exact execution lease".to_owned(),
-            )
-        })?;
-        if let Err(error) = lease.replace_task_state(state.clone()) {
-            let _ = thread.fail_from_executor(
-                lease,
-                crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
-            );
-            return Err(RuntimeError::Configuration(error.to_string()));
-        }
-        thread
-            .park_from_executor(lease, crate::kernel::objects::BlockedReason::HostWait)
-            .map_err(|(error, _lease)| RuntimeError::Configuration(error.to_string()))
-    }
-
-    fn claim_reclaim_snapshot(
-        &self,
-    ) -> Result<
-        (
-            carrick_hal::threaded::GuestCpuState,
-            crate::kernel::objects::ThreadExecutionLease,
-        ),
-        RuntimeError,
-    > {
-        let thread = self.kernel_thread.as_ref().ok_or_else(|| {
-            RuntimeError::Configuration("typed reclaim restore lost Kernel thread".to_owned())
-        })?;
-        let executor = crate::kernel::objects::ExecutorId::for_transitional_thread(self.this_tid)
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        let lease = thread
-            .claim_blocked_for_transitional_executor(executor)
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        let abi = <E::Arch as carrick_hal::GuestArch>::linux_guest_abi();
-        let current_mm = self
-            .service_kernel_context
-            .as_ref()
-            .map(|context| context.shared().mm().id())
-            .ok_or_else(|| {
-                RuntimeError::Configuration(
-                    "typed reclaim restore lost current Kernel MM authority".to_owned(),
-                )
-            })?;
-        let current_asid_generation = lease
-            .task_state_authority()
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))?
-            .1;
-        let state = match lease.task_state_for_restore(abi, 1, current_mm, current_asid_generation)
-        {
-            Ok(state) => state.clone(),
-            Err(error) => {
-                let _ = thread.fail_from_executor(
-                    lease,
-                    crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
-                );
-                return Err(RuntimeError::Configuration(error.to_string()));
-            }
-        };
-        if state.cpu.task_identity() != (current_mm.raw(), current_asid_generation) {
-            let _ = thread.fail_from_executor(
-                lease,
-                crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
-            );
-            return Err(RuntimeError::Configuration(
-                "typed reclaim restore authority does not match parked generation".to_owned(),
-            ));
-        }
-        Ok((state.cpu, lease))
-    }
-
-    fn complete_reclaim_restore(
-        &self,
-        lease: crate::kernel::objects::ThreadExecutionLease,
-        result: Result<(), TrapError>,
-    ) -> Result<(), RuntimeError> {
-        let thread = self.kernel_thread.as_ref().ok_or_else(|| {
-            RuntimeError::Configuration("typed reclaim restore lost Kernel thread".to_owned())
-        })?;
-        match result {
-            Ok(()) => {
-                *self.execution_lease.lock() = Some(lease);
-                Ok(())
-            }
-            Err(error) => {
-                let _ = thread.fail_from_executor(
-                    lease,
-                    crate::kernel::objects::ExecutionFailure::SnapshotRestoreFailed,
-                );
-                Err(RuntimeError::Trap(error))
-            }
-        }
-    }
-
     /// Publish this runtime thread's process-visible state without confusing
     /// HVPatch's shared Darwin pid for the Linux task id.
     fn publish_process_run_state(&self, state: crate::run_state::RunState) {
@@ -6114,389 +5654,6 @@ where
         );
     }
 
-    fn park_vcpu_for_blocking_wait(
-        &self,
-        engine: &mut E,
-        park_class: crate::thread::VcpuParkClass,
-    ) -> Result<Option<BlockingWaitReclaim>, RuntimeError> {
-        self.park_vcpu_for_blocking_wait_with_policy(engine, park_class, false)
-    }
-
-    fn park_vcpu_for_blocking_wait_with_policy(
-        &self,
-        engine: &mut E,
-        park_class: crate::thread::VcpuParkClass,
-        force_reclaim: bool,
-    ) -> Result<Option<BlockingWaitReclaim>, RuntimeError> {
-        if !engine.reclaims() {
-            return Ok(None);
-        }
-        // KEEP the vCPU when the pool is uncontended, unless the caller has
-        // already classified this wait as long enough to yield proactively.
-        //
-        // `has_waiters`/`has_spare_capacity` were written for exactly this and
-        // then never called from anywhere in the workspace, so every blocking
-        // wait paid a full HVF destroy/recreate even with the pool almost
-        // entirely free. Wiring them makes the common case the no-reclaim path,
-        // which an ABBA measured as CPU-neutral and 13x more consistent
-        // run-to-run (`2026-08-13-hvpatch-noreclaim-abba.md`), while keeping
-        // reclaim as the safety valve under real contention.
-        //
-        // Both conditions are needed and the asymmetry is deliberate. Keeping
-        // the vCPU requires a slot to be FREE, not merely that nobody is
-        // waiting yet: a thread parked at a barrier it can only leave once some
-        // future waiter runs would otherwise deadlock that waiter. And an
-        // existing waiter means release now, spare capacity or not.
-        let scheduler = carrick_hal::vcpu_sched::global();
-        if should_keep_vcpu_for_blocking_wait(
-            force_reclaim,
-            scheduler.has_spare_capacity(),
-            scheduler.has_waiters(),
-        ) {
-            return Ok(None);
-        }
-        let park_started = std::time::Instant::now();
-        // A one-thread Linux process does not necessarily own the VM: hvpatch
-        // multiplexes several process registries in one persistent HVF VM.
-        // Whole-VM park/rebuild is therefore legal only on the legacy
-        // one-process-per-VM path. Hvpatch always destroys/recreates this
-        // thread's vCPU alone while other processes continue running.
-        let single_threaded_process =
-            self.registry.live_count() == 1 && self.process_fork_barrier.is_none();
-        self.begin_reclaim_snapshot_save()?;
-        let cpu = if single_threaded_process {
-            // Single-threaded: this thread IS the whole process — no sibling
-            // can race the teardown, so release unconditionally via the
-            // combined vCPU+VM park (the historical pre-lease path, kept
-            // byte-identical; the class is recorded but nothing consults it
-            // for ST). The registry bookkeeping is harmless here (one
-            // thread, no contention) and keeps one claim protocol; the flag
-            // is claimed back by this same thread's own `unpark_vcpu` on wake.
-            let _ = self
-                .registry
-                .park_vcpu_classified(self.this_tid, park_class);
-            let st = engine.save_shared_wait_state().map_err(|error| {
-                self.fail_snapshot_boundary(
-                    crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
-                );
-                RuntimeError::Trap(error)
-            })?;
-            self.registry.set_vm_released(true);
-            st
-        } else {
-            // MT: vCPU-only park. Destroy this thread's OWN vCPU FIRST
-            // (reclaim_park shape — snapshot stashed, compatible with the
-            // shared-wait resume), and only THEN set the registry "parked"
-            // mark — so `vcpu_parked` truthfully means "vCPU actually
-            // destroyed". The mark carries the wait's wake-path CLASS: a
-            // parked FD-BACKED wait vetoes any sibling's whole-VM release
-            // (the fd-wait wake path under a released VM has an
-            // un-root-caused gap — attribution cluster B). The whole-VM
-            // release is deliberately NOT taken here: an eager last-unparked
-            // release on this common park path made every hot MT blocking
-            // wait pay a full VM release+rebuild (wait_pipe_pingpong p50
-            // 41.9µs → 354µs, +867% — see
-            // .superpowers/sdd/task-6-regression-attribution.md, cluster A1)
-            // and wedged the CPython forkserver suite (cluster B). The
-            // release is DEFERRED to the slicing wait arms' second parked
-            // full slice — see `try_upgrade_vm_release_on_slice_tick`.
-            let st = engine.save_guest_state().map_err(|error| {
-                self.fail_snapshot_boundary(
-                    crate::kernel::objects::ExecutionFailure::SnapshotSaveFailed,
-                );
-                RuntimeError::Trap(error)
-            })?;
-            let _ = self
-                .registry
-                .park_vcpu_classified(self.this_tid, park_class);
-            st
-        };
-        let state = self.current_migratable_binding(cpu).inspect_err(|_error| {
-            self.fail_snapshot_boundary(
-                crate::kernel::objects::ExecutionFailure::SnapshotGenerationMismatch,
-            );
-        })?;
-        self.settle_reclaim_snapshot(&state)?;
-        let old_slot = carrick_hal::vcpu_sched::current_slot();
-        if let Some(lease) = carrick_hal::vcpu_sched::take_current_lease() {
-            carrick_hal::vcpu_sched::global()
-                .release(lease, carrick_hal::vcpu_sched::Yield::Blocked);
-        }
-        if engine.reclaim_refreshes_kicker() {
-            self.kicker.unregister(self.this_tid);
-        }
-        {
-            use std::sync::atomic::Ordering::Relaxed;
-            VCPU_RECLAIMS.fetch_add(1, Relaxed);
-            VCPU_RECLAIM_PARK_NS.fetch_add(
-                u64::try_from(park_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                Relaxed,
-            );
-        }
-        Ok(Some(BlockingWaitReclaim {
-            old_slot,
-            single_threaded_process,
-        }))
-    }
-
-    /// Deferred MT whole-VM release — the SLICE-TICK UPGRADE. Called only
-    /// from the SLICING wait arms (WaitOnSignals, WaitOnSleep — the arms
-    /// that re-dispatch on ≥1 s parked service slices), on a tick where this
-    /// thread has ALREADY completed at least one full parked slice AND the
-    /// CURRENT tick is itself a full ≥1 s slice (both counted/checked by the
-    /// caller — a finite wait's final <1 s window uses short slices and must
-    /// not churn releases at slice rate). At that point this thread's own
-    /// vCPU is already destroyed by the slice's vCPU-only park, so an idle
-    /// fully-parked MT process converges to holding zero HVF VMs within ~1 s
-    /// — while hot blocking paths (pipe/futex pingpongs, which park and wake
-    /// in microseconds) never reach a second slice and never pay the
-    /// release+rebuild round trip (the +867% wait_pipe regression the eager
-    /// design caused — task-6-regression-attribution.md, cluster A1).
-    /// Post-release ticks stretch progressively (2s→4s→8s, caller-managed)
-    /// so a long-idle process converges to ~1 rebuild per 8 s. The better
-    /// endpoint — SKIP the resume/re-park round trip entirely on an idle
-    /// TimedOut tick — is now IMPLEMENTED: both slicing arms wrap the wait in
-    /// an inner re-wait loop, so a fully-idle parked process re-arms without
-    /// resuming/re-parking (deadline + EINTR bookkeeping stays inside the
-    /// loop; a finite deadline expiry, a real wake, or a non-parked short
-    /// wait still breaks out to the single resume). A long-idle MT process
-    /// therefore holds zero HVF VMs and issues ~1 rebuild for the whole idle
-    /// span (the boot + final wake), not one per stretched tick.
-    ///
-    /// Returns true iff the process VM is released when this returns (this
-    /// call released it, or it was already released) — the caller uses it to
-    /// drive the post-release slice-stretch progression.
-    ///
-    /// INVARIANT (enforced, not just documented): a parked FD-BACKED wait
-    /// anywhere in the process VETOES the release
-    /// (`all_other_parked_release_safe`) — fd-backed waits never have the VM
-    /// released from under them until the fd-wait wake gap is root-caused
-    /// (the CPython forkserver wedge: attribution report cluster B, retained
-    /// cores cr-attr-fs.38232 et al. — an fd-wait manager parked and made no
-    /// progress). Consequently a process whose blocked threads are ALL in
-    /// fd-backed waits never releases its VM; a mixed process releases only
-    /// while every parked sibling is wake-safe (signal/timer/futex-driven,
-    /// or an empty-fd-set poll like `ppoll(NULL)`).
-    fn try_upgrade_vm_release_on_slice_tick(&self, engine: &mut E) -> bool {
-        if self.process_fork_barrier.is_some()
-            || !mt_vm_lease_enabled()
-            || self.registry.live_count() == 1
-        {
-            // ST processes already released eagerly at park
-            // (save_shared_wait_state); the upgrade is MT-only.
-            // Hvpatch never releases the shared VM from a process-local wait.
-            return false;
-        }
-        self.try_release_vm_mt(engine)
-    }
-
-    /// MT whole-VM release machinery (used only by the slice-tick upgrade
-    /// above): this thread — whose own vCPU is ALREADY destroyed by its
-    /// vCPU-only park — releases the remaining whole-VM state so a fleet of
-    /// fully-blocked MT processes holds zero HVF VM slots.
-    ///
-    /// The re-check + teardown + `set_vm_released` run under the topology
-    /// lock so they are ATOMIC against a waking sibling's claim + rebind
-    /// (which hold the same lock in `resume_vcpu_after_blocking_wait`):
-    /// without it, a sibling waking between the all-parked re-check and the
-    /// teardown could claim FALSE (flag not yet set) and re-create its vCPU
-    /// in the VM we are destroying. TRY-lock, not lock: on a NON-refresh
-    /// (pool-swap) backend this thread is still kicker-registered while
-    /// parked, so blocking on a forker-held topology lock would deadlock the
-    /// quiesce drain; on HVF (kicker already unregistered by the park) the
-    /// try-lock still holds — a contended lock means a fork/exec is
-    /// rebuilding the VM topology anyway, so releasing now would be wasted
-    /// work at best. A held lock simply skips the release (the park stays
-    /// vCPU-only); so does an unparked sibling (the re-check), a parked
-    /// FD-BACKED sibling (the release-safe veto), or an already-set flag
-    /// (VM already dead — reported as released).
-    ///
-    /// `vm_released` is set ONLY when the engine reports a successful
-    /// whole-VM release (`Ok(true)`). On `Err` — e.g. HV_BUSY from a vCPU in
-    /// a teardown window the registry no longer tracks (a thread mid-exit) —
-    /// the VM is still alive and setting the flag would poison an innocent
-    /// sibling's wake with a rebuild against a live VM; instead the park
-    /// stays vCPU-only, with a gated diagnostic.
-    ///
-    /// Returns true iff the VM stands released on return.
-    fn try_release_vm_mt(&self, engine: &mut E) -> bool {
-        let Some(_topo) = crate::fork_quiesce::try_acquire_topology_lock(
-            carrick_observability::probes::HvpatchTopologyOperation::VmRelease,
-            0,
-            self.this_tid.raw(),
-        ) else {
-            return false;
-        };
-        if self.registry.vm_released() {
-            // A slicing sibling already released this tick cycle and no
-            // waker has claimed yet: the VM is already gone.
-            return true;
-        }
-        let release_safe = if mt_vm_lease_fdbacked_release_enabled() {
-            // TEST-ONLY (CARRICK_MT_VM_LEASE_FDBACKED=1): treat fd-backed
-            // parks as release-safe — the reproducible form of the
-            // procladder_mixed mutation check (b01e18e2). The veto stays the
-            // shipping default until cluster B is root-caused (the recorded
-            // reviewer condition).
-            self.registry.all_other_parked(self.this_tid)
-        } else {
-            self.registry.all_other_parked_release_safe(self.this_tid)
-        };
-        if !release_safe {
-            // A sibling woke (its unpark cleared its mark) — it is about to
-            // re-create its vCPU — or (default veto) a parked sibling is in
-            // an FD-BACKED wait, whose wake path must never see the VM
-            // released from under it (attribution cluster B). The VM stays.
-            return false;
-        }
-        match engine.release_vm_after_reclaim_park() {
-            Ok(true) => {
-                self.registry.set_vm_released(true);
-                true
-            }
-            // Backend has no whole-VM state to release (pool-swap): nothing
-            // to flag; the wake side's rebind_to_slot is already correct.
-            Ok(false) => false,
-            Err(error) => {
-                tracing::warn!(
-                    tid = self.this_tid.raw(),
-                    %error,
-                    "MT whole-VM release failed; keeping the park vCPU-only \
-                     (vm_released NOT set)"
-                );
-                false
-            }
-        }
-    }
-
-    fn park_vcpu_for_timed_wait(
-        &self,
-        engine: &mut E,
-        timeout: Option<Duration>,
-        park_class: crate::thread::VcpuParkClass,
-    ) -> Result<Option<BlockingWaitReclaim>, RuntimeError> {
-        if should_reclaim_vcpu_for_timed_wait(timeout) {
-            self.park_vcpu_for_blocking_wait_with_policy(engine, park_class, true)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn resume_vcpu_after_blocking_wait(
-        &self,
-        engine: &mut E,
-        reclaim: Option<BlockingWaitReclaim>,
-    ) -> Result<(), RuntimeError> {
-        // Timed from entry so the census captures the whole resume, including
-        // any wait for a free slot — which is exactly the cost the executor
-        // model removes, since an executor never gives its vCPU up.
-        let resume_started = std::time::Instant::now();
-        let _resume_census = ResumeCensusGuard(resume_started);
-        let Some(reclaim) = reclaim else {
-            return Ok(());
-        };
-        let mut kicker_dropped = engine.reclaim_refreshes_kicker();
-        let new_lease = loop {
-            if let Some(lease) = carrick_hal::vcpu_sched::global().acquire_timeout(
-                self.this_tid.raw() as u64,
-                reclaim.old_slot,
-                Duration::from_millis(50),
-            ) {
-                break lease;
-            }
-            if self.fork_is_quiescing() {
-                if !kicker_dropped {
-                    self.kicker.unregister(self.this_tid);
-                    kicker_dropped = true;
-                }
-                // Waiting for a lease to resume from a blocking wait: the
-                // register file lives in the saved wait state, not in a live
-                // vCPU, so withdraw instead of owing an unpublishable note.
-                self.withdraw_from_crash_capture();
-                self.park_if_fork_quiescing();
-            }
-        };
-        carrick_hal::vcpu_sched::set_current_lease(new_lease);
-        let (cpu, execution_lease) = self.claim_reclaim_snapshot()?;
-        if engine.reclaim_refreshes_kicker() {
-            let _topo = crate::fork_quiesce::acquire_topology_lock(
-                carrick_observability::probes::HvpatchTopologyOperation::VcpuRebind,
-                0,
-                self.this_tid.raw(),
-            );
-            // Claim the whole-VM rebuild INSIDE the topology lock — the same
-            // lock the park-side teardown and every rebind hold — so a
-            // claim-FALSE result proves the claimer's rebuild (or the
-            // teardown's downgrade) already completed: a claim-false waker
-            // can never reach `rebind_to_slot` against a dead VM. Exactly one
-            // of any set of simultaneous wakers claims true (registry mutex).
-            // `unpark_vcpu` is ALWAYS called (the mark must clear); the MT
-            // claim is honored only with the lease enabled, so
-            // CARRICK_MT_VM_LEASE=0 is a true zero (no MT release can have
-            // set the flag with the lease off, so ignoring a claim is safe).
-            let claimed = self.registry.unpark_vcpu(self.this_tid);
-            let rebuild_vm = reclaim.single_threaded_process || (mt_vm_lease_enabled() && claimed);
-            let restore_result = if rebuild_vm {
-                if reclaim.single_threaded_process {
-                    engine.rebind_shared_wait_state(new_lease.slot, &cpu)
-                } else {
-                    // MT first waker: rebuild the process VM on behalf of the
-                    // still-parked siblings — the mapping replay must carry
-                    // the UNION of every thread's dynamic mappings, not just
-                    // this thread's per-thread list.
-                    engine.rebind_shared_wait_state_mt(new_lease.slot, &cpu)
-                }
-            } else {
-                engine.rebind_to_slot(new_lease.slot, &cpu)
-            };
-            self.complete_reclaim_restore(execution_lease, restore_result)?;
-            self.register_vcpu(engine);
-        } else {
-            if self.fork_is_quiescing() {
-                if !kicker_dropped {
-                    self.kicker.unregister(self.this_tid);
-                    kicker_dropped = true;
-                }
-                // Same reason as the refresh branch above: nothing readable to
-                // publish while the vCPU is being rebound.
-                self.withdraw_from_crash_capture();
-                self.park_if_fork_quiescing();
-            }
-            if kicker_dropped {
-                self.register_vcpu(engine);
-            }
-            // Non-refresh (pool-swap: KVM x86 / bhyve) branch: no backend in
-            // this branch tears down per-process VM state on a shared-wait
-            // park (`save_shared_wait_state` defaults to the vCPU pool-swap),
-            // so there is no dead-VM window and the claim needs no topology
-            // lock. Taking it here would deadlock a concurrent fork quiesce:
-            // this thread stays kicker-REGISTERED on pool-swap backends, so
-            // the forker (holding the topology lock) would wait on our park
-            // while we wait on its lock. Same lease gating as the refresh
-            // branch: unpark always, honor an MT claim only with the lease on.
-            let claimed = self.registry.unpark_vcpu(self.this_tid);
-            let rebuild_vm = reclaim.single_threaded_process || (mt_vm_lease_enabled() && claimed);
-            let restore_result = if rebuild_vm {
-                if reclaim.single_threaded_process {
-                    engine.rebind_shared_wait_state(new_lease.slot, &cpu)
-                } else {
-                    engine.rebind_shared_wait_state_mt(new_lease.slot, &cpu)
-                }
-            } else {
-                engine.rebind_to_slot(new_lease.slot, &cpu)
-            };
-            self.complete_reclaim_restore(execution_lease, restore_result)?;
-        }
-        let prev = reclaim.old_slot.unwrap_or(new_lease.slot);
-        crate::probes::mn_reclaim(
-            self.this_tid.raw(),
-            prev,
-            new_lease.slot,
-            if new_lease.slot == prev { 1 } else { 2 },
-        );
-        Ok(())
-    }
-
     fn exec_replaced_thread_exit(&self) -> Option<DispatchOutcome> {
         if thread_should_finish_for_exec_replacement(&self.registry, self.this_tid) {
             Some(DispatchOutcome::ThreadExit { code: 0 })
@@ -7017,7 +6174,6 @@ pub(crate) enum VcpuLoopLaunch {
     Direct(Result<VcpuLoopOutcome, RuntimeError>),
     Persistent {
         result: HvpatchLoopResult,
-        terminal_settlement: HvpatchExternalTerminalSettlement,
         directory: Arc<HvpatchRuntimeDirectory>,
         shutdown_on_wait: bool,
     },
@@ -7035,55 +6191,14 @@ const fn persistent_pool_shutdown_on_wait(started_pool: bool) -> bool {
 /// `Job` variant carried a transitional-runner task receipt, which nothing on
 /// the persistent path ever produced.
 pub(crate) enum VcpuThreadHandle {
-    Host {
-        handle: std::thread::JoinHandle<()>,
-        completion: continuation::LogicalJobCompletion,
-    },
     Persistent {
         terminal_settlement: HvpatchExternalTerminalSettlement,
     },
 }
 
 impl VcpuThreadHandle {
-    fn is_finished(&self) -> bool {
-        match self {
-            Self::Host { completion, .. } => completion.is_finished(),
-            Self::Persistent {
-                terminal_settlement,
-            } => terminal_settlement.completion().is_finished(),
-        }
-    }
-
-    fn host_thread_id(&self) -> Option<std::thread::ThreadId> {
-        match self {
-            Self::Host { handle, .. } => Some(handle.thread().id()),
-            Self::Persistent { .. } => None,
-        }
-    }
-
-    fn diagnostic_name(&self) -> String {
-        match self {
-            Self::Host { handle, .. } => handle.thread().name().unwrap_or("<unnamed>").to_owned(),
-            Self::Persistent { .. } => "persistent-hvpatch-job".to_owned(),
-        }
-    }
-
-    fn join(self) -> Result<(), RuntimeError> {
-        match self {
-            Self::Host { handle, .. } => handle.join().map_err(|_| {
-                RuntimeError::Trap(TrapError::Hypervisor(
-                    "HVPatch vCPU bootstrap pthread panicked".to_owned(),
-                ))
-            }),
-            Self::Persistent {
-                terminal_settlement,
-            } => terminal_settlement.wait_result().map(|_| ()),
-        }
-    }
-
     fn completion(&self) -> continuation::LogicalJobCompletion {
         match self {
-            Self::Host { completion, .. } => completion.clone(),
             Self::Persistent {
                 terminal_settlement,
             } => terminal_settlement.completion(),
@@ -7092,7 +6207,6 @@ impl VcpuThreadHandle {
 
     fn finish_completed(self, current: continuation::JobId) -> Result<(), RuntimeError> {
         match self {
-            Self::Host { .. } => Ok(()),
             Self::Persistent {
                 terminal_settlement,
             } if terminal_settlement.completion().id() == current => Ok(()),
@@ -7541,7 +6655,6 @@ where
         prepared.disarm();
         VcpuLoopLaunch::Persistent {
             result: logical.result,
-            terminal_settlement: logical.terminal_settlement,
             directory: Arc::clone(directory),
             shutdown_on_wait: persistent_pool_shutdown_on_wait(started_pool),
         }
@@ -7973,77 +7086,6 @@ mod tests {
             publish < gate,
             "the start gate is claimed only after the initial task state is published"
         );
-
-        let settle = source
-            .split("fn settle_reclaim_snapshot")
-            .nth(1)
-            .and_then(|tail| tail.split("fn claim_reclaim_snapshot").next())
-            .expect("destructive-save settlement body");
-        assert!(!settle.contains(concat!("publish_initial_", "task_state")));
-        assert!(settle.contains("execution_lease.lock().take()"));
-        // Loop-departure settlement and vCPU destruction moved with the thread
-        // terminal into `threads.rs::handle_thread_exit`.
-        let threads = include_str!("threads.rs");
-        let terminal = threads
-            .split("pub(super) fn handle_thread_exit")
-            .nth(1)
-            .expect("persistent thread terminal");
-        let departure = terminal
-            .find("self.settle_execution_lease_on_loop_departure()")
-            .expect("common loop-departure settlement");
-        let destroy = terminal
-            .find("engine.destroy_vcpu_on_thread_exit()")
-            .expect("common vCPU destruction");
-        assert!(departure < destroy);
-    }
-
-    #[test]
-    fn switching_out_precedes_every_destructive_reclaim_save() {
-        let source = include_str!("mod.rs");
-        let begin = source
-            .find(concat!("begin_reclaim_", "snapshot_save()?;"))
-            .expect("exact lease must enter SwitchingOut");
-        let shared_save = source
-            .find("engine.save_shared_wait_state()")
-            .expect("shared destructive save");
-        let private_save = source
-            .find("engine.save_guest_state()")
-            .expect("private destructive save");
-        assert!(begin < shared_save && begin < private_save);
-
-        let settle = source
-            .split("fn settle_reclaim_snapshot")
-            .nth(1)
-            .and_then(|tail| tail.split("fn claim_reclaim_snapshot").next())
-            .expect("settlement body");
-        assert!(!settle.contains("begin_switch_out"));
-    }
-
-    #[test]
-    fn loop_departure_settles_before_every_terminal_retirement_branch() {
-        // REPOINTED for the fork-closure deletion. The welded loop bounded its
-        // own terminal with `let terminal_hvpatch_process`; the persistent
-        // thread terminal is `threads.rs::handle_thread_exit`, which settles the
-        // execution lease as its FIRST statement, before any retirement.
-        let source = include_str!("threads.rs");
-        let terminal_branch = source
-            .find("pub(super) fn handle_thread_exit")
-            .expect("persistent thread terminal");
-        let settlement = source[terminal_branch..]
-            .find("self.settle_execution_lease_on_loop_departure()")
-            .map(|offset| terminal_branch + offset)
-            .expect("branch-complete execution settlement");
-        assert!(settlement > terminal_branch);
-        let terminal_branch = settlement;
-        for retirement in [
-            "retire_in_process_address_space",
-            "process.exit_thread",
-            "engine.destroy_vcpu_on_thread_exit()",
-        ] {
-            if let Some(offset) = source[terminal_branch..].find(retirement) {
-                assert!(settlement < terminal_branch + offset, "{retirement}");
-            }
-        }
     }
 
     /// `SA_RESTART` must resume the calls `signal(7)` says it resumes, and must
@@ -9415,13 +8457,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn departing_vcpu_is_destroyed_unless_terminal_cleanup_already_owns_it() {
-        assert!(!should_destroy_departing_vcpu(true, false));
-        assert!(!should_destroy_departing_vcpu(false, true));
-        assert!(should_destroy_departing_vcpu(false, false));
-    }
-
     /// Editing stage-1 and NEEDING A PAUSE are different questions, and the
     /// page-table manager keys table reclaim on the first. A sole guest
     /// executor takes no pause precisely because it is already exclusive, so if
@@ -9481,16 +8516,6 @@ mod tests {
     }
 
     #[test]
-    fn timed_wait_reclaim_keeps_vcpu_for_short_finite_timeouts() {
-        assert!(!should_reclaim_vcpu_for_timed_wait(Some(
-            SHORT_TIMED_WAIT_RECLAIM_CUTOFF
-        )));
-        assert!(!should_reclaim_vcpu_for_timed_wait(Some(
-            SHORT_TIMED_WAIT_RECLAIM_CUTOFF - Duration::from_millis(1)
-        )));
-    }
-
-    #[test]
     fn hvpatch_child_output_writer_drains_payload_larger_than_a_pipe() {
         let mut fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -9512,30 +8537,6 @@ mod tests {
         write_hvpatch_child_output(fds[1], &payload).expect("complete pipe write");
         unsafe { libc::close(fds[1]) };
         assert_eq!(reader.join().expect("pipe reader"), payload);
-    }
-
-    #[test]
-    fn clone_admission_exit_waits_for_in_flight_and_stays_closed() {
-        let gate = Arc::new(CloneAdmissionGate::default());
-        let permit = gate
-            .try_enroll_thread_clone()
-            .expect("initial clone permit");
-        std::thread::scope(|scope| {
-            let closer = scope.spawn(|| gate.claim_process_exit());
-            while !permit.is_cancelled() {
-                std::thread::yield_now();
-            }
-            assert!(gate.try_enroll_thread_clone().is_none());
-            drop(permit);
-            assert_eq!(
-                closer
-                    .join()
-                    .expect("exit closer thread")
-                    .expect("exit admission drain"),
-                ProcessExitClaim::Owner
-            );
-        });
-        assert!(gate.try_enroll_thread_clone().is_none());
     }
 
     #[test]
@@ -9613,29 +8614,6 @@ mod tests {
         );
         assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
         drop(enrollment);
-    }
-
-    #[test]
-    fn clone_admission_arbitrates_exec_before_exit_without_mutual_drain() {
-        let gate = Arc::new(CloneAdmissionGate::default());
-        let owner = ThreadId::synthetic_for_tests(1002);
-        let exec = gate.close_for_exec(owner).expect("exec admission close");
-        assert!(gate.try_enroll_thread_clone().is_none());
-        assert_eq!(
-            gate.claim_process_exit().expect("exit arbitration"),
-            ProcessExitClaim::LostToExec
-        );
-        drop(exec);
-        assert!(gate.try_enroll_thread_clone().is_some());
-
-        // Once exec releases, exit can claim permanent ownership and a later
-        // exec cannot establish a competing terminal drain.
-        assert_eq!(
-            gate.claim_process_exit().expect("exit owns admission"),
-            ProcessExitClaim::Owner
-        );
-        assert!(gate.close_for_exec(owner).is_err());
-        assert!(gate.try_enroll_thread_clone().is_none());
     }
 
     #[test]
@@ -9736,42 +8714,6 @@ mod tests {
         assert!(
             include_str!("quiesce.rs")
                 .contains("parent_context.task().threads().len().saturating_sub(1)")
-        );
-    }
-
-    #[test]
-    fn concurrent_fork_close_does_not_retire_a_vfork_parent() {
-        let gate = Arc::new(CloneAdmissionGate::default());
-        let owner = ThreadId::synthetic_for_tests(1005);
-        let process_fork = gate
-            .try_enroll_process_fork(owner)
-            .expect("process fork admission");
-        let fork = process_fork
-            .try_close_for_fork(owner)
-            .expect("fork admission close")
-            .expect("no sibling clone blocks fork close");
-
-        assert!(gate.is_closing(), "ordinary fork must close new admission");
-        assert!(
-            !gate.is_terminal_closing(),
-            "an unrelated fork close must not retire a suspended vfork parent"
-        );
-
-        drop(fork);
-        drop(process_fork);
-        let exec = gate.close_for_exec(owner).expect("exec admission close");
-        assert!(
-            gate.is_terminal_closing(),
-            "exec replacement must retire a suspended vfork parent"
-        );
-        drop(exec);
-        assert_eq!(
-            gate.claim_process_exit().expect("process exit close"),
-            ProcessExitClaim::Owner
-        );
-        assert!(
-            gate.is_terminal_closing(),
-            "process exit must retire a suspended vfork parent"
         );
     }
 
@@ -9900,15 +8842,16 @@ mod tests {
             "the exact current owner retains its separate outcome authority"
         );
 
+        let consumed_result = HvpatchLoopResult::pending();
         let consumed = HvpatchExternalTerminalSettlement::new(
-            HvpatchLoopResult::pending(),
+            consumed_result.clone(),
             continuation::LogicalJobCompletion::pending(),
         );
         consumed
             .publish_member(Ok(VcpuLoopOutcome::ThreadDone))
             .unwrap();
         assert!(matches!(
-            consumed.wait_result(),
+            consumed_result.wait(),
             Ok(VcpuLoopOutcome::ThreadDone)
         ));
         let consumed_handles = Arc::new(Mutex::new(Vec::new()));
@@ -10029,29 +8972,6 @@ mod tests {
             crate::kernel::objects::ThreadExecutionState::Runnable { .. }
         ));
         assert_eq!(scheduler.queued_len(), 1);
-    }
-
-    #[test]
-    fn timed_wait_reclaim_releases_vcpu_for_long_or_indefinite_waits() {
-        assert!(should_reclaim_vcpu_for_timed_wait(None));
-        assert!(should_reclaim_vcpu_for_timed_wait(Some(
-            SHORT_TIMED_WAIT_RECLAIM_CUTOFF + Duration::from_millis(1)
-        )));
-        assert!(should_keep_vcpu_for_blocking_wait(false, true, false));
-        // (see `pre_dispatch_pt_pause_covers_madvise_dontneed` below)
-        assert!(!should_keep_vcpu_for_blocking_wait(false, false, false));
-        assert!(!should_keep_vcpu_for_blocking_wait(false, true, true));
-        assert!(
-            !should_keep_vcpu_for_blocking_wait(true, true, false),
-            "a selected long wait must release its slot before future admissions queue"
-        );
-    }
-
-    #[test]
-    fn threaded_fd_wait_interrupts_for_internal_fork_quiesce() {
-        assert!(threaded_fd_wait_should_interrupt(true, false));
-        assert!(threaded_fd_wait_should_interrupt(false, true));
-        assert!(!threaded_fd_wait_should_interrupt(false, false));
     }
 
     #[test]

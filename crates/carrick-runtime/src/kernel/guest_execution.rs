@@ -90,16 +90,6 @@ impl GuestExecutorCensus {
     pub fn has_peer_executor(&self) -> bool {
         self.live() > 1
     }
-
-    /// `libc::fork` CHILD-side reset. The parent's other vCPU loops do not
-    /// exist in the child (only the calling thread is replicated) and nothing
-    /// in the child would ever decrement them, so an inherited count would keep
-    /// the child raising barriers for threads that cannot run — and, worse,
-    /// hand its drains a population they can never satisfy. Call from the child
-    /// arm beside the futex/kicker/barrier resets.
-    pub(crate) fn reset_for_forked_child(&self) {
-        self.live.store(1, Ordering::SeqCst);
-    }
 }
 
 /// Membership in a [`GuestExecutorCensus`], held for exactly one vCPU loop.
@@ -165,17 +155,5 @@ mod tests {
             !census.has_peer_executor(),
             "an unwound loop must leave the population"
         );
-    }
-
-    #[test]
-    fn a_forked_child_starts_from_its_own_thread_alone() {
-        let census = Arc::new(GuestExecutorCensus::default());
-        let _forker = census.enter(None);
-        let _sibling = census.enter(None);
-        // Post-fork, the child's copy still reads the parent's siblings.
-        assert_eq!(census.live(), 2);
-        census.reset_for_forked_child();
-        assert_eq!(census.live(), 1);
-        assert!(!census.has_peer_executor());
     }
 }

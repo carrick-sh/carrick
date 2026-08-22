@@ -3627,20 +3627,6 @@ impl LogicalJobCompletion {
     }
 }
 
-pub(crate) struct LogicalJobCompletionGuard(LogicalJobCompletion);
-
-impl LogicalJobCompletionGuard {
-    pub(crate) fn new(completion: LogicalJobCompletion) -> Self {
-        Self(completion)
-    }
-}
-
-impl Drop for LogicalJobCompletionGuard {
-    fn drop(&mut self) {
-        self.0.publish();
-    }
-}
-
 struct JobCompletionSubscription {
     completion: LogicalJobCompletion,
     listener: u64,
@@ -4553,7 +4539,6 @@ mod tests {
             "publish_exit_status",
             "notify_hvpatch_parent_exit",
             "unregister_hvpatch_runtime_endpoint",
-            "retire_in_process_address_space",
             "publish_process_terminal(terminal_publication)",
             "ExecutorExit::Quiesced",
             "notify_quiesced_progress",
