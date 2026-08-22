@@ -2066,8 +2066,7 @@ where
         }
         let member_publication = PersistentProcessMemberPublication::new(
             Arc::clone(&child_threads),
-            &logical.result,
-            &logical.completion,
+            &logical.terminal_settlement,
         );
         dormant
             .activate(
