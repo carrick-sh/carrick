@@ -3334,6 +3334,32 @@ pub(crate) fn hvpatch_lane_active() -> bool {
     HVPATCH_LANE.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Scoped override of the carrier-global HVPatch lane flag, for tests only.
+///
+/// `HVPATCH_LANE` describes the CARRIER: `bind_hvpatch_process` sets it once and
+/// nothing ever clears it, which is correct for a run and wrong inside a test
+/// binary, where every test after the first binding silently observes a
+/// different lane than the one it was written against. That is the scope-domain
+/// hazard `docs/identity-and-scope-domains.md` names: a `static` carrying no
+/// mark saying what it describes. A test that asserts either side of the flag
+/// takes this guard and gets a deterministic answer regardless of run order.
+#[cfg(test)]
+pub(crate) struct HvpatchLaneScope(bool);
+
+#[cfg(test)]
+impl HvpatchLaneScope {
+    pub(crate) fn force(active: bool) -> Self {
+        Self(HVPATCH_LANE.swap(active, std::sync::atomic::Ordering::AcqRel))
+    }
+}
+
+#[cfg(test)]
+impl Drop for HvpatchLaneScope {
+    fn drop(&mut self) {
+        HVPATCH_LANE.store(self.0, std::sync::atomic::Ordering::Release);
+    }
+}
+
 impl SyscallDispatcher {
     pub(in crate::dispatch) fn complete_wait_fd_authority(
         &self,

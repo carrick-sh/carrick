@@ -3079,6 +3079,11 @@ mod tests {
     fn cross_process_sigqueue_usr1_ring_full_returns_eagain_without_host_kill_fallback() {
         use zerocopy::IntoBytes;
 
+        // `bootstrap_signal_send_as` is the subject here, and
+        // `sigqueueinfo_common` only reaches it while no HVPatch process is
+        // bound. The flag is carrier-global and never clears, so pin it rather
+        // than inherit whatever an earlier test in this binary left behind.
+        let _lane = crate::dispatch::HvpatchLaneScope::force(false);
         let _g = XSIG_RING_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -3171,6 +3176,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         use zerocopy::IntoBytes;
 
+        // `bootstrap_signal_send_as` is the subject here, and
+        // `sigqueueinfo_common` only reaches it while no HVPatch process is
+        // bound. The flag is carrier-global and never clears, so pin it rather
+        // than inherit whatever an earlier test in this binary left behind.
+        let _lane = crate::dispatch::HvpatchLaneScope::force(false);
         let _g = XSIG_RING_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -3255,6 +3265,12 @@ mod tests {
     #[test]
     fn cross_process_sigqueue_signal_zero_checks_guest_credentials() {
         use std::os::unix::fs::PermissionsExt as _;
+
+        // `bootstrap_signal_send_as` is the subject here, and
+        // `sigqueueinfo_common` only reaches it while no HVPatch process is
+        // bound. The flag is carrier-global and never clears, so pin it rather
+        // than inherit whatever an earlier test in this binary left behind.
+        let _lane = crate::dispatch::HvpatchLaneScope::force(false);
 
         assert!(
             !crate::namespace::pid::enabled(),
@@ -4381,6 +4397,11 @@ mod tests {
     #[test]
     fn sigqueueinfo_payload_uses_resolved_guest_main_thread_key() {
         use zerocopy::IntoBytes;
+        // `bootstrap_signal_send_as` is the subject here, and
+        // `sigqueueinfo_common` only reaches it while no HVPatch process is
+        // bound. The flag is carrier-global and never clears, so pin it rather
+        // than inherit whatever an earlier test in this binary left behind.
+        let _lane = crate::dispatch::HvpatchLaneScope::force(false);
         let d = SyscallDispatcher::new();
         let kernel = d.capture_one_task_context().unwrap();
         let main = kernel.thread().registry_id();
