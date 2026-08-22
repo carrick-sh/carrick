@@ -26,6 +26,8 @@
 use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR};
 
 use super::{EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
+use crate::network::model::LinuxNetworkLink;
+use carrick_abi::LINUX_IFF_RUNNING;
 
 pub(crate) fn synthetic_file(path: &str) -> Option<Vec<u8>> {
     match path {
@@ -76,101 +78,56 @@ const NET_ATTRS: &[&str] = &[
     "type",
 ];
 
-struct NetIface {
-    name: String,
-    index: u32,
-    mac: [u8; 6],
-    mac_len: usize,
-    flags: u32,
-    is_loopback: bool,
-}
-
-fn default_net_model() -> crate::network::model::LinuxNetworkModel {
-    crate::network::model::LinuxNetworkModel::from_spec(
-        &carrick_spec::NetworkNamespaceSpec::default(),
-    )
-}
-
-fn net_interfaces_from_model(model: &crate::network::model::LinuxNetworkModel) -> Vec<NetIface> {
-    model
-        .links
-        .iter()
-        .map(|link| {
-            let flags = if link.loopback {
-                (libc::IFF_LOOPBACK | libc::IFF_UP | libc::IFF_RUNNING) as u32
-            } else {
-                (libc::IFF_UP | libc::IFF_RUNNING | libc::IFF_BROADCAST | libc::IFF_MULTICAST)
-                    as u32
-            };
-            NetIface {
-                name: link.name.clone(),
-                index: link.index,
-                mac: if link.loopback {
-                    [0, 0, 0, 0, 0, 0]
-                } else {
-                    [0x02, 0, 0, 0, 0, link.index as u8]
-                },
-                mac_len: 6,
-                flags,
-                is_loopback: link.loopback,
-            }
-        })
-        .collect()
-}
-
-/// Render `/sys/class/net/<if>/<attr>` for a live interface, or `None` if the
-/// path isn't a recognized attribute of a present interface.
-#[cfg(test)]
-fn synthetic_net_file(path: &str) -> Option<Vec<u8>> {
-    synthetic_net_file_from_interfaces(path, net_interfaces_from_model(&default_net_model()))
-}
-
-fn synthetic_net_file_from_interfaces(path: &str, interfaces: Vec<NetIface>) -> Option<Vec<u8>> {
+/// Render `/sys/class/net/<if>/<attr>` from the namespace's link, or `None` if
+/// the path is not a recognized attribute of a link this namespace has.
+///
+/// Every value comes from the link the namespace holds. It used to come from a
+/// live `getifaddrs(3)` walk with no name mapping at all, so a guest reading
+/// `/sys/class/net` saw the Mac's own `en0`, `awdl0`, `bridge0` and `utun*`
+/// while the rtnetlink dump it had just read advertised `lo` and `eth0` — and
+/// `/sys/class/net/eth0/address`, the standard way to read a MAC on Linux, was
+/// ENOENT.
+fn synthetic_net_file_from_links(path: &str, links: &[LinuxNetworkLink]) -> Option<Vec<u8>> {
     let rest = path.strip_prefix("/sys/class/net/")?;
     let (ifname, attr) = rest.split_once('/')?;
-    let iface = interfaces.into_iter().find(|i| i.name == ifname)?;
-    let running = iface.flags as i32 & libc::IFF_RUNNING != 0;
+    let link = links.iter().find(|link| link.name == ifname)?;
+    let running = link.flags & LINUX_IFF_RUNNING != 0;
     let body = match attr {
-        "ifindex" => format!("{}\n", iface.index),
+        "ifindex" => format!("{}\n", link.index),
         "address" => {
-            if iface.mac_len == 0 {
+            if link.hw_addr.is_empty() {
                 "00:00:00:00:00:00\n".to_string()
             } else {
-                let octets: Vec<String> = iface.mac[..iface.mac_len]
+                let octets: Vec<String> = link
+                    .hw_addr
                     .iter()
-                    .map(|b| format!("{b:02x}"))
+                    .map(|byte| format!("{byte:02x}"))
                     .collect();
                 format!("{}\n", octets.join(":"))
             }
         }
         "operstate" => if running { "up\n" } else { "down\n" }.to_string(),
         "carrier" => if running { "1\n" } else { "0\n" }.to_string(),
-        "flags" => format!("0x{:x}\n", iface.flags),
-        // ARPHRD_LOOPBACK (772) vs ARPHRD_ETHER (1); default MTU by type.
-        "type" => if iface.is_loopback { "772\n" } else { "1\n" }.to_string(),
-        "mtu" => if iface.is_loopback {
-            "16384\n"
-        } else {
-            "1500\n"
-        }
-        .to_string(),
+        "flags" => format!("0x{:x}\n", link.flags),
+        "type" => format!("{}\n", link.arphrd),
+        "mtu" => format!("{}\n", link.mtu),
         _ => return None,
     };
     Some(body.into_bytes())
 }
 
-fn net_path_kind_from_interfaces(path: &str, interfaces: &[NetIface]) -> Option<EntryKind> {
+fn net_path_kind_from_links(path: &str, links: &[LinuxNetworkLink]) -> Option<EntryKind> {
     if path == "/sys/class" || path == "/sys/class/net" {
         return Some(EntryKind::Directory);
     }
     let rest = path.strip_prefix("/sys/class/net/")?;
     match rest.split_once('/') {
-        None => interfaces
+        None => links
             .iter()
-            .any(|i| i.name == rest)
+            .any(|link| link.name == rest)
             .then_some(EntryKind::Directory),
         Some((ifname, attr)) => (NET_ATTRS.contains(&attr)
-            && interfaces.iter().any(|i| i.name == ifname))
+            && links.iter().any(|link| link.name == ifname))
         .then_some(EntryKind::File),
     }
 }
@@ -203,42 +160,40 @@ fn synthetic_dir_entries(path: &str) -> Option<Vec<super::DirEnt>> {
     )
 }
 
+/// The `/sys` mount.
+///
+/// It holds the network NAMESPACE, not a copy of its contents: `/sys/class/net`
+/// is a view of whatever that namespace currently describes, so a republication
+/// (the run's own model replacing the boot-time host mirror) reaches the mount
+/// without remounting it. That is why there is no longer a
+/// `SysVfs::from_network_model` beside `SysVfs::new` — a second constructor was
+/// a second source, and the model-less one was the DEFAULT mount, which is how
+/// `ls /sys/class/net` came to list `awdl0` and `utun0` on the shipping lane.
 pub struct SysVfs {
-    network_model: Option<crate::network::model::LinuxNetworkModel>,
+    net_ns: std::sync::Arc<crate::kernel::NetNs>,
 }
 
 impl SysVfs {
     pub fn new() -> Self {
         Self {
-            network_model: None,
+            net_ns: std::sync::Arc::clone(crate::kernel::root_net_ns()),
         }
     }
 
-    pub(crate) fn from_network_model(model: crate::network::model::LinuxNetworkModel) -> Self {
-        Self {
-            network_model: Some(model),
-        }
-    }
-
-    fn net_interfaces(&self) -> Vec<NetIface> {
-        let default_model;
-        let model = match &self.network_model {
-            Some(m) => m,
-            None => {
-                default_model = default_net_model();
-                &default_model
-            }
-        };
-        net_interfaces_from_model(model)
+    /// A `/sys` rendering a namespace other than the carrier's root — the shape
+    /// a per-task mount takes once `unshare(CLONE_NEWNET)` is honoured, and the
+    /// only way a test can assert on a view without republishing the root's.
+    #[cfg(test)]
+    fn in_namespace(net_ns: std::sync::Arc<crate::kernel::NetNs>) -> Self {
+        Self { net_ns }
     }
 
     fn synthetic_net_file(&self, path: &str) -> Option<Vec<u8>> {
-        synthetic_net_file_from_interfaces(path, self.net_interfaces())
+        synthetic_net_file_from_links(path, &self.net_ns.view().links)
     }
 
     fn net_path_kind(&self, path: &str) -> Option<EntryKind> {
-        let interfaces = self.net_interfaces();
-        net_path_kind_from_interfaces(path, &interfaces)
+        net_path_kind_from_links(path, &self.net_ns.view().links)
     }
 }
 
@@ -316,17 +271,24 @@ impl Vfs for SysVfs {
         }
         if path == "/sys/class/net" {
             return Ok(self
-                .net_interfaces()
-                .into_iter()
-                .map(|i| super::DirEnt {
-                    name: i.name,
+                .net_ns
+                .view()
+                .links
+                .iter()
+                .map(|link| super::DirEnt {
+                    name: link.name.clone(),
                     kind: EntryKind::Directory,
                 })
                 .collect());
         }
         if let Some(rest) = path.strip_prefix("/sys/class/net/")
             && !rest.contains('/')
-            && self.net_interfaces().iter().any(|i| i.name == rest)
+            && self
+                .net_ns
+                .view()
+                .links
+                .iter()
+                .any(|link| link.name == rest)
         {
             return Ok(NET_ATTRS
                 .iter()
@@ -481,55 +443,60 @@ mod tests {
         assert_eq!(v.lookup("/sys/no-such"), Err(LINUX_ENOENT));
     }
 
-    #[cfg(target_os = "macos")]
+    /// The DEFAULT `/sys` mount — the one the shipping `--net host` lane uses —
+    /// shows a Linux namespace, not the Mac.
+    ///
+    /// Red before this change: `SysVfs::new()` carried no network model and fell
+    /// back to a raw `getifaddrs(3)` walk with no name mapping, so `ls
+    /// /sys/class/net` listed `anpi0 ap1 awdl0 bridge0 en0 gif0 llw0 lo0 stf0
+    /// utun0...` where Docker lists exactly `eth0 lo`. It was self-contradictory
+    /// as well as wrong: the rtnetlink dump the same guest read advertised
+    /// `eth0` with a hardware address while `/sys/class/net/eth0/address` — the
+    /// standard way to read a MAC on Linux — was ENOENT, and
+    /// `/sys/class/net/en0/address` returned the Mac's real one.
     #[test]
-    fn sys_class_net_lists_and_renders_loopback() {
+    fn default_sys_class_net_shows_a_linux_namespace_not_the_host() {
         let v = SysVfs::new();
-        // /sys/class/net is a directory listing the host interfaces; loopback
-        // ("lo") is always present.
-        assert_eq!(
-            v.lookup("/sys/class/net").unwrap().kind,
-            EntryKind::Directory
-        );
-        let ifaces = v.readdir("/sys/class/net").unwrap();
-        // Interface names mirror the LinuxNetworkModel view, so find the
-        // loopback by its type (772 = ARPHRD_LOOPBACK) rather than hard-coding a name.
-        let lo = ifaces
-            .iter()
-            .map(|d| d.name.clone())
-            .find(|n| {
-                synthetic_net_file(&format!("/sys/class/net/{n}/type")) == Some(b"772\n".to_vec())
-            })
-            .expect("a loopback interface");
-        // It's a directory whose attribute files exist and render.
-        assert_eq!(
-            v.lookup(&format!("/sys/class/net/{lo}")).unwrap().kind,
-            EntryKind::Directory
-        );
-        assert_eq!(
-            v.lookup(&format!("/sys/class/net/{lo}/ifindex"))
-                .unwrap()
-                .kind,
-            EntryKind::File
-        );
-        let attrs = v.readdir(&format!("/sys/class/net/{lo}")).unwrap();
-        assert!(attrs.iter().any(|d| d.name == "operstate"));
-        assert!(attrs.iter().any(|d| d.name == "address"));
+        let names = v
+            .readdir("/sys/class/net")
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"lo".to_string()), "{names:?}");
         assert!(
-            synthetic_net_file(&format!("/sys/class/net/{lo}/ifindex"))
-                .unwrap()
-                .len()
-                > 1
+            names.iter().all(|name| name == "lo"
+                || name
+                    .strip_prefix("eth")
+                    .is_some_and(|n| n.parse::<u32>().is_ok())),
+            "only Linux link names may reach the guest: {names:?}"
         );
-        // An interface that doesn't exist is ENOENT.
+        for host_only in ["en0", "lo0", "awdl0", "utun0", "bridge0"] {
+            assert_eq!(
+                v.lookup(&format!("/sys/class/net/{host_only}")),
+                Err(LINUX_ENOENT),
+                "{host_only} is the Mac's, not the guest's"
+            );
+        }
+
+        // ARPHRD_LOOPBACK, and Linux's loopback MTU — macOS `lo0` reports 16384,
+        // which is what the host-derived renderer printed.
         assert_eq!(
-            v.lookup("/sys/class/net/definitely-not-a-nic"),
-            Err(LINUX_ENOENT)
+            synthetic_net_file_from_links("/sys/class/net/lo/type", &v.net_ns.view().links),
+            Some(b"772\n".to_vec())
+        );
+        assert_eq!(
+            synthetic_net_file_from_links("/sys/class/net/lo/mtu", &v.net_ns.view().links),
+            Some(b"65536\n".to_vec())
         );
     }
 
+    /// A `/sys` mounted in a namespace renders THAT namespace, and every
+    /// attribute comes from the link the namespace holds — so `/sys` cannot
+    /// disagree with the rtnetlink dump built from the same object.
     #[test]
-    fn sys_class_net_can_render_from_linux_network_model() {
+    fn sys_class_net_renders_the_namespace_it_is_mounted_in() {
         let mut network = carrick_spec::NetworkNamespaceSpec::bridge_default(
             Some("web".to_string()),
             Vec::new(),
@@ -553,7 +520,11 @@ mod tests {
         network.ipv4 = network.attachments[0].ipv4;
         network.gateway_v4 = network.attachments[0].gateway_v4;
         let model = crate::network::model::LinuxNetworkModel::from_spec(&network);
-        let v = SysVfs::from_network_model(model);
+        let namespace = std::sync::Arc::new(crate::kernel::NetNs::from_model(
+            crate::namespace::process::alloc_ns_id(),
+            model,
+        ));
+        let v = SysVfs::in_namespace(std::sync::Arc::clone(&namespace));
 
         let names = v
             .readdir("/sys/class/net")
@@ -576,8 +547,24 @@ mod tests {
         assert_eq!(
             v.lookup("/sys/class/net/en0"),
             Err(LINUX_ENOENT),
-            "model-backed sysfs must not leak host interface names"
+            "a namespace-backed sysfs must not leak host interface names"
         );
+
+        // The MAC `/sys` reports is the one the namespace assigned, which is the
+        // one rtnetlink advertises in `IFLA_ADDRESS`. They were computed
+        // separately before, which is how `eth0` came to have a MAC over netlink
+        // and no `address` file at all.
+        let address = v
+            .open(
+                "/sys/class/net/eth1/address",
+                OpenFlags::default(),
+                &OpenContext::default(),
+            )
+            .unwrap();
+        let VfsHandle::Bytes { contents, .. } = address else {
+            panic!("address should open as synthetic bytes");
+        };
+        assert_eq!(String::from_utf8(contents).unwrap(), "02:00:00:00:00:03\n");
     }
 
     #[test]

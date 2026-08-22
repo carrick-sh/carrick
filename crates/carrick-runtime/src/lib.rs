@@ -407,8 +407,10 @@ pub fn rosetta_available() -> bool {
 ))]
 pub mod execute {
     // Shared on the non-macOS lane (used by /proc + uname on every backend).
-    pub fn guest_hostname() -> &'static str {
-        "carrick"
+    // The root UTS namespace is the authority here too — the backends differ in
+    // how they run a guest, not in where the guest's hostname lives.
+    pub fn guest_hostname() -> String {
+        crate::kernel::root_uts_ns().nodename()
     }
 
     /// Linux mirror of the macOS `execute::Runtime`. The CLI's run seam

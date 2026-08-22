@@ -14,6 +14,7 @@ pub mod frame_inventory;
 pub mod guest_execution;
 pub mod ids;
 pub mod mm_transaction;
+pub mod netns;
 pub mod objects;
 pub mod operations;
 pub mod registry;
@@ -62,6 +63,8 @@ pub use ids::{
     InvalidLinuxSignal, LinuxSignal, LinuxTid, MmId, ObjectIdError, ObjectIdRegistry,
     ProcessGroupId, SessionId, SighandId, TaskId, TaskSerial, ThreadSerial,
 };
+pub use netns::{NetNs, UtsNs};
+pub(crate) use netns::{publish_root_net_view, publish_root_nodename, root_net_ns, root_uts_ns};
 pub use objects::{
     Credentials, FileDescription, FileDescriptionBackingKind, FileDescriptionBackingSnapshot,
     FileSlot, FileTable, FsContext, HandlerFrameState, LinuxWaitStatus, Mm, ObjectGraphError,

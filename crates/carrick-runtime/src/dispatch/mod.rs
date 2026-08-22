@@ -160,7 +160,6 @@ use crate::linux_abi::{
     LINUX_AF_NETLINK,
     LINUX_AF_UNIX,
     LINUX_AF_UNSPEC,
-    LINUX_ARPHRD_LOOPBACK,
     // ABI constants moved from dispatch.rs (Goal #3)
     LINUX_AT_EACCESS,
     LINUX_AT_EMPTY_PATH,
@@ -314,9 +313,6 @@ use crate::linux_abi::{
     LINUX_IFA_ADDRESS,
     LINUX_IFA_LABEL,
     LINUX_IFA_LOCAL,
-    LINUX_IFF_LOOPBACK,
-    LINUX_IFF_RUNNING,
-    LINUX_IFF_UP,
     LINUX_IFLA_ADDRESS,
     LINUX_IFLA_IFNAME,
     LINUX_IFNAMSIZ,
@@ -3800,6 +3796,21 @@ impl SyscallDispatcher {
         self.proc.lock().hvpatch_process.clone()
     }
 
+    /// The network namespace the CALLING guest process belongs to.
+    ///
+    /// Resolved through the kernel graph by exact task, because that is where
+    /// namespace membership lives; the root namespace is the answer only for
+    /// lanes with no task registry to ask (`run-elf`, the unit tests), where
+    /// there is exactly one guest process and it has never left the root.
+    pub(crate) fn caller_net_ns(&self) -> Arc<crate::kernel::NetNs> {
+        self.hvpatch_process()
+            .and_then(|process| process.kernel_graph().live_task(process.task_id()))
+            .map_or_else(
+                || Arc::clone(crate::kernel::root_net_ns()),
+                |task| task.net_ns(),
+            )
+    }
+
     pub(crate) fn timer_delivery(&self) -> Option<Arc<dyn carrick_hal::TimerDelivery>> {
         self.timer_delivery
             .read()
@@ -4134,13 +4145,19 @@ impl SyscallDispatcher {
 
     pub fn with_network(network: std::sync::Arc<crate::network::RuntimeNetwork>) -> Self {
         let mut dispatcher = Self::new();
+        // The run's own view replaces the boot-time host mirror in the ROOT
+        // network namespace, so every surface that renders from a namespace —
+        // `/sys/class/net`, the rtnetlink dumps — moves together. Previously the
+        // container modes RE-MOUNTED `/sys` with a private copy of the model
+        // and host mode did not, which left the default lane rendering
+        // `/sys/class/net` straight off `getifaddrs(3)`: the guest saw `en0`,
+        // `awdl0` and `utun0` there while rtnetlink advertised `lo` and `eth0`.
+        // Host mode is the exception, and deliberately: there the guest really
+        // does share the host's connectivity, so the view the root namespace
+        // seeded itself with — one mirror of the host wire, taken once — is the
+        // right answer and the spec has no addresses to offer.
         if network.spec.mode != carrick_spec::NetworkMode::Host {
-            dispatcher.fs.vfs_mounts_mut().mount(
-                "/sys",
-                Box::new(crate::vfs::SysVfs::from_network_model(
-                    network.model.clone(),
-                )),
-            );
+            crate::kernel::publish_root_net_view(network.model.clone());
         }
         if should_mount_network_resolv_conf(&network.model) {
             let contents = resolv_conf_contents_for_network(&network.model);
@@ -4228,8 +4245,19 @@ impl SyscallDispatcher {
         );
     }
 
+    /// Name the run's UTS namespace (`--hostname`, or the container name).
+    ///
+    /// The name goes into the NAMESPACE, which is where a hostname lives on
+    /// Linux and what makes it shared: every task holds an `Arc` to the same
+    /// object, so a name set here is the name every guest process reads. The
+    /// per-dispatcher `ProcState.guest_hostname` copy this still writes is the
+    /// remaining fork-COPY, and the one place `uname(2)` reads; it is seeded
+    /// from the namespace and cannot yet diverge from it because `sethostname`
+    /// is EPERM, but it is the next thing to delete.
     pub fn set_guest_hostname(&self, hostname: impl Into<String>) {
-        self.proc.lock().guest_hostname = hostname.into();
+        let hostname = hostname.into();
+        crate::kernel::publish_root_nodename(&hostname);
+        self.proc.lock().guest_hostname = hostname;
     }
 
     pub(crate) fn request_signal_pump(&self) {
