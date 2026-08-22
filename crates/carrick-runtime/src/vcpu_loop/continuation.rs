@@ -3556,13 +3556,28 @@ impl HvpatchTaskBinding {
                         "detached address-space cleanup backend type mismatch".to_owned(),
                     )
                 })?;
-            backend.retire_detached_address_space_with(
+            // Report a retirement failure BEFORE `backend` drops. Dropping it
+            // runs `HvpatchTaskMmAuthority::drop`, which finds the inventory
+            // still `Active` and aborts the carrier with the generic
+            // "published HVPatch inventory dropped before exact retirement" —
+            // masking the error that actually caused it. The abort is correct
+            // (a published inventory must never leak), but for months it was
+            // the only thing an operator saw.
+            let retired = backend.retire_detached_address_space_with(
                 |commit| {
                     self.quantum
                         .apply_detached_address_space_retirement_with_receipt(commit)
                 },
                 |commit| self.quantum.apply_detached_address_space_retirement(commit),
-            )?;
+            );
+            if let Err(error) = &retired {
+                eprintln!(
+                    "carrick: FATAL: detached address-space retirement failed \
+                     (the MM-authority drop abort that follows is a CONSEQUENCE of \
+                     this, not the cause): {error}"
+                );
+            }
+            retired?;
             drop(backend);
             Ok(())
         }
