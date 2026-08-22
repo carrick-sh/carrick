@@ -2047,6 +2047,11 @@ mod task_only_materializer_tests {
         assert!(task_authority_shape.contains("FrameInventoryReceiptChallenge"));
         assert!(task_authority_shape.contains("malformed successful HVPatch inventory receipt"));
         assert!(task_authority_shape.contains("HvpatchPreparedInventoryRetirement"));
+        // The expectation is now "what this mm owned when its retirement was
+        // STAGED": `stage_retirement` clears `extents` in the same critical
+        // section that records `retirement_expected`, so reading the live
+        // ledger alone would authenticate against an empty set.
+        assert!(task_authority_shape.contains("retirement_expected"));
         assert!(task_authority_shape.contains("let mut expected_mappings"));
         assert!(task_authority_shape.contains("committed_unmaps != expected_ids"));
         assert!(include_str!("trap.rs").contains("mm_empty_at_revision"));
