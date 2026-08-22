@@ -636,6 +636,12 @@ mod threads;
 pub(crate) use quiesce::fork_barrier;
 // The threaded loop owns its backend-specific fault resolution. Native Darwin
 // reuses the architecture lowering and Linux signal-frame half below.
+pub(crate) use signal::is_default_ignore_signal;
+// Production reaches this through `signal::upgrade_protection_si_code` directly
+// (`poll_with_engine`); only `dispatch::mem`'s tests need it re-exported, so the
+// re-export is test-only rather than an unused import in the lib build.
+#[cfg(test)]
+pub(crate) use signal::upgrade_protection_si_code;
 use signal::{
     deliver_fault_signal, deliver_pending_signal_with_restart,
     deliver_reserved_signal_with_restart, lower_el0_fault,
@@ -644,7 +650,6 @@ pub(crate) use signal::{
     deliver_pending_signal, partial_write_interrupt_outcome, raise_sigpipe_for_blocking_write,
     signal_progress_count, signal_wait_expired, signal_wait_slice,
 };
-pub(crate) use signal::{is_default_ignore_signal, upgrade_protection_si_code};
 pub(crate) use signal::{
     reset_signal_progress_for_executor_boundary, signal_progress_is_zero_for_executor_boundary,
 };
@@ -6770,7 +6775,7 @@ where
         // outcomes leave it available to signal delivery below.
         self.service_kernel_context = Some(kernel_context.retain_exact());
         let sync_shared_file_aliases = engine.needs_shared_file_alias_sync();
-        loop {
+        'service: {
             if sync_shared_file_aliases && !matches!(frame.number.raw(), 260 | 95) {
                 engine.sync_shared_file_aliases()?;
             }
@@ -6813,7 +6818,7 @@ where
                 | DispatchOutcome::WaitOnSignals { .. }
                 | DispatchOutcome::WaitOnSleep { .. }
                 | DispatchOutcome::WaitOnSharedWord { .. }) => {
-                    break Err(RuntimeError::Configuration(format!(
+                    break 'service Err(RuntimeError::Configuration(format!(
                         "blocking dispatch outcome reached the syscall service tail: {blocking:?}"
                     )));
                 }
@@ -6832,7 +6837,7 @@ where
                     let file = file.map(|(fd, offset, prot)| (fd.into_owned_fd(), offset, prot));
                     let Some(install) = transaction.claim() else {
                         drop(file);
-                        break Ok(DispatchOutcome::Returned {
+                        break 'service Ok(DispatchOutcome::Returned {
                             value: crate::linux_abi::LINUX_ENOMEM.guest_retval(),
                         });
                     };
@@ -6904,7 +6909,7 @@ where
                             %error,
                             "HVPatch alias install failed; guest mmap lowered to ENOMEM"
                         );
-                        break Ok(DispatchOutcome::Returned {
+                        break 'service Ok(DispatchOutcome::Returned {
                             value: crate::linux_abi::LINUX_ENOMEM.guest_retval(),
                         });
                     }
@@ -6953,11 +6958,11 @@ where
                     {
                         std::process::abort();
                     }
-                    break Ok(DispatchOutcome::Returned {
+                    break 'service Ok(DispatchOutcome::Returned {
                         value: success_retval,
                     });
                 }
-                other => break Ok(other),
+                other => break 'service Ok(other),
             }
         }
     }

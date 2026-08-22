@@ -3778,9 +3778,7 @@ impl Future for ProcessDrain {
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
     use std::os::fd::RawFd;
-    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::task::{Context, Poll, Wake, Waker};
