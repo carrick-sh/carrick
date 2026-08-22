@@ -658,6 +658,75 @@ mod task_only_carrier_directory_tests {
     }
 
     #[test]
+    fn a_superseded_fork_inheritance_no_longer_blocks_retirement() {
+        let id = |raw| {
+            std::num::NonZeroU64::new(raw)
+                .map(carrick_hal::MappingId::from_kernel_allocation)
+                .unwrap()
+        };
+        let frame = |raw| {
+            carrick_hal::FrameId::from_kernel_allocation(std::num::NonZeroU64::new(raw).unwrap())
+        };
+        let mm = std::num::NonZeroU64::new(503).unwrap();
+
+        // The live set at retirement: one mapping, unmapped by the commit.
+        let live = vec![(id(71), frame(11))];
+        let retired = carrick_hal::FrameInventoryRetirementReceipt::from_kernel_authority(
+            test_kernel_apply(
+                retirement_inventory_commit(96, &[id(71)]),
+                96,
+                mm,
+                12,
+                live.clone(),
+            ),
+            true,
+        );
+        let transaction = carrick_hal::KernelTransactionId::from_kernel_allocation(
+            std::num::NonZeroU64::new(96).unwrap(),
+        );
+
+        // A fork inheritance the child has since COW'd. `stage_cow_inventory_split`
+        // already pushed `UnmapMapping` for `child_mapping` and retired its frame
+        // reference in that transaction, and `commit_cow_inventory_split` dropped
+        // the extent — so the obligation is discharged and the mapping is gone
+        // from the live set. Retirement must not be asked to account for it a
+        // second time; demanding that failed every forked child that wrote to an
+        // inherited page.
+        let superseded = PendingForkFrameReceipt {
+            transaction,
+            kind: carrick_observability::probes::HvpatchForkFrameKind::PrivateCow,
+            parent_mapping: id(22),
+            child_mapping: id(70),
+            frame: frame(9),
+            ipa: 0x0020_0000,
+            length: 0x0009_4000,
+        };
+        assert!(
+            authenticate_pending_retirement(&live, &[superseded], &retired).ok(),
+            "a fork inheritance whose mapping was superseded before retirement is \
+             already accounted for"
+        );
+
+        // A STILL-LIVE inherited mapping whose frame drifted is a real defect and
+        // must stay rejected: the retirement would be unmapping a frame the child
+        // never inherited.
+        let drifted = PendingForkFrameReceipt {
+            transaction,
+            kind: carrick_observability::probes::HvpatchForkFrameKind::PrivateCow,
+            parent_mapping: id(22),
+            child_mapping: id(71),
+            frame: frame(9),
+            ipa: 0x0020_0000,
+            length: 0x0009_4000,
+        };
+        assert!(
+            !authenticate_pending_retirement(&live, &[drifted], &retired).ok(),
+            "a live inherited mapping retiring under a different frame is still a \
+             failure"
+        );
+    }
+
+    #[test]
     fn inventory_phase_is_process_owned_and_exactly_ordered() {
         let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
         let mut sibling = HvpatchTaskInventoryAuthority::SiblingShared {
@@ -6253,8 +6322,25 @@ fn authenticate_pending_retirement(
         expected_authorized: expected
             .iter()
             .all(|&(mapping, frame)| receipt.authorizes(mapping, frame)),
+        // Only OUTSTANDING inheritances. A pending receipt records an
+        // obligation created at fork publication: "this child mapping holds a
+        // frame inherited from the parent". It is discharged either here, by the
+        // retirement unmapping that mapping with that frame, or EARLIER, when
+        // the mapping was superseded — `stage_cow_inventory_split` pushes its
+        // own `UnmapMapping` and `RetireFrame` for the old mapping and
+        // `commit_cow_inventory_split` drops the extent, all inside that
+        // transaction. Demanding that retirement account for an already-settled
+        // obligation is a category error, and it failed every forked child that
+        // wrote to an inherited page: the superseded mapping id is simply absent
+        // from the retirement's set. A mapping still live in `expected` must
+        // still retire under the frame it inherited.
         pending_authorized: pending
             .iter()
+            .filter(|pending| {
+                expected
+                    .iter()
+                    .any(|(mapping, _)| *mapping == pending.child_mapping)
+            })
             .all(|pending| receipt.authorizes(pending.child_mapping, pending.frame)),
     }
 }
@@ -6833,12 +6919,41 @@ impl HvpatchTaskInventoryAuthority {
                     }
                     // Abort is unrecoverable, so name the exact clause that
                     // rejected the receipt rather than only its verdict.
+                    //
+                    // A rejected pending fork receipt has two very different
+                    // shapes: the child mapping is absent from the retirement
+                    // entirely (a superseded mapping id), or it is present under
+                    // a DIFFERENT frame (the child COW'd the inherited page).
+                    // Print which, because they call for opposite fixes.
+                    let unauthorized: Vec<String> = pending_receipts
+                        .iter()
+                        .filter(|pending| !retired.authorizes(pending.child_mapping, pending.frame))
+                        .take(6)
+                        .map(|pending| {
+                            let retired_frame = retired
+                                .mapping_set()
+                                .iter()
+                                .find(|(mapping, _)| *mapping == pending.child_mapping)
+                                .map(|(_, frame)| *frame);
+                            format!(
+                                "{{child={:?} receipt_frame={:?} retirement_frame={retired_frame:?} \
+                                 parent={:?} ipa={:#x} len={:#x} kind={:?}}}",
+                                pending.child_mapping,
+                                pending.frame,
+                                pending.parent_mapping,
+                                pending.ipa,
+                                pending.length,
+                                pending.kind,
+                            )
+                        })
+                        .collect();
                     eprintln!(
                         "carrick: FATAL: Kernel returned a malformed successful HVPatch retirement receipt\
                          (challenge={challenge} revision_advanced={revision_advanced} \
                          transaction_distinct={transaction_distinct} {audit:?} \
                          receipt_revision={} retired_revision={} expected_mappings={} \
-                         receipt_mapping_set={} pending_receipts={})",
+                         receipt_mapping_set={} pending_receipts={} \
+                         unauthorized={unauthorized:?})",
                         receipt.revision(),
                         retired.revision(),
                         retirement.expected_mappings.len(),
