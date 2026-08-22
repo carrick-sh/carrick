@@ -392,10 +392,62 @@ skip, which is why the criterion 3 reducer exits 0 while the ledger still leaks.
 Attribution against a pre-`f250844d` binary built at `dbfffc6f` confirms the
 leak itself is older.
 
-### IN FLIGHT AT THE PAUSE — pick this up first
+### THE EXECVE AUTHORITY FIX IS WRITTEN AND VERIFIED — but NOT merged
 
-**An agy worker is mid-implementation of the execve authority fix.** It survives
-this session; collect it before starting anything else.
+Branch **`agy/exec-authority`**, commit **`7b8fba14`**, worktree
+`.worktrees/exec-authority`, based at `979dceaf`. Two review rounds. The worker
+is reaped; nothing is running.
+
+**The core fix is correct and I verified it myself rather than trusting the
+report** (the worker never pasted verification output despite being asked
+twice — treat its `tests_run` as a list of intentions):
+
+- the fork+exec+exit reducer's kernel snapshot returns 9741 bytes of JSON where
+  it previously refused with `mapping MappingId(78) names mm MmId(55)`;
+- the reducer exits 0 ten times out of ten;
+- `forkcow`, `cloneexitsig`, `waitidsiuid`, `xthreadsig`, `sigchld` all exit 0;
+- `cargo check --workspace --all-targets` 0 errors, `carrick-runtime --lib`
+  1605/1605, `carrick-vmm-hvf --lib` 225/225, `fmt-check` clean.
+
+It answered the hazard correctly: `rebind_exec_authority` builds a NEW
+`Arc<HvpatchTaskMmAuthority>` with `kernel_mm: Mutex::new(None)` and swaps the
+registration's pointer, so the parent's authority is dropped from that pointer
+rather than mutated. It also rebinds the carrier directory under the new
+`mm_key`, closing the third audited defect.
+
+**Three things to settle before merging. Do not merge as-is.**
+
+1. **An UNREQUESTED change to ASID maintenance** (`carrick-aarch64/src/engine.rs`):
+   it saves `TTBR0`, installs `LINUX_PAGE_TABLES_BASE` for the maintenance
+   trampoline, and restores it. That is the "neutral root" option this file
+   named for criterion 2(a) — but it is unrelated to the exec task, was never
+   verified against the probes it targets, and **measurably makes them worse**:
+   the `ASID maintenance` error is gone, yet `cloneexithandled` and
+   `clone3exithandled` now hang (rc=124) or abort (rc=134) where they previously
+   returned a named error. Same regression shape as `d4ad1aaa`: a fail-fast
+   traded for a hang. Neither probe passed before, so this is not a functional
+   regression — but it is worse for diagnosis. It also swallows errors on a
+   critical path (`let _ = vcpu.set_sys_reg(Ttbr0, saved_ttbr0)`), so a failed
+   restore leaves the vCPU on the kernel tables silently. **Split it out and do
+   it red-first against those two probes.**
+2. **`kernel/scheduler.rs` turns two fail-closed paths into `Ok(false)`** in
+   `fail_blocked_exact` — `UnknownThread` and `InvalidTransition`. Round 2 kept
+   it with a specific and plausible justification in the commit body:
+   `cancel_dormant` calls it during pool shutdown for threads already exited and
+   reaped, so failing closed aborted shutdown on clean exits. That story is
+   consistent with the "dormant task cancellation failed" errors seen earlier —
+   but it was asserted, never demonstrated. **Revert it and see what breaks
+   before accepting it.**
+3. The remaining question the worker's own diff raises: is
+   `LINUX_PAGE_TABLES_BASE` a root that outlives the ROOT process? It is the
+   boot table base, so a worker doing ASID maintenance after the initial task
+   exits may install tables that no longer exist.
+
+Recover the review context from
+`/Users/tjfontaine/.claude/jobs/80da92aa/tmp/review-execauth-1.md` and
+`brief-execauth.md` if needed.
+
+### Previously in flight — worker lifecycle commands
 
     W=/Users/tjfontaine/.claude/local-marketplaces/agy-director/agy-director/scripts/agy_worker.py
     AGY_RUN_ID=authority python3 "$W" status
