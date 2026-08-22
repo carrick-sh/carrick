@@ -10,24 +10,73 @@ retired native campaign or restart the completed closure-harness work.
 
 ## Objective — preserve verbatim
 
-On the canonical macOS/HVF arm64 HVPatch lane, first make the conformance gate
-fail closed and freeze the current 2,127-suite declared surface; then achieve
-100% executed assertion-level parity with native-arm64 Linux across all
-applicable suites and arm64 musl/GNU conformance probes, with zero gaps,
-excuses, false matches, skips, crashes, timeouts, empty results, oracle
-failures, or retry-recovered acceptance. After correctness closes, bring the
-Go, CPython, Node, and LTP ecosystem aggregates plus cold go-build to no more
-than 2.0x native-arm64 Docker, treating every valid completing suite at or
-above 10x as a correctness blocker. Permit evidence-driven rearchitecture;
-require red-first deterministic reducers, Docker bpftrace ground truth,
-carrick trace/DTrace or lldb/core diagnosis, isolated subagent work, serialized
-authoritative Carrick/Docker measurements, exact signed-artifact provenance,
-and durable phase-boundary reports. Complete only when gate integrity,
-correctness, and performance all pass together on the final integrated
-artifact.
+On the canonical macOS / Apple Silicon / HVF / HVPatch arm64 lane, make the
+HVPatch kernel's process lifecycle correct on one honest code path. Complete
+only when all five hold together on one clean-tree signed artifact:
 
-The goal is still active. Do not mark it complete, bless a baseline, weaken the
-denominator, add an excuse, accept a retry, or start final performance work.
+1. **One execution path.** `ExecutionBackend` no longer exists as a
+   single-variant enum; the welded-thread vCPU loop, the transitional runner
+   pool, `CompatibilityThreadWaiter`, and the host-fork `handle_fork` are
+   deleted; every `include_str!` gate that asserts deleted text is PRESENT is
+   inverted to assert it is ABSENT.
+2. **Process teardown is correct.** A forked child completes teardown: its MM
+   inventory authority reaches `Retired`, its stage-2 extents release exactly
+   once, it does not outlive its parent's exit, and no executor reports an
+   invariant mismatch, a duplicate retirement, a stale dormant binding, or an
+   ASID-maintenance fault.
+3. **The shell reducer exits 0.**
+   `carrick run ubuntu:24.04 --raw --fs host /bin/sh -c '/bin/echo hi'` exits 0,
+   ten runs running, with `/bin/bash -c` clean as the fork-not-vfork control.
+4. **`just ci` green end to end**, status read from a FILE and never from a
+   pipe, including `lint-domains` with the host-authority census reconciled by
+   reviewing or eliminating what survives deletion — never a bulk re-bless.
+5. **`just conformance-probes-closure` exits 0** with zero skips and zero gating
+   DIFFs. Closure mode is the closing instrument; ordinary mode silently skips
+   missing binaries and is not acceptable as proof.
+
+Method is binding: every fix red-first against a deterministic reducer proven to
+fail on the broken binary; every suspected regression reproduced on unmodified
+HEAD in a separate worktree before it is called one; no probe blessed, no excuse
+row, no default-off mechanism introduced; guest runs never parallelized.
+
+Out of scope, and not to be started until this closes: non-macOS hardware lanes,
+the 2,127-suite conformance closure, and all performance work.
+
+Spec: `docs/superpowers/specs/2026-08-22-hvpatch-fork-lifecycle-closure-design.md`
+Plan: `docs/superpowers/plans/2026-08-22-hvpatch-fork-lifecycle-closure.md`
+Baseline: `docs/perf-results/2026-08-22-fork-closure-baseline.md`
+
+### SUSPENDED prior objective — not abandoned, not started
+
+The exact-conformance-and-performance objective below governed this file until
+2026-08-22. It is **suspended** because it is unmeasurable in the current state:
+the 2026-08-22 probe gate returned **0 MATCH / 813 DIFF / 1 SKIP**, and the
+kernel cannot tear down a process. Percentages and ratios measured against that
+are noise. Its first clause — "make the conformance gate fail closed and freeze
+the declared surface" — was also quietly falsified: two probes had no binaries
+and were being silently skipped, so the frozen surface was not being measured.
+Criterion 5 above fixes that permanently.
+
+Restore it verbatim once the objective above closes:
+
+> On the canonical macOS/HVF arm64 HVPatch lane, first make the conformance gate
+> fail closed and freeze the current 2,127-suite declared surface; then achieve
+> 100% executed assertion-level parity with native-arm64 Linux across all
+> applicable suites and arm64 musl/GNU conformance probes, with zero gaps,
+> excuses, false matches, skips, crashes, timeouts, empty results, oracle
+> failures, or retry-recovered acceptance. After correctness closes, bring the
+> Go, CPython, Node, and LTP ecosystem aggregates plus cold go-build to no more
+> than 2.0x native-arm64 Docker, treating every valid completing suite at or
+> above 10x as a correctness blocker. Permit evidence-driven rearchitecture;
+> require red-first deterministic reducers, Docker bpftrace ground truth,
+> carrick trace/DTrace or lldb/core diagnosis, isolated subagent work, serialized
+> authoritative Carrick/Docker measurements, exact signed-artifact provenance,
+> and durable phase-boundary reports. Complete only when gate integrity,
+> correctness, and performance all pass together on the final integrated
+> artifact.
+> 
+> The goal is still active. Do not mark it complete, bless a baseline, weaken the
+> denominator, add an excuse, accept a retry, or start final performance work.
 
 ## CURRENT ENGINEERING CHECKPOINT — 2026-08-22 fork/exec defect peel
 
