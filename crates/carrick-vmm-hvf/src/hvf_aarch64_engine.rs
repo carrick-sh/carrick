@@ -519,6 +519,13 @@ impl HvpatchTaskOnlyEngineState {
         self._backend.apply_inventory(apply)
     }
 
+    /// True when this task shares another process's frame-inventory ledger —
+    /// a vfork/`CLONE_VM` task — and therefore has no inventory of its own to
+    /// retire.
+    pub fn shares_another_process_inventory(&self) -> bool {
+        self._backend.shares_another_process_inventory()
+    }
+
     pub fn prepare_inventory_retirement(
         &self,
         commit: carrick_hal::FrameInventoryCommit<()>,

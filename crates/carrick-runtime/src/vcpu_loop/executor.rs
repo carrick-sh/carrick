@@ -123,6 +123,21 @@ impl HvpatchTaskEngineBindingState {
                 apply_commit(commit)
             }
             HvpatchTaskEngineBindingPayload::TaskOnly(state) => {
+                // A vfork/`CLONE_VM` task shares another process's kernel mm, so
+                // the frame-inventory ledger is not its to retire — the owner
+                // retires it. The caller picks this path from STAGE-1
+                // ownership, which is a different domain: a task can own a
+                // stage-1 root and still share the ledger, and then staging a
+                // retirement from that ledger would unmap the owner's live
+                // mappings. Ask the authority that actually knows.
+                //
+                // Reached by `/bin/sh -c`, which vforks: teardown failed with
+                // "HVPatch inventory retirement is duplicate or not active
+                // (phase=shared_process)" after the guest had already run
+                // correctly.
+                if state.shares_another_process_inventory() {
+                    return Ok(());
+                }
                 let commit =
                     carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_engine(state)?;
                 state.prepare_inventory_retirement(commit)?;
