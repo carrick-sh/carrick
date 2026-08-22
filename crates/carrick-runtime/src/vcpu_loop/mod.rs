@@ -4346,6 +4346,25 @@ where
                 );
                 executor::ExecutorExit::Syscall
             }
+            DispatchOutcome::SignalThread {
+                tid,
+                signum,
+                kernel_target,
+            } => {
+                // `tkill`/`tgkill`/`pthread_kill` at a sibling thread. This
+                // existed only in the welded loop; without it the outcome fell
+                // through to the catch-all below, which returns `InvalidState`
+                // and hangs the guest — `xthreadsig` timed out at
+                // `SignalThread { signum: 10 }`.
+                self.state.complete_signal_thread(
+                    &self.kernel,
+                    engine,
+                    tid,
+                    signum,
+                    kernel_target,
+                )?;
+                executor::ExecutorExit::Syscall
+            }
             DispatchOutcome::SetMemoryModel { tso } => {
                 engine.set_memory_model(hardware_tso_for_debug(tso))?;
                 self.state.complete_returned(engine, 0)?;
