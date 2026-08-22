@@ -4807,6 +4807,17 @@ pub(crate) fn swap_hvpatch_task_state(live: &mut HvfTaskState, parked: &mut HvfT
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfTaskState {
+    pub(crate) fn runtime_authorities_match(
+        &self,
+        page_tables: &std::sync::Arc<
+            parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
+        >,
+        protections: &std::sync::Arc<MemoryProtections>,
+    ) -> bool {
+        std::sync::Arc::ptr_eq(page_tables, &self.page_tables)
+            && std::sync::Arc::ptr_eq(protections, &self.protections)
+    }
+
     fn neutral() -> Self {
         Self {
             mappings: Vec::new(),
@@ -9533,6 +9544,21 @@ impl HvfVmState {
         >,
     ) {
         self.page_tables = page_tables;
+    }
+
+    pub(crate) fn task_runtime_authorities_match(
+        &self,
+        page_tables: &std::sync::Arc<
+            parking_lot::Mutex<Option<crate::page_table::PageTableManager>>,
+        >,
+        protections: &std::sync::Arc<MemoryProtections>,
+    ) -> bool {
+        self.task
+            .runtime_authorities_match(page_tables, protections)
+    }
+
+    pub(crate) fn task_protections_authority(&self) -> std::sync::Arc<MemoryProtections> {
+        std::sync::Arc::clone(&self.protections)
     }
 
     /// Tell `manager` whether THIS thread's edit is exclusive, before an

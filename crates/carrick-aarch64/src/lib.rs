@@ -29,5 +29,5 @@ pub mod engine;
 pub mod mailbox;
 pub mod vmm;
 
-pub use engine::{Aarch64EngineCore, Aarch64TaskEngineState};
+pub use engine::{Aarch64EngineCore, Aarch64TaskEngineState, Aarch64TaskRuntimeProjection};
 pub use vmm::{Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy};
