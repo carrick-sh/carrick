@@ -13655,6 +13655,33 @@ impl HvfVmState {
             // overlay's guest_writable flag — not the stale shared region's — gates.
             let lookup_address = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
             let Some(mapping) = self.mapping_for_range(lookup_address, chunk_len) else {
+                // `MemoryError::OutOfBounds` renders as "guest memory read is out
+                // of bounds", which is wrong three times over on this path: it is
+                // a WRITE, the address is usually mapped, and the real reason is
+                // that `mapping_for_range` REJECTED a covering region as not
+                // live. Say so — this exact silence cost a full investigation to
+                // get behind.
+                if let Some(region) = self
+                    .mappings
+                    .iter()
+                    .find(|m| m.start <= lookup_address && lookup_address < m.end)
+                {
+                    tracing::error!(
+                        va = format!("0x{lookup_address:x}"),
+                        len = chunk_len,
+                        region = format!("[0x{:x}..0x{:x})", region.start, region.end),
+                        physical_ipa = format!("0x{:x}", region.physical_ipa),
+                        reusable_global_frame = is_reusable_global_frame_extent(
+                            region.physical_ipa,
+                            region.physical_size as u64
+                        ),
+                        owns_host_mapping = region.host_mapping.is_some(),
+                        owns_stage2_lease = region.stage2_lease.is_some(),
+                        owner_generation = region.owner_generation,
+                        "guest write rejected: a region covers this VA but failed \
+                         the global-frame owner-liveness check"
+                    );
+                }
                 return Err(MemoryError::OutOfBounds { address, length });
             };
             if require_guest_writable
