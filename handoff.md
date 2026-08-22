@@ -363,17 +363,49 @@ Review those 7 semantic deltas, then refresh — do not hand-edit the inventory.
   `let needs_sibling_drain = false;`, leaving an unreachable branch where a
   Linux guarantee used to be.
 
+### The execve authority defect — planned, audited, in progress
+
+A forked child that execs and exits abandons its frame-inventory rows: the
+kernel graph then holds mappings naming an mm that no longer exists, and
+`carrick debug hvpatch-kernel` refuses on any such guest. Full chain, hazard and
+verification: **`docs/hvpatch-exec-authority-routing-plan.md`**.
+
+The one thing to carry in your head: **for a vfork child,
+`registration.task_mm` is the SAME `Arc` as the parent's**, because `publish`
+took the `existing_task_mm` branch and aborted the child's own prepared
+authority. Transitioning that authority in place at exec would redirect the
+PARENT's authority at the child's ledger. `bind_kernel_mm` being set-once
+independently proves in-place transition is impossible, not merely unsafe.
+
+An audit for the same defect shape
+(**`docs/hvpatch-authority-mismatch-audit-2026-08-22.md`**) returned six
+candidates; **three were rejected or refuted on inspection**, all six having
+been reported "certain". The three that survive share this one root cause, so
+one change closes them: the stale `SharedProcess` authority, the set-once
+`kernel_mm`, and the carrier directory's stale `HvpatchMmAuthorityKey`. The
+audit's 24-entry "cleared" list is the search nobody has to repeat.
+
+Correction worth keeping: `f250844d` did not fix this defect, it MASKED it. The
+same situation previously failed loudly with "duplicate or not active
+(phase=shared_process)" and exit 125; the early return turned that into a silent
+skip, which is why the criterion 3 reducer exits 0 while the ledger still leaks.
+Attribution against a pre-`f250844d` binary built at `dbfffc6f` confirms the
+leak itself is older.
+
 ### Next work, in order
 
-1. **Criterion 2 (a)** — the ASID root. Find which issuer sends
+1. **The execve authority re-publication** above — it is the one change that
+   closes three audited defects and unblocks reading the live kernel graph.
+2. **Criterion 2 (a)** — the ASID root. Find which issuer sends
    `InvalidateAsid` after the address space retires, then decide between a
    neutral carrier root and a strict ordering.
-2. **Criterion 5** — run the closure gate detached and read the real number.
-   Re-check defect (c) there rather than under `run-elf --raw`.
-3. **Criterion 4** — port the core-dump/crash-capture cluster, then job control,
+3. **Criterion 5** — run the closure gate detached, AFTER the teardown defects
+   close. Its partial run showed every DIFF as `carrick: <missing>`, so today it
+   would only re-measure those.
+4. **Criterion 4** — port the core-dump/crash-capture cluster, then job control,
    then re-add the lost wait probes. This is a feature workstream, not a sweep.
    Then reconcile the census's 7 semantic deltas via `--refresh-candidate`.
-4. **The structural hazard behind two of this campaign's bugs.**
+5. **The structural hazard behind two of this campaign's bugs.**
    `service_outcome` ends in `other => { tracing::error!("unlowered outcome");
    InvalidState }`, so a `DispatchOutcome` variant whose only handler died with
    the welded loop becomes a runtime HANG instead of a compile error. Two were
@@ -381,7 +413,7 @@ Review those 7 semantic deltas, then refresh — do not hand-edit the inventory.
    early through `is_blocking_dispatch_outcome`, so the match cannot simply be
    made exhaustive; route the early return through a type that leaves only
    non-blocking variants for the match to cover.
-5. Task 4 (HVF `persistent_vm_lifecycle`) after its blocking analysis; Phase 2
+6. Task 4 (HVF `persistent_vm_lifecycle`) after its blocking analysis; Phase 2
    Task 5 remainder; Phase 3 Tasks 10-12.
 
 ## SUPERSEDED CHECKPOINT — 2026-08-22 fork/exec defect peel
