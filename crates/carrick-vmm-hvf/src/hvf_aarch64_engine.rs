@@ -840,6 +840,14 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         crate::trap::audit_hvpatch_executor_boundary(&self.state, &vcpu.mailbox)
     }
 
+    fn restore_persistent_executor_invariants(
+        &mut self,
+        vcpu: &mut Self::Vcpu,
+    ) -> Result<(), TrapError> {
+        self.state
+            .restore_persistent_worker_vcpu_boundary(&vcpu.inner, &vcpu.mailbox)
+    }
+
     fn set_persistent_vm_lifecycle(&mut self, enabled: bool) {
         self.state.set_persistent_vm_lifecycle(enabled);
     }

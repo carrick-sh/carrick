@@ -281,6 +281,11 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         ))
     }
 
+    pub fn restore_persistent_executor_invariants(&mut self) -> Result<(), TrapError> {
+        self.vm
+            .restore_persistent_executor_invariants(&mut self.vcpu)
+    }
+
     pub fn into_task_state_and_vcpu(self) -> (Aarch64TaskEngineState<V>, V::Vcpu) {
         let Self {
             vm,
@@ -435,6 +440,12 @@ fn aarch64_task_state_from_snapshot(
         ttbr0: snapshot.ttbr0,
         ttbr1: snapshot.ttbr1,
         tcr: snapshot.tcr,
+        sctlr_el1: snapshot.sctlr,
+        mair_el1: snapshot.mair,
+        vbar_el1: snapshot.vbar,
+        cpacr_el1: snapshot.cpacr,
+        cntkctl_el1: snapshot.cntkctl_el1,
+        tpidr_el1: snapshot.tpidr_el1,
         actlr_el1: snapshot.actlr_el1,
         tpidr_el0: snapshot.tpidr_el0,
         tpidrro_el0: snapshot.tpidrro_el0,
@@ -455,8 +466,9 @@ fn aarch64_task_state_from_snapshot(
 }
 
 /// Overlay one migratable task image onto a destination executor snapshot.
-/// Executor-local SP_EL1/mailbox state and invariant EL1 configuration are
-/// retained from `destination`; invalid executor configuration fails closed.
+/// Executor-local `SP_EL1`/mailbox state is retained from `destination`.
+/// Before the overlay, the destination's neutral EL1 controls are validated;
+/// the task's exact saved controls are then restored for guest execution.
 pub fn restore_aarch64_task_state(
     destination: &Aarch64VcpuSnapshot,
     state: &Aarch64TaskCpuStateV1,
@@ -495,6 +507,12 @@ pub fn restore_aarch64_task_state(
     restored.ttbr0 = state.ttbr0;
     restored.ttbr1 = state.ttbr1;
     restored.tcr = state.tcr;
+    restored.sctlr = state.sctlr_el1;
+    restored.mair = state.mair_el1;
+    restored.vbar = state.vbar_el1;
+    restored.cpacr = state.cpacr_el1;
+    restored.cntkctl_el1 = state.cntkctl_el1;
+    restored.tpidr_el1 = state.tpidr_el1;
     restored.actlr_el1 = state.actlr_el1;
     restored.tpidr_el0 = state.tpidr_el0;
     restored.tpidrro_el0 = state.tpidrro_el0;
@@ -3301,6 +3319,7 @@ mod tests {
             mair: boot.mair_el1,
             vbar: carrick_mem::memory::LINUX_EL1_VECTORS_BASE,
             cpacr: boot.cpacr_el1,
+            cntkctl_el1: 0x3,
             tpidr_el0: 0xb000,
             tpidrro_el0: 0xc000,
             tpidr_el1: 0xd000,
@@ -3519,20 +3538,28 @@ mod tests {
     }
 
     /// A task snapshot must restore every migratable field while retaining the
-    /// destination executor's stack/mailbox and invariant EL1 configuration.
+    /// destination executor's stack/mailbox. The destination must be neutral
+    /// before load, then the task's exact EL1 control values are overlaid.
     ///
     /// The historical byte boundary copied source executor-local state here;
     /// this regression test keeps the typed overlay split explicit.
     #[test]
     fn snapshot_roundtrip_preserves_complete_task_state_and_destination_local_state() {
-        let source = sample();
+        let mut source = sample();
+        source.sctlr ^= 0x3000_0000;
+        source.mair ^= 0x1100;
+        source.vbar += 0x4000;
+        source.cpacr ^= 0x10;
+        source.cntkctl_el1 ^= 0x4;
+        source.tpidr_el1 = 0xd0ff;
+        let neutral = sample();
         let destination = Aarch64VcpuSnapshot {
             sp_el1: 0xd001,
-            tpidr_el1: 0xd002,
-            vbar: source.vbar,
-            sctlr: source.sctlr,
-            mair: source.mair,
-            cpacr: source.cpacr,
+            tpidr_el1: 0,
+            vbar: neutral.vbar,
+            sctlr: neutral.sctlr,
+            mair: neutral.mair,
+            cpacr: neutral.cpacr,
             ..sample()
         };
 
@@ -3556,6 +3583,13 @@ mod tests {
         assert_eq!(restored.pstate, source.pstate);
         assert_eq!(restored.sp_el0, source.sp_el0);
         assert_eq!(restored.ttbr0, source.ttbr0);
+        assert_eq!(restored.sctlr, source.sctlr);
+        assert_eq!(restored.mair, source.mair);
+        assert_eq!(restored.vbar, source.vbar);
+        assert_eq!(restored.cpacr, source.cpacr);
+        assert_eq!(restored.cntkctl_el1, source.cntkctl_el1);
+        assert_eq!(restored.tpidr_el1, source.tpidr_el1);
+        assert_eq!(restored.sp_el1, destination.sp_el1);
         assert_eq!(restored.ttbr1, source.ttbr1);
         assert_eq!(restored.tcr, source.tcr);
         assert_eq!(restored.actlr_el1, source.actlr_el1);
@@ -3569,14 +3603,6 @@ mod tests {
             restored.sp_el1, destination.sp_el1,
             "SP_EL1 must stay executor-local"
         );
-        assert_eq!(
-            restored.tpidr_el1, destination.tpidr_el1,
-            "mailbox scratch binding must stay executor-local"
-        );
-        assert_eq!(restored.vbar, destination.vbar);
-        assert_eq!(restored.sctlr, destination.sctlr);
-        assert_eq!(restored.mair, destination.mair);
-        assert_eq!(restored.cpacr, destination.cpacr);
         assert_eq!(task.mm_generation, 23);
         assert_eq!(task.asid_generation, 29);
         assert_eq!(task.syscall_continuation, Some(continuation()));

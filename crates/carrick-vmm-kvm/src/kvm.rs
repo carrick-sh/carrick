@@ -469,13 +469,14 @@ fn reg_to_id(r: Reg) -> u64 {
 fn sysreg_to_id(r: SysReg) -> u64 {
     // Architectural (op0,op1,CRn,CRm,op2) encodings (ARM ARM, AArch64-sysreg).
     match r {
-        SysReg::Sctlr => sysreg_id(3, 0, 1, 0, 0),     // SCTLR_EL1
-        SysReg::Ttbr0 => sysreg_id(3, 0, 2, 0, 0),     // TTBR0_EL1
-        SysReg::Ttbr1 => sysreg_id(3, 0, 2, 0, 1),     // TTBR1_EL1
-        SysReg::Tcr => sysreg_id(3, 0, 2, 0, 2),       // TCR_EL1
-        SysReg::Mair => sysreg_id(3, 0, 10, 2, 0),     // MAIR_EL1
-        SysReg::Vbar => sysreg_id(3, 0, 12, 0, 0),     // VBAR_EL1
-        SysReg::Cpacr => sysreg_id(3, 0, 1, 0, 2),     // CPACR_EL1
+        SysReg::Sctlr => sysreg_id(3, 0, 1, 0, 0), // SCTLR_EL1
+        SysReg::Ttbr0 => sysreg_id(3, 0, 2, 0, 0), // TTBR0_EL1
+        SysReg::Ttbr1 => sysreg_id(3, 0, 2, 0, 1), // TTBR1_EL1
+        SysReg::Tcr => sysreg_id(3, 0, 2, 0, 2),   // TCR_EL1
+        SysReg::Mair => sysreg_id(3, 0, 10, 2, 0), // MAIR_EL1
+        SysReg::Vbar => sysreg_id(3, 0, 12, 0, 0), // VBAR_EL1
+        SysReg::Cpacr => sysreg_id(3, 0, 1, 0, 2), // CPACR_EL1
+        SysReg::CntkctlEl1 => sysreg_id(3, 0, 14, 1, 0), // CNTKCTL_EL1
         SysReg::TpidrEl0 => sysreg_id(3, 3, 13, 0, 2), // TPIDR_EL0 (EL0 thread pointer)
         // x86_64 FsBase/GsBase are a disjoint ISA view; never on the aarch64 lane.
         _ => unreachable!("x86_64 SysReg variant on the aarch64 KVM lane"),
@@ -1787,6 +1788,7 @@ impl KvmVcpu {
             mair: self.get_sys_reg(SysReg::Mair)?,
             vbar: self.get_sys_reg(SysReg::Vbar)?,
             cpacr: self.get_sys_reg(SysReg::Cpacr)?,
+            cntkctl_el1: self.get_sys_reg(SysReg::CntkctlEl1)?,
             tpidr_el0: self.get_sys_reg(SysReg::TpidrEl0)?,
             // HVF-shaped sysregs the KVM aarch64 lane does not use: no Rosetta TSO
             // bit (ACTLR_EL1/EnTSO), TPIDRRO_EL0 unused, and TPIDR_EL1 holds only
@@ -1833,6 +1835,7 @@ impl KvmVcpu {
         self.set_sys_reg(SysReg::Mair, snap.mair)?;
         self.set_sys_reg(SysReg::Vbar, snap.vbar)?;
         self.set_sys_reg(SysReg::Cpacr, snap.cpacr)?;
+        self.set_sys_reg(SysReg::CntkctlEl1, snap.cntkctl_el1)?;
         self.set_sys_reg(SysReg::TpidrEl0, snap.tpidr_el0)?;
         for (n, v) in snap.vregs.iter().enumerate() {
             self.set_vreg(n as u32, *v)?;

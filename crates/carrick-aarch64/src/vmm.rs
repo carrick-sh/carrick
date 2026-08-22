@@ -141,6 +141,7 @@ pub struct Aarch64VcpuSnapshot {
     pub mair: u64,
     pub vbar: u64,
     pub cpacr: u64,
+    pub cntkctl_el1: u64,
     /// TPIDR_EL0 — the EL0 thread pointer (libc TLS base).
     pub tpidr_el0: u64,
     /// TPIDRRO_EL0 — the read-only EL0 thread pointer. `hv_vcpu_create` zeroes it
@@ -344,6 +345,15 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     fn audit_executor_boundary(&mut self, _vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "AArch64 VMM does not expose executor boundary audit authority".to_owned(),
+        ))
+    }
+
+    fn restore_persistent_executor_invariants(
+        &mut self,
+        _vcpu: &mut Self::Vcpu,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "AArch64 VMM does not expose persistent executor invariant authority".to_owned(),
         ))
     }
 

@@ -842,11 +842,10 @@ pub struct Aarch64SyscallContinuationV1 {
 
 /// Version-one migratable AArch64 task state owned by a Kernel thread.
 ///
-/// Executor-local EL1 state is deliberately absent: in particular this does
-/// not carry `SP_EL1`, the syscall-mailbox binding, `VBAR_EL1`, `SCTLR_EL1`,
-/// `MAIR_EL1`, or `CPACR_EL1`. A persistent executor validates and retains
-/// those values while this state moves only the Linux task's architectural
-/// identity.
+/// Executor-local `SP_EL1` and the syscall-mailbox binding are deliberately
+/// absent. The remaining EL1 control registers are task-visible state: a
+/// persistent executor snapshots them before detaching the task, restores its
+/// own neutral controls while idle, and overlays the task values on reload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Aarch64TaskCpuStateV1 {
     /// X0..X30.
@@ -867,6 +866,14 @@ pub struct Aarch64TaskCpuStateV1 {
     pub ttbr0: u64,
     pub ttbr1: u64,
     pub tcr: u64,
+    /// Task-visible EL1 control state. Persistent executors restore their own
+    /// neutral copy only while idle, then overlay these exact values on load.
+    pub sctlr_el1: u64,
+    pub mair_el1: u64,
+    pub vbar_el1: u64,
+    pub cpacr_el1: u64,
+    pub cntkctl_el1: u64,
+    pub tpidr_el1: u64,
     pub actlr_el1: u64,
     pub tpidr_el0: u64,
     pub tpidrro_el0: u64,
