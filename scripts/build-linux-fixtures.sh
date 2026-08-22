@@ -147,3 +147,4 @@ cargo metadata \
   >/dev/null
 
 build_fixture "fork_bench.rs" "carrick-linux-aarch64-fork-bench"
+build_fixture "fork_bench_10k.rs" "carrick-linux-aarch64-fork-bench-10k"
