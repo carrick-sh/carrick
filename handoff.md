@@ -115,6 +115,34 @@ test-integration have not been observed passing.
 **Do not quote a `just ci` result from a pipeline.** `just ci | tail` reports
 `tail`'s status; redirect to a file and read `$?`.
 
+### The gate outage was hiding a SECOND red gate: `lint-domains`
+
+With clippy fixed, `just ci` now stops at `lint-domains`, whose host-authority
+census reports inventory drift. **This is pre-existing** — it reproduces on
+unmodified HEAD `50bf9ddd8` in a separate worktree — and it had simply never
+been reached, because clippy failed first.
+
+The drift is NOT mechanical churn, and must not be blessed blindly. A
+`--refresh-candidate` compared position-insensitively against the committed
+inventory (678 candidate rows vs 682 reviewed) isolates the real delta:
+
+- **4 genuinely NEW reviewed-authority uses**, all host-thread operations added
+  by the persistent-executor campaign — `std::thread::Builder::new` ×2 in
+  `vcpu_loop/continuation.rs`, `std::thread::Builder::new` ×1 and
+  `std::thread::yield_now` ×1 in `vcpu_loop/executor.rs`;
+- **8 rows gone**, mostly from `vcpu_loop/quiesce.rs` and `vcpu_loop/mod.rs`
+  (`libc::getpid` ×2, `libc::getuid`, `Builder::new`, `thread::sleep` ×2,
+  `yield_now` ×2);
+- every other differing row is a position-only move.
+
+So the census is doing exactly its job: it caught host-thread creation that the
+persistent-executor work introduced without review. Those four rows need a real
+classification (`forbidden_semantic` / `declared_backing` /
+`declared_substrate`) — which is Task 7's subject matter, since Task 7 Step 1
+requires that HVPatch reach no `std::thread::spawn`/`Builder::spawn` at all.
+`--refresh-candidate` deliberately writes rows as unreviewed and exits nonzero;
+do not paper over it with a bulk re-bless.
+
 Note: the `[workspace.lints.clippy]` change is committed inside `84e385655`
 rather than `4acd8cc9f`, swept in by a broad `git add`; that commit's message
 does not mention it.
