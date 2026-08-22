@@ -513,18 +513,18 @@ fn forward_record_lock<M: GuestMemory>(
             return write_logical_record_lock_conflict(&mut *cx.memory, arg, conflict, is_ofd);
         }
         match this.fs.classic_record_locks.try_set(request.clone()) {
-            Ok(()) => return DispatchOutcome::Returned { value: 0 },
+            Ok(()) => DispatchOutcome::Returned { value: 0 },
             Err(errno) if matches!(linux_cmd, LINUX_F_SETLK | LINUX_F_OFD_SETLK) => {
-                return DispatchOutcome::errno(errno);
+                DispatchOutcome::errno(errno)
             }
-            Err(errno) if errno != LINUX_EAGAIN => return DispatchOutcome::errno(errno),
+            Err(errno) if errno != LINUX_EAGAIN => DispatchOutcome::errno(errno),
             Err(_) => {
                 let wait = LogicalRecordLockWait::new(
                     Arc::clone(&this.fs.classic_record_locks),
                     request,
                     cx.tid(),
                 );
-                return DispatchOutcome::BlockingRecordLock(BlockingRecordLock::logical(wait));
+                DispatchOutcome::BlockingRecordLock(BlockingRecordLock::logical(wait))
             }
         }
     }
