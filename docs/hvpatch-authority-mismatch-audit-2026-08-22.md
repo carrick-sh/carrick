@@ -25,7 +25,7 @@ turned out to be live production code.
 | 3 | sibling adopts an `Active` authority | `trap.rs:6714` | **REJECTED** — that is the design; threads share the mm and its authority |
 | 4 | `Active { ledger }` holds the pre-exec ledger | `trap.rs:6715` | **REFUTED** — `frame_inventory` is reassigned only inside the `shared_process_mm` branch (`trap.rs:5170`) |
 | 5 | `HvpatchMmAuthorityKey` in the carrier directory | `trap.rs:7660` | **CONFIRMED** — still maps the pre-exec `mm_root_slot` |
-| 6 | `Stage1MmBackend.binding` | `stage1_mm.rs:127` | UNVERIFIED — see below |
+| 6 | `Stage1MmBackend.binding` | `stage1_mm.rs:127` | **REFUTED** — `publish_binding` overwrites and bumps a revision, and exec does republish |
 
 **1, 2 and 5 share one root cause: execve mutates the task's HVF state in place
 and never re-publishes it.** One change closes all three; the plan is
@@ -39,16 +39,25 @@ registrations". Since `apply_retirement` passes `*self.kernel_mm.lock()` as
 receipt against the PRE-exec mm. In-place transition is not merely unsafe, it is
 impossible.
 
-## Finding 6 — not yet verified
+## Finding 6 — refuted
 
-- **Stage1MmBackend.binding** (`stage1_mm.rs:127`)
-  - stale by: crates/carrick-runtime/src/hvpatch/stage1_mm.rs:117-130 (`Stage1MmLease::publish_stage1_root` / `PreparedStage1Mm::publish_stage1_root` called during `MmResources::commit_exec` at `hvpatch/mm_resources.rs:234`): Updates `self.state.publish_binding(binding)` on `Stage1MmState`, but omits calling `sel
-  - read by: crates/carrick-runtime/src/hvpatch/stage1_mm.rs:549 (`Stage1MmBackend::snapshot`), crates/carrick-runtime/src/hvpatch/mod.rs:556 (`ProcessContext::mm_binding`), and crates/carrick-runtime/src/kernel/snapshot.rs:659 (`MmBackend::snapshot`).
-  - claimed consequence: A debug or diagnostic consumer querying an address space via `carrick debug hvpatch-kernel`, `ForeignMmAccess`, or kernel debug snapshots (`Kernel::snapshot` / `MmBackendSnapshot`) after `publish_stage1_root` observes the stale initial stage-1 root GPA and TTBR0 from before publication rather than t
+`Stage1MmBackend.binding` was reported stale after `publish_stage1_root`. It is
+not: `publish_binding` (`stage1_mm.rs:401`) overwrites the binding under a write
+lock and bumps a revision, and execve does republish — `commit_exec`
+(`hvpatch/mod.rs:748`) calls `backend.publish_binding(binding)` with the new
+stage-1 root read back from `TTBR0`. Nothing goes stale.
 
-Verify it before acting: the claimed consequence is diagnostic-only, which makes
-it low-priority but also cheap to confirm now that `carrick debug
-hvpatch-kernel` names its failing clause.
+## Calibration — half of this audit was wrong
+
+Six candidates, **three rejected or refuted** on inspection: the pre-exec ledger,
+the sibling adopting an `Active` authority, and this one. All six were reported
+with `confidence: certain`.
+
+That is the reason every finding here carries a set-site, an invalidating
+transition, and the predicate that reads it: those three fields are what make a
+claim checkable in minutes. A finding stated as a conclusion rather than as a
+chain would have cost an afternoon each to disprove — and two of these would
+have been "fixed", changing correct code.
 
 ## Cleared — relationships that ARE maintained
 
