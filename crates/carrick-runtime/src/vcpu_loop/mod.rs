@@ -3856,13 +3856,7 @@ where
         self.state
             .registry
             .register_child_with_tid(tid, clear_child_tid_addr);
-        self.state
-            .threads
-            .lock()
-            .push(VcpuThreadHandle::Persistent {
-                result: logical.result.clone(),
-                completion: logical.completion.clone(),
-            });
+        enroll_persistent_process_member(&self.state.threads, &logical.result, &logical.completion);
         if let Err(error) = check_hvpatch_clone_failpoint(HvpatchCloneFailpoint::RegistryHandle) {
             drop(dormant);
             self.rollback_published_hvpatch_clone(
@@ -4363,6 +4357,18 @@ where
             self.state.register_vcpu(engine);
         }
 
+        // Exec/exit can force a blocked vfork parent runnable solely so it can
+        // retire its exact logical result. Do not resume the old continuation
+        // or touch guest state after that terminal ownership transition.
+        if self.kernel.process_exiting()
+            || thread_should_finish_for_exec_replacement(&self.state.registry, self.state.this_tid)
+        {
+            let _ = self
+                .state
+                .handle_persistent_thread_exit(&self.kernel, engine, 0, self.traps);
+            return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
+        }
+
         let phase = std::mem::replace(&mut self.phase, HvpatchProductionPhase::Resident);
         match phase {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4583,15 +4589,6 @@ where
             }
             HvpatchProductionPhase::Resident => {}
             HvpatchProductionPhase::Complete => return Ok(executor::ExecutorExit::Exited),
-        }
-
-        if self.kernel.process_exiting()
-            || thread_should_finish_for_exec_replacement(&self.state.registry, self.state.this_tid)
-        {
-            let _ = self
-                .state
-                .handle_persistent_thread_exit(&self.kernel, engine, 0, self.traps);
-            return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
         }
 
         if let Some(exit) = self.suspend_for_process_quiesce(control)? {
@@ -8002,6 +7999,77 @@ impl VcpuThreadHandle {
     }
 }
 
+fn enroll_persistent_process_member(
+    threads: &Arc<Mutex<Vec<VcpuThreadHandle>>>,
+    result: &HvpatchLoopResult,
+    completion: &continuation::LogicalJobCompletion,
+) {
+    let mut handles = threads.lock();
+    if handles
+        .iter()
+        .any(|handle| handle.completion().id() == completion.id())
+    {
+        std::process::abort();
+    }
+    handles.push(VcpuThreadHandle::Persistent {
+        result: result.clone(),
+        completion: completion.clone(),
+    });
+}
+
+fn remove_persistent_process_member(
+    threads: &Arc<Mutex<Vec<VcpuThreadHandle>>>,
+    completion: continuation::JobId,
+) {
+    threads
+        .lock()
+        .retain(|handle| handle.completion().id() != completion);
+}
+
+fn finish_persistent_process_handles(
+    threads: &Arc<Mutex<Vec<VcpuThreadHandle>>>,
+    current: continuation::JobId,
+) -> Result<(), RuntimeError> {
+    let handles = std::mem::take(&mut *threads.lock());
+    for handle in handles {
+        handle.finish_completed(current)?;
+    }
+    Ok(())
+}
+
+struct PersistentProcessMemberPublication {
+    threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
+    completion: continuation::JobId,
+    armed: bool,
+}
+
+impl PersistentProcessMemberPublication {
+    fn new(
+        threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
+        result: &HvpatchLoopResult,
+        completion: &continuation::LogicalJobCompletion,
+    ) -> Self {
+        enroll_persistent_process_member(&threads, result, completion);
+        Self {
+            threads,
+            completion: completion.id(),
+            armed: true,
+        }
+    }
+
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PersistentProcessMemberPublication {
+    fn drop(&mut self) {
+        if self.armed {
+            remove_persistent_process_member(&self.threads, self.completion);
+        }
+    }
+}
+
 impl VcpuLoopLaunch {
     pub(crate) fn wait(self) -> Result<VcpuLoopOutcome, RuntimeError> {
         match self {
@@ -8416,6 +8484,7 @@ where
         drop(parked_vcpu);
 
         let (execution_lease, injected_lease) = ExecutionLeaseCell::injected();
+        let process_members = Arc::clone(&threads);
         let mut state = ThreadRuntimeState::<HvfEngine>::new(
             registry,
             futex,
@@ -8482,6 +8551,11 @@ where
                 return VcpuLoopLaunch::Direct(Err(RuntimeError::Trap(error)));
             }
         };
+        let member_publication = PersistentProcessMemberPublication::new(
+            process_members,
+            &logical.result,
+            &logical.completion,
+        );
         let started_pool = match directory.start_persistent_pool(
             logical.context.kernel(),
             authority,
@@ -8495,6 +8569,10 @@ where
             }
         };
         if let Err(error) = dormant.activate(&prepared.scheduler, Arc::clone(&thread), proof) {
+            // The job was never exposed. Remove its process-local drain handle
+            // before closing a newly-created pool, or shutdown would wait on a
+            // completion no scheduler row can ever publish.
+            drop(member_publication);
             prepared.fail_exact();
             if started_pool && let Err(shutdown) = directory.shutdown_persistent_pool() {
                 return VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(format!(
@@ -8503,6 +8581,7 @@ where
             }
             return VcpuLoopLaunch::Direct(Err(RuntimeError::Trap(error)));
         }
+        member_publication.commit();
         prepared.disarm();
         VcpuLoopLaunch::Persistent {
             result: logical.result,
@@ -12812,6 +12891,120 @@ mod tests {
             gate.is_terminal_closing(),
             "process exit must retire a suspended vfork parent"
         );
+    }
+
+    #[test]
+    fn persistent_exec_drain_retains_leader_result_until_exact_completion() {
+        let (_process, context) = crate::hvpatch::process_context_for_tests(70_102);
+        let directory = HvpatchRuntimeDirectory::default();
+        let (scheduler, _) = directory.continuation_services(context.kernel());
+        let handles = Arc::new(Mutex::new(Vec::new()));
+        let leader_result = HvpatchLoopResult::pending();
+        let leader_completion = continuation::LogicalJobCompletion::pending();
+        let exec_result = HvpatchLoopResult::pending();
+        let exec_completion = continuation::LogicalJobCompletion::pending();
+
+        enroll_persistent_process_member(&handles, &leader_result, &leader_completion);
+        enroll_persistent_process_member(&handles, &exec_result, &exec_completion);
+        let drain = continuation::ProcessDrain::for_scheduler(
+            context.thread().key(),
+            &scheduler,
+            exec_completion.id(),
+            handles
+                .lock()
+                .iter()
+                .map(VcpuThreadHandle::completion)
+                .collect(),
+        );
+        assert!(!drain.is_ready(), "exec must wait for the suspended leader");
+
+        leader_result.publish(Ok(VcpuLoopOutcome::ThreadDone));
+        leader_completion.publish();
+        assert!(drain.is_ready());
+        finish_persistent_process_handles(&handles, exec_completion.id())
+            .expect("drain exact leader result without synthesizing one");
+    }
+
+    #[test]
+    fn persistent_exec_terminal_check_precedes_blocked_vfork_resume() {
+        let source = include_str!("mod.rs");
+        let poll = source
+            .split("fn poll_with_engine(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("impl<E: ThreadedEngine + 'static> ProductionHvpatchLoopPoll")
+                    .next()
+            })
+            .expect("production poll body");
+        let terminal = poll
+            .find("thread_should_finish_for_exec_replacement")
+            .expect("top-of-quantum exec terminal check");
+        let phase = poll
+            .find("let phase = std::mem::replace")
+            .expect("phase dispatch");
+        assert!(
+            terminal < phase,
+            "a forced vfork wake must exit before ResumeBlocked"
+        );
+    }
+
+    #[test]
+    fn persistent_exec_stop_wakes_the_exact_blocked_leader_generation() {
+        let (process, root) = crate::hvpatch::process_context_for_tests(70_103);
+        let plan = crate::kernel::ClonePlan::from_flags(
+            carrick_abi::LinuxCloneFlags::THREAD
+                | carrick_abi::LinuxCloneFlags::SIGHAND
+                | carrick_abi::LinuxCloneFlags::VM,
+        )
+        .expect("thread clone plan");
+        let sibling_tid = ThreadId::synthetic_for_tests(70_104);
+        let sibling = process
+            .kernel_graph()
+            .reserve_thread_clone(&root, plan, None)
+            .expect("reserve sibling")
+            .prepare(sibling_tid)
+            .expect("prepare sibling")
+            .commit()
+            .expect("publish sibling")
+            .start_thread()
+            .expect("start sibling")
+            .into_context();
+        let root_state = executor::tests::task_state(&root, 710);
+        let sibling_state = executor::tests::task_state(&sibling, 711);
+        root.thread()
+            .publish_initial_task_state(root_state)
+            .expect("publish root state");
+        sibling
+            .thread()
+            .publish_initial_task_state(sibling_state)
+            .expect("publish sibling state");
+        let lease = root
+            .thread()
+            .claim_runnable(
+                crate::kernel::objects::ExecutorId::for_transitional_thread(
+                    ThreadId::synthetic_for_tests(71),
+                )
+                .expect("test executor"),
+            )
+            .expect("claim leader");
+        root.thread()
+            .park_from_executor(lease, crate::kernel::objects::BlockedReason::ChildState)
+            .expect("block vfork leader");
+        let directory = HvpatchRuntimeDirectory::default();
+        let (scheduler, _) = directory.continuation_services(root.kernel());
+
+        threads::wake_removed_persistent_sibling_threads(
+            &sibling,
+            &scheduler,
+            &[ThreadId::synthetic_for_tests(root.thread().key().tid.raw())],
+        )
+        .expect("wake exact removed leader");
+
+        assert!(matches!(
+            root.thread().execution_state(),
+            crate::kernel::objects::ThreadExecutionState::Runnable { .. }
+        ));
+        assert_eq!(scheduler.queued_len(), 1);
     }
 
     #[test]
