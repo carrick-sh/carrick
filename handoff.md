@@ -247,11 +247,23 @@ callers in the collapse and must be PORTED into the persistent executor:**
   `write_hvpatch_child_output`. If this reading is right, guest core dumps and
   `WCOREDUMP` do not work at all today, and the port belongs in
   `finalize_persistent_process_terminal` exactly as fault delivery did.
-- **Job control** (~4): `wait_until_job_control_resumed` (both `kernel/objects.rs`
-  and `hvpatch/mod.rs`), `stop_for_job_control`, `syscall_trace_identity`.
-- Plus `GuestBlockedGuard`/`publish` (the `/proc/[pid]/stat` run state a guest
-  and LTP's `TST_PROCESS_STATE_WAIT` read), `HvpatchSyscallServiceGuard`/`begin`
-  (USDT service probes), and the stage-1 `acknowledge_tlb_flush` contracts.
+- **Job control** (~4) — **now VERIFIED broken, with a written port plan:
+  `docs/hvpatch-job-control-port-plan.md`.** A guest that receives `SIGSTOP` is
+  MARKED stopped and reported as stopped to `wait4`, but never actually stops
+  running. `stop_task_for_job_control` has a live caller
+  (`vcpu_loop/mod.rs:7010`) and so does `wait_child_with_job_control`
+  (`dispatch/proc.rs:2981`), but `wait_until_job_control_resumed` — the only
+  thing that PARKS the thread — is reachable only from a wrapper that itself has
+  no callers. The middle link is missing, so `wait4` tells the parent something
+  false. Two symbols in that clippy group are genuine corpses with named
+  replacements and should be DELETED, not ported: `record_process_exit_commit`
+  and `retire_address_space_with`.
+- Plus `GuestBlockedGuard`/`publish`: with no publisher, a blocked task reports
+  `'R'` in `/proc/[pid]/stat` forever. LTP's `TST_PROCESS_STATE_WAIT` polls
+  exactly that field, so every case that waits for a child to reach `'S'` is
+  silently broken. Covered in the job-control plan.
+  Plus `HvpatchSyscallServiceGuard`/`begin` (USDT service probes) and the
+  stage-1 `acknowledge_tlb_flush` wrapper (deletable, see below).
 
 **LOST INSTRUMENT — record this before it is forgotten.**
 `trace_hvpatch_wait_begin`, `trace_hvpatch_wait_end` and
