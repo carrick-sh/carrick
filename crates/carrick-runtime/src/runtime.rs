@@ -290,7 +290,7 @@ pub struct RunStaticElfBackendOptions<'a> {
 
 pub fn run_static_elf_with_backend_args_and_dispatcher_debug<A, E>(
     path: impl AsRef<Path>,
-    mut dispatcher: SyscallDispatcher,
+    dispatcher: SyscallDispatcher,
     argv: A,
     env: E,
     options: RunStaticElfBackendOptions<'_>,
@@ -304,17 +304,18 @@ where
         options.exec_backend,
         options.native_page_profile,
     )?;
-    dispatcher.set_execution_backend(plan.backend);
-    match plan.backend {
-        crate::page_profile::ExecutionBackend::HvPatch => crate::hvpatch::run_static_hvpatch(
-            path.as_ref(),
-            dispatcher,
-            argv,
-            env,
-            options.max_traps,
-            options.debug_state_path,
-        ),
-    }
+    // Kept for its capability check: it refuses a non-macOS/AArch64 lane
+    // before the guest is built. HVPatch is the only backend, so the plan
+    // carries no selection any more.
+    let _plan = plan;
+    crate::hvpatch::run_static_hvpatch(
+        path.as_ref(),
+        dispatcher,
+        argv,
+        env,
+        options.max_traps,
+        options.debug_state_path,
+    )
 }
 
 fn canonical_host_executable_path(path: &Path) -> String {
@@ -451,37 +452,13 @@ where
 /// PT_INTERP are loaded via `dispatcher.read_exec_file` — the same
 /// overlay-first reader used by the guest-runtime execve path — so no
 /// in-memory `RootFs` is required.
-pub fn run_elf_from_dispatcher_debug<A, E>(
+pub(crate) fn run_elf_from_dispatcher_debug<A, E>(
     path: &str,
     dispatcher: SyscallDispatcher,
     argv: A,
     env: E,
     max_traps: usize,
     debug_state_path: Option<&PathBuf>,
-) -> Result<RunResult, RuntimeError>
-where
-    A: IntoIterator<Item = String>,
-    E: IntoIterator<Item = String>,
-{
-    run_elf_from_dispatcher_with_backend_debug(
-        path,
-        dispatcher,
-        argv,
-        env,
-        max_traps,
-        debug_state_path,
-        crate::page_profile::ExecutionBackend::HvPatch,
-    )
-}
-
-pub(crate) fn run_elf_from_dispatcher_with_backend_debug<A, E>(
-    path: &str,
-    dispatcher: SyscallDispatcher,
-    argv: A,
-    env: E,
-    max_traps: usize,
-    debug_state_path: Option<&PathBuf>,
-    backend: crate::page_profile::ExecutionBackend,
 ) -> Result<RunResult, RuntimeError>
 where
     A: IntoIterator<Item = String>,
@@ -562,7 +539,7 @@ where
     });
     drop(launch_context);
     let image = built?;
-    finish_image_for_backend(image, dispatcher, max_traps, debug_state_path, backend)
+    crate::hvpatch::finish_hvpatch_image(image, dispatcher, max_traps, debug_state_path)
 }
 
 pub fn run_rootfs_elf_with_hvf_args<A, E>(
@@ -773,8 +750,7 @@ fn run_address_space_with_hvf_and_dispatcher(
         // Build the engine (create VM + vCPU, map the address space, park at the EL0
         // trampoline) — the shared `Aarch64EngineCore<HvfAarch64Vmm>` bring-up.
         let mut trap = crate::trap::new_hvf_trap_engine(&image)?;
-        let persistent_vm = persistent_hvf_vm_lifecycle(dispatcher.execution_backend());
-        carrick_hal::ThreadedEngine::set_persistent_vm_lifecycle(&mut trap, persistent_vm);
+        carrick_hal::ThreadedEngine::set_persistent_vm_lifecycle(&mut trap, true);
         // Hand the dispatcher the real region list + auxv so /proc/self/maps
         // (regions, bootstrap pages, stack) and /proc/self/auxv reflect the loaded
         // ELF instead of the legacy summary. Language runtimes, malloc
@@ -788,31 +764,27 @@ fn run_address_space_with_hvf_and_dispatcher(
         let _ = stamp_identity_page(&mut trap, &dispatcher, &boot_context);
         drop(boot_context);
         let run = run_threaded_hvf_loop(trap, dispatcher, max_traps);
-        if persistent_vm {
-            finalize_persistent_hvf_run(
-                run,
-                || crate::trap::destroy_persistent_vm_at_run_terminal().map_err(RuntimeError::from),
-                crate::vm_lifecycle::record_process_terminal,
-                |run| {
-                    if let Some(path) =
-                        std::env::var_os(crate::vm_lifecycle::VM_LIFECYCLE_ARTIFACT_PATH_ENV)
-                        && let Err(artifact_error) =
-                            crate::vm_lifecycle::write_completed_process_artifact(Path::new(&path))
-                    {
-                        let run_context = run
-                            .as_ref()
-                            .err()
-                            .map_or_else(|| "guest run completed".to_owned(), ToString::to_string);
-                        return Err(RuntimeError::Unsupported(format!(
-                            "HVPatch VM lifecycle artifact publication failed after {run_context}: {artifact_error}"
-                        )));
-                    }
-                    Ok(())
-                },
-            )
-        } else {
-            run
-        }
+        finalize_persistent_hvf_run(
+            run,
+            || crate::trap::destroy_persistent_vm_at_run_terminal().map_err(RuntimeError::from),
+            crate::vm_lifecycle::record_process_terminal,
+            |run| {
+                if let Some(path) =
+                    std::env::var_os(crate::vm_lifecycle::VM_LIFECYCLE_ARTIFACT_PATH_ENV)
+                    && let Err(artifact_error) =
+                        crate::vm_lifecycle::write_completed_process_artifact(Path::new(&path))
+                {
+                    let run_context = run
+                        .as_ref()
+                        .err()
+                        .map_or_else(|| "guest run completed".to_owned(), ToString::to_string);
+                    return Err(RuntimeError::Unsupported(format!(
+                        "HVPatch VM lifecycle artifact publication failed after {run_context}: {artifact_error}"
+                    )));
+                }
+                Ok(())
+            },
+        )
     })();
     match run {
         Ok(r) => Ok(r),
@@ -892,37 +864,6 @@ fn with_hvf_syscall_mailbox(image: AddressSpace) -> Result<AddressSpace, Address
         image
     };
     image.with_syscall_mailbox_arena()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImageFinalizer {
-    HvPatch,
-}
-
-fn persistent_hvf_vm_lifecycle(backend: crate::page_profile::ExecutionBackend) -> bool {
-    backend == crate::page_profile::ExecutionBackend::HvPatch
-}
-
-fn image_finalizer_for_backend(
-    backend: crate::page_profile::ExecutionBackend,
-) -> Result<ImageFinalizer, RuntimeError> {
-    match backend {
-        crate::page_profile::ExecutionBackend::HvPatch => Ok(ImageFinalizer::HvPatch),
-    }
-}
-
-fn finish_image_for_backend(
-    image: AddressSpace,
-    dispatcher: SyscallDispatcher,
-    max_traps: usize,
-    debug_state_path: Option<&PathBuf>,
-    backend: crate::page_profile::ExecutionBackend,
-) -> Result<RunResult, RuntimeError> {
-    match image_finalizer_for_backend(backend)? {
-        ImageFinalizer::HvPatch => {
-            crate::hvpatch::finish_hvpatch_image(image, dispatcher, max_traps, debug_state_path)
-        }
-    }
 }
 
 /// Finish a freshly-loaded image (its initial stack already set, if any) and
@@ -2665,21 +2606,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn image_finalizer_routes_hvpatch() {
-        assert_eq!(
-            image_finalizer_for_backend(crate::page_profile::ExecutionBackend::HvPatch).unwrap(),
-            ImageFinalizer::HvPatch
-        );
-    }
-
-    #[test]
-    fn only_hvpatch_selects_persistent_hvf_vm_lifecycle() {
-        assert!(persistent_hvf_vm_lifecycle(
-            crate::page_profile::ExecutionBackend::HvPatch
-        ));
-    }
 
     #[test]
     fn setup_failure_has_one_vm_teardown_and_runtime_error_artifact() {

@@ -9,7 +9,7 @@ use crate::network::NetworkHostsEntry;
 use crate::rootfs::RootFs;
 #[cfg(feature = "fs-memory")]
 use crate::runtime::run_rootfs_elf_with_hvf_args_and_dispatcher_debug;
-use crate::runtime::{RunResult, RuntimeError, run_elf_from_dispatcher_with_backend_debug};
+use crate::runtime::{RunResult, RuntimeError, run_elf_from_dispatcher_debug};
 use crate::vfs::BindVfs;
 use anyhow::{Context, Result};
 use carrick_spec::{FsBackendKind, NetworkNamespaceSpec, PidMode, Platform, RunSpec};
@@ -125,9 +125,8 @@ fn prepare_host_root(
 fn cached_lower_enabled(execution_plan: &crate::page_profile::ExecutionPlan) -> bool {
     #[cfg(target_os = "macos")]
     {
-        execution_plan.backend == crate::page_profile::ExecutionBackend::HvPatch
-            && std::env::var_os("CARRICK_FS_CACHED_LOWER").as_deref()
-                != Some(std::ffi::OsStr::new("0"))
+        let _ = execution_plan;
+        std::env::var_os("CARRICK_FS_CACHED_LOWER").as_deref() != Some(std::ffi::OsStr::new("0"))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -327,7 +326,6 @@ impl Runtime {
                     dispatcher.set_rootfs_layer(rootfs);
                 }
                 dispatcher.set_page_geometry(execution_plan.page_geometry);
-                dispatcher.set_execution_backend(execution_plan.backend);
                 let guest_hostname = effective_guest_hostname(spec);
                 dispatcher.set_guest_hostname(guest_hostname.as_ref());
                 // Sandboxed container fs (extracted OCI layers on a cap-std
@@ -400,14 +398,13 @@ impl Runtime {
                     .debug_state_path
                     .as_ref()
                     .map(|p| PathBuf::from(p.as_std_path()));
-                let run_result = run_elf_from_dispatcher_with_backend_debug(
+                let run_result = run_elf_from_dispatcher_debug(
                     &spec.executable,
                     dispatcher,
                     spec.argv.clone(),
                     env,
                     spec.max_traps,
                     debug_path.as_ref(),
-                    execution_plan.backend,
                 );
                 match run_result {
                     Ok(r) => r,
@@ -448,7 +445,6 @@ impl Runtime {
                     spec.executable.clone(),
                 );
                 dispatcher.set_page_geometry(execution_plan.page_geometry);
-                dispatcher.set_execution_backend(execution_plan.backend);
                 let guest_hostname = effective_guest_hostname(spec);
                 dispatcher.set_guest_hostname(guest_hostname.as_ref());
                 if let Some(cwd) = &spec.cwd {

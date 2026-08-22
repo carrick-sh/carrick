@@ -137,29 +137,19 @@ struct CountingMmapMemory {
 fn hvpatch_fixed_va_aliases_do_not_consume_the_legacy_monotonic_ipa_cursor() {
     let allocations = Cell::new(0_u64);
     for _ in 0..40_000 {
-        let ipa = alloc_alias_ipa_for_publication_with(
-            crate::page_profile::ExecutionBackend::HvPatch,
-            LINUX_PAGE_SIZE,
-            true,
-            |_| {
-                allocations.set(allocations.get() + 1);
-                None
-            },
-        );
+        let ipa = alloc_alias_ipa_for_publication_with(LINUX_PAGE_SIZE, true, |_| {
+            allocations.set(allocations.get() + 1);
+            None
+        });
         assert_eq!(ipa, Some(crate::memory::LINUX_ALIAS_IPA_BASE));
     }
     assert_eq!(allocations.get(), 0);
 
     assert_eq!(
-        alloc_alias_ipa_for_publication_with(
-            crate::page_profile::ExecutionBackend::HvPatch,
-            LINUX_PAGE_SIZE,
-            false,
-            |_| {
-                allocations.set(allocations.get() + 1);
-                Some(0x1234_0000)
-            },
-        ),
+        alloc_alias_ipa_for_publication_with(LINUX_PAGE_SIZE, false, |_| {
+            allocations.set(allocations.get() + 1);
+            Some(0x1234_0000)
+        },),
         Some(0x1234_0000)
     );
     assert_eq!(allocations.get(), 1);
@@ -190,33 +180,15 @@ fn backend_mmap_arena_is_not_classified_as_an_alias() {
 #[test]
 fn hvpatch_sparse_semantic_arena_stays_identity_while_low_fixed_hole_aliases() {
     assert!(
-        !mmap_request_uses_alias(
-            crate::page_profile::ExecutionBackend::HvPatch,
-            true,
-            false,
-            false,
-            true,
-        ),
+        !mmap_request_uses_alias(true, false, false, true),
         "an absent sparse page inside the semantic arena must materialize through the identity route"
     );
     assert!(
-        mmap_request_uses_alias(
-            crate::page_profile::ExecutionBackend::HvPatch,
-            true,
-            false,
-            false,
-            false,
-        ),
+        mmap_request_uses_alias(true, false, false, false),
         "a true low fixed hole still requires alias backing"
     );
     assert!(
-        !mmap_request_uses_alias(
-            crate::page_profile::ExecutionBackend::HvPatch,
-            true,
-            false,
-            true,
-            false,
-        ),
+        !mmap_request_uses_alias(true, false, true, false),
         "already-backed identity memory must not acquire a second alias"
     );
 }
@@ -6139,7 +6111,6 @@ fn hvpatch_low_fixed_hole_maps_a_host_alias() {
     const VA: u64 = 0x1_0000_0000;
 
     let mut dispatcher = SyscallDispatcher::new();
-    dispatcher.set_execution_backend(crate::page_profile::ExecutionBackend::HvPatch);
     let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize);
     let reporter = CompatReporter::default();
     let request = SyscallRequest::new(

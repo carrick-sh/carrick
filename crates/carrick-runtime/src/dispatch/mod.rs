@@ -1203,61 +1203,25 @@ impl std::fmt::Debug for BlockingHostWrite {
     }
 }
 
+/// A parked `F_SETLKW`/`F_OFD_SETLKW`. Every record lock is arbitrated by
+/// carrick's own logical table keyed on the guest's task/description identity;
+/// the host `fcntl` transport was the retired lanes' answer, where one guest
+/// process was one host process and the host kernel could own the arbitration.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct BlockingRecordLock {
     #[serde(skip_serializing)]
-    host_fd: Option<std::sync::Arc<PinnedHostFd>>,
-    host_cmd: i32,
-    l_start: i64,
-    l_len: i64,
-    l_type: i16,
-    l_whence: i16,
-    #[serde(skip_serializing)]
-    logical: Option<fs::LogicalRecordLockWait>,
+    logical: fs::LogicalRecordLockWait,
 }
 
 impl BlockingRecordLock {
-    pub(crate) fn new(
-        host_fd: i32,
-        host_cmd: i32,
-        l_start: i64,
-        l_len: i64,
-        l_type: i16,
-        l_whence: i16,
-    ) -> Result<Self, LinuxErrno> {
-        Ok(Self {
-            host_fd: Some(std::sync::Arc::new(PinnedHostFd::new(host_fd)?)),
-            host_cmd,
-            l_start,
-            l_len,
-            l_type,
-            l_whence,
-            logical: None,
-        })
-    }
-
     pub(crate) fn logical(wait: fs::LogicalRecordLockWait) -> Self {
-        Self {
-            host_fd: None,
-            host_cmd: 0,
-            l_start: 0,
-            l_len: 0,
-            l_type: 0,
-            l_whence: 0,
-            logical: Some(wait),
-        }
+        Self { logical: wait }
     }
 }
 
 impl std::fmt::Debug for BlockingRecordLock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BlockingRecordLock")
-            .field("host_fd", &self.host_fd.as_ref().map(|fd| fd.fd))
-            .field("host_cmd", &self.host_cmd)
-            .field("l_start", &self.l_start)
-            .field("l_len", &self.l_len)
-            .field("l_type", &self.l_type)
-            .field("l_whence", &self.l_whence)
             .field("logical", &self.logical)
             .finish()
     }
@@ -1327,28 +1291,9 @@ pub(crate) fn drive_blocking_host_write(write: &mut BlockingHostWrite) -> Blocki
 }
 
 pub(crate) fn drive_blocking_record_lock(lock: &BlockingRecordLock) -> DispatchOutcome {
-    if let Some(logical) = &lock.logical {
-        return match logical.acquire() {
-            Ok(()) => DispatchOutcome::Returned { value: 0 },
-            Err(errno) => DispatchOutcome::errno(errno),
-        };
-    }
-    let Some(host_fd) = &lock.host_fd else {
-        return DispatchOutcome::errno(LINUX_EINVAL);
-    };
-    let mut fl: libc::flock = unsafe { core::mem::zeroed() };
-    fl.l_start = lock.l_start as libc::off_t;
-    fl.l_len = lock.l_len as libc::off_t;
-    fl.l_type = lock.l_type;
-    fl.l_whence = lock.l_whence;
-
-    // BLOCKING-IO-OK: this is the blocking half of F_SETLKW/F_OFD_SETLKW after
-    // the dispatcher has returned its state locks to the run loop. Sibling guest
-    // threads can keep running and release the conflicting record lock.
-    let rc = unsafe { libc::fcntl(host_fd.fd, lock.host_cmd, &mut fl as *mut libc::flock) };
-    match rc.host_syscall_errno() {
-        Ok(_) => DispatchOutcome::Returned { value: 0 },
-        Err(errno) => DispatchOutcome::Errno { errno },
+    match lock.logical.acquire() {
+        Ok(()) => DispatchOutcome::Returned { value: 0 },
+        Err(errno) => DispatchOutcome::errno(errno),
     }
 }
 
@@ -1361,43 +1306,9 @@ pub(crate) enum BlockingRecordLockStep {
 /// Unlike `drive_blocking_record_lock`, this never issues F_SETLKW and never
 /// parks the reactor thread behind a guest-owned lock.
 pub(crate) fn try_drive_blocking_record_lock(lock: &BlockingRecordLock) -> BlockingRecordLockStep {
-    if let Some(logical) = &lock.logical {
-        return match logical.try_acquire() {
-            Ok(()) => BlockingRecordLockStep::Done(DispatchOutcome::Returned { value: 0 }),
-            Err(errno) if errno == LINUX_EAGAIN => BlockingRecordLockStep::Wait,
-            Err(errno) => BlockingRecordLockStep::Done(DispatchOutcome::Errno { errno }),
-        };
-    }
-    let Some(host_fd) = &lock.host_fd else {
-        return BlockingRecordLockStep::Done(DispatchOutcome::errno(LINUX_EINVAL));
-    };
-    let mut fl: libc::flock = unsafe { core::mem::zeroed() };
-    fl.l_start = lock.l_start as libc::off_t;
-    fl.l_len = lock.l_len as libc::off_t;
-    fl.l_type = lock.l_type;
-    fl.l_whence = lock.l_whence;
-    let command = if lock.host_cmd == libc::F_SETLKW {
-        libc::F_SETLK
-    } else {
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        {
-            if lock.host_cmd == libc::F_OFD_SETLKW {
-                libc::F_OFD_SETLK
-            } else {
-                lock.host_cmd
-            }
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-        {
-            lock.host_cmd
-        }
-    };
-    let rc = unsafe { libc::fcntl(host_fd.fd, command, &mut fl as *mut libc::flock) };
-    match rc.host_syscall_errno() {
-        Ok(_) => BlockingRecordLockStep::Done(DispatchOutcome::Returned { value: 0 }),
-        Err(errno) if errno == LINUX_EAGAIN || errno == crate::linux_abi::LINUX_EACCES => {
-            BlockingRecordLockStep::Wait
-        }
+    match lock.logical.try_acquire() {
+        Ok(()) => BlockingRecordLockStep::Done(DispatchOutcome::Returned { value: 0 }),
+        Err(errno) if errno == LINUX_EAGAIN => BlockingRecordLockStep::Wait,
         Err(errno) => BlockingRecordLockStep::Done(DispatchOutcome::Errno { errno }),
     }
 }
@@ -2512,10 +2423,6 @@ pub struct SyscallDispatcher {
     /// Linux/host page geometry selected for this run. Default dispatch stays
     /// 4 KiB Linux pages; native-only lanes can override before first syscall.
     page_geometry: crate::page_profile::PageGeometry,
-    /// Backend selected for this process. In addition to signal-wake routing,
-    /// execve staging consults this to preserve backend-specific image policy
-    /// (HvPatch must repatch replacement text before internal HVF pages exist).
-    execution_backend: crate::page_profile::ExecutionBackend,
     /// Set by syscall handlers that make process-directed async signal delivery
     /// observable while guest userspace is spinning. The threaded runtime drains
     /// this after completing the syscall and starts the signal pump before
@@ -3933,7 +3840,6 @@ impl SyscallDispatcher {
             mqueue: Arc::clone(&self.mqueue),
             network: Arc::clone(&self.network),
             page_geometry: self.page_geometry,
-            execution_backend: self.execution_backend,
             signal_pump_requested: std::sync::atomic::AtomicBool::new(false),
             async_signal_wake_owner: self.async_signal_wake_owner,
             exec_host_fs_fallback: self.exec_host_fs_fallback,
@@ -4054,7 +3960,6 @@ impl SyscallDispatcher {
                 linux_page_size: crate::page_profile::DEFAULT_LINUX_PAGE_SIZE,
                 native_profile: None,
             },
-            execution_backend: crate::page_profile::ExecutionBackend::HvPatch,
             signal_pump_requested: std::sync::atomic::AtomicBool::new(false),
             async_signal_wake_owner: AsyncSignalWakeOwner::SignalPump,
             // Default: bare run-elf boot — allow the host-fs execve fallback.
@@ -4178,17 +4083,6 @@ impl SyscallDispatcher {
 
     pub(crate) fn set_page_geometry(&mut self, page_geometry: crate::page_profile::PageGeometry) {
         self.page_geometry = page_geometry;
-    }
-
-    pub(crate) fn set_execution_backend(&mut self, backend: crate::page_profile::ExecutionBackend) {
-        self.execution_backend = backend;
-        self.async_signal_wake_owner = match backend {
-            crate::page_profile::ExecutionBackend::HvPatch => AsyncSignalWakeOwner::SignalPump,
-        };
-    }
-
-    pub(crate) fn execution_backend(&self) -> crate::page_profile::ExecutionBackend {
-        self.execution_backend
     }
 
     pub(crate) fn activate_file_authority(
@@ -4744,9 +4638,6 @@ impl SyscallDispatcher {
         vdso: bool,
         needs_at_base: bool,
     ) -> Option<String> {
-        if self.execution_backend != crate::page_profile::ExecutionBackend::HvPatch {
-            return None;
-        }
         use std::os::unix::fs::MetadataExt as _;
         let file = self.open_exec_host_file(path)?;
         let metadata = file.metadata().ok()?;
@@ -5636,7 +5527,7 @@ impl SyscallDispatcher {
                 let target =
                     crate::thread::ThreadId::from_guest_supplied_tid(request.arg(0) as i32);
                 let signum = request.arg(1);
-                if self.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch {
+                {
                     let info = (signum != 0).then(|| {
                         crate::linux_abi::LinuxSiginfo::kill(
                             signum as i32,
@@ -5647,15 +5538,13 @@ impl SyscallDispatcher {
                     });
                     self.hvpatch_specific_thread_signal(kernel, None, target.raw(), signum, info)
                         .unwrap_or_else(|| DispatchOutcome::errno(LINUX_ESRCH))
-                } else {
-                    dispatch_threaded_signal_route(tid, registry, target, signum)?
                 }
             }
             131 => {
                 let target =
                     crate::thread::ThreadId::from_guest_supplied_tid(request.arg(1) as i32);
                 let signum = request.arg(2);
-                if self.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch {
+                {
                     let info = (signum != 0).then(|| {
                         crate::linux_abi::LinuxSiginfo::kill(
                             signum as i32,
@@ -5672,8 +5561,6 @@ impl SyscallDispatcher {
                         info,
                     )
                     .unwrap_or_else(|| DispatchOutcome::errno(LINUX_ESRCH))
-                } else {
-                    dispatch_threaded_signal_route(tid, registry, target, signum)?
                 }
             }
             178 => DispatchOutcome::Returned {
@@ -6623,30 +6510,6 @@ pub(super) fn dispatch_futex_waitv_args(
     }
 }
 
-fn dispatch_threaded_signal_route(
-    caller: crate::thread::ThreadId,
-    registry: &crate::thread::ThreadRegistry,
-    target: crate::thread::ThreadId,
-    signum: u64,
-) -> Option<DispatchOutcome> {
-    if signum > LINUX_MAX_SIGNUM {
-        return Some(DispatchOutcome::Errno {
-            errno: LINUX_EINVAL,
-        });
-    }
-    if caller == target {
-        return None;
-    }
-    if registry.is_live(target) {
-        return Some(DispatchOutcome::SignalThread {
-            tid: target,
-            signum: signum as i32,
-            kernel_target: None,
-        });
-    }
-    None
-}
-
 /// Type-safe write for any Linux UAPI struct that implements
 /// [`KernelAbi`]. Writes EXACTLY `T::ABI_SIZE` bytes — the size the
 /// Linux kernel itself uses on the wire. The compiler refuses to pass
@@ -7346,21 +7209,19 @@ impl SyscallDispatcher {
         &self,
         context: &crate::kernel::KernelContext,
     ) -> Option<crate::vfs::SyntheticProcIdentity> {
-        (self.execution_backend == crate::page_profile::ExecutionBackend::HvPatch)
-            .then_some(())
-            .and_then(|()| {
-                let task = context.task();
-                let identity = context.kernel().task_identity(task.key().id).ok()?;
-                Some(crate::vfs::SyntheticProcIdentity {
-                    pid: identity.task.id.raw() as u32,
-                    tid: context.thread().key().tid.raw() as u32,
-                    ppid: identity.parent.map_or(0, |parent| parent.id.raw() as u32),
-                    pgrp: identity.process_group.raw() as u32,
-                    session: identity.session.raw() as u32,
-                    user_cpu_us: task.self_cpu_us(),
-                    system_cpu_us: task.self_system_cpu_us(),
-                })
+        Some(()).and_then(|()| {
+            let task = context.task();
+            let identity = context.kernel().task_identity(task.key().id).ok()?;
+            Some(crate::vfs::SyntheticProcIdentity {
+                pid: identity.task.id.raw() as u32,
+                tid: context.thread().key().tid.raw() as u32,
+                ppid: identity.parent.map_or(0, |parent| parent.id.raw() as u32),
+                pgrp: identity.process_group.raw() as u32,
+                session: identity.session.raw() as u32,
+                user_cpu_us: task.self_cpu_us(),
+                system_cpu_us: task.self_system_cpu_us(),
             })
+        })
     }
 
     /// Every LIVE Linux process, for the synthetic `/proc/<peer-pid>`
@@ -7430,9 +7291,6 @@ impl SyscallDispatcher {
         context: &crate::kernel::KernelContext,
         registry: Option<&crate::thread::ThreadRegistry>,
     ) -> Option<Vec<crate::vfs::SyntheticProcThread>> {
-        if self.execution_backend != crate::page_profile::ExecutionBackend::HvPatch {
-            return None;
-        }
         let registry = registry?;
         #[cfg(feature = "platform-macos")]
         let states: std::collections::HashMap<_, _> = registry

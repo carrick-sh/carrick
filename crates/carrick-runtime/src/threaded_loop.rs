@@ -157,32 +157,23 @@ where
 }
 
 fn resolve_hvpatch_setup<T, Retire>(
-    backend: crate::page_profile::ExecutionBackend,
     setup: Result<T, RuntimeError>,
     retire_vcpu: Retire,
 ) -> Result<T, RuntimeError>
 where
     Retire: FnOnce(),
 {
-    match setup {
-        Err(error) if backend == crate::page_profile::ExecutionBackend::HvPatch => {
-            retire_vcpu();
-            Err(error)
-        }
-        other => other,
+    if setup.is_err() {
+        retire_vcpu();
     }
+    setup
 }
 
-fn main_registry_id_for_backend(
-    backend: crate::page_profile::ExecutionBackend,
-    host_pid: i32,
-) -> crate::thread::ThreadId {
-    let tid = if backend == crate::page_profile::ExecutionBackend::HvPatch {
-        carrick_abi::LINUX_BOOTSTRAP_PID as i32
-    } else {
-        host_pid
-    };
-    crate::thread::ThreadId::from_guest_supplied_tid(tid)
+/// HVPatch is the only execution path, so the root registry identity is always
+/// the Linux bootstrap pid. It was previously selected against the backend, with
+/// the host pid as the retired lanes' answer.
+fn main_registry_id() -> crate::thread::ThreadId {
+    crate::thread::ThreadId::from_guest_supplied_tid(carrick_abi::LINUX_BOOTSTRAP_PID as i32)
 }
 
 pub fn run_threaded_loop<E, H>(
@@ -207,11 +198,7 @@ where
     // handlers + a termios-restore guard); the guard is held for the loop.
     let _loop_guard = host.pre_loop_setup();
 
-    let backend = dispatcher.execution_backend();
-    let host_pid = i32::try_from(std::process::id()).map_err(|_| {
-        RuntimeError::Configuration("host PID does not fit Linux thread identity".to_owned())
-    })?;
-    let main_tid: ThreadId = main_registry_id_for_backend(backend, host_pid);
+    let main_tid: ThreadId = main_registry_id();
     let registry = Arc::new(ThreadRegistry::new(main_tid));
     // Publish for /proc/<tid>/stat + /proc/<pid>/task/ synthesis.
     crate::thread::set_current_registry(Arc::clone(&registry));
@@ -276,7 +263,7 @@ where
     let signal_arrival: Arc<dyn carrick_hal::SignalArrival> =
         host_for_factory.make_signal_arrival(&kicker, &platform_futex);
     let setup = crate::hvpatch::initialize_root_process(&mut engine, &dispatcher);
-    let hvpatch_process = resolve_hvpatch_setup(backend, setup, || {
+    let hvpatch_process = resolve_hvpatch_setup(setup, || {
         // The outer HVPatch owner destroys the VM and records the terminal.
         // Retire only this already-created vCPU so teardown has one owner.
         engine.destroy_vcpu_on_thread_exit();
@@ -419,10 +406,8 @@ mod tests {
 
     #[test]
     fn hvpatch_main_registry_id_is_linux_init() {
-        let host_pid = 67_000;
         assert_eq!(
-            main_registry_id_for_backend(crate::page_profile::ExecutionBackend::HvPatch, host_pid)
-                .raw(),
+            main_registry_id().raw(),
             carrick_abi::LINUX_BOOTSTRAP_PID as i32,
         );
     }
@@ -525,7 +510,6 @@ mod tests {
     fn hvpatch_setup_failure_retires_only_the_created_vcpu_once() {
         let retire_count = std::cell::Cell::new(0_u32);
         let result = resolve_hvpatch_setup::<(), _>(
-            crate::page_profile::ExecutionBackend::HvPatch,
             Err(RuntimeError::Unsupported(
                 "deterministic post-vCPU setup failure".to_owned(),
             )),

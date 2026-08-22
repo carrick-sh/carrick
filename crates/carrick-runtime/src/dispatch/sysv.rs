@@ -2438,7 +2438,6 @@ impl SyscallDispatcher {
             // is the only real IPA authority. A hint-less attach still consumes
             // the legacy cursor because its offset selects a fresh guest VA.
             let Some(ipa) = crate::dispatch::mem::alloc_alias_ipa_for_publication(
-                this.execution_backend(),
                 map_len,
                 requested_va.is_some(),
             ) else {
@@ -2800,7 +2799,7 @@ impl SyscallDispatcher {
             let operator = this.identity_pid() as i32;
             let tid = cx.tid();
             let _block_state = (!flags.contains(MsgOpFlags::NOWAIT))
-                .then(|| SysvSemBlockStateGuard::new(sysv_run_state_task_pid(this, cx.kernel), tid));
+                .then(|| SysvSemBlockStateGuard::new(sysv_run_state_task_pid(cx.kernel), tid));
             let mut saw_would_block = false;
             loop {
                 match SysvIpcService::msgsnd(msqid, &creds, msg_type, &payload, operator) {
@@ -2872,7 +2871,7 @@ impl SyscallDispatcher {
             let operator = this.identity_pid() as i32;
             let tid = cx.tid();
             let _block_state = (!flags.contains(MsgOpFlags::NOWAIT))
-                .then(|| SysvSemBlockStateGuard::new(sysv_run_state_task_pid(this, cx.kernel), tid));
+                .then(|| SysvSemBlockStateGuard::new(sysv_run_state_task_pid(cx.kernel), tid));
             let mut saw_would_block = false;
             loop {
                 match SysvIpcService::msgrcv(cx, msqid, &creds, msgp.0, sz, msgtyp, flags, operator) {
@@ -3584,12 +3583,8 @@ struct SysvSemBlockStateGuard {
 /// peer resolves through `published_stat_char(process.key.id)` (the logical
 /// Linux pid), so the publisher must use that same domain via
 /// `publish_task_thread`. Mirrors `ThreadRuntimeState::publish_process_run_state`.
-fn sysv_run_state_task_pid(
-    this: &SyscallDispatcher,
-    context: &crate::kernel::KernelContext,
-) -> Option<i32> {
-    (this.execution_backend() == crate::page_profile::ExecutionBackend::HvPatch)
-        .then(|| context.task().key().id.raw())
+fn sysv_run_state_task_pid(context: &crate::kernel::KernelContext) -> Option<i32> {
+    Some(context.task().key().id.raw())
 }
 
 fn publish_sysv_block_run_state(
@@ -3826,7 +3821,7 @@ impl SyscallDispatcher {
             nsops,
             timeout,
             SemopWaitCtx {
-                task_pid: sysv_run_state_task_pid(self, cx.kernel),
+                task_pid: sysv_run_state_task_pid(cx.kernel),
                 wait_counts: &wait_counts,
                 interrupted: &interrupted,
                 completed: &completed,

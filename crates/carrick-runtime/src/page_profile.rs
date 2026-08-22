@@ -11,16 +11,8 @@ pub use carrick_dsr::page_geometry::{
     SubpageState, classify_host_page_state, decide_linux4k_on_16k_mapping,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExecutionBackend {
-    /// HVF execution with static text patched to enter in-guest syscall
-    /// islands. This lane is intentionally limited to macOS/AArch64.
-    HvPatch,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExecutionPlan {
-    pub backend: ExecutionBackend,
     pub page_geometry: PageGeometry,
     pub diagnostics: Vec<String>,
 }
@@ -97,7 +89,6 @@ fn resolve_execution_plan_for_request_for_host(
                 )));
             }
             Ok(ExecutionPlan {
-                backend: ExecutionBackend::HvPatch,
                 page_geometry: PageGeometry {
                     host_page_size: DEFAULT_LINUX_PAGE_SIZE,
                     linux_page_size: DEFAULT_LINUX_PAGE_SIZE,
@@ -174,7 +165,6 @@ mod tests {
         )
         .expect("macOS/AArch64 hvpatch plan");
 
-        assert_eq!(plan.backend, ExecutionBackend::HvPatch);
         assert_eq!(plan.page_geometry.host_page_size, DEFAULT_LINUX_PAGE_SIZE);
         assert_eq!(plan.page_geometry.linux_page_size, DEFAULT_LINUX_PAGE_SIZE);
         assert_eq!(plan.page_geometry.native_profile, None);

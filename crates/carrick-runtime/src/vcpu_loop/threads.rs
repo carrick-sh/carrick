@@ -966,13 +966,6 @@ where
         let child_platform_futex_factory = Arc::clone(&self.platform_futex_factory);
         let child_threads = Arc::clone(&self.threads);
         let child_kicker = Arc::clone(&self.kicker);
-        // Cleanup handles kept past the move into run_vcpu_until_exit: if the
-        // sibling loop returns Err, its normal thread-exit cleanup never ran, so
-        // we MUST still drop it from the registry + kicker here. Otherwise it
-        // lingers as a phantom live thread.
-        let cleanup_registry = Arc::clone(&self.registry);
-        let cleanup_kicker = Arc::clone(&self.kicker);
-        let cleanup_kernel = Arc::clone(kernel);
         let max_traps = self.max_traps;
         let trace = self.trace;
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -1224,50 +1217,20 @@ where
                                     exit_code = result.exit_code,
                                     "sibling reached process exit publication"
                                 );
-                                if child_kernel.dispatcher.execution_backend()
-                                    == crate::page_profile::ExecutionBackend::HvPatch
-                                {
-                                    // The vCPU loop's terminal owner already ran
-                                    // the unified child/root process finalizer.
-                                    return;
-                                }
-                                let _ = std::io::Write::flush(&mut std::io::stdout());
-                                let _ = std::io::Write::flush(&mut std::io::stderr());
-                                let _ = unsafe {
-                                    libc::write(
-                                        1,
-                                        result.stdout.as_ptr() as *const _,
-                                        result.stdout.len(),
-                                    )
-                                };
-                                let _ = unsafe {
-                                    libc::write(
-                                        2,
-                                        result.stderr.as_ptr() as *const _,
-                                        result.stderr.len(),
-                                    )
-                                };
-                                unsafe { libc::_exit(result.exit_code) };
+                                // The vCPU loop's terminal owner already ran the
+                                // unified child/root process finalizer. The
+                                // retired lanes flushed and `_exit`ed the host
+                                // process here, because one guest process was
+                                // one host process.
                             }
                             Ok(VcpuLoopOutcome::TrapLimit(_)) | Ok(VcpuLoopOutcome::ThreadDone) => {
                             }
                             Err(e) => {
                                 tracing::error!(tid = tid.raw(), error = %e, "thread sibling vCPU loop failed");
-                                if child_kernel.dispatcher.execution_backend()
-                                    == crate::page_profile::ExecutionBackend::HvPatch
-                                {
-                                    // Unified HVPatch terminal cleanup owns the
-                                    // registry, Kernel task, and backend state.
-                                    return;
-                                }
-                                // Exit-cleanup gate (see handle_thread_exit).
-                                let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
-                                cleanup_registry.exit(tid);
-                                cleanup_kicker.unregister(tid);
-                                crate::host_signal::forget_thread(tid.raw());
-                                let _ = cleanup_kernel
-                                    .dispatcher
-                                    .exit_one_task_thread(linux_tid);
+                                // Unified HVPatch terminal cleanup owns the
+                                // registry, Kernel task, and backend state, so
+                                // this arm no longer runs its own exit-cleanup
+                                // gate over the registry/kicker/Kernel task.
                             }
                         }
                     }
