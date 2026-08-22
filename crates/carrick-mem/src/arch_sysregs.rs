@@ -71,6 +71,31 @@ pub const TCR_EL1_BOOTSTRAP: u64 = {
 /// is NOT part of this shared constant.
 pub const SCTLR_EL1_BOOTSTRAP: u64 = (1 << 2) | (1 << 12) | (1 << 14) | (1 << 15) | (1 << 26) | 1;
 
+/// `SCTLR_EL1` bits the architecture RESERVES AS ONE on the profiles carrick
+/// runs: `ITD`(7) and `SED`(8) — AArch32 at EL0 not implemented — and
+/// `nTLSMD`(28) and `LSMAOE`(29) — FEAT_LSMAOC not implemented.
+///
+/// Carrick never programs these and has no opinion about them, but a vCPU reads
+/// them back SET. [`SCTLR_EL1_BOOTSTRAP`] is the list of bits carrick programs,
+/// not a readback value, so comparing a live register against it for equality
+/// can never hold — measured on Apple HVF as `0x3400d185` where the constant is
+/// `0x0400d005`. Use [`is_bootstrap_sctlr_el1`] to ask whether a readback is
+/// still the neutral bootstrap configuration.
+pub const SCTLR_EL1_RES1: u64 = (1 << 7) | (1 << 8) | (1 << 28) | (1 << 29);
+
+/// Is `readback` still the neutral bootstrap `SCTLR_EL1`, as HARDWARE reports
+/// it? Every programmed bit must be present and no other functional bit may be,
+/// with the architecturally [`SCTLR_EL1_RES1`] bits excluded from both
+/// directions of the comparison.
+///
+/// Note for the KVM backend: it additionally ORs in `SPAN`(23) as documented
+/// above, which this predicate does NOT tolerate. That is unchanged from the
+/// equality it replaces, which did not tolerate it either.
+#[must_use]
+pub const fn is_bootstrap_sctlr_el1(readback: u64) -> bool {
+    readback & !SCTLR_EL1_RES1 == SCTLR_EL1_BOOTSTRAP & !SCTLR_EL1_RES1
+}
+
 /// `CPACR_EL1` bootstrap value — `FPEN=0b11` (no FP/SIMD trap at EL0). Without
 /// this, the guest libc's first NEON `memset`/`dup` faults on startup.
 pub const CPACR_EL1_BOOTSTRAP: u64 = 0x3 << 20;
