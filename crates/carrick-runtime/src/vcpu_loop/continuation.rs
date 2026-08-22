@@ -803,15 +803,24 @@ impl BlockedContinuation {
                     Some(pid) => {
                         let id = crate::kernel::TaskId::from_abi_positive(pid)
                             .map_err(|_| ContinuationBuildError::StaleChildSelector)?;
-                        let identity = kernel
+                        let kernel = kernel
                             .as_ref()
-                            .ok_or(ContinuationBuildError::StaleChildSelector)?
-                            .task_identity(id)
-                            .map_err(|_| ContinuationBuildError::StaleChildSelector)?;
-                        if identity.parent != Some(parent_task) {
+                            .ok_or(ContinuationBuildError::StaleChildSelector)?;
+                        // A child may finish exiting and transition from `state.tasks` to
+                        // `state.zombies` in the race window between wait4 returning StillRunning
+                        // and continuation enrollment; checking `zombie(id)` prevents a spurious
+                        // StaleChildSelector error when building WaitOnHvpatchChild.
+                        let (child_key, parent) = if let Ok(identity) = kernel.task_identity(id) {
+                            (identity.task, identity.parent)
+                        } else if let Some(zombie) = kernel.registry().zombie(id) {
+                            (zombie.key, zombie.parent)
+                        } else {
+                            return Err(ContinuationBuildError::StaleChildSelector);
+                        };
+                        if parent != Some(parent_task) {
                             return Err(ContinuationBuildError::StaleChildSelector);
                         }
-                        ChildSelector::Exact(identity.task)
+                        ChildSelector::Exact(child_key)
                     }
                 };
                 Self::WaitOnHvpatchChild(new_state(

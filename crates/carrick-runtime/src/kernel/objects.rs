@@ -3589,16 +3589,6 @@ impl Task {
         self.resume_from_job_control(false)
     }
 
-    pub(crate) fn wait_until_job_control_resumed(&self) -> bool {
-        let mut state = self.job_control.lock();
-        let mut waited = false;
-        while state.stopped_by.is_some() {
-            waited = true;
-            self.job_control_changed.wait(&mut state);
-        }
-        waited
-    }
-
     pub(super) fn waitable_job_control_event(
         &self,
         include_stopped: bool,
