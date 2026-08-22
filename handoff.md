@@ -142,6 +142,45 @@ spectacularly "slow" because it sits on its deadline. So this is almost
 certainly the same fork/exec teardown defect family as criterion 2, seen through
 the gate instead of through one probe.
 
+**What sampling and `carrick debug` already say — do not re-derive this.**
+
+Sampled the gate's own processes (`sample <pid>`), which first requires knowing
+that a raw HVPatch run is THREE processes and only one of them is interesting:
+an NsSupervisor idle in `kevent`, a detached FileAuthority helper idle in
+`poll`, and the VM carrier in `vcpu_loop::executor::run_executor_loop`. Sampling
+the wrong one shows a healthy idle server and proves nothing.
+
+On carriers alive 38-45 seconds, across three of them:
+
+- **`hv_vcpu_run` appears ZERO times.** No thread is executing guest code at all.
+- All nine executor threads are parked in
+  `run_executor_loop -> executor_worker -> Scheduler::take -> take_row ->
+  changed.wait()`, an UNTIMED condvar wait for a runnable thread.
+- 13 threads in `__psynch_cvwait`, the reactor threads in `poll`/`kevent`.
+
+So the slow tail is not slow guest work — it is a carrier with nothing runnable,
+idling for tens of seconds. That is a wake/scheduling or teardown-completion
+question, which is the same family as the criterion 2 defects above, and it is
+consistent with the gate having regressed from under ten minutes.
+
+**`carrick debug hvpatch-kernel` refuses on EVERY live run, and its refusal is
+itself a finding:**
+
+    Error: runtime refused the kernel debug request: kernel snapshot invariant
+    violated: mapping frame/mm/length join is missing
+
+Reproduced on four consecutive gate runs and for every requested table (the
+validator runs over the whole graph regardless of `--table`). The check is
+`crates/carrick-runtime/src/kernel/snapshot.rs:1663`, and like every other
+failure in this campaign it collapses THREE distinct causes into one message:
+the mapping's `mm` is not in the snapshot, the frame's alias list does not
+contain the mapping, or the frame's length disagrees with the mapping's. Split
+that condition so it names which — that is the single cheapest next step, and
+this whole session's evidence is that naming the clause turns these into
+one-rebuild diagnoses. It also means the live kernel graph is currently
+UNREADABLE, so the best instrument for the idle-carrier question is unavailable
+until it is fixed.
+
 **Attribute it with a controlled A/B, and do not run the build concurrently with
 a conformance measurement** — build the pre-campaign binary in a worktree under
 `.worktrees/`, then time the SAME probe set on each binary, serially. The
