@@ -1166,8 +1166,8 @@ where
                         // The sibling's lifetime in-guest flag: created ONCE
                         // here, published with this bootstrap registration so
                         // the sibling is kickable before its loop starts, then
-                        // moved into `run_vcpu_until_exit` so the loop stores
-                        // into the very cell the kicker holds.
+                        // moved into the logical job so the loop stores into
+                        // the very cell the kicker holds.
                         let sibling_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
                         let handle: Box<dyn carrick_hal::VcpuKickDyn> =
                             Box::new(child_engine.kick_handle());
@@ -1178,7 +1178,7 @@ where
                             eprintln!("[sibling tid#{tid}] vCPU built, pc={pc:#x}, entering loop");
                         }
                         let logical_threads = Arc::clone(&child_threads);
-                        let launch = launch_vcpu_until_exit(
+                        let launch = launch_persistent_hvpatch_job(
                             Arc::clone(&child_kernel),
                             child_engine,
                             child_registry,

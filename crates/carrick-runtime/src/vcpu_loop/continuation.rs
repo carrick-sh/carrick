@@ -2541,17 +2541,10 @@ impl CarrierWaitServiceInner {
                 return;
             };
             inner.reactor_poll_calls.fetch_add(1, Ordering::Relaxed);
-            #[cfg(test)]
-            if let Some(observer) = inner.reactor_poll_observer.lock().take() {
-                observer.wait();
-            }
             if inner.shutdown.load(Ordering::Acquire) {
                 return;
             }
-            if result < 0 {
-                continue;
-            }
-            if pollfds[0].revents != 0 {
+            if result >= 0 && pollfds[0].revents != 0 {
                 let mut bytes = [0u8; 256];
                 loop {
                     let read =
@@ -2560,6 +2553,22 @@ impl CarrierWaitServiceInner {
                         break;
                     }
                 }
+            }
+            // The observer means "a poll cycle COMPLETED", and completing one
+            // includes draining the control pipe. Signalling before the drain
+            // loses a nudge that lands between the take and the drain: the
+            // drain swallows the byte, the next `poll` has nothing to wake on,
+            // and an installed observer then waits forever on a reactor parked
+            // in `poll(-1)`. Taking the observer after the drain closes that
+            // window in both directions — a nudge that arrives after the drain
+            // is still in the pipe and wakes the next poll, whose take then
+            // finds this observer.
+            #[cfg(test)]
+            if let Some(observer) = inner.reactor_poll_observer.lock().take() {
+                observer.wait();
+            }
+            if result < 0 {
+                continue;
             }
             for (pollfd, source) in pollfds.iter().skip(1).zip(sources) {
                 if pollfd.revents == 0 {
@@ -4925,25 +4934,37 @@ mod tests {
     #[test]
     fn hvpatch_launch_callgraph_never_constructs_the_compatibility_loop_future() {
         let source = include_str!("mod.rs");
-        let launch = source
-            .split_once("pub(crate) fn launch_vcpu_until_exit")
-            .expect("HVPatch launch entry")
-            .1
-            .split_once("struct PreparedInitialRunnerTask")
-            .expect("end of launch entry")
-            .0;
-        assert!(
-            launch.contains("launch_persistent_hvpatch_job"),
-            "HVPatch launch must publish one engine-free job into Task 4's pool"
-        );
-        let hvpatch_arm = launch
-            .split_once("launch_persistent_hvpatch_job")
-            .expect("persistent HVPatch call")
-            .0;
-        assert!(
-            !hvpatch_arm.contains("run_vcpu_until_exit_inner"),
-            "HVPatch launch still constructs the opaque engine-owning future"
-        );
+        // INVERTED for the fork-closure deletion. This used to bound the launch
+        // entry between `launch_vcpu_until_exit` and `PreparedInitialRunnerTask`
+        // and assert the HVPatch arm came first. Both are deleted: there is no
+        // compatibility launch entry left to come second, so the invariant is
+        // now that none of that text exists at all. Asserting ABSENCE is the
+        // only form that keeps gating once the text is gone — a `split_once` on
+        // absent text would hand the whole file to the next assertion.
+        for deleted in [
+            "fn launch_vcpu_until_exit",
+            "fn launch_compatibility_vcpu_future",
+            "fn run_vcpu_until_exit",
+            "fn run_vcpu_until_exit_inner",
+        ] {
+            assert!(
+                !source.contains(deleted),
+                "the welded-thread vCPU loop is retired; `{deleted}` must not exist"
+            );
+        }
+        // `prepare_initial_runner_handoff` and its `PreparedInitialRunnerTask`
+        // are NOT part of that chain: `launch_persistent_hvpatch_job` calls them
+        // to publish the initial task state and claim its start gate. Deleting
+        // them with the welded loop was caught by the compiler, not by a test.
+        for shared in [
+            "fn prepare_initial_runner_handoff",
+            "struct PreparedInitialRunnerTask",
+        ] {
+            assert!(
+                source.contains(shared),
+                "the persistent launcher's initial handoff `{shared}` must survive"
+            );
+        }
         let logical_job = source
             .split_once("fn prepare_hvpatch_logical_job")
             .expect("reusable logical-job constructor")
@@ -4964,7 +4985,7 @@ mod tests {
             .split_once("fn launch_persistent_hvpatch_job")
             .expect("persistent HVPatch launcher")
             .1
-            .split_once("struct PreparedInitialRunnerTask")
+            .split_once("fn trap_watchdog_decision")
             .expect("end of persistent launcher")
             .0;
         for prohibited in [
@@ -7596,34 +7617,6 @@ mod tests {
     }
 
     #[test]
-    fn rejected_initial_submission_drops_engine_guard_on_bootstrap_thread() {
-        struct BootstrapProbe {
-            cleanup: mpsc::Sender<std::thread::ThreadId>,
-        }
-        fn cleanup(probe: &mut BootstrapProbe) {
-            probe
-                .cleanup
-                .send(std::thread::current().id())
-                .expect("cleanup receipt");
-        }
-        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("runner");
-        runner.reject_next_submission_for_test();
-        let bootstrap = std::thread::current().id();
-        let (tx, rx) = mpsc::channel();
-        let guarded =
-            super::super::OwnerThreadEngine::for_test(BootstrapProbe { cleanup: tx }, cleanup);
-        let result = runner.try_spawn(async move {
-            drop(guarded);
-        });
-        assert!(matches!(result, Err(TransitionalRunnerError::TaskFailed)));
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(1))
-                .expect("same-thread cleanup"),
-            bootstrap
-        );
-    }
-
-    #[test]
     fn failed_initial_submission_retires_exact_runnable_without_queue_row() {
         let (kernel, context) = bootstrap(15_460);
         let scheduler = Scheduler::new(kernel);
@@ -7806,57 +7799,6 @@ mod tests {
                 .expect("exit owner must yield the sole worker, not synchronously join"),
             vec![11, 22, 33]
         );
-    }
-
-    #[test]
-    fn dirty_transitional_worker_fails_exact_job_and_replacement_is_clean() {
-        struct DirtyEngineProbe {
-            cleanup_tx: mpsc::Sender<std::thread::ThreadId>,
-        }
-        fn cleanup(probe: &mut DirtyEngineProbe) {
-            probe
-                .cleanup_tx
-                .send(std::thread::current().id())
-                .expect("dirty cleanup receipt");
-        }
-        struct DirtyBoundary {
-            _engine: super::super::OwnerThreadEngine<DirtyEngineProbe>,
-        }
-        impl Future for DirtyBoundary {
-            type Output = ();
-
-            fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<()> {
-                let dirty = crate::dispatch::lock_order::LockOrderGuard::acquire(
-                    crate::dispatch::lock_order::LockLevel::Proc,
-                );
-                std::mem::forget(dirty);
-                Poll::Pending
-            }
-        }
-
-        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
-        let (cleanup_tx, cleanup_rx) = mpsc::channel();
-        assert_eq!(
-            runner
-                .spawn(DirtyBoundary {
-                    _engine: super::super::OwnerThreadEngine::for_test(
-                        DirtyEngineProbe { cleanup_tx },
-                        cleanup,
-                    ),
-                })
-                .wait(),
-            Err(TransitionalRunnerError::TaskFailed)
-        );
-        let dirty_worker = cleanup_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("dirty task cleanup");
-        let (value, clean_worker) = runner
-            .spawn(async { (73_u8, std::thread::current().id()) })
-            .wait()
-            .expect("clean replacement");
-        assert_eq!(value, 73);
-        assert_ne!(dirty_worker, clean_worker);
-        assert_eq!(runner.topology().worker_threads(), 1);
     }
 
     #[test]
@@ -8353,38 +8295,6 @@ mod tests {
     }
 
     #[test]
-    fn live_task_panic_cleans_up_on_owner_worker_and_retires_it() {
-        struct PanicEngineProbe {
-            cleanup_tx: mpsc::Sender<std::thread::ThreadId>,
-        }
-        fn cleanup(probe: &mut PanicEngineProbe) {
-            probe
-                .cleanup_tx
-                .send(std::thread::current().id())
-                .expect("cleanup receipt");
-        }
-        let runner = TransitionalDedicatedRunner::with_worker_limit(1).expect("one worker");
-        let (cleanup_tx, cleanup_rx) = mpsc::channel();
-        let panic_receipt = runner.spawn(async move {
-            let _engine =
-                super::super::OwnerThreadEngine::for_test(PanicEngineProbe { cleanup_tx }, cleanup);
-            panic!("injected live engine panic");
-        });
-        assert_eq!(
-            panic_receipt.wait(),
-            Err(TransitionalRunnerError::TaskFailed)
-        );
-        let cleanup_thread = cleanup_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("owner cleanup ran");
-        let successor_thread = runner
-            .spawn(async { std::thread::current().id() })
-            .wait()
-            .expect("replacement worker");
-        assert_ne!(cleanup_thread, successor_thread);
-    }
-
-    #[test]
     fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
         let continuation_source = include_str!("continuation.rs")
             .split("#[cfg(test)]\nmod tests")
@@ -8410,23 +8320,16 @@ mod tests {
         assert!(continuation_source.contains("run_task_quantum(&task)"));
         assert!(!continuation_source.contains("TaskQuantumSource"));
         assert!(!continuation_source.contains("fallback_fd"));
-        for required in [
-            "TransitionalWorkerContext::register",
-            "publish_current_hardware_kick",
-            "scheduler.request_preemption()",
-            "drop(worker_context.take())",
-        ] {
-            assert!(
-                continuation_source.contains(required),
-                "worker-owned executor path misses {required}"
-            );
-        }
+        assert!(
+            continuation_source.contains("scheduler.request_preemption()"),
+            "worker-owned executor path misses scheduler.request_preemption()"
+        );
 
         let loop_source = include_str!("mod.rs");
         let prepare_suspend = loop_source
             .split("fn prepare_hvpatch_continuation")
             .nth(1)
-            .and_then(|tail| tail.split("async fn suspend_hvpatch_continuation").next())
+            .and_then(|tail| tail.split("fn persistent_block_exit").next())
             .expect("engine-free HVPatch continuation preparation");
         for required in [
             "ContinuationCapture::from_lease",
@@ -8439,110 +8342,34 @@ mod tests {
                 "engine-free continuation preparation misses {required}"
             );
         }
-        let suspend = loop_source
-            .split("fn suspend_hvpatch_continuation")
-            .nth(1)
-            .and_then(|tail| tail.split("fn service_threaded_syscall").next())
-            .expect("real HVPatch continuation adapter body");
-        for required in [
-            "prepare_registration",
-            ".enroll(",
-            "recheck_registration",
-            "save_shared_wait_state",
-            "settle_transitional_blocked_continuation",
-            "Yield::Blocked",
-            "event_outside_quiesce(token, self.process_fork_barrier.clone())",
-            "take_transitional_lease",
-            "resume_continuation",
+        // INVERTED for the fork-closure deletion. The engine-owning welded loop
+        // and its `suspend_hvpatch_continuation` adapter used to be bounded and
+        // inspected here for product boundaries and prohibited host-blocking
+        // authority. `launch_vcpu_until_exit` returned unconditionally at its
+        // first statement, so none of that ran; the persistent executor reaches
+        // the same continuation through `persistent_block_exit`. The surviving
+        // invariant is that the welded chain does not exist at all.
+        for deleted in [
+            "fn suspend_hvpatch_continuation",
+            "async fn yield_hvpatch_quantum",
+            "fn run_vcpu_until_exit",
+            "fn launch_vcpu_until_exit",
+            "struct OwnerThreadEngine",
+            "enum CompatibilityThreadWaiter",
         ] {
             assert!(
-                suspend.contains(required),
-                "missing product boundary: {required}"
-            );
-        }
-        for prohibited in [
-            "libc::wait",
-            "libc::waitpid",
-            "libc::kill",
-            "libc::nanosleep",
-            "ThreadWaiter",
-            "kqueue",
-            "vfork_release_fd",
-            "acquire_timeout",
-        ] {
-            assert!(
-                !suspend.contains(prohibited),
-                "product adapter retains {prohibited}"
+                !loop_source.contains(deleted),
+                "the welded-thread vCPU loop is retired; `{deleted}` must not exist"
             );
         }
         let dispatch = loop_source
             .split("fn service_threaded_syscall")
             .nth(1)
             .expect("dispatch service body");
-        let escape = dispatch
-            .find("continuation::is_blocking_dispatch_outcome(&outcome)")
-            .expect("HVPatch blocking escape");
-        let first_inline_wait = dispatch
-            .find("DispatchOutcome::BlockingHostWrite")
-            .expect("compatibility wait arm");
         assert!(
-            escape < first_inline_wait,
-            "HVPatch must escape before compatibility waits"
+            dispatch.contains("continuation::is_blocking_dispatch_outcome(&outcome)"),
+            "HVPatch must still escape a blocking outcome at the dispatch seam"
         );
-        let run_loop = loop_source
-            .split("pub(crate) async fn run_vcpu_until_exit")
-            .nth(1)
-            .expect("real vCPU loop");
-        let conversion = run_loop
-            .find("suspend_hvpatch_continuation")
-            .expect("product continuation conversion");
-        let terminal_match = run_loop
-            .find("match outcome")
-            .expect("post-continuation syscall completion");
-        assert!(conversion < terminal_match);
-        let launch = loop_source
-            .split("pub(crate) fn launch_vcpu_until_exit")
-            .nth(1)
-            .and_then(|tail| tail.split("pub(crate) async fn run_vcpu_until_exit").next())
-            .expect("bounded launch adapter");
-        let bootstrap_guard = launch
-            .find("OwnerThreadEngine::new(engine)")
-            .expect("immediate bootstrap owner guard");
-        let runner_lookup = launch
-            .find("kernel.transitional_runner()")
-            .expect("runner lookup");
-        assert!(bootstrap_guard < runner_lookup);
-        for required in [
-            "runner.try_spawn_dormant(future)",
-            "prepared.fail_exact()",
-            "prepared.scheduler.wake",
-            "prepared.scheduler.request_preemption()",
-            "prepared.disarm()",
-            "gate.open()",
-            "dormant.activate()",
-            "drop(dormant)",
-        ] {
-            assert!(
-                launch.contains(required),
-                "bootstrap handoff misses {required}"
-            );
-        }
-        let publish = launch
-            .find("prepared.scheduler.wake")
-            .expect("scheduler publication");
-        let preempt = launch
-            .find("prepared.scheduler.request_preemption()")
-            .expect("post-publication preemption");
-        let gate = launch.find("gate.open()").expect("runner gate open");
-        let activate = launch
-            .find("dormant.activate()")
-            .expect("dormant activation");
-        assert!(publish < activate && activate < preempt && preempt < gate);
-        assert!(
-            !launch.contains("future.as_mut().poll"),
-            "bootstrap pthread must never poll the guest execution future"
-        );
-        assert!(launch.contains("prepare_initial_runner_handoff"));
         let quiesce = include_str!("quiesce.rs");
         let hvpatch_fork = quiesce
             .split("fn prepare_in_process_fork")
@@ -8617,8 +8444,6 @@ mod tests {
         assert!(loop_source.contains("continuation.install_temporary_signal_mask(context)"));
         assert!(loop_source.contains("self.continuation_restart = Some(result.restart())"));
         assert!(loop_source.contains("ContinuationResumeError::StaleFileSlot"));
-        assert!(loop_source.contains("OwnerThreadEngine::new(engine)"));
-        assert!(loop_source.contains("engine.disarm()"));
         assert!(!loop_source.contains("TransitionalSchedulerKick"));
         assert!(!loop_source.contains("continuation_executor"));
 

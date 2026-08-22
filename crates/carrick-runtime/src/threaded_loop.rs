@@ -344,7 +344,7 @@ where
         host_for_factory.make_timer_delivery(Arc::clone(&kicker), main_tid),
     );
 
-    let outcome = crate::vcpu_loop::launch_vcpu_until_exit(
+    let outcome = crate::vcpu_loop::launch_persistent_hvpatch_job(
         Arc::clone(&kernel),
         engine,
         Arc::clone(&registry),
