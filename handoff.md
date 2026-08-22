@@ -140,20 +140,73 @@ observable. `forkfiletable` 9 lines, `mqnotifycrossproc` 16, `clone3args` 14.
 compiles were live reported 7/15 aborts and 38 lines; uncontended it is 5/15 and
 55 twice over. Quote an uncontended sample.
 
-### The NEXT defect, already isolated
+### The NEXT defect — ROOT-CAUSED, fix deliberately not attempted
 
-The eight probes that no longer abort fail later and reportably:
+`stamp_identity_page` in `bootstrap_hvpatch_process_child` fails for every
+forked child. The reported error is a triple lie and cost a whole investigation:
 
-    HVPatch process job failed error=trap engine failed: hypervisor operation
-    failed: process child identity bootstrap: guest memory read is out of bounds
+    process child identity bootstrap: guest memory read is out of bounds
     at 0x2d001e4000 for 4 bytes
 
-That is `stamp_identity_page` inside `bootstrap_hvpatch_process_child`
-(`vcpu_loop/mod.rs:2941`). `0x2d001e4000` is a high address with the shape of a
-stage-1 / global-frame IPA rather than the child's semantic guest VA — i.e. the
-domain confusion `AGENTS.md` names ("never feed one domain back into a lookup
-for another; authenticate through the live stage-1 translation and the exact
-current owner generation"). Start there.
+It is a WRITE, not a read (`MemoryError::OutOfBounds`'s Display says "read" and
+`write_bytes` returns it too). `0x2d001e4000` is not out of bounds — it is
+`LINUX_IDENTITY_PAGE_BASE`, a compile-time constant. And nothing is missing: a
+region covers it exactly.
+
+`cfa1c76b` makes the real reason permanent. On `forkcow`, under
+`RUST_LOG=carrick_vmm_hvf=error`:
+
+    guest write rejected: a region covers this VA but failed the global-frame
+    owner-liveness check va="0x2d001e4000" len=4
+    region="[0x2d001e4000..0x2d001e8000)" physical_ipa="0x9b00408000"
+    reusable_global_frame=true owns_host_mapping=false owns_stage2_lease=false
+    owner_generation=0
+
+**The chain, each step measured, not inferred:**
+
+1. The write reaches `HvfVmState::validate_guest_write_range`, which runs BEFORE
+   the copy loop and uses the IMMUTABLE `mapping_for_range`. Four other paths
+   return this same error and were each instrumented and cleared: the
+   `write_bytes` PROT_NONE gate, the `write_bytes_raw` write-denied gate,
+   `syscall_buffer_chunk`, and the copy loop's own `mapping_for_range_mut`.
+2. `mapping_for_range` finds the covering region but filters it as not live:
+   `persistent_vm_lifecycle` is true and the extent is a reusable global frame,
+   so liveness requires `global_frame_region_owner_matches`.
+3. That fails. The child's identity page is an INHERITED, non-owning region — no
+   `host_mapping`, no `stage2_lease` — so `locally_owned` is false and it falls
+   through to `global_frame_host_owner_matches`.
+4. There, no global-frame owner is registered for `(0x9b00408000, 0x4000)` at
+   all, so `owner_host_addr == 0` and the FIRST conjunct fails:
+
+       owner_host_addr != 0 && owner_host_addr == host_addr
+           && (generation == 0 || owner_generation == generation)
+
+   The row carries `generation = 0`, and the `generation == 0` escape is
+   documented as keeping "the historical pointer-only behaviour" for early rows
+   precisely because tightening them "unmapped the syscall mailbox and killed
+   the guest outright". **That escape is unreachable when no owner is
+   registered.** The comment's stated intent and the code disagree.
+
+**Why the fix was not attempted.** This is the predicate whose own comment says
+a wrong change killed the guest outright, and loosening it silently re-validates
+genuinely stale mappings — the exact global-frame-IPA-versus-owner-generation
+domain hazard `AGENTS.md` names. Decide it with evidence at the start of a
+session, not the end of one.
+
+**The two candidate readings to discriminate:**
+
+- (a) The predicate is wrong: an inherited non-owning row with `generation = 0`
+  and no registered owner is legitimate (that is what an inherited kernel
+  mapping IS), and the `generation == 0` escape should be reachable —
+  i.e. the `owner_host_addr != 0` conjunct is too strong for that case.
+- (b) The publication is wrong: a forked child's kernel-region rows should own
+  or re-register their global-frame extent, and `generation = 0` with no owner
+  means fork skipped a publication step.
+
+The parent succeeds at the identical stamp twice before the child fails once
+(`IDSTAMPMARKER` evidence), so whatever the parent has and the child lacks is
+the answer. Instrument the parent's region for the same VA and diff the four
+fields the new diagnostic prints.
 
 Five probes still abort — `clonebasic`, `waitexitstorm`, `waitidsiuid`,
 `sigchld`, `execpipe` — so at least one more retirement path reaches the drop
