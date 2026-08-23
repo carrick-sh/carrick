@@ -428,7 +428,7 @@ mod tests {
             FutexGenerationEnrollment::Ready(_) => panic!("stable generation must subscribe"),
         };
         let futex = FutexTableFutex::new(Arc::new(FutexTable::default()));
-        assert_eq!(futex.shared_wake(location, key, 1), 0);
+        assert_eq!(futex.shared_wake(location, key, 1), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
