@@ -1463,6 +1463,13 @@ impl BlockedContinuation {
                 } else {
                     ContinuationCompletion::Errno(LINUX_EINTR)
                 };
+                if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
+                    eprintln!(
+                        "SIGDBG continuation signal-event family={family:?} restart={restart:?} \
+                         reserved={:?} deliverable={deliverable:?}",
+                        reserved_signal.as_ref().map(|r| r.signum()),
+                    );
+                }
                 if signal_masks.temporary.is_some() {
                     if let Some(reserved) = reserved_signal.as_ref() {
                         signal_authority.set_blocked(reserved.effective_mask());
@@ -4137,7 +4144,12 @@ mod tests {
         let signal_source = include_str!("signal.rs");
         assert!(signal_source.contains("deliver_pending_signal_with_restart"));
         assert!(loop_source.contains("continuation.install_temporary_signal_mask(context)"));
-        assert!(loop_source.contains("self.continuation_restart = Some(result.restart())"));
+        // The resume path must stash the restart decision — but ONLY for a
+        // completion the signal path itself produced. A Ready->Redispatch
+        // resume stashing its default NoRestart vetoed SA_RESTART for the
+        // redispatched syscall's own EINTR (waitrestart scenario A).
+        assert!(loop_source.contains("self.continuation_restart = match result.completion"));
+        assert!(loop_source.contains("=> Some(result.restart()),"));
         assert!(loop_source.contains("ContinuationResumeError::StaleFileSlot"));
         assert!(!loop_source.contains("TransitionalSchedulerKick"));
         assert!(!loop_source.contains("continuation_executor"));

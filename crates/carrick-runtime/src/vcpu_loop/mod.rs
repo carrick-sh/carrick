@@ -819,6 +819,45 @@ impl HvpatchRuntimeDirectory {
         self.endpoints.lock().insert(task, endpoint);
     }
 
+    /// Wake every registered task's parked vehicles so they re-check pending
+    /// signal state. The process-directed signal lane's host publication
+    /// (`PROC_PENDING`) carries no task identity, so arrival is a carrier
+    /// broadcast; `task.wake()` is a hint and spurious wakes are harmless.
+    /// Without this, a thread parked in a non-futex continuation (wait4's
+    /// `WaitOnHvpatchChild`) never observed a process-directed SIGALRM: the
+    /// pump's `kick_all` reaches only live vCPU leases and its futex notify
+    /// only enrolled futex waiters (the `waitrestart` hang).
+    fn wake_all_tasks_for_process_signal(&self) {
+        let debug = std::env::var_os("CARRICK_SIG_DEBUG").is_some();
+        let endpoints: Vec<HvpatchRuntimeEndpoint> =
+            self.endpoints.lock().values().cloned().collect();
+        if debug {
+            eprintln!(
+                "SIGDBG process-wake broadcast: endpoints={}",
+                endpoints.len()
+            );
+        }
+        for endpoint in endpoints {
+            if endpoint.kernel.upgrade().is_none() {
+                continue;
+            }
+            let Ok(snapshot) = endpoint.task_binding.capture_signal_snapshot() else {
+                if debug {
+                    eprintln!("SIGDBG process-wake broadcast: stale binding skipped");
+                }
+                continue;
+            };
+            let woken = snapshot.context().task().wake();
+            if debug {
+                eprintln!(
+                    "SIGDBG process-wake broadcast: task={:?} subscribed_wake={}",
+                    snapshot.context().task().key(),
+                    woken
+                );
+            }
+        }
+    }
+
     fn remove(&self, task: crate::kernel::TaskKey) {
         self.endpoints.lock().remove(&task);
     }
@@ -1415,6 +1454,19 @@ impl KernelState {
             signal_arrival: Arc::clone(&self.signal_arrival),
         }));
         directory.register_endpoint(process.task_key(), Arc::downgrade(self), binding);
+        // Give the signal pump's process-directed reconcile a route to parked
+        // continuations: the ONE shared directory enumerates live tasks at
+        // invocation time, so first-install-wins semantics are correct across
+        // per-process endpoint registrations.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let weak_directory = Arc::downgrade(directory);
+            crate::host_signal::set_process_signal_wake_hook(Box::new(move || {
+                if let Some(directory) = weak_directory.upgrade() {
+                    directory.wake_all_tasks_for_process_signal();
+                }
+            }));
+        }
     }
 
     fn enroll_hvpatch_persistent_process_job(
@@ -6281,7 +6333,21 @@ where
                 )));
             }
         };
-        self.continuation_restart = Some(result.restart());
+        // A restart decision is only MEANINGFUL when this resume itself
+        // evaluated a signal (the Signal/ReservedSignal event path, which
+        // weighs SA_RESTART against the continuation's family and progress).
+        // A Ready->Redispatch resume carries the default NoRestart, and
+        // stashing that as Some(..) VETOED the syscall-boundary restart
+        // predicates for whatever the REDISPATCHED syscall did next: wait4
+        // re-dispatched after a task wake, hit the pre-park deliverable-signal
+        // gate, returned EINTR — and the stale Some(NoRestart) overrode the
+        // all-true SA_RESTART predicates, surfacing EINTR to a guest whose
+        // handler asked for restart (waitrestart scenario A).
+        self.continuation_restart = match result.completion {
+            continuation::ContinuationCompletion::Redispatch
+            | continuation::ContinuationCompletion::RedispatchWithPartial(_) => None,
+            _ => Some(result.restart()),
+        };
         self.reserved_signal = result.take_reserved_signal();
 
         use continuation::ContinuationCompletion as Completion;
