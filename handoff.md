@@ -169,6 +169,49 @@ merge, and a `filter_map_bool_then` from the proc-threads fix. All
 cleared; workspace check and clippy are 0-error at `HEAD`. Lesson applied
 to worker verification: the battery now includes `--all-targets` check.
 
+### LATER THE SAME DAY: the exit-storm quadratic falls, and a datastructure plan lands
+
+The fork-ramp hunt (opened as "why does the 1000-fork ramp cost ~65-120 ms
+per fork when the fork machinery is 2.1 ms?") closed the same day:
+
+- **Instrument chain:** fork-runtime-stages ledger (machinery exonerated) →
+  topology-lock ledger, after teaching the durable script ops 7–10 it had
+  been DROPPING as "operation errors" (locks exonerated: ~1.4 s held total)
+  → deep-stack profile (BTreeMap::Iter under
+  `retire_task_state_process_mappings` in the executor loop) → pid-provider
+  timing: **~540 ms PER process exit**, 45 s of elapsed in one 10 s window.
+- **Two causes, both fixed** (`fix(vmm-hvf): make process retirement O(own
+  footprint)`): `mutate_external_alias_state`'s whole-registry clone-and-
+  diff with nested linear scans (O(aliases² + replay²) per exit — the
+  retirement twin of the COW-path shape `ac2e70e5` killed), and per-event
+  `std::env::var` debug gates serializing on std's environment lock —
+  including the session's OWN new FUTEXDBG gate firing per futex op. Both
+  now: keyed maps + OnceLock-cached env parses.
+- **Result:** futexforkrequeue **8.8 s wall (was 135–260 s), rc=0, every
+  boolean line true** — normal_wakes=1000, timed_out=0, cmp_requeue=800.
+  execfromthread and vforkexecthread complete in ~1 s. Of the five gate
+  timeout probes, THREE are now fully green; `setidthreadchurn` and
+  `waitrestart` still hang (different defect, next hunt).
+- **Strategic follow-through:** an Opus research pass produced
+  `docs/kernel-collections-research-2026-08-23.md` — full taxonomy of the
+  kernel's collection needs with file:line evidence, crate mapping
+  (slotmap/rangemap/iset/rpds/rustc-hash), a ranked M1–M12 migration list
+  whose M1 (shard the alias registry by `AliasOwnershipScope`)
+  independently converges on the measured hot spot, and
+  anti-recommendations (no dashmap/left-right/im). That doc is the map for
+  eliminating the load-coupled defect class structurally.
+
+Wave C endgame: **sigfam retired** after three turns (its one verified win,
+sigsuspendxthread, is merged; two turns lost to build-waits/stale echoes —
+turn economics, not competence). **fscrash** produced a real pipe-readiness
+mechanism (clonefilesexec 3/3 green, shell reducer 3/3) but the director's
+battery caught a regression its own battery missed — `blockingpipewrite`
+`write_blocked_until_signal=false` — plus a fail-open `unwrap_or(-1)` poll
+fd; review round in flight. Director queue: setidthreadchurn + waitrestart
+hangs, sigtimedwait-family value diffs, futexwakeexact refault-livelock
+(pre-existing, now named by the detector), forkfpreclaim teardown,
+mtforkcorrupt flake, gate 13 after fscrash resolves.
+
 ### Instrument lessons paid for this session
 
 - `carrick debug hvpatch-kernel` table names are SINGULAR (`task`, not
