@@ -80,8 +80,42 @@ Restore it verbatim once the objective above closes:
 
 ## CURRENT ENGINEERING CHECKPOINT — 2026-08-22, session 3 (delegated closure)
 
-**The exec-authority stack is verified and UNMERGED, held on one defect: the
-lost-wake hang. Everything below was measured, not assumed.**
+### MERGED: seven commits, one defect family left standing
+
+Main is `99fdee3f`: execve authority re-publication, dormant-cancellation
+tolerance (demonstrated), the carrier maintenance root (2(a) FIXED), both
+lost-wake windows closed, the core-dump port, and the job-control port with
+its new `sigstopjobcontrol` probe. Definitive battery on the merged signed
+artifact (SHA-256 `527939c9221691d4…`, CDHash `3a32d5afd5eb36a8…`, LC_UUID
+`9A57BA2C-8310-3F96-ADCC-7F7B27170E4B`, hypervisor entitlement +
+`__dof_carrick` present), run QUIET and then UNDER LOAD per the owner's
+ruling that load-coupled behavior is an architectural defect class, not
+noise ("we don't see that with normal Linux kernels in VMs"):
+
+- `/bin/echo hi` 10/10 quiet AND 10/10 loaded; `sleep 12` reducer 3/3 —
+  **criterion 3 holds under load for the first time.**
+- `sigstopjobcontrol` 3/3 + 3/3 (child provably frozen while stopped);
+  forkcow, cloneexitsig, waitidsiuid clean both phases.
+- **Every residual failure is ONE clause** — criterion 2(b), `FATAL: drop
+  HVPatch MM authority (phase=active …): published HVPatch inventory
+  dropped before exact retirement` — at ~15% (clone3exithandled 2/3 quiet,
+  cloneexithandled 2/3 loaded, coredumpbit's zero-output aborts, one
+  truncated sigchld). **The dropped authority's `mm_root_slot` is IDENTICAL
+  in every abort: `(661424963584, 2097152)` = 0x9A00200000 — the same root
+  slot every time, `kernel_mm` varying.** That constancy points at a
+  specific lifecycle role, not randomness. Worker `activedrop` is on it
+  (worktree `.worktrees/activedrop`, brief requires statistical red at 15
+  runs, root-cause fix, zero aborts in 30 quiet+loaded).
+- `xthreadsig` prints `delivered=false` ~2-3 of 5 runs on BOTH the stack and
+  its base (serial, unloaded) — a pre-existing cross-thread delivery race,
+  now on the defect list; the probe never gates its exit code on it, so
+  only the closure gate's line diff sees it.
+
+Session history below. Everything in it is superseded by the paragraph
+above where they disagree.
+
+**The exec-authority stack was verified and initially UNMERGED, held on one
+defect: the lost-wake hang — since fixed and merged. Measured, not assumed.**
 
 ### What happened this session
 
