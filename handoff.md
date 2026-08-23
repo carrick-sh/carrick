@@ -239,21 +239,33 @@ the collections policy doc refined by the owner):
 - **shapefix worker merged (3 commits)**: keyed PID lookups, pgroup
   membership reuse, wait_child_matching bounded to Task::children —
   per the adoption policy. New unit tests (lib 1611).
-- **execfromthread container wedge LOCALIZED (diagnostics committed)**:
-  the exec sibling drain is CORRECT (SIGDBG handshake probes show
-  keeper removing the leader and the leader finishing on observation).
-  The wedge is SCHEDULER FAIRNESS: the execing worker's dispatch
-  waited ~1200 quanta (~30 s) while the leader stormed sched_yield —
-  a forked process's threads starve behind a yield-spinning sibling
-  (10 executors available; worker got ~10 quanta in 30 s; the raw
-  lane's root process schedules fairly). setidthreadchurn (yield-
-  spinning churn threads + set*id main) matches the same shape. NEXT
-  HUNT: the run-queue/executor admission policy for forked processes'
-  threads — why yield-requeue monopolizes; suspect per-process
-  serialization (job/lease affinity) rather than queue order, since
-  raw is immune. Also note /proc/self/status renders Pid: 2 while
-  getpid()=1 for the container shell (stale namespace translation in
-  the procfs renderer — separate defect, still open).
+- **execfromthread container wedge LOCALIZED to the exec-survivor's
+  lost first quantum (diagnostics committed, TWO corrections in one
+  session — the record shows the method)**. First read said scheduler
+  starvation; WRONG: the "1200 leader quanta" are ~50 ms of a ~25k
+  quanta/s sched_yield storm, not 30 s of starvation (interleaved
+  stderr/stdout line numbers are NOT a wall clock — trap for the next
+  reader). With the full SIGDBG handshake set (quantum-check,
+  sibling-stop, execve-arm, prepare BEGIN/LOADED/CLOSED), the true
+  sequence: worker wakes on time, image loads, clone admission closes,
+  sibling drain removes the leader, the leader observes live=false and
+  finishes — ALL within ~100 ms — and then the SURVIVOR never receives
+  its first quantum (kernel snapshot: survivor thread SwitchingOut
+  generation 1 forever; carrier near-idle). Raw-lane root exec is
+  immune → suspect the forked process's retired-ASID cross-
+  invalidation after the exec retarget (`retarget_running_exec` →
+  `pending_exec_cleanup` → `invalidate_after_exec` peer-ack wait; the
+  poke protocol for idle executors reads correct — five layers each
+  look right in isolation). MINIMAL REDUCER (deterministic, raw=0 s /
+  container=wedge): guest whose worker thread sleeps 50 ms then
+  execs self while main pure-yield-storms; recipe in the session log,
+  rebuild as a probe when the fix lands (TDD red-first). NEXT
+  INSTRUMENT: the executor pool needs a debug table (receipts +
+  pending invalidations) in `carrick debug` — the noted snapshot gap
+  is now load-bearing. setidthreadchurn may share the root (its churn
+  threads yield-storm during set*id broadcasts). Also open:
+  /proc/self/status renders Pid: 2 while getpid()=1 for the container
+  shell (stale namespace translation in the procfs renderer).
 
 ### GATE 13 (2026-08-23, log target/perf/gate13.log): 781/834 + 40/40 — and the tail is now LOAD
 
