@@ -1,317 +1,610 @@
-# Kernel collection data structures — research report (2026-08-23)
+# Kernel collection data structures — research and adoption policy (2026-08-23)
 
-Produced by a read-only research pass (Opus) commissioned after live profiling
-kept finding O(n)/O(n^2) scans in global structures under one mutex — the
-measured trigger was `retire_task_state_process_mappings` at ~540 ms per
-process exit in a 1000-process fork storm (fixed tactically the same day by
-keying `mutate_external_alias_state`'s diff; this report is the strategic
-follow-through). Every current-structure claim carries a file:line from HEAD
-at the time of research (`c49c4334` lineage). The ranked migration list
-(M1–M12) is the actionable core; each entry names the invariant the migration
-must preserve.
+## Status and decision
 
-**Method note:** complexity claims are read off the code shape; the only
-*measured* numbers are ≈540 ms/process exit at 1000 processes, ~35 ms/fork at
-1000 live, the 45 s-in-a-10 s-window retirement total, and
-`docs/perf-results/2026-08-19-futex-requeue-durability/README.md`'s 179
-broadcasts × ~1000 waiters ≈ 179 k unparks in one probe. Everything else is a
-hypothesis about ordering, not a measurement.
+This report follows a read-only source audit prompted by measured O(n)/O(n²)
+work in global structures under one mutex. The trigger was
+`retire_task_state_process_mappings` at approximately **540 ms per process
+exit** in a 1000-process fork storm. The same campaign measured approximately
+**35 ms/fork at 1000 live processes**, **45 s of retirement work inside a 10 s
+window**, and 179 futex signal broadcasts across approximately 1000 waiters
+(about **179,000 unparks**) in one probe.
+
+The decision is deliberately not “standard library versus crates.io versus
+hand-written.” Carrick should choose at two levels:
+
+1. Carrick owns the **semantic composite**: identity, generation, ordering,
+   ownership, rollback, and multi-index atomicity.
+2. `std` or an ecosystem crate may supply a **leaf algorithm** when its exact
+   semantics match that composite.
+
+That yields the following policy:
+
+| Need | Default decision |
+|---|---|
+| One exact-key index, ordered set, or bounded queue | Use `std`. |
+| A standard range, arena, or intrusive algorithm whose semantics match exactly | Use an ecosystem crate behind a Carrick-owned typed wrapper. |
+| Multiple coordinated indexes, generation/lifetime authentication, insertion-order precedence, or rollback | Build a Carrick-owned composite, using `std`/ecosystem leaves internally. |
+| A specialized structure justified only by expected speed | Keep the current structure until a controlled measurement identifies the remaining cost. |
+
+Do **not** add a generic `carrick-collections` crate or re-export third-party
+collection types yet. Keep each semantic composite beside its owning domain.
+Extract a shared leaf type only when at least two crates require the same
+semantics, not merely a similarly named container.
+
+## Evidence discipline
+
+Every current-structure claim below is anchored to the `c49c4334` lineage used
+for the audit. Complexity follows from code shape. Only the four measurements
+above are measured performance results; all other performance effects are
+hypotheses until a controlled experiment confirms them.
+
+Crate health, release recency, popularity, and license compatibility are
+screening inputs, not adoption evidence. A dependency is not approved merely
+because it is maintained or widely downloaded. Before adoption it must pass:
+
+- semantic API review against the Carrick invariant;
+- license and feature-closure gates;
+- a differential/reference-model test, plus red-first evidence when the change
+  corrects an existing semantic defect;
+- a controlled benchmark on the affected population;
+- deletion of the structure or path it replaces.
 
 ---
 
 ## 1. Taxonomy of the kernel's collection needs
 
-### T1 — Generation-keyed identity maps ("a stale generation must MISS")
+### T1 — Linux-visible identity with never-reused serials
 
-`TaskKey { id: TaskId /*NonZeroI32 pid*/, serial: TaskSerial /*NonZeroU64, never reused*/ }` (`crates/carrick-runtime/src/kernel/objects.rs:72`), `ThreadKey { tid, serial }` (`objects.rs:78`). The serial **is** a generation, and `ObjectIdRegistry` (`kernel/ids.rs:170`) is a pure `AtomicU64` — so the key is already `(slot, generation)`.
+`TaskKey { id: TaskId, serial: TaskSerial }` and `ThreadKey { tid,
+serial }` live at `crates/carrick-runtime/src/kernel/objects.rs:72-81`.
+`ObjectIdRegistry` allocates the serial from an `AtomicU64` and refuses
+exhaustion (`kernel/ids.rs:170-203`). The serial is a kernel-lifetime identity,
+not merely a recycled arena-slot generation.
 
-**Current:** the key is thrown away and only the *numeric* half is used as the map key:
-- `RegistryState.tasks: BTreeMap<TaskId, TaskRecord>` (`kernel/core.rs:1502`) — keyed by pid, **not** by TaskKey.
-- `Kernel::context()` (`core.rs:1054-1071`) does a numeric-only lookup; the generation check is a *separate, opt-in* step bolted on by the caller — `KernelTaskBinding::capture` (`core.rs:208-214`) and `capture_signal_snapshot` (`core.rs:229-231`) compare `context.task.key() != self.task` after the fact.
-- `Task::threads: Mutex<BTreeMap<LinuxTid, (ThreadKey, ThreadRef)>>` (`objects.rs:2582`) — same shape; `Task::retire_thread` (`objects.rs:3862-3872`) hand-checks `*published_key != key`.
-- `MmResourceState { leases: BTreeMap<TaskKey, …>, retired: BTreeSet<TaskKey> }` (`crates/carrick-runtime/src/hvpatch/mm_resources.rs:82,86`) — the `retired` set is documented "**Permanent within one runtime**" and grows without bound for the life of the carrier.
+**Current defects:**
 
-**Failure mode:** generation discipline is *convention*, enforced at ~8 call sites and absent at the rest; and the tombstone set is an unbounded leak whose only job is to re-derive what the generation already encodes. `AsidAllocator` (`hvpatch/asid.rs:244-250`) proves the team already knows the right shape — `AsidGeneration { asid, generation }` with a bounded `retired` set drained on TLB ack.
+- `RegistryState.tasks: BTreeMap<TaskId, TaskRecord>` is numeric-keyed
+  (`kernel/core.rs:1502`), while exact-generation checks are repeated by callers
+  such as `KernelTaskBinding::capture` (`core.rs:208-214`).
+- `Task::threads: Mutex<BTreeMap<LinuxTid, (ThreadKey, ThreadRef)>>`
+  (`objects.rs:2582`) has the same split between numeric lookup and exact
+  authentication.
+- `MmResourceState.retired: BTreeSet<TaskKey>` is permanent for the carrier
+  (`hvpatch/mm_resources.rs:82-86`) and grows with retired generations.
 
-### T2 — Reverse indexes that are missing, forcing O(live-processes) scans
+**Important distinction:** `retired` is not only an anti-alias tombstone. It
+makes repeated cleanup of one exact retired generation idempotent while an
+unknown generation remains an error (`mm_resources.rs:244-275`). A generational
+arena miss cannot distinguish those outcomes by itself.
 
-**Current:** there is no `LinuxTid → (TaskKey, ThreadKey)` index anywhere. Every resolution walks the whole process table:
-- `live_keys_for_thread` `operations.rs:1855` — `state.tasks.values().find_map(|r| r.task.thread(tid))`, on **any syscall entry that resolves a bare tid**.
-- `exact_thread_for_scheduler` `operations.rs:1870` — same shape, on **every scheduler wake/kick that names a `ThreadKey`**.
-- `with_live_active_scheduler_thread` `operations.rs:1886`; `with_live_scheduler_descendant` family `operations.rs:1907, 1959, 1986, 2011`.
-- `wait_child_matching` `operations.rs:3730-3740` scans **all zombies VM-wide** and `operations.rs:3768` scans **all tasks**, per `wait4`.
-- `set_oom_score_adj` `core.rs:1341`, `task_nice` `core.rs:1361`, `set_task_nice` `core.rs:1372` do `tasks.iter().find(|(id,_)| id.raw()==pid)` — **linear over a BTreeMap already keyed by that value**. That is a straight bug in shape, not a data-structure question.
-- `process_group_prio_targets` `core.rs:1395`, `user_prio_targets` `core.rs:1419` — full scans for `setpriority(PRIO_PGRP/PRIO_USER)`.
-- `update_fs_umask` `operations.rs:2735-2748` — nested `for record in tasks × for thread in threads` = **O(processes × threads)**.
+### T2 — Missing or unused reverse indexes
 
-**Failure mode:** exactly the defect class AGENTS.md names — O(live-processes) work on a per-event hot path, all under one lock (`Registry.state: RwLock<RegistryState>`, `core.rs:1199`).
+The registry lacks a live `LinuxTid → (TaskKey, ThreadKey)` index. Exact-thread
+resolution scans every task in `operations.rs:1855-2035`, including scheduler
+wake and authority paths.
 
-### T3 — Interval / range maps (point-stab + overlap scan)
+Other observed shapes:
 
-Five distinct populations, four of them hand-rolled differently:
+- `set_oom_score_adj`, `task_nice`, and `set_task_nice`
+  (`core.rs:1341/1361/1372`) linearly search a `BTreeMap` already keyed by the
+  requested PID. These are direct shape bugs.
+- `wait_child_matching` scans all zombies and then all tasks
+  (`operations.rs:3730-3805`), although `Task::children` already owns a
+  `BTreeSet<TaskKey>` (`objects.rs:2569,3277-3289`).
+- `process_group_prio_targets` scans all tasks (`core.rs:1391`), although
+  `ProcessGroupRecord.members` already exists (`core.rs:1549`).
+- `user_prio_targets` scans all tasks (`core.rs:1419`); an euid index would need
+  to participate in every credential transition.
+- `update_fs_umask` scans tasks × threads (`operations.rs:2735-2748`). An
+  `FsContextId → TaskKey` index would be too coarse because resource sharing is
+  per exact thread/resource generation.
 
-| site | structure | query | complexity |
-|---|---|---|---|
-| `carrick-guest-mem/src/protections.rs:45` `RangeSet { ranges: Vec<(u64,u64)> }` | sorted, merged, non-overlapping | `contains`/`covers`/`intersections` via `partition_point` | **query O(log n)**, insert O(n) memmove — *this is the good one* |
-| `carrick-vmm-hvf/src/trap.rs:2181` `copy_from_global_frame_owner` | `BTreeMap<(ipa,len), Owner>` | "which owner extent contains this IPA" via `owners.iter().find(...)` | **O(owners)**, and the `volatile_copy_from_guest` runs **while holding the global lock** |
-| `trap.rs:4580` `CowArmedRanges { ranges: Vec<ForkCowRange> }` | overlapping allowed | `span_for` = `filter(contains).max_by(most-specific)` (`trap.rs:4586-4602`) | **O(armed ranges)** per COW fault |
-| `trap.rs:5765` `GlobalFrameIpaAllocator { free: Vec<(u64,u64)>, live: BTreeMap }` | free list | `allocate` linear best-fit `trap.rs:5789`; `release` does **`push` + full `sort_unstable_by_key` + full merge-rebuild** `trap.rs:5863-5875` | alloc O(F), **release O(F log F) with a realloc** |
-| `trap.rs:1912` `alias_registry(): Mutex<Vec<AliasBacking>>` | overlapping, duplicate-keyed | VA/IPA containment, see T4 | O(rows) — the big one |
+The rule is **reuse existing authoritative membership before adding another
+index**. A new index belongs in the same critical section as the authoritative
+mutation and must never become an independently locked source of truth.
 
-**Failure mode:** the same query ("which extent contains X") is answered four different ways, three of them linear, and the one correct implementation (`protections.rs`) is not reusable because it carries no value payload and is private to its module.
+### T3 — Range and interval queries
 
-### T4 — Duplicate-key ordered registries with *two conflicting* disciplines
+Carrick currently has several different range shapes:
 
-This is the subtlest need in the tree and the one a naive migration will silently break. The single `Vec<AliasBacking>` at `trap.rs:1912` is read under **two incompatible tie-break rules**:
+| Site | Required semantics | Current structure |
+|---|---|---|
+| `carrick-guest-mem/src/protections.rs:45` | Non-overlapping merged set; point/overlap/coverage queries; range-local rollback | Sorted `Vec<(u64,u64)>` with `partition_point` |
+| `trap.rs:2181` global-frame owners | Non-overlapping containing extent plus generation-pinned owner | `BTreeMap<(ipa,len), Owner>` with linear containment scan |
+| `trap.rs:4580` COW armed ranges | Overlapping keep-all; most-specific containing range wins | `Vec<ForkCowRange>` with linear filter/max |
+| `trap.rs:5765` global-frame allocator | Non-overlapping free extents; aligned smallest-fit allocation; exact live authority | `Vec` free list plus `BTreeMap` live set |
+| `trap.rs:1912` alias registry | Overlapping candidates with several different ranking predicates | One global `Vec<AliasBacking>` |
 
-- **First-match-wins, keyed `(ipa, ownership_scope)`** — the *publication/identity* index. `register_shared_alias` `trap.rs:2295-2301` uses `iter_mut().find(...)` to replace the **first** matching row; `process_alias_index` `trap.rs:2513-2521` reproduces it with `.or_insert` ("First occurrence wins, mirroring the linear scans' `.find` semantics this replaces"); `mutate_external_alias_state` `trap.rs:7663-7674` builds first-occurrence `before_by_key`/`after_by_key` for the same reason.
-- **Last-match-wins, keyed `(scope, VA interval)`** — the *translation* index. `lookup_shared_alias_by_va` `trap.rs:2558` and `lookup_live_alias_by_va_any_scope` `trap.rs:2578` use `.iter().rev().find(...)`, documented at `trap.rs:2438-2444`: a Go arena page is covered by both a `PROT_NONE` reservation row **and** a later `MAP_FIXED` commit row, and the commit — registered last — is the one stage-1 actually uses. `physical_cow_source` `trap.rs:11452` and `shared_futex_location` `trap.rs:14104` are also `.rev()`.
+These are not one interchangeable “interval map” problem. In particular,
+overwrite-and-split semantics are valid only when obscured ranges are meant to
+be destroyed. An overlapping candidate registry must retain every candidate
+and apply the domain's selection rule at query time.
 
-So it is **one row set with two indexes**, and insertion order carries load-bearing semantics for one of them. Any replacement must keep both.
+### T4 — Alias rows with cross-index ordering and liveness
 
-**Additional failure mode inside the same structure:** `alias_backing_is_live` (`trap.rs:2359`) issues a **`mach_vm_region` Mach trap** — and it is used as the *predicate of the linear scan* at `trap.rs:2565`, `trap.rs:2585`, `trap.rs:14108`, `trap.rs:11558`. With thousands of rows that is thousands of Mach traps per lookup, taken while holding the global mutex.
+The alias registry is the most load-bearing collection in this report. The same
+row population supports multiple selection rules:
 
-### T5 — Version chains / epoch registries
+- Registration replaces the **first** row matching `(ipa, ownership_scope)` in
+  place (`trap.rs:2295-2324`). Replacement does not make the row newest.
+- `lookup_shared_alias` performs first-match IPA containment and skips dead
+  host backings (`trap.rs:2404-2415`).
+- VA lookup uses reverse insertion order and requires one row to contain the
+  whole query (`trap.rs:2424-2573`).
+- `physical_cow_source` uses reverse order, then authenticates process scope,
+  semantic VA→IPA correspondence, physical extent, liveness, and reusable-frame
+  owner generation (`trap.rs:11449-11483`).
+- `shared_futex_location` uses reverse-order IPA containment plus sharing and
+  liveness (`trap.rs:14084-14115`).
+- `AliasOwnershipScope::Global` participates in the same global insertion order
+  as process-scoped rows. Splitting global and process rows and always checking
+  one first would change precedence.
 
-`AliasVersionRegistry { aliases: Vec<AliasVersionChain>, replays: Vec<ReplayVersionChain>, alias_epochs: Vec<((u64, Scope), u64)>, replay_epochs: Vec<(u64, u64)> }` (`trap.rs:7567-7573`). Every access is a linear `find`: `bump_version_epoch` `trap.rs:7583`, chain lookup `trap.rs:7615-7618` and `trap.rs:7635-7638`, and again at `trap.rs:7695-7698`, `trap.rs:7735-7738`.
+`alias_backing_is_live` issues `mach_vm_region` and currently appears inside
+linear predicates (`trap.rs:2359-2402,2565,2585,14108,11558`). That cost must be
+removed without changing the skip-dead-and-continue behavior. Checking only one
+preselected row and returning `None` when it is dead is not equivalent.
 
-**Failure mode:** four parallel association-lists where the key is a plain `Copy + Eq` tuple. This is a `BTreeMap`/`HashMap` written as a `Vec`, and it sits directly under the COW-fault path.
+### T5 — Version chains and epochs
 
-### T6 — Snapshot / rollback
+`AliasVersionRegistry` contains four association-list `Vec`s
+(`trap.rs:7567-7573`). Epoch and chain lookup are linear in
+`bump_version_epoch`, `scoped_alias_epoch_update`, and receipt processing
+(`trap.rs:7583-7738`). These are ordinary exact-key indexes embedded in a
+domain-specific receipt/rollback protocol.
 
-- **HVF side:** `mutate_external_alias_state` `trap.rs:7649-7652` clones the **entire** `BTreeSet<ReplayMappingKey>` and the **entire** `Vec<AliasBacking>` on **every mutation**, then diffs. Seven further sites do a bare `alias_registry().lock().clone()`: `trap.rs:11145, 14779, 15429, 15651, 16033, 16458`. `CowArmedRanges::snapshot()` `trap.rs:4580` is a full `Vec::clone`, taken per fork transaction (`trap.rs:11194`), and `arm()` `trap.rs:4570-4574` does `extend + sort + dedup` = O(n log n) per arm.
-- **Kernel side:** `snapshot.rs` is a **full owned projection with no rollback path at all** — `KernelSnapshotV1` is 20 `Vec<…Row>` (`snapshot.rs:29-51`), rebuilt from scratch, retried up to `MAX_ATTEMPTS = 3` (`snapshot.rs:26`) with races detected by **re-reading revisions** (`snapshot.rs:873-920`), not by undo. Rollback everywhere in the graph is RAII-discard: `MmTransaction::drop` clears staged ops (`mm_transaction.rs:119-125`), `ReservationToken::drop` releases the pid claim (`registry.rs:288-294`), `InventoryOverlay` is simply dropped (`frame_inventory.rs:94-104`).
-- **`ObservationInventory::sweep`** `core.rs:455-468` — six `retain`s over the whole weak index plus **two** full `observation_count` traversals, on every snapshot.
-- **`FileTableRwWriteGuard`** `objects.rs:1449-1458` — clones the **entire fd map** (`HashMap<i32,(u64,FileDescriptionId)>`) on every write guard, purely to diff for change publication.
+### T6 — Snapshot, diff, and rollback
 
-**Failure mode:** clone-the-world is the *only* snapshot primitive in the tree. It is correct and it is O(global) per event — the exact coupling the architecture forbids.
+- `mutate_external_alias_state` clones the whole replay set and alias registry,
+  mutates them, and diffs both sides (`trap.rs:7649-7745`).
+- Several fork/spec paths clone the whole alias registry
+  (`trap.rs:11145,14779,15429,15651,16033,16458`).
+- `CowArmedRanges::snapshot` clones the complete range vector per fork
+  transaction (`trap.rs:4580,11194`).
+- `FileTableRwWriteGuard` clones the complete fd map to publish a diff
+  (`objects.rs:1449-1458`).
+- `KernelSnapshotV1` is a debug/observability projection with revision retries,
+  not a rollback transaction (`snapshot.rs:26,873-920`).
 
-### T7 — MPMC queues, wait queues, broadcast wakeups
+Carrick already uses the correct rollback shape in several places: stage work is
+recorded, committed, or discarded by RAII (`MmTransaction`,
+`InventoryOverlay`, reservation tokens). The improvement target is keyed undo
+information, not persistent collections throughout the kernel graph.
 
-- **Run queue:** `RunQueueState { rows: VecDeque<QueueRow>, queued: BTreeSet<QueueKey> }` (`scheduler.rs:369-379`) under one `Mutex` + one broadcast `Condvar` (`scheduler.rs:399-400`). Targeted dequeue is `rows.iter().position(...)` — `scheduler.rs:865`, O(runnable).
-- **Executor directory:** `binding_for_thread` `scheduler.rs:304-315` **clones every kick token** then `.find()`; `has_running` `:317`, `current_tokens` `:330` do the same.
-- **Futex table:** 64-way Fibonacci-sharded `HashMap<u64, Arc<FutexBucket>>` (`carrick-thread/src/thread.rs:899, 1006-1009`) — that part is well designed. The defect is `all_buckets()` `thread.rs:1022-1030`: locks all 64 shards, clones every bucket into a fresh `Vec`, and is called by `notify_signal_pending` `thread.rs:1351` **and** `notify_signal_pending_for(tid)` `thread.rs:1369`. **Buckets are never removed from the shard maps** — no `remove`/`retain` on them — so the cost of *any* signal wake grows monotonically with the number of distinct futex addresses the carrier has ever seen. Waking **one** thread by tid costs O(all buckets ever).
-- **Wait/wake enrollment:** `Task::wake_listeners: Mutex<BTreeMap<u64, TaskWakeListener>>` (`objects.rs:2593`), `job_control: Mutex<TaskJobControl> + Condvar` (`objects.rs:2579`), `ReservationGate` `Mutex<u64> + Condvar + BTreeMap<u64,_>` (`core.rs:475-484`), `fork_quiesce.rs:99/542/561` listener maps. These are fine in shape.
+### T7 — Queues, futex enrollment, and targeted wakeups
 
-### T8 — Free-list / ID allocators
+- The scheduler run queue is `Mutex<VecDeque<QueueRow>> + Condvar` with a
+  membership set (`scheduler.rs:369-400`). Targeted removal is linear
+  (`scheduler.rs:865`), but the population is bounded by runnable threads.
+- The executor directory clones tokens to find one thread
+  (`scheduler.rs:304-342`).
+- The futex table is already 64-way sharded (`carrick-thread/src/thread.rs:899,
+  1006-1009`). Signal delivery clones every bucket ever created
+  (`thread.rs:1022-1030,1351-1390`).
 
-- `IdRegistry::reserve_next` `registry.rs:91-119` — **linear probe** over `next..wrap` skipping `claims.contains_key`, O(claims) when the pid namespace is dense.
-- `GlobalFrameIpaAllocator` — see T3.
-- `AsidAllocator` `hvpatch/asid.rs:244` — correct: `VecDeque` reuse pool + generation-stamped live/retired sets bounded by the 16-bit ASID space.
+Futex buckets cannot simply be garbage-collected when their waiter counters
+reach zero. `FutexWait` stores only `(addr, generation)` (`thread.rs:620-627`),
+and `prepare_wait` intentionally releases the bucket before the later prepared
+wait (`thread.rs:1038-1075`). Removing and recreating that bucket in the gap can
+forget an intervening generation advance and lose the wake. Bucket lifetime is
+currently part of the wake protocol.
+
+A process-directed wake also needs more than `task → buckets`: multiple tasks
+may wait on one shared futex bucket. The parking token/filter must identify the
+target task as well as the thread.
+
+### T8 — Free lists and Linux ID allocation
+
+- `IdRegistry::reserve_next` linearly probes claimed PIDs
+  (`registry.rs:91-119`).
+- `GlobalFrameIpaAllocator::release` sorts and rebuilds the complete free list;
+  allocation linearly finds the smallest aligned fitting extent
+  (`trap.rs:5781-5878`).
+- `AsidAllocator` already has the correct bounded shape: a reuse queue plus
+  generation-stamped live/retired sets drained after TLB acknowledgement
+  (`hvpatch/asid.rs:244-250`).
+
+The global-frame allocator's alignment is load-bearing. A free extent whose raw
+length fits may no longer fit after its base is aligned, including the 2 MiB
+alignment used by large frames. A size index alone therefore cannot promise an
+O(log F) smallest-fit lookup.
 
 ---
 
-## 2. Recommended structure per need, mapped to crates
+## 2. Structure decisions by need
 
-Workspace license policy is `deny.toml` `[licenses].allow` — MIT, Apache-2.0, BSD-2/3, ISC, Zlib, MPL-2.0, BSL-1.0, 0BSD, Unlicense, Unicode-3.0, CDLA-Permissive-2.0. Everything recommended below clears it; exceptions are flagged.
+### D1 — Task and thread identity: Carrick-owned wrappers over `std`
 
-### T1 — Generation-keyed identity → **`slotmap` 1.1.1 (Zlib)**, plus a small in-house `PidTable`
-
-`slotmap` — Zlib, 24.6 M recent downloads, last release 2025-12-06, `no_std`-capable, stable 1.x. Its `KeyData` is exactly `(index: u32, version: u32)` and `SlotMap::get` is an array index + a version compare: **a stale key structurally cannot alias**, which is precisely the discipline `core.rs:208-214` currently hand-writes.
-
-- `SecondaryMap<K, V>` gives the per-task side tables (`mm_resources.leases`, `reservations`, `watchers`) keyed by the *same* key with the same miss discipline, deleting `MmResourceState.retired` (`mm_resources.rs:86`) outright — a generational key needs no tombstone.
-- `SlotMap::insert_with_key` lets `TaskKey` be produced *by* the store, so identity allocation and storage stop being two facts that can disagree.
-
-**Why not the alternatives:**
-- `generational-arena` 0.2.9 — MPL-2.0 (allowed), 1.06 M downloads, but last release **May 2023** and no `SecondaryMap` equivalent. Strictly dominated by `slotmap`.
-- `thunderdome` 0.6.1 — MIT/Apache, last release **June 2023**, 185 k downloads. Nicer 64-bit `Index`, but low adoption and stale.
-- `slab` 0.4.12 — MIT, 201 M downloads, actively released (2026-01-31). **Has no generation** — a reused slot silently aliases. That is the exact bug the serials exist to prevent. Use `slab` only where the key never escapes a single transaction.
-
-**The gap `slotmap` does not close:** `TaskId` is a *Linux-visible, recyclable* `NonZeroI32` pid, not a slotmap index, and `pid_max` is 4 Mi so it cannot be dense-indexed. One small in-house structure is needed:
+Introduce a domain API, initially backed by the existing standard maps:
 
 ```text
-// crates/carrick-collections/src/pid_table.rs
-/// pid -> live slot, generation-checked. Two-level radix (4096 entries/page,
-/// pages allocated on demand) so a sparse 22-bit pid space costs O(live pids)
-/// memory and O(1) lookup — no hashing, no tombstones.
-pub struct PidTable<K: slotmap::Key> { pages: Vec<Option<Box<[Option<(TaskSerial, K)>; 4096]>>> }
-impl PidTable<K> { fn get(&self, key: TaskKey) -> Option<K>   // serial mismatch => None
-                   fn get_numeric(&self, id: TaskId) -> Option<(TaskSerial, K)> }
+TaskTable
+  get_numeric(TaskId) -> Option<&TaskRecord>
+  get_exact(TaskKey) -> Result<&TaskRecord, UnknownTask | StaleTaskBinding>
+  insert_exact(TaskKey, TaskRecord)
+  remove_exact(TaskKey)
+
+ThreadIndex
+  get_numeric(LinuxTid) -> Option<(TaskKey, ThreadKey)>
+  get_exact(ThreadKey) -> Result<(TaskKey, ThreadRef), UnknownThread | StaleThread>
 ```
 
-That single type replaces `RegistryState.tasks`' numeric keying, kills `registry.rs:91`'s linear probe (a free-page bitmap over the same pages gives O(1) `reserve_next`), and makes `core.rs:1054`'s lookup generation-checked *by construction* instead of by convention. Nothing on crates.io does the pid-recycling + never-reused-serial combination; this is ~150 lines and belongs to us.
+This centralizes stale-generation failure without weakening `TaskSerial`'s
+never-reused `u64` guarantee. `slotmap` is **not** the TaskKey/ThreadKey
+authority: its slot generation is an internal weak-reference mechanism, not
+Carrick's Linux-visible identity contract.
 
-### T2 — Reverse indexes → **plain `std` maps with a fast hasher: `rustc-hash` 2.1.3 (Apache-2.0 OR MIT)**
+Do not delete `MmResourceState.retired` until the idempotent-retirement protocol
+has a bounded replacement. A lifecycle-owned retirement receipt or an explicit
+at-most-once cleanup authority may remove it later; treating every missing key
+as “already retired” would hide unknown-task bugs.
 
-No exotic crate is warranted. What's missing is the index itself:
-- `tid_index: HashMap<LinuxTid, (TaskKey, ThreadKey)>` in `RegistryState`, maintained by the same code that mutates `Task::threads` (`objects.rs:2582`). Kills `operations.rs:1855, 1870, 1886, 1907, 1959, 1986, 2011`.
-- `children_by_parent` / `zombies_by_parent: HashMap<TaskKey, SmallVec<[TaskId; 4]>>`. Kills `operations.rs:3730` and `:3768` (`wait4`).
-- `by_pgid` / `by_uid` membership sets. `ProcessGroupRecord.members: BTreeSet<TaskKey>` already exists (`core.rs:1549`) — `core.rs:1395` just doesn't use it. Same for `user_prio_targets` `core.rs:1419`.
-- `fs_context_index: HashMap<FsContextId, SmallVec<[TaskKey;…]>>` kills the `O(procs × threads)` loop at `operations.rs:2735-2748`.
-- `core.rs:1341/1361/1372` need no index at all — change `.iter().find(|(id,_)| id.raw()==pid)` to `.get(&TaskId…)`. Three one-line fixes.
+A paged PID table and free bitmap remain valid custom candidates if PID lookup
+or dense allocation becomes measured overhead. They are not prerequisites for
+generation correctness.
 
-`rustc-hash`: Apache-2.0 OR MIT, 199 M recent downloads, released 2026-07-02, `no_std`, and `FxHashMap` is the same hasher rustc uses. The kernel graph currently uses **default SipHash-1-3 everywhere** — a repo-wide grep found `BuildHasherDefault`/`FxHash` in exactly one file (`carrick-dsr-x86/src/translator.rs`). For `u64`/`i32` keys hashed on every syscall entry this is pure loss. Adopt `FxHashMap` as **the** map type for kernel-internal, non-adversarial keys via a `carrick-collections` re-export; keep SipHash only where a key is guest-controlled and collision-attackable (it isn't, inside one carrier).
+### D2 — Reverse indexes: `std`, exact membership, one lock
 
-**Anti-note:** do not reach for `dashmap`/`papaya`/`scc` here (see §4).
+Approved shapes:
 
-### T3 — Interval maps
+- `tid_index: HashMap<LinuxTid, (TaskKey, ThreadKey)>`, maintained under the
+  registry write lock that admits/retires thread claims;
+- existing `Task::children` for `wait4`, followed by exact task/zombie lookups;
+- existing `ProcessGroupRecord.members` for process-group operations;
+- executor `by_thread: HashMap<ThreadKey, ExecutorId>` under the executor
+  directory's existing lock.
 
-Two shapes, two answers.
+Start with `std::collections::HashMap`'s default randomized hasher. A fast
+non-cryptographic hasher is a per-index optimization only after the key domain
+is proven Carrick-generated/non-adversarial and a controlled benchmark shows a
+material gain. Guest futex addresses and other guest-derived keys do not meet a
+blanket “internal” exemption.
 
-**(a) Non-overlapping, newest-wins, value-carrying → `rangemap` 1.8.0 (MIT/Apache-2.0).**
-1.8.0, 11.3 M recent downloads, released **2026-08-14** — the healthiest interval crate in the ecosystem by a wide margin. `RangeMap::insert` semantics: an overlapping insert "partially or completely replaces" the existing range(s), and equal-valued neighbours coalesce. **That is exactly the newest-wins-with-automatic-splitting rule** that `lookup_shared_alias_by_va`'s `.rev()` (`trap.rs:2558`) and `unregister_alias_entries`' manual split loop (`trap.rs:2602-2645`) implement by hand today. Bounds are `K: Ord + Clone`, `V: PartialEq + Clone` — `AliasBacking` is `Copy + Eq` (`trap.rs:1861`), so it fits directly. Queries: `get`, `get_key_value`, `overlapping(range)`, `overlaps`, `gaps`, `remove` — `gaps` alone replaces the `GlobalFrameIpaAllocator` free list.
+For FS-context membership, either index exact `ThreadKey`s or make membership a
+property of the `FsContext` authority itself. `FsContextId → TaskKey` is not
+sufficient.
 
-Fits: the alias VA index (T4b), `copy_from_global_frame_owner` (`trap.rs:2181`), `GlobalFrameIpaAllocator.free` (`trap.rs:5767`), and — if the payload is wanted — a generalized `MemoryProtections` (`protections.rs:45`).
+### D3 — Standard non-overlapping ranges: `rangemap` is an eligible leaf
 
-Caveats: no declared `no_std`/`alloc` feature (irrelevant here); `insert` is a `BTreeMap` splice, so O(log n + touched) not O(1); and its coalescing means two distinct-valued rows cannot cover the same bytes, which is *correct* for the translation index and *wrong* for the publication index.
+`rangemap::RangeMap`/`RangeSet` is a good candidate where the required
+semantics are exactly:
 
-**(b) Overlapping, keep-all, most-specific-wins → `iset` 0.3.3 (MIT).**
-Released 2026-05-09, 66 k recent downloads. Self-balancing AVL in a flat `Vec`, insert/remove O(log N), overlap query O(log N + K), and — critically — `force_insert` **permits duplicate/overlapping intervals**, with `iter(query)`/`overlap(point)` returning all of them. The only crate found that matches `CowArmedRanges::span_for` (`trap.rs:4586`), which must see *every* containing range and then pick the most specific.
+- ranges do not remain multiply represented;
+- a new value overwrites overlapping old values;
+- removal permanently clears the removed interval;
+- equal-valued neighbours may coalesce.
 
-Caveats: 0.3.x, small user base, and `get`/`remove` on a duplicated interval pick an entry "arbitrarily" — so a duplicate-keyed use must drive removal off a stored handle, not off the interval.
+Potential consumers are non-overlapping owner extents and canonical free or
+protection ranges. Every consumer must still be wrapped in typed
+`GuestVa`/`Gpa` APIs with checked range construction and domain-specific error
+behavior.
 
-**Alternatives considered and rejected:**
-- `nodit` 0.10.0 — MIT, 68 k downloads, last release 2025-10-18. Good `BTreeMap`-based discrete interval tree; fails-closed on overlapping insert instead of overwriting — arguably *safer* but requires an explicit cut at every call site and does not match today's semantics. **Licensing trap: 0.7.0 and 0.7.1 were AGPL-3.0-or-later**; only ≥0.8.0 is MIT. If ever used, pin `>=0.8` and let `cargo deny` enforce it.
-- `interavl` 0.6.0 — Apache-2.0, released 2026-04-16, but 25 k downloads and ~1.9 kLOC. Viable but not better than `iset` and much less exercised.
-- `store-interval-tree` 0.4.0 — MIT/Apache but **2 366 recent downloads, last release 2022-11-22**. Dead. Do not adopt.
+Do not automatically replace `protections.rs`'s existing sorted `Vec`. It has
+range-local snapshot/restore semantics and may have a very small population.
+First compare its measured mutation/query population with the candidate.
 
-### T4 — The alias registry: one row store, two indexes (build ours, on `slotmap` + `rangemap` + `FxHashMap`)
+### D4 — Overlapping intervals: ecosystem algorithm, Carrick selection policy
 
-Nothing off the shelf gives "duplicate-keyed rows, first-wins on one key and last-wins on another, with generation authentication and rollback." Build it:
+`iset` is an eligible candidate for the keep-all overlap algorithm because it
+can return all intervals containing a point. Its 0.x API and smaller adoption
+make a wrapper and reference-model testing mandatory. Carrick must store a
+stable row key/ordinal and choose the winner itself.
+
+If `iset` fails semantic, performance, or maintenance review, the fallback is a
+Carrick-owned augmented interval tree. Do not write that tree merely because the
+kernel is specialized; first prove the ecosystem leaf cannot satisfy the
+required candidate enumeration.
+
+### D5 — Alias registry: custom `AliasRegistry`, not one off-the-shelf map
+
+The target is one authoritative composite:
 
 ```text
-// crates/carrick-vmm-hvf/src/alias_space.rs
-struct AliasSpace {                       // ONE per AliasOwnershipScope
-    rows: SlotMap<AliasRowKey, AliasBacking>,          // the only owner of a row
-    by_publication: FxHashMap<Gpa, AliasRowKey>,       // (ipa) -> FIRST publication  [first-wins]
-    by_va: RangeMap<GuestVa, AliasRowKey>,             // VA extent -> covering row   [newest-wins, auto-split]
-    by_physical: FxHashMap<Gpa, SmallVec<[AliasRowKey; 2]>>, // physical_ipa -> rows (replay + retirement)
-    epochs: FxHashMap<Gpa, u64>,                       // replaces AliasVersionRegistry's Vecs
+AliasRegistry {
+    next_ordinal: u64,
+    global: AliasSpace,
+    root: AliasSpace,
+    by_mm: HashMap<MmRootSlot, AliasSpace>,
 }
 
-static ALIAS_SPACES: Mutex<FxHashMap<AliasOwnershipScope, AliasSpace>>;
+AliasSpace {
+    rows: StableRowStore<AliasRowKey, AliasRow { backing, ordinal }>,
+    by_identity: HashMap<AliasIpa, AliasRowKey>,
+    by_va: KeepAllIntervalIndex<GuestVa, AliasRowKey>,
+    by_ipa: KeepAllIntervalIndex<Gpa, AliasRowKey>,
+    by_physical: HashMap<PhysicalIpa, Vec<AliasRowKey>>,
+    epochs: HashMap<AliasIpa, u64>,
+}
 ```
 
-Three properties fall out:
+The stable row store may use `slotmap`: its keys are private row handles, so
+slot-generation wrap does not replace Carrick task identity. The interval
+indexes may use `iset` after qualification.
 
-1. **`AliasOwnershipScope` (`trap.rs:1821`) *is* the process key** — `MmRootSlot { base, size }` is the mm identity, and `alias_is_owned_by_process` (`trap.rs:2452`) already tests exactly that. Sharding by scope turns `retire_task_state_process_mappings`' global `registry.retain(...)` (`trap.rs:10591-10601`) into **`spaces.remove(&scope)`** — O(own footprint), not O(global). The single change that most directly attacks the 540 ms/process-exit measurement.
-2. `by_publication` preserves first-wins exactly (insert only if vacant, mirroring `process_alias_index`'s `.or_insert`, `trap.rs:2518`); `by_va` preserves newest-wins exactly (`RangeMap::insert` overwrites and splits, mirroring `.rev().find` + `unregister_alias_entries`).
-3. `mutate_external_alias_state`'s clone-and-diff (`trap.rs:7649-7652`) disappears: a keyed mutator *knows* its touched keys, which is already what `scoped_alias_epoch_update` (`trap.rs:7601`) proved when it was added as a fast path. Once every mutator is keyed, the general diff has no callers left — delete it, per "no second path."
+Required behavior:
 
-**Separately and independently: hoist `alias_backing_is_live` out of the scan predicate.** `trap.rs:2565/2585/14108/11558` call a `mach_vm_region` Mach trap once per candidate row under the global lock. Even after the index change it must become a single check on the *selected* row, not a filter over candidates.
+1. New rows receive a global monotonic ordinal. Replacing the first identity row
+   retains its ordinal unless current code would append a new row.
+2. A process lookup combines its local space and the global space, then ranks
+   candidates by the same ordinal direction as the old single `Vec`.
+3. Each query owns its full predicate: containment, whole-range coverage,
+   scope, VA→IPA correspondence, sharing class, liveness, and owner generation.
+4. A dead newest candidate is skipped and the next eligible live candidate is
+   considered. Liveness may be cached or proactively cleaned only with an
+   explicit invalidation/lifecycle authority.
+5. Retiring an mm removes only its `AliasSpace` and performs O(its own rows)
+   destruction. `Global` and `Root` remain distinct; neither is a wildcard.
+6. Rebinding an inherited alias moves one row between spaces atomically while
+   retaining the precedence required by current insertion order.
+7. Replay, alias, and version mutation retains the existing
+   `replay → alias → version` lock order until those states become one lock.
 
-### T5 — Version chains → delete the `Vec`s, use `FxHashMap` + `smallvec`
+M1 sharding and M2 indexing from the previous report must be designed and
+landed as one replacement. Sharding alone changes global/local precedence;
+indexing alone leaves global retirement coupling.
 
-`AliasVersionRegistry`'s four `Vec` association-lists (`trap.rs:7567-7573`) become `FxHashMap<(Gpa, Scope), Chain>` / `FxHashMap<Gpa, Chain>` folded into `AliasSpace.epochs` above. `bump_version_epoch` (`trap.rs:7583`) becomes `*epochs.entry(key).or_insert(0) += 1`. No new dependency; `smallvec` (MIT/Apache, already ubiquitous transitively) for the per-key version vectors.
+### D6 — Versions and rollback: exact maps plus keyed journals
 
-### T6 — Snapshot / rollback → **`rpds` 1.2.1 (MIT)** for the clone-heavy paths, RAII journals elsewhere
+Replace the four `AliasVersionRegistry` association lists with ordinary exact
+maps, inside the alias/receipt domain. Preserve:
 
-`rpds` — MIT, 3.7 M recent downloads, released **2026-05-15**, actively maintained. Persistent `HashTrieMap`/`RedBlackTreeMap`/`Vector` with structural sharing: `.clone()` is O(1) and an update is O(log n) with the old handle still valid. That converts "snapshot = clone the world" into "snapshot = copy a pointer," which is precisely what `CowArmedRanges::snapshot` (`trap.rs:4580` → `trap.rs:11194`) and the seven `alias_registry().lock().clone()` sites (`trap.rs:11145, 14779, 15429, 15651, 16033, 16458`) need.
+- first epoch is 1;
+- checked monotonic increment and abort on exhaustion;
+- exact chain reset (`base = after`, then clear versions);
+- receipt publication/retirement order.
 
-- `imbl` 7.0.1 is the maintained fork of `im` (released 2026-07-18, 2.1 M downloads) and is generally faster than `rpds` for large maps. **Licensing caution:** crates.io reports its license string as **`MPL-2.0+`**, and `deny.toml` allows the exact token `MPL-2.0`. That `+` may not match cargo-deny's SPDX expression list — verify with `just deny` before committing to it. `rpds`' plain MIT avoids the question, hence the lead.
-- **`im` 15.1.0 is unmaintained** (last release 2022-04-29). Do not adopt.
+Once every external alias mutator names its touched alias identities and replay
+IPAs, delete `mutate_external_alias_state`'s general clone-and-diff path.
 
-**Do not** persistent-ify the kernel graph wholesale. `snapshot.rs` is a *debug/observability* projection with a 3-attempt revision-race retry (`snapshot.rs:26, 873-920`), not a transaction; the right fix there is cheaper indexes (T2) and a *bounded* `ObservationInventory` sweep, not persistence. Concretely for `core.rs:455-468`: drop the two full `observation_count` traversals and make `sweep` amortized — evict a weak entry when its key is next touched, plus a generation-bounded pass, so it stops being O(all observed generations) per snapshot.
+Use small domain-specific undo records for `MmTransaction`, frame inventory,
+alias publication, and file-table writes. Do not introduce `rpds` or `imbl` yet.
+After alias state is scope-local and keyed, remeasure the remaining snapshot
+cost. Persistent collections are justified only if a large, genuine
+snapshot-and-restore population remains.
 
-For the real transactions (`MmTransaction` `mm_transaction.rs:34`, `InventoryOverlay` `frame_inventory.rs:94`, `AliasPublicationReceipt` `trap.rs:7524`), the current **RAII undo-journal** pattern is already right and should be the *only* pattern. Generalize it into one `carrick-collections::Journal<Undo>` type so stage-1 / stage-2 / frame-inventory really do compose into one rollback-capable transaction rather than three parallel ad-hoc ones.
+`KernelSnapshotV1` stays an owned diagnostic projection. Do not tax every
+syscall lookup with persistent nodes to optimize an observability path.
 
-`FileTableRwWriteGuard`'s full fd-map clone (`objects.rs:1449`) is the same shape and takes the same fix: journal the touched slots, don't clone the map.
+### D7 — Scheduler and futexes: keep locks, add exact directories
 
-### T7 — Queues and wakeups → mostly **std, plus one missing index**; `crossbeam`/`concurrent-queue` only if lock-free is actually needed
+Keep `Mutex<VecDeque> + Condvar` for the scheduler queue. Add the executor
+`by_thread` index first. Consider `slotmap` rows with `prev`/`next` keys or
+`intrusive-collections` only if targeted removal remains measured after the
+larger global costs are removed.
 
-- **Run queue** (`scheduler.rs:369`): keep the `Mutex<VecDeque> + Condvar`. Ten persistent executors on one queue is *not* a scalability problem, and a lock-free queue would lose the `queued: BTreeSet` membership invariant. The one real defect is `remove_exact`'s `rows.iter().position(...)` (`scheduler.rs:865`) — replace `VecDeque<QueueRow>` with an **intrusive doubly-linked list** so a targeted removal is O(1). `intrusive-collections` 0.10.3 (MIT/Apache, 5.8 M downloads, released **2026-08-04**, `no_std`) is the right crate; the simpler pure-safe alternative is `slotmap` for the rows plus prev/next slot keys, keeping everything inside the existing `Mutex`.
-- **Executor directory** (`scheduler.rs:304-342`): the clone-then-`find` is gratuitous. Add `by_thread: FxHashMap<ThreadKey, ExecutorId>` alongside `entries` (`scheduler.rs:194`).
-- **Futex table** — two fixes, no new crate:
-  1. **GC the buckets.** Nothing removes entries from the 64 shard maps, so `all_buckets()` (`thread.rs:1022`) grows forever. Drop a bucket when `enrolled == 0 && waiters == 0 && pending_redirects == 0` (all already tracked, `thread.rs:713-732`) under its shard lock.
-  2. **Index parked waiters by tid.** `notify_signal_pending_for(tid)` (`thread.rs:1369`) walks *every* bucket to wake *one* thread. Add `parked_by_tid: FxHashMap<ThreadId, SmallVec<[BucketKey; 2]>>` maintained at park/unpark, and the thread-directed wake becomes O(that thread's buckets). This is also the structural half of the process-global-broadcast problem `docs/perf-results/2026-08-19-futex-requeue-durability/README.md` names: "a signal is delivered to a TASK; waking every waiter in the carrier to ask 'was it you?' is the process-global surrogate `docs/identity-and-scope-domains.md` warns about."
-  3. `notify_signal_pending()` (process-directed) additionally wants a `task → buckets` index so it broadcasts inside one Linux process, not the whole carrier.
-- `crossbeam-skiplist` 0.1.3 (MIT/Apache) — last release **2024-01-08**, still 0.1.x. Not needed and not stable enough to be THE structure.
-- `concurrent-queue` 2.5.0 (MIT/Apache, 72 M downloads, last release 2024-04-26) — solid, but there is no site here where a lock-free MPMC queue beats the existing `Mutex + Condvar` at 10 executors.
-- `boxcar` 0.2.14 (MIT) — a concurrent append-only vector. Genuinely useful for the **event ring / diagnostics accumulators** (`event_ring.rs`, `FrameInventoryEvent` batches, `frame_inventory.rs:178`) where readers must not block writers. Not for anything that needs removal.
+For futex signals:
 
-### T8 — Allocators → `rangemap::RangeSet` + a size index
+- add a thread-directed enrollment directory that points to the exact live
+  bucket `Arc`s, maintained with enrollment, requeue, and unenrollment;
+- make process-directed notification accept an exact task identity;
+- include task identity in the parking token/filter so a shared bucket wakes
+  only the target process's waiters;
+- preserve the enrolled/parked/pending-redirect/credit protocol through every
+  transition.
 
-`GlobalFrameIpaAllocator` (`trap.rs:5765`) should be:
-- `free: RangeSet<u64>` — `insert` coalesces automatically, **deleting the sort-and-rebuild at `trap.rs:5863-5875` entirely**;
-- `by_size: BTreeSet<(u64 /*len*/, u64 /*base*/)>` — makes the smallest-fitting-extent best-fit policy (`trap.rs:5803-5807`, deliberately chosen to preserve large holes for exec frames) an O(log F) `range((length,0)..).next()` instead of the O(F) scan at `trap.rs:5789`;
-- `live: BTreeMap<u64,u64>` — keep as-is; the fail-closed exact-extent authority (`trap.rs:5857`), already O(log n).
+Do **not** garbage-collect address buckets until prepared wait tokens retain or
+enroll an exact bucket generation. The safe GC proof must cover the interval
+between guest-word validation and actual parking, not only current waiter
+counters.
 
-`IdRegistry::reserve_next` (`registry.rs:91`) gets a free-slot bitmap over the same pages as `PidTable` (T1), turning the linear probe into a word scan.
+The existing event ring remains its custom fixed-size, allocation-free,
+overwriting atomic array. `boxcar` is append-only and growing, so it does not
+match that contract.
 
----
+### D8 — Global-frame allocator: custom two-index allocator over `std`
 
-## 3. Ranked migration list
+Use one Carrick-owned allocator with:
 
-Ranked by *expected* impact against the measurements above. Each entry names the invariant the migration must preserve — the things that will silently break.
+- `free_by_base: BTreeMap<Gpa, Length>` for predecessor/successor coalescing;
+- `free_by_size: BTreeSet<(Length, Gpa)>` for candidate ordering;
+- `live: BTreeMap<Gpa, Length>` as the exact fail-closed release authority.
 
-**M1 — Shard the alias registry by `AliasOwnershipScope`.** `trap.rs:1912` → `Mutex<FxHashMap<Scope, AliasSpace>>`.
-*Impact:* directly attacks the 540 ms/process-exit storm (`retire_task_state_process_mappings` `trap.rs:10591` global `retain` → `remove`) **and** the ~35 ms/fork (`process_alias_index` `trap.rs:2513` and the six `alias_registry().lock().clone()` sites now touch one scope, not all). Prerequisite for M2–M4.
-*Invariants:* (a) `AliasOwnershipScope::Global` rows are visible to *every* scope — keep a separate `global` space consulted after the process space, matching `alias_matches_process_scope` (`trap.rs:2432`); (b) `Root` means "no mm root slot" (`trap.rs:2454`), a distinct scope, not a wildcard; (c) `rebind_inherited_alias_to_process` (`trap.rs:1848`) *moves* a row between scopes on fork — it becomes a remove+insert and must be atomic under the scopes lock; (d) lock order stays `replay → alias → version` (`trap.rs:7646`).
+Every split, allocation, release, and coalesce updates both free indexes inside
+the allocator's existing mutex. Release becomes O(log F) neighbour lookup plus
+bounded index updates instead of sort-and-rebuild.
 
-**M2 — Split the alias row store into `rows` + `by_publication` + `by_va`.**
-*Impact:* removes the linear scan from `physical_cow_source` (`trap.rs:11452`) — **per COW fault**, the hottest path in a fork storm — and from `lookup_shared_alias_by_va` (`trap.rs:2558`), `lookup_live_alias_by_va_any_scope` (`trap.rs:2578`), `shared_futex_location` (`trap.rs:14104`), `fork_translation_has_overlay_owner` (`trap.rs:6428`, called once per mapping inside the fork loop at `trap.rs:16957` → O(mappings × aliases)), and `trap.rs:11553/11614/11647`.
-*Invariants:* **first-wins on `(ipa, scope)`; last-wins on VA containment.** Prove both with a red-first probe: a Go-arena fixture where a `PROT_NONE` reserve and a later `MAP_FIXED` commit cover the same VA (the case documented at `trap.rs:2438-2444`) must still resolve to the commit; and a re-register of the same `(ipa, scope)` must still replace the *first* row (`trap.rs:2295`). Also: whole-range-in-one-entry or `None` (`trap.rs:2434`) — a buffer straddling two rows must still EFAULT, which `RangeMap::get_key_value` gives only if the returned range is checked to cover the whole query.
+Allocation must align each candidate base and verify the aligned remainder.
+With arbitrary alignment, scanning size-ordered candidates is not guaranteed
+O(log F). If measurements show that scan remains significant, exploit the
+small finite alignment classes used by HVPatch with alignment-specific indexes;
+do not claim the stronger bound before implementing that design.
 
-**M3 — Delete `mutate_external_alias_state`'s clone-and-diff.** `trap.rs:7642-7745`.
-*Impact:* the wholesale `replay.clone()` + `registry.clone()` per mutation is O(global) on every `unregister_alias`, `clear_alias_registry`, and process retirement. After M2 every mutator knows its keys, so `scoped_alias_epoch_update` (`trap.rs:7601`) becomes the *only* path. Per "no backward compatibility," delete the general one rather than keeping both.
-*Invariants:* epoch monotonicity and abort-on-exhaustion (`trap.rs:7607-7610`); chain reset semantics (`chain.base = after; chain.versions.clear()`, `trap.rs:7619-7620`) must be byte-identical for the same input.
-
-**M4 — Replace `AliasVersionRegistry`'s four `Vec`s with maps.** `trap.rs:7567-7573`, `bump_version_epoch` `trap.rs:7583`.
-*Impact:* removes four linear `find`s from the same COW-fault path. Small code, no new dependency, folds naturally into `AliasSpace` from M1.
-*Invariant:* `bump_version_epoch` currently returns `Some(1)` for a *new* key (`trap.rs:7588`); the map version must too, or every first mutation on a key silently changes epoch semantics.
-
-**M5 — Range-index `global_frame_host_owners` and get the copy out of the lock.** `trap.rs:1974`, `copy_from_global_frame_owner` `trap.rs:2181`.
-*Impact:* a linear `iter().find` range-containment lookup **plus a `volatile_copy_from_guest` performed while holding the process-global mutex**. `RangeMap<u64, OwnerKey>` makes the lookup O(log n); then take the owner's host pointer + generation under the lock, release, and copy.
-*Invariants:* the generation identity is load-bearing and non-negotiable — `global_frame_host_owner_matches` (`trap.rs:2125`) documents that a `map_shared_anon`/`munmap` cycle returned the *same* host VA 499/499 times, and that the pointer-only predicate was the `cpython-importlib` SIGSEGV. The `(None, 0) => true` case (a row published while nothing owned the extent) must survive exactly as written; tightening it "killed the guest outright." Releasing the lock before the copy requires pinning the owner (refcount or `Arc`) so retirement cannot `munmap` under the copy — a real new hazard this migration introduces that must be designed for, not assumed away.
-
-**M6 — Futex bucket GC + `tid → buckets` index.** `thread.rs:1022, 1351, 1369`.
-*Impact:* `notify_signal_pending_for` currently walks every bucket ever created to wake one thread; `notify_signal_pending` broadcasts carrier-wide. The recorded number is 179 broadcasts × ~1000 waiters ≈ 179 k unparks in a single probe.
-*Invariants:* the enrolled-vs-parked distinction (`thread.rs:713-723`) is what makes the requeue durable — a bucket may only be GC'd when `enrolled == 0 && waiters == 0 && pending_redirects == 0`, and the wake-credit mechanism must be drained too. Process-directed broadcast must still reach *every* waiter in the target Linux process, including one caught mid-requeue (`thread.rs:724-732`).
-
-**M7 — `RegistryState` reverse indexes + generation-keyed task store.** `core.rs:1500-1509`, `operations.rs:1855/1870/1886/…`, `operations.rs:3730/3768`, `core.rs:1341/1361/1372`, `operations.rs:2735-2748`.
-*Impact:* the kernel-graph half of the load coupling — every scheduler kick and every `wait4` is O(live processes) today. Start with the three trivial `.iter().find` → `.get` fixes (`core.rs:1341/1361/1372`), then `tid_index`, then `zombies_by_parent`.
-*Invariants:* the generation check must move from *after* the lookup to *inside* it — `KernelTaskBinding::capture` (`core.rs:208-214`) and `exact_thread_for_scheduler` (`operations.rs:1870`) currently compare keys post-hoc, and a `PidTable::get(TaskKey)` that returns `None` on serial mismatch must produce the *same* `StaleTaskBinding` error, not `UnknownTask`. Every index must be updated inside the same registry write-lock section that mutates the authoritative map, or the index becomes a second source of truth.
-
-**M8 — `GlobalFrameIpaAllocator` free list → `RangeSet` + size index.** `trap.rs:5765-5883`.
-*Impact:* removes an O(F log F) sort-and-rebuild from every extent release in the exit storm, and an O(F) best-fit from every allocation.
-*Invariant:* the "smallest fitting extent, lowest base as tie-break" policy (`trap.rs:5803-5807`) exists specifically to preserve large contiguous holes for HVPatch exec frames — preserve it exactly, and keep `live` as the fail-closed exact-extent authority (`trap.rs:5857`).
-
-**M9 — `MmResourceState.retired` deletion + `slotmap` for the mm leases.** `mm_resources.rs:82-86`.
-*Impact:* removes an explicitly-permanent unbounded set. Small, but a pure leak.
-*Invariant:* the duplicate-task rejection at `mm_resources.rs:112/155/172` must still fire — a generational store gives it for free (the key is either live or it misses), but `publish_root`/`publish_child` must return `DuplicateTask` on a *live* key, not silently overwrite.
-
-**M10 — `carrick-collections` crate + `FxHashMap` as the default kernel map.**
-*Impact:* the enabling refactor. Houses `PidTable`, `Journal<Undo>`, the generalized `RangeSet<V>` promoted out of `protections.rs:45`, and re-exports `slotmap`/`rangemap`/`iset`/`rustc-hash` so there is one answer per shape. Switching kernel-internal maps off SipHash is a broad, mechanical, measurable win — run it through `scripts/migrate/rewrite.py` as a count-asserted spec, per AGENTS.md.
-*Invariant:* keep SipHash anywhere a key could be adversarially chosen. Inside one carrier with carrick-allocated keys, none are.
-
-**M11 — Run-queue intrusive list + executor `by_thread` index.** `scheduler.rs:865, 304-342`.
-*Impact:* real but smaller — bounded by runnable threads and by ~10 executors. Do after M1–M7.
-
-**M12 — `rpds` for `CowArmedRanges` and the fork-spec snapshots.** `trap.rs:4580/11194`, the six `.lock().clone()` sites.
-*Impact:* turns O(n) snapshot into O(1). Deliberately last: after M1–M3 the cloned sets are per-scope and small, so the benefit may largely evaporate — **measure after M3 before spending the dependency.**
-
-**Cross-cutting invariant for all of the above:** the existing lock order `replay → alias → version` (`trap.rs:7646`, restated at `trap.rs:2291`) and `registry → observations` (`snapshot.rs:967-969`) must be preserved verbatim; adding an index is a new lock only if you let it be, and the right move is to put each index *inside* the existing critical section, not beside it.
+PID allocation may use a custom free bitmap later. Keep it separate from the
+task-record store: allocation availability, Linux-visible identity, and record
+storage are related invariants but not the same collection.
 
 ---
 
-## 4. Anti-recommendations
+## 3. Dependency disposition
 
-**`dashmap` (6.2.1, MIT), `papaya` (0.2.5, MIT), `scc` (3.8.6, Apache-2.0), `flurry`.** All healthy, all popular. All wrong here. Every one of them replaces "one lock over a consistent map" with "many locks over a map with no consistent snapshot." The kernel graph's correctness rests on multi-key atomicity — `retire_task_state_process_mappings` (`trap.rs:10555`) mutates the registry, the mappings, and the frame inventory as **one** transaction; `snapshot.rs:934` takes registry-then-observations in a fixed order. A sharded concurrent map cannot give a cross-key consistent read, so adopting one converts a lock-contention problem into a correctness problem. Additionally `DashMap` deadlocks on re-entrant access to the same shard, which is exactly the shape `mutate_external_alias_state` has today. **The measured problem is O(n) work under the lock, not lock contention.** Fix the algorithm; keep the lock.
+| Crate | Disposition | Allowed use |
+|---|---|---|
+| `rangemap` | Eligible after qualification | Canonical non-overlapping overwrite/coalesce range maps and sets |
+| `iset` | Evaluate behind a wrapper | Keep-all overlapping interval candidate enumeration |
+| `slotmap` | Eligible for private handles | Alias/run-queue/internal arena rows; never TaskKey/ThreadKey authority |
+| `rustc-hash` | Deferred | Per-index optimization for proven non-adversarial keys after measurement |
+| `intrusive-collections` | Deferred | Scheduler targeted removal only after it is measured |
+| `rpds` / `imbl` | Deferred | Narrow genuine snapshot/restore path after scope/index migrations and remeasurement |
+| `smallvec` | Deferred | Only where cardinality histograms justify inline storage |
+| `boxcar` | Rejected for current named uses | Does not match the fixed bounded event ring |
+| `dashmap`, `papaya`, `scc`, `flurry` | Rejected for graph/alias authority | Cross-key atomicity and consistent snapshots matter more than sharded access |
+| `left-right`, `evmap` | Rejected for alias state | Frequently written COW state would pay duplicate application/publish costs |
+| `slab` | Rejected for external identities | No generation; stale keys can silently name reused slots |
+| `indexmap` | Rejected for alias ranges | Insertion order does not solve interval candidate selection |
 
-**`left-right` (0.11.8, MIT/Apache) and `evmap` (11.0.0, MIT/Apache).** The obvious-looking answer for a "read-mostly global registry," and both are well maintained. But writes go through an oplog and are **applied twice**, `publish()` waits for reader epochs, and "writes through left-right are slower than direct access." The alias registry is *not* read-mostly — `register_shared_alias` (`trap.rs:2290`) fires on **every COW fault**, which in a fork storm is the dominant event. A frequently-written left-right either publishes constantly (paying the epoch wait per write) or grows an unbounded oplog. Wrong axis.
-
-**`im` 15.1.0.** Unmaintained since 2022-04-29 despite 4.75 M recent downloads. For persistent structures: `rpds` (MIT, 2026-05) or `imbl` (the maintained fork, 2026-07) — never `im`.
-
-**`nodit` <0.8.0.** AGPL-3.0-or-later. `cargo deny` will reject it, correctly.
-
-**`store-interval-tree`.** 2 366 recent downloads, last touched 2022-11-22. Adopting a dead 4-year-old crate for a load-bearing kernel structure is worse than the hand-rolled `Vec` it replaces.
-
-**`crossbeam-skiplist`.** Still 0.1.3, last release 2024-01-08. An ordered lock-free map is tempting for `global_frame_host_owners`, but it does not answer the range-containment question (still needs `range(..=ipa).next_back()` plus a manual extent check), and a 0.1.x crate cannot be THE structure under an opt-out-not-opt-in policy.
-
-**`slab` as a task/thread store.** MIT, 201 M downloads, actively maintained — and it has **no generation**. `TaskSerial`/`ThreadSerial` exist precisely because a recycled pid must not alias its predecessor (`objects.rs:3862-3872`, `mm_resources.rs:84-86`). A `slab` key silently aliases on reuse. Use only for arena storage whose keys never outlive one transaction.
-
-**`indexmap`.** 2.14.0, Apache/MIT, 326 M downloads — excellent crate, wrong problem. It buys *insertion-order iteration*, which looks like it might serve the newest-wins alias discipline. It does not: newest-wins needs interval overwrite-and-split, not ordered iteration, and `IndexMap` would preserve the O(n) scan while adding a dependency.
-
-**A single global `RwLock<RegistryState>` "just made finer-grained."** Tempting after reading `core.rs:1199`, and wrong as a *first* move. Every O(live-processes) scan listed in T2 stays O(live-processes) after the lock is split — the wrong work would be parallelized and a lock-ordering hazard taken on for it. Add the indexes first (M7), then re-measure before touching lock granularity at all.
-
-**Persistent (`rpds`/`imbl`) data structures for the kernel graph as a whole.** O(1) clone is seductive given `snapshot.rs`'s 20 full `Vec`s. But `snapshot.rs` is a debug projection with a revision-race retry (`snapshot.rs:26, 873-920`), not a transaction, and persistent maps cost a pointer-chase per *lookup* — taxing every syscall to speed up a diagnostic path. Use `rpds` narrowly (M12) where a genuine snapshot-and-restore exists, and only after M3 proves the clone is still large.
-
-**Adding any crate without making it THE structure.** Per AGENTS.md, a parallel `rangemap`-backed index alongside the `Vec` would be the fifth interval implementation in the tree (after `protections.rs:45`, `trap.rs:5767`, `trap.rs:4580`, and the alias `Vec` itself). Each migration must *delete* what it replaces in the same change.
+Do not use a transitive dependency as though it were a workspace API. Any
+adopted crate becomes a direct dependency of its consumer, with its features and
+license checked explicitly.
 
 ---
 
-## Two flags outside the brief
+## 4. Revised migration sequence
 
-1. **`protections.rs:45` `RangeSet` is the best interval structure in the repo and it is private and value-less.** Sorted-merged `Vec` with `partition_point` queries, a two-cursor `intersects_set`, and — notably — a **range-local** `snapshot_mapping_range`/`restore_mapping_range` (`protections.rs:266-300`) that "cannot erase a sibling's disjoint VMA." That range-local rollback is exactly the primitive the HVF side is missing. Promoting it (generic over a value `V`, typed on `GuestVa`/`Gpa`) into `carrick-collections` is higher leverage than any single crate adoption, and it satisfies "look for what already exists before writing anything new."
+Ranked first by measured coupling, then by semantic risk and implementation
+cost. Each phase must delete the path it replaces.
 
-2. **The bare `u64` keys are the T4 bug shape all over again.** `FutexTable.shards: HashMap<u64, …>` (`thread.rs:899`) holds a *guest futex address* on the private path and a *`SharedFutexLocation::waiter_key()`* on the shared path — two domains in one integer type, which `docs/typed-interfaces-audit.md` lists as the origin of three shipped bugs. `ReplayMappingKey = (u64, usize, usize, u64)` (`trap.rs:2236`) and `global_frame_host_owners`' `(u64, u64)` (`trap.rs:1974`) are the same shape. Whatever structure replaces them should take the opportunity to key on `Gpa`/`GuestVa`/a `FutexKey` newtype, so the migration also closes a `just lint-domains`-class gap instead of carrying it forward.
+### M0 — Apply the zero-dependency shape fixes
+
+- Replace the three PID `.iter().find(...)` calls with exact map lookup.
+- Route process-group priority through `ProcessGroupRecord.members`.
+- Route `wait4` candidate enumeration through the parent's existing child set.
+- Add executor `by_thread` under its existing lock.
+
+These changes need focused correctness tests but no new collection dependency.
+Measure them independently; do not attribute the 540 ms alias result to them.
+
+### M1 — Specify and reference-test alias selection
+
+Before changing storage, encode a simple test-only reference model of the
+current `Vec` semantics. Required equivalence fixtures:
+
+- overlapping `PROT_NONE` reservation and later `MAP_FIXED` commit;
+- replacement of the first `(ipa, scope)` row without moving its precedence;
+- dead newest row with an older live fallback;
+- overlapping global and process-scoped rows in both insertion orders;
+- whole-range-in-one-entry versus straddling two rows;
+- stale owner generation against a recycled host VA/IPA extent;
+- rebind across fork and atomic process-scope retirement.
+
+The new registry must match the reference model before performance evidence is
+considered.
+
+### M2 — Replace the alias registry as one composite
+
+Land scope-local storage, stable rows, global ordinal, VA/IPA candidate indexes,
+and keyed identity indexes together. Preserve the reference semantics and lock
+order. Then remeasure:
+
+- 1000-process exit retirement;
+- fork cost as live process count grows;
+- COW-fault alias lookup;
+- `mach_vm_region` calls per successful lookup.
+
+This is the migration most directly tied to the measured 540 ms/process exit
+and 35 ms/fork pathologies.
+
+### M3 — Delete alias clone-and-diff and map the version chains
+
+Convert every mutator to touched-key publication, replace version association
+lists with exact maps, and delete `mutate_external_alias_state`. Preserve epoch
+and receipt semantics byte-for-byte. Re-run the M2 measurements so the result is
+separable from sharding/indexing.
+
+### M4 — Range-index and pin global-frame owners
+
+Replace linear owner containment lookup with a non-overlapping typed range
+index. The lookup may release the global index lock before copying only after it
+pins an `Arc`-owned mapping and exact generation so retirement cannot `munmap`
+the host extent under the copy. Preserve the `(None, 0) => true` compatibility
+case documented at `trap.rs:2139-2163`.
+
+### M5 — Add exact futex signal enrollment indexes
+
+Implement thread- and task-qualified wake targeting without bucket GC. Prove
+the mid-requeue, unpark/repark, wake-credit, and prepared-wait gaps. Re-run the
+recorded requeue durability workload and machine-count unparks.
+
+### M6 — Add registry thread identity indexes
+
+Add `tid_index` and the exact `TaskTable`/`ThreadIndex` APIs. Update them in the
+same registry write-lock sections as task/thread claims. Preserve the distinction
+between `Unknown*` and `Stale*` errors.
+
+Only after those indexes land should user/euid or FS-context membership be
+considered, and only against measured callers.
+
+### M7 — Replace global-frame allocator sort/rebuild
+
+Introduce the custom base/size/live composite. Prove aligned smallest-fit,
+lowest-base tie-breaking, exact release rejection, split/coalesce, arena bounds,
+and rollback. Report the actual candidate count under 16 KiB and 2 MiB
+alignment before claiming O(log F) allocation.
+
+### M8 — Bound exact-generation retirement history
+
+Redesign `MmResourceState.retired` only with an explicit proof of repeated
+cleanup semantics. A successful result must remain idempotent for the exact
+retired generation, reject live duplicates, reject unknown tasks, and never let
+a recycled numeric PID target its predecessor's lease.
+
+### M9 — Journal touched fd/range state
+
+Replace full file-table clones with touched-slot undo/publication. Reassess
+`CowArmedRanges` after alias sharding: if its snapshot population remains large,
+evaluate a keep-all interval structure or narrow copy-on-write representation
+against the current vector reference model.
+
+### M10 — Reassess deferred dependencies and lock granularity
+
+Only after M0-M9:
+
+- benchmark default `HashMap` versus a fast hasher on exact hot indexes;
+- measure scheduler targeted-removal population before intrusive storage;
+- measure remaining snapshot size/frequency before persistent collections;
+- measure contention after algorithmic work before splitting global locks.
+
+The measured defect is currently excessive work under locks, not evidence that
+the locks themselves are the limiting algorithm.
+
+---
+
+## 5. Cross-cutting invariants and anti-recommendations
+
+Every migration preserves:
+
+- `replay → alias → version` lock order (`trap.rs:7646`, `trap.rs:2291`);
+- `registry → observations` lock order (`snapshot.rs:967-969`);
+- exact source/binary/receipt provenance for any performance or conformance
+  claim;
+- typed `GuestVa`, `Gpa`, physical IPA, owner generation, task, and futex-key
+  domains;
+- one authoritative implementation: no permanent old/new dual path.
+
+Avoid these approaches:
+
+- **Sharded concurrent maps for kernel graph authority.** They do not provide
+  the required cross-key transaction or consistent snapshot.
+- **A global fast-hasher alias.** Key threat models differ; select per index.
+- **One universal interval type.** Non-overlapping overwrite, overlapping
+  keep-all, aligned allocation, and range-local rollback are different
+  semantics.
+- **Generational arenas as Linux identity.** Internal slot validity is not the
+  never-reused TaskSerial/ThreadSerial contract.
+- **Futex bucket GC based only on current counters.** It ignores prepared wait
+  tokens and can forget wake generations.
+- **Persistent collections for the whole graph.** They optimize diagnostic
+  cloning by taxing the syscall path.
+- **A `carrick-collections` dependency façade.** Re-exporting crates hides the
+  semantic decision instead of centralizing it.
+- **Adding an index beside an independently mutable legacy path.** A composite
+  may own multiple indexes, but every mutation must go through its single API
+  and the replaced path must be deleted.
+
+## 6. Typed-domain opportunity
+
+Collection migrations must close, not reproduce, the existing bare-integer bug
+shape:
+
+- `FutexTable.shards: HashMap<u64, ...>` combines private guest addresses and
+  shared waiter identities (`carrick-thread/src/thread.rs:899`).
+- `ReplayMappingKey = (u64, usize, usize, u64)` combines several physical and
+  permission domains (`trap.rs:2236`).
+- `global_frame_host_owners` uses `(u64, u64)` for an IPA extent
+  (`trap.rs:1974`).
+
+New structures should use `FutexKey`, `GuestVa`, `Gpa`, `PhysicalIpa`, typed
+lengths, and exact generation-bearing owner keys. The type boundary is part of
+the collection design, not a cosmetic follow-up.
+
+## 7. Bottom line
+
+Carrick should build its own **kernel semantic data structures** where the
+structure means more than its container: `AliasRegistry`, task/thread identity
+tables, the global-frame allocator, futex enrollment, and undo journals.
+
+Carrick should generally not build its own hash table, balanced tree, slot arena,
+or interval-tree algorithm when a maintained crate exactly supplies that leaf.
+Use `std` first; qualify `rangemap`, `iset`, or `slotmap` for narrow roles; wrap
+them in typed Carrick APIs; and let controlled measurements decide whether the
+remaining speculative dependencies are warranted.
