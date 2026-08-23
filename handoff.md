@@ -212,6 +212,40 @@ hangs, sigtimedwait-family value diffs, futexwakeexact refault-livelock
 (pre-existing, now named by the detector), forkfpreclaim teardown,
 mtforkcorrupt flake, gate 13 after fscrash resolves.
 
+### GATE 13 (2026-08-23, log target/perf/gate13.log): 781/834 + 40/40 — and the tail is now LOAD
+
+781 PASS / 53 FAIL on the new 834-row denominator (463 sources; the
+sharedanonfutexfork admission), scenarios 40/40. Cleared since gate 12:
+waitrestart, futexforkrequeue, futexwakecount, clonefilesexec,
+dirfdnotdir, readpasteof, unlinkatbindmount, sharedanonfutexfork green
+both libcs. The remaining 53 decompose (script: /tmp classifier in the
+session log; re-derive with the FAIL rows):
+
+- **Load-coupled, the dominant class**: execfromthread and
+  vforkexecthread PASS standalone in ~1 s and TIMEOUT (45 s, SIGKILL,
+  empty stdout) under the gate's concurrency — both libcs. Likewise
+  sigsuspendxthread / threadcommname / threadstatstate pass 3x
+  standalone at HEAD and flip their value lines under gate load
+  (suspended_thread_woke=false etc.). This is the owner's ruled
+  defect class (normal kernels in VMs don't do this) — the next hunt
+  is WHY signal wake / exec latency scales with carrier load; the
+  collections research's M6/M7 (futex bucket GC, tid index) and the
+  per-publication broadcast wake are prime suspects.
+- **Verification gap fixed going forward**: worker/director batteries
+  ran MUSL binaries only; gnu-only fails (devnullseek iouringsqpoll
+  mmapmunmap vdsosymbols) and gnu rows of "fixed" probes were never
+  exercised. Batteries must run BOTH libc variants.
+- Persistent value-diffs/crashes: coredumpbit/file, epollcluster,
+  epolletmanyhup, execpermitchurn, forkfpreclaim, futexwaiterstates,
+  futexwakeexact, killfault, killreap, mprotectexec, mqnotifycrossproc,
+  ptracesequence, ptracesignalstop, setidthreadchurn (musl synccall
+  broadcast — hypotheses in session log), shmnestedfork,
+  sigtimedwaitintr, waitexitstorm, clone3pidfdsig, siglongjmpaltstack,
+  waitidsiuid.
+
+Owner guidance recorded: conformance probes only need Docker when a NEW
+probe requires its authority captured; routine gates stay carrick-only.
+
 ### CLOSED (78cd28e9): waitrestart falls — three stacked signal-delivery defects
 
 The hunt below ran to ground the same day. Three defects, each proven
