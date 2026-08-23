@@ -2873,16 +2873,9 @@ where
                 tracing::error!(%failure, "classify persistent terminal MM ownership");
                 std::process::abort();
             });
-        let extent_count = if owns_final_mm {
-            engine.frame_inventory_extent_count()
-        } else {
-            0
-        };
-        if extent_count > 0 {
+        if owns_final_mm {
             let capacity = carrick_hal::FrameEventCapacity::for_event_count(
-                extent_count
-                    .checked_mul(2)
-                    .unwrap_or_else(|| std::process::abort()),
+                carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH,
             )
             .unwrap_or_else(|_| std::process::abort());
             let reservation = terminal_context
