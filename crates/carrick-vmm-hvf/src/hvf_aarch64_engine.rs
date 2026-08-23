@@ -905,6 +905,20 @@ pub fn retire_detached_task_only_exec_predecessor(
     })?;
     HvfVmState::retire_task_state_exec_predecessor(task)
 }
+
+pub fn cancel_dormant_task_engine(state: &mut HvpatchTaskEngineState) -> Result<(), TrapError> {
+    HvfVmState::retire_task_state_dormant_authority(&mut state.backend_mut().state.task)
+}
+
+pub fn cancel_dormant_task_only_engine(
+    state: &HvpatchTaskOnlyEngineState,
+) -> Result<(), TrapError> {
+    let mut parked = state.parked_task.lock();
+    if let Some(task) = parked.as_mut() {
+        HvfVmState::retire_task_state_dormant_authority(task)?;
+    }
+    Ok(())
+}
 pub fn split_initial_task_engine(
     engine: HvfAarch64Engine,
 ) -> (HvpatchTaskEngineState, HvfAarch64Vcpu) {

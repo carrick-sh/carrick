@@ -5752,6 +5752,11 @@ impl GlobalFrameIpaAllocator {
         self.free = merged;
         Ok(())
     }
+
+    fn is_live(&self, base: u64, length: u64) -> bool {
+        let length = align_up(length, CowArmedRanges::COMPOUND_SIZE).unwrap_or(length);
+        self.live.get(&base).copied() == Some(length)
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6840,6 +6845,18 @@ impl HvpatchTaskInventoryAuthority {
                 *self = Self::SharedProcess { ledger };
                 Ok(())
             }
+            Self::Active {
+                ledger,
+                receipt,
+                retirement,
+            } => {
+                *self = Self::Active {
+                    ledger,
+                    receipt,
+                    retirement,
+                };
+                Ok(())
+            }
             Self::InventoryPublished {
                 ledger,
                 staged,
@@ -6864,10 +6881,11 @@ impl HvpatchTaskInventoryAuthority {
                 }
             }
             other => {
+                let phase = other.phase_name();
                 *self = other;
-                Err(TrapError::Hypervisor(
-                    "HVPatch inventory activation requires published inventory".to_owned(),
-                ))
+                Err(TrapError::Hypervisor(format!(
+                    "HVPatch inventory activation requires published inventory (phase={phase})"
+                )))
             }
         }
     }
@@ -7056,7 +7074,8 @@ impl HvpatchTaskInventoryAuthority {
     }
 
     fn rollback_unpublished(&mut self) -> Result<(), TrapError> {
-        match std::mem::replace(self, Self::Retired) {
+        let current = std::mem::replace(self, Self::Retired);
+        match current {
             Self::Absent
             | Self::SiblingShared { .. }
             | Self::SharedProcess { .. }
@@ -7072,9 +7091,29 @@ impl HvpatchTaskInventoryAuthority {
                 drop(commit);
                 Ok(())
             }
-            Self::InventoryPublished { .. } | Self::Active { .. } => Err(TrapError::Hypervisor(
-                "published HVPatch inventory dropped before exact retirement".to_owned(),
-            )),
+            Self::InventoryPublished { .. } | Self::Active { .. } => {
+                let phase = current.phase_name();
+                *self = current;
+                Err(TrapError::Hypervisor(format!(
+                    "published HVPatch inventory dropped before exact retirement (phase={phase})"
+                )))
+            }
+        }
+    }
+
+    fn retire_exec_predecessor(&mut self) {
+        let current = std::mem::replace(self, Self::Retired);
+        if let Self::ProcessPrepared {
+            ledger,
+            staged,
+            commit,
+            challenge: _,
+        } = current
+        {
+            if let Some(mut inventory) = ledger.try_lock() {
+                let _ = HvfVmState::rollback_unpublished_mappings(&mut inventory, &staged);
+            }
+            drop(commit);
         }
     }
 
@@ -7186,6 +7225,10 @@ impl HvpatchTaskMmAuthority {
         self.inventory
             .lock()
             .apply_retirement(mm, &self.pending_receipts, apply)
+    }
+
+    fn retire_exec_predecessor(&self) {
+        self.inventory.lock().retire_exec_predecessor();
     }
 
     fn bind_kernel_mm(&self, mm: std::num::NonZeroU64) -> Result<(), TrapError> {
@@ -7968,8 +8011,17 @@ impl HvpatchTaskRegistration {
             &new_task_mm,
             stage2_lease_keys,
         )?;
+        if let Some(old_task_mm) = self.task_mm.take() {
+            old_task_mm.retire_exec_predecessor();
+        }
         self.task_mm = Some(new_task_mm);
         Ok(())
+    }
+
+    pub(crate) fn retire_dormant_authority(&mut self) {
+        if let Some(task_mm) = &self.task_mm {
+            task_mm.retire_exec_predecessor();
+        }
     }
 
     fn activate(&self) -> Result<(), TrapError> {
@@ -9174,6 +9226,11 @@ impl HvfVmState {
             drop(lease);
             return Ok(());
         }
+        if is_reusable_global_frame_extent(ipa, length)
+            && !global_frame_ipa_allocator().lock().is_live(ipa, length)
+        {
+            return Ok(());
+        }
         let size = usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?;
         let rc = unsafe { inventory_hv_vm_unmap(ipa, size) };
         if rc != 0 {
@@ -10286,6 +10343,15 @@ impl HvfVmState {
             )
         })?;
         cleanup.retire()
+    }
+
+    pub(crate) fn retire_task_state_dormant_authority(
+        task: &mut HvfTaskState,
+    ) -> Result<(), TrapError> {
+        if let Some(reg) = &mut task.registration {
+            reg.retire_dormant_authority();
+        }
+        Ok(())
     }
 
     fn seed_readonly_spans_from_plan(&self, plan: &GuestMappingPlan) {
@@ -17481,6 +17547,10 @@ impl HvfVmState {
         // against the replacement mm.
         self.cow_armed = std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
         self.cow_deferred_publications = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        self.pending_fork_frame_receipts.clear();
+        self.pending_process_aliases.clear();
+        self.fork_mapping_descs.clear();
+        self.fork_child_descs.clear();
         // The shared AArch64 engine already builds this editor lazily from the
         // live page-table backing on its first real edit. Keeping an eager
         // manager here cloned the complete 1.8 MiB root-slot table on every exec,
@@ -23506,5 +23576,55 @@ mod tag_strip_tests {
             vec![live_fragment],
             "the retired row must not suppress the live suffix from fork arming",
         );
+    }
+
+    #[test]
+    fn active_inventory_activation_is_idempotent_for_thread_siblings() {
+        let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+        let receipt = test_kernel_apply(
+            empty_inventory_commit(101),
+            101,
+            std::num::NonZeroU64::new(101).unwrap(),
+            1,
+            Vec::new(),
+        );
+        let mut active = HvpatchTaskInventoryAuthority::Active {
+            ledger,
+            receipt,
+            retirement: None,
+        };
+        assert_eq!(active.phase_name(), "active");
+        active.activate(&[]).unwrap();
+        assert_eq!(active.phase_name(), "active");
+    }
+
+    #[test]
+    fn exec_predecessor_authority_retires_without_aborting_active_drop() {
+        let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+        let receipt = test_kernel_apply(
+            empty_inventory_commit(102),
+            102,
+            std::num::NonZeroU64::new(102).unwrap(),
+            1,
+            Vec::new(),
+        );
+        let authority = HvpatchTaskMmAuthority {
+            mappings: Vec::new(),
+            mm_root_slot: Some((0x1000_0000, 0x20_0000)),
+            inventory: parking_lot::Mutex::new(HvpatchTaskInventoryAuthority::Active {
+                ledger,
+                receipt,
+                retirement: None,
+            }),
+            kernel_mm: parking_lot::Mutex::new(std::num::NonZeroU64::new(102)),
+            cow_armed: None,
+            cow_deferred_publications: None,
+            pending_receipts: Vec::new(),
+            alias_receipts: parking_lot::Mutex::new(Vec::new()),
+            drop_order: None,
+        };
+        authority.retire_exec_predecessor();
+        assert_eq!(authority.inventory.lock().phase_name(), "retired");
+        drop(authority);
     }
 }
