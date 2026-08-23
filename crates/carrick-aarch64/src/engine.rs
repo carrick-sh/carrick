@@ -2533,6 +2533,16 @@ fn seed_sibling_snapshot(
     // PSTATE the new thread must run with. Without this the sibling restores the
     // EL1h trap-time PSTATE and re-enters at the wrong exception level.
     snap.pstate = parent.spsr_el1;
+    // The gettid fast-path stamp (CONTEXTIDR_EL1) is PER-THREAD identity and
+    // must not be inherited: a sibling carrying the parent's stamp answered
+    // gettid(2) at EL1 with the LEADER's tid, so a container guest's
+    // tgkill(gettid_of_sibling) targeted the wrong thread and the suspended
+    // sibling never woke (sigsuspendxthread). Zero means "unstamped" — the
+    // EL1 handler then traps to the host, whose dispatch answers from the
+    // kernel graph's ThreadKey. A process-fork child leader is re-stamped by
+    // its bootstrap (`stamp_guest_tid_checked`); a clone sibling stays
+    // trap-served, matching the raw lane's proven behavior.
+    snap.contextidr_el1 = 0;
     snap
 }
 

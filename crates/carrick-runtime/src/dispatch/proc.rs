@@ -1809,19 +1809,16 @@ impl SyscallDispatcher {
         }
 
         fn gettid(this, cx) {
-            if let Some(t) = cx.thread
-                && t.registry.live_count() > 1
-            {
-                let tid = t.tid.raw() as u32;
-                let ns_tid = if tid == std::process::id() {
-                    crate::namespace::pid::host_to_ns_or_self(tid)
-                } else {
-                    tid
-                };
-                return Ok(DispatchOutcome::Returned {
-                    value: i64::from(ns_tid),
-                });
-            }
+            // The kernel graph is THE tid authority — same reasoning as
+            // `set_tid_address` below. The deleted arm returned the executor
+            // REGISTRY ThreadId when the process was multithreaded: a
+            // different numbering that only coincides with kernel ThreadKey
+            // tids while the guest is the carrier's sole process. In a
+            // container (sh init + probe) the two diverge, so a guest's
+            // gettid() named a tid that tgkill/procfs resolve to a DIFFERENT
+            // thread — sigsuspendxthread's tgkill(SIGUSR1) landed on main
+            // instead of the suspended sibling (handler ran, wrong thread,
+            // sibling parked forever).
             if let Some(tid) = hvpatch_reported_tid(cx.kernel.thread().key().tid.raw()) {
                 return Ok(DispatchOutcome::Returned {
                     value: i64::from(tid),
