@@ -766,6 +766,13 @@ where
             );
         }
         crate::probes::execve_argv(&path, &argv);
+        let sigdbg = std::env::var_os("CARRICK_SIG_DEBUG").is_some();
+        if sigdbg {
+            eprintln!(
+                "SIGDBG prepare-execve tid={:?} path={path} BEGIN",
+                self.this_tid
+            );
+        }
         let proc_argv: Vec<String> = argv
             .iter()
             .map(|argument| String::from_utf8_lossy(argument).into_owned())
@@ -790,6 +797,9 @@ where
                     .map(ExecvePreparation::Complete);
             }
         };
+        if sigdbg {
+            eprintln!("SIGDBG prepare-execve tid={:?} image LOADED", self.this_tid);
+        }
         let inventory_failure_injection = kernel
             .hvpatch_process
             .as_ref()
@@ -805,6 +815,12 @@ where
                     .map(ExecvePreparation::Complete);
             }
         };
+        if sigdbg {
+            eprintln!(
+                "SIGDBG prepare-execve tid={:?} admission CLOSED",
+                self.this_tid
+            );
+        }
         crate::probes::execve_loaded(
             &path,
             image.entry(),
