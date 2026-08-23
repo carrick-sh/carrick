@@ -1390,19 +1390,23 @@ impl Registry {
         &self,
         pgid: ProcessGroupId,
     ) -> Vec<(Arc<Task>, carrick_abi::NsUid)> {
-        self.state
-            .read()
-            .tasks
-            .values()
-            .filter(|record| {
-                record.task.lifecycle() == TaskLifecycle::Live
-                    && record.task.process_group() == pgid
-            })
-            .map(|record| {
-                (
-                    Arc::clone(&record.task),
-                    record.task.process_credentials().euid(),
-                )
+        let state = self.state.read();
+        let Some(group) = state.process_groups.get(&pgid) else {
+            return Vec::new();
+        };
+        group
+            .members
+            .iter()
+            .filter_map(|member| {
+                let record = state.tasks.get(&member.id)?;
+                if record.task.key() == *member && record.task.lifecycle() == TaskLifecycle::Live {
+                    Some((
+                        Arc::clone(&record.task),
+                        record.task.process_credentials().euid(),
+                    ))
+                } else {
+                    None
+                }
             })
             .collect()
     }
@@ -1410,6 +1414,10 @@ impl Registry {
     /// Every LIVE task whose process euid is `uid`, for PRIO_USER. The euid in
     /// the pair is redundant (it equals `uid`) but keeps one shape with
     /// [`Self::process_group_prio_targets`] so the dispatch arm is shared.
+    ///
+    /// Note (docs/kernel-collections-research-2026-08-23.md T2/M6): This remains
+    /// a linear task scan because maintaining a reverse euid index would require
+    /// joining every credential transition.
     pub(crate) fn user_prio_targets(
         &self,
         uid: carrick_abi::NsUid,
@@ -1610,7 +1618,9 @@ mod tests {
     use carrick_abi::LinuxCloneFlags;
 
     use super::*;
-    use crate::kernel::{ClonePlan, Credentials, FileTable, FsContext, Mm, Sighand};
+    use crate::kernel::{
+        ClonePlan, Credentials, FileTable, FsContext, LinuxWaitStatus, Mm, Sighand,
+    };
 
     fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
         let bootstrap = RootBootstrap::for_reference_model(
@@ -1823,5 +1833,63 @@ mod tests {
         assert!(!kernel.registry().set_oom_score_adj(0, 100));
 
         assert!(!kernel.registry().set_oom_score_adj(u32::MAX, 100));
+    }
+
+    #[test]
+    fn process_group_prio_targets_matches_live_group_members_and_filters_dead_members() {
+        let (kernel, root) = bootstrap(5000);
+        let pgid_root = ProcessGroupId::from_leader(root.task.key().id);
+
+        let fork = |tid: i32, name: &str| {
+            kernel
+                .fork_task(
+                    &root,
+                    ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                    ThreadId::synthetic_for_tests(tid),
+                    name.to_string(),
+                    None,
+                )
+                .expect("fork child")
+        };
+
+        let child1 = fork(5001, "child-1");
+        let child2 = fork(5002, "child-2");
+        kernel
+            .set_process_group(root.task.key().id, Some(child2.task.key().id), None)
+            .expect("setpgid child2");
+        let pgid_child2 = ProcessGroupId::from_leader(child2.task.key().id);
+
+        let child3 = fork(5003, "child-3");
+        kernel
+            .exit_task(
+                child3.task.key().id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("child 3 exit");
+
+        // Child 4 in root's process group, but currently Exiting (not Live)
+        let child4 = fork(5004, "child-4");
+        assert!(child4.task.begin_exit());
+
+        let root_targets = kernel.registry().process_group_prio_targets(pgid_root);
+        let root_target_ids: Vec<TaskId> = root_targets.iter().map(|(t, _)| t.key().id).collect();
+        assert_eq!(
+            root_target_ids,
+            vec![root.task.key().id, child1.task.key().id]
+        );
+
+        let child2_targets = kernel.registry().process_group_prio_targets(pgid_child2);
+        let child2_target_ids: Vec<TaskId> =
+            child2_targets.iter().map(|(t, _)| t.key().id).collect();
+        assert_eq!(child2_target_ids, vec![child2.task.key().id]);
+
+        let unknown_pgid = ProcessGroupId::from_abi_positive(99999).expect("valid pgid");
+        assert!(
+            kernel
+                .registry()
+                .process_group_prio_targets(unknown_pgid)
+                .is_empty()
+        );
     }
 }
