@@ -6354,7 +6354,8 @@ fn fork_translation_has_overlay_owner(
                 .checked_add(va - overlay.start)
                 .is_some_and(|ipa| ipa == translated)
     }) || alias_registry().lock().iter().any(|alias| {
-        alias_matches_process_scope(alias.ownership_scope, mm_root_slot)
+        (alias_matches_process_scope(alias.ownership_scope, mm_root_slot)
+            || matches!(alias.ownership_scope, AliasOwnershipScope::Root))
             && va >= alias.start
             && va < alias.start.saturating_add(alias.size as u64)
             && alias.ipa.checked_add(va.saturating_sub(alias.start)) == Some(translated)
@@ -9465,6 +9466,7 @@ impl HvfVmState {
         inventory: &HvpatchFrameInventory,
         compound_gpa: u64,
         retain_compound: bool,
+        authority_mapping_count: impl Fn(carrick_hal::FrameId) -> Option<usize>,
     ) -> Result<CowInventorySplitShape, TrapError> {
         let compound_end = compound_gpa
             .checked_add(CowArmedRanges::COMPOUND_SIZE)
@@ -9505,7 +9507,9 @@ impl HvfVmState {
                     old.frame
                 ))
             })?;
-        let retire_old_frame = global_references == 1 && fragments.is_empty();
+        let retire_old_frame = global_references == 1
+            && fragments.is_empty()
+            && authority_mapping_count(old.frame) == Some(1);
         Ok(CowInventorySplitShape {
             old_key,
             old,
@@ -10440,8 +10444,13 @@ impl HvfVmState {
         }
         mutate_external_alias_state(|_, registry| {
             registry.retain(|alias| {
-                !alias_is_owned_by_process(alias.ownership_scope, task.mm_root_slot)
-                    && !extents.contains(&(alias.physical_ipa, alias.physical_size))
+                if alias_is_owned_by_process(alias.ownership_scope, task.mm_root_slot) {
+                    false
+                } else if matches!(alias.ownership_scope, AliasOwnershipScope::Global) {
+                    !extents.contains(&(alias.physical_ipa, alias.physical_size))
+                } else {
+                    true
+                }
             });
         });
 
@@ -12398,7 +12407,7 @@ impl HvfVmState {
                     span.va
                 ))
             })?;
-        let old_offset = old_ipa.checked_sub(old_physical_ipa).ok_or_else(|| {
+        let _old_offset = old_ipa.checked_sub(old_physical_ipa).ok_or_else(|| {
             TrapError::Hypervisor("HVPatch COW physical offset underflow".to_owned())
         })?;
         let retain_old_compound = {
@@ -12417,7 +12426,12 @@ impl HvfVmState {
             retire_old_frame,
         } = {
             let inventory = self.frame_inventory.lock();
-            Self::cow_inventory_split_shape(&inventory, old_physical_ipa, retain_old_compound)?
+            Self::cow_inventory_split_shape(
+                &inventory,
+                old_physical_ipa,
+                retain_old_compound,
+                |frame| authority.frame_mapping_count(frame).ok().flatten(),
+            )?
         };
         let old_frame = old_inventory_extent.frame;
         // Resolve every authority needed for stage-1 publication before the
@@ -12498,9 +12512,7 @@ impl HvfVmState {
             CowArmedRanges::COMPOUND_SIZE,
         )?;
         let new_physical_ipa = new_lease.base;
-        let new_ipa = new_physical_ipa
-            .checked_add(old_offset)
-            .ok_or_else(|| TrapError::Hypervisor("HVPatch COW semantic IPA overflow".to_owned()))?;
+        let new_ipa = new_physical_ipa;
         let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
         let map_result = unsafe {
             inventory_hv_vm_map(
@@ -12788,7 +12800,7 @@ impl HvfVmState {
             }
         }
 
-        let semantic_host = unsafe { new_host_ptr.add(old_offset as usize) };
+        let semantic_host = new_host_ptr;
         let alias = AliasBacking {
             start: span.va,
             ipa: new_ipa,
@@ -13776,7 +13788,7 @@ impl HvfVmState {
             // translated overlay IPA, not the VA (see `syscall_buffer_lookup_addr`).
             // Identity otherwise — no walk. PROT_NONE was already gated on the VA.
             let translated_lookup = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
-            let (lookup_address, mapping_start, mapping_end, mapping_ipa, host_addr) = {
+            let (_lookup_address, mapping_start, mapping_end, mapping_ipa, host_addr) = {
                 // Private-overlay descriptors are keyed by their translated
                 // IPA, while a boot brk descriptor remains keyed by Linux VA
                 // even after HVPatch repoints its stage-1 leaf to a reusable
@@ -13848,7 +13860,7 @@ impl HvfVmState {
             // Read directly out of the host buffer. Works for both
             // applevisor-owned mappings (the parent case) and raw mappings
             // we re-created in a forked child via hv_vm_map.
-            let chunk_offset = (lookup_address - mapping_start) as usize;
+            let chunk_offset = (chunk_address - mapping_start) as usize;
             unsafe {
                 volatile_copy_from_guest(
                     host_addr.add(chunk_offset),
@@ -13953,7 +13965,7 @@ impl HvfVmState {
                 mapping_end,
                 mapping_ipa,
             );
-            let chunk_offset = (lookup_address - mapping_start) as usize;
+            let chunk_offset = (chunk_address - mapping_start) as usize;
             unsafe {
                 volatile_copy_to_guest(
                     bytes.as_ptr().add(copied),
@@ -21119,8 +21131,9 @@ mod frame_inventory_backend_tests {
                 .insert((physical_ipa, CowArmedRanges::COMPOUND_SIZE), 1);
         }
 
-        let shape = HvfVmState::cow_inventory_split_shape(&inventory, physical_ipa, true)
-            .expect("partial semantic COW split shape");
+        let shape =
+            HvfVmState::cow_inventory_split_shape(&inventory, physical_ipa, true, |_| Some(1))
+                .expect("partial semantic COW split shape");
 
         assert_eq!(
             shape.fragments,
