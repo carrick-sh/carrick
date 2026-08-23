@@ -160,11 +160,38 @@ impl ProcessTimerDelivery {
     fn drive_itimer(
         target: ProcessTimerTarget,
         slot: std::sync::Arc<ProcessItimerSlot>,
-        _which: usize,
+        which: usize,
         generation: u64,
         spec: carrick_hal::TimerSpecNs,
         signum: i32,
     ) {
+        if carrick_timer_core::itimer::is_cpu_timer(which) {
+            let mut cpu_due_ns =
+                carrick_host::guest_cpu::total_ns_including_active().saturating_add(spec.value);
+            loop {
+                if !slot.generation_matches(generation) {
+                    return;
+                }
+                let now_ns = carrick_host::guest_cpu::total_ns_including_active();
+                if now_ns >= cpu_due_ns {
+                    if !target.deliver(signum) {
+                        return;
+                    }
+                    if spec.interval == 0 {
+                        slot.retire_one_shot(generation);
+                        return;
+                    }
+                    cpu_due_ns = now_ns.saturating_add(spec.interval);
+                } else {
+                    let diff = cpu_due_ns - now_ns;
+                    let delay_ns = carrick_timer_core::itimer::cpu_timer_recheck_delay_ns(
+                        carrick_timer_core::CpuNs(diff),
+                    );
+                    std::thread::sleep(std::time::Duration::from_nanos(delay_ns.raw()));
+                }
+            }
+        }
+
         std::thread::sleep(std::time::Duration::from_nanos(spec.value));
 
         loop {

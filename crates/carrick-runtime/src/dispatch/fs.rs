@@ -5580,6 +5580,7 @@ impl SyscallDispatcher {
                             self.captured_slot_authority(fd)
                                 .map(WaitFdAuthority::logical)
                                 .unwrap_or_else(|| std::process::abort()),
+                            || false,
                         );
                     }
                     OpenDescription::HostPipe {
@@ -12370,6 +12371,7 @@ impl SyscallDispatcher {
                         OpenDescription::PipeWriter { base, pipe } => {
                             let pipe = Arc::clone(pipe);
                             let flags = base.status_flags();
+                            let tid = cx.tid();
                             drop(open);
                             let outcome = write_pipe(
                                 &bytes,
@@ -12379,6 +12381,13 @@ impl SyscallDispatcher {
                                 this.captured_slot_authority(fd)
                                     .map(WaitFdAuthority::logical)
                                     .unwrap_or_else(|| std::process::abort()),
+                                || {
+                                    this.has_deliverable_dispatch_pending_for_wait(
+                                        cx.kernel,
+                                        tid,
+                                        carrick_abi::WaitSigMask::NONE,
+                                    )
+                                },
                             );
                             if let DispatchOutcome::Returned { value } = outcome {
                                 if value > 0 {
@@ -12889,6 +12898,7 @@ impl SyscallDispatcher {
                                 }
                             }
                             OpenDescription::PipeWriter { base, pipe } => {
+                                let tid = cx.tid();
                                 outcome = write_pipe(
                                     &bytes,
                                     pipe,
@@ -12897,6 +12907,13 @@ impl SyscallDispatcher {
                                     this.captured_slot_authority(fd)
                                         .map(WaitFdAuthority::logical)
                                         .unwrap_or_else(|| std::process::abort()),
+                                    || {
+                                        this.has_deliverable_dispatch_pending_for_wait(
+                                            cx.kernel,
+                                            tid,
+                                            carrick_abi::WaitSigMask::NONE,
+                                        )
+                                    },
                                 );
                                 writeback = None;
                             }
