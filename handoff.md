@@ -204,6 +204,47 @@ Progress since gate 6, all merged to main:
   wedged carrier SURVIVES SIGTERM (teardown deadlock blocks the signal
   exit path). Ops rule learned: probe batteries must use `timeout -k`.
 
+### THE SYSTEMATIC HUNT — gate 11: 763/832, scenarios 40/40, timeouts nearly extinct
+
+Owner directive mid-session: first principles, hypotheses proved and
+disproved with our own tools. The futexforkrequeue freeze became the
+proving ground, and the chain ran seven eliminations deep — every step
+via an instrument that now lives in the tree:
+
+1. Sample -> the quadratic alias clone+diff per COW fault. FIXED
+   (`ac2e70e5`, scoped epoch updates; post-fix profile clean).
+2. Snapshot refusal "task.children references task no row defines" ->
+   REFUTED as a validator artifact (tasks-only universe on partial
+   views); FIXED (`2ddbf00d`). Lesson repeated from the MmId case:
+   distrust a partial join.
+3. New instrument (`942107d9`): thread execution state + slot presence
+   in the debug snapshot -> hundreds Runnable WITH task_state (row-
+   shredder and unclaimable-thread theories dead), exactly ten
+   SwitchingOut, one per executor.
+4. Loud-skip on unsettled-lease drop -> zero hits (that path innocent).
+5. Sample the executors -> ALL TEN inside `invalidate_after_exec`:
+   **the cross-invalidation ack deadlock** — blocking `recv()` for peer
+   acks while `InvalidateAsid` is serviced only between quanta. FIXED
+   (`50baf827`): ack waits service their own command channel; consumed
+   Stop deferred, never lost. futexforkrequeue now COMPLETES
+   deterministically (rc=0, 159s, was infinite).
+6. En route: shared-futex timeouts verified working (futexsharedto 1s);
+   the 1000-waiter population confirmed by-design from probe source.
+
+Two worker branches REJECTED unmerged, for the record: `agy/sigwait`
+(claimed green, fails its own probe 3/3 on a fresh build at its commit)
+and `agy/dangling` (fixed the refuted corruption premise; probe still
+froze on its binary). Their diffs stay on their branches as reference.
+
+**Gate 11 residue (69 rows):** 39 value-diffs (futex wake/requeue
+counts, coredumpfile/coredumpbit exactness, clonefilesexec,
+mqnotifycrossproc, fork-family value rows newly VISIBLE because they now
+complete instead of timing out), 20 crashes across 10 probes (read their
+enriched records), 10 timeouts across 5 probes — including
+futexforkrequeue itself at 159s vs the 45s budget: a THROUGHPUT defect
+(~30x, next lever per the sample: remaining per-fault work at
+fork-storm scale). Scenario phase 40/40 for the second consecutive run.
+
 ### WAVE B CLOSE — gate 10: 769/832 generic (92.4%), SCENARIO PHASE 40/40 GREEN
 
 The dedicated scenario phase exits 0 for the first time (dedicated=0):
