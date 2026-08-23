@@ -1337,15 +1337,13 @@ impl Registry {
         let Ok(pid) = i32::try_from(pid) else {
             return false;
         };
+        let Ok(task_id) = TaskId::from_abi_positive(pid) else {
+            return false;
+        };
         let state = self.state.read();
-        match state
-            .tasks
-            .iter()
-            .find(|(id, _)| id.raw() == pid)
-            .map(|(_, record)| Arc::clone(&record.task))
-        {
-            Some(task) => {
-                task.set_oom_score_adj(value);
+        match state.tasks.get(&task_id) {
+            Some(record) => {
+                record.task.set_oom_score_adj(value);
                 true
             }
             None => false,
@@ -1358,27 +1356,27 @@ impl Registry {
     /// `getpriority(PRIO_PROCESS, peer)` needs the TARGET's value; it used to
     /// report the CALLER's, which is only right when the target IS the caller.
     pub(crate) fn task_nice(&self, pid: i32) -> Option<i32> {
+        let Ok(task_id) = TaskId::from_abi_positive(pid) else {
+            return None;
+        };
         self.state
             .read()
             .tasks
-            .iter()
-            .find(|(id, _)| id.raw() == pid)
-            .map(|(_, record)| record.task.nice())
+            .get(&task_id)
+            .map(|record| record.task.nice())
     }
 
     /// Apply a nice value to live process `pid`. `false` means no such live
     /// process. Companion to [`Self::task_nice`]; nice is per-`Task`, so a
     /// cross-process `setpriority` is serviceable from the kernel graph.
     pub(crate) fn set_task_nice(&self, pid: i32, nice: i32) -> bool {
+        let Ok(task_id) = TaskId::from_abi_positive(pid) else {
+            return false;
+        };
         let state = self.state.read();
-        match state
-            .tasks
-            .iter()
-            .find(|(id, _)| id.raw() == pid)
-            .map(|(_, record)| Arc::clone(&record.task))
-        {
-            Some(task) => {
-                task.set_nice(nice);
+        match state.tasks.get(&task_id) {
+            Some(record) => {
+                record.task.set_nice(nice);
                 true
             }
             None => false,
@@ -1800,5 +1798,30 @@ mod tests {
         drop(subscription);
         release.release(VforkReleaseReason::Exit);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn process_attribute_lookups_by_pid_use_exact_task_id_and_reject_misses() {
+        let (kernel, context) = bootstrap(4500);
+        let pid = context.task.key().id.raw();
+
+        assert_eq!(kernel.registry().task_nice(pid), Some(0));
+        assert!(kernel.registry().set_task_nice(pid, 5));
+        assert_eq!(kernel.registry().task_nice(pid), Some(5));
+
+        assert!(kernel.registry().set_oom_score_adj(pid as u32, 200));
+        assert_eq!(context.task.oom_score_adj(), 200);
+
+        assert_eq!(kernel.registry().task_nice(99999), None);
+        assert!(!kernel.registry().set_task_nice(99999, 10));
+        assert!(!kernel.registry().set_oom_score_adj(99999, 100));
+
+        assert_eq!(kernel.registry().task_nice(0), None);
+        assert_eq!(kernel.registry().task_nice(-1), None);
+        assert!(!kernel.registry().set_task_nice(0, 10));
+        assert!(!kernel.registry().set_task_nice(-1, 10));
+        assert!(!kernel.registry().set_oom_score_adj(0, 100));
+
+        assert!(!kernel.registry().set_oom_score_adj(u32::MAX, 100));
     }
 }
