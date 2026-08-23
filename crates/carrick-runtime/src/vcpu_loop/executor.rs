@@ -7222,9 +7222,8 @@ pub(crate) mod tests {
         assert_eq!(invalidations.len(), 1);
         assert_eq!(invalidations[0].executor, executor);
         assert_ne!(invalidations[0].host_thread, thread::current().id());
-        process
-            .mm_resources()
-            .acknowledge_tlb_flush(retired)
+        retired
+            .complete()
             .expect("release exact ASID/root only after all acks");
         pool.shutdown().expect("pool shutdown");
     }
@@ -7256,9 +7255,8 @@ pub(crate) mod tests {
         assert!(pool.invalidate_asid_retirement(retirement).is_err());
         assert_eq!(retirement.pending(), vec![executor]);
         assert!(
-            process
-                .mm_resources()
-                .acknowledge_tlb_flush(retired)
+            retired
+                .complete()
                 .unwrap_err()
                 .to_string()
                 .contains("awaits executor invalidation")
