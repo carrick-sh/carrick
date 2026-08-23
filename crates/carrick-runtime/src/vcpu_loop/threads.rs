@@ -300,6 +300,14 @@ where
 
     fn publish_persistent_sibling_stop(&self, kernel: &Kernel) -> Result<(), RuntimeError> {
         let removed = self.registry.remove_all_except(self.this_tid);
+        if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
+            eprintln!(
+                "SIGDBG sibling-stop registry={:p} keeper={:?} removed={:?}",
+                std::sync::Arc::as_ptr(&self.registry),
+                self.this_tid,
+                removed
+            );
+        }
         self.kicker.kick_all_except(self.this_tid);
         self.futex.notify_signal_pending();
         self.platform_futex.notify_signal_pending();

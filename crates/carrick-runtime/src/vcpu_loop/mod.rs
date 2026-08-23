@@ -4220,10 +4220,17 @@ where
                         )
                     })?
                     .retain_exact();
-                match self
-                    .state
-                    .prepare_execve(&self.kernel, &context, engine, path, argv, env)?
-                {
+                let preparation =
+                    self.state
+                        .prepare_execve(&self.kernel, &context, engine, path, argv, env)?;
+                if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
+                    eprintln!(
+                        "SIGDBG execve-arm tid={:?} prepared={}",
+                        self.state.this_tid,
+                        matches!(preparation, exec::ExecvePreparation::Prepared(_)),
+                    );
+                }
+                match preparation {
                     exec::ExecvePreparation::Complete(Some(outcome)) => self.finish(Ok(outcome)),
                     exec::ExecvePreparation::Complete(None) => executor::ExecutorExit::Syscall,
                     exec::ExecvePreparation::Prepared(prepared) => {
@@ -4681,13 +4688,18 @@ where
         // Exec/exit can force a blocked vfork parent runnable solely so it can
         // retire its exact logical result. Do not resume the old continuation
         // or touch guest state after that terminal ownership transition.
-        if !self.phase.is_terminal_transition()
-            && (self.kernel.process_exiting()
-                || thread_should_finish_for_exec_replacement(
-                    &self.state.registry,
-                    self.state.this_tid,
-                ))
-        {
+        let exec_finish =
+            thread_should_finish_for_exec_replacement(&self.state.registry, self.state.this_tid);
+        if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
+            eprintln!(
+                "SIGDBG quantum-check registry={:p} tid={:?} live={} finish={exec_finish} terminal={}",
+                std::sync::Arc::as_ptr(&self.state.registry),
+                self.state.this_tid,
+                self.state.registry.is_live(self.state.this_tid),
+                self.phase.is_terminal_transition(),
+            );
+        }
+        if !self.phase.is_terminal_transition() && (self.kernel.process_exiting() || exec_finish) {
             let _ = self
                 .state
                 .handle_persistent_thread_exit(&self.kernel, engine, 0, self.traps);
