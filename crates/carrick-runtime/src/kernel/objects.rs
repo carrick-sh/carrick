@@ -5431,6 +5431,17 @@ impl Thread {
     fn fail_unsettled_execution_lease(&self, lease: &ThreadExecutionLease) {
         let mut execution = self.execution.lock();
         if !Self::execution_state_matches_lease(execution.state, lease) {
+            // FAIL LOUD instead of silently skipping: an unsettled lease
+            // whose thread no longer matches leaves the thread PERMANENTLY
+            // in its current transient state with no owner — the frozen
+            // futexforkrequeue guests show exactly ten SwitchingOut
+            // task_state=false threads, one per executor, created by this
+            // silent return. Name the pair so the abandoning path is
+            // attributable.
+            eprintln!(
+                "carrick: WARN: unsettled execution lease dropped for thread                  {:?} but state {:?} does not match lease (executor={:?}                  epoch={} generation={:?}) — thread left unowned",
+                self.key, execution.state, lease.executor, lease.executor_epoch, lease.generation
+            );
             return;
         }
         let generation = lease
