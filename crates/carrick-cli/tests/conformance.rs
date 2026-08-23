@@ -497,7 +497,7 @@ fn run_native_bound_named_probe(
         probe,
         env,
     ));
-    run_carrick_probe_process(command, None, CASE_DEADLINE)
+    run_carrick_probe_process(command, None, CASE_DEADLINE).normalized_output
 }
 
 fn free_loopback_port() -> u16 {
@@ -3212,6 +3212,113 @@ fn probe_binaries_in(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+#[derive(Clone, Debug)]
+struct CarrickProbeExecution {
+    normalized_output: String,
+    raw_stdout: Vec<u8>,
+    raw_stderr: Vec<u8>,
+    exit_status: Option<std::process::ExitStatus>,
+    timed_out: bool,
+    deadline: Duration,
+}
+
+fn format_exit_status(
+    status: Option<&std::process::ExitStatus>,
+    timed_out: bool,
+    deadline: Duration,
+) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    if timed_out {
+        let detail = match status {
+            Some(s) => match (s.code(), s.signal()) {
+                (Some(c), _) => format!(" (reaped with WIFEXITED code {c})"),
+                (None, Some(sig)) => {
+                    let core = if s.core_dumped() {
+                        ", WCOREDUMP (core dumped)"
+                    } else {
+                        ""
+                    };
+                    format!(" (reaped after SIGKILL, WIFSIGNALED: signal {sig}{core})")
+                }
+                _ => String::new(),
+            },
+            None => String::new(),
+        };
+        return format!("TIMEOUT after {}s{detail}", deadline.as_secs());
+    }
+    match status {
+        Some(s) => {
+            if let Some(code) = s.code() {
+                format!("WIFEXITED (exit code {code})")
+            } else if let Some(sig) = s.signal() {
+                let core = if s.core_dumped() {
+                    ", WCOREDUMP (core dumped)"
+                } else {
+                    ""
+                };
+                format!("WIFSIGNALED (signal {sig}{core})")
+            } else if let Some(sig) = s.stopped_signal() {
+                format!("WIFSTOPPED (signal {sig})")
+            } else {
+                format!("raw status {}", s.into_raw())
+            }
+        }
+        None => "unknown".to_string(),
+    }
+}
+
+fn format_stdout_status(raw_stdout: &[u8]) -> String {
+    if raw_stdout.is_empty() {
+        "false (empty stdout, 0 bytes)".to_string()
+    } else if raw_stdout.ends_with(b"\n") {
+        format!(
+            "false (complete, {} bytes, ends with newline)",
+            raw_stdout.len()
+        )
+    } else {
+        format!(
+            "true (truncated mid-line, {} bytes, missing trailing newline)",
+            raw_stdout.len()
+        )
+    }
+}
+
+fn format_stderr_tail(raw_stderr: &[u8], max_lines: usize) -> String {
+    let stderr_lossy = String::from_utf8_lossy(raw_stderr);
+    let lines: Vec<&str> = stderr_lossy.lines().collect();
+    if lines.is_empty() {
+        return "  stderr: <empty>\n".to_string();
+    }
+    let tail_len = lines.len().min(max_lines);
+    let start = lines.len().saturating_sub(max_lines);
+    let mut out = format!(
+        "  stderr tail (last {tail_len} line{} of {}):\n",
+        if tail_len == 1 { "" } else { "s" },
+        lines.len()
+    );
+    for line in &lines[start..] {
+        out.push_str("    ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn format_failure_record(exec: &CarrickProbeExecution, line_diff: &str) -> String {
+    let mut record = String::new();
+    record.push_str(&format!(
+        "  exit_status: {}\n",
+        format_exit_status(exec.exit_status.as_ref(), exec.timed_out, exec.deadline)
+    ));
+    record.push_str(&format!(
+        "  stdout_truncated: {}\n",
+        format_stdout_status(&exec.raw_stdout)
+    ));
+    record.push_str(&format_stderr_tail(&exec.raw_stderr, 20));
+    record.push_str(line_diff);
+    record
+}
+
 /// Run the probe-injection snippet under carrick, feeding `stdin_bytes` (the
 /// base64 of the probe) to the child's STDIN. Mirrors `run_carrick`'s
 /// deadline + process-group-kill + sweep pattern, but pipes stdin.
@@ -3225,7 +3332,7 @@ fn run_carrick_probe_with_deadline(
     stdin_bytes: &[u8],
     deadline: Duration,
 ) -> String {
-    run_carrick_probe_with_policy(bin, lane, stdin_bytes, deadline, false)
+    run_carrick_probe_with_policy(bin, lane, stdin_bytes, deadline, false).normalized_output
 }
 
 fn run_carrick_probe_with_deadline_named(
@@ -3234,7 +3341,7 @@ fn run_carrick_probe_with_deadline_named(
     stdin_bytes: &[u8],
     deadline: Duration,
     name: &str,
-) -> String {
+) -> CarrickProbeExecution {
     run_carrick_probe_with_policy(
         bin,
         lane,
@@ -3250,7 +3357,7 @@ fn run_carrick_probe_with_policy(
     stdin_bytes: &[u8],
     deadline: Duration,
     unconfined: bool,
-) -> String {
+) -> CarrickProbeExecution {
     let mut command = Command::new(bin);
     command.args(["run", "--platform", lane.platform, "--raw", "--fs", "host"]);
     if unconfined {
@@ -3282,7 +3389,7 @@ fn run_carrick_bound_probe_named(
     probe: &Path,
     deadline: Duration,
     name: &str,
-) -> String {
+) -> CarrickProbeExecution {
     run_carrick_bound_probe_with_policy(bin, lane, probe, deadline, probe_needs_unconfined(name))
 }
 
@@ -3292,7 +3399,7 @@ fn run_carrick_bound_probe_with_policy(
     probe: &Path,
     deadline: Duration,
     unconfined: bool,
-) -> String {
+) -> CarrickProbeExecution {
     let init = probe
         .parent()
         .expect("probe binaries live in a target directory")
@@ -3334,7 +3441,7 @@ fn run_carrick_probe_process(
     mut command: Command,
     stdin_bytes: Option<&[u8]>,
     deadline: Duration,
-) -> String {
+) -> CarrickProbeExecution {
     use std::io::Write;
     use std::os::unix::process::CommandExt;
 
@@ -3381,12 +3488,21 @@ fn run_carrick_probe_process(
     let out = child.wait_with_output().expect("wait carrick probe");
     done.store(true, Ordering::Relaxed);
     let timed_out = watcher.join().unwrap_or(false);
-    if timed_out {
-        return format!("<TIMEOUT after {}s>", deadline.as_secs());
+    let normalized_output = if timed_out {
+        format!("<TIMEOUT after {}s>", deadline.as_secs())
+    } else {
+        let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&out.stderr));
+        normalize(&combined)
+    };
+    CarrickProbeExecution {
+        normalized_output,
+        raw_stdout: out.stdout,
+        raw_stderr: out.stderr,
+        exit_status: Some(out.status),
+        timed_out,
+        deadline,
     }
-    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-    combined.push_str(&String::from_utf8_lossy(&out.stderr));
-    normalize(&combined)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3640,7 +3756,7 @@ fn run_one_probe(
     } else {
         CASE_DEADLINE
     };
-    let carrick_out = match transport {
+    let carrick_exec = match transport {
         ProbeTransport::ContainerInjection => {
             run_carrick_probe_with_deadline_named(bin, lane, &encoded, deadline, &name)
         }
@@ -3649,7 +3765,7 @@ fn run_one_probe(
         }
     };
     let docker_out = run_docker_probe_named(lane, &name, &encoded);
-    classify_probe(name, lane.label, &carrick_out, docker_out)
+    classify_probe(name, lane.label, &carrick_exec, docker_out)
 }
 
 /// Classify a probe from its (already-collected) carrick + docker outputs — pure,
@@ -3681,7 +3797,7 @@ const KNOWN_LANE_GAPS: &[(&str, &str)] = &[
 fn classify_probe(
     name: String,
     lane_label: &str,
-    carrick_out: &str,
+    carrick_exec: &CarrickProbeExecution,
     docker_out: std::io::Result<String>,
 ) -> (String, ProbeOutcome) {
     let docker_out = match docker_out {
@@ -3690,16 +3806,27 @@ fn classify_probe(
     };
     let known_gap = KNOWN_PROBE_GAPS.contains(&name.as_str())
         || KNOWN_LANE_GAPS.contains(&(lane_label, name.as_str()));
-    let outcome = match (diff_lines(carrick_out, &docker_out), known_gap) {
+    let outcome = match (
+        diff_lines(&carrick_exec.normalized_output, &docker_out),
+        known_gap,
+    ) {
         (None, false) => ProbeOutcome::Pass,
         (None, true) => ProbeOutcome::UnexpectedPass,
-        (Some(diff), false) => ProbeOutcome::Fail(diff),
+        (Some(diff), false) => {
+            let record = format_failure_record(carrick_exec, &diff);
+            ProbeOutcome::Fail(record)
+        }
         // An excused (known-gap) DIFF: Xfail ONLY while the carrick-side output
         // still matches the recorded excuse fingerprint — otherwise the
         // divergence itself changed and a NEW regression is hiding behind the
         // name-keyed excuse, so fail.
         (Some(diff), true) => {
-            excused_probe_outcome(diff, excuse_fingerprint(lane_label, &name), carrick_out)
+            let record = format_failure_record(carrick_exec, &diff);
+            excused_probe_outcome(
+                record,
+                excuse_fingerprint(lane_label, &name),
+                &carrick_exec.normalized_output,
+            )
         }
     };
     (name, outcome)
@@ -4084,24 +4211,27 @@ fn conformance_probes() {
                 .collect();
 
             // Phase 1 — carrick only.
-            let carrick_outs: Vec<Option<String>> = fan_out_indexed(jobs.len(), n_workers, |i| {
-                jobs[i].1.as_ref().ok().map(|enc| match transport {
-                    ProbeTransport::ContainerInjection => run_carrick_probe_with_deadline_named(
-                        &bin,
-                        *lane,
-                        enc,
-                        CASE_DEADLINE,
-                        &jobs[i].0,
-                    ),
-                    ProbeTransport::DirectElf => run_carrick_bound_probe_named(
-                        &bin,
-                        *lane,
-                        &parallel[i],
-                        CASE_DEADLINE,
-                        &jobs[i].0,
-                    ),
-                })
-            });
+            let carrick_outs: Vec<Option<CarrickProbeExecution>> =
+                fan_out_indexed(jobs.len(), n_workers, |i| {
+                    jobs[i].1.as_ref().ok().map(|enc| match transport {
+                        ProbeTransport::ContainerInjection => {
+                            run_carrick_probe_with_deadline_named(
+                                &bin,
+                                *lane,
+                                enc,
+                                CASE_DEADLINE,
+                                &jobs[i].0,
+                            )
+                        }
+                        ProbeTransport::DirectElf => run_carrick_bound_probe_named(
+                            &bin,
+                            *lane,
+                            &parallel[i],
+                            CASE_DEADLINE,
+                            &jobs[i].0,
+                        ),
+                    })
+                });
             // Phase 2 — oracle, strictly after phase 1 (carrick and Docker never
             // overlap). Prefer the committed cache (no Docker); else live Docker on a
             // miss/stale entry; else Unblessed (no Docker + no cache → can't gate it).
@@ -4147,12 +4277,15 @@ fn conformance_probes() {
                             OracleSource::Live(r) => r,
                             OracleSource::Unblessed => Ok(String::new()),
                         };
-                        classify_probe(
-                            name,
-                            lane.label,
-                            &carrick_out.unwrap_or_default(),
-                            docker_out,
-                        )
+                        let carrick_exec = carrick_out.unwrap_or_else(|| CarrickProbeExecution {
+                            normalized_output: String::new(),
+                            raw_stdout: Vec::new(),
+                            raw_stderr: Vec::new(),
+                            exit_status: None,
+                            timed_out: false,
+                            deadline: CASE_DEADLINE,
+                        });
+                        classify_probe(name, lane.label, &carrick_exec, docker_out)
                     }
                 };
                 results.push(outcome);
@@ -4423,7 +4556,7 @@ fn hvf_syscall_transports_preserve_guest_registers() {
             .arg(&probe)
             .env("CARRICK_HVF_SYSCALL_TRANSPORT", transport)
             .env("CARRICK_RUN_ID", case_run_id());
-        let output = run_carrick_probe_process(command, None, CASE_DEADLINE);
+        let output = run_carrick_probe_process(command, None, CASE_DEADLINE).normalized_output;
         assert_eq!(normalize(&output), expected, "transport={transport}");
     }
 
@@ -4433,7 +4566,7 @@ fn hvf_syscall_transports_preserve_guest_registers() {
         .arg(&probe)
         .env("CARRICK_HVF_SYSCALL_TRANSPORT", "auto")
         .env("CARRICK_RUN_ID", case_run_id());
-    let output = run_carrick_probe_process(invalid, None, CASE_DEADLINE);
+    let output = run_carrick_probe_process(invalid, None, CASE_DEADLINE).normalized_output;
     assert!(
         output.contains("invalid CARRICK_HVF_SYSCALL_TRANSPORT value \"auto\"")
             && output.contains("expected `legacy` or `mailbox`"),
@@ -4834,4 +4967,103 @@ fn conformance_go_fixture() {
     } else {
         println!("PASS conformance_go_fixture");
     }
+}
+
+#[test]
+fn failure_record_exit_status_formatting() {
+    use std::os::unix::process::ExitStatusExt;
+
+    // Normal exits
+    let exit_0 = std::process::ExitStatus::from_raw(0);
+    assert_eq!(
+        format_exit_status(Some(&exit_0), false, Duration::from_secs(45)),
+        "WIFEXITED (exit code 0)"
+    );
+    let exit_1 = std::process::ExitStatus::from_raw(1 << 8);
+    assert_eq!(
+        format_exit_status(Some(&exit_1), false, Duration::from_secs(45)),
+        "WIFEXITED (exit code 1)"
+    );
+
+    // Terminated by signal
+    let sigsegv = std::process::ExitStatus::from_raw(11);
+    assert_eq!(
+        format_exit_status(Some(&sigsegv), false, Duration::from_secs(45)),
+        "WIFSIGNALED (signal 11)"
+    );
+
+    // Terminated by signal with core dump
+    let sigsegv_core = std::process::ExitStatus::from_raw(11 | 0x80);
+    assert_eq!(
+        format_exit_status(Some(&sigsegv_core), false, Duration::from_secs(45)),
+        "WIFSIGNALED (signal 11, WCOREDUMP (core dumped))"
+    );
+
+    // Timeout
+    let sigkill = std::process::ExitStatus::from_raw(9);
+    assert_eq!(
+        format_exit_status(Some(&sigkill), true, Duration::from_secs(45)),
+        "TIMEOUT after 45s (reaped after SIGKILL, WIFSIGNALED: signal 9)"
+    );
+}
+
+#[test]
+fn failure_record_stdout_status_formatting() {
+    assert_eq!(format_stdout_status(b""), "false (empty stdout, 0 bytes)");
+    assert_eq!(
+        format_stdout_status(b"probe_ok=true\n"),
+        "false (complete, 14 bytes, ends with newline)"
+    );
+    assert_eq!(
+        format_stdout_status(b"probe_ok=true"),
+        "true (truncated mid-line, 13 bytes, missing trailing newline)"
+    );
+}
+
+#[test]
+fn failure_record_stderr_tail_formatting() {
+    assert_eq!(format_stderr_tail(b"", 20), "  stderr: <empty>\n");
+
+    let short_err = b"line 1\nline 2\n";
+    let formatted_short = format_stderr_tail(short_err, 20);
+    assert!(formatted_short.starts_with("  stderr tail (last 2 lines of 2):\n"));
+    assert!(formatted_short.contains("    line 1\n"));
+    assert!(formatted_short.contains("    line 2\n"));
+
+    let long_err: Vec<u8> = (1..=30)
+        .map(|i| format!("err line {i}\n"))
+        .collect::<String>()
+        .into_bytes();
+    let formatted_long = format_stderr_tail(&long_err, 20);
+    assert!(formatted_long.starts_with("  stderr tail (last 20 lines of 30):\n"));
+    assert!(!formatted_long.contains("    err line 1\n"));
+    assert!(!formatted_long.contains("    err line 10\n"));
+    assert!(formatted_long.contains("    err line 11\n"));
+    assert!(formatted_long.contains("    err line 30\n"));
+}
+
+#[test]
+fn failure_record_assembly() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let exec = CarrickProbeExecution {
+        normalized_output: "<TIMEOUT after 45s>".to_string(),
+        raw_stdout: Vec::new(),
+        raw_stderr: b"vcpu panic\nauthority drop\n".to_vec(),
+        exit_status: Some(std::process::ExitStatus::from_raw(9)),
+        timed_out: true,
+        deadline: Duration::from_secs(45),
+    };
+    let diff = "  line 1:\n    - carrick: <TIMEOUT after 45s>\n    + linux:   ok=true\n";
+    let record = format_failure_record(&exec, diff);
+    assert!(record.contains(
+        "  exit_status: TIMEOUT after 45s (reaped after SIGKILL, WIFSIGNALED: signal 9)\n"
+    ));
+    assert!(record.contains("  stdout_truncated: false (empty stdout, 0 bytes)\n"));
+    assert!(
+        record.contains("  stderr tail (last 2 lines of 2):\n    vcpu panic\n    authority drop\n")
+    );
+    assert!(
+        record.contains("  line 1:\n    - carrick: <TIMEOUT after 45s>\n    + linux:   ok=true\n")
+    );
 }
