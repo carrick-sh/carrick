@@ -46,8 +46,6 @@ pub(crate) enum MmResourcesError {
     RootSlotExhausted,
     #[error("hvpatch stage-1 mm retirement still awaits executor invalidation")]
     RetirementIncomplete,
-    #[error("hvpatch stage-1 retirement belongs to another allocator")]
-    ForeignRetirement,
     #[error(transparent)]
     Residency(#[from] AsidResidencyError),
 }
@@ -69,7 +67,6 @@ impl From<Stage1MmError> for MmResourcesError {
             Stage1MmError::Stage1Root(error) => Self::Stage1Root(error),
             Stage1MmError::RootSlotExhausted | Stage1MmError::Retired => Self::RootSlotExhausted,
             Stage1MmError::RetirementIncomplete => Self::RetirementIncomplete,
-            Stage1MmError::ForeignRetirement => Self::ForeignRetirement,
             Stage1MmError::Residency(error) => Self::Residency(error),
         }
     }
@@ -275,19 +272,6 @@ impl MmResources {
         state.retired.insert(task);
         Ok(RetiredStage1Mm { retirement })
     }
-
-    /// K1's prototype still self-acknowledges because the signed multi-vCPU TLB
-    /// retirement proof is not available until K3. Keeping this call explicit
-    /// preserves the honest RED debt rather than forging a proof token.
-    pub(crate) fn acknowledge_tlb_flush(
-        &self,
-        retired: RetiredStage1Mm,
-    ) -> Result<(), MmResourcesError> {
-        if let Some(retirement) = retired.retirement {
-            self.mm_pool.acknowledge_tlb_flush(retirement)?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -334,7 +318,7 @@ mod tests {
             resources.prepare_child(),
             Err(MmResourcesError::AsidExhausted)
         ));
-        resources.acknowledge_tlb_flush(retired).unwrap();
+        retired.complete().expect("complete retirement");
         assert_eq!(
             resources.prepare_child().unwrap().binding().asid,
             binding.asid
@@ -352,7 +336,7 @@ mod tests {
         assert!(!resources.is_final_owner(parent).unwrap());
 
         let retired = resources.retire(child).unwrap();
-        resources.acknowledge_tlb_flush(retired).unwrap();
+        retired.complete().expect("complete retirement");
         assert!(resources.is_final_owner(parent).unwrap());
         assert_eq!(backend.binding().stage1_root.gpa().raw(), 0x4000);
         assert!(resources.prepare_child().is_ok());
@@ -394,11 +378,11 @@ mod tests {
         );
         assert_eq!(replacement.asid_generation(), replacement_generation);
         assert_eq!(backend.binding(), old);
-        resources
-            .acknowledge_tlb_flush(RetiredStage1Mm {
-                retirement: Some(retired.unwrap()),
-            })
-            .unwrap();
+        RetiredStage1Mm {
+            retirement: Some(retired.unwrap()),
+        }
+        .complete()
+        .unwrap();
     }
 
     #[test]
@@ -412,7 +396,7 @@ mod tests {
             .unwrap();
         let old_binding = old_backend.binding();
         let retired = resources.retire(old).unwrap();
-        resources.acknowledge_tlb_flush(retired).unwrap();
+        retired.complete().expect("complete retirement");
 
         let replacement_backend = resources
             .publish_child(replacement, resources.prepare_child().unwrap())
@@ -421,7 +405,7 @@ mod tests {
         assert_eq!(replacement_binding.asid, old_binding.asid);
 
         let duplicate = resources.retire(old).unwrap();
-        resources.acknowledge_tlb_flush(duplicate).unwrap();
+        duplicate.complete().expect("complete duplicate retirement");
         assert_eq!(replacement_backend.binding(), replacement_binding);
         assert!(matches!(
             resources.prepare_exec(old),

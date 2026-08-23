@@ -233,16 +233,6 @@ impl Stage1MmPool {
             root_slot: lease.root_slot,
         })
     }
-
-    pub(crate) fn acknowledge_tlb_flush(
-        &self,
-        retirement: Stage1MmRetirement,
-    ) -> Result<(), Stage1MmError> {
-        if !Arc::ptr_eq(&self.inner, &retirement.pool.inner) {
-            return Err(Stage1MmError::ForeignRetirement);
-        }
-        retirement.complete()
-    }
 }
 
 #[derive(Debug)]
@@ -345,8 +335,6 @@ pub(crate) enum Stage1MmError {
     Retired,
     #[error("hvpatch stage-1 mm retirement still awaits executor invalidation")]
     RetirementIncomplete,
-    #[error("hvpatch stage-1 retirement belongs to another allocator")]
-    ForeignRetirement,
     #[error(transparent)]
     Residency(#[from] AsidResidencyError),
 }
@@ -684,8 +672,7 @@ mod tests {
         assert_eq!(replacement.root_slot(), first_root_slot);
         let lease = replacement.commit();
         let retirement = pool.retire(&lease).expect("retire committed lease");
-        pool.acknowledge_tlb_flush(retirement)
-            .expect("acknowledge retirement");
+        retirement.complete().expect("acknowledge retirement");
     }
 
     #[test]
@@ -714,8 +701,7 @@ mod tests {
                 retirement.asid_generation(),
             ))
             .expect("owner-thread invalidation ack");
-        pool.acknowledge_tlb_flush(retirement)
-            .expect("complete retirement");
+        retirement.complete().expect("complete retirement");
 
         let replacement = pool.prepare_child().expect("replacement child");
         assert_eq!(replacement.binding().asid, binding.asid);
