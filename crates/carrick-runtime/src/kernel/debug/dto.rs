@@ -951,7 +951,15 @@ impl KernelDebugSnapshot {
         // A task key is defined by a live task row or by a zombie record.
         let task_universe: Option<BTreeSet<DebugTaskKey>> = match (&tasks, &zombies) {
             (Some(tasks), Some(zombies)) => Some(tasks.union(zombies).copied().collect()),
-            (Some(tasks), None) => Some(tasks.clone()),
+            // A task key is legitimately defined by a ZOMBIE record too, so
+            // when the query did not request the zombie table the universe is
+            // UNKNOWN, not "the live tasks": validating children against a
+            // tasks-only set manufactured `task.children references task id
+            // that no row defines` refusals for every zombied child on
+            // single-table queries — a false smoking gun that briefly
+            // misdiagnosed the futexforkrequeue freeze as registry
+            // corruption. Partial views skip referential checks.
+            (Some(_), None) => None,
             (None, Some(_)) | (None, None) => None,
         };
 
