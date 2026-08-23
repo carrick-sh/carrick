@@ -798,13 +798,18 @@ impl WaitFds {
     }
 
     pub fn raw(fds: Vec<(i32, i16)>) -> Self {
+        let authority = if fds.is_empty() {
+            WaitFdAuthority::Empty
+        } else {
+            WaitFdAuthority::Missing
+        };
         Self {
             fds: fds
                 .into_iter()
                 .map(|(fd, events)| crate::io_wait::WaitFd::raw(fd, events))
                 .collect(),
             guards: Vec::new(),
-            authority: WaitFdAuthority::Missing,
+            authority,
         }
     }
 
@@ -844,10 +849,14 @@ impl WaitFds {
         mut self,
         slot_authorities: Vec<crate::kernel::objects::FileSlotAuthority>,
     ) -> Self {
-        self.authority = WaitFdAuthority::Logical {
-            strict: slot_authorities,
-            watched: Vec::new(),
-        };
+        if self.fds.is_empty() && slot_authorities.is_empty() {
+            self.authority = WaitFdAuthority::Empty;
+        } else {
+            self.authority = WaitFdAuthority::Logical {
+                strict: slot_authorities,
+                watched: Vec::new(),
+            };
+        }
         self
     }
 
@@ -897,10 +906,14 @@ impl WaitFds {
         if slot_authorities.is_empty() && !self.fds.is_empty() {
             return Err(LINUX_EBADF);
         }
-        self.authority = WaitFdAuthority::Logical {
-            strict: slot_authorities,
-            watched: Vec::new(),
-        };
+        if self.fds.is_empty() {
+            self.authority = WaitFdAuthority::Empty;
+        } else {
+            self.authority = WaitFdAuthority::Logical {
+                strict: slot_authorities,
+                watched: Vec::new(),
+            };
+        }
         Ok(self)
     }
 
