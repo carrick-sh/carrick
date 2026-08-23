@@ -2235,9 +2235,21 @@ fn replay_mapping_key(backing: AliasBacking) -> ReplayMappingKey {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn forget_replay_extent(ipa: u64, size: usize) {
-    mutate_external_alias_state(|replay, _| {
-        replay.retain(|(mapped_ipa, mapped_size, _, _)| *mapped_ipa != ipa || *mapped_size != size);
-    });
+    let mut replay = replay_mappings().lock();
+    let _registry = alias_registry().lock();
+    let doomed: Vec<ReplayMappingKey> = replay
+        .range((ipa, 0, 0, 0)..=(ipa, usize::MAX, usize::MAX, u64::MAX))
+        .filter(|(_, mapped_size, _, _)| *mapped_size == size)
+        .copied()
+        .collect();
+    if doomed.is_empty() {
+        return;
+    }
+    for row in &doomed {
+        replay.remove(row);
+    }
+    let mut versions = alias_version_registry().lock();
+    scoped_alias_epoch_update(&mut versions, None, &[ipa], &replay);
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2256,18 +2268,58 @@ pub static ALIAS_REMAP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// replaces the entry.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn register_shared_alias(b: AliasBacking) {
-    mutate_external_alias_state(|replay, registry| {
-        replay.retain(|(ipa, _, _, _)| *ipa != b.physical_ipa);
-        replay.insert(replay_mapping_key(b));
-        if let Some(entry) = registry
-            .iter_mut()
-            .find(|entry| entry.ipa == b.ipa && entry.ownership_scope == b.ownership_scope)
+    // Same replay -> alias -> version lock order as every other writer.
+    let mut replay = replay_mappings().lock();
+    let mut registry = alias_registry().lock();
+    let key = replay_mapping_key(b);
+    let replay_rows_changed = {
+        let mut had_other = false;
+        let mut had_exact = false;
+        for row in replay
+            .range((b.physical_ipa, 0, 0, 0)..=(b.physical_ipa, usize::MAX, usize::MAX, u64::MAX))
         {
-            *entry = b;
-        } else {
-            registry.push(b);
+            if *row == key {
+                had_exact = true;
+            } else {
+                had_other = true;
+            }
         }
-    });
+        had_other || !had_exact
+    };
+    if replay_rows_changed {
+        // At most a handful of rows share one physical IPA; this bounded
+        // retain replaces the old full-set walk.
+        replay.retain(|(ipa, _, _, _)| *ipa != b.physical_ipa);
+        replay.insert(key);
+    }
+    let mut old_entry = None;
+    if let Some(entry) = registry
+        .iter_mut()
+        .find(|entry| entry.ipa == b.ipa && entry.ownership_scope == b.ownership_scope)
+    {
+        old_entry = Some(*entry);
+        *entry = b;
+    } else {
+        registry.push(b);
+    }
+    let entry_changed = old_entry != Some(b);
+    let mut versions = alias_version_registry().lock();
+    let mut replay_ipas: Vec<u64> = Vec::new();
+    if replay_rows_changed || entry_changed {
+        replay_ipas.push(b.physical_ipa);
+    }
+    if entry_changed
+        && let Some(old) = old_entry
+        && old.physical_ipa != b.physical_ipa
+    {
+        replay_ipas.push(old.physical_ipa);
+    }
+    scoped_alias_epoch_update(
+        &mut versions,
+        entry_changed.then_some(((b.ipa, b.ownership_scope), Some(b))),
+        &replay_ipas,
+        &replay,
+    );
 }
 
 /// Is the host backing of an alias entry actually mapped in THIS process? The
@@ -7518,6 +7570,55 @@ fn bump_version_epoch<K: Copy + Eq>(epochs: &mut Vec<(K, u64)>, key: K) -> Optio
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// Scoped fast path for the two per-COW-fault alias mutators. The general
+/// `mutate_external_alias_state` CLONES the whole replay set and alias
+/// registry and diffs them O(n^2) per mutation to discover the touched keys;
+/// on fork-storm workloads that made every COW fault O(aliases) and
+/// `futexforkrequeue` burned its whole 45s budget in the diff (sampled:
+/// register_shared_alias walking the BTreeMap under perform_frame_cow).
+/// The hot mutators KNOW their touched keys, so this bumps exactly those
+/// epochs with the same lock order and the same chain-reset semantics.
+fn scoped_alias_epoch_update(
+    versions: &mut AliasVersionRegistry,
+    alias_change: Option<((u64, AliasOwnershipScope), Option<AliasBacking>)>,
+    replay_ipas: &[u64],
+    replay: &std::collections::BTreeSet<ReplayMappingKey>,
+) {
+    if let Some((key, after)) = alias_change {
+        bump_version_epoch(&mut versions.alias_epochs, key).unwrap_or_else(|| {
+            eprintln!("carrick: FATAL: external alias mutation epoch exhausted");
+            std::process::abort();
+        });
+        if let Some(chain) = versions
+            .aliases
+            .iter_mut()
+            .find(|chain| (chain.ipa, chain.scope) == key)
+        {
+            chain.base = after;
+            chain.versions.clear();
+        }
+    }
+    for physical_ipa in replay_ipas {
+        bump_version_epoch(&mut versions.replay_epochs, *physical_ipa).unwrap_or_else(|| {
+            eprintln!("carrick: FATAL: external replay mutation epoch exhausted");
+            std::process::abort();
+        });
+        if let Some(chain) = versions
+            .replays
+            .iter_mut()
+            .find(|chain| chain.physical_ipa == *physical_ipa)
+        {
+            chain.base = replay
+                .iter()
+                .filter(|(ipa, _, _, _)| ipa == physical_ipa)
+                .copied()
+                .collect();
+            chain.versions.clear();
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn mutate_external_alias_state<R>(
     mutate: impl FnOnce(&mut std::collections::BTreeSet<ReplayMappingKey>, &mut Vec<AliasBacking>) -> R,
 ) -> R {
@@ -12742,12 +12843,38 @@ impl HvfVmState {
                 split.old.stage2_base,
                 usize::try_from(split.old.stage2_length).unwrap_or_default(),
             );
-            mutate_external_alias_state(|_, registry| {
-                registry.retain(|alias| {
-                    (alias.physical_ipa, alias.physical_size as u64)
-                        != (split.old.stage2_base, split.old.stage2_length)
-                });
-            });
+            {
+                // Scoped removal: the doomed entries are exactly those naming
+                // the retired old extent. The general mutate_external_alias_
+                // state wrapper clones + O(n^2)-diffs both structures per
+                // call, and this runs on EVERY COW fault — it was the hot
+                // line of the futexforkrequeue fork-storm profile.
+                let replay = replay_mappings().lock();
+                let mut registry = alias_registry().lock();
+                let doomed: Vec<AliasBacking> = registry
+                    .iter()
+                    .filter(|alias| {
+                        (alias.physical_ipa, alias.physical_size as u64)
+                            == (split.old.stage2_base, split.old.stage2_length)
+                    })
+                    .copied()
+                    .collect();
+                if !doomed.is_empty() {
+                    registry.retain(|alias| {
+                        (alias.physical_ipa, alias.physical_size as u64)
+                            != (split.old.stage2_base, split.old.stage2_length)
+                    });
+                    let mut versions = alias_version_registry().lock();
+                    for alias in &doomed {
+                        scoped_alias_epoch_update(
+                            &mut versions,
+                            Some(((alias.ipa, alias.ownership_scope), None)),
+                            &[alias.physical_ipa],
+                            &replay,
+                        );
+                    }
+                }
+            }
             self.mappings.retain(|mapping| {
                 (mapping.physical_ipa, mapping.physical_size as u64)
                     != (split.old.stage2_base, split.old.stage2_length)
@@ -12887,6 +13014,7 @@ impl HvfVmState {
             .checked_add(len as u64)
             .ok_or_else(|| TrapError::Hypervisor("HVPatch COW write range overflow".to_owned()))?;
         let mut current = start;
+        let mut stalled: Option<(u64, u32)> = None;
         while current < end {
             let armed = self.cow_armed.lock().span_for(current).is_some();
             let (retained_output_has_no_physical_source, retained_output_source_is_shared) =
@@ -12950,6 +13078,25 @@ impl HvfVmState {
                     // The materializer rechecks after acquiring quiesce. If a
                     // sibling repaired the leaf first, restart this chunk and
                     // route against the now-current stage-1/physical state.
+                    // FAIL CLOSED if the restart makes no progress: a None
+                    // return with UNCHANGED routing inputs re-enters this arm
+                    // forever — a silent 100% CPU livelock that also starves
+                    // this executor's InvalidateAsid servicing and parks every
+                    // peer in consume_invalidation_acks (seen live on
+                    // futexforkrequeue; core ffr-livelock-76407). Two repeats
+                    // are already impossible if the recheck story holds; 16
+                    // allows genuine sibling races to win first.
+                    match &mut stalled {
+                        Some((va, count)) if *va == current => {
+                            *count += 1;
+                            if *count >= 16 {
+                                return Err(TrapError::Hypervisor(format!(
+                                    "HVPatch retained-reuse materialization made no progress                                      at 0x{current:x} after {count} restarts                                      (intent={intent:?} armed={armed}                                      no_source={retained_output_has_no_physical_source}                                      shared={retained_output_source_is_shared}) —                                      COW routing livelock"
+                                )));
+                            }
+                        }
+                        _ => stalled = Some((current, 1)),
+                    }
                     continue;
                 }
                 FrameCowWriteRoute::CopyOnWrite => {
