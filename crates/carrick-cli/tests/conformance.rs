@@ -3235,7 +3235,12 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// (the job-control port's red-first probe: a SIGSTOPped child must make NO
 /// progress before SIGCONT) moves the denominator from 461 to 462 and the
 /// gating rows from 870 to 872 — 436 conformance sources under both variants.
-const PROBE_SOURCE_COUNT: usize = 462;
+/// `sharedanonfutexfork` (the anon-`MAP_SHARED` cross-fork futex reducer
+/// behind futexforkrequeue's all-waiters-ETIMEDOUT shape: fork children must
+/// share one wait queue with the parent on a shared anonymous word) moves the
+/// denominator from 462 to 463 and the gating rows from 872 to 874 — 437
+/// conformance sources under both variants.
+const PROBE_SOURCE_COUNT: usize = 463;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -4984,9 +4989,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 415);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 435);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 872);
+    assert_eq!(generic.len(), 417);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 437);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 874);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
