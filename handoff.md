@@ -212,7 +212,24 @@ hangs, sigtimedwait-family value diffs, futexwakeexact refault-livelock
 (pre-existing, now named by the detector), forkfpreclaim teardown,
 mtforkcorrupt flake, gate 13 after fscrash resolves.
 
-### OPEN HUNT, fully localized: process-directed signals never wake parked continuations
+### CLOSED (78cd28e9): waitrestart falls — three stacked signal-delivery defects
+
+The hunt below ran to ground the same day. Three defects, each proven
+live before its fix: (1) process-directed HOST publications had no wake
+channel to parked continuations (hook added: publication → kernel-graph
+task.wake() per live endpoint); (2) the wait4/waitid arms never adopted
+the pre-park deliverable-signal gate their sibling parks all run (gate
+added, EINTR before park); (3) every continuation resume stashed
+Some(result.restart()), so a Ready→Redispatch resume's default
+NoRestart VETOED the all-true SA_RESTART predicates and the sigframe
+was built without the rewind (decision now stashed only for signal-path
+completions). waitrestart 3x green (was a permanent hang); the
+scenario-A reducer shows handler-run + restarted-wait-reaps; full
+signal battery green; maskfork's one false line attributed pre-existing.
+**Four of gate 12's five timeout probes are now fully green** —
+setidthreadchurn is the last (different defect). Gate 13 launched.
+
+### The hunt record (kept for the method): process-directed signals never wake parked continuations
 
 The waitrestart hang (rc=124; the SA_RESTART-through-blocking-wait
 framework blocker behind much of LTP) is now pinned to one missing wake
