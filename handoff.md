@@ -204,7 +204,17 @@ Progress since gate 6, all merged to main:
   wedged carrier SURVIVES SIGTERM (teardown deadlock blocks the signal
   exit path). Ops rule learned: probe batteries must use `timeout -k`.
 
-Still queued: gate run 7 after invsizing lands; the 35 no-clause rows;
+**Gate run 7** (invsizing merged): 680/832 generic, 31/40 scenarios.
+Clause scoreboard: capacity 0, reservation-candidate 0 (the sizing fix
+holds at scale), activation 0, phase=active ~20 (stubborn residual,
+futex-family), fd-pinning GREW 12->31 lines (3 probes: pauseeintr,
+procladder, procstat — fd-less waits hitting `FdPinFailed` when the
+WaitFds authority tag is Missing instead of Empty; worker `fdpin`
+dispatched with the located mechanism,
+continuation.rs `exact_slot_authorities`). Net flat vs run 6 — the
+families are trading rows as fixes unmask successors.
+
+Still queued: the 35 no-clause rows;
 the held futex value-diffs + threadstatstate; coredumpfile register
 exactness; the carrier-only process retirement write phase
 (docs/hvpatch-carrier-only-process-plan.md). The remaining ~145 rows are
