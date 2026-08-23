@@ -111,7 +111,44 @@ noise ("we don't see that with normal Linux kernels in VMs"):
   now on the defect list; the probe never gates its exit code on it, so
   only the closure gate's line diff sees it.
 
-Session history below. Everything in it is superseded by the paragraph
+### CLOSURE GATE RESULT — first complete, honest run (run 4, 2026-08-22 evening)
+
+`just conformance-probes-closure` on the committed tree at `1f5d65b4`
+(binary rebuilt by the recipe): **generic phase 541 PASS / 291 FAIL of 832
+rows in 516 seconds** — the gate is back under its historical ten minutes,
+**zero timeouts anywhere** (was 415/415 hang-timeouts), ASID-maintenance
+and dormant clauses both zero at population scale. Denominator honestly
+extended 461→462 for `sigstopjobcontrol` when the gate fail-closed on it,
+exactly per the constant's protocol. Two earlier runs are VOID: run 2's
+binary was built from my own mid-edit tree (the shared-tree trap,
+self-inflicted — commit before gating), run 3 died on the stale
+denominator.
+
+Of the 291 failures, two named clauses account for half, both on the
+authority lifecycle the exec rework rebuilt, both reproducing under the
+gate's 24-way concurrency:
+
+- **"HVPatch inventory activation requires published inventory"** — 95
+  rows, concentrated on THREAD probes (threadspawn, threadrecycle,
+  threadstat*, xthreadsig): a spawn resolves/activates an authority that
+  is not yet Published — suspect the publish→activate ordering around
+  `rebind_exec_authority` / CLONE_THREAD resolution.
+- **"drop HVPatch MM authority (phase=active)"** — 51 rows, concentrated
+  on EXEC probes: criterion 2(b) has a SECOND, concurrency-coupled
+  mechanism beyond the serial quantum-boundary one `dc86bf2c` fixed.
+  Fresh specimen: a post-all-fixes sigchld wedge, cored at
+  `target/perf/sigchld-wedge-postfix-89439.core` (+ sample).
+
+Worker `authlifecycle` (worktree `.worktrees/authlifecycle`) is on both
+clauses with concurrent-probe red protocols. The remaining ~145 rows are
+assertion-level conformance gaps (e.g. `write_blocked_until_signal=false`,
+`sigchld_from_orphan=false`, `fdatasync_devnull_einval=false`) plus
+consequences of the two clauses — triage AFTER the clauses close. The
+dedicated scenario phase is 25/40 with its own cluster (network bridge/
+compose scenarios; one runner names a nonexistent `serve` test target —
+harness wiring, not runtime).
+
+Session history below. Everything in it is superseded by the paragraphs
 above where they disagree.
 
 **The exec-authority stack was verified and initially UNMERGED, held on one
