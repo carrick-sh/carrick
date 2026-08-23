@@ -275,6 +275,13 @@ fn reconcile_durable_signal_state(
         // them, so a replaced/pre-start pipe edge cannot be their authority.
         kicker.kick_all();
         futex.notify_signal_pending();
+        // Neither channel above reaches an HVPatch thread parked as a
+        // CONTINUATION outside the futex table (wait4's WaitOnHvpatchChild
+        // above all): kick_all sees only live vCPU leases and the futex
+        // broadcast only enrolled waiters. Route the arrival through the
+        // kernel graph's task wake as well, so parked vehicles re-check
+        // pending state (the waitrestart SIGALRM-into-blocked-wait4 hang).
+        crate::host_signal::invoke_process_signal_wake_hook();
     }
     for tid in crate::host_signal::pending_thread_tids() {
         // Per-thread pending state is equally durable. Reconcile it to the

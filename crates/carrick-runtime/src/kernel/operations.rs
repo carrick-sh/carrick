@@ -1786,7 +1786,14 @@ impl Kernel {
             false
         };
         drop(generation);
-        task.wake();
+        let subscribed = task.wake();
+        if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
+            eprintln!(
+                "SIGDBG post_signal_to_task_key sig={} task={:?} subscribed_wake={subscribed}",
+                signal.raw(),
+                task.key(),
+            );
+        }
         if continued && let Some(parent) = parent {
             parent.wake();
         }

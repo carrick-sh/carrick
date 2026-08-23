@@ -603,6 +603,40 @@ pub fn clear_pump_kqueue(kq: i32) {
     let _ = PUMP_KQUEUE.compare_exchange(kq, -1, Ordering::SeqCst, Ordering::SeqCst);
 }
 
+/// Carrier-wide wake for HVPatch parked continuations on PROCESS-directed
+/// signal publication. The pump's reconcile historically had exactly two wake
+/// channels — `kicker.kick_all()` (live vCPU leases only; a parked
+/// continuation holds none) and the private-futex broadcast (futex waiters
+/// only) — so a thread parked in a non-futex, non-signal-family continuation
+/// (wait4's `WaitOnHvpatchChild` above all) never learned a process-directed
+/// signal arrived: SIGALRM sat deliverable while the parent parked forever
+/// (the `waitrestart` hang). The HVPatch runtime registers a hook here that
+/// routes through the kernel graph's `task.wake()` — "THE single door" — for
+/// every live task. Host `PROC_PENDING` carries no task identity (a recorded
+/// carrier-scope defect), so the wake is a carrier broadcast; waking is a
+/// hint and a spurious wake is harmless.
+static PROCESS_SIGNAL_WAKE_HOOK: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> =
+    std::sync::OnceLock::new();
+
+/// Install the carrier's process-directed signal wake hook. First install
+/// wins; repeat installs (per-process endpoint registration re-runs) are
+/// no-ops, which is correct because the hook closes over the ONE shared
+/// runtime directory and enumerates live tasks at invocation time.
+pub fn set_process_signal_wake_hook(hook: Box<dyn Fn() + Send + Sync>) {
+    let _ = PROCESS_SIGNAL_WAKE_HOOK.set(hook);
+}
+
+/// Invoke the registered process-directed wake hook (no-op before install).
+pub fn invoke_process_signal_wake_hook() {
+    let hook = PROCESS_SIGNAL_WAKE_HOOK.get();
+    if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
+        eprintln!("SIGDBG process-wake hook: installed={}", hook.is_some());
+    }
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Wake the signal pump via its `EVFILT_USER` (`NOTE_TRIGGER`). NOT
 /// async-signal-safe (`kevent` isn't) — call only from normal thread context;
 /// host signal handlers use the self-pipe (`notify_pending`) instead.
@@ -1058,6 +1092,13 @@ pub fn publish_process_signal_with_wake(signum: i32, wake: PublicationWake) {
         wake_signal_pump_pipe();
         notify_pump();
     }
+    // Every publisher of this lane runs in normal thread context (the pump
+    // loop's EVFILT_TIMER arm or a fallback timer thread — async-signal
+    // handlers use `publish_pending`, never this). The pump is LAZY on HVF
+    // (tty-gated), so its reconcile cannot be the only route to HVPatch
+    // parked continuations — invoke the kernel-graph wake here, at the
+    // publication itself.
+    invoke_process_signal_wake_hook();
 }
 
 /// 0 = handlers not installed yet, 1 = installed. Used to make

@@ -3016,6 +3016,22 @@ impl SyscallDispatcher {
                         }
                         let tid = Self::ctx_tid(cx);
                         let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
+                        // A deliverable pending signal must interrupt the wait
+                        // BEFORE parking (Linux EINTR; SA_RESTART restarts it
+                        // after the handler). Without this check a signal that
+                        // arrived through the kernel post (an HVPatch itimer
+                        // SIGALRM above all) woke the parked continuation, the
+                        // re-dispatch saw StillRunning, and the park re-formed
+                        // with the signal still pending — forever (the
+                        // waitrestart hang). Every other interruptible park
+                        // (ppoll/net/sysv/mqueue) already runs this gate.
+                        if this.has_deliverable_dispatch_pending_for_wait(
+                            cx.kernel,
+                            tid,
+                            carrick_abi::WaitSigMask::Additive(non_interrupting),
+                        ) {
+                            return Ok(DispatchOutcome::errno(LINUX_EINTR));
+                        }
                         return Ok(DispatchOutcome::WaitOnHvpatchChild {
                             target,
                             sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
@@ -3427,10 +3443,26 @@ impl SyscallDispatcher {
                     }
                     crate::hvpatch::WaitResult::StillRunning => {
                         if guest_nohang {
+                            if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
+                                eprintln!("SIGDBG wait4 StillRunning -> WNOHANG 0");
+                            }
                             return Ok(DispatchOutcome::Returned { value: 0 });
                         }
                         let tid = Self::ctx_tid(cx);
                         let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
+                        // See the waitid arm above: a deliverable pending
+                        // signal interrupts the wait BEFORE parking, or the
+                        // TaskWake redispatch re-parks over it forever.
+                        if this.has_deliverable_dispatch_pending_for_wait(
+                            cx.kernel,
+                            tid,
+                            carrick_abi::WaitSigMask::Additive(non_interrupting),
+                        ) {
+                            if std::env::var_os("CARRICK_SIG_DEBUG").is_some() {
+                                eprintln!("SIGDBG wait4 StillRunning -> pre-park EINTR");
+                            }
+                            return Ok(DispatchOutcome::errno(LINUX_EINTR));
+                        }
                         return Ok(DispatchOutcome::WaitOnHvpatchChild {
                             target: (pid.0 != -1).then_some(pid.0),
                             sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
