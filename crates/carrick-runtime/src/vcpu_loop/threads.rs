@@ -377,6 +377,10 @@ where
         code: i32,
         traps: usize,
     ) -> VcpuLoopOutcome {
+        self.trace_hvpatch_thread_terminal(
+            carrick_observability::probes::HvpatchThreadTerminalReason::GuestThreadExit,
+            code,
+        );
         let mut last = self.withdraw_persistent_terminal_owner_runtime(kernel, engine);
         if !last && let Some(process) = kernel.hvpatch_process.as_ref() {
             match process.exit_thread(self.linux_tid) {

@@ -170,12 +170,6 @@ fn try_begin_hvpatch_process_fork_with_admission(
     ProcessForkStart::Admitted { admission }
 }
 
-/// Process-wide fork quiesce barrier (defined in `fork_quiesce` so the blocking
-/// wait predicates can reach the same instance).
-pub(crate) fn fork_barrier() -> &'static crate::fork_quiesce::QuiesceBarrier {
-    crate::fork_quiesce::barrier()
-}
-
 /// Process-wide page-table-edit Pause-Modify-Resume barrier.
 pub(crate) fn pt_barrier() -> &'static crate::fork_quiesce::PtQuiesce {
     crate::fork_quiesce::pt_barrier()
@@ -408,38 +402,6 @@ where
             self.this_tid,
             PtPauseBudget::DEFAULT,
         )
-    }
-
-    pub(super) fn release_and_park_vcpu_for_fork(
-        &self,
-        engine: &mut E,
-    ) -> Result<(), RuntimeError> {
-        // A fatal owner reuses the task-local fork barrier to obtain a real
-        // stop-the-world point. Publish the complete register file before the
-        // kicker unregister makes this sibling count as parked.
-        self.publish_crash_registers_if_requested(engine)?;
-        if !engine.supports_in_process_fork() {
-            engine.release_vcpu_for_fork()?;
-        }
-        // Drop out of the kicker the instant the vCPU is gone: while parked we
-        // have no live vCPU, so another fork must not count us in `others` nor
-        // try to kick a destroyed vCPU.
-        self.kicker.unregister(self.this_tid);
-        self.park_if_fork_quiescing();
-        // Recreate the vCPU under the topology lock so vcpu_create cannot race
-        // another fork's hv_vm_destroy/create. Register only after it exists.
-        {
-            let _topo = crate::fork_quiesce::acquire_topology_lock(
-                carrick_observability::probes::HvpatchTopologyOperation::VcpuRebind,
-                0,
-                self.this_tid.raw(),
-            );
-            if !engine.supports_in_process_fork() {
-                engine.rebuild_vcpu_after_fork()?;
-            }
-            self.register_vcpu(engine);
-        }
-        Ok(())
     }
 
     pub(super) fn prepare_in_process_fork<M, O>(

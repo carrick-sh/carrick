@@ -122,30 +122,6 @@ fn syscall_edits_stage1(number: u64, arg2: u64) -> bool {
 /// need `&mut self` for `complete_errno`/`complete_returned`, so a guard
 /// holding `&self` could not coexist with them. It carries the identity it
 /// publishes under instead, which is fixed for the life of the thread.
-struct GuestBlockedGuard {
-    task_pid: Option<i32>,
-    linux_tid: i32,
-    this_tid: ThreadId,
-}
-
-impl GuestBlockedGuard {
-    fn publish(&self, state: crate::run_state::RunState, stat: char) {
-        if let Some(task_pid) = self.task_pid {
-            crate::run_state::publish_task_thread(task_pid, self.linux_tid, state);
-        } else {
-            crate::run_state::publish(state);
-            crate::run_state::publish_guest_tid(self.this_tid.raw(), state);
-        }
-        crate::thread::set_current_thread_state(self.this_tid, stat);
-    }
-}
-
-impl Drop for GuestBlockedGuard {
-    fn drop(&mut self) {
-        self.publish(crate::run_state::RunState::Running, 'R');
-    }
-}
-
 fn apply_alias_frame_inventory(
     context: &crate::kernel::KernelContext,
     commit: carrick_hal::FrameInventoryCommit<()>,
@@ -551,7 +527,6 @@ mod threads;
 // Re-export the free fns that moved into submodules so the in-crate callers
 // (`crate::runtime`, this module's own code) keep naming them as
 // `crate::vcpu_loop::X` / bare `X`.
-pub(crate) use quiesce::fork_barrier;
 // The threaded loop owns its backend-specific fault resolution. Native Darwin
 // reuses the architecture lowering and Linux signal-frame half below.
 pub(crate) use signal::is_default_ignore_signal;
@@ -1516,13 +1491,6 @@ impl KernelState {
         self.clone_admission.close_for_exec(owner)
     }
 
-    /// How many vCPU loops are still live for this Linux process. Exec and
-    /// exit teardown wait this out; the barrier RAISE decisions read the
-    /// predicate below.
-    fn guest_executor_count(&self) -> usize {
-        self.guest_executors.live()
-    }
-
     /// Must this thread raise a stop-the-world barrier before it mutates state
     /// the guest shares — stage-1 descriptors, or process topology?
     ///
@@ -1930,10 +1898,6 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// Exact authority captured at the current syscall boundary. Lifecycle
     /// outcomes consume it rather than recapturing a newer registry generation.
     service_kernel_context: Option<crate::kernel::KernelContext>,
-    /// Last task-wake generation reconciled at a safe guest boundary. Lane
-    /// kicks remain the prompt path; this closes the host-side/rebind interval
-    /// where no vCPU run exists yet to consume one.
-    observed_task_wake_generation: u64,
     continuation_restart: Option<continuation::RestartDecision>,
     reserved_signal: Option<continuation::ReservedSignal>,
     this_tid: ThreadId,
@@ -2946,6 +2910,11 @@ where
                             prepared.fatal_tid,
                             publ.generation,
                             0,
+                        );
+                        tracing::debug!(
+                            path = %publ.path,
+                            bytes = publ.bytes,
+                            "published guest core file"
                         );
                         Some(publ)
                     }
@@ -4066,6 +4035,7 @@ where
         Ok(match outcome {
             DispatchOutcome::Returned { value } => {
                 self.state.complete_returned(engine, value)?;
+                self.state.trace_syscall_return(self.traps, Some(value));
                 // Self-directed signals (e.g. raise(SIGABRT)) posted during syscall handling must be serviced before returning to guest EL0, otherwise the thread resumes execution and runs subsequent instructions (like _exit(99)) before any asynchronous kick can arrive.
                 let context = self
                     .state
@@ -4094,6 +4064,7 @@ where
             }
             DispatchOutcome::Errno { errno } => {
                 let value = self.state.complete_errno(engine, errno)?;
+                self.state.trace_syscall_return(self.traps, Some(value));
                 let context = self
                     .state
                     .service_kernel_context
@@ -5472,7 +5443,6 @@ where
             linux_tid,
             fatal_image_generation,
             service_kernel_context: None,
-            observed_task_wake_generation: 0,
             continuation_restart: None,
             reserved_signal: None,
             this_tid,
@@ -5516,15 +5486,6 @@ where
     /// duration of the park". No such thing existed; the identifier appeared
     /// only in that comment. This is it, made RAII so a blocking site cannot
     /// return early or `?` out and silently leave the guest marked runnable.
-    fn enter_guest_blocked(&self) -> GuestBlockedGuard {
-        self.publish_thread_run_state(crate::run_state::RunState::Blocked, 'S');
-        GuestBlockedGuard {
-            task_pid: self.hvpatch_task_pid,
-            linux_tid: self.linux_tid.raw(),
-            this_tid: self.this_tid,
-        }
-    }
-
     /// Publish both process-visible and per-thread state at the points that
     /// already maintain the thread registry on mature lanes.
     fn publish_thread_run_state(&self, state: crate::run_state::RunState, stat: char) {
@@ -5999,14 +5960,6 @@ where
         result
     }
 
-    fn park_if_fork_quiescing(&self) {
-        if let Some(barrier) = &self.process_fork_barrier {
-            barrier.park_if_quiescing();
-        } else {
-            fork_barrier().park_if_quiescing();
-        }
-    }
-
     fn trace_syscall(&self, traps: usize, frame: carrick_hal::RawSyscall) {
         if !self.trace {
             return;
@@ -6029,14 +5982,6 @@ where
             a[3],
             a[4]
         );
-    }
-
-    fn exec_replaced_thread_exit(&self) -> Option<DispatchOutcome> {
-        if thread_should_finish_for_exec_replacement(&self.registry, self.this_tid) {
-            Some(DispatchOutcome::ThreadExit { code: 0 })
-        } else {
-            None
-        }
     }
 
     fn trace_hvpatch_thread_terminal(
@@ -9096,7 +9041,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(runtime.guest_executor_count(), 0);
+        assert_eq!(runtime.guest_executors.live(), 0);
         assert_eq!(root.task().threads().len(), 2);
         assert_eq!(sibling.task().key(), root.task().key());
         assert!(

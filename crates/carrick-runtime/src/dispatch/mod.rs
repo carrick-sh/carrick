@@ -3678,52 +3678,6 @@ impl SyscallDispatcher {
             .map(|context| context.thread().key().tid)
     }
 
-    pub(crate) fn exit_one_task_thread(
-        &self,
-        tid: crate::kernel::LinuxTid,
-    ) -> Result<(), crate::kernel::KernelOperationError> {
-        let binding = self.kernel_binding.read().clone();
-        let context = match binding.capture(tid) {
-            Ok(context) => context,
-            Err(crate::kernel::KernelError::UnknownThread(_)) => return Ok(()),
-            Err(_) if !binding.kernel().task_is_live(binding.task_id()) => return Ok(()),
-            Err(_) => {
-                return Err(crate::kernel::KernelOperationError::UnknownTask(
-                    binding.task_id(),
-                ));
-            }
-        };
-        loop {
-            let observed = binding.kernel().reservation_epoch();
-            match binding.kernel().exit_thread(&context, None) {
-                Ok(_) => {
-                    self.close_draining_file_table(
-                        context.kernel(),
-                        &context.resources().files(),
-                        Some(context.task().key()),
-                        None,
-                    );
-                    return Ok(());
-                }
-                Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
-                    binding.kernel().wait_for_reservation_change(observed);
-                }
-                Err(crate::kernel::KernelOperationError::UnknownThread(_))
-                    if !context.exact_thread_is_live() =>
-                {
-                    return Ok(());
-                }
-                Err(crate::kernel::KernelOperationError::ParentExited)
-                | Err(crate::kernel::KernelOperationError::UnknownTask(_))
-                    if !binding.kernel().task_is_live(binding.task_id()) =>
-                {
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
     pub(crate) fn hvpatch_process(&self) -> Option<crate::hvpatch::ProcessContext> {
         self.proc.lock().hvpatch_process.clone()
     }
@@ -3960,6 +3914,52 @@ impl SyscallDispatcher {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn resolves(&self, number: u64) -> bool {
         Self::dispatch_normalized_known(number)
+    }
+
+    pub fn exit_one_task_thread(
+        &self,
+        tid: crate::kernel::LinuxTid,
+    ) -> Result<(), crate::kernel::KernelOperationError> {
+        let binding = self.kernel_binding.read().clone();
+        let context = match binding.capture(tid) {
+            Ok(context) => context,
+            Err(crate::kernel::KernelError::UnknownThread(_)) => return Ok(()),
+            Err(_) if !binding.kernel().task_is_live(binding.task_id()) => return Ok(()),
+            Err(_) => {
+                return Err(crate::kernel::KernelOperationError::UnknownTask(
+                    binding.task_id(),
+                ));
+            }
+        };
+        loop {
+            let observed = binding.kernel().reservation_epoch();
+            match binding.kernel().exit_thread(&context, None) {
+                Ok(_) => {
+                    self.close_draining_file_table(
+                        context.kernel(),
+                        &context.resources().files(),
+                        Some(context.task().key()),
+                        None,
+                    );
+                    return Ok(());
+                }
+                Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
+                    binding.kernel().wait_for_reservation_change(observed);
+                }
+                Err(crate::kernel::KernelOperationError::UnknownThread(_))
+                    if !context.exact_thread_is_live() =>
+                {
+                    return Ok(());
+                }
+                Err(crate::kernel::KernelOperationError::ParentExited)
+                | Err(crate::kernel::KernelOperationError::UnknownTask(_))
+                    if !binding.kernel().task_is_live(binding.task_id()) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub fn new() -> Self {
