@@ -936,6 +936,56 @@ mod task_only_carrier_directory_tests {
     }
 
     #[test]
+    fn active_inventory_activation_is_idempotent_for_thread_siblings() {
+        let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+        let receipt = test_kernel_apply(
+            empty_inventory_commit(101),
+            101,
+            std::num::NonZeroU64::new(101).unwrap(),
+            1,
+            Vec::new(),
+        );
+        let mut active = HvpatchTaskInventoryAuthority::Active {
+            ledger,
+            receipt,
+            retirement: None,
+        };
+        assert_eq!(active.phase_name(), "active");
+        active.activate(&[]).unwrap();
+        assert_eq!(active.phase_name(), "active");
+    }
+
+    #[test]
+    fn exec_predecessor_authority_retires_without_aborting_active_drop() {
+        let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+        let receipt = test_kernel_apply(
+            empty_inventory_commit(102),
+            102,
+            std::num::NonZeroU64::new(102).unwrap(),
+            1,
+            Vec::new(),
+        );
+        let authority = HvpatchTaskMmAuthority {
+            mappings: Vec::new(),
+            mm_root_slot: Some((0x1000_0000, 0x20_0000)),
+            inventory: parking_lot::Mutex::new(HvpatchTaskInventoryAuthority::Active {
+                ledger,
+                receipt,
+                retirement: None,
+            }),
+            kernel_mm: parking_lot::Mutex::new(std::num::NonZeroU64::new(102)),
+            cow_armed: None,
+            cow_deferred_publications: None,
+            pending_receipts: Vec::new(),
+            alias_receipts: parking_lot::Mutex::new(Vec::new()),
+            drop_order: None,
+        };
+        authority.retire_exec_predecessor();
+        assert_eq!(authority.inventory.lock().phase_name(), "retired");
+        drop(authority);
+    }
+
+    #[test]
     fn root_parent_shared_process_interns_by_exact_kernel_mm_without_parent_row() {
         let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
         let rollbacks = Arc::new(AtomicUsize::new(0));
@@ -12510,12 +12560,12 @@ impl HvfVmState {
                     .ok_or_else(|| {
                         TrapError::Hypervisor("HVPatch COW leaf IPA overflow".to_owned())
                     })?;
-                let page_is_writable =
-                    span.kernel_only || !self.protections.range_write_denied(page_va, 1);
+                let page_is_writable = (span.kernel_only
+                    || !self.protections.range_write_denied(page_va, 1))
+                    && (leaf & VALID != 0);
                 if leaf & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
                     || (page_is_writable
-                        && (leaf & VALID == 0
-                            || leaf & 0b11 != TYPE_TABLE_OR_PAGE
+                        && (leaf & 0b11 != TYPE_TABLE_OR_PAGE
                             || leaf & AP_MASK != expected_ap
                             || (!span.kernel_only && leaf & NON_GLOBAL == 0)))
                 {
@@ -23576,55 +23626,5 @@ mod tag_strip_tests {
             vec![live_fragment],
             "the retired row must not suppress the live suffix from fork arming",
         );
-    }
-
-    #[test]
-    fn active_inventory_activation_is_idempotent_for_thread_siblings() {
-        let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
-        let receipt = test_kernel_apply(
-            empty_inventory_commit(101),
-            101,
-            std::num::NonZeroU64::new(101).unwrap(),
-            1,
-            Vec::new(),
-        );
-        let mut active = HvpatchTaskInventoryAuthority::Active {
-            ledger,
-            receipt,
-            retirement: None,
-        };
-        assert_eq!(active.phase_name(), "active");
-        active.activate(&[]).unwrap();
-        assert_eq!(active.phase_name(), "active");
-    }
-
-    #[test]
-    fn exec_predecessor_authority_retires_without_aborting_active_drop() {
-        let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
-        let receipt = test_kernel_apply(
-            empty_inventory_commit(102),
-            102,
-            std::num::NonZeroU64::new(102).unwrap(),
-            1,
-            Vec::new(),
-        );
-        let authority = HvpatchTaskMmAuthority {
-            mappings: Vec::new(),
-            mm_root_slot: Some((0x1000_0000, 0x20_0000)),
-            inventory: parking_lot::Mutex::new(HvpatchTaskInventoryAuthority::Active {
-                ledger,
-                receipt,
-                retirement: None,
-            }),
-            kernel_mm: parking_lot::Mutex::new(std::num::NonZeroU64::new(102)),
-            cow_armed: None,
-            cow_deferred_publications: None,
-            pending_receipts: Vec::new(),
-            alias_receipts: parking_lot::Mutex::new(Vec::new()),
-            drop_order: None,
-        };
-        authority.retire_exec_predecessor();
-        assert_eq!(authority.inventory.lock().phase_name(), "retired");
-        drop(authority);
     }
 }

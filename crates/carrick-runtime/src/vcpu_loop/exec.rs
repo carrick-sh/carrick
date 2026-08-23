@@ -949,7 +949,9 @@ where
             let old_capacity = if old_extent_count == 0 {
                 None
             } else {
-                match super::quiesce::inventory_capacity_for_extents(old_extent_count) {
+                match carrick_hal::FrameEventCapacity::for_event_count(
+                    carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH,
+                ) {
                     Ok(capacity) => Some(capacity),
                     Err(error) => {
                         return Self::exec_failed_past_no_return(

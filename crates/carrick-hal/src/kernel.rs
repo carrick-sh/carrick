@@ -184,11 +184,12 @@ impl FrameInventoryBatch {
         event_capacity: FrameEventCapacity,
     ) -> Result<Self, FrameInventoryBatchError> {
         let mut events = Vec::new();
-        events
-            .try_reserve_exact(event_capacity.get())
-            .map_err(|_| FrameInventoryBatchError::AllocationFailed {
-                requested: event_capacity.get(),
-            })?;
+        let initial_capacity = event_capacity.get().min(256);
+        events.try_reserve(initial_capacity).map_err(|_| {
+            FrameInventoryBatchError::AllocationFailed {
+                requested: initial_capacity,
+            }
+        })?;
         Ok(Self {
             transaction,
             event_capacity,
@@ -207,6 +208,22 @@ impl FrameInventoryBatch {
             return Err(FrameInventoryBatchError::BatchFull {
                 capacity: self.event_capacity.get(),
             });
+        }
+        if self.events.len() == self.events.capacity() {
+            let next_capacity = self
+                .events
+                .capacity()
+                .checked_mul(2)
+                .unwrap_or(self.event_capacity.get())
+                .min(self.event_capacity.get());
+            let additional = next_capacity.saturating_sub(self.events.len());
+            if additional > 0 {
+                self.events.try_reserve(additional).map_err(|_| {
+                    FrameInventoryBatchError::AllocationFailed {
+                        requested: next_capacity,
+                    }
+                })?;
+            }
         }
         self.events.push(event);
         Ok(())

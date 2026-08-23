@@ -1459,7 +1459,7 @@ impl PageTableManager {
             }
             let descriptor = self.read_desc(off);
             if descriptor & VALID == 0 {
-                return Err(PageTableError::BadAddress);
+                continue;
             }
             let replacement = (descriptor & !AP_MASK) | AP_RW;
             if replacement != descriptor {
