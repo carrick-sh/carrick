@@ -6499,6 +6499,36 @@ pub struct ProcessSpec {
     cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ProcessSpec {
+    pub(crate) fn stage_with_reservation_factory(
+        &mut self,
+        mut reserve: impl FnMut(
+            usize,
+            usize,
+            carrick_hal::FrameEventCapacity,
+        ) -> Result<carrick_hal::FrameInventoryReservation, TrapError>,
+    ) -> Result<(), TrapError> {
+        let mapping_candidates = self.inventory_mappings.len();
+        let frame_candidates = self
+            .inventory_mappings
+            .iter()
+            .filter(|mapping| mapping.inherited_frame.is_none())
+            .count();
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(
+            carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH,
+        )
+        .map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "invalid HVPatch child frame inventory capacity: {error}"
+            ))
+        })?;
+        let reservation = reserve(frame_candidates, mapping_candidates, capacity)?;
+        self.frame_inventory.lock().process_reservation = Some(reservation);
+        Ok(())
+    }
+}
+
 /// Deferred HVPatch task backend state. Its variants deliberately contain no
 /// vCPU, mailbox allocator/binding, vCPU handle/id, reclaim authority, or host
 /// owner identity; those belong exclusively to a Task4 worker pthread.
@@ -16795,14 +16825,10 @@ impl HvfVmState {
         let stage_started = std::time::Instant::now();
         let frame_inventory = {
             let mut parent_inventory = self.frame_inventory.lock();
-            let reservation = parent_inventory.process_reservation.take().ok_or_else(|| {
-                TrapError::Hypervisor(
-                    "HVPatch child map began without a frame inventory reservation".to_owned(),
-                )
-            })?;
+            let reservation = parent_inventory.process_reservation.take();
             let mut child =
                 HvpatchFrameInventory::with_frames(std::sync::Arc::clone(&parent_inventory.frames));
-            child.process_reservation = Some(reservation);
+            child.process_reservation = reservation;
             std::sync::Arc::new(parking_lot::Mutex::new(child))
         };
         let mut child_cow_armed = self.cow_armed.lock().clone();

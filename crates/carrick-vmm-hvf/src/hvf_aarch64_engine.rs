@@ -727,6 +727,31 @@ pub fn materialize_hvpatch_process_without_vcpu(
     })
 }
 
+pub fn materialize_hvpatch_process_without_vcpu_with_reservation(
+    identity: HvpatchCarrierTaskIdentity,
+    spec: Aarch64ProcessSpec<HvfAarch64Vmm>,
+    reserve: impl FnMut(
+        usize,
+        usize,
+        carrick_hal::FrameEventCapacity,
+    ) -> Result<carrick_hal::FrameInventoryReservation, TrapError>,
+) -> Result<HvpatchPreparedTaskOnlyEngineState, TrapError> {
+    let _no_executor_allocation = TaskOnlyNoExecutorAllocationGuard::capture();
+    let mut parts = spec.into_task_only_parts();
+    parts.builder.stage_with_reservation_factory(reserve)?;
+    let carrier = HvpatchPreparedCarrierTaskState::process(identity, parts.builder)?;
+    #[cfg(test)]
+    TASK_ONLY_MATERIALIZATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(HvpatchPreparedTaskOnlyEngineState {
+        carrier,
+        snapshot: parts.snapshot,
+        page_tables: parts.page_tables,
+        protections: parts.protections,
+        process_asid: Some(parts.process_asid),
+        _not_send: std::marker::PhantomData,
+    })
+}
+
 pub fn materialize_hvpatch_shared_process_without_vcpu(
     identity: HvpatchCarrierTaskIdentity,
     shared_kernel_mm: u64,

@@ -132,17 +132,6 @@ impl<const N: usize> Drop for InventoryAbandon<'_, N> {
     }
 }
 
-pub(super) fn inventory_capacity_for_extents(
-    extents: usize,
-) -> Result<carrick_hal::FrameEventCapacity, RuntimeError> {
-    let events = extents.checked_mul(2).ok_or_else(|| {
-        RuntimeError::Configuration("HVPatch frame inventory event count overflow".to_owned())
-    })?;
-    carrick_hal::FrameEventCapacity::for_event_count(events).map_err(|error| {
-        RuntimeError::Configuration(format!("invalid HVPatch frame inventory capacity: {error}"))
-    })
-}
-
 enum ProcessForkStart {
     Busy,
     AdmissionClosed,
@@ -772,49 +761,29 @@ where
             }
         };
         let child_mm_id = prepared_fork.child_mm_id();
-        let (inventory_preparation, _inventory_abandon) = if shares_mm {
-            (
-                HvpatchProcessInventoryPreparation::SharedMm {
-                    kernel_mm: child_mm_id.raw(),
-                },
-                None,
-            )
+        let mut inventory_transaction = None;
+        let mut inventory_reserve =
+            |frame_candidates: usize,
+             mapping_candidates: usize,
+             capacity: carrick_hal::FrameEventCapacity|
+             -> Result<carrick_hal::FrameInventoryReservation, RuntimeError> {
+                let reservation = parent_process
+                    .kernel_graph()
+                    .reserve_frame_inventory(frame_candidates, mapping_candidates, capacity)
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "reserve HVPatch child frame inventory: {error}"
+                        ))
+                    })?;
+                inventory_transaction = Some(reservation.transaction());
+                Ok(reservation)
+            };
+        let inventory_preparation = if shares_mm {
+            HvpatchProcessInventoryPreparation::SharedMm {
+                kernel_mm: child_mm_id.raw(),
+            }
         } else {
-            let inventory_extent_count = ops.inventory_extent_count(memory);
-            let inventory_capacity = match inventory_capacity_for_extents(inventory_extent_count) {
-                Ok(capacity) => capacity,
-                Err(error) => {
-                    if quiesced {
-                        process_barrier.end_quiesce();
-                    }
-                    process_barrier.end_fork();
-                    return Err(error);
-                }
-            };
-            let inventory_reservation = match parent_process.kernel_graph().reserve_frame_inventory(
-                inventory_extent_count,
-                inventory_extent_count,
-                inventory_capacity,
-            ) {
-                Ok(reservation) => reservation,
-                Err(error) => {
-                    if quiesced {
-                        process_barrier.end_quiesce();
-                    }
-                    process_barrier.end_fork();
-                    return Err(RuntimeError::Configuration(format!(
-                        "reserve HVPatch child frame inventory: {error}"
-                    )));
-                }
-            };
-            let inventory_transaction = inventory_reservation.transaction();
-            (
-                HvpatchProcessInventoryPreparation::Copied(inventory_reservation),
-                Some(InventoryAbandon::new(
-                    parent_process.kernel_graph().frame_inventory(),
-                    [Some(inventory_transaction)],
-                )),
-            )
+            HvpatchProcessInventoryPreparation::Copied(&mut inventory_reserve)
         };
         // The reservation and its complete bounded storage exist before this
         // topology lock. Keep it local until every guest-pointer/pidfd preflight
@@ -965,6 +934,9 @@ where
                 return Err(error);
             }
         };
+        let _inventory_abandon = inventory_transaction.map(|tx| {
+            InventoryAbandon::new(parent_process.kernel_graph().frame_inventory(), [Some(tx)])
+        });
         emit_fork_runtime_stage(
             carrick_observability::probes::HvpatchForkRuntimeStagePhase::ProcessSpec,
             fork_stage_started,
@@ -1428,17 +1400,6 @@ mod pt_pause_tests {
             "the loser owns no admission permit"
         );
         barrier.end_fork();
-    }
-
-    #[test]
-    fn inventory_bounds_two_events_per_extent_and_rejects_oversize() {
-        assert_eq!(inventory_capacity_for_extents(3).unwrap().get(), 6);
-        assert!(
-            inventory_capacity_for_extents(
-                carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH / 2 + 1
-            )
-            .is_err()
-        );
     }
 
     #[test]
