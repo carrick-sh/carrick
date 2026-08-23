@@ -6,6 +6,8 @@ use super::*;
 
 pub(crate) type EpollWakeRegistry = std::sync::Arc<Mutex<Vec<i32>>>;
 
+static GLOBAL_EPOLL_WAKE_FDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
 /// Create an epoll wake registry owned by one dispatcher/process state.
 pub(crate) fn new_epoll_wake_registry() -> EpollWakeRegistry {
     std::sync::Arc::new(Mutex::new(Vec::new()))
@@ -22,10 +24,16 @@ pub(crate) fn new_epoll_wake_registry() -> EpollWakeRegistry {
 /// separate fd that, written, makes the epoll `poll_fd` readable).
 pub(crate) fn register_epoll_kqueue(registry: &EpollWakeRegistry, fd: i32) {
     registry.lock().push(fd);
+    let mut global = GLOBAL_EPOLL_WAKE_FDS.lock();
+    if !global.contains(&fd) {
+        global.push(fd);
+    }
 }
 
 pub(crate) fn unregister_epoll_kqueue(registry: &EpollWakeRegistry, fd: i32) {
     registry.lock().retain(|&f| f != fd);
+    let mut global = GLOBAL_EPOLL_WAKE_FDS.lock();
+    global.retain(|&f| f != fd);
 }
 
 /// Drop the parent process's in-memory epoll wake-fd registry in a fork child.
@@ -52,6 +60,9 @@ pub(crate) fn after_fork_child(registry: &EpollWakeRegistry) {
 /// handle through the registry).
 pub(crate) fn notify_inmem_epoll(registry: &EpollWakeRegistry) {
     for &fd in registry.lock().iter() {
+        crate::event_mux::trigger_user_wake_fd(fd);
+    }
+    for &fd in GLOBAL_EPOLL_WAKE_FDS.lock().iter() {
         crate::event_mux::trigger_user_wake_fd(fd);
     }
 }

@@ -43,8 +43,8 @@ impl PipeInner {
             state: Mutex::new(PipeState {
                 buffer: VecDeque::with_capacity(capacity.min(65536)),
                 capacity,
-                readers: 1,
-                writers: 1,
+                readers: 0,
+                writers: 0,
                 pipe_id,
             }),
             changed: Condvar::new(),
@@ -201,53 +201,71 @@ pub(crate) fn write_pipe(
     status_flags: u64,
     fd: i32,
     authority: super::WaitFdAuthority,
+    is_interrupted: impl Fn() -> bool,
 ) -> DispatchOutcome {
     let nonblocking = status_flags & LINUX_O_NONBLOCK != 0;
     let length = bytes.len();
-
-    let mut state = pipe.state.lock();
-    if state.readers == 0 {
-        return DispatchOutcome::errno(LINUX_EPIPE);
-    }
     if length == 0 {
         return DispatchOutcome::Returned { value: 0 };
     }
 
-    let capacity = state.capacity;
-    let available = capacity.saturating_sub(state.buffer.len());
+    let mut written = 0;
+    let mut state = pipe.state.lock();
 
-    // If pipe is completely full, block waiting for space or signal.
-    if available == 0 {
-        if nonblocking {
+    while written < length {
+        if state.readers == 0 {
+            if written > 0 {
+                break;
+            }
+            return DispatchOutcome::errno(LINUX_EPIPE);
+        }
+
+        let capacity = state.capacity;
+        let available = capacity.saturating_sub(state.buffer.len());
+
+        // For writes <= PIPE_BUF (4096), write must be atomic: all or wait.
+        if written == 0 && length <= PIPE_BUF && available < length {
+            if nonblocking {
+                return DispatchOutcome::errno(LINUX_EAGAIN);
+            }
+            return DispatchOutcome::WaitOnFds {
+                fds: WaitFds::authorized_raw_one(fd, libc::POLLOUT, authority),
+                timeout: None,
+                on_timeout: LINUX_EAGAIN.guest_retval(),
+                sig_mask: carrick_abi::WaitSigMask::NONE,
+            };
+        }
+
+        if available > 0 {
+            let chunk = (length - written).min(available);
+            state.buffer.extend(&bytes[written..written + chunk]);
+            written += chunk;
+            pipe.changed.notify_all();
+            if written == length || nonblocking {
+                break;
+            }
+        } else if nonblocking {
+            if written > 0 {
+                break;
+            }
             return DispatchOutcome::errno(LINUX_EAGAIN);
         }
-        return DispatchOutcome::WaitOnFds {
-            fds: WaitFds::authorized_raw_one(fd, libc::POLLOUT, authority),
-            timeout: None,
-            on_timeout: LINUX_EAGAIN.guest_retval(),
-            sig_mask: carrick_abi::WaitSigMask::NONE,
-        };
-    }
 
-    // For writes <= PIPE_BUF (4096), write must be atomic: all or wait.
-    if length <= PIPE_BUF && available < length {
-        if nonblocking {
-            return DispatchOutcome::errno(LINUX_EAGAIN);
+        // Blocking write with no space left: wait for reader to consume or signal to interrupt.
+        if is_interrupted() {
+            break;
         }
-        return DispatchOutcome::WaitOnFds {
-            fds: WaitFds::authorized_raw_one(fd, libc::POLLOUT, authority),
-            timeout: None,
-            on_timeout: LINUX_EAGAIN.guest_retval(),
-            sig_mask: carrick_abi::WaitSigMask::NONE,
-        };
+        pipe.changed
+            .wait_for(&mut state, std::time::Duration::from_millis(20));
+        if is_interrupted() {
+            break;
+        }
     }
 
-    let chunk_len = length.min(available);
-    state.buffer.extend(&bytes[..chunk_len]);
     drop(state);
     pipe.changed.notify_all();
     DispatchOutcome::Returned {
-        value: chunk_len as i64,
+        value: written as i64,
     }
 }
 
@@ -268,6 +286,7 @@ mod tests {
             0,
             4,
             WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+            || false,
         );
         assert_eq!(
             out,
@@ -298,6 +317,7 @@ mod tests {
             0,
             4,
             WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+            || false,
         );
         assert_eq!(out, DispatchOutcome::Returned { value: 5000 });
 
@@ -321,6 +341,7 @@ mod tests {
             0,
             4,
             WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+            || false,
         );
         assert_eq!(out, DispatchOutcome::errno(LINUX_EPIPE));
 
@@ -353,6 +374,7 @@ mod tests {
                 LINUX_O_NONBLOCK,
                 4,
                 WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+                || false,
             ),
             DispatchOutcome::Returned { value: 4096 }
         );
@@ -365,6 +387,7 @@ mod tests {
                 LINUX_O_NONBLOCK,
                 4,
                 WaitFdAuthority::internal(InternalWaitKind::CarrierControl),
+                || false,
             ),
             DispatchOutcome::errno(LINUX_EAGAIN)
         );
