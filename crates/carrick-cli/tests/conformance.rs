@@ -2019,6 +2019,7 @@ impl Drop for ServerGuard {
     }
 }
 
+#[allow(clippy::panic)] // test-harness setup: fail loud, matching the file convention
 fn spawn_server(bin: &std::path::Path) -> (ServerGuard, String, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("carrick.sock");
@@ -2089,6 +2090,7 @@ fn run_compose_output(
     output
 }
 
+#[allow(clippy::panic)] // test-harness wait: fail loud, matching the file convention
 fn wait_for_compose_logs(
     sock: &str,
     file: &std::path::Path,
