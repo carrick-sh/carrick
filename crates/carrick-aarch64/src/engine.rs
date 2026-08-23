@@ -1049,7 +1049,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 
     /// Invalidate one numeric ASID on this exact owner-thread vCPU. The strong
     /// software generation is authenticated by the runtime command; hardware
-    /// consumes only the architectural 16-bit ASID operand in x0[63:48].
+    /// consumes only the architectural 16-bit ASID operand in `x0[63:48]`.
     pub fn invalidate_asid_on_vcpu(
         vcpu: &mut V::Vcpu,
         asid: u16,
