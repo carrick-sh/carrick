@@ -363,6 +363,7 @@ struct SemSet {
     /// Linux `semncnt`/`semzcnt` per semaphore.
     logical_wait_counts: SemWaitCounters,
     changed: Arc<parking_lot::Condvar>,
+    removed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Linux sembuf ABI.
@@ -3009,6 +3010,7 @@ impl SyscallDispatcher {
                         nsems_usize
                     ])),
                     changed: Arc::new(parking_lot::Condvar::new()),
+                    removed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 },
             );
             if key != LINUX_IPC_PRIVATE {
@@ -3697,6 +3699,9 @@ fn sysv_semop<M: GuestMemory>(
 
     let mut block_state: Option<SysvSemBlockStateGuard> = None;
     loop {
+        if sem_set.removed.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EIDRM));
+        }
         if interrupted() {
             return Ok(DispatchOutcome::errno(LINUX_EINTR));
         }
@@ -3878,6 +3883,8 @@ impl SyscallDispatcher {
 
         match cmd {
             LINUX_IPC_RMID => {
+                meta.removed
+                    .store(true, std::sync::atomic::Ordering::Release);
                 let key = meta.key;
                 let changed = Arc::clone(&meta.changed);
                 state.semaphores.remove(&guest_semid);
@@ -4284,6 +4291,7 @@ mod ipc_set_tests {
             logical_last_operators: Arc::new(Mutex::new(vec![None; 3])),
             logical_wait_counts: Arc::new(Mutex::new(vec![SemWaitCounts::default(); 3])),
             changed: Arc::new(parking_lot::Condvar::new()),
+            removed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let child = parent.clone();
         child.record_logical_semop(
@@ -4320,6 +4328,7 @@ mod ipc_set_tests {
                 logical_last_operators: Arc::new(Mutex::new(vec![None; nsems])),
                 logical_wait_counts: Arc::new(Mutex::new(vec![SemWaitCounts::default(); nsems])),
                 changed: Arc::new(parking_lot::Condvar::new()),
+                removed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             Self { set }
         }
@@ -4582,6 +4591,7 @@ mod ipc_set_tests {
             logical_last_operators: Arc::new(Mutex::new(vec![None; 3])),
             logical_wait_counts: Arc::new(Mutex::new(vec![SemWaitCounts::default(); 3])),
             changed: Arc::new(parking_lot::Condvar::new()),
+            removed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let child = parent.clone();
 
