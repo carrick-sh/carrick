@@ -6343,6 +6343,7 @@ fn fork_translation_has_overlay_owner(
     candidate_index: usize,
     va: u64,
     translated: u64,
+    mm_root_slot: Option<(u64, u64)>,
 ) -> bool {
     mappings.iter().enumerate().any(|(index, overlay)| {
         index != candidate_index
@@ -6352,6 +6353,11 @@ fn fork_translation_has_overlay_owner(
                 .ipa
                 .checked_add(va - overlay.start)
                 .is_some_and(|ipa| ipa == translated)
+    }) || alias_registry().lock().iter().any(|alias| {
+        alias_matches_process_scope(alias.ownership_scope, mm_root_slot)
+            && va >= alias.start
+            && va < alias.start.saturating_add(alias.size as u64)
+            && alias.ipa.checked_add(va.saturating_sub(alias.start)) == Some(translated)
     })
 }
 
@@ -16712,13 +16718,17 @@ impl HvfVmState {
         let stage_started = std::time::Instant::now();
         let mut child_pte_receipts = Vec::new();
         for (index, mapping) in mappings.iter().enumerate() {
-            let Some(translated) = page_tables.translate(mapping.start) else {
+            let Some(translated) = page_tables
+                .translate(mapping.start)
+                .or_else(|| page_tables.translate_retained_output(mapping.start))
+            else {
                 // A live PROT_NONE reservation or post-munmap physical owner
                 // intentionally has no valid stage-1 translation. It still
                 // belongs in the child's physical/frame inventory and COW-arm
                 // registry so a later mprotect/remap cannot expose the parent's
                 // frame, but there is no live PTE to authenticate at fork.
                 if self.protections.range_no_access(mapping.start, 1)
+                    || mapping.is_dynamic_alias
                     || !fork_mapping_requires_base_translation(
                         mapping.start,
                         mapping.size,
@@ -16742,8 +16752,13 @@ impl HvfVmState {
             // stage-1 graph is authoritative, so authenticate its translation
             // against any other exact overlay owner rather than assuming the
             // winning overlay was appended after this descriptor.
-            let overlay_matches =
-                fork_translation_has_overlay_owner(&mappings, index, mapping.start, translated);
+            let overlay_matches = fork_translation_has_overlay_owner(
+                &mappings,
+                index,
+                mapping.start,
+                translated,
+                self.mm_root_slot,
+            );
             if translated != mapping.ipa && !overlay_matches {
                 return Err(TrapError::Hypervisor(format!(
                     "hvpatch child stage-1 VA 0x{:x} resolves to IPA 0x{translated:x}, expected 0x{:x}",
