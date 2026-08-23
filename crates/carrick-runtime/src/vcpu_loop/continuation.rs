@@ -5735,6 +5735,28 @@ mod tests {
     }
 
     #[test]
+    fn hvpatch_fd_less_wait_authorizes_empty_slot_authority() {
+        let (_kernel, context) = bootstrap(15_228);
+        let generation = publish(&context, 0x555);
+        for fds in [
+            WaitFds::raw(Vec::new()),
+            WaitFds::raw(Vec::new()).with_slot_authorities(Vec::new()),
+            WaitFds::empty(),
+        ] {
+            let result = BlockedContinuation::from_dispatch_outcome(
+                DispatchOutcome::WaitOnFds {
+                    fds,
+                    timeout: None,
+                    on_timeout: 0,
+                    sig_mask: WaitSigMask::NONE,
+                },
+                capture(&context, generation, ContinuationBackend::Hvpatch),
+            );
+            assert!(result.is_ok(), "fd-less wait should accept empty authority");
+        }
+    }
+
+    #[test]
     fn shared_wait_service_is_bounded_and_blocked_tasks_own_no_executor() {
         let mut fixture = race_fixture(15_230);
         let topology = fixture.service.topology();

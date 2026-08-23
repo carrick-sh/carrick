@@ -315,6 +315,16 @@ mod overlay_dispatch_tests {
     }
 
     #[test]
+    fn wait_fds_empty_with_guest_slots_preserves_empty_authority() {
+        let ids = crate::kernel::ids::ObjectIdRegistry::new();
+        let files = crate::kernel::objects::FileTable::new(ids.file_table_id().expect("table ID"));
+        let wait_fds = WaitFds::raw(Vec::new())
+            .with_guest_slots(&files, [])
+            .expect("empty fds authorized");
+        assert_eq!(*wait_fds.authority(), WaitFdAuthority::Empty);
+    }
+
+    #[test]
     fn blocking_host_write_from_owned_bytes_reuses_buffer_storage() {
         let mut fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
