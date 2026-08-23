@@ -614,6 +614,21 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     pub fn from_parts(mut vm: V, vcpu: V::Vcpu) -> Self {
         let page_tables = Arc::new(Mutex::new(None));
         vm.bind_stage1_page_tables(Arc::clone(&page_tables));
+        // Adopt the backend's protections authority when it exposes one
+        // (`exec_protections` is the backend's live task authority, not an
+        // exec-only value). Creating a separate engine-side Arc here split the
+        // per-mm protections into TWO instances: every marking write goes
+        // through `self.vm.protections()` (the backend's), while the fork
+        // process-spec and sibling specs snapshot/share the engine's. The
+        // root process's engine mirror therefore stayed EMPTY forever, so a
+        // forked child inherited no `mutable_shared_backing` ranges and every
+        // anon-`MAP_SHARED` futex in a child fell to the process-private
+        // table (sharedanonfutexfork / futexforkrequeue: all waiters
+        // ETIMEDOUT while the parent's wake found zero). One mm, one
+        // authority.
+        let protections = vm
+            .exec_protections()
+            .unwrap_or_else(|| Arc::new(MemoryProtections::default()));
         Self {
             vm,
             vcpu,
@@ -628,7 +643,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             asid_generation: 1,
             pending_guest_run_receipt_ns: 0,
             page_tables,
-            protections: Arc::new(MemoryProtections::default()),
+            protections,
             fork_arena_high_water: u64::MAX,
             pending_process_fork: None,
             pt_snapshot_scratch: None,
@@ -1606,9 +1621,31 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// host-`SYS_futex` path on the same physical page. `None` for a private/COW
     /// word (those stay in-process via the parking-lot `FutexTable`).
     fn shared_futex_location(&self, guest_addr: u64) -> Option<SharedFutexLocation> {
+        // Fork-lineage debug (CARRICK_FORK_DEBUG_VA=<hex guest VA>): name WHICH
+        // gate refuses shared classification for that word. Every `None` below
+        // silently lowers the op into the process-private FutexTable, where a
+        // parent/child classification split is invisible until every waiter
+        // times out (the sharedanonfutexfork / futexforkrequeue shape).
+        let debug = std::env::var("CARRICK_FORK_DEBUG_VA")
+            .ok()
+            .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+            .is_some_and(|va| va == guest_addr);
         if !self.vm.protections().is_some_and(|protections| {
             protections.range_mutable_shared_backing(guest_addr, std::mem::size_of::<u32>())
         }) {
+            if debug {
+                match self.vm.protections() {
+                    None => eprintln!(
+                        "[FUTEXDBG] va={guest_addr:#x} REFUSED: backend exposes NO \
+                         protections view"
+                    ),
+                    Some(protections) => eprintln!(
+                        "[FUTEXDBG] va={guest_addr:#x} REFUSED: protections view live but \
+                         mutable_shared_backing misses the word (ranges: {:?})",
+                        protections.snapshot_all().mutable_shared_backing
+                    ),
+                }
+            }
             return None;
         }
         // Futex identity is PHYSICAL, so always walk the live stage-1 tables.
@@ -1619,8 +1656,31 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // separate process-private FutexTables even though the frame receipt was
         // shared. A 4-byte-aligned futex word cannot cross a 4 KiB page.
         let guard = self.page_tables.lock();
-        let backing_gpa = shared_futex_backing_gpa(guard.as_ref()?, guest_addr)?;
-        self.vm.shared_futex_location(backing_gpa)
+        let Some(page_tables) = guard.as_ref() else {
+            if debug {
+                eprintln!("[FUTEXDBG] va={guest_addr:#x} REFUSED: no live stage-1 page tables");
+            }
+            return None;
+        };
+        let Some(backing_gpa) = shared_futex_backing_gpa(page_tables, guest_addr) else {
+            if debug {
+                eprintln!("[FUTEXDBG] va={guest_addr:#x} REFUSED: stage-1 walk has no leaf");
+            }
+            return None;
+        };
+        let location = self.vm.shared_futex_location(backing_gpa);
+        if debug {
+            eprintln!(
+                "[FUTEXDBG] va={guest_addr:#x} gpa={:#x} backend location: {}",
+                backing_gpa.raw(),
+                if location.is_some() {
+                    "SHARED"
+                } else {
+                    "REFUSED (no shared mapping/alias covers the GPA)"
+                }
+            );
+        }
+        location
     }
 
     /// Make a guest `mprotect`/`mmap`'s protection GUEST-visible by editing the
@@ -2969,6 +3029,23 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let protections = Arc::new(MemoryProtections::from_snapshot(
             self.protections.snapshot_all(),
         ));
+        if std::env::var_os("CARRICK_FORK_DEBUG_VA").is_some() {
+            let wrapper = self.protections.snapshot_all();
+            let backend = self.vm.protections().map(|p| p.snapshot_all());
+            eprintln!(
+                "[FUTEXDBG] fork spec: wrapper protections Arc={:p} shared={:?}; backend \
+                 protections shared={:?}; same instance={}",
+                Arc::as_ptr(&self.protections),
+                wrapper.mutable_shared_backing,
+                backend.as_ref().map(|s| &s.mutable_shared_backing),
+                self.vm.protections().is_some_and(|p| {
+                    std::ptr::eq(
+                        p as *const MemoryProtections,
+                        Arc::as_ptr(&self.protections),
+                    )
+                }),
+            );
+        }
         emit_stage(
             HvpatchForkProcessSpecStagePhase::WrapperProtections,
             stage_started,
