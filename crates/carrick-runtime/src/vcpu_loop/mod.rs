@@ -3993,7 +3993,7 @@ where
                     .state
                     .service_kernel_context
                     .as_ref()
-                    .map_or(false, |cx| cx.task().is_job_control_stopped());
+                    .is_some_and(|cx| cx.task().is_job_control_stopped());
                 if is_stopped {
                     self.state
                         .publish_thread_run_state(crate::run_state::RunState::Blocked, 'T');

@@ -3499,6 +3499,20 @@ impl HvpatchTaskBinding {
         ))
     }
 
+    pub(crate) fn cancel_dormant_backend(&self) -> Result<(), crate::trap::TrapError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if let Some(backend) = self.backend.lock().as_mut() {
+                if let Some(backend) = backend
+                    .downcast_mut::<crate::vcpu_loop::executor::HvpatchTaskEngineBindingState>(
+                ) {
+                    backend.cancel_dormant()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn retire_detached_shared_mm_edge(&self) -> Result<(), crate::trap::TrapError> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {

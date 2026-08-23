@@ -176,6 +176,19 @@ impl HvpatchTaskEngineBindingState {
         }
     }
 
+    pub(super) fn cancel_dormant(&mut self) -> Result<(), TrapError> {
+        match &mut self.payload {
+            HvpatchTaskEngineBindingPayload::Resident(state) => {
+                carrick_vmm_hvf::hvf_aarch64_engine::cancel_dormant_task_engine(state)
+            }
+            HvpatchTaskEngineBindingPayload::TaskOnly(state) => {
+                carrick_vmm_hvf::hvf_aarch64_engine::cancel_dormant_task_only_engine(state)
+            }
+            #[cfg(test)]
+            HvpatchTaskEngineBindingPayload::Test => Ok(()),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn test_only() -> Self {
         Self {
@@ -1393,6 +1406,7 @@ impl TaskBindingResolver<crate::vcpu_loop::continuation::HvpatchTaskBinding>
                 })?
             {
                 binding.after_terminal_settlement();
+                let _ = binding.cancel_dormant_backend();
                 cancelled = cancelled
                     .checked_add(1)
                     .ok_or_else(|| TrapError::Hypervisor("dormant cancellation overflow".into()))?;
