@@ -204,6 +204,32 @@ Progress since gate 6, all merged to main:
   wedged carrier SURVIVES SIGTERM (teardown deadlock blocks the signal
   exit path). Ops rule learned: probe batteries must use `timeout -k`.
 
+**GATE RUN 8 — the campaign capstone: 733 PASS / 99 FAIL (88%), and
+EVERY named crash clause is at zero** (phase=active 0, batch capacity 0,
+reservation candidate 0, activation 0, fd-pin 1 straggler). Day's arc:
+0 -> 541 -> 584 -> 681 -> 680 -> 733 of 832. The merged wave since run 7:
+fdpin (fd-less WaitFds get Empty authority at construction), futexdrop
+(4 commits: the Drop abort names its HOLDER; three more DispatchOutcome
+variants — SignalDeath, SharedFutexWake, SharedFutexRequeue — were dying
+in the `other =>` catch-all EXACTLY as this file's structural-hazard item
+predicted; shared-anon futex identity across forks; listener accounting),
+noclause (enriched failure records carry exit status + stderr tail, and
+the 35 clauseless deaths are classified in
+docs/hvpatch-noclause-classification-2026-08-22.md: 17 wedges, 15
+already-pass, 3 recovered clauses, ZERO genuine silent deaths).
+
+**What remains of the 99:** 49 died-with-signal-recorded rows (the new
+records name the signal — extract and cluster them next), 45 value-diffs
+(the deliberately held futex wake/requeue semantics + threadstatstate +
+stragglers; note futexdrop's listener-accounting commit may have moved
+these — re-derive from run 8, not run 7), 3 panics, 2 other-FATALs. The
+residual WEDGE family (futexwakeexact, execpermitchurn, procladder
+intermittents) is reduced but alive — the holder-tag diagnostics and four
+wedge specimens in target/perf/ are the hunt kit. The `service_outcome`
+type-routing (structural item 5) is now TRIPLY vindicated and should be
+done as engineering, not as another bug hunt: route blocking variants
+through a type so the match is exhaustive.
+
 **Gate run 7** (invsizing merged): 680/832 generic, 31/40 scenarios.
 Clause scoreboard: capacity 0, reservation-candidate 0 (the sizing fix
 holds at scale), activation 0, phase=active ~20 (stubborn residual,
