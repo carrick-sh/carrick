@@ -2930,8 +2930,11 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// row count therefore moved from 858 to 866 — 433 conformance sources under
 /// arm64 musl AND GNU. `waitidsiuid` and `mqnotifycrossproc` (`301ac30a9`)
 /// move the source denominator from 459 to 461 and the gating rows from 866 to
-/// 870 — 435 conformance sources under both libc variants.
-const PROBE_SOURCE_COUNT: usize = 461;
+/// 870 — 435 conformance sources under both libc variants. `sigstopjobcontrol`
+/// (the job-control port's red-first probe: a SIGSTOPped child must make NO
+/// progress before SIGCONT) moves the denominator from 461 to 462 and the
+/// gating rows from 870 to 872 — 436 conformance sources under both variants.
+const PROBE_SOURCE_COUNT: usize = 462;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -4549,7 +4552,7 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
         .expect("checked-in closure probe inventory must match the source denominator");
     assert_eq!(generic.len(), 415);
     assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 435);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 870);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 872);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")
