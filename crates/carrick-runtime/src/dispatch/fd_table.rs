@@ -1436,10 +1436,12 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::PipeReader { pipe, .. } => {
                 let mut state = pipe.state.lock();
                 state.readers = state.readers.saturating_add(1);
+                pipe.update_readiness_locked(&state);
             }
             OpenDescription::PipeWriter { pipe, .. } => {
                 let mut state = pipe.state.lock();
                 state.writers = state.writers.saturating_add(1);
+                pipe.update_readiness_locked(&state);
             }
             _ => {}
         }
@@ -1452,12 +1454,14 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
             OpenDescription::PipeReader { pipe, .. } => {
                 let mut state = pipe.state.lock();
                 state.readers = state.readers.saturating_sub(1);
+                pipe.update_readiness_locked(&state);
                 drop(state);
                 pipe.changed.notify_all();
             }
             OpenDescription::PipeWriter { pipe, .. } => {
                 let mut state = pipe.state.lock();
                 state.writers = state.writers.saturating_sub(1);
+                pipe.update_readiness_locked(&state);
                 drop(state);
                 pipe.changed.notify_all();
             }

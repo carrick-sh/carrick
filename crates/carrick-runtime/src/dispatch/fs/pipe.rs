@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use super::DispatchOutcome;
 use crate::dispatch::WaitFds;
+use crate::dispatch::fd_table::{HostFdRef, make_readiness_pipe};
 
 pub(crate) const DEFAULT_PIPE_CAPACITY: usize = 65536; // 64 KiB = 16 Linux pages
 pub(crate) const MAX_PIPE_CAPACITY: usize = 1048576; // 1 MiB (/proc/sys/fs/pipe-max-size)
@@ -32,6 +33,10 @@ pub(crate) struct PipeInner {
     pub(crate) state: Mutex<PipeState>,
     pub(crate) changed: Condvar,
     pub(crate) capacity_cell: Arc<AtomicI64>,
+    pub(crate) read_pipe_ready: Option<(HostFdRef, HostFdRef)>,
+    pub(crate) write_pipe_ready: Option<(HostFdRef, HostFdRef)>,
+    read_notified: std::sync::atomic::AtomicBool,
+    write_notified: std::sync::atomic::AtomicBool,
 }
 
 pub(crate) type PipeRef = Arc<PipeInner>;
@@ -39,7 +44,9 @@ pub(crate) type PipeRef = Arc<PipeInner>;
 impl PipeInner {
     pub(crate) fn new(pipe_id: u64, capacity: usize) -> Self {
         let capacity = capacity.clamp(PIPE_BUF, MAX_PIPE_CAPACITY);
-        Self {
+        let read_pipe_ready = make_readiness_pipe();
+        let write_pipe_ready = make_readiness_pipe();
+        let inner = Self {
             state: Mutex::new(PipeState {
                 buffer: VecDeque::with_capacity(capacity.min(65536)),
                 capacity,
@@ -49,15 +56,59 @@ impl PipeInner {
             }),
             changed: Condvar::new(),
             capacity_cell: Arc::new(AtomicI64::new(capacity as i64)),
-        }
+            read_pipe_ready,
+            write_pipe_ready,
+            read_notified: std::sync::atomic::AtomicBool::new(false),
+            write_notified: std::sync::atomic::AtomicBool::new(false),
+        };
+        inner.update_readiness_locked(&inner.state.lock());
+        inner
     }
 
     #[cfg(test)]
     pub(crate) fn new_connected(pipe_id: u64, capacity: usize) -> Self {
         let pipe = Self::new(pipe_id, capacity);
-        pipe.state.lock().readers = 1;
-        pipe.state.lock().writers = 1;
+        {
+            let mut state = pipe.state.lock();
+            state.readers = 1;
+            state.writers = 1;
+            pipe.update_readiness_locked(&state);
+        }
         pipe
+    }
+
+    pub(crate) fn update_readiness_locked(&self, state: &PipeState) {
+        let read_ready = !state.buffer.is_empty() || state.writers == 0;
+        if let Some((r, w)) = &self.read_pipe_ready {
+            if read_ready {
+                if !self.read_notified.swap(true, Ordering::SeqCst) {
+                    let _ = unsafe { libc::write(w.raw(), [1u8].as_ptr() as *const _, 1) };
+                }
+            } else if self.read_notified.swap(false, Ordering::SeqCst) {
+                let mut buf = [0u8; 32];
+                let _ = unsafe { libc::read(r.raw(), buf.as_mut_ptr() as *mut _, buf.len()) };
+            }
+        }
+
+        let write_ready = state.readers == 0 || state.buffer.len() < state.capacity;
+        if let Some((r, w)) = &self.write_pipe_ready {
+            if write_ready {
+                if !self.write_notified.swap(true, Ordering::SeqCst) {
+                    let _ = unsafe { libc::write(w.raw(), [1u8].as_ptr() as *const _, 1) };
+                }
+            } else if self.write_notified.swap(false, Ordering::SeqCst) {
+                let mut buf = [0u8; 32];
+                let _ = unsafe { libc::read(r.raw(), buf.as_mut_ptr() as *mut _, buf.len()) };
+            }
+        }
+    }
+
+    pub(crate) fn read_poll_fd(&self) -> Option<HostFdRef> {
+        self.read_pipe_ready.as_ref().map(|(r, _)| r.clone())
+    }
+
+    pub(crate) fn write_poll_fd(&self) -> Option<HostFdRef> {
+        self.write_pipe_ready.as_ref().map(|(r, _)| r.clone())
     }
 
     pub(crate) fn pipe_id(&self) -> u64 {
@@ -76,6 +127,7 @@ impl PipeInner {
         state.capacity = new_capacity;
         self.capacity_cell
             .store(new_capacity as i64, Ordering::Release);
+        self.update_readiness_locked(&state);
         drop(state);
         self.changed.notify_all();
         Ok(new_capacity)
@@ -93,7 +145,7 @@ pub(crate) fn read_pipe<M: GuestMemory>(
     length: usize,
     pipe: &PipeRef,
     status_flags: u64,
-    fd: i32,
+    _fd: i32,
     authority: super::WaitFdAuthority,
 ) -> DispatchOutcome {
     if length == 0 {
@@ -104,6 +156,7 @@ pub(crate) fn read_pipe<M: GuestMemory>(
     if !state.buffer.is_empty() {
         let read_len = state.buffer.len().min(length);
         let bytes: Vec<u8> = state.buffer.drain(..read_len).collect();
+        pipe.update_readiness_locked(&state);
         drop(state);
         pipe.changed.notify_all();
         if memory.write_bytes(address, &bytes).is_err() {
@@ -119,13 +172,15 @@ pub(crate) fn read_pipe<M: GuestMemory>(
     }
     if nonblocking {
         DispatchOutcome::errno(LINUX_EAGAIN)
-    } else {
+    } else if let Some(host_fd) = pipe.read_poll_fd() {
         DispatchOutcome::WaitOnFds {
-            fds: WaitFds::authorized_raw_one(fd, libc::POLLIN, authority),
+            fds: WaitFds::authorized_raw_one(host_fd.raw(), libc::POLLIN, authority),
             timeout: None,
             on_timeout: LINUX_EAGAIN.guest_retval(),
             sig_mask: carrick_abi::WaitSigMask::NONE,
         }
+    } else {
+        DispatchOutcome::errno(LINUX_EMFILE)
     }
 }
 
@@ -149,6 +204,7 @@ pub(crate) fn read_pipe_bytes(
         {
             *dest = src;
         }
+        pipe.update_readiness_locked(&state);
         drop(state);
         pipe.changed.notify_all();
         return Ok(read_len);
@@ -178,6 +234,7 @@ pub(crate) fn take_pipe_bytes(
 
     let read_len = state.buffer.len().min(length);
     let bytes = state.buffer.drain(..read_len).collect();
+    pipe.update_readiness_locked(&state);
     drop(state);
     pipe.changed.notify_all();
     Ok(bytes)
@@ -191,6 +248,7 @@ pub(crate) fn restore_pipe_bytes(pipe: &PipeRef, bytes: &[u8]) {
     for byte in bytes.iter().rev() {
         state.buffer.push_front(*byte);
     }
+    pipe.update_readiness_locked(&state);
     drop(state);
     pipe.changed.notify_all();
 }
@@ -199,7 +257,7 @@ pub(crate) fn write_pipe(
     bytes: &[u8],
     pipe: &PipeRef,
     status_flags: u64,
-    fd: i32,
+    _fd: i32,
     authority: super::WaitFdAuthority,
     is_interrupted: impl Fn() -> bool,
 ) -> DispatchOutcome {
@@ -228,8 +286,17 @@ pub(crate) fn write_pipe(
             if nonblocking {
                 return DispatchOutcome::errno(LINUX_EAGAIN);
             }
+            let Some(host_fd) = pipe.write_poll_fd() else {
+                return DispatchOutcome::errno(LINUX_EMFILE);
+            };
+            // The readiness protocol is a LEVEL signal: while the pipe is
+            // guest-writable, one byte sits in the write-readiness
+            // notification pipe, so the host wait is POLLIN on its READ end.
+            // POLLOUT here polled a pipe read end for writability, which the
+            // host never reports — the park completed only via signals or
+            // timeouts, never via the reader draining the buffer.
             return DispatchOutcome::WaitOnFds {
-                fds: WaitFds::authorized_raw_one(fd, libc::POLLOUT, authority),
+                fds: WaitFds::authorized_raw_one(host_fd.raw(), libc::POLLIN, authority),
                 timeout: None,
                 on_timeout: LINUX_EAGAIN.guest_retval(),
                 sig_mask: carrick_abi::WaitSigMask::NONE,
@@ -240,6 +307,7 @@ pub(crate) fn write_pipe(
             let chunk = (length - written).min(available);
             state.buffer.extend(&bytes[written..written + chunk]);
             written += chunk;
+            pipe.update_readiness_locked(&state);
             pipe.changed.notify_all();
             if written == length || nonblocking {
                 break;
@@ -262,6 +330,7 @@ pub(crate) fn write_pipe(
         }
     }
 
+    pipe.update_readiness_locked(&state);
     drop(state);
     pipe.changed.notify_all();
     DispatchOutcome::Returned {

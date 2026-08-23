@@ -1408,6 +1408,10 @@ impl SyscallDispatcher {
                         Some(host_fd.view())
                     }
                 }
+                OpenDescription::PipeReader { pipe, .. } => pipe.read_poll_fd().map(|fd| fd.view()),
+                OpenDescription::PipeWriter { pipe, .. } => {
+                    pipe.write_poll_fd().map(|fd| fd.view())
+                }
                 // eventfd is host-backed by a readiness pipe (read end readable
                 // A pidfd is read-ready when its process exits; the backing
                 // multiplexer's poll fd (the kqueue fd on macOS, the
@@ -5441,7 +5445,7 @@ impl SyscallDispatcher {
             // every fd be host-backed (stdio bare, HostPipe, HostSocket).
             // An eventfd with POLLOUT requested goes the poll_ready_events path
             // (always-writable); its host read_fd never reports POLLOUT.
-            let host_fds: Option<Vec<i32>> = fds
+            let host_fds: Option<Vec<(i32, i16, bool)>> = fds
                 .iter()
                 .map(|p| {
                     if ((p.events & LINUX_POLLOUT) != 0 && this.fd_is_eventfd(p.fd))
@@ -5449,8 +5453,47 @@ impl SyscallDispatcher {
                             && this.staged_splice_pipe_bytes(p.fd) != 0)
                     {
                         None
+                    } else if let Some(open_file) = this.open_file(p.fd) {
+                        let open = open_file.description.read();
+                        match &*open {
+                            OpenDescription::HostPipe { host_fd, .. }
+                            | OpenDescription::HostFile { host_fd, .. } => {
+                                Some((host_fd.raw(), p.events, false))
+                            }
+                            OpenDescription::HostSocket { host_fd, base, .. } => {
+                                if base.pending_socket_error().is_some() {
+                                    None
+                                } else {
+                                    Some((host_fd.raw(), p.events, false))
+                                }
+                            }
+                            OpenDescription::PipeReader { pipe, .. } => {
+                                pipe.read_poll_fd().map(|fd| (fd.raw(), libc::POLLIN, true))
+                            }
+                            OpenDescription::PipeWriter { pipe, .. } => {
+                                pipe.write_poll_fd().map(|fd| (fd.raw(), libc::POLLIN, true))
+                            }
+                            OpenDescription::EventFd { state, .. } => {
+                                state.read_fd.as_ref().map(|fd| (fd.raw(), libc::POLLIN, true))
+                            }
+                            OpenDescription::Pidfd { kqueue, .. } => {
+                                Some((kqueue.poll_fd(), p.events, false))
+                            }
+                            OpenDescription::Inotify { state, .. } => {
+                                Some((state.poll_fd(), p.events, false))
+                            }
+                            OpenDescription::Fanotify { group, .. } => match group.poll_fd() {
+                                fd if fd >= 0 => Some((fd, p.events, false)),
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    } else if is_stdio_fd(p.fd) {
+                        Some((p.fd, p.events, false))
+                    } else if p.fd < 0 {
+                        Some((p.fd, p.events, false))
                     } else {
-                        this.host_fd_for_poll(p.fd).map(HostFd::get)
+                        None
                     }
                 })
                 .collect();
@@ -5458,9 +5501,9 @@ impl SyscallDispatcher {
                 let mut sys_pollfds: Vec<libc::pollfd> = fds
                     .iter()
                     .zip(host_fds.iter())
-                    .map(|(p, hf)| libc::pollfd {
+                    .map(|(_, (hf, events, _))| libc::pollfd {
                         fd: *hf,
-                        events: p.events,
+                        events: *events,
                         revents: 0,
                     })
                     .collect();
@@ -5482,7 +5525,16 @@ impl SyscallDispatcher {
                 let mut ready = 0i64;
                 for (i, p) in sys_pollfds.iter().enumerate() {
                     let mut pollfd = fds[i];
-                    pollfd.revents = p.revents;
+                    let (_, _, is_readiness_pipe) = host_fds[i];
+                    if is_readiness_pipe {
+                        if p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                            pollfd.revents = this.poll_ready_events(pollfd.fd, pollfd.events);
+                        } else {
+                            pollfd.revents = 0;
+                        }
+                    } else {
+                        pollfd.revents = p.revents;
+                    }
                     // macOS poll() on a regular file returns POLLPRI whenever the
                     // caller requested it (the BSD vnode "always ready" default);
                     // Linux only ever sets POLLPRI on a genuine out-of-band
