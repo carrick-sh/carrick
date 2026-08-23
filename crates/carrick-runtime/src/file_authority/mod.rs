@@ -18,7 +18,6 @@ mod types;
 pub(crate) use core::FileAuthorityCore;
 pub(crate) use ipc::IpcFileAuthority;
 pub(crate) use root::FileAuthorityRun;
-#[cfg(test)]
 pub(crate) use transport::DirectFileAuthority;
 pub(crate) use transport::FileAuthorityTransport;
 pub(crate) use types::*;
