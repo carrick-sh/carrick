@@ -43,8 +43,8 @@ impl PipeInner {
             state: Mutex::new(PipeState {
                 buffer: VecDeque::with_capacity(capacity.min(65536)),
                 capacity,
-                readers: 0,
-                writers: 0,
+                readers: 1,
+                writers: 1,
                 pipe_id,
             }),
             changed: Condvar::new(),
@@ -216,26 +216,38 @@ pub(crate) fn write_pipe(
     let capacity = state.capacity;
     let available = capacity.saturating_sub(state.buffer.len());
 
-    // For writes <= PIPE_BUF (4096), write must be atomic: all or wait.
-    let needed = if length <= PIPE_BUF { length } else { 1 };
-
-    if available >= needed {
-        let chunk_len = length.min(available);
-        state.buffer.extend(&bytes[..chunk_len]);
-        drop(state);
-        pipe.changed.notify_all();
-        DispatchOutcome::Returned {
-            value: chunk_len as i64,
+    // If pipe is completely full, block waiting for space or signal.
+    if available == 0 {
+        if nonblocking {
+            return DispatchOutcome::errno(LINUX_EAGAIN);
         }
-    } else if nonblocking {
-        DispatchOutcome::errno(LINUX_EAGAIN)
-    } else {
-        DispatchOutcome::WaitOnFds {
+        return DispatchOutcome::WaitOnFds {
             fds: WaitFds::authorized_raw_one(fd, libc::POLLOUT, authority),
             timeout: None,
             on_timeout: LINUX_EAGAIN.guest_retval(),
             sig_mask: carrick_abi::WaitSigMask::NONE,
+        };
+    }
+
+    // For writes <= PIPE_BUF (4096), write must be atomic: all or wait.
+    if length <= PIPE_BUF && available < length {
+        if nonblocking {
+            return DispatchOutcome::errno(LINUX_EAGAIN);
         }
+        return DispatchOutcome::WaitOnFds {
+            fds: WaitFds::authorized_raw_one(fd, libc::POLLOUT, authority),
+            timeout: None,
+            on_timeout: LINUX_EAGAIN.guest_retval(),
+            sig_mask: carrick_abi::WaitSigMask::NONE,
+        };
+    }
+
+    let chunk_len = length.min(available);
+    state.buffer.extend(&bytes[..chunk_len]);
+    drop(state);
+    pipe.changed.notify_all();
+    DispatchOutcome::Returned {
+        value: chunk_len as i64,
     }
 }
 

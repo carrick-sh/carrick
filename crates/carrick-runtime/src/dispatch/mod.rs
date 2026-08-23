@@ -4921,10 +4921,20 @@ impl SyscallDispatcher {
         if let Some(state) = closing_inotify {
             self.fs.inotify_registry.unregister_all(&state);
         }
+        let is_inmem_stream = matches!(
+            &*open_file.description.read(),
+            OpenDescription::PipeReader { .. }
+                | OpenDescription::PipeWriter { .. }
+                | OpenDescription::EventFd { .. }
+                | OpenDescription::TimerFd { .. }
+        );
         // Drop `open_file` first so the description — and with it the last
         // `Arc<FanotifyGroup>`, if this really was the last reference — is gone
         // before the sweep asks which groups are still alive.
         close_open_file(open_file);
+        if is_inmem_stream {
+            self.notify_inmem_epoll();
+        }
         if closing_fanotify {
             self.fs.fanotify_registry.prune_dead_groups();
         }
