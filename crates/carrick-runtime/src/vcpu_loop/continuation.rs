@@ -2187,11 +2187,21 @@ impl ReadinessProbe {
                     deadline: state.deadline,
                 }
             }
-            ContinuationDetail::Signals { .. } => state
-                .deadline
-                .map_or(Self::Passive { deadline: None }, |deadline| Self::Timer {
-                    deadline,
-                }),
+            // A signal park must hear `task.wake()` — THE single door — like
+            // every other park: a thread-directed post to a FORKED task's
+            // sigsuspend/sigtimedwait park has no other prompt vehicle (the
+            // root task's raw lane masked this; the container lane's child
+            // task saw its handler run only on a late fallback sweep,
+            // sigsuspendxthread `suspended_thread_woke=false`).
+            ContinuationDetail::Signals { .. } => {
+                let task = state.authority.task_ref.clone();
+                let observed = state.authority.task_wake_generation;
+                Self::TaskWake {
+                    task,
+                    observed,
+                    deadline: state.deadline,
+                }
+            }
             ContinuationDetail::Vfork { wait, .. } => Self::Vfork { wait: wait.clone() },
             ContinuationDetail::Sleep => state
                 .deadline
