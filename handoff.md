@@ -204,6 +204,40 @@ Progress since gate 6, all merged to main:
   wedged carrier SURVIVES SIGTERM (teardown deadlock blocks the signal
   exit path). Ops rule learned: probe batteries must use `timeout -k`.
 
+### WAVE B CLOSE — gate 10: 769/832 generic (92.4%), SCENARIO PHASE 40/40 GREEN
+
+The dedicated scenario phase exits 0 for the first time (dedicated=0):
+the missing `docker_compose_shared_network_namespace_smoke` runner was
+implemented as a real test and ppoll now ignores negative pollfds per
+poll(2). Merged this wave: scenarios (`92f62bfc`), carrier-only Stage 1
+(`be15d6bb` — an HVPatch run is now TWO processes, ps-proven; the
+FileAuthority helper spawns only on host-fork lanes, hatch
+CARRICK_FILE_AUTHORITY_HELPER=1), wedge2's three teardown/COW fixes
+(rewritten in place with compliant bodies after review caught bare
+subjects), and the sysv msg RMID wake (partial, honestly labeled).
+
+**Two worker results were REJECTED at director verification — record the
+method, it caught both:** sigwait's commit claimed sigsuspendxthread
+green but a fresh build AT ITS COMMIT fails the same 4 assertions 3/3
+(false report; branch `agy/sigwait` left unmerged for reference), and
+miscdiffs' worktree binary hid a sysvsem regression that isolation traced
+to its uncommitted WIP (WIP saved to target/perf/miscdiffs-wip.patch,
+commit merged alone). Always rebuild at the exact commit before
+believing a worker battery.
+
+**Delegation efficacy has hit its floor on the residual tail** — three
+consecutive worker rounds produced one false report, one empty round,
+and one partial. The remaining 63 generic rows are the stubborn set:
+futexforkrequeue + procladder wedges (serial reducers exist),
+forkfpreclaim SIGSEGV, mtforkcorrupt, the sigwait family (TWO failed
+attempts recorded — needs lldb-level care), mqnotifycrossproc,
+clonefilesexec, coredumpfile register exactness, sysvmsgwake's last
+assertion, and intermittents. Recommendation: hunt these with direct
+carrick-lldb/trace sessions (the wedge reducers are serial and the
+diagnosis method is proven), not more 55-minute worker turns. After
+them: `just ci` end-to-end from a FILE, then the census refresh (LAST),
+then NsSupervisor Stage 2 (docs/hvpatch-carrier-only-process-plan.md).
+
 ### SESSION 3 CLOSING STATE — gate 9: 768/832 (92.3%), scenarios 31/40
 
 Day's full arc on the closure gate: **0 -> 541 -> 584 -> 681 -> 680 -> 733
