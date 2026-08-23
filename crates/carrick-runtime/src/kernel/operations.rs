@@ -3515,14 +3515,15 @@ impl Kernel {
         // mistaken for this exit.
         let subscribers = self.exit_subscribers.take(prepared.task);
         drop(state);
-        // Queue the parent's exit notification while every affected task is
-        // still reserved. A consuming wait sees the durable zombie above but
-        // gets TaskBusy until the signal is pending; this matches Linux's
-        // observable ordering for a SIGCHLD handler immediately after waitpid.
-        notify_parent(prepared.result_zombie.parent);
         let mut state = self.registry().state.write();
         prepared.reservation.commit(&mut state)?;
         drop(state);
+        // Queue the parent's exit notification after the exit reservation is
+        // committed. If notify_parent ran before commit, a parent that woke
+        // immediately would see TaskBusy in wait_child_matching and park in
+        // BlockedContinuation having already consumed this exit's wake edge,
+        // wedging forever.
+        notify_parent(prepared.result_zombie.parent);
         for files in &exiting_file_tables {
             self.retire_file_table_if_unreferenced(files);
         }
@@ -3582,7 +3583,7 @@ impl Kernel {
     }
 
     /// Publish terminal state while queueing the exact parent's notification
-    /// before releasing waiters on the exit reservation.
+    /// after committing the exit reservation.
     pub fn exit_task_key_eventually_notifying(
         self: &Arc<Self>,
         task: TaskKey,
@@ -4511,7 +4512,7 @@ mod tests {
     }
 
     #[test]
-    fn exit_notification_precedes_reservation_release() {
+    fn exit_notification_runs_after_reservation_release() {
         let (kernel, root) = bootstrap(79);
         let child = kernel
             .fork_task(
@@ -4537,9 +4538,10 @@ mod tests {
             .expect("child exit");
 
         assert_ne!(hook_epoch.load(Ordering::Acquire), 0);
-        assert!(
-            kernel.reservation_epoch() > hook_epoch.load(Ordering::Acquire),
-            "waiters must be released only after the parent notification hook",
+        assert_eq!(
+            kernel.reservation_epoch(),
+            hook_epoch.load(Ordering::Acquire),
+            "parent notification hook must run after the exit reservation is committed",
         );
     }
 

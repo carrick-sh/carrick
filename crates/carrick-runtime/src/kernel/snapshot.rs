@@ -1690,9 +1690,9 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
                 aliases.len()
             ));
         }
-        if *frame_length != mapping.length {
+        if mapping.length > *frame_length {
             return invariant(format!(
-                "mapping {:?} length {:?} disagrees with frame {:?} length {:?}",
+                "mapping {:?} length {:?} exceeds frame {:?} length {:?}",
                 mapping.mapping, mapping.length, mapping.frame, frame_length
             ));
         }
