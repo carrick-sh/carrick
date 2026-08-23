@@ -139,8 +139,19 @@ gate's 24-way concurrency:
   Fresh specimen: a post-all-fixes sigchld wedge, cored at
   `target/perf/sigchld-wedge-postfix-89439.core` (+ sample).
 
-Worker `authlifecycle` (worktree `.worktrees/authlifecycle`) is on both
-clauses with concurrent-probe red protocols. The remaining ~145 rows are
+Worker `authlifecycle` (worktree `.worktrees/authlifecycle`) fixed both in
+round 1 (`4f07672e`, merged): activation made idempotent for Active
+siblings, predecessor MM retirement on exec rebind, dormant-cancellation
+backend retirement. **Gate run 5 on the merged binary: 584 PASS / 248
+FAIL.** Population truth vs the probe-level green: clause 1 is DEAD (0
+occurrences); clause 2 residual at 20 rows; and the third clause — "stage
+inventory after HVPatch retirement: frame inventory batch reached its
+N-event capacity" — GREW 70→113 rows because more retirements now actually
+stage. N varies (40–56), the same probes pass serially, so the batch is
+sized from one inventory revision and staged from a later one — the
+revision-N-vs-now domain confusion, `a1eaad6a`'s shape. Round 2 is
+dispatched on exactly that (atomic size+stage view; no capacity constants)
+plus the 20 residual phase=active rows. The remaining ~145 rows are
 assertion-level conformance gaps (e.g. `write_blocked_until_signal=false`,
 `sigchld_from_orphan=false`, `fdatasync_devnull_einval=false`) plus
 consequences of the two clauses — triage AFTER the clauses close. The
