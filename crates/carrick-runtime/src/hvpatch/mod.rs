@@ -91,16 +91,6 @@ impl ProcessTimerTarget {
             .filter(|task| task.key() == self.task)
     }
 
-    fn cpu_ns(&self, which: usize) -> Option<u64> {
-        let task = self.task()?;
-        let user_ns = task.self_cpu_us().saturating_mul(1_000);
-        Some(if which == carrick_abi::LINUX_ITIMER_PROF as usize {
-            user_ns.saturating_add(task.self_system_cpu_us().saturating_mul(1_000))
-        } else {
-            user_ns
-        })
-    }
-
     fn deliver(&self, signum: i32) -> bool {
         if signum == 0 {
             return self.task().is_some();
@@ -170,37 +160,16 @@ impl ProcessTimerDelivery {
     fn drive_itimer(
         target: ProcessTimerTarget,
         slot: std::sync::Arc<ProcessItimerSlot>,
-        which: usize,
+        _which: usize,
         generation: u64,
         spec: carrick_hal::TimerSpecNs,
         signum: i32,
     ) {
-        let cpu_timer = which == carrick_abi::LINUX_ITIMER_VIRTUAL as usize
-            || which == carrick_abi::LINUX_ITIMER_PROF as usize;
-        let mut due_cpu_ns = if cpu_timer {
-            let Some(now) = target.cpu_ns(which) else {
-                return;
-            };
-            now.saturating_add(spec.value)
-        } else {
-            std::thread::sleep(std::time::Duration::from_nanos(spec.value));
-            0
-        };
+        std::thread::sleep(std::time::Duration::from_nanos(spec.value));
 
         loop {
             if !slot.generation_matches(generation) {
                 return;
-            }
-            if cpu_timer {
-                let Some(now) = target.cpu_ns(which) else {
-                    return;
-                };
-                if now < due_cpu_ns {
-                    std::thread::sleep(std::time::Duration::from_nanos(
-                        due_cpu_ns.saturating_sub(now).clamp(1, 1_000_000),
-                    ));
-                    continue;
-                }
             }
             if !target.deliver(signum) {
                 return;
@@ -209,14 +178,7 @@ impl ProcessTimerDelivery {
                 slot.retire_one_shot(generation);
                 return;
             }
-            if cpu_timer {
-                let Some(now) = target.cpu_ns(which) else {
-                    return;
-                };
-                due_cpu_ns = now.saturating_add(spec.interval);
-            } else {
-                std::thread::sleep(std::time::Duration::from_nanos(spec.interval));
-            }
+            std::thread::sleep(std::time::Duration::from_nanos(spec.interval));
         }
     }
 }
