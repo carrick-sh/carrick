@@ -210,6 +210,7 @@ pub struct DebugZombieRow {
 #[serde(deny_unknown_fields)]
 pub struct DebugThreadRow {
     pub key: DebugThreadKey,
+    pub execution: String,
     pub task: DebugTaskKey,
     pub registry_id: Option<i32>,
     pub class: DebugClass,
@@ -543,6 +544,7 @@ impl KernelDebugSnapshot {
                     .threads
                     .iter()
                     .map(|row| DebugThreadRow {
+                        execution: row.execution.clone(),
                         key: thread_key(row.key),
                         task: task_key(row.task),
                         registry_id: row.registry_id.map(|id| id.raw()),
