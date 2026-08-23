@@ -2,15 +2,49 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-#[cfg(test)]
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 
 use super::{
     AuthorityEpoch, AuthorityFatal, Command, FileAuthorityBinding, FileAuthorityCore,
     FileAuthorityTransport, ObjectGeneration, Outcome, Request, RequestId, Response, SlotPageLimit,
 };
-#[cfg(test)]
 use super::{ClientId, ClientIdentity};
+
+/// Process placement strategy for the per-run file authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileAuthorityPlacement {
+    /// In-process direct authority for unified VM carrier execution (HVPatch).
+    InProcess,
+    /// Detached helper process spawned via double-fork for host-fork execution lanes.
+    DetachedHelper,
+}
+
+pub(crate) const FILE_AUTHORITY_HELPER_ENV: &str = "CARRICK_FILE_AUTHORITY_HELPER";
+
+impl FileAuthorityPlacement {
+    /// Resolve the authority placement for a given execution backend request.
+    ///
+    /// HVPatch defaults to `InProcess`. An opt-out hatch (`CARRICK_FILE_AUTHORITY_HELPER=1`)
+    /// restores the detached helper process for bisection/debugging.
+    pub(crate) fn for_backend(backend: carrick_spec::ExecBackendRequest) -> Self {
+        if helper_hatch_enabled() {
+            return Self::DetachedHelper;
+        }
+        match backend {
+            carrick_spec::ExecBackendRequest::HvPatch => Self::InProcess,
+        }
+    }
+
+    /// Default placement for the current runtime lane.
+    pub(crate) fn for_current_lane() -> Self {
+        Self::for_backend(carrick_spec::ExecBackendRequest::HvPatch)
+    }
+}
+
+fn helper_hatch_enabled() -> bool {
+    std::env::var_os(FILE_AUTHORITY_HELPER_ENV)
+        .is_some_and(|val| val == "1" || val.to_string_lossy().eq_ignore_ascii_case("true"))
+}
 
 /// The one authenticated FileAuthority endpoint retained by a dispatcher run.
 ///
@@ -33,27 +67,37 @@ impl std::fmt::Debug for FileAuthorityRun {
 }
 
 impl FileAuthorityRun {
-    /// Start the process-real helper in production. Unit tests use the same
-    /// core and request surface directly so ordinary dispatcher fixtures do not
-    /// fork helper processes.
+    /// Start the per-run file authority for the current execution lane.
+    ///
+    /// HVPatch and in-process execution lanes use direct in-memory authority (`DirectFileAuthority`).
+    /// Host-fork execution lanes retain the detached helper (`IpcFileAuthority::spawn_per_run`).
     pub(crate) fn launch() -> Result<Arc<Self>, AuthorityFatal> {
+        Self::launch_with_placement(FileAuthorityPlacement::for_current_lane())
+    }
+
+    /// Start the per-run file authority with a specific placement strategy.
+    pub(crate) fn launch_with_placement(
+        placement: FileAuthorityPlacement,
+    ) -> Result<Arc<Self>, AuthorityFatal> {
         let epoch = run_epoch()?;
-        #[cfg(not(test))]
-        let (transport, binding) = {
-            let (transport, binding) =
-                super::IpcFileAuthority::spawn_per_run(FileAuthorityCore::for_run(epoch), epoch)?;
-            (
-                Arc::new(transport) as Arc<dyn FileAuthorityTransport>,
-                binding,
-            )
-        };
-        #[cfg(test)]
-        let (transport, binding) = {
-            let (transport, binding) = direct_root(epoch)?;
-            (
-                Arc::new(transport) as Arc<dyn FileAuthorityTransport>,
-                binding,
-            )
+        let (transport, binding) = match placement {
+            FileAuthorityPlacement::InProcess => {
+                let (transport, binding) = direct_root(epoch)?;
+                (
+                    Arc::new(transport) as Arc<dyn FileAuthorityTransport>,
+                    binding,
+                )
+            }
+            FileAuthorityPlacement::DetachedHelper => {
+                let (transport, binding) = super::IpcFileAuthority::spawn_per_run(
+                    FileAuthorityCore::for_run(epoch),
+                    epoch,
+                )?;
+                (
+                    Arc::new(transport) as Arc<dyn FileAuthorityTransport>,
+                    binding,
+                )
+            }
         };
 
         // Root registration and root-table creation consumed requests 1-2.
@@ -135,7 +179,6 @@ fn run_epoch() -> Result<AuthorityEpoch, AuthorityFatal> {
     AuthorityEpoch::for_run(raw).map_err(|_| AuthorityFatal::IdentityExhausted)
 }
 
-#[cfg(test)]
 fn direct_root(
     epoch: AuthorityEpoch,
 ) -> Result<(super::DirectFileAuthority, FileAuthorityBinding), AuthorityFatal> {
@@ -270,5 +313,26 @@ mod tests {
             1,
             "a same-client request reached the authority while another was in flight"
         );
+    }
+
+    #[test]
+    fn placement_defaults_to_in_process_for_hvpatch() {
+        assert_eq!(
+            FileAuthorityPlacement::for_backend(carrick_spec::ExecBackendRequest::HvPatch),
+            FileAuthorityPlacement::InProcess
+        );
+        assert_eq!(
+            FileAuthorityPlacement::for_current_lane(),
+            FileAuthorityPlacement::InProcess
+        );
+    }
+
+    #[test]
+    fn launch_with_in_process_placement_succeeds() {
+        let authority = FileAuthorityRun::launch_with_placement(FileAuthorityPlacement::InProcess)
+            .expect("launch in-process authority");
+        let binding = authority.binding();
+        assert_eq!(binding.client.id.raw(), 1);
+        assert_eq!(binding.generation, ObjectGeneration::INITIAL);
     }
 }
