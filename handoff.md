@@ -212,6 +212,45 @@ hangs, sigtimedwait-family value diffs, futexwakeexact refault-livelock
 (pre-existing, now named by the detector), forkfpreclaim teardown,
 mtforkcorrupt flake, gate 13 after fscrash resolves.
 
+### OPEN HUNT, fully localized: process-directed signals never wake parked continuations
+
+The waitrestart hang (rc=124; the SA_RESTART-through-blocking-wait
+framework blocker behind much of LTP) is now pinned to one missing wake
+channel. Evidence chain, all live-measured:
+
+1. Post-pipe-readiness-merge, both threads park CLEANLY (the child's
+   1600-respins/s pipe livelock is gone — that was a separate defect the
+   fscrash merge fixed): parent Blocked in wait4, child Blocked in pipe
+   read, stable generations.
+2. Kernel snapshot: **SIGALRM (14) IS pending at task level** on the
+   parent; SIGALRM is NOT in the parent thread's blocked mask; the
+   sighand row has the real handler with SA_RESTART. The signal arrived
+   and is deliverable; delivery never happens.
+3. `scripts/dtrace/signal-publish-attribution.d`: ZERO
+   carrick*:::signal-publish firings — the alarm rides the pump lane
+   (`vcpu_kick.rs` EVFILT_TIMER arm → `publish_process_signal`), never a
+   kernel-graph publisher.
+4. The pump's `reconcile_durable_signal_state` handles process-directed
+   pending with exactly two instruments: `kicker.kick_all()` (reaches
+   only LIVE vCPU leases — a parked continuation holds none) and
+   `futex.notify_signal_pending()` (reaches only futex-table waiters —
+   wait4 is not one). **Both are carrier-era wake channels; HVPatch
+   parked continuations are in neither set.** Per-tid-directed
+   publications DO wake parks (the continuation signal evaluator at
+   `continuation.rs:2071` even fast-paths WaitOnHvpatchChild to Ready)
+   — only the PROCESS-directed lane is wake-deaf.
+5. `sigwaitalarm`/`pauseeintr` pass — their wake path needs mapping
+   before the fix (they prove SOME channel reaches signal-family parks).
+
+Fix direction: process-directed publication (or the pump reconcile)
+must reach the kernel graph's `task.wake()` — "THE single door" — for
+the targeted task. Note the deeper identity defect discovered en route:
+`crate::itimer` slots and host `PROC_PENDING` are CARRIER-scoped
+statics with no task identity; two guest processes arming itimers would
+collide (docs/identity-and-scope-domains.md class; record before fixing
+around it). `setidthreadchurn` (the other remaining timeout probe)
+plausibly shares the process-directed-wake root — verify after.
+
 ### Instrument lessons paid for this session
 
 - `carrick debug hvpatch-kernel` table names are SINGULAR (`task`, not
