@@ -204,6 +204,28 @@ Progress since gate 6, all merged to main:
   wedged carrier SURVIVES SIGTERM (teardown deadlock blocks the signal
   exit path). Ops rule learned: probe batteries must use `timeout -k`.
 
+### GATE 12 — 780/832 (93.75%), scenarios 40/40: best run of the campaign
+
+Two more roots landed after the hunt closed: the cross-invalidation ack
+deadlock (`50baf827`) and a REGRESSION my own harvest let through —
+wedge2's COW commit flattened the intra-compound offset
+(`new_ipa = new_physical_ipa`), SIGSEGVing every forked child whose span
+sits past the compound base (~16 probes). Bisect convicted it (red 3/3
+at the commit, green 3/3 at its parent); the surgical restore
+(`offset` back into new_ipa/semantic_host, rest of the commit kept) is
+`git log -1`-visible, and the lesson is procedural: a harvest whose
+verification loop was cut by a shell timeout is NOT a completed harvest —
+forkcow was never re-checked post-merge, and the standing serial check
+caught it within the hour.
+
+**The remaining 52:** 39 value-diffs across 21 probes (futex
+wake/requeue counts, coredump exactness, clonefilesexec, mq notify,
+ptrace family, sigsuspend family, thread stat/comm stragglers), 10
+timeout rows across 5 probes — the THROUGHPUT family (futexforkrequeue
+completes at 159s vs 45s budget; fork-storm per-op cost is the lever),
+and 3 fresh small crashes (dirfdnotdir, readpasteof, unlinkatbindmount —
+read their enriched records). Scenario phase 40/40 third consecutive.
+
 ### THE SYSTEMATIC HUNT — gate 11: 763/832, scenarios 40/40, timeouts nearly extinct
 
 Owner directive mid-session: first principles, hypotheses proved and
