@@ -7335,43 +7335,50 @@ impl SyscallDispatcher {
         context: &crate::kernel::KernelContext,
         registry: Option<&crate::thread::ThreadRegistry>,
     ) -> Option<Vec<crate::vfs::SyntheticProcThread>> {
-        let registry = registry?;
         #[cfg(feature = "platform-macos")]
-        let states: std::collections::HashMap<_, _> = registry
-            .thread_ports()
-            .into_iter()
-            .map(|(id, port)| {
-                let state = if port == 0 {
-                    'R'
-                } else {
-                    crate::host_proc::thread_run_state_char(port)
-                };
-                (id, state)
-            })
-            .collect();
+        let states: Option<std::collections::HashMap<_, _>> = registry.map(|r| {
+            r.thread_ports()
+                .into_iter()
+                .map(|(id, port)| {
+                    let state = if port == 0 {
+                        'R'
+                    } else {
+                        crate::host_proc::thread_run_state_char(port)
+                    };
+                    (id, state)
+                })
+                .collect()
+        });
         #[cfg(any(
             feature = "platform-linux",
             feature = "platform-freebsd",
             feature = "platform-netbsd"
         ))]
-        let states: std::collections::HashMap<_, _> =
-            registry.thread_state_chars().into_iter().collect();
+        let states: Option<std::collections::HashMap<_, _>> =
+            registry.map(|r| r.thread_state_chars().into_iter().collect());
         let mut threads: Vec<_> = context
             .task()
             .threads()
             .into_iter()
             .map(|thread| {
                 let registry_id = thread.registry_id();
-                let comm = registry.thread_name(registry_id).map(|name| {
-                    let len = name
-                        .iter()
-                        .position(|&byte| byte == 0)
-                        .unwrap_or(name.len());
-                    String::from_utf8_lossy(&name[..len]).into_owned()
-                });
+                let comm = registry
+                    .and_then(|r| r.thread_name(registry_id))
+                    .map(|name| {
+                        let len = name
+                            .iter()
+                            .position(|&byte| byte == 0)
+                            .unwrap_or(name.len());
+                        String::from_utf8_lossy(&name[..len]).into_owned()
+                    });
+                let state = states
+                    .as_ref()
+                    .and_then(|m| m.get(&registry_id).copied())
+                    .or_else(|| thread.linux_run_state())
+                    .unwrap_or('R');
                 crate::vfs::SyntheticProcThread {
                     tid: thread.key().tid.raw() as u32,
-                    state: states.get(&registry_id).copied().unwrap_or('R'),
+                    state,
                     comm,
                     user_cpu_us: thread.cpu_us(),
                     system_cpu_us: thread.system_cpu_us(),
