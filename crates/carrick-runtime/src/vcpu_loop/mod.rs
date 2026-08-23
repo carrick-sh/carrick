@@ -4056,8 +4056,8 @@ where
                     self.state.fatal_image_generation,
                     Some(value),
                     None,
-                    None,
-                    None,
+                    self.state.continuation_restart.take(),
+                    self.state.reserved_signal.take(),
                     self.traps,
                 )? {
                     return Ok(self.enter_terminal_with_outcome(engine, outcome));
@@ -4084,8 +4084,8 @@ where
                     self.state.fatal_image_generation,
                     Some(value),
                     None,
-                    None,
-                    None,
+                    self.state.continuation_restart.take(),
+                    self.state.reserved_signal.take(),
                     self.traps,
                 )? {
                     return Ok(self.enter_terminal_with_outcome(engine, outcome));
