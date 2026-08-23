@@ -1868,9 +1868,6 @@ impl Kernel {
     ) -> Option<Arc<super::objects::Thread>> {
         let state = self.registry().state.read();
         state.tasks.values().find_map(|record| {
-            if record.task.lifecycle() != TaskLifecycle::Live {
-                return None;
-            }
             let thread = record.task.thread(key.tid)?;
             (thread.key() == key).then_some(thread)
         })
@@ -1887,9 +1884,6 @@ impl Kernel {
     ) -> Option<R> {
         let state = self.registry().state.read();
         let thread = state.tasks.values().find_map(|record| {
-            if record.task.lifecycle() != TaskLifecycle::Live {
-                return None;
-            }
             let thread = record.task.thread(key.tid)?;
             (thread.key() == key).then_some(thread)
         })?;
@@ -1911,9 +1905,6 @@ impl Kernel {
         let state = self.registry().state.read();
         let resolve = |key: ThreadKey| {
             state.tasks.values().find_map(|record| {
-                if record.task.lifecycle() != TaskLifecycle::Live {
-                    return None;
-                }
                 let thread = record.task.thread(key.tid)?;
                 (thread.key() == key).then_some((record.task.key(), thread))
             })
@@ -1966,9 +1957,6 @@ impl Kernel {
         let state = self.registry().state.read();
         let resolve = |key: ThreadKey| {
             state.tasks.values().find_map(|record| {
-                if record.task.lifecycle() != TaskLifecycle::Live {
-                    return None;
-                }
                 let thread = record.task.thread(key.tid)?;
                 (thread.key() == key).then_some((record.task.key(), thread))
             })
@@ -2021,9 +2009,6 @@ impl Kernel {
         let state = self.registry().state.read();
         let resolve = |key: ThreadKey| {
             state.tasks.values().find_map(|record| {
-                if record.task.lifecycle() != TaskLifecycle::Live {
-                    return None;
-                }
                 let thread = record.task.thread(key.tid)?;
                 (thread.key() == key).then_some((record.task.key(), record.task.parent(), thread))
             })
