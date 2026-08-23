@@ -355,6 +355,8 @@ mod topology_probe_tests {
     use super::*;
     use carrick_observability::probes::HvpatchTopologyOperation;
 
+    static TOPOLOGY_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     /// True iff a FRESH thread cannot take the process-wide topology mutex.
     fn excluded_from_another_thread() -> bool {
         std::thread::scope(|scope| {
@@ -372,6 +374,7 @@ mod topology_probe_tests {
     // then observe each other's guards rather than their own.
     #[test]
     fn topology_guard_excludes_other_threads_and_re_enters_on_the_owning_one() {
+        let _test_lock = TOPOLOGY_TEST_LOCK.lock();
         let guard = acquire_topology_lock(HvpatchTopologyOperation::InProcessFork, 41, 42);
         // The lock excludes THREADS, so contention must be observed from a
         // different thread — asking on the owning thread is re-entry, not
@@ -412,6 +415,7 @@ mod topology_probe_tests {
 
     #[test]
     fn topology_try_miss_subscribes_to_exact_release_without_blocking() {
+        let _test_lock = TOPOLOGY_TEST_LOCK.lock();
         let outer = acquire_topology_lock(HvpatchTopologyOperation::InProcessFork, 51, 52);
         let observed = topology_release_generation();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);

@@ -351,8 +351,11 @@ mod task_only_carrier_directory_tests {
         assert_eq!(rollbacks.load(Ordering::SeqCst), 3);
     }
 
+    static ALIAS_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn injected_alias_and_directory_failures_rollback_before_visibility() {
+        let _test_lock = ALIAS_TEST_LOCK.lock();
         for failpoint in [1, 2] {
             let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
             let rollbacks = Arc::new(AtomicUsize::new(0));
@@ -415,6 +418,7 @@ mod task_only_carrier_directory_tests {
 
     #[test]
     fn alias_receipt_restores_exact_registry_and_replay_preimages() {
+        let _test_lock = ALIAS_TEST_LOCK.lock();
         let preimage = alias(0x1111_0000, 1);
         let replacement = alias(0x2222_0000, 3);
         register_shared_alias(preimage);
@@ -453,6 +457,7 @@ mod task_only_carrier_directory_tests {
 
     #[test]
     fn alias_retirement_never_restores_over_a_later_writer() {
+        let _test_lock = ALIAS_TEST_LOCK.lock();
         let preimage = alias(0x5555_0000, 1);
         let owned = alias(0x6666_0000, 3);
         let later = alias(0x7777_0000, 5);
@@ -474,6 +479,7 @@ mod task_only_carrier_directory_tests {
 
     #[test]
     fn buried_alias_owner_retires_without_clobbering_successor() {
+        let _test_lock = ALIAS_TEST_LOCK.lock();
         let preimage = alias(0x8888_0000, 1);
         let first_value = alias(0x9999_0000, 3);
         let second_value = alias(0xaaaa_0000, 5);
@@ -498,6 +504,7 @@ mod task_only_carrier_directory_tests {
 
     #[test]
     fn external_writer_between_owned_versions_becomes_effective_base() {
+        let _test_lock = ALIAS_TEST_LOCK.lock();
         let preimage = alias(0xbbbb_0000, 1);
         let first_value = alias(0xcccc_0000, 3);
         let external = alias(0xdddd_0000, 5);
@@ -523,6 +530,7 @@ mod task_only_carrier_directory_tests {
 
     #[test]
     fn repeated_alias_key_exhaustion_is_preflighted_without_partial_publication() {
+        let _test_lock = ALIAS_TEST_LOCK.lock();
         let preimage = alias(0xf111_0000, 1);
         let first_value = alias(0xf222_0000, 3);
         let second_value = alias(0xf333_0000, 5);
@@ -567,6 +575,7 @@ mod task_only_carrier_directory_tests {
 
     #[test]
     fn external_unregister_and_clear_invalidate_owned_versions() {
+        let _test_lock = ALIAS_TEST_LOCK.lock();
         let preimage = alias(0xf666_0000, 1);
         let owned = alias(0xf777_0000, 3);
         register_shared_alias(preimage);
