@@ -174,10 +174,40 @@ closes old defect (c)'s BadAddress) cleared them. Final 151 taxonomy:
 - 35 crash-no-clause rows (stderr lost; capture improvement wanted);
 - 3 "wake exact persistent sibling" rows.
 
-Round 3 (worker cap) is on the three named crash clauses. After it: the
-35 no-clause rows, then the 63 value-diffs as subsystem-clustered
-conformance briefs, then the carrier-only process retirement
-(docs/hvpatch-carrier-only-process-plan.md) whose write phase is queued. The remaining ~145 rows are
+Progress since gate 6, all merged to main:
+
+- **conf-fsdev** (3 commits): /dev/null lseek, /dev/zero mmap, fdatasync
+  EINVAL, RNDGETENTCNT, sysvsem IPC_RMID→EIDRM wakes, pipe refcounts +
+  epoll-close notify, acceptsock, threadcommname. Punted with named
+  reasons: clonefilesexec (fd-table/exec, core territory),
+  procladder_epollmgr, blockingpipewrite's signal half.
+  epolletblockedhup still red.
+- **conf-signals** (3 commits, harvested from timed-out turns that DID
+  commit incrementally): ITIMER_VIRTUAL/PROF wall-clock arming; pre-wait
+  deliverable-signal check in pselect6/ppoll (selecttimeout, ppollunblock,
+  nanosleeprem green); synthetic proc thread enumeration. Its UNVERIFIED
+  sigtimedwait-family WIP is saved at
+  target/perf/conf-signals-wip-sigwait.patch — reference for the next
+  signal dispatch, NOT mergeable as-is (it removes a has_pending_in
+  readiness check). Remaining signal probes: xthreadsig, procsignalmask,
+  sigsuspendxthread, mtsigrelease.
+- **authlifecycle was STOPPED after two timed-out turns with no commits**
+  (the 3-round cap): its WIP (slack multipliers, a removed overflow
+  fail-close, a widened authority match — all prohibited shapes) is
+  preserved at target/perf/authlifecycle-round3-wip.patch and was NOT
+  merged. Its one useful yield: the sizing formula discovery.
+- **invsizing** (fresh worker) has committed the honest clause-3 fix —
+  "size fork frame inventory reservations from staged mappings" — and is
+  continuing on fd-pinning and the futex-family phase=active residual.
+- Two NEW wedge specimens banked in target/perf/: futexpingpong (35 min,
+  RID-less, survived nothing) and kernelidentity — the latter proves a
+  wedged carrier SURVIVES SIGTERM (teardown deadlock blocks the signal
+  exit path). Ops rule learned: probe batteries must use `timeout -k`.
+
+Still queued: gate run 7 after invsizing lands; the 35 no-clause rows;
+the held futex value-diffs + threadstatstate; coredumpfile register
+exactness; the carrier-only process retirement write phase
+(docs/hvpatch-carrier-only-process-plan.md). The remaining ~145 rows are
 assertion-level conformance gaps (e.g. `write_blocked_until_signal=false`,
 `sigchld_from_orphan=false`, `fdatasync_devnull_einval=false`) plus
 consequences of the two clauses — triage AFTER the clauses close. The
