@@ -1626,10 +1626,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // silently lowers the op into the process-private FutexTable, where a
         // parent/child classification split is invisible until every waiter
         // times out (the sharedanonfutexfork / futexforkrequeue shape).
-        let debug = std::env::var("CARRICK_FORK_DEBUG_VA")
-            .ok()
-            .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
-            .is_some_and(|va| va == guest_addr);
+        let debug = fork_debug_va().is_some_and(|va| va == guest_addr);
         if !self.vm.protections().is_some_and(|protections| {
             protections.range_mutable_shared_backing(guest_addr, std::mem::size_of::<u32>())
         }) {
@@ -3029,7 +3026,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let protections = Arc::new(MemoryProtections::from_snapshot(
             self.protections.snapshot_all(),
         ));
-        if std::env::var_os("CARRICK_FORK_DEBUG_VA").is_some() {
+        if fork_debug_va().is_some() {
             let wrapper = self.protections.snapshot_all();
             let backend = self.vm.protections().map(|p| p.snapshot_all());
             eprintln!(
@@ -3528,6 +3525,20 @@ fn core_resume_pair(pending_resume_pc: Option<u64>, snapshot: &Aarch64VcpuSnapsh
 /// Kept separate from `syscall_buffer_ipa`: ordinary high-VA syscall buffers
 /// are intentionally resolved by semantic VA inside several backends, while a
 /// futex key must name the physical backing shared by every address space.
+
+/// Cached `CARRICK_FORK_DEBUG_VA` (parsed once). `std::env::var` serializes on
+/// std's process-wide environment lock; the shared-futex classification gate
+/// runs on EVERY non-private futex op, so a per-call env read measurably
+/// contended hot paths under a 1000-process storm.
+fn fork_debug_va() -> Option<u64> {
+    static CELL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("CARRICK_FORK_DEBUG_VA")
+            .ok()
+            .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+    })
+}
+
 fn shared_futex_backing_gpa(page_tables: &PageTableManager, guest_addr: u64) -> Option<Gpa> {
     page_tables.translate(guest_addr).map(Gpa)
 }

@@ -1817,7 +1817,7 @@ impl GuestMappingSharing {
 /// the owning thread's `mappings` Vec and this entry is removed on `munmap`
 /// (`unregister_alias`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum AliasOwnershipScope {
     /// Alias belongs to the original/root address space in this host process.
     Root,
@@ -2035,9 +2035,7 @@ fn register_global_frame_host_owner(
             mapping.len()
         )));
     }
-    if let Some(debug_ipa) = std::env::var("CARRICK_FORK_DEBUG_IPA")
-        .ok()
-        .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+    if let Some(debug_ipa) = fork_debug_ipa()
         && key.0 <= debug_ipa
         && debug_ipa < key.0.saturating_add(key.1)
     {
@@ -2068,6 +2066,30 @@ fn register_global_frame_host_owner(
     Ok(())
 }
 
+/// Cached `CARRICK_FORK_DEBUG_IPA` / `CARRICK_FORK_DEBUG_VA` (parsed once).
+/// `std::env::var` serializes on std's process-wide environment lock; calling
+/// it per retirement / fault-path event measurably contended the 1000-process
+/// exit storm, so the debug gates read this cache instead.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn fork_debug_ipa() -> Option<u64> {
+    static CELL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("CARRICK_FORK_DEBUG_IPA")
+            .ok()
+            .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn fork_debug_va() -> Option<u64> {
+    static CELL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("CARRICK_FORK_DEBUG_VA")
+            .ok()
+            .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+    })
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn retire_global_frame_host_owner(ipa: u64, length: u64) -> bool {
     // Lifecycle debug: CARRICK_FORK_DEBUG_IPA=<hex> logs every owner
@@ -2075,9 +2097,7 @@ fn retire_global_frame_host_owner(ipa: u64, length: u64) -> bool {
     // drops its OwnedHostMapping — macOS can recycle the host VA immediately —
     // so a retire while a live process still references the frame is the
     // scrubbed-shared-granule bug's trigger shape.
-    if let Some(debug_ipa) = std::env::var("CARRICK_FORK_DEBUG_IPA")
-        .ok()
-        .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+    if let Some(debug_ipa) = fork_debug_ipa()
         && ipa <= debug_ipa
         && debug_ipa < ipa.saturating_add(length)
     {
@@ -7632,28 +7652,42 @@ fn mutate_external_alias_state<R>(
     let result = mutate(&mut replay, &mut registry);
     let mut versions = alias_version_registry().lock();
 
+    // Index the FIRST alias per (ipa, scope) on each side once. The previous
+    // shape rescanned the whole registry per key (two linear `find`s plus a
+    // linear key dedup), which was O(aliases^2) per mutation and made every
+    // process retirement in a 1000-process exit storm pay hundreds of
+    // milliseconds inside this function. First-occurrence indexing preserves
+    // the historical `find`-first semantics for duplicate keys exactly.
+    let mut before_by_key = std::collections::BTreeMap::new();
+    for alias in registry_before.iter() {
+        before_by_key
+            .entry((alias.ipa, alias.ownership_scope))
+            .or_insert(*alias);
+    }
+    let mut after_by_key = std::collections::BTreeMap::new();
+    for alias in registry.iter() {
+        after_by_key
+            .entry((alias.ipa, alias.ownership_scope))
+            .or_insert(*alias);
+    }
     let mut alias_keys = Vec::new();
+    let mut seen_alias_keys = std::collections::BTreeSet::new();
     for alias in registry_before.iter().chain(registry.iter()) {
         let key = (alias.ipa, alias.ownership_scope);
-        if !alias_keys.contains(&key) {
+        if seen_alias_keys.insert(key) {
             alias_keys.push(key);
         }
     }
     let mut affected_physical_ipas = Vec::new();
+    let mut affected_physical_set = std::collections::BTreeSet::new();
     for key in alias_keys {
-        let before = registry_before
-            .iter()
-            .find(|entry| (entry.ipa, entry.ownership_scope) == key)
-            .copied();
-        let after = registry
-            .iter()
-            .find(|entry| (entry.ipa, entry.ownership_scope) == key)
-            .copied();
+        let before = before_by_key.get(&key).copied();
+        let after = after_by_key.get(&key).copied();
         if before == after {
             continue;
         }
         for alias in before.into_iter().chain(after) {
-            if !affected_physical_ipas.contains(&alias.physical_ipa) {
+            if affected_physical_set.insert(alias.physical_ipa) {
                 affected_physical_ipas.push(alias.physical_ipa);
             }
         }
@@ -7670,21 +7704,32 @@ fn mutate_external_alias_state<R>(
             chain.versions.clear();
         }
     }
-    for (ipa, _, _, _) in replay_before.iter().chain(replay.iter()) {
-        if !affected_physical_ipas.contains(ipa) {
-            let before: Vec<_> = replay_before
-                .iter()
-                .filter(|(candidate, _, _, _)| candidate == ipa)
-                .copied()
-                .collect();
-            let after: Vec<_> = replay
-                .iter()
-                .filter(|(candidate, _, _, _)| candidate == ipa)
-                .copied()
-                .collect();
-            if before != after {
-                affected_physical_ipas.push(*ipa);
-            }
+    // Group both replay sides by physical IPA once, then compare per key.
+    // The previous shape filtered BOTH whole sets per replay row (and did a
+    // linear `contains` on the affected list), the replay half of the same
+    // O(n^2) mutation cost. BTreeSet iteration is sorted, so the grouped
+    // per-IPA vectors are byte-identical to the filtered ones.
+    let mut replay_before_by_ipa: std::collections::BTreeMap<u64, Vec<ReplayMappingKey>> =
+        std::collections::BTreeMap::new();
+    for row in replay_before.iter() {
+        replay_before_by_ipa.entry(row.0).or_default().push(*row);
+    }
+    let mut replay_after_by_ipa: std::collections::BTreeMap<u64, Vec<ReplayMappingKey>> =
+        std::collections::BTreeMap::new();
+    for row in replay.iter() {
+        replay_after_by_ipa.entry(row.0).or_default().push(*row);
+    }
+    for ipa in replay_before_by_ipa
+        .keys()
+        .chain(replay_after_by_ipa.keys())
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        if !affected_physical_set.contains(&ipa)
+            && replay_before_by_ipa.get(&ipa) != replay_after_by_ipa.get(&ipa)
+        {
+            affected_physical_set.insert(ipa);
+            affected_physical_ipas.push(ipa);
         }
     }
     for physical_ipa in affected_physical_ipas {
@@ -13064,9 +13109,7 @@ impl HvfVmState {
                 retained_output_has_no_physical_source,
                 retained_output_source_is_shared,
             );
-            if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
-                .ok()
-                .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+            if let Some(debug_va) = fork_debug_va()
                 && current <= debug_va
                 && debug_va < end.min(current.saturating_add(CowArmedRanges::COMPOUND_SIZE))
             {
@@ -14230,9 +14273,7 @@ impl HvfVmState {
         // Scrub debug: CARRICK_FORK_DEBUG_VA=<hex> logs any zeroing whose range
         // covers that VA, with the caller — the instrument that named the agent
         // zeroing a live dict granule during the forkserver corruption hunt.
-        if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
-            .ok()
-            .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+        if let Some(debug_va) = fork_debug_va()
             && address <= debug_va
             && debug_va < address.saturating_add(length as u64)
         {
@@ -14322,9 +14363,7 @@ impl HvfVmState {
                             Some(unsafe { mapping.host_addr.add(offset) })
                         })
                 });
-            if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
-                .ok()
-                .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+            if let Some(debug_va) = fork_debug_va()
                 && chunk_va <= debug_va
                 && debug_va < chunk_va.saturating_add(chunk_len as u64)
             {
@@ -16442,10 +16481,7 @@ impl HvfVmState {
         // already SURVIVED this filter, so a row dropped here — the child then
         // inherits a writable stage-1 leaf onto the parent's frame with nothing
         // arming COW — was previously invisible.
-        if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
-            .ok()
-            .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
-        {
+        if let Some(debug_va) = fork_debug_va() {
             let window_lo = debug_va.saturating_sub(0x20_0000);
             let window_hi = debug_va.saturating_add(0x20_0000);
             for alias in aliases.iter().filter(|alias| {
@@ -16579,9 +16615,7 @@ impl HvfVmState {
                 // Added while hunting a deterministic zeroed 16 KiB granule in
                 // a forkserver worker; the drop below is silent by design and
                 // was otherwise unobservable.
-                if let Some(debug_va) = std::env::var("CARRICK_FORK_DEBUG_VA")
-                    .ok()
-                    .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
+                if let Some(debug_va) = fork_debug_va()
                     && mapping.start <= debug_va
                     && debug_va < mapping.end
                 {

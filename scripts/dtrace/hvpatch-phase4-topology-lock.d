@@ -9,7 +9,9 @@
  * carrick*:::hvpatch-topology-lock carries five scalar CTF arguments:
  *   uint32_t operation   (0=in-process fork, 1=exec replacement,
  *                         2=exec sibling gate, 3=sibling materialization,
- *                         4=vCPU rebind, 5=VM release, 6=legacy fork;
+ *                         4=vCPU rebind, 5=VM release, 6=legacy fork,
+ *                         7=process retire, 8=alias map, 9=frame COW,
+ *                         10=alias unmap;
  *                         append-only)
  *   uint32_t phase       (0=requested, 1=acquired, 2=released, 3=try miss;
  *                         append-only)
@@ -51,7 +53,7 @@ dtrace:::BEGIN
 }
 
 carrick*:::hvpatch-topology-lock
-/(pid == $target || progenyof($target)) && arg0 > 6/
+/(pid == $target || progenyof($target)) && arg0 > 10/
 {
     operation_errors++;
 }
@@ -63,7 +65,7 @@ carrick*:::hvpatch-topology-lock
 }
 
 carrick*:::hvpatch-topology-lock
-/(pid == $target || progenyof($target)) && arg0 <= 6 && arg1 == 0/
+/(pid == $target || progenyof($target)) && arg0 <= 10 && arg1 == 0/
 {
     events++;
     requests++;
@@ -77,7 +79,7 @@ carrick*:::hvpatch-topology-lock
 }
 
 carrick*:::hvpatch-topology-lock
-/(pid == $target || progenyof($target)) && arg0 <= 6 && arg1 == 1/
+/(pid == $target || progenyof($target)) && arg0 <= 10 && arg1 == 1/
 {
     events++;
     acquires++;
@@ -111,7 +113,7 @@ carrick*:::hvpatch-topology-lock
 }
 
 carrick*:::hvpatch-topology-lock
-/(pid == $target || progenyof($target)) && arg0 <= 6 && arg1 == 2/
+/(pid == $target || progenyof($target)) && arg0 <= 10 && arg1 == 2/
 {
     events++;
     releases++;
@@ -134,7 +136,7 @@ carrick*:::hvpatch-topology-lock
 }
 
 carrick*:::hvpatch-topology-lock
-/(pid == $target || progenyof($target)) && arg0 <= 6 && arg1 == 3/
+/(pid == $target || progenyof($target)) && arg0 <= 10 && arg1 == 3/
 {
     events++;
     try_misses++;
