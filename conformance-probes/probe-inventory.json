@@ -1859,6 +1859,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "sharedanonfutexfork": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "shmlinkat": {
     "class": "conformance",
     "excluded": false,
