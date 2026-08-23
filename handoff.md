@@ -78,7 +78,108 @@ Restore it verbatim once the objective above closes:
 > The goal is still active. Do not mark it complete, bless a baseline, weaken the
 > denominator, add an excuse, accept a retry, or start final performance work.
 
-## CURRENT ENGINEERING CHECKPOINT — 2026-08-22, session 3 (delegated closure)
+## CURRENT ENGINEERING CHECKPOINT — 2026-08-23, session 4 (the shared-identity root cause)
+
+### FIXED: fork children lost ALL anon-MAP_SHARED futex identity
+
+The "throughput family" investigation opened on futexforkrequeue (159 s vs
+its 45 s budget) and closed on a correctness root cause instead — the
+gate-12 taxonomy had it mis-filed. The probe's 1000 waiters were not slow;
+every one ETIMEDOUT because the parent's FUTEX_CMP_REQUEUE found ZERO
+waiters on the shared word. The chain, each link proven with an instrument:
+
+1. `sharedanonfutexfork` (NEW two-waiter reducer, red 3/3 deterministic):
+   children park, parent wakes 0, both time out — while the shared-page
+   counters stay coherent. So the FRAME is shared; the WAIT QUEUE is not.
+2. `scripts/dtrace/futex-shared-key-identity.d` (NEW, over the existing
+   `carrick*:::futex-route` USDT): children's waits route `shared=0`
+   (process-private table), parent's wakes route `shared=1`. A
+   CLASSIFICATION split, not a key-value split.
+3. `CARRICK_FORK_DEBUG_VA`-gated FUTEXDBG stages (NEW, in
+   `Aarch64EngineCore::shared_futex_location`): the child refuses at the
+   FIRST gate — protections view live but `mutable_shared_backing` EMPTY.
+4. The same hook at the fork spec builder: `same instance=false` — the
+   engine wrapper's protections Arc (empty) is NOT the backend's (marked).
+   `from_parts` created its own Arc; every marking write goes through
+   `vm.protections()` (backend), but fork/sibling specs snapshot the
+   wrapper's. The root process's wrapper stayed empty forever, so every
+   forked child was born unmarked. `execve_into` already resyncs
+   (exec'd processes were immune — why OCI-image lanes never showed it).
+
+Fix (`fix(arch): one protections authority per mm`): `from_parts` adopts
+`vm.exec_protections()` — the same discipline `bind_stage1_page_tables`
+already enforces. Green: reducer 3/3; futexforkrequeue's cmp_requeue now
+returns 800 = 300 woken + 500 requeued (the Linux answer) with
+normal_wakes=300; futexwakecount went 6 false → 0. Regressions green 3/3:
+futexpingpong futexghost forkcow sigchld mtsigrelease execthreads; runtime
+lib 1609 3/3. Denominator 462 → 463 (rows 872 → 874) by the sanctioned
+protocol — and the inventory unit test's literals were ALREADY stale from
+the sigstopjobcontrol bump (nothing executes that test; fixed in the same
+commit, `206391e9`).
+
+**What remains of futexforkrequeue:** the fork ramp itself — ~120 ms/fork
+puts 1000 forks at ~2 min, so early waiters' 60 s FUTEX_WAIT deadlines
+expire before the parent finishes forking. That IS the throughput defect,
+now cleanly separated from the correctness one. The same ramp cost is the
+plausible core of execfromthread / setidthreadchurn / vforkexecthread /
+waitrestart timeout rows. Next instrument: per-fork phase attribution on
+a completing run (sample or the fork lifecycle USDT stages).
+
+### Open at this checkpoint (attribution pending)
+
+- `futexwakeexact` now dies with MY refault-livelock detector firing
+  (far=0xfffffefa50 esr=0x9200004f — stack write COW recurring 4x) and
+  `forkfpreclaim` with "terminal owner did not complete teardown". Both
+  need base-vs-HEAD attribution (base binary building in the sigfam
+  worktree) before either is called a regression of the protections fix.
+- `mtforkcorrupt` rc=134 abort — pre-existing crash shape, unattributed.
+- Load-coupled single flake of `cargo test -p carrick-runtime --lib`
+  under three concurrent worker builds; unnamed (3/3 green after), watch
+  for recurrence in the quiet gate run.
+
+### Wave C dispositions
+
+- **sigfam** (1 turn): sigsuspendxthread GENUINELY fixed (3/3 at its
+  commit — the graveyard probe falls). But its `WaitSigMask::Replace
+  (wait_set.complement())` on the shared WaitOnSignals constructor is the
+  exact polarity trap the typed domains exist for: right for sigsuspend
+  (wait_set is already the suspend mask's complement), WRONG for
+  rt_sigtimedwait (unblocks the waited signals mid-park). Its battery ran
+  no sigtimedwait probe; mine did: rtsigtimedwaitsiginfo, sigtimedwaitintr,
+  sigwaitblock all rc=124 hangs at its commit. Base comparison in flight;
+  verdict pending — likely round-2 with findings, not a merge.
+- **futexvals** (3 turns, transport death): two commits verified and
+  MERGED — threadstatstate/threadcommname fix (3/3 green) and the
+  fork_translation_has_overlay_owner test-signature fix (premise
+  verified: base really fails `cargo check --all-targets`). Its
+  uncommitted executor.rs WIP (outside its fence) was discarded — but it
+  had correctly spotted the dead `consume_invalidation_acks`, which I
+  deleted properly in the lint-drift commit.
+- **fscrash** (1 turn): no code — correctly attributed all 3 gate-12 fs
+  crashes (dirfdnotdir readpasteof unlinkatbindmount) to the reverted
+  `4d877237` window; director re-verified 1x each rc=0 at HEAD. Round 2
+  dispatched: clonefilesexec, mqnotifycrossproc, execpermitchurn.
+
+### Lint drift the wave merges left (now clean)
+
+`cargo check --workspace --all-targets` and full clippy had THREE
+accumulated failures nothing gated: the stale trap.rs test signature
+(futexvals fixed), two `-D clippy::panic` hits from the wave-B scenarios
+merge, and a `filter_map_bool_then` from the proc-threads fix. All
+cleared; workspace check and clippy are 0-error at `HEAD`. Lesson applied
+to worker verification: the battery now includes `--all-targets` check.
+
+### Instrument lessons paid for this session
+
+- `carrick debug hvpatch-kernel` table names are SINGULAR (`task`, not
+  `tasks`) and unknown names are REFUSED — my first phase poller swallowed
+  stderr and read "0 tasks" for a whole 260 s run. Fail-open wrappers
+  around fail-closed tools reintroduce the exact failure mode the tool was
+  built to prevent.
+- The kernel debug snapshot has NO futex table — candidate extension for
+  the shared-futex waiter census the next hunt will want.
+
+## PRIOR CHECKPOINT — 2026-08-22, session 3 (delegated closure)
 
 ### MERGED: seven commits, one defect family left standing
 
