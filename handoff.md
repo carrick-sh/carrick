@@ -212,6 +212,49 @@ hangs, sigtimedwait-family value diffs, futexwakeexact refault-livelock
 (pre-existing, now named by the detector), forkfpreclaim teardown,
 mtforkcorrupt flake, gate 13 after fscrash resolves.
 
+### SESSION 5 (2026-08-23 evening): the "load" tail was mostly the CONTAINER LANE, and three more roots fell
+
+The gate-13 "load-coupled" classification was WRONG for most of its
+members and is corrected here. The discriminator experiment: the
+filtered ordinary gate at ONE worker still failed them — the ingredient
+is the container-injection transport (`carrick run` + sh init +
+pid-multiprocess), not concurrency. Verification protocol updated:
+batteries must run BOTH lanes (run-elf raw AND container injection) and
+BOTH libcs.
+
+Landed (with the shapefix worker's three kernel-registry migrations and
+the collections policy doc refined by the owner):
+
+- **gettid/tid-stamp identity (fix(runtime), merged)**: gettid's
+  multithreaded arm returned the executor REGISTRY ThreadId (retired
+  model), and the CONTEXTIDR_EL1 gettid fast-path stamp was inherited
+  by clone siblings — every thread of a container process answered
+  gettid with the LEADER's tid, so tgkill mis-targeted and /proc thread
+  views diverged. Fixed at both: kernel-graph authority + zero the
+  sibling seed stamp (EL1 declines on 0 → host trap answers). This ONE
+  fix turned sigsuspendxthread, threadcommname, and threadstatstate
+  green in the container lane. The procthread antigravity worker
+  independently converged on the same defect (its redundant-layer fix
+  retired unmerged; convergence recorded).
+- **shapefix worker merged (3 commits)**: keyed PID lookups, pgroup
+  membership reuse, wait_child_matching bounded to Task::children —
+  per the adoption policy. New unit tests (lib 1611).
+- **execfromthread container wedge LOCALIZED (diagnostics committed)**:
+  the exec sibling drain is CORRECT (SIGDBG handshake probes show
+  keeper removing the leader and the leader finishing on observation).
+  The wedge is SCHEDULER FAIRNESS: the execing worker's dispatch
+  waited ~1200 quanta (~30 s) while the leader stormed sched_yield —
+  a forked process's threads starve behind a yield-spinning sibling
+  (10 executors available; worker got ~10 quanta in 30 s; the raw
+  lane's root process schedules fairly). setidthreadchurn (yield-
+  spinning churn threads + set*id main) matches the same shape. NEXT
+  HUNT: the run-queue/executor admission policy for forked processes'
+  threads — why yield-requeue monopolizes; suspect per-process
+  serialization (job/lease affinity) rather than queue order, since
+  raw is immune. Also note /proc/self/status renders Pid: 2 while
+  getpid()=1 for the container shell (stale namespace translation in
+  the procfs renderer — separate defect, still open).
+
 ### GATE 13 (2026-08-23, log target/perf/gate13.log): 781/834 + 40/40 — and the tail is now LOAD
 
 781 PASS / 53 FAIL on the new 834-row denominator (463 sources; the
