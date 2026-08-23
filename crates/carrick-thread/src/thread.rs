@@ -970,7 +970,7 @@ impl FutexTable {
         })
     }
 
-    fn publish_generation(&self, addr: u64, generation: u64) {
+    fn publish_generation(&self, addr: u64, generation: u64, limit: u32) -> u32 {
         let callbacks = {
             let mut listeners = self.generation_listeners.lock();
             let ids = listeners
@@ -979,15 +979,18 @@ impl FutexTable {
                     (listener.addr == addr && listener.expected_generation != generation)
                         .then_some(*id)
                 })
+                .take(usize::try_from(limit).unwrap_or(usize::MAX))
                 .collect::<Vec<_>>();
             ids.into_iter()
                 .filter_map(|id| listeners.remove(&id).map(|listener| listener.callback))
                 .collect::<Vec<_>>()
         };
+        let count = u32::try_from(callbacks.len()).unwrap_or(0);
         let event = FutexGenerationEvent { addr, generation };
         for callback in callbacks {
             callback(event);
         }
+        count
     }
 
     fn interrupt_generation(&self) -> FutexInterruptGeneration {
@@ -1395,43 +1398,51 @@ impl FutexTable {
         }
         let bucket = self.bucket(addr);
         let generation = bucket.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        self.publish_generation(addr, generation);
+        let woken_listeners = self.publish_generation(addr, generation, n);
         let key = Self::bucket_key(&bucket);
-        let mut remaining = n as usize;
+        let n_to_wake = n.saturating_sub(woken_listeners);
+        let mut remaining = n_to_wake as usize;
         let mut owed = 0u32;
-        let result = unsafe {
-            parking_lot_core::unpark_filter(
-                key,
-                |_| {
-                    if remaining == 0 {
-                        FilterOp::Stop
-                    } else {
-                        remaining -= 1;
-                        FilterOp::Unpark
-                    }
-                },
-                |result| {
-                    // Runs with the parking-lot bucket lock STILL HELD, which is
-                    // the only place this decision is safe: a waiter claims its
-                    // credit inside its own park validate under the same lock, so
-                    // "not parked right now" and "owed a wake" cannot interleave.
-                    let unparked = result.unparked_threads as u32;
-                    if unparked < n {
-                        // Waiters enrolled but not parked at this instant are in
-                        // flight between parks — a signal broadcast unparks every
-                        // waiter so it can re-check its predicate. On Linux they
-                        // would still be queued and this wake would reach them, so
-                        // leave a credit and count it as released.
-                        let claimants = bucket.enrolled.load(Ordering::Acquire)
-                            + bucket.pending_redirects.load(Ordering::Acquire);
-                        let claimants = u32::try_from(claimants).unwrap_or(u32::MAX);
-                        owed = bucket.owe_wakes(n - unparked, claimants.saturating_sub(unparked));
-                    }
-                    UnparkToken(FUTEX_WAKE_TOKEN)
-                },
-            )
+        let result = if remaining > 0 {
+            unsafe {
+                parking_lot_core::unpark_filter(
+                    key,
+                    |_| {
+                        if remaining == 0 {
+                            FilterOp::Stop
+                        } else {
+                            remaining -= 1;
+                            FilterOp::Unpark
+                        }
+                    },
+                    |result| {
+                        // Runs with the parking-lot bucket lock STILL HELD, which is
+                        // the only place this decision is safe: a waiter claims its
+                        // credit inside its own park validate under the same lock, so
+                        // "not parked right now" and "owed a wake" cannot interleave.
+                        let unparked = result.unparked_threads as u32;
+                        if unparked < n_to_wake {
+                            // Waiters enrolled but not parked at this instant are in
+                            // flight between parks — a signal broadcast unparks every
+                            // waiter so it can re-check its predicate. On Linux they
+                            // would still be queued and this wake would reach them, so
+                            // leave a credit and count it as released.
+                            let claimants = bucket.enrolled.load(Ordering::Acquire)
+                                + bucket.pending_redirects.load(Ordering::Acquire);
+                            let claimants = u32::try_from(claimants).unwrap_or(u32::MAX);
+                            owed = bucket.owe_wakes(
+                                n_to_wake - unparked,
+                                claimants.saturating_sub(unparked),
+                            );
+                        }
+                        UnparkToken(FUTEX_WAKE_TOKEN)
+                    },
+                )
+            }
+        } else {
+            parking_lot_core::UnparkResult::default()
         };
-        result.unparked_threads as u32 + owed
+        (result.unparked_threads as u32 + owed + woken_listeners).min(n)
     }
 
     /// `FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE` core: wake up to `nr_wake` waiters
@@ -1462,17 +1473,19 @@ impl FutexTable {
 
         // Waking advances the source generation so woken threads observe a
         // change; requeued threads are carried by their redirect instead.
-        if nr_wake > 0 {
+        let woken_listeners = if nr_wake > 0 {
             let generation = from_bucket.generation.fetch_add(1, Ordering::AcqRel) + 1;
-            self.publish_generation(from, generation);
-        }
+            self.publish_generation(from, generation, nr_wake)
+        } else {
+            0
+        };
 
         // Pass 1, in FIFO order under the bucket lock: wake the first `nr_wake`,
         // then MARK the next `nr_requeue` with their destination and leave them
         // parked (`Skip`). Marking is what makes the move durable — a signal
         // broadcast that later unparks one of them would otherwise send it back
         // to the key it computes from its own address.
-        let mut to_wake = nr_wake;
+        let mut to_wake = nr_wake.saturating_sub(woken_listeners);
         let mut to_mark = nr_requeue;
         let mut marked = 0u32;
         let result = unsafe {
@@ -1506,7 +1519,26 @@ impl FutexTable {
                 |_| UnparkToken(FUTEX_WAKE_TOKEN),
             )
         };
-        let woken = result.unparked_threads as u32;
+        let woken = (result.unparked_threads as u32 + woken_listeners).min(nr_wake);
+
+        let requeued_listeners = if to_mark > 0 {
+            let mut listeners = self.generation_listeners.lock();
+            let ids = listeners
+                .iter()
+                .filter_map(|(id, listener)| (listener.addr == from).then_some(*id))
+                .take(to_mark as usize)
+                .collect::<Vec<_>>();
+            let count = ids.len() as u32;
+            for id in ids {
+                if let Some(listener) = listeners.get_mut(&id) {
+                    listener.addr = to;
+                    listener.expected_generation = to_bucket.generation.load(Ordering::Acquire);
+                }
+            }
+            count
+        } else {
+            0
+        };
 
         // Pass 2: relink the marked waiters onto `to` WITHOUT waking them, so no
         // window exists in which a requeued waiter is parked nowhere and a
@@ -1530,7 +1562,7 @@ impl FutexTable {
             // `have_more_threads` is deliberately NOT consulted: it was observed
             // reporting "none left" with ~900 waiters still enrolled.
         }
-        (woken, marked)
+        (woken, (marked + requeued_listeners).min(nr_requeue))
     }
 
     /// Consume `tid`'s pending `FUTEX_CMP_REQUEUE` destination, if any.
