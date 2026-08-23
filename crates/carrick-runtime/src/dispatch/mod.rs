@@ -7352,13 +7352,8 @@ impl SyscallDispatcher {
         let states: Option<std::collections::HashMap<_, _>> = registry.map(|r| {
             r.thread_ports()
                 .into_iter()
-                .map(|(id, port)| {
-                    let state = if port == 0 {
-                        'R'
-                    } else {
-                        crate::host_proc::thread_run_state_char(port)
-                    };
-                    (id, state)
+                .filter_map(|(id, port)| {
+                    (port != 0).then(|| (id, crate::host_proc::thread_run_state_char(port)))
                 })
                 .collect()
         });
@@ -7377,6 +7372,7 @@ impl SyscallDispatcher {
                 let registry_id = thread.registry_id();
                 let comm = registry
                     .and_then(|r| r.thread_name(registry_id))
+                    .or_else(|| carrick_thread::thread::current_thread_name(registry_id))
                     .map(|name| {
                         let len = name
                             .iter()
@@ -7384,10 +7380,9 @@ impl SyscallDispatcher {
                             .unwrap_or(name.len());
                         String::from_utf8_lossy(&name[..len]).into_owned()
                     });
-                let state = states
-                    .as_ref()
-                    .and_then(|m| m.get(&registry_id).copied())
-                    .or_else(|| thread.linux_run_state())
+                let state = thread
+                    .linux_run_state()
+                    .or_else(|| states.as_ref().and_then(|m| m.get(&registry_id).copied()))
                     .unwrap_or('R');
                 crate::vfs::SyntheticProcThread {
                     tid: thread.key().tid.raw() as u32,
