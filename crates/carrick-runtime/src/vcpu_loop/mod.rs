@@ -4453,6 +4453,114 @@ where
                 // the resume address.
                 executor::ExecutorExit::Syscall
             }
+            DispatchOutcome::SharedFutexWake {
+                location,
+                waiter_key,
+                count,
+            } => {
+                let value = shared_futex_wake(location.wait_addr().raw(), waiter_key, count);
+                self.state.complete_returned(engine, value)?;
+                self.state.trace_syscall_return(self.traps, Some(value));
+                let context = self
+                    .state
+                    .service_kernel_context
+                    .as_ref()
+                    .unwrap_or_else(|| std::process::abort())
+                    .retain_exact();
+                if let Some(outcome) = service_signals_threaded(
+                    &self.kernel,
+                    &context,
+                    engine,
+                    self.state.this_tid,
+                    self.state.fatal_image_generation,
+                    Some(value),
+                    None,
+                    self.state.continuation_restart.take(),
+                    self.state.reserved_signal.take(),
+                    self.traps,
+                )? {
+                    return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                }
+                if let Some(exit) = self.suspend_for_job_control(engine, control)? {
+                    return Ok(exit);
+                }
+                executor::ExecutorExit::Syscall
+            }
+            DispatchOutcome::SharedFutexRequeue {
+                from,
+                from_key,
+                to,
+                to_key,
+                wake,
+                requeue,
+            } => {
+                trace_shared_futex_requeue(0, from_key, to_key, wake, requeue, 0, 0);
+                let (carrier_woken, carrier_requeued) =
+                    carrick_thread::platform_futex::carrier_shared_futex_table().requeue(
+                        from_key as u64,
+                        to_key as u64,
+                        wake,
+                        requeue,
+                    );
+                let (ulock_woken, ulock_requeued) = crate::ulock::requeue_counted(
+                    from.wait_addr().raw(),
+                    from_key,
+                    to.wait_addr().raw(),
+                    to_key,
+                    wake,
+                    requeue,
+                );
+                let woken = carrier_woken.max(ulock_woken);
+                let requeued = carrier_requeued.max(ulock_requeued);
+                trace_shared_futex_requeue(1, from_key, to_key, wake, requeue, woken, requeued);
+                let value = i64::from(woken + requeued);
+                self.state.complete_returned(engine, value)?;
+                self.state.trace_syscall_return(self.traps, Some(value));
+                let context = self
+                    .state
+                    .service_kernel_context
+                    .as_ref()
+                    .unwrap_or_else(|| std::process::abort())
+                    .retain_exact();
+                if let Some(outcome) = service_signals_threaded(
+                    &self.kernel,
+                    &context,
+                    engine,
+                    self.state.this_tid,
+                    self.state.fatal_image_generation,
+                    Some(value),
+                    None,
+                    self.state.continuation_restart.take(),
+                    self.state.reserved_signal.take(),
+                    self.traps,
+                )? {
+                    return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                }
+                if let Some(exit) = self.suspend_for_job_control(engine, control)? {
+                    return Ok(exit);
+                }
+                executor::ExecutorExit::Syscall
+            }
+            DispatchOutcome::SignalDeath { signum } => {
+                let context = self
+                    .state
+                    .service_kernel_context
+                    .as_ref()
+                    .unwrap_or_else(|| std::process::abort())
+                    .retain_exact();
+                let outcome = VcpuLoopOutcome::ProcessExit(Box::new(assemble_run_result(
+                    &self.kernel,
+                    128 + signum,
+                    Some(signum),
+                    self.traps,
+                    false,
+                )));
+                self.begin_persistent_process_terminal(
+                    engine,
+                    PersistentTerminal::from_outcome(outcome),
+                    context,
+                )
+            }
             other => {
                 tracing::error!(
                     ?other,
@@ -7390,6 +7498,46 @@ fn service_signals_threaded<E: ThreadedEngine>(
         }
     }
     Ok(None)
+}
+
+fn shared_futex_wake(host_addr: usize, waiter_key: usize, count: u32) -> i64 {
+    let carrier_woken =
+        carrick_thread::platform_futex::carrier_shared_futex_table().wake(waiter_key as u64, count);
+    let ulock_woken = crate::ulock::wake_counted(host_addr, waiter_key, count);
+    crate::probes::ulock_wake(host_addr as u64, 0, ulock_woken);
+    i64::from(carrier_woken).max(ulock_woken.max(0))
+}
+
+fn trace_shared_futex_requeue(
+    phase: u32,
+    from_key: usize,
+    to_key: usize,
+    wake_req: u32,
+    requeue_req: u32,
+    wake_ret: u32,
+    requeue_ret: u32,
+) {
+    let from = crate::ulock::waiter_debug_counts(from_key);
+    let to = crate::ulock::waiter_debug_counts(to_key);
+    crate::probes::ulock_requeue(crate::probes::UlockRequeueProbe {
+        phase,
+        from_key: from_key as u64,
+        to_key: to_key as u64,
+        wake_req,
+        requeue_req,
+        wake_ret,
+        requeue_ret,
+        from_count: from.count,
+        from_requeue_wake: from.requeue_wake,
+        from_requeue_count: from.requeue_count,
+        from_logical_requeued: from.logical_requeued,
+        from_logical_wake: from.logical_wake,
+        to_count: to.count,
+        to_requeue_wake: to.requeue_wake,
+        to_requeue_count: to.requeue_count,
+        to_logical_requeued: to.logical_requeued,
+        to_logical_wake: to.logical_wake,
+    });
 }
 
 #[cfg(test)]

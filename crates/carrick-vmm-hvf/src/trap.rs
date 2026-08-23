@@ -1785,7 +1785,7 @@ impl GuestMappingSharing {
     }
 
     fn has_shared_futex_identity(self) -> bool {
-        self == Self::GlobalShared
+        self != Self::Private
     }
 }
 
@@ -22948,7 +22948,7 @@ mod tag_strip_tests {
         let sharing = GuestMappingSharing::ForkSharedAnonymous;
         assert!(sharing.shares_across_fork());
         assert!(!sharing.uses_global_ipa());
-        assert!(!sharing.has_shared_futex_identity());
+        assert!(sharing.has_shared_futex_identity());
 
         // A MAP_SHARED anonymous alias needs a fork-shared backing, but that
         // does not make it a shared-file/futex identity. Its physical frame
