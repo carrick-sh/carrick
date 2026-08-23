@@ -2152,6 +2152,18 @@ enum HvpatchProductionPhase {
     Complete,
 }
 
+impl HvpatchProductionPhase {
+    fn is_terminal_transition(&self) -> bool {
+        matches!(
+            self,
+            Self::ExecSiblingDrain { .. }
+                | Self::TerminalProcessDrain { .. }
+                | Self::TerminalClaimRetry { .. }
+                | Self::TerminalRetireRetry { .. }
+        )
+    }
+}
+
 enum PersistentTerminal {
     Outcome {
         outcome: VcpuLoopOutcome,
@@ -4499,8 +4511,12 @@ where
         // Exec/exit can force a blocked vfork parent runnable solely so it can
         // retire its exact logical result. Do not resume the old continuation
         // or touch guest state after that terminal ownership transition.
-        if self.kernel.process_exiting()
-            || thread_should_finish_for_exec_replacement(&self.state.registry, self.state.this_tid)
+        if !self.phase.is_terminal_transition()
+            && (self.kernel.process_exiting()
+                || thread_should_finish_for_exec_replacement(
+                    &self.state.registry,
+                    self.state.this_tid,
+                ))
         {
             let _ = self
                 .state
@@ -9245,6 +9261,43 @@ mod tests {
         assert!(
             terminal < phase,
             "a forced vfork wake must exit before ResumeBlocked"
+        );
+    }
+
+    #[test]
+    fn persistent_terminal_transition_phases_are_not_aborted_by_process_exiting() {
+        let context = alias_context(70_105);
+        assert!(
+            HvpatchProductionPhase::TerminalClaimRetry {
+                terminal: PersistentTerminal::from_outcome(VcpuLoopOutcome::ThreadDone),
+                context: context.retain_exact(),
+                _subscription: None,
+            }
+            .is_terminal_transition()
+        );
+        assert!(
+            HvpatchProductionPhase::TerminalProcessDrain {
+                terminal: PersistentTerminal::from_outcome(VcpuLoopOutcome::ThreadDone),
+                context: context.retain_exact(),
+                drain: continuation::ProcessDrain::excluding(
+                    continuation::LogicalJobCompletion::pending(),
+                    Vec::new(),
+                ),
+            }
+            .is_terminal_transition()
+        );
+        assert!(!HvpatchProductionPhase::Resident.is_terminal_transition());
+        assert!(
+            !HvpatchProductionPhase::ResumeBlocked {
+                frame: carrick_hal::RawSyscall {
+                    number: carrick_abi::CanonicalNr(0),
+                    args: [0; 6],
+                    guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                    native_number: carrick_abi::NativeNr(0),
+                },
+                vfork_child_pid: None,
+            }
+            .is_terminal_transition()
         );
     }
 
