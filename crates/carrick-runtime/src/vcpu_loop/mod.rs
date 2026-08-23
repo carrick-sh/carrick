@@ -1899,6 +1899,13 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// outcomes consume it rather than recapturing a newer registry generation.
     service_kernel_context: Option<crate::kernel::KernelContext>,
     continuation_restart: Option<continuation::RestartDecision>,
+    /// Consecutive identical (FAR, ESR) COW faults "successfully" resolved.
+    /// A resolution that does not change the faulting translation refaults
+    /// forever inside one quantum, starving this executor's command channel
+    /// and wedging every peer waiting in `consume_invalidation_acks` — seen
+    /// live on `futexforkrequeue` (core: ffr-livelock-76407). Fail closed
+    /// with a named clause instead of spinning.
+    cow_refault_watch: Option<(u64, u64, u32)>,
     reserved_signal: Option<continuation::ReservedSignal>,
     this_tid: ThreadId,
     threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
@@ -5011,6 +5018,7 @@ where
                 // duplicate that pair here: the structural consumer joins and
                 // consumes one sequence per attempted fault.
                 if engine.resolve_frame_cow_fault(syndrome, far)? {
+                    self.state.note_cow_resolution(far, syndrome)?;
                     return Ok(executor::ExecutorExit::Syscall);
                 }
                 return Err(RuntimeError::Trap(TrapError::GuestAtEl1 {
@@ -5028,6 +5036,7 @@ where
                 ..
             }) => {
                 if engine.resolve_frame_cow_fault(syndrome, far)? {
+                    self.state.note_cow_resolution(far, syndrome)?;
                     return Ok(executor::ExecutorExit::Syscall);
                 }
                 // The fault probes are load-bearing instruments, not debug
@@ -5571,6 +5580,7 @@ where
             fatal_image_generation,
             service_kernel_context: None,
             continuation_restart: None,
+            cow_refault_watch: None,
             reserved_signal: None,
             this_tid,
             threads,
@@ -5615,6 +5625,31 @@ where
     /// return early or `?` out and silently leave the guest marked runnable.
     /// Publish both process-visible and per-thread state at the points that
     /// already maintain the thread registry on mature lanes.
+    /// Record one "successfully resolved" COW fault and fail closed if the
+    /// IDENTICAL (FAR, ESR) fault keeps recurring: a correct resolution must
+    /// change the faulting translation, so the second identical fault already
+    /// proves the resolver lied, and the historical behaviour was a silent
+    /// 100% CPU refault loop that also starved `InvalidateAsid` servicing.
+    /// The threshold of 4 is pure paranoia headroom over "impossible twice".
+    fn note_cow_resolution(&mut self, far: u64, syndrome: u64) -> Result<(), RuntimeError> {
+        const COW_REFAULT_LIMIT: u32 = 4;
+        match &mut self.cow_refault_watch {
+            Some((last_far, last_esr, count)) if *last_far == far && *last_esr == syndrome => {
+                *count += 1;
+                if *count >= COW_REFAULT_LIMIT {
+                    return Err(RuntimeError::Configuration(format!(
+                        "HVPatch COW resolution did not satisfy the faulting access: \
+                         identical fault recurred {count} times \
+                         (far={far:#x} esr={syndrome:#x} tid={}) — refault livelock",
+                        self.this_tid
+                    )));
+                }
+            }
+            _ => self.cow_refault_watch = Some((far, syndrome, 1)),
+        }
+        Ok(())
+    }
+
     fn publish_thread_run_state(&self, state: crate::run_state::RunState, stat: char) {
         self.publish_process_run_state(state);
         crate::thread::set_current_thread_state(self.this_tid, stat);
