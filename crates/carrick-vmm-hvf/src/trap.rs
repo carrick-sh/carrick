@@ -21757,6 +21757,7 @@ mod frame_inventory_backend_tests {
             1,
             0x4000_0000,
             winning_ipa,
+            None,
         ));
     }
 }
