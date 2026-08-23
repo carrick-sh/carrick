@@ -3431,10 +3431,14 @@ fn sysv_msgctl<M: GuestMemory>(
                     return Err(LINUX_EPERM);
                 }
             }
-            wake_msg_queue_waiters(&path, msqid);
+            if let Ok(word) = MsgQueueWaitWord::open(&path) {
+                word.wake_all();
+            }
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(msg_queue_wait_path(&path));
             this.sysv.lock().message_queues.remove(&msqid);
+            carrick_thread::platform_futex::carrier_shared_futex_table()
+                .wake(msqid.raw() as u64, u32::MAX);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
         LINUX_IPC_STAT => {
