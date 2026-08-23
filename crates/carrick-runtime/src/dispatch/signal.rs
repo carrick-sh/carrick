@@ -1324,7 +1324,9 @@ impl SyscallDispatcher {
         let kernel = context.kernel();
         let required_task = match tgid {
             Some(raw) => {
-                if u32::try_from(raw).is_ok_and(|pid| pid == self.identity_pid()) {
+                if u32::try_from(raw).is_ok_and(|pid| pid == self.identity_pid())
+                    || names_self_pid(i64::from(raw))
+                {
                     Some(context.task().key().id)
                 } else if let Some(target_key) = hvpatch_process_signal_target(kernel, raw) {
                     Some(target_key.id)

@@ -837,7 +837,7 @@ impl BlockedContinuation {
             } => Self::WaitOnSignals(new_state(
                 deadline(timeout),
                 Vec::new(),
-                None,
+                Some(WaitSigMask::Replace(wait_set.complement())),
                 ContinuationDetail::Signals {
                     wait_set,
                     block_mask,
@@ -2171,7 +2171,7 @@ impl ReadinessProbe {
                 write: Arc::clone(write),
                 completion: Arc::clone(&state.producer_completion),
             },
-            ContinuationDetail::Process { .. } | ContinuationDetail::Signals { .. } => {
+            ContinuationDetail::Process { .. } => {
                 let task = state.authority.task_ref.clone();
                 let observed = state.authority.task_wake_generation;
                 Self::TaskWake {
@@ -2180,6 +2180,11 @@ impl ReadinessProbe {
                     deadline: state.deadline,
                 }
             }
+            ContinuationDetail::Signals { .. } => state
+                .deadline
+                .map_or(Self::Passive { deadline: None }, |deadline| Self::Timer {
+                    deadline,
+                }),
             ContinuationDetail::Vfork { wait, .. } => Self::Vfork { wait: wait.clone() },
             ContinuationDetail::Sleep => state
                 .deadline
@@ -4993,6 +4998,7 @@ mod tests {
                         | ContinuationFamily::WaitOnProcExit
                         | ContinuationFamily::WaitOnProcState
                         | ContinuationFamily::WaitOnHvpatchChild
+                        | ContinuationFamily::WaitOnSignals
                 )
             );
             if let Some(deadline) = continuation.deadline() {
