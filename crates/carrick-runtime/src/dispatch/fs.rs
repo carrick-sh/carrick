@@ -277,11 +277,17 @@ fn host_fd_matches_device(host_fd: i32, path: &str) -> bool {
 fn fd_is_random_device(this: &SyscallDispatcher, fd: i32) -> bool {
     this.open_file(fd).is_some_and(|open_file| {
         let open = open_file.description.read();
-        let OpenDescription::HostPipe { host_fd, .. } = &*open else {
-            return false;
-        };
-        host_fd_matches_device(host_fd.raw(), "/dev/random")
-            || host_fd_matches_device(host_fd.raw(), "/dev/urandom")
+        match &*open {
+            OpenDescription::HostPipe { host_fd, .. } => {
+                host_fd_matches_device(host_fd.raw(), "/dev/random")
+                    || host_fd_matches_device(host_fd.raw(), "/dev/urandom")
+            }
+            OpenDescription::SyntheticDevice { kind, .. } => matches!(
+                kind,
+                crate::vfs::SyntheticDeviceKind::Random | crate::vfs::SyntheticDeviceKind::Urandom
+            ),
+            _ => false,
+        }
     })
 }
 
@@ -5154,6 +5160,7 @@ impl SyscallDispatcher {
                     | OpenDescription::HostSocket { .. }
                     | OpenDescription::PipeReader { .. }
                     | OpenDescription::PipeWriter { .. }
+                    | OpenDescription::SyntheticDevice { .. }
             )
         })
     }
@@ -9543,6 +9550,18 @@ impl SyscallDispatcher {
                 OpenDescription::Directory {
                     entries, offset, ..
                 } => (*offset as i64, entries.len() as i64),
+                OpenDescription::SyntheticDevice { .. } => {
+                    return match whence {
+                        LINUX_SEEK_SET | LINUX_SEEK_CUR | LINUX_SEEK_END => {
+                            if offset < 0 {
+                                Ok(DispatchOutcome::errno(LINUX_EINVAL))
+                            } else {
+                                Ok(DispatchOutcome::Returned { value: 0 })
+                            }
+                        }
+                        _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                    };
+                }
                 // Linux returns ESPIPE for lseek on a pipe / socket / tty
                 // (the kernel's POSIX answer for "unseekable stream") and
                 // EINVAL only for nonsensical arg combinations. Returning
@@ -9554,7 +9573,6 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
-                | OpenDescription::SyntheticDevice { .. }
                 // A perf event fd is an unseekable stream (verified ESPIPE
                 // against the Docker oracle).
                 | OpenDescription::PerfEvent { .. }

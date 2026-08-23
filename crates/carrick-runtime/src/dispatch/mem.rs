@@ -1681,6 +1681,13 @@ impl SyscallDispatcher {
                 }
                 None
             }
+            OpenDescription::SyntheticDevice { kind, .. } => {
+                if *kind == crate::vfs::SyntheticDeviceKind::Zero {
+                    None
+                } else {
+                    return Err(linux_errno::ENODEV);
+                }
+            }
             _ => return Err(LINUX_EBADF),
         };
         Ok(PrivateMmapSnapshot {
@@ -2742,6 +2749,15 @@ impl SyscallDispatcher {
                             | OpenDescription::SyntheticFile { path, .. } => path.clone(),
                             OpenDescription::HostFile { metadata, .. } => {
                                 metadata.path.to_string_lossy().into_owned()
+                            }
+                            OpenDescription::SyntheticDevice { kind, .. } => {
+                                match kind {
+                                    crate::vfs::SyntheticDeviceKind::Null => "/dev/null".to_string(),
+                                    crate::vfs::SyntheticDeviceKind::Zero => "/dev/zero".to_string(),
+                                    crate::vfs::SyntheticDeviceKind::Full => "/dev/full".to_string(),
+                                    crate::vfs::SyntheticDeviceKind::Random => "/dev/random".to_string(),
+                                    crate::vfs::SyntheticDeviceKind::Urandom => "/dev/urandom".to_string(),
+                                }
                             }
                             _ => String::new(),
                         }
@@ -3925,6 +3941,15 @@ impl SyscallDispatcher {
                             ));
                         }
                         // chardev zero-fill: keep `bytes` zeroed (no read).
+                    }
+                    OpenDescription::SyntheticDevice { kind, .. } => {
+                        if *kind != crate::vfs::SyntheticDeviceKind::Zero {
+                            return Ok(request.refused(
+                                MmapRefusal::Spec("mmap of a non-zero synthetic device"),
+                                linux_errno::ENODEV,
+                            ));
+                        }
+                        // /dev/zero zero-fill: keep `bytes` zeroed (no read).
                     }
                     _ => {
                         return Ok(request.refused(
