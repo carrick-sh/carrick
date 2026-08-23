@@ -2223,6 +2223,100 @@ impl PoolControl {
         Ok(())
     }
 
+    /// Wait for peer invalidation acks WHILE SERVICING this executor's own
+    /// `InvalidateAsid` commands. A blocking wait deadlocked whole carriers:
+    /// with ten executors each inside a process terminal, every one waited in
+    /// `consume_invalidation_acks` for peers that were themselves waiting —
+    /// commands are otherwise only serviced between quanta — and the frozen
+    /// guests showed all ten executors in `invalidate` with hundreds of
+    /// claimable Runnable threads starving (futexforkrequeue). Mutual
+    /// servicing breaks the cycle. A `Stop` consumed here is REMEMBERED and
+    /// returned so the caller can honor shutdown after the terminal settles —
+    /// it must not be lost (shutdown stalls) or treated as an error (it is
+    /// routine at pool shutdown).
+    fn consume_invalidation_acks_servicing<E: PersistentExecutor>(
+        retirement: &crate::hvpatch::Stage1MmRetirement,
+        pending: Vec<(
+            ExecutorId,
+            mpsc::Receiver<Result<crate::hvpatch::InvalidationAck, String>>,
+        )>,
+        current: ExecutorId,
+        backend: &mut E,
+        boundary: &WorkerBoundaryAudit,
+        receipts: &ReceiptLog,
+        commands: &mpsc::Receiver<WorkerCommand>,
+    ) -> Result<bool, String> {
+        let mut stop_seen = false;
+        for (target, response) in pending {
+            let ack = loop {
+                match response.recv_timeout(std::time::Duration::from_millis(1)) {
+                    Ok(ack) => break ack?,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(format!(
+                            "ASID retirement executor {target:?} lost acknowledgement"
+                        ));
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => loop {
+                        match commands.try_recv() {
+                            Ok(WorkerCommand::InvalidateAsid {
+                                generation,
+                                response: peer_response,
+                            }) => {
+                                if let Err(error) = boundary.audit_runtime(backend) {
+                                    let message = format!(
+                                        "executor {current:?} failed boundary audit before ASID invalidation: {error}"
+                                    );
+                                    let _ = peer_response.send(Err(message.clone()));
+                                    return Err(message);
+                                }
+                                if let Err(error) = backend.invalidate_asid(generation) {
+                                    let message = format!(
+                                        "executor {current:?} failed ASID generation {} invalidation: {error}",
+                                        generation.generation()
+                                    );
+                                    let _ = peer_response.send(Err(message.clone()));
+                                    return Err(message);
+                                }
+                                receipts.record(
+                                    current,
+                                    ExecutorPoolEvent::InvalidatedAsid {
+                                        generation: generation.generation(),
+                                    },
+                                );
+                                probe_executor_lifecycle(
+                                    current,
+                                    crate::probes::HvpatchExecutorLifecyclePhase::InvalidateAsid,
+                                    None,
+                                    None,
+                                    generation.generation(),
+                                );
+                                let _ = peer_response.send(Ok(
+                                    crate::hvpatch::InvalidationAck::new(current, generation),
+                                ));
+                            }
+                            Ok(WorkerCommand::Stop) => stop_seen = true,
+                            Ok(WorkerCommand::Initialize | WorkerCommand::Run) => {
+                                return Err(
+                                    "executor received an invalid owner-thread command during                                      ASID acknowledgement wait"
+                                        .to_owned(),
+                                );
+                            }
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                stop_seen = true;
+                                break;
+                            }
+                        }
+                    },
+                }
+            };
+            retirement
+                .acknowledge(ack)
+                .map_err(|error| format!("ASID retirement acknowledgement rejected: {error}"))?;
+        }
+        Ok(stop_seen)
+    }
+
     #[cfg(test)]
     fn invalidate_external(
         &self,
@@ -2240,7 +2334,8 @@ impl PoolControl {
         backend: &mut E,
         boundary: &WorkerBoundaryAudit,
         receipts: &ReceiptLog,
-    ) -> Result<(), String> {
+        commands: &mpsc::Receiver<WorkerCommand>,
+    ) -> Result<bool, String> {
         let generation = retirement.asid_generation();
         let targets = retirement.pending();
         let pending = self.dispatch_invalidation_commands(
@@ -2264,7 +2359,9 @@ impl PoolControl {
                 .acknowledge(crate::hvpatch::InvalidationAck::new(current, generation))
                 .map_err(|error| error.to_string())?;
         }
-        Self::consume_invalidation_acks(retirement, pending)
+        Self::consume_invalidation_acks_servicing(
+            retirement, pending, current, backend, boundary, receipts, commands,
+        )
     }
 }
 
@@ -2860,7 +2957,14 @@ where
         receipts,
         control,
     } = runtime;
+    // A Stop consumed while an ASID acknowledgement wait was servicing this
+    // executor's own command channel is honored HERE, after the terminal that
+    // consumed it has fully settled.
+    let mut deferred_stop = false;
     loop {
+        if deferred_stop {
+            return Ok(());
+        }
         if service_owner_thread_commands(backend, registration.id(), commands, boundary, receipts)?
         {
             return Ok(());
@@ -3209,20 +3313,28 @@ where
             std::process::abort();
         }
         if let Some(retirement) = pending_exec_retirement.take() {
-            if let Err(error) =
-                control.invalidate_after_exec(&retirement, executor_id, backend, boundary, receipts)
-            {
-                let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                    resolver.as_ref(),
-                    scheduler,
-                    running,
-                    ExecutionFailure::SnapshotRestoreFailed,
-                    receipts,
-                );
-                return Err(with_settlement_error(
-                    format!("exec predecessor ASID retirement failed: {error}"),
-                    settlement,
-                ));
+            match control.invalidate_after_exec(
+                &retirement,
+                executor_id,
+                backend,
+                boundary,
+                receipts,
+                commands,
+            ) {
+                Ok(stop_seen) => deferred_stop |= stop_seen,
+                Err(error) => {
+                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    );
+                    return Err(with_settlement_error(
+                        format!("exec predecessor ASID retirement failed: {error}"),
+                        settlement,
+                    ));
+                }
             }
             if let Err(error) = binding.retire_detached_exec_predecessor() {
                 let settlement = fail_running_and_retire::<F::TaskBinding, _>(
@@ -3269,20 +3381,28 @@ where
         }
         if let Some(retirement) = terminal_retirement {
             let cleanup = if let Some(stage1) = retirement.retirement() {
-                if let Err(error) =
-                    control.invalidate_after_exec(stage1, executor_id, backend, boundary, receipts)
-                {
-                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
-                        resolver.as_ref(),
-                        scheduler,
-                        running,
-                        ExecutionFailure::SnapshotRestoreFailed,
-                        receipts,
-                    );
-                    return Err(with_settlement_error(
-                        format!("terminal ASID retirement failed: {error}"),
-                        settlement,
-                    ));
+                match control.invalidate_after_exec(
+                    stage1,
+                    executor_id,
+                    backend,
+                    boundary,
+                    receipts,
+                    commands,
+                ) {
+                    Ok(stop_seen) => deferred_stop |= stop_seen,
+                    Err(error) => {
+                        let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            ExecutionFailure::SnapshotRestoreFailed,
+                            receipts,
+                        );
+                        return Err(with_settlement_error(
+                            format!("terminal ASID retirement failed: {error}"),
+                            settlement,
+                        ));
+                    }
                 }
                 binding.retire_detached_address_space()
             } else {
