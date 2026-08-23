@@ -31,7 +31,7 @@ class ClosureProbeScenarioTest(unittest.TestCase):
         self.assertEqual(len(plan.sources), 20)
         self.assertEqual(len(plan.commands), 14)
         self.assertEqual(
-            {command.test_target for command in plan.commands}, {"conformance", "serve"}
+            {command.test_target for command in plan.commands}, {"conformance"}
         )
         self.assertEqual(
             [source.name for source in plan.sources], sorted(source.name for source in plan.sources)

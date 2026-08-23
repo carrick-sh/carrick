@@ -53,7 +53,7 @@ def build_plan(inventory: dict[str, Any]) -> Plan:
     commands = [
         RunnerCommand(
             runner,
-            "serve" if runner == "docker_compose_shared_network_namespace_smoke" else "conformance",
+            "conformance",
             tuple(names),
         )
         for runner, names in sorted(grouped.items())
@@ -110,8 +110,6 @@ def _run_command(root: Path, command: RunnerCommand, libc: str) -> CommandResult
         "--exact",
         "--nocapture",
     ]
-    if command.test_target == "serve":
-        args.append("--ignored")
     try:
         process = subprocess.run(
             args,

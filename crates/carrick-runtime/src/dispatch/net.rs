@@ -5510,11 +5510,16 @@ impl SyscallDispatcher {
                 } else {
                     Some(std::time::Duration::from_millis(timeout_ms as u64))
                 };
-                let wait_fds: Vec<(i32, i16)> = sys_pollfds.iter().map(|p| (p.fd, p.events)).collect();
+                let wait_fds: Vec<(i32, i16)> = sys_pollfds
+                    .iter()
+                    .zip(fds.iter())
+                    .filter(|(p, g)| p.fd >= 0 && g.fd >= 0)
+                    .map(|(p, _)| (p.fd, p.events))
+                    .collect();
                 // poll/ppoll: a timeout means "no fds ready" → return 0.
                 let files = this.captured_file_table();
                 let wait_fds = match WaitFds::raw(wait_fds)
-                    .with_guest_slots(&files, fds.iter().map(|pollfd| pollfd.fd))
+                    .with_guest_slots(&files, fds.iter().filter(|p| p.fd >= 0).map(|pollfd| pollfd.fd))
                 {
                     Ok(wait_fds) => wait_fds,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),

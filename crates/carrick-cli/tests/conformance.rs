@@ -2010,6 +2010,307 @@ fn conformance_bridge_loopback_isolation() {
     }
 }
 
+struct ServerGuard(std::process::Child);
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_server(bin: &std::path::Path) -> (ServerGuard, String, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("carrick.sock");
+    let sock_str = sock.to_str().unwrap().to_string();
+    let mut child = std::process::Command::new(bin)
+        .env(
+            "CARRICK_EXEC_BACKEND",
+            if std::env::var("CARRICK_PROBE_MODE").as_deref() == Ok("closure") {
+                "hvpatch"
+            } else {
+                "vmm"
+            },
+        )
+        .args(["serve", "--docker-api", "--host", &sock_str])
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if sock.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !sock.exists() {
+        let status = child.try_wait().unwrap();
+        panic!("carrick serve did not create socket within 5s (child exit: {status:?})");
+    }
+    (ServerGuard(child), sock_str, dir)
+}
+
+fn docker_compose_available() -> bool {
+    std::process::Command::new("docker")
+        .args(["compose", "version"])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+fn compose_project(kind: &str) -> String {
+    format!("carricksmoke{kind}{}", std::process::id())
+}
+
+fn run_compose(sock: &str, file: &std::path::Path, project: &str, args: &[&str]) {
+    let _ = run_compose_output(sock, file, project, args);
+}
+
+fn run_compose_output(
+    sock: &str,
+    file: &std::path::Path,
+    project: &str,
+    args: &[&str],
+) -> std::process::Output {
+    let output = std::process::Command::new("docker")
+        .env("DOCKER_HOST", format!("unix://{sock}"))
+        .arg("compose")
+        .arg("-p")
+        .arg(project)
+        .arg("-f")
+        .arg(file)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "docker compose {:?} failed\nstdout:\n{}\nstderr:\n{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn wait_for_compose_logs(
+    sock: &str,
+    file: &std::path::Path,
+    project: &str,
+    needles: &[&str],
+) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut collected = String::new();
+    while std::time::Instant::now() < deadline {
+        let out = run_compose_output(sock, file, project, &["logs", "--no-color"]);
+        collected = String::from_utf8_lossy(&out.stdout).to_string();
+        if needles.iter().all(|needle| collected.contains(needle)) {
+            return collected;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("timed out waiting for compose log needles: {needles:?}\ncollected:\n{collected}");
+}
+
+#[test]
+fn docker_compose_shared_network_namespace_smoke() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    if !docker_compose_available() {
+        eprintln!(
+            "SKIP docker_compose_shared_network_namespace_smoke: docker compose is not available"
+        );
+        return;
+    }
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!(
+            "SKIP docker_compose_shared_network_namespace_smoke: target/release/carrick not built"
+        );
+        return;
+    };
+    let lane = ARM64;
+    if !lane_runnable_here(&lane) {
+        eprintln!(
+            "SKIP docker_compose_shared_network_namespace_smoke: host ({}) cannot run {} guests",
+            std::env::consts::ARCH,
+            lane.platform
+        );
+        return;
+    }
+
+    let Ok(target) = selected_dedicated_probe_target(&lane) else {
+        eprintln!(
+            "SKIP docker_compose_shared_network_namespace_smoke: dedicated probe target not selected"
+        );
+        return;
+    };
+    let probes = probes_dir(target);
+    let server_probe = probes.join("sidecar_loopback_server");
+    let client_probe = probes.join("sidecar_loopback_client");
+    let isolated_probe = probes.join("sidecar_loopback_isolated_client");
+    if !server_probe.exists() || !client_probe.exists() || !isolated_probe.exists() {
+        eprintln!(
+            "SKIP docker_compose_shared_network_namespace_smoke: required probes not built under {}",
+            probes.display()
+        );
+        return;
+    }
+
+    ensure_signed(&bin);
+
+    let (_server, sock, _dir) = spawn_server(&bin);
+    let docker =
+        bollard::Docker::connect_with_unix(&sock, 30, bollard::API_DEFAULT_VERSION).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut copied = std::collections::HashMap::new();
+    let probe_map = [
+        ("sidecar_loopback_server", &server_probe),
+        ("sidecar_loopback_client", &client_probe),
+        ("sidecar_loopback_isolated_client", &isolated_probe),
+    ];
+    for (name, source) in probe_map {
+        let target = tmp.path().join(name);
+        std::fs::copy(source, &target).unwrap();
+        copied.insert(name, target);
+    }
+
+    let sidecar_compose = tmp.path().join("sidecar.yml");
+    std::fs::write(
+        &sidecar_compose,
+        format!(
+            r#"
+services:
+  db:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/sidecar_loopback_server"]
+    networks:
+      appnet:
+        aliases:
+          - database
+    volumes:
+      - data:/data
+      - type: bind
+        source: {server}
+        target: /opt/carrick/sidecar_loopback_server
+        read_only: true
+  sidecar:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/sidecar_loopback_client"]
+    depends_on:
+      - db
+    network_mode: "service:db"
+    volumes:
+      - type: bind
+        source: {client}
+        target: /opt/carrick/sidecar_loopback_client
+        read_only: true
+  web:
+    image: ubuntu:24.04
+    command: ["/opt/carrick/sidecar_loopback_isolated_client"]
+    depends_on:
+      - db
+    networks:
+      appnet:
+        aliases:
+          - api
+    volumes:
+      - type: bind
+        source: {isolated}
+        target: /opt/carrick/sidecar_loopback_isolated_client
+        read_only: true
+volumes:
+  data: {{}}
+networks:
+  appnet:
+    driver: bridge
+"#,
+            server = copied["sidecar_loopback_server"].display(),
+            client = copied["sidecar_loopback_client"].display(),
+            isolated = copied["sidecar_loopback_isolated_client"].display()
+        ),
+    )
+    .unwrap();
+    let sidecar_project = compose_project("sidecarns");
+    run_compose(
+        &sock,
+        &sidecar_compose,
+        &sidecar_project,
+        &["up", "-d", "--remove-orphans"],
+    );
+    let sidecar_logs = wait_for_compose_logs(
+        &sock,
+        &sidecar_compose,
+        &sidecar_project,
+        &[
+            "sidecar_loopback_client_response=sidecar-pong",
+            "sidecar_loopback_bridge_peer_isolated=true",
+            "sidecar_loopback_server_done=true",
+        ],
+    );
+    assert!(
+        sidecar_logs.contains("sidecar_loopback_server_peer_loopback=true"),
+        "shared namespace server did not see a loopback peer\nlogs:\n{sidecar_logs}"
+    );
+    std::thread::sleep(Duration::from_secs(2));
+
+    let sidecar_ps = run_compose_output(&sock, &sidecar_compose, &sidecar_project, &["ps", "-a"]);
+    let sidecar_ps_stdout = String::from_utf8_lossy(&sidecar_ps.stdout);
+    assert!(
+        sidecar_ps_stdout.contains("db")
+            && sidecar_ps_stdout.contains("sidecar")
+            && sidecar_ps_stdout.contains("web"),
+        "compose ps did not list db, sidecar, and web\nstdout:\n{sidecar_ps_stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&sidecar_ps.stderr)
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let sidecar_filter = format!("com.docker.compose.project={sidecar_project}");
+        let mut container_filters = std::collections::HashMap::new();
+        container_filters.insert("label".to_string(), vec![sidecar_filter.clone()]);
+        let containers = docker
+            .list_containers(Some(bollard::container::ListContainersOptions::<String> {
+                all: true,
+                filters: container_filters,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let mut db_id = None;
+        let mut sidecar_id = None;
+        for container in &containers {
+            match container
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("com.docker.compose.service"))
+                .map(String::as_str)
+            {
+                Some("db") => db_id = container.id.clone(),
+                Some("sidecar") => sidecar_id = container.id.clone(),
+                _ => {}
+            }
+        }
+        let db_id = db_id.unwrap_or_else(|| panic!("db container id"));
+        let sidecar_id = sidecar_id.unwrap_or_else(|| panic!("sidecar container id"));
+        let sidecar = docker.inspect_container(&sidecar_id, None).await.unwrap();
+        let expected_network_mode = format!("container:{db_id}");
+        assert_eq!(
+            sidecar
+                .host_config
+                .as_ref()
+                .and_then(|c| c.network_mode.as_deref()),
+            Some(expected_network_mode.as_str())
+        );
+    });
+
+    run_compose(
+        &sock,
+        &sidecar_compose,
+        &sidecar_project,
+        &["down", "-v", "--remove-orphans"],
+    );
+}
+
 fn rosetta_available() -> bool {
     std::path::Path::new("/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta").exists()
 }
