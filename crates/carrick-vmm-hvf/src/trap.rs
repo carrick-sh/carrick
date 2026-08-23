@@ -978,6 +978,7 @@ mod task_only_carrier_directory_tests {
             cow_deferred_publications: None,
             pending_receipts: Vec::new(),
             alias_receipts: parking_lot::Mutex::new(Vec::new()),
+            last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Test),
             drop_order: None,
         };
         authority.retire_exec_predecessor();
@@ -7230,6 +7231,39 @@ impl HvpatchTaskInventoryAuthority {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HvpatchTaskMmHolder {
+    Registration,
+    RegistrationDrop,
+    RegistrationCleanup,
+    LiveExecutor,
+    CarrierDirectory,
+    DormantRetire,
+    ExecRebind,
+    FailpointRollback,
+    #[cfg(test)]
+    Test,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::fmt::Display for HvpatchTaskMmHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Registration => write!(f, "registration"),
+            Self::RegistrationDrop => write!(f, "registration-drop"),
+            Self::RegistrationCleanup => write!(f, "registration-cleanup"),
+            Self::LiveExecutor => write!(f, "live-executor"),
+            Self::CarrierDirectory => write!(f, "carrier-directory"),
+            Self::DormantRetire => write!(f, "dormant-retire"),
+            Self::ExecRebind => write!(f, "exec-rebind"),
+            Self::FailpointRollback => write!(f, "failpoint-rollback"),
+            #[cfg(test)]
+            Self::Test => write!(f, "test"),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(dead_code)] // retained MM authority; worker-side load consumes these fields
 pub(crate) struct HvpatchTaskMmAuthority {
     mappings: Vec<HvpatchTaskMappingState>,
@@ -7241,6 +7275,7 @@ pub(crate) struct HvpatchTaskMmAuthority {
         Option<std::sync::Arc<parking_lot::Mutex<Vec<PendingFrameCowPublication>>>>,
     pending_receipts: Vec<PendingForkFrameReceipt>,
     alias_receipts: parking_lot::Mutex<Vec<AliasPublicationReceipt>>,
+    last_holder: parking_lot::Mutex<HvpatchTaskMmHolder>,
     #[cfg(test)]
     drop_order: Option<std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>>,
 }
@@ -7261,9 +7296,14 @@ impl HvpatchTaskMmAuthority {
             cow_deferred_publications: prepared.cow_deferred_publications.take(),
             pending_receipts: std::mem::take(&mut prepared.pending_receipts),
             alias_receipts: parking_lot::Mutex::new(vec![alias_receipt]),
+            last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Registration),
             #[cfg(test)]
             drop_order: prepared.drop_order.take(),
         }
+    }
+
+    pub(crate) fn record_holder(&self, holder: HvpatchTaskMmHolder) {
+        *self.last_holder.lock() = holder;
     }
 
     fn apply_inventory(
@@ -7335,13 +7375,14 @@ impl Drop for HvpatchTaskMmAuthority {
         let phase = self.inventory.get_mut().phase_name();
         let mm_root_slot = self.mm_root_slot;
         let kernel_mm = *self.kernel_mm.get_mut();
+        let holder = *self.last_holder.get_mut();
         self.inventory
             .get_mut()
             .rollback_unpublished()
             .unwrap_or_else(|error| {
                 eprintln!(
                     "carrick: FATAL: drop HVPatch MM authority \
-                     (phase={phase} mm_root_slot={mm_root_slot:?} kernel_mm={kernel_mm:?}): {error}"
+                     (phase={phase} mm_root_slot={mm_root_slot:?} kernel_mm={kernel_mm:?} holder={holder}): {error}"
                 );
                 std::process::abort();
             });
@@ -7901,6 +7942,7 @@ impl HvpatchCarrierTaskStateDirectory {
         inner
             .task_mms
             .insert(new_mm_key, std::sync::Arc::downgrade(task_mm));
+        task_mm.record_holder(HvpatchTaskMmHolder::CarrierDirectory);
         Ok(())
     }
 }
@@ -7930,6 +7972,7 @@ impl HvpatchTaskRegistration {
             .task_mm
             .as_ref()
             .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?;
+        task_mm.record_holder(HvpatchTaskMmHolder::LiveExecutor);
         let inventory = task_mm.inventory.lock();
         let shared_process_mm = matches!(
             *inventory,
@@ -8092,6 +8135,7 @@ impl HvpatchTaskRegistration {
             stage2_lease_keys,
         )?;
         if let Some(old_task_mm) = self.task_mm.take() {
+            old_task_mm.record_holder(HvpatchTaskMmHolder::ExecRebind);
             old_task_mm.retire_exec_predecessor();
         }
         self.task_mm = Some(new_task_mm);
@@ -8100,6 +8144,7 @@ impl HvpatchTaskRegistration {
 
     pub(crate) fn retire_dormant_authority(&mut self) {
         if let Some(task_mm) = &self.task_mm {
+            task_mm.record_holder(HvpatchTaskMmHolder::DormantRetire);
             task_mm.retire_exec_predecessor();
         }
     }
@@ -8121,8 +8166,20 @@ impl HvpatchTaskRegistration {
         // If it is the final MM binding, every stage-2 lease unmaps here, before
         // the final task-MM Arc below releases any host mapping owner.
         self.directory.retire(self.key)?;
-        drop(self.task_mm.take());
+        if let Some(task_mm) = self.task_mm.take() {
+            task_mm.record_holder(HvpatchTaskMmHolder::RegistrationCleanup);
+            drop(task_mm);
+        }
         Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for HvpatchTaskRegistration {
+    fn drop(&mut self) {
+        if let Some(task_mm) = &self.task_mm {
+            task_mm.record_holder(HvpatchTaskMmHolder::RegistrationDrop);
+        }
     }
 }
 
@@ -8511,6 +8568,7 @@ impl HvpatchCarrierTaskStateDirectory {
             drop(row);
             drop(carrier_mm);
             drop(inner);
+            task_mm.record_holder(HvpatchTaskMmHolder::FailpointRollback);
             drop(task_mm);
             return Err(TrapError::Hypervisor(
                 "injected carrier task-state failure after directory publication".to_owned(),
@@ -17793,6 +17851,7 @@ impl HvfVmState {
                     )),
                     pending_receipts: Vec::new(),
                     alias_receipts: parking_lot::Mutex::new(Vec::new()),
+                    last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::ExecRebind),
                     #[cfg(test)]
                     drop_order: None,
                 });
