@@ -204,6 +204,55 @@ Progress since gate 6, all merged to main:
   wedged carrier SURVIVES SIGTERM (teardown deadlock blocks the signal
   exit path). Ops rule learned: probe batteries must use `timeout -k`.
 
+### SESSION 3 CLOSING STATE — gate 9: 768/832 (92.3%), scenarios 31/40
+
+Day's full arc on the closure gate: **0 -> 541 -> 584 -> 681 -> 680 -> 733
+-> 768 of 832**, gate wall ~9 minutes throughout. Twenty-eight commits
+merged to main this session across ten directed worker branches plus
+director-side work. After gate 8's capstone (all named crash clauses zero),
+two more waves landed:
+
+- **epollpipe** (`8aab8d4f`): epoll-ET HUP/EOF wake registry (also unwedged
+  epolletmanyhup), blocking pipe write until signal/space, SIGPIPE/EPIPE
+  semantics, ITIMER_PROF/VIRTUAL driven by guest CPU time (correcting the
+  earlier wall-clock version).
+- **wedgehunt** (`4e116e65`): THE dominant wedge root — in
+  `commit_task_exit_notifying`, `notify_parent` ran BEFORE
+  `prepared.reservation.commit()`, so the parent's wake fired while the
+  exiting child still held it TaskBusy; an immediate wait4 read TaskBusy ->
+  StillRunning and parked forever, wake edge already consumed. Committing
+  the reservation first closes it. waitexitstorm went 0-for-serial to
+  10/10; the 48-row timeout family collapsed to 36.
+
+**The remaining 64 generic failures:**
+- 36 timeout-wedges — RESIDUAL mechanisms beyond the exit-ordering fix,
+  concentrated in process-ladder (procladder*), MT-fork (mtforkcorrupt,
+  forkfpregs, forkfpreclaim), futex-fork (futexforkrequeue,
+  futexwakecount), and exec-from-thread shapes. The hunt kit stands:
+  holder-tag Drop diagnostics, enriched gate failure records
+  (exit status + stderr tail), four wedge samples and a 1.6M core in
+  target/perf/, and `carrick debug hvpatch-kernel --run-id` works on live
+  wedges. Method that closed the last one: run the reducer WITHOUT
+  timeout, diagnose the live wedge (kernel graph + sample), name the
+  publish-before-commit window.
+- 19 value-diffs: coredumpfile register exactness (core-dump port
+  follow-up), clonefilesexec (CLONE_FILES+exec fd table, punted twice —
+  needs a core-territory worker), sigsuspendxthread/sigwaitthread/
+  rtsigtimedwaitsiginfo (the sigwait family — the saved UNVERIFIED WIP at
+  target/perf/conf-signals-wip-sigwait.patch is the starting reference),
+  mqnotifycrossproc, sysvmsgwake, udpreuseaddr, killfault,
+  futexwaiterstates, threadcommname, threadstatstate stragglers.
+- 9 crashes: exec-from-thread family (execfromthread, execthreads),
+  mtforkcorrupt, forkfpreclaim, ptracekillcont, one waitexitstorm shape,
+  clonefilesexec — read their enriched records first.
+- Scenario phase 31/40: network bridge/compose scenarios + the runner
+  naming a nonexistent `serve` test target (harness wiring).
+
+**Worker lifecycle: ALL REAPED, all ten branches merged and deleted; the
+only surviving worktrees are the long-standing ones plus
+`.worktrees/attrib-mmleak` (pre-fix binary, still useful) — everything
+else cleaned. AGY_RUN_ID=closure state dir is empty.**
+
 **GATE RUN 8 — the campaign capstone: 733 PASS / 99 FAIL (88%), and
 EVERY named crash clause is at zero** (phase=active 0, batch capacity 0,
 reservation candidate 0, activation 0, fd-pin 1 straggler). Day's arc:
