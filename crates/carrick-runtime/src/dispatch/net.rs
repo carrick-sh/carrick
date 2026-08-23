@@ -4921,6 +4921,8 @@ impl SyscallDispatcher {
             // (tv_nsec), and it has no sigmask. pselect6(72) keeps the decode below.
             let is_select = request_number == carrick_abi::CARRICK_PRIVATE_X86_SELECT;
             let request_args = cx.raw_args();
+            let tid = cx.tid();
+            let kernel = cx.kernel;
             let memory = &mut *cx.memory;
             let reporter = cx.reporter;
 
@@ -4960,6 +4962,12 @@ impl SyscallDispatcher {
             } else {
                 carrick_abi::WaitSigMask::NONE
             };
+            if this.has_deliverable_dispatch_pending_for_wait(kernel, tid, sig_mask) {
+                if let carrick_abi::WaitSigMask::Replace(mask) = sig_mask {
+                    this.begin_sigsuspend(kernel, tid, mask);
+                }
+                return Ok(DispatchOutcome::errno(LINUX_EINTR));
+            }
 
             // Decode timespec → millis for libc::poll. NULL = block forever (-1).
             let timeout_ms: i32 = if timeout_addr == 0 {
@@ -5321,6 +5329,8 @@ impl SyscallDispatcher {
             // no sigmask. ppoll(73) keeps the *timespec + sigmask decode below.
             let is_poll = request_number == carrick_abi::CARRICK_PRIVATE_X86_POLL;
             let request_args = cx.raw_args();
+            let tid = cx.tid();
+            let kernel = cx.kernel;
             let memory = &mut *cx.memory;
             let reporter = cx.reporter;
 
@@ -5386,6 +5396,12 @@ impl SyscallDispatcher {
             } else {
                 carrick_abi::WaitSigMask::NONE
             };
+            if this.has_deliverable_dispatch_pending_for_wait(kernel, tid, sig_mask) {
+                if let carrick_abi::WaitSigMask::Replace(mask) = sig_mask {
+                    this.begin_sigsuspend(kernel, tid, mask);
+                }
+                return Ok(DispatchOutcome::errno(LINUX_EINTR));
+            }
 
             // Linux rejects an nfds greater than the guest's soft RLIMIT_NOFILE
             // with EINVAL BEFORE touching the fds array (poll/ppoll: do_sys_poll

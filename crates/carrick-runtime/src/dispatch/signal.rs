@@ -574,7 +574,7 @@ impl SyscallDispatcher {
         });
     }
 
-    fn begin_sigsuspend(
+    pub(in crate::dispatch) fn begin_sigsuspend(
         &self,
         context: &crate::kernel::KernelContext,
         tid: crate::thread::ThreadId,
@@ -1248,7 +1248,12 @@ impl SyscallDispatcher {
             return None;
         }
         let kernel = ctx.kernel.kernel();
-        let Some(target_key) = hvpatch_process_signal_target(kernel, pid) else {
+        let target_key = if u32::try_from(pid).is_ok_and(|p| p == self.identity_pid()) {
+            Some(ctx.kernel.task().key())
+        } else {
+            hvpatch_process_signal_target(kernel, pid)
+        };
+        let Some(target_key) = target_key else {
             if hvpatch_signal_observes_zombie(kernel, pid) {
                 // Addressable but no longer running: the signal is dropped and
                 // the call succeeds, exactly as Linux does for a zombie.
@@ -1316,14 +1321,22 @@ impl SyscallDispatcher {
             Ok(tid) => tid,
             Err(_) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
         };
+        let kernel = context.kernel();
         let required_task = match tgid {
-            Some(raw) => match crate::kernel::TaskId::from_abi_positive(raw) {
-                Ok(task) => Some(task),
-                Err(_) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
-            },
+            Some(raw) => {
+                if u32::try_from(raw).is_ok_and(|pid| pid == self.identity_pid()) {
+                    Some(context.task().key().id)
+                } else if let Some(target_key) = hvpatch_process_signal_target(kernel, raw) {
+                    Some(target_key.id)
+                } else {
+                    match crate::kernel::TaskId::from_abi_positive(raw) {
+                        Ok(task) => Some(task),
+                        Err(_) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
+                    }
+                }
+            }
             None => None,
         };
-        let kernel = context.kernel();
         let Some((target_task, target_thread)) = kernel.live_keys_for_thread(required_task, tid)
         else {
             return Some(DispatchOutcome::errno(LINUX_ESRCH));
