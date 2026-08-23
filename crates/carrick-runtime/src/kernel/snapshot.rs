@@ -99,6 +99,12 @@ pub type ThreadSnapshotClass = ObjectSnapshotClass;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ThreadSnapshotRow {
     pub key: ThreadKey,
+    /// Rendered `ThreadExecutionState` — Runnable/Running/Blocked{reason,
+    /// continuation}/Exited/Failed. THE field a frozen-guest diagnosis needs:
+    /// the futexforkrequeue freeze hunt had a consistent graph, empty signal
+    /// sets, and NO way to ask "what is this thread blocked on" until this
+    /// existed.
+    pub execution: String,
     pub task: TaskKey,
     pub registry_id: Option<ThreadId>,
     pub class: ObjectSnapshotClass,
@@ -531,6 +537,7 @@ impl Kernel {
             thread_signals.push(thread_signal_row(*key, class, revision, signal));
             thread_rows.push(ThreadSnapshotRow {
                 key: *key,
+                execution: thread.execution_diagnostic(),
                 task: *task_key,
                 registry_id: Some(thread.registry_id()),
                 class,

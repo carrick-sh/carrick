@@ -4684,6 +4684,20 @@ impl Thread {
         self.key
     }
 
+    /// Diagnostic rendering for the debug snapshot: the execution state plus
+    /// the two slot-presence facts a scheduler-freeze diagnosis needs (a
+    /// Runnable thread without task_state is UNCLAIMABLE — claim_runnable
+    /// fails `claim_runnable_without_cpu_state` and the queue row is shredded).
+    pub fn execution_diagnostic(&self) -> String {
+        let execution = self.execution.lock();
+        format!(
+            "{:?} task_state={} continuation={}",
+            execution.state,
+            execution.task_state.is_some(),
+            execution.blocked_continuation.is_some()
+        )
+    }
+
     pub fn execution_state(&self) -> ThreadExecutionState {
         self.execution.lock().state
     }
