@@ -3730,21 +3730,28 @@ impl Kernel {
         if mode == WaitMode::Consume {
             ensure_task_unreserved(&state, parent_id)?;
         }
-        let Some(parent) = state.tasks.get(&parent_id).map(|record| record.task.key()) else {
+        let Some((parent, children)) = state
+            .tasks
+            .get(&parent_id)
+            .map(|record| (record.task.key(), record.task.children()))
+        else {
             return Err(KernelOperationError::UnknownTask(parent_id));
         };
-        let exited = state
-            .zombies
-            .iter()
-            .find(|(id, record)| {
-                record.zombie.parent == Some(parent)
-                    && process_group.is_none_or(|group| record.zombie.process_group == group)
-                    && exact_target.map_or_else(
-                        || target.is_none_or(|target| target == **id),
-                        |target| target == record.zombie.key,
-                    )
-            })
-            .map(|(id, record)| (*id, record.zombie.clone()));
+        let exited = children.iter().find_map(|child_key| {
+            let record = state.zombies.get(&child_key.id)?;
+            if record.zombie.key == *child_key
+                && record.zombie.parent == Some(parent)
+                && process_group.is_none_or(|group| record.zombie.process_group == group)
+                && exact_target.map_or_else(
+                    || target.is_none_or(|target| target == child_key.id),
+                    |target| target == *child_key,
+                )
+            {
+                Some((child_key.id, record.zombie.clone()))
+            } else {
+                None
+            }
+        });
         if let Some((id, zombie)) = exited {
             if mode == WaitMode::Consume {
                 ensure_task_unreserved(&state, id)?;
@@ -3772,14 +3779,16 @@ impl Kernel {
         }
 
         {
-            let state_change = state.tasks.iter().find_map(|(id, record)| {
-                (record.task.parent() == Some(parent)
+            let state_change = children.iter().find_map(|child_key| {
+                let record = state.tasks.get(&child_key.id)?;
+                if record.task.key() == *child_key
+                    && record.task.parent() == Some(parent)
                     && process_group.is_none_or(|group| record.task.process_group() == group)
                     && exact_target.map_or_else(
-                        || target.is_none_or(|target| target == *id),
-                        |target| target == record.task.key(),
-                    ))
-                .then(|| {
+                        || target.is_none_or(|target| target == child_key.id),
+                        |target| target == *child_key,
+                    )
+                {
                     record
                         .task
                         .waitable_job_control_event(
@@ -3789,29 +3798,34 @@ impl Kernel {
                         )
                         .map(|event| match event {
                             TaskJobControlEvent::Stopped(signal) => WaitOutcome::Stopped {
-                                task: *id,
+                                task: child_key.id,
                                 signal,
                                 ruid: record.task.process_credentials().ruid(),
                             },
                             TaskJobControlEvent::Continued => WaitOutcome::Continued {
-                                task: *id,
+                                task: child_key.id,
                                 ruid: record.task.process_credentials().ruid(),
                             },
                         })
-                })
-                .flatten()
+                } else {
+                    None
+                }
             });
             if let Some(state_change) = state_change {
                 return Ok(state_change);
             }
         }
 
-        let live_child = state.tasks.iter().any(|(id, record)| {
-            record.task.parent() == Some(parent)
+        let live_child = children.iter().any(|child_key| {
+            let Some(record) = state.tasks.get(&child_key.id) else {
+                return false;
+            };
+            record.task.key() == *child_key
+                && record.task.parent() == Some(parent)
                 && process_group.is_none_or(|group| record.task.process_group() == group)
                 && exact_target.map_or_else(
-                    || target.is_none_or(|target| target == *id),
-                    |target| target == record.task.key(),
+                    || target.is_none_or(|target| target == child_key.id),
+                    |target| target == *child_key,
                 )
         });
         Ok(if live_child {
