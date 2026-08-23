@@ -963,18 +963,19 @@ where
                     }
                 }
             };
-            let replacement_capacity =
-                match super::quiesce::inventory_capacity_for_extents(replacement_extent_count) {
-                    Ok(capacity) => capacity,
-                    Err(error) => {
-                        return Self::exec_failed_past_no_return(
-                            kernel,
-                            engine,
-                            &format!("size HVPatch exec replacement inventory: {error}"),
-                        )
-                        .map(Some);
-                    }
-                };
+            let replacement_capacity = match carrick_hal::FrameEventCapacity::for_event_count(
+                carrick_hal::MAX_FRAME_INVENTORY_EVENTS_PER_BATCH,
+            ) {
+                Ok(capacity) => capacity,
+                Err(error) => {
+                    return Self::exec_failed_past_no_return(
+                        kernel,
+                        engine,
+                        &format!("size HVPatch exec replacement inventory: {error}"),
+                    )
+                    .map(Some);
+                }
+            };
             let retired = match old_capacity {
                 None => None,
                 Some(old_capacity) => {

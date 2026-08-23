@@ -2266,9 +2266,15 @@ type HvpatchProcessPreparation<P> = (
 );
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-enum HvpatchProcessInventoryPreparation {
+enum HvpatchProcessInventoryPreparation<'a> {
     /// A plain fork owns a new MM and must publish its staged frame inventory.
-    Copied(carrick_hal::FrameInventoryReservation),
+    Copied(
+        &'a mut dyn FnMut(
+            usize,
+            usize,
+            carrick_hal::FrameEventCapacity,
+        ) -> Result<carrick_hal::FrameInventoryReservation, RuntimeError>,
+    ),
     /// `CLONE_VM`/vfork retains the parent's exact MM/inventory authority.  No
     /// process inventory transaction exists for the child edge.
     SharedMm { kernel_mm: u64 },
@@ -2279,11 +2285,10 @@ trait HvpatchProcessBackendOps<E: ThreadedEngine, M: GuestMemory> {
     type Prepared;
     type Backend;
 
-    fn inventory_extent_count(&self, memory: &M) -> usize;
     fn prepare(
         &mut self,
         memory: &mut M,
-        inventory: HvpatchProcessInventoryPreparation,
+        inventory: HvpatchProcessInventoryPreparation<'_>,
         request: carrick_hal::ProcessForkRequest,
         identity: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskIdentity,
         mm_generation: u64,
@@ -2329,14 +2334,10 @@ where
     type Prepared = carrick_vmm_hvf::hvf_aarch64_engine::HvpatchPreparedTaskOnlyEngineState;
     type Backend = carrick_vmm_hvf::hvf_aarch64_engine::HvpatchTaskOnlyEngineState;
 
-    fn inventory_extent_count(&self, memory: &E) -> usize {
-        memory.frame_inventory_extent_count()
-    }
-
     fn prepare(
         &mut self,
         memory: &mut E,
-        inventory: HvpatchProcessInventoryPreparation,
+        inventory: HvpatchProcessInventoryPreparation<'_>,
         request: carrick_hal::ProcessForkRequest,
         identity: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskIdentity,
         mm_generation: u64,
@@ -2344,10 +2345,7 @@ where
     ) -> Result<HvpatchProcessPreparation<Self::Prepared>, RuntimeError> {
         type HvfEngine = carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine;
         let prepared = match inventory {
-            HvpatchProcessInventoryPreparation::Copied(inventory) => {
-                memory
-                    .begin_process_inventory(inventory)
-                    .map_err(RuntimeError::Trap)?;
+            HvpatchProcessInventoryPreparation::Copied(reserve) => {
                 let spec = match memory.build_process_spec(request) {
                     Ok(spec) => spec,
                     Err(error) => {
@@ -2368,8 +2366,13 @@ where
                         ));
                     }
                 };
-                match carrick_vmm_hvf::hvf_aarch64_engine::materialize_hvpatch_process_without_vcpu(
-                    identity, *spec,
+                match carrick_vmm_hvf::hvf_aarch64_engine::materialize_hvpatch_process_without_vcpu_with_reservation(
+                    identity,
+                    *spec,
+                    |frames, mappings, capacity| {
+                        reserve(frames, mappings, capacity)
+                            .map_err(|error| carrick_hal::TrapError::Hypervisor(error.to_string()))
+                    },
                 ) {
                     Ok(prepared) => prepared,
                     Err(error) => {
@@ -8282,14 +8285,10 @@ mod tests {
             type Prepared = ();
             type Backend = ();
 
-            fn inventory_extent_count(&self, _memory: &Memory) -> usize {
-                1
-            }
-
             fn prepare(
                 &mut self,
                 _memory: &mut Memory,
-                inventory: HvpatchProcessInventoryPreparation,
+                inventory: HvpatchProcessInventoryPreparation<'_>,
                 _request: carrick_hal::ProcessForkRequest,
                 _identity: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskIdentity,
                 mm_generation: u64,
