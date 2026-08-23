@@ -4548,6 +4548,13 @@ where
                     .as_ref()
                     .unwrap_or_else(|| std::process::abort())
                     .retain_exact();
+                self.kernel.record_fatal_signal(FatalSignalRecord {
+                    image_generation: self.state.fatal_image_generation,
+                    tid: context.thread().key().tid,
+                    signo: signum,
+                    code: 0,
+                    addr: 0,
+                });
                 let outcome = VcpuLoopOutcome::ProcessExit(Box::new(assemble_run_result(
                     &self.kernel,
                     128 + signum,
