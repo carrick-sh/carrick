@@ -12508,7 +12508,14 @@ impl HvfVmState {
                     span.va
                 ))
             })?;
-        let _old_offset = old_ipa.checked_sub(old_physical_ipa).ok_or_else(|| {
+        // The semantic span sits at `old_offset` WITHIN its 16 KiB compound.
+        // The COW replacement must preserve that intra-compound offset: the
+        // 2026-08-23 wedge2 change flattened `new_ipa`/`semantic_host` to the
+        // compound base, which COWs the WRONG PAGE for every span whose
+        // offset is nonzero — forkcow's child then reads unrelated bytes and
+        // SIGSEGVs (bisect-convicted, red 3/3 at that commit, green 3/3 at
+        // its parent).
+        let old_offset = old_ipa.checked_sub(old_physical_ipa).ok_or_else(|| {
             TrapError::Hypervisor("HVPatch COW physical offset underflow".to_owned())
         })?;
         let retain_old_compound = {
@@ -12613,7 +12620,9 @@ impl HvfVmState {
             CowArmedRanges::COMPOUND_SIZE,
         )?;
         let new_physical_ipa = new_lease.base;
-        let new_ipa = new_physical_ipa;
+        let new_ipa = new_physical_ipa
+            .checked_add(old_offset)
+            .ok_or_else(|| TrapError::Hypervisor("HVPatch COW semantic IPA overflow".to_owned()))?;
         let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
         let map_result = unsafe {
             inventory_hv_vm_map(
@@ -12927,7 +12936,7 @@ impl HvfVmState {
             }
         }
 
-        let semantic_host = new_host_ptr;
+        let semantic_host = unsafe { new_host_ptr.add(old_offset as usize) };
         let alias = AliasBacking {
             start: span.va,
             ipa: new_ipa,
