@@ -7352,9 +7352,8 @@ impl SyscallDispatcher {
         let states: Option<std::collections::HashMap<_, _>> = registry.map(|r| {
             r.thread_ports()
                 .into_iter()
-                .filter_map(|(id, port)| {
-                    (port != 0).then(|| (id, crate::host_proc::thread_run_state_char(port)))
-                })
+                .filter(|&(_, port)| port != 0)
+                .map(|(id, port)| (id, crate::host_proc::thread_run_state_char(port)))
                 .collect()
         });
         #[cfg(any(

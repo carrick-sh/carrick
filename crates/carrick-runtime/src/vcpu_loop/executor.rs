@@ -2205,24 +2205,6 @@ impl PoolControl {
         Ok(pending)
     }
 
-    fn consume_invalidation_acks(
-        retirement: &crate::hvpatch::Stage1MmRetirement,
-        pending: Vec<(
-            ExecutorId,
-            mpsc::Receiver<Result<crate::hvpatch::InvalidationAck, String>>,
-        )>,
-    ) -> Result<(), String> {
-        for (target, response) in pending {
-            let ack = response.recv().map_err(|_| {
-                format!("ASID retirement executor {target:?} lost acknowledgement")
-            })??;
-            retirement
-                .acknowledge(ack)
-                .map_err(|error| format!("ASID retirement acknowledgement rejected: {error}"))?;
-        }
-        Ok(())
-    }
-
     /// Wait for peer invalidation acks WHILE SERVICING this executor's own
     /// `InvalidateAsid` commands. A blocking wait deadlocked whole carriers:
     /// with ten executors each inside a process terminal, every one waited in
@@ -2317,6 +2299,9 @@ impl PoolControl {
         Ok(stop_seen)
     }
 
+    /// Test-only external invalidation: the caller is OUTSIDE the executor
+    /// pool (no command queue of its own to service), so a plain blocking
+    /// ack wait cannot deadlock the mutual-servicing way an executor's does.
     #[cfg(test)]
     fn invalidate_external(
         &self,
@@ -2324,7 +2309,15 @@ impl PoolControl {
     ) -> Result<(), String> {
         let pending = self
             .dispatch_invalidation_commands(retirement.asid_generation(), retirement.pending())?;
-        Self::consume_invalidation_acks(retirement, pending)
+        for (target, response) in pending {
+            let ack = response.recv().map_err(|_| {
+                format!("ASID retirement executor {target:?} lost acknowledgement")
+            })??;
+            retirement
+                .acknowledge(ack)
+                .map_err(|error| format!("ASID retirement acknowledgement rejected: {error}"))?;
+        }
+        Ok(())
     }
 
     fn invalidate_after_exec<E: PersistentExecutor>(
