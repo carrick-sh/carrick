@@ -151,7 +151,33 @@ stage. N varies (40–56), the same probes pass serially, so the batch is
 sized from one inventory revision and staged from a later one — the
 revision-N-vs-now domain confusion, `a1eaad6a`'s shape. Round 2 is
 dispatched on exactly that (atomic size+stage view; no capacity constants)
-plus the 20 residual phase=active rows. The remaining ~145 rows are
+plus the 20 residual phase=active rows.
+
+**Gate run 6** (round-2 fix merged: dynamic batch sizing + COW
+descriptor-validity): **681 PASS / 151 FAIL generic, 30/40 scenarios.**
+Capacity clause EXTINCT (0). The exec-family drop-while-active rows are
+gone — the COW validity fix (VALID==0 pages in a
+set_writable_preserving_attributes range are sparse, skip them; this also
+closes old defect (c)'s BadAddress) cleared them. Final 151 taxonomy:
+
+- 63 value-diff conformance gaps (futex wake/requeue semantics, signal
+  EINTR shapes, epoll edge cases, /dev nodes, sysvsem RMID, pipes —
+  clusters listed in the triage earlier in this file's history);
+- 20 drop-while-active, now a FUTEX-family holder (futexghost,
+  futexpingpong, futexshare, futexwakeexact, ltpcheckpoint,
+  procstatstate, seccompenforce);
+- ~17 "frame inventory reservation has no unused mapping candidate" —
+  possibly introduced/exposed by round 2's MAX reservations; round 3 must
+  A/B against run 4's log;
+- 12 "failed to pin an exact fd description" (child then reported
+  panicked — pauseeintr et al);
+- 35 crash-no-clause rows (stderr lost; capture improvement wanted);
+- 3 "wake exact persistent sibling" rows.
+
+Round 3 (worker cap) is on the three named crash clauses. After it: the
+35 no-clause rows, then the 63 value-diffs as subsystem-clustered
+conformance briefs, then the carrier-only process retirement
+(docs/hvpatch-carrier-only-process-plan.md) whose write phase is queued. The remaining ~145 rows are
 assertion-level conformance gaps (e.g. `write_blocked_until_signal=false`,
 `sigchld_from_orphan=false`, `fdatasync_devnull_einval=false`) plus
 consequences of the two clauses — triage AFTER the clauses close. The
