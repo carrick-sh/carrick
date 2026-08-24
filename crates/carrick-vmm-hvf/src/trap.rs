@@ -1124,6 +1124,7 @@ mod task_only_carrier_directory_tests {
             shared_key_base: 0,
             shared_key_offset: 0,
             inherited_frame: None,
+            owner_generation: 0,
         };
         drop(descriptor);
         assert!(observed.load(Ordering::SeqCst));
@@ -2496,7 +2497,7 @@ fn missing_process_aliases(
 /// processes; futex_cmp_requeue01's 1000-waiter phase starves on it). The
 /// index makes one pass over the registry and answers each mapping in O(1).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-type ProcessAliasKey = (u64, u64, usize, usize);
+type ProcessAliasKey = (u64, u64, usize, usize, u64);
 
 /// One-pass index of the process-scoped alias publications, keyed by
 /// [`ProcessAliasKey`]. First occurrence wins, mirroring the linear scans'
@@ -2510,7 +2511,13 @@ fn process_alias_index(
     for alias in aliases {
         if alias_matches_process_scope(alias.ownership_scope, mm_root_slot) {
             index
-                .entry((alias.start, alias.ipa, alias.host_addr, alias.size))
+                .entry((
+                    alias.start,
+                    alias.ipa,
+                    alias.host_addr,
+                    alias.size,
+                    alias.owner_generation,
+                ))
                 .or_insert(*alias);
         }
     }
@@ -2529,6 +2536,7 @@ fn mapping_is_current_for_process_fork_indexed(
             mapping.ipa,
             mapping.host_addr as usize,
             semantic_extent_size(mapping.start, mapping.end),
+            mapping.owner_generation,
         ))
 }
 
@@ -5641,6 +5649,7 @@ struct ThreadMappingDesc {
     guest_writable: bool,
     shared_key_base: u64,
     shared_key_offset: u64,
+    owner_generation: u64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6025,6 +6034,7 @@ impl ThreadMappingDesc {
             guest_writable: region.guest_writable,
             shared_key_base: region.shared_key_base,
             shared_key_offset: region.shared_key_offset,
+            owner_generation: region.owner_generation,
         }
     }
 
@@ -6055,6 +6065,7 @@ impl ThreadMappingDesc {
             guest_writable: alias.guest_writable,
             shared_key_base: alias.shared_key_base,
             shared_key_offset: alias.shared_key_offset,
+            owner_generation: alias.owner_generation,
         })
     }
 
@@ -6076,10 +6087,7 @@ impl ThreadMappingDesc {
             guest_writable: self.guest_writable,
             shared_key_base: self.shared_key_base,
             shared_key_offset: self.shared_key_offset,
-            owner_generation: global_frame_host_owner_generation(
-                self.physical_ipa,
-                self.physical_size as u64,
-            ),
+            owner_generation: self.owner_generation,
         }
     }
 }
@@ -6385,6 +6393,7 @@ struct ProcessMappingDesc {
     shared_key_base: u64,
     shared_key_offset: u64,
     inherited_frame: Option<carrick_hal::FrameId>,
+    owner_generation: u64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -16647,6 +16656,7 @@ impl HvfVmState {
         let mut cursor = request.root_slot_base;
         let aliases = alias_registry().lock().clone();
         let alias_index = process_alias_index(&aliases, self.mm_root_slot);
+        let mut seen_dynamic_aliases = std::collections::HashSet::new();
         let mut source_mappings: Vec<ThreadMappingDesc> = self
             .mappings
             .iter()
@@ -16654,13 +16664,18 @@ impl HvfVmState {
                 if !mapping.is_dynamic_alias {
                     return Some(ThreadMappingDesc::from_region(mapping));
                 }
+                let key = (
+                    mapping.start,
+                    mapping.ipa,
+                    mapping.host_addr as usize,
+                    semantic_extent_size(mapping.start, mapping.end),
+                    mapping.owner_generation,
+                );
+                if !seen_dynamic_aliases.insert(key) {
+                    return None;
+                }
                 alias_index
-                    .get(&(
-                        mapping.start,
-                        mapping.ipa,
-                        mapping.host_addr as usize,
-                        semantic_extent_size(mapping.start, mapping.end),
-                    ))
+                    .get(&key)
                     .copied()
                     .and_then(ThreadMappingDesc::from_alias)
             })
@@ -16924,6 +16939,7 @@ impl HvfVmState {
                     shared_key_offset: mapping.shared_key_offset,
                     inherited_frame: Some(parent_extent.frame),
                     stage2_lease: None,
+                    owner_generation: mapping.owner_generation,
                 });
                 continue;
             }
@@ -17080,6 +17096,7 @@ impl HvfVmState {
                 shared_key_offset: mapping.shared_key_offset,
                 inherited_frame: None,
                 stage2_lease,
+                owner_generation: 0,
             });
             inventory_mappings.push(ProcessInventoryDesc {
                 gpa: physical_ipa,
@@ -17403,10 +17420,7 @@ impl HvfVmState {
                     inventory_backing: mapping.inventory_backing,
                     shared_key_base: mapping.shared_key_base,
                     shared_key_offset: mapping.shared_key_offset,
-                    owner_generation: global_frame_host_owner_generation(
-                        mapping.physical_ipa,
-                        mapping.physical_size as u64,
-                    ),
+                    owner_generation: mapping.owner_generation,
                 };
                 pending_aliases.push(if mapping.sharing.uses_global_ipa() {
                     alias
@@ -17433,10 +17447,7 @@ impl HvfVmState {
                 sharing: mapping.sharing,
                 shared_key_base: mapping.shared_key_base,
                 shared_key_offset: mapping.shared_key_offset,
-                owner_generation: global_frame_host_owner_generation(
-                    mapping.physical_ipa,
-                    mapping.physical_size as u64,
-                ),
+                owner_generation: mapping.owner_generation,
             });
         }
         let mut process_reservation = spec
@@ -17604,10 +17615,7 @@ impl HvfVmState {
                     inventory_backing: mapping.inventory_backing,
                     shared_key_base: mapping.shared_key_base,
                     shared_key_offset: mapping.shared_key_offset,
-                    owner_generation: global_frame_host_owner_generation(
-                        mapping.physical_ipa,
-                        mapping.physical_size as u64,
-                    ),
+                    owner_generation: mapping.owner_generation,
                 };
                 aliases_to_publish.push(if mapping.sharing.uses_global_ipa() {
                     alias
@@ -17632,10 +17640,7 @@ impl HvfVmState {
                 sharing: mapping.sharing,
                 shared_key_base: mapping.shared_key_base,
                 shared_key_offset: mapping.shared_key_offset,
-                owner_generation: global_frame_host_owner_generation(
-                    mapping.physical_ipa,
-                    mapping.physical_size as u64,
-                ),
+                owner_generation: mapping.owner_generation,
             });
         }
         let mut process_reservation = spec
@@ -21804,6 +21809,7 @@ mod frame_inventory_backend_tests {
             guest_writable: true,
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: 0,
         };
 
         let inherited = inherited_fork_inventory_extents(
@@ -22088,6 +22094,7 @@ mod frame_inventory_backend_tests {
             shared_key_offset: 0,
             inherited_frame: None,
             stage2_lease: None,
+            owner_generation: 0,
         };
         let winning_ipa = 0x9b00_028000;
         let stale_ipa = 0x9b00_008000;
@@ -22350,6 +22357,7 @@ mod thread_sibling_tests {
             guest_writable: true,
             shared_key_base: 0,
             shared_key_offset: 0,
+            owner_generation: 17,
         };
 
         let copied = desc.into_unowned_region();
@@ -22362,6 +22370,7 @@ mod thread_sibling_tests {
         assert!(copied.memory.is_none());
         assert!(copied.host_mapping.is_none());
         assert_eq!(copied.sharing, GuestMappingSharing::GlobalShared);
+        assert_eq!(copied.owner_generation, 17);
     }
 
     #[test]
@@ -24056,7 +24065,7 @@ mod tag_strip_tests {
         let va = 0x1382_8ed0_0000;
         let retired_ipa = root_slot.0 + 0x20_0000;
         let live_ipa = root_slot.0 + 0x40_0000;
-        let mapping = |ipa, host_addr, is_dynamic_alias| HvfMappedRegion {
+        let mapping = |ipa, host_addr, is_dynamic_alias, owner_generation| HvfMappedRegion {
             start: va,
             ipa,
             physical_ipa: ipa,
@@ -24073,7 +24082,7 @@ mod tag_strip_tests {
             guest_writable: true,
             shared_key_base: 0,
             shared_key_offset: 0,
-            owner_generation: 0,
+            owner_generation,
         };
         let live_alias = AliasBacking {
             start: va,
@@ -24093,25 +24102,33 @@ mod tag_strip_tests {
             inventory_backing: InventoryBackingIdentity::SharedAnon(43),
             shared_key_base: 0,
             shared_key_offset: 0,
-            owner_generation: 0,
+            owner_generation: 7,
         };
 
         assert!(
             !mapping_is_current_for_process_fork_test(
-                &mapping(retired_ipa, 0x2000, true),
+                &mapping(retired_ipa, 0x2000, true, 0),
                 &[live_alias],
                 Some(root_slot),
             ),
             "a retained stage-2 lifetime owner is not a live child mapping"
         );
         assert!(mapping_is_current_for_process_fork_test(
-            &mapping(live_ipa, 0x3000, true),
+            &mapping(live_ipa, 0x3000, true, 7),
             &[live_alias],
             Some(root_slot),
         ));
         assert!(
+            !mapping_is_current_for_process_fork_test(
+                &mapping(live_ipa, 0x3000, true, 6),
+                &[live_alias],
+                Some(root_slot),
+            ),
+            "a recycled VA/IPA/host triple from an older owner generation must stay retired",
+        );
+        assert!(
             mapping_is_current_for_process_fork_test(
-                &mapping(root_slot.0, 0x4000, false),
+                &mapping(root_slot.0, 0x4000, false, 0),
                 &[],
                 Some(root_slot),
             ),
