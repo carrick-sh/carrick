@@ -873,16 +873,22 @@ impl HvpatchRuntimeDirectory {
     }
 
     fn join_process_threads(&self) -> Result<(), RuntimeError> {
-        let mut child_panicked = false;
+        // Carry the joined children's actual failure payloads into the
+        // terminal clause: the bare "HVPatch process child panicked" summary
+        // hid the root cause behind a generic string (14 gate-14 rows were
+        // indistinguishable until their stderr tails were exhumed one by
+        // one), and a 2-line stderr tail can cut the tracing line that held
+        // the detail.
+        let mut child_errors: Vec<String> = Vec::new();
         loop {
             let jobs = std::mem::take(&mut *self.process_jobs.lock());
             if jobs.is_empty() {
-                return if child_panicked {
-                    Err(RuntimeError::Unsupported(
-                        "HVPatch process child panicked".to_owned(),
-                    ))
-                } else {
-                    Ok(())
+                return match child_errors.first() {
+                    Some(first) => Err(RuntimeError::Unsupported(format!(
+                        "HVPatch process child panicked ({} failed): first: {first}",
+                        child_errors.len()
+                    ))),
+                    None => Ok(()),
                 };
             }
             for job in jobs {
@@ -894,7 +900,7 @@ impl HvpatchRuntimeDirectory {
                 };
                 if let Err(error) = result {
                     tracing::error!(%error, "HVPatch process job failed");
-                    child_panicked = true;
+                    child_errors.push(error.to_string());
                 }
             }
             // A joined child may have forked another process before it left.
