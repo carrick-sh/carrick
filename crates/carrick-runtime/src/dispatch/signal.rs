@@ -1772,7 +1772,7 @@ impl SyscallDispatcher {
             );
             if dispatcher_pending.is_empty() && !host_pending {
                 return Ok(DispatchOutcome::WaitOnSignals {
-                    wait_set: suspend_mask.complement(),
+                    wait_set: SigSet::EMPTY,
                     block_mask,
                     timeout: None,
                 });
@@ -1988,6 +1988,19 @@ impl SyscallDispatcher {
                 let queued = this.take_pending_siginfo(cx.kernel, tid, signum);
                 return Ok(rt_sigtimedwait_deliver(memory, info_ptr, signum, queued));
             }
+            let block_mask = SigBlockMask::for_signal_wait(
+                wait_set,
+                this.signal_mask_for(cx.kernel, tid),
+                this.wait_ignored_disposition_mask(cx.kernel),
+            );
+            if this.has_deliverable_dispatch_pending_for_wait(
+                cx.kernel,
+                tid,
+                carrick_abi::WaitSigMask::Replace(SigSet::from_raw(block_mask.raw())),
+            ) || crate::host_signal::has_unblocked_pending_for(tid.raw(), block_mask)
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EINTR));
+            }
             install_host_handlers_for_wait_set(wait_set);
             match timeout {
                 Some(d) if d.is_zero() => Ok(DispatchOutcome::errno(LINUX_EAGAIN)),
@@ -1997,11 +2010,7 @@ impl SyscallDispatcher {
                     // signals always wake, unblocked caught non-set signals
                     // wake to EINTR, thread-blocked or to-be-ignored ones
                     // (e.g. handler-less SIGCHLD) do neither.
-                    block_mask: SigBlockMask::for_signal_wait(
-                        wait_set,
-                        this.signal_mask_for(cx.kernel, tid),
-                        this.wait_ignored_disposition_mask(cx.kernel),
-                    ),
+                    block_mask,
                     timeout,
                 }),
             }
@@ -2523,7 +2532,21 @@ fn hvpatch_process_signal_target(
     kernel: &crate::kernel::Kernel,
     pid: i32,
 ) -> Option<crate::kernel::TaskKey> {
-    let target = crate::kernel::TaskId::from_abi_positive(pid).ok()?;
+    // TRANSITIONAL identity bridge: in the raw (non-namespaced) lane
+    // `getpid(2)` still answers the CARRIER's host pid (`logical_pid()`
+    // falls back to `std::process::id()` — the retired 1:1 model's
+    // numbering), while the kernel graph numbers the same process
+    // `LINUX_BOOTSTRAP_PID`. A forked child killing its parent by that
+    // observed pid must reach the bootstrap task or the signal silently
+    // resolves to nothing (sigtimedwaitintr's fork_killer hung exactly
+    // there). The real fix is answering getpid from the kernel graph in
+    // the HVPatch lane — the documented identity-and-scope migration —
+    // after which this arm is dead and must be deleted.
+    let target = if u32::try_from(pid).is_ok_and(|p| p == std::process::id()) {
+        crate::kernel::TaskId::from_abi_positive(carrick_abi::LINUX_BOOTSTRAP_PID as i32).ok()?
+    } else {
+        crate::kernel::TaskId::from_abi_positive(pid).ok()?
+    };
     kernel.live_task_key(target).or_else(|| {
         let tid = crate::kernel::LinuxTid::from_abi_positive(pid).ok()?;
         kernel
@@ -4728,7 +4751,7 @@ mod tests {
                 wait_set,
                 block_mask,
                 timeout: None,
-            } if wait_set == SigSet::EMPTY.complement()
+            } if wait_set == SigSet::EMPTY
                 && block_mask == SigBlockMask::blocking_all_of(ignored)
         ));
         assert_eq!(

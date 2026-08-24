@@ -837,7 +837,7 @@ impl BlockedContinuation {
             } => Self::WaitOnSignals(new_state(
                 deadline(timeout),
                 Vec::new(),
-                Some(WaitSigMask::Replace(wait_set.complement())),
+                Some(WaitSigMask::Replace(SigSet::from_raw(block_mask.raw()))),
                 ContinuationDetail::Signals {
                     wait_set,
                     block_mask,
@@ -1005,6 +1005,13 @@ impl BlockedContinuation {
 
     pub fn signal_masks(&self) -> SignalMaskContinuationState {
         self.state().signal_masks
+    }
+
+    pub fn is_waiting_for_signal(&self, signal: crate::kernel::LinuxSignal) -> bool {
+        match &self.state().detail {
+            ContinuationDetail::Signals { wait_set, .. } => wait_set.contains(signal.raw()),
+            _ => false,
+        }
     }
 
     pub fn child_selector(&self) -> Option<ChildSelector> {
@@ -2097,6 +2104,9 @@ impl SignalReadinessProbe {
                 return Some(ContinuationEvent::Ready);
             }
             if authority.has_pending_in(wait_set) {
+                if host_signum != 0 {
+                    crate::host_signal::publish_pending_for(self.thread.tid.raw(), host_signum);
+                }
                 return Some(ContinuationEvent::Ready);
             }
             let blocked =
