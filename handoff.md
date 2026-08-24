@@ -78,6 +78,74 @@ Restore it verbatim once the objective above closes:
 > The goal is still active. Do not mark it complete, bless a baseline, weaken the
 > denominator, add an excuse, accept a retry, or start final performance work.
 
+## SESSION CLOSE-OUT — 2026-08-23 (sessions 4–5, CONCLUDED)
+
+**This is the authoritative hand-off. Everything below this section is
+the supporting record; a next owner needs only this block to start.**
+
+### Exact state at close
+
+- **Main is `85b4f3d6`**, clean (the only uncommitted file is another
+  agent's `justfile` `install-sccache` recipe — never commit it). All
+  work below is merged, live-verified, and lint-clean (workspace
+  `cargo check --all-targets` and clippy 0 errors at close).
+- **Gate arc**: 0/813 → **781/834 generic + 40/40 scenarios** (gate 13,
+  `target/perf/gate13.log`). Denominator honestly extended twice
+  (462→463, `sharedanonfutexfork`). Gate 13 PREDATES this session's
+  five merged fixes — a fresh gate run is the next owner's first
+  cheap win and should clear at least: waitrestart×2 (already green in
+  13), sigsuspendxthread×2, threadcommname×2, threadstatstate×2, and
+  possibly execfromthread on lucky scheduling.
+- **Fixed this session (each root-caused, red-first, both-lane
+  verified)**: anon-shared futex identity (one protections authority
+  per mm); process-retirement O(aliases²) + env-lock contention
+  (futexforkrequeue 260s→6s all-true); pipe host-readiness fds
+  (clonefilesexec + a 1600/s respin livelock); waitrestart's three
+  stacked signal-delivery defects (SA_RESTART framework blocker);
+  gettid/CONTEXTIDR per-thread identity (three container rows);
+  idle-executor ASID-ack poke (first execfromthread container passes);
+  three kernel-registry shape migrations (worker-built, merged).
+- **Strategic doc**: `docs/kernel-collections-research-2026-08-23.md`
+  (owner-refined adoption policy + M1–M12 ranked migrations).
+
+### Exact next steps, in order
+
+1. **Run gate 14** (`just conformance-probes-closure`, output to a
+   FILE) on a fresh signed build of `85b4f3d6`; refresh the tally in
+   this file. Expect ≥787/834.
+2. **The settle/claim seam** (execfromthread's remaining ~50% wedge,
+   fully mapped below): FIRST extend `carrick debug` with an
+   executor-pool table (receipts, queue rows, pending invalidations —
+   the snapshot gap is load-bearing), THEN red-first surgery on
+   `settle_runnable_successor`/`take_row` generation handling for
+   retargeted rows. Reducer: container execfromthread, ~50% wedge.
+3. **setidthreadchurn** (last gate-timeout probe): musl `__synccall`
+   broadcast under yield-spinning threads; hypotheses in the session
+   record; likely adjacent to the settle/claim work.
+4. **Container procfs Pid rendering** (`/proc/self/status` says Pid 2
+   while getpid()=1): stale namespace translation in the renderer.
+5. Remaining value-diffs (maskfork's fork-pending set, coredumpbit/
+   file register exactness, ptrace pair, epoll pair, futexwakeexact's
+   refault-livelock, forkfpreclaim teardown, killfault/killreap,
+   mqnotifycrossproc, waitexitstorm, shmnestedfork, sigtimedwaitintr,
+   clone3pidfdsig, siglongjmpaltstack, waitidsiuid, gnu-only four).
+6. **Criterion 4 endgame**: full `just ci` from a FILE; census
+   `--refresh-candidate` reconciliation LAST. Then criterion 1
+   remnants (runner gates are proven test-only legacy — delete with
+   the settle/claim work) and NsSupervisor Stage 2
+   (`docs/hvpatch-carrier-only-process-plan.md`).
+
+### Standing method (unchanged, binding)
+
+Red-first deterministic reducers; both lanes AND both libcs in every
+battery; attribution against unmodified base before calling anything a
+regression; `timeout -k 5` always; `git -C` always (cwd persists);
+scoped kill.sh, never pkill; workers get one-probe turns and their
+batteries are re-run at the exact commit before merge; the debug
+snapshot's table names are SINGULAR and its stderr is never swallowed.
+
+**Session over.** The next owner starts at step 1.
+
 ## CURRENT ENGINEERING CHECKPOINT — 2026-08-23, session 4 (the shared-identity root cause)
 
 ### FIXED: fork children lost ALL anon-MAP_SHARED futex identity
