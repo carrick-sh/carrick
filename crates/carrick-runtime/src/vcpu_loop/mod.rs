@@ -741,6 +741,7 @@ impl HvpatchRuntimeDirectory {
         let Some(pool) = self.persistent_pool.lock().take() else {
             return Ok(());
         };
+        tracing::info!("HVPatch persistent pool shutdown begins (run queue will close)");
         pool.shutdown()
             .map(|_| ())
             .map_err(|error| RuntimeError::Configuration(error.to_string()))
@@ -3016,7 +3017,14 @@ where
                 run.wait_status_encoding(core_dumped),
                 Ok((**run).clone()),
             ),
-            PersistentTerminal::Error(_) => (127, 127 << 8, Err(())),
+            PersistentTerminal::Error(error) => {
+                // The owner's failure would otherwise vanish: its sibling job
+                // result is not the launch result, so this arm's Err(()) was
+                // the only externally visible trace ("sibling-owned process
+                // termination failed" with no cause). Name the cause here.
+                tracing::error!(%error, "HVPatch terminal owner publishes failure");
+                (127, 127 << 8, Err(()))
+            }
             PersistentTerminal::Outcome {
                 outcome: VcpuLoopOutcome::ThreadDone,
                 ..
@@ -6875,10 +6883,46 @@ impl Drop for PersistentProcessMemberPublication {
     }
 }
 
+/// The root launch's deferred pool-shutdown obligation. The root main
+/// thread's job can complete (even as a terminal-claim LOSER, with
+/// `ThreadDone`) while the winning sibling OWNER is still running process
+/// teardown on the persistent pool — so the pool must not close until the
+/// caller has waited for the owner's terminal publication. Shutting down
+/// inside `wait()` stranded the owner mid-teardown: its wakes hit "run
+/// queue is closed" and every fork-storm exit died on "HVPatch terminal
+/// owner did not complete teardown" (reducer: `forkstackstorm`).
+pub(crate) struct PersistentPoolShutdown {
+    directory: Arc<HvpatchRuntimeDirectory>,
+}
+
+impl PersistentPoolShutdown {
+    pub(crate) fn shutdown(self) -> Result<(), RuntimeError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.directory.shutdown_persistent_pool()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = &self.directory;
+            Ok(())
+        }
+    }
+}
+
 impl VcpuLoopLaunch {
-    pub(crate) fn wait(self) -> Result<VcpuLoopOutcome, RuntimeError> {
+    /// Wait for the root main-thread job. Pool shutdown is NOT performed
+    /// here: the caller must first drain the process topology and the
+    /// terminal owner's publication, then consume the returned
+    /// [`PersistentPoolShutdown`]. See its doc for the ordering defect this
+    /// prevents.
+    pub(crate) fn wait_deferring_pool_shutdown(
+        self,
+    ) -> (
+        Result<VcpuLoopOutcome, RuntimeError>,
+        Option<PersistentPoolShutdown>,
+    ) {
         match self {
-            Self::Direct(result) => result,
+            Self::Direct(result) => (result, None),
             Self::Persistent {
                 result,
                 directory,
@@ -6886,11 +6930,18 @@ impl VcpuLoopLaunch {
                 ..
             } => {
                 let outcome = result.wait();
-                if shutdown_on_wait {
-                    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                    directory.shutdown_persistent_pool()?;
-                }
-                outcome
+                tracing::info!(
+                    shutdown_on_wait,
+                    outcome = match &outcome {
+                        Ok(VcpuLoopOutcome::ProcessExit(_)) => "process-exit",
+                        Ok(VcpuLoopOutcome::ThreadDone) => "thread-done",
+                        Ok(_) => "other-ok",
+                        Err(_) => "error",
+                    },
+                    "HVPatch root launch wait returned"
+                );
+                let shutdown = shutdown_on_wait.then_some(PersistentPoolShutdown { directory });
+                (outcome, shutdown)
             }
         }
     }

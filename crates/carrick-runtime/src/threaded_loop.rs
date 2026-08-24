@@ -344,7 +344,7 @@ where
         host_for_factory.make_timer_delivery(Arc::clone(&kicker), main_tid),
     );
 
-    let outcome = crate::vcpu_loop::launch_persistent_hvpatch_job(
+    let (outcome, pool_shutdown) = crate::vcpu_loop::launch_persistent_hvpatch_job(
         Arc::clone(&kernel),
         engine,
         Arc::clone(&registry),
@@ -359,16 +359,28 @@ where
         carrick_hal::InGuestFlag::for_guest_thread(),
         max_traps,
     )
-    .wait();
+    .wait_deferring_pool_shutdown();
     // Process children are not Linux thread-group siblings of their creator.
     // The outer root run, which owns the shared HVPatch VM lifetime, joins the
     // global process topology after its own terminal loop even when that loop
     // reports an error, so no shared-VM execution owner is detached.
     let process_join = kernel.join_hvpatch_process_threads();
+    // The terminal OWNER can be a sibling thread that outlives the root main
+    // thread's job (main loses the exit_group claim and completes ThreadDone
+    // first). The owner still runs on the persistent pool, so its bounded
+    // publication wait MUST precede pool shutdown; closing first stranded the
+    // owner ("run queue is closed" wake rejections) and timed this call out as
+    // "HVPatch terminal owner did not complete teardown" on every fork-storm
+    // exit (reducer: `forkstackstorm`).
+    let terminal = kernel.take_process_terminal();
+    let pool_shutdown = match pool_shutdown {
+        Some(shutdown) => shutdown.shutdown(),
+        None => Ok(()),
+    };
     let outcome = outcome?;
     process_join?;
 
-    let result = match kernel.take_process_terminal()? {
+    let result = match terminal? {
         Some(Ok(result)) => result,
         Some(Err(())) => {
             return Err(RuntimeError::Unsupported(
@@ -394,6 +406,7 @@ where
             }
         },
     };
+    pool_shutdown?;
 
     Ok(result)
 }
