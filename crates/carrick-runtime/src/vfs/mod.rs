@@ -103,7 +103,7 @@ pub use proc::{
     SyntheticProcContext, SyntheticProcIdentity, SyntheticProcProcess, SyntheticProcThread,
     SyntheticProcZombie,
 };
-pub use resolvconf::ResolvConfVfs;
+pub use resolvconf::{HostResolverLaunchError, HostResolverSnapshot, ResolvConfVfs};
 pub use rootfs::RootFsVfs;
 pub use sys::SysVfs;
 
@@ -421,6 +421,14 @@ pub trait Vfs: Send + Sync {
 
     fn readdir(&self, _path: &str) -> Result<Vec<DirEnt>, VfsError> {
         Err(crate::linux_abi::LINUX_ENOTDIR)
+    }
+
+    /// Archive-only bounded enumeration. Implementations must stop after at
+    /// most `limit + 1` entries; the ordinary `readdir` contract remains
+    /// unchanged for guest getdents. Mounts that do not implement this
+    /// capability fail closed instead of falling back to unbounded allocation.
+    fn readdir_bounded(&self, _path: &str, _limit: usize) -> Result<Vec<DirEnt>, VfsError> {
+        Err(crate::linux_abi::LINUX_ENOSYS)
     }
 
     /// Open `path`. Returns a [`VfsHandle`] variant that the

@@ -139,7 +139,7 @@ use exec::{
 };
 
 use crate::trap::{HvfTrapEngine, TrapError};
-// `SyscallTrap`/`TrapError`/`ForkOutcome` live in the carrick-hal leaf crate
+// `SyscallTrap`/`TrapError` live in the carrick-hal leaf crate
 // and are re-exported through `carrick_vmm_hvf::trap` (re-exported here as
 // `crate::trap`). Re-export `SyscallTrap` from this module too so the original
 // `carrick_runtime::runtime::SyscallTrap` path (used by the runtime_loop tests
@@ -185,7 +185,7 @@ fn hardware_tso_for_debug_from_env(requested: bool, disable: Option<&str>) -> bo
 pub const DEFAULT_MAX_TRAPS: usize = usize::MAX;
 
 // `SyscallTrap` (the trap-engine contract the loops drive) moved into
-// carrick-vmm-hvf alongside `TrapError`/`ForkOutcome`/`HvfTrapEngine`. Re-exported
+// carrick-vmm-hvf alongside `TrapError`/`HvfTrapEngine`. Re-exported
 // from `crate::trap`; imported here via the `use crate::trap::{…}` below so
 // `SplitView`/`HvfTrapEngine` impls and the loop bounds are unchanged.
 
@@ -578,21 +578,6 @@ where
     )
 }
 
-/// Publish a detached container as owned by this carrier. The persisted schema
-/// still exposes both historical pid fields, so both temporarily name the
-/// carrier until that compatibility surface is migrated.
-fn publish_carrier_running() -> Option<String> {
-    let id = std::env::var("CARRICK_CONTAINER_ID").ok()?;
-    if let Ok(mut state) = crate::container::ContainerState::load(&id) {
-        let carrier_pid = std::process::id() as i32;
-        state.status = crate::container::ContainerStatus::Running;
-        state.supervisor_pid = carrier_pid;
-        state.init_pid = carrier_pid;
-        let _ = state.persist();
-    }
-    Some(id)
-}
-
 fn finalize_persistent_hvf_run<Destroy, Record, Publish>(
     mut run: Result<RunResult, RuntimeError>,
     destroy_vm: Destroy,
@@ -636,8 +621,9 @@ fn run_address_space_with_hvf_and_dispatcher(
     if crate::namespace::pid::requested() && !crate::namespace::pid::enabled() {
         let _ = crate::namespace::pid::init(std::process::id());
     }
-    let container_id = publish_carrier_running();
-    let run = (move || -> Result<RunResult, RuntimeError> {
+    let container_id = std::env::var("CARRICK_CONTAINER_ID").ok();
+    let mut exact_control_installed = false;
+    let run = (|| -> Result<RunResult, RuntimeError> {
         dispatcher.activate_file_authority().map_err(|error| {
             RuntimeError::Configuration(format!("activate per-run FileAuthority: {error}"))
         })?;
@@ -657,9 +643,9 @@ fn run_address_space_with_hvf_and_dispatcher(
         })?;
         let _ = stamp_identity_page(&mut trap, &dispatcher, &boot_context);
         drop(boot_context);
-        let run = run_threaded_hvf_loop(trap, dispatcher, max_traps);
-        finalize_persistent_hvf_run(
-            run,
+        let mut completion = run_threaded_hvf_loop(trap, dispatcher, max_traps);
+        let mut run = finalize_persistent_hvf_run(
+            completion.run,
             || crate::trap::destroy_persistent_vm_at_run_terminal().map_err(RuntimeError::from),
             crate::vm_lifecycle::record_process_terminal,
             |run| {
@@ -678,9 +664,25 @@ fn run_address_space_with_hvf_and_dispatcher(
                 }
                 Ok(())
             },
-        )
+        );
+        // Keep mutating control live through VM destruction, terminal receipt,
+        // and optional lifecycle-artifact publication.  Only then publish the
+        // exact externally visible status and release the endpoint.  Any error
+        // after control installation is fail-closed as 125.
+        if let Some(control) = completion.carrier_control.as_mut() {
+            exact_control_installed = true;
+            let exit_code = run.as_ref().map_or(125, |result| result.exit_code);
+            if let Err(error) = control.complete(exit_code)
+                && run.is_ok()
+            {
+                run = Err(RuntimeError::Configuration(format!(
+                    "publish carrier terminal state: {error}"
+                )));
+            }
+        }
+        run
     })();
-    if let Some(id) = container_id.as_deref() {
+    if !exact_control_installed && let Some(id) = container_id.as_deref() {
         let exit_code = run.as_ref().map_or(125, |result| result.exit_code);
         crate::container::mark_exited(id, exit_code);
     }
@@ -761,8 +763,8 @@ pub(crate) fn finish_and_run_image(
     max_traps: usize,
     debug_state_path: Option<&PathBuf>,
 ) -> Result<RunResult, RuntimeError> {
-    // Arm this (initial) process's deadlock watchdog; forked children re-arm in
-    // the ForkOutcome::Child path. No-op unless CARRICK_DEADLOCK_WATCHDOG_MS set.
+    // Arm the one carrier's deadlock watchdog. Logical fork children advance
+    // the same carrier-global counter; no host-child re-arm exists.
     crate::deadlock_watchdog::arm();
     // Per-ISA image bytes come from the engine's GuestArch (the x86_64 seam);
     // this file is the macOS/HVF path, so the engine is `HvfTrapEngine`.
@@ -837,7 +839,7 @@ where
     // it.
     let _termios_guard = crate::host_tty::TermiosRestoreGuard::new();
 
-    let mut this_tid = ThreadId::main_from_host_pid();
+    let this_tid = ThreadId::main_from_host_pid();
     // Per-thread blocking-I/O waiter (owns this thread's kqueue). Recreated in
     // a forked child below (kqueue is not inherited across fork).
     let mut waiter = crate::io_wait::ThreadWaiter::new(this_tid);
@@ -984,173 +986,13 @@ where
                 runtime.complete_syscall(value)?;
                 last_syscall_retval = Some(value);
             }
-            DispatchOutcome::Fork {
-                flags,
-                pidfd_out,
-                clone_parent,
-                parent_tid_addr,
-                child_tid_addr,
-                exit_signal,
-                child_stack: _,
-                vfork,
-            } => 'fork_arm: {
-                if let Some(reason) =
-                    crate::dispatch::SyscallDispatcher::host_fork_file_authority_rejection(
-                        &kernel_context,
-                        flags,
-                    )
-                {
-                    tracing::warn!(
-                        flags,
-                        reason,
-                        "single-thread host-fork file authority rejected clone"
-                    );
-                    let value = crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval();
-                    runtime.complete_syscall(value)?;
-                    last_syscall_retval = Some(value);
-                    break 'fork_arm;
-                }
-                // The single-threaded loop (run-elf) keeps the ordinary CoW fork
-                // even for a vfork clone: it has no sibling threads, and Go / the
-                // conformance gate exercise the THREADED loop
-                // (run_vcpu_until_exit / handle_fork) where the faithful vfork
-                // share-RAM + parent-suspend lives. A run-elf vfork therefore
-                // behaves as a plain fork — safe (same as before), just not the
-                // faithful CLONE_VM|CLONE_VFORK.
-                let _ = vfork;
-                // Pre-fork admission gate (see quiesce.rs handle_fork):
-                // persistent host VM exhaustion degrades to Linux-shaped
-                // fork(2) = EAGAIN with the parent VM untouched, instead of a
-                // post-fork rebuild fatal.
-                if let Err(error) = runtime.fork_admission_check() {
-                    tracing::warn!(
-                        %error,
-                        "fork admission gate: host VM capacity exhausted; fork(2) = EAGAIN"
-                    );
-                    let value = crate::linux_abi::LINUX_EAGAIN.guest_retval();
-                    runtime.complete_syscall(value)?;
-                    last_syscall_retval = Some(value);
-                    break 'fork_arm;
-                }
-                let child_parent = if clone_parent {
-                    dispatcher.clone_parent_host_pid()
-                } else {
-                    std::process::id()
-                };
-                let child_subreaper = dispatcher.subreaper_for_fork_child();
-                let child_ns_pid = crate::namespace::pid::allocate_child_ns_pid_pre_fork();
-                // Section exhaustion (a guest that forks children nobody ever
-                // reaps) is Linux-shaped EAGAIN from fork(2), not a guest
-                // abort (spec "Failure model").
-                let prepared_child_record = match crate::guest_cpu::prepare_child_record_pre_fork(
-                    child_parent,
-                    child_subreaper,
-                    child_ns_pid.unwrap_or(0),
-                    clone_parent && child_parent != 0,
-                    0,
-                ) {
-                    Ok(r) => r,
-                    Err(_exhausted) => {
-                        let value = crate::linux_abi::LINUX_EAGAIN.guest_retval();
-                        runtime.complete_syscall(value)?;
-                        last_syscall_retval = Some(value);
-                        // Fall through to the loop's pending-signal delivery
-                        // exactly like any other completed syscall.
-                        break 'fork_arm;
-                    }
-                };
-                let outcome = match runtime.fork() {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        crate::guest_cpu::abort_prepared_child_record();
-                        return Err(RuntimeError::Trap(error));
-                    }
-                };
-                let retval: i64 = match outcome {
-                    crate::trap::ForkOutcome::Parent { child_pid } => {
-                        crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
-                        // By REF (see quiesce.rs): the single-threaded loop has
-                        // no sibling forkers today, but the stash contract is
-                        // "child channel only" everywhere.
-                        crate::guest_cpu::publish_prepared_child_record_parent_ref(
-                            prepared_child_record,
-                            child_pid as u32,
-                        );
-                        crate::namespace::pid::notify_child_registered();
-                        // Watch the child's exit (EVFILT_PROC/NOTE_EXIT) so the
-                        // signal pump delivers the requested exit signal to this
-                        // (parent) tid when it exits — without a host SIGCHLD
-                        // handler, which would break wait4's host-waitpid reap.
-                        crate::host_signal::register_child_exit_watch(
-                            child_pid,
-                            this_tid.raw(),
-                            i32::try_from(exit_signal).unwrap_or(crate::linux_abi::LINUX_SIGCHLD),
-                        );
-                        // CLONE_PIDFD: hand the parent a pidfd for the new child.
-                        if let Some(addr) = pidfd_out {
-                            let fd = dispatcher
-                                .install_child_pidfd(&kernel_context, child_pid)
-                                .unwrap_or(-1);
-                            let _ = runtime.write_bytes(addr, &fd.to_le_bytes());
-                        }
-                        // PID namespace: the child's ns-pid was allocated and
-                        // stored in its prepared record before fork. Identity
-                        // when namespaces are off.
-                        let retval = i64::from(child_ns_pid.unwrap_or(child_pid as u32));
-                        if let Some(addr) = parent_tid_addr {
-                            let tid = (retval as i32).to_le_bytes();
-                            let _ = runtime.write_bytes(addr, &tid);
-                        }
-                        retval
-                    }
-                    crate::trap::ForkOutcome::Child => {
-                        dispatcher.clear_output_buffers();
-                        // The forked child only keeps the forking thread, so its
-                        // inherited event-ring watchdog is dead — reset the ring +
-                        // re-arm it for the child (before any child rec()).
-                        crate::event_ring::reinit_after_fork();
-                        // kqueue is NOT inherited across fork, and the inherited
-                        // self-pipe is shared with the parent — give the child
-                        // fresh ones so its parked-thread wakes are its own.
-                        crate::host_signal::reinit_after_fork();
-                        crate::dispatch::reset_fifo_beacons_after_fork_child();
-                        dispatcher.epoll_after_fork_child(&kernel_context);
-                        // Threads don't survive fork: re-arm the child's deadlock
-                        // watchdog (shares the tree-global progress counter).
-                        crate::deadlock_watchdog::arm();
-                        crate::guest_cpu::complete_child_record_post_fork_child();
-                        dispatcher.proc_after_fork_child();
-                        let child_context = dispatcher
-                            .reset_one_task_kernel_binding_for_current_process(
-                                &kernel_context,
-                                ThreadId::main_from_host_pid(),
-                            )
-                            .unwrap_or_else(|error| {
-                                tracing::error!(%error, "rebind single-thread fork-child Kernel authority");
-                                std::process::abort();
-                            });
-                        // Re-stamp from the exact child generation published above.
-                        let _ = stamp_identity_page(runtime, &dispatcher, &child_context);
-                        if let Some(addr) = parent_tid_addr {
-                            let tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
-                            let _ = runtime.write_bytes(addr, &tid);
-                        }
-                        if let Some(addr) = child_tid_addr {
-                            let tid = (crate::namespace::pid::self_ns_pid() as i32).to_le_bytes();
-                            let _ = runtime.write_bytes(addr, &tid);
-                        }
-                        dispatcher.mem_after_fork_child();
-                        dispatcher.sysv_after_fork_child();
-                        // The child's pid changed; its waiter watches for
-                        // process-directed signals immediately, then upgrades
-                        // to a per-thread kqueue only if it parks.
-                        this_tid = ThreadId::main_from_host_pid();
-                        waiter = crate::io_wait::ThreadWaiter::process_only(this_tid);
-                        0
-                    }
-                };
-                runtime.complete_syscall(retval)?;
-                last_syscall_retval = Some(retval);
+            DispatchOutcome::Fork { .. } => {
+                // This loop is retained only as a deterministic syscall/memory
+                // fixture. Product execution uses the unified kernel loop, where
+                // fork/vfork clone logical tasks and never create a host process.
+                let value = crate::linux_abi::LINUX_EOPNOTSUPP.guest_retval();
+                runtime.complete_syscall(value)?;
+                last_syscall_retval = Some(value);
             }
             DispatchOutcome::Execve { path, argv, env } => {
                 crate::probes::execve_argv(&path, &argv);
@@ -1938,16 +1780,6 @@ impl crate::threaded_loop::HostBackend for HvfHostBackend {
 
     fn pre_loop_setup(&self) -> Box<dyn std::any::Any> {
         crate::host_signal::install_default_handlers();
-        // The root process is the atomic-permit supervisor: one EVFILT_PROC
-        // kqueue that frees the generation-stamped slots of any owner that dies
-        // hard (SIGKILL/segfault/missed cooperative cleanup), recreating flock's
-        // kernel-backed reclaim. Runs by default (the atomic permit is the
-        // default admission path); skipped only when the flock fallback is
-        // selected via CARRICK_HVF_ATOMIC_PERMIT=0.
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if crate::trap::atomic_permit_enabled() {
-            crate::trap::start_vcpu_permit_reaper();
-        }
         Box::new(crate::host_tty::TermiosRestoreGuard::new())
     }
 
@@ -1967,7 +1799,7 @@ fn run_threaded_hvf_loop(
     trap: HvfTrapEngine,
     dispatcher: SyscallDispatcher,
     max_traps: usize,
-) -> Result<RunResult, RuntimeError> {
+) -> crate::threaded_loop::ThreadedLoopCompletion {
     crate::threaded_loop::run_threaded_loop(trap, dispatcher, HvfHostBackend, max_traps)
 }
 
@@ -2398,14 +2230,6 @@ impl<M: GuestMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
         self.trap.complete_syscall(return_value)
     }
-    fn fork(&mut self) -> Result<crate::trap::ForkOutcome, TrapError> {
-        self.trap.fork()
-    }
-    fn fork_admission_check(&self) -> Result<(), TrapError> {
-        // Forward explicitly: the trait DEFAULT (Ok) would otherwise shadow the
-        // wrapped engine's pre-fork exhaustion gate.
-        self.trap.fork_admission_check()
-    }
     fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
         self.trap.execve_into(new_image)
     }
@@ -2509,21 +2333,15 @@ mod tests {
         }
 
         let expected: BTreeMap<&str, [usize; 3]> = BTreeMap::from([
-            ("apfs.rs", [0, 0, 1]),
-            ("deadlock_watchdog.rs", [0, 0, 1]),
             ("dispatch/ioring.rs", [1, 0, 0]),
             ("dispatch/mem/tests.rs", [5, 0, 0]),
-            ("dispatch/signal.rs", [0, 0, 3]),
             ("dispatch/sysv.rs", [1, 0, 0]),
             ("dispatch/tests.rs", [3, 0, 0]),
             ("exec_stamps.rs", [1, 0, 0]),
-            ("fs_backend.rs", [1, 1, 1]),
-            ("interactive_supervisor.rs", [3, 0, 0]),
+            ("fs_backend.rs", [1, 0, 0]),
             ("network/socket_namespace.rs", [7, 0, 0]),
             ("run_state.rs", [1, 0, 0]),
-            ("vcpu_loop/signal.rs", [2, 0, 0]),
-            ("vfs/proc.rs", [1, 0, 0]),
-            ("vfs/resolvconf.rs", [0, 0, 1]),
+            ("vcpu_loop/signal.rs", [1, 0, 0]),
         ]);
         let patterns = [
             ["unsafe { libc::", "fork()"].concat(),

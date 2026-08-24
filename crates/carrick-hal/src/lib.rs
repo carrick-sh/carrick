@@ -1,7 +1,7 @@
 //! `carrick-hal` — the carrick Hardware Abstraction Layer.
 //!
 //! Traits-only leaf crate: zero OS / hypervisor dependencies. Holds the
-//! runtime↔engine contract (`SyscallTrap`, `TrapError`, `ForkOutcome`),
+//! runtime↔engine contract (`SyscallTrap`, `TrapError`),
 //! the raw hypervisor traits (`HvVm`/`HvVcpu`/`VcpuExit`), the host-primitive
 //! traits (`EventMultiplexer`, `CrossProcessFutex`),
 //! errno translation, and shared types (`OsError`, `MemPerms`, `Reg`, `SysReg`).
@@ -17,7 +17,7 @@ pub use error::{MemPerms, OsError, Reg, SysReg};
 pub mod stage1_exclusive;
 
 pub mod trap;
-pub use trap::{ExecInventoryCommits, ForkOutcome, RawSyscall, SyscallTrap, TrapError};
+pub use trap::{ExecInventoryCommits, RawSyscall, SyscallTrap, TrapError};
 pub mod vm_backend;
 pub use vm_backend::{ForkRamStrategy, GuestVmBackend};
 pub mod hypervisor;

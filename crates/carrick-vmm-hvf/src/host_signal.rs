@@ -436,7 +436,10 @@ pub fn register_child_exit_watch(child_pid: i32, parent_tid: i32, exit_signal: i
         if let Err(errno) = result {
             handle_child_exit_watch_arm_error(child_pid, errno);
         } else {
-            publish_child_exit_if_waitable(child_pid);
+            #[cfg(test)]
+            {
+                publish_child_exit_if_waitable(child_pid);
+            }
         }
     }
 }
@@ -460,7 +463,10 @@ pub fn rearm_child_watches(kq: i32) {
         if let Err(errno) = result {
             handle_child_exit_watch_arm_error(pid, errno);
         } else {
-            publish_child_exit_if_waitable(pid);
+            #[cfg(test)]
+            {
+                publish_child_exit_if_waitable(pid);
+            }
         }
     }
 }
@@ -482,6 +488,7 @@ fn publish_child_exit_signal(child_pid: i32) -> bool {
     }
 }
 
+#[cfg(test)]
 fn publish_child_exit_if_waitable(child_pid: i32) -> bool {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let rc = unsafe {
@@ -1034,11 +1041,11 @@ pub fn is_xsig_nudge(host_signum: i32) -> bool {
     host_signum == XSIG_NUDGE_HOST_SIGNUM
 }
 
-/// Nudge `target_host_pid` to drain its xsignal entries (host SIGINFO).
-pub fn xsig_nudge(target_host_pid: i32) {
-    unsafe {
-        libc::kill(target_host_pid, XSIG_NUDGE_HOST_SIGNUM);
-    }
+/// Nudge this carrier to drain its xsignal entries. Guest tasks do not name
+/// host processes, so the historical host-pid argument is deliberately ignored.
+pub fn xsig_nudge(_target_host_pid: i32) {
+    carrick_signal_core::xsig::mark_xsig_dirty();
+    notify_pending();
 }
 
 /// The xsignal nudge handler: a guest process queued a SIGCHLD/RT for us. Just

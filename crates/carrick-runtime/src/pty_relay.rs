@@ -53,6 +53,7 @@
 //! at the same time — not a width mis-detection. See the
 //! `interactive_onlcr_race` project note.
 
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io;
 use std::os::unix::io::RawFd;
@@ -230,13 +231,10 @@ impl Drop for SigwinchInstallGuard {
         unsafe {
             libc::sigaction(libc::SIGWINCH, &self.old, core::ptr::null_mut());
         }
-        // SAFETY: both fds are owned by the guard until committed; on the
-        // rollback path the relay thread never spawned, so relay_loop never
-        // closed winch_r — closing both here is correct (no double-close).
-        unsafe {
-            libc::close(self.winch_r);
-            libc::close(self.winch_w);
-        }
+        // Keep both published pipe descriptors alive for process lifetime. A
+        // handler may already have loaded `winch_w` before the disarm above;
+        // closing it would let that in-flight handler write to a reused fd.
+        retire_published_winch_pipe(self.winch_r, self.winch_w);
     }
 }
 
@@ -277,14 +275,20 @@ impl PtyRelay {
         real_out: RawFd,
         winsize_r: RawFd,
     ) -> io::Result<Self> {
-        crate::host_tty::make_raw(real_in)?;
+        if let Err(error) = crate::host_tty::make_raw(real_in) {
+            close_pair(&pair);
+            return Err(error);
+        }
 
         // ── SIGWINCH self-pipe ───────────────────────────────────────────────
         // Create a non-blocking pipe: handler writes, relay loop reads.
         let mut wp = [0i32; 2];
         // SAFETY: wp is a 2-int array for pipe(2).
         if unsafe { libc::pipe(wp.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            crate::host_tty::restore_stdin_termios();
+            close_pair(&pair);
+            return Err(error);
         }
         let (winch_r, winch_w) = (wp[0], wp[1]);
         // Make the write end non-blocking so the handler's write never blocks
@@ -319,6 +323,8 @@ impl PtyRelay {
                 let e = io::Error::last_os_error();
                 libc::close(winch_r);
                 libc::close(winch_w);
+                crate::host_tty::restore_stdin_termios();
+                close_pair(&pair);
                 return Err(e); // nothing published yet; clean
             }
             old
@@ -342,7 +348,13 @@ impl PtyRelay {
         // `?` here drops `guard` on Err → full rollback (disarm global, restore
         // disposition, close both winch fds). The relay thread never spawned on
         // that path, so relay_loop never closed winch_r — no double-close.
-        let mut relay = Self::start_inner(pair, real_in, real_out, winch_r, winsize_r)?;
+        let mut relay = match Self::start_inner(pair, real_in, real_out, winch_r, winsize_r) {
+            Ok(relay) => relay,
+            Err(error) => {
+                crate::host_tty::restore_stdin_termios();
+                return Err(error);
+            }
+        };
         relay.raw_active = true;
         relay.winch_r = winch_r;
         relay.winch_w = winch_w;
@@ -375,7 +387,13 @@ impl PtyRelay {
         let mut sp = [0i32; 2];
         // SAFETY: sp is a 2-int array for pipe(2).
         if unsafe { libc::pipe(sp.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            close_pair(&pair);
+            if winsize_r >= 0 {
+                // SAFETY: ownership was transferred with this setup attempt.
+                unsafe { libc::close(winsize_r) };
+            }
+            return Err(error);
         }
         let (shutdown_r, shutdown_w) = (sp[0], sp[1]);
         let master = pair.master_fd;
@@ -435,6 +453,7 @@ impl PtyRelay {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        drain_pending_master(self.pair.master_fd, self.real_out_for_close);
 
         // Restore SIGWINCH disposition AFTER the thread has exited so the
         // handler can't fire concurrently with the restore.
@@ -450,6 +469,7 @@ impl PtyRelay {
             crate::host_tty::restore_stdin_termios();
             let _ = self.real_in_for_restore;
         }
+        retire_published_winch_pipe(self.winch_r, self.winch_w);
 
         // SAFETY: these fds are owned by this relay and no longer in use after
         // the thread has joined.
@@ -457,11 +477,8 @@ impl PtyRelay {
             libc::close(self.shutdown_w);
             libc::close(self.pair.master_fd);
             libc::close(self.pair.slave_fd);
-            // winch_r is closed by relay_loop (same pattern as shutdown_r).
-            // Close winch_w if it was opened (production path).
-            if self.winch_w >= 0 {
-                libc::close(self.winch_w);
-            }
+            // Published winch pipe endpoints intentionally remain open until
+            // process exit to exclude async-handler fd reuse.
             if self.real_in_for_restore >= 0 {
                 libc::close(self.real_in_for_restore);
             }
@@ -470,6 +487,52 @@ impl PtyRelay {
             }
         }
     }
+}
+
+fn close_pair(pair: &PtyPair) {
+    // SAFETY: callers invoke this only on setup paths that have not published
+    // either descriptor to a live PtyRelay.
+    unsafe {
+        libc::close(pair.master_fd);
+        libc::close(pair.slave_fd);
+    }
+}
+
+fn retire_published_winch_pipe(read_fd: RawFd, write_fd: RawFd) {
+    // Deliberately leak the two raw descriptors until process exit. This is at
+    // most one pair in a carrier and prevents an in-flight async handler that
+    // already loaded `write_fd` from corrupting a subsequently reused fd.
+    let _ = (read_fd, write_fd);
+}
+
+fn drain_pending_master(master: RawFd, real_out: RawFd) {
+    // The production pty master is deliberately blocking while the relay is
+    // live.  Once that relay has joined, however, a blocking read here would
+    // wait forever when the guest left no final output.  Borrow O_NONBLOCK for
+    // the bounded drain and restore the descriptor's original status flags.
+    // SAFETY: master remains owned and open until PtyRelay::stop closes it.
+    let original_flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+    if original_flags < 0 {
+        return;
+    }
+    // SAFETY: F_SETFL only changes the status flags of this live descriptor.
+    if unsafe { libc::fcntl(master, libc::F_SETFL, original_flags | libc::O_NONBLOCK) } < 0 {
+        return;
+    }
+    let mut buffer = [0_u8; 4096];
+    loop {
+        // SAFETY: buffer is valid writable storage and master is open.
+        let read = unsafe { libc::read(master, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if read <= 0 {
+            break;
+        }
+        if write_all_fd(real_out, &buffer[..read as usize]).is_none() {
+            break;
+        }
+    }
+    // SAFETY: restore the exact flags observed before the drain. Failure is
+    // harmless because the descriptor is closed immediately after this call.
+    let _ = unsafe { libc::fcntl(master, libc::F_SETFL, original_flags) };
 }
 
 /// Core poll loop: bridges real_in ↔ master and terminates on shutdown signal.
@@ -513,6 +576,7 @@ fn relay_loop(
     const IDX_SHUTDOWN: usize = 2;
     const IDX_WINCH: usize = 3;
     const IDX_WINSIZE: usize = 4;
+    const IDX_REAL_OUT: usize = 5;
 
     // If winch_r == -1, set events = 0 so poll never wakes for it.
     let winch_events = if winch_r >= 0 { libc::POLLIN } else { 0 };
@@ -543,8 +607,15 @@ fn relay_loop(
             events: winsize_events,
             revents: 0,
         },
+        libc::pollfd {
+            fd: real_out,
+            events: 0,
+            revents: 0,
+        },
     ];
     let mut buf = [0u8; 4096];
+    let mut line_discipline = RelayLineDiscipline::default();
+    let mut pending_echo = VecDeque::new();
     // Track the last window size we propagated. SIGWINCH delivery is unreliable
     // in carrick's HVF context (the handler often never fires — HVF masks
     // signals on the vCPU threads), so we ALSO poll on a timeout and detect
@@ -560,6 +631,11 @@ fn relay_loop(
     // 250ms to check for resizes; the test path (-1) blocks indefinitely.
     let poll_timeout = if winch_r >= 0 { 250 } else { -1 };
     loop {
+        fds[IDX_REAL_OUT].events = if pending_echo.is_empty() {
+            0
+        } else {
+            libc::POLLOUT
+        };
         // SAFETY: fds is a valid pollfd array.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, poll_timeout) };
         if n < 0 {
@@ -590,6 +666,7 @@ fn relay_loop(
             while let Some(ws) = read_winsize_message(winsize_r) {
                 apply_winsize(winsize_target, &ws);
                 last_ws = Some(ws);
+                crate::kernel::tty::route_foreground_signal(crate::linux_abi::LINUX_SIGWINCH);
             }
         }
         // Robust resize handling: on every wakeup (data, timeout, or SIGWINCH)
@@ -603,6 +680,7 @@ fn relay_loop(
             if changed {
                 apply_winsize(winsize_target, &cur);
                 last_ws = Some(cur);
+                crate::kernel::tty::route_foreground_signal(crate::linux_abi::LINUX_SIGWINCH);
             }
         }
         // real_in readable → copy to master.
@@ -610,7 +688,13 @@ fn relay_loop(
             match read_fd(real_in, &mut buf) {
                 Some(0) | None => break,
                 Some(k) => {
-                    if write_all_fd(master, &buf[..k]).is_none() {
+                    if !forward_input_bytes(
+                        &buf[..k],
+                        &mut line_discipline,
+                        winsize_target,
+                        master,
+                        &mut pending_echo,
+                    ) {
                         break;
                     }
                 }
@@ -627,16 +711,125 @@ fn relay_loop(
                 }
             }
         }
+        if fds[IDX_REAL_OUT].revents & libc::POLLOUT != 0 {
+            flush_pending_echo(real_out, &mut pending_echo);
+        }
     }
     // SAFETY: shutdown_r is the relay-local read end of the shutdown pipe;
     // it is not visible to the caller and safe to close here.
     unsafe { libc::close(shutdown_r) };
-    // Close winch_r if one was provided (production path).
-    if winch_r >= 0 {
-        unsafe { libc::close(winch_r) };
-    }
+    // Published SIGWINCH pipe endpoints remain open for process lifetime: an
+    // in-flight handler may have loaded the write fd before teardown disarmed
+    // the global, so closing either endpoint would permit fd-reuse corruption.
+    let _ = winch_r;
     if winsize_r >= 0 {
         unsafe { libc::close(winsize_r) };
+    }
+}
+
+fn forward_input_bytes(
+    bytes: &[u8],
+    line_discipline: &mut RelayLineDiscipline,
+    slave_fd: RawFd,
+    master_fd: RawFd,
+    pending_echo: &mut VecDeque<u8>,
+) -> bool {
+    for byte in bytes {
+        let forwarded =
+            line_discipline.route_control_input(std::slice::from_ref(byte), slave_fd, pending_echo);
+        if !forwarded.is_empty() && write_all_fd(master_fd, &forwarded).is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+#[derive(Default)]
+struct RelayLineDiscipline {
+    literal_next: bool,
+}
+
+impl RelayLineDiscipline {
+    fn route_control_input(
+        &mut self,
+        bytes: &[u8],
+        slave_fd: RawFd,
+        pending_echo: &mut VecDeque<u8>,
+    ) -> Vec<u8> {
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(slave_fd, &mut termios) } != 0
+            || termios.c_lflag & libc::ISIG == 0
+        {
+            return bytes.to_vec();
+        }
+        let controls = [
+            (termios.c_cc[libc::VINTR], crate::linux_abi::LINUX_SIGINT),
+            (termios.c_cc[libc::VQUIT], crate::linux_abi::LINUX_SIGQUIT),
+            (termios.c_cc[libc::VSUSP], crate::linux_abi::LINUX_SIGTSTP),
+        ];
+        let mut forwarded = Vec::with_capacity(bytes.len());
+        for byte in bytes {
+            if self.literal_next {
+                forwarded.push(*byte);
+                self.literal_next = false;
+                continue;
+            }
+            if termios.c_lflag & (libc::ICANON | libc::IEXTEN) == (libc::ICANON | libc::IEXTEN)
+                && termios.c_cc[libc::VLNEXT] != 0xff
+                && *byte == termios.c_cc[libc::VLNEXT]
+            {
+                // Preserve VLNEXT itself so the host line discipline quotes
+                // the following byte; suppress only Carrick's parallel signal
+                // recognition for that following byte.
+                forwarded.push(*byte);
+                self.literal_next = true;
+                continue;
+            }
+            if let Some((_, signal)) = controls
+                .iter()
+                .find(|(control, _)| *control != 0xff && byte == control)
+            {
+                if termios.c_lflag & libc::NOFLSH == 0 {
+                    forwarded.clear();
+                    unsafe {
+                        libc::tcflush(slave_fd, libc::TCIOFLUSH);
+                    }
+                }
+                pending_echo.extend(signal_control_echo(&termios, *byte));
+                crate::kernel::tty::route_foreground_signal(*signal);
+            } else {
+                forwarded.push(*byte);
+            }
+        }
+        forwarded
+    }
+}
+
+#[cfg(test)]
+fn route_control_input(bytes: &[u8], slave_fd: RawFd) -> Vec<u8> {
+    RelayLineDiscipline::default().route_control_input(bytes, slave_fd, &mut VecDeque::new())
+}
+
+fn signal_control_echo(termios: &libc::termios, byte: u8) -> Vec<u8> {
+    if termios.c_lflag & libc::ECHO == 0 {
+        return Vec::new();
+    }
+    if termios.c_lflag & libc::ECHOCTL != 0 && (byte < 0x20 || byte == 0x7f) {
+        vec![b'^', if byte == 0x7f { b'?' } else { byte + b'@' }]
+    } else {
+        vec![byte]
+    }
+}
+
+fn flush_pending_echo(real_out: RawFd, pending: &mut VecDeque<u8>) {
+    let (front, _) = pending.as_slices();
+    let chunk = &front[..front.len().min(64)];
+    if chunk.is_empty() {
+        return;
+    }
+    let written = unsafe { libc::write(real_out, chunk.as_ptr().cast(), chunk.len()) };
+    if written > 0 {
+        pending.drain(..written as usize);
     }
 }
 
@@ -704,6 +897,270 @@ mod tests {
             libc::close(pty.master_fd);
             libc::close(pty.slave_fd);
         }
+    }
+
+    #[test]
+    fn signal_control_bytes_are_consumed_before_host_pty_transport() {
+        let pty = PtyPair::allocate().expect("allocate pty");
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(pty.slave_fd, &mut termios) }, 0);
+        termios.c_lflag |= libc::ISIG | libc::NOFLSH;
+        termios.c_cc[libc::VINTR] = 3;
+        assert_eq!(
+            unsafe { libc::tcsetattr(pty.slave_fd, libc::TCSANOW, &termios) },
+            0
+        );
+        assert_eq!(route_control_input(&[b'a', 3, b'b'], pty.slave_fd), b"ab");
+        unsafe {
+            libc::close(pty.master_fd);
+            libc::close(pty.slave_fd);
+        }
+    }
+
+    #[test]
+    fn vlnext_quotes_a_signal_control_byte() {
+        let pty = PtyPair::allocate().expect("allocate pty");
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(pty.slave_fd, &mut termios) }, 0);
+        termios.c_lflag |= libc::ISIG | libc::IEXTEN;
+        termios.c_cc[libc::VINTR] = 3;
+        termios.c_cc[libc::VLNEXT] = 22;
+        assert_eq!(
+            unsafe { libc::tcsetattr(pty.slave_fd, libc::TCSANOW, &termios) },
+            0
+        );
+
+        assert_eq!(route_control_input(&[22, 3], pty.slave_fd), [22, 3]);
+        unsafe {
+            libc::close(pty.master_fd);
+            libc::close(pty.slave_fd);
+        }
+    }
+
+    #[test]
+    fn vlnext_delivers_literal_signal_byte_through_host_line_discipline() {
+        let pty = PtyPair::allocate().expect("allocate pty");
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(pty.slave_fd, &mut termios) }, 0);
+        termios.c_lflag |= libc::ISIG | libc::IEXTEN | libc::ICANON;
+        termios.c_lflag &= !libc::ECHO;
+        termios.c_cc[libc::VINTR] = 3;
+        termios.c_cc[libc::VLNEXT] = 22;
+        assert_eq!(
+            unsafe { libc::tcsetattr(pty.slave_fd, libc::TCSANOW, &termios) },
+            0
+        );
+
+        let forwarded = route_control_input(&[22, 3, b'\n'], pty.slave_fd);
+        assert_eq!(
+            unsafe { libc::write(pty.master_fd, forwarded.as_ptr().cast(), forwarded.len()) },
+            forwarded.len() as isize
+        );
+        let mut pollfd = libc::pollfd {
+            fd: pty.slave_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 100) }, 1);
+        let mut received = [0_u8; 2];
+        assert_eq!(
+            unsafe { libc::read(pty.slave_fd, received.as_mut_ptr().cast(), received.len()) },
+            2
+        );
+        assert_eq!(received, [3, b'\n']);
+        unsafe {
+            libc::close(pty.master_fd);
+            libc::close(pty.slave_fd);
+        }
+    }
+
+    #[test]
+    fn vlnext_quote_state_survives_relay_read_boundaries() {
+        let pty = PtyPair::allocate().expect("allocate pty");
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(pty.slave_fd, &mut termios) }, 0);
+        termios.c_lflag |= libc::ISIG | libc::IEXTEN;
+        termios.c_cc[libc::VINTR] = 3;
+        termios.c_cc[libc::VLNEXT] = 22;
+        assert_eq!(
+            unsafe { libc::tcsetattr(pty.slave_fd, libc::TCSANOW, &termios) },
+            0
+        );
+
+        let mut line_discipline = RelayLineDiscipline::default();
+        let mut pending_echo = VecDeque::new();
+        assert_eq!(
+            line_discipline.route_control_input(&[22], pty.slave_fd, &mut pending_echo),
+            [22]
+        );
+        assert_eq!(
+            line_discipline.route_control_input(&[3], pty.slave_fd, &mut pending_echo),
+            [3]
+        );
+        unsafe {
+            libc::close(pty.master_fd);
+            libc::close(pty.slave_fd);
+        }
+    }
+
+    #[test]
+    fn noflsh_preserves_pre_signal_input_otherwise_signal_flushes_it() {
+        let pty = PtyPair::allocate().expect("allocate pty");
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(pty.slave_fd, &mut termios) }, 0);
+        termios.c_lflag |= libc::ISIG;
+        termios.c_lflag &= !libc::NOFLSH;
+        termios.c_cc[libc::VINTR] = 3;
+        assert_eq!(
+            unsafe { libc::tcsetattr(pty.slave_fd, libc::TCSANOW, &termios) },
+            0
+        );
+        assert_eq!(
+            route_control_input(b"before\x03after", pty.slave_fd),
+            b"after"
+        );
+
+        termios.c_lflag |= libc::NOFLSH;
+        assert_eq!(
+            unsafe { libc::tcsetattr(pty.slave_fd, libc::TCSANOW, &termios) },
+            0
+        );
+        assert_eq!(
+            route_control_input(b"before\x03after", pty.slave_fd),
+            b"beforeafter"
+        );
+        unsafe {
+            libc::close(pty.master_fd);
+            libc::close(pty.slave_fd);
+        }
+    }
+
+    #[test]
+    fn incremental_signal_order_matches_host_input_queue_flush() {
+        for (noflsh, expected) in [(false, &b"after\n"[..]), (true, &b"beforeafter\n"[..])] {
+            let pty = PtyPair::allocate().expect("allocate pty");
+            let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(pty.slave_fd, &mut termios) }, 0);
+            termios.c_lflag |= libc::ISIG | libc::ICANON;
+            termios.c_lflag &= !libc::ECHO;
+            if noflsh {
+                termios.c_lflag |= libc::NOFLSH;
+            } else {
+                termios.c_lflag &= !libc::NOFLSH;
+            }
+            termios.c_cc[libc::VINTR] = 3;
+            assert_eq!(
+                unsafe { libc::tcsetattr(pty.slave_fd, libc::TCSANOW, &termios) },
+                0
+            );
+            let mut line_discipline = RelayLineDiscipline::default();
+            let mut pending_echo = VecDeque::new();
+            assert!(forward_input_bytes(
+                b"before\x03after\n",
+                &mut line_discipline,
+                pty.slave_fd,
+                pty.master_fd,
+                &mut pending_echo,
+            ));
+            let mut pollfd = libc::pollfd {
+                fd: pty.slave_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 100) }, 1);
+            let mut received = [0_u8; 32];
+            let count =
+                unsafe { libc::read(pty.slave_fd, received.as_mut_ptr().cast(), received.len()) };
+            assert_eq!(&received[..count as usize], expected);
+            unsafe {
+                libc::close(pty.master_fd);
+                libc::close(pty.slave_fd);
+            }
+        }
+    }
+
+    #[test]
+    fn isig_control_echoes_caret_notation_when_echoctl_is_enabled() {
+        let pty = PtyPair::allocate().expect("allocate pty");
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(pty.slave_fd, &mut termios) }, 0);
+        termios.c_lflag |= libc::ISIG | libc::ECHO | libc::ECHOCTL;
+        termios.c_cc[libc::VINTR] = 3;
+        assert_eq!(
+            unsafe { libc::tcsetattr(pty.slave_fd, libc::TCSANOW, &termios) },
+            0
+        );
+
+        let mut pending_echo = VecDeque::new();
+        assert!(
+            RelayLineDiscipline::default()
+                .route_control_input(&[3], pty.slave_fd, &mut pending_echo)
+                .is_empty()
+        );
+        assert_eq!(pending_echo.into_iter().collect::<Vec<_>>(), b"^C");
+        unsafe {
+            libc::close(pty.master_fd);
+            libc::close(pty.slave_fd);
+        }
+    }
+
+    #[test]
+    fn signal_echo_queues_without_blocking_on_a_saturated_pty() {
+        let pty = PtyPair::allocate().expect("allocate pty");
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(pty.slave_fd, &mut termios) }, 0);
+        termios.c_lflag |= libc::ISIG | libc::NOFLSH | libc::ECHO | libc::ECHOCTL;
+        termios.c_cc[libc::VINTR] = 3;
+        assert_eq!(
+            unsafe { libc::tcsetattr(pty.slave_fd, libc::TCSANOW, &termios) },
+            0
+        );
+        let flags = unsafe { libc::fcntl(pty.slave_fd, libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_eq!(
+            unsafe { libc::fcntl(pty.slave_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let fill = [b'x'; 4096];
+        while unsafe { libc::write(pty.slave_fd, fill.as_ptr().cast(), fill.len()) } > 0 {}
+        assert_eq!(
+            unsafe { libc::fcntl(pty.slave_fd, libc::F_SETFL, flags) },
+            0
+        );
+
+        let mut pending_echo = VecDeque::new();
+        assert!(
+            RelayLineDiscipline::default()
+                .route_control_input(&[3], pty.slave_fd, &mut pending_echo)
+                .is_empty()
+        );
+        assert_eq!(pending_echo.into_iter().collect::<Vec<_>>(), b"^C");
+        unsafe {
+            libc::close(pty.master_fd);
+            libc::close(pty.slave_fd);
+        }
+    }
+
+    #[test]
+    fn retired_sigwinch_pipe_cannot_be_reused_by_an_inflight_handler() {
+        let mut pipe = [0_i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        retire_published_winch_pipe(pipe[0], pipe[1]);
+        assert_ne!(unsafe { libc::fcntl(pipe[0], libc::F_GETFD) }, -1);
+        assert_ne!(unsafe { libc::fcntl(pipe[1], libc::F_GETFD) }, -1);
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+    }
+
+    #[test]
+    fn stop_with_no_pending_master_output_returns() {
+        let (real_app, real_term) = socketpair();
+        let relay = PtyRelay::start_for_test(real_term, real_term).expect("start relay");
+        relay.stop();
+        // SAFETY: the peer is not owned by the relay.
+        unsafe { libc::close(real_app) };
     }
 
     /// Verify that the relay copies bytes in both directions and that stop()

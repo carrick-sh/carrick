@@ -1573,6 +1573,16 @@ impl SyscallDispatcher {
             })
     }
 
+    fn fd_is_controlling_tty(&self, fd: i32) -> bool {
+        let controlling = self.pty_table().lock().controlling();
+        match self.pty_info(fd) {
+            Some((role, _)) => controlling == Some(role.index),
+            None => {
+                controlling.is_some() && matches!(self.tty_ioctl_fd_kind(fd), Ok(TtyFdKind::Stdio))
+            }
+        }
+    }
+
     pub(super) fn fd_is_valid(&self, fd: i32) -> bool {
         (is_stdio_fd(fd) && !self.stdio_is_closed(fd)) || self.fd_table_contains(fd)
     }
@@ -8034,6 +8044,26 @@ impl SyscallDispatcher {
             if this.fd_is_o_path(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
+            let changes_tty_state = matches!(
+                ioctl_request,
+                LINUX_TCSETS
+                    | LINUX_TCSETSW
+                    | LINUX_TCSETSF
+                    | LINUX_TCSETS2
+                    | LINUX_TCSETSW2
+                    | LINUX_TCSETSF2
+                    | LINUX_TIOCSPGRP
+                    | LINUX_TIOCSCTTY
+                    | LINUX_TIOCNOTTY
+                    | LINUX_TIOCSWINSZ
+            );
+            if changes_tty_state
+                && cx.kernel.kernel().tty_caller_is_background(cx.kernel)
+                && !block_ttou
+            {
+                this.mark_process_signal_pending(cx.kernel, LINUX_SIGTTOU);
+                return Ok(DispatchOutcome::errno(LINUX_EINTR));
+            }
 
             // ── Rosetta 2 virtualization handshake ──────────────────────────────────
             // At startup Apple's Rosetta issues a small set of ioctls on its
@@ -8056,6 +8086,27 @@ impl SyscallDispatcher {
             // passing through to the host fd (real macOS pty). Return early so the
             // stdio-gated arms below never run for pty fds.
             if let Some((role, host_fd)) = this.pty_info(fd.0) {
+                let controls_controlling_tty = matches!(
+                    ioctl_request,
+                    LINUX_TIOCGPGRP
+                        | LINUX_TIOCSPGRP
+                        | LINUX_TIOCSCTTY
+                        | LINUX_TIOCGSID
+                        | LINUX_TIOCNOTTY
+                );
+                if controls_controlling_tty
+                    && this.pty_table().lock().controlling() != Some(role.index)
+                {
+                    // Carrick currently models exactly the launch terminal.
+                    // Never grant authority over another allocated pty merely
+                    // because its host fd also happens to be a tty.
+                    let errno = if ioctl_request == LINUX_TIOCSCTTY {
+                        LINUX_EPERM
+                    } else {
+                        LINUX_ENOTTY
+                    };
+                    return Ok(DispatchOutcome::errno(errno));
+                }
                 return Ok(match ioctl_request {
                     // TIOCGPTN is a MASTER-only ioctl: it returns the pts index
                     // of the master's slave. On a slave it is ENOTTY — which is
@@ -8178,19 +8229,9 @@ impl SyscallDispatcher {
                         }
                     }
                     LINUX_TIOCGPGRP => {
-                        // SAFETY: host_fd is our live pty fd.
-                        let pgrp = unsafe { libc::tcgetpgrp(host_fd) };
-                        if pgrp < 0 {
-                            DispatchOutcome::errno(crate::host_to_linux_errno(get_last_error()))
-                        } else {
-                            // The host pty's foreground pgrp is a HOST pgid;
-                            // translate it to the value the guest's PID namespace
-                            // sees, so a shell's `tcgetpgrp() == getpgrp()`
-                            // foreground check holds (else it SIGTTIN-stops
-                            // itself). Identity when namespaces are off.
-                            let ns_pgrp =
-                                crate::namespace::pid::host_to_ns_pgid(pgrp as u32) as i32;
-                            write_packed(&mut *cx.memory, arg, &ns_pgrp.to_le_bytes())
+                        match cx.kernel.kernel().tty_foreground_process_group(cx.kernel) {
+                            Ok(group) => write_packed(&mut *cx.memory, arg, &group.raw().to_le_bytes()),
+                            Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
                         }
                     }
                     LINUX_TIOCSPGRP => {
@@ -8201,29 +8242,35 @@ impl SyscallDispatcher {
                                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                             }
                         }
-                        let ns_pgrp = i32::from_le_bytes(buf);
-                        // The guest names a pgrp in its OWN namespace; map it back
-                        // to the host pgid before handing it to the host pty.
-                        let Some(pgrp) = crate::namespace::pid::ns_to_host_pgid(ns_pgrp as u32)
-                        else {
-                            return Ok(DispatchOutcome::errno(LINUX_EPERM));
+                        let Ok(group) = crate::kernel::ProcessGroupId::from_abi_positive(i32::from_le_bytes(buf)) else {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                         };
-                        let pgrp = pgrp as i32;
-                        // SAFETY: host_fd is our live pty fd.
-                        let r = crate::host_tty::with_sigttou_blocked(block_ttou, || unsafe {
-                            libc::tcsetpgrp(host_fd, pgrp)
-                        });
-                        if r < 0 {
-                            DispatchOutcome::errno(crate::host_to_linux_errno(get_last_error()))
-                        } else {
-                            DispatchOutcome::Returned { value: 0 }
+                        match cx.kernel.kernel().tty_set_foreground_process_group(cx.kernel, group) {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(crate::kernel::TtyControlError::NotControlling) => DispatchOutcome::errno(LINUX_ENOTTY),
+                            Err(crate::kernel::TtyControlError::Permission) => DispatchOutcome::errno(LINUX_EPERM),
                         }
                     }
-                    LINUX_TIOCSCTTY => {
-                        // SAFETY: host_fd is our live pty fd. Best-effort.
-                        unsafe { libc::ioctl(host_fd, libc::TIOCSCTTY as libc::c_ulong, 0i32) };
-                        DispatchOutcome::Returned { value: 0 }
+                    LINUX_TIOCSCTTY => match cx
+                        .kernel
+                        .kernel()
+                        .tty_acquire(cx.kernel, arg != 0)
+                    {
+                        Ok(()) => DispatchOutcome::Returned { value: 0 },
+                        Err(_) => DispatchOutcome::errno(LINUX_EPERM),
+                    },
+                    LINUX_TIOCGSID => {
+                        match cx.kernel.kernel().tty_session(cx.kernel) {
+                            Ok(session) => {
+                                write_packed(&mut *cx.memory, arg, &session.raw().to_le_bytes())
+                            }
+                            Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
+                        }
                     }
+                    LINUX_TIOCNOTTY => match cx.kernel.kernel().tty_detach(cx.kernel) {
+                        Ok(()) => DispatchOutcome::Returned { value: 0 },
+                        Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
+                    },
                     LINUX_FIONREAD => {
                         // A BSD pts supports FIONREAD/TIOCINQ on its input queue;
                         // forward to the live macOS pty fd. Without this arm a pty
@@ -8527,32 +8574,23 @@ impl SyscallDispatcher {
                 | LINUX_TCSETSW2
                 | LINUX_TCSETSF2 => DispatchOutcome::errno(LINUX_ENOTTY),
                 LINUX_TIOCSCTTY => match this.tty_ioctl_fd_kind(fd.0) {
-                    Ok(TtyFdKind::Stdio) => DispatchOutcome::Returned { value: 0 },
+                    Ok(TtyFdKind::Stdio)
+                        if this.pty_table().lock().controlling().is_some() =>
+                    {
+                        match cx.kernel.kernel().tty_acquire(cx.kernel, arg != 0) {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(_) => DispatchOutcome::errno(LINUX_EPERM),
+                        }
+                    }
+                    Ok(TtyFdKind::Stdio) => DispatchOutcome::errno(LINUX_ENOTTY),
                     Ok(TtyFdKind::Other) => DispatchOutcome::errno(LINUX_ENOTTY),
                     Err(errno) => DispatchOutcome::errno(errno),
                 },
                 LINUX_TIOCGPGRP => match this.tty_ioctl_fd_kind(fd.0) {
                     Ok(TtyFdKind::Stdio) => {
-                        // Under `-t` fd 0/1/2 is a real pty slave: pass through to
-                        // the host line discipline so job control works correctly.
-                        if crate::host_tty::host_isatty(fd.0) {
-                            match crate::host_tty::host_tty_tcgetpgrp(fd.0) {
-                                // Translate the HOST foreground pgid into the value
-                                // the guest's PID namespace sees, so a shell's
-                                // `tcgetpgrp() == getpgrp()` foreground check holds
-                                // (else it SIGTTIN-stops itself). Identity when off.
-                                Ok(pgrp) => {
-                                    let ns_pgrp =
-                                        crate::namespace::pid::host_to_ns_pgid(pgrp as u32) as i32;
-                                    write_packed(&mut *cx.memory, arg, &ns_pgrp.to_le_bytes())
-                                }
-                                Err(raw_errno) => DispatchOutcome::errno(
-                                    crate::host_to_linux_errno(raw_errno),
-                                ),
-                            }
-                        } else {
-                            // Headless / non-tty fallback: synthesise bootstrap pgid.
-                            write_packed(&mut *cx.memory, arg, &LINUX_BOOTSTRAP_PGID.to_le_bytes())
+                        match cx.kernel.kernel().tty_foreground_process_group(cx.kernel) {
+                            Ok(group) => write_packed(&mut *cx.memory, arg, &group.raw().to_le_bytes()),
+                            Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
                         }
                     }
                     Ok(TtyFdKind::Other) => DispatchOutcome::errno(LINUX_ENOTTY),
@@ -8567,33 +8605,13 @@ impl SyscallDispatcher {
                                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                             }
                         }
-                        let ns_pgid = i32::from_le_bytes(buf);
-                        // Under `-t` fd 0/1/2 is a real pty slave: pass through so
-                        // the host line discipline tracks the foreground pgrp, enabling
-                        // Ctrl-C → SIGINT delivery to the correct guest pgrp. The guest
-                        // names the pgrp in its OWN namespace; map it to the host pgid.
-                        if crate::host_tty::host_isatty(fd.0) {
-                            let Some(pgid) =
-                                crate::namespace::pid::ns_to_host_pgid(ns_pgid as u32)
-                            else {
-                                return Ok(DispatchOutcome::errno(LINUX_EPERM));
-                            };
-                            let pgid = pgid as i32;
-                            match crate::host_tty::with_sigttou_blocked(block_ttou, || {
-                                crate::host_tty::host_tty_tcsetpgrp(fd.0, pgid)
-                            }) {
-                                Ok(()) => DispatchOutcome::Returned { value: 0 },
-                                Err(raw_errno) => DispatchOutcome::errno(
-                                    crate::host_to_linux_errno(raw_errno),
-                                ),
-                            }
-                        } else {
-                            // Headless fallback: accept the bootstrap pgid, EPERM others.
-                            if ns_pgid == LINUX_BOOTSTRAP_PGID {
-                                DispatchOutcome::Returned { value: 0 }
-                            } else {
-                                DispatchOutcome::errno(LINUX_EPERM)
-                            }
+                        let Ok(group) = crate::kernel::ProcessGroupId::from_abi_positive(i32::from_le_bytes(buf)) else {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        };
+                        match cx.kernel.kernel().tty_set_foreground_process_group(cx.kernel, group) {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(crate::kernel::TtyControlError::NotControlling) => DispatchOutcome::errno(LINUX_ENOTTY),
+                            Err(crate::kernel::TtyControlError::Permission) => DispatchOutcome::errno(LINUX_EPERM),
                         }
                     }
                     Ok(TtyFdKind::Other) => DispatchOutcome::errno(LINUX_ENOTTY),
@@ -8667,7 +8685,10 @@ impl SyscallDispatcher {
                     DispatchOutcome::Returned { value: 0 }
                 }
                 LINUX_TIOCNOTTY => match this.tty_ioctl_fd_kind(fd.0) {
-                    Ok(TtyFdKind::Stdio) => DispatchOutcome::Returned { value: 0 },
+                    Ok(TtyFdKind::Stdio) => match cx.kernel.kernel().tty_detach(cx.kernel) {
+                        Ok(()) => DispatchOutcome::Returned { value: 0 },
+                        Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
+                    },
                     Ok(TtyFdKind::Other) => DispatchOutcome::errno(LINUX_ENOTTY),
                     Err(errno) => DispatchOutcome::errno(errno),
                 },
@@ -8855,19 +8876,9 @@ impl SyscallDispatcher {
                 },
                 LINUX_TIOCGSID => match this.tty_ioctl_fd_kind(fd.0) {
                     Ok(TtyFdKind::Stdio) => {
-                        // Under `-t` stdio is a real pty slave. Ask Darwin for
-                        // the controlling session instead of returning Carrick's
-                        // bootstrap fallback, so interactive job-control probes
-                        // see the host pty state when it exists.
-                        if crate::host_tty::host_isatty(fd.0) {
-                            match crate::host_tty::host_tty_tcgetsid(fd.0) {
-                                Ok(sid) => write_packed(&mut *cx.memory, arg, &sid.to_le_bytes()),
-                                Err(raw_errno) => DispatchOutcome::errno(
-                                    crate::host_to_linux_errno(raw_errno),
-                                ),
-                            }
-                        } else {
-                            write_packed(&mut *cx.memory, arg, &LINUX_BOOTSTRAP_SID.to_le_bytes())
+                        match cx.kernel.kernel().tty_session(cx.kernel) {
+                            Ok(session) => write_packed(&mut *cx.memory, arg, &session.raw().to_le_bytes()),
+                            Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
                         }
                     }
                     Ok(TtyFdKind::Other) => DispatchOutcome::errno(LINUX_ENOTTY),
@@ -9670,6 +9681,16 @@ impl SyscallDispatcher {
             // memfd_secret: no file read method → EINVAL (memfdsecret probe).
             if this.fd_is_secretmem(fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            if this.fd_is_controlling_tty(fd.0) {
+                let tid = Self::ctx_tid(cx);
+                if cx.kernel.kernel().tty_caller_is_background(cx.kernel)
+                    && !this.signal_is_ignored(cx.kernel, crate::linux_abi::LINUX_SIGTTIN)
+                    && !this.signal_blocked(cx.kernel, tid, crate::linux_abi::LINUX_SIGTTIN)
+                {
+                    this.mark_process_signal_pending(cx.kernel, crate::linux_abi::LINUX_SIGTTIN);
+                    return Ok(DispatchOutcome::errno(LINUX_EINTR));
+                }
             }
             let address = buf.0;
             let length =
@@ -12292,6 +12313,20 @@ impl SyscallDispatcher {
             // memfd_secret: no file write method → EINVAL (memfdsecret probe).
             if this.fd_is_secretmem(fd) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            if this.fd_is_controlling_tty(fd) {
+                let tid = Self::ctx_tid(cx);
+                let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+                let tostop = unsafe { libc::tcgetattr(fd, &mut termios) } == 0
+                    && termios.c_lflag & libc::TOSTOP != 0;
+                if tostop
+                    && cx.kernel.kernel().tty_caller_is_background(cx.kernel)
+                    && !this.signal_is_ignored(cx.kernel, crate::linux_abi::LINUX_SIGTTOU)
+                    && !this.signal_blocked(cx.kernel, tid, crate::linux_abi::LINUX_SIGTTOU)
+                {
+                    this.mark_process_signal_pending(cx.kernel, crate::linux_abi::LINUX_SIGTTOU);
+                    return Ok(DispatchOutcome::errno(LINUX_EINTR));
+                }
             }
             let address = buf.0;
             let length =

@@ -32,16 +32,14 @@ use carrick_guest_mem::{
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 use carrick_hal::{
-    ForkOutcome, GuestEntryRegs, OsError, ProcessForkRequest, RawSyscall, Reg, SlotId, SysReg,
-    SyscallTrap, ThreadedEngine, TrapError,
+    GuestEntryRegs, OsError, ProcessForkRequest, RawSyscall, Reg, SlotId, SysReg, SyscallTrap,
+    ThreadedEngine, TrapError,
 };
 use carrick_mem::memory::AddressSpace;
 use carrick_mem::page_table::{PageTableError, PageTableManager};
 use parking_lot::Mutex;
 
-use crate::vmm::{
-    Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy, FrameCowWriteIntent,
-};
+use crate::vmm::{Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, FrameCowWriteIntent};
 
 /// HVPatch installs this scoped-ASID routine into the existing EL1 maintenance
 /// page's NOP tail. Other AArch64 backends do not invoke it until they install
@@ -140,10 +138,6 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// access. SHARED by `CLONE_THREAD` siblings (`Arc` clone), COW'd on fork.
     protections: Arc<MemoryProtections>,
 
-    /// Runtime-published mmap-arena high-water used only for fork footprint
-    /// diagnostics. The runtime refreshes it immediately before every fork.
-    fork_arena_high_water: u64,
-
     /// Exact parent state retained across the host-thread spawn/materialization
     /// window of an in-process fork. Runtime commits it only after the child is
     /// materialized; a recoverable failure restores both authorities.
@@ -175,7 +169,6 @@ pub struct Aarch64TaskEngineState<V: Aarch64Vmm> {
     pending_guest_run_receipt_ns: u64,
     page_tables: Arc<Mutex<Option<PageTableManager>>>,
     protections: Arc<MemoryProtections>,
-    fork_arena_high_water: u64,
     pending_process_fork: Option<ParentForkCowRollback>,
     pt_snapshot_scratch: Option<PageTableManager>,
 }
@@ -239,7 +232,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_guest_run_receipt_ns: 0,
             page_tables,
             protections,
-            fork_arena_high_water: u64::MAX,
             pending_process_fork: None,
             pt_snapshot_scratch: None,
         }
@@ -354,7 +346,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_guest_run_receipt_ns,
             page_tables,
             protections,
-            fork_arena_high_water,
             pending_process_fork,
             pt_snapshot_scratch,
         } = self;
@@ -373,7 +364,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 pending_guest_run_receipt_ns,
                 page_tables,
                 protections,
-                fork_arena_high_water,
                 pending_process_fork,
                 pt_snapshot_scratch,
             },
@@ -396,7 +386,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_guest_run_receipt_ns,
             page_tables,
             protections,
-            fork_arena_high_water,
             pending_process_fork,
             pt_snapshot_scratch,
         } = state;
@@ -415,7 +404,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_guest_run_receipt_ns,
             page_tables,
             protections,
-            fork_arena_high_water,
             pending_process_fork,
             pt_snapshot_scratch,
         }
@@ -644,7 +632,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_guest_run_receipt_ns: 0,
             page_tables,
             protections,
-            fork_arena_high_water: u64::MAX,
             pending_process_fork: None,
             pt_snapshot_scratch: None,
         }
@@ -753,7 +740,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             pending_guest_run_receipt_ns: 0,
             page_tables,
             protections,
-            fork_arena_high_water: u64::MAX,
             pending_process_fork: None,
             pt_snapshot_scratch: None,
         }
@@ -1858,20 +1844,6 @@ fn classify_private_repoint_tlbi(result: Result<(), TrapError>) -> Result<(), Re
     })
 }
 
-fn emit_fork_footprint(phase: i32, arena_high_water: u64) {
-    let vm_region_count = carrick_host::host_proc::self_vm_region_count().unwrap_or(0);
-    let usage = carrick_host::host_proc::self_resource_usage();
-    let resident_bytes = usage.map(|u| u.resident_bytes).unwrap_or(0);
-    let virtual_bytes = usage.map(|u| u.virtual_bytes).unwrap_or(0);
-    carrick_observability::probes::fork_footprint(
-        phase,
-        vm_region_count,
-        arena_high_water,
-        resident_bytes,
-        virtual_bytes,
-    );
-}
-
 // ─── RegAccess ───────────────────────────────────────────────────────────────
 
 impl<V: Aarch64Vmm> carrick_hal::RegAccess for Aarch64EngineCore<V> {
@@ -2108,123 +2080,6 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
 
     fn is_forked_child(&self) -> bool {
         self.is_forked_child
-    }
-
-    fn fork_admission_check(&self) -> Result<(), TrapError> {
-        self.vm.fork_admission_check()
-    }
-
-    fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
-        let elapsed_us = |start: std::time::Instant| -> u64 {
-            let micros = start.elapsed().as_micros();
-            micros.min(u128::from(u64::MAX)) as u64
-        };
-        // 1. Snapshot the parent vCPU register file BEFORE forking, so both sides
-        //    resume inside the same trapped syscall site. (Taken while the vCPU is
-        //    suspended at the syscall trap — atomic, race-free.)
-        let phase_start = std::time::Instant::now();
-        let snap = self.vcpu.snapshot()?;
-        carrick_observability::probes::fork_lifecycle(2, 0, elapsed_us(phase_start), 0, 0);
-        // The guest's real x9 to carry onto the child (the child resumes straight at
-        // the eret and never runs `complete_syscall`). KVM's snapshot captured the
-        // CLOBBERED x9 (the sentinel store), so it returns `Some(real_x9)` to repair.
-        // HVF's vehicle clobbers no GPR, so its snapshot already holds the live x9 and
-        // it returns `None` (and ignores this param in `rebuild_*_after_fork`); 0 is a
-        // harmless placeholder there.
-        let saved_x9 = self.vcpu.get_saved_x9().ok().flatten().unwrap_or(0);
-
-        // For EagerCopy backends (HVF), freeze RAM pre-fork so the child can rebuild
-        // from a coherent image; Cow backends (KVM) lean on Linux COW.
-        let phase_start = std::time::Instant::now();
-        match self.vm.fork_ram_strategy() {
-            ForkRamStrategy::EagerCopy => self.vm.freeze_ram_for_fork()?,
-            ForkRamStrategy::Cow => {}
-        }
-        carrick_observability::probes::fork_lifecycle(2, 1, elapsed_us(phase_start), 0, 0);
-
-        // Clone the parent's page-table manager VALUE now (under the lock), to seed
-        // the child's OWN fresh Arc below. Cloning (vs resetting to None) mirrors
-        // HVF: a reset would force a lazy rebuild on the child's first pt_edit, but
-        // `syscall_buffer_ipa` is `&self` and CANNOT rebuild — so a forked child
-        // that passes a `repoint_private` overlay VA to a syscall BEFORE its first
-        // mmap/mprotect/munmap would translate against a None manager, fall back to
-        // identity, and read the STALE SHARED aperture instead of its own COW
-        // overlay. Cloning lets the child translate immediately. At fork the child's
-        // COW table backing == the parent's synced manager bytes, so the clone is
-        // exactly what a lazy rebuild from the child's backing would produce.
-        let phase_start = std::time::Instant::now();
-        let cloned_pt = self.page_tables.lock().clone();
-        carrick_observability::probes::fork_lifecycle(2, 2, elapsed_us(phase_start), 0, 0);
-
-        // 2. Real host fork.
-        //
-        // SAFETY: the run loop quiesces other threads around a guest fork; the
-        // calling thread is the only active one here, so no other thread holds the
-        // malloc lock (or any other process-global lock) at fork time, and the child
-        // inherits a consistent allocator state.
-        emit_fork_footprint(0, self.fork_arena_high_water);
-        self.vm
-            .emit_fork_footprint_attribution(self.fork_arena_high_water);
-        let phase_start = std::time::Instant::now();
-        let pid = unsafe { libc::fork() };
-        let fork_elapsed = elapsed_us(phase_start);
-        if pid < 0 {
-            return Err(TrapError::ForkFailed(
-                std::io::Error::last_os_error().to_string(),
-            ));
-        }
-        if pid > 0 {
-            carrick_observability::probes::fork_lifecycle(
-                2,
-                3,
-                fork_elapsed,
-                i64::from(pid as i32),
-                0,
-            );
-            // PARENT: KVM's live VM is untouched (`rebuild_parent_after_fork` is a
-            // no-op). HVF tore its VM down pre-fork (in `freeze_ram_for_fork`), so
-            // it MUST rebuild here too — a fresh VM, re-`hv_vm_map` of its own (and
-            // the quiesced siblings') buffers, and a register restore from the
-            // pre-fork snapshot. Return the child pid so the runtime writes it into
-            // the guest's x0.
-            let phase_start = std::time::Instant::now();
-            self.vm
-                .rebuild_parent_after_fork(&mut self.vcpu, &snap, saved_x9)?;
-            carrick_observability::probes::fork_lifecycle(
-                2,
-                4,
-                elapsed_us(phase_start),
-                i64::from(pid as i32),
-                0,
-            );
-            return Ok(ForkOutcome::Parent {
-                child_pid: pid as i32,
-            });
-        }
-        carrick_observability::probes::fork_lifecycle(3, 3, fork_elapsed, 0, 0);
-
-        // 3. CHILD: rebuild the VM (per backend) + re-seat the register file (the
-        //    backend owns the x0=0 / x9 / sentinel-PC-advance / vDSO re-calibration,
-        //    since the PC-advance distance and post-MMIO replay are per-trap-vehicle).
-        let phase_start = std::time::Instant::now();
-        self.vm
-            .rebuild_child_after_fork(&mut self.vcpu, &snap, saved_x9)?;
-        carrick_observability::probes::fork_lifecycle(3, 5, elapsed_us(phase_start), 0, 0);
-        let phase_start = std::time::Instant::now();
-        self.is_forked_child = true;
-        // The child resumes mid-clone; clear stale parent syscall/fault state so a
-        // signal arriving before the child's first svc cannot read parent values.
-        self.pending_resume_pc = None;
-        self.last_syscall_nr = None;
-        self.last_syscall_orig_x0 = 0;
-        self.last_fault_esr = 0;
-        // Give the child its OWN page-table manager — a FRESH Arc, NOT the Arc the
-        // parent's CLONE_THREAD siblings still share (so a later child pt_edit can
-        // never reach back into the parent's manager). Seeded with the clone taken
-        // above (the child's COW table backing == the parent's synced bytes).
-        self.replace_page_tables(cloned_pt);
-        carrick_observability::probes::fork_lifecycle(3, 6, elapsed_us(phase_start), 0, 0);
-        Ok(ForkOutcome::Child)
     }
 
     fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
@@ -3278,10 +3133,6 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         V::vcpu_budget()
     }
 
-    fn set_vfork_arena_high_water(&mut self, high_water: u64) {
-        self.fork_arena_high_water = high_water;
-    }
-
     fn reclaims(&self) -> bool {
         self.vm.reclaims()
     }
@@ -3490,35 +3341,6 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn fresh_fork_kicker(&self) -> Arc<dyn carrick_hal::VcpuRegistry> {
         self.vm.fresh_fork_kicker()
-    }
-
-    fn fork_vfork(&mut self) -> Result<ForkOutcome, TrapError> {
-        // vfork (`CLONE_VM`): the child SHARES the parent's guest RAM. Flag it on the
-        // backend (HVF maps the SAME buffers instead of snapshotting private regions;
-        // KVM ignores the flag — its fork is plain COW), run the normal fork, then
-        // clear the flag so a later plain fork snapshots again.
-        self.vm.set_vfork_share(true);
-        let r = self.fork();
-        self.vm.set_vfork_share(false);
-        r
-    }
-
-    fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
-        // Multithreaded-fork sibling: snapshot + destroy THIS vCPU and publish its
-        // regions so the forker re-maps them into the rebuilt VM (HVF). KVM no-op.
-        self.vm.release_vcpu_for_fork(&mut self.vcpu)
-    }
-
-    fn rebuild_vcpu_after_fork(&mut self) -> Result<(), TrapError> {
-        // Multithreaded-fork sibling, step 2: recreate this vCPU in the forker's
-        // republished VM and restore the pre-fork register state (HVF). KVM no-op.
-        self.vm.rebuild_vcpu_after_fork(&mut self.vcpu)
-    }
-
-    fn publish_vm_for_siblings(&mut self) -> Result<(), TrapError> {
-        // Forker, after rebuilding its VM: publish a clone for the quiesced siblings
-        // to recreate their vCPUs in (HVF). KVM no-op.
-        self.vm.publish_vm_for_siblings()
     }
 
     fn destroy_vcpu_on_thread_exit(&mut self) {

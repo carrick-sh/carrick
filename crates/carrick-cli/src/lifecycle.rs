@@ -8,9 +8,9 @@
 //! container's process and state; carrick has nothing of the kind. The model
 //! here is podman-style: **a detached container is one VM carrier, and the
 //! source of truth is the on-disk registry**, not a running service. All the
-//! "control-plane" subcommands in this module are therefore pure reads and
-//! signals against that registry — they never talk to a daemon because there
-//! isn't one.
+//! "control-plane" subcommands in this module are therefore registry reads plus
+//! authenticated requests to the carrier's in-kernel control endpoint — they
+//! never talk to a daemon because there isn't one.
 //!
 //! The registry lives in `carrick_runtime::container`: a directory per
 //! container holding a serialized [`ContainerState`] (id, name, image, command,
@@ -53,25 +53,23 @@
 //! over the *same* overlay, which is why the stale region file is unlinked first (a
 //! reused region keeps dead members).
 //!
-//! ## Transitional `exec` topology
+//! ## Logical `exec` topology
 //!
-//! `exec` still runs a second runtime process and points it at the container's
-//! existing overlay (`CARRICK_EXEC_OVERLAY`) and pid region
-//! (`CARRICK_JOIN_REGION`) so the command shares filesystem and legacy
-//! PID-region state. This is explicitly
-//! transitional and does not satisfy the carrier-only invariant; carrier
-//! control must replace it with logical in-kernel task admission.
+//! Noninteractive `exec` authenticates the carrier incarnation, admits a fresh
+//! parentless logical process through its persistent executor scheduler, and
+//! retrieves the bounded terminal result by opaque capability. It never starts
+//! a second runtime. Interactive stdin and TTY streaming remain unavailable
+//! until the control protocol has framed bidirectional transport.
 //!
-//! ## Signals are HOST signals
+//! ## Signals are logical Linux signals
 //!
-//! `stop`/`kill`/`rm` deliver signals with host `kill(2)` against the recorded
-//! init pid, so `parse_signal` resolves names to the *host* (macOS) numbering,
-//! not the guest Linux ABI — `SIGUSR1` is 10 on macOS but 30 on Linux, and we
-//! are signalling a host process. `stop` honours the configured stop signal and
-//! grace window (flag > image `STOPSIGNAL`/`--stop-timeout` > `SIGTERM`/10s),
-//! polling for exit on a 100 ms cadence before escalating to SIGKILL. Liveness
-//! polling everywhere is best-effort sleeping because macOS has no inotify on
-//! the registry and no daemon to push events.
+//! `stop`/`kill`/`rm --force` authenticate the persisted carrier incarnation
+//! (nonce + exact kernel `TaskKey`) and ask that carrier to signal logical
+//! guest init. `parse_signal` therefore resolves Linux ABI numbering regardless
+//! of the host — notably Linux `SIGUSR1` is 10 even though Darwin's is 30.
+//! `stop` honours the configured stop signal and grace window (flag > image
+//! `STOPSIGNAL`/`--stop-timeout` > `SIGTERM`/10s), polling authenticated kernel
+//! status and refreshed durable state before escalating to logical SIGKILL.
 //!
 //! The remaining helpers reproduce docker's *presentation* — `ps`/`inspect`
 //! column layouts and JSON schema, the minimal Go-`text/template` subset in
@@ -81,10 +79,14 @@
 //! output unmodified.
 
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
-use carrick_runtime::container::{self, ContainerState, ContainerStatus, RunConfig};
+use carrick_runtime::container::{
+    self, CarrierControlState, ContainerState, ContainerStatus, RunConfig, StopSignalAbi,
+};
+use carrick_runtime::kernel::control::{ControlOperation, ControlOutcome};
 
 use crate::runtime_util::{human_age, human_size, truncate_str};
 
@@ -93,8 +95,9 @@ use crate::runtime_util::{human_age, human_size, truncate_str};
 ///
 /// Flow (daemonless, podman-style):
 ///  1. Generate the id and write a `Created` registry entry.
-///  2. `fork()`. The PARENT prints the id and returns (the user's shell is
-///     freed). The CHILD `setsid()`s, redirects stdio (stdin←/dev/null,
+///  2. `CarrierLauncher` uses `posix_spawn` to re-exec `__carrier-entry`. The
+///     launcher prints the id and returns after readiness. The carrier
+///     `setsid()`s, redirects stdio (stdin←/dev/null,
 ///     stdout/stderr→the container log), exports `CARRICK_CONTAINER_ID`, and
 ///     runs the engine in that same carrier process, records itself as Running,
 ///     and blocks until the logical guest-init exits.
@@ -104,9 +107,9 @@ pub(crate) fn run_detached(
     name: Option<String>,
 ) -> anyhow::Result<()> {
     let created_secs = now_secs();
-    let id = container::make_id(std::process::id() as u64, created_secs);
-    let name = resolve_name(name, &id)?;
-    // Resolve the image in the FOREGROUND (before forking) so pull errors reach
+    let id = new_container_id(created_secs);
+    let _lifecycle_lock = container::lock_lifecycle(&id)?;
+    // Resolve the image in the foreground (before carrier birth) so pull errors reach
     // the user's terminal — and so the effective stop signal (flag > image
     // STOPSIGNAL) is baked into the persisted RunConfig for a later `stop`.
     let resolved = resolve_request_image(&req, &store)?;
@@ -114,25 +117,296 @@ pub(crate) fn run_detached(
         req.stop_signal.as_deref(),
         resolved.config.stop_signal.as_deref(),
     )?;
+    let name_lock = container::lock_name_registry()?;
+    let name = resolve_name(name, &id)?;
     build_created_state(&req, &id, name, created_secs, stop_signal)
         .create()
         .with_context(|| format!("failed to create container registry entry for {id}"))?;
+    drop(name_lock);
 
-    let log = container::log_path(&id)?;
-    // SAFETY: fork(2). The CLI is single-threaded here (no tokio runtime is live
-    // — block_on_oci builds its own per-call runtime and we have not entered it).
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        let _ = ContainerState::remove(&id);
-        bail!("fork failed for detached run");
+    let pid = match CarrierLauncher::launch(&store, &id) {
+        Ok(pid) => pid,
+        Err(error) => {
+            let _ = ContainerState::remove(&id);
+            return Err(error);
+        }
+    };
+    await_detached_ready(&id, pid)?;
+    println!("{id}");
+    Ok(())
+}
+
+struct CarrierLauncher;
+
+const CARRIER_LAUNCH_GRANT_FD: libc::c_int = 198;
+
+impl CarrierLauncher {
+    /// The one product boundary allowed to create a carrier. `posix_spawn`
+    /// re-execs a hidden carrier entry, so this remains safe when called from
+    /// the API server's multi-threaded tokio process and carries no borrowed
+    /// Rust/tokio state across a fork.
+    fn launch(store: &carrick_image::ImageStore, id: &str) -> anyhow::Result<libc::pid_t> {
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+
+        let executable_path = std::env::current_exe().context("resolve carrier executable")?;
+        let environment = std::env::vars_os()
+            .map(|(key, value)| {
+                let mut bytes = key.as_os_str().as_bytes().to_vec();
+                bytes.push(b'=');
+                bytes.extend_from_slice(value.as_os_str().as_bytes());
+                std::ffi::CString::new(bytes)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .context("carrier environment contains NUL")?;
+        let executable = std::ffi::CString::new(executable_path.as_os_str().as_bytes())
+            .context("carrier executable path contains NUL")?;
+        let mut state = ContainerState::load(id)?;
+        let ticket = container::prepare_launch_ticket(&mut state)?;
+        let (grant_read, grant_write) = match launch_grant_pipe() {
+            Ok(pipe) => pipe,
+            Err(error) => {
+                container::cancel_launch_ticket(id, &ticket);
+                return Err(error).context("create carrier launch grant");
+            }
+        };
+        let argv = match carrier_entry_argv(&executable_path, store.root(), id) {
+            Ok(argv) => argv,
+            Err(error) => {
+                unsafe {
+                    libc::close(grant_read);
+                    libc::close(grant_write);
+                }
+                container::cancel_launch_ticket(id, &ticket);
+                return Err(error);
+            }
+        };
+        let mut argv_ptrs = argv
+            .iter()
+            .map(|arg| arg.as_ptr().cast_mut())
+            .collect::<Vec<_>>();
+        argv_ptrs.push(std::ptr::null_mut());
+        let mut env_ptrs = environment
+            .iter()
+            .map(|entry| entry.as_ptr().cast_mut())
+            .collect::<Vec<_>>();
+        env_ptrs.push(std::ptr::null_mut());
+        let mut actions = std::mem::MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
+        let actions_rc = unsafe { libc::posix_spawn_file_actions_init(actions.as_mut_ptr()) };
+        if actions_rc != 0 {
+            unsafe {
+                libc::close(grant_read);
+                libc::close(grant_write);
+            }
+            container::cancel_launch_ticket(id, &ticket);
+            return Err(std::io::Error::from_raw_os_error(actions_rc))
+                .context("initialize carrier spawn actions");
+        }
+        let mut actions = unsafe { actions.assume_init() };
+        let mut action_rc = unsafe {
+            libc::posix_spawn_file_actions_adddup2(
+                &mut actions,
+                grant_read,
+                CARRIER_LAUNCH_GRANT_FD,
+            )
+        };
+        if action_rc == 0 {
+            action_rc =
+                unsafe { libc::posix_spawn_file_actions_addclose(&mut actions, grant_read) };
+        }
+        if action_rc == 0 {
+            action_rc =
+                unsafe { libc::posix_spawn_file_actions_addclose(&mut actions, grant_write) };
+        }
+        if action_rc != 0 {
+            unsafe {
+                libc::posix_spawn_file_actions_destroy(&mut actions);
+                libc::close(grant_read);
+                libc::close(grant_write);
+            }
+            container::cancel_launch_ticket(id, &ticket);
+            return Err(std::io::Error::from_raw_os_error(action_rc))
+                .context("configure carrier launch grant");
+        }
+        let mut pid = 0;
+        // SAFETY: all argv/env strings and pointer arrays remain live through
+        // the call and are NUL terminated; file actions/attributes are null.
+        let rc = unsafe {
+            libc::posix_spawn(
+                &mut pid,
+                executable.as_ptr(),
+                &actions,
+                std::ptr::null(),
+                argv_ptrs.as_ptr(),
+                env_ptrs.as_ptr(),
+            )
+        };
+        unsafe {
+            libc::posix_spawn_file_actions_destroy(&mut actions);
+            libc::close(grant_read);
+        }
+        if rc != 0 {
+            unsafe { libc::close(grant_write) };
+            container::cancel_launch_ticket(id, &ticket);
+            bail!(
+                "posix_spawn carrier failed: {}",
+                std::io::Error::from_raw_os_error(rc)
+            );
+        }
+        let authorization = match container::bind_launch_ticket_to_pid(id, &ticket, pid) {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                unsafe { libc::close(grant_write) };
+                rollback_spawned_carrier(pid);
+                container::cancel_launch_ticket(id, &ticket);
+                return Err(error).context("bind carrier launch authorization to spawned pid");
+            }
+        };
+        let mut grant = unsafe { std::fs::File::from_raw_fd(grant_write) };
+        if let Err(error) = grant.write_all(ticket.as_bytes()) {
+            rollback_spawned_carrier(pid);
+            container::cancel_launch_ticket(id, &ticket);
+            return Err(error).context("release exact carrier launch grant");
+        }
+        drop(grant);
+        debug_assert_eq!(authorization, format!("{ticket}:{pid}"));
+        Ok(pid)
     }
-    if pid > 0 {
-        // PARENT: print the id and return; the child lives on under launchd.
-        println!("{id}");
-        return Ok(());
+}
+
+fn launch_grant_pipe() -> std::io::Result<(libc::c_int, libc::c_int)> {
+    let mut pipe = [0_i32; 2];
+    if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    // CHILD: first launch — extract the rootfs (attach_overlay = None).
-    run_detached_carrier(req, store, &id, &log, None);
+    for fd in pipe {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+            }
+            return Err(error);
+        }
+    }
+    for index in 0..pipe.len() {
+        if pipe[index] == CARRIER_LAUNCH_GRANT_FD {
+            let relocated = unsafe {
+                libc::fcntl(
+                    pipe[index],
+                    libc::F_DUPFD_CLOEXEC,
+                    CARRIER_LAUNCH_GRANT_FD + 1,
+                )
+            };
+            if relocated < 0 {
+                let error = std::io::Error::last_os_error();
+                unsafe {
+                    libc::close(pipe[0]);
+                    libc::close(pipe[1]);
+                }
+                return Err(error);
+            }
+            unsafe { libc::close(pipe[index]) };
+            pipe[index] = relocated;
+        }
+    }
+    Ok((pipe[0], pipe[1]))
+}
+
+fn rollback_spawned_carrier(pid: libc::pid_t) {
+    // The sole host process-control exception: `pid` is the exact unreaped direct child
+    // returned by posix_spawn and is used only for startup rollback.
+    let mut status = 0;
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    loop {
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if waited == pid {
+            break;
+        }
+        if waited < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
+    }
+}
+
+fn carrier_entry_argv(
+    executable: &std::path::Path,
+    store: &std::path::Path,
+    id: &str,
+) -> anyhow::Result<Vec<std::ffi::CString>> {
+    let grant_fd = CARRIER_LAUNCH_GRANT_FD.to_string();
+    [
+        executable.as_os_str().as_bytes(),
+        b"--store",
+        store.as_os_str().as_bytes(),
+        b"__carrier-entry",
+        id.as_bytes(),
+        grant_fd.as_bytes(),
+    ]
+    .into_iter()
+    .map(std::ffi::CString::new)
+    .collect::<Result<Vec<_>, _>>()
+    .context("carrier argv contains NUL")
+}
+
+pub(crate) fn carrier_entry(store: carrick_image::ImageStore, id: &str, grant_fd: i32) -> ! {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+
+    if grant_fd < 3 {
+        eprintln!("carrick carrier entry rejected invalid launch grant fd for {id}");
+        std::process::exit(125);
+    }
+    let mut ticket = [0_u8; 32];
+    let mut grant = unsafe { std::fs::File::from_raw_fd(grant_fd) };
+    if let Err(error) = grant.read_exact(&mut ticket) {
+        eprintln!("carrick carrier entry failed to read launch grant for {id}: {error}");
+        std::process::exit(125);
+    }
+    drop(grant);
+    let ticket = match std::str::from_utf8(&ticket) {
+        Ok(ticket) if ticket.bytes().all(|byte| byte.is_ascii_hexdigit()) => ticket,
+        _ => {
+            eprintln!("carrick carrier entry rejected malformed launch grant for {id}");
+            std::process::exit(125);
+        }
+    };
+    let authorization =
+        match container::consume_launch_ticket(id, ticket, std::process::id() as libc::pid_t) {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                eprintln!("carrick carrier entry rejected launch ticket for {id}: {error}");
+                std::process::exit(125);
+            }
+        };
+    let state = ContainerState::load(id).unwrap_or_else(|error| {
+        eprintln!("carrick carrier entry failed to load {id}: {error}");
+        std::process::exit(125);
+    });
+    if state.status != ContainerStatus::Created
+        || state.control.is_some()
+        || state.launch_ticket.as_deref() != Some(authorization.as_str())
+    {
+        eprintln!("carrick carrier entry refused non-created or already-owned container {id}");
+        std::process::exit(125);
+    }
+    let request = rebuild_request_from_state(&state);
+    let log = container::log_path(id).unwrap_or_else(|error| {
+        eprintln!("carrick carrier entry failed to resolve log for {id}: {error}");
+        std::process::exit(125);
+    });
+    run_detached_carrier(
+        request,
+        store,
+        id,
+        &log,
+        state.config.scratch_path.as_deref(),
+        &authorization,
+    )
 }
 
 fn now_secs() -> u64 {
@@ -140,6 +414,15 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn new_container_id(created_secs: u64) -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    container::make_id(
+        std::process::id() as u64 ^ sequence.rotate_left(17),
+        created_secs ^ sequence,
+    )
 }
 
 /// Resolve the container's name: reject a user-supplied `--name` that collides
@@ -179,6 +462,9 @@ fn build_created_state(
         auto_remove: req.rm,
         api_auto_remove: false,
         labels: std::collections::HashMap::new(),
+        control: None,
+        terminal_control: None,
+        launch_ticket: None,
         config: RunConfig {
             platform: req.platform.clone(),
             exec_backend: req.exec_backend,
@@ -216,6 +502,7 @@ fn build_created_state(
             interactive: req.interactive,
             max_traps: req.max_traps,
             stop_signal,
+            stop_signal_abi: StopSignalAbi::Linux,
             stop_timeout: req.stop_timeout,
             security_opts: req.security_opts.clone(),
             cap_add: req.cap_add.clone(),
@@ -283,6 +570,7 @@ fn run_detached_carrier(
     id: &str,
     log: &std::path::Path,
     attach_overlay: Option<&str>,
+    launch_authorization: &str,
 ) -> ! {
     // SAFETY: setsid on a fresh fork child that is not a process-group leader.
     unsafe {
@@ -292,6 +580,7 @@ fn run_detached_carrier(
     // SAFETY: single-threaded child, pre-runtime.
     unsafe {
         std::env::set_var("CARRICK_CONTAINER_ID", id);
+        std::env::set_var("CARRICK_LAUNCH_AUTHORIZATION", launch_authorization);
         if let Some(scratch) = attach_overlay {
             // Reuse the existing overlay (already holds the rootfs + prior
             // writes); the runtime attaches it and skips layer extraction.
@@ -325,9 +614,48 @@ pub(crate) fn create(
     store: carrick_image::ImageStore,
     name: Option<String>,
 ) -> anyhow::Result<()> {
+    let id = create_one_direct(req, store, name)?;
+    println!("{id}");
+    Ok(())
+}
+
+pub(crate) fn create_one_direct(
+    req: carrick_engine::CliRunRequest,
+    store: carrick_image::ImageStore,
+    name: Option<String>,
+) -> anyhow::Result<String> {
+    create_one_direct_with_metadata(req, store, name, InitialContainerMetadata::default())
+}
+
+#[derive(Default)]
+pub(crate) struct InitialContainerMetadata {
+    pub hostname: Option<String>,
+    pub labels: std::collections::HashMap<String, String>,
+    pub api_auto_remove: bool,
+    pub api_network_mode: Option<String>,
+    pub network_container: Option<String>,
+    pub network_attachments: Vec<carrick_runtime::container::NetworkAttachment>,
+}
+
+fn apply_initial_metadata(state: &mut ContainerState, metadata: InitialContainerMetadata) {
+    state.config.hostname = metadata.hostname;
+    state.labels = metadata.labels;
+    state.api_auto_remove = metadata.api_auto_remove;
+    state.config.api_network_mode = metadata.api_network_mode;
+    state.config.network_container = metadata.network_container;
+    if !metadata.network_attachments.is_empty() {
+        state.config.network_attachments = metadata.network_attachments;
+    }
+}
+
+pub(crate) fn create_one_direct_with_metadata(
+    req: carrick_engine::CliRunRequest,
+    store: carrick_image::ImageStore,
+    name: Option<String>,
+    metadata: InitialContainerMetadata,
+) -> anyhow::Result<String> {
     let created_secs = now_secs();
-    let id = container::make_id(std::process::id() as u64, created_secs);
-    let name = resolve_name(name, &id)?;
+    let id = new_container_id(created_secs);
     // Warm the image cache + surface image errors at create time, and capture
     // the image's STOPSIGNAL so a later `stop` honors it (flag > image > TERM).
     let resolved = resolve_request_image(&req, &store)?;
@@ -335,11 +663,15 @@ pub(crate) fn create(
         req.stop_signal.as_deref(),
         resolved.config.stop_signal.as_deref(),
     )?;
-    build_created_state(&req, &id, name, created_secs, stop_signal)
+    let name_lock = container::lock_name_registry()?;
+    let name = resolve_name(name, &id)?;
+    let mut state = build_created_state(&req, &id, name, created_secs, stop_signal);
+    apply_initial_metadata(&mut state, metadata);
+    state
         .create()
         .with_context(|| format!("failed to create container registry entry for {id}"))?;
-    println!("{id}");
-    Ok(())
+    drop(name_lock);
+    Ok(id)
 }
 
 /// Reconstruct a `CliRunRequest` from a persisted container so `start` can
@@ -395,7 +727,7 @@ fn rebuild_request_from_state(state: &ContainerState) -> carrick_engine::CliRunR
         dns_options: c.dns_options.clone(),
         volumes_from: c.volumes_from.clone(),
         published_ports: c.published_ports.clone(),
-        // The effective host stop signum is already persisted in RunConfig and
+        // The effective Linux stop signum is already persisted in RunConfig and
         // preserved across relaunch; engine.run ignores these, so leave unset.
         stop_signal: None,
         stop_timeout: None,
@@ -530,22 +862,30 @@ pub(crate) fn start(
     specs: &[String],
 ) -> anyhow::Result<()> {
     for_each_container(specs, "one or more containers failed to start", |spec| {
-        start_one(store, spec)
+        start_one_direct(store, spec)
     })
 }
 
-fn start_one(store: &carrick_image::ImageStore, spec: &str) -> anyhow::Result<String> {
+pub(crate) fn start_one_direct(
+    store: &carrick_image::ImageStore,
+    spec: &str,
+) -> anyhow::Result<String> {
     let id = container::resolve(spec).map_err(anyhow::Error::msg)?;
-    let mut state = ContainerState::load(&id)?;
+    let _lifecycle_lock = container::lock_lifecycle(&id)?;
+    start_one_locked(store, &id)
+}
+
+fn start_one_locked(store: &carrick_image::ImageStore, id: &str) -> anyhow::Result<String> {
+    let mut state = ContainerState::load(id)?;
     let status = container::reconciled_status(&state);
     if status == ContainerStatus::Running {
         // docker: starting an already-running container is a no-op success.
-        return Ok(id);
+        return Ok(id.to_owned());
     }
-    if state.auto_remove && status != ContainerStatus::Created {
+    if (state.auto_remove || state.api_auto_remove) && status != ContainerStatus::Created {
         bail!(
-            "container {} was created with --rm and cannot be started/restarted",
-            container::short_id(&id)
+            "container {} was created with auto-remove and cannot be started/restarted",
+            container::short_id(id)
         );
     }
     // A memory-backed container is not joinable/startable. When the fs-memory
@@ -559,13 +899,13 @@ fn start_one(store: &carrick_image::ImageStore, spec: &str) -> anyhow::Result<St
     // If a prior run populated the overlay (scratch_path set), attach it (skip
     // re-extraction, preserving the container's writes); otherwise this is the
     // first start and the runtime extracts the rootfs.
-    let attach_overlay = state.config.scratch_path.clone();
     // A relaunch creates a FRESH carrier + region; unlink the stale region file
     // so alloc_region maps a clean, seeded one (a reused file keeps dead members).
     if let Some(region) = &state.config.region_path {
         let _ = std::fs::remove_file(region);
     }
     reset_for_relaunch(&mut state);
+    container::clear_terminal_receipt(id)?;
     state.persist()?;
 
     let req = rebuild_request_from_state(&state);
@@ -575,16 +915,85 @@ fn start_one(store: &carrick_image::ImageStore, spec: &str) -> anyhow::Result<St
     // where its actionable message is swallowed to the container log.
     carrick_engine::check_platform_runnable(carrick_engine::request_platform(&req))
         .map_err(anyhow::Error::msg)?;
-    let log = container::log_path(&id)?;
-    // SAFETY: fork(2); single-threaded (no live tokio runtime).
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        bail!("fork failed for start");
+    let pid = CarrierLauncher::launch(store, id)?;
+    await_detached_ready(id, pid)?;
+    Ok(id.to_owned())
+}
+
+const DETACHED_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn await_detached_ready(id: &str, child_pid: libc::pid_t) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + DETACHED_READY_TIMEOUT;
+    loop {
+        if let Ok(state) = ContainerState::load(id) {
+            if let Some(control) = published_control_for_child(&state, child_pid)
+                && matches!(
+                    carrick_runtime::kernel::control::send(
+                        id,
+                        control,
+                        carrick_runtime::kernel::control::ControlOperation::Status,
+                    ),
+                    Ok(carrick_runtime::kernel::control::ControlOutcome::Alive)
+                )
+            {
+                return Ok(());
+            }
+            if state.status == ContainerStatus::Exited {
+                bail!(
+                    "container {} exited before carrier control became ready (status {})",
+                    container::short_id(id),
+                    state
+                        .exit_code
+                        .unwrap_or(container::UNKNOWN_CARRIER_EXIT_CODE)
+                );
+            }
+        }
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
+        if waited == child_pid {
+            let exit_code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else if libc::WIFSIGNALED(status) {
+                128 + libc::WTERMSIG(status)
+            } else {
+                125
+            };
+            container::mark_exited(id, exit_code);
+            bail!(
+                "container {} carrier exited before readiness (status {exit_code})",
+                container::short_id(id)
+            );
+        }
+        if waited < 0 {
+            bail!(
+                "failed to observe container {} carrier readiness: {}",
+                container::short_id(id),
+                std::io::Error::last_os_error()
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            // The pid is still our unreaped direct child, so it cannot have
+            // been recycled between WNOHANG and this exact startup rollback.
+            rollback_spawned_carrier(child_pid);
+            container::mark_exited(id, 125);
+            bail!(
+                "container {} carrier control did not become ready within {}s",
+                container::short_id(id),
+                DETACHED_READY_TIMEOUT.as_secs()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    if pid > 0 {
-        return Ok(id);
-    }
-    run_detached_carrier(req, store.clone(), &id, &log, attach_overlay.as_deref());
+}
+
+fn published_control_for_child(
+    state: &ContainerState,
+    child_pid: libc::pid_t,
+) -> Option<&carrick_runtime::container::CarrierControlState> {
+    (state.status == ContainerStatus::Running && state.init_pid == child_pid)
+        .then_some(state.control.as_ref())
+        .flatten()
 }
 
 /// Reset a container's volatile state for a relaunch. The carrier overwrites
@@ -596,6 +1005,9 @@ fn reset_for_relaunch(state: &mut ContainerState) {
     state.exit_code = None;
     state.init_pid = 0;
     state.supervisor_pid = 0;
+    state.control = None;
+    state.terminal_control = None;
+    state.launch_ticket = None;
     state.config.region_path = None;
 }
 
@@ -644,7 +1056,10 @@ pub(crate) fn restart(
     specs: &[String],
 ) -> anyhow::Result<()> {
     for_each_container(specs, "one or more containers failed to restart", |spec| {
-        stop_one(spec, time).and_then(|_| start_one(store, spec))
+        let id = container::resolve(spec).map_err(anyhow::Error::msg)?;
+        let _lifecycle_lock = container::lock_lifecycle(&id)?;
+        stop_one_locked(&id, time)?;
+        start_one_locked(store, &id)
     })
 }
 
@@ -776,11 +1191,17 @@ pub(crate) fn system_df(store: &carrick_image::ImageStore) -> anyhow::Result<()>
 pub(crate) fn system_prune(store: &carrick_image::ImageStore) -> anyhow::Result<()> {
     let (mut removed, mut cont_bytes) = (0usize, 0u64);
     for c in container::list() {
-        if container::reconciled_status(&c) != ContainerStatus::Running {
-            if let Some(p) = c.config.scratch_path.as_deref() {
+        let Ok(_lifecycle_lock) = container::lock_lifecycle(&c.id) else {
+            continue;
+        };
+        let Ok(mut current) = ContainerState::load(&c.id) else {
+            continue;
+        };
+        if container::reconcile_terminal_state(&mut current) != ContainerStatus::Running {
+            if let Some(p) = current.config.scratch_path.as_deref() {
                 cont_bytes += dir_size(std::path::Path::new(p));
             }
-            if ContainerState::remove(&c.id).is_ok() {
+            if ContainerState::remove(&current.id).is_ok() {
                 removed += 1;
             }
         }
@@ -955,35 +1376,52 @@ pub(crate) fn stop(time: Option<u64>, containers: &[String]) -> anyhow::Result<(
 
 pub(crate) fn stop_one(spec: &str, time: Option<u64>) -> anyhow::Result<String> {
     let id = container::resolve(spec).map_err(anyhow::Error::msg)?;
-    let state = ContainerState::load(&id)?;
-    if !state.init_alive() {
+    let _lifecycle_lock = container::lock_lifecycle(&id)?;
+    stop_one_locked(&id, time)
+}
+
+fn stop_one_locked(id: &str, time: Option<u64>) -> anyhow::Result<String> {
+    let state = ContainerState::load(id)?;
+    if state.status != ContainerStatus::Running {
         // Already stopped — docker treats `stop` of a stopped container as a
         // no-op success and echoes the id.
-        return Ok(id);
+        return Ok(id.to_owned());
     }
-    let init = state.init_pid;
+    let control = running_control(id, &state)?.clone();
+    let auto_remove = state.auto_remove;
     // The container's configured stop signal (image STOPSIGNAL / --stop-signal),
-    // else SIGTERM; then the grace window (flag > config --stop-timeout > 10s).
-    let signum = state.config.stop_signal.unwrap_or(libc::SIGTERM);
+    // else Linux SIGTERM; then the grace window (flag > config timeout > 10s).
+    let signum = configured_stop_signal(id, &state.config)?;
     let secs = stop_grace_secs(time, state.config.stop_timeout);
-    // Configured stop signal, then poll for exit up to `secs`, then SIGKILL.
-    // SAFETY: kill on the recorded host init pid.
-    unsafe {
-        libc::kill(init, signum);
+    send_logical_signal(id, &control, signum, auto_remove)?;
+    if wait_for_terminal_receipt(
+        id,
+        &control,
+        auto_remove,
+        std::time::Duration::from_secs(secs),
+    )? {
+        return Ok(id.to_owned());
     }
-    let deadline_ticks = secs.saturating_mul(10); // 100ms ticks
-    for _ in 0..deadline_ticks {
-        if !container::pid_alive(init) {
-            return Ok(id);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    // Grace expired: logical Linux SIGKILL to the same authenticated task.
+    send_logical_signal(id, &control, LINUX_SIGKILL, auto_remove)?;
+    if !wait_for_terminal_receipt(id, &control, auto_remove, TERMINAL_RECEIPT_TIMEOUT)? {
+        bail!(
+            "container {} accepted SIGKILL but did not publish a terminal receipt",
+            container::short_id(id)
+        );
     }
-    // Grace expired: SIGKILL.
-    // SAFETY: kill on the recorded host init pid.
-    unsafe {
-        libc::kill(init, libc::SIGKILL);
+    Ok(id.to_owned())
+}
+
+fn configured_stop_signal(id: &str, config: &RunConfig) -> anyhow::Result<i32> {
+    match (config.stop_signal_abi, config.stop_signal) {
+        (StopSignalAbi::Linux, Some(signum)) => Ok(signum),
+        (StopSignalAbi::Linux | StopSignalAbi::LegacyHost, None) => Ok(LINUX_SIGTERM),
+        (StopSignalAbi::LegacyHost, Some(_)) => bail!(
+            "container {} has an ambiguous legacy host-numbered stop signal; recreate it to persist Linux signal semantics",
+            container::short_id(id)
+        ),
     }
-    Ok(id)
 }
 
 /// `carrick kill` — send `signal` to the container's init.
@@ -998,58 +1436,284 @@ pub(crate) fn kill(signal: &str, containers: &[String]) -> anyhow::Result<()> {
 
 pub(crate) fn kill_one(spec: &str, signum: i32) -> anyhow::Result<String> {
     let id = container::resolve(spec).map_err(anyhow::Error::msg)?;
+    let _lifecycle_lock = container::lock_lifecycle(&id)?;
     let state = ContainerState::load(&id)?;
-    if !state.init_alive() {
+    if state.status != ContainerStatus::Running {
         bail!("container {} is not running", container::short_id(&id));
     }
-    // SAFETY: kill on the recorded host init pid.
-    let rc = unsafe { libc::kill(state.init_pid, signum) };
-    if rc != 0 {
-        bail!("failed to signal container {}", container::short_id(&id));
-    }
+    let control = running_control(&id, &state)?;
+    send_logical_signal(&id, control, signum, state.auto_remove)?;
     Ok(id)
 }
 
 /// `carrick rm` — remove a container's registry entry. Refuses a running
-/// container unless `force` (which SIGKILLs it first).
+/// container unless `force` (which sends logical Linux SIGKILL and requires a
+/// durable terminal receipt before removing the registry entry).
 pub(crate) fn rm(force: bool, containers: &[String]) -> anyhow::Result<()> {
     for_each_container(
         containers,
         "one or more containers failed to be removed",
-        |spec| rm_one(spec, force),
+        |spec| remove_one_direct(spec, force),
     )
 }
 
-fn rm_one(spec: &str, force: bool) -> anyhow::Result<String> {
+pub(crate) fn remove_one_direct(spec: &str, force: bool) -> anyhow::Result<String> {
     let id = container::resolve(spec).map_err(anyhow::Error::msg)?;
+    let _lifecycle_lock = container::lock_lifecycle(&id)?;
     let state = ContainerState::load(&id)?;
-    if state.init_alive() {
+    let was_running = state.status == ContainerStatus::Running;
+    if was_running {
         if !force {
             bail!(
                 "container {} is running; stop it first or use --force",
                 container::short_id(&id)
             );
         }
-        // SAFETY: SIGKILL the running init before removing its entry.
-        unsafe {
-            libc::kill(state.init_pid, libc::SIGKILL);
-        }
-        // Give the carrier a brief moment to complete its own teardown.
-        for _ in 0..20 {
-            if !container::pid_alive(state.init_pid) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        let control = running_control(&id, &state)?.clone();
+        send_logical_signal(&id, &control, LINUX_SIGKILL, state.auto_remove)?;
+        if !wait_for_terminal_receipt(&id, &control, state.auto_remove, TERMINAL_RECEIPT_TIMEOUT)? {
+            bail!(
+                "container {} accepted SIGKILL but is still live or unresponsive; refusing unsafe removal",
+                container::short_id(&id)
+            );
         }
     }
-    ContainerState::remove(&id)?;
+    if was_running {
+        match ContainerState::load(&id) {
+            Ok(current)
+                if current.status == ContainerStatus::Exited
+                    && current.terminal_control.as_ref() == state.control.as_ref() => {}
+            Ok(_) => bail!(
+                "container {} changed lifecycle state before removal; refusing unsafe removal",
+                container::short_id(&id)
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                container::clear_terminal_receipt(&id)?;
+                return Ok(id);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    // An auto-remove carrier may have removed its own entry with the terminal
+    // receipt. Treat that as successful force removal.
+    if let Err(error) = ContainerState::remove(&id)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error.into());
+    }
+    container::clear_terminal_receipt(&id)?;
     Ok(id)
 }
 
-/// Parse a signal name (`TERM`, `SIGTERM`, `9`, `KILL`, …) to its HOST (macOS)
-/// signal number. The result is sent via host `kill(2)` (and persisted as the
-/// container's stop signum), so names MUST resolve to the host's numbering, not
-/// the guest's Linux ABI.
+const LINUX_SIGKILL: i32 = 9;
+const LINUX_SIGTERM: i32 = 15;
+const TERMINAL_RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const CONTROL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn running_control<'a>(
+    id: &str,
+    state: &'a ContainerState,
+) -> anyhow::Result<&'a CarrierControlState> {
+    state.control.as_ref().with_context(|| {
+        format!(
+            "running container {} has no authenticated carrier control incarnation",
+            container::short_id(id)
+        )
+    })
+}
+
+fn send_logical_signal(
+    id: &str,
+    control: &CarrierControlState,
+    linux_signal: i32,
+    allow_missing_receipt: bool,
+) -> anyhow::Result<()> {
+    let outcome = match carrick_runtime::kernel::control::send(
+        id,
+        control,
+        ControlOperation::Signal { linux_signal },
+    ) {
+        Ok(outcome) => outcome,
+        Err(_) if has_exact_terminal_receipt(id, Some(control), allow_missing_receipt)? => {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "authenticated carrier control failed for container {}",
+                    container::short_id(id)
+                )
+            });
+        }
+    };
+    match outcome {
+        ControlOutcome::Signalled | ControlOutcome::AcceptedProtectedInit => Ok(()),
+        ControlOutcome::NotRunning
+            if has_exact_terminal_receipt(id, Some(control), allow_missing_receipt)? =>
+        {
+            Ok(())
+        }
+        ControlOutcome::NotRunning => bail!(
+            "container {} logical init is not running and has no terminal receipt",
+            container::short_id(id)
+        ),
+        ControlOutcome::StaleIncarnation => bail!(
+            "container {} carrier incarnation changed; refusing to signal a stale owner",
+            container::short_id(id)
+        ),
+        ControlOutcome::StaleTask => bail!(
+            "container {} logical init identity changed; refusing to signal a stale task",
+            container::short_id(id)
+        ),
+        ControlOutcome::InvalidSignal => bail!(
+            "container {} rejected invalid Linux signal {linux_signal}",
+            container::short_id(id)
+        ),
+        ControlOutcome::InvalidSchema => bail!(
+            "container {} rejected the carrier control schema",
+            container::short_id(id)
+        ),
+        ControlOutcome::Alive
+        | ControlOutcome::InvalidExec
+        | ControlOutcome::ExecUnavailable
+        | ControlOutcome::ExecRejected
+        | ControlOutcome::ExecAccepted { .. }
+        | ControlOutcome::ExecPending
+        | ControlOutcome::ExecRunning
+        | ControlOutcome::ExecComplete { .. }
+        | ControlOutcome::UnknownExecCapability
+        | ControlOutcome::ArchiveAccepted { .. }
+        | ControlOutcome::ArchiveReadAccepted { .. }
+        | ControlOutcome::ArchiveMetadata { .. }
+        | ControlOutcome::ArchiveChunk { .. }
+        | ControlOutcome::ArchiveWriteReady
+        | ControlOutcome::ArchiveComplete
+        | ControlOutcome::ArchiveError { .. } => bail!(
+            "container {} returned an invalid status outcome for a signal request",
+            container::short_id(id)
+        ),
+    }
+}
+
+fn has_exact_terminal_receipt(
+    id: &str,
+    expected: Option<&CarrierControlState>,
+    allow_missing: bool,
+) -> anyhow::Result<bool> {
+    match ContainerState::load(id) {
+        Ok(state) => Ok(state.status == ContainerStatus::Exited
+            && expected.is_none_or(|control| state.terminal_control.as_ref() == Some(control))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && allow_missing => {
+            Ok(container::terminal_receipt(id)?
+                .is_some_and(|receipt| expected.is_none_or(|control| receipt.control == *control)))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Wait for the exact carrier to publish terminal state. Each live observation
+/// is authenticated against the same nonce and logical init TaskKey. A replaced
+/// incarnation is an error, not success; disappearance is success only when the
+/// carrier's auto-remove policy removed the registry entry.
+fn wait_for_terminal_receipt(
+    id: &str,
+    expected: &CarrierControlState,
+    allow_missing: bool,
+    timeout: std::time::Duration,
+) -> anyhow::Result<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let state = match ContainerState::load(id) {
+            Ok(state) => state,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && allow_missing => {
+                return has_exact_terminal_receipt(id, Some(expected), true);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+                "container {} registry disappeared without a terminal receipt",
+                container::short_id(id)
+            ),
+            Err(error) => return Err(error.into()),
+        };
+        match state.status {
+            ContainerStatus::Exited => {
+                if state.terminal_control.as_ref() == Some(expected) {
+                    return Ok(true);
+                }
+                bail!(
+                    "container {} terminal receipt belongs to a different carrier incarnation",
+                    container::short_id(id)
+                );
+            }
+            ContainerStatus::Created => bail!(
+                "container {} was relaunched while awaiting terminal state",
+                container::short_id(id)
+            ),
+            ContainerStatus::Running => {}
+        }
+        if state.control.as_ref() != Some(expected) {
+            bail!(
+                "container {} carrier incarnation changed while awaiting terminal state",
+                container::short_id(id)
+            );
+        }
+        match carrick_runtime::kernel::control::send(id, expected, ControlOperation::Status) {
+            Ok(ControlOutcome::Alive) => {}
+            Ok(ControlOutcome::NotRunning) => {
+                // The kernel task has stopped; require its carrier to persist
+                // the authoritative terminal receipt before reporting success.
+            }
+            Ok(ControlOutcome::StaleIncarnation) => bail!(
+                "container {} carrier incarnation changed while awaiting terminal state",
+                container::short_id(id)
+            ),
+            Ok(ControlOutcome::StaleTask) => bail!(
+                "container {} logical init identity changed while awaiting terminal state",
+                container::short_id(id)
+            ),
+            Ok(other) => bail!(
+                "container {} returned invalid status outcome {other:?}",
+                container::short_id(id)
+            ),
+            Err(error) => {
+                // Terminal persistence precedes endpoint shutdown. Re-read once
+                // to admit that race, otherwise fail closed on a live entry.
+                match ContainerState::load(id) {
+                    Ok(current)
+                        if current.status == ContainerStatus::Exited
+                            && current.terminal_control.as_ref() == Some(expected) =>
+                    {
+                        return Ok(true);
+                    }
+                    Err(load_error)
+                        if load_error.kind() == std::io::ErrorKind::NotFound && allow_missing =>
+                    {
+                        return has_exact_terminal_receipt(id, Some(expected), true);
+                    }
+                    Err(load_error) if load_error.kind() == std::io::ErrorKind::NotFound => {
+                        bail!(
+                            "container {} registry disappeared without a terminal receipt",
+                            container::short_id(id)
+                        );
+                    }
+                    Ok(_) => return Err(error.into()),
+                    Err(load_error) => return Err(load_error.into()),
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(
+            CONTROL_POLL_INTERVAL
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
+    }
+}
+
+/// Parse a signal name (`TERM`, `SIGTERM`, `9`, `KILL`, …) to its Linux ABI
+/// signal number. The value is persisted as OCI stop policy and is delivered to
+/// a logical kernel task, so it must never depend on Darwin's numbering.
 pub(crate) fn parse_signal(s: &str) -> Option<i32> {
     let t = s.trim();
     if let Ok(n) = t.parse::<i32>() {
@@ -1057,23 +1721,43 @@ pub(crate) fn parse_signal(s: &str) -> Option<i32> {
     }
     let name = t.strip_prefix("SIG").unwrap_or(t).to_ascii_uppercase();
     let n = match name.as_str() {
-        "HUP" => libc::SIGHUP,
-        "INT" => libc::SIGINT,
-        "QUIT" => libc::SIGQUIT,
-        "ABRT" => libc::SIGABRT,
-        "KILL" => libc::SIGKILL,
-        "USR1" => libc::SIGUSR1,
-        "USR2" => libc::SIGUSR2,
-        "TERM" => libc::SIGTERM,
-        "STOP" => libc::SIGSTOP,
-        "CONT" => libc::SIGCONT,
-        "WINCH" => libc::SIGWINCH,
+        "HUP" => 1,
+        "INT" => 2,
+        "QUIT" => 3,
+        "ILL" => 4,
+        "TRAP" => 5,
+        "ABRT" | "IOT" => 6,
+        "BUS" => 7,
+        "FPE" => 8,
+        "KILL" => 9,
+        "USR1" => 10,
+        "SEGV" => 11,
+        "USR2" => 12,
+        "PIPE" => 13,
+        "ALRM" => 14,
+        "TERM" => 15,
+        "STKFLT" => 16,
+        "CHLD" | "CLD" => 17,
+        "CONT" => 18,
+        "STOP" => 19,
+        "TSTP" => 20,
+        "TTIN" => 21,
+        "TTOU" => 22,
+        "URG" => 23,
+        "XCPU" => 24,
+        "XFSZ" => 25,
+        "VTALRM" => 26,
+        "PROF" => 27,
+        "WINCH" => 28,
+        "IO" | "POLL" => 29,
+        "PWR" => 30,
+        "SYS" | "UNUSED" => 31,
         _ => return None,
     };
     Some(n)
 }
 
-/// Resolve a container's effective HOST stop signum from the `--stop-signal`
+/// Resolve a container's effective Linux stop signum from the `--stop-signal`
 /// flag and the image's OCI `STOPSIGNAL`: an explicit flag wins; else the image
 /// value; else `None` (stop falls back to `SIGTERM`). An invalid *explicit*
 /// flag is a hard error (docker rejects it at run time); an unparseable *image*
@@ -1102,14 +1786,12 @@ pub(crate) fn stop_grace_secs(flag: Option<u64>, config_timeout: Option<u64>) ->
     flag.or(config_timeout).unwrap_or(10)
 }
 
-/// `carrick exec [-i] [-t] [-u] [-w] [-e] <container> <cmd>...` — run a command
-/// in a running container, sharing its filesystem (the persisted overlay) and
-/// PID namespace (the file-backed region). Requires the container to have been
-/// started with `--fs host`. Transitional: this creates a second runtime
-/// process and must move behind the carrier control endpoint.
+/// `carrick exec [-u] [-w] [-e] <container> <cmd>...` — admit a fresh logical
+/// process into the running container's authenticated carrier and capture its
+/// result. Interactive and TTY transport remain explicitly unavailable.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec(
-    store: carrick_image::ImageStore,
+    _store: carrick_image::ImageStore,
     spec: &str,
     command: Vec<String>,
     interactive: bool,
@@ -1118,121 +1800,151 @@ pub(crate) fn exec(
     workdir: Option<String>,
     env: Vec<String>,
 ) -> anyhow::Result<()> {
+    if interactive || tty {
+        bail!(
+            "interactive/TTY exec is unavailable until carrier-control stdin and TTY framing is implemented"
+        );
+    }
     let id = container::resolve(spec).map_err(anyhow::Error::msg)?;
     let state = ContainerState::load(&id)?;
-    if !state.init_alive() {
+    if state.status != ContainerStatus::Running {
         bail!("container {} is not running", container::short_id(&id));
     }
-    let Some(scratch) = state.config.scratch_path.clone() else {
-        bail!("exec requires a container started with --fs host");
+    let request = build_control_exec_request(&state, command, user, workdir, env)?;
+    let result = run_control_exec_capture(&id, &state, request)?;
+    emit_exec_result(&result)?;
+    std::process::exit(result.exit_code);
+}
+
+pub(crate) fn run_control_exec_capture(
+    id: &str,
+    state: &ContainerState,
+    request: carrick_runtime::kernel::control::ExecRequest,
+) -> anyhow::Result<carrick_runtime::kernel::control::ExecResult> {
+    use carrick_runtime::kernel::control::{ControlOperation, ControlOutcome};
+
+    let control = state.control.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "container {} has no authenticated carrier control endpoint",
+            container::short_id(id)
+        )
+    })?;
+    let capability = match carrick_runtime::kernel::control::send(
+        id,
+        control,
+        ControlOperation::Exec { request },
+    )? {
+        ControlOutcome::ExecAccepted { capability } => capability,
+        ControlOutcome::InvalidExec => bail!("logical exec request was invalid"),
+        ControlOutcome::ExecUnavailable => bail!("logical exec admission is unavailable"),
+        ControlOutcome::ExecRejected => bail!("logical exec admission was rejected"),
+        ControlOutcome::NotRunning => {
+            bail!("container {} is not running", container::short_id(id))
+        }
+        ControlOutcome::StaleIncarnation | ControlOutcome::StaleTask => {
+            bail!(
+                "container {} carrier identity changed",
+                container::short_id(id)
+            )
+        }
+        other => bail!("carrier returned invalid exec admission outcome {other:?}"),
     };
-    let Some(region) = state.config.region_path.clone() else {
-        bail!(
-            "container {} has no joinable namespace (it was started with --pid host)",
-            container::short_id(&id)
-        );
-    };
-    // Tell the runtime to ATTACH this container's overlay + JOIN its pid region
-    // instead of creating a new overlay. This still creates a peer runtime.
-    // SAFETY: single-threaded CLI, before any runtime/fork.
-    unsafe {
-        std::env::set_var("CARRICK_EXEC_OVERLAY", &scratch);
-        std::env::set_var("CARRICK_JOIN_REGION", &region);
+    loop {
+        match carrick_runtime::kernel::control::send(
+            id,
+            control,
+            ControlOperation::ExecWait { capability },
+        )? {
+            ControlOutcome::ExecComplete { result } => return Ok(result),
+            ControlOutcome::ExecPending | ControlOutcome::ExecRunning => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            ControlOutcome::UnknownExecCapability => {
+                bail!("logical exec capability is unknown or already consumed")
+            }
+            ControlOutcome::StaleIncarnation | ControlOutcome::StaleTask => {
+                bail!(
+                    "container {} carrier identity changed",
+                    container::short_id(id)
+                )
+            }
+            other => bail!("carrier returned invalid exec wait outcome {other:?}"),
+        }
     }
+}
 
-    // exec inherits the container's env (image ENV + its `-e`) plus exec's `-e`.
-    let mut env_overrides = state.config.env.clone();
-    env_overrides.extend(env);
-    let network_source = shared_network_source_state(&state.config);
-    let effective_network = network_source
-        .as_ref()
-        .map(|state| &state.config)
-        .unwrap_or(&state.config);
-    let effective_name = network_source
-        .as_ref()
-        .and_then(|state| state.name.as_deref())
-        .or(state.name.as_deref());
-
-    let req = carrick_engine::CliRunRequest {
-        image_ref: state.image.clone(),
-        // Restart/exec reuses the already-resolved image; no re-pull.
-        pull: carrick_image::PullPolicy::Missing,
-        platform: state.config.platform.clone(),
-        args: command,
-        env_overrides,
-        // Reapply the container's bind mounts so exec sees the same mounted dirs.
-        mounts: state.config.mounts.clone(),
+pub(crate) fn build_control_exec_request(
+    state: &ContainerState,
+    command: Vec<String>,
+    user: Option<String>,
+    workdir: Option<String>,
+    env: Vec<String>,
+) -> anyhow::Result<carrick_runtime::kernel::control::ExecRequest> {
+    let exec_env = env
+        .into_iter()
+        .map(|entry| {
+            let (key, value) = entry
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("exec environment must be KEY=VALUE: {entry}"))?;
+            Ok(carrick_runtime::kernel::control::ExecEnvVar {
+                key: key.to_owned(),
+                value: value.to_owned(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let effective_user = user.or_else(|| state.config.user.clone());
+    let exec_user = match effective_user.as_deref() {
+        None | Some("") => Some(carrick_runtime::kernel::control::ExecUser {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        }),
+        Some(spec) => Some(parse_exec_numeric_user(spec)?),
+    };
+    Ok(carrick_runtime::kernel::control::ExecRequest {
+        argv: command,
+        env: exec_env,
         workdir: workdir.or_else(|| state.config.workdir.clone()),
-        user: user.or_else(|| state.config.user.clone()),
-        hostname: state.config.hostname.clone(),
-        // exec runs the command directly — no image ENTRYPOINT prepended.
-        entrypoint_override: Some(vec![]),
-        tty,
-        interactive,
-        rm: false,
-        name: None,
-        max_traps: carrick_runtime::runtime::DEFAULT_MAX_TRAPS,
-        debug_state_path: None,
-        fs: Some(carrick_spec::FsBackendKind::Host),
-        exec_backend: state.config.exec_backend,
-        pid: state.config.pid,
-        network: state.config.network,
-        network_bridge: bridge_network_name(effective_network),
-        network_container: state.config.network_container.clone(),
-        network_namespace_id: Some(
-            state
-                .config
-                .network_container
-                .clone()
-                .unwrap_or_else(|| state.id.clone()),
-        ),
-        network_attachments: bridge_network_attachments(effective_network, effective_name),
-        network_ipv4: bridge_network_ipv4(effective_network, effective_name),
-        network_aliases: bridge_network_aliases(effective_network),
-        extra_hosts: state.config.extra_hosts.clone(),
-        dns_servers: state.config.dns_servers.clone(),
-        dns_search: state.config.dns_search.clone(),
-        dns_options: state.config.dns_options.clone(),
-        volumes_from: state.config.volumes_from.clone(),
-        published_ports: Vec::new(),
-        // exec is a transient command, not a managed container — it is never
-        // `stop`ped, so it carries no stop config.
-        stop_signal: None,
-        stop_timeout: None,
-        // docker exec runs under the container's seccomp profile: reuse the
-        // container's persisted security options.
-        security_opts: state.config.security_opts.clone(),
-        cap_add: state.config.cap_add.clone(),
-    };
+        user: exec_user,
+        tty: false,
+        attach: carrick_runtime::kernel::control::ExecAttach::Capture,
+    })
+}
 
-    let engine = carrick_engine::Engine::new(store);
-    // Resolve under tokio, drop the runtime, then execute (fork) with no tokio
-    // alive — see the tokio-fork-isolation spec.
-    let spec = match crate::runtime_util::block_on_oci(engine.resolve(req)) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("carrick: exec failed: {e:#}");
-            std::process::exit(126);
-        }
+fn parse_exec_numeric_user(
+    spec: &str,
+) -> anyhow::Result<carrick_runtime::kernel::control::ExecUser> {
+    let (uid, gid) = match spec.split_once(':') {
+        Some((uid, gid)) => (
+            uid.parse::<u32>()
+                .with_context(|| format!("exec user must be numeric uid[:gid]: {spec}"))?,
+            gid.parse::<u32>()
+                .with_context(|| format!("exec user must be numeric uid[:gid]: {spec}"))?,
+        ),
+        None => (
+            spec.parse::<u32>()
+                .with_context(|| format!("exec user must be numeric uid[:gid]: {spec}"))?,
+            0,
+        ),
     };
-    let result = match carrick_runtime::Runtime::execute(&spec) {
-        Ok(r) => r,
-        Err(e) => {
-            // The command couldn't be started (e.g. not found / not executable
-            // surfaces inside as 126/127; this is the engine/setup-failure case).
-            eprintln!("carrick: exec failed: {e:#}");
-            std::process::exit(126);
-        }
-    };
-    let status = if result.trap_limit_hit {
-        1
-    } else {
-        result.exit_code
-    };
-    if !(tty || interactive) {
-        crate::runtime_util::emit_raw(&result);
+    Ok(carrick_runtime::kernel::control::ExecUser {
+        uid,
+        gid,
+        supplementary_gids: Vec::new(),
+    })
+}
+
+fn emit_exec_result(result: &carrick_runtime::kernel::control::ExecResult) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    std::io::stdout().write_all(&result.stdout)?;
+    std::io::stdout().flush()?;
+    std::io::stderr().write_all(&result.stderr)?;
+    std::io::stderr().flush()?;
+    if result.output_truncated {
+        eprintln!("carrick: exec output was truncated by the carrier-control capture bound");
     }
-    std::process::exit(status);
+    Ok(())
 }
 
 /// `carrick wait <container>...` — block until each container stops, then print
@@ -1251,6 +1963,7 @@ pub(crate) fn wait(containers: &[String]) -> anyhow::Result<()> {
 fn wait_one(spec: &str) -> anyhow::Result<i32> {
     let id = container::resolve(spec).map_err(anyhow::Error::msg)?;
     loop {
+        let _lifecycle_lock = container::lock_lifecycle(&id)?;
         let Ok(mut state) = ContainerState::load(&id) else {
             // Gone (e.g. a `--rm` container removed on exit): nothing to wait on.
             return Ok(0);
@@ -1260,6 +1973,7 @@ fn wait_one(spec: &str) -> anyhow::Result<i32> {
                 .exit_code
                 .unwrap_or(container::UNKNOWN_CARRIER_EXIT_CODE));
         }
+        drop(_lifecycle_lock);
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
@@ -1765,9 +2479,12 @@ pub(crate) fn select_tail(data: &[u8], tail: Option<usize>) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerState, ContainerStatus, RunConfig, bridge_network_attachments,
-        build_created_state, parse_signal, ps_row_json, rebuild_request_from_state, render_format,
-        reset_for_relaunch, resolve_stop_signal, select_tail, stop_grace_secs,
+        CARRIER_LAUNCH_GRANT_FD, ContainerState, ContainerStatus, InitialContainerMetadata,
+        RunConfig, StopSignalAbi, apply_initial_metadata, bridge_network_attachments,
+        build_control_exec_request, build_created_state, carrier_entry_argv,
+        configured_stop_signal, launch_grant_pipe, new_container_id, parse_exec_numeric_user,
+        parse_signal, ps_row_json, published_control_for_child, rebuild_request_from_state,
+        render_format, reset_for_relaunch, resolve_stop_signal, select_tail, stop_grace_secs,
         validate_published_port_availability,
     };
 
@@ -1785,6 +2502,9 @@ mod tests {
             auto_remove: false,
             api_auto_remove: false,
             labels: std::collections::HashMap::new(),
+            control: None,
+            terminal_control: None,
+            launch_ticket: None,
             config: RunConfig {
                 cap_add: Vec::new(),
                 platform: Some("linux/arm64".into()),
@@ -1818,10 +2538,164 @@ mod tests {
                 interactive: false,
                 max_traps: 4242,
                 stop_signal: Some(libc::SIGQUIT),
+                stop_signal_abi: StopSignalAbi::Linux,
                 stop_timeout: Some(15),
                 security_opts: vec!["seccomp=unconfined".into()],
             },
         }
+    }
+
+    #[test]
+    fn control_exec_request_uses_numeric_user_workdir_and_only_exec_env_overrides() {
+        let state = sample_state();
+        let request = build_control_exec_request(
+            &state,
+            vec!["echo".to_owned(), "ok".to_owned()],
+            Some("42:43".to_owned()),
+            Some("/tmp".to_owned()),
+            vec!["A=exec".to_owned(), "B=2".to_owned()],
+        )
+        .expect("control exec request");
+
+        assert_eq!(request.argv, ["echo", "ok"]);
+        assert_eq!(request.workdir.as_deref(), Some("/tmp"));
+        assert_eq!(
+            request.user.as_ref().map(|user| (user.uid, user.gid)),
+            Some((42, 43))
+        );
+        assert_eq!(
+            request
+                .env
+                .iter()
+                .map(|entry| (entry.key.as_str(), entry.value.as_str()))
+                .collect::<Vec<_>>(),
+            [("A", "exec"), ("B", "2")],
+            "the carrier merges overrides over its authoritative current full environment",
+        );
+        assert!(!request.tty);
+        assert_eq!(
+            request.attach,
+            carrick_runtime::kernel::control::ExecAttach::Capture,
+        );
+        let defaults =
+            build_control_exec_request(&state, vec!["true".to_owned()], None, None, Vec::new())
+                .expect("persisted exec defaults");
+        assert_eq!(defaults.workdir.as_deref(), Some("/w"));
+        assert_eq!(
+            defaults.user.as_ref().map(|user| (user.uid, user.gid)),
+            Some((1_000, 0)),
+        );
+    }
+
+    #[test]
+    fn control_exec_rejects_named_users_and_malformed_env() {
+        assert!(parse_exec_numeric_user("nobody").is_err());
+        assert!(
+            build_control_exec_request(
+                &sample_state(),
+                vec!["true".to_owned()],
+                None,
+                None,
+                vec!["MISSING_EQUALS".to_owned()],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn detached_readiness_requires_running_control_from_the_exact_child() {
+        let mut state = sample_state();
+        state.status = ContainerStatus::Created;
+        state.control = Some(carrick_runtime::container::CarrierControlState {
+            schema: carrick_runtime::kernel::control::CARRIER_CONTROL_STATE_SCHEMA.to_owned(),
+            owner_nonce: carrick_runtime::kernel::control::ControlNonce::fresh().expect("nonce"),
+            init: carrick_runtime::kernel::control::ControlTaskKey { pid: 1, serial: 1 },
+        });
+        assert!(published_control_for_child(&state, 6).is_none());
+        state.status = ContainerStatus::Running;
+        assert!(published_control_for_child(&state, 7).is_none());
+        assert!(published_control_for_child(&state, 6).is_some());
+        state.control = None;
+        assert!(published_control_for_child(&state, 6).is_none());
+    }
+
+    #[test]
+    fn carrier_entry_reexec_argv_preserves_store_and_exact_id() {
+        let argv = carrier_entry_argv(
+            std::path::Path::new("/opt/carrick/bin/carrick"),
+            std::path::Path::new("/case-sensitive/store"),
+            "container-17",
+        )
+        .expect("argv");
+        let rendered = argv
+            .iter()
+            .map(|arg| arg.to_str().expect("utf8 fixture"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered,
+            [
+                "/opt/carrick/bin/carrick",
+                "--store",
+                "/case-sensitive/store",
+                "__carrier-entry",
+                "container-17",
+                "198",
+            ]
+        );
+    }
+
+    #[test]
+    fn concurrent_launch_grant_sources_are_cloexec_and_disjoint() {
+        let first = launch_grant_pipe().expect("first grant pipe");
+        let second = launch_grant_pipe().expect("second grant pipe");
+        let fds = [first.0, first.1, second.0, second.1];
+        let distinct = fds
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(distinct.len(), fds.len());
+        assert!(!fds.contains(&CARRIER_LAUNCH_GRANT_FD));
+        for fd in fds {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert_ne!(flags, -1);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    #[test]
+    fn container_ids_are_unique_within_one_process_and_second() {
+        assert_ne!(new_container_id(17), new_container_id(17));
+    }
+
+    #[test]
+    fn initial_api_metadata_is_part_of_the_created_state() {
+        let mut state = sample_state();
+        let metadata = InitialContainerMetadata {
+            hostname: Some("api-host".to_owned()),
+            labels: std::collections::HashMap::from([("role".to_owned(), "test".to_owned())]),
+            api_auto_remove: true,
+            api_network_mode: Some("bridge-a".to_owned()),
+            network_container: Some("peer-id".to_owned()),
+            network_attachments: vec![carrick_runtime::container::NetworkAttachment {
+                name: "bridge-a".to_owned(),
+                aliases: vec!["alias-a".to_owned()],
+                links: Vec::new(),
+                mac_address: None,
+                gw_priority: 0,
+                ipv4_address: None,
+                ipv6_address: None,
+                link_local_ips: Vec::new(),
+                driver_opts: std::collections::HashMap::new(),
+            }],
+        };
+        apply_initial_metadata(&mut state, metadata);
+        assert_eq!(state.config.hostname.as_deref(), Some("api-host"));
+        assert_eq!(state.labels.get("role").map(String::as_str), Some("test"));
+        assert!(state.api_auto_remove);
+        assert_eq!(state.config.api_network_mode.as_deref(), Some("bridge-a"));
+        assert_eq!(state.config.network_container.as_deref(), Some("peer-id"));
+        assert_eq!(state.config.network_attachments[0].name, "bridge-a");
     }
 
     #[test]
@@ -2173,17 +3047,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_signal_pins_host_numbers_and_new_aliases() {
-        // Signal NAMES resolve to the HOST (macOS) signal numbers — the stop
-        // signum is persisted and later passed to host kill(2), so it must be a
-        // host number, not Linux's (e.g. SIGUSR1 is 10 on macOS, 30 on Linux).
-        assert_eq!(parse_signal("SIGUSR1"), Some(libc::SIGUSR1));
-        assert_eq!(parse_signal("USR1"), Some(libc::SIGUSR1));
-        assert_eq!(parse_signal("SIGSTOP"), Some(libc::SIGSTOP));
-        assert_eq!(parse_signal("term"), Some(libc::SIGTERM));
-        // Aliases added for stop-signal coverage.
-        assert_eq!(parse_signal("SIGABRT"), Some(libc::SIGABRT));
-        assert_eq!(parse_signal("WINCH"), Some(libc::SIGWINCH));
+    fn parse_signal_pins_linux_numbers_and_standard_names() {
+        // Names are Linux ABI numbers even when the CLI runs on Darwin. These
+        // are delivered to the logical kernel task, never a host process.
+        assert_eq!(parse_signal("SIGUSR1"), Some(10));
+        assert_eq!(parse_signal("USR2"), Some(12));
+        assert_eq!(parse_signal("SIGCHLD"), Some(17));
+        assert_eq!(parse_signal("CONT"), Some(18));
+        assert_eq!(parse_signal("SIGSTOP"), Some(19));
+        assert_eq!(parse_signal("term"), Some(15));
+        assert_eq!(parse_signal("SIGABRT"), Some(6));
+        assert_eq!(parse_signal("WINCH"), Some(28));
+        assert_eq!(parse_signal("SIGSYS"), Some(31));
         // Numeric form + bounds (1..=64).
         assert_eq!(parse_signal("9"), Some(9));
         assert_eq!(parse_signal("0"), None);
@@ -2192,17 +3067,28 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_host_kill_is_confined_to_exact_startup_rollback() {
+        let source = include_str!("lifecycle.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("test module marker")
+            .0;
+        let uses = production.match_indices("libc::kill(").collect::<Vec<_>>();
+        assert_eq!(uses.len(), 1, "unexpected host kill in lifecycle: {uses:?}");
+        let context = &source[uses[0].0.saturating_sub(240)..uses[0].0 + 120];
+        assert!(context.contains("unreaped direct child"));
+        assert!(context.contains("startup rollback"));
+    }
+
+    #[test]
     fn resolve_stop_signal_precedence_flag_over_image_over_none() {
         // An explicit --stop-signal wins over the image's STOPSIGNAL.
         assert_eq!(
             resolve_stop_signal(Some("SIGUSR1"), Some("SIGQUIT")).unwrap(),
-            Some(libc::SIGUSR1)
+            Some(10)
         );
         // No flag → the image's STOPSIGNAL.
-        assert_eq!(
-            resolve_stop_signal(None, Some("SIGQUIT")).unwrap(),
-            Some(libc::SIGQUIT)
-        );
+        assert_eq!(resolve_stop_signal(None, Some("SIGQUIT")).unwrap(), Some(3));
         // Neither → None (stop falls back to SIGTERM at stop time).
         assert_eq!(resolve_stop_signal(None, None).unwrap(), None);
         // An invalid EXPLICIT flag is a hard error (docker rejects it at run).
@@ -2210,6 +3096,23 @@ mod tests {
         // An unparseable IMAGE STOPSIGNAL is ignored (→ None), never an error —
         // we don't fail a run over a weird value baked into someone's image.
         assert_eq!(resolve_stop_signal(None, Some("BOGUS")).unwrap(), None);
+    }
+
+    #[test]
+    fn configured_stop_signal_is_linux_or_fails_closed_for_ambiguous_legacy_state() {
+        let mut config = RunConfig {
+            stop_signal: Some(10),
+            stop_signal_abi: StopSignalAbi::Linux,
+            ..RunConfig::default()
+        };
+        assert_eq!(configured_stop_signal("abcdef", &config).unwrap(), 10);
+
+        config.stop_signal_abi = StopSignalAbi::LegacyHost;
+        let error = configured_stop_signal("abcdef", &config).expect_err("legacy is ambiguous");
+        assert!(error.to_string().contains("ambiguous legacy"));
+
+        config.stop_signal = None;
+        assert_eq!(configured_stop_signal("abcdef", &config).unwrap(), 15);
     }
 
     #[test]

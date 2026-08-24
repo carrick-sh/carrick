@@ -543,12 +543,6 @@ impl SyscallTrap for ScriptedTrap {
         Ok(())
     }
 
-    fn fork(&mut self) -> Result<carrick_runtime::trap::ForkOutcome, TrapError> {
-        Err(TrapError::Hypervisor(
-            "scripted trap does not implement fork".to_owned(),
-        ))
-    }
-
     fn execve_into(&mut self, _: &carrick_runtime::memory::AddressSpace) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "scripted trap does not implement execve".to_owned(),

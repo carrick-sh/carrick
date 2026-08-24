@@ -4,8 +4,46 @@
 
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::{Bytes, Incoming};
+use hyper::body::{Body, Bytes, Incoming};
 use hyper::{Method, Request, Response, StatusCode};
+use std::sync::{Arc, LazyLock};
+
+pub(crate) const MAX_HTTP_ARCHIVE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CONCURRENT_ARCHIVE_BODY_BYTES: usize = 32 * 1024 * 1024;
+static ARCHIVE_BODY_BUDGET: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
+    Arc::new(tokio::sync::Semaphore::new(
+        MAX_CONCURRENT_ARCHIVE_BODY_BYTES,
+    ))
+});
+
+#[derive(Debug, Eq, PartialEq)]
+enum LimitedBodyError {
+    TooLarge,
+    Transport(String),
+}
+
+async fn collect_limited_body<B>(mut body: B, limit: usize) -> Result<Bytes, LimitedBodyError>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|error| LimitedBodyError::Transport(error.to_string()))?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        let next = bytes
+            .len()
+            .checked_add(data.len())
+            .ok_or(LimitedBodyError::TooLarge)?;
+        if next > limit {
+            return Err(LimitedBodyError::TooLarge);
+        }
+        bytes.extend_from_slice(&data);
+    }
+    Ok(Bytes::from(bytes))
+}
 
 /// The server's unified response body. Buffered endpoints wrap their
 /// `Full<Bytes>` via [`boxed`]; `/build` streams via `http_body_util::StreamBody`.
@@ -67,6 +105,19 @@ fn json(status: StatusCode, body: String) -> Response<Full<Bytes>> {
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
 }
 
+async fn lifecycle_handler(
+    operation: impl FnOnce() -> (u16, String) + Send + 'static,
+) -> (u16, String) {
+    match tokio::task::spawn_blocking(operation).await {
+        Ok(response) => response,
+        Err(error) => (
+            500,
+            serde_json::json!({ "message": format!("lifecycle worker failed: {error}") })
+                .to_string(),
+        ),
+    }
+}
+
 /// The single service entry point. Infallible at the HTTP layer: every handler
 /// error becomes a response, never a panic (the no-panic gate). The response
 /// body is the boxed [`ResponseBody`]: buffered endpoints box their
@@ -123,16 +174,61 @@ pub(crate) async fn route(
         return Ok(crate::serve::handlers::download_archive_route(id, query).await);
     }
 
+    if method == Method::HEAD && container_action(&path).map(|(_, a)| a) == Some("archive") {
+        let id = container_action(&path)
+            .map(|(id, _)| id)
+            .unwrap_or_default()
+            .to_string();
+        return Ok(crate::serve::handlers::head_archive_route(id, query).await);
+    }
+
     if method == Method::PUT && container_action(&path).map(|(_, a)| a) == Some("archive") {
         let id = container_action(&path)
             .map(|(id, _)| id)
             .unwrap_or_default()
             .to_string();
-        let body_bytes = match BodyExt::collect(req.into_body()).await {
-            Ok(b) => b.to_bytes(),
-            Err(_) => Bytes::new(),
+        if req
+            .headers()
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|length| length > MAX_HTTP_ARCHIVE_BYTES)
+        {
+            return Ok(boxed(json(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                serde_json::json!({ "message": "archive body is too large" }).to_string(),
+            )));
+        }
+        let budget = match Arc::clone(&ARCHIVE_BODY_BUDGET)
+            .acquire_many_owned(MAX_HTTP_ARCHIVE_BYTES as u32)
+            .await
+        {
+            Ok(budget) => budget,
+            Err(error) => {
+                return Ok(boxed(json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({ "message": format!("archive body budget is unavailable: {error}") }).to_string(),
+                )));
+            }
         };
-        return Ok(crate::serve::handlers::upload_archive_route(id, query, body_bytes).await);
+        let body_bytes = match collect_limited_body(req.into_body(), MAX_HTTP_ARCHIVE_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(LimitedBodyError::TooLarge) => {
+                return Ok(boxed(json(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    serde_json::json!({ "message": "archive body is too large" }).to_string(),
+                )));
+            }
+            Err(LimitedBodyError::Transport(error)) => {
+                return Ok(boxed(json(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({ "message": format!("archive request body failed: {error}") }).to_string(),
+                )));
+            }
+        };
+        let response = crate::serve::handlers::upload_archive_route(id, query, body_bytes).await;
+        drop(budget);
+        return Ok(response);
     }
 
     if method == Method::GET && path == "/events" {
@@ -179,8 +275,10 @@ pub(crate) async fn route(
         }
         (&Method::POST, "/containers/create") => {
             let name = query_param(&query, "name");
-            let (status, body) =
-                crate::serve::handlers::create_container(&body_bytes, name.as_deref());
+            let (status, body) = lifecycle_handler(move || {
+                crate::serve::handlers::create_container(&body_bytes, name.as_deref())
+            })
+            .await;
             json(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 body,
@@ -286,35 +384,53 @@ pub(crate) async fn route(
             )
         }
         (&Method::POST, p) if container_action(p).map(|(_, a)| a) == Some("start") => {
-            let id = container_action(p).map(|(id, _)| id).unwrap_or_default();
-            let (status, body) = crate::serve::handlers::start_container(id);
+            let id = container_action(p)
+                .map(|(id, _)| id)
+                .unwrap_or_default()
+                .to_owned();
+            let (status, body) =
+                lifecycle_handler(move || crate::serve::handlers::start_container(&id)).await;
             json(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 body,
             )
         }
         (&Method::POST, p) if container_action(p).map(|(_, a)| a) == Some("stop") => {
-            let id = container_action(p).map(|(id, _)| id).unwrap_or_default();
+            let id = container_action(p)
+                .map(|(id, _)| id)
+                .unwrap_or_default()
+                .to_owned();
             let t = query_param(&query, "t").and_then(|v| v.parse::<u64>().ok());
-            let (status, body) = crate::serve::handlers::stop_container(id, t);
+            let (status, body) =
+                lifecycle_handler(move || crate::serve::handlers::stop_container(&id, t)).await;
             json(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 body,
             )
         }
         (&Method::POST, p) if container_action(p).map(|(_, a)| a) == Some("kill") => {
-            let id = container_action(p).map(|(id, _)| id).unwrap_or_default();
+            let id = container_action(p)
+                .map(|(id, _)| id)
+                .unwrap_or_default()
+                .to_owned();
             let signal = query_param(&query, "signal");
-            let (status, body) = crate::serve::handlers::kill_container(id, signal.as_deref());
+            let (status, body) = lifecycle_handler(move || {
+                crate::serve::handlers::kill_container(&id, signal.as_deref())
+            })
+            .await;
             json(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 body,
             )
         }
         (&Method::POST, p) if container_action(p).map(|(_, a)| a) == Some("restart") => {
-            let id = container_action(p).map(|(id, _)| id).unwrap_or_default();
+            let id = container_action(p)
+                .map(|(id, _)| id)
+                .unwrap_or_default()
+                .to_owned();
             let t = query_param(&query, "t").and_then(|v| v.parse::<u64>().ok());
-            let (status, body) = crate::serve::handlers::restart_container(id, t);
+            let (status, body) =
+                lifecycle_handler(move || crate::serve::handlers::restart_container(&id, t)).await;
             json(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 body,
@@ -332,11 +448,16 @@ pub(crate) async fn route(
             if p.strip_prefix("/containers/")
                 .is_some_and(|s| !s.is_empty() && !s.contains('/')) =>
         {
-            let id = p.strip_prefix("/containers/").unwrap_or_default();
+            let id = p
+                .strip_prefix("/containers/")
+                .unwrap_or_default()
+                .to_owned();
             let force = query_param(&query, "force").is_some_and(|v| v == "true" || v == "1");
             let remove_volumes = query_param(&query, "v").is_some_and(|v| v == "true" || v == "1");
-            let (status, body) =
-                crate::serve::handlers::remove_container(id, force, remove_volumes);
+            let (status, body) = lifecycle_handler(move || {
+                crate::serve::handlers::remove_container(&id, force, remove_volumes)
+            })
+            .await;
             json(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 body,
@@ -403,9 +524,14 @@ pub(crate) async fn route(
             )
         }
         (&Method::POST, p) if container_action(p).map(|(_, a)| a) == Some("rename") => {
-            let id = container_action(p).map(|(id, _)| id).unwrap_or_default();
+            let id = container_action(p)
+                .map(|(id, _)| id)
+                .unwrap_or_default()
+                .to_owned();
             let new_name = query_param(&query, "name").unwrap_or_default();
-            let (status, body) = crate::serve::handlers::rename_container(id, &new_name);
+            let (status, body) =
+                lifecycle_handler(move || crate::serve::handlers::rename_container(&id, &new_name))
+                    .await;
             json(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 body,
@@ -422,4 +548,90 @@ pub(crate) async fn route(
         _ => text(StatusCode::NOT_FOUND, "page not found"),
     };
     Ok(boxed(resp))
+}
+
+#[cfg(test)]
+mod archive_body_tests {
+    use super::*;
+    use hyper::body::Frame;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    struct TestBody {
+        frames: VecDeque<Result<Frame<Bytes>, std::io::Error>>,
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl Body for TestBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(self.frames.pop_front())
+        }
+    }
+
+    fn body(
+        frames: impl IntoIterator<Item = Result<Frame<Bytes>, std::io::Error>>,
+    ) -> (TestBody, Arc<AtomicUsize>) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        (
+            TestBody {
+                frames: frames.into_iter().collect(),
+                polls: Arc::clone(&polls),
+            },
+            polls,
+        )
+    }
+
+    #[tokio::test]
+    async fn archive_body_collector_stops_at_the_first_oversized_chunk() {
+        let (body, polls) = body([
+            Ok(Frame::data(Bytes::from_static(b"abc"))),
+            Ok(Frame::data(Bytes::from_static(b"def"))),
+            Ok(Frame::data(Bytes::from_static(b"must-not-be-polled"))),
+        ]);
+
+        assert_eq!(
+            collect_limited_body(body, 5).await,
+            Err(LimitedBodyError::TooLarge)
+        );
+        assert_eq!(polls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn archive_body_collector_preserves_transport_errors() {
+        let (body, _) = body([
+            Ok(Frame::data(Bytes::from_static(b"abc"))),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "fixture transport loss",
+            )),
+        ]);
+
+        assert_eq!(
+            collect_limited_body(body, 16).await,
+            Err(LimitedBodyError::Transport(
+                "fixture transport loss".to_owned()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_body_collector_preserves_bounded_chunks() {
+        let (body, _) = body([
+            Ok(Frame::data(Bytes::from_static(b"abc"))),
+            Ok(Frame::data(Bytes::from_static(b"def"))),
+        ]);
+
+        assert_eq!(
+            collect_limited_body(body, 6).await,
+            Ok(Bytes::from_static(b"abcdef"))
+        );
+    }
 }

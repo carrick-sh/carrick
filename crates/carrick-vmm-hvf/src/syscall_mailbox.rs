@@ -125,16 +125,6 @@ impl MailboxSlotAllocator {
             allocator: Arc::clone(self),
         })
     }
-
-    /// After host `fork`, only the calling thread survives. Its binding keeps
-    /// the retained lease; copied used bits for vanished sibling threads would
-    /// otherwise leak slots forever because those threads cannot run `Drop` in
-    /// the child.
-    pub(crate) fn retain_only_after_fork_child(&self, retained: MailboxSlotId) {
-        let mut used = self.used.lock();
-        used.fill(false);
-        used[usize::from(retained.0)] = true;
-    }
 }
 
 impl Default for MailboxSlotAllocator {
@@ -863,24 +853,6 @@ mod tests {
         ));
         drop(leases.remove(17));
         assert_eq!(allocator.allocate().expect("reused slot").id().raw(), 17);
-    }
-
-    #[test]
-    fn fork_child_discards_vanished_sibling_ownership() {
-        let allocator = Arc::new(MailboxSlotAllocator::new());
-        let retained = allocator.allocate().expect("retained slot");
-        let vanished_a = allocator.allocate().expect("sibling slot");
-        let vanished_b = allocator.allocate().expect("sibling slot");
-        allocator.retain_only_after_fork_child(retained.id());
-
-        let first = allocator.allocate().expect("first reclaimed sibling slot");
-        let second = allocator.allocate().expect("second reclaimed sibling slot");
-        assert_eq!((first.id().raw(), second.id().raw()), (1, 2));
-
-        // In the real child the vanished thread values do not exist to drop.
-        // Avoid simulating their impossible drops against the reset allocator.
-        std::mem::forget(vanished_a);
-        std::mem::forget(vanished_b);
     }
 
     #[test]

@@ -15,8 +15,9 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::UnixListener;
 
-/// Entry point for `carrick serve`. Runs its own multi-thread tokio runtime so
-/// the (single-threaded, fork-based) `run` path is untouched.
+/// Entry point for `carrick serve`. The API server owns a multi-thread Tokio
+/// runtime; each container is launched through the typed carrier boundary and
+/// all of its logical guest tasks remain inside that carrier.
 pub(crate) fn serve(docker_api: bool, host: String) -> anyhow::Result<()> {
     if !docker_api {
         anyhow::bail!("carrick serve currently supports only --docker-api");

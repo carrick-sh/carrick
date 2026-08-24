@@ -34,10 +34,11 @@ use crate::linux_abi::LinuxErrno;
 use carrick_abi::{NsGid, NsUid};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::dispatch::HostSyscallResult;
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
@@ -125,10 +126,79 @@ pub struct SharedFileEntry {
     pub contents: SharedFileContents,
 }
 
+thread_local! {
+    static EXCLUSIVE_ARCHIVE_GATES: std::cell::RefCell<Vec<usize>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+/// Per-overlay exclusion between a multi-path archive transaction and ordinary
+/// guest mutations. Ordinary mutations take a recursive shared guard, retaining
+/// concurrency; archive validation/apply/rollback takes the exclusive guard.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct ArchiveMutationGate {
+    lock: RwLock<()>,
+}
+
+pub(crate) struct ArchiveTransactionGuard<'a> {
+    gate_id: usize,
+    _guard: RwLockWriteGuard<'a, ()>,
+}
+
+enum MutationGuard<'a> {
+    Shared { _guard: RwLockReadGuard<'a, ()> },
+    ArchiveOwner,
+}
+
+impl ArchiveMutationGate {
+    fn id(&self) -> usize {
+        std::ptr::from_ref(self).addr()
+    }
+
+    pub(crate) fn archive_transaction(&self) -> ArchiveTransactionGuard<'_> {
+        let guard = self.lock.write();
+        let gate_id = self.id();
+        EXCLUSIVE_ARCHIVE_GATES.with(|held| held.borrow_mut().push(gate_id));
+        ArchiveTransactionGuard {
+            gate_id,
+            _guard: guard,
+        }
+    }
+
+    fn mutation(&self) -> MutationGuard<'_> {
+        let gate_id = self.id();
+        if EXCLUSIVE_ARCHIVE_GATES.with(|held| held.borrow().contains(&gate_id)) {
+            MutationGuard::ArchiveOwner
+        } else {
+            MutationGuard::Shared {
+                _guard: self.lock.read_recursive(),
+            }
+        }
+    }
+}
+
+impl Drop for ArchiveTransactionGuard<'_> {
+    fn drop(&mut self) {
+        EXCLUSIVE_ARCHIVE_GATES.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(index) = held.iter().rposition(|gate| *gate == self.gate_id) {
+                held.remove(index);
+            }
+        });
+    }
+}
+
 /// Trait every writable-layer backend implements. Methods are layer-
 /// aware (see module docs); the dispatcher does its own overlay-first
 /// merging with the read-only rootfs underneath.
 pub trait FsBackend: Send + Sync {
+    /// Return the backend's mutation exclusion only when all namespace-changing
+    /// methods participate. Unknown backends fail closed for archive import.
+    #[doc(hidden)]
+    fn archive_mutation_gate(&self) -> Option<&ArchiveMutationGate> {
+        None
+    }
     /// Snapshot the durable root authority needed by native host self-reexec.
     /// Memory and synthetic backends reject this boundary explicitly.
     fn native_reexec_authority(&self) -> Result<HostFsReexecAuthority, BackendError> {
@@ -370,9 +440,32 @@ pub trait FsBackend: Send + Sync {
     /// host syscalls per child on the fs-walk workload).
     fn child_names(&self, dir: &str) -> Vec<(String, RootFsEntryKind, Option<u64>)>;
 
+    /// Archive-only bounded directory enumeration. Implementations must stop
+    /// after producing `limit + 1` visible candidates and must never delegate
+    /// to the unbounded [`FsBackend::child_names`] default. The extra entry is
+    /// the caller's exact overflow sentinel.
+    fn child_names_bounded(
+        &self,
+        _dir: &str,
+        _limit: usize,
+    ) -> Result<Vec<(String, RootFsEntryKind, Option<u64>)>, BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
     /// Immediate children of `dir` that are tombstoned. The dispatcher
     /// uses this to filter rootfs-supplied entries.
     fn deleted_child_names(&self, dir: &str) -> Vec<String>;
+
+    /// Bounded counterpart to [`FsBackend::deleted_child_names`] for archive
+    /// overlay merges. Unknown backends fail closed rather than allocating an
+    /// unbounded tombstone set.
+    fn deleted_child_names_bounded(
+        &self,
+        _dir: &str,
+        _limit: usize,
+    ) -> Result<Vec<String>, BackendError> {
+        Err(BackendError::Unsupported)
+    }
 
     /// Rename an entry the backend owns. Returns `Ok(true)` iff the
     /// source was present in the backend; `Ok(false)` means the
@@ -944,6 +1037,7 @@ struct MemoryBackendState {
 #[derive(Debug, Default)]
 pub struct MemoryBackend {
     inner: RwLock<MemoryBackendState>,
+    archive_mutation_gate: ArchiveMutationGate,
 }
 
 impl MemoryBackend {
@@ -956,6 +1050,7 @@ impl Clone for MemoryBackend {
     fn clone(&self) -> Self {
         Self {
             inner: RwLock::new(self.inner.read().clone()),
+            archive_mutation_gate: ArchiveMutationGate::default(),
         }
     }
 }
@@ -969,6 +1064,10 @@ impl PartialEq for MemoryBackend {
 impl Eq for MemoryBackend {}
 
 impl FsBackend for MemoryBackend {
+    fn archive_mutation_gate(&self) -> Option<&ArchiveMutationGate> {
+        Some(&self.archive_mutation_gate)
+    }
+
     fn lookup(&self, path: &str) -> Option<OverlayEntry> {
         let normalized = normalize(path)?;
         let inner = self.inner.read();
@@ -1104,6 +1203,7 @@ impl FsBackend for MemoryBackend {
     }
 
     fn make_dir(&self, path: &str) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let mut inner = self.inner.write();
         inner.deletions.remove(&normalized);
@@ -1112,6 +1212,7 @@ impl FsBackend for MemoryBackend {
     }
 
     fn create_file(&self, path: &str) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let mut inner = self.inner.write();
         inner.deletions.remove(&normalized);
@@ -1132,6 +1233,7 @@ impl FsBackend for MemoryBackend {
         contents: Arc<[u8]>,
         mode: u32,
     ) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let mut inner = self.inner.write();
         inner.deletions.remove(&normalized);
@@ -1148,6 +1250,7 @@ impl FsBackend for MemoryBackend {
     }
 
     fn create_socket(&self, path: &str, mode: u32) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let mut inner = self.inner.write();
         inner.deletions.remove(&normalized);
@@ -1160,6 +1263,7 @@ impl FsBackend for MemoryBackend {
     }
 
     fn set_mode(&self, path: &str, mode: u32) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let mut inner = self.inner.write();
         let mode = mode & 0o7777;
@@ -1192,6 +1296,7 @@ impl FsBackend for MemoryBackend {
     }
 
     fn set_file_contents(&self, path: &str, contents: Vec<u8>) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let mut inner = self.inner.write();
         inner.deletions.remove(&normalized);
@@ -1208,6 +1313,7 @@ impl FsBackend for MemoryBackend {
         bytes: &[u8],
         final_size: usize,
     ) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let end = offset
             .checked_add(bytes.len())
             .ok_or(BackendError::Invalid)?;
@@ -1228,6 +1334,7 @@ impl FsBackend for MemoryBackend {
     }
 
     fn remove_entry(&self, path: &str) -> bool {
+        let _mutation = self.archive_mutation_gate.mutation();
         let Some(normalized) = normalize(path) else {
             return false;
         };
@@ -1239,6 +1346,7 @@ impl FsBackend for MemoryBackend {
     }
 
     fn mark_deleted(&self, path: &str) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let mut inner = self.inner.write();
         inner.files.remove(&normalized);
@@ -1249,42 +1357,77 @@ impl FsBackend for MemoryBackend {
     }
 
     fn child_names(&self, dir: &str) -> Vec<(String, RootFsEntryKind, Option<u64>)> {
+        self.child_names_bounded(dir, usize::MAX)
+            .unwrap_or_default()
+    }
+
+    fn child_names_bounded(
+        &self,
+        dir: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, RootFsEntryKind, Option<u64>)>, BackendError> {
         let Some(prefix) = normalize(dir) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let inner = self.inner.read();
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(limit.checked_add(1).unwrap_or(0));
         for (path, contents) in inner.files.iter() {
             if let Some(name) = child_name(&prefix, path) {
                 out.push((name, RootFsEntryKind::File, Some(contents.len() as u64)));
+                if out.len() > limit {
+                    return Ok(out);
+                }
             }
         }
         for path in inner.sockets.keys() {
             if let Some(name) = child_name(&prefix, path) {
                 out.push((name, RootFsEntryKind::Socket, Some(0)));
+                if out.len() > limit {
+                    return Ok(out);
+                }
             }
         }
         for path in inner.dirs.iter() {
             if let Some(name) = child_name(&prefix, path) {
                 out.push((name, RootFsEntryKind::Directory, None));
+                if out.len() > limit {
+                    return Ok(out);
+                }
             }
         }
-        out
+        Ok(out)
     }
 
     fn deleted_child_names(&self, dir: &str) -> Vec<String> {
+        self.deleted_child_names_bounded(dir, usize::MAX)
+            .unwrap_or_default()
+    }
+
+    fn deleted_child_names_bounded(
+        &self,
+        dir: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, BackendError> {
         let Some(prefix) = normalize(dir) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        self.inner
-            .read()
+        let inner = self.inner.read();
+        let mut deleted = Vec::with_capacity(limit.checked_add(1).unwrap_or(0));
+        for name in inner
             .deletions
             .iter()
             .filter_map(|path| child_name(&prefix, path))
-            .collect()
+        {
+            deleted.push(name);
+            if deleted.len() > limit {
+                break;
+            }
+        }
+        Ok(deleted)
     }
 
     fn rename_overlay_entry(&self, from: &str, to: &str) -> Result<bool, BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let src = normalize(from).ok_or(BackendError::Invalid)?;
         let dst = normalize(to).ok_or(BackendError::Invalid)?;
         let mut inner = self.inner.write();
@@ -1304,6 +1447,7 @@ impl FsBackend for MemoryBackend {
     }
 
     fn exchange_overlay_entries(&self, a: &str, b: &str) -> Result<bool, BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let a_norm = normalize(a).ok_or(BackendError::Invalid)?;
         let b_norm = normalize(b).ok_or(BackendError::Invalid)?;
         let mut inner = self.inner.write();
@@ -1381,6 +1525,17 @@ impl FsBackend for MemoryBackend {
 /// never collide on the scratch name between create and unlink.
 static ANON_FD_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Monotonic suffix for scratch trees retired from the live run namespace.
+/// Time and pid make names legible in crash forensics; this counter is the
+/// collision authority when two backends retire within the same clock tick.
+static SCRATCH_TRASH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+const SCRATCH_TRASH_PREFIX: &str = ".carrick-trash-";
+const LEGACY_SCRATCH_TRASH_PREFIX: &str = ".carrick-reap-";
+const SCRATCH_TRASH_DIRECTORY: &str = ".carrick-trash";
+const SCRATCH_CLEANUP_QUEUE_DEPTH: usize = 8;
+const SCRATCH_SYNC_CLEANUP_LIMIT: usize = 256;
+
 /// Real-filesystem FsBackend rooted at a scratch directory on disk.
 ///
 /// All host syscalls go through a [`cap_std::fs::Dir`] handle that
@@ -1407,6 +1562,7 @@ pub struct HostFsBackend {
     /// scratch dir go through this. Holding it directly (rather than
     /// the underlying `PathBuf`) is what enforces the sandbox.
     dir: cap_std::fs::Dir,
+    archive_mutation_gate: ArchiveMutationGate,
     /// Backing `TempDir` so the scratch root is removed when the
     /// backend drops. `Some` for the normal case; `None` if the
     /// caller already owns the lifetime (e.g. tests with a custom
@@ -1840,144 +1996,298 @@ impl Drop for HostFsBackend {
     }
 }
 
-/// Whether scratch reclamation is handed to a detached reaper instead of
-/// blocking process exit. Default ON; `CARRICK_FS_DEFERRED_TEARDOWN=0` is the
-/// exact escape hatch (AGENTS.md).
-fn deferred_teardown_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("CARRICK_FS_DEFERRED_TEARDOWN").as_deref()
-            != Some(std::ffi::OsStr::new("0"))
+/// Retire a scratch tree without paying recursive unlink wall on the exit
+/// owner. The same-directory rename removes the live name in O(1), after which
+/// one bounded in-process worker may reclaim it while the carrier remains
+/// alive. The worker deliberately has no shutdown join: process exit is the
+/// latency boundary, and the next startup sweep is the durable fallback for a
+/// partly removed or merely queued tree.
+fn defer_remove_tree(path: PathBuf) {
+    let Some(parent) = path.parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let retired = rename_scratch_to_trash(&path);
+    cleanup_oldest_trash_checkpoint(&parent);
+    if let Some(retired) = retired {
+        enqueue_scratch_cleanup(retired);
+    }
+}
+
+fn rename_scratch_to_trash(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let trash = parent.join(SCRATCH_TRASH_DIRECTORY);
+    if std::fs::create_dir_all(&trash).is_err() {
+        return None;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+
+    for _ in 0..4 {
+        let sequence = SCRATCH_TRASH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let retired = trash.join(format!("{SCRATCH_TRASH_PREFIX}{pid}-{stamp}-{sequence}"));
+        match std::fs::rename(path, &retired) {
+            Ok(()) => return Some(retired),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            // Missing means another owner already retired or reclaimed this
+            // exact tree. Any other failure leaves the lock-bearing original
+            // in place for the next startup sweep; never recurse on this exit
+            // path merely because the optimization could not arm.
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Make durable cleanup progress without handing recursive deletion latency to
+/// startup or guest exit. The filesystem tree is the cursor: each invocation
+/// removes at most [`SCRATCH_SYNC_CLEANUP_LIMIT`] entries from the oldest
+/// retired tree, preserving that tree's age until it is fully gone.
+fn cleanup_oldest_trash_checkpoint(scratch_root: &Path) -> usize {
+    let dedicated = scratch_root.join(SCRATCH_TRASH_DIRECTORY);
+    let search_root = if dedicated.is_dir() {
+        dedicated.as_path()
+    } else {
+        scratch_root
+    };
+    let mut budget = CleanupBudget::new(SCRATCH_SYNC_CLEANUP_LIMIT);
+    let Some(Ok(entries)) = budget.attempt(|| std::fs::read_dir(search_root)) else {
+        return 0;
+    };
+    let mut oldest: Option<(PathBuf, (std::time::SystemTime, std::ffi::OsString))> = None;
+    for entry in entries {
+        if !budget.charge() {
+            break;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Some(Ok(file_type)) = budget.attempt(|| entry.file_type()) else {
+            continue;
+        };
+        let path = entry.path();
+        if !file_type.is_dir() || !is_retired_scratch(&path) {
+            continue;
+        }
+        let modified = match budget.attempt(|| entry.metadata().and_then(|meta| meta.modified())) {
+            Some(Ok(modified)) => modified,
+            Some(Err(_)) => std::time::UNIX_EPOCH,
+            None => break,
+        };
+        let order = (
+            modified,
+            path.file_name().unwrap_or_default().to_os_string(),
+        );
+        if oldest.as_ref().is_none_or(|(_, current)| order < *current) {
+            oldest = Some((path, order));
+        }
+    }
+    let Some((oldest, (original_modified, _))) = oldest else {
+        return 0;
+    };
+    cleanup_tree_entries_with_budget(&oldest, search_root, &mut budget);
+    if let Some(Ok(directory)) = budget.attempt(|| std::fs::File::open(&oldest)) {
+        let _ = budget.attempt(|| {
+            directory.set_times(std::fs::FileTimes::new().set_modified(original_modified))
+        });
+    }
+    debug_assert_eq!(
+        budget.attempts + budget.remaining,
+        SCRATCH_SYNC_CLEANUP_LIMIT
+    );
+    budget.removed
+}
+
+#[cfg(test)]
+fn cleanup_tree_entries_bounded(path: &Path, remaining: &mut usize) -> usize {
+    let limit = *remaining;
+    let mut budget = CleanupBudget::new(*remaining);
+    let work_root = path.parent().unwrap_or(path);
+    cleanup_tree_entries_with_budget(path, work_root, &mut budget);
+    *remaining = budget.remaining;
+    debug_assert_eq!(budget.attempts + budget.remaining, limit);
+    budget.removed
+}
+
+#[derive(Debug)]
+struct CleanupBudget {
+    remaining: usize,
+    attempts: usize,
+    removed: usize,
+}
+
+impl CleanupBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            remaining: limit,
+            attempts: 0,
+            removed: 0,
+        }
+    }
+
+    fn charge(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        self.attempts += 1;
+        true
+    }
+
+    fn attempt<T>(
+        &mut self,
+        operation: impl FnOnce() -> std::io::Result<T>,
+    ) -> Option<std::io::Result<T>> {
+        self.charge().then(operation)
+    }
+
+    fn removed_one(&mut self) {
+        self.removed += 1;
+    }
+}
+
+fn cleanup_tree_entries_with_budget(path: &Path, work_root: &Path, budget: &mut CleanupBudget) {
+    let Some(Ok(metadata)) = budget.attempt(|| std::fs::symlink_metadata(path)) else {
+        return;
+    };
+    if !metadata.file_type().is_dir() {
+        if let Some(Ok(())) = budget.attempt(|| std::fs::remove_file(path)) {
+            budget.removed_one();
+        }
+        return;
+    }
+
+    let _ =
+        budget.attempt(|| std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)));
+
+    let Some(Ok(entries)) = budget.attempt(|| std::fs::read_dir(path)) else {
+        return;
+    };
+    let failures = cleanup_failure_root(work_root);
+    let mut blocked = false;
+    for entry in entries {
+        if !budget.charge() {
+            break;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let entry_path = entry.path();
+        let Some(Ok(file_type)) = budget.attempt(|| entry.file_type()) else {
+            continue;
+        };
+        // Preserve one attempt to quarantine the whole retired root if this
+        // mutation fails. A permanently immutable prefix must not monopolize
+        // every later checkpoint.
+        if budget.remaining < 3 {
+            break;
+        }
+        if file_type.is_dir() {
+            let sequence = SCRATCH_TRASH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let promoted = work_root.join(format!(
+                "{SCRATCH_TRASH_PREFIX}promoted-{}-{sequence}",
+                std::process::id()
+            ));
+            if !matches!(
+                budget.attempt(|| std::fs::rename(&entry_path, promoted)),
+                Some(Ok(()))
+            ) {
+                blocked = true;
+                break;
+            }
+        } else {
+            match budget.attempt(|| std::fs::remove_file(&entry_path)) {
+                Some(Ok(())) => budget.removed_one(),
+                Some(Err(_)) => {
+                    blocked = true;
+                    break;
+                }
+                None => break,
+            }
+        }
+    }
+    if blocked {
+        let sequence = SCRATCH_TRASH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let target = failures.join(format!("{}-{sequence}", std::process::id()));
+        if matches!(
+            budget.attempt(|| std::fs::create_dir_all(&failures)),
+            Some(Ok(()))
+        ) {
+            let _ = budget.attempt(|| std::fs::rename(path, target));
+        }
+        return;
+    }
+    if let Some(Ok(())) = budget.attempt(|| std::fs::remove_dir(path)) {
+        budget.removed_one();
+    }
+}
+
+fn cleanup_failure_root(work_root: &Path) -> PathBuf {
+    let scratch_root = if work_root
+        .file_name()
+        .is_some_and(|name| name == SCRATCH_TRASH_DIRECTORY)
+    {
+        work_root.parent().unwrap_or(work_root)
+    } else {
+        work_root
+    };
+    scratch_root.join(".carrick-cleanup-failures")
+}
+
+fn is_retired_scratch(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with(SCRATCH_TRASH_PREFIX) || name.starts_with(LEGACY_SCRATCH_TRASH_PREFIX)
+        })
+}
+
+enum ScratchCleanupWork {
+    Remove(PathBuf),
+    Discover(PathBuf),
+}
+
+fn scratch_cleanup_sender() -> &'static Option<std::sync::mpsc::SyncSender<ScratchCleanupWork>> {
+    static SENDER: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<ScratchCleanupWork>>> =
+        std::sync::OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(SCRATCH_CLEANUP_QUEUE_DEPTH);
+        std::thread::Builder::new()
+            .name("carrick-fs-cleanup".to_string())
+            .spawn(move || {
+                while let Ok(work) = receiver.recv() {
+                    match work {
+                        ScratchCleanupWork::Remove(path) => {
+                            let _ = std::fs::remove_dir_all(path);
+                        }
+                        ScratchCleanupWork::Discover(root) => {
+                            for retired in discover_orphans(&root, None) {
+                                let _ = std::fs::remove_dir_all(retired);
+                            }
+                        }
+                    }
+                }
+            })
+            .ok()
+            .map(|_| sender)
     })
 }
 
-/// Remove a scratch tree without paying for it on this process's wall:
-/// rename it aside (one O(1) same-directory rename) so the name is free
-/// immediately, then hand the unlinking to a detached `/bin/rm -rf` that
-/// outlives us. `posix_spawn` is used rather than `fork` deliberately - this
-/// runs at teardown in a process with live threads and Darwin's
-/// CoreFoundation is fork-unsafe.
-///
-/// Every failure mode degrades to the historical synchronous removal, and the
-/// renamed tree keeps its `.carrick.lock`, so `sweep_orphans` on a later run
-/// reclaims anything a reaper missed. Nothing can leak permanently.
-fn defer_remove_tree(path: PathBuf) {
-    if !deferred_teardown_enabled() {
-        let _ = std::fs::remove_dir_all(&path);
-        return;
-    }
-    let Some(parent) = path.parent() else {
-        let _ = std::fs::remove_dir_all(&path);
-        return;
-    };
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let aside = parent.join(format!(".carrick-reap-{}-{stamp}", unsafe {
-        libc::getpid()
-    }));
-    let target = match std::fs::rename(&path, &aside) {
-        Ok(()) => aside,
-        // Cross-device or a racing sweeper: fall back to removing in place.
-        Err(_) => path,
-    };
-    if spawn_detached_reaper(&target).is_err() {
-        let _ = std::fs::remove_dir_all(&target);
+fn enqueue_scratch_cleanup(path: PathBuf) {
+    if let Some(sender) = scratch_cleanup_sender() {
+        // Never let a saturated cleanup queue become guest exit latency. A
+        // dropped enqueue is still durable because the retired name is one the
+        // next startup sweep owns unconditionally.
+        let _ = sender.try_send(ScratchCleanupWork::Remove(path));
     }
 }
 
-/// `posix_spawn("/bin/rm", ["-rf", target])`, detached: no `waitpid`, so the
-/// child is reparented to init as this process exits.  The reaper gets its own
-/// process group: the conformance harness intentionally `killpg`s the completed
-/// carrick invocation to catch escaped guest children, and teardown must survive
-/// that scoped cleanup long enough to finish.
-fn spawn_detached_reaper(target: &Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let program = std::ffi::CString::new("/bin/rm").map_err(std::io::Error::other)?;
-    let arg0 = std::ffi::CString::new("rm").map_err(std::io::Error::other)?;
-    let arg1 = std::ffi::CString::new("-rf").map_err(std::io::Error::other)?;
-    let arg2 =
-        std::ffi::CString::new(target.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
-    let argv = [
-        arg0.as_ptr(),
-        arg1.as_ptr(),
-        arg2.as_ptr(),
-        std::ptr::null(),
-    ];
-    // The reaper MUST NOT inherit our stdio. A detached child holding the
-    // write end of a parent's capture pipe keeps that pipe open after carrick
-    // exits, so anything reading our output (the conformance harness, a shell
-    // `$(...)`, CI) blocks until the unlink finishes - which would hand back
-    // exactly the wall this change removes, disguised as carrick being slow.
-    // Point all three descriptors at /dev/null instead.
-    let devnull = std::ffi::CString::new("/dev/null").map_err(std::io::Error::other)?;
-    let mut actions = std::mem::MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
-    // SAFETY: init before use; destroyed on every return path below.
-    if unsafe { libc::posix_spawn_file_actions_init(actions.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
+fn enqueue_orphan_discovery(root: PathBuf) {
+    if let Some(sender) = scratch_cleanup_sender() {
+        let _ = sender.try_send(ScratchCleanupWork::Discover(root));
     }
-    let mut actions = unsafe { actions.assume_init() };
-    let mut rc = 0;
-    for fd in 0..3 {
-        // SAFETY: `actions` is initialized; `devnull` outlives the spawn.
-        let add = unsafe {
-            libc::posix_spawn_file_actions_addopen(
-                &mut actions,
-                fd,
-                devnull.as_ptr(),
-                libc::O_RDWR,
-                0,
-            )
-        };
-        if add != 0 {
-            rc = add;
-        }
-    }
-    let mut attrs = std::mem::MaybeUninit::<libc::posix_spawnattr_t>::uninit();
-    let attr_init = unsafe { libc::posix_spawnattr_init(attrs.as_mut_ptr()) };
-    if attr_init != 0 {
-        unsafe {
-            libc::posix_spawn_file_actions_destroy(&mut actions);
-        }
-        return Err(std::io::Error::from_raw_os_error(attr_init));
-    }
-    let mut attrs = unsafe { attrs.assume_init() };
-    if rc == 0 {
-        // A pgroup value of zero makes the spawned child the leader of a new
-        // process group (setpgid(child, child)).  It remains in our session but
-        // is outside the carrick run's scoped killpg target.
-        rc = unsafe { libc::posix_spawnattr_setpgroup(&mut attrs, 0) };
-    }
-    if rc == 0 {
-        rc = unsafe {
-            libc::posix_spawnattr_setflags(&mut attrs, libc::POSIX_SPAWN_SETPGROUP as libc::c_short)
-        };
-    }
-    let mut pid: libc::pid_t = 0;
-    if rc == 0 {
-        // SAFETY: `argv` is NUL-terminated with live CStrings; `actions`
-        // redirects stdio; a null attr pointer keeps default signal handling.
-        rc = unsafe {
-            libc::posix_spawn(
-                &mut pid,
-                program.as_ptr(),
-                &actions,
-                &attrs,
-                argv.as_ptr() as *const *mut libc::c_char,
-                std::ptr::null(),
-            )
-        };
-    }
-    // SAFETY: initialized above, not used after this point.
-    unsafe {
-        libc::posix_spawnattr_destroy(&mut attrs);
-        libc::posix_spawn_file_actions_destroy(&mut actions);
-    }
-    if rc != 0 {
-        return Err(std::io::Error::from_raw_os_error(rc));
-    }
-    Ok(())
 }
 
 impl std::fmt::Debug for HostFsBackend {
@@ -2017,6 +2327,7 @@ impl HostFsBackend {
         let fast_fs = fast_fs_enabled();
         Ok(Self {
             dir,
+            archive_mutation_gate: ArchiveMutationGate::default(),
             _scratch: Some(scratch),
             _attached_cleanup_path: None,
             _lock: Some(lock),
@@ -2079,6 +2390,7 @@ impl HostFsBackend {
         let fast_fs = fast_fs_enabled();
         Self {
             dir,
+            archive_mutation_gate: ArchiveMutationGate::default(),
             _scratch: None,
             _attached_cleanup_path: None,
             _lock: None,
@@ -2171,6 +2483,7 @@ impl HostFsBackend {
         };
         Ok(Self {
             dir,
+            archive_mutation_gate: ArchiveMutationGate::default(),
             _scratch: None,
             _attached_cleanup_path: authority.cleanup_on_drop.then_some(path),
             _lock: lock,
@@ -4416,6 +4729,10 @@ fn dir_from_raw_fd(raw: i32) -> cap_std::fs::Dir {
 }
 
 impl FsBackend for HostFsBackend {
+    fn archive_mutation_gate(&self) -> Option<&ArchiveMutationGate> {
+        Some(&self.archive_mutation_gate)
+    }
+
     /// Answer "is this path whiteed out" without resolving the path when the
     /// sandbox holds NO whiteouts at all.
     ///
@@ -4911,6 +5228,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn make_dir(&self, path: &str) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
@@ -4948,6 +5266,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn create_file(&self, path: &str) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
@@ -4973,6 +5292,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn create_fifo(&self, path: &str, mode: u32) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         use std::os::fd::AsRawFd;
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
@@ -5034,6 +5354,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn create_socket(&self, path: &str, mode: u32) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         // macOS can't `mknod(S_IFSOCK)` as a non-root process, and the real
         // host socket the guest bound lives at a HASHED scratch path (so its
         // sun_path fits macOS's 104-byte limit, see net::support). To give the
@@ -5073,6 +5394,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn create_device(&self, path: &str, full_mode: u32, dev: u64) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         // macOS can't `mknod(S_IFCHR|S_IFBLK)` as a non-root process, so the
         // guest-facing node is a MARKER regular file on the scratch (mirrors
         // `create_socket`): a real, fork-coherent file the guest can stat/unlink,
@@ -5122,6 +5444,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn set_file_contents(&self, path: &str, contents: Vec<u8>) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         let (dir, at_rel) = self.at(rel).map_err(|_| BackendError::Io)?;
@@ -5157,6 +5480,7 @@ impl FsBackend for HostFsBackend {
         contents: Arc<[u8]>,
         mode: u32,
     ) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         self.set_file_contents(path, contents.as_ref().to_vec())?;
         self.set_mode(path, mode)
     }
@@ -5168,6 +5492,7 @@ impl FsBackend for HostFsBackend {
         bytes: &[u8],
         final_size: usize,
     ) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let end = offset
             .checked_add(bytes.len())
             .ok_or(BackendError::Invalid)?;
@@ -5224,6 +5549,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn remove_entry_checked(&self, path: &str) -> Result<bool, BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         // The cap-std scratch is the source of truth (readdir/lookup hit
@@ -5268,6 +5594,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn mark_deleted(&self, path: &str) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         // Also evict any in-scratch entry so the scratch tree matches
         // the tombstoned view.
@@ -5286,8 +5613,17 @@ impl FsBackend for HostFsBackend {
     }
 
     fn child_names(&self, dir: &str) -> Vec<(String, RootFsEntryKind, Option<u64>)> {
+        self.child_names_bounded(dir, usize::MAX)
+            .unwrap_or_default()
+    }
+
+    fn child_names_bounded(
+        &self,
+        dir: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, RootFsEntryKind, Option<u64>)>, BackendError> {
         let Some(normalized) = normalize(dir) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         // Read the LIVE cap-std directory. Files created via open_raw_fd
         // (which hands back a raw fd) and directories created via mkdir
@@ -5303,9 +5639,9 @@ impl FsBackend for HostFsBackend {
             None => self.dir.entries(), // scratch root == guest "/"
         };
         let Ok(read) = read else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(limit.checked_add(1).unwrap_or(0));
         for entry in read.flatten() {
             // The on-disk name is already the host's canonical (escape-encoded
             // or plain-UTF-8) form; carry it through unchanged. The guest-facing
@@ -5339,17 +5675,29 @@ impl FsBackend for HostFsBackend {
                 }
             };
             out.push((name, kind, size));
+            if out.len() > limit {
+                return Ok(out);
+            }
         }
-        out
+        Ok(out)
     }
 
     fn deleted_child_names(&self, dir: &str) -> Vec<String> {
+        self.deleted_child_names_bounded(dir, usize::MAX)
+            .unwrap_or_default()
+    }
+
+    fn deleted_child_names_bounded(
+        &self,
+        dir: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, BackendError> {
         use std::os::unix::ffi::OsStringExt as _;
         if !self.may_have_whiteouts() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let Some(normalized) = normalize(dir) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let read = match Self::rel_path(&normalized) {
             Some(rel) => match self.at(rel) {
@@ -5359,9 +5707,9 @@ impl FsBackend for HostFsBackend {
             None => self.dir.entries(),
         };
         let Ok(read) = read else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        let mut deleted = Vec::new();
+        let mut deleted = Vec::with_capacity(limit.checked_add(1).unwrap_or(0));
         for entry in read.flatten() {
             let marker_name = entry.file_name().to_string_lossy().into_owned();
             if !marker_name.starts_with(HOST_WHITEOUT_SIDECAR_PREFIX) {
@@ -5386,12 +5734,16 @@ impl FsBackend for HostFsBackend {
                     .is_some_and(|expected| expected == entry.file_name())
             {
                 deleted.push(leaf_path.to_string_lossy().into_owned());
+                if deleted.len() > limit {
+                    return Ok(deleted);
+                }
             }
         }
-        deleted
+        Ok(deleted)
     }
 
     fn rename_overlay_entry(&self, from: &str, to: &str) -> Result<bool, BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let src = normalize(from).ok_or(BackendError::Invalid)?;
         let dst = normalize(to).ok_or(BackendError::Invalid)?;
         let src_rel = Self::rel_path(&src)
@@ -5453,6 +5805,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn exchange_overlay_entries(&self, a: &str, b: &str) -> Result<bool, BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let a_norm = normalize(a).ok_or(BackendError::Invalid)?;
         let b_norm = normalize(b).ok_or(BackendError::Invalid)?;
         let a_rel = Self::rel_path(&a_norm)
@@ -5844,6 +6197,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn symlink(&self, target: &str, linkpath: &str) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(linkpath).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         if let Some(parent) = rel.parent()
@@ -5866,6 +6220,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn hard_link(&self, src: &str, linkpath: &str) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let src_norm = normalize(src).ok_or(BackendError::Invalid)?;
         let dst_norm = normalize(linkpath).ok_or(BackendError::Invalid)?;
         let src_rel = Self::rel_path(&src_norm)
@@ -5887,6 +6242,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn set_mode(&self, path: &str, mode: u32) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         use cap_std::fs::MetadataExt;
         use cap_std::fs::Permissions;
         use cap_std::fs::PermissionsExt;
@@ -5969,6 +6325,7 @@ impl FsBackend for HostFsBackend {
         uid: Option<NsUid>,
         gid: Option<NsGid>,
     ) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         self.stamp_root_marker(CARRICK_HAS_META_XATTRS_XATTR, &self.meta_xattr_seen);
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
@@ -6039,6 +6396,7 @@ impl FsBackend for HostFsBackend {
         mtime: Option<(i64, i64)>,
         nofollow: bool,
     ) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         // `None` (UTIME_OMIT) leaves the component untouched.
         let to_ts = |t: Option<(i64, i64)>| match t {
@@ -6104,6 +6462,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn allocate(&self, path: &str, size: u64) -> Result<(), BackendError> {
+        let _mutation = self.archive_mutation_gate.mutation();
         let _normalized = normalize(path).ok_or(BackendError::Invalid)?;
         // mode-0 fallocate only ever grows the file. Open the real fd and
         // `ftruncate` up to `size` if the file is currently smaller; never
@@ -6155,6 +6514,7 @@ impl FsBackend for HostFsBackend {
         flags: i32,
         follow: bool,
     ) -> Result<(), LinuxErrno> {
+        let _mutation = self.archive_mutation_gate.mutation();
         // Accept the Linux VFS xattr namespaces (user./trusted./security./
         // system.); the guest is root so trusted.* is allowed, matching the
         // Docker-as-root oracle. Other prefixes report unsupported.
@@ -6365,6 +6725,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn remove_xattr(&self, path: &str, name: &str, follow: bool) -> Result<(), LinuxErrno> {
+        let _mutation = self.archive_mutation_gate.mutation();
         // Mirror get_xattr: a non-`user.*` or carrick-internal name has no
         // guest-visible attribute to remove → ENODATA.
         if !is_guest_xattr_namespace(name) || is_internal_carrick_xattr(name) {
@@ -6769,23 +7130,39 @@ fn acquire_lockfile(scratch_dir: &Path) -> std::io::Result<fd_lock::RwLock<std::
 }
 
 fn sweep_orphans(scratch_root: &Path) {
+    const STARTUP_DISCOVERY_LIMIT: usize = 64;
+    let retired_scratch = discover_orphans(scratch_root, Some(STARTUP_DISCOVERY_LIMIT));
+    cleanup_oldest_trash_checkpoint(scratch_root);
+    for retired in retired_scratch {
+        if retired.exists() {
+            enqueue_scratch_cleanup(retired);
+        }
+    }
+
+    // Complete discovery away from the startup critical path. The dedicated
+    // trash namespace makes normal retirement immediately discoverable; this
+    // background pass is only for crashed live-name trees and legacy trash.
+    enqueue_orphan_discovery(scratch_root.to_path_buf());
+}
+
+fn discover_orphans(scratch_root: &Path, limit: Option<usize>) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(scratch_root) else {
-        return;
+        return Vec::new();
     };
-    for entry in entries.flatten() {
+    let mut retired_scratch = Vec::new();
+    for entry in entries.take(limit.unwrap_or(usize::MAX)).flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
-        // A tree renamed aside by `defer_remove_tree` whose reaper died before
-        // finishing: reclaim it outright. The name is carrick's own and can
-        // only be produced by that path, so no live run owns it.
-        if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(".carrick-reap-"))
-        {
-            let _ = std::fs::remove_dir_all(&path);
+        // A tree retired by `defer_remove_tree` is never live again. Reclaim it
+        // even if an interrupted in-process cleanup already removed the lock
+        // file. Keep recognizing the pre-kernel-retirement name so upgrades do
+        // not strand old scratch trees.
+        if is_retired_scratch(&path) {
+            if let Some(retired) = rename_scratch_to_trash(&path) {
+                retired_scratch.push(retired);
+            }
             continue;
         }
         let lock_path = path.join(".carrick.lock");
@@ -6806,14 +7183,18 @@ fn sweep_orphans(scratch_root: &Path) {
             // No other process holds the lock; orphan from a prior crashed run
             // OR a run that exited via process::exit (which skips Drop, so an
             // overlay-composed scratch left its `merged` overlay mounted). Detach
-            // that mount BEFORE remove_dir_all, or the recursive remove descends
-            // into the live overlay. Best-effort: umount2 of a non-mount is a
-            // harmless EINVAL.
+            // that mount before retiring the name, or the cleanup worker could
+            // descend into the live overlay. Best-effort: umount2 of a non-mount
+            // is a harmless EINVAL.
             #[cfg(target_os = "linux")]
             unmount_overlay_at(&path.join("merged"));
-            let _ = std::fs::remove_dir_all(&path);
+            drop(lock);
+            if let Some(retired) = rename_scratch_to_trash(&path) {
+                retired_scratch.push(retired);
+            }
         }
     }
+    retired_scratch
 }
 
 /// Best-effort lazy unmount of an overlay left at `merged` (see `sweep_orphans`
@@ -7051,6 +7432,16 @@ mod tests {
         assert_eq!(names, vec!["lists".to_owned()]);
     }
 
+    fn scenario_bounded_child_names_returns_only_limit_plus_one<B: FsBackend>(b: &mut B) {
+        b.make_dir("/wide").unwrap();
+        for index in 0..64 {
+            b.create_file(&format!("/wide/entry-{index:02}")).unwrap();
+        }
+        let entries = b.child_names_bounded("/wide", 7).unwrap();
+        assert_eq!(entries.len(), 8);
+        assert!(entries.capacity() <= 8);
+    }
+
     // -- MemoryBackend ------------------------------------------------
 
     #[test]
@@ -7084,6 +7475,11 @@ mod tests {
     }
 
     #[test]
+    fn memory_child_names_are_bounded_before_archive_sorting() {
+        scenario_bounded_child_names_returns_only_limit_plus_one(&mut MemoryBackend::new());
+    }
+
+    #[test]
     fn layered_directory_entries_hide_internal_sidecar_names() {
         let b = MemoryBackend::new();
         b.make_dir("/dir").unwrap();
@@ -7111,86 +7507,366 @@ mod tests {
 
     // -- HostFsBackend ------------------------------------------------
 
-    /// A successful detached spawn must actually remove the tree, not merely
-    /// report that `posix_spawn(3)` created a child which then exits before
-    /// invoking `rm`.  If this breaks, every normal run leaves a full OCI
-    /// scratch behind and the next `HostFsBackend::new` pays for it
-    /// synchronously in `sweep_orphans`.
-    #[cfg(target_os = "macos")]
     #[test]
-    fn detached_reaper_removes_nonempty_tree() {
-        let parent = tempfile::TempDir::new().expect("reaper test parent");
-        let victim = parent.path().join("victim");
-        std::fs::create_dir(&victim).expect("create victim");
-        std::fs::write(victim.join("file"), b"payload").expect("seed victim");
+    fn hostfs_teardown_has_no_process_creation_surface() {
+        let production = include_str!("fs_backend.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source before the test module");
 
-        spawn_detached_reaper(&victim).expect("spawn detached reaper");
+        for forbidden in [
+            "spawn_detached_reaper(",
+            concat!("libc::posix_", "spawn("),
+            concat!("libc::posix_", "spawn_file_actions_"),
+            concat!("libc::posix_", "spawnattr_"),
+            "std::process::Command::new",
+            "\"/bin/rm\"",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "hostfs teardown must not create a host subprocess through {forbidden}"
+            );
+        }
+    }
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while victim.exists() && std::time::Instant::now() < deadline {
+    /// Regression for the measured 26k-entry OCI upper teardown: the exit
+    /// owner may retire the live name, but it must not recursively unlink the
+    /// tree before returning. The cleanup worker is allowed to finish while
+    /// this test process remains alive.
+    #[test]
+    fn hostfs_teardown_retires_large_tree_before_recursive_cleanup() {
+        let parent = tempfile::TempDir::new().expect("teardown test parent");
+        let victim = parent.path().join("run-scratch");
+        std::fs::create_dir(&victim).expect("create scratch");
+        std::fs::write(victim.join(".carrick.lock"), b"").expect("seed lock");
+        for index in 0..26_000 {
+            std::fs::write(victim.join(format!("entry-{index}")), b"")
+                .expect("seed representative OCI entry");
+        }
+
+        let started = std::time::Instant::now();
+        defer_remove_tree(victim.clone());
+        let return_wall = started.elapsed();
+
+        assert!(
+            !victim.exists(),
+            "the retired live scratch name must disappear"
+        );
+        let retired = std::fs::read_dir(parent.path().join(SCRATCH_TRASH_DIRECTORY))
+            .expect("read scratch parent")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".carrick-trash-"))
+            })
+            .expect("recursive cleanup must not finish on the caller's exit path");
+        assert!(
+            return_wall < std::time::Duration::from_millis(250),
+            "retiring 26k entries must be an O(1) rename, took {return_wall:?}"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while retired.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
-            !victim.exists(),
-            "spawned reaper exited without removing its target"
+            !retired.exists(),
+            "the in-process cleanup worker did not reclaim the retired tree"
         );
     }
 
-    /// The conformance harness kills the completed carrick invocation's
-    /// process group to reap escaped guest children.  A teardown worker that
-    /// inherits that group is killed too, leaving the full scratch tree for
-    /// the next run's synchronous orphan sweep.
-    #[cfg(target_os = "macos")]
     #[test]
-    fn detached_reaper_survives_creator_process_group_cleanup() {
-        use std::os::unix::process::CommandExt as _;
-
-        const HELPER_TARGET_ENV: &str = "CARRICK_TEST_REAPER_TARGET";
-        if let Some(victim) = std::env::var_os(HELPER_TARGET_ENV) {
-            spawn_detached_reaper(std::path::Path::new(&victim))
-                .expect("helper spawns detached reaper");
-            return;
+    fn startup_sweep_enqueues_partially_cleaned_trash_without_blocking() {
+        let root = tempfile::TempDir::new().expect("sweep test root");
+        let retired = root.path().join(".carrick-trash-dead-carrier");
+        std::fs::create_dir(&retired).expect("create retired tree");
+        for index in 0..26_000 {
+            std::fs::write(retired.join(format!("remaining-entry-{index}")), b"")
+                .expect("seed partial cleanup residue");
         }
 
-        let parent = tempfile::TempDir::new().expect("reaper test parent");
-        let victim = parent.path().join("victim");
-        std::fs::create_dir(&victim).expect("create victim");
-        for index in 0..4_096 {
-            std::fs::write(victim.join(format!("file-{index}")), b"payload").expect("seed victim");
-        }
+        let started = std::time::Instant::now();
+        sweep_orphans(root.path());
+        let sweep_wall = started.elapsed();
 
-        let mut helper =
-            std::process::Command::new(std::env::current_exe().expect("current test executable"));
-        helper
-            .arg("fs_backend::tests::detached_reaper_survives_creator_process_group_cleanup")
-            .arg("--exact")
-            .env(HELPER_TARGET_ENV, &victim)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .process_group(0);
-        let helper = helper.spawn().expect("spawn reaper helper");
-        let helper_pid = helper.id() as i32;
-        let status = helper
-            .wait_with_output()
-            .expect("wait for reaper helper")
-            .status;
-        assert!(status.success(), "reaper helper failed: {status}");
-
-        // This is the canonical harness cleanup operation.  The creator is
-        // already gone; any descendant that remained in its group is killed.
-        unsafe {
-            libc::kill(-helper_pid, libc::SIGKILL);
-        }
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while victim.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            sweep_wall < std::time::Duration::from_millis(250),
+            "startup sweep must enqueue, not recursively delete, 26k entries; took {sweep_wall:?}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while retired.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
-            !victim.exists(),
-            "reaper inherited the creator's process group and was killed by canonical cleanup"
+            !retired.exists(),
+            "cleanup worker did not reclaim startup trash"
         );
+    }
+
+    #[test]
+    fn startup_sweep_retires_unlocked_orphan_before_cleanup() {
+        let root = tempfile::TempDir::new().expect("sweep test root");
+        let orphan = root.path().join("crashed-run");
+        std::fs::create_dir(&orphan).expect("create orphan");
+        std::fs::write(orphan.join(".carrick.lock"), b"").expect("seed orphan lock");
+        for index in 0..26_000 {
+            std::fs::write(orphan.join(format!("remaining-entry-{index}")), b"")
+                .expect("seed orphan residue");
+        }
+
+        let started = std::time::Instant::now();
+        sweep_orphans(root.path());
+        let sweep_wall = started.elapsed();
+
+        assert!(
+            !orphan.exists(),
+            "unlocked orphan must leave the live namespace"
+        );
+        assert!(
+            sweep_wall < std::time::Duration::from_millis(250),
+            "startup sweep must rename, not recursively delete, 26k entries; took {sweep_wall:?}"
+        );
+        let retired = std::fs::read_dir(root.path().join(SCRATCH_TRASH_DIRECTORY))
+            .expect("read scratch root")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(SCRATCH_TRASH_PREFIX))
+            });
+        if let Some(retired) = retired {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while retired.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                !retired.exists(),
+                "cleanup worker did not reclaim orphan trash"
+            );
+        }
+    }
+
+    fn count_retired_entries(root: &Path) -> usize {
+        let mut count = 0;
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                count += 1;
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    pending.push(entry.path());
+                }
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn repeated_short_runs_reduce_oldest_trash_without_async_worker() {
+        let root = tempfile::TempDir::new().expect("checkpoint test root");
+        let oldest = root.path().join(".carrick-trash-oldest");
+        let newer = root.path().join(".carrick-trash-newer");
+        for (path, entries) in [(&oldest, 600), (&newer, 50)] {
+            std::fs::create_dir(path).expect("create trash tree");
+            for index in 0..entries {
+                std::fs::write(path.join(format!("entry-{index}")), b"").expect("seed trash entry");
+            }
+        }
+        std::fs::File::open(&oldest)
+            .expect("open oldest trash")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+            )
+            .expect("date oldest trash");
+        std::fs::File::open(&newer)
+            .expect("open newer trash")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(2)),
+            )
+            .expect("date newer trash");
+
+        let mut previous = count_retired_entries(root.path());
+        for run in 0..16 {
+            if previous == 0 {
+                break;
+            }
+            let started = std::time::Instant::now();
+            let removed = cleanup_oldest_trash_checkpoint(root.path());
+            let checkpoint_wall = started.elapsed();
+            let remaining = count_retired_entries(root.path());
+
+            assert!((1..=256).contains(&removed), "run {run} removed {removed}");
+            assert_eq!(
+                previous - remaining,
+                removed,
+                "the filesystem tree must be the exact durable progress ledger"
+            );
+            assert!(
+                remaining < previous,
+                "every short carrier must make monotonic cleanup progress"
+            );
+            assert!(
+                checkpoint_wall < std::time::Duration::from_millis(250),
+                "bounded checkpoint exceeded startup/exit wall: {checkpoint_wall:?}"
+            );
+            if run == 0 {
+                assert_eq!(
+                    count_retired_entries(&newer),
+                    50,
+                    "the first checkpoint must spend its budget on the oldest trash"
+                );
+            }
+            previous = remaining;
+        }
+        assert_eq!(previous, 0, "bounded checkpoints must converge the backlog");
+    }
+
+    #[test]
+    fn failed_metadata_lookup_consumes_cleanup_budget() {
+        let root = tempfile::TempDir::new().expect("cleanup budget root");
+        let missing = root.path().join("missing");
+        let mut remaining = 1;
+
+        assert_eq!(cleanup_tree_entries_bounded(&missing, &mut remaining), 0);
+        assert_eq!(
+            remaining, 0,
+            "a failed metadata attempt must consume the bounded work budget"
+        );
+    }
+
+    #[test]
+    fn failed_delete_attempt_consumes_cleanup_budget_without_counting_success() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::TempDir::new().expect("cleanup delete budget root");
+        let locked = root.path().join("locked");
+        std::fs::create_dir(&locked).expect("create locked parent");
+        let victim = locked.join("victim");
+        std::fs::write(&victim, b"x").expect("create victim");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+            .expect("lock parent");
+
+        let mut remaining = 2;
+        let removed = cleanup_tree_entries_bounded(&victim, &mut remaining);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
+            .expect("unlock parent for tempfile cleanup");
+
+        assert_eq!(removed, 0, "failed deletion is not a successful removal");
+        assert_eq!(remaining, 0, "metadata + delete attempts consume budget");
+        assert!(victim.exists());
+    }
+
+    #[test]
+    fn deep_retired_chain_makes_progress_each_checkpoint() {
+        let root = tempfile::TempDir::new().expect("deep cleanup root");
+        let retired = root.path().join(".carrick-trash-deep");
+        std::fs::create_dir(&retired).expect("create retired root");
+        let mut cursor = retired.clone();
+        for _ in 0..200 {
+            cursor = cursor.join("d");
+            std::fs::create_dir(&cursor).expect("create deep level");
+        }
+        std::fs::write(cursor.join("leaf"), b"x").expect("create deep leaf");
+
+        let before = count_retired_entries(root.path());
+        let removed = cleanup_oldest_trash_checkpoint(root.path());
+        let after = count_retired_entries(root.path());
+        assert!(removed > 0, "deep cleanup must make durable progress");
+        assert!(after < before, "deep cleanup must reduce the tree");
+    }
+
+    #[test]
+    fn wide_live_root_cannot_hide_retired_cleanup() {
+        let root = tempfile::TempDir::new().expect("wide cleanup root");
+        for index in 0..400 {
+            std::fs::create_dir(root.path().join(format!("live-{index:04}")))
+                .expect("create live directory");
+        }
+        let trash = root.path().join(SCRATCH_TRASH_DIRECTORY);
+        std::fs::create_dir(&trash).expect("create dedicated trash directory");
+        let retired = trash.join(".carrick-trash-hidden");
+        std::fs::create_dir(&retired).expect("create retired tree");
+        std::fs::write(retired.join("leaf"), b"x").expect("create retired leaf");
+
+        assert!(
+            cleanup_oldest_trash_checkpoint(root.path()) > 0,
+            "wide live roots must not exhaust cleanup discovery"
+        );
+        assert!(!retired.exists());
+    }
+
+    #[test]
+    fn startup_orphan_discovery_is_bounded_on_a_wide_root() {
+        let root = tempfile::TempDir::new().expect("wide discovery root");
+        for index in 0..400 {
+            std::fs::create_dir(root.path().join(format!("live-{index:04}")))
+                .expect("create live directory");
+        }
+        let started = std::time::Instant::now();
+        sweep_orphans(root.path());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "startup must inspect only a bounded root prefix"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn immutable_oldest_tree_is_quarantined_without_starving_newer_trash() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempfile::TempDir::new().expect("failed-prefix root");
+        let oldest = root.path().join(".carrick-trash-oldest-blocked");
+        let newer = root.path().join(".carrick-trash-newer-healthy");
+        std::fs::create_dir(&oldest).expect("create blocked tree");
+        std::fs::create_dir(&newer).expect("create healthy tree");
+        let immutable = oldest.join("immutable");
+        std::fs::write(&immutable, b"x").expect("create immutable entry");
+        std::fs::write(newer.join("healthy"), b"x").expect("create healthy entry");
+        let immutable_c = std::ffi::CString::new(immutable.as_os_str().as_bytes()).expect("path");
+        assert_eq!(
+            unsafe { libc::chflags(immutable_c.as_ptr(), libc::UF_IMMUTABLE) },
+            0
+        );
+
+        let _ = cleanup_oldest_trash_checkpoint(root.path());
+        assert!(!oldest.exists(), "blocked tree must leave eligible trash");
+        assert!(root.path().join(".carrick-cleanup-failures").exists());
+        assert!(cleanup_oldest_trash_checkpoint(root.path()) > 0);
+        assert!(!newer.exists(), "healthy newer trash must still converge");
+
+        for entry in walk_paths(root.path()) {
+            if entry.file_name().is_some_and(|name| name == "immutable") {
+                let path = std::ffi::CString::new(entry.as_os_str().as_bytes()).expect("path");
+                let _ = unsafe { libc::chflags(path.as_ptr(), 0) };
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn walk_paths(root: &Path) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    pending.push(path.clone());
+                }
+                paths.push(path);
+            }
+        }
+        paths
     }
 
     #[cfg(target_os = "macos")]
@@ -7199,6 +7875,13 @@ mod tests {
         let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
             .unwrap();
         (HostFsBackend::from_existing_dir(dir), scratch)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_child_names_are_bounded_before_archive_sorting() {
+        let (mut backend, _scratch) = host_backend();
+        scenario_bounded_child_names_returns_only_limit_plus_one(&mut backend);
     }
 
     #[cfg(target_os = "macos")]

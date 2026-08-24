@@ -1036,9 +1036,6 @@ fn deliver_notify(
                     0,
                 ) {
                     crate::host_signal::xsig_nudge(pid);
-                } else {
-                    let host_signo = crate::host_signal::linux_to_host_signum(signo);
-                    unsafe { libc::kill(pid, host_signo) };
                 }
             }
         },

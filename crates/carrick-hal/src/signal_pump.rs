@@ -70,11 +70,9 @@ static SIGCHLD_INSTALLED: AtomicBool = AtomicBool::new(false);
 /// Guards the one-time install of the sigactions + self-pipe + pump thread.
 static PUMP_STARTED: AtomicBool = AtomicBool::new(false);
 
-/// Async-signal-safe SIGCHLD handler. Does NOT touch `PROC_PENDING`: SIGCHLD is the
-/// host's native notification that a guest CHILD (a real host process) exited;
-/// resolving WHICH child + publishing its exit signal is the pump thread's reaper
-/// job ([`publish_exited_child_watches`], needs `waitid` + locks). So the handler does ONLY
-/// `poke()` — one `write(2)` — to wake the pump thread.
+/// Async-signal-safe SIGCHLD handler for explicit host-side tooling. Guest task
+/// exits are published by Carrick's logical kernel and never arrive as host
+/// child-process notifications. The handler only pokes the pump.
 extern "C" fn sigchld_handler(_signum: libc::c_int) {
     poke();
 }
@@ -138,6 +136,7 @@ pub fn restore_pump_signals_after_fork() {
 /// RECORDED exit signal to its RECORDED parent tid. Runs on the pump THREAD, so
 /// `waitid` + the child-watch locks are safe. `WNOWAIT` PEEKS the zombie WITHOUT
 /// reaping it, so the guest's own later `wait4` still returns the status.
+#[cfg(test)]
 pub fn publish_exited_child_watches() {
     const CLD_EXITED: i32 = 1;
     const CLD_KILLED: i32 = 2;
@@ -291,6 +290,7 @@ fn spawn_pump_thread(read_fd: i32, registry: Arc<dyn VcpuRegistry>, futex: Arc<d
                         break;
                     }
                 }
+                #[cfg(test)]
                 publish_exited_child_watches();
                 registry.kick_all();
                 futex.notify_signal_pending();
@@ -349,9 +349,8 @@ pub fn start_pump<G: HostSignalGlue>(
         return;
     }
     spawn_pump_thread(read_fd, Arc::clone(registry), Arc::clone(futex));
-    // Kick-start one pass: a signal that landed while the pump was stopped across
-    // a fork only set pending bits / left a zombie; one poke runs the first
-    // publish_exited_child_watches + kick_all immediately. Harmless when idle.
+    // Kick-start one pass so pending carrier-local signals immediately wake the
+    // vCPU registry. Harmless when idle.
     poke();
 }
 

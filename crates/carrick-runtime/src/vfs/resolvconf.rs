@@ -8,12 +8,13 @@
 //! and Go/glibc then fall back to `[::1]:53` and fail). The real resolvers live
 //! in the SystemConfiguration DNS store.
 //!
-//! carrick (the host process) CAN follow that chain, so it reads the host's
-//! effective resolver config — which configd renders into `/etc/resolv.conf`,
-//! falling back to `scutil --dns` for the primary scoped resolver — and serves
-//! a clean copy here. The guest's resolver then gets real nameservers; the DNS
-//! queries egress through the existing host-socket passthrough (the
-//! `dispatch::net` syscall handlers), exactly as `docker run --net host` would.
+//! carrick can follow that chain in-process, so it snapshots configd's rendered
+//! resolver file and serves a clean copy here. Callers may also inject an
+//! explicit launch snapshot through [`HostResolverSnapshot`], keeping resolver
+//! discovery outside the carrier without executing a utility. The guest then
+//! gets real nameservers; the DNS queries egress through the existing
+//! host-socket passthrough (the `dispatch::net` syscall handlers), exactly as
+//! `docker run --net host` would.
 //!
 //! The config is snapshotted once at guest setup (like Docker, which writes the
 //! container's resolv.conf at create time); a host DNS change mid-run is not
@@ -24,14 +25,112 @@ use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT};
 
 pub(crate) const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 
+/// Resolver bytes captured at launch, before guest execution begins.
+///
+/// The type is the provider boundary for an outer launcher that obtains DNS
+/// state through SystemConfiguration or another authenticated source. The
+/// runtime itself performs no framework FFI and launches no resolver utility.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HostResolverSnapshot {
+    contents: String,
+    provider_nameservers: Vec<std::net::IpAddr>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum HostResolverLaunchError {
+    #[error("host network launch has no usable nameserver in the captured resolver snapshot")]
+    NoUsableNameserver,
+}
+
+impl HostResolverSnapshot {
+    pub fn from_resolv_conf(contents: impl Into<String>) -> Self {
+        Self {
+            contents: contents.into(),
+            provider_nameservers: Vec::new(),
+        }
+    }
+
+    /// Add validated nameservers supplied by an outer launch provider. These
+    /// replace the former utility fallback only when the rendered file contains
+    /// no `nameserver` directive.
+    pub fn with_provider_nameservers(
+        mut self,
+        nameservers: impl IntoIterator<Item = std::net::IpAddr>,
+    ) -> Self {
+        self.provider_nameservers.extend(nameservers);
+        self
+    }
+
+    /// Capture configd's rendered resolver file using only in-process file I/O.
+    pub fn capture_launch() -> Self {
+        const HOST_RESOLV_CONF_PATHS: [&str; 3] = [
+            "/etc/resolv.conf",
+            "/var/run/resolv.conf",
+            "/private/var/run/resolv.conf",
+        ];
+        let contents = HOST_RESOLV_CONF_PATHS
+            .into_iter()
+            .find_map(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        Self {
+            contents,
+            provider_nameservers: Vec::new(),
+        }
+    }
+
+    /// Capture and validate the host resolver only when this launch depends on
+    /// it. Network-none needs no resolver, bridge mode owns its gateway DNS,
+    /// and an explicit `--dns` is rendered from the network model instead.
+    pub fn capture_for_network(
+        network: &carrick_spec::NetworkNamespaceSpec,
+    ) -> Result<Option<Self>, HostResolverLaunchError> {
+        Self::validate_for_network(network, Self::capture_launch())
+    }
+
+    pub fn validate_for_network(
+        network: &carrick_spec::NetworkNamespaceSpec,
+        snapshot: Self,
+    ) -> Result<Option<Self>, HostResolverLaunchError> {
+        if network.mode != carrick_spec::NetworkMode::Host || !network.dns_servers.is_empty() {
+            return Ok(None);
+        }
+        if snapshot.has_usable_nameserver() {
+            Ok(Some(snapshot))
+        } else {
+            Err(HostResolverLaunchError::NoUsableNameserver)
+        }
+    }
+
+    pub fn has_usable_nameserver(&self) -> bool {
+        !self.provider_nameservers.is_empty()
+            || self.contents.lines().any(|line| {
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("nameserver") else {
+                    return false;
+                };
+                let Some(address) = rest.split_whitespace().next() else {
+                    return false;
+                };
+                let address = address
+                    .split_once('%')
+                    .map_or(address, |(address, _)| address);
+                address.parse::<std::net::IpAddr>().is_ok()
+            })
+    }
+}
+
 pub struct ResolvConfVfs {
     contents: Vec<u8>,
 }
 
 impl ResolvConfVfs {
     pub fn new() -> Self {
+        Self::from_host_snapshot(&HostResolverSnapshot::capture_launch())
+    }
+
+    pub fn from_host_snapshot(snapshot: &HostResolverSnapshot) -> Self {
         Self {
-            contents: synthesize_resolv_conf(),
+            contents: synthesize_resolv_conf(snapshot),
         }
     }
 
@@ -101,30 +200,25 @@ impl Vfs for ResolvConfVfs {
     }
 }
 
-/// Build the guest resolv.conf from the macOS host's DNS configuration. Reads
-/// the host `/etc/resolv.conf` (configd's render of the primary resolver, which
-/// carrick — unlike the guest — can follow the symlink chain to), keeping only
-/// the resolver directives; if that yields no `nameserver`, falls back to
-/// `scutil --dns`. Always returns a syntactically valid file.
-fn synthesize_resolv_conf() -> Vec<u8> {
+/// Build the guest resolv.conf from an explicit launch snapshot, keeping only
+/// resolver directives. Always returns a syntactically valid file.
+fn synthesize_resolv_conf(snapshot: &HostResolverSnapshot) -> Vec<u8> {
     let mut out = String::from("# Generated by carrick from the macOS host DNS configuration.\n");
     let mut have_ns = false;
 
-    if let Ok(host) = std::fs::read_to_string("/etc/resolv.conf") {
-        for line in host.lines() {
-            let t = line.trim();
-            if is_resolver_directive(t) {
-                out.push_str(t);
-                out.push('\n');
-                have_ns |= t.starts_with("nameserver");
-            }
+    for line in snapshot.contents.lines() {
+        let t = line.trim();
+        if is_resolver_directive(t) {
+            out.push_str(t);
+            out.push('\n');
+            have_ns |= t.starts_with("nameserver");
         }
     }
 
     if !have_ns {
-        for ns in scutil_primary_nameservers() {
+        for nameserver in &snapshot.provider_nameservers {
             out.push_str("nameserver ");
-            out.push_str(&ns);
+            out.push_str(&nameserver.to_string());
             out.push('\n');
             have_ns = true;
         }
@@ -144,41 +238,6 @@ fn is_resolver_directive(line: &str) -> bool {
     ["nameserver", "search", "domain", "options", "sortlist"]
         .iter()
         .any(|d| line.starts_with(d) && line[d.len()..].starts_with(char::is_whitespace))
-}
-
-/// Parse `scutil --dns` for the FIRST resolver scope's nameservers (the primary
-/// resolver). Best-effort: returns empty on any failure.
-fn scutil_primary_nameservers() -> Vec<String> {
-    let Ok(output) = std::process::Command::new("/usr/sbin/scutil")
-        .arg("--dns")
-        .output()
-    else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut servers = Vec::new();
-    let mut in_first_resolver = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with("resolver #") {
-            // Stop once we've collected the first resolver's servers.
-            if in_first_resolver {
-                break;
-            }
-            in_first_resolver = t == "resolver #1";
-            continue;
-        }
-        if in_first_resolver
-            && let Some(rest) = t.strip_prefix("nameserver[")
-            && let Some((_, addr)) = rest.split_once(" : ")
-        {
-            servers.push(addr.trim().to_string());
-        }
-    }
-    servers
 }
 
 #[cfg(test)]
@@ -259,5 +318,72 @@ mod tests {
         // A word that merely starts with a directive name is not one.
         assert!(!is_resolver_directive("searchengine foo"));
         assert!(!is_resolver_directive("nameservers 1.2.3.4"));
+    }
+
+    #[test]
+    fn explicit_launch_snapshot_is_filtered_without_a_utility() {
+        let snapshot = HostResolverSnapshot::from_resolv_conf(
+            "# host generated\nsearch example.test\ninvalid secret\n",
+        )
+        .with_provider_nameservers(["192.0.2.53".parse().unwrap()]);
+        let vfs = ResolvConfVfs::from_host_snapshot(&snapshot);
+        let contents = String::from_utf8(vfs.contents).unwrap();
+        assert!(contents.contains("nameserver 192.0.2.53\n"));
+        assert!(contents.contains("search example.test\n"));
+        assert!(!contents.contains("invalid secret"));
+    }
+
+    #[test]
+    fn rendered_nameserver_precedes_provider_fallback() {
+        let snapshot = HostResolverSnapshot::from_resolv_conf("nameserver 192.0.2.1\n")
+            .with_provider_nameservers(["192.0.2.2".parse().unwrap()]);
+        let contents =
+            String::from_utf8(ResolvConfVfs::from_host_snapshot(&snapshot).contents).unwrap();
+        assert!(contents.contains("nameserver 192.0.2.1\n"));
+        assert!(!contents.contains("192.0.2.2"));
+    }
+
+    #[test]
+    fn usable_nameserver_validation_rejects_empty_and_malformed_snapshots() {
+        assert!(!HostResolverSnapshot::default().has_usable_nameserver());
+        assert!(
+            !HostResolverSnapshot::from_resolv_conf("nameserver not-an-address\n")
+                .has_usable_nameserver()
+        );
+        assert!(
+            HostResolverSnapshot::from_resolv_conf("nameserver fe80::1%en0\n")
+                .has_usable_nameserver()
+        );
+    }
+
+    #[test]
+    fn network_modes_that_own_or_disable_dns_do_not_require_a_host_snapshot() {
+        let none = carrick_spec::NetworkNamespaceSpec::none();
+        assert_eq!(HostResolverSnapshot::capture_for_network(&none), Ok(None));
+
+        let bridge =
+            carrick_spec::NetworkNamespaceSpec::bridge_default(None, Vec::new(), Vec::new());
+        assert_eq!(HostResolverSnapshot::capture_for_network(&bridge), Ok(None));
+
+        let explicit = carrick_spec::NetworkNamespaceSpec {
+            dns_servers: vec!["192.0.2.53".parse().unwrap()],
+            ..Default::default()
+        };
+        assert_eq!(
+            HostResolverSnapshot::capture_for_network(&explicit),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn host_network_without_override_refuses_an_unusable_launch_snapshot() {
+        let host = carrick_spec::NetworkNamespaceSpec::default();
+        assert_eq!(
+            HostResolverSnapshot::validate_for_network(
+                &host,
+                HostResolverSnapshot::from_resolv_conf("search example.test\n"),
+            ),
+            Err(HostResolverLaunchError::NoUsableNameserver),
+        );
     }
 }

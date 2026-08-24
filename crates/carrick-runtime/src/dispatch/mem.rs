@@ -6447,15 +6447,6 @@ impl SyscallDispatcher {
         self.mem.lock().locked_ranges = ranges;
         Ok(())
     }
-
-    pub(crate) fn mem_after_fork_child(&self) {
-        let mut mem = self.mem.lock();
-        mem.locked_ranges.clear();
-        // The child does not inherit the parent's writable-memfd-map bookkeeping
-        // (the descriptions it references may be closed in the child); a stale
-        // entry would spuriously EBUSY a child's F_ADD_SEALS.
-        mem.writable_memfd_maps.clear();
-    }
 }
 
 fn linux_madvise_advice_is_supported(advice: u64) -> bool {

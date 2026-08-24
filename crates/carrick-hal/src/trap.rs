@@ -172,23 +172,6 @@ pub trait SyscallTrap {
     /// does not hold a meaningful return address.
     fn current_pc(&self) -> Result<u64, TrapError>;
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError>;
-    /// Real host fork. Returns the child pid in the parent, 0 in the child.
-    /// After this returns, the trap engine in the child holds a freshly rebuilt
-    /// vCPU context pointing at the same guest memory; the runtime then writes
-    /// the appropriate retval into the guest's x0 via `complete_syscall`.
-    fn fork(&mut self) -> Result<ForkOutcome, TrapError>;
-    /// Pre-fork admission gate: verify the host has VM/vCPU capacity for the
-    /// CHILD this fork is about to create, BEFORE any VM teardown or
-    /// `libc::fork`, so persistent exhaustion (HVF's ~127-VM hard ceiling)
-    /// surfaces here — with the parent VM still intact — as
-    /// [`TrapError::HostResourceExhausted`], which the runtime's fork arms
-    /// degrade to a guest `fork(2) = EAGAIN`. A post-fork rebuild failure
-    /// cannot be degraded (the child already exists and the parent VM is
-    /// gone), so this gate is the only sound EAGAIN point. Default: no gate
-    /// (backends without a hard creation ceiling).
-    fn fork_admission_check(&self) -> Result<(), TrapError> {
-        Ok(())
-    }
     /// `execve(2)` — tear down the current guest address space and
     /// re-initialise this engine with `new_image`. Does NOT advance past a
     /// syscall (execve has no successful return); the next `next_syscall`
@@ -339,14 +322,10 @@ pub enum TrapError {
         virtual_address: u64,
         physical_address: u64,
     },
-    #[error("fork(2) failed: {0}")]
-    ForkFailed(String),
     /// The host ran out of VM/vCPU capacity and stayed exhausted past the
     /// bounded admission wait (HVF's ~127-VM hard ceiling / the ~120-permit
-    /// soft budget). Fork-shaped callers degrade this to a guest
-    /// `fork(2) = EAGAIN` (via the pre-fork [`SyscallTrap::fork_admission_check`]
-    /// gate) instead of a fatal engine abort; other creation paths surface it
-    /// as a bounded, loud error instead of parking forever.
+    /// soft budget). Creation paths surface it as a bounded, loud error instead
+    /// of parking forever.
     #[error("host VM/vCPU capacity exhausted: {what}")]
     HostResourceExhausted { what: String },
     #[error(
@@ -457,13 +436,4 @@ impl TrapError {
             from_el0_direct,
         }
     }
-}
-
-/// Outcome of `SyscallTrap::fork`. The parent learns the child's PID; the child
-/// returns and continues executing with a freshly-rebuilt VM that points at the
-/// same host buffers.
-#[derive(Debug)]
-pub enum ForkOutcome {
-    Parent { child_pid: i32 },
-    Child,
 }

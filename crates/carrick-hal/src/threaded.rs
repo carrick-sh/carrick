@@ -10,7 +10,7 @@ use carrick_guest_mem::GuestMemory;
 pub use carrick_guest_mem::{HostVa, SharedFutexLocation};
 
 use crate::error::{OsError, Reg, SysReg};
-use crate::trap::{ForkOutcome, SyscallTrap, TrapError};
+use crate::trap::{SyscallTrap, TrapError};
 
 /// The process-local thread/vCPU **registry key**.
 ///
@@ -1695,26 +1695,6 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     /// Stamp the running guest thread's guest-visible tid into the vCPU (the
     /// EL1 `gettid` fast path). No-op unless the syscall shim is enabled.
     fn set_guest_thread_id(&self, tid: u64) -> Result<(), TrapError>;
-    /// `vfork(2)` variant of [`SyscallTrap::fork`]: the child SHARES the
-    /// parent's guest RAM (`CLONE_VM`) and the parent is suspended until the
-    /// child execve's/exits. Defaults to a plain `fork` for backends without a
-    /// distinct shared-RAM path.
-    fn fork_vfork(&mut self) -> Result<ForkOutcome, TrapError> {
-        self.fork()
-    }
-    /// Publish the guest mmap-arena high-water (the dispatcher's
-    /// `mmap_arena_high_water`) just before a `vfork(2)` so a shared-VM backend can
-    /// bound the per-window residency scan to the used arena prefix instead of the
-    /// full (e.g. 32 GiB) arena. Default no-op; the KVM backend stores it for
-    /// `prepare_vfork_share`. Harmless to call on a non-vfork fork.
-    fn set_vfork_arena_high_water(&mut self, _high_water: u64) {}
-    /// `vfork(2)` PARENT, on RESUME (the suspended parent's pipe wait returned —
-    /// the child has execve'd/`_exit`ed). Reconcile any shared-VM writes the child
-    /// made back into the parent's address space and release the share. Backends
-    /// that share the parent's RAM directly (HVF) or have no shared-VM path need
-    /// nothing here; the KVM backend, which shares via a shadow that the suspended
-    /// parent must copy back, overrides it. Default no-op.
-    fn finish_vfork_parent(&mut self) {}
     /// Backend hook before dispatching a guest syscall. Direct shared-memory
     /// backends need nothing; a backend that emulates file-backed `MAP_SHARED`
     /// with copied guest RAM can use this to publish guest stores before the
@@ -1725,23 +1705,8 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     fn sync_shared_file_aliases(&mut self) -> Result<(), TrapError> {
         Ok(())
     }
-    fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
-        Ok(())
-    }
-    fn rebuild_vcpu_after_fork(&mut self) -> Result<(), TrapError> {
-        Ok(())
-    }
-    fn publish_vm_for_siblings(&mut self) -> Result<(), TrapError> {
-        Ok(())
-    }
     fn destroy_vcpu_on_thread_exit(&mut self) {}
-    /// Construct a FRESH vCPU-kick registry for the CHILD side of a guest
-    /// `fork(2)`. `libc::fork` replicates only the calling thread, so the child
-    /// must drop the parent's kicker (no phantom siblings). Returned as the
-    /// object-safe trait type the shared loop holds so the core never names the
-    /// concrete kicker. The child rebuilds its private-futex backend separately
-    /// via the `PlatformFutexFactory` (over a fresh `FutexTable`) so the two
-    /// stay over the SAME table (the notify-signal-pending consistency invariant).
+    /// Construct a fresh vCPU-kick registry for one logical process.
     fn fresh_fork_kicker(&self) -> Arc<dyn VcpuRegistry>;
 }
 

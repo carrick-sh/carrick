@@ -1391,6 +1391,8 @@ pub(crate) struct KernelState {
     process_terminal: Mutex<Option<Result<RunResult, ()>>>,
     process_terminal_ready: Condvar,
     fatal_signal: FatalSignalAuthority,
+    control_exec: Mutex<Option<crate::kernel::control::ExecRuntime>>,
+    external_exec: Mutex<Option<crate::kernel::control::ExecWork>>,
 }
 
 impl KernelState {
@@ -1429,6 +1431,94 @@ impl KernelState {
             process_terminal: Mutex::new(None),
             process_terminal_ready: Condvar::new(),
             fatal_signal: FatalSignalAuthority::default(),
+            control_exec: Mutex::new(None),
+            external_exec: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn install_control_exec_runtime(
+        &self,
+        runtime: crate::kernel::control::ExecRuntime,
+    ) -> Result<(), RuntimeError> {
+        let mut installed = self.control_exec.lock();
+        if installed.is_some() {
+            return Err(RuntimeError::Configuration(
+                "carrier logical exec runtime already installed".to_owned(),
+            ));
+        }
+        *installed = Some(runtime);
+        Ok(())
+    }
+
+    pub(crate) fn install_control_exec_waker(
+        &self,
+        runtime: &crate::kernel::control::ExecRuntime,
+        linux_tid: crate::kernel::LinuxTid,
+    ) -> Result<(), RuntimeError> {
+        let process = self.hvpatch_process.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "carrier logical exec wake route has no HVPatch process".to_owned(),
+            )
+        })?;
+        let directory = self.hvpatch_runtime.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "carrier logical exec wake route has no runtime directory".to_owned(),
+            )
+        })?;
+        let context = self
+            .dispatcher
+            .capture_kernel_context(linux_tid)
+            .map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "capture carrier logical exec wake target: {error}"
+                ))
+            })?;
+        let thread = context.thread().key();
+        let scheduler = directory.continuation_services(process.kernel_graph()).0;
+        runtime
+            .install_waker(Arc::new(move || {
+                let _ = scheduler.wake_control(thread);
+            }))
+            .map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "install carrier logical exec wake route: {error}"
+                ))
+            })
+    }
+
+    fn try_take_control_exec(&self) -> Option<crate::kernel::control::ExecWork> {
+        self.control_exec.lock().as_ref()?.try_take()
+    }
+
+    fn install_external_exec_work(
+        &self,
+        work: crate::kernel::control::ExecWork,
+    ) -> Result<(), RuntimeError> {
+        let mut installed = self.external_exec.lock();
+        if installed.is_some() {
+            return Err(RuntimeError::Configuration(
+                "logical process already has external exec work".to_owned(),
+            ));
+        }
+        *installed = Some(work);
+        Ok(())
+    }
+
+    fn take_external_exec_work(&self) -> Option<crate::kernel::control::ExecWork> {
+        self.external_exec.lock().take()
+    }
+
+    fn admit_external_exec(&self, task: crate::kernel::TaskKey) -> Result<(), RuntimeError> {
+        let mut external = self.external_exec.lock();
+        let Some(work) = external.as_mut() else {
+            return Ok(());
+        };
+        if work.admit(task.into()) {
+            Ok(())
+        } else {
+            Err(RuntimeError::Configuration(
+                "logical exec request expired before exact task admission".to_owned(),
+            ))
         }
     }
 
@@ -2180,6 +2270,39 @@ impl HvpatchExternalTerminalSettlement {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeferredResumeBlocked {
+    frame: carrick_hal::RawSyscall,
+    vfork_child_pid: Option<i32>,
+    original_blocked_reason: Option<crate::kernel::objects::BlockedReason>,
+}
+
+impl DeferredResumeBlocked {
+    fn capture(
+        phase: &HvpatchProductionPhase,
+        original_blocked_reason: Option<crate::kernel::objects::BlockedReason>,
+    ) -> Option<Self> {
+        match phase {
+            HvpatchProductionPhase::ResumeBlocked {
+                frame,
+                vfork_child_pid,
+            } => Some(Self {
+                frame: *frame,
+                vfork_child_pid: *vfork_child_pid,
+                original_blocked_reason,
+            }),
+            _ => None,
+        }
+    }
+
+    fn restore(self, phase: &mut HvpatchProductionPhase) {
+        *phase = HvpatchProductionPhase::ResumeBlocked {
+            frame: self.frame,
+            vfork_child_pid: self.vfork_child_pid,
+        };
+    }
+}
+
 enum HvpatchProductionPhase {
     Resident,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2195,9 +2318,11 @@ enum HvpatchProductionPhase {
     },
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     RetryProcessFork {
-        frame: carrick_hal::RawSyscall,
+        frame: Option<carrick_hal::RawSyscall>,
         request: quiesce::ForkRequest,
         coordinator: Option<quiesce::ProcessForkCoordinator>,
+        external_exec: Option<crate::kernel::control::ExecWork>,
+        deferred_resume_blocked: Option<DeferredResumeBlocked>,
         _subscription: quiesce::ProcessForkRetrySubscription,
     },
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2660,6 +2785,7 @@ struct ProductionHvpatchLoopJob<E: ThreadedEngine> {
     terminal_runtime: PersistentTerminalRuntimeState,
     pending_terminal_retirement: Option<crate::hvpatch::PendingAddressSpaceRetirement>,
     pending_terminal_inventory: Option<(Arc<crate::kernel::Kernel>, crate::kernel::MmId)>,
+    external_exec: Option<crate::kernel::control::ExecWork>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2828,6 +2954,157 @@ impl<E: ThreadedEngine + 'static> ProductionHvpatchLoopJob<E>
 where
     E::SiblingSpec: 'static,
 {
+    fn external_exec_failure(&mut self, engine: &mut E, code: i32) -> executor::ExecutorExit {
+        let context = self
+            .state
+            .service_kernel_context
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort())
+            .retain_exact();
+        let outcome = VcpuLoopOutcome::ProcessExit(Box::new(assemble_run_result(
+            &self.kernel,
+            code,
+            None,
+            self.traps,
+            false,
+        )));
+        self.begin_persistent_process_terminal(
+            engine,
+            PersistentTerminal::from_outcome(outcome),
+            context,
+        )
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn start_external_exec(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+    ) -> Result<executor::ExecutorExit, RuntimeError> {
+        let request = self
+            .external_exec
+            .as_mut()
+            .ok_or_else(|| {
+                RuntimeError::Configuration("external exec work disappeared".to_owned())
+            })?
+            .take_request()
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let context = self
+            .state
+            .service_kernel_context
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "external exec lost exact child Kernel context".to_owned(),
+                )
+            })?
+            .retain_exact();
+        let user = request.user.map(|user| {
+            let supplementary = user
+                .supplementary_gids
+                .into_iter()
+                .map(carrick_abi::NsGid::new)
+                .collect();
+            (
+                carrick_abi::NsUid::new(user.uid),
+                carrick_abi::NsGid::new(user.gid),
+                supplementary,
+            )
+        });
+        let context = match self.kernel.dispatcher.configure_logical_exec_context(
+            &context,
+            request.workdir.as_deref(),
+            user,
+        ) {
+            Ok(context) => context,
+            Err(_) => return Ok(self.external_exec_failure(engine, 126)),
+        };
+        let kernel = Arc::clone(&self.kernel);
+        let setup = kernel.dispatcher.with_kernel_resources(&context, || {
+            let requested_path = request.argv[0].clone();
+            let argv = request.argv.into_iter().map(String::into_bytes).collect();
+            let mut env = self.kernel.dispatcher.current_exec_env();
+            for variable in request.env {
+                let prefix = format!("{}=", variable.key).into_bytes();
+                env.retain(|entry| !entry.starts_with(&prefix));
+                let mut entry = prefix;
+                entry.extend_from_slice(variable.value.as_bytes());
+                env.push(entry);
+            }
+            let path = if requested_path.contains('/') {
+                Ok(requested_path)
+            } else {
+                let search = env
+                    .iter()
+                    .rev()
+                    .find_map(|entry| entry.strip_prefix(b"PATH="))
+                    .and_then(|value| std::str::from_utf8(value).ok())
+                    .unwrap_or("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+                self.kernel
+                    .dispatcher
+                    .resolve_execvp_path(&requested_path, search)
+            };
+            path.map(|path| (path, argv, env))
+        });
+        let (path, argv, env) = match setup {
+            Ok(setup) => setup,
+            Err(errno) => {
+                let exit_code = if errno == crate::linux_abi::LINUX_ENOENT {
+                    127
+                } else {
+                    126
+                };
+                return Ok(self.external_exec_failure(engine, exit_code));
+            }
+        };
+        match self
+            .state
+            .prepare_execve(&self.kernel, &context, engine, path, argv, env)?
+        {
+            exec::ExecvePreparation::Complete(Some(outcome)) => {
+                Ok(self.enter_terminal_with_outcome(engine, outcome))
+            }
+            exec::ExecvePreparation::Complete(None) => Ok(self.external_exec_failure(engine, 126)),
+            exec::ExecvePreparation::Prepared(prepared) => {
+                let prepared = *prepared;
+                let drain = self
+                    .state
+                    .begin_persistent_exec_sibling_drain(&self.kernel, self.completion.id())?;
+                if drain.is_ready() {
+                    self.state
+                        .finish_persistent_sibling_drain(self.completion.id())?;
+                    let finished = self.state.finish_prepared_execve(
+                        &self.kernel,
+                        &context,
+                        engine,
+                        prepared,
+                    )?;
+                    let replaced = self.publish_exec_replacement(control)?;
+                    Ok(match (finished, replaced) {
+                        (Some(outcome), _) => self.enter_terminal_with_outcome(engine, outcome),
+                        (None, true) => self.suspend(
+                            HvpatchLoopSuspension::Preemption,
+                            executor::ExecutorExit::Preempted,
+                        ),
+                        (None, false) => executor::ExecutorExit::Syscall,
+                    })
+                } else {
+                    self.phase = HvpatchProductionPhase::ExecSiblingDrain {
+                        context,
+                        prepared,
+                        drain,
+                    };
+                    Ok(self.suspend(
+                        HvpatchLoopSuspension::ExecSiblingDrain,
+                        executor::ExecutorExit::Blocked(
+                            crate::kernel::objects::BlockedReason::ChildState,
+                        ),
+                    ))
+                }
+            }
+        }
+    }
+
     fn take_terminal_inventory_authority(
         &mut self,
     ) -> Result<(Arc<crate::kernel::Kernel>, crate::kernel::MmId), TrapError> {
@@ -2839,19 +3116,163 @@ where
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn control_quantum(
+        &self,
+    ) -> Result<Option<crate::kernel::objects::SchedulerControlQuantum>, RuntimeError> {
+        let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "carrier logical exec lost exact root Kernel context".to_owned(),
+            )
+        })?;
+        let thread = context.thread();
+        thread
+            .scheduler_control_quantum(thread.key())
+            .map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "inspect carrier logical exec control quantum: {error}"
+                ))
+            })
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn finish_control_quantum(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        deferred_resume_blocked: Option<DeferredResumeBlocked>,
+    ) -> Result<executor::ExecutorExit, RuntimeError> {
+        let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "carrier logical exec lost exact root Kernel context".to_owned(),
+            )
+        })?;
+        let thread = context.thread();
+        let quantum = thread
+            .finish_scheduler_control_quantum(thread.key())
+            .map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "finish carrier logical exec control quantum: {error}"
+                ))
+            })?;
+        // Clear-then-recheck closes coalesced admission races. Every request
+        // queued before the clear remains visible here. A request queued after
+        // this check observes no marker, so its waker creates a fresh control
+        // edge. If the next request is already visible, restore the displaced
+        // continuation token and service it in this same owner quantum.
+        if let Some(work) = self.kernel.try_take_control_exec() {
+            thread
+                .restore_scheduler_control_quantum(thread.key(), quantum)
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "continue carrier logical exec control quantum: {error}"
+                    ))
+                })?;
+            return self.begin_control_exec_fork(engine, control, work, deferred_resume_blocked);
+        }
+        let Some(deferred) = deferred_resume_blocked else {
+            if quantum.blocked_reason.is_some() {
+                return Err(RuntimeError::Configuration(
+                    "carrier logical exec lost its deferred blocked continuation".to_owned(),
+                ));
+            }
+            return Ok(executor::ExecutorExit::Syscall);
+        };
+        if quantum.blocked_reason != deferred.original_blocked_reason {
+            return Err(RuntimeError::Configuration(
+                "carrier logical exec changed the deferred blocked reason".to_owned(),
+            ));
+        }
+        let continuation_ready = control
+            .execution_lease_mut()
+            .map_err(RuntimeError::Trap)?
+            .blocked_continuation()
+            .is_some_and(|continuation| continuation.ready_event().is_ok());
+        let original_blocked_reason = deferred.original_blocked_reason;
+        deferred.restore(&mut self.phase);
+        match (original_blocked_reason, continuation_ready) {
+            // A real producer won while the control quantum was runnable. Let
+            // ResumeBlocked consume that exact event in this same lease.
+            (_, true) | (None, _) => Ok(executor::ExecutorExit::Syscall),
+            (Some(reason), false) => Ok(self.suspend(
+                HvpatchLoopSuspension::BlockedContinuation,
+                executor::ExecutorExit::Blocked(reason),
+            )),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn begin_control_exec_fork(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        work: crate::kernel::control::ExecWork,
+        deferred_resume_blocked: Option<DeferredResumeBlocked>,
+    ) -> Result<executor::ExecutorExit, RuntimeError> {
+        let context = self
+            .state
+            .service_kernel_context
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "carrier logical exec lost exact root Kernel context".to_owned(),
+                )
+            })?
+            .retain_exact();
+        let prepared = self.state.prepare_in_process_fork(
+            &self.kernel,
+            &context,
+            engine,
+            control,
+            &mut ProductionHvpatchProcessBackendOps,
+            quiesce::ProcessForkAttempt {
+                request: quiesce::ForkRequest {
+                    flags: 0,
+                    pidfd_out: None,
+                    clone_parent: false,
+                    parent_tid_addr: None,
+                    child_tid_addr: None,
+                    exit_signal: 0,
+                    child_stack: 0,
+                    vfork: None,
+                },
+                coordinator: None,
+                external_exec: Some(work),
+            },
+        )?;
+        self.complete_persistent_process_fork(
+            engine,
+            control,
+            None,
+            deferred_resume_blocked,
+            prepared,
+        )
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn complete_persistent_process_fork(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
-        frame: carrick_hal::RawSyscall,
+        frame: Option<carrick_hal::RawSyscall>,
+        deferred_resume_blocked: Option<DeferredResumeBlocked>,
         prepared: quiesce::PreparedInProcessFork,
     ) -> Result<executor::ExecutorExit, RuntimeError> {
         match prepared {
             quiesce::PreparedInProcessFork::Complete(Some(value)) => {
-                self.state.complete_returned(engine, value)?;
+                if frame.is_some() {
+                    self.state.complete_returned(engine, value)?;
+                }
+                if frame.is_none() {
+                    return self.finish_control_quantum(engine, control, deferred_resume_blocked);
+                }
                 Ok(executor::ExecutorExit::Syscall)
             }
             quiesce::PreparedInProcessFork::Complete(None) => {
+                if deferred_resume_blocked.is_some() {
+                    return Err(RuntimeError::Configuration(
+                        "external logical exec retired the blocked init process".to_owned(),
+                    ));
+                }
                 let context = self
                     .state
                     .service_kernel_context
@@ -2872,6 +3293,11 @@ where
                 ))
             }
             quiesce::PreparedInProcessFork::SuspendVfork(suspension) => {
+                let frame = frame.ok_or_else(|| {
+                    RuntimeError::Configuration(
+                        "external logical exec unexpectedly requested vfork suspension".to_owned(),
+                    )
+                })?;
                 let request = suspension.request;
                 let child_pid = suspension.child_pid;
                 let exit = self.state.persistent_block_exit(
@@ -2893,12 +3319,15 @@ where
             quiesce::PreparedInProcessFork::Retry {
                 request,
                 coordinator,
+                external_exec,
                 _subscription,
             } => {
                 self.phase = HvpatchProductionPhase::RetryProcessFork {
                     frame,
                     request,
                     coordinator,
+                    external_exec,
+                    deferred_resume_blocked,
                     _subscription,
                 };
                 Ok(self.suspend(
@@ -3060,9 +3489,31 @@ where
         };
         let process_exit_event = process.record_process_exit_begin(exit_code, self.state.this_tid);
         let child = process.is_child();
-        if child {
-            let out = self.kernel.dispatcher.stdout();
-            let err = self.kernel.dispatcher.stderr();
+        let out = self.kernel.dispatcher.stdout();
+        let err = self.kernel.dispatcher.stderr();
+        if let Some(work) = self.external_exec.take() {
+            let terminating_signal = match &terminal {
+                PersistentTerminal::Outcome {
+                    outcome: VcpuLoopOutcome::ProcessExit(run) | VcpuLoopOutcome::TrapLimit(run),
+                    ..
+                } => run.terminating_signal,
+                PersistentTerminal::Error(_) => None,
+                PersistentTerminal::Outcome {
+                    outcome: VcpuLoopOutcome::ThreadDone,
+                    ..
+                } => None,
+            };
+            if let Err(error) = work.complete(crate::kernel::control::ExecResult {
+                exit_code,
+                terminating_signal,
+                stdout: out.clone(),
+                stderr: err.clone(),
+                output_truncated: false,
+            }) {
+                tracing::error!(%error, "publish logical exec terminal result failed");
+                std::process::abort();
+            }
+        } else if child && !self.kernel.dispatcher.external_exec_capture_enabled() {
             let _ = write_hvpatch_child_output(1, &out);
             let _ = write_hvpatch_child_output(2, &err);
         }
@@ -4483,9 +4934,16 @@ where
                             vfork,
                         },
                         coordinator: None,
+                        external_exec: None,
                     },
                 )?;
-                return self.complete_persistent_process_fork(engine, control, frame, prepared);
+                return self.complete_persistent_process_fork(
+                    engine,
+                    control,
+                    Some(frame),
+                    None,
+                    prepared,
+                );
             }
             DispatchOutcome::CloneThread {
                 stack,
@@ -4904,6 +5362,30 @@ where
         self.state
             .publish_thread_run_state(crate::run_state::RunState::Running, 'R');
 
+        // A control exec is a peer-root operation, not completion of the
+        // init's blocked syscall. Service it at this scheduler safe point
+        // before ResumeBlocked consumes and re-parks the continuation. The
+        // typed token survives a fork retry and restores the exact frame and
+        // vfork identity after publication.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(quantum) = self.control_quantum()?
+            && let Some(deferred_resume_blocked) =
+                DeferredResumeBlocked::capture(&self.phase, quantum.blocked_reason)
+        {
+            if let Some(work) = self.kernel.try_take_control_exec() {
+                return self.begin_control_exec_fork(
+                    engine,
+                    control,
+                    work,
+                    Some(deferred_resume_blocked),
+                );
+            }
+            // Admission may have been cancelled before the owner claimed it.
+            // Consume only the control edge and put the untouched continuation
+            // back; never turn this into guest readiness.
+            return self.finish_control_quantum(engine, control, Some(deferred_resume_blocked));
+        }
+
         let phase = std::mem::replace(&mut self.phase, HvpatchProductionPhase::Resident);
         match phase {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4918,6 +5400,10 @@ where
                     shares_mm,
                     child_settid,
                 )?;
+                if let Some(work) = self.kernel.take_external_exec_work() {
+                    self.external_exec = Some(work);
+                    return self.start_external_exec(engine, control);
+                }
             }
             HvpatchProductionPhase::ResumeForkQuiesce { _subscription } => {
                 drop(_subscription);
@@ -4957,6 +5443,8 @@ where
                 frame,
                 request,
                 coordinator,
+                external_exec,
+                deferred_resume_blocked,
                 _subscription,
             } => {
                 drop(_subscription);
@@ -4979,9 +5467,16 @@ where
                     quiesce::ProcessForkAttempt {
                         request,
                         coordinator,
+                        external_exec,
                     },
                 )?;
-                return self.complete_persistent_process_fork(engine, control, frame, prepared);
+                return self.complete_persistent_process_fork(
+                    engine,
+                    control,
+                    frame,
+                    deferred_resume_blocked,
+                    prepared,
+                );
             }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             HvpatchProductionPhase::RetryCloneThread {
@@ -5181,6 +5676,14 @@ where
             }
             HvpatchProductionPhase::Resident => {}
             HvpatchProductionPhase::Complete => return Ok(executor::ExecutorExit::Exited),
+        }
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if self.control_quantum()?.is_some() {
+            if let Some(work) = self.kernel.try_take_control_exec() {
+                return self.begin_control_exec_fork(engine, control, work, None);
+            }
+            return self.finish_control_quantum(engine, control, None);
         }
 
         if let Some(exit) = self.suspend_for_process_quiesce(engine, control)? {
@@ -7315,6 +7818,7 @@ fn prepare_hvpatch_logical_job(
         terminal_runtime: PersistentTerminalRuntimeState::Resident,
         pending_terminal_retirement: None,
         pending_terminal_inventory: None,
+        external_exec: None,
     };
     let job = HvpatchLoopJob::production(production, injected_lease);
     let quantum = Arc::new(continuation::HvpatchTaskQuantum::new(
@@ -8745,6 +9249,7 @@ mod tests {
                 terminal_runtime: PersistentTerminalRuntimeState::Resident,
                 pending_terminal_retirement: None,
                 pending_terminal_inventory: None,
+                external_exec: None,
             };
             let mut memory = Memory::default();
             memory.0.insert(0x1000, 11_i32.to_le_bytes().to_vec());
@@ -9135,6 +9640,7 @@ mod tests {
                         vfork: None,
                     },
                     coordinator: None,
+                    external_exec: None,
                 },
             );
             let Some(phase) = phase else {
@@ -9837,6 +10343,98 @@ mod tests {
             }
             .is_terminal_transition()
         );
+    }
+
+    fn deferred_frame() -> carrick_hal::RawSyscall {
+        carrick_hal::RawSyscall {
+            number: carrick_abi::CanonicalNr(101),
+            args: [1, 2, 3, 4, 5, 6],
+            guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+            native_number: carrick_abi::NativeNr(202),
+        }
+    }
+
+    fn assert_deferred_resume_exact(
+        phase: &HvpatchProductionPhase,
+        expected_frame: carrick_hal::RawSyscall,
+        expected_vfork_child: Option<i32>,
+    ) {
+        let HvpatchProductionPhase::ResumeBlocked {
+            frame,
+            vfork_child_pid,
+        } = phase
+        else {
+            panic!("deferred phase was not restored to ResumeBlocked");
+        };
+        assert_eq!(*frame, expected_frame);
+        assert_eq!(*vfork_child_pid, expected_vfork_child);
+    }
+
+    #[test]
+    fn control_exec_complete_restores_exact_blocked_frame_and_vfork_identity() {
+        let frame = deferred_frame();
+        let original = HvpatchProductionPhase::ResumeBlocked {
+            frame,
+            vfork_child_pid: Some(70_106),
+        };
+        let deferred = DeferredResumeBlocked::capture(
+            &original,
+            Some(crate::kernel::objects::BlockedReason::HostWait),
+        )
+        .expect("capture ResumeBlocked");
+        let mut after_peer_publication = HvpatchProductionPhase::Resident;
+        deferred.restore(&mut after_peer_publication);
+        assert_deferred_resume_exact(&after_peer_publication, frame, Some(70_106));
+    }
+
+    #[test]
+    fn control_exec_retry_carries_exact_blocked_frame_and_vfork_identity() {
+        fn carry_retry_token(token: DeferredResumeBlocked) -> Option<DeferredResumeBlocked> {
+            Some(token)
+        }
+
+        let frame = deferred_frame();
+        let original = HvpatchProductionPhase::ResumeBlocked {
+            frame,
+            vfork_child_pid: Some(70_107),
+        };
+        let retry_token = carry_retry_token(
+            DeferredResumeBlocked::capture(
+                &original,
+                Some(crate::kernel::objects::BlockedReason::HostWait),
+            )
+            .expect("capture ResumeBlocked"),
+        );
+        let mut after_retry = HvpatchProductionPhase::Resident;
+        retry_token
+            .expect("RetryProcessFork carries deferred token")
+            .restore(&mut after_retry);
+        assert_deferred_resume_exact(&after_retry, frame, Some(70_107));
+    }
+
+    #[test]
+    fn control_exec_completion_clear_then_rechecks_coalesced_queue() {
+        let source = include_str!("mod.rs");
+        let finish = source
+            .split_once("fn finish_control_quantum(")
+            .expect("control completion helper")
+            .1
+            .split_once("fn begin_control_exec_fork(")
+            .expect("end control completion helper")
+            .0;
+        let clear = finish
+            .find("finish_scheduler_control_quantum")
+            .expect("atomically clear current marker");
+        let recheck = finish
+            .find("try_take_control_exec")
+            .expect("recheck queued work");
+        let restore = finish
+            .find("restore_scheduler_control_quantum")
+            .expect("restore displaced continuation for next work");
+        let continue_work = finish
+            .find("begin_control_exec_fork")
+            .expect("service next work in same root quantum");
+        assert!(clear < recheck && recheck < restore && restore < continue_work);
     }
 
     #[test]

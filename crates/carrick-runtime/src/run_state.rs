@@ -278,11 +278,11 @@ pub fn clear_guest_tid(tid: i32) {
 ///
 /// Under HVPatch a Linux process is a task in the carrier, not a host process,
 /// so nothing outside the guest's own lifecycle can tell that its record is
-/// finished with. The namespace supervisor's leak backstop cannot: it answers
-/// "is the owner gone?" with `kill(host_pid, 0)`, and these records are keyed
-/// by GUEST pid — a value that names no host process, so the probe returns
-/// ESRCH and the sweep released the records of LIVE guest processes. Task exit
-/// is therefore the only correct release point.
+/// finished with. The compatibility liveness sweep cannot: it answers "is the
+/// owner gone?" with `kill(host_pid, 0)`, and these records are keyed by GUEST
+/// pid — a value that names no host process, so the probe returns ESRCH and
+/// would release the records of LIVE guest processes. Task exit is therefore
+/// the only correct release point.
 ///
 /// Clears ONLY the process-kind slot, never a `KIND_TID` entry that happens to
 /// share the low-32 value, mirroring [`clear_guest_tid`].
@@ -361,9 +361,9 @@ fn find_record(section: &ProcessSection, id: u32, want_tid: bool) -> Option<Proc
     None
 }
 
-/// Stamp whose lifetime owns this record, so a reader in ANOTHER host process
-/// (the namespace supervisor) can tell that its `host_pid` is a guest pid and
-/// that host liveness says nothing about it.
+/// Stamp whose lifetime owns this record, so any arena reader — including a
+/// transitional `carrick exec` joiner in another host process — can tell that
+/// its `host_pid` is a guest pid and host liveness says nothing about it.
 fn mark_owner_domain(record: &carrick_kernel::process::ProcessRecord) {
     if crate::dispatch::hvpatch_lane_active() {
         record.flags.fetch_or(

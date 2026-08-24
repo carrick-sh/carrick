@@ -121,6 +121,7 @@ pub(crate) fn create_container(body: &[u8], name: Option<&str>) -> (u16, String)
         tty: req.tty.unwrap_or(false),
         interactive: req.open_stdin.unwrap_or(false),
         user: req.user.as_deref(),
+        hostname: req.hostname.as_deref(),
         entrypoint: req.entrypoint.as_deref(),
         auto_remove: false,
         binds: &binds,
@@ -134,21 +135,25 @@ pub(crate) fn create_container(body: &[u8], name: Option<&str>) -> (u16, String)
         dns_options: &dns_options,
         volumes_from: &volumes_from,
         security_opts: &security_opts,
+        labels: &labels,
+        api_auto_remove,
+        api_network_mode: network.api_network_mode.as_deref(),
+        network_container: network.network_container.as_deref(),
+        network_attachments: &network.attachments,
     };
     match crate::serve::spawn::create_container(&image, &cmd, &opts) {
         // `id` is the 64-hex container id `carrick create` generated; the Docker
         // `Id` is always that id, not the (optional) name.
         Ok(id) => {
-            if let Err(e) = persist_api_container_metadata(
-                &id,
-                &network.attachments,
-                network.api_network_mode.as_deref(),
-                network.network_container.as_deref(),
-                req.hostname.as_deref(),
-                &labels,
-                api_auto_remove,
-            ) {
-                return (500, error_json(&e.to_string()));
+            if !network.attachments.is_empty() {
+                let attach_result = carrick_runtime::container::ContainerState::load(&id)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|state| {
+                        crate::serve::resources::attach_container_to_networks(&state)
+                    });
+                if let Err(e) = attach_result {
+                    return (500, error_json(&e.to_string()));
+                }
             }
             let resp = CreateResponse {
                 id,
@@ -443,48 +448,6 @@ fn primary_network_first(
     attachments
 }
 
-fn persist_api_container_metadata(
-    id: &str,
-    attachments: &[carrick_runtime::container::NetworkAttachment],
-    api_network_mode: Option<&str>,
-    network_container: Option<&str>,
-    hostname: Option<&str>,
-    labels: &HashMap<String, String>,
-    api_auto_remove: bool,
-) -> anyhow::Result<()> {
-    if attachments.is_empty()
-        && api_network_mode.is_none()
-        && network_container.is_none()
-        && hostname.is_none()
-        && labels.is_empty()
-        && !api_auto_remove
-    {
-        return Ok(());
-    }
-    let mut state = carrick_runtime::container::ContainerState::load(id)?;
-    if !attachments.is_empty() {
-        state.config.network_attachments = attachments.to_vec();
-    }
-    if let Some(mode) = api_network_mode {
-        state.config.api_network_mode = Some(mode.to_string());
-    }
-    if let Some(target) = network_container {
-        state.config.network_container = Some(target.to_string());
-    }
-    if let Some(hostname) = hostname {
-        state.config.hostname = Some(hostname.to_string());
-    }
-    if !labels.is_empty() {
-        state.labels = labels.clone();
-    }
-    state.api_auto_remove = api_auto_remove;
-    state.persist()?;
-    if !attachments.is_empty() {
-        crate::serve::resources::attach_container_to_networks(&state)?;
-    }
-    Ok(())
-}
-
 /// Docker returns 204 No Content on a successful start.
 pub(crate) fn start_container(id: &str) -> (u16, String) {
     match crate::serve::spawn::start_container(id) {
@@ -537,17 +500,23 @@ pub(crate) fn wait_container_stream(id: String) -> Response<crate::serve::router
     };
 
     let state_for_cleanup = carrick_runtime::container::ContainerState::load(&real_id).ok();
+    let expected_terminal_control = state_for_cleanup.as_ref().and_then(|state| {
+        state
+            .control
+            .clone()
+            .or_else(|| state.terminal_control.clone())
+    });
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(1);
     tokio::task::spawn_blocking(move || {
-        let (_status, body) = wait_container(&real_id);
-        if state_for_cleanup
-            .as_ref()
-            .is_some_and(|state| state.api_auto_remove)
-            && let Some(state) = state_for_cleanup.as_ref()
+        let (status, body) = wait_container(&real_id);
+        if status == 200
+            && state_for_cleanup
+                .as_ref()
+                .is_some_and(|state| state.api_auto_remove)
+            && let Some(expected) = expected_terminal_control.as_ref()
         {
             std::thread::sleep(std::time::Duration::from_millis(300));
-            crate::serve::resources::detach_container_from_all_networks(state);
-            let _ = carrick_runtime::container::ContainerState::remove(&real_id);
+            let _ = cleanup_api_auto_remove(&real_id, expected);
         }
         let _ = tx.blocking_send(Ok(Frame::data(Bytes::from(body))));
     });
@@ -559,6 +528,24 @@ pub(crate) fn wait_container_stream(id: String) -> Response<crate::serve::router
         .header("Content-Type", "application/json")
         .body(body)
         .unwrap_or_else(|_| fallback())
+}
+
+fn cleanup_api_auto_remove(
+    id: &str,
+    expected: &carrick_runtime::container::CarrierControlState,
+) -> anyhow::Result<bool> {
+    let _lifecycle_lock = carrick_runtime::container::lock_lifecycle(id)?;
+    let current = carrick_runtime::container::ContainerState::load(id)?;
+    if current.status != carrick_runtime::container::ContainerStatus::Exited
+        || current.terminal_control.as_ref() != Some(expected)
+        || !current.api_auto_remove
+    {
+        return Ok(false);
+    }
+    crate::serve::resources::detach_container_from_all_networks(&current);
+    carrick_runtime::container::ContainerState::remove(id)?;
+    carrick_runtime::container::clear_terminal_receipt(id)?;
+    Ok(true)
 }
 
 /// Docker returns 204 No Content on a successful remove.
@@ -1348,119 +1335,57 @@ pub(crate) async fn download_archive_route(
 ) -> Response<crate::serve::router::ResponseBody> {
     use http_body_util::BodyExt;
 
-    let fallback = || {
-        Response::new(
-            http_body_util::Full::new(Bytes::new())
-                .map_err(|never| match never {})
-                .boxed(),
-        )
+    let path = match decode_archive_query_path(&query) {
+        Ok(path) => path,
+        Err(error) => return archive_error_response(StatusCode::BAD_REQUEST, &error),
     };
-
-    let real_id = match carrick_runtime::container::resolve(&id) {
-        Ok(real_id) => real_id,
-        Err(e) => {
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header("Content-Type", "application/json")
-                .body(
-                    http_body_util::Full::new(Bytes::from(error_json(&e)))
-                        .map_err(|never| match never {})
-                        .boxed(),
-                )
-                .unwrap_or_else(|_| fallback());
-        }
-    };
-    let Some(raw_path) = crate::serve::router::query_param(&query, "path") else {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header("Content-Type", "application/json")
+    let result = tokio::task::spawn_blocking(move || download_archive(&id, path)).await;
+    match result {
+        Ok(Ok(download)) => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/x-tar")
+            .header("X-Docker-Container-Path-Stat", download.stat_header)
             .body(
-                http_body_util::Full::new(Bytes::from(error_json("archive path is required")))
+                http_body_util::Full::new(Bytes::from(download.bytes))
                     .map_err(|never| match never {})
                     .boxed(),
             )
-            .unwrap_or_else(|_| fallback());
-    };
-    let guest_path = crate::serve::build::url_decode(&raw_path);
-    let Some((parent, entry)) = archive_path_args(&guest_path) else {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header("Content-Type", "application/json")
-            .body(
-                http_body_util::Full::new(Bytes::from(error_json("invalid archive path")))
-                    .map_err(|never| match never {})
-                    .boxed(),
-            )
-            .unwrap_or_else(|_| fallback());
-    };
-
-    let entry_for_tar = entry.clone();
-    let output = tokio::task::spawn_blocking(move || {
-        wait_until_running_for_archive(&real_id, std::time::Duration::from_secs(10))?;
-        let exe = std::env::current_exe()?;
-        let out = std::process::Command::new(exe)
-            .arg("exec")
-            .arg(&real_id)
-            .arg("/usr/bin/tar")
-            .arg("-C")
-            .arg(parent)
-            .arg("-cf")
-            .arg("-")
-            .arg(&entry_for_tar)
-            .output()?;
-        anyhow::Ok(out)
-    })
-    .await;
-    let output = match output {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => {
-            return Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .header("Content-Type", "application/json")
-                .body(
-                    http_body_util::Full::new(Bytes::from(error_json(&e.to_string())))
-                        .map_err(|never| match never {})
-                        .boxed(),
-                )
-                .unwrap_or_else(|_| fallback());
-        }
-        Err(e) => {
-            return Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .header("Content-Type", "application/json")
-                .body(
-                    http_body_util::Full::new(Bytes::from(error_json(&e.to_string())))
-                        .map_err(|never| match never {})
-                        .boxed(),
-                )
-                .unwrap_or_else(|_| fallback());
-        }
-    };
-    if !output.status.success() {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header("Content-Type", "application/json")
-            .body(
-                http_body_util::Full::new(Bytes::from(error_json(&String::from_utf8_lossy(
-                    &output.stderr,
-                ))))
-                .map_err(|never| match never {})
-                .boxed(),
-            )
-            .unwrap_or_else(|_| fallback());
+            .unwrap_or_else(|_| archive_fallback()),
+        Ok(Err(error)) => archive_error_response(error.status, &error.message),
+        Err(error) => archive_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("archive download worker failed: {error}"),
+        ),
     }
-    let stat_header = archive_stat_header(&entry, &output.stdout);
+}
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "application/x-tar")
-        .header("X-Docker-Container-Path-Stat", stat_header)
-        .body(
-            http_body_util::Full::new(Bytes::from(output.stdout))
-                .map_err(|never| match never {})
-                .boxed(),
-        )
-        .unwrap_or_else(|_| fallback())
+pub(crate) async fn head_archive_route(
+    id: String,
+    query: String,
+) -> Response<crate::serve::router::ResponseBody> {
+    use http_body_util::BodyExt;
+
+    let path = match decode_archive_query_path(&query) {
+        Ok(path) => path,
+        Err(error) => return archive_error_response(StatusCode::BAD_REQUEST, &error),
+    };
+    let result = tokio::task::spawn_blocking(move || archive_metadata(&id, path)).await;
+    match result {
+        Ok(Ok(stat_header)) => Response::builder()
+            .status(StatusCode::OK)
+            .header("X-Docker-Container-Path-Stat", stat_header)
+            .body(
+                http_body_util::Full::new(Bytes::new())
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap_or_else(|_| archive_fallback()),
+        Ok(Err(error)) => archive_error_response(error.status, &error.message),
+        Err(error) => archive_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("archive metadata worker failed: {error}"),
+        ),
+    }
 }
 
 pub(crate) async fn upload_archive_route(
@@ -1470,199 +1395,410 @@ pub(crate) async fn upload_archive_route(
 ) -> Response<crate::serve::router::ResponseBody> {
     use http_body_util::BodyExt;
 
-    let fallback = || {
-        Response::new(
-            http_body_util::Full::new(Bytes::new())
-                .map_err(|never| match never {})
-                .boxed(),
-        )
+    let path = match decode_archive_query_path(&query) {
+        Ok(path) => path,
+        Err(error) => return archive_error_response(StatusCode::BAD_REQUEST, &error),
     };
-
-    let real_id = match carrick_runtime::container::resolve(&id) {
-        Ok(real_id) => real_id,
-        Err(e) => {
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header("Content-Type", "application/json")
-                .body(
-                    http_body_util::Full::new(Bytes::from(error_json(&e)))
-                        .map_err(|never| match never {})
-                        .boxed(),
-                )
-                .unwrap_or_else(|_| fallback());
-        }
-    };
-    let Some(raw_path) = crate::serve::router::query_param(&query, "path") else {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header("Content-Type", "application/json")
+    if body_bytes.len() > crate::serve::router::MAX_HTTP_ARCHIVE_BYTES {
+        return archive_error_response(StatusCode::PAYLOAD_TOO_LARGE, "archive body is too large");
+    }
+    let result = tokio::task::spawn_blocking(move || upload_archive(&id, path, &body_bytes)).await;
+    match result {
+        Ok(Ok(())) => Response::builder()
+            .status(StatusCode::OK)
             .body(
-                http_body_util::Full::new(Bytes::from(error_json("archive path is required")))
+                http_body_util::Full::new(Bytes::new())
                     .map_err(|never| match never {})
                     .boxed(),
             )
-            .unwrap_or_else(|_| fallback());
-    };
-    let guest_path = crate::serve::build::url_decode(&raw_path);
-    if guest_path.is_empty() {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header("Content-Type", "application/json")
-            .body(
-                http_body_util::Full::new(Bytes::from(error_json("invalid archive path")))
-                    .map_err(|never| match never {})
-                    .boxed(),
-            )
-            .unwrap_or_else(|_| fallback());
+            .unwrap_or_else(|_| archive_fallback()),
+        Ok(Err(error)) => archive_error_response(error.status, &error.message),
+        Err(error) => archive_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("archive upload worker failed: {error}"),
+        ),
     }
-
-    let result = tokio::task::spawn_blocking(move || {
-        use std::io::Write;
-        use std::process::Stdio;
-
-        wait_until_running_for_archive(&real_id, std::time::Duration::from_secs(10))?;
-        let exe = std::env::current_exe()?;
-        let mut child = std::process::Command::new(exe)
-            .arg("exec")
-            .arg(&real_id)
-            .arg("-i")
-            .arg("/usr/bin/tar")
-            .arg("-C")
-            .arg(&guest_path)
-            .arg("-xf")
-            .arg("-")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        if let Some(stdin) = child.stdin.as_mut() {
-            stdin.write_all(&body_bytes)?;
-        }
-        let out = child.wait_with_output()?;
-        anyhow::Ok(out)
-    })
-    .await;
-    let output = match result {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => {
-            return Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .header("Content-Type", "application/json")
-                .body(
-                    http_body_util::Full::new(Bytes::from(error_json(&e.to_string())))
-                        .map_err(|never| match never {})
-                        .boxed(),
-                )
-                .unwrap_or_else(|_| fallback());
-        }
-        Err(e) => {
-            return Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .header("Content-Type", "application/json")
-                .body(
-                    http_body_util::Full::new(Bytes::from(error_json(&e.to_string())))
-                        .map_err(|never| match never {})
-                        .boxed(),
-                )
-                .unwrap_or_else(|_| fallback());
-        }
-    };
-    if !output.status.success() {
-        return Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .header("Content-Type", "application/json")
-            .body(
-                http_body_util::Full::new(Bytes::from(error_json(&String::from_utf8_lossy(
-                    &output.stderr,
-                ))))
-                .map_err(|never| match never {})
-                .boxed(),
-            )
-            .unwrap_or_else(|_| fallback());
-    }
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .body(
-            http_body_util::Full::new(Bytes::new())
-                .map_err(|never| match never {})
-                .boxed(),
-        )
-        .unwrap_or_else(|_| fallback())
 }
 
-fn wait_until_running_for_archive(id: &str, timeout: std::time::Duration) -> anyhow::Result<()> {
-    let deadline = std::time::Instant::now() + timeout;
+struct ArchiveHttpError {
+    status: StatusCode,
+    message: String,
+}
+
+struct DownloadedArchive {
+    bytes: Vec<u8>,
+    stat_header: String,
+}
+
+/// Best-effort cancellation for a carrier archive capability. The carrier's
+/// idle deadline remains the authority when the transport itself is gone, but
+/// every local error path must release eagerly so eight failed HTTP clients
+/// cannot pin the bounded table until expiry.
+struct ArchiveCapabilityGuard {
+    real_id: String,
+    control: carrick_runtime::container::CarrierControlState,
+    capability: carrick_runtime::kernel::control::ArchiveCapability,
+    armed: bool,
+}
+
+impl ArchiveCapabilityGuard {
+    fn new(
+        real_id: String,
+        control: carrick_runtime::container::CarrierControlState,
+        capability: carrick_runtime::kernel::control::ArchiveCapability,
+    ) -> Self {
+        Self {
+            real_id,
+            control,
+            capability,
+            armed: true,
+        }
+    }
+
+    fn capability(&self) -> carrick_runtime::kernel::control::ArchiveCapability {
+        self.capability
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ArchiveCapabilityGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = carrick_runtime::kernel::control::send(
+            &self.real_id,
+            &self.control,
+            carrick_runtime::kernel::control::ControlOperation::ArchiveAbort {
+                capability: self.capability,
+            },
+        );
+    }
+}
+
+fn archive_control_target(
+    id: &str,
+) -> Result<(String, carrick_runtime::container::CarrierControlState), ArchiveHttpError> {
+    let real_id = carrick_runtime::container::resolve(id).map_err(|message| ArchiveHttpError {
+        status: StatusCode::NOT_FOUND,
+        message,
+    })?;
+    let _lifecycle_lock =
+        carrick_runtime::container::lock_lifecycle(&real_id).map_err(|error| ArchiveHttpError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("lock container archive lifecycle: {error}"),
+        })?;
+    let state = carrick_runtime::container::ContainerState::load(&real_id).map_err(|error| {
+        ArchiveHttpError {
+            status: if error.kind() == std::io::ErrorKind::NotFound {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            },
+            message: error.to_string(),
+        }
+    })?;
+    if state.status != carrick_runtime::container::ContainerStatus::Running {
+        return Err(ArchiveHttpError {
+            status: StatusCode::CONFLICT,
+            message: "stopped-container archive is unavailable: persisted state does not authenticate the exact writable upper and immutable lower filesystem authorities".to_owned(),
+        });
+    }
+    let control = state.control.ok_or_else(|| ArchiveHttpError {
+        status: StatusCode::CONFLICT,
+        message: "container has no live carrier control endpoint".to_owned(),
+    })?;
+    Ok((real_id, control))
+}
+
+fn archive_metadata(id: &str, path: String) -> Result<String, ArchiveHttpError> {
+    use carrick_runtime::kernel::control::{ControlOperation, ControlOutcome};
+
+    let (real_id, control) = archive_control_target(id)?;
+    let request = carrick_runtime::kernel::control::ArchiveRequest::new(path)
+        .map_err(archive_http_control_error)?;
+    let outcome = carrick_runtime::kernel::control::send(
+        &real_id,
+        &control,
+        ControlOperation::ArchiveMetadata { request },
+    )
+    .map_err(archive_http_transport_error)?;
+    let ControlOutcome::ArchiveMetadata { metadata } = outcome else {
+        return Err(archive_http_outcome_error(outcome));
+    };
+    docker_archive_stat_header(&metadata).map_err(|message| ArchiveHttpError {
+        status: StatusCode::BAD_GATEWAY,
+        message,
+    })
+}
+
+fn download_archive(id: &str, path: String) -> Result<DownloadedArchive, ArchiveHttpError> {
+    use carrick_runtime::kernel::control::{ControlOperation, ControlOutcome};
+
+    let (real_id, control) = archive_control_target(id)?;
+    let request = carrick_runtime::kernel::control::ArchiveRequest::new(path)
+        .map_err(archive_http_control_error)?;
+    let outcome = carrick_runtime::kernel::control::send(
+        &real_id,
+        &control,
+        ControlOperation::ArchiveBeginRead { request },
+    )
+    .map_err(archive_http_transport_error)?;
+    let ControlOutcome::ArchiveReadAccepted {
+        capability,
+        metadata,
+    } = outcome
+    else {
+        return Err(archive_http_outcome_error(outcome));
+    };
+    let mut guard = ArchiveCapabilityGuard::new(real_id, control, capability);
+    let stat_header =
+        docker_archive_stat_header(&metadata).map_err(|message| ArchiveHttpError {
+            status: StatusCode::BAD_GATEWAY,
+            message,
+        })?;
+    let mut result = Vec::new();
     loop {
-        match carrick_runtime::container::ContainerState::load(id) {
-            Ok(state) => {
-                if carrick_runtime::container::reconciled_status(&state)
-                    == carrick_runtime::container::ContainerStatus::Running
+        let outcome = carrick_runtime::kernel::control::send(
+            &guard.real_id,
+            &guard.control,
+            ControlOperation::ArchiveReadChunk {
+                capability: guard.capability(),
+            },
+        )
+        .map_err(archive_http_transport_error)?;
+        match outcome {
+            ControlOutcome::ArchiveChunk { chunk } => {
+                if chunk.bytes.len() > carrick_runtime::kernel::control::MAX_ARCHIVE_CHUNK_BYTES
+                    || result.len().saturating_add(chunk.bytes.len())
+                        > crate::serve::router::MAX_HTTP_ARCHIVE_BYTES
+                    || (chunk.bytes.is_empty() && !chunk.eof)
                 {
-                    return Ok(());
+                    return Err(ArchiveHttpError {
+                        status: StatusCode::BAD_GATEWAY,
+                        message: "carrier returned an invalid archive chunk".to_owned(),
+                    });
+                }
+                result.extend_from_slice(&chunk.bytes);
+                if chunk.eof {
+                    guard.disarm();
+                    return Ok(DownloadedArchive {
+                        bytes: result,
+                        stat_header,
+                    });
                 }
             }
-            Err(e) => anyhow::bail!(e),
+            other => {
+                return Err(archive_http_outcome_error(other));
+            }
         }
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "container {} is not running",
-                carrick_runtime::container::short_id(id)
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
-fn archive_stat_header(entry: &str, tar_bytes: &[u8]) -> String {
+fn docker_archive_stat_header(
+    metadata: &carrick_runtime::kernel::control::ArchiveMetadata,
+) -> Result<String, String> {
     use base64::Engine as _;
 
-    let name = tar_header_name(tar_bytes).unwrap_or_else(|| entry.to_string());
-    let size = tar_header_octal(tar_bytes, 124, 12).unwrap_or(0);
-    let mode = tar_header_octal(tar_bytes, 100, 8).unwrap_or(0o644);
-    let stat = serde_json::json!({
-        "name": name,
-        "size": size,
-        "mode": mode,
-        "mtime": "1970-01-01T00:00:00Z",
-        "linkTarget": "",
-    });
-    base64::engine::general_purpose::STANDARD.encode(stat.to_string())
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct DockerPathStat<'a> {
+        name: &'a str,
+        size: u64,
+        mode: u32,
+        mtime: String,
+        link_target: &'a str,
+    }
+
+    let timestamp = chrono::DateTime::from_timestamp(metadata.mtime_secs, metadata.mtime_nanos)
+        .ok_or_else(|| "carrier returned an invalid archive timestamp".to_owned())?;
+    let stat = DockerPathStat {
+        name: &metadata.name,
+        size: metadata.size,
+        mode: metadata.mode,
+        mtime: timestamp.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        link_target: metadata.link_target.as_deref().unwrap_or(""),
+    };
+    let json = serde_json::to_vec(&stat)
+        .map_err(|error| format!("encode archive path metadata: {error}"))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(json))
 }
 
-fn tar_header_name(tar_bytes: &[u8]) -> Option<String> {
-    let header = tar_bytes.get(..100)?;
-    let end = header.iter().position(|b| *b == 0).unwrap_or(header.len());
-    if end == 0 {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&header[..end]).into_owned())
-}
+fn upload_archive(id: &str, path: String, bytes: &[u8]) -> Result<(), ArchiveHttpError> {
+    use carrick_runtime::kernel::control::{ControlOperation, ControlOutcome};
 
-fn tar_header_octal(tar_bytes: &[u8], offset: usize, len: usize) -> Option<u64> {
-    let field = tar_bytes.get(offset..offset.checked_add(len)?)?;
-    let text = String::from_utf8_lossy(field);
-    let trimmed = text.trim_matches(char::from(0)).trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    u64::from_str_radix(trimmed, 8).ok()
-}
+    let (real_id, control) = archive_control_target(id)?;
+    let request = carrick_runtime::kernel::control::ArchiveRequest::new(path)
+        .map_err(archive_http_control_error)?;
+    let outcome = carrick_runtime::kernel::control::send(
+        &real_id,
+        &control,
+        ControlOperation::ArchiveBeginWrite { request },
+    )
+    .map_err(archive_http_transport_error)?;
+    let ControlOutcome::ArchiveAccepted { capability } = outcome else {
+        return Err(archive_http_outcome_error(outcome));
+    };
+    let mut guard = ArchiveCapabilityGuard::new(real_id, control, capability);
 
-fn archive_path_args(path: &str) -> Option<(String, String)> {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return None;
+    if bytes.is_empty() {
+        let outcome = carrick_runtime::kernel::control::send(
+            &guard.real_id,
+            &guard.control,
+            ControlOperation::ArchiveWriteChunk {
+                capability: guard.capability(),
+                bytes: Vec::new(),
+                eof: true,
+            },
+        )
+        .map_err(archive_http_transport_error)?;
+        return match outcome {
+            ControlOutcome::ArchiveComplete => {
+                guard.disarm();
+                Ok(())
+            }
+            other => Err(archive_http_outcome_error(other)),
+        };
     }
-    if trimmed == "/" {
-        return Some(("/".to_string(), ".".to_string()));
-    }
-    match trimmed.rsplit_once('/') {
-        Some(("", entry)) if !entry.is_empty() => Some(("/".to_string(), entry.to_string())),
-        Some((parent, entry)) if !parent.is_empty() && !entry.is_empty() => {
-            Some((parent.to_string(), entry.to_string()))
+
+    for (index, chunk) in bytes
+        .chunks(carrick_runtime::kernel::control::MAX_ARCHIVE_CHUNK_BYTES)
+        .enumerate()
+    {
+        let eof =
+            (index + 1) * carrick_runtime::kernel::control::MAX_ARCHIVE_CHUNK_BYTES >= bytes.len();
+        let outcome = carrick_runtime::kernel::control::send(
+            &guard.real_id,
+            &guard.control,
+            ControlOperation::ArchiveWriteChunk {
+                capability: guard.capability(),
+                bytes: chunk.to_vec(),
+                eof,
+            },
+        )
+        .map_err(archive_http_transport_error)?;
+        let accepted = match &outcome {
+            ControlOutcome::ArchiveWriteReady => !eof,
+            ControlOutcome::ArchiveComplete => eof,
+            _ => false,
+        };
+        if !accepted {
+            return Err(archive_http_outcome_error(outcome));
         }
-        None => Some((".".to_string(), trimmed.to_string())),
+    }
+    guard.disarm();
+    Ok(())
+}
+
+fn archive_http_transport_error(error: impl ToString) -> ArchiveHttpError {
+    ArchiveHttpError {
+        status: StatusCode::BAD_GATEWAY,
+        message: error.to_string(),
+    }
+}
+
+fn archive_http_control_error(
+    error: carrick_runtime::kernel::control::ArchiveControlError,
+) -> ArchiveHttpError {
+    use carrick_runtime::kernel::control::ArchiveControlError;
+    let status = match error {
+        ArchiveControlError::InvalidPath | ArchiveControlError::InvalidArchive => {
+            StatusCode::BAD_REQUEST
+        }
+        ArchiveControlError::NotFound => StatusCode::NOT_FOUND,
+        ArchiveControlError::NotDirectory => StatusCode::NOT_ACCEPTABLE,
+        ArchiveControlError::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        ArchiveControlError::Capacity => StatusCode::TOO_MANY_REQUESTS,
+        ArchiveControlError::UnknownCapability
+        | ArchiveControlError::Filesystem(_)
+        | ArchiveControlError::Unavailable => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    ArchiveHttpError {
+        status,
+        message: error.to_string(),
+    }
+}
+
+fn archive_http_outcome_error(
+    outcome: carrick_runtime::kernel::control::ControlOutcome,
+) -> ArchiveHttpError {
+    if let carrick_runtime::kernel::control::ControlOutcome::ArchiveError { error } = outcome {
+        archive_http_control_error(error)
+    } else {
+        ArchiveHttpError {
+            status: StatusCode::BAD_GATEWAY,
+            message: format!("carrier returned an invalid archive outcome: {outcome:?}"),
+        }
+    }
+}
+
+fn archive_error_response(
+    status: StatusCode,
+    message: &str,
+) -> Response<crate::serve::router::ResponseBody> {
+    use http_body_util::BodyExt as _;
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(
+            http_body_util::Full::new(Bytes::from(error_json(message)))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap_or_else(|_| archive_fallback())
+}
+
+fn archive_fallback() -> Response<crate::serve::router::ResponseBody> {
+    use http_body_util::BodyExt as _;
+    Response::new(
+        http_body_util::Full::new(Bytes::new())
+            .map_err(|never| match never {})
+            .boxed(),
+    )
+}
+
+fn decode_archive_query_path(query: &str) -> Result<String, String> {
+    let raw = crate::serve::router::query_param(query, "path")
+        .ok_or_else(|| "archive path query parameter is required".to_owned())?;
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'+' {
+            decoded.push(b' ');
+            index += 1;
+            continue;
+        }
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return Err("archive path has an incomplete percent escape".to_owned());
+        }
+        let high = hex_value(bytes[index + 1])
+            .ok_or_else(|| "archive path has an invalid percent escape".to_owned())?;
+        let low = hex_value(bytes[index + 2])
+            .ok_or_else(|| "archive path has an invalid percent escape".to_owned())?;
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+    let path =
+        String::from_utf8(decoded).map_err(|_| "archive path is not valid UTF-8".to_owned())?;
+    carrick_runtime::kernel::control::ArchiveRequest::new(path.clone())
+        .map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
 }
@@ -1948,90 +2084,46 @@ pub(crate) fn pull_image(query: &str) -> Response<crate::serve::router::Response
 }
 
 async fn run_pull_task(image_ref: String, tx: mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>) {
-    use hyper::body::Frame;
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    async fn send(
+        tx: &mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
+        value: serde_json::Value,
+    ) {
+        let mut line = value.to_string();
+        line.push('\n');
+        let _ = tx.send(Ok(Frame::data(Bytes::from(line)))).await;
+    }
 
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            let msg = format!("failed to resolve carrick binary: {e}");
-            let _ = tx
-                .send(Ok(Frame::data(Bytes::from(
-                    serde_json::json!({ "error": msg }).to_string() + "\n",
-                ))))
-                .await;
+    let image = match carrick_image::ImageReference::parse(&image_ref) {
+        Ok(image) => image,
+        Err(error) => {
+            send(&tx, serde_json::json!({ "error": error.to_string() })).await;
             return;
         }
     };
-
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("pull").arg(&image_ref);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.stdin(std::process::Stdio::null());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = format!("failed to spawn carrick pull: {e}");
-            let _ = tx
-                .send(Ok(Frame::data(Bytes::from(
-                    serde_json::json!({ "error": msg }).to_string() + "\n",
-                ))))
-                .await;
-            return;
+    let store = carrick_image::ImageStore::default_for_user();
+    let target = carrick_image::PlatformTarget::default_target();
+    send(
+        &tx,
+        serde_json::json!({ "status": format!("Pulling {}", image.canonical()) }),
+    )
+    .await;
+    match carrick_image::pull_image_with_platform(&image, &store, &target).await {
+        Ok(_) => {
+            send(
+                &tx,
+                serde_json::json!({
+                    "status": format!("Downloaded newer image for {}", image.canonical())
+                }),
+            )
+            .await;
         }
-    };
-
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
-    let tx_clone = tx.clone();
-    let stdout_handle = tokio::spawn(async move {
-        if let Some(out) = stdout {
-            let mut lines = BufReader::new(out).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let frame = serde_json::json!({ "status": format!("{line}\n") }).to_string() + "\n";
-                if tx_clone
-                    .send(Ok(Frame::data(Bytes::from(frame))))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
+        Err(error) => {
+            send(&tx, serde_json::json!({ "error": error.to_string() })).await;
         }
-    });
-
-    let tx_clone2 = tx.clone();
-    let stderr_handle = tokio::spawn(async move {
-        if let Some(err) = stderr {
-            let mut lines = BufReader::new(err).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let frame = serde_json::json!({ "status": format!("{line}\n") }).to_string() + "\n";
-                if tx_clone2
-                    .send(Ok(Frame::data(Bytes::from(frame))))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }
-    });
-
-    let _ = tokio::join!(stdout_handle, stderr_handle);
-    match child.wait().await {
-        Ok(status) if !status.success() => {
-            let msg = format!("pull failed (carrick pull exited with {status})");
-            let frame = serde_json::json!({ "error": msg }).to_string() + "\n";
-            let _ = tx.send(Ok(Frame::data(Bytes::from(frame)))).await;
-        }
-        _ => {}
     }
 }
-
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) struct ExecConfig {
     pub container_id: String,
     pub cmd: Vec<String>,
@@ -2042,24 +2134,183 @@ pub(crate) struct ExecConfig {
     pub workdir: Option<String>,
 }
 
-static EXEC_REGISTRY: OnceLock<Mutex<HashMap<String, ExecConfig>>> = OnceLock::new();
-
-fn get_exec_registry() -> &'static Mutex<HashMap<String, ExecConfig>> {
-    EXEC_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct ExecInstanceState {
     pub container_id: String,
     pub running: bool,
     pub exit_code: i64,
     pub pid: i64,
+    pub guest_result: Option<carrick_runtime::kernel::control::ExecResult>,
+    pub transport_failed: bool,
 }
 
-static EXEC_INSTANCE_STATE: OnceLock<Mutex<HashMap<String, ExecInstanceState>>> = OnceLock::new();
+const MAX_EXEC_API_INSTANCES: usize = 1_024;
+const PENDING_EXEC_API_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const COMPLETED_EXEC_API_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
-fn get_exec_state() -> &'static Mutex<HashMap<String, ExecInstanceState>> {
-    EXEC_INSTANCE_STATE.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Debug)]
+struct ExecApiEntry {
+    config: Option<ExecConfig>,
+    state: ExecInstanceState,
+    created_at: std::time::Instant,
+    completed_at: Option<std::time::Instant>,
+}
+
+#[derive(Debug)]
+struct ExecApiRegistry {
+    entries: HashMap<String, ExecApiEntry>,
+    capacity: usize,
+    pending_ttl: std::time::Duration,
+    completed_ttl: std::time::Duration,
+}
+
+impl ExecApiRegistry {
+    fn with_limits(
+        capacity: usize,
+        pending_ttl: std::time::Duration,
+        completed_ttl: std::time::Duration,
+    ) -> Self {
+        Self {
+            entries: HashMap::new(),
+            capacity: capacity.max(1),
+            pending_ttl,
+            completed_ttl,
+        }
+    }
+
+    fn production() -> Self {
+        Self::with_limits(
+            MAX_EXEC_API_INSTANCES,
+            PENDING_EXEC_API_TTL,
+            COMPLETED_EXEC_API_TTL,
+        )
+    }
+
+    fn prune(&mut self, now: std::time::Instant) {
+        let pending_ttl = self.pending_ttl;
+        let completed_ttl = self.completed_ttl;
+        self.entries.retain(|_, entry| {
+            entry.state.running
+                || entry.completed_at.map_or_else(
+                    || now.saturating_duration_since(entry.created_at) < pending_ttl,
+                    |completed_at| now.saturating_duration_since(completed_at) < completed_ttl,
+                )
+        });
+    }
+
+    fn insert(
+        &mut self,
+        id: String,
+        config: ExecConfig,
+        now: std::time::Instant,
+    ) -> Result<(), ()> {
+        self.prune(now);
+        if self.entries.contains_key(&id) {
+            return Err(());
+        }
+        if self.entries.len() >= self.capacity {
+            let oldest_idle = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| !entry.state.running)
+                .min_by_key(|(_, entry)| entry.completed_at.unwrap_or(entry.created_at))
+                .map(|(id, _)| id.clone());
+            if let Some(oldest_idle) = oldest_idle {
+                self.entries.remove(&oldest_idle);
+            }
+        }
+        if self.entries.len() >= self.capacity {
+            return Err(());
+        }
+        let container_id = config.container_id.clone();
+        self.entries.insert(
+            id,
+            ExecApiEntry {
+                config: Some(config),
+                state: ExecInstanceState {
+                    container_id,
+                    running: false,
+                    exit_code: 0,
+                    pid: 0,
+                    guest_result: None,
+                    transport_failed: false,
+                },
+                created_at: now,
+                completed_at: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn config(&mut self, id: &str, now: std::time::Instant) -> Option<ExecConfig> {
+        self.prune(now);
+        self.entries.get(id)?.config.clone()
+    }
+
+    fn begin(&mut self, id: &str, now: std::time::Instant) -> Option<ExecConfig> {
+        self.prune(now);
+        let entry = self.entries.get_mut(id)?;
+        let config = entry.config.take()?;
+        entry.state.running = true;
+        Some(config)
+    }
+
+    fn complete_guest(
+        &mut self,
+        id: &str,
+        result: carrick_runtime::kernel::control::ExecResult,
+        transport_failed: bool,
+        now: std::time::Instant,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(id) else {
+            return false;
+        };
+        entry.state.running = false;
+        entry.state.exit_code = i64::from(result.exit_code);
+        entry.state.guest_result = Some(result);
+        entry.state.transport_failed = transport_failed;
+        entry.completed_at = Some(now);
+        true
+    }
+
+    fn fail_before_guest(&mut self, id: &str, now: std::time::Instant) -> bool {
+        let Some(entry) = self.entries.get_mut(id) else {
+            return false;
+        };
+        entry.state.running = false;
+        entry.state.exit_code = 1;
+        entry.state.guest_result = None;
+        entry.state.transport_failed = false;
+        entry.completed_at = Some(now);
+        true
+    }
+
+    fn mark_transport_failed(&mut self, id: &str) -> bool {
+        let Some(entry) = self.entries.get_mut(id) else {
+            return false;
+        };
+        if entry.state.guest_result.is_none() {
+            return false;
+        }
+        entry.state.transport_failed = true;
+        true
+    }
+
+    fn state(&mut self, id: &str, now: std::time::Instant) -> Option<ExecInstanceState> {
+        self.prune(now);
+        self.entries.get(id).map(|entry| entry.state.clone())
+    }
+
+    #[cfg(test)]
+    fn contains(&self, id: &str) -> bool {
+        self.entries.contains_key(id)
+    }
+}
+
+static EXEC_API_REGISTRY: OnceLock<Mutex<ExecApiRegistry>> = OnceLock::new();
+
+fn get_exec_registry() -> &'static Mutex<ExecApiRegistry> {
+    EXEC_API_REGISTRY.get_or_init(|| Mutex::new(ExecApiRegistry::production()))
 }
 
 /// `POST /containers/{id}/exec`: register an exec instance and return its id.
@@ -2089,23 +2340,14 @@ pub(crate) fn create_exec(body: &[u8], container_id: &str) -> (u16, String) {
         workdir: req.working_dir,
     };
 
-    get_exec_registry()
+    if get_exec_registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(exec_id.clone(), config);
-
-    get_exec_state()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(
-            exec_id.clone(),
-            ExecInstanceState {
-                container_id: container_id.to_string(),
-                running: false,
-                exit_code: 0,
-                pid: 0,
-            },
-        );
+        .insert(exec_id.clone(), config, std::time::Instant::now())
+        .is_err()
+    {
+        return (503, error_json("exec instance registry is at capacity"));
+    }
 
     let resp = ExecCreateResponse { id: exec_id };
     (
@@ -2136,7 +2378,7 @@ pub(crate) async fn start_exec_route(
         let mut registry = get_exec_registry()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        match registry.remove(&exec_id) {
+        match registry.config(&exec_id, std::time::Instant::now()) {
             Some(c) => c,
             None => {
                 return Response::builder()
@@ -2194,24 +2436,56 @@ pub(crate) async fn start_exec_route(
 
     let detach = start_body.detach.unwrap_or(false);
 
+    if config.tty || config.interactive {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(
+                http_body_util::Full::new(Bytes::from(error_json(
+                    "interactive/TTY exec is unavailable until carrier-control stdin and TTY framing is implemented",
+                )))
+                .map_err(|never| match never {})
+                .boxed(),
+            )
+            .unwrap_or_else(|_| fallback());
+    }
+
+    let config = {
+        let mut registry = get_exec_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match registry.begin(&exec_id, std::time::Instant::now()) {
+            Some(config) => config,
+            None => {
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(
+                        http_body_util::Full::new(Bytes::from(error_json("No such exec instance")))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .unwrap_or_else(|_| fallback());
+            }
+        }
+    };
+
     if detach {
         let exec_id_clone = exec_id.clone();
         tokio::spawn(async move {
-            get_exec_state()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry(exec_id_clone.clone())
-                .and_modify(|s| s.running = true);
-            let result = run_exec_detached(config).await;
-            let code = if result.is_ok() { 0 } else { 1 };
-            get_exec_state()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry(exec_id_clone)
-                .and_modify(|s| {
-                    s.running = false;
-                    s.exit_code = code;
-                });
+            match run_exec_detached(config).await {
+                Ok(result) => {
+                    get_exec_registry()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .complete_guest(&exec_id_clone, result, false, std::time::Instant::now());
+                }
+                Err(error) => {
+                    tracing::error!(%error, "detached exec failed before guest completion");
+                    get_exec_registry()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .fail_before_guest(&exec_id_clone, std::time::Instant::now());
+                }
+            }
         });
         return Response::builder()
             .status(StatusCode::NO_CONTENT)
@@ -2227,38 +2501,29 @@ pub(crate) async fn start_exec_route(
 
     let exec_id_for_state = exec_id.clone();
     tokio::spawn(async move {
-        get_exec_state()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(exec_id_for_state.clone())
-            .and_modify(|s| s.running = true);
         match upgraded.await {
             Ok(upgraded) => {
                 let io = hyper_util::rt::TokioIo::new(upgraded);
-                let result = run_exec_attached(config, io).await;
-                if let Err(e) = &result {
-                    tracing::error!("exec attached error: {e}");
+                match run_exec_attached(config, io, &exec_id_for_state).await {
+                    Ok(Some(error)) => {
+                        tracing::error!(%error, "guest exec completed but attached transport failed");
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "attached exec failed before guest completion");
+                        get_exec_registry()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .fail_before_guest(&exec_id_for_state, std::time::Instant::now());
+                    }
                 }
-                let code = if result.is_ok() { 0 } else { 1 };
-                get_exec_state()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .entry(exec_id_for_state)
-                    .and_modify(|s| {
-                        s.running = false;
-                        s.exit_code = code;
-                    });
             }
             Err(e) => {
                 tracing::error!("upgrade error: {e}");
-                get_exec_state()
+                get_exec_registry()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .entry(exec_id_for_state)
-                    .and_modify(|s| {
-                        s.running = false;
-                        s.exit_code = 1;
-                    });
+                    .fail_before_guest(&exec_id_for_state, std::time::Instant::now());
             }
         }
     });
@@ -2275,182 +2540,327 @@ pub(crate) async fn start_exec_route(
         .unwrap_or_else(|_| fallback())
 }
 
-async fn run_exec_detached(config: ExecConfig) -> anyhow::Result<()> {
-    // nosemgrep: rust.lang.security.args.command-injection -- the server spawns
-    // itself (current_exe) with operator-controlled API inputs as separate argv
-    // entries, never a shell; a CLI that re-execs itself is expected here.
-    let exe = std::env::current_exe()?;
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("exec");
-    if config.tty {
-        cmd.arg("-t");
-    }
-    if config.interactive {
-        cmd.arg("-i");
-    }
-    if let Some(u) = &config.user {
-        cmd.arg("-u").arg(u);
-    }
-    if let Some(w) = &config.workdir {
-        cmd.arg("-w").arg(w);
-    }
-    for e in &config.env {
-        cmd.arg("-e").arg(e);
-    }
-    cmd.arg(&config.container_id);
-    for arg in &config.cmd {
-        cmd.arg(arg);
-    }
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
-    cmd.stdin(std::process::Stdio::null());
-
-    let mut child = cmd.spawn()?;
-    child.wait().await?;
-    Ok(())
+async fn run_exec_detached(
+    config: ExecConfig,
+) -> anyhow::Result<carrick_runtime::kernel::control::ExecResult> {
+    execute_noninteractive_config(config).await
 }
 
 async fn run_exec_attached(
     config: ExecConfig,
-    io: hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>,
-) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    mut io: hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>,
+    exec_id: &str,
+) -> anyhow::Result<Option<anyhow::Error>> {
+    let result = execute_noninteractive_config(config).await?;
+    get_exec_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .complete_guest(exec_id, result.clone(), false, std::time::Instant::now());
+    let transport_error = deliver_exec_result(&mut io, &result).await;
+    if transport_error.is_some() {
+        get_exec_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mark_transport_failed(exec_id);
+    }
+    Ok(transport_error)
+}
 
-    // nosemgrep: rust.lang.security.args.command-injection -- the server spawns
-    // itself (current_exe) with operator-controlled API inputs as separate argv
-    // entries, never a shell; a CLI that re-execs itself is expected here.
-    let exe = std::env::current_exe()?;
+async fn deliver_exec_result<W>(
+    writer: &mut W,
+    result: &carrick_runtime::kernel::control::ExecResult,
+) -> Option<anyhow::Error>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt as _;
 
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("exec");
-    if config.tty {
-        cmd.arg("-t");
+    async {
+        write_docker_exec_frame(writer, 1, &result.stdout).await?;
+        write_docker_exec_frame(writer, 2, &result.stderr).await?;
+        writer.shutdown().await?;
+        anyhow::Ok(())
     }
-    if config.interactive {
-        cmd.arg("-i");
-    }
-    if let Some(u) = &config.user {
-        cmd.arg("-u").arg(u);
-    }
-    if let Some(w) = &config.workdir {
-        cmd.arg("-w").arg(w);
-    }
-    for e in &config.env {
-        cmd.arg("-e").arg(e);
-    }
-    cmd.arg(&config.container_id);
-    for arg in &config.cmd {
-        cmd.arg(arg);
-    }
+    .await
+    .err()
+}
 
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    if config.interactive {
-        cmd.stdin(std::process::Stdio::piped());
-    } else {
-        cmd.stdin(std::process::Stdio::null());
+async fn execute_noninteractive_config(
+    config: ExecConfig,
+) -> anyhow::Result<carrick_runtime::kernel::control::ExecResult> {
+    if config.tty || config.interactive {
+        anyhow::bail!(
+            "interactive/TTY Docker exec is unavailable until carrier-control stdin and TTY framing is implemented"
+        );
     }
-
-    let (mut client_read, mut client_write) = tokio::io::split(io);
-    let (tx_write, mut rx_write) = mpsc::channel::<Bytes>(64);
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = format!("failed to spawn carrick exec: {e}");
-            let framed = frame_stream_data(msg.as_bytes(), 1, config.tty);
-            let _ = client_write.write_all(&framed).await;
-            return Err(e.into());
+    tokio::task::spawn_blocking(move || {
+        let state = carrick_runtime::container::ContainerState::load(&config.container_id)?;
+        if state.status != carrick_runtime::container::ContainerStatus::Running {
+            anyhow::bail!("container is not running");
         }
-    };
+        let request = crate::lifecycle::build_control_exec_request(
+            &state,
+            config.cmd,
+            config.user,
+            config.workdir,
+            config.env,
+        )?;
+        crate::lifecycle::run_control_exec_capture(&config.container_id, &state, request)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("logical exec worker failed: {error}"))?
+}
 
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("stdout not piped"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("stderr not piped"))?;
-    let stdin = child.stdin.take();
+async fn write_docker_exec_frame<W>(writer: &mut W, stream: u8, bytes: &[u8]) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt as _;
 
-    let write_handle = tokio::spawn(async move {
-        while let Some(data) = rx_write.recv().await {
-            if client_write.write_all(&data).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let stdin_handle = tokio::spawn(async move {
-        if let Some(mut sin) = stdin {
-            let mut buf = [0u8; 4096];
-            loop {
-                match client_read.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if sin.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                        if sin.flush().await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-    });
-
-    let tx_stdout = tx_write.clone();
-    let tty = config.tty;
-    let stdout_handle = tokio::spawn(async move {
-        let mut buf = [0u8; 4096];
-        loop {
-            match stdout.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    let framed = frame_stream_data(&buf[..n], 1, tty);
-                    if tx_stdout.send(framed).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let tx_stderr = tx_write.clone();
-    let stderr_handle = tokio::spawn(async move {
-        let mut buf = [0u8; 4096];
-        loop {
-            match stderr.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    let framed = frame_stream_data(&buf[..n], 2, tty);
-                    if tx_stderr.send(framed).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    drop(tx_write);
-
-    let _ = tokio::join!(stdin_handle, stdout_handle, stderr_handle, write_handle);
-    let _ = child.wait().await;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let length = u32::try_from(bytes.len()).map_err(|_| anyhow::anyhow!("exec frame too large"))?;
+    let mut header = [0_u8; 8];
+    header[0] = stream;
+    header[4..].copy_from_slice(&length.to_be_bytes());
+    writer.write_all(&header).await?;
+    writer.write_all(bytes).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod exec_control_tests {
+    use super::{ExecApiRegistry, ExecConfig, deliver_exec_result, write_docker_exec_frame};
+
+    fn config() -> ExecConfig {
+        ExecConfig {
+            container_id: "container".to_owned(),
+            cmd: vec!["/bin/true".to_owned()],
+            env: Vec::new(),
+            tty: false,
+            interactive: false,
+            user: None,
+            workdir: None,
+        }
+    }
+
+    #[test]
+    fn noninteractive_api_output_uses_docker_multiplex_framing() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let (mut writer, mut reader) = tokio::io::duplex(64);
+            write_docker_exec_frame(&mut writer, 1, b"abc")
+                .await
+                .expect("stdout frame");
+            writer.shutdown().await.expect("shutdown");
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).await.expect("read frame");
+            assert_eq!(bytes, [1, 0, 0, 0, 0, 0, 0, 3, b'a', b'b', b'c']);
+        });
+    }
+
+    #[test]
+    fn transport_failure_preserves_the_exact_guest_result() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let result = carrick_runtime::kernel::control::ExecResult {
+                exit_code: 42,
+                terminating_signal: None,
+                stdout: b"output".to_vec(),
+                stderr: Vec::new(),
+                output_truncated: false,
+            };
+            let (mut writer, reader) = tokio::io::duplex(1);
+            drop(reader);
+            let mut registry = ExecApiRegistry::with_limits(
+                1,
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(10),
+            );
+            let now = std::time::Instant::now();
+            registry
+                .insert("exec".to_owned(), config(), now)
+                .expect("instance");
+            assert!(registry.begin("exec", now).is_some());
+            assert!(registry.complete_guest("exec", result.clone(), false, now));
+            let transport_error = deliver_exec_result(&mut writer, &result).await;
+            assert!(transport_error.is_some());
+            assert!(registry.mark_transport_failed("exec"));
+            let state = registry.state("exec", now).expect("persisted result");
+            assert_eq!(state.guest_result, Some(result));
+            assert_eq!(state.exit_code, 42);
+            assert!(state.transport_failed);
+        });
+    }
+
+    #[test]
+    fn exec_api_registry_is_hard_capped_and_expires_abandoned_entries() {
+        let now = std::time::Instant::now();
+        let mut registry = ExecApiRegistry::with_limits(
+            2,
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(5),
+        );
+        registry
+            .insert("running".to_owned(), config(), now)
+            .expect("first");
+        assert!(registry.begin("running", now).is_some());
+        registry
+            .insert("abandoned".to_owned(), config(), now)
+            .expect("second");
+        registry
+            .insert(
+                "replacement".to_owned(),
+                config(),
+                now + std::time::Duration::from_secs(1),
+            )
+            .expect("evict oldest idle entry");
+        assert!(!registry.contains("abandoned"));
+        assert!(registry.begin("replacement", now).is_some());
+        assert!(
+            registry
+                .insert("overflow".to_owned(), config(), now)
+                .is_err(),
+            "running entries must not be evicted to admit unbounded instances",
+        );
+
+        let result = carrick_runtime::kernel::control::ExecResult {
+            exit_code: 7,
+            terminating_signal: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            output_truncated: false,
+        };
+        assert!(registry.complete_guest("running", result.clone(), false, now));
+        let state = registry.state("running", now).expect("completed state");
+        assert_eq!(state.guest_result, Some(result));
+        assert_eq!(state.exit_code, 7);
+        assert!(!state.transport_failed);
+        assert!(registry.mark_transport_failed("running"));
+        let state = registry.state("running", now).expect("transport state");
+        assert_eq!(state.exit_code, 7);
+        assert_eq!(
+            state.guest_result.as_ref().map(|result| result.exit_code),
+            Some(7)
+        );
+        assert!(state.transport_failed);
+        registry.prune(now + std::time::Duration::from_secs(6));
+        assert!(!registry.contains("running"));
+        assert!(registry.contains("replacement"));
+    }
+}
+
+#[cfg(test)]
+mod archive_control_tests {
+    use base64::Engine as _;
+
+    use super::{archive_control_target, decode_archive_query_path, docker_archive_stat_header};
+
+    #[test]
+    fn archive_query_path_is_percent_decoded_and_rejects_malformed_or_traversing_input() {
+        assert_eq!(
+            decode_archive_query_path("path=%2Fvar%2Flib%2Fapp").as_deref(),
+            Ok("/var/lib/app")
+        );
+        assert_eq!(
+            decode_archive_query_path("path=%2Fvar%2Flib%2Fmy+app").as_deref(),
+            Ok("/var/lib/my app")
+        );
+        assert!(decode_archive_query_path("path=/var/../etc").is_err());
+        assert!(decode_archive_query_path("path=%2Ftmp%2Gbad").is_err());
+        assert!(decode_archive_query_path("missing=value").is_err());
+    }
+
+    #[test]
+    fn stopped_archive_fails_closed_after_the_exact_lifecycle_lock() {
+        let id = carrick_runtime::container::make_id(
+            u64::from(std::process::id()),
+            0x0061_7263_6869_7665,
+        );
+        let state = carrick_runtime::container::ContainerState {
+            id: id.clone(),
+            name: None,
+            image: "archive-stopped-test".to_owned(),
+            command: Vec::new(),
+            status: carrick_runtime::container::ContainerStatus::Exited,
+            supervisor_pid: 0,
+            init_pid: 0,
+            created_secs: 0,
+            exit_code: Some(0),
+            auto_remove: false,
+            api_auto_remove: false,
+            labels: std::collections::HashMap::new(),
+            control: None,
+            terminal_control: None,
+            launch_ticket: None,
+            config: carrick_runtime::container::RunConfig::default(),
+        };
+        std::fs::create_dir_all(carrick_runtime::container::container_dir(&id))
+            .expect("create test container directory");
+        state.persist().expect("persist stopped state");
+        let held = carrick_runtime::container::lock_lifecycle(&id).expect("hold lifecycle lock");
+        let thread_id = id.clone();
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let join = std::thread::spawn(move || {
+            let result = archive_control_target(&thread_id);
+            finished_tx.send(result).expect("report archive result");
+        });
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "stopped-state classification must serialize with start/remove"
+        );
+        drop(held);
+        let error = finished_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("archive classification resumed")
+            .expect_err("stopped archive must fail closed");
+        assert_eq!(error.status, hyper::StatusCode::CONFLICT);
+        assert!(error.message.contains("does not authenticate"));
+        join.join().expect("archive thread");
+        carrick_runtime::container::ContainerState::remove(&id).expect("remove test state");
+    }
+
+    #[test]
+    fn docker_archive_stat_header_carries_exact_carrier_metadata() {
+        let encoded =
+            docker_archive_stat_header(&carrick_runtime::kernel::control::ArchiveMetadata {
+                name: "payload".to_owned(),
+                size: 7,
+                mode: 0o100640,
+                mtime_secs: 56,
+                mtime_nanos: 123,
+                link_target: None,
+            })
+            .expect("stat header");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("base64");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(json["name"], "payload");
+        assert_eq!(json["size"], 7);
+        assert_eq!(json["mode"], 0o100640);
+        assert_eq!(json["mtime"], "1970-01-01T00:00:56.000000123Z");
+        assert_eq!(json["linkTarget"], "");
+    }
 }
 
 /// `GET /exec/{id}/json`: return the exec instance's running state and exit code.
 pub(crate) fn inspect_exec(exec_id: &str) -> (u16, String) {
-    // Check state registry first (exec has been started or completed).
-    if let Some(state) = get_exec_state()
+    if let Some(state) = get_exec_registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(exec_id)
+        .state(exec_id, std::time::Instant::now())
     {
         let resp = ExecInspectResponse {
             id: exec_id.to_string(),
@@ -2458,24 +2868,6 @@ pub(crate) fn inspect_exec(exec_id: &str) -> (u16, String) {
             exit_code: state.exit_code,
             container_id: state.container_id.clone(),
             pid: state.pid,
-        };
-        return (
-            200,
-            serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string()),
-        );
-    }
-    // Check config registry (exec created but not yet started).
-    if let Some(config) = get_exec_registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(exec_id)
-    {
-        let resp = ExecInspectResponse {
-            id: exec_id.to_string(),
-            running: false,
-            exit_code: 0,
-            container_id: config.container_id.clone(),
-            pid: 0,
         };
         return (
             200,
@@ -2556,6 +2948,19 @@ pub(crate) fn rename_container(id: &str, new_name: &str) -> (u16, String) {
         Ok(r) => r,
         Err(e) => return (404, error_json(&e)),
     };
+    let _lifecycle_lock = match carrick_runtime::container::lock_lifecycle(&real) {
+        Ok(lock) => lock,
+        Err(e) => return (500, error_json(&e.to_string())),
+    };
+    let _name_lock = match carrick_runtime::container::lock_name_registry() {
+        Ok(lock) => lock,
+        Err(e) => return (500, error_json(&e.to_string())),
+    };
+    if let Ok(owner) = carrick_runtime::container::resolve(new_name)
+        && owner != real
+    {
+        return (409, error_json("container name is already in use"));
+    }
     let mut state = match carrick_runtime::container::ContainerState::load(&real) {
         Ok(s) => s,
         Err(e) => return (500, error_json(&e.to_string())),
@@ -2581,52 +2986,124 @@ pub(crate) fn top_container(id: &str) -> (u16, String) {
     if !state.init_alive() {
         return (409, error_json(&format!("Container {id} is not running")));
     }
-    // Shell out to `carrick exec` to get the process list.
-    // nosemgrep: rust.lang.security.args.command-injection -- the server spawns
-    // itself (current_exe) with operator-controlled API inputs as separate argv
-    // entries, never a shell; a CLI that re-execs itself is expected here.
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => return (500, error_json(&e.to_string())),
+    let snapshot = match carrick_runtime::kernel::debug::fetch(
+        &real,
+        Some(vec![carrick_runtime::kernel::debug::KernelDebugTable::Task]),
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return (
+                503,
+                error_json(&format!(
+                    "container process snapshot is unavailable from carrier control: {error}"
+                )),
+            );
+        }
     };
-    let output = std::process::Command::new(exe)
-        .arg("exec")
-        .arg(&real)
-        .arg("ps")
-        .arg("-eo")
-        .arg("pid,user,comm")
-        .output();
-    match output {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            let mut lines = text.lines();
-            let titles: Vec<String> = lines
-                .next()
-                .unwrap_or_default()
-                .split_whitespace()
-                .map(String::from)
-                .collect();
-            let processes: Vec<Vec<String>> = lines
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| l.split_whitespace().map(String::from).collect())
-                .collect();
-            let resp = TopResponse { titles, processes };
-            (
-                200,
-                serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string()),
-            )
-        }
-        Ok(_) => {
-            // ps failed — return an empty list rather than an error
-            let resp = TopResponse {
-                titles: vec!["PID".to_string(), "USER".to_string(), "COMMAND".to_string()],
-                processes: vec![],
-            };
-            (
-                200,
-                serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string()),
-            )
-        }
-        Err(e) => (500, error_json(&e.to_string())),
+    let processes = snapshot
+        .tasks
+        .unwrap_or_default()
+        .into_iter()
+        .map(|task| {
+            vec![
+                task.key.id.to_string(),
+                "-".to_owned(),
+                task.diagnostic_name.unwrap_or(task.lifecycle),
+            ]
+        })
+        .collect();
+    let response = TopResponse {
+        titles: vec!["PID".to_owned(), "USER".to_owned(), "COMMAND".to_owned()],
+        processes,
+    };
+    (
+        200,
+        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_owned()),
+    )
+}
+
+#[cfg(test)]
+mod lifecycle_transaction_tests {
+    use super::*;
+
+    fn created_state(id: &str, name: &str) -> carrick_runtime::container::ContainerState {
+        let mut state: carrick_runtime::container::ContainerState = serde_json::from_str(
+            r#"{"id":"placeholder","name":null,"image":"img","command":[],
+                "status":"created","supervisor_pid":0,"init_pid":0,"created_secs":0,
+                "exit_code":null,"auto_remove":false}"#,
+        )
+        .expect("state fixture");
+        state.id = id.to_owned();
+        state.name = Some(name.to_owned());
+        state
+    }
+
+    #[test]
+    fn rename_rechecks_name_claim_and_release_atomically() {
+        let suffix = std::process::id();
+        let first_id = format!("rename-first-{suffix}");
+        let second_id = format!("rename-second-{suffix}");
+        let first_name = format!("rename-owned-{suffix}");
+        let second_name = format!("rename-other-{suffix}");
+        let _ = carrick_runtime::container::ContainerState::remove(&first_id);
+        let _ = carrick_runtime::container::ContainerState::remove(&second_id);
+        created_state(&first_id, &first_name)
+            .create()
+            .expect("first state");
+        created_state(&second_id, &second_name)
+            .create()
+            .expect("second state");
+
+        assert_eq!(rename_container(&second_id, &first_name).0, 409);
+        assert_eq!(
+            carrick_runtime::container::ContainerState::load(&second_id)
+                .expect("preserved second")
+                .name
+                .as_deref(),
+            Some(second_name.as_str())
+        );
+
+        carrick_runtime::container::ContainerState::remove(&first_id).expect("release first name");
+        assert_eq!(rename_container(&second_id, &first_name).0, 204);
+        assert_eq!(
+            carrick_runtime::container::ContainerState::load(&second_id)
+                .expect("renamed second")
+                .name
+                .as_deref(),
+            Some(first_name.as_str())
+        );
+        let _ = carrick_runtime::container::ContainerState::remove(&second_id);
+    }
+
+    #[test]
+    fn api_auto_remove_requires_the_exact_terminal_incarnation() {
+        let id = format!("api-auto-remove-exact-{}", std::process::id());
+        let _ = carrick_runtime::container::ContainerState::remove(&id);
+        let expected = carrick_runtime::container::CarrierControlState {
+            schema: carrick_runtime::kernel::control::CARRIER_CONTROL_STATE_SCHEMA.to_owned(),
+            owner_nonce: carrick_runtime::kernel::control::ControlNonce::fresh().expect("nonce"),
+            init: carrick_runtime::kernel::control::ControlTaskKey { pid: 1, serial: 8 },
+        };
+        let stale = carrick_runtime::container::CarrierControlState {
+            schema: carrick_runtime::kernel::control::CARRIER_CONTROL_STATE_SCHEMA.to_owned(),
+            owner_nonce: carrick_runtime::kernel::control::ControlNonce::fresh().expect("nonce"),
+            init: carrick_runtime::kernel::control::ControlTaskKey { pid: 1, serial: 7 },
+        };
+        let mut state = created_state(&id, "api-auto-remove");
+        state.status = carrick_runtime::container::ContainerStatus::Exited;
+        state.exit_code = Some(23);
+        state.api_auto_remove = true;
+        state.terminal_control = Some(expected.clone());
+        state.create().expect("terminal state");
+
+        assert!(!cleanup_api_auto_remove(&id, &stale).expect("stale cleanup rejected"));
+        assert!(carrick_runtime::container::ContainerState::load(&id).is_ok());
+        assert!(cleanup_api_auto_remove(&id, &expected).expect("exact cleanup"));
+        assert_eq!(
+            carrick_runtime::container::ContainerState::load(&id)
+                .expect_err("exact cleanup removed state")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 }

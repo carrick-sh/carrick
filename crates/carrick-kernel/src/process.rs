@@ -24,10 +24,10 @@ bitflags! {
         /// process, so this record's `host_pid` field holds a GUEST pid. Any
         /// host-pid liveness probe against it (`kill(pid, 0)`) is meaningless:
         /// it names an unrelated host process or none at all. The flag lives on
-        /// the RECORD rather than in a per-process static because the arena is
-        /// shared memory and the namespace supervisor — which runs in its own
-        /// host process, where a carrier-set static reads false — is exactly
-        /// the reader that must honor it.
+        /// the RECORD rather than in a process-local static because the arena
+        /// can also be attached by compatibility joiners such as transitional
+        /// `carrick exec`; every arena reader must honor the carrier's owner
+        /// domain rather than infer it from its own process-local state.
         const OWNER_GUEST_TASK = 1 << 4;
     }
 }

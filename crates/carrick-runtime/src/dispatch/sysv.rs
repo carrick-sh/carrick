@@ -721,10 +721,6 @@ impl SysvShmState {
 struct SysvIpcService;
 
 impl SysvIpcService {
-    fn after_fork_child() {
-        MSG_QUEUE_FD_CACHE.with(|cache| cache.borrow_mut().refresh_for_current_process());
-    }
-
     fn cleanup_process_exit(state: &mut SysvShmState) {
         state.message_queues.clear();
         cleanup_msg_queue_files_for_scope();
@@ -2185,25 +2181,6 @@ impl SyscallDispatcher {
     #[allow(dead_code)]
     pub(crate) fn init_sysv_run_scope(&self) {
         init_sysv_run_scope();
-    }
-
-    pub(crate) fn sysv_after_fork_child(&self) {
-        // `self` is already the CHILD's dispatcher clone, so `identity_pid()`
-        // is the child's own Linux pid — the value Linux records in `shm_lpid`
-        // for the attachments the child inherited. Resolved BEFORE the sysv
-        // lock: identity takes the proc lock, and proc-then-sysv is the order
-        // the /proc renderers use (see `cleanup_sysv_shm_attachments_on_
-        // process_exit` for the deadlock this prevents).
-        let lpid = self.identity_pid() as i32;
-        let mut state = self.sysv.lock();
-        SysvIpcService::after_fork_child();
-        let ids = state.attachments.values().copied().collect::<Vec<_>>();
-        for shmid in ids {
-            if let Some(seg) = state.segments.get_mut(&shmid) {
-                seg.nattch = adjust_shm_nattch(seg, 1);
-                seg.lpid = lpid;
-            }
-        }
     }
 
     pub(crate) fn sysvipc_shm_table(&self) -> String {

@@ -55,30 +55,22 @@
 //!
 //! ## The no-`#[tokio::main]` invariant
 //!
-//! The single most load-bearing decision in this crate is that `main` is a
-//! plain synchronous function. A guest `clone(2)`/`fork(2)` is serviced by a
-//! host `fork(2)` *inside a syscall handler*, deep under the trap loop. A
-//! multi-thread tokio runtime initialised before that point would poison every
-//! forked child: the worker threads don't exist post-fork, the I/O driver's
-//! kqueue fd state is stale, and the child panics on the first stdio flush. So
-//! all async work (image pulls, registry auth, summary reads) is confined to a
-//! short-lived *current-thread* runtime built and dropped per call inside
-//! [`runtime_util::block_on_oci`], guaranteeing no async machinery is alive in
-//! the parent by the time a guest fork can fire. `configure_process_environment`
-//! enforces the rest of the fork-safety contract (SIGPIPE→ignore so a guest
-//! `ls | head` gets EPIPE instead of killing carrick; `OS_ACTIVITY_MODE=disable`
-//! because HVF's internal os_log handle is not fork-safe; proctitle relocation
-//! before any `setenv`).
+//! `main` remains synchronous so lifecycle and signed-HVF setup do not inherit
+//! an ambient application runtime. OCI work uses a short-lived current-thread
+//! runtime inside [`runtime_util::block_on_oci`]; the optional Docker API server
+//! deliberately owns its separate Tokio runtime. Guest `fork`/`clone` are
+//! logical Carrick-kernel operations inside the existing carrier and never
+//! inherit or recreate a host async runtime.
 //!
-//! ## Process model: one guest == one host process
+//! ## Process model: one container == one host carrier
 //!
-//! Carrick has no in-process VM-per-guest. A guest *process* is a host carrick
-//! process, and a guest `fork` is a real host `fork`. That is why this binary
-//! installs a loud [`install_guest_abort_banner`] panic hook: an unimplemented
-//! syscall in a forked grandchild (apt's http method, dpkg, gpgv) would
-//! otherwise scroll past buried in the guest's own output, leaving the user
-//! with only a downstream "dpkg returned 100". The banner makes the *root*
-//! panic attributed and greppable.
+//! HVPatch keeps every logical Linux process, thread, wait edge and signal in
+//! the Carrick kernel graph inside one carrier. Guest `fork`/`clone` and Docker
+//! exec do not create host subprocesses. Detached launch has one typed
+//! `posix_spawn` carrier-birth boundary; the Docker API server remains an
+//! operator process and launches exactly one carrier per running container.
+//! The loud [`install_guest_abort_banner`] panic hook attributes failures in
+//! that carrier without inventing a host-process identity for logical tasks.
 //!
 //! Module-level theory statements: [`commands`] (dispatch + the run pipeline +
 //! the trace auto-sudo re-exec), [`lifecycle`] (daemonless container
@@ -130,6 +122,8 @@ compile_error!("alloc-owner-census is supported only on Darwin/AArch64 native bu
 // so — like the census modules below — it is declared on every platform even
 // though only a libdtrace host can produce the stream.
 mod amplification_profile;
+#[cfg(target_os = "macos")]
+mod apfs_operator;
 mod args;
 mod commands;
 // `debug` (guest address-space snapshot for the lldb plugin) reads the macOS-only

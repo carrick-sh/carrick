@@ -1160,6 +1160,7 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
     let (kernel, root) = crate::kernel::Kernel::bootstrap_root(bootstrap)
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+    crate::kernel::tty::install(&kernel);
     mm_backend.bind_inventory(&kernel, root.shared().mm().id());
     // Publish the live kernel debug endpoint for this run. Default ON;
     // `CARRICK_KERNEL_DEBUG=0` opts out. The socket is how `carrick debug
@@ -1184,6 +1185,11 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
         0,
     );
     dispatcher.bind_hvpatch_process(context.clone());
+    dispatcher
+        .initialize_bound_controlling_tty()
+        .map_err(|error| {
+            RuntimeError::Configuration(format!("initialize controlling tty authority: {error}"))
+        })?;
     Ok(Some(context))
 }
 

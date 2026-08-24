@@ -475,6 +475,12 @@ impl EventMultiplexer for EpollMultiplexer {
             // A process-exit pidfd: PEEK the status (WNOWAIT leaves the zombie so
             // the guest's own wait4 still reaps it).
             if let Some(&pidfd) = self.pidfds.get(&raw_token) {
+                #[cfg(not(test))]
+                let exit_status = {
+                    let _ = pidfd;
+                    None
+                };
+                #[cfg(test)]
                 let exit_status = peek_pidfd_exit(pidfd);
                 out.push(PollEvent {
                     token: raw_token,
@@ -617,6 +623,7 @@ fn is_inotify_self(token: u64) -> bool {
 /// (`CLD_KILLED`/`CLD_DUMPED`) — the shell convention — so the caller always
 /// gets a meaningful small integer. `None` if the process is not yet waitable
 /// (should not happen once the pidfd is EPOLLIN-readable) or `waitid` errors.
+#[cfg(test)]
 fn peek_pidfd_exit(pidfd: RawFd) -> Option<i32> {
     // SAFETY: zeroed siginfo_t is a valid initial state for waitid to fill.
     let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };

@@ -333,6 +333,13 @@ pub struct Kernel {
     /// because this allocator is VM-wide.
     keyrings: crate::keyring::KeyringService,
     pub(super) debug_aux_provider: Mutex<Option<Weak<dyn super::debug::KernelDebugAuxProvider>>>,
+    pub(super) controlling_tty: Mutex<Option<ControllingTtyState>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ControllingTtyState {
+    pub(super) session: SessionId,
+    pub(super) foreground: ProcessGroupId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -893,6 +900,7 @@ impl Kernel {
             reservation_gate: ReservationGate::default(),
             keyrings: crate::keyring::KeyringService::new(),
             debug_aux_provider: Mutex::new(None),
+            controlling_tty: Mutex::new(None),
         });
         let context = KernelContext::capture(kernel.clone(), task, leader, TaskRevision::INITIAL);
         Ok((kernel, context))

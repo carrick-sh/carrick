@@ -57,7 +57,8 @@
 //!
 //! The runtime loop drives the engine through one trait, [`SyscallTrap`]:
 //! `next_syscall` (run until a trap; `Ok(None)` is a no-syscall kick exit),
-//! `complete_syscall` (write the retval), `fork` / `execve_into` (address-space
+//! `complete_syscall` (write the retval), process projection / `execve_into`
+//! (address-space
 //! lifecycle), and the signal pair `inject_signal` / `restore_from_sigframe`.
 //! [`HvfTrapEngine`] is the real implementation; the runtime also has a
 //! non-HVF `SplitView` adapter, which is why every method has a portable
@@ -68,21 +69,16 @@
 //! Linux's `force_sigsegv` (an unwritable signal stack kills the thread-group by
 //! SIGSEGV rather than fatalling carrick).
 //!
-//! ## Address-space lifecycle: fork, clone, execve
+//! ## Address-space lifecycle: process projection, clone, execve
 //!
-//! There is no guest kernel to copy a page table, so process/thread creation is
-//! done by *rebuilding HVF state around the host's own fork/threads*:
+//! HVPatch keeps process identity and address spaces inside one carrier. Guest
+//! process/thread creation updates Carrick's kernel graph and stage-1 projection;
+//! it never creates a host process:
 //!
-//! - **`fork(2)`** (`HvfInner::fork`) is a real `libc::fork`. macOS HVF state is
-//!   not fork-safe, so the parent tears down its vCPU+VM via the *raw* API
-//!   BEFORE forking (a live VM at fork time leaves the child unable to
-//!   `hv_vm_create`); both sides then rebuild a fresh VM and re-`hv_vm_map` the
-//!   same host buffers. The legacy VMM path gets private-buffer isolation from
-//!   host `MAP_PRIVATE` fork COW and clones only the child's independently
-//!   editable stage-1 table backing. HVPatch instead shares stable global
+//! - **Process fork** shares stable global
 //!   frames read-only across distinct per-mm stage-1 graphs and copies only the
 //!   first writer's affected compound frame. Genuine guest `MAP_SHARED`
-//!   mappings remain shared on either path.
+//!   mappings remain shared.
 //! - **Thread clone** (`HvfInner::build_thread_spec` / `from_thread_spec`)
 //!   keeps ONE process VM and gives each guest thread its own vCPU in it. The
 //!   stage-2 mappings are VM-global, so a sibling only re-materialises local
@@ -91,20 +87,11 @@
 //!   passes through an admission gate (`wait_for_vcpu_slot`); see the
 //!   private `vcpu_gate` module for why a guest that out-threads the cap *blocks*
 //!   rather than failing `clone` (Linux has no such cap, so failing would
-//!   deadlock a join). A *multithreaded* fork additionally quiesces siblings,
-//!   destroys their vCPUs so the forker can `hv_vm_destroy`, then republishes the
-//!   rebuilt VM for them to recreate vCPUs in (`release_vcpu_for_fork` /
-//!   `publish_vm_for_siblings` / `rebuild_vcpu_after_fork`).
+//!   deadlock a join).
 //! - **`execve(2)`** (`HvfInner::execve_into`) tears down and rebuilds the VM
-//!   like fork, but installs a brand-new [`AddressSpace`] and resets the vCPU to
+//!   with a brand-new [`AddressSpace`] and resets the vCPU to
 //!   "initial process startup" (zeroed GPRs, entry trampoline) rather than
 //!   "resume mid-syscall". It has no successful return.
-//!
-//! All three paths bypass `applevisor`'s `Drop`: once a single `fork(2)` has run,
-//! applevisor's internal handle bookkeeping no longer matches HVF, and its
-//! destructors panic ("no VM or vCPU available"). `HvfInner` is held in a
-//! [`std::mem::ManuallyDrop`] and the host pages leak until process exit — which
-//! is fine, the process is exiting anyway, and the kernel reclaims the VM.
 //!
 //! ## Signals: synthesising kernel signal delivery in userspace
 //!
@@ -196,7 +183,7 @@ pub use sysreg::{host_clock_uptime_ns, host_counter, host_counter_frequency};
 // it as `Arc<MemoryProtections>` and clone it into each sibling vCPU thread.
 use carrick_mem::protections::MemoryProtections;
 
-// SyscallTrap/TrapError/ForkOutcome moved down into the carrick-hal leaf crate
+// SyscallTrap/TrapError moved down into the carrick-hal leaf crate
 // (the runtime↔engine contract is platform-agnostic). Re-export them here so
 // existing `crate::trap::…` paths in carrick-vmm-hvf and carrick-runtime are
 // unchanged. HvfTrapEngine below implements the trait from its new home.
@@ -212,7 +199,7 @@ pub use carrick_hal::aarch64::{
     is_aarch64_hvc_exception, is_aarch64_hvc_fault, is_aarch64_hvc_maintenance,
     is_aarch64_svc_exception, is_aarch64_syscall_exception,
 };
-pub use carrick_hal::trap::{ForkOutcome, RawSyscall, SyscallTrap, TrapError};
+pub use carrick_hal::trap::{RawSyscall, SyscallTrap, TrapError};
 
 pub const HVF_PAGE_SIZE: u64 = 0x4000;
 // Guest stage-1 uses a 4 KiB granule even though HVF maps stage-2 in 16 KiB
@@ -1111,7 +1098,7 @@ mod task_only_carrier_directory_tests {
             ipa: 0x1234_0000,
             end: 0x5000,
             stage2_lease: Some(lease),
-            host: ForkMappingHost::Owned(host),
+            host: ProcessMappingHost::Owned(host),
             size: 0x4000,
             physical_ipa: 0x1234_0000,
             physical_host_addr: host_addr,
@@ -2779,79 +2766,6 @@ impl AliasRemapLimiter {
     }
 }
 
-/// A sibling vCPU's mapping, published during a fork quiesce so the forking
-/// thread can re-map the UNION of every sibling's regions into the rebuilt
-/// PARENT VM — not just its own. Threads share ONE `hv_vm`, but `fork()` rebuilds
-/// it from only the forking thread's `mappings`; a per-thread alias a SIBLING
-/// established (e.g. a Go heap-arena chunk mmap'd at high-VA on that thread) is
-/// otherwise dropped from the rebuilt VM and the parent translation-faults on it
-/// (DC ZVA on a missing stage-2 entry — the concurrent-os/exec crash).
-///
-/// `host_addr`/`perms` are stored as `usize`/`u64` (not the raw pointer / MemPerms)
-/// so the registry is `Send` across the publishing siblings and the consuming
-/// forker. Safe because publication happens in `release_vcpu_for_fork`, after
-/// which the sibling PARKS (holding its `OwnedHostMapping` alive) until the fork
-/// completes — so the forker always re-maps a live backing (no use-after-free).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy)]
-struct SiblingForkMapping {
-    start: u64,
-    ipa: u64,
-    physical_ipa: u64,
-    end: u64,
-    host_addr: usize,
-    size: usize,
-    physical_size: usize,
-    perms: u64,
-    is_dynamic_alias: bool,
-    sharing: GuestMappingSharing,
-    guest_writable: bool,
-    shared_key_base: u64,
-    shared_key_offset: u64,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn sibling_fork_mappings() -> &'static parking_lot::Mutex<Vec<SiblingForkMapping>> {
-    static CELL: std::sync::OnceLock<parking_lot::Mutex<Vec<SiblingForkMapping>>> =
-        std::sync::OnceLock::new();
-    CELL.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
-}
-
-/// Drop all published sibling mappings. Called by the forker at quiesce start
-/// (before kicking siblings) so each fork round starts from a clean set.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub fn clear_sibling_fork_mappings() {
-    sibling_fork_mappings().lock().clear();
-}
-
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-pub fn clear_sibling_fork_mappings() {}
-
-/// Publish a quiescing sibling's regions so the forker re-maps them into the
-/// rebuilt parent VM.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn publish_sibling_fork_mappings(regions: &[HvfMappedRegion]) {
-    let mut reg = sibling_fork_mappings().lock();
-    reg.reserve(regions.len());
-    for m in regions {
-        reg.push(SiblingForkMapping {
-            start: m.start,
-            ipa: m.ipa,
-            physical_ipa: m.physical_ipa,
-            end: m.end,
-            host_addr: m.host_addr as usize,
-            size: m.size,
-            physical_size: m.physical_size,
-            perms: u64::from(m.perms),
-            is_dynamic_alias: m.is_dynamic_alias,
-            sharing: m.sharing,
-            guest_writable: m.guest_writable,
-            shared_key_base: m.shared_key_base,
-            shared_key_offset: m.shared_key_offset,
-        });
-    }
-}
-
 /// Process-global count of live HVF vCPUs (created minus destroyed). Pure
 /// diagnostic: reported in the fork__quiesce phase-2 probe so a `carrick trace`
 /// shows exactly how many vCPUs are alive when the forker calls hv_vm_destroy.
@@ -2881,7 +2795,6 @@ fn vcpu_created() {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmCreateAdmission {
     Initial,
-    ForkRebuild { vfork: bool },
     ExecveRebuild,
     SharedWaitResume,
 }
@@ -2891,8 +2804,6 @@ impl VmCreateAdmission {
     fn probe_code(self) -> i32 {
         match self {
             Self::Initial => 0,
-            Self::ForkRebuild { vfork: false } => 1,
-            Self::ForkRebuild { vfork: true } => 2,
             Self::ExecveRebuild => 3,
             Self::SharedWaitResume => 4,
         }
@@ -2926,16 +2837,10 @@ impl VmCreateAdmission {
     /// headroom for other system VM consumers.
     const GLOBAL_VCPU_CEILING: usize = 120;
 
-    /// Resident-VM budget for the fork gate: same soft margin under the
-    /// measured ~126-concurrent-VM HVF ceiling as the vCPU-permit budget.
-    const GLOBAL_VM_CEILING: usize = 120;
-
     fn global_permit_budget(self) -> Option<usize> {
         match self {
-            Self::Initial | Self::SharedWaitResume | Self::ForkRebuild { vfork: false } => {
-                Some(Self::GLOBAL_VCPU_CEILING)
-            }
-            Self::ForkRebuild { vfork: true } | Self::ExecveRebuild => None,
+            Self::Initial | Self::SharedWaitResume => Some(Self::GLOBAL_VCPU_CEILING),
+            Self::ExecveRebuild => None,
         }
     }
 }
@@ -3142,19 +3047,6 @@ fn release_global_vcpu_permit(vcpu_id: u64) {
     }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn reset_global_vcpu_permits_after_fork_child() {
-    let mut state = global_vcpu_permits()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let inherited = std::mem::take(&mut state.live);
-    state.pending.clear();
-    drop(state);
-    for (_, permit) in inherited {
-        close_global_vcpu_permit(permit);
-    }
-}
-
 // ===========================================================================
 // Atomic vCPU admission permit (Option 3, Task 1) — the DEFAULT admission path.
 // The flock permit above remains as a fallback, selectable with
@@ -3245,11 +3137,9 @@ struct PermitToken {
     owner_pid: u32,
 }
 
-/// The fork-shared slot table itself, laid out in the `MAP_ANON | MAP_SHARED`
-/// page. `#[repr(C)]` so parent and child agree on the layout; every field is an
-/// atomic so all cross-process access is well-defined. `next_generation` hands
-/// out a monotonic (30-bit-wrapping) generation per acquire so a freed-then-
-/// reused slot never collides with a stale token/event.
+/// The carrier-local slot table itself, laid out in a kernel-arena page.
+/// `next_generation` hands out a monotonic (30-bit-wrapping) generation per
+/// acquire so a freed-then-reused slot never collides with a stale token/event.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[repr(C)]
 struct SharedPermitTable {
@@ -3260,14 +3150,11 @@ struct SharedPermitTable {
     slots: [std::sync::atomic::AtomicU64; atomic_permit_slot::MAX_SLOTS],
 }
 
-/// Process-local handle onto the fork-shared [`SharedPermitTable`].
+/// Process-local handle onto the carrier's [`SharedPermitTable`].
 ///
-/// `table` is the shared page's address — identical in parent and child because
-/// the region is `MAP_SHARED` and created before any guest fork. `local` is a
-/// PROCESS-PRIVATE `vcpu_id -> PermitToken` map (fork copies it, and the child
-/// clears it via [`PermitRegion::reset_local_after_fork_child`]) — it is the
-/// authority for token-guarded release: only a `vcpu_id` that registered a token
-/// can free the shared slot it named.
+/// `local` is the carrier-private `vcpu_id -> PermitToken` authority for
+/// token-guarded release: only a `vcpu_id` that registered a token can free the
+/// slot it named.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct PermitRegion {
     table: usize,
@@ -3284,9 +3171,8 @@ impl PermitRegion {
         use std::sync::atomic::Ordering;
         let size = std::mem::size_of::<SharedPermitTable>();
         // SAFETY: MAP_ANON pages are zero-filled, so the region is a valid
-        // `SharedPermitTable` with every slot `FREE_WORD`. MAP_SHARED + created
-        // before any guest fork makes the mapping (and its address) inherited by
-        // every fork child, so all processes share one slot table.
+        // `SharedPermitTable` with every slot `FREE_WORD`. MAP_SHARED matches the
+        // kernel-arena representation used by production.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -3491,68 +3377,18 @@ impl PermitRegion {
         self.free_exact(token);
     }
 
-    /// Reclaim (free) every non-free slot owned by `pid` — optionally restricted
-    /// to a single `generation`. Used by the death-reclaim supervisor and the
-    /// cooperative fork-child exit path (Tasks 2/3). Returns the number freed.
-    #[allow(dead_code)] // consumed by the Task 2/3 reaper + cooperative exit.
-    fn reclaim_owner(&self, pid: u32, generation: Option<u32>) -> usize {
-        use std::sync::atomic::Ordering;
-        let mut freed = 0;
-        for slot in self.table().slots.iter() {
-            loop {
-                let cur = slot.load(Ordering::Acquire);
-                if atomic_permit_slot::state_of(cur) == SlotState::Free
-                    || atomic_permit_slot::pid_of(cur) != pid
-                {
-                    break;
-                }
-                if let Some(g) = generation {
-                    if atomic_permit_slot::gen_of(cur) != (g & atomic_permit_slot::GEN_VALUE_MASK) {
-                        break;
-                    }
-                }
-                if slot
-                    .compare_exchange_weak(
-                        cur,
-                        atomic_permit_slot::FREE_WORD,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    freed += 1;
-                    break;
-                }
-                // CAS lost to a concurrent mutator; re-check this slot.
-            }
-        }
-        freed
-    }
-
-    /// Fork-child reset: drop the inherited local token map WITHOUT touching any
-    /// shared slot. The inherited tokens name the PARENT's live vCPUs; the shared
-    /// (MAP_SHARED) slots still belong to the parent and must not be freed here.
-    fn reset_local_after_fork_child(&self) {
-        self.local.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    }
-
-    /// Cooperative release of THIS process's atomic permits (Task 3). Called from
-    /// the HVF engine's `process_exit_cleanup` on the exiting fork-child's own
-    /// thread, BEFORE `_exit` skips Rust drops — the fast path that shrinks the
-    /// churn window instead of waiting for the root reaper backstop.
+    /// Cooperatively release this carrier's locally registered atomic permits.
     ///
     /// Precise + idempotent: it DRAINS the process-local token map and frees each
     /// named slot with the generation-guarded [`Self::free_exact`], so
     /// - a slot a normal `vcpu_destroyed` already freed is gone from the map (no
     ///   entry → nothing to free);
-    /// - a slot the supervisor already reclaimed (now `Free`, or reused under an
-    ///   advanced generation) fails the guard in `free_exact` → no double-free;
+    /// - a slot already freed or reused under an advanced generation fails the
+    ///   guard in `free_exact` → no double-free;
     /// - a second call finds an empty map → frees nothing.
     ///
-    /// It can only free slots THIS process registered: after a fork the child
-    /// cleared the inherited map via [`Self::reset_local_after_fork_child`] and
-    /// re-acquired its own, so the map never names the PARENT's slots. Returns the
-    /// number of slots actually freed (for tests/diagnostics).
+    /// It can only free slots this carrier registered. Returns the number of
+    /// slots actually freed (for tests/diagnostics).
     fn cooperative_release_local(&self) -> usize {
         let tokens: Vec<PermitToken> = {
             let mut map = self.local.lock().unwrap_or_else(|e| e.into_inner());
@@ -3586,18 +3422,6 @@ impl PermitRegion {
     }
 
     #[cfg(test)]
-    fn force_owner_for_test(&self, slot: u16, pid: u32, generation: u32) {
-        use std::sync::atomic::Ordering;
-        let s = &self.table().slots[slot as usize];
-        let cur = s.load(Ordering::Acquire);
-        let state = (cur & atomic_permit_slot::STATE_MASK) >> atomic_permit_slot::STATE_SHIFT;
-        s.store(
-            atomic_permit_slot::pack(state, pid, generation),
-            Ordering::Release,
-        );
-    }
-
-    #[cfg(test)]
     fn try_free_exact_for_test(&self, token: PermitToken) -> bool {
         self.free_exact(token)
     }
@@ -3606,63 +3430,6 @@ impl PermitRegion {
     fn table_addr_for_test(&self) -> usize {
         self.table
     }
-}
-
-/// Bridge the fork-shared slot table to the root death-reclaim supervisor
-/// ([`crate::vcpu_permit_reaper`]). The reaper only ever needs the occupied
-/// owners and a generation-guarded reclaim, so it works in `(pid, generation)`
-/// tuples and never names the private slot types.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl crate::vcpu_permit_reaper::PermitReclaimSource for PermitRegion {
-    fn owner_slots(&self) -> Vec<(u32, u32)> {
-        use std::sync::atomic::Ordering;
-        let mut owners = Vec::new();
-        for slot in self.table().slots.iter() {
-            let word = slot.load(Ordering::SeqCst);
-            if atomic_permit_slot::state_of(word) != SlotState::Free {
-                owners.push((
-                    atomic_permit_slot::pid_of(word),
-                    atomic_permit_slot::gen_of(word),
-                ));
-            }
-        }
-        owners
-    }
-
-    fn reclaim(&self, pid: u32, generation: u32) -> usize {
-        // `Some(generation)` is the generation guard: a late death event for a
-        // dead owner cannot free a NEW slot held by a reused pid.
-        self.reclaim_owner(pid, Some(generation))
-    }
-}
-
-/// Start the root's atomic-permit death-reclaim supervisor (Task 2). The thin
-/// re-export wired from `HvfHostBackend::pre_loop_setup`; idempotent, and it
-/// binds the supervisor to the process-global permit region so the daemon frees
-/// the slots of any owner that dies without a cooperative release.
-/// Both slot tables feed ONE reaper: pid death must reclaim the dead owner's
-/// vCPU-permit slots AND its resident-VM slot.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-struct DualReclaimSource(&'static PermitRegion, &'static PermitRegion);
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl crate::vcpu_permit_reaper::PermitReclaimSource for DualReclaimSource {
-    fn owner_slots(&self) -> Vec<(u32, u32)> {
-        let mut owners = self.0.owner_slots();
-        owners.extend(self.1.owner_slots());
-        owners
-    }
-    fn reclaim(&self, pid: u32, generation: u32) -> usize {
-        self.0.reclaim(pid, generation) + self.1.reclaim(pid, generation)
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub fn start_vcpu_permit_reaper() {
-    static DUAL: std::sync::OnceLock<DualReclaimSource> = std::sync::OnceLock::new();
-    crate::vcpu_permit_reaper::spawn_reaper(
-        DUAL.get_or_init(|| DualReclaimSource(permit_region(), vm_residency_region())),
-    );
 }
 
 /// The process-global permit region. Initialized lazily on first use, but the
@@ -3850,25 +3617,9 @@ fn release_admission_permit_for_vcpu(vcpu_id: u64) {
     }
 }
 
-/// Dispatch the fork-child reset to whichever permit path is active.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn reset_admission_permits_after_fork_child() {
-    carrick_observability::vm_lifecycle::reset_after_fork_child();
-    if atomic_permit_enabled() {
-        permit_region().reset_local_after_fork_child();
-        vm_residency_region().reset_local_after_fork_child();
-    } else {
-        reset_global_vcpu_permits_after_fork_child();
-    }
-}
-
-/// Cooperative fast-path release of THIS process's atomic permit slots, invoked
-/// from the HVF engine's `process_exit_cleanup` (Task 3) before a fork-child (or
-/// signal-death) `_exit` skips Rust drops. No-op unless the atomic permit path is
-/// active — on the default flock path the permit is fd-lifetime-bound, so the
-/// engine hook stays the historical no-op. Idempotent with the token-guarded
-/// `vcpu_destroyed` release and the root reaper's `reclaim_owner` (both are
-/// generation-guarded). Returns the number of slots freed (for tests).
+/// Cooperatively release this carrier's atomic permit slots before process
+/// termination. No-op unless the atomic permit path is active; token-guarded
+/// release keeps this idempotent with normal `vcpu_destroyed` teardown.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub fn cooperative_release_atomic_permit() -> usize {
     if !atomic_permit_enabled() {
@@ -4000,10 +3751,9 @@ fn create_vcpu_with_permit(
 fn create_vcpu(
     vm: &applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
 ) -> Result<applevisor::vcpu::Vcpu, TrapError> {
-    // Existing-VM vCPUs (thread siblings, reclaim/rebind, sibling fork rebuild)
-    // are admitted by the in-process scheduler. The file-lock permit below gates
-    // NEW HVF VMs/fork storms only; applying it here starves a multithreaded
-    // fork child behind its own one-vCPU ancestors.
+    // Existing-VM vCPUs (thread siblings and reclaim/rebind) are admitted by the
+    // in-process scheduler. Applying the VM-creation permit here would duplicate
+    // that scheduler's bounded vCPU accounting.
     match vm.vcpu_create() {
         Ok(vcpu) => {
             vcpu_created();
@@ -4052,96 +3802,6 @@ fn create_vm_with_admission(
     }
 }
 
-/// Pre-fork admission gate (the `SyscallTrap::fork_admission_check` backend):
-/// bounded-acquire ONE plain-fork admission permit and release it immediately.
-/// The permit budget models exactly what the fork is about to consume — the
-/// CHILD's post-fork `create_vm_with_admission(ForkRebuild)` — so a probe that
-/// cannot get a slot within `ADMISSION_PERMIT_MAX_WAIT` proves the child's
-/// rebuild would stall/fail too, and the fork degrades to guest `EAGAIN`
-/// BEFORE any teardown (the parent VM is untouched; no child exists yet).
-///
-/// Probe-and-release rather than reserve-and-inherit: the released slot can in
-/// principle be raced away before the child re-acquires it, but that window
-/// falls back to the existing post-fork `HV_NO_RESOURCES` park+retry — the
-/// persistent-exhaustion case (a parked fleet pinning every slot, the
-/// procladder_mt pause-shaped red's fatal) is what this converts to `EAGAIN`.
-/// Inheriting the permit across `libc::fork` is not sound today: the atomic
-/// slot is generation-stamped with the PARENT's pid (the death-reaper would
-/// free the child's slot when the parent exits), and the flock path's
-/// in-process pending bookkeeping does not survive into the child.
-///
-/// CLOSED BLIND SPOT: permits alone UNDER-REPORT resident VMs — a vCPU-only
-/// park releases its permit while keeping its VM, so a parked fleet could pin
-/// the hard ~127-VM ceiling while the permit-only gate passed trivially (the
-/// lease-off @160 fatal and the fd-veto capacity cost; evidence doc
-/// docs/2026-07-09-mt-residency-lease-evidence.md, Next Track 1a). This gate
-/// now ALSO probes the resident-VM slot table (`vm_residency_region()`,
-/// Task 1) with a bounded `probe_vm_slot_budget` call: a pinned fleet with
-/// free permits but no free VM slot now bounds out and degrades to guest
-/// `EAGAIN` instead of reaching the post-fork `hv_vm_create` fatal.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub fn probe_fork_vm_admission() -> Result<(), TrapError> {
-    let Some(budget) = (VmCreateAdmission::ForkRebuild { vfork: false }).global_permit_budget()
-    else {
-        return Ok(());
-    };
-    let permit = acquire_admission_permit(budget)?;
-    release_unregistered_admission_permit(permit);
-    // Resident-VM budget: permits alone UNDER-REPORT residency (a vCPU-only
-    // park frees its permit while keeping its VM — the lease-off @160 fatal
-    // and the fd-veto capacity cost, evidence doc Next Track 1). Probe the
-    // hard-slot table too. Flock fallback has no residency table; it keeps
-    // the historical permit-only gate.
-    if atomic_permit_enabled() {
-        probe_vm_slot_budget(
-            vm_residency_region(),
-            VmCreateAdmission::GLOBAL_VM_CEILING,
-            FORK_VM_PROBE_MAX_WAIT,
-        )?;
-    }
-    Ok(())
-}
-
-/// Fork-gate bound for the resident-VM probe. Deliberately the SAME 10 s as
-/// the post-fork `hv_vm_create` HV_NO_RESOURCES backpressure MAX_WAIT: the
-/// pre-fork gate never waits longer than the post-fork path it replaces, so
-/// a pinned fleet (lease off, or fd-veto-retained VMs) degrades to guest
-/// EAGAIN in ~10 s instead of a rc=125 trap fatal. Lease-driven releases
-/// land at the 2–8 s slice ticks, well inside the bound.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const FORK_VM_PROBE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Bounded acquire-and-release of ONE slot in `region`: proves a hard slot
-/// exists for the fork child's `hv_vm_create` under `budget`.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn probe_vm_slot_budget(
-    region: &PermitRegion,
-    budget: usize,
-    max_wait: std::time::Duration,
-) -> Result<(), TrapError> {
-    let pid = std::process::id();
-    let mut backoff = GlobalVcpuPermitBackoff::default();
-    let start = std::time::Instant::now();
-    let mut parks: u32 = 0;
-    loop {
-        if let Some(token) = region.acquire(budget, pid) {
-            region.release_unregistered(token);
-            return Ok(());
-        }
-        if start.elapsed() >= max_wait {
-            return Err(permit_exhausted(
-                "resident-vm slot",
-                budget,
-                parks,
-                start.elapsed(),
-            ));
-        }
-        parks += 1;
-        trace_permit_park("resident-vm slot", budget, parks, start.elapsed());
-        std::thread::sleep(backoff.next_delay());
-    }
-}
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn virtual_machine_with_private_signals_blocked(
     config: applevisor::vm::VirtualMachineConfig,
@@ -4153,7 +3813,7 @@ fn virtual_machine_with_private_signals_blocked(
 
 /// Enable EL0 direct reads of `CNTVCT_EL0`/`CNTFRQ_EL0` (`CNTKCTL_EL1.EL0VCTEN |
 /// EL0PCTEN`) on a freshly-created vCPU. Must run on EVERY vCPU — initial,
-/// per-thread, fork/execve rebuild. If only some vCPUs have it, the others trap
+/// per-thread and execve rebuild. If only some vCPUs have it, the others trap
 /// CNTVCT and fall back to the host-`Instant` emulation, which is a DIFFERENT
 /// clock basis (ns-since-process-start, not the hardware counter the vDSO
 /// assumes). That skews the monotonic clock between Go's worker threads, so a
@@ -4176,33 +3836,10 @@ fn vcpu_destroyed(vcpu_id: u64) {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-thread_local! {
-    /// Per-sibling vCPU snapshot held between `release_vcpu_for_fork` and
-    /// `rebuild_vcpu_after_fork` (both run on the same thread, around the fork
-    /// quiesce park).
-    static FORK_VCPU_SNAPSHOT: std::cell::RefCell<Option<VcpuSnapshot>> =
-        const { std::cell::RefCell::new(None) };
-
-}
-
-/// Whether the current owner pthread carries no legacy fork snapshot across an
-/// executor switch. The persistent-executor backend calls this from its narrow
-/// boundary-audit hook; runtime code does not reach into HVF TLS directly.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub fn fork_vcpu_snapshot_is_empty_for_executor_boundary() -> bool {
-    FORK_VCPU_SNAPSHOT.with(|snapshot| snapshot.borrow().is_none())
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn audit_hvpatch_executor_boundary(
     state: &HvfVmState,
     mailbox: &MailboxBinding,
 ) -> Result<(), TrapError> {
-    if !fork_vcpu_snapshot_is_empty_for_executor_boundary() {
-        return Err(TrapError::Hypervisor(
-            "HVF executor boundary retained fork vCPU snapshot".to_owned(),
-        ));
-    }
     if state.reclaim_authority == ReclaimParkAuthority::Live {
         return Err(TrapError::Hypervisor(
             "HVF executor boundary retained live vCPU authority".to_owned(),
@@ -4214,72 +3851,6 @@ pub(crate) fn audit_hvpatch_executor_boundary(
         ));
     }
     Ok(())
-}
-
-#[cfg(test)]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn install_fork_vcpu_snapshot_for_executor_boundary_test() {
-    let snapshot = VcpuSnapshot {
-        core: Aarch64VcpuSnapshot {
-            gprs: [0; 31],
-            pc: 0,
-            pstate: 0,
-            sp_el0: 0,
-            sp_el1: 0,
-            elr_el1: 0,
-            spsr_el1: 0,
-            ttbr0: 0,
-            ttbr1: 0,
-            tcr: 0,
-            sctlr: 0,
-            mair: 0,
-            vbar: 0,
-            cpacr: 0,
-            cntkctl_el1: 0,
-            tpidr_el0: 0,
-            tpidrro_el0: 0,
-            tpidr_el1: 0,
-            contextidr_el1: 0,
-            actlr_el1: 0,
-            vregs: [0; 32],
-            fpsr: 0,
-            fpcr: 0,
-        },
-        last_exit_class: 0,
-    };
-    FORK_VCPU_SNAPSHOT.with(|current| {
-        assert!(current.borrow().is_none());
-        *current.borrow_mut() = Some(snapshot);
-    });
-}
-
-#[cfg(test)]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn clear_fork_vcpu_snapshot_for_executor_boundary_test() {
-    FORK_VCPU_SNAPSHOT.with(|snapshot| {
-        snapshot.borrow_mut().take();
-    });
-}
-
-#[cfg(test)]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod executor_boundary_audit_tests {
-    #[test]
-    fn fork_snapshot_getter_detects_real_dirty_tls_and_clear() {
-        assert!(super::fork_vcpu_snapshot_is_empty_for_executor_boundary());
-        super::install_fork_vcpu_snapshot_for_executor_boundary_test();
-        assert!(!super::fork_vcpu_snapshot_is_empty_for_executor_boundary());
-        super::clear_fork_vcpu_snapshot_for_executor_boundary_test();
-        assert!(super::fork_vcpu_snapshot_is_empty_for_executor_boundary());
-    }
-}
-
-/// Clear the published fork VM (child path; the child is single-threaded).
-pub fn clear_rebuilt_vm_for_fork() {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        *rebuilt_vm_cell().lock() = None;
-    }
 }
 
 /// V0–V31 SIMD/FP registers, saved/restored across signal delivery alongside
@@ -5040,17 +4611,6 @@ pub(crate) struct HvfTaskState {
     /// handler-injection path rewinds PC to the `svc` and restores this x0.
     last_syscall_nr: Option<u64>,
     last_syscall_orig_x0: u64,
-    /// The vfork (`CLONE_VM`) flag for the NEXT fork: the child SHARES the
-    /// parent's guest RAM instead of snapshotting private regions. Set by the
-    /// engine's `set_vfork_share`, read by `fork_prepare_and_teardown`.
-    vfork_share: bool,
-    /// Fork descriptor stash, captured by `fork_prepare_and_teardown` (the
-    /// pre-`libc::fork` half) and consumed by `fork_rebuild` (the post-fork
-    /// half). The parent re-maps `mapping_descs` (its own buffers); the child
-    /// re-maps `child_descs` (the private snapshots / shared originals). Only
-    /// populated between the two halves of a single fork.
-    fork_mapping_descs: Vec<ForkMappingDesc>,
-    fork_child_descs: Vec<ForkMappingDesc>,
     /// HvPatch owns one process-wide HVF VM across guest exec/fork lifecycle;
     /// ordinary VMM preserves the mature destroy/recreate behavior.
     persistent_vm_lifecycle: bool,
@@ -5198,9 +4758,6 @@ impl HvfTaskState {
             page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
-            vfork_share: false,
-            fork_mapping_descs: Vec::new(),
-            fork_child_descs: Vec::new(),
             persistent_vm_lifecycle: false,
             frame_inventory: HvpatchFrameInventoryState::new(std::sync::Arc::new(
                 parking_lot::Mutex::new(HvpatchFrameInventory::default()),
@@ -5238,9 +4795,6 @@ impl HvfTaskState {
             && self.page_tables.lock().is_none()
             && self.last_syscall_nr.is_none()
             && self.last_syscall_orig_x0 == 0
-            && !self.vfork_share
-            && self.fork_mapping_descs.is_empty()
-            && self.fork_child_descs.is_empty()
             && !self.persistent_vm_lifecycle
             && !inventory.initialized
             && inventory.extents.is_empty()
@@ -5358,9 +4912,6 @@ pub(crate) fn hvpatch_task_state_test_fixture(
         page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         last_syscall_nr: None,
         last_syscall_orig_x0: 0,
-        vfork_share: false,
-        fork_mapping_descs: Vec::new(),
-        fork_child_descs: Vec::new(),
         persistent_vm_lifecycle: true,
         frame_inventory: HvpatchFrameInventoryState::new(std::sync::Arc::new(
             parking_lot::Mutex::new(HvpatchFrameInventory::default()),
@@ -5593,17 +5144,12 @@ struct MappingView {
     shared_key_offset: u64,
 }
 
-/// Snapshot of vCPU register state captured before fork(2). The child restores
-/// from this after rebuilding the HVF context so it resumes exactly where the
-/// parent left off (post-clone syscall).
+/// Snapshot of vCPU register state used for reclaim and executor rebinding.
 ///
 /// The architectural register file lives in the ISA-neutral
 /// [`Aarch64VcpuSnapshot`] `core` — the SAME type the shared engine and the KVM
 /// lane trade in — so the HVF lane no longer duplicates those 21 fields. The
-/// only thing HVF carries on top is the backend-owned `last_exit_class` (the
-/// trap class latched at the exit the snapshot was taken on), which the neutral
-/// type deliberately does NOT model. This is the "neutral core + backend extra"
-/// shape: the per-VMM HVF↔neutral mapping (CPSR ↔ `core.pstate` and the `*_EL1`
+/// per-VMM HVF↔neutral mapping (CPSR ↔ `core.pstate` and the `*_EL1`
 /// sysreg names ↔ their neutral aliases) lives in
 /// `snapshot_vcpu_from`/`restore_vcpu*`; mailbox rebinding owns SP_EL1. The
 /// TTBR1_EL1 (Rosetta x86-64 high-half
@@ -5615,11 +5161,6 @@ pub(crate) struct VcpuSnapshot {
     /// The ISA-neutral architectural register file (GPRs, EL1 sysregs, V-regs, FP
     /// control) shared with the engine and the KVM lane.
     pub(crate) core: Aarch64VcpuSnapshot,
-    /// Backend-only: the HVF trap class latched at the exit this snapshot was
-    /// taken on. Engine-owned and intentionally absent from the neutral snapshot;
-    /// restored onto the rebuilt vCPU's `last_exit_class` so a reclaim/fork
-    /// resumes with the correct exit-class context.
-    pub(crate) last_exit_class: u64,
 }
 
 // Off macOS/aarch64 the HVF backend is cfg'd out entirely (no `applevisor`, no
@@ -6278,47 +5819,6 @@ fn audit_persistent_executor_carrier_mappings(
     }
     Ok(())
 }
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-struct ForkMappingDesc {
-    start: u64,
-    ipa: u64,
-    physical_ipa: u64,
-    end: u64,
-    host: ForkMappingHost,
-    size: usize,
-    physical_size: usize,
-    perms: applevisor::memory::MemPerms,
-    is_dynamic_alias: bool,
-    sharing: GuestMappingSharing,
-    guest_writable: bool,
-    shared_key_base: u64,
-    shared_key_offset: u64,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-enum ForkMappingHost {
-    Borrowed(*mut u8),
-    Owned(crate::host_mapping::OwnedHostMapping),
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl ForkMappingHost {
-    fn ptr(&self) -> *mut u8 {
-        match self {
-            ForkMappingHost::Borrowed(ptr) => *ptr,
-            ForkMappingHost::Owned(mapping) => mapping.as_ptr(),
-        }
-    }
-
-    fn into_owned(self) -> Option<crate::host_mapping::OwnedHostMapping> {
-        match self {
-            ForkMappingHost::Borrowed(_) => None,
-            ForkMappingHost::Owned(mapping) => Some(mapping),
-        }
-    }
-}
-
 /// Everything a freshly-spawned host thread needs to stand up its own vCPU
 /// in the SHARED process VM and resume the cloned guest thread.
 ///
@@ -6380,7 +5880,7 @@ struct ProcessMappingDesc {
     // prepare-error path. Named initializers make declaration order otherwise
     // invisible, but Rust field destruction follows this order.
     stage2_lease: Option<GlobalFrameStage2Lease>,
-    host: ForkMappingHost,
+    host: ProcessMappingHost,
     size: usize,
     physical_ipa: u64,
     physical_host_addr: *mut u8,
@@ -6394,6 +5894,29 @@ struct ProcessMappingDesc {
     shared_key_offset: u64,
     inherited_frame: Option<carrick_hal::FrameId>,
     owner_generation: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+enum ProcessMappingHost {
+    Borrowed(*mut u8),
+    Owned(crate::host_mapping::OwnedHostMapping),
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ProcessMappingHost {
+    fn ptr(&self) -> *mut u8 {
+        match self {
+            Self::Borrowed(pointer) => *pointer,
+            Self::Owned(mapping) => mapping.as_ptr(),
+        }
+    }
+
+    fn into_owned(self) -> Option<crate::host_mapping::OwnedHostMapping> {
+        match self {
+            Self::Borrowed(_) => None,
+            Self::Owned(mapping) => Some(mapping),
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -8187,9 +7710,6 @@ impl HvpatchTaskRegistration {
             page_tables,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
-            vfork_share: false,
-            fork_mapping_descs: Vec::new(),
-            fork_child_descs: Vec::new(),
             persistent_vm_lifecycle: true,
             frame_inventory: HvpatchFrameInventoryState::new(ledger),
             cow_authority: Some(cow_authority),
@@ -10770,9 +10290,6 @@ impl HvfVmState {
                 page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
                 last_syscall_nr: None,
                 last_syscall_orig_x0: 0,
-                vfork_share: false,
-                fork_mapping_descs: Vec::new(),
-                fork_child_descs: Vec::new(),
                 persistent_vm_lifecycle: false,
                 frame_inventory: HvpatchFrameInventoryState::new(std::sync::Arc::new(
                     parking_lot::Mutex::new(HvpatchFrameInventory::default()),
@@ -11162,53 +10679,6 @@ impl HvfVmState {
     /// `vcpu_handle` field) and hands it out here.
     pub(crate) fn vcpu_kick_handle(&self) -> crate::vcpu_kick::VcpuKickHandle {
         crate::vcpu_kick::VcpuKickHandle::new(self.vcpu_handle.clone())
-    }
-
-    /// Set the vfork (`CLONE_VM`) flag for the NEXT fork.
-    pub(crate) fn set_vfork_share(&mut self, share_vm: bool) {
-        self.vfork_share = share_vm;
-    }
-
-    /// Emit pre-host-fork resident footprint by guest mapping class. The expensive
-    /// `mincore` walk runs only when DTrace enables `fork-footprint-class`; normal
-    /// fork performance gates do not pay the scan.
-    pub(crate) fn emit_fork_footprint_attribution(&self, arena_high_water: u64) {
-        carrick_observability::probes::with_fork_footprint_class_probe(|| {
-            let mut classes = [ForkFootprintClassSample::default(); 10];
-            for m in &self.mappings {
-                let class_id = fork_footprint_class_id(
-                    m.start,
-                    m.sharing.shares_across_fork(),
-                    m.guest_writable,
-                );
-                let Ok(index) = usize::try_from(class_id) else {
-                    continue;
-                };
-                let Some(sample) = classes.get_mut(index) else {
-                    continue;
-                };
-                let scan_len = fork_footprint_scan_len(m, class_id, arena_high_water);
-                sample.region_count = sample.region_count.saturating_add(1);
-                sample.scan_bytes = sample.scan_bytes.saturating_add(scan_len as u64);
-                sample.resident_bytes = sample
-                    .resident_bytes
-                    .saturating_add(resident_bytes_for_host_range(m.host_addr, scan_len));
-                sample.flags |= fork_footprint_flags(m);
-            }
-
-            for (class_id, sample) in classes.iter().enumerate() {
-                if sample.region_count == 0 {
-                    continue;
-                }
-                carrick_observability::probes::fork_footprint_class(
-                    class_id as i32,
-                    sample.region_count,
-                    sample.scan_bytes,
-                    sample.resident_bytes,
-                    sample.flags,
-                );
-            }
-        });
     }
 
     /// Live private semantic mappings that a process fork must arm read-only in
@@ -13599,22 +13069,6 @@ impl HvfVmState {
         Ok(binding)
     }
 
-    fn rebind_mailbox_after_vcpu_create(
-        &self,
-        vcpu: &applevisor::vcpu::Vcpu,
-        binding: &mut MailboxBinding,
-        preserve_outstanding: bool,
-    ) -> Result<(), TrapError> {
-        use applevisor::prelude::SysReg;
-
-        let pointer = self.mailbox_host_pointer(binding.slot())?;
-        // SAFETY: the refreshed pointer covers the same uniquely leased slot in
-        // the rebuilt VM mapping and remains live until another rebuild/drop.
-        unsafe { binding.rebind(pointer, preserve_outstanding) };
-        vcpu.set_sys_reg(SysReg::SP_EL1, binding.slot().guest_address())
-            .map_err(hvf_error)
-    }
-
     pub(crate) fn relocate_mailbox_after_cow(
         &self,
         binding: &mut MailboxBinding,
@@ -15719,74 +15173,6 @@ impl HvfVmState {
         Ok(())
     }
 
-    /// Multithreaded fork — sibling side, step 1. Snapshot this vCPU and destroy
-    /// it (raw `hv_vcpu_destroy`; only the owning thread may) so the forking
-    /// thread can `hv_vm_destroy` before `libc::fork` (which fails HV_BUSY while
-    /// any vCPU is alive). The wrapper is left stale until `rebuild_vcpu_after_fork`.
-    pub(crate) fn release_vcpu_for_fork(
-        &mut self,
-        vcpu: &mut applevisor::vcpu::Vcpu,
-    ) -> Result<(), TrapError> {
-        // Publish this sibling's regions so the forking thread re-maps them into
-        // the rebuilt parent VM (the rebuild otherwise replays only the forker's
-        // own mappings, dropping this thread's per-thread aliases). We then park
-        // (caller: release_and_park_vcpu_for_fork) holding our OwnedHostMappings
-        // alive, so the forker re-maps live backings.
-        publish_sibling_fork_mappings(&self.mappings);
-        let snap = HvfInner::snapshot_vcpu_from(vcpu)?;
-        FORK_VCPU_SNAPSHOT.with(|s| *s.borrow_mut() = Some(snap));
-        let vcpu_id = vcpu.id();
-        let rc = unsafe { applevisor_sys::hv_vcpu_destroy(vcpu_id) };
-        if rc == 0 {
-            vcpu_destroyed(vcpu_id);
-        }
-        // phase 3: a nonzero rc means this sibling FAILED to destroy its own
-        // vCPU, so it stays live and the forker's hv_vm_destroy hits HV_BUSY.
-        crate::probes::fork_quiesce(3, rc as i64, vcpu.id() as i64, unsafe { libc::getpid() });
-        Ok(())
-    }
-
-    /// Multithreaded fork — forking thread (parent), after rebuilding its VM.
-    /// Publish a clone of the new process VM so quiesced siblings can recreate
-    /// their vCPUs in it.
-    pub(crate) fn publish_vm_for_siblings(&self) {
-        *rebuilt_vm_cell().lock() = Some((*self._vm).clone());
-    }
-
-    /// Multithreaded fork — sibling side, step 2 (after the parent published the
-    /// rebuilt VM and released the quiesce). Recreate this vCPU in the new VM
-    /// and restore the pre-fork register state. Mappings are VM-global (the
-    /// parent remapped them into the shared VM), so nothing to re-map here.
-    pub(crate) fn rebuild_vcpu_after_fork(
-        &mut self,
-        vcpu: &mut applevisor::vcpu::Vcpu,
-        mailbox: &mut MailboxBinding,
-    ) -> Result<(), TrapError> {
-        let snap = FORK_VCPU_SNAPSHOT
-            .with(|s| s.borrow_mut().take())
-            .ok_or_else(|| TrapError::Hypervisor("no fork vCPU snapshot for rebuild".into()))?;
-        // Post-fork: recreate in the parent's rebuilt VM (published). On a
-        // quiesce ABORT (timeout — no fork happened), nothing was published and
-        // the existing VM is still live, so recreate the vCPU in it.
-        let new_vm = rebuilt_vm_cell()
-            .lock()
-            .clone()
-            .unwrap_or_else(|| (*self._vm).clone());
-        let new_vcpu = create_vcpu(&new_vm)?;
-        enable_el0_counter_access(new_vcpu.id());
-        self.vcpu_id = new_vcpu.id();
-        self.vcpu_handle = new_vcpu.get_handle();
-        // Replace _vm and vcpu WITHOUT running applevisor's panicky Drop on the
-        // old (already-destroyed) handles — mirror the fork/thread-sibling
-        // leak-until-exit discipline.
-        std::mem::forget(std::mem::replace(vcpu, new_vcpu));
-        replace_destroyed_vm(self, new_vm);
-        HvfInner::restore_vcpu_into(vcpu, &snap)?;
-        self.rebind_mailbox_after_vcpu_create(vcpu, mailbox, true)?;
-        self.last_exit_class = snap.last_exit_class;
-        Ok(())
-    }
-
     /// A guest thread is exiting: destroy ITS OWN vCPU (only the owning thread
     /// may) so the slot is freed in the process-global VM. Without this, the
     /// no-op `Drop` leaks the vCPU live forever, and a later fork's
@@ -15798,548 +15184,6 @@ impl HvfVmState {
         if rc == 0 {
             vcpu_destroyed(vcpu_id);
         }
-    }
-
-    /// Multithreaded legacy-VMM fork — PRE-`libc::fork` half (the forking
-    /// thread, single process). Capture mapping descriptors, clone only the
-    /// child's independently editable page-table/control backing, and tear down
-    /// the HVF VM via the raw API (a live VM at fork time makes the child's
-    /// `hv_vm_create` fail). Host-MAP_PRIVATE guest buffers receive ordinary
-    /// fork COW. Both sides then rebuild from the stashed descriptors in
-    /// `fork_rebuild`. Does NOT call `libc::fork` (the shared engine does that)
-    /// and does NOT snapshot the vCPU registers (the engine snapshots separately
-    /// and passes them into `fork_rebuild`).
-    pub(crate) fn fork_prepare_and_teardown(&mut self) -> Result<(), TrapError> {
-        let elapsed_us = |start: std::time::Instant| -> u64 {
-            let micros = start.elapsed().as_micros();
-            micros.min(u128::from(u64::MAX)) as u64
-        };
-        // Probe parity with the old monolithic fork: the engine snapshots the
-        // vCPU (PC/ELR/CPSR) just before this; report the pre-fork marker. The
-        // vCPU registers are no longer read here (the engine owns the snapshot),
-        // so fire the marker with zeros — the engine's snapshot carries the
-        // authoritative values the old `fork_pre` reported.
-        crate::probes::fork_pre(0, 0, 0);
-
-        // vfork (CLONE_VM): before libc::fork, mark each WRITABLE guest region
-        // VM_INHERIT_SHARE so the fork SHARES its pages with the child (XNU
-        // vm_map_fork_share — child references the SAME vm_object, no shadow/copy,
-        // both is_shared; the parent is NOT made COW). This gives a CLONE_VFORK
-        // child true write-visibility into the SUSPENDED parent (clone05) while
-        // keeping the SAME physical pages, so the child's re-hv_vm_map binds the
-        // same PAs — unlike a fresh MAP_SHARED copy (smashed the vfork-exec stack)
-        // or a mach_vm_remap COW (HVF rejects). `guest_writable` is the exact
-        // discriminator: it is false for every carrick-internal region (trampolines,
-        // vectors, page tables, identity page, vvar, sigreturn) and read-only guest
-        // text, so the share never touches the trap machinery; the page-table region
-        // additionally stays a private clone (child branch below). minherit covers
-        // the WHOLE region (offset 0, full len) — a sub-range would clip the map
-        // entry and shadow on the first fork. The parent restores VM_INHERIT_COPY
-        // after the fork (fork_rebuild) so later PLAIN forks stay cheap COW.
-        let phase_start = std::time::Instant::now();
-        if self.vfork_share {
-            for m in &self.mappings {
-                let is_pt = m.start == crate::memory::LINUX_PAGE_TABLES_BASE;
-                if m.guest_writable && !m.sharing.shares_across_fork() && !is_pt {
-                    set_region_fork_inheritance(m.host_addr, m.size, VM_INHERIT_SHARE);
-                }
-            }
-        }
-        crate::probes::fork_lifecycle(
-            4,
-            0,
-            elapsed_us(phase_start),
-            self.mappings.len() as i64,
-            i64::from(self.vfork_share),
-        );
-
-        let phase_start = std::time::Instant::now();
-        let aliases = alias_registry().lock().clone();
-        let alias_index = process_alias_index(&aliases, self.mm_root_slot);
-        let mapping_descs: Vec<ForkMappingDesc> = self
-            .mappings
-            .iter()
-            .filter(|mapping| mapping_is_current_for_process_fork_indexed(mapping, &alias_index))
-            .map(|m| ForkMappingDesc {
-                start: m.start,
-                ipa: m.ipa,
-                physical_ipa: m.physical_ipa,
-                end: m.end,
-                host: ForkMappingHost::Borrowed(m.host_addr),
-                size: m.size,
-                physical_size: m.physical_size,
-                perms: m.perms,
-                is_dynamic_alias: m.is_dynamic_alias,
-                sharing: m.sharing,
-                guest_writable: m.guest_writable,
-                shared_key_base: m.shared_key_base,
-                shared_key_offset: m.shared_key_offset,
-            })
-            .collect();
-        crate::probes::fork_lifecycle(4, 1, elapsed_us(phase_start), mapping_descs.len() as i64, 0);
-
-        let share_vm = self.vfork_share;
-        let mut child_descs: Vec<ForkMappingDesc> = Vec::with_capacity(mapping_descs.len());
-        let phase_start = std::time::Instant::now();
-        for desc in &mapping_descs {
-            // vfork (CLONE_VM): the child shares the parent's address space until it
-            // execs/exits, while the parent vCPU stays SUSPENDED. carrick forks a
-            // real host process, and bulk guest RAM is host-MAP_PRIVATE, so the
-            // child's COW view is ISOLATED — which is exactly right for the common
-            // vfork-FOR-EXEC case (Go, posix_spawn, the shell): the child's pre-exec
-            // trampoline writes COW away, leaving the suspended parent's stack/canary
-            // intact, and execve rebuilds the child fresh. (The STRICT vfork-write
-            // corner — a CLONE_VFORK child that mutates a shared global the parent
-            // then reads WITHOUT exec'ing, i.e. LTP clone05 — is a known gap: making
-            // those writes shared requires promoting the writable regions to
-            // MAP_SHARED, which corrupts the live stack the child's exec trampoline
-            // writes and regresses every vfork-exec. The isolation here is the
-            // correct trade for real workloads.)
-            //
-            // The stage-1 page-table BACKING stays a PRIVATE clone even for vfork:
-            // the child's cloned PageTableManager assumes a private backing, and a
-            // COW/shared PT desyncs the guest VA->PA walk under HVF (breaks
-            // cross-process futex/tst_checkpoint + clone05). Tiny region, ~free.
-            let is_page_table_region = desc.start == crate::memory::LINUX_PAGE_TABLES_BASE;
-            let child_host =
-                if (share_vm && !is_page_table_region) || desc.sharing.shares_across_fork() {
-                    ForkMappingHost::Borrowed(desc.host.ptr()) // shared mapping: child maps the SAME buffer
-                } else if is_page_table_region {
-                    ForkMappingHost::Owned(clone_page_tables_for_child(desc.host.ptr(), desc.size)?)
-                } else {
-                    // Bulk private guest RAM (data/bss/heap/stack/mmap arena) is
-                    // host-MAP_PRIVATE, so libc::fork already COW-isolates it: the
-                    // child re-maps its OWN COW view of the same VA, skipping the
-                    // eager mincore+copy snapshot (the dominant per-fork cost — the
-                    // epoll-ltp ~50x win).
-                    ForkMappingHost::Borrowed(desc.host.ptr())
-                };
-            child_descs.push(ForkMappingDesc {
-                start: desc.start,
-                ipa: desc.ipa,
-                physical_ipa: desc.physical_ipa,
-                end: desc.end,
-                host: child_host,
-                size: desc.size,
-                physical_size: desc.physical_size,
-                perms: desc.perms,
-                is_dynamic_alias: desc.is_dynamic_alias,
-                sharing: desc.sharing,
-                guest_writable: desc.guest_writable,
-                shared_key_base: desc.shared_key_base,
-                shared_key_offset: desc.shared_key_offset,
-            });
-        }
-        crate::probes::fork_lifecycle(4, 2, elapsed_us(phase_start), child_descs.len() as i64, 0);
-
-        // Tear down the parent's HVF context BEFORE the engine forks. macOS's
-        // HVF kernel state is not fork-safe: if a VM exists in the parent at
-        // fork(2) time, the child inherits a "resource is busy" state that
-        // prevents `hv_vm_create` from succeeding. Both processes then rebuild a
-        // fresh VM from the stashed descriptors in `fork_rebuild`. The engine's
-        // `freeze_ram_for_fork` hook does NOT pass the vCPU, so we destroy by the
-        // tracked `vcpu_id` (the stale `HvfAarch64Vcpu` wrapper is replaced in
-        // `fork_rebuild`, which DOES hold `&mut vcpu`).
-        let phase_start = std::time::Instant::now();
-        let vcpu_destroy_rc = unsafe { applevisor_sys::hv_vcpu_destroy(self.vcpu_id) };
-        if vcpu_destroy_rc == 0 {
-            vcpu_destroyed(self.vcpu_id);
-        }
-        crate::probes::fork_lifecycle(
-            4,
-            3,
-            elapsed_us(phase_start),
-            vcpu_destroy_rc as i64,
-            self.vcpu_id as i64,
-        );
-        let phase_start = std::time::Instant::now();
-        crate::probes::vm_lifecycle(2, -1);
-        let vm_destroy_rc = unsafe { inventory_hv_vm_destroy() };
-        if vm_destroy_rc == 0 {
-            record_vm_released();
-        }
-        // phase 2: a nonzero rc means a vCPU was still live at teardown — the
-        // HV_BUSY root cause (the rebuilt VM is then corrupt and sibling
-        // vcpu_create fails). Traceable via `carrick trace` fork__quiesce.
-        crate::probes::fork_quiesce(
-            2,
-            vm_destroy_rc as i64,
-            VCPU_LIVE.load(std::sync::atomic::Ordering::SeqCst),
-            unsafe { libc::getpid() },
-        );
-        crate::probes::fork_lifecycle(
-            4,
-            4,
-            elapsed_us(phase_start),
-            vm_destroy_rc as i64,
-            VCPU_LIVE.load(std::sync::atomic::Ordering::SeqCst),
-        );
-
-        let phase_start = std::time::Instant::now();
-        self.fork_mapping_descs = mapping_descs;
-        self.fork_child_descs = child_descs;
-        crate::probes::fork_lifecycle(
-            4,
-            5,
-            elapsed_us(phase_start),
-            self.fork_mapping_descs.len() as i64,
-            self.fork_child_descs.len() as i64,
-        );
-        Ok(())
-    }
-
-    /// Multithreaded fork — POST-`libc::fork` half. Build a fresh VM + vCPU,
-    /// re-`hv_vm_map` the right buffers (the CHILD uses the private snapshots; the
-    /// PARENT re-maps its own + the union of every quiesced sibling's regions),
-    /// restore the engine-supplied register `snap` onto the NEW vCPU, and
-    /// re-stamp the vvar RNG generation (child). `is_child` keys the parent-vs-
-    /// child inheritance EXACTLY as the old monolithic `fork`.
-    pub(crate) fn fork_rebuild(
-        &mut self,
-        vcpu: &mut applevisor::vcpu::Vcpu,
-        mailbox: &mut MailboxBinding,
-        snap: &VcpuSnapshot,
-        is_child: bool,
-    ) -> Result<(), TrapError> {
-        let role = if is_child { 1 } else { 0 };
-        if is_child {
-            self.mailbox_slots
-                .retain_only_after_fork_child(mailbox.slot());
-        }
-        let rebuild_start = std::time::Instant::now();
-        let elapsed_us = |start: std::time::Instant| -> u64 {
-            let micros = start.elapsed().as_micros();
-            micros.min(u128::from(u64::MAX)) as u64
-        };
-        // Take the descriptors stashed in `fork_prepare_and_teardown`. The parent
-        // re-maps its own buffers (`mapping_descs`); the child re-maps the private
-        // snapshots / shared originals (`child_descs`). The unused set drops here.
-        let mapping_descs = std::mem::take(&mut self.fork_mapping_descs);
-        let child_descs = std::mem::take(&mut self.fork_child_descs);
-
-        // Build a fresh VM + vCPU. Both processes have just had their HVF state
-        // torn down (parent did it pre-fork; child inherited the now-empty state
-        // via fork). Each side independently re-registers the inherited host
-        // buffers via raw `hv_vm_map`.
-        if is_child {
-            let phase_start = std::time::Instant::now();
-            reset_admission_permits_after_fork_child();
-            crate::probes::fork_lifecycle(role + 4, 10, elapsed_us(phase_start), 0, 0);
-        }
-        let phase_start = std::time::Instant::now();
-        let (new_vm, permit) = create_vm_with_admission(VmCreateAdmission::ForkRebuild {
-            vfork: self.vfork_share,
-        })?;
-        crate::probes::fork_lifecycle(role + 4, 11, elapsed_us(phase_start), 0, 0);
-        let phase_start = std::time::Instant::now();
-        let new_vcpu = create_vcpu_with_permit(&new_vm, permit)?;
-        crate::probes::fork_lifecycle(
-            role + 4,
-            12,
-            elapsed_us(phase_start),
-            new_vcpu.id() as i64,
-            0,
-        );
-        let phase_start = std::time::Instant::now();
-        enable_el0_counter_access(new_vcpu.id());
-        self.vcpu_id = new_vcpu.id();
-        self.vcpu_handle = new_vcpu.get_handle();
-
-        // Swap the new VM + vCPU into place WITHOUT running applevisor's Drop on
-        // the old (raw-destroyed) handles. `is_forked_child` is true only in the
-        // child process; the parent kept its pre-fork host process identity.
-        std::mem::forget(std::mem::replace(vcpu, new_vcpu));
-        replace_destroyed_vm(self, new_vm);
-        crate::probes::fork_lifecycle(
-            role + 4,
-            13,
-            elapsed_us(phase_start),
-            self.vcpu_id as i64,
-            0,
-        );
-
-        // In the parent, keep the exact shared protection table siblings already
-        // use; otherwise post-fork mmap/mprotect changes split across two Arcs and
-        // one thread can see a valid Go heap futex as PROT_NONE. The child is
-        // single-threaded after fork, so it gets a private copy of the parent's
-        // ranges at the fork point.
-        let phase_start = std::time::Instant::now();
-        self.protections = if is_child {
-            std::sync::Arc::new(MemoryProtections::from_snapshot(
-                self.protections.snapshot_all(),
-            ))
-        } else {
-            std::sync::Arc::clone(&self.protections)
-        };
-        // The stage-1 page-table manager must survive fork EXACTLY like
-        // protections. The PARENT's tables and their host backing are unchanged
-        // by fork, so it keeps the SAME shared manager — a fresh manager would
-        // rebuild from the (live) backing with `next_free` reset to the first
-        // spare, then re-hand-out table pages already in use, writing L3 entries
-        // over a live L2 table (proven: the cross-test TestUserArenaNew SIGSEGV,
-        // an L2 slot holding `USER_PAGE_FLAGS | <arena PA>`). The CHILD gets a
-        // private backing copy, so it needs its OWN manager — but a CLONE of the
-        // parent's state, not a reset, so its bump cursor matches that backing.
-        self.page_tables = if is_child {
-            let cloned = self.page_tables.lock().clone();
-            std::sync::Arc::new(parking_lot::Mutex::new(cloned))
-        } else {
-            std::sync::Arc::clone(&self.page_tables)
-        };
-        // CRITICAL: LEAK the old mapping Vec (do NOT drop it). Each old
-        // `HvfMappedRegion` owns an `OwnedHostMapping` whose Drop `munmap`s the host
-        // backing — and the `mapping_descs` we re-`hv_vm_map` below carry BORROWED
-        // raw pointers INTO those exact buffers. Dropping the old Vec here would
-        // munmap them out from under the re-map, so `hv_vm_map` faults (HV_ERROR).
-        // This matches the original monolithic `fork`, which swapped the whole
-        // `HvfInner` via `ptr::write` + `mem::forget` and so never ran Drop on the
-        // old mappings (the leak-until-exit / ManuallyDrop discipline; the kernel
-        // reclaims the pages at process exit). The CHILD remaps its own private
-        // snapshots (`child_descs`), which are MOVED into the rebuilt mappings below,
-        // so the parent's borrowed originals it inherited via COW are likewise kept
-        // alive by this leak.
-        std::mem::forget(std::mem::replace(
-            &mut self.mappings,
-            Vec::with_capacity(mapping_descs.len()),
-        ));
-        self.reclaim_authority = ReclaimParkAuthority::Live;
-        self.last_exit_class = snap.last_exit_class;
-        self.last_fault_esr = 0;
-        self.is_forked_child = is_child;
-        self.forked_no_exec = is_child;
-        self.last_syscall_nr = None;
-        self.last_syscall_orig_x0 = 0;
-        crate::probes::fork_lifecycle(role + 4, 14, elapsed_us(phase_start), 0, 0);
-
-        // Re-map each region using raw hv_vm_map. The PARENT re-maps its original
-        // buffers; the CHILD maps the pre-fork private snapshots for PRIVATE
-        // regions and the shared originals for guest-MAP_SHARED ones.
-        let descs = if is_child { child_descs } else { mapping_descs };
-        let desc_count = descs.len() as u64;
-        crate::probes::fork_rebuild(role, 0, desc_count, 0, 0);
-        let local_map_start = std::time::Instant::now();
-        let mut local_maps = 0u64;
-        for desc in descs {
-            let host_addr = desc.host.ptr();
-            let perms_raw: u64 = u64::from(desc.perms);
-            let r = unsafe {
-                inventory_hv_vm_map(
-                    host_addr as *mut std::ffi::c_void,
-                    desc.ipa,
-                    desc.size,
-                    perms_raw,
-                )
-            };
-            if r != 0 {
-                return Err(TrapError::ChildMapFailed {
-                    host_addr: host_addr as u64,
-                    guest_start: desc.ipa,
-                    size: desc.size,
-                    code: r as u32,
-                });
-            }
-            local_maps = local_maps.saturating_add(1);
-            // Re-register every high-VA alias into the process-shared index with
-            // THIS rebuild's host_addr. Critical for the CHILD: the index is
-            // COW-inherited from the parent. A PRIVATE alias names the same host
-            // VA in the child process but its host-MAP_PRIVATE fork view; this
-            // overwrite rebinds the process-local registry to that view. For the
-            // parent it is idempotent. Low-VA boot regions are not aliases (every
-            // thread has them) and are never in the index.
-            if desc.is_dynamic_alias {
-                if let Some(previous) = alias_registry()
-                    .lock()
-                    .iter()
-                    .find(|alias| alias.start == desc.start && alias.ipa == desc.ipa)
-                    .copied()
-                {
-                    register_shared_alias(AliasBacking {
-                        host_addr: host_addr as usize,
-                        physical_host_addr: if previous.physical_host_addr == previous.host_addr {
-                            host_addr as usize
-                        } else {
-                            previous.physical_host_addr
-                        },
-                        ownership_scope: alias_ownership_scope(desc.sharing, self.mm_root_slot),
-                        ..previous
-                    });
-                }
-            }
-            self.mappings.push(HvfMappedRegion {
-                start: desc.start,
-                ipa: desc.ipa,
-                physical_ipa: desc.physical_ipa,
-                end: desc.end,
-                host_addr,
-                size: desc.size,
-                physical_size: desc.physical_size,
-                perms: desc.perms,
-                guest_writable: desc.guest_writable,
-                // No Memory object — the host buffer is either an inherited
-                // shared mapping or a snapshot copy. Drop runs no HVF call for
-                // this mapping; the engine's VM tear-down releases all stage-2
-                // entries in one shot.
-                memory: None,
-                host_mapping: desc.host.into_owned(),
-                stage2_lease: None,
-                is_dynamic_alias: desc.is_dynamic_alias,
-                sharing: desc.sharing,
-                shared_key_base: desc.shared_key_base,
-                shared_key_offset: desc.shared_key_offset,
-                owner_generation: global_frame_host_owner_generation(
-                    desc.physical_ipa,
-                    desc.physical_size as u64,
-                ),
-            });
-        }
-        crate::probes::fork_rebuild(role, 1, desc_count, local_maps, elapsed_us(local_map_start));
-
-        // PARENT post-vfork: restore VM_INHERIT_COPY on the regions we shared for
-        // this vfork (set VM_INHERIT_SHARE in fork_prepare_and_teardown), so a LATER
-        // plain fork of this parent gets cheap COW isolation again rather than
-        // silently sharing its address space. The vfork child execs/exits, so it
-        // keeps the inherited SHARE attribute harmlessly (a no-op once it detaches).
-        if !is_child && self.vfork_share {
-            let phase_start = std::time::Instant::now();
-            for m in &self.mappings {
-                let is_pt = m.start == crate::memory::LINUX_PAGE_TABLES_BASE;
-                if m.guest_writable && !m.sharing.shares_across_fork() && !is_pt {
-                    set_region_fork_inheritance(m.host_addr, m.size, VM_INHERIT_COPY);
-                }
-            }
-            crate::probes::fork_lifecycle(
-                role + 4,
-                15,
-                elapsed_us(phase_start),
-                self.mappings.len() as i64,
-                0,
-            );
-        }
-
-        // PARENT only: re-map the UNION of all quiesced siblings' regions that
-        // the forking thread's `mapping_descs` lacked. Threads share one VM but
-        // this rebuild replays only the forker's mappings, so a per-thread alias
-        // a SIBLING established (e.g. a Go heap-arena chunk at high-VA) is missing
-        // from the rebuilt stage-2 — the parent then DC-ZVA-faults on it
-        // (translation fault, mapped_here=false). The shared stage-1 page tables
-        // (kept by Arc above) already carry the VA->IPA entry; only the stage-2
-        // `hv_vm_map` is absent, so re-map each sibling region by IPA (deduped
-        // against what we just mapped; alias IPAs are process-global + unique).
-        // The backing is alive: every publisher PARKED in
-        // release_and_park_vcpu_for_fork after publishing and stays parked until
-        // we end the quiesce, holding its OwnedHostMapping. The region is UNOWNED
-        // here (memory/host_mapping = None) so the parent never frees a buffer the
-        // sibling owns. The CHILD is single-threaded post-fork (uses child_descs),
-        // so it must NOT inherit sibling aliases — hence parent only.
-        let mut sibling_maps = 0u64;
-        if !is_child {
-            let mut mapped_ipas: std::collections::HashSet<u64> =
-                self.mappings.iter().map(|m| m.ipa).collect();
-            let siblings = sibling_fork_mappings().lock().clone();
-            let aliases = alias_registry().lock().clone();
-            let sibling_count = siblings.len() as u64;
-            let sibling_map_start = std::time::Instant::now();
-            for sm in siblings {
-                if sm.is_dynamic_alias
-                    && !aliases.iter().any(|alias| {
-                        alias_matches_process_scope(alias.ownership_scope, self.mm_root_slot)
-                            && alias.start == sm.start
-                            && alias.ipa == sm.ipa
-                            && alias.host_addr == sm.host_addr
-                            && alias.size == semantic_extent_size(sm.start, sm.end)
-                    })
-                {
-                    continue;
-                }
-                if !mapped_ipas.insert(sm.ipa) {
-                    continue;
-                }
-                let r = unsafe {
-                    inventory_hv_vm_map(
-                        sm.host_addr as *mut std::ffi::c_void,
-                        sm.ipa,
-                        sm.size,
-                        sm.perms,
-                    )
-                };
-                if r != 0 {
-                    return Err(TrapError::ChildMapFailed {
-                        host_addr: sm.host_addr as u64,
-                        guest_start: sm.ipa,
-                        size: sm.size,
-                        code: r as u32,
-                    });
-                }
-                sibling_maps = sibling_maps.saturating_add(1);
-                self.mappings.push(HvfMappedRegion {
-                    start: sm.start,
-                    ipa: sm.ipa,
-                    physical_ipa: sm.physical_ipa,
-                    end: sm.end,
-                    host_addr: sm.host_addr as *mut u8,
-                    size: sm.size,
-                    physical_size: sm.physical_size,
-                    perms: applevisor::memory::MemPerms::from(sm.perms),
-                    guest_writable: sm.guest_writable,
-                    memory: None,
-                    host_mapping: None,
-                    stage2_lease: None,
-                    is_dynamic_alias: sm.is_dynamic_alias,
-                    sharing: sm.sharing,
-                    shared_key_base: sm.shared_key_base,
-                    shared_key_offset: sm.shared_key_offset,
-                    owner_generation: global_frame_host_owner_generation(
-                        sm.physical_ipa,
-                        sm.physical_size as u64,
-                    ),
-                });
-            }
-            crate::probes::fork_rebuild(
-                role,
-                2,
-                sibling_count,
-                sibling_maps,
-                elapsed_us(sibling_map_start),
-            );
-        }
-
-        // Restore vCPU register state from the engine's pre-fork snapshot. Both
-        // parent and child resume inside the same `clone` syscall site; the
-        // dispatcher then writes the appropriate retval into X0 (child pid for
-        // parent, 0 for child).
-        let phase_start = std::time::Instant::now();
-        HvfInner::restore_vcpu_into(vcpu, snap)?;
-        self.rebind_mailbox_after_vcpu_create(vcpu, mailbox, true)?;
-        self.last_exit_class = snap.last_exit_class;
-        crate::probes::fork_lifecycle(role + 4, 16, elapsed_us(phase_start), 0, 0);
-        crate::probes::fork_rebuild(role, 3, desc_count, local_maps, elapsed_us(rebuild_start));
-        let post_pid = if is_child {
-            0
-        } else {
-            unsafe { libc::getpid() }
-        };
-        crate::probes::fork_post(post_pid, snap.core.pc, snap.core.elr_el1);
-        if is_child {
-            // The child has a new pid, but its inherited USDT DOF is registered
-            // with the kernel under the PARENT's pid. Re-register so DTrace's
-            // `carrick*` provider matches this child too — otherwise forked guest
-            // processes (apt's http method, dpkg-deb's tar subprocess) are
-            // invisible to `carrick trace`.
-            let phase_start = std::time::Instant::now();
-            let _ = crate::probes::register_dtrace_probes();
-            crate::probes::fork_lifecycle(role + 4, 17, elapsed_us(phase_start), 0, 0);
-            // P2 getrandom fork-safety: re-stamp the vvar RNG generation with a
-            // fresh epoch. `self` is now the child's rebuilt engine — its vvar
-            // mapping points at the child's freshly re-mapped snapshot buffer, and
-            // the vCPU was just recreated (clean stage-2 TLB) — so this write IS
-            // visible to the child's guest reads. The child's distinct generation
-            // forces the userspace getrandom blob to reseed instead of reusing the
-            // parent's keystream (gated by conformance-probes/getrandomvdsofork).
-            let phase_start = std::time::Instant::now();
-            let _ = self.stamp_rng_generation();
-            crate::probes::fork_lifecycle(role + 4, 18, elapsed_us(phase_start), 0, 0);
-        }
-        Ok(())
     }
 
     pub(crate) fn take_persistent_executor_spec(
@@ -16446,11 +15290,6 @@ impl HvfVmState {
         mailbox: &MailboxBinding,
     ) -> Result<(), TrapError> {
         self.audit_persistent_executor_idle()?;
-        if !fork_vcpu_snapshot_is_empty_for_executor_boundary() {
-            return Err(TrapError::Hypervisor(
-                "persistent worker retained a legacy fork vCPU snapshot".to_owned(),
-            ));
-        }
         if self.reclaim_authority != ReclaimParkAuthority::Live {
             return Err(TrapError::Hypervisor(
                 "persistent worker lost its live owner-thread vCPU authority".to_owned(),
@@ -16590,9 +15429,6 @@ impl HvfVmState {
                 page_tables,
                 last_syscall_nr: None,
                 last_syscall_orig_x0: 0,
-                vfork_share: false,
-                fork_mapping_descs: Vec::new(),
-                fork_child_descs: Vec::new(),
                 persistent_vm_lifecycle,
                 frame_inventory: HvpatchFrameInventoryState::new(frame_inventory),
                 cow_authority,
@@ -16932,7 +15768,7 @@ impl HvfVmState {
                     start: mapping.start,
                     ipa: mapping.ipa,
                     end: mapping.end,
-                    host: ForkMappingHost::Borrowed(mapping.physical_host_addr),
+                    host: ProcessMappingHost::Borrowed(mapping.physical_host_addr),
                     size: mapping.size,
                     physical_ipa: mapping.physical_ipa,
                     physical_host_addr: mapping.physical_host_addr,
@@ -17089,7 +15925,7 @@ impl HvfVmState {
                 start: mapping.start,
                 ipa,
                 end: mapping.end,
-                host: ForkMappingHost::Owned(host),
+                host: ProcessMappingHost::Owned(host),
                 size: mapping.size,
                 physical_ipa,
                 physical_host_addr,
@@ -17680,9 +16516,6 @@ impl HvfVmState {
                 page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
                 last_syscall_nr: None,
                 last_syscall_orig_x0: 0,
-                vfork_share: false,
-                fork_mapping_descs: Vec::new(),
-                fork_child_descs: Vec::new(),
                 persistent_vm_lifecycle: spec.persistent_vm_lifecycle,
                 frame_inventory: HvpatchFrameInventoryState::new(spec.frame_inventory),
                 cow_authority: None,
@@ -18116,8 +16949,6 @@ impl HvfVmState {
         self.cow_deferred_publications = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         self.pending_fork_frame_receipts.clear();
         self.pending_process_aliases.clear();
-        self.fork_mapping_descs.clear();
-        self.fork_child_descs.clear();
         // The shared AArch64 engine already builds this editor lazily from the
         // live page-table backing on its first real edit. Keeping an eager
         // manager here cloned the complete 1.8 MiB root-slot table on every exec,
@@ -18473,13 +17304,10 @@ impl HvfInner {
                 fpsr,
                 fpcr,
             },
-            // The engine owns last_exit_class; the snapshot carries 0 for it.
-            last_exit_class: 0,
         })
     }
 
-    /// Restore `snap` onto the passed `vcpu` (the fork/clone/reclaim rebuild +
-    /// the engine's `Aarch64Vcpu::restore`). The old `restore_vcpu` body.
+    /// Restore `snap` onto the passed `vcpu` for reclaim/executor rebinding.
     pub(crate) fn restore_vcpu_into(
         vcpu: &mut applevisor::vcpu::Vcpu,
         snap: &VcpuSnapshot,
@@ -19214,209 +18042,6 @@ fn reclaim_park_authority_contains_no_task_snapshot() {
     assert!(authority.destination_vcpu_is_live().is_ok());
 }
 
-/// Back one guest region with a raw `mmap(MAP_ANON)` buffer + `hv_vm_map`,
-/// returning an UNOWNED [`HvfMappedRegion`] (`memory: None`).
-///
-/// We deliberately do NOT use applevisor's `Memory` (`vm.memory_create`), whose
-/// `alloc_zeroed(Layout::from_size_align(size, 16 KiB))` produces a VM mapping
-/// that macOS `fork(2)` is ~8x more expensive to COW than a clean anonymous
-/// `mmap` — even though neither is resident (both ~6 MiB RSS). For carrick's
-/// ~640 MiB of guest windows this was the dominant per-fork cost: 640 MiB
-/// fork+wait measured 9.6 ms (applevisor) vs 1.1 ms (raw mmap). See
-/// `examples/fork_alloc_bench.rs`. The host pages leak only at process exit,
-/// matching the existing `ManuallyDrop<HvfInner>` discipline (applevisor
-/// `Memory` Drop never ran either) and the `map_shared_file` raw path.
-/// Allocate a fresh `MAP_SHARED` anon buffer and copy `src`'s RESIDENT pages
-/// into it. Used by `HvfInner::fork` to take a private snapshot of guest-
-/// PRIVATE memory: guest RAM is host-`MAP_SHARED` for HVF coherence (see
-/// `map_region_raw`), so `fork(2)` does NOT COW-isolate it — without an
-/// explicit copy a forked child and its parent would share, and corrupt, the
-/// macOS `vm_inherit.h`: parent + child share the SAME pages across `fork(2)`.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const VM_INHERIT_SHARE: libc::c_int = 0;
-/// macOS `vm_inherit.h`: child gets a COW copy across `fork(2)` (the default).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const VM_INHERIT_COPY: libc::c_int = 1;
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const FORK_FOOTPRINT_CLASS_PRIVATE_MMAP_ARENA: i32 = 1;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const FORK_FOOTPRINT_CLASS_PRIVATE_HEAP: i32 = 2;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const FORK_FOOTPRINT_CLASS_PRIVATE_OVERLAY: i32 = 3;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const FORK_FOOTPRINT_CLASS_PRIVATE_HIGH_ALIAS: i32 = 4;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const FORK_FOOTPRINT_CLASS_PRIVATE_WRITABLE_OTHER: i32 = 5;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const FORK_FOOTPRINT_CLASS_PRIVATE_RO_OR_INTERNAL: i32 = 6;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const FORK_FOOTPRINT_CLASS_SHARED_APERTURE: i32 = 7;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const FORK_FOOTPRINT_CLASS_SHARED_OTHER: i32 = 8;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const FORK_FOOTPRINT_CLASS_PRIVATE_PAGE_TABLES: i32 = 9;
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const FORK_FOOTPRINT_FLAG_CHILD_OBSERVES: u64 = 1 << 0;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const FORK_FOOTPRINT_FLAG_PARENT_SHARED: u64 = 1 << 1;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const FORK_FOOTPRINT_FLAG_COW_COPY: u64 = 1 << 2;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const FORK_FOOTPRINT_FLAG_GUEST_WRITABLE: u64 = 1 << 3;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const FORK_FOOTPRINT_FLAG_INDEPENDENT_STAGE1: u64 = 1 << 4;
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Default)]
-struct ForkFootprintClassSample {
-    region_count: u64,
-    scan_bytes: u64,
-    resident_bytes: u64,
-    flags: u64,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn fork_footprint_class_id(start: u64, fork_shared: bool, guest_writable: bool) -> i32 {
-    if fork_shared {
-        if start == crate::memory::LINUX_SHARED_FILE_BASE {
-            return FORK_FOOTPRINT_CLASS_SHARED_APERTURE;
-        }
-        return FORK_FOOTPRINT_CLASS_SHARED_OTHER;
-    }
-    if start == crate::memory::LINUX_MMAP_BASE {
-        return FORK_FOOTPRINT_CLASS_PRIVATE_MMAP_ARENA;
-    }
-    if start == crate::memory::LINUX_HEAP_BASE {
-        return FORK_FOOTPRINT_CLASS_PRIVATE_HEAP;
-    }
-    if start == crate::memory::LINUX_PRIVATE_OVERLAY_BASE {
-        return FORK_FOOTPRINT_CLASS_PRIVATE_OVERLAY;
-    }
-    if start == crate::memory::LINUX_PAGE_TABLES_BASE {
-        return FORK_FOOTPRINT_CLASS_PRIVATE_PAGE_TABLES;
-    }
-    if crate::memory::is_high_va(start) {
-        return FORK_FOOTPRINT_CLASS_PRIVATE_HIGH_ALIAS;
-    }
-    if guest_writable {
-        FORK_FOOTPRINT_CLASS_PRIVATE_WRITABLE_OTHER
-    } else {
-        FORK_FOOTPRINT_CLASS_PRIVATE_RO_OR_INTERNAL
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn fork_footprint_flags(m: &HvfMappedRegion) -> u64 {
-    let mut flags = FORK_FOOTPRINT_FLAG_CHILD_OBSERVES;
-    if m.sharing.shares_across_fork() {
-        flags |= FORK_FOOTPRINT_FLAG_PARENT_SHARED;
-    } else if m.start == crate::memory::LINUX_PAGE_TABLES_BASE {
-        flags |= FORK_FOOTPRINT_FLAG_INDEPENDENT_STAGE1;
-    } else {
-        flags |= FORK_FOOTPRINT_FLAG_COW_COPY;
-    }
-    if m.guest_writable {
-        flags |= FORK_FOOTPRINT_FLAG_GUEST_WRITABLE;
-    }
-    flags
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn fork_footprint_scan_len(m: &HvfMappedRegion, class_id: i32, arena_high_water: u64) -> usize {
-    if class_id == FORK_FOOTPRINT_CLASS_PRIVATE_MMAP_ARENA {
-        arena_high_water
-            .saturating_sub(crate::memory::LINUX_MMAP_BASE)
-            .try_into()
-            .unwrap_or(m.size)
-            .min(m.size)
-    } else {
-        m.size
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn resident_bytes_for_host_range(host_addr: *mut u8, len: usize) -> u64 {
-    if host_addr.is_null() || len == 0 {
-        return 0;
-    }
-    let page = {
-        let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if p <= 0 { 16 * 1024 } else { p as usize }
-    };
-    let pages = len.div_ceil(page);
-    let mut resident = vec![0u8; pages];
-    let rc = unsafe {
-        libc::mincore(
-            host_addr.cast::<libc::c_void>(),
-            len,
-            resident.as_mut_ptr().cast::<libc::c_char>(),
-        )
-    };
-    if rc != 0 {
-        return 0;
-    }
-    resident
-        .iter()
-        .filter(|flag| **flag & 1 != 0)
-        .count()
-        .saturating_mul(page) as u64
-}
-
-/// Set a guest region's per-process `fork(2)` inheritance via macOS `minherit(2)`.
-///
-/// `VM_INHERIT_SHARE` makes the WHOLE region's pages SHARED across a later
-/// `libc::fork` (XNU `vm_map_fork_share`: the child references the SAME
-/// `vm_object` — no shadow, no copy — and both entries are `is_shared`; the
-/// parent is NOT converted to copy-on-write, unlike FreeBSD/NetBSD UVM). This is
-/// how a vfork/CLONE_VM child gets true write-visibility into the SUSPENDED
-/// parent (LTP clone05) while keeping the same physical pages, so the child's
-/// re-`hv_vm_map` binds the same PAs. `VM_INHERIT_COPY` restores cheap COW
-/// isolation for subsequent plain forks.
-///
-/// MUST be applied to a WHOLE mmap region (offset 0, full len): `minherit` on a
-/// sub-range clips the `vm_map_entry`, so the first fork shadows the sub-entry
-/// (`vo_size > entry_size`) instead of sharing. carrick's per-region mmaps make
-/// the whole-region call natural. Best-effort: a failure degrades to COW (the
-/// vfork child just won't see the parent's writes), never a crash.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn set_region_fork_inheritance(host_addr: *mut u8, size: usize, inherit: libc::c_int) {
-    unsafe extern "C" {
-        fn minherit(
-            addr: *mut libc::c_void,
-            len: libc::size_t,
-            inherit: libc::c_int,
-        ) -> libc::c_int;
-    }
-    let rc = unsafe { minherit(host_addr.cast(), size, inherit) };
-    let _ = rc;
-}
-
-/// Create the independent stage-1 table backing required by a legacy VMM fork.
-/// Called pre-fork while the guest vCPU is suspended (atomic, no race). This is
-/// page-table/control state, never an alternate private guest-frame snapshot
-/// authority.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn clone_page_tables_for_child(
-    src: *mut u8,
-    size: usize,
-) -> Result<crate::host_mapping::OwnedHostMapping, TrapError> {
-    let dst = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-        size,
-        crate::host_mapping::HostMappingKind::PerMmKernelState,
-    )
-    .map_err(|error| {
-        TrapError::Hypervisor(format!(
-            "fork child-snapshot mmap (size={size}) failed: {error}"
-        ))
-    })?;
-    let dst_ptr = dst.as_ptr();
-    unsafe { std::ptr::copy_nonoverlapping(src, dst_ptr, size) };
-    Ok(dst)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn prepare_exec_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> {
     let requested_size = usize::try_from(mapping.mapped_size)
         .map_err(|_| TrapError::MappingTooLarge(mapping.mapped_size))?;
@@ -19495,7 +18120,7 @@ fn map_region_raw(
     // MAP_SHARED anon is HVF-coherent (same as `map_shared_file`). The cost:
     // fork(2) no longer COW-isolates these pages. HVPatch isolates them with
     // per-mm stage-1 COW; the legacy VMM fork path separately clones only its
-    // page-table/control backing (`clone_page_tables_for_child`).
+    // page-table/control backing.
     // The aperture region is host-MAP_SHARED so it stays shared across fork(2)
     // (never snapshotted); all other regions are private guest RAM.
     let backing_started = std::time::Instant::now();
@@ -19736,19 +18361,6 @@ mod vm_create_admission_tests {
     fn resource_growing_vm_creation_uses_global_permit() {
         assert!(VmCreateAdmission::Initial.global_permit_budget().is_some());
         assert!(
-            VmCreateAdmission::ForkRebuild { vfork: false }
-                .global_permit_budget()
-                .is_some(),
-            "plain fork rebuilds create another live one-vCPU VM in the fork tree"
-        );
-        assert!(
-            VmCreateAdmission::ForkRebuild { vfork: true }
-                .global_permit_budget()
-                .is_none(),
-            "vfork parents wait in the fork handler, so the child rebuild must not \
-             compete with the parent for the same global permit"
-        );
-        assert!(
             VmCreateAdmission::ExecveRebuild
                 .global_permit_budget()
                 .is_none()
@@ -19769,21 +18381,12 @@ mod vm_create_admission_tests {
         let ceiling = Some(VmCreateAdmission::GLOBAL_VCPU_CEILING);
         assert_eq!(VmCreateAdmission::Initial.global_permit_budget(), ceiling);
         assert_eq!(
-            VmCreateAdmission::ForkRebuild { vfork: false }.global_permit_budget(),
-            ceiling,
-            "plain fork rebuilds are gated by the same creation ceiling"
-        );
-        assert_eq!(
             VmCreateAdmission::SharedWaitResume.global_permit_budget(),
             ceiling,
             "shared-wait resume drains parked processes through the creation ceiling"
         );
-        // vfork parents wait in the fork handler and execve rebuilds must make
-        // progress, so both bypass the global creation permit entirely.
-        assert_eq!(
-            VmCreateAdmission::ForkRebuild { vfork: true }.global_permit_budget(),
-            None
-        );
+        // Execve rebuilds must make progress and therefore bypass the global
+        // creation permit.
         assert_eq!(
             VmCreateAdmission::ExecveRebuild.global_permit_budget(),
             None
@@ -19837,30 +18440,6 @@ mod vm_create_admission_tests {
         // Idempotent: a second release is a no-op.
         region.release_token(VM_RESIDENCY_LOCAL_KEY);
         assert_eq!(region.occupied(), 0);
-    }
-
-    #[test]
-    fn dual_reclaim_source_merges_and_reclaims_both_tables() {
-        use crate::vcpu_permit_reaper::PermitReclaimSource;
-        let a = Box::leak(Box::new(PermitRegion::new_anon_for_test()));
-        let b = Box::leak(Box::new(PermitRegion::new_anon_for_test()));
-        // `force_owner_for_test` overwrites only the pid on an ALREADY-acquired
-        // slot (preserving its real Acquiring state and generation) — so a real
-        // slot must be acquired first for the slot to count as occupied.
-        let token_a = a
-            .acquire(atomic_permit_slot::MAX_SLOTS, std::process::id())
-            .unwrap();
-        let token_b = b
-            .acquire(atomic_permit_slot::MAX_SLOTS, std::process::id())
-            .unwrap();
-        a.force_owner_for_test(token_a.slot, 4242, token_a.generation);
-        b.force_owner_for_test(token_b.slot, 4242, token_b.generation);
-        let (gen_a, gen_b) = (token_a.generation, token_b.generation);
-        let dual = DualReclaimSource(a, b);
-        let owners = dual.owner_slots();
-        assert!(owners.contains(&(4242, gen_a)));
-        assert!(owners.contains(&(4242, gen_b)));
-        assert_eq!(dual.reclaim(4242, gen_a) + dual.reclaim(4242, gen_b), 2);
     }
 
     // ---- Part B: HV_NO_RESOURCES park+retry backpressure ----
@@ -19988,9 +18567,7 @@ mod vm_create_admission_tests {
         let t = r.acquire(4, std::process::id()).unwrap(); // slot published owned BEFORE any count-only state
         assert_eq!(r.occupied(), 1);
         assert_eq!(r.slot_state(t.slot), SlotState::Acquiring); // owner+gen visible even pre-register
-        // a crash here is reclaimable: reap by owner finds the acquiring slot
-        r.force_owner_for_test(t.slot, 999_999_999, t.generation);
-        assert_eq!(r.reclaim_owner(999_999_999, None), 1);
+        assert!(r.try_free_exact_for_test(t));
         assert_eq!(r.occupied(), 0);
     }
 
@@ -20018,24 +18595,7 @@ mod vm_create_admission_tests {
         assert_eq!(r.occupied(), 1);
     }
 
-    #[test]
-    fn fork_child_reset_clears_local_only() {
-        let r = PermitRegion::new_anon_for_test();
-        let t = r.acquire(4, std::process::id()).unwrap();
-        r.register(1, t);
-        r.reset_local_after_fork_child(); // child clears local map
-        assert!(r.local_token(1).is_none());
-        assert_eq!(r.occupied(), 1); // parent's shared slot untouched
-    }
-
-    // ---- Task 3: cooperative release before a fork-child `_exit` ------------
-    //
-    // `process_exit_cleanup` runs on the exiting child's own thread BEFORE
-    // `_exit` skips Rust drops. It drains THIS process's local token map,
-    // freeing each named slot with the generation-guarded `free_exact`, so it
-    // is idempotent with `vcpu_destroyed` (which may have released already) and
-    // the supervisor's later `reclaim_owner`, and it never frees the parent's
-    // slots (its local map, after the fork reset, names only this process).
+    // ---- Cooperative carrier-exit release -----------------------------------
 
     #[test]
     fn cooperative_release_frees_owned_slots_and_is_idempotent() {
@@ -20047,13 +18607,13 @@ mod vm_create_admission_tests {
         r.register(2, t2);
         assert_eq!(r.occupied(), 2);
 
-        // The fork-child `_exit` fast path frees both registered slots at once.
+        // The carrier-exit fast path frees both registered slots at once.
         assert_eq!(r.cooperative_release_local(), 2);
         assert_eq!(r.occupied(), 0);
         assert!(r.local_token(1).is_none());
         assert!(r.local_token(2).is_none());
 
-        // Idempotent: a second call (or a late supervisor reclaim) frees nothing.
+        // Idempotent: a second call frees nothing.
         assert_eq!(r.cooperative_release_local(), 0);
         assert_eq!(r.occupied(), 0);
     }
@@ -20073,36 +18633,6 @@ mod vm_create_admission_tests {
         // Cooperative exit frees only the STILL-owned remaining slot; no double-free.
         assert_eq!(r.cooperative_release_local(), 1);
         assert_eq!(r.occupied(), 0);
-    }
-
-    #[test]
-    fn cooperative_release_no_ops_after_supervisor_reclaim() {
-        let r = PermitRegion::new_anon_for_test();
-        let pid = std::process::id();
-        let t = r.acquire(4, pid).unwrap();
-        r.register(1, t);
-        // The supervisor won the race and already reclaimed the slot by (pid, gen).
-        assert_eq!(r.reclaim_owner(pid, Some(t.generation)), 1);
-        assert_eq!(r.occupied(), 0);
-        // The local map still names the (now-free) slot, but the generation guard
-        // in `free_exact` makes the cooperative release a no-op — no double-free.
-        assert_eq!(r.cooperative_release_local(), 0);
-        assert_eq!(r.occupied(), 0);
-    }
-
-    #[test]
-    fn cooperative_release_after_fork_reset_spares_parent_slots() {
-        let r = PermitRegion::new_anon_for_test();
-        let pid = std::process::id();
-        let t = r.acquire(4, pid).unwrap();
-        r.register(1, t);
-        // Simulate the fork child: the inherited local map is cleared before the
-        // child re-acquires its own permits. The parent's shared slot stays owned.
-        r.reset_local_after_fork_child();
-        // The child's cooperative `_exit` must NOT free the parent's shared slot:
-        // its (now-empty) local map names none of the parent's tokens.
-        assert_eq!(r.cooperative_release_local(), 0);
-        assert_eq!(r.occupied(), 1);
     }
 
     #[test]
@@ -20149,8 +18679,8 @@ mod vm_create_admission_tests {
     // admission class's budget is `None`, so the replacement acquires no
     // permit at all). After Task 1's tokenization this is ALREADY correct: the
     // pre-exec `vcpu_id` was registered when its process/thread was admitted
-    // (`Initial`/`ForkRebuild{vfork:false}`/`SharedWaitResume` all have `Some`
-    // budgets), so `vcpu_destroyed`'s `release_token(vcpu_id)` finds it in the
+    // (`Initial`/`SharedWaitResume` have `Some` budgets), so `vcpu_destroyed`'s
+    // `release_token(vcpu_id)` finds it in the
     // local map and frees exactly that slot — no leak, and nothing left for an
     // extra explicit release to double-free. These tests drive that exact
     // sequence against a private `PermitRegion` (they never call
@@ -20320,29 +18850,6 @@ mod vm_create_admission_tests {
             "observed {observed} concurrently-held permits with budget {budget} \
              — over-admission past the budget cap (store-buffering regression)"
         );
-    }
-
-    #[test]
-    fn fork_vm_probe_bounds_out_when_residency_is_pinned_and_admits_after_release() {
-        let region = PermitRegion::new_anon_for_test();
-        let budget = 4;
-        let mut tokens = Vec::new();
-        for i in 0..budget {
-            let t = region
-                .acquire(budget, 1000 + i as u32)
-                .expect("under budget");
-            region.register(i as u64, t);
-            tokens.push(t);
-        }
-        // Pinned at budget: the probe must bound out quickly (test-scale wait).
-        let err = probe_vm_slot_budget(&region, budget, std::time::Duration::from_millis(50));
-        assert!(matches!(err, Err(TrapError::HostResourceExhausted { .. })));
-        // One release frees a hard slot: the probe admits again.
-        region.release_token(0);
-        assert!(
-            probe_vm_slot_budget(&region, budget, std::time::Duration::from_millis(50)).is_ok()
-        );
-        drop(tokens);
     }
 }
 
@@ -22142,7 +20649,7 @@ mod frame_inventory_backend_tests {
             start: 0x4000_0000,
             ipa,
             end: 0x4000_4000,
-            host: ForkMappingHost::Borrowed(host as *mut u8),
+            host: ProcessMappingHost::Borrowed(host as *mut u8),
             size: 0x4000,
             physical_ipa: ipa,
             physical_host_addr: host as *mut u8,
@@ -23464,38 +21971,6 @@ mod tag_strip_tests {
         assert_eq!(
             strip_pointer_tag(0x0000_0001_2345_6000),
             0x0000_0001_2345_6000
-        );
-    }
-
-    #[test]
-    fn fork_footprint_classifies_guest_mapping_roles() {
-        assert_eq!(
-            super::fork_footprint_class_id(crate::memory::LINUX_MMAP_BASE, false, true),
-            super::FORK_FOOTPRINT_CLASS_PRIVATE_MMAP_ARENA
-        );
-        assert_eq!(
-            super::fork_footprint_class_id(crate::memory::LINUX_HEAP_BASE, false, true),
-            super::FORK_FOOTPRINT_CLASS_PRIVATE_HEAP
-        );
-        assert_eq!(
-            super::fork_footprint_class_id(crate::memory::LINUX_PRIVATE_OVERLAY_BASE, false, true),
-            super::FORK_FOOTPRINT_CLASS_PRIVATE_OVERLAY
-        );
-        assert_eq!(
-            super::fork_footprint_class_id(crate::memory::LINUX_SHARED_FILE_BASE, true, true),
-            super::FORK_FOOTPRINT_CLASS_SHARED_APERTURE
-        );
-        assert_eq!(
-            super::fork_footprint_class_id(crate::memory::LINUX_HIGH_VA_THRESHOLD, false, true),
-            super::FORK_FOOTPRINT_CLASS_PRIVATE_HIGH_ALIAS
-        );
-        assert_eq!(
-            super::fork_footprint_class_id(0x4000, false, false),
-            super::FORK_FOOTPRINT_CLASS_PRIVATE_RO_OR_INTERNAL
-        );
-        assert_eq!(
-            super::fork_footprint_class_id(crate::memory::LINUX_PAGE_TABLES_BASE, false, true),
-            super::FORK_FOOTPRINT_CLASS_PRIVATE_PAGE_TABLES
         );
     }
 

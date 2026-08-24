@@ -1456,6 +1456,23 @@ impl Scheduler {
         self.commit_wake(pending)
     }
 
+    /// Schedule an owner-thread control quantum without completing the
+    /// thread's guest-visible blocked continuation. This is intentionally a
+    /// separate authority from `wake`: sleep, poll, and futex readiness may
+    /// only be published by their real producers.
+    pub(crate) fn wake_control(
+        &self,
+        thread: ThreadKey,
+    ) -> Result<WakeDisposition, SchedulerError> {
+        let _transition = self.generation_transition.lock();
+        let admission = self.queue.inner.try_admit_wake()?;
+        let action = self.decide_control_wake(thread)?;
+        self.commit_wake(PendingWake {
+            action,
+            _admission: admission,
+        })
+    }
+
     fn begin_wake(&self, thread: ThreadKey) -> Result<PendingWake, SchedulerError> {
         let admission = self.queue.inner.try_admit_wake()?;
         let action = self.decide_wake(thread)?;
@@ -1487,6 +1504,51 @@ impl Scheduler {
             .exact_thread_for_scheduler(key)
             .ok_or(SchedulerError::UnknownThread)?;
         let action = thread.scheduler_wake(key)?;
+        Ok(match action {
+            ThreadSchedulerAction::Queue {
+                key,
+                predecessor,
+                generation,
+                closing_authorized,
+            } => {
+                if let Some(predecessor) = predecessor {
+                    self.observe_generation_transition(
+                        key,
+                        predecessor,
+                        generation,
+                        SchedulerGenerationTransition::Runnable,
+                    )?;
+                }
+                WakeAction::Queue {
+                    thread,
+                    key: QueueKey {
+                        thread: key,
+                        generation,
+                    },
+                    closing_authorized,
+                }
+            }
+            ThreadSchedulerAction::Kick {
+                executor,
+                executor_epoch,
+                key,
+                generation,
+            } => WakeAction::Kick(ExecutorKickToken {
+                executor,
+                executor_epoch,
+                thread: key,
+                generation,
+            }),
+            ThreadSchedulerAction::None => WakeAction::Pending,
+        })
+    }
+
+    fn decide_control_wake(&self, key: ThreadKey) -> Result<WakeAction, SchedulerError> {
+        let thread = self
+            .kernel
+            .exact_thread_for_scheduler(key)
+            .ok_or(SchedulerError::UnknownThread)?;
+        let action = thread.scheduler_control_wake(key)?;
         Ok(match action {
             ThreadSchedulerAction::Queue {
                 key,
@@ -2329,6 +2391,57 @@ mod tests {
         let next = scheduler.take(&executor).unwrap();
         assert_eq!(next.generation().raw(), first.raw() + 2);
         scheduler.settle_exited(next).unwrap();
+    }
+
+    #[test]
+    fn control_wake_during_guest_retry_does_not_invent_a_blocked_continuation() {
+        let (kernel, context) = bootstrap(12_101);
+        publish(&context, 1);
+        let scheduler = Scheduler::new(kernel);
+        let executor = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        scheduler.make_runnable(context.thread().key()).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+        scheduler
+            .settle_blocked(running, BlockedReason::ChildState)
+            .unwrap();
+
+        assert_eq!(
+            scheduler.wake_control(context.thread().key()).unwrap(),
+            WakeDisposition::Queued
+        );
+        let retry_attempt = scheduler.take(&executor).unwrap();
+        scheduler
+            .settle_blocked(retry_attempt, BlockedReason::HostWait)
+            .unwrap();
+        assert_eq!(
+            scheduler.queued_len(),
+            0,
+            "an active control quantum must park until the fork retry subscription fires"
+        );
+        assert!(matches!(
+            context.thread().execution_state(),
+            ThreadExecutionState::Blocked {
+                reason: BlockedReason::HostWait,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            scheduler.wake_control(context.thread().key()).unwrap(),
+            WakeDisposition::Queued
+        );
+        let completed_retry = scheduler.take(&executor).unwrap();
+        let quantum = context
+            .thread()
+            .finish_scheduler_control_quantum(context.thread().key())
+            .expect("finish retried control quantum");
+        assert_eq!(
+            quantum.blocked_reason, None,
+            "a fork/clone retry owns its phase state and has no deferred blocked continuation"
+        );
+        scheduler.settle_exited(completed_retry).unwrap();
     }
 
     #[test]

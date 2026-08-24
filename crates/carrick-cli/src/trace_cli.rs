@@ -45,6 +45,16 @@ use std::io::Write;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use std::path::Path;
 
+/// Replace the explicit `carrick trace` operator with its root-side instance.
+/// This process boundary is confined to the trace operator module and is never
+/// reachable from carrier/runtime execution.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub(crate) fn exec_trace_under_sudo(argv: &[OsString]) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+
+    std::process::Command::new("sudo").args(argv).exec()
+}
+
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use crate::trace_profile::TraceProfileKind;
 

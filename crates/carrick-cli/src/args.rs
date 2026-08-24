@@ -114,6 +114,15 @@ impl From<PullArg> for carrick_image::PullPolicy {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
+    /// Print the source identity embedded by `scripts/build-signed.sh`.
+    #[command(name = "__build-source-marker", hide = true)]
+    BuildSourceMarker,
+    /// Internal re-exec target for the one typed carrier-birth boundary.
+    #[command(name = "__carrier-entry", hide = true)]
+    CarrierEntry {
+        id: String,
+        grant_fd: i32,
+    },
     /// Internal process-birth qualification fixture for native profiling.
     #[command(name = "__native-profile-birth-fixture", hide = true)]
     NativeProfileBirthFixture {
@@ -395,7 +404,7 @@ pub(crate) enum Commands {
         interactive: bool,
         /// Run the container detached (like `docker run -d`): start it in the
         /// background, print its id, and return immediately. The container runs
-        /// under its own NsSupervisor with stdout/stderr captured to a log;
+        /// as one background VM carrier with stdout/stderr captured to a log;
         /// manage it with `carrick ps|stop|kill|rm`.
         #[arg(short = 'd', long = "detach", conflicts_with_all = ["tty", "interactive"])]
         detach: bool,
@@ -709,9 +718,7 @@ pub(crate) enum Commands {
         #[arg(required = true)]
         containers: Vec<String>,
     },
-    /// Run a command in a running container (like `docker exec`). The command
-    /// shares the container's filesystem and PID namespace. Requires the
-    /// container to have been started with `--fs host`.
+    /// Run a command as a logical process in a running container's carrier.
     Exec {
         /// Keep STDIN open even if not attached.
         #[arg(short = 'i', long = "interactive")]
