@@ -166,10 +166,10 @@ pub fn set_init(init_host_pid: u32) {
     let _ = region.register(init_host_pid, NS_INIT_PID, 0);
 }
 
-/// Allocate the region AND register the init in one process (no supervisor
-/// fork) — used by the degraded path / tests where translation is wanted but
-/// the supervisor process is not forked. Idempotent. Returns `false` if the
-/// shared-region mmap failed (caller stays in identity mode).
+/// Allocate the region and register the carrier as namespace init in one
+/// process. Used by the normal container launch path and by tests. Idempotent.
+/// Returns `false` if the shared-region mmap failed (caller stays in identity
+/// mode).
 pub fn init(init_host_pid: u32) -> bool {
     if !alloc_region() {
         return false;
@@ -178,7 +178,7 @@ pub fn init(init_host_pid: u32) -> bool {
     true
 }
 
-/// Crate-internal view over an explicit process section. The supervisor's unit
+/// Crate-internal view over an explicit process section. PID-namespace unit
 /// tests build a region over a private arena with this; production code goes
 /// through the [`region`] global.
 pub(crate) fn region_over(section: &'static ProcessSection) -> NsSharedRegion {
@@ -397,16 +397,15 @@ pub fn self_ns_ppid() -> u32 {
         // genuinely outside the ns would read 0, but carrick's container tree
         // has no such case below the init: every member descends from pid 1,
         // so a non-member host ppid always means "parent died" → 1.) This makes
-        // reparenting correct even before the supervisor's orphan flag lands.
+        // reparenting correct even before the carrier publishes the orphan flag.
         None => NS_INIT_PID,
     }
 }
 
 /// Namespace-visible parent pid for a registered host pid, derived from the
 /// fork-time parent recorded in the shared namespace table. This is more stable
-/// than `libc::getppid()` for Carrick guest children because the host process
-/// topology also contains runtime/supervisor processes that are not guest
-/// parents.
+/// than `libc::getppid()` because Carrick guest processes are logical tasks in
+/// one carrier and therefore do not have a corresponding host parent topology.
 pub fn ns_ppid_for_host(host_pid: u32) -> Option<u32> {
     region()?.ns_ppid_for_host(host_pid)
 }
@@ -602,10 +601,9 @@ pub fn is_execed_child_of_current(target_ns_pid: u32) -> bool {
 /// `carrick exec`: attach the running container's file-backed region and join it
 /// as a new member — a fresh ns-pid, parented OUTSIDE the namespace (the
 /// `carrick exec` CLI, so the exec'd guest's ns-ppid is 0, matching docker exec).
-/// Enables pid translation but does NOT fork a supervisor (the container already
-/// has one; its 1 s rescan arms an exit watch on this member). Returns `false`
-/// if the region cannot be mapped — the caller must then refuse to run, rather
-/// than silently execute outside the namespace.
+/// Enables pid translation while the original VM carrier remains namespace
+/// init. Returns `false` if the region cannot be mapped — the caller must then
+/// refuse to run, rather than silently execute outside the namespace.
 pub fn join_existing(path: &std::path::Path) -> bool {
     if !attach_region(path) {
         return false;
@@ -1155,7 +1153,7 @@ mod tests {
         // exited without a subreaper reap) keeps its record forever; 4096 of
         // them exhaust the section. Once the owner host pid is FULLY gone (no
         // process, no zombie — the launchd reap already happened) and no live
-        // guest waiter can still consume its exit, the supervisor sweep must
+        // guest waiter can still consume its exit, the compatibility sweep must
         // release the record.
         let region = test_region();
         region.section.init_host_pid.store(100, Ordering::Relaxed);

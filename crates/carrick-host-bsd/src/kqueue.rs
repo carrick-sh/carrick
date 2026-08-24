@@ -213,9 +213,7 @@ impl Kevent {
     /// Armed with `NOTE_EXITSTATUS` as well as `NOTE_EXIT` so the returned
     /// event's `data` field carries the exit status
     /// ([`proc_exit_status`](Self::proc_exit_status)). Under plain `NOTE_EXIT`
-    /// macOS leaves `data` at 0; the NsSupervisor needs the real status to
-    /// harvest a namespace member's exit code before launchd reaps the host
-    /// zombie (after which `waitpid` is ECHILD). Detection-only callers
+    /// macOS leaves `data` at 0. Callers that only need exit detection
     /// ([`proc_exit_ident`](Self::proc_exit_ident)) are unaffected by the extra
     /// fflag.
     pub fn proc_exit(pid: i32) -> Self {
@@ -300,9 +298,7 @@ impl Kevent {
 
     /// For a returned `EVFILT_PROC`/`NOTE_EXIT` event, the exited process's
     /// status in `waitpid(2)` out-parameter format (macOS carries it in the
-    /// `data` field, NOTE_EXITSTATUS). Used by the NsSupervisor to harvest a
-    /// namespace member's exit status at death — before launchd reaps the
-    /// host zombie, after which `waitpid` from any other process is ECHILD.
+    /// `data` field under `NOTE_EXITSTATUS`).
     pub fn proc_exit_status(self) -> i32 {
         self.0.data as i32
     }

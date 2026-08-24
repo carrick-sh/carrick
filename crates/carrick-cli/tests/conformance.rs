@@ -2583,10 +2583,10 @@ fn normalize(s: &str) -> String {
         .to_string()
 }
 
-/// Per-case run id, stamped into the carrick guest's title via CARRICK_RUN_ID
-/// (inherited across guest forks). Lets each case reap ONLY its own guests, so
-/// cases run concurrently — and alongside other lanes/worktrees — without the
-/// old global sweep killing each other's in-flight guests.
+/// Per-case run id, stamped into the carrick carrier's title via CARRICK_RUN_ID.
+/// Lets each case reap ONLY its own carrier, so cases run concurrently — and
+/// alongside other lanes/worktrees — without the old global sweep killing each
+/// other's in-flight runs.
 static CASE_SEQ: AtomicU64 = AtomicU64::new(0);
 fn case_run_id() -> String {
     format!(
@@ -2905,8 +2905,8 @@ fn indent(s: &str) -> String {
 // exit-code parity, no JSON envelope on stdout, and stdout/stderr separation —
 // against the real-docker oracle. This is the guard that the default path (the
 // one a user types most) behaves like `docker run`. It also exercises the
-// `--pid private` default, so it regression-guards the NsSupervisor exit-code
-// harvest.
+// `--pid private` default, so it regression-guards single-carrier exit-code
+// propagation.
 // ---------------------------------------------------------------------------
 
 struct ExitCase {
@@ -3122,7 +3122,7 @@ fn conformance_default_run_contract() {
 
             let mut problems = Vec::new();
             // Exit-code parity — the core P1 guarantee, and the regression guard
-            // for the NsSupervisor exit-code harvest race.
+            // for carrier terminal-status propagation.
             if i64::from(c_code) != d_code {
                 problems.push(format!("exit: carrick={c_code} docker={d_code}"));
             }
@@ -4003,8 +4003,8 @@ const TIMING_SENSITIVE_PROBES: &[&str] = &[
     // signature of host-saturation jitter, not a code regression. Serial lane.
     "waitsiblingsigchld",
     // pidnsinitreap: the orphan polls getppid() for reparent-to-init within a
-    // bounded ~2.5s window; under the 8-way gate load the NsSupervisor reparent
-    // translation can miss the window and the orphan's pipe report is lost
+    // bounded ~2.5s window; under the 8-way gate load the in-carrier reparent
+    // observation can miss the window and the orphan's pipe report is lost
     // (grandchild_report_ok=false). MATCHes 6/6 standalone — same host-saturation
     // jitter class as sigchld/waitsiblingsigchld, not a code regression.
     "pidnsinitreap",

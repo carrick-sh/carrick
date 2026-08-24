@@ -203,6 +203,9 @@ impl Runtime {
             rosetta_license_notice();
         }
         let execution_plan = crate::page_profile::resolve_execution_plan(spec)?;
+        let host_resolver_snapshot =
+            crate::vfs::HostResolverSnapshot::capture_for_network(&spec.network)
+                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         debug_assert_eq!(
             execution_plan.page_geometry.linux_page_size,
             crate::page_profile::DEFAULT_LINUX_PAGE_SIZE
@@ -313,7 +316,10 @@ impl Runtime {
                     ))
                 })?;
 
-                let mut dispatcher = SyscallDispatcher::with_network(runtime_network.clone());
+                let mut dispatcher = SyscallDispatcher::with_network_and_host_resolver(
+                    runtime_network.clone(),
+                    host_resolver_snapshot.as_ref(),
+                );
                 if let HostRootLayout::CachedLower(rootfs) = root_layout {
                     dispatcher.set_rootfs_layer(rootfs);
                 }
@@ -361,30 +367,13 @@ impl Runtime {
                 let _ = dispatcher.set_fs_backend(Box::new(host));
 
                 // Interactive pty or raw stream
-                let _supervisor_parent =
+                let _interactive_session =
                     setup_interactive_stdio(&mut dispatcher, spec.tty, spec.raw).map_err(|e| {
                         RuntimeError::FsBackend(anyhow::anyhow!(
                             "failed to setup interactive stdio: {}",
                             e
                         ))
                     })?;
-                if let Some(parent) = _supervisor_parent {
-                    let code = parent.relay_and_wait().map_err(|e| {
-                        RuntimeError::FsBackend(anyhow::anyhow!(
-                            "interactive supervisor failed: {}",
-                            e
-                        ))
-                    })?;
-                    return Ok(RunResult {
-                        exit_code: code,
-                        terminating_signal: None,
-                        stdout: Vec::new(),
-                        stderr: Vec::new(),
-                        traps: 0,
-                        report: crate::compat::CompatReport::default(),
-                        trap_limit_hit: false,
-                    });
-                }
 
                 let debug_path = spec
                     .debug_state_path
@@ -436,6 +425,9 @@ impl Runtime {
                     rootfs.clone(),
                     spec.executable.clone(),
                 );
+                if let Some(snapshot) = host_resolver_snapshot.as_ref() {
+                    dispatcher.set_host_resolver_snapshot(snapshot);
+                }
                 dispatcher.set_page_geometry(execution_plan.page_geometry);
                 let guest_hostname = effective_guest_hostname(spec);
                 dispatcher.set_guest_hostname(guest_hostname.as_ref());
@@ -467,30 +459,13 @@ impl Runtime {
                 }
 
                 // Interactive pty or raw stream
-                let _supervisor_parent =
+                let _interactive_session =
                     setup_interactive_stdio(&mut dispatcher, spec.tty, spec.raw).map_err(|e| {
                         RuntimeError::FsBackend(anyhow::anyhow!(
                             "failed to setup interactive stdio: {}",
                             e
                         ))
                     })?;
-                if let Some(parent) = _supervisor_parent {
-                    let code = parent.relay_and_wait().map_err(|e| {
-                        RuntimeError::FsBackend(anyhow::anyhow!(
-                            "interactive supervisor failed: {}",
-                            e
-                        ))
-                    })?;
-                    return Ok(RunResult {
-                        exit_code: code,
-                        terminating_signal: None,
-                        stdout: Vec::new(),
-                        stderr: Vec::new(),
-                        traps: 0,
-                        report: crate::compat::CompatReport::default(),
-                        trap_limit_hit: false,
-                    });
-                }
 
                 let debug_path = spec
                     .debug_state_path
@@ -747,33 +722,16 @@ fn setup_interactive_stdio(
     dispatcher: &mut SyscallDispatcher,
     tty: bool,
     raw: bool,
-) -> anyhow::Result<Option<crate::interactive_supervisor::InteractiveParent>> {
+) -> anyhow::Result<Option<crate::interactive_supervisor::InteractiveSession>> {
     if !tty {
         if raw {
             dispatcher.set_stream_stdio(true);
         }
         return Ok(None);
     }
-    // Guardrail: forking with a live tokio runtime deadlocks the child in
-    // BlockingPool::shutdown (the blocking-pool worker threads don't survive
-    // fork). The CLI must resolve the image under tokio, drop the runtime, then
-    // call execute — so no tokio runtime is current here.
-    debug_assert!(
-        tokio::runtime::Handle::try_current().is_err(),
-        "tokio runtime must not be live across the interactive-session fork \
-         (tokio-fork-isolation invariant)"
-    );
-    match crate::interactive_supervisor::fork_interactive_session()
-        .context("failed to create interactive session supervisor")?
-    {
-        crate::interactive_supervisor::SupervisorFork::Parent(parent) => Ok(Some(parent)),
-        crate::interactive_supervisor::SupervisorFork::Child(child) => {
-            child
-                .adopt_stdio(dispatcher)
-                .context("failed to adopt interactive pty in runtime child")?;
-            Ok(None)
-        }
-    }
+    crate::interactive_supervisor::InteractiveSession::start(dispatcher)
+        .context("failed to create carrier-local interactive PTY")
+        .map(Some)
 }
 
 #[cfg(test)]

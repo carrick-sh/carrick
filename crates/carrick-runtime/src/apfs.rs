@@ -23,8 +23,6 @@
 //!     destroy instead of an `rm -rf` of millions of inodes.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use thiserror::Error;
 
 /// Default name of the carrick-owned APFS subvolume. Visible to the
@@ -66,35 +64,21 @@ pub struct VolumeInfo {
     pub case_sensitive: bool,
 }
 
-/// Run `diskutil` with the given args; return stdout on success or
-/// a structured error on failure.
-fn run_diskutil(args: &[&str]) -> Result<String, ApfsError> {
-    let out = Command::new("diskutil")
-        .args(args)
-        .output()
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                ApfsError::DiskutilMissing
-            } else {
-                ApfsError::Io(err)
-            }
-        })?;
-    if !out.status.success() {
-        return Err(ApfsError::DiskutilFailed {
-            operation: args.join(" "),
-            code: out.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        });
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+/// Typed operator capability for the explicit `carrick volume` surface.
+///
+/// The runtime owns APFS parsing and policy, but never a process launcher. The
+/// CLI implements this capability in its operator-only module; carrier launch
+/// has no value of this type and therefore cannot invoke `diskutil`.
+pub trait ApfsOperator {
+    fn run_diskutil(&mut self, args: &[&str]) -> Result<String, ApfsError>;
 }
 
 /// Identify the APFS container that hosts the boot volume — that's
 /// where we add our subvolume so it shares the boot disk's free space
 /// (instead of carving out a new physical store). Parses
 /// `diskutil info /` for the "APFS Container" line.
-pub fn boot_apfs_container() -> Result<String, ApfsError> {
-    let stdout = run_diskutil(&["info", "/"])?;
+pub fn boot_apfs_container(operator: &mut impl ApfsOperator) -> Result<String, ApfsError> {
+    let stdout = operator.run_diskutil(&["info", "/"])?;
     for line in stdout.lines() {
         let trimmed = line.trim();
         if let Some(value) = trimmed.strip_prefix("APFS Container:") {
@@ -107,8 +91,11 @@ pub fn boot_apfs_container() -> Result<String, ApfsError> {
 /// List every APFS volume on the host, returning the subset whose
 /// name matches `name`. Used to detect "is the carrick volume already
 /// laid down?" without parsing plist (cheap, scrapeable, stable).
-pub fn find_volumes_named(name: &str) -> Result<Vec<VolumeInfo>, ApfsError> {
-    let stdout = run_diskutil(&["apfs", "list"])?;
+pub fn find_volumes_named(
+    operator: &mut impl ApfsOperator,
+    name: &str,
+) -> Result<Vec<VolumeInfo>, ApfsError> {
+    let stdout = operator.run_diskutil(&["apfs", "list"])?;
     Ok(parse_apfs_list_for(&stdout, name))
 }
 
@@ -117,8 +104,12 @@ pub fn find_volumes_named(name: &str) -> Result<Vec<VolumeInfo>, ApfsError> {
 /// or the multiple-volumes case if the user has more than one — we
 /// return `Some(first)` for the multiple case to keep the API simple;
 /// callers wanting strictness can use [`find_volumes_named`].
-pub fn find_carrick_volume() -> Result<Option<VolumeInfo>, ApfsError> {
-    Ok(find_volumes_named(DEFAULT_VOLUME_NAME)?.into_iter().next())
+pub fn find_carrick_volume(
+    operator: &mut impl ApfsOperator,
+) -> Result<Option<VolumeInfo>, ApfsError> {
+    Ok(find_volumes_named(operator, DEFAULT_VOLUME_NAME)?
+        .into_iter()
+        .next())
 }
 
 /// Create a case-sensitive APFS subvolume in the boot container.
@@ -127,11 +118,14 @@ pub fn find_carrick_volume() -> Result<Option<VolumeInfo>, ApfsError> {
 ///
 /// The subvolume shares the boot container's free space (no fixed
 /// quota by default); for a quota-bounded scratch, pass `Some(bytes)`.
-pub fn create_carrick_volume(quota_bytes: Option<u64>) -> Result<VolumeInfo, ApfsError> {
-    if let Some(existing) = find_carrick_volume()? {
+pub fn create_carrick_volume(
+    operator: &mut impl ApfsOperator,
+    quota_bytes: Option<u64>,
+) -> Result<VolumeInfo, ApfsError> {
+    if let Some(existing) = find_carrick_volume(operator)? {
         return Ok(existing);
     }
-    let container = boot_apfs_container()?;
+    let container = boot_apfs_container(operator)?;
     let mut args: Vec<String> = vec![
         "apfs".into(),
         "addVolume".into(),
@@ -147,8 +141,8 @@ pub fn create_carrick_volume(quota_bytes: Option<u64>) -> Result<VolumeInfo, Apf
         args.push(quota.to_string());
     }
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let _ = run_diskutil(&arg_refs)?;
-    find_carrick_volume()?.ok_or_else(|| {
+    let _ = operator.run_diskutil(&arg_refs)?;
+    find_carrick_volume(operator)?.ok_or_else(|| {
         ApfsError::BootContainerNotFound(
             "addVolume reported success but the new volume isn't visible to `diskutil apfs list`"
                 .to_owned(),
@@ -162,11 +156,11 @@ pub fn create_carrick_volume(quota_bytes: Option<u64>) -> Result<VolumeInfo, Apf
 /// This is destructive — anything the user (or a prior carrick run)
 /// left on the volume is gone. We require an opt-in argument to
 /// reduce footgun blast radius.
-pub fn delete_carrick_volume() -> Result<(), ApfsError> {
-    let Some(volume) = find_carrick_volume()? else {
+pub fn delete_carrick_volume(operator: &mut impl ApfsOperator) -> Result<(), ApfsError> {
+    let Some(volume) = find_carrick_volume(operator)? else {
         return Ok(());
     };
-    let _ = run_diskutil(&["apfs", "deleteVolume", &volume.device])?;
+    let _ = operator.run_diskutil(&["apfs", "deleteVolume", &volume.device])?;
     Ok(())
 }
 
@@ -174,12 +168,15 @@ pub fn delete_carrick_volume() -> Result<(), ApfsError> {
 /// volumes are usually auto-mounted, but a reboot leaves them mounted
 /// only if launchd is configured for them. Returns the volume's
 /// current mount point regardless.
-pub fn ensure_mounted(volume: &VolumeInfo) -> Result<PathBuf, ApfsError> {
+pub fn ensure_mounted(
+    operator: &mut impl ApfsOperator,
+    volume: &VolumeInfo,
+) -> Result<PathBuf, ApfsError> {
     if let Some(mp) = &volume.mount_point {
         return Ok(mp.clone());
     }
-    let _ = run_diskutil(&["mount", &volume.device])?;
-    let refreshed = find_carrick_volume()?.ok_or_else(|| {
+    let _ = operator.run_diskutil(&["mount", &volume.device])?;
+    let refreshed = find_carrick_volume(operator)?.ok_or_else(|| {
         ApfsError::BootContainerNotFound(
             "mount apparently succeeded but the volume disappeared".to_owned(),
         )

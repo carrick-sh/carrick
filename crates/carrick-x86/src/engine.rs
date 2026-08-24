@@ -28,8 +28,8 @@ use carrick_hal::threaded::{
 };
 use carrick_hal::x8664_arch::{SegmentBaseRegs, SyscallNorm, X8664GuestArch, service_arch_prctl};
 use carrick_hal::{
-    ForkOutcome, GuestEntryRegs, OsError, RawSyscall, Reg, SysReg, SyscallTrap, ThreadedEngine,
-    TrapError, X86SignalXstate, X86XstateCapabilities,
+    GuestEntryRegs, OsError, RawSyscall, Reg, SysReg, SyscallTrap, ThreadedEngine, TrapError,
+    X86SignalXstate, X86XstateCapabilities,
 };
 use carrick_mem::memory::{AddressSpace, LINUX_NULL_GUARD_END};
 
@@ -94,17 +94,6 @@ fn record_x86_syscall_stat(number: u64) {
         _ => {
             X86_SYSCALL_STATS_OVERFLOW.fetch_add(1, Ordering::Relaxed);
         }
-    }
-}
-
-fn reset_x86_syscall_stats_for_fork_child() {
-    if !x86_syscall_stats_enabled() {
-        return;
-    }
-    X86_SYSCALL_STATS_PRINTED.store(false, Ordering::Relaxed);
-    X86_SYSCALL_STATS_OVERFLOW.store(0, Ordering::Relaxed);
-    for counter in &X86_SYSCALL_STATS {
-        counter.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1261,10 +1250,6 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         self.is_forked_child
     }
 
-    fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
-        crate::engine::fork_x86(self, false)
-    }
-
     fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
         // Delegate the image replacement to the backend (it rebuilds a fresh VM
         // from `new_image` and re-points the live vCPU). The default
@@ -1367,90 +1352,6 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         self.vcpu.restore_user_segments()?;
         Ok(restored.sigmask)
     }
-}
-
-/// Shared `fork(2)` sequencing (design §2.5b). Snapshots the parent vCPU, does the
-/// host `libc::fork`, and on the child side rebuilds the guest per
-/// `fork_ram_strategy`:
-///   - `Cow` (KVM/NVMM): the child inherits RAM via COW; the backend's
-///     `rebuild_child_after_fork` may still replace VMM objects whose fds are not
-///     valid in the fork child (KVM), then the generic engine re-seeds the vCPU.
-///   - `EagerCopy` (bhyve): freeze the segment, rebuild a fresh named child VM
-///     from it (`freeze_ram` / `rebuild_child_vm`), then re-seed.
-fn fork_x86<V: X86Vmm>(
-    engine: &mut X86EngineCore<V>,
-    vfork: bool,
-) -> Result<ForkOutcome, TrapError> {
-    use crate::vmm::ForkRamStrategy;
-
-    // Snapshot the parent vCPU BEFORE forking (suspended at the trap — atomic).
-    let snap = bringup_fns::snapshot(&engine.vcpu)?;
-    let strategy = engine.vm.fork_ram_strategy();
-
-    // For EagerCopy backends, freeze the whole segment pre-fork (the parent does
-    // this so the child can rebuild from a coherent image).
-    let frozen = match strategy {
-        ForkRamStrategy::EagerCopy => engine.vm.freeze_ram()?,
-        ForkRamStrategy::Cow => Vec::new(),
-    };
-
-    // vfork (CLONE_VM|CLONE_VFORK): arm the shared-VM path PRE-fork so the child
-    // shares the parent's address space. A backend without a shared-VM path (or
-    // one whose RAM is already fork-shared) leaves this `false` and the vfork
-    // degrades to a plain CoW fork (still correct — the runtime keeps the parent
-    // suspended; only the share is absent). On KVM this allocates shared shadows.
-    let shared = if vfork {
-        engine.vm.prepare_vfork_share()?
-    } else {
-        false
-    };
-
-    // Real host fork. The run loop quiesces other threads around a guest fork;
-    // the calling thread is the only active one here.
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return Err(TrapError::ForkFailed(
-            std::io::Error::last_os_error().to_string(),
-        ));
-    }
-    if pid > 0 {
-        return Ok(ForkOutcome::Parent { child_pid: pid });
-    }
-
-    // CHILD.
-    reset_x86_syscall_stats_for_fork_child();
-    // `engine.protections` needs NO re-snapshot: `libc::fork()` already COW-copied
-    // the Arc's `Vec` into the child's address space, so the child's PROT_NONE set
-    // is an independent copy of the parent's at fork time (the shared-Arc contract
-    // only matters for CLONE_THREAD siblings inside ONE process). Do NOT "fix" this
-    // by re-snapshotting — that would double-copy.
-    if shared {
-        // vfork shared: register the child's slots over the parent's shared shadows.
-        engine
-            .vm
-            .rebuild_child_after_fork_vfork(&mut engine.vcpu, &frozen)?;
-    } else {
-        engine
-            .vm
-            .rebuild_child_after_fork(&mut engine.vcpu, &frozen)?;
-    }
-    let layout = engine.layout;
-    let child_snap = bringup_fns::seed_entry(&snap, GuestEntryRegs::default());
-    engine
-        .vm
-        .restore_vcpu(&mut engine.vcpu, layout, &child_snap)?;
-    // The child's RAM diverged from the parent (COW / eager copy), so the
-    // inherited vvar realtime_off no longer matches this process — re-calibrate
-    // the vDSO clock page (shared, no per-backend code).
-    let _ = crate::vdso::populate_vdso_vvar(&engine.vm, &engine.vcpu);
-    // Runtime still completes the clone syscall once this returns. The child has
-    // already been restored at the syscall-return point, so completion must only
-    // write RAX=0 and must not reuse the parent's pending resume PC.
-    engine.pending_resume_pc = None;
-    engine.last_syscall_canonical = None;
-    engine.sysret_resume = None;
-    engine.is_forked_child = true;
-    Ok(ForkOutcome::Child)
 }
 
 // ─── ThreadedEngine ──────────────────────────────────────────────────────────
@@ -1706,18 +1607,6 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
         self.sysret_resume = metadata.sysret_resume;
         self.is_forked_child = metadata.is_forked_child;
         Ok(())
-    }
-
-    fn fork_vfork(&mut self) -> Result<ForkOutcome, TrapError> {
-        crate::engine::fork_x86(self, true)
-    }
-
-    fn set_vfork_arena_high_water(&mut self, high_water: u64) {
-        self.vm.set_vfork_arena_high_water(high_water);
-    }
-
-    fn finish_vfork_parent(&mut self) {
-        self.vm.finish_vfork_parent();
     }
 
     fn needs_shared_file_alias_sync(&self) -> bool {

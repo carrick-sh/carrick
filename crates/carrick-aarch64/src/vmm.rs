@@ -825,64 +825,6 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// Create a fresh vCPU bound to this VM.
     fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError>;
 
-    // ── fork (skeleton shared; this is the per-VMM rebuild mechanism) ──
-    //
-    // NOTE: `fork_ram_strategy` is inherited from the shared [`GuestVmBackend`]
-    // supertrait (ISA-neutral POLICY, signature-identical with x86).
-
-    /// Freeze the guest RAM segment on the PARENT before `libc::fork`, so an
-    /// `EagerCopy` backend's child can rebuild from a coherent image. Only invoked
-    /// by the shared `fork()` when [`carrick_hal::GuestVmBackend::fork_ram_strategy`] is `EagerCopy`
-    /// (HVF, whose windows are `MAP_SHARED`); the `Cow` default (KVM) is a no-op.
-    /// Mirrors the x86 `freeze_ram`.
-    fn freeze_ram_for_fork(&mut self) -> Result<(), TrapError> {
-        Ok(())
-    }
-
-    /// Emit backend-specific pre-host-fork footprint attribution. The shared
-    /// engine calls this immediately after the process-wide `fork__footprint`
-    /// sample and immediately before `libc::fork`. Backends without per-mapping
-    /// attribution keep the no-op default.
-    fn emit_fork_footprint_attribution(&self, _arena_high_water: u64) {}
-
-    /// Child-side rebuild after `libc::fork()`: KVM rebuilds a fresh `KvmVm` over
-    /// the COW host mmaps; HVF rebuilds a fresh `applevisor` VM and re-`hv_vm_map`s
-    /// each region. This hook owns the whole child-side register re-seat (restore
-    /// `snapshot`, set x0=0, restore the real x9 = `saved_x9`, advance the child PC
-    /// past the EL1-vector sentinel store / HVC, re-calibrate the vDSO clock), since
-    /// the PC-advance distance and the post-MMIO replay are per-trap-vehicle. The
-    /// shared `fork()` then sets the engine's `is_forked_child` flag, clears the
-    /// pending/tracking state, and clones the page-table editor. (The x86
-    /// `rebuild_child_after_fork` analogue, plus the aarch64 x9/sentinel carry.)
-    fn rebuild_child_after_fork(
-        &mut self,
-        vcpu: &mut Self::Vcpu,
-        snapshot: &Aarch64VcpuSnapshot,
-        saved_x9: u64,
-    ) -> Result<(), TrapError>;
-
-    /// Parent-side rebuild after `libc::fork()`. KVM keeps its live VM untouched —
-    /// default no-op. HVF MUST tear its VM down BEFORE `libc::fork` (a live VM at
-    /// fork time makes the child's `hv_vm_create` fail), so BOTH sides rebuild a
-    /// fresh `applevisor` VM and re-`hv_vm_map` their buffers; this is the PARENT's
-    /// half (the child's is [`Self::rebuild_child_after_fork`]). The shared `fork()`
-    /// calls this on the parent branch with the same pre-fork `snapshot`/`saved_x9`.
-    /// `share_vm` is the vfork flag (`CLONE_VM`): the child shares the parent's RAM.
-    fn rebuild_parent_after_fork(
-        &mut self,
-        _vcpu: &mut Self::Vcpu,
-        _snapshot: &Aarch64VcpuSnapshot,
-        _saved_x9: u64,
-    ) -> Result<(), TrapError> {
-        Ok(())
-    }
-
-    /// Set the vfork (`CLONE_VM`) flag for the NEXT fork: the child shares the
-    /// parent's guest RAM instead of snapshotting private regions. The shared
-    /// `fork_vfork` sets this, runs the normal `fork()`, and the backend's
-    /// `freeze_ram_for_fork`/rebuild hooks read it. KVM ignores it (default no-op).
-    fn set_vfork_share(&mut self, _share_vm: bool) {}
-
     /// `execve(2)` image replacement. KVM remaps slots in place on the live VM;
     /// HVF rebuilds the VM. The shared `execve_into` calls this then reprograms
     /// sysregs (shared `program_sysregs`) + clears pending state.
@@ -1013,14 +955,6 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         self.rebind_shared_wait_state(slot, state, vcpu)
     }
 
-    /// Pre-fork admission gate (see `SyscallTrap::fork_admission_check`):
-    /// verify the host can admit the CHILD VM this fork will create, before
-    /// any teardown, so persistent exhaustion degrades to guest `EAGAIN`.
-    /// Default: no gate (KVM has no hard VM-creation ceiling).
-    fn fork_admission_check(&self) -> Result<(), TrapError> {
-        Ok(())
-    }
-
     /// Build the `Send` payload a `clone(CLONE_THREAD)` sibling needs to add its
     /// own vCPU on the SAME VM (shared VM handle + window descriptors + a
     /// live-vcpu ticket). KVM `build_sibling_spec` (ignores `vcpu`); HVF publishes
@@ -1091,25 +1025,6 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// applevisor's liveness Weak); `false` (default) for pool-swap backends.
     fn reclaim_refreshes_kicker(&self) -> bool {
         false
-    }
-
-    /// Multithreaded fork — sibling side, step 1: snapshot + destroy THIS vCPU
-    /// (raw destroy; only the owning thread may) and publish this thread's regions
-    /// so the forker can re-map them into the rebuilt parent VM. KVM no-op.
-    fn release_vcpu_for_fork(&mut self, _vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
-        Ok(())
-    }
-
-    /// Multithreaded fork — forker, after rebuilding its VM: publish a clone of the
-    /// new process VM so quiesced siblings recreate their vCPUs in it. KVM no-op.
-    fn publish_vm_for_siblings(&self) -> Result<(), TrapError> {
-        Ok(())
-    }
-
-    /// Multithreaded fork — sibling side, step 2: recreate this vCPU in the
-    /// forker's republished VM and restore the pre-fork register state. KVM no-op.
-    fn rebuild_vcpu_after_fork(&mut self, _vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
-        Ok(())
     }
 
     /// A guest thread is exiting: destroy its vCPU (freeing an HVF concurrent-vCPU

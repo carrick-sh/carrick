@@ -4619,7 +4619,7 @@ mod tests {
             "let dormant",
             ".activate(",
             "PreparedInProcessFork::SuspendVfork",
-            "if request.clone_parent",
+            "if is_external_exec || request.clone_parent",
             "PreparedInProcessFork::Retry",
             "subscribe_quiesced_progress",
             "try_acquire_topology_lock",
@@ -4766,7 +4766,9 @@ mod tests {
     }
     use crate::compat::SyscallArgs;
     use crate::dispatch::{BlockingHostWrite, DispatchOutcome, SyscallRequest, WaitFds};
-    use crate::kernel::objects::{ExecutionGeneration, MigratableTaskState, ThreadExecutionState};
+    use crate::kernel::objects::{
+        BlockedReason, ExecutionGeneration, MigratableTaskState, ThreadExecutionState,
+    };
     use crate::kernel::{ClonePlan, Kernel, KernelContext, RootBootstrap, Scheduler};
     use crate::thread::FutexTable;
 
@@ -5200,6 +5202,217 @@ mod tests {
             continuation,
             registration,
         }
+    }
+
+    fn control_quantum_fixture(
+        pid: i32,
+        family: ContinuationFamily,
+    ) -> (RaceFixture, Option<Arc<FutexTable>>) {
+        let (kernel, context) = bootstrap(pid);
+        let generation = publish(&context, pid as u64);
+        let mut futex = None;
+        let outcome = match family {
+            ContinuationFamily::WaitOnSleep => DispatchOutcome::WaitOnSleep {
+                duration: Duration::from_secs(30),
+                remaining: Some(crate::dispatch::GuestPtr(0xa000)),
+            },
+            ContinuationFamily::WaitOnPollFds => DispatchOutcome::WaitOnPollFds {
+                fds: WaitFds::empty(),
+                timeout: Some(Duration::from_secs(30)),
+                on_timeout: 0,
+                sig_mask: WaitSigMask::NONE,
+            },
+            ContinuationFamily::FutexWait => {
+                let table = Arc::new(FutexTable::new());
+                let outcome = DispatchOutcome::FutexWait {
+                    wait: table.prepare_wait(0xcafe),
+                    timeout: Some(Duration::from_secs(30)),
+                };
+                futex = Some(table);
+                outcome
+            }
+            other => panic!("unsupported control-quantum fixture {other:?}"),
+        };
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
+            outcome,
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("control-quantum continuation");
+        if let Some(table) = futex.as_ref() {
+            continuation.bind_product_futex(table);
+        }
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let executor = scheduler
+            .register_executor(Arc::new(TestKick::default()))
+            .expect("executor");
+        scheduler
+            .make_runnable(context.thread().key())
+            .expect("queue root");
+        let running = scheduler.take(&executor).expect("claim root");
+        let service = Arc::new(CarrierWaitService::new(Arc::clone(&scheduler)));
+        let registration = service.prepare_registration(&continuation);
+        (
+            RaceFixture {
+                scheduler,
+                service,
+                context,
+                executor,
+                running,
+                continuation,
+                registration,
+            },
+            futex,
+        )
+    }
+
+    #[test]
+    fn control_quantum_preserves_sleep_poll_and_futex_until_real_readiness() {
+        for (offset, family) in [
+            ContinuationFamily::WaitOnSleep,
+            ContinuationFamily::WaitOnPollFds,
+            ContinuationFamily::FutexWait,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (mut fixture, _futex) = control_quantum_fixture(15_140 + offset as i32, family);
+            fixture
+                .scheduler
+                .begin_switch_out(&fixture.running)
+                .expect("switch out");
+            fixture
+                .service
+                .enroll(&mut fixture.registration)
+                .expect("enroll");
+            let expected_id = fixture.continuation.id();
+            let expected_deadline = fixture.continuation.deadline();
+            fixture
+                .scheduler
+                .settle_blocked_continuation(
+                    fixture.running,
+                    fixture.continuation,
+                    fixture.registration,
+                )
+                .expect("park original continuation");
+
+            assert_eq!(
+                fixture
+                    .scheduler
+                    .wake_control(fixture.context.thread().key())
+                    .expect("control wake"),
+                crate::kernel::WakeDisposition::Queued
+            );
+            let running = fixture
+                .scheduler
+                .take(&fixture.executor)
+                .expect("claim control quantum");
+            let preserved = running
+                .lease()
+                .blocked_continuation()
+                .expect("preserved continuation");
+            assert_eq!(preserved.family(), family);
+            assert_eq!(preserved.id(), expected_id);
+            assert_eq!(preserved.deadline(), expected_deadline);
+            assert!(
+                preserved.ready_event().is_err(),
+                "control work fabricated {family:?} readiness"
+            );
+            let quantum = fixture
+                .context
+                .thread()
+                .finish_scheduler_control_quantum(fixture.context.thread().key())
+                .expect("finish control quantum");
+            assert_eq!(quantum.blocked_reason, Some(BlockedReason::HostWait));
+            fixture
+                .scheduler
+                .settle_blocked(running, quantum.blocked_reason.expect("blocked reason"))
+                .expect("repark exact continuation");
+
+            assert_eq!(
+                fixture
+                    .scheduler
+                    .wake(fixture.context.thread().key())
+                    .expect("real producer wake"),
+                crate::kernel::WakeDisposition::Queued
+            );
+            let ready = fixture
+                .scheduler
+                .take(&fixture.executor)
+                .expect("claim real readiness");
+            let resumed = ready
+                .lease()
+                .blocked_continuation()
+                .expect("ready continuation");
+            assert_eq!(resumed.id(), expected_id);
+            assert_eq!(resumed.deadline(), expected_deadline);
+            assert_eq!(
+                resumed.ready_event().expect("real readiness event"),
+                ContinuationEvent::Ready
+            );
+            fixture
+                .scheduler
+                .settle_exited(ready)
+                .expect("retire fixture");
+        }
+    }
+
+    #[test]
+    fn real_readiness_between_control_queue_and_claim_is_not_lost() {
+        let (mut fixture, _futex) =
+            control_quantum_fixture(15_143, ContinuationFamily::WaitOnSleep);
+        fixture
+            .scheduler
+            .begin_switch_out(&fixture.running)
+            .expect("switch out");
+        fixture
+            .service
+            .enroll(&mut fixture.registration)
+            .expect("enroll");
+        let expected_id = fixture.continuation.id();
+        fixture
+            .scheduler
+            .settle_blocked_continuation(
+                fixture.running,
+                fixture.continuation,
+                fixture.registration,
+            )
+            .expect("park");
+        assert_eq!(
+            fixture
+                .scheduler
+                .wake_control(fixture.context.thread().key())
+                .expect("queue control"),
+            crate::kernel::WakeDisposition::Queued
+        );
+        assert_eq!(
+            fixture
+                .scheduler
+                .wake(fixture.context.thread().key())
+                .expect("producer races before claim"),
+            crate::kernel::WakeDisposition::Coalesced
+        );
+        let ready = fixture
+            .scheduler
+            .take(&fixture.executor)
+            .expect("claim control plus real readiness");
+        let continuation = ready
+            .lease()
+            .blocked_continuation()
+            .expect("preserved continuation");
+        assert_eq!(continuation.id(), expected_id);
+        assert_eq!(
+            continuation.ready_event().expect("real event survives"),
+            ContinuationEvent::Ready
+        );
+        fixture
+            .context
+            .thread()
+            .finish_scheduler_control_quantum(fixture.context.thread().key())
+            .expect("finish control quantum");
+        fixture
+            .scheduler
+            .settle_exited(ready)
+            .expect("retire fixture");
     }
 
     #[derive(Debug, Default)]

@@ -1919,14 +1919,10 @@ fn read_namespace_file(path: &Path) -> Option<NamespaceFile> {
 }
 
 fn process_is_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    let rc = unsafe { libc::kill(pid, 0) };
-    if rc == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    u32::try_from(pid)
+        .ok()
+        .and_then(crate::host_proc::pid_info)
+        .is_some_and(|info| info.state != 'Z')
 }
 
 fn connect_tracked_tcp(

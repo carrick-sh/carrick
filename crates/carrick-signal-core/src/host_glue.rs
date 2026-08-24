@@ -173,13 +173,13 @@ pub fn reset_routed_handlers_after_execve<G: HostSignalGlue>(ignored: carrick_ab
 
 // ─── xsignal nudge (was kvm/bhyve/nvmm_xsig.rs) ────────────────────────────────
 
-/// Nudge `target_host_pid` to drain its xsignal entries (host `G::nudge_signum()`).
-/// A nudge to a dead pid returns ESRCH, ignored (the slot is simply never drained).
-pub fn xsig_nudge<G: HostSignalGlue>(target_host_pid: i32) {
-    // SAFETY: kill(2) with a pid and a valid signal.
-    unsafe {
-        libc::kill(target_host_pid, G::nudge_signum());
-    }
+/// Nudge the carrier to drain its xsignal entries.
+///
+/// Guest tasks are logical kernel objects inside this carrier, so a guest pid
+/// must never be translated into a host-process signal target.
+pub fn xsig_nudge<G: HostSignalGlue>(_target_host_pid: i32) {
+    crate::xsig::mark_xsig_dirty();
+    G::poke();
 }
 
 /// The xsignal nudge handler: a sibling queued a guest signal for us in the shared

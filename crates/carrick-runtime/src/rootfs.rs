@@ -222,6 +222,8 @@ pub enum RootFsError {
     Utf8(#[from] std::string::FromUtf8Error),
     #[error("too many symlinks while resolving rootfs path: {0}")]
     TooManySymlinks(String),
+    #[error("rootfs directory exceeds the caller's entry bound: {0}")]
+    DirectoryTooLarge(String),
 }
 
 /// Statistics returned by [`extract_layer_paths_to_dir`].
@@ -783,6 +785,92 @@ impl RootFs {
             .map(|name| {
                 let metadata = self.metadata_for_normalized(&dir.join(&name))?;
                 // In-memory rootfs has no host inode; getdents64 will hash the path.
+                Ok(RootFsDirEntry {
+                    name,
+                    metadata,
+                    ino: 0,
+                })
+            })
+            .collect()
+    }
+
+    /// Archive-only bounded directory enumeration. At most `limit + 1`
+    /// entries are ever retained; the extra entry is used solely to prove the
+    /// caller's cumulative archive budget was exceeded.
+    pub(crate) fn directory_entries_bounded(
+        &self,
+        path: impl AsRef<Path>,
+        limit: usize,
+    ) -> Result<Vec<RootFsDirEntry>, RootFsError> {
+        if let Some(host) = self.immutable_host.as_ref() {
+            let dir = normalize_rootfs_path(path.as_ref())?;
+            let dir_text = display_rootfs_path(&dir);
+            if !matches!(
+                host.backend.real_stat(&dir_text, true),
+                Some(RealStat {
+                    kind: RootFsEntryKind::Directory,
+                    ..
+                })
+            ) {
+                return Err(RootFsError::NotFound(dir_text));
+            }
+            let children = host
+                .backend
+                .child_names_bounded(&display_rootfs_path(&dir), limit)
+                .map_err(|_| RootFsError::NotFound(display_rootfs_path(&dir)))?;
+            if children.len() > limit {
+                return Err(RootFsError::DirectoryTooLarge(display_rootfs_path(&dir)));
+            }
+            return children
+                .into_iter()
+                .map(|(name, kind, known_size)| {
+                    let child = dir.join(&name);
+                    let child_text = display_rootfs_path(&child);
+                    let stat = host.backend.real_stat(&child_text, false);
+                    Ok(RootFsDirEntry {
+                        name,
+                        metadata: RootFsMetadata {
+                            path: child,
+                            kind: stat.map(|value| value.kind).unwrap_or(kind),
+                            mode: stat.map(|value| value.mode).unwrap_or(
+                                if kind == RootFsEntryKind::Directory {
+                                    0o755
+                                } else {
+                                    0o644
+                                },
+                            ),
+                            size: stat
+                                .and_then(|value| usize::try_from(value.size).ok())
+                                .or_else(|| known_size.and_then(|size| usize::try_from(size).ok()))
+                                .unwrap_or(0),
+                        },
+                        ino: stat.map(|value| value.ino).unwrap_or(0),
+                    })
+                })
+                .collect();
+        }
+
+        let dir = normalize_rootfs_path(path.as_ref())?;
+        if !self.directories.contains(&dir) {
+            return Err(RootFsError::NotFound(display_rootfs_path(&dir)));
+        }
+        let mut names = BTreeSet::new();
+        for child in self.files.keys().chain(self.directories.iter()) {
+            insert_child_name(&mut names, &dir, child);
+            if names.len() > limit {
+                return Err(RootFsError::DirectoryTooLarge(display_rootfs_path(&dir)));
+            }
+        }
+        for child in self.symlinks.keys() {
+            insert_child_name(&mut names, &dir, child);
+            if names.len() > limit {
+                return Err(RootFsError::DirectoryTooLarge(display_rootfs_path(&dir)));
+            }
+        }
+        names
+            .into_iter()
+            .map(|name| {
+                let metadata = self.metadata_for_normalized(&dir.join(&name))?;
                 Ok(RootFsDirEntry {
                     name,
                     metadata,

@@ -413,6 +413,62 @@ impl SyscallDispatcher {
         None
     }
 
+    pub(crate) fn validate_directory_search_as(
+        &self,
+        path: &str,
+        uid: carrick_abi::NsUid,
+        gid: carrick_abi::NsGid,
+        supplementary_groups: &[carrick_abi::NsGid],
+    ) -> Result<String, LinuxErrno> {
+        let resolved = self.canonicalize_following(path)?;
+        let metadata = self.layered_metadata(&resolved)?;
+        if metadata.kind != RootFsEntryKind::Directory {
+            return Err(crate::linux_abi::LINUX_ENOTDIR);
+        }
+        for ancestor in std::path::Path::new(&resolved).ancestors().skip(1) {
+            let ancestor = ancestor.to_string_lossy();
+            if ancestor.is_empty() || ancestor == "/" {
+                continue;
+            }
+            if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&ancestor, true)
+                && matches!(real.kind, RootFsEntryKind::Directory)
+            {
+                dac_search_directory_with_supplementary_groups(
+                    uid,
+                    gid,
+                    supplementary_groups,
+                    real.uid,
+                    real.gid,
+                    real.mode,
+                )?;
+            }
+        }
+        let (owner_uid, owner_gid, mode) = self
+            .fs
+            .rootfs_vfs
+            .overlay
+            .real_stat(&resolved, true)
+            .map(|real| (real.uid, real.gid, real.mode))
+            .unwrap_or_else(|| {
+                let (owner_uid, owner_gid) = self
+                    .fs
+                    .rootfs_vfs
+                    .overlay
+                    .get_owner(&resolved)
+                    .unwrap_or((carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT));
+                (owner_uid, owner_gid, metadata.mode)
+            });
+        dac_search_directory_with_supplementary_groups(
+            uid,
+            gid,
+            supplementary_groups,
+            owner_uid,
+            owner_gid,
+            mode,
+        )?;
+        Ok(resolved)
+    }
+
     fn fd_access(
         &self,
         context: &crate::kernel::KernelContext,
@@ -479,6 +535,30 @@ impl SyscallDispatcher {
         }
         None
     }
+}
+
+fn dac_search_directory_with_supplementary_groups(
+    uid: carrick_abi::NsUid,
+    gid: carrick_abi::NsGid,
+    supplementary_groups: &[carrick_abi::NsGid],
+    file_uid: carrick_abi::NsUid,
+    file_gid: carrick_abi::NsGid,
+    file_mode: u32,
+) -> Result<(), LinuxErrno> {
+    let matching_gid = if gid == file_gid || supplementary_groups.contains(&file_gid) {
+        file_gid
+    } else {
+        gid
+    };
+    crate::dispatch::dac_check(
+        uid,
+        matching_gid,
+        file_uid,
+        file_gid,
+        file_mode,
+        true,
+        LINUX_X_OK,
+    )
 }
 
 fn synthetic_readonly_access_for_path(path: &str, mode: u64) -> DispatchOutcome {

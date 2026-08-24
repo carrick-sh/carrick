@@ -434,6 +434,33 @@ impl Vfs for BindVfs {
         Ok(entries)
     }
 
+    fn readdir_bounded(&self, path: &str, limit: usize) -> Result<Vec<DirEnt>, VfsError> {
+        let host = self.to_host(path)?;
+        let mut entries = Vec::with_capacity(limit.saturating_add(1));
+        for entry in std::fs::read_dir(&host).map_err(map_io_error)? {
+            let entry = entry.map_err(map_io_error)?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if crate::fs_backend::is_internal_sidecar_name(&name) {
+                continue;
+            }
+            let file_type = entry.file_type().map_err(map_io_error)?;
+            let kind = if file_type.is_dir() {
+                EntryKind::Directory
+            } else if file_type.is_symlink() {
+                EntryKind::Symlink
+            } else if file_type.is_socket() || is_socket_marker(&entry.path(), true) {
+                EntryKind::Socket
+            } else {
+                EntryKind::File
+            };
+            entries.push(DirEnt { name, kind });
+            if entries.len() > limit {
+                break;
+            }
+        }
+        Ok(entries)
+    }
+
     fn open(
         &self,
         path: &str,

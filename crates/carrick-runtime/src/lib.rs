@@ -27,8 +27,9 @@
 //! Carrick has **no guest Linux kernel**. A Linux ELF is loaded into a guest
 //! address space, executed at EL0 under Apple's Hypervisor.framework (HVF), and
 //! every `svc #0` (the AArch64 syscall instruction) traps back to the host. The
-//! trapped syscall is then *emulated* — translated to Darwin host primitives
-//! (real file descriptors, `kqueue`, `__ulock`, `posix_spawn`, `fork`) — and the
+//! trapped syscall is then *emulated* — translated to carrier-local kernel
+//! state and bounded Darwin host primitives (real file descriptors, `kqueue`,
+//! `__ulock`) — and the
 //! result is written back into the guest registers before resuming. To the
 //! Linux process it is running on Linux; there is no VM image, no init, no guest
 //! ring-0 code. carrick is simultaneously the VMM *and* the kernel the guest
@@ -39,8 +40,8 @@
 //!
 //! - **The exec engine** (the leaf crate `carrick-vmm-hvf`, re-exported below under
 //!   `crate::trap`, `crate::thread`, `crate::io_wait`, …): the HVF trap engine
-//!   that owns the vCPUs, fork/exec address-space surgery, the SIMD/FP restore
-//!   shim, cross-thread vCPU coordination (the kicker, the fork/page-table
+//!   that owns the vCPUs, process/exec address-space projection, the SIMD/FP
+//!   restore shim, cross-thread vCPU coordination (the kicker and page-table
 //!   quiesce barriers), the Darwin `kqueue` wrapper, and host-signal capture.
 //!   This is the "VMM half".
 //! - **The kernel half** (this crate proper): [`dispatch`] — the syscall
@@ -70,18 +71,13 @@
 //!
 //! # Sharp edges (read before touching the lifecycle)
 //!
-//! - **HVF is not fork-safe.** A VM live in the parent at `libc::fork(2)` makes
-//!   the child's `hv_vm_create` return `HV_BUSY`. Every fork in carrick is
-//!   therefore avoided on the carrier-only HVPatch path: guest `fork(2)` creates
-//!   a logical Carrick-kernel task and never clones the host carrier. See
-//!   [`runtime`].
-//! - **A forked child must `_exit`, never unwind.** It shares the parent's fd
-//!   table; dropping an fd-owning value on the way out double-closes an inherited
-//!   fd and trips std's IO-safety abort (`SIGABRT`). The lifecycle code branches
-//!   on "am I a forked child" on every exit path for exactly this reason.
+//! - **The carrier must never fork for a guest task.** Guest `fork(2)` creates a
+//!   logical Carrick-kernel task and a distinct MM projection inside the existing
+//!   carrier. Host process creation is reserved for the typed CLI carrier-launch
+//!   boundary.
 //! - **One vCPU per guest thread, one process VM.** Stage-2 mappings are shared
 //!   across all vCPUs, but stage-1 page-table edits (mmap/mprotect/munmap) and
-//!   forks are stop-the-world events coordinated through the quiesce barriers in
+//!   process-MM changes are coordinated through the quiesce barriers in
 //!   `carrick-vmm-hvf::fork_quiesce`.
 
 // carrick-runtime is an INTERNAL crate (consumed only by carrick-engine and
@@ -257,7 +253,7 @@ pub fn current_thread_states() -> Vec<(thread::ThreadId, char)> {
 }
 
 // Under platform-linux there is no carrick-vmm-hvf to re-export `trap` from; the
-// SyscallTrap/TrapError/ForkOutcome contract lives in carrick-hal (section
+// SyscallTrap/TrapError contract lives in carrick-hal (section
 // HAL). Re-export a `trap` shim so `crate::trap::{SyscallTrap, …}` resolves on
 // both platforms. The concrete engine (HvfTrapEngine / KvmTrapEngine) is
 // selected by the run-loop, which is itself platform-gated.
@@ -267,7 +263,7 @@ pub fn current_thread_states() -> Vec<(thread::ThreadId, char)> {
     feature = "platform-netbsd"
 ))]
 pub mod trap {
-    pub use carrick_hal::{ForkOutcome, RawSyscall, SyscallTrap, TrapError};
+    pub use carrick_hal::{RawSyscall, SyscallTrap, TrapError};
     // Portable helpers the native (DSR) backend shares with the HVF trap
     // layer; real impls for every host OS live in carrick-host (the HVF trap
     // module re-exports the same symbols on macOS, so `crate::trap::…`
@@ -296,13 +292,6 @@ pub mod trap {
     pub use carrick_vmm_kvm::kvm::VCPU_LIVE;
     #[cfg(not(feature = "platform-linux"))]
     pub static VCPU_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
-    /// Clear any VM republished by a previous fork. No-op on Linux.
-    pub fn clear_rebuilt_vm_for_fork() {}
-
-    /// Reset the per-fork sibling-mapping registry. No-op on Linux (the KVM fork
-    /// rebuilds a fresh VM in the child only; no shared-VM union to collect).
-    pub fn clear_sibling_fork_mappings() {}
 
     /// Dump cross-thread kick statistics at process exit. No-op on Linux.
     pub fn dump_kick_stats() {}
@@ -1151,64 +1140,73 @@ pub mod io_wait {
         where
             F: Fn() -> bool,
         {
-            loop {
-                if child_status_ready(pid) {
-                    return WaitResult::Ready;
-                }
-                // A ptraced child (PTRACE_TRACEME, then a delivered signal) is in
-                // a signal-delivery STOP, not an exit — the WEXITED-only probe
-                // above never reports it and the park would wedge forever (LTP
-                // ptrace05 on the KVM lane). Probe the trap-stop separately:
-                //   * a guest-meaningful stop signal → Ready, so the re-dispatched
-                //     wait4's WNOHANG pre-check / blocking host wait observes the
-                //     WIFSTOPPED status (Linux reports tracee stops to wait4 even
-                //     without WUNTRACED);
-                //   * a carrick-INTERNAL signal (the SIGRTMIN vCPU kick / the
-                //     SIGRTMIN+1 xsignal nudge) → transparently PTRACE_CONT with
-                //     the signal re-injected (its handler still runs) and keep
-                //     waiting. The guest never asked for those; on HVF they don't
-                //     exist as host signals (`hv_vcpus_exit` kicks), so a traced
-                //     HVF child only ever stops for guest-raised signals.
-                match tracee_trap_stop(pid) {
-                    TraceeTrapStop::GuestSignal => return WaitResult::Ready,
-                    TraceeTrapStop::InternalSignal(sig) => {
-                        continue_tracee_with(pid, sig);
-                        continue;
+            #[cfg(not(test))]
+            {
+                let _ = (pid, block_mask, should_interrupt);
+                return WaitResult::Interrupted;
+            }
+            #[cfg(test)]
+            {
+                loop {
+                    if child_status_ready(pid) {
+                        return WaitResult::Ready;
                     }
-                    TraceeTrapStop::None => {}
-                }
-                // Still running. Park briefly (≤50 ms) in an empty `ppoll` so a
-                // delivered signal returns `Interrupted` (the loop maps that to
-                // EINTR / a fork-quiesce park), then re-poll the child. Not a busy
-                // spin — each idle slice sleeps in `ppoll`.
-                // TimedOut (slice elapsed) or a spurious Ready: re-poll the
-                // child at the loop top; only an Interrupted bails out.
-                //
-                // CRITICAL: pass `block_mask` (the caller's non-interrupting mask
-                // — blocked signals + default-ignored unblocked SIGCHLD/SIGURG/
-                // SIGWINCH) so a carrick-internal vCPU kick (SIGRTMIN, e.g. the
-                // signal pump's `kick_all` after a fork) or a default-ignored
-                // SIGCHLD does NOT spuriously surface as `Interrupted` → EINTR.
-                // A handler-less guest `wait4` is not interruptible by those on
-                // real Linux; without the mask, a parent whose `wait4` parks
-                // before the child exits gets a bogus EINTR (x86 fork race — the
-                // child exited during the park; aarch64 reaps before parking so
-                // it never bit). `ppoll_wait` retries on a masked interrupt and
-                // re-polls the child, so the wait restarts transparently.
-                if let WaitResult::Interrupted = ppoll_wait_recheck_on_masked_interrupt(
-                    self.tid,
-                    &[],
-                    Some(Duration::from_millis(50)),
-                    block_mask,
-                    &should_interrupt,
-                ) {
-                    return WaitResult::Interrupted;
+                    // A ptraced child (PTRACE_TRACEME, then a delivered signal) is in
+                    // a signal-delivery STOP, not an exit — the WEXITED-only probe
+                    // above never reports it and the park would wedge forever (LTP
+                    // ptrace05 on the KVM lane). Probe the trap-stop separately:
+                    //   * a guest-meaningful stop signal → Ready, so the re-dispatched
+                    //     wait4's WNOHANG pre-check / blocking host wait observes the
+                    //     WIFSTOPPED status (Linux reports tracee stops to wait4 even
+                    //     without WUNTRACED);
+                    //   * a carrick-INTERNAL signal (the SIGRTMIN vCPU kick / the
+                    //     SIGRTMIN+1 xsignal nudge) → transparently PTRACE_CONT with
+                    //     the signal re-injected (its handler still runs) and keep
+                    //     waiting. The guest never asked for those; on HVF they don't
+                    //     exist as host signals (`hv_vcpus_exit` kicks), so a traced
+                    //     HVF child only ever stops for guest-raised signals.
+                    match tracee_trap_stop(pid) {
+                        TraceeTrapStop::GuestSignal => return WaitResult::Ready,
+                        TraceeTrapStop::InternalSignal(sig) => {
+                            continue_tracee_with(pid, sig);
+                            continue;
+                        }
+                        TraceeTrapStop::None => {}
+                    }
+                    // Still running. Park briefly (≤50 ms) in an empty `ppoll` so a
+                    // delivered signal returns `Interrupted` (the loop maps that to
+                    // EINTR / a fork-quiesce park), then re-poll the child. Not a busy
+                    // spin — each idle slice sleeps in `ppoll`.
+                    // TimedOut (slice elapsed) or a spurious Ready: re-poll the
+                    // child at the loop top; only an Interrupted bails out.
+                    //
+                    // CRITICAL: pass `block_mask` (the caller's non-interrupting mask
+                    // — blocked signals + default-ignored unblocked SIGCHLD/SIGURG/
+                    // SIGWINCH) so a carrick-internal vCPU kick (SIGRTMIN, e.g. the
+                    // signal pump's `kick_all` after a fork) or a default-ignored
+                    // SIGCHLD does NOT spuriously surface as `Interrupted` → EINTR.
+                    // A handler-less guest `wait4` is not interruptible by those on
+                    // real Linux; without the mask, a parent whose `wait4` parks
+                    // before the child exits gets a bogus EINTR (x86 fork race — the
+                    // child exited during the park; aarch64 reaps before parking so
+                    // it never bit). `ppoll_wait` retries on a masked interrupt and
+                    // re-polls the child, so the wait restarts transparently.
+                    if let WaitResult::Interrupted = ppoll_wait_recheck_on_masked_interrupt(
+                        self.tid,
+                        &[],
+                        Some(Duration::from_millis(50)),
+                        block_mask,
+                        &should_interrupt,
+                    ) {
+                        return WaitResult::Interrupted;
+                    }
                 }
             }
         }
     }
 
     /// What a `WSTOPPED` peek of a specific child found.
+    #[cfg(test)]
     enum TraceeTrapStop {
         /// Not stopped (or `pid <= 0`, or not a ptrace trap stop).
         None,
@@ -1248,6 +1246,7 @@ pub mod io_wait {
     /// Peek (`WNOWAIT`) whether child `pid` sits in a ptrace signal-delivery
     /// stop (`CLD_TRAPPED`), without consuming any state. Only meaningful for a
     /// specific child; `pid <= 0` reports `None`.
+    #[cfg(test)]
     fn tracee_trap_stop(pid: i32) -> TraceeTrapStop {
         if pid <= 0 {
             return TraceeTrapStop::None;
@@ -1282,6 +1281,7 @@ pub mod io_wait {
     /// `PTRACE_CONT` a trap-stopped tracee, re-injecting `sig` so its handler
     /// (the kick no-op / the nudge ring-drain) still runs. Failure is benign
     /// (e.g. the tracee died meanwhile): the caller re-polls.
+    #[cfg(test)]
     fn continue_tracee_with(pid: i32, sig: i32) {
         // SAFETY: PT_CONTINUE with addr 1 ("resume where stopped") and the
         // signal to re-inject; same shape as the dispatch ptrace(PTRACE_CONT).
@@ -1297,6 +1297,7 @@ pub mod io_wait {
     /// child was already reaped, or is not ours) we report ready so the caller
     /// surfaces the real status / `ECHILD` exactly as it would without this
     /// backstop.
+    #[cfg(test)]
     fn child_status_ready(pid: i32) -> bool {
         // A ptraced child that published a pending signal-delivery stop (the
         // shared kill path marks the slot BEFORE raising) is waitable NOW: the

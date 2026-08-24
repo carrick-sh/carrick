@@ -337,33 +337,6 @@ fn sigdeath_marker_path(host_pid: u32) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(".carrick-sigdeath-{host_pid}"))
 }
 
-/// Parent side: consume the signal-death marker a just-reaped forked child left,
-/// returning the Linux signal it died by. `Some` only for a BSD-host child whose
-/// default-TERMINATE Linux signal could not be represented faithfully as a host
-/// signalled death, so it `_exit(128+N)`ed and left a marker. Always `None` on a
-/// Linux host (host signal numbers and dispositions match Linux, so the marker is
-/// never written).
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn consume_sigdeath_marker(host_pid: u32) -> Option<i32> {
-    let path = sigdeath_marker_path(host_pid);
-    let sig = *std::fs::read(&path).ok()?.first()? as i32;
-    let _ = std::fs::remove_file(&path);
-    Some(sig)
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn consume_sigdeath_marker(_host_pid: u32) -> Option<i32> {
-    None
-}
-
-/// Test-only: plant a signal-death marker exactly as `forked_child_die_by_signal`
-/// would (`[signum as u8]` at the host-pid-keyed path), so `consume_sigdeath_marker`
-/// / `translate_child_wait_status` can be unit-tested without forking a real child.
-#[cfg(all(test, not(target_os = "linux")))]
-pub(crate) fn plant_sigdeath_marker_for_test(host_pid: u32, signum: i32) {
-    let _ = std::fs::write(sigdeath_marker_path(host_pid), [signum as u8]);
-}
-
 /// Called from a forked child when a default-action signal (no installed
 /// handler) must terminate it. Flushes buffered stdio to the inherited host
 /// fds, then makes THIS host process die *by* `signum` — resetting the
@@ -774,28 +747,5 @@ mod tests {
         .expect("x86_64 ELF accepted when requested");
 
         assert_eq!(image.entry(), 0x400000);
-    }
-}
-
-#[cfg(all(test, not(target_os = "linux")))]
-mod sigdeath_marker_tests {
-    use super::*;
-
-    #[test]
-    fn marker_round_trips_then_clears() {
-        // A synthetic, host-pid-keyed marker path that no live process owns.
-        let host_pid = 0x7FFD_1234u32;
-        // Make the slot pristine in case a prior aborted run left a marker.
-        let _ = std::fs::remove_file(sigdeath_marker_path(host_pid));
-
-        // No marker yet → None.
-        assert_eq!(consume_sigdeath_marker(host_pid), None);
-
-        // Plant SIGPOLL (29) and consume it once.
-        plant_sigdeath_marker_for_test(host_pid, 29);
-        assert_eq!(consume_sigdeath_marker(host_pid), Some(29));
-
-        // Consuming is one-shot: the marker file is removed on read.
-        assert_eq!(consume_sigdeath_marker(host_pid), None);
     }
 }

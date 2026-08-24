@@ -118,6 +118,7 @@ fn is_rt_signal(signum: i32) -> bool {
 ///     non-namespaced path. The ring carries it to the receiver's dispatch
 ///     layer, which honours the guest disposition (handler/pending/SIG_DFL).
 ///   * RT signals (32..=64) — macOS has no such signal number to host-kill with.
+#[cfg(test)]
 fn cross_process_needs_xsig(signum: i32) -> bool {
     signum == crate::linux_abi::LINUX_SIGCHLD
         || signum == crate::linux_abi::LINUX_SIGPIPE
@@ -127,6 +128,7 @@ fn cross_process_needs_xsig(signum: i32) -> bool {
         || is_rt_signal(signum)
 }
 
+#[cfg(test)]
 fn namespace_member_standard_kill_needs_xsig(signum: i32) -> bool {
     (1..32).contains(&signum)
         && !matches!(
@@ -153,6 +155,7 @@ fn stop_self_by_signal(signum: i32) {
     }
 }
 
+#[cfg(test)]
 fn should_route_specific_xsig(target_host_pid: i32, signum: i32) -> bool {
     if target_host_pid <= 0 {
         return false;
@@ -2397,6 +2400,7 @@ fn rt_sigtimedwait_deliver(
         // checks the dequeued si_pid names the killer child, and an empty
         // si_pid=0 siginfo fails it on the kvm/bhyve lanes where standard
         // cross-process signals arrive as real host signals.
+        #[cfg(test)]
         let queued = queued.or_else(|| {
             let sender_host = crate::host_signal::last_sender_for(signum);
             (sender_host > 0).then(|| {
@@ -2504,9 +2508,8 @@ impl SignalTarget {
     /// The kill(2) encoding of this target — the exact i64 the old raw
     /// `target` parameter carried. Every comparison in
     /// [`bootstrap_signal_send_as`] (self test, `0` = caller's group, the
-    /// i32-range ESRCH guard, the `> 0` xsig gate) and the final `libc::kill`
-    /// operate on this value, so the sign/sentinel semantics live in one
-    /// place.
+    /// i32-range ESRCH guard and the transitional explicit-signal-ring lookup
+    /// operate on this value, so the sign/sentinel semantics live in one place.
     fn host_kill_encoding(self) -> i64 {
         match self {
             Self::HostProcess(p) | Self::HostThread(p) => i64::from(p.0),
@@ -2517,6 +2520,7 @@ impl SignalTarget {
     }
 }
 
+#[cfg(test)]
 fn host_signal_transport_allowed(hvpatch_lane: bool, _target: SignalTarget) -> bool {
     !hvpatch_lane
 }
@@ -2590,7 +2594,9 @@ pub(crate) fn bootstrap_signal_send_as(
     // send never reaches the host transport, because HVPatch resolves it in the
     // kernel graph (`hvpatch_specific_thread_signal`). The xsig ring's tid field
     // therefore carries no target here.
+    #[cfg(test)]
     let target_ns_tid = 0;
+    #[cfg(test)]
     let host_transport_allowed =
         host_signal_transport_allowed(crate::dispatch::hvpatch_lane_active(), target);
     // The raw kill(2) value this target denotes: every sign/sentinel test
@@ -2623,120 +2629,91 @@ pub(crate) fn bootstrap_signal_send_as(
         crate::host_signal::raise_for_self(signum as i32);
         return DispatchOutcome::Returned { value: 0 };
     }
-    if !host_transport_allowed {
-        return DispatchOutcome::errno(LINUX_ESRCH);
-    }
-    // kill(0) = the caller's process group. Fanning it out via a host group-kill
-    // is safe ONLY when carrick leads its own process group (so the group holds
-    // just carrick + its guest children) — true under the conformance harness
-    // (which spawns carrick with its own process group) and after any guest
-    // setpgrp/setsid. If carrick is NOT the group leader (a bare foreground
-    // `carrick run` still in the launcher's group), a host kill(0) would escape
-    // to the launcher's other jobs — so degrade to self-only delivery: correct
-    // for the contained case, safe for the shared one.
-    if target == 0 && unsafe { libc::getpgrp() } != std::process::id() as i32 {
-        if signum != 0 {
-            crate::host_signal::raise_for_self(signum as i32);
-        }
-        return DispatchOutcome::Returned { value: 0 };
-    }
-    // Cross-process: enforce kill(2)'s Linux permission model when both
-    // the caller and the target have published a guest euid. Root (euid==0)
-    // can signal anyone (matches Linux's CAP_KILL effective semantics for
-    // the simple uid-only model); a non-root caller must share the
-    // target's euid. LTP `kill05` walks this path: parent sets euid=Y,
-    // child sets euid=X (different); parent's `kill(child, SIGKILL)` must
-    // return EPERM. If we can't read either cred (peer is non-carrick or
-    // hasn't published yet) we fall through to allow — matching today's
-    // behaviour for processes outside the published set.
-    if let (Some(caller), Some(target_euid)) =
-        (caller_euid, crate::cred_ipc::read_target(target as i32))
-        && !caller.is_root()
-        && caller != target_euid
+    #[cfg(not(test))]
+    let _ = caller_euid;
+    #[cfg(not(test))]
+    return DispatchOutcome::errno(LINUX_ESRCH);
+    #[cfg(test)]
     {
-        return DispatchOutcome::errno(LINUX_EPERM);
-    }
-    // Cross-process kill: target is some other host pid. After clone(),
-    // child guests run as separate host processes — apt's parent
-    // process uses kill(child_pid, SIGINT) as part of the AcquireMethod
-    // shutdown protocol, and ESRCH here breaks the protocol with
-    // "method did not start correctly". Defer to libc::kill on the host;
-    // the host kernel knows whether `target` is one of our descendants
-    // and returns ESRCH itself if not. Negative pids (process-group kill)
-    // pass through too.
-    // target == 0 (the caller's process group) and target < -1 (a specific
-    // process group) both deliver to a host process group via libc::kill below;
-    // only an out-of-i32 target is a genuinely non-existent pid.
-    if target < i32::MIN as i64 || target > i32::MAX as i64 {
-        return DispatchOutcome::errno(LINUX_ESRCH);
-    }
-    // A plain host kill can't faithfully carry some cross-process signals to
-    // another carrick process. For private-pid-namespace members, route every
-    // catchable specific-target signal through the shared explicit-signal ring
-    // too: the ring carries sender ns-pid directly, instead of relying on a
-    // process-global host siginfo side channel that races under signal floods.
-    let route_xsig = target > 0 && should_route_specific_xsig(target as i32, signum as i32);
-    if route_xsig {
-        let sender_ns = crate::namespace::pid::self_ns_pid() as i32;
-        let sender_uid = caller_euid
-            .map(|u| u.raw())
-            .unwrap_or_else(|| unsafe { libc::getuid() });
-        // Routing still addresses the ring by host pid (`target`), so
-        // cross-process thread-directed delivery only reaches a tid the
-        // target process's registry actually has live — in practice this
-        // works where it worked before (tid == pid main threads), and now
-        // lands thread-directed in the target instead of process-directed.
-        if crate::host_signal::xsig_enqueue(
-            target as i32,
-            signum as i32,
-            crate::linux_abi::LINUX_SI_USER,
-            sender_ns,
-            sender_uid,
-            0,
-            target_ns_tid,
-        ) {
-            crate::host_signal::xsig_nudge(target as i32);
+        if !host_transport_allowed {
+            return DispatchOutcome::errno(LINUX_ESRCH);
+        }
+        // kill(0) = the caller's process group. Fanning it out via a host group-kill
+        // is safe ONLY when carrick leads its own process group (so the group holds
+        // just carrick + its guest children) — true under the conformance harness
+        // (which spawns carrick with its own process group) and after any guest
+        // setpgrp/setsid. If carrick is NOT the group leader (a bare foreground
+        // `carrick run` still in the launcher's group), a host kill(0) would escape
+        // to the launcher's other jobs — so degrade to self-only delivery: correct
+        // for the contained case, safe for the shared one.
+        if target == 0 && unsafe { libc::getpgrp() } != std::process::id() as i32 {
+            if signum != 0 {
+                crate::host_signal::raise_for_self(signum as i32);
+            }
             return DispatchOutcome::Returned { value: 0 };
         }
-        if crate::namespace::pid::enabled()
-            && namespace_member_standard_kill_needs_xsig(signum as i32)
+        // Cross-process: enforce kill(2)'s Linux permission model when both
+        // the caller and the target have published a guest euid. Root (euid==0)
+        // can signal anyone (matches Linux's CAP_KILL effective semantics for
+        // the simple uid-only model); a non-root caller must share the
+        // target's euid. LTP `kill05` walks this path: parent sets euid=Y,
+        // child sets euid=X (different); parent's `kill(child, SIGKILL)` must
+        // return EPERM. If we can't read either cred (peer is non-carrick or
+        // hasn't published yet) we fall through to allow — matching today's
+        // behaviour for processes outside the published set.
+        if let (Some(caller), Some(target_euid)) =
+            (caller_euid, crate::cred_ipc::read_target(target as i32))
+            && !caller.is_root()
+            && caller != target_euid
         {
-            return DispatchOutcome::Returned { value: 0 };
+            return DispatchOutcome::errno(LINUX_EPERM);
         }
-        // Ring full / unavailable: fall through to the host kill below.
+        // This retired non-kernel transport still parses the historical signed
+        // selector for its explicit-signal ring, but no selector may escape to a
+        // host process-control syscall. Out-of-range values name no guest task.
+        if target < i32::MIN as i64 || target > i32::MAX as i64 {
+            return DispatchOutcome::errno(LINUX_ESRCH);
+        }
+        // A plain host kill can't faithfully carry some cross-process signals to
+        // another carrick process. For private-pid-namespace members, route every
+        // catchable specific-target signal through the shared explicit-signal ring
+        // too: the ring carries sender ns-pid directly, instead of relying on a
+        // process-global host siginfo side channel that races under signal floods.
+        let route_xsig = target > 0 && should_route_specific_xsig(target as i32, signum as i32);
+        if route_xsig {
+            let sender_ns = crate::namespace::pid::self_ns_pid() as i32;
+            let sender_uid = caller_euid
+                .map(|u| u.raw())
+                .unwrap_or_else(|| unsafe { libc::getuid() });
+            // Routing still addresses the ring by host pid (`target`), so
+            // cross-process thread-directed delivery only reaches a tid the
+            // target process's registry actually has live — in practice this
+            // works where it worked before (tid == pid main threads), and now
+            // lands thread-directed in the target instead of process-directed.
+            if crate::host_signal::xsig_enqueue(
+                target as i32,
+                signum as i32,
+                crate::linux_abi::LINUX_SI_USER,
+                sender_ns,
+                sender_uid,
+                0,
+                target_ns_tid,
+            ) {
+                crate::host_signal::xsig_nudge(target as i32);
+                return DispatchOutcome::Returned { value: 0 };
+            }
+            if crate::namespace::pid::enabled()
+                && namespace_member_standard_kill_needs_xsig(signum as i32)
+            {
+                return DispatchOutcome::Returned { value: 0 };
+            }
+            // Ring full / unavailable: fall through to the host kill below.
+        }
+        // Carrick no longer has a guest-process-as-host-process lane. Specific,
+        // group, and broadcast targets must have resolved through the kernel graph
+        // above; an unresolved target is ESRCH, never a host-process operation.
+        DispatchOutcome::errno(LINUX_ESRCH)
     }
-    // THE KERNEL LANE MUST NOT REACH THE HOST WITH A GUEST PID.
-    //
-    // Everything below assumes `target` is a host pid, which it is on `native`
-    // and `vmm` where a Linux process IS a host process. On the kernel lane a
-    // Linux process is a THREAD of this host process and its pid is a
-    // carrick-kernel task id, so handing it to `libc::kill` signals whatever
-    // host process happens to own that number.
-    //
-    // That is not a future hazard, it is a live one: guest task ids are
-    // allocated from `host_pid + 1` upward
-    // (`docs/perf-results/2026-08-13-hvpatch-id-mechanism-settled.md`), and
-    // host pids in that range belong to real, unrelated processes started
-    // around the same time. It gets categorically worse once the id space is
-    // seeded at 1, where pid 1 on macOS is `launchd` — which is why this guard
-    // is a PREREQUISITE for that change rather than a consequence of it.
-    //
-    // ESRCH is the honest answer while cross-process guest signal delivery
-    // still goes through the kernel's own queues rather than the host's: it is
-    // what the host call already returns for a guest pid that matches nothing,
-    // minus the chance of hitting one that does.
-    if crate::dispatch::hvpatch_lane_active() && target > 0 {
-        return DispatchOutcome::errno(LINUX_ESRCH);
-    }
-    // Translate the Linux signum to the host's numbering: the target is a real
-    // host process, and Linux/macOS disagree on several numbers (e.g. SIGUSR1
-    // 10 vs 30). `wait4` translates the resulting status back to Linux.
-    let host_signum = crate::host_signal::linux_to_host_signum(signum as i32);
-    let rc = unsafe { libc::kill(target as i32, host_signum) };
-    if let Err(errno) = rc.host_syscall_errno() {
-        return DispatchOutcome::errno(errno);
-    }
-    DispatchOutcome::Returned { value: 0 }
 }
 
 #[cfg(test)]
@@ -3111,7 +3088,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_process_sigqueue_usr1_ring_full_returns_eagain_without_host_kill_fallback() {
+    fn retired_cross_process_sigqueue_transport_returns_esrch_without_host_fallback() {
         use zerocopy::IntoBytes;
 
         // `bootstrap_signal_send_as` is the subject here, and
@@ -3160,11 +3137,7 @@ mod tests {
             "the regression requires a full ring"
         );
 
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn signal target");
-        let child_pid = i64::from(child.id());
+        let child_pid = i64::from(i32::MAX - 1);
         assert!(
             !should_route_specific_xsig(child_pid as i32, usr1),
             "plain kill policy deliberately keeps ordinary SIGUSR1 off the ring"
@@ -3195,14 +3168,12 @@ mod tests {
             false,
         );
 
-        let _ = child.kill();
-        let _ = child.wait();
         let _ = carrick_signal_core::xsig::xsig_drain_for_self();
 
         assert_eq!(
             outcome,
-            DispatchOutcome::errno(LINUX_EAGAIN),
-            "queued delivery must report ring exhaustion instead of losing si_value via host kill"
+            DispatchOutcome::errno(LINUX_ESRCH),
+            "an unresolved logical task must never fall back to a host process transport"
         );
     }
 
@@ -3241,11 +3212,10 @@ mod tests {
             ));
         }
 
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn signal target");
-        let child_pid = i64::from(child.id());
+        // Reuse the already-existing test harness parent as a liveness witness;
+        // this regression must not create a host child merely to exercise the
+        // retired test-only credential adapter.
+        let child_pid = i64::from(unsafe { libc::getppid() });
         let target_euid = carrick_abi::NsUid::new(2000);
         let cred_path = std::path::PathBuf::from(format!("/tmp/carrick-cred-{child_pid}"));
         let _ = std::fs::remove_file(&cred_path);
@@ -3285,8 +3255,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(cred_path);
-        let _ = child.kill();
-        let _ = child.wait();
         let _ = carrick_signal_core::xsig::xsig_drain_for_self();
 
         assert_eq!(published_euid, Some(target_euid));
@@ -3306,17 +3274,18 @@ mod tests {
         // bound. The flag is carrier-global and never clears, so pin it rather
         // than inherit whatever an earlier test in this binary left behind.
         let _lane = crate::dispatch::HvpatchLaneScope::force(false);
+        let _g = XSIG_RING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         assert!(
             !crate::namespace::pid::enabled(),
             "the regression is the ordinary non-namespaced route"
         );
 
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn signal target");
-        let child_pid = i64::from(child.id());
+        // Reuse the already-existing test harness parent as a liveness witness;
+        // no Carrick-created host child belongs in this retired adapter test.
+        let child_pid = i64::from(unsafe { libc::getppid() });
         let target_euid = carrick_abi::NsUid::new(2000);
         let cred_path = std::path::PathBuf::from(format!("/tmp/carrick-cred-{child_pid}"));
         let _ = std::fs::remove_file(&cred_path);
@@ -3347,9 +3316,6 @@ mod tests {
         let outcome = d.sigqueueinfo_common(&cx, child_pid, child_pid, 0, GuestPtr(0), false);
 
         let _ = std::fs::remove_file(cred_path);
-        let _ = child.kill();
-        let _ = child.wait();
-
         assert_eq!(published_euid, Some(target_euid));
         assert_eq!(
             outcome,

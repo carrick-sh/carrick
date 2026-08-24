@@ -960,6 +960,7 @@ pub fn report_child_virtual_ptrace_stop(pid: u32) -> Option<VirtualPtraceStop> {
     })
 }
 
+#[cfg(test)]
 fn begin_virtual_ptrace_control(stop: VirtualPtraceStop, state: VirtualPtraceState) -> Option<()> {
     let record = virtual_ptrace_record_for_stop(stop, VirtualPtraceState::StopReported)?;
     let reported = VirtualPtraceControl::traced(
@@ -974,6 +975,7 @@ fn begin_virtual_ptrace_control(stop: VirtualPtraceStop, state: VirtualPtraceSta
     Some(())
 }
 
+#[cfg(test)]
 fn rollback_virtual_ptrace_control(stop: VirtualPtraceStop, state: VirtualPtraceState) -> bool {
     let Some(record) = virtual_ptrace_record_for_stop(stop, state) else {
         return false;
@@ -993,6 +995,7 @@ fn rollback_virtual_ptrace_control(stop: VirtualPtraceStop, state: VirtualPtrace
 }
 
 /// Resume a reported virtual ptrace stop using host SIGCONT.
+#[cfg(test)]
 pub fn resume_child_virtual_ptrace(stop: VirtualPtraceStop) -> bool {
     if begin_virtual_ptrace_control(stop, VirtualPtraceState::ResumeRequested).is_none() {
         return false;
@@ -1034,6 +1037,7 @@ pub fn resume_child_virtual_ptrace(stop: VirtualPtraceStop) -> bool {
 }
 
 /// Kill a reported virtual ptrace tracee using host SIGKILL.
+#[cfg(test)]
 pub fn kill_child_virtual_ptrace(stop: VirtualPtraceStop) -> bool {
     if begin_virtual_ptrace_control(stop, VirtualPtraceState::KillRequested).is_none() {
         return false;
@@ -1050,6 +1054,7 @@ pub fn kill_child_virtual_ptrace(stop: VirtualPtraceStop) -> bool {
 }
 
 /// Detach a reported virtual ptrace tracee and resume it with host SIGCONT.
+#[cfg(test)]
 pub fn detach_child_virtual_ptrace(stop: VirtualPtraceStop) -> bool {
     if begin_virtual_ptrace_control(stop, VirtualPtraceState::DetachRequested).is_none() {
         return false;

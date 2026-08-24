@@ -44,8 +44,8 @@ use crate::fs_backend::{
 };
 use crate::linux_abi::LinuxErrno;
 use crate::linux_abi::{
-    LINUX_EACCES, LINUX_EEXIST, LINUX_EFBIG, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT,
-    LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS,
+    LINUX_E2BIG, LINUX_EACCES, LINUX_EEXIST, LINUX_EFBIG, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT,
+    LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS,
 };
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 use std::sync::Arc;
@@ -1007,6 +1007,93 @@ impl Vfs for RootFsVfs {
                 .collect()),
             Err(_) => Err(LINUX_ENOTDIR),
         }
+    }
+
+    fn readdir_bounded(&self, path: &str, limit: usize) -> Result<Vec<DirEnt>, VfsError> {
+        let deleted = self
+            .overlay
+            .deleted_child_names_bounded(path, limit)
+            .map_err(|_| LINUX_ENOSYS)?;
+        if deleted.len() > limit {
+            return Err(LINUX_E2BIG);
+        }
+        let deleted = deleted
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let mut seen = std::collections::HashSet::with_capacity(limit.saturating_add(1));
+        let mut out = Vec::with_capacity(limit.saturating_add(1));
+
+        if let Some(rootfs) = self.rootfs.as_ref() {
+            match rootfs.directory_entries_bounded(path, limit) {
+                Ok(entries) => {
+                    for entry in entries {
+                        if crate::fs_backend::is_internal_sidecar_name(&entry.name)
+                            || deleted.contains(&entry.name)
+                        {
+                            continue;
+                        }
+                        let child = if path == "/" {
+                            format!("/{}", entry.name)
+                        } else {
+                            format!("{}/{}", path.trim_end_matches('/'), entry.name)
+                        };
+                        if self.overlay.shadows(&child) {
+                            continue;
+                        }
+                        seen.insert(entry.name.clone());
+                        out.push(DirEnt {
+                            name: entry.name,
+                            kind: match entry.metadata.kind {
+                                RootFsEntryKind::File => EntryKind::File,
+                                RootFsEntryKind::Directory => EntryKind::Directory,
+                                RootFsEntryKind::Symlink => EntryKind::Symlink,
+                                RootFsEntryKind::CharDevice => EntryKind::CharDevice,
+                                RootFsEntryKind::Fifo => EntryKind::Fifo,
+                                RootFsEntryKind::Socket => EntryKind::Socket,
+                            },
+                        });
+                        if out.len() > limit {
+                            return Err(LINUX_E2BIG);
+                        }
+                    }
+                }
+                Err(RootFsError::NotFound(_)) => {}
+                Err(RootFsError::DirectoryTooLarge(_)) => return Err(LINUX_E2BIG),
+                Err(_) => return Err(LINUX_ENOTDIR),
+            }
+        }
+
+        let upper = self
+            .overlay
+            .child_names_bounded(path, limit)
+            .map_err(|_| LINUX_ENOSYS)?;
+        if upper.len() > limit {
+            return Err(LINUX_E2BIG);
+        }
+        for (name, kind, _) in upper {
+            if crate::fs_backend::is_internal_sidecar_name(&name)
+                || seen.contains(&name)
+                || deleted.contains(&name)
+            {
+                continue;
+            }
+            seen.insert(name.clone());
+            out.push(DirEnt {
+                name,
+                kind: match kind {
+                    RootFsEntryKind::File => EntryKind::File,
+                    RootFsEntryKind::Directory => EntryKind::Directory,
+                    RootFsEntryKind::Symlink => EntryKind::Symlink,
+                    RootFsEntryKind::CharDevice => EntryKind::CharDevice,
+                    RootFsEntryKind::Fifo => EntryKind::Fifo,
+                    RootFsEntryKind::Socket => EntryKind::Socket,
+                },
+            });
+            if out.len() > limit {
+                return Err(LINUX_E2BIG);
+            }
+        }
+        Ok(out)
     }
 
     fn mkdir(&self, path: &str, _mode: u32) -> Result<(), VfsError> {

@@ -1775,35 +1775,8 @@ fn ns_pid_to_host(ns_pid: u32) -> Option<u32> {
 #[derive(Debug, Clone, Copy)]
 struct ProcHostPid(u32);
 
-impl ProcHostPid {
-    fn waitid_id(self) -> libc::id_t {
-        self.0 as libc::id_t
-    }
-
-    fn raw_i32(self) -> i32 {
-        self.0 as i32
-    }
-}
-
 fn host_child_exited_unreaped(pid: ProcHostPid) -> bool {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid.waitid_id(),
-            &mut info,
-            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
-        )
-    };
-    if rc != 0 {
-        return false;
-    }
-
-    const CLD_EXITED: i32 = 1;
-    const CLD_KILLED: i32 = 2;
-    const CLD_DUMPED: i32 = 3;
-    carrick_portable::si_pid(&info) == pid.raw_i32()
-        && matches!(info.si_code, CLD_EXITED | CLD_KILLED | CLD_DUMPED)
+    crate::host_proc::pid_info(pid.0).is_some_and(|info| info.state == 'Z')
 }
 
 fn mapped_existing_ns_pid(ns_pid: u32, host_pid: u32) -> bool {
@@ -3842,7 +3815,7 @@ Threads:\t1\n",
                 // uid/gid (501/20) `host_proc` reads — a sibling guest process
                 // is root:0 in the default rootful container, consistent with
                 // its own getuid()==0 and with /proc/self/status.
-                uid = crate::cred_ipc::read_target(host_pid as i32).unwrap_or(NsUid::ROOT),
+                uid = NsUid::ROOT,
                 gid = NsGid::ROOT,
             )
             .into_bytes(),
@@ -5830,68 +5803,6 @@ mod tests {
         assert!(
             stat.starts_with("2147418113 (logical-child) Z 41 40 39 "),
             "logical zombie identity/state was not preserved: {stat:?}"
-        );
-    }
-
-    /// Host-observed death must outrank a published run-state: a child that
-    /// exited but is not yet reaped reads `Z` in `/proc/<pid>/stat` even while
-    /// its (stale, unretractable) `Booting`/`Running` publish still sits in
-    /// the shared table. This is the sysvsem `semctl_getpid_child_state`
-    /// divergence: without the precedence check, the published `R` masked the
-    /// zombie on every no-ns path (native `carrick run`, HVF/native `run-elf`).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn published_run_state_does_not_mask_an_unreaped_zombie_child() {
-        // Real host fork: the child exits immediately; the parent (this test)
-        // is the only process allowed to waitid(WNOWAIT) it, matching the
-        // /proc reader whose stale-R this guards (the guest parent).
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0, "fork failed");
-        if child == 0 {
-            unsafe { libc::_exit(0) };
-        }
-        let child_pid = child as u32;
-        // The parent-side fork path publishes Booting for the child before the
-        // guest can observe it; mirror that here, then let the child die with
-        // the entry still published (nothing retires it until the reap).
-        crate::run_state::publish_child_booting(child_pid);
-
-        // Wait until the host reports the exited-unreaped child (bounded).
-        let mut zombie_seen = false;
-        for _ in 0..200 {
-            if host_child_exited_unreaped(ProcHostPid(child_pid)) {
-                zombie_seen = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(zombie_seen, "child never became an unreaped zombie");
-
-        let ctx = SyntheticProcContext::default();
-        let stat = synthetic_proc_pid_file(child_pid, "stat", "test", &ctx)
-            .expect("stat for an unreaped zombie child must resolve");
-        let stat = String::from_utf8(stat).unwrap();
-        let state = stat
-            .rsplit_once(") ")
-            .and_then(|(_, tail)| tail.chars().next())
-            .expect("stat line has a state field");
-        let status = synthetic_proc_pid_file(child_pid, "status", "test", &ctx)
-            .expect("status for an unreaped zombie child must resolve");
-        let status = String::from_utf8(status).unwrap();
-
-        // Reap + wipe the published entry BEFORE asserting so a failure does
-        // not leak a zombie or a stale shared-table slot into sibling tests.
-        let mut wait_status = 0;
-        unsafe { libc::waitpid(child, &mut wait_status, 0) };
-        crate::run_state::wipe_id_for_tests(child_pid);
-
-        assert_eq!(
-            state, 'Z',
-            "published run-state masked the zombie: {stat:?}"
-        );
-        assert!(
-            status.contains("State:\tZ (zombie)"),
-            "status must render the zombie: {status:?}"
         );
     }
 }

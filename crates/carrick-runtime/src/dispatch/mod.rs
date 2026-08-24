@@ -170,9 +170,7 @@ use crate::linux_abi::{
     LINUX_AT_STATX_FORCE_SYNC,
     LINUX_AT_SYMLINK_FOLLOW,
     LINUX_AT_SYMLINK_NOFOLLOW,
-    LINUX_BOOTSTRAP_PGID,
     LINUX_BOOTSTRAP_PID,
-    LINUX_BOOTSTRAP_SID,
     LINUX_CAPABILITY_VERSION_1,
     LINUX_CAPABILITY_VERSION_2,
     LINUX_CAPABILITY_VERSION_3,
@@ -685,15 +683,18 @@ macro_rules! syscall_table {
 }
 
 mod abi_args;
+mod archive;
+pub(crate) use archive::{
+    ArchiveEntryMetadata, ArchiveFsAuthority, ArchiveFsError, MAX_ARCHIVE_BYTES,
+};
 mod pty_registry;
 #[macro_use]
 mod creds;
 mod epoll_shim;
 pub(crate) use epoll_shim::{
-    EpollWakeRegistry, after_fork_child as reset_epoll_wake_registry_after_fork_child,
-    new_epoll_wake_registry, notify_inmem_epoll, register_epoll_kqueue, unregister_epoll_kqueue,
+    EpollWakeRegistry, new_epoll_wake_registry, notify_inmem_epoll, register_epoll_kqueue,
+    unregister_epoll_kqueue,
 };
-pub(crate) use fifo_beacon::after_fork_child as reset_fifo_beacons_after_fork_child;
 pub(crate) mod fd_table;
 mod fifo_beacon;
 pub(crate) mod ioring;
@@ -2073,22 +2074,6 @@ impl AsyncSignalWakeOwner {
             crate::timer_delivery::deliver(signum);
         }
     }
-
-    pub(crate) fn publish_thread_signal(self, target_tid: i32, signum: i32) {
-        #[cfg(feature = "platform-macos")]
-        match self {
-            Self::SignalPump => crate::host_signal::publish_pending_for(target_tid, signum),
-        }
-        #[cfg(any(
-            feature = "platform-linux",
-            feature = "platform-freebsd",
-            feature = "platform-netbsd"
-        ))]
-        {
-            let _ = self;
-            crate::host_signal::publish_pending_for(target_tid, signum);
-        }
-    }
 }
 
 pub(crate) struct HostAliasCommit {
@@ -3273,6 +3258,184 @@ mod kernel_context_tests {
             Some([carrick_abi::NsGid::new(9), carrick_abi::NsGid::new(10)].as_slice())
         );
     }
+
+    #[test]
+    fn logical_exec_workdir_is_validated_before_exact_context_mutation() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher
+            .capture_one_task_context()
+            .expect("logical exec context");
+        context
+            .resources()
+            .fs_context()
+            .set_cwd("/before".to_owned());
+
+        assert!(matches!(
+            dispatcher.configure_logical_exec_context(
+                &context,
+                Some("/definitely/missing/logical-exec-workdir"),
+                None,
+            ),
+            Err(errno) if errno == crate::linux_abi::LINUX_ENOENT,
+        ));
+        assert_eq!(context.resources().fs_context().cwd(), "/before");
+        dispatcher
+            .configure_logical_exec_context(&context, Some("/"), None)
+            .expect("root workdir");
+        assert_eq!(context.resources().fs_context().cwd(), "/");
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn logical_execvp_skips_non_executable_path_candidates() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let backend = crate::fs_backend::MemoryBackend::new();
+        backend.make_dir("/blocked").expect("blocked dir");
+        backend.make_dir("/allowed").expect("allowed dir");
+        backend
+            .set_file_contents("/blocked/tool", b"bad".to_vec())
+            .expect("blocked tool");
+        backend
+            .set_mode("/blocked/tool", 0o644)
+            .expect("blocked mode");
+        backend
+            .set_file_contents("/allowed/tool", b"good".to_vec())
+            .expect("allowed tool");
+        backend
+            .set_mode("/allowed/tool", 0o755)
+            .expect("allowed mode");
+        let _ = dispatcher.set_fs_backend(Box::new(backend));
+
+        assert_eq!(
+            dispatcher.resolve_execvp_path("tool", "/blocked:/allowed"),
+            Ok("/allowed/tool".to_owned())
+        );
+        assert_eq!(
+            dispatcher.resolve_execvp_path("tool", "/missing:/blocked"),
+            Err(crate::linux_abi::LINUX_EACCES),
+            "an executable-looking candidate that denied access wins over ENOENT",
+        );
+        assert_eq!(
+            dispatcher.resolve_execvp_path("tool", "/missing:/also-missing"),
+            Err(crate::linux_abi::LINUX_ENOENT),
+        );
+    }
+
+    #[test]
+    fn logical_exec_workdir_checks_target_credentials_before_mutation() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let scratch = tempfile::tempdir().expect("scratch root");
+        let root = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
+            .expect("scratch authority");
+        let backend = crate::fs_backend::HostFsBackend::from_existing_dir(root);
+        backend.make_dir("/secret").expect("secret dir");
+        backend.set_mode("/secret", 0o710).expect("secret mode");
+        backend
+            .set_owner(
+                "/secret",
+                Some(carrick_abi::NsUid::ROOT),
+                Some(carrick_abi::NsGid::new(2000)),
+            )
+            .expect("secret owner");
+        let _ = dispatcher.set_fs_backend(Box::new(backend));
+        let context = dispatcher.capture_one_task_context().expect("context");
+        context
+            .resources()
+            .fs_context()
+            .set_cwd("/before".to_owned());
+
+        assert!(matches!(
+            dispatcher.configure_logical_exec_context(
+                &context,
+                Some("/secret"),
+                Some((
+                    carrick_abi::NsUid::new(1000),
+                    carrick_abi::NsGid::new(1000),
+                    Vec::new(),
+                )),
+            ),
+            Err(errno) if errno == crate::linux_abi::LINUX_EACCES
+        ));
+        assert_eq!(context.resources().fs_context().cwd(), "/before");
+        assert!(context.resources().credentials().fsuid().is_root());
+
+        let configured = dispatcher
+            .configure_logical_exec_context(
+                &context,
+                Some("/secret"),
+                Some((
+                    carrick_abi::NsUid::new(1000),
+                    carrick_abi::NsGid::new(1000),
+                    vec![carrick_abi::NsGid::new(2000)],
+                )),
+            )
+            .expect("supplementary group search permission");
+        assert_eq!(context.resources().fs_context().cwd(), "/secret");
+        assert_eq!(
+            configured.resources().credentials().fsuid(),
+            carrick_abi::NsUid::new(1000)
+        );
+    }
+
+    #[test]
+    fn logical_exec_target_user_workdir_and_path_share_one_exact_resource_scope() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let scratch = tempfile::tempdir().expect("scratch root");
+        let root = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
+            .expect("scratch authority");
+        let backend = crate::fs_backend::HostFsBackend::from_existing_dir(root);
+        backend.make_dir("/private-bin").expect("private bin");
+        backend
+            .set_owner(
+                "/private-bin",
+                Some(carrick_abi::NsUid::ROOT),
+                Some(carrick_abi::NsGid::new(2000)),
+            )
+            .expect("private bin owner");
+        backend
+            .set_mode("/private-bin", 0o710)
+            .expect("private bin search mode");
+        backend
+            .set_file_contents("/private-bin/tool", b"fixture".to_vec())
+            .expect("tool");
+        backend
+            .set_owner(
+                "/private-bin/tool",
+                Some(carrick_abi::NsUid::ROOT),
+                Some(carrick_abi::NsGid::new(2000)),
+            )
+            .expect("tool owner");
+        backend
+            .set_mode("/private-bin/tool", 0o750)
+            .expect("tool mode");
+        let _ = dispatcher.set_fs_backend(Box::new(backend));
+        let context = dispatcher.capture_one_task_context().expect("context");
+        let configured = dispatcher
+            .configure_logical_exec_context(
+                &context,
+                Some("/private-bin"),
+                Some((
+                    carrick_abi::NsUid::new(1000),
+                    carrick_abi::NsGid::new(2000),
+                    Vec::new(),
+                )),
+            )
+            .expect("target user may search workdir");
+
+        let resolved = dispatcher.with_kernel_resources(&configured, || {
+            assert_eq!(
+                dispatcher.cred_snapshot().fsuid,
+                carrick_abi::NsUid::new(1000)
+            );
+            assert_eq!(
+                dispatcher.cred_snapshot().fsgid,
+                carrick_abi::NsGid::new(2000)
+            );
+            dispatcher.resolve_execvp_path("tool", "/missing:/private-bin")
+        });
+        assert_eq!(resolved, Ok("/private-bin/tool".to_owned()));
+        assert_eq!(configured.resources().fs_context().cwd(), "/private-bin");
+    }
 }
 
 /// A normalized syscall handler resolved to a bare function pointer: the
@@ -3499,6 +3662,18 @@ impl SyscallDispatcher {
         context: &crate::kernel::KernelContext,
         operation: impl FnOnce() -> R,
     ) -> R {
+        self.with_kernel_resources(context, operation)
+    }
+
+    /// Run one lifecycle transaction against the exact captured task resource
+    /// graph. Logical exec uses this after target-user/workdir configuration so
+    /// credential, file-table, filesystem-context, MM, PATH, and image reads
+    /// cannot fall back to a leader or ambient dispatcher binding.
+    pub(crate) fn with_kernel_resources<R>(
+        &self,
+        context: &crate::kernel::KernelContext,
+        operation: impl FnOnce() -> R,
+    ) -> R {
         resources::with_captured_resources(context, operation)
     }
 
@@ -3571,21 +3746,6 @@ impl SyscallDispatcher {
                 }
             }
         });
-    }
-
-    pub(crate) fn host_fork_file_authority_rejection(
-        context: &crate::kernel::KernelContext,
-        flags: u64,
-    ) -> Option<&'static str> {
-        if carrick_abi::LinuxCloneFlags::from_bits_retain(flags)
-            .contains(carrick_abi::LinuxCloneFlags::FILES)
-        {
-            return Some("cross-process CLONE_FILES needs fork-coherent fd-table authority");
-        }
-        if context.resources().files().has_splice_pushback() {
-            return Some("staged splice bytes cannot be copied across a host fork");
-        }
-        None
     }
 
     pub(crate) fn reset_one_task_kernel_binding_for_current_process(
@@ -3733,6 +3893,7 @@ impl SyscallDispatcher {
     /// therefore a prerequisite for seeding the guest id space at 1, not a
     /// consequence of it; see
     /// `docs/perf-results/2026-08-13-hvpatch-guest-pid-identity-design.md`.
+    #[cfg(test)]
     pub(crate) fn guest_pid_is_live(&self, pid: i32) -> Option<bool> {
         let process = self.hvpatch_process()?;
         let Ok(task) = crate::kernel::TaskId::from_abi_positive(pid) else {
@@ -3746,7 +3907,7 @@ impl SyscallDispatcher {
     /// Resolve a guest-supplied positive pid to another Linux PROCESS and the
     /// effective uid that process runs as.
     ///
-    /// `None` has the same meaning as in [`Self::guest_pid_is_live`]: this lane
+    /// `None` means this lane has no guest-kernel task registry to consult; this lane
     /// has no kernel task registry, so the caller keeps its host probe.
     ///
     /// Otherwise the answer comes entirely from carrick's kernel graph. That is
@@ -3976,6 +4137,10 @@ impl SyscallDispatcher {
     }
 
     pub fn new() -> Self {
+        Self::new_with_host_resolver(None)
+    }
+
+    fn new_with_host_resolver(snapshot: Option<&crate::vfs::HostResolverSnapshot>) -> Self {
         Self {
             kernel_binding: RwLock::new(bootstrap_one_task_binding()),
             timer_delivery: RwLock::new(None),
@@ -3984,7 +4149,7 @@ impl SyscallDispatcher {
             mem: Arc::new(mem::MemAuthority::new(mem::MemState::new())),
             host_alias_transactions: Arc::new(HostAliasTransactions::new()),
             proc: Mutex::new(proc::ProcState::new()),
-            fs: fs::FsState::new(),
+            fs: fs::FsState::new_with_host_resolver(snapshot),
             seccomp: crate::seccomp::SeccompState::default(),
             // Unconfined until a frontend applies a policy: bare run-elf boots
             // and unit tests keep today's handler-honest behavior.
@@ -4086,7 +4251,14 @@ impl SyscallDispatcher {
     }
 
     pub fn with_network(network: std::sync::Arc<crate::network::RuntimeNetwork>) -> Self {
-        let mut dispatcher = Self::new();
+        Self::with_network_and_host_resolver(network, None)
+    }
+
+    pub fn with_network_and_host_resolver(
+        network: std::sync::Arc<crate::network::RuntimeNetwork>,
+        snapshot: Option<&crate::vfs::HostResolverSnapshot>,
+    ) -> Self {
+        let mut dispatcher = Self::new_with_host_resolver(snapshot);
         // The run's own view replaces the boot-time host mirror in the ROOT
         // network namespace, so every surface that renders from a namespace —
         // `/sys/class/net`, the rtnetlink dumps — moves together. Previously the
@@ -4110,6 +4282,13 @@ impl SyscallDispatcher {
         }
         dispatcher.network = network;
         dispatcher
+    }
+
+    pub fn set_host_resolver_snapshot(&mut self, snapshot: &crate::vfs::HostResolverSnapshot) {
+        self.fs.vfs_mounts_mut().mount(
+            "/etc/resolv.conf",
+            Box::new(crate::vfs::ResolvConfVfs::from_host_snapshot(snapshot)),
+        );
     }
 
     pub fn with_page_geometry(page_geometry: crate::page_profile::PageGeometry) -> Self {
@@ -4168,12 +4347,6 @@ impl SyscallDispatcher {
 
     pub(crate) fn notify_inmem_epoll(&self) {
         notify_inmem_epoll(self.captured_file_table().epoll_wake_registry());
-    }
-
-    pub(crate) fn epoll_after_fork_child(&self, context: &crate::kernel::KernelContext) {
-        reset_epoll_wake_registry_after_fork_child(
-            context.resources().files().epoll_wake_registry(),
-        );
     }
 
     /// Name the run's UTS namespace (`--hostname`, or the container name).
@@ -4553,6 +4726,73 @@ impl SyscallDispatcher {
         self.publish_external_credential_projection(&context, &credentials);
     }
 
+    pub(crate) fn configure_logical_exec_context(
+        &self,
+        context: &crate::kernel::KernelContext,
+        workdir: Option<&str>,
+        user: Option<(
+            carrick_abi::NsUid,
+            carrick_abi::NsGid,
+            Vec<carrick_abi::NsGid>,
+        )>,
+    ) -> Result<crate::kernel::KernelContext, crate::linux_abi::LinuxErrno> {
+        self.with_kernel_resources(context, || {
+            self.configure_logical_exec_context_scoped(context, workdir, user)
+        })
+    }
+
+    fn configure_logical_exec_context_scoped(
+        &self,
+        context: &crate::kernel::KernelContext,
+        workdir: Option<&str>,
+        user: Option<(
+            carrick_abi::NsUid,
+            carrick_abi::NsGid,
+            Vec<carrick_abi::NsGid>,
+        )>,
+    ) -> Result<crate::kernel::KernelContext, crate::linux_abi::LinuxErrno> {
+        let current = self.cred_snapshot();
+        let (target_uid, target_gid) = user
+            .as_ref()
+            .map_or((current.fsuid, current.fsgid), |(uid, gid, _)| (*uid, *gid));
+        let target_groups = user
+            .as_ref()
+            .map_or_else(|| self.current_groups(), |(_, _, groups)| groups.clone());
+        let resolved_workdir = if let Some(path) = workdir {
+            if !path.starts_with('/') {
+                return Err(crate::linux_abi::LINUX_EINVAL);
+            }
+            Some(self.validate_directory_search_as(path, target_uid, target_gid, &target_groups)?)
+        } else {
+            None
+        };
+        let configured = if let Some((uid, gid, supplementary)) = user {
+            let updated = self.update_credentials_context(context, |credentials| {
+                credentials.seed_identity(uid, gid);
+                credentials.set_supplementary_groups(supplementary);
+            })?;
+            self.publish_external_credential_projection(
+                &updated,
+                &updated.resources().credentials(),
+            );
+            updated
+        } else {
+            context.retain_exact()
+        };
+        if let Some(resolved) = resolved_workdir {
+            let trimmed = resolved.trim_end_matches('/');
+            configured
+                .resources()
+                .fs_context()
+                .set_cwd(if trimmed.is_empty() {
+                    "/".to_owned()
+                } else {
+                    trimmed.to_owned()
+                });
+        }
+        Ok(configured)
+    }
+
     /// Record whether the guest's native ISA is x86_64 so `uname(2)` (and other
     /// arch-dependent syscalls) report it. Set once at run-image setup from
     /// `E::Arch::elf_machine()`; native aarch64 guests leave it false.
@@ -4592,6 +4832,41 @@ impl SyscallDispatcher {
         // so the flag tracks the current image across execve (x86 -> native and
         // native -> x86).
         proc.binfmt_interpreted = false;
+    }
+
+    pub(crate) fn current_exec_env(&self) -> Vec<Vec<u8>> {
+        self.proc.lock().env.clone()
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn resolve_execvp_path(
+        &self,
+        command: &str,
+        search: &str,
+    ) -> Result<String, crate::linux_abi::LinuxErrno> {
+        let mut access_denied = false;
+        for directory in search.split(':') {
+            let candidate = if directory.is_empty() {
+                command.to_owned()
+            } else {
+                format!("{}/{}", directory.trim_end_matches('/'), command)
+            };
+            match self.check_exec_target(&candidate) {
+                Ok(()) => return Ok(candidate),
+                Err(errno) if errno == crate::linux_abi::LINUX_EACCES => {
+                    access_denied = true;
+                }
+                Err(errno)
+                    if errno == crate::linux_abi::LINUX_ENOENT
+                        || errno == crate::linux_abi::LINUX_ENOTDIR => {}
+                Err(errno) => return Err(errno),
+            }
+        }
+        Err(if access_denied {
+            crate::linux_abi::LINUX_EACCES
+        } else {
+            crate::linux_abi::LINUX_ENOENT
+        })
     }
 
     /// Name of the currently-installed backend (for logging / debug).
@@ -4796,6 +5071,14 @@ impl SyscallDispatcher {
     /// reach the user's terminal before the guest exits.
     pub fn set_stream_stdio(&self, on: bool) {
         *self.io.stream_stdio.lock() = on;
+    }
+
+    pub(crate) fn enable_external_exec_capture(&self) {
+        self.io.enable_external_exec_capture();
+    }
+
+    pub(crate) fn external_exec_capture_enabled(&self) -> bool {
+        self.io.external_exec_capture_enabled()
     }
 
     /// Whether guest stdout/stderr are live inherited host descriptors. Native
@@ -5156,6 +5439,17 @@ impl SyscallDispatcher {
             .pty_table
             .lock()
             .set_controlling(host_slave_name, std::process::id())
+    }
+
+    pub(crate) fn initialize_bound_controlling_tty(
+        &self,
+    ) -> Result<(), crate::kernel::KernelError> {
+        if self.fs.pty_table.lock().controlling().is_none() {
+            return Ok(());
+        }
+        let context = self.capture_one_task_context()?;
+        context.kernel().initialize_launch_controlling_tty(&context);
+        Ok(())
     }
 
     /// Single-threaded dispatch (legacy + unit tests + the fork-based
@@ -8269,6 +8563,7 @@ pub fn rootfs_errno(error: RootFsError) -> LinuxErrno {
         RootFsError::UnsafePath(_) | RootFsError::Utf8(_) | RootFsError::TooManySymlinks(_) => {
             LINUX_EINVAL
         }
+        RootFsError::DirectoryTooLarge(_) => LINUX_E2BIG,
         RootFsError::Io(_) => LINUX_EINVAL,
     }
 }

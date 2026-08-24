@@ -108,23 +108,16 @@ pub fn bring_up(image: &AddressSpace) -> Result<HvfAarch64Engine, TrapError> {
 
 // ─── neutral ⟷ HVF VcpuSnapshot ──────────────────────────────────────────────
 //
-// HVF's `VcpuSnapshot` is now `{ core: Aarch64VcpuSnapshot, last_exit_class }`, so
-// the neutral view IS the `core` and these conversions are trivial. The
+// HVF's `VcpuSnapshot` wraps the neutral core, so these conversions are trivial. The
 // per-register HVF↔neutral mapping (CPSR ↔ pstate and the `*_EL1` sysreg names)
 // lives in `snapshot_vcpu_from`/`restore_vcpu*`; mailbox rebinding owns SP_EL1.
-// `last_exit_class` is engine-owned and not part of the neutral
-// snapshot, so `to_neutral` drops it and `from_neutral` re-attaches a
-// caller-supplied value (0 except on the engine-owned reclaim path).
 
 pub(crate) fn to_neutral(s: &VcpuSnapshot) -> Aarch64VcpuSnapshot {
     s.core.clone()
 }
 
-pub(crate) fn from_neutral(s: &Aarch64VcpuSnapshot, last_exit_class: u64) -> VcpuSnapshot {
-    VcpuSnapshot {
-        core: s.clone(),
-        last_exit_class,
-    }
+pub(crate) fn from_neutral(s: &Aarch64VcpuSnapshot) -> VcpuSnapshot {
+    VcpuSnapshot { core: s.clone() }
 }
 
 // ─── impl Aarch64Vcpu for HvfAarch64Vcpu ─────────────────────────────────────
@@ -253,7 +246,7 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         // last_exit_class is engine-owned; the neutral snapshot doesn't carry it, so
         // restore 0 (the inner restore overwrites the vCPU latch from the snapshot's
         // own field, which we set to 0 — the trap loop relatches it on the next exit).
-        HvfInner::restore_vcpu_into(&mut self.inner, &from_neutral(snap, 0))
+        HvfInner::restore_vcpu_into(&mut self.inner, &from_neutral(snap))
     }
 
     fn restore_thread_start(&mut self, snap: &Aarch64VcpuSnapshot) -> Result<(), TrapError> {
@@ -261,7 +254,7 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         // enter via the EL0 trampoline (PC=trampoline, SPSR_EL1=EL0t, ELR_EL1=snap.pc)
         // — distinct from the plain `restore` a fork resume uses. (KVM keeps the trait
         // default, which is a plain restore.)
-        HvfInner::restore_vcpu_thread_start_into(&mut self.inner, &from_neutral(snap, 0))
+        HvfInner::restore_vcpu_thread_start_into(&mut self.inner, &from_neutral(snap))
     }
 
     fn get_saved_x9(&self) -> Result<Option<u64>, TrapError> {
@@ -1439,70 +1432,6 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         Ok(HvfAarch64Vcpu::new(vcpu, mailbox))
     }
 
-    fn fork_admission_check(&self) -> Result<(), TrapError> {
-        // Pre-fork exhaustion gate: prove the host can admit the CHILD's
-        // post-fork VM rebuild (bounded probe-and-release of one plain-fork
-        // permit) BEFORE the parent tears its VM down / libc::fork's, so a
-        // parked-fleet exhaustion becomes guest fork(2)=EAGAIN instead of a
-        // post-fork HV_NO_RESOURCES fatal ("trap engine failed").
-        crate::trap::probe_fork_vm_admission()
-    }
-
-    fn freeze_ram_for_fork(&mut self) -> Result<(), TrapError> {
-        // Pre-fork (parent, single process): snapshot every PRIVATE region into a
-        // child-private copy (guest RAM is MAP_SHARED, so fork doesn't isolate it),
-        // capture the mapping descriptors, and tear down the HVF VM via the raw API
-        // (a live VM at fork time makes the child's `hv_vm_create` fail). Both sides
-        // then rebuild from the captured state.
-        self.state.fork_prepare_and_teardown()
-    }
-
-    fn emit_fork_footprint_attribution(&self, arena_high_water: u64) {
-        self.state.emit_fork_footprint_attribution(arena_high_water);
-    }
-
-    fn set_vfork_share(&mut self, share_vm: bool) {
-        self.state.set_vfork_share(share_vm);
-    }
-
-    fn rebuild_child_after_fork(
-        &mut self,
-        vcpu: &mut Self::Vcpu,
-        snapshot: &Aarch64VcpuSnapshot,
-        _saved_x9: u64,
-    ) -> Result<(), TrapError> {
-        // CHILD side: build a fresh VM, re-`hv_vm_map` the child-private snapshot
-        // buffers (+ the shared aperture), restore the register file, re-stamp the
-        // vvar RNG generation. No x9/sentinel PC-advance: the HVF HVC vehicle clobbers
-        // no GPR and ELR_EL1 (= post-svc) is restored by the snapshot, so the child
-        // resumes mid-clone exactly like the parent.
-        let snap = from_neutral(snapshot, 0);
-        self.state.fork_rebuild(
-            &mut vcpu.inner,
-            &mut vcpu.mailbox,
-            &snap,
-            /*is_child=*/ true,
-        )
-    }
-
-    fn rebuild_parent_after_fork(
-        &mut self,
-        vcpu: &mut Self::Vcpu,
-        snapshot: &Aarch64VcpuSnapshot,
-        _saved_x9: u64,
-    ) -> Result<(), TrapError> {
-        // PARENT side: rebuild a fresh VM, re-`hv_vm_map` its OWN buffers + the union
-        // of every quiesced sibling's regions, restore the register file. (HVF tore
-        // its VM down in `freeze_ram_for_fork`, so the parent must rebuild too.)
-        let snap = from_neutral(snapshot, 0);
-        self.state.fork_rebuild(
-            &mut vcpu.inner,
-            &mut vcpu.mailbox,
-            &snap,
-            /*is_child=*/ false,
-        )
-    }
-
     fn execve_rebuild(
         &mut self,
         vcpu: &mut Self::Vcpu,
@@ -1713,22 +1642,6 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn fresh_fork_kicker(&self) -> Arc<dyn VcpuRegistry> {
         Arc::new(crate::vcpu_kick::VcpuKicker::new())
-    }
-
-    // ── multithreaded-fork sibling lifecycle ──
-
-    fn release_vcpu_for_fork(&mut self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
-        self.state.release_vcpu_for_fork(&mut vcpu.inner)
-    }
-
-    fn publish_vm_for_siblings(&self) -> Result<(), TrapError> {
-        self.state.publish_vm_for_siblings();
-        Ok(())
-    }
-
-    fn rebuild_vcpu_after_fork(&mut self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
-        self.state
-            .rebuild_vcpu_after_fork(&mut vcpu.inner, &mut vcpu.mailbox)
     }
 
     fn destroy_vcpu_on_thread_exit(&mut self, vcpu: &mut Self::Vcpu) {

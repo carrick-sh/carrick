@@ -17,7 +17,6 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Bytes, Frame};
 use hyper::{Response, StatusCode};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
 /// The parsed `POST /build` query string. Docker's legacy build protocol passes
@@ -254,90 +253,49 @@ async fn run_build_streaming(
         }
     }
 
-    // 2. Build the `carrick build` argv.
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            send_error(&tx, &format!("failed to resolve carrick binary: {e}")).await;
-            return;
-        }
-    };
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("build");
-    // `carrick build` accepts a single `-t`; pass the first tag. Additional tags
-    // are not applied (documented limitation — the wrapper is single-tag).
+    // 2. Run the build in-process. `run_build` enters the unified carrier
+    // directly; the API server never creates an intermediate CLI helper.
     let primary_tag = parsed.tags.first().cloned();
-    if let Some(t) = &primary_tag {
-        cmd.arg("-t").arg(t);
-    }
-    cmd.arg("-f").arg(&parsed.dockerfile);
-    for (k, v) in &parsed.build_args {
-        cmd.arg("--build-arg").arg(format!("{k}={v}"));
-    }
-    if parsed.nocache {
-        cmd.arg("--no-cache");
-    }
-    cmd.arg(&ctx_dir);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.stdin(std::process::Stdio::null());
-    // nosemgrep: rust.lang.security.args.command-injection -- the server spawns
-    // itself (current_exe) with build inputs as separate argv entries, never a
-    // shell; a CLI that re-execs itself is the established serve pattern.
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            send_error(&tx, &format!("failed to spawn carrick build: {e}")).await;
-            return;
-        }
-    };
-
-    // 3. Forward stdout + stderr line-by-line as `{"stream":...}` frames. kaniko
-    // writes its build progress to stderr and our wrapper prints "Successfully
-    // built/tagged" to stdout, so merge both into the one Docker stream.
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    if let Some(out) = stdout {
-        let mut lines = BufReader::new(out).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if !send_json(&tx, serde_json::json!({ "stream": format!("{line}\n") })).await {
-                break;
-            }
-        }
-    }
-    if let Some(err) = stderr {
-        let mut lines = BufReader::new(err).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if !send_json(&tx, serde_json::json!({ "stream": format!("{line}\n") })).await {
-                break;
-            }
-        }
-    }
-
-    // 4. Terminal frame: aux ID on success, error on failure.
-    match child.wait().await {
-        Ok(status) if status.success() => {
-            let tag = primary_tag.unwrap_or_else(|| "carrick-build:latest".to_string());
+    let build_args = parsed
+        .build_args
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    let tag_for_result = primary_tag
+        .clone()
+        .unwrap_or_else(|| "carrick-build:latest".to_owned());
+    let _ = send_json(
+        &tx,
+        serde_json::json!({ "stream": format!("Building {tag_for_result} in the Carrick carrier\n") }),
+    )
+    .await;
+    let build = tokio::task::spawn_blocking(move || {
+        crate::commands::run_build(
+            &carrick_image::ImageStore::default_for_user(),
+            primary_tag,
+            std::path::PathBuf::from(parsed.dockerfile),
+            build_args,
+            parsed.nocache,
+            false,
+            None,
+            None,
+            None,
+            false,
+            ctx_dir,
+        )
+    })
+    .await;
+    match build {
+        Ok(Ok(())) => {
             let _ = send_json(
                 &tx,
-                serde_json::json!({ "stream": format!("Successfully built {tag}\n") }),
+                serde_json::json!({ "stream": format!("Successfully built {tag_for_result}\n") }),
             )
             .await;
-            // An `aux` frame carrying the (tag-as-)ID lets bollard's build stream
-            // surface a build result; we don't have the digest handy here, so use
-            // the tag as a stable identifier.
-            let _ = send_json(&tx, serde_json::json!({ "aux": { "ID": tag } })).await;
+            let _ = send_json(&tx, serde_json::json!({ "aux": { "ID": tag_for_result } })).await;
         }
-        Ok(status) => {
-            send_error(
-                &tx,
-                &format!("build failed (carrick build exited with {status})"),
-            )
-            .await;
-        }
-        Err(e) => {
-            send_error(&tx, &format!("failed to wait for carrick build: {e}")).await;
-        }
+        Ok(Err(error)) => send_error(&tx, &format!("build failed: {error:#}")).await,
+        Err(error) => send_error(&tx, &format!("build task failed: {error}")).await,
     }
     // tmp (and the unpacked context) is dropped here, cleaning up the temp dir.
     drop(tmp);

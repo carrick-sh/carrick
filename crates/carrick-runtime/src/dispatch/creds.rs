@@ -137,12 +137,7 @@ fn resolve_prio_process_target<M: GuestMemory>(
     if is_self {
         return PrioTarget::Caller;
     }
-    match crate::namespace::pid::ns_to_host_or_self(who as u32) {
-        Some(h) if crate::host_proc::is_guest_process(h) => PrioTarget::Other {
-            euid: crate::cred_ipc::read_target(h as i32).unwrap_or(NsUid::ROOT),
-        },
-        _ => PrioTarget::NotFound,
-    }
+    PrioTarget::NotFound
 }
 
 /// The Linux `(uid_t)-1` "leave unchanged" sentinel. uid_t is unsigned, so the
@@ -287,6 +282,15 @@ impl SyscallDispatcher {
         kernel: &crate::kernel::KernelContext,
         update: impl FnOnce(&mut crate::kernel::Credentials),
     ) -> Result<Arc<crate::kernel::Credentials>, LinuxErrno> {
+        self.update_credentials_context(kernel, update)
+            .map(|updated| updated.resources().credentials())
+    }
+
+    pub(super) fn update_credentials_context(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        update: impl FnOnce(&mut crate::kernel::Credentials),
+    ) -> Result<crate::kernel::KernelContext, LinuxErrno> {
         // Snapshot the uid identity BEFORE the update: a uid transition
         // rewrites the capability sets (capabilities(7)), and this is the one
         // path every set*uid/set*gid/setfsuid handler funnels through, so the
@@ -302,7 +306,7 @@ impl SyscallDispatcher {
                 if before != after {
                     apply_uid_transition_capabilities(kernel, before, after);
                 }
-                Ok(credentials)
+                Ok(updated)
             }
             Err(
                 crate::kernel::KernelOperationError::StaleContext

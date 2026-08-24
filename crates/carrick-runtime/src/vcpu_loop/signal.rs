@@ -601,7 +601,7 @@ where
             let queued_siginfo = if reserved.is_some() {
                 dequeued_siginfo
             } else {
-                dequeued_siginfo
+                let queued_siginfo = dequeued_siginfo
                     .or_else(|| {
                         (!from_dispatcher)
                             .then(|| dispatcher.take_pending_siginfo(context, tid, pending))
@@ -628,23 +628,24 @@ where
                                 )
                             },
                         )
+                    });
+                #[cfg(test)]
+                let queued_siginfo = queued_siginfo.or_else(|| {
+                    let sender_host = crate::host_signal::last_sender_for(pending);
+                    (sender_host > 0).then(|| {
+                        let ns_pid =
+                            crate::namespace::pid::host_to_ns_or_self(sender_host as u32) as i32;
+                        let uid = crate::cred_ipc::read_target(sender_host)
+                            .unwrap_or(carrick_abi::NsUid::ROOT);
+                        crate::linux_abi::LinuxSiginfo::kill(
+                            pending,
+                            crate::linux_abi::LINUX_SI_USER,
+                            ns_pid,
+                            uid.raw(),
+                        )
                     })
-                    .or_else(|| {
-                        let sender_host = crate::host_signal::last_sender_for(pending);
-                        (sender_host > 0).then(|| {
-                            let ns_pid =
-                                crate::namespace::pid::host_to_ns_or_self(sender_host as u32)
-                                    as i32;
-                            let uid = crate::cred_ipc::read_target(sender_host)
-                                .unwrap_or(carrick_abi::NsUid::ROOT);
-                            crate::linux_abi::LinuxSiginfo::kill(
-                                pending,
-                                crate::linux_abi::LINUX_SI_USER,
-                                ns_pid,
-                                uid.raw(),
-                            )
-                        })
-                    })
+                });
+                queued_siginfo
             };
             match trap.inject_signal(
                 pending,
@@ -717,10 +718,6 @@ mod tests {
         }
 
         fn complete_syscall(&mut self, _return_value: i64) -> Result<(), TrapError> {
-            Err(TrapError::UnsupportedPlatform)
-        }
-
-        fn fork(&mut self) -> Result<crate::trap::ForkOutcome, TrapError> {
             Err(TrapError::UnsupportedPlatform)
         }
 
@@ -900,74 +897,6 @@ mod tests {
         .expect("reserved default delivery")
         .expect("captured default action");
         assert_eq!(action.term_signal, Some(signum));
-    }
-
-    fn native_geometry() -> crate::page_profile::PageGeometry {
-        crate::page_profile::PageGeometry {
-            host_page_size: 16 * 1024,
-            linux_page_size: 16 * 1024,
-            native_profile: Some(carrick_spec::NativePageProfile::Native16k),
-        }
-    }
-
-    #[test]
-    fn ptrace_signal_stop_queued_native_signal_reports_and_resumes() {
-        let _guard = PTRACE_SIGNAL_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        crate::guest_cpu::init_child_table();
-        let tracer_pid = std::process::id();
-        let prepared = crate::guest_cpu::prepare_child_record_pre_fork(tracer_pid, 0, 0, false, 0)
-            .expect("prepare native queued-signal child");
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0, "fork failed");
-        if child == 0 {
-            crate::guest_cpu::complete_child_record_post_fork_child();
-            let dispatcher = SyscallDispatcher::with_page_geometry(native_geometry());
-            dispatcher.set_ptrace_traceme_for_test();
-            if !crate::guest_cpu::register_self_virtual_ptrace(tracer_pid) {
-                unsafe { libc::_exit(70) };
-            }
-            let tid = ThreadId::main_from_host_pid();
-            dispatcher.mark_signal_pending(
-                &dispatcher.exact_signal_context_for_test(),
-                tid,
-                crate::linux_abi::LINUX_SIGUSR2,
-            );
-            let mut trap = NoopTrap::default();
-            if deliver_pending_signal(
-                &mut trap,
-                &dispatcher,
-                &dispatcher.exact_signal_context_for_test(),
-                None,
-                tid,
-                None,
-            )
-            .is_err()
-            {
-                unsafe { libc::_exit(71) };
-            }
-            unsafe { libc::_exit(42) };
-        }
-
-        crate::guest_cpu::publish_prepared_child_record_parent_ref(prepared, child as u32);
-        let mut stop_status = 0;
-        assert_eq!(
-            unsafe { libc::waitpid(child, &mut stop_status, libc::WUNTRACED) },
-            child
-        );
-        assert!(libc::WIFSTOPPED(stop_status));
-        assert_eq!(libc::WSTOPSIG(stop_status), libc::SIGSTOP);
-        let stop = crate::guest_cpu::report_child_virtual_ptrace_stop(child as u32)
-            .expect("queued virtual stop");
-        assert_eq!(stop.linux_signum(), crate::linux_abi::LINUX_SIGUSR2);
-        assert!(crate::guest_cpu::resume_child_virtual_ptrace(stop));
-
-        let mut exit_status = 0;
-        assert_eq!(unsafe { libc::waitpid(child, &mut exit_status, 0) }, child);
-        assert!(libc::WIFEXITED(exit_status));
-        assert_eq!(libc::WEXITSTATUS(exit_status), 42);
-        let _ = crate::guest_cpu::reap_child_guest_ns(child as u32);
     }
 
     #[test]

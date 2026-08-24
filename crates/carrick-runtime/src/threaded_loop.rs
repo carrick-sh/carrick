@@ -176,11 +176,36 @@ fn main_registry_id() -> crate::thread::ThreadId {
     crate::thread::ThreadId::from_guest_supplied_tid(carrick_abi::LINUX_BOOTSTRAP_PID as i32)
 }
 
-pub fn run_threaded_loop<E, H>(
+pub(crate) struct ThreadedLoopCompletion {
+    pub(crate) run: Result<RunResult, RuntimeError>,
+    pub(crate) carrier_control: Option<crate::kernel::control::ManagedCarrierControl>,
+}
+
+pub(crate) fn run_threaded_loop<E, H>(
+    engine: E,
+    dispatcher: SyscallDispatcher,
+    host: H,
+    max_traps: usize,
+) -> ThreadedLoopCompletion
+where
+    E: carrick_hal::ThreadedEngine + 'static,
+    E::SiblingSpec: 'static,
+    H: HostBackend,
+{
+    let mut carrier_control = None;
+    let run = run_threaded_loop_inner(engine, dispatcher, host, max_traps, &mut carrier_control);
+    ThreadedLoopCompletion {
+        run,
+        carrier_control,
+    }
+}
+
+fn run_threaded_loop_inner<E, H>(
     mut engine: E,
     dispatcher: SyscallDispatcher,
     host: H,
     max_traps: usize,
+    carrier_control: &mut Option<crate::kernel::control::ManagedCarrierControl>,
 ) -> Result<RunResult, RuntimeError>
 where
     E: carrick_hal::ThreadedEngine + 'static,
@@ -319,6 +344,65 @@ where
         })?;
     }
     kernel.register_hvpatch_runtime_endpoint(Arc::clone(&futex), Arc::clone(&kicker));
+    let mut control_exec = None;
+    // Mutating carrier control is mandatory for a managed detached container.
+    // Publish Running only after the socket is bound and the exact root task has
+    // a live wake route; stop/kill must never race a half-bootstrapped carrier.
+    if let Ok(container_id) = std::env::var("CARRICK_CONTAINER_ID") {
+        let launch_authorization = std::env::var("CARRICK_LAUNCH_AUTHORIZATION").map_err(|_| {
+            RuntimeError::Configuration(
+                "managed container omitted exact carrier launch authorization".to_owned(),
+            )
+        })?;
+        let process = kernel.hvpatch_process.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "managed container has no HVPatch root for carrier control".to_owned(),
+            )
+        })?;
+        let runtime = crate::kernel::control::ExecRuntime::new(64);
+        let archive_runtime = Arc::new(crate::kernel::control::ArchiveRuntime::new(
+            kernel.dispatcher.archive_authority(),
+            8,
+        ));
+        kernel.install_control_exec_runtime(runtime.clone())?;
+        let guard = crate::kernel::control::ManagedCarrierControl::start(
+            Arc::clone(process.kernel_graph()),
+            process.task_key(),
+            &container_id,
+            &launch_authorization,
+        )
+        .map_err(|error| {
+            RuntimeError::Configuration(format!("start carrier control endpoint: {error}"))
+        })?;
+        guard
+            .exec_admission_slot()
+            .ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "managed carrier control omitted logical exec admission slot".to_owned(),
+                )
+            })?
+            .install(Arc::new(runtime.clone()))
+            .map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "install carrier logical exec admission: {error}"
+                ))
+            })?;
+        guard
+            .archive_admission_slot()
+            .ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "managed carrier control omitted VFS archive admission slot".to_owned(),
+                )
+            })?
+            .install(archive_runtime)
+            .map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "install carrier VFS archive admission: {error}"
+                ))
+            })?;
+        control_exec = Some(runtime);
+        *carrier_control = Some(guard);
+    }
     debug_assert!(kernel.hvpatch_process.as_ref().is_none_or(|process| {
         process.pid() == carrick_abi::LINUX_BOOTSTRAP_PID as i32
             && process.live_process_count() == 1
@@ -346,7 +430,7 @@ where
         host_for_factory.make_timer_delivery(Arc::clone(&kicker), main_tid),
     );
 
-    let (outcome, pool_shutdown) = crate::vcpu_loop::launch_persistent_hvpatch_job(
+    let launch = crate::vcpu_loop::launch_persistent_hvpatch_job(
         Arc::clone(&kernel),
         engine,
         Arc::clone(&registry),
@@ -360,8 +444,11 @@ where
         // The main guest thread's lifetime in-guest handshake flag.
         carrick_hal::InGuestFlag::for_guest_thread(),
         max_traps,
-    )
-    .wait_deferring_pool_shutdown();
+    );
+    if let Some(exec) = control_exec {
+        kernel.install_control_exec_waker(&exec, root_linux_tid)?;
+    }
+    let (outcome, pool_shutdown) = launch.wait_deferring_pool_shutdown();
     // Process children are not Linux thread-group siblings of their creator.
     // The outer root run, which owns the shared HVPatch VM lifetime, joins the
     // global process topology after its own terminal loop even when that loop

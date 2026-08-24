@@ -3,35 +3,28 @@
 //!
 //! # Theory of operation
 //!
-//! The load-bearing decision behind this whole file: **a guest process is a
-//! real macOS process, and a guest thread is a real macOS thread.** carrick
-//! does not simulate a process table — it forks. The host process tree mirrors
-//! the guest process tree, and the host scheduler runs guest threads. That
-//! makes most of `proc` thin, but it forces a few non-obvious identity rules.
+//! Guest processes are Carrick-kernel objects inside one carrier. Guest threads
+//! use carrier threads and bounded vCPU leases, while process identity,
+//! parentage, waits, signals, and address spaces remain in the kernel graph.
+//! Guest identifiers never authorize host process creation or control.
 //!
 //! ## fork vs. clone(CLONE_THREAD)
 //!
-//! `clone` is the fork/thread fork: the kernel's flag-consistency rules are
+//! `clone` is the process/thread split: the kernel's flag-consistency rules are
 //! enforced UP FRONT (CLONE_THREAD ⇒ CLONE_SIGHAND ⇒ CLONE_VM, else EINVAL)
 //! before dispatch chooses a path, so a malformed thread-clone fails like Linux
 //! instead of silently taking the fork path. When the full `THREAD_MASK` is set
 //! the handler returns a `CloneThread` outcome (the runtime creates a new vCPU
-//! thread sharing the address space); otherwise it is a process fork (a real
-//! host `fork`, a fresh address space, the host child becoming a guest child).
+//! thread sharing the address space); otherwise it is a logical process fork
+//! with a distinct MM projection.
 //! Thread creation is what apt/dpkg, Go, Node and CPython all actually depend
 //! on; the per-thread-vCPU model lives in the runtime, not here.
 //!
-//! ## Identity in a mirrored tree ([`ProcState`])
+//! ## Kernel-owned identity ([`ProcState`])
 //!
-//! Because guest pids ARE host pids, identity queries mostly defer to the host
-//! — but two cases need help. `getppid` must distinguish the ROOT guest process
-//! (which reports the stable bootstrap/init parent) from a forked child (which
-//! reports its real host parent, which — because the trees mirror — IS its
-//! guest parent); `bootstrap_host_pid`, captured before any guest fork and
-//! inherited through the copied address space, is the discriminator. And a guest
-//! under a PID namespace names itself by its ns-pid, so the `sched_pid_*` /
-//! `is_self` predicates accept the host pid, `LINUX_BOOTSTRAP_PID`, a live
-//! sibling thread's tid, and (under a pid ns) the ns-pid that maps back to us.
+//! Identity queries resolve through kernel task keys and namespace mappings.
+//! The carrier's host pid is lifecycle metadata, not a guest process identity
+//! or a fallback target for guest-facing process syscalls.
 //!
 //! ## prctl: mostly a faithful register file
 //!
@@ -50,9 +43,8 @@
 //!
 //! carrick has a uniform SCHED_OTHER / priority-0 model, so `sched_get*`
 //! queries answer the same for any valid pid — the only thing that varies is
-//! "does this task exist?" (`sched_pid_exists`, which falls through to a host
-//! `kill(pid, 0)` probe for peer processes). Affinity is recorded as an
-//! observable mask (inherited across fork via the address-space copy) without
+//! "does this task exist?" (resolved through the kernel graph). Affinity is
+//! recorded as an observable mask inherited by logical child tasks without
 //! physically pinning the host thread. `getrandom` and the interval timers
 //! (`itimers`, whose expiry signal is delivered by an `EVFILT_TIMER` on the
 //! signal pump's kqueue — see `crate::itimer`) round out the file.
@@ -290,12 +282,7 @@ pub(super) fn resolve_sched_target<M: GuestMemory>(
             None => SchedTarget::NotFound,
         };
     }
-    match crate::namespace::pid::ns_to_host_or_self(pid as u32) {
-        Some(host) if crate::host_proc::is_guest_process(host) => SchedTarget::OtherGuest {
-            euid: crate::cred_ipc::read_target(host as i32).unwrap_or(carrick_abi::NsUid::ROOT),
-        },
-        _ => SchedTarget::NotFound,
-    }
+    SchedTarget::NotFound
 }
 
 /// True when `pid` names a live process accessible to the guest (self or another
@@ -351,9 +338,11 @@ enum PtraceTransport {
     VirtualHvpatch,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HostPgid(u32);
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PtraceWaitTarget {
     Exact(HostPid),
@@ -361,6 +350,7 @@ enum PtraceWaitTarget {
     ProcessGroup(HostPgid),
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VirtualPtraceControlRequest {
     Continue,
@@ -368,6 +358,7 @@ enum VirtualPtraceControlRequest {
     Detach,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PtraceRequestRoute {
     Host,
@@ -389,10 +380,12 @@ fn select_ptrace_transport(
     }
 }
 
+#[cfg(test)]
 fn should_drain_child_guest_cpu(transport: PtraceTransport, terminal_reap: bool) -> bool {
     transport == PtraceTransport::Host || terminal_reap
 }
 
+#[cfg(test)]
 fn route_ptrace_request(
     transport: PtraceTransport,
     request: u64,
@@ -417,6 +410,7 @@ fn route_ptrace_request(
     }
 }
 
+#[cfg(test)]
 fn ptrace_wait_target_for_wait4(host_target: i32) -> PtraceWaitTarget {
     match host_target {
         target if target > 0 => PtraceWaitTarget::Exact(HostPid(target as u32)),
@@ -429,6 +423,7 @@ fn ptrace_wait_target_for_wait4(host_target: i32) -> PtraceWaitTarget {
 // `libc::id_t` is u32 on Darwin and i64 on FreeBSD, so the fallible pid
 // conversion below is load-bearing on some targets and an identity on others.
 #[allow(clippy::useless_conversion)]
+#[cfg(test)]
 fn ptrace_wait_target_for_waitid(
     host_idtype: libc::idtype_t,
     host_id: libc::id_t,
@@ -462,6 +457,7 @@ fn ptrace_wait_target_for_waitid(
     }
 }
 
+#[cfg(test)]
 fn ptrace_wait_target_conflicts(leased_pid: u32, target: PtraceWaitTarget) -> bool {
     match target {
         PtraceWaitTarget::Exact(pid) => pid.0 == leased_pid,
@@ -473,6 +469,7 @@ fn ptrace_wait_target_conflicts(leased_pid: u32, target: PtraceWaitTarget) -> bo
     }
 }
 
+#[cfg(test)]
 fn ptrace_wait_park_pid(target: PtraceWaitTarget) -> Option<i32> {
     match target {
         PtraceWaitTarget::Exact(pid) => i32::try_from(pid.0).ok(),
@@ -499,10 +496,12 @@ fn hvpatch_reported_tid(kernel_tid: i32) -> Option<u32> {
     u32::try_from(kernel_tid).ok()
 }
 
+#[cfg(test)]
 fn virtual_ptrace_stop_status(linux_signum: i32) -> i32 {
     (linux_signum << 8) | 0x7f
 }
 
+#[cfg(test)]
 fn child_is_terminally_waitable(pid: u32) -> bool {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let rc = unsafe {
@@ -721,6 +720,7 @@ pub(super) fn affinity_to_bytes(mask: &[u64], out_len: usize) -> Vec<u8> {
 
 /// Build a `LinuxRusage` carrying just CPU time (user/system microseconds);
 /// other fields stay zero. Used for the `wait4` rusage out-param.
+#[cfg(test)]
 fn rusage_from_us(user_us: u64, system_us: u64) -> LinuxRusage {
     let tv = |us: u64| crate::linux_abi::LinuxTimeval {
         tv_sec: (us / 1_000_000) as i64,
@@ -849,6 +849,7 @@ impl ProcState {
         &self.guest_hostname
     }
 
+    #[cfg(test)]
     fn matching_virtual_ptrace_leases(
         &mut self,
         target: PtraceWaitTarget,
@@ -872,48 +873,13 @@ impl ProcState {
             .collect()
     }
 
+    #[cfg(test)]
     fn record_virtual_ptrace_stop(&mut self, pid: u32, stop: crate::guest_cpu::VirtualPtraceStop) {
         self.virtual_ptrace_stops.insert(pid, stop);
-    }
-
-    fn control_virtual_ptrace_stop(
-        &mut self,
-        pid: u32,
-        request: VirtualPtraceControlRequest,
-    ) -> bool {
-        let Some(stop) = self.virtual_ptrace_stops.get(&pid).copied() else {
-            return false;
-        };
-        let controlled = match request {
-            VirtualPtraceControlRequest::Continue => {
-                crate::guest_cpu::resume_child_virtual_ptrace(stop)
-            }
-            VirtualPtraceControlRequest::Kill => crate::guest_cpu::kill_child_virtual_ptrace(stop),
-            VirtualPtraceControlRequest::Detach => {
-                crate::guest_cpu::detach_child_virtual_ptrace(stop)
-            }
-        };
-        // A failed carrier syscall can roll the host record back to StopReported.
-        // Retain that exact capability and its exclusive wait lease so the tracer
-        // may retry; every terminal or successful transition releases it.
-        if controlled || !crate::guest_cpu::virtual_ptrace_stop_is_reported(stop) {
-            self.virtual_ptrace_stops.remove(&pid);
-        }
-        controlled
     }
 }
 
 impl SyscallDispatcher {
-    pub(crate) fn publish_terminal_child_exit_signal(&self, child_pid: i32) {
-        if let Some((parent_tid, exit_signal)) =
-            crate::host_signal::take_child_exit_parent(child_pid)
-            && exit_signal != 0
-        {
-            self.async_signal_wake_owner()
-                .publish_thread_signal(parent_tid, exit_signal);
-        }
-    }
-
     /// True once this dispatcher is running in a real host child created for a
     /// guest `fork`/fork-like `clone`. Such descendants inherited the original
     /// CLI process state and must use `_exit` on guest process exit instead of
@@ -949,48 +915,6 @@ impl SyscallDispatcher {
         wait_for_release();
     }
 
-    pub(crate) fn proc_after_fork_child(&self) {
-        let mut proc = self.proc.lock();
-        if proc.child_subreaper != 0 {
-            proc.subreaper_ancestor = if proc.child_subreaper_owner != 0 {
-                proc.child_subreaper_owner
-            } else {
-                u32::try_from(unsafe { libc::getppid() }).unwrap_or(0)
-            };
-            // This path is a real host fork. HVPatch clones ProcState through
-            // `fork_clone_in_process`, which records an exact task generation.
-            proc.hvpatch_subreaper_ancestor = None;
-        }
-        proc.child_subreaper = 0;
-        proc.child_subreaper_owner = 0;
-        proc.timerslack_default = proc.timerslack;
-        // Linux does not inherit membarrier(2) registration across fork; the
-        // child starts unregistered (LTP membarrier01 forks precisely to get a
-        // fresh, unregistered process for each subtest).
-        proc.membarrier_ready = 0;
-        // Interval timers (setitimer/alarm) are NOT inherited across fork
-        // (POSIX): the child starts with every ITIMER_* disarmed. The neutral
-        // itimer-core delivery state is cleared separately in the host-signal
-        // fork reinit; this clears the dispatcher's own record so a child
-        // getitimer reports 0 rather than the parent's inherited remaining time
-        // (LTP alarm07).
-        proc.itimers = [None, None, None];
-        proc.ptrace_traceme = false;
-        proc.virtual_ptrace_stops.clear();
-    }
-
-    pub(crate) fn subreaper_for_fork_child(&self) -> u32 {
-        let proc = self.proc.lock();
-        let current = proc.logical_pid();
-        if proc.child_subreaper != 0 && proc.child_subreaper_owner == current {
-            current
-        } else if proc.child_subreaper != 0 && proc.child_subreaper_owner != 0 {
-            proc.child_subreaper_owner
-        } else {
-            proc.subreaper_ancestor
-        }
-    }
-
     /// Exact live HVPatch subreaper inherited by this process. Returning no
     /// adopter deliberately falls back to the kernel run root: a retired exact
     /// key must not be followed by numeric pid reuse.
@@ -1006,21 +930,6 @@ impl SyscallDispatcher {
         let mut proc = self.proc.lock();
         proc.child_subreaper = 1;
         proc.child_subreaper_owner = proc.logical_pid();
-    }
-
-    pub(crate) fn clone_parent_host_pid(&self) -> u32 {
-        if crate::namespace::pid::enabled() {
-            let ns_parent = crate::namespace::pid::self_ns_ppid();
-            return crate::namespace::pid::ns_to_host_or_self(ns_parent).unwrap_or(0);
-        }
-        let bootstrap_host_pid = self.proc.lock().bootstrap_host_pid;
-        if std::process::id() == bootstrap_host_pid {
-            0
-        } else if let Some(parent) = crate::guest_cpu::adopted_parent_for_self() {
-            parent
-        } else {
-            unsafe { libc::getppid() as u32 }
-        }
     }
 
     /// Parse a `struct sock_fprog *` at `fprog_ptr` and install its cBPF program
@@ -1296,6 +1205,7 @@ impl SyscallDispatcher {
 
     /// Resolve a pidfd to its backing host pid, or `None` for guest-virtual
     /// HvPatch pidfds and non-pidfd descriptors.
+    #[cfg(test)]
     pub(super) fn pidfd_host_pid(&self, fd: i32) -> Option<i32> {
         match self.pidfd_target(fd)? {
             PidfdTarget::Host(pid) => Some(pid),
@@ -2654,6 +2564,10 @@ impl SyscallDispatcher {
                 };
                 return Ok(outcome);
             }
+            #[cfg(not(test))]
+            return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
+            #[cfg(test)]
+            {
             // The tracee in the HOST domain (bare i32, NOT re-wrapped in
             // NsPid: a host pid inside the ns-pid wrapper silently defeats
             // every downstream `.names_self()`/`.to_host()`).
@@ -2672,15 +2586,11 @@ impl SyscallDispatcher {
                     crate::host_signal::linux_to_host_signum(linux_signal)
                 }
             };
-            // Ask carrick's own kernel first; fall back to the host probe on
-            // the lanes where a Linux process IS a host process. See
-            // `SyscallDispatcher::guest_pid_is_live`.
+            // Carrick's kernel graph is the only guest-process liveness
+            // authority. A missing kernel binding is a retired one-task path,
+            // never permission to probe an arbitrary host pid.
             let target_exists = |host: i32| -> bool {
-                if let Some(live) = this.guest_pid_is_live(host) {
-                    return live;
-                }
-                (unsafe { libc::kill(host, 0) == 0 })
-                    || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+                this.guest_pid_is_live(host).unwrap_or(false)
             };
 
             let route = match route_ptrace_request(transport, request, data) {
@@ -2700,19 +2610,8 @@ impl SyscallDispatcher {
                     proc.ptrace_traceme = true;
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
-                PtraceRequestRoute::VirtualControl(control) => {
-                    let Some(host) = host_pid(pid).filter(|host| *host > 0) else {
-                        return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-                    };
-                    let controlled = this
-                        .proc
-                        .lock()
-                        .control_virtual_ptrace_stop(host as u32, control);
-                    return Ok(if controlled {
-                        DispatchOutcome::Returned { value: 0 }
-                    } else {
-                        DispatchOutcome::errno(LINUX_ESRCH)
-                    });
+                PtraceRequestRoute::VirtualControl(_) => {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
                 }
                 PtraceRequestRoute::Host | PtraceRequestRoute::Shared => {}
             }
@@ -2794,6 +2693,7 @@ impl SyscallDispatcher {
                 this.proc.lock().ptrace_traceme = true;
             }
             Ok(DispatchOutcome::Returned { value: 0 })
+            }
         }
 
         fn reboot(this, cx) {
@@ -2903,6 +2803,7 @@ impl SyscallDispatcher {
         }
 
         fn waitid(this, cx, idtype: u64, id: u64, infop_addr: GuestPtr, options: u64) {
+            #[cfg(test)]
             let transport =
                 select_ptrace_transport(this.page_geometry(), this.hvpatch_process().is_some());
             // Retain unknown bits so the supported-mask rejection below stays
@@ -3039,6 +2940,10 @@ impl SyscallDispatcher {
                     }
                 }
             }
+            #[cfg(not(test))]
+            return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
+            #[cfg(test)]
+            {
             let (host_idtype, host_id): (libc::idtype_t, libc::id_t) = match idtype {
                 LINUX_P_ALL => (libc::P_ALL, 0),
                 LINUX_P_PID => {
@@ -3374,10 +3279,12 @@ impl SyscallDispatcher {
                 crate::namespace::pid::unregister_reaped(carrick_portable::si_pid(&info) as u32);
             }
             Ok(DispatchOutcome::Returned { value: 0 })
+            }
         }
 
         fn wait4(this, cx, pid: Pid, wstatus_addr: GuestPtr, options: u64, rusage_addr: GuestPtr) {
             let memory = &mut *cx.memory;
+            #[cfg(test)]
             let transport =
                 select_ptrace_transport(this.page_geometry(), this.hvpatch_process().is_some());
             // Retain unknown bits so the supported-mask rejection stays
@@ -3470,6 +3377,10 @@ impl SyscallDispatcher {
                     }
                 }
             }
+            #[cfg(not(test))]
+            return Ok(DispatchOutcome::errno(LINUX_ENOSYS));
+            #[cfg(test)]
+            {
             // PID namespace (§5.3): a positive `pid` arg names a child by its
             // ns-pid; translate it to the host pid the kernel knows. An ns-pid
             // that names no member is ESRCH. pid <= 0 (any-child / pgrp) stays
@@ -3801,29 +3712,6 @@ impl SyscallDispatcher {
                     if host_target < -1 && errno == LINUX_EINVAL {
                         return Ok(DispatchOutcome::errno(LINUX_ESRCH));
                     }
-                    // Linux/FreeBSD surface ECHILD (rather than macOS's EINVAL)
-                    // for a pid < -1 wait. Linux distinguishes a process group
-                    // that does NOT EXIST (→ ESRCH; LTP waitpid04 / probe
-                    // waitpgid pass INT_MIN, an unrepresentable pgid) from a real
-                    // group with no waitable children (→ ECHILD). kill(pgid, 0)
-                    // reports ESRCH only for a nonexistent group, so probe with
-                    // it and remap only that case — every valid-group ECHILD
-                    // passes through unchanged.
-                    // NOTE: `host_target` is a GUEST pgid on the kernel lane,
-                    // so this probes the host's groups with a number that means
-                    // something else there. It is deliberately NOT guarded:
-                    // signal 0 SENDS nothing, so the exposure is a wrong answer
-                    // rather than a wrong action, and guarding it measurably
-                    // regressed `waitpgid`'s INT_MIN assertion from true to
-                    // false. Answering from the kernel's own process-group
-                    // table is the real fix.
-                    if host_target < -1
-                        && errno == crate::linux_abi::LINUX_ECHILD
-                        && unsafe { libc::kill(host_target, 0) } == -1
-                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-                    {
-                        return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-                    }
                     return Ok(DispatchOutcome::errno(errno));
                 }
             };
@@ -3891,14 +3779,6 @@ impl SyscallDispatcher {
                 host_status = (linux_signum << 8) | 0x7f;
                 host_status_is_guest_status = true;
             }
-            // Terminal reap of a child (not a WUNTRACED/WCONTINUED state report):
-            // resolve its async exit-signal watch. If the pump already delivered
-            // the signal, the watch is gone. If not, publish it synchronously before
-            // returning from wait4: Linux makes the child-exit signal observable by
-            // the time waitpid returns, and clone301 checks a caught SIGCHLD/SIGUSR2
-            // after reaping. Taking the watch here still prevents a later kqueue
-            // NOTE_EXIT from double-delivering a stale signal into the next test
-            // phase (the original kill12/kill10 failure mode).
             let terminal_reap = libc::WIFEXITED(host_status) || libc::WIFSIGNALED(host_status);
             if terminal_reap {
                 // Untraced lifecycle gauge (CARRICK_EXEC_STAMPS): closes the
@@ -3908,7 +3788,6 @@ impl SyscallDispatcher {
                     host_status,
                     &host_rusage,
                 );
-                this.publish_terminal_child_exit_signal(result);
                 // The child host process is now dead; tear down its leaked host VM
                 // node (bhyve's named /dev/vmm/carrick-<pid>-* persists past the
                 // child's _exit). Sole, non-hanging teardown — no live holder. No-op
@@ -3959,7 +3838,7 @@ impl SyscallDispatcher {
             let host_status = if host_status_is_guest_status {
                 host_status
             } else {
-                translate_child_wait_status(result as u32, host_status)
+                translate_wait_status(host_status)
             };
             if wstatus_addr.0 != 0 {
                 let bytes = host_status.to_ne_bytes();
@@ -3975,6 +3854,7 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned {
                 value: i64::from(ns_result),
             })
+            }
         }
 
         fn execve(this, cx, pathname_addr: GuestPtr, argv_addr: GuestPtr, envp_addr: GuestPtr) {
@@ -4206,6 +4086,12 @@ impl SyscallDispatcher {
             let PidfdTarget::Host(host_pid) = target else {
                 unreachable!("HvPatch pidfd handled above")
             };
+            #[cfg(not(test))]
+            let _ = host_pid;
+            #[cfg(not(test))]
+            return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+            #[cfg(test)]
+            {
             if signum == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
@@ -4274,6 +4160,7 @@ impl SyscallDispatcher {
                 signum,
                 Some(caller_euid),
             ))
+            }
         }
 
         fn getrandom(this, cx, address: GuestPtr, length: u64, flags: u64) {
@@ -4601,6 +4488,7 @@ fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {
 /// caller re-waits instead of surfacing a bogus `WIFSTOPPED` to the guest. The
 /// parked `wait_proc_exit` path absorbs the same stops; this covers the blocking
 /// host-wait4 observation points.
+#[cfg(test)]
 fn absorb_internal_tracee_stop(pid: i32, host_status: i32) -> bool {
     if pid <= 0 || !libc::WIFSTOPPED(host_status) {
         return false;
@@ -4624,6 +4512,7 @@ fn absorb_internal_tracee_stop(pid: i32, host_status: i32) -> bool {
 /// dump flag, bits 8..15 = exit code); only the signal NUMBER differs between
 /// macOS and Linux. Exited children (low 7 bits == 0) and stopped children
 /// (low byte == 0x7f) are returned unchanged.
+#[cfg(test)]
 fn translate_wait_status(status: i32) -> i32 {
     // The host IS Linux on the KVM lane: the wait status is already in the
     // guest ABI (same encoding, same signal numbers, and 0xffff really means
@@ -4655,6 +4544,7 @@ fn translate_wait_status(status: i32) -> i32 {
 /// The wstatus core-dumped bit (0x80) iff `linux_sig` is a core-dumping signal
 /// per signal(7): SIGQUIT(3), SIGILL(4), SIGTRAP(5), SIGABRT(6), SIGBUS(7),
 /// SIGFPE(8), SIGSEGV(11), SIGXCPU(24), SIGXFSZ(25), SIGSYS(31).
+#[cfg(test)]
 fn core_dump_bit_for(linux_sig: i32) -> i32 {
     if matches!(linux_sig, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31) {
         0x80
@@ -4664,6 +4554,7 @@ fn core_dump_bit_for(linux_sig: i32) -> i32 {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[cfg(test)]
 fn translate_wait_status_darwin(status: i32) -> i32 {
     let low = status & 0x7f;
     if low == 0x7f {
@@ -4698,28 +4589,6 @@ fn translate_wait_status_darwin(status: i32) -> i32 {
     }
 }
 
-/// Wait-status translation that first honours a forked-child signal-death marker.
-/// On a BSD host `forked_child_die_by_signal` `_exit(128+N)`s (and drops a marker)
-/// when the host signal for a default-TERMINATE Linux signal cannot faithfully
-/// represent the Linux signal death. Reconstruct the `WIFSIGNALED(N)` status the guest's wait4 must
-/// observe; otherwise fall through to the plain host→guest translation. A pure
-/// no-op on a Linux host (no marker is ever written there — `consume_sigdeath_marker`
-/// is a compile-time `None`).
-fn translate_child_wait_status(host_pid: u32, status: i32) -> i32 {
-    if libc::WIFEXITED(status) {
-        let code = libc::WEXITSTATUS(status);
-        // forked_child_die_by_signal exits 128+signum for signum in 1..=64.
-        if (129..=128 + 64).contains(&code) {
-            if let Some(sig) = crate::exec_helpers::consume_sigdeath_marker(host_pid) {
-                if sig == code - 128 {
-                    return (sig & 0x7f) | core_dump_bit_for(sig);
-                }
-            }
-        }
-    }
-    translate_wait_status(status)
-}
-
 /// Atomically load a cross-process futex word from its fork-coherent host address
 /// (the shared aperture on HVF/KVM, the bhyve futex mirror on bhyve). Atomic to
 /// match the guest's own atomic access to the same word.
@@ -4745,6 +4614,7 @@ fn shared_futex_store(location: carrick_guest_mem::SharedFutexLocation, value: u
     }
 }
 
+#[cfg(test)]
 fn host_wait_status_is_stopped_by(status: i32, linux_signum: i32) -> bool {
     let low = status & 0x7f;
     if low != 0x7f {
@@ -4757,6 +4627,7 @@ fn host_wait_status_is_stopped_by(status: i32, linux_signum: i32) -> bool {
 /// Darwin can report a stopped child from `waitid(WEXITED|WNOWAIT)`. Linux only
 /// reports SIGCHLD states selected by the caller's W* bits, so filter the host
 /// siginfo before deciding whether a child is waitable.
+#[cfg(test)]
 fn clear_unrequested_waitid_state(info: &mut libc::siginfo_t, options: LinuxWaitOptions) -> bool {
     if carrick_portable::si_pid(info) == 0 || waitid_state_requested(info.si_code, options) {
         return true;
@@ -4765,6 +4636,7 @@ fn clear_unrequested_waitid_state(info: &mut libc::siginfo_t, options: LinuxWait
     false
 }
 
+#[cfg(test)]
 impl SyscallDispatcher {
     /// Promote a `waitid` `CLD_KILLED` to `CLD_DUMPED` when the child died by a
     /// core-dumping signal AND core dumps are enabled (RLIMIT_CORE soft > 0).
@@ -4796,6 +4668,7 @@ impl SyscallDispatcher {
     }
 }
 
+#[cfg(test)]
 fn waitid_state_requested(si_code: i32, options: LinuxWaitOptions) -> bool {
     const CLD_EXITED: i32 = 1;
     const CLD_KILLED: i32 = 2;
@@ -4812,6 +4685,7 @@ fn waitid_state_requested(si_code: i32, options: LinuxWaitOptions) -> bool {
     }
 }
 
+#[cfg(test)]
 fn waitid_host_state_option(si_code: i32) -> Option<i32> {
     match si_code {
         libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED => Some(libc::WEXITED),
@@ -4865,6 +4739,7 @@ pub(crate) fn build_hvpatch_waitid_siginfo(
 /// si_status@24 after the common si_signo/si_errno/si_code header. The CLD_*
 /// codes match between the kernels; si_status is the raw exit code for
 /// CLD_EXITED but a signal number otherwise, so translate that host->Linux.
+#[cfg(test)]
 fn build_sigchld_siginfo(
     si_pid: i32,
     si_uid: u32,
@@ -5039,12 +4914,6 @@ mod native_virtual_ptrace_tests {
     }
 
     #[test]
-    fn native_continue_without_reported_stop_is_rejected() {
-        let mut proc = ProcState::new();
-        assert!(!proc.control_virtual_ptrace_stop(999_991, VirtualPtraceControlRequest::Continue));
-    }
-
-    #[test]
     fn only_native_nonterminal_wait_reports_defer_guest_cpu_drain() {
         assert!(should_drain_child_guest_cpu(PtraceTransport::Host, false));
         assert!(should_drain_child_guest_cpu(PtraceTransport::Host, true));
@@ -5168,75 +5037,6 @@ mod futex_timeout_tests {
             ),
             other => panic!("expected a FutexWait park outcome, got {other:?}"),
         }
-    }
-}
-
-// `translate_child_wait_status` reconstructs `WIFSIGNALED` from a forked-child
-// signal-death marker. This only applies off Linux, where some default-TERMINATE
-// Linux signals cannot be represented faithfully as host signalled deaths and
-// the child could only `_exit(128+N)` + drop a marker. On Linux the marker is
-// never written, so the test is compiled out.
-#[cfg(all(test, not(target_os = "linux")))]
-mod wait_status_tests {
-    use super::*;
-
-    /// A host wait status for a normal `_exit(code)`: low 7 bits are 0
-    /// (WIFEXITED), the exit code sits in bits 8..15. Encoding matches Linux.
-    fn exited(code: i32) -> i32 {
-        (code & 0xff) << 8
-    }
-
-    #[test]
-    fn ignore_signal_child_death_reconstructs_wifsignaled() {
-        // A SIGPOLL (29) child on a BSD host could only `_exit(128+29)` and leave
-        // a marker; the parent's wait4 must still observe WIFSIGNALED(29), not
-        // "exited 157" (LTP waitpid01). `plant` overwrites any stale marker.
-        let host_pid = 0x7FFE_0001u32;
-        crate::exec_helpers::plant_sigdeath_marker_for_test(host_pid, 29);
-
-        let status = translate_child_wait_status(host_pid, exited(128 + 29));
-        assert!(
-            libc::WIFSIGNALED(status),
-            "an ignore-signal child death must report killed-by-signal, got {status:#x}"
-        );
-        assert_eq!(
-            libc::WTERMSIG(status),
-            29,
-            "the reconstructed termination signal must be SIGPOLL (29)"
-        );
-    }
-
-    #[test]
-    fn sigstkflt_child_death_reconstructs_wifsignaled() {
-        // SIGSTKFLT (16) has no BSD carrier.
-        let host_pid = 0x7FFE_0002u32;
-        crate::exec_helpers::plant_sigdeath_marker_for_test(host_pid, 16);
-
-        let status = translate_child_wait_status(host_pid, exited(128 + 16));
-        assert!(libc::WIFSIGNALED(status), "status {status:#x}");
-        assert_eq!(libc::WTERMSIG(status), 16);
-    }
-
-    #[test]
-    fn sigpwr_child_death_reconstructs_wifsignaled() {
-        // SIGPWR (30) has no BSD carrier; BSD 30 is SIGUSR1.
-        let host_pid = 0x7FFE_0004u32;
-        crate::exec_helpers::plant_sigdeath_marker_for_test(host_pid, 30);
-
-        let status = translate_child_wait_status(host_pid, exited(128 + 30));
-        assert!(libc::WIFSIGNALED(status), "status {status:#x}");
-        assert_eq!(libc::WTERMSIG(status), 30);
-    }
-
-    #[test]
-    fn genuine_exit_without_marker_stays_wifexited() {
-        // A real `exit(5)` is outside the 128+N marker window, so the marker is
-        // never consulted: it must pass through as WIFEXITED(5), never be misread
-        // as a signal death.
-        let host_pid = 0x7FFE_0003u32;
-        let status = translate_child_wait_status(host_pid, exited(5));
-        assert!(libc::WIFEXITED(status), "status {status:#x}");
-        assert_eq!(libc::WEXITSTATUS(status), 5);
     }
 }
 

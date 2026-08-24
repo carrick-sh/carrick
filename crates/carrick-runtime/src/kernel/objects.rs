@@ -1107,6 +1107,10 @@ impl FileTable {
         }
     }
 
+    pub(super) fn for_external_exec(id: FileTableId) -> Self {
+        Self::new(id)
+    }
+
     fn for_exec(id: FileTableId, caller: &Self) -> Self {
         let open_files: HashMap<_, _> = caller
             .open_files
@@ -1303,10 +1307,6 @@ impl FileTable {
         HashMap<FileDescriptionId, Arc<Mutex<crate::dispatch::SplicePushback>>>,
     > {
         self.mutex_write(&self.splice_pushback)
-    }
-
-    pub(crate) fn has_splice_pushback(&self) -> bool {
-        !self.splice_pushback.lock().is_empty()
     }
 
     pub(crate) fn read_epoll_fds(&self) -> RwLockReadGuard<'_, BTreeSet<i32>> {
@@ -4396,6 +4396,13 @@ struct ThreadExecutionRecord {
     blocked_continuation: Option<Box<crate::vcpu_loop::continuation::BlockedContinuation>>,
     next_executor_epoch: u64,
     exec_invalidation_pending: bool,
+    control_quantum: Option<SchedulerControlQuantum>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SchedulerControlQuantum {
+    pub(crate) blocked_reason: Option<BlockedReason>,
+    requeue_pending: bool,
 }
 
 fn cancel_continuation_slot(
@@ -4415,6 +4422,7 @@ impl ThreadExecutionRecord {
             blocked_continuation: None,
             next_executor_epoch: 1,
             exec_invalidation_pending: false,
+            control_quantum: None,
         }
     }
 }
@@ -4728,10 +4736,11 @@ impl Thread {
     pub fn execution_diagnostic(&self) -> String {
         let execution = self.execution.lock();
         format!(
-            "{:?} task_state={} continuation={}",
+            "{:?} task_state={} continuation={} control_quantum={:?}",
             execution.state,
             execution.task_state.is_some(),
-            execution.blocked_continuation.is_some()
+            execution.blocked_continuation.is_some(),
+            execution.control_quantum
         )
     }
 
@@ -4824,12 +4833,25 @@ impl Thread {
                     closing_authorized: true,
                 }
             }
-            ThreadExecutionState::Runnable { generation } => ThreadSchedulerAction::Queue {
-                key: self.key,
-                predecessor: None,
-                generation,
-                closing_authorized: false,
-            },
+            ThreadExecutionState::Runnable { generation } => {
+                // Runnable normally implies the producer edge was already
+                // consumed. A control-only quantum is the exception: it made
+                // the task runnable without guest readiness, so a racing real
+                // producer must still publish into the preserved continuation.
+                if execution.control_quantum.is_some()
+                    && let Some(continuation) = execution.blocked_continuation.as_ref()
+                {
+                    continuation.publish_ready_event(
+                        crate::vcpu_loop::continuation::ContinuationEvent::Ready,
+                    );
+                }
+                ThreadSchedulerAction::Queue {
+                    key: self.key,
+                    predecessor: None,
+                    generation,
+                    closing_authorized: false,
+                }
+            }
             ThreadExecutionState::Running {
                 generation,
                 executor,
@@ -4873,6 +4895,183 @@ impl Thread {
         drop(execution);
         self.revision.publish();
         Ok(action)
+    }
+
+    /// Schedule owner-thread control work without manufacturing readiness for
+    /// the guest continuation. A real producer wake may still arrive while the
+    /// control quantum runs; that independent edge uses `wake_pending` and
+    /// publishes `ContinuationEvent::Ready` during settlement as usual.
+    pub(crate) fn scheduler_control_wake(
+        &self,
+        expected: ThreadKey,
+    ) -> Result<ThreadSchedulerAction, ThreadExecutionError> {
+        if expected != self.key {
+            return Err(ThreadExecutionError::SchedulerThreadMismatch {
+                expected,
+                actual: self.key,
+            });
+        }
+        let mut execution = self.execution.lock();
+        // A retry may temporarily park the same quantum as HostWait. Preserve
+        // a blocked reason only when there is an actual continuation token to
+        // displace and later restore. Fork/clone/job-control retry phases also
+        // park as Blocked, but own their state in the production phase rather
+        // than in `blocked_continuation`; treating their reason as restorable
+        // would manufacture an impossible deferred-continuation obligation.
+        if execution.control_quantum.is_none() {
+            let blocked_reason = match (execution.state, execution.blocked_continuation.is_some()) {
+                (ThreadExecutionState::Blocked { reason, .. }, true) => Some(reason),
+                _ => None,
+            };
+            execution.control_quantum = Some(SchedulerControlQuantum {
+                blocked_reason,
+                requeue_pending: matches!(
+                    execution.state,
+                    ThreadExecutionState::Running { .. }
+                        | ThreadExecutionState::SwitchingOut { .. }
+                ),
+            });
+        } else if matches!(
+            execution.state,
+            ThreadExecutionState::Running { .. } | ThreadExecutionState::SwitchingOut { .. }
+        ) && let Some(quantum) = execution.control_quantum.as_mut()
+        {
+            quantum.requeue_pending = true;
+        }
+        let action = match execution.state {
+            ThreadExecutionState::Blocked {
+                generation: predecessor,
+                ..
+            } => {
+                let generation = predecessor
+                    .next()
+                    .ok_or(ThreadExecutionError::GenerationExhausted)?;
+                execution.state = ThreadExecutionState::Runnable { generation };
+                ThreadSchedulerAction::Queue {
+                    key: self.key,
+                    predecessor: Some(predecessor),
+                    generation,
+                    closing_authorized: true,
+                }
+            }
+            ThreadExecutionState::Runnable { generation } => ThreadSchedulerAction::Queue {
+                key: self.key,
+                predecessor: None,
+                generation,
+                closing_authorized: false,
+            },
+            ThreadExecutionState::Running {
+                generation,
+                executor,
+                executor_epoch,
+                ..
+            } => ThreadSchedulerAction::Kick {
+                executor,
+                executor_epoch,
+                key: self.key,
+                generation,
+            },
+            ThreadExecutionState::SwitchingOut { .. } => ThreadSchedulerAction::None,
+            state => {
+                execution.control_quantum = None;
+                return Err(ThreadExecutionError::InvalidTransition {
+                    operation: "scheduler_control_wake",
+                    state,
+                });
+            }
+        };
+        drop(execution);
+        self.revision.publish();
+        Ok(action)
+    }
+
+    pub(crate) fn finish_scheduler_control_quantum(
+        &self,
+        expected: ThreadKey,
+    ) -> Result<SchedulerControlQuantum, ThreadExecutionError> {
+        if expected != self.key {
+            return Err(ThreadExecutionError::SchedulerThreadMismatch {
+                expected,
+                actual: self.key,
+            });
+        }
+        let mut execution = self.execution.lock();
+        let quantum =
+            execution
+                .control_quantum
+                .take()
+                .ok_or(ThreadExecutionError::InvalidTransition {
+                    operation: "finish_scheduler_control_quantum",
+                    state: execution.state,
+                })?;
+        drop(execution);
+        self.revision.publish();
+        Ok(quantum)
+    }
+
+    pub(crate) fn scheduler_control_quantum(
+        &self,
+        expected: ThreadKey,
+    ) -> Result<Option<SchedulerControlQuantum>, ThreadExecutionError> {
+        if expected != self.key {
+            return Err(ThreadExecutionError::SchedulerThreadMismatch {
+                expected,
+                actual: self.key,
+            });
+        }
+        Ok(self.execution.lock().control_quantum)
+    }
+
+    pub(crate) fn restore_scheduler_control_quantum(
+        &self,
+        expected: ThreadKey,
+        quantum: SchedulerControlQuantum,
+    ) -> Result<(), ThreadExecutionError> {
+        if expected != self.key {
+            return Err(ThreadExecutionError::SchedulerThreadMismatch {
+                expected,
+                actual: self.key,
+            });
+        }
+        let mut execution = self.execution.lock();
+        if !matches!(
+            execution.state,
+            ThreadExecutionState::Runnable { .. }
+                | ThreadExecutionState::Running { .. }
+                | ThreadExecutionState::SwitchingOut { .. }
+        ) {
+            return Err(ThreadExecutionError::InvalidTransition {
+                operation: "restore_scheduler_control_quantum",
+                state: execution.state,
+            });
+        }
+        match execution.control_quantum {
+            None
+            | Some(SchedulerControlQuantum {
+                blocked_reason: None,
+                ..
+            }) => {
+                execution.control_quantum = Some(SchedulerControlQuantum {
+                    requeue_pending: false,
+                    ..quantum
+                });
+            }
+            Some(existing) if existing.blocked_reason == quantum.blocked_reason => {
+                execution.control_quantum = Some(SchedulerControlQuantum {
+                    requeue_pending: false,
+                    ..quantum
+                });
+            }
+            Some(_) => {
+                return Err(ThreadExecutionError::InvalidTransition {
+                    operation: "restore_scheduler_control_quantum",
+                    state: execution.state,
+                });
+            }
+        }
+        drop(execution);
+        self.revision.publish();
+        Ok(())
     }
 
     /// Seed the first complete task snapshot after backend materialization.
@@ -4927,6 +5126,9 @@ impl Thread {
         };
         let blocked_continuation = execution.blocked_continuation.take();
         execution.next_executor_epoch = next_executor_epoch;
+        if let Some(quantum) = execution.control_quantum.as_mut() {
+            quantum.requeue_pending = false;
+        }
         execution.state = ThreadExecutionState::Running {
             generation,
             executor,
@@ -5153,6 +5355,7 @@ impl Thread {
             crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
         );
         execution.exec_invalidation_pending = false;
+        execution.control_quantum = None;
         execution.state = ThreadExecutionState::Failed { generation, reason };
         lease.settled = true;
         drop(execution);
@@ -5201,6 +5404,7 @@ impl Thread {
             crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
         );
         execution.exec_invalidation_pending = false;
+        execution.control_quantum = None;
         execution.state = ThreadExecutionState::Failed {
             generation: successor,
             reason,
@@ -5220,6 +5424,7 @@ impl Thread {
         execution.task_state = None;
         execution.blocked_continuation = None;
         execution.exec_invalidation_pending = false;
+        execution.control_quantum = None;
         execution.state = ThreadExecutionState::Failed {
             generation: ExecutionGeneration::INITIAL,
             reason,
@@ -5252,6 +5457,7 @@ impl Thread {
             crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
         );
         execution.exec_invalidation_pending = false;
+        execution.control_quantum = None;
         execution.state = ThreadExecutionState::Failed {
             generation: expected,
             reason,
@@ -5289,6 +5495,7 @@ impl Thread {
             crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
         );
         execution.exec_invalidation_pending = false;
+        execution.control_quantum = None;
         execution.state = ThreadExecutionState::Failed { generation, reason };
         drop(execution);
         self.revision.publish();
@@ -5322,6 +5529,9 @@ impl Thread {
                 ..
             }
         );
+        let control_pending = execution
+            .control_quantum
+            .is_some_and(|quantum| quantum.requeue_pending);
         if wake_pending && !scheduler_owned && !matches!(settlement, ExecutionSettlement::Exited) {
             return Err((ThreadExecutionError::SchedulerSettlementRequired, lease));
         }
@@ -5339,6 +5549,7 @@ impl Thread {
             );
             execution.state = ThreadExecutionState::Exited { generation };
             execution.exec_invalidation_pending = false;
+            execution.control_quantum = None;
         } else {
             match settlement {
                 ExecutionSettlement::Runnable => {
@@ -5357,11 +5568,13 @@ impl Thread {
                 ExecutionSettlement::Blocked(reason) => {
                     execution.task_state = lease.task_state.take();
                     execution.blocked_continuation = lease.blocked_continuation.take();
-                    if wake_pending {
+                    if wake_pending || control_pending {
                         if let Some(continuation) = execution.blocked_continuation.as_ref() {
-                            continuation.publish_ready_event(
-                                crate::vcpu_loop::continuation::ContinuationEvent::Ready,
-                            );
+                            if wake_pending {
+                                continuation.publish_ready_event(
+                                    crate::vcpu_loop::continuation::ContinuationEvent::Ready,
+                                );
+                            }
                         }
                         execution.state = ThreadExecutionState::Runnable { generation };
                         action = ThreadSchedulerAction::Queue {
@@ -5384,10 +5597,12 @@ impl Thread {
                 ExecutionSettlement::BlockedContinuation(reason, continuation) => {
                     execution.task_state = lease.task_state.take();
                     let continuation_id = continuation.id();
-                    if wake_pending {
-                        continuation.publish_ready_event(
-                            crate::vcpu_loop::continuation::ContinuationEvent::Ready,
-                        );
+                    if wake_pending || control_pending {
+                        if wake_pending {
+                            continuation.publish_ready_event(
+                                crate::vcpu_loop::continuation::ContinuationEvent::Ready,
+                            );
+                        }
                         execution.state = ThreadExecutionState::Runnable { generation };
                         action = ThreadSchedulerAction::Queue {
                             key: self.key,
@@ -5417,6 +5632,7 @@ impl Thread {
                         crate::vcpu_loop::continuation::CancellationCause::ThreadExit,
                     );
                     execution.state = ThreadExecutionState::Exited { generation };
+                    execution.control_quantum = None;
                 }
             }
         }
@@ -5495,6 +5711,7 @@ impl Thread {
             crate::vcpu_loop::continuation::CancellationCause::ServiceShutdown,
         );
         execution.exec_invalidation_pending = false;
+        execution.control_quantum = None;
         execution.state = ThreadExecutionState::Failed {
             generation,
             reason: ExecutionFailure::UnsettledLeaseDropped {
@@ -5529,6 +5746,7 @@ impl Thread {
             crate::vcpu_loop::continuation::CancellationCause::Exec,
         );
         execution.exec_invalidation_pending = false;
+        execution.control_quantum = None;
         execution.state = ThreadExecutionState::Exited { generation };
         drop(execution);
         self.revision.publish();

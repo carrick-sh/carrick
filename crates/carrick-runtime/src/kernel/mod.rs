@@ -5,6 +5,7 @@
 
 pub mod address;
 pub mod clone_plan;
+pub mod control;
 pub mod core;
 pub mod crash_capture;
 pub mod debug;
@@ -20,6 +21,7 @@ pub mod operations;
 pub mod registry;
 pub mod scheduler;
 pub mod snapshot;
+pub(crate) mod tty;
 
 #[cfg(test)]
 mod tests;
@@ -82,7 +84,9 @@ pub use operations::{
     StartedFork, StartedThreadClone, TaskIdentity, TaskOperationReservation,
     ThreadCloneReservation, ThreadPublicationReservationAttempt, WaitMode, WaitOutcome,
 };
-pub(crate) use operations::{ExactSignalTargetAuthorization, ExactThreadSignalPost};
+pub(crate) use operations::{
+    ExactSignalTargetAuthorization, ExactThreadSignalPost, TtyControlError,
+};
 pub use registry::{
     IdError, IdRegistry, IdRegistryCounts, ProcessGroupClaim, SessionClaim, TaskClaim,
     TaskReservation, ThreadClaim, ThreadReservation,

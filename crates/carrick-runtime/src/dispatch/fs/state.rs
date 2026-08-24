@@ -2,6 +2,7 @@
 
 use super::super::*;
 use crate::linux_abi::{LinuxDnotifyMask, LinuxErrno};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Guest-visible fd allocation pressure caused by host-backed path opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -211,30 +212,74 @@ pub(in crate::dispatch) struct FsState {
 /// Process-local output transport. Linux fd-table authority lives exclusively
 /// in the captured Kernel [`crate::kernel::FileTable`].
 pub(in crate::dispatch) struct RuntimeIo {
-    pub stdout: Mutex<Vec<u8>>,
-    pub stderr: Mutex<Vec<u8>>,
+    pub stdout: Arc<Mutex<Vec<u8>>>,
+    pub stderr: Arc<Mutex<Vec<u8>>>,
     /// When true, writes to fd 1/2 stream directly to host fds 1/2 instead of
     /// buffering into `stdout`/`stderr`.
     pub stream_stdio: Mutex<bool>,
+    external_exec_capture: AtomicBool,
 }
 
 impl RuntimeIo {
     pub(in crate::dispatch) fn new() -> Self {
         Self {
-            stdout: Mutex::new(Vec::new()),
-            stderr: Mutex::new(Vec::new()),
+            stdout: Arc::new(Mutex::new(Vec::new())),
+            stderr: Arc::new(Mutex::new(Vec::new())),
             stream_stdio: Mutex::new(false),
+            external_exec_capture: AtomicBool::new(false),
         }
     }
 
     pub(in crate::dispatch) fn fork_clone(&self) -> Self {
+        let external_exec_capture = self.external_exec_capture.load(Ordering::Acquire);
         Self {
             // The host-fork child clears inherited buffered output before it
             // resumes. An in-process child starts with the same clean boundary.
-            stdout: Mutex::new(Vec::new()),
-            stderr: Mutex::new(Vec::new()),
+            stdout: if external_exec_capture {
+                Arc::clone(&self.stdout)
+            } else {
+                Arc::new(Mutex::new(Vec::new()))
+            },
+            stderr: if external_exec_capture {
+                Arc::clone(&self.stderr)
+            } else {
+                Arc::new(Mutex::new(Vec::new()))
+            },
             stream_stdio: Mutex::new(*self.stream_stdio.lock()),
+            external_exec_capture: AtomicBool::new(external_exec_capture),
         }
+    }
+
+    pub(in crate::dispatch) fn enable_external_exec_capture(&self) {
+        self.external_exec_capture.store(true, Ordering::Release);
+    }
+
+    pub(in crate::dispatch) fn external_exec_capture_enabled(&self) -> bool {
+        self.external_exec_capture.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod external_exec_capture_tests {
+    use super::*;
+
+    #[test]
+    fn external_exec_descendants_share_one_capture_sink() {
+        let root = RuntimeIo::new();
+        root.enable_external_exec_capture();
+        let child = root.fork_clone();
+        child.stdout.lock().extend_from_slice(b"child");
+        child.stderr.lock().extend_from_slice(b"error");
+        assert_eq!(&*root.stdout.lock(), b"child");
+        assert_eq!(&*root.stderr.lock(), b"error");
+    }
+
+    #[test]
+    fn ordinary_fork_keeps_process_local_capture() {
+        let root = RuntimeIo::new();
+        let child = root.fork_clone();
+        child.stdout.lock().extend_from_slice(b"child");
+        assert!(root.stdout.lock().is_empty());
     }
 }
 
@@ -293,7 +338,9 @@ impl FsState {
         rootfs
     }
 
-    pub(in crate::dispatch) fn new() -> Self {
+    pub(in crate::dispatch) fn new_with_host_resolver(
+        snapshot: Option<&crate::vfs::HostResolverSnapshot>,
+    ) -> Self {
         let pty_table = std::sync::Arc::new(parking_lot::Mutex::new(crate::vfs::PtyTable::new()));
         Self {
             vfs_mounts: std::sync::Arc::new({
@@ -317,7 +364,11 @@ impl FsState {
                 // this exact path; the rest of /etc comes from the rootfs.
                 m.mount(
                     "/etc/resolv.conf",
-                    Box::new(crate::vfs::ResolvConfVfs::new()),
+                    Box::new(
+                        snapshot.map_or_else(crate::vfs::ResolvConfVfs::new, |snapshot| {
+                            crate::vfs::ResolvConfVfs::from_host_snapshot(snapshot)
+                        }),
+                    ),
                 );
                 // /etc/services from the macOS host (format-identical to Linux),
                 // so the guest's getservbyname/port lookups work under --fs host

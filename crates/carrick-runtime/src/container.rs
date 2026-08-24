@@ -5,13 +5,15 @@
 //! is owned by its one VM carrier. This module is just a filesystem registry:
 //! one directory per container under a shared root, holding a JSON state file
 //! plus the captured stdout/stderr log.
-//! `ps`/`stop`/`kill`/`rm` are pure CLI operations over this directory — they
-//! read state, send signals to the recorded pids, and unlink. Nothing needs to
-//! be running for them to work; if no container is detached, nothing is alive.
+//! `ps`/`stop`/`kill`/`rm` are CLI operations over this directory plus the
+//! authenticated control endpoint owned by each carrier. Guest-semantic
+//! signals address the persisted logical init identity, never a host pid.
 //!
 //! This mirrors the podman model (per-container conmon + on-disk state), not
 //! the docker model (one always-on daemon owning every container).
 
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -36,7 +38,8 @@ pub const UNKNOWN_CARRIER_EXIT_CODE: i32 = 255;
 
 /// One container's persisted state. Written by the detached carrier and read by
 /// the lifecycle CLI subcommands. Field set is intentionally small and
-/// host-meaningful (the pids are HOST pids — what the CLI signals).
+/// host-meaningful (the compatibility pids identify the carrier, but are not
+/// guest-signal targets).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerState {
     /// Full 64-hex container id.
@@ -51,8 +54,8 @@ pub struct ContainerState {
     /// Compatibility alias for the carrier host pid. New carrier-only launches
     /// write the same pid to this and `init_pid`; 0 until known.
     pub supervisor_pid: i32,
-    /// Host pid of the carrier that owns logical guest-init (ns-pid 1) — the
-    /// target of `stop`/`kill`. 0 until known.
+    /// Host pid of the carrier that owns logical guest-init (ns-pid 1).
+    /// Lifecycle signal delivery uses `control`, not this compatibility hint.
     pub init_pid: i32,
     /// Unix epoch seconds when the container was created (stamped by the
     /// caller, since the runtime forbids `SystemTime::now` in some contexts).
@@ -68,11 +71,52 @@ pub struct ContainerState {
     /// Docker/API-facing labels used for container discovery and filtering.
     #[serde(default)]
     pub labels: std::collections::HashMap<String, String>,
+    /// Exact mutating-control incarnation for this carrier.
+    #[serde(default)]
+    pub control: Option<CarrierControlState>,
+    /// Exact carrier incarnation that published this terminal state. A bare
+    /// `Exited` status is not sufficient authority for lifecycle mutation.
+    #[serde(default)]
+    pub terminal_control: Option<CarrierControlState>,
+    /// One-shot 128-bit authorization for the exact re-exec allowed to become
+    /// this container's carrier. Cleared by the winning carrier before boot.
+    #[serde(default)]
+    pub launch_ticket: Option<String>,
     /// Run configuration needed to `exec` into (and later restart) this
     /// container. Additive: `#[serde(default)]` so registry entries written
     /// before this field existed still load.
     #[serde(default)]
     pub config: RunConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CarrierControlState {
+    pub schema: String,
+    pub owner_nonce: crate::kernel::control::ControlNonce,
+    pub init: crate::kernel::control::ControlTaskKey,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CarrierTerminalReceipt {
+    pub control: CarrierControlState,
+    pub exit_code: i32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StopSignalAbi {
+    /// Pre-carrier-control state. A non-default value is ambiguous because the
+    /// old CLI persisted Darwin numbers and did not preserve its source text.
+    LegacyHost,
+    /// Linux signal numbering delivered to the logical kernel task.
+    #[default]
+    Linux,
+}
+
+fn legacy_stop_signal_abi() -> StopSignalAbi {
+    StopSignalAbi::LegacyHost
 }
 
 /// The subset of a container's run inputs persisted so `exec` (and later
@@ -166,9 +210,13 @@ pub struct RunConfig {
     /// immediately.
     #[serde(default = "default_max_traps")]
     pub max_traps: usize,
-    /// HOST (macOS) stop signum (`docker run --stop-signal` / image `STOPSIGNAL`).
+    /// Linux stop signum (`docker run --stop-signal` / image `STOPSIGNAL`).
     /// `None` falls back to `SIGTERM` at stop time.
     pub stop_signal: Option<i32>,
+    /// Numbering authority for `stop_signal`. Missing fields deserialize as the
+    /// retired host ABI; newly-created states explicitly persist Linux.
+    #[serde(default = "legacy_stop_signal_abi")]
+    pub stop_signal_abi: StopSignalAbi,
     /// Grace seconds before `SIGKILL` (`--stop-timeout`). `None` falls back to
     /// `stop -t`, else 10.
     pub stop_timeout: Option<u64>,
@@ -242,6 +290,7 @@ impl Default for RunConfig {
             // yield the real default — 0 would trip the trap limit immediately.
             max_traps: default_max_traps(),
             stop_signal: None,
+            stop_signal_abi: StopSignalAbi::Linux,
             stop_timeout: None,
             security_opts: Vec::new(),
             cap_add: Vec::new(),
@@ -322,6 +371,270 @@ pub fn log_path(id: &str) -> std::io::Result<PathBuf> {
         .join("output.log"))
 }
 
+fn receipt_path(id: &str) -> std::io::Result<PathBuf> {
+    if !is_safe_id(id) {
+        return Err(unsafe_id_err());
+    }
+    Ok(registry_root()
+        .join(".terminal-receipts")
+        .join(format!("{id}.json")))
+}
+
+fn launch_ticket_path(id: &str, ticket: &str) -> std::io::Result<PathBuf> {
+    if !is_safe_id(id) || ticket.len() != 32 || !ticket.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(unsafe_id_err());
+    }
+    Ok(container_dir_checked(id)
+        .ok_or_else(unsafe_id_err)?
+        .join(format!(".launch-ticket-{ticket}")))
+}
+
+pub fn prepare_launch_ticket(state: &mut ContainerState) -> std::io::Result<String> {
+    if state.status != ContainerStatus::Created
+        || state.control.is_some()
+        || state.launch_ticket.is_some()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "container already has a carrier launch in progress",
+        ));
+    }
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| std::io::Error::other(format!("generate launch ticket: {error:?}")))?;
+    let ticket = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let path = launch_ticket_path(&state.id, &ticket)?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    state.launch_ticket = Some(ticket.clone());
+    if let Err(error) = state.persist() {
+        let _ = std::fs::remove_file(path);
+        state.launch_ticket = None;
+        return Err(error);
+    }
+    Ok(ticket)
+}
+
+fn bound_launch_authorization(ticket: &str, pid: libc::pid_t) -> String {
+    format!("{ticket}:{pid}")
+}
+
+/// Bind the prepared bearer to the exact pid returned by `posix_spawn` before
+/// the parent releases the child-side grant pipe.
+pub fn bind_launch_ticket_to_pid(
+    id: &str,
+    ticket: &str,
+    pid: libc::pid_t,
+) -> std::io::Result<String> {
+    if pid <= 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "carrier launch pid must be positive",
+        ));
+    }
+    let mut state = ContainerState::load(id)?;
+    if state.status != ContainerStatus::Created
+        || state.control.is_some()
+        || state.launch_ticket.as_deref() != Some(ticket)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "carrier launch ticket no longer owns the Created state",
+        ));
+    }
+    let authorization = bound_launch_authorization(ticket, pid);
+    state.launch_ticket = Some(authorization.clone());
+    state.persist()?;
+    Ok(authorization)
+}
+
+/// Atomically consume the exact parent's one-shot ticket. The ticket is first
+/// authenticated against the current process id, then unlink is used as the
+/// one-shot primitive. The bound authorization remains in state until managed
+/// carrier control atomically publishes Running.
+pub fn consume_launch_ticket(id: &str, ticket: &str, pid: libc::pid_t) -> std::io::Result<String> {
+    let path = launch_ticket_path(id, ticket)?;
+    let state = ContainerState::load(id)?;
+    let authorization = bound_launch_authorization(ticket, pid);
+    if state.status != ContainerStatus::Created
+        || state.control.is_some()
+        || state.launch_ticket.as_deref() != Some(authorization.as_str())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "carrier launch ticket does not own the Created state",
+        ));
+    }
+    std::fs::remove_file(path)?;
+    Ok(authorization)
+}
+
+pub fn cancel_launch_ticket(id: &str, ticket: &str) {
+    if let Ok(path) = launch_ticket_path(id, ticket) {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Ok(mut state) = ContainerState::load(id)
+        && state.launch_ticket.as_deref().is_some_and(|authorization| {
+            authorization == ticket || authorization.starts_with(&format!("{ticket}:"))
+        })
+    {
+        state.launch_ticket = None;
+        let _ = state.persist();
+    }
+}
+
+/// Exclusive lifecycle transaction for one container. POSIX record locks are
+/// process-owned and are not inherited across `fork`, so a detached carrier
+/// cannot accidentally retain the CLI parent's start/remove transaction.
+#[derive(Debug)]
+pub struct ContainerLifecycleLock {
+    file: std::fs::File,
+    _process_guard: parking_lot::MutexGuard<'static, ()>,
+}
+
+const LIFECYCLE_LOCK_STRIPES: usize = 64;
+
+fn lifecycle_lock_stripe(key: &str) -> &'static parking_lot::Mutex<()> {
+    static STRIPES: std::sync::OnceLock<[parking_lot::Mutex<()>; LIFECYCLE_LOCK_STRIPES]> =
+        std::sync::OnceLock::new();
+    let stripes = STRIPES.get_or_init(|| std::array::from_fn(|_| parking_lot::Mutex::new(())));
+    let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    &stripes[hash as usize % LIFECYCLE_LOCK_STRIPES]
+}
+
+impl Drop for ContainerLifecycleLock {
+    fn drop(&mut self) {
+        // SAFETY: zero is a valid starting representation for `libc::flock`;
+        // the fields used by F_SETLK are initialized immediately below.
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_UNLCK as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        // SAFETY: fd is owned by `self.file`; `lock` points to a live flock.
+        let _ = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_SETLK, &lock) };
+    }
+}
+
+pub fn lock_lifecycle(id: &str) -> std::io::Result<ContainerLifecycleLock> {
+    if !is_safe_id(id) {
+        return Err(unsafe_id_err());
+    }
+    lock_registry_record(id, &format!("{id}.lock"))
+}
+
+/// Serialize the registry-wide name uniqueness check with initial state
+/// publication. This lock is intentionally separate from per-container
+/// lifecycle locks and is held only across the short name claim transaction.
+pub fn lock_name_registry() -> std::io::Result<ContainerLifecycleLock> {
+    lock_registry_record(".container-names", ".container-names.lock")
+}
+
+fn lock_registry_record(key: &str, filename: &str) -> std::io::Result<ContainerLifecycleLock> {
+    let process_guard = lifecycle_lock_stripe(key).lock();
+    let directory = registry_root().join(".lifecycle-locks");
+    ensure_private_aux_directory(&directory)?;
+    let path = directory.join(filename);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let metadata = file.metadata()?;
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_file() || metadata.uid() != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "container lifecycle lock is not an owned regular file",
+        ));
+    }
+    // SAFETY: zero is a valid starting representation for `libc::flock`;
+    // the fields used by F_SETLKW are initialized immediately below.
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as _;
+    lock.l_whence = libc::SEEK_SET as _;
+    // SAFETY: fd is owned by `file`; `lock` points to a live flock.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLKW, &lock) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(ContainerLifecycleLock {
+        file,
+        _process_guard: process_guard,
+    })
+}
+
+pub fn terminal_receipt(id: &str) -> std::io::Result<Option<CarrierTerminalReceipt>> {
+    let path = receipt_path(id)?;
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn persist_terminal_receipt(id: &str, receipt: &CarrierTerminalReceipt) -> std::io::Result<()> {
+    let path = receipt_path(id)?;
+    let directory = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "terminal receipt path has no parent",
+        )
+    })?;
+    ensure_private_aux_directory(directory)?;
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec(receipt).map_err(std::io::Error::other)?,
+    )?;
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(temporary, path)
+}
+
+fn ensure_private_aux_directory(directory: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(registry_root())?;
+    match std::fs::symlink_metadata(directory) {
+        Ok(metadata) => {
+            // SAFETY: geteuid has no preconditions.
+            let uid = unsafe { libc::geteuid() };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.uid() != uid {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{} is not an owned directory", directory.display()),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(directory)?;
+        }
+        Err(error) => return Err(error),
+    }
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+}
+
+pub fn clear_terminal_receipt(id: &str) -> std::io::Result<()> {
+    match std::fs::remove_file(receipt_path(id)?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 impl ContainerState {
     /// Create the container directory and write the initial state atomically
     /// (write to a temp file + rename, like `cred_ipc`). The id is one carrick
@@ -329,11 +642,15 @@ impl ContainerState {
     pub fn create(&self) -> std::io::Result<()> {
         let dir = container_dir_checked(&self.id).ok_or_else(unsafe_id_err)?;
         std::fs::create_dir_all(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        clear_terminal_receipt(&self.id)?;
         self.persist()
     }
 
     /// Persist the current state to `state.json` atomically.
     pub fn persist(&self) -> std::io::Result<()> {
+        let directory = container_dir_checked(&self.id).ok_or_else(unsafe_id_err)?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
         let path = state_path(&self.id)?;
         let tmp = path.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(self)
@@ -341,6 +658,7 @@ impl ContainerState {
         // `path`/`tmp` are under the registry root by construction (id is an
         // allowlisted token; see container_dir_checked).
         std::fs::write(&tmp, &bytes)?; // nosemgrep
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         std::fs::rename(&tmp, &path) // nosemgrep
     }
 
@@ -407,6 +725,20 @@ pub fn pid_alive(pid: i32) -> bool {
 /// malformed entries are skipped). Stale `Running` entries whose init has died
 /// are reported with their recorded state — the CLI reconciles them.
 pub fn list() -> Vec<ContainerState> {
+    let mut out = list_unreconciled();
+    for state in &mut out {
+        if reconciled_status(state) == ContainerStatus::Exited {
+            state.status = ContainerStatus::Exited;
+            state.exit_code.get_or_insert(UNKNOWN_CARRIER_EXIT_CODE);
+        }
+    }
+    out
+}
+
+/// Registry lookup input without host-PID reconciliation. Mutating lifecycle
+/// commands authenticate the persisted control incarnation themselves; a PID
+/// liveness hint must never erase that authority before they acquire its lock.
+fn list_unreconciled() -> Vec<ContainerState> {
     let root = registry_root();
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(&root) else {
@@ -417,9 +749,8 @@ pub fn list() -> Vec<ContainerState> {
             continue;
         }
         if let Some(id) = entry.file_name().to_str()
-            && let Ok(mut state) = ContainerState::load(id)
+            && let Ok(state) = ContainerState::load(id)
         {
-            let _ = reconcile_terminal_state(&mut state);
             out.push(state);
         }
     }
@@ -429,7 +760,7 @@ pub fn list() -> Vec<ContainerState> {
 /// Resolve a user-supplied id-or-name (and unambiguous id prefix) to a full
 /// container id. Returns `Err` with a human message on no-match / ambiguity.
 pub fn resolve(id_or_name: &str) -> Result<String, String> {
-    let all = list();
+    let all = list_unreconciled();
     // Exact id.
     if all.iter().any(|c| c.id == id_or_name) {
         return Ok(id_or_name.to_string());
@@ -491,14 +822,57 @@ pub fn make_id(seed_hi: u64, seed_lo: u64) -> String {
 /// recording the exit code. Best-effort: a missing entry is not an error.
 pub fn mark_exited(id: &str, exit_code: i32) {
     if let Ok(mut state) = ContainerState::load(id) {
+        // Managed carrier control already published the authoritative exact
+        // receipt. The outer runtime compatibility hook must not erase its
+        // provenance after `complete()` returns.
+        if state.status == ContainerStatus::Exited && state.terminal_control.is_some() {
+            return;
+        }
+        // A managed carrier owns Running state. A losing duplicate entry or
+        // compatibility finalizer must never overwrite that exact owner.
+        if state.control.is_some() {
+            return;
+        }
         if state.auto_remove {
             let _ = ContainerState::remove(id);
         } else {
             state.status = ContainerStatus::Exited;
             state.exit_code = Some(exit_code);
+            state.control = None;
+            state.terminal_control = None;
+            state.launch_ticket = None;
             let _ = state.persist();
         }
     }
+}
+
+/// Publish terminal state only when `expected` still owns this exact carrier
+/// incarnation. A stale drop/rollback must never overwrite a replacement run.
+pub fn mark_control_owner_exited(
+    id: &str,
+    expected: &CarrierControlState,
+    exit_code: i32,
+) -> std::io::Result<bool> {
+    let mut state = ContainerState::load(id)?;
+    if state.control.as_ref() != Some(expected) {
+        return Ok(false);
+    }
+    let receipt = CarrierTerminalReceipt {
+        control: expected.clone(),
+        exit_code,
+    };
+    persist_terminal_receipt(id, &receipt)?;
+    if state.auto_remove {
+        ContainerState::remove(id)?;
+    } else {
+        state.status = ContainerStatus::Exited;
+        state.exit_code = Some(exit_code);
+        state.control = None;
+        state.terminal_control = Some(expected.clone());
+        state.launch_ticket = None;
+        state.persist()?;
+    }
+    Ok(true)
 }
 
 /// Reconcile a loaded state against reality: a `Running` entry whose init is
@@ -523,6 +897,9 @@ pub fn reconcile_terminal_state(state: &mut ContainerState) -> ContainerStatus {
     }
     state.status = ContainerStatus::Exited;
     state.exit_code.get_or_insert(UNKNOWN_CARRIER_EXIT_CODE);
+    state.control = None;
+    state.terminal_control = None;
+    state.launch_ticket = None;
     if state.auto_remove {
         let _ = ContainerState::remove(&state.id);
     } else {
@@ -533,6 +910,8 @@ pub fn reconcile_terminal_state(state: &mut ContainerState) -> ContainerStatus {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     #[test]
@@ -598,6 +977,9 @@ mod tests {
             auto_remove: false,
             api_auto_remove: false,
             labels: std::collections::HashMap::new(),
+            control: None,
+            terminal_control: None,
+            launch_ticket: None,
             config: RunConfig::default(),
         };
         assert_eq!(reconciled_status(&s), ContainerStatus::Exited);
@@ -624,6 +1006,7 @@ mod tests {
         // Load-bearing: a legacy entry with NO config object must default
         // max_traps to DEFAULT_MAX_TRAPS, not 0 (0 trips the trap limit at once).
         assert_eq!(s.config.max_traps, crate::runtime::DEFAULT_MAX_TRAPS);
+        assert_eq!(s.config.stop_signal_abi, StopSignalAbi::Linux);
 
         // A config object present but WITHOUT max_traps also defaults correctly
         // (the named field serde default).
@@ -632,6 +1015,7 @@ mod tests {
             "exit_code":null,"auto_remove":false,"config":{"env":["A=1"]}}"#;
         let s_nt: ContainerState = serde_json::from_str(no_traps).expect("loads");
         assert_eq!(s_nt.config.max_traps, crate::runtime::DEFAULT_MAX_TRAPS);
+        assert_eq!(s_nt.config.stop_signal_abi, StopSignalAbi::LegacyHost);
         assert_eq!(
             s_nt.config.exec_backend,
             carrick_spec::ExecBackendRequest::HvPatch
@@ -666,6 +1050,7 @@ mod tests {
         assert!(round.config.tty);
         assert_eq!(round.config.max_traps, 4242);
         assert_eq!(round.config.stop_signal, Some(3));
+        assert_eq!(round.config.stop_signal_abi, StopSignalAbi::Linux);
         assert_eq!(round.config.stop_timeout, Some(7));
         assert_eq!(
             round.config.exec_backend,
@@ -686,6 +1071,203 @@ mod tests {
                 .to_string();
             assert!(error.contains(guidance), "unexpected error: {error}");
         }
+    }
+
+    #[test]
+    fn managed_terminal_state_is_bound_to_the_exact_control_incarnation() {
+        let id = format!("terminal-receipt-{}", std::process::id());
+        let _ = ContainerState::remove(&id);
+        let _ = clear_terminal_receipt(&id);
+        let control = CarrierControlState {
+            schema: crate::kernel::control::CARRIER_CONTROL_STATE_SCHEMA.to_owned(),
+            owner_nonce: crate::kernel::control::ControlNonce::fresh().expect("nonce"),
+            init: crate::kernel::control::ControlTaskKey { pid: 1, serial: 7 },
+        };
+        let state = ContainerState {
+            id: id.clone(),
+            name: None,
+            image: "test".to_owned(),
+            command: vec!["/bin/true".to_owned()],
+            status: ContainerStatus::Running,
+            supervisor_pid: std::process::id() as i32,
+            init_pid: std::process::id() as i32,
+            created_secs: 0,
+            exit_code: None,
+            auto_remove: false,
+            api_auto_remove: false,
+            labels: std::collections::HashMap::new(),
+            control: Some(control.clone()),
+            terminal_control: None,
+            launch_ticket: None,
+            config: RunConfig::default(),
+        };
+        state.create().expect("create state");
+
+        assert!(mark_control_owner_exited(&id, &control, 23).expect("mark terminal"));
+        mark_exited(&id, 23);
+        let terminal = ContainerState::load(&id).expect("terminal state");
+        assert_eq!(terminal.status, ContainerStatus::Exited);
+        assert_eq!(terminal.exit_code, Some(23));
+        assert_eq!(terminal.control, None);
+        assert_eq!(terminal.terminal_control, Some(control.clone()));
+        assert_eq!(
+            terminal_receipt(&id).expect("receipt"),
+            Some(CarrierTerminalReceipt {
+                control: control.clone(),
+                exit_code: 23,
+            })
+        );
+
+        let _ = ContainerState::remove(&id);
+        let _ = clear_terminal_receipt(&id);
+
+        let auto_id = format!("terminal-receipt-auto-{}", std::process::id());
+        let _ = ContainerState::remove(&auto_id);
+        let _ = clear_terminal_receipt(&auto_id);
+        let mut auto = terminal;
+        auto.id = auto_id.clone();
+        auto.status = ContainerStatus::Running;
+        auto.exit_code = None;
+        auto.auto_remove = true;
+        auto.control = Some(control.clone());
+        auto.terminal_control = None;
+        auto.create().expect("create auto-remove state");
+
+        assert!(mark_control_owner_exited(&auto_id, &control, 9).expect("auto-remove terminal"));
+        assert_eq!(
+            ContainerState::load(&auto_id)
+                .expect_err("auto-remove state removed")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            terminal_receipt(&auto_id).expect("auto-remove receipt"),
+            Some(CarrierTerminalReceipt {
+                control,
+                exit_code: 9,
+            })
+        );
+        let _ = clear_terminal_receipt(&auto_id);
+    }
+
+    #[test]
+    fn lifecycle_lock_refuses_a_symlink_file() {
+        let id = format!("lifecycle-lock-symlink-{}", std::process::id());
+        let directory = registry_root().join(".lifecycle-locks");
+        ensure_private_aux_directory(&directory).expect("private lock directory");
+        let path = directory.join(format!("{id}.lock"));
+        let _ = std::fs::remove_file(&path);
+        std::os::unix::fs::symlink("/tmp", &path).expect("symlink fixture");
+
+        let error = lock_lifecycle(&id).expect_err("O_NOFOLLOW must reject symlink lock");
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(libc::ELOOP) | Some(libc::EACCES) | Some(libc::EPERM)
+            ),
+            "unexpected error: {error}"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn lifecycle_lock_serializes_threads_in_the_same_process() {
+        let id = format!("lifecycle-lock-thread-{}", std::process::id());
+        let first = lock_lifecycle(&id).expect("first lifecycle lock");
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let thread_id = id.clone();
+        let contender = std::thread::spawn(move || {
+            let _second = lock_lifecycle(&thread_id).expect("second lifecycle lock");
+            acquired_tx.send(()).expect("report acquisition");
+        });
+
+        assert_eq!(
+            acquired_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "same-process lifecycle contender bypassed the first transaction"
+        );
+        drop(first);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("contender acquires after release");
+        contender.join().expect("contender thread");
+    }
+
+    #[test]
+    fn name_registry_lock_serializes_concurrent_creators() {
+        let first = lock_name_registry().expect("first name registry lock");
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            let _second = lock_name_registry().expect("second name registry lock");
+            acquired_tx.send(()).expect("report acquisition");
+        });
+        assert_eq!(
+            acquired_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        drop(first);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("creator acquires after release");
+        contender.join().expect("creator thread");
+    }
+
+    #[test]
+    fn launch_ticket_is_one_shot_and_losing_entry_cannot_overwrite_winner() {
+        let id = format!("launch-ticket-{}", std::process::id());
+        let _ = ContainerState::remove(&id);
+        let mut state: ContainerState = serde_json::from_str(
+            r#"{"id":"placeholder","name":null,"image":"img","command":[],
+                "status":"created","supervisor_pid":0,"init_pid":0,"created_secs":0,
+                "exit_code":null,"auto_remove":false}"#,
+        )
+        .expect("state fixture");
+        state.id = id.clone();
+        state.create().expect("create state");
+
+        let ticket = prepare_launch_ticket(&mut state).expect("prepare ticket");
+        assert_eq!(ticket.len(), 32);
+        bind_launch_ticket_to_pid(&id, &ticket, 77).expect("bind exact spawned pid");
+        assert_eq!(
+            consume_launch_ticket(&id, &ticket, 78)
+                .expect_err("wrong pid must not consume ticket")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let authorization =
+            consume_launch_ticket(&id, &ticket, 77).expect("exact entry consumes ticket");
+        assert_eq!(
+            ContainerState::load(&id)
+                .expect("authorized state")
+                .launch_ticket
+                .as_deref(),
+            Some(authorization.as_str())
+        );
+        assert_eq!(
+            consume_launch_ticket(&id, &ticket, 77)
+                .expect_err("duplicate entry must lose")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        let control = CarrierControlState {
+            schema: crate::kernel::control::CARRIER_CONTROL_STATE_SCHEMA.to_owned(),
+            owner_nonce: crate::kernel::control::ControlNonce::fresh().expect("nonce"),
+            init: crate::kernel::control::ControlTaskKey { pid: 1, serial: 11 },
+        };
+        let mut winner = ContainerState::load(&id).expect("consumed state");
+        winner.status = ContainerStatus::Running;
+        winner.control = Some(control.clone());
+        winner.persist().expect("publish winner");
+
+        mark_exited(&id, 125);
+        let preserved = ContainerState::load(&id).expect("winner preserved");
+        assert_eq!(preserved.status, ContainerStatus::Running);
+        assert_eq!(preserved.control, Some(control));
+        assert_eq!(preserved.exit_code, None);
+
+        let _ = ContainerState::remove(&id);
     }
 
     #[test]
@@ -714,5 +1296,62 @@ mod tests {
             "{message}"
         );
         let _ = ContainerState::remove(&id);
+    }
+
+    #[test]
+    fn persisted_container_state_is_private() {
+        let mut state: ContainerState = serde_json::from_str(
+            r#"{"id":"private-state-test","name":null,"image":"img","command":[],
+                "status":"created","supervisor_pid":0,"init_pid":0,"created_secs":0,
+                "exit_code":null,"auto_remove":false}"#,
+        )
+        .expect("state fixture");
+        state.id = format!("private-state-{}", std::process::id());
+        let _ = ContainerState::remove(&state.id);
+
+        state.create().expect("create private state");
+
+        let directory_mode = std::fs::metadata(container_dir(&state.id))
+            .expect("container directory")
+            .permissions()
+            .mode()
+            & 0o777;
+        let state_mode = std::fs::metadata(state_path(&state.id).expect("state path"))
+            .expect("state file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(directory_mode, 0o700);
+        assert_eq!(state_mode, 0o600);
+
+        let _ = ContainerState::remove(&state.id);
+    }
+
+    #[test]
+    fn persisting_a_legacy_container_tightens_its_directory() {
+        let mut state: ContainerState = serde_json::from_str(
+            r#"{"id":"legacy-private-state","name":null,"image":"img","command":[],
+                "status":"created","supervisor_pid":0,"init_pid":0,"created_secs":0,
+                "exit_code":null,"auto_remove":false}"#,
+        )
+        .expect("state fixture");
+        state.id = format!("legacy-private-state-{}", std::process::id());
+        let directory = container_dir(&state.id);
+        let _ = ContainerState::remove(&state.id);
+        std::fs::create_dir_all(&directory).expect("legacy directory");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))
+            .expect("legacy mode");
+
+        state.persist().expect("persist legacy state");
+
+        assert_eq!(
+            std::fs::metadata(&directory)
+                .expect("directory")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+        );
+        let _ = ContainerState::remove(&state.id);
     }
 }

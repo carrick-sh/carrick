@@ -20,8 +20,8 @@
 //!    - `Run`/`Create`/`Exec` build a [`carrick_engine::CliRunRequest`] and go
 //!      through `carrick_engine::Engine::resolve` — i.e. resolve+pull an OCI
 //!      image and compose its rootfs — then call `Runtime::execute` separately,
-//!      once the async pull is torn down (no tokio runtime live across the fork).
-//!      This is the docker path.
+//!      once the async pull is torn down (no tokio runtime live across the
+//!      possible interactive-session fork). This is the docker path.
 //!    - `RunElf`/`DispatchSyscall` bypass the engine and the image store
 //!      entirely, loading a *host* ELF (or a single synthetic syscall) straight
 //!      through `carrick-runtime`. This is the fixture path used by Go/CPython/
@@ -44,12 +44,12 @@
 //!
 //! ## Fork-safety on the engine error path
 //!
-//! Under `--pid private` the supervisor fork happens *inside* `engine.run`, so
-//! an HVF/setup failure can surface in the `Err` arm while already in a forked
-//! guest-init child. That arm therefore exits with `libc::_exit(125)`, never
-//! `std::process::exit`: the latter runs atexit/Drop cleanup, which after a fork
-//! double-closes an inherited fd and trips an IO-safety abort. This mirrors how
-//! the runtime exits all its other forked children.
+//! An interactive run may cross the separately-scoped TTY supervisor boundary
+//! inside `Runtime::execute`, so an HVF/setup failure can surface in the `Err`
+//! arm while already in a forked runtime child. That child uses
+//! `libc::_exit(125)` because normal atexit/Drop cleanup after fork can
+//! double-close an inherited fd and trip an IO-safety abort. The ordinary/raw
+//! carrier uses `std::process::exit(125)` and retains normal cleanup.
 //!
 //! ## `trace`: the auto-sudo re-exec
 //!
@@ -138,7 +138,8 @@ use crate::runtime_util::{
 };
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use crate::trace_cli::{
-    TraceSudoInvocation, current_supplementary_groups, trace_drop_credentials, trace_sudo_argv,
+    TraceSudoInvocation, current_supplementary_groups, exec_trace_under_sudo,
+    trace_drop_credentials, trace_sudo_argv,
 };
 use crate::trace_profile::validate_v2_path;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -453,6 +454,12 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
     };
 
     match command {
+        Commands::BuildSourceMarker => {
+            println!("{}", build_source_marker_json());
+        }
+        Commands::CarrierEntry { id, grant_fd } => {
+            crate::lifecycle::carrier_entry(store, &id, grant_fd)
+        }
         Commands::NativeProfileBirthFixture { hold_ms, quiet } => {
             run_native_profile_birth_fixture(hold_ms, quiet)?;
         }
@@ -552,13 +559,12 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     unsafe { std::env::set_var(k, v) };
                 }
             }
-            // Fork-shared alias-IPA counter, before any guest fork (see the Run
-            // handler / alloc_alias_ipa — prevents cross-process alias-IPA reuse
-            // in the unflushable shared stage-2 TLB).
+            // Carrier-wide alias-IPA counter, before any logical guest task is
+            // created (see the Run handler / alloc_alias_ipa — prevents
+            // cross-task alias-IPA reuse in the shared stage-2 TLB).
             carrick_runtime::memory::init_alias_ipa_allocator();
-            // Same reason: force the fork-coherent fs-resolve generation word
-            // into existence in the ROOT before any guest fork, so every
-            // descendant shares the one MAP_SHARED page.
+            // Same reason: force the carrier-wide fs-resolve generation word
+            // into existence before any logical guest task is created.
             carrick_runtime::fs_resolve_cache::init();
             let mut dispatcher = if rootfs_layers.is_empty() {
                 SyscallDispatcher::new()
@@ -945,23 +951,21 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 cap_add,
             };
 
-            // Stand up the fork-shared alias-IPA counter NOW, in the root process,
-            // before any guest (or the --pid-private supervisor) forks — every
-            // host-forked descendant must inherit the one MAP_SHARED counter so no
-            // two guest processes ever reuse an alias IPA in the shared hv_vm
-            // (a latent cross-process stage-2 coherence hazard). See alloc_alias_ipa.
+            // Stand up the carrier-wide alias-IPA counter before any logical guest
+            // task is created. Every task allocates from this one counter so no two
+            // address spaces ever reuse an alias IPA in the shared hv_vm (a latent
+            // cross-task stage-2 coherence hazard). See alloc_alias_ipa.
             carrick_runtime::memory::init_alias_ipa_allocator();
-            // Same reason: force the fork-coherent fs-resolve generation word
-            // into existence in the ROOT before any guest fork, so every
-            // descendant shares the one MAP_SHARED page.
+            // Same reason: force the carrier-wide fs-resolve generation word into
+            // existence before any logical guest task is created.
             carrick_runtime::fs_resolve_cache::init();
 
-            // Detached (`carrick run -d`): fork into the background under a
-            // per-container supervisor, print the id, and return. Manage it with
-            // `carrick ps|stop|kill|rm`. `run_detached` resolves/pulls the image
-            // in the foreground first, so a resolution error surfaces to the
-            // user's terminal (not the detached log) and the effective stop
-            // signal is baked into the persisted config.
+            // Detached (`carrick run -d`): fork one VM carrier into the
+            // background, print the id, and return. Manage it with `carrick
+            // ps|stop|kill|rm`. `run_detached` resolves/pulls the image in the
+            // foreground first, so a resolution error surfaces to the user's
+            // terminal (not the detached log) and the effective stop signal is
+            // baked into the persisted config.
             if detach {
                 let name_for_state = req.name.clone();
                 return crate::lifecycle::run_detached(req, store.clone(), name_for_state);
@@ -1015,15 +1019,16 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("carrick: {e:#}");
-                    // execute() forks (interactive supervisor / `--pid private`
-                    // NsSupervisor); a setup failure can surface in the forked
-                    // guest-init child, where `std::process::exit`'s atexit/Drop
-                    // is unsafe after fork and double-closes an inherited fd
-                    // (IO-safety abort → SIGABRT). `_exit` terminates without that
-                    // cleanup, like the runtime's other forked-child exits.
-                    // SAFETY: _exit is async-signal-safe; stderr already flushed
-                    // (eprintln is unbuffered); no buffered stdout to lose.
-                    unsafe { libc::_exit(125) };
+                    if tty {
+                        // The separately-scoped interactive TTY supervisor may
+                        // put this error arm in its forked runtime child. Do not
+                        // unwind fd-owning state there.
+                        // SAFETY: `_exit` skips atexit/Drop; stderr is unbuffered.
+                        unsafe { libc::_exit(125) };
+                    }
+                    // Ordinary/raw HVPatch execution is the original carrier,
+                    // so normal process cleanup and terminal receipts are safe.
+                    std::process::exit(125);
                 }
             };
 
@@ -1545,7 +1550,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     // libdtrace needs root to open /dev/dtrace. Re-exec the
                     // whole `carrick trace ...` invocation under sudo so the
                     // caller doesn't have to remember the prefix.
-                    use std::os::unix::process::CommandExt;
                     tracing::warn!("carrick trace: not root; re-executing under sudo");
                     // Plain `sudo` resets the environment (env_reset), which
                     // would drop the CARRICK_* knobs the trace'd run needs
@@ -1583,7 +1587,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         forwarded_env: &environment,
                         command: &command,
                     });
-                    let err = std::process::Command::new("sudo").args(&forwarded).exec();
+                    let err = exec_trace_under_sudo(&forwarded);
                     bail!("carrick trace: failed to re-exec under sudo: {}", err);
                 }
                 let drop_credentials = trace_drop_credentials(trace_uid, trace_gid, &trace_groups);
@@ -1858,6 +1862,12 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 let report =
                     carrick_runtime::dtrace_consumer::run_child_under_dtrace(&me, &command, &opts)
                         .map_err(|error| anyhow::anyhow!("trace failed: {error}"))?;
+                if opts.script.is_some()
+                    && profile.is_none()
+                    && custom_trace_report_is_lossy(report)
+                {
+                    bail!("custom DTrace capture was lossy or interrupted");
+                }
                 if let Some(requested_profile) = profile {
                     let raw_path = output_path
                         .ok_or_else(|| anyhow::anyhow!("profile trace has no output path"))?;
@@ -2096,6 +2106,25 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn build_source_marker_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "carrick-build-source-v1",
+        "head": option_env!("CARRICK_BUILD_SOURCE_HEAD").unwrap_or("unstamped"),
+        "tree": option_env!("CARRICK_BUILD_SOURCE_TREE").unwrap_or("unstamped"),
+        "state": option_env!("CARRICK_BUILD_SOURCE_STATE").unwrap_or("unstamped"),
+    })
+}
+
+fn custom_trace_report_is_lossy(report: carrick_runtime::dtrace_consumer::DTraceRunReport) -> bool {
+    report.principal_drops != 0
+        || report.aggregation_drops != 0
+        || report.dynamic_drops != 0
+        || report.dynamic_rinse_drops != 0
+        || report.dynamic_dirty_drops != 0
+        || report.other_drops != 0
+        || report.interrupted
+}
+
 fn run_volume_command(command: VolumeCommand) -> anyhow::Result<()> {
     match command {
         VolumeCommand::Create {
@@ -2263,7 +2292,8 @@ fn volume_field(volume: &serde_json::Value, field: &str) -> String {
 
 #[cfg(target_os = "macos")]
 fn run_scratch_volume_create(quota: Option<u64>) -> anyhow::Result<()> {
-    let v = carrick_runtime::apfs::create_carrick_volume(quota)
+    let mut operator = crate::apfs_operator::DiskutilOperator;
+    let v = carrick_runtime::apfs::create_carrick_volume(&mut operator, quota)
         .context("failed to create carrick scratch volume")?;
     println!(
         "{} {} {} case-sensitive={}",
@@ -2285,7 +2315,8 @@ fn run_scratch_volume_create(_quota: Option<u64>) -> anyhow::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn run_scratch_volume_info() -> anyhow::Result<()> {
-    match carrick_runtime::apfs::find_carrick_volume()
+    let mut operator = crate::apfs_operator::DiskutilOperator;
+    match carrick_runtime::apfs::find_carrick_volume(&mut operator)
         .context("failed to query carrick scratch volume")?
     {
         Some(v) => {
@@ -2309,7 +2340,8 @@ fn run_scratch_volume_info() -> anyhow::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn run_scratch_volume_delete(yes: bool) -> anyhow::Result<()> {
-    let Some(v) = carrick_runtime::apfs::find_carrick_volume()
+    let mut operator = crate::apfs_operator::DiskutilOperator;
+    let Some(v) = carrick_runtime::apfs::find_carrick_volume(&mut operator)
         .context("failed to query carrick scratch volume")?
     else {
         println!("no carrick scratch volume to delete");
@@ -2322,7 +2354,7 @@ fn run_scratch_volume_delete(yes: bool) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    carrick_runtime::apfs::delete_carrick_volume()
+    carrick_runtime::apfs::delete_carrick_volume(&mut operator)
         .context("failed to delete carrick scratch volume")?;
     println!("deleted {} ({})", v.device, v.name);
     Ok(())
@@ -2662,7 +2694,7 @@ const DEFAULT_BUILD_TAG: &str = "carrick-build:latest";
 /// stdio so kaniko's progress streams live) and then either lets kaniko push or
 /// ingests the resulting tar with [`ImageStore::load_docker_archive`].
 #[allow(clippy::too_many_arguments)]
-fn run_build(
+pub(crate) fn run_build(
     store: &ImageStore,
     tag: Option<String>,
     file: std::path::PathBuf,
@@ -2709,8 +2741,6 @@ fn run_build(
     // kaniko's `--destination` is required even for `--no-push`; default it.
     let destination = tag.unwrap_or_else(|| DEFAULT_BUILD_TAG.to_owned());
 
-    let me = std::env::current_exe().context("failed to resolve current carrick binary path")?;
-
     // DATA-LOSS GUARD: never bind-mount the user's context directory directly.
     //
     // kaniko's between-stage filesystem reset calls `os.RemoveAll("/workspace")`
@@ -2742,7 +2772,7 @@ fn run_build(
     let out_path = out_dir.as_ref().map(|d| d.path().to_path_buf());
 
     let argv = kaniko_run_argv(
-        &me.to_string_lossy(),
+        "carrick",
         &context_copy.to_string_lossy(),
         out_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
         &dockerfile_rel,
@@ -2754,19 +2784,68 @@ fn run_build(
         platform.as_deref(),
     );
 
-    // Shell out to ourselves, inheriting stdio so kaniko's build progress
-    // streams straight to the user (same translator pattern as `carrick serve`
-    // / `carrick trace`). argv[0] is the carrick binary path.
-    let (program, args) = argv
-        .split_first()
-        .context("internal error: empty kaniko run argv")?;
-    let status = std::process::Command::new(program)
-        .args(args)
-        .status()
-        .with_context(|| format!("failed to spawn {program} for the kaniko build"))?;
-    if !status.success() {
-        // kaniko's own diagnostics already streamed to the user's terminal.
-        bail!("build failed (kaniko exited with {status})");
+    let image_index = argv
+        .iter()
+        .position(|argument| argument == KANIKO_IMAGE)
+        .context("internal error: kaniko image missing from direct run request")?;
+    let mut mounts = vec![parse_volume_mount(&format!(
+        "{}:/workspace",
+        context_copy.display()
+    ))?];
+    if let Some(out) = out_path.as_deref() {
+        mounts.push(parse_volume_mount(&format!("{}:/out", out.display()))?);
+    }
+    let request = carrick_engine::CliRunRequest {
+        image_ref: KANIKO_IMAGE.to_owned(),
+        platform: None,
+        args: argv[image_index + 1..].to_vec(),
+        env_overrides: Vec::new(),
+        mounts,
+        workdir: None,
+        user: None,
+        hostname: None,
+        entrypoint_override: None,
+        tty: false,
+        interactive: false,
+        rm: false,
+        name: None,
+        max_traps: usize::MAX,
+        debug_state_path: None,
+        fs: Some(carrick_spec::FsBackendKind::Host),
+        pull: carrick_image::PullPolicy::Missing,
+        exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
+        pid: carrick_spec::PidMode::Private,
+        network: carrick_spec::NetworkMode::Host,
+        network_bridge: None,
+        network_container: None,
+        network_namespace_id: None,
+        network_attachments: Vec::new(),
+        network_ipv4: None,
+        network_aliases: Vec::new(),
+        extra_hosts: Vec::new(),
+        dns_servers: Vec::new(),
+        dns_search: Vec::new(),
+        dns_options: Vec::new(),
+        volumes_from: Vec::new(),
+        published_ports: Vec::new(),
+        stop_signal: None,
+        stop_timeout: None,
+        security_opts: Vec::new(),
+        cap_add: Vec::new(),
+    };
+    carrick_runtime::memory::init_alias_ipa_allocator();
+    carrick_runtime::fs_resolve_cache::init();
+    let engine = carrick_engine::Engine::new(store.clone());
+    let spec = block_on_oci(engine.resolve(request)).context("resolve kaniko build carrier")?;
+    let result = carrick_runtime::Runtime::execute(&spec).context("run kaniko build carrier")?;
+    emit_raw(&result);
+    let status = if result.trap_limit_hit {
+        1
+    } else {
+        result.exit_code
+    };
+    if status != 0 {
+        bail!("build failed (kaniko exited with status {status})");
     }
 
     if push {
@@ -3020,6 +3099,38 @@ mod tests {
     #[cfg(target_os = "macos")]
     use crate::trace_profile::TraceProfileKind;
 
+    #[test]
+    fn build_source_marker_is_always_explicit_and_versioned() {
+        let marker = build_source_marker_json();
+        assert_eq!(marker["schema"], "carrick-build-source-v1");
+        for field in ["head", "tree", "state"] {
+            assert!(
+                marker[field]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+            );
+        }
+    }
+
+    #[test]
+    fn custom_trace_drop_or_interrupt_is_never_accepted() {
+        assert!(!custom_trace_report_is_lossy(
+            carrick_runtime::dtrace_consumer::DTraceRunReport::default()
+        ));
+        assert!(custom_trace_report_is_lossy(
+            carrick_runtime::dtrace_consumer::DTraceRunReport {
+                principal_drops: 1,
+                ..Default::default()
+            }
+        ));
+        assert!(custom_trace_report_is_lossy(
+            carrick_runtime::dtrace_consumer::DTraceRunReport {
+                interrupted: true,
+                ..Default::default()
+            }
+        ));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn live_kernel_symbols_only_use_the_native_wall_callback() {
@@ -3089,6 +3200,9 @@ mod tests {
             auto_remove: false,
             api_auto_remove: false,
             labels: std::collections::HashMap::new(),
+            control: None,
+            terminal_control: None,
+            launch_ticket: None,
             config,
         };
         let _ = carrick_runtime::container::ContainerState::remove(&id);

@@ -779,11 +779,9 @@ where
             .collect();
         let command_line = proc_argv.join(" ");
         let proc_env = env.clone();
-        let image = match kernel
-            .dispatcher
-            .with_kernel_credentials(kernel_context, || {
-                load_execve_image(&kernel.dispatcher, &path, argv, env)
-            }) {
+        let image = match kernel.dispatcher.with_kernel_resources(kernel_context, || {
+            load_execve_image(&kernel.dispatcher, &path, argv, env)
+        }) {
             Ok(image) => image,
             Err(errno) => {
                 if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {

@@ -93,6 +93,19 @@ pub(crate) enum ExactThreadSignalPost {
     QueueFull,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CarrierControlSignalPost {
+    Posted,
+    AcceptedProtectedInit,
+    Missing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TtyControlError {
+    NotControlling,
+    Permission,
+}
+
 impl ExactThreadSignalPost {
     const fn is_posted(self) -> bool {
         matches!(self, Self::Posted(_))
@@ -510,6 +523,7 @@ pub struct ForkReservation {
     diagnostic_name: String,
     vfork_relationship: Option<(VforkParentWait, VforkChildRelease)>,
     failpoint: Option<KernelFailpoint>,
+    external_peer_root: bool,
 }
 
 impl ForkReservation {
@@ -604,7 +618,7 @@ impl ForkReservation {
         };
         let child = Arc::new(Task::new(
             child_key,
-            Some(self.child_parent_task.key()),
+            (!self.external_peer_root).then(|| self.child_parent_task.key()),
             self.caller_task.process_group(),
             self.caller_task.session(),
             Arc::clone(&child_shared),
@@ -666,6 +680,20 @@ impl PreparedFork {
 
     pub fn child_key(&self) -> TaskKey {
         self.child.key()
+    }
+
+    pub(crate) fn retain_stdio_only(&mut self) -> Result<(), KernelOperationError> {
+        let old_files = self.child_resources.files();
+        let files = Arc::new(FileTable::for_external_exec(
+            self.reservation.kernel.object_ids().file_table_id()?,
+        ));
+        let resources = Arc::new(self.child_resources.with_files(files));
+        self.leader.replace_resources(Arc::clone(&resources));
+        self.child_resources = resources;
+        self.reservation
+            .kernel
+            .retire_file_table_if_unreferenced(&old_files);
+        Ok(())
     }
 
     pub(crate) fn prepared_execution_identity(
@@ -745,6 +773,7 @@ impl PreparedFork {
             diagnostic_name,
             vfork_relationship,
             failpoint,
+            external_peer_root,
         } = reservation;
         let child_key = child.key();
         let leader_tid = LinuxTid::for_task_leader(child_id);
@@ -784,7 +813,9 @@ impl PreparedFork {
             check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
 
             let task_claim = task_reservation.commit();
-            child_parent_task.add_child(child_key);
+            if !external_peer_root {
+                child_parent_task.add_child(child_key);
+            }
             if let Some(group) = state.process_groups.get_mut(&process_group) {
                 group.members.insert(child_key);
             }
@@ -813,7 +844,9 @@ impl PreparedFork {
                     .exit_subscribers
                     .register_erased(child_key, &subscriber.0);
             }
-            if let Some(parent_record) = state.tasks.get_mut(&child_parent_task.key().id) {
+            if !external_peer_root
+                && let Some(parent_record) = state.tasks.get_mut(&child_parent_task.key().id)
+            {
                 parent_record.revision = next_child_parent_revision;
             }
             operation.commit(&mut state)?
@@ -1127,6 +1160,115 @@ impl PreparedThreadClone {
 }
 
 impl Kernel {
+    pub(crate) fn initialize_launch_controlling_tty(&self, caller: &KernelContext) {
+        {
+            let mut tty = self.controlling_tty.lock();
+            tty.get_or_insert(super::core::ControllingTtyState {
+                session: caller.task().session(),
+                foreground: caller.task().process_group(),
+            });
+        }
+        super::tty::acknowledge_ready();
+    }
+
+    pub(crate) fn tty_acquire(
+        &self,
+        caller: &KernelContext,
+        force: bool,
+    ) -> Result<(), TtyControlError> {
+        let session = caller.task().session();
+        if session.raw() != caller.task().key().id.raw() {
+            return Err(TtyControlError::Permission);
+        }
+        let mut tty = self.controlling_tty.lock();
+        match tty.as_ref() {
+            Some(current) if current.session == session => Ok(()),
+            Some(_) if !force || !caller.resources().credentials().is_privileged() => {
+                Err(TtyControlError::Permission)
+            }
+            _ => {
+                *tty = Some(super::core::ControllingTtyState {
+                    session,
+                    foreground: caller.task().process_group(),
+                });
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn tty_foreground_process_group(
+        &self,
+        caller: &KernelContext,
+    ) -> Result<ProcessGroupId, TtyControlError> {
+        let tty = self.controlling_tty.lock();
+        let tty = tty.as_ref().ok_or(TtyControlError::NotControlling)?;
+        if tty.session != caller.task().session() {
+            return Err(TtyControlError::NotControlling);
+        }
+        Ok(tty.foreground)
+    }
+
+    pub(crate) fn tty_session(&self, caller: &KernelContext) -> Result<SessionId, TtyControlError> {
+        let tty = self.controlling_tty.lock();
+        let tty = tty.as_ref().ok_or(TtyControlError::NotControlling)?;
+        if tty.session != caller.task().session() {
+            return Err(TtyControlError::NotControlling);
+        }
+        Ok(tty.session)
+    }
+
+    pub(crate) fn tty_set_foreground_process_group(
+        &self,
+        caller: &KernelContext,
+        foreground: ProcessGroupId,
+    ) -> Result<(), TtyControlError> {
+        let state = self.registry().state.read();
+        let Some(group) = state.process_groups.get(&foreground) else {
+            return Err(TtyControlError::Permission);
+        };
+        if group.object.session() != caller.task().session() {
+            return Err(TtyControlError::Permission);
+        }
+        drop(state);
+        let mut tty = self.controlling_tty.lock();
+        let tty = tty.as_mut().ok_or(TtyControlError::NotControlling)?;
+        if tty.session != caller.task().session() {
+            return Err(TtyControlError::NotControlling);
+        }
+        tty.foreground = foreground;
+        Ok(())
+    }
+
+    pub(crate) fn tty_detach(&self, caller: &KernelContext) -> Result<(), TtyControlError> {
+        let mut tty = self.controlling_tty.lock();
+        let current = tty.as_ref().ok_or(TtyControlError::NotControlling)?;
+        if current.session != caller.task().session() {
+            return Err(TtyControlError::NotControlling);
+        }
+        *tty = None;
+        Ok(())
+    }
+
+    pub(crate) fn tty_caller_is_background(&self, caller: &KernelContext) -> bool {
+        self.tty_foreground_process_group(caller)
+            .is_ok_and(|foreground| foreground != caller.task().process_group())
+    }
+
+    pub(crate) fn post_signal_to_tty_foreground(&self, signal: LinuxSignal) -> usize {
+        let Some(group) = self
+            .controlling_tty
+            .lock()
+            .as_ref()
+            .map(|tty| tty.foreground)
+        else {
+            return 0;
+        };
+        self.task_keys_in_process_group(group)
+            .into_iter()
+            .filter(|task| self.post_signal_to_task_key(*task, signal, None))
+            .count()
+    }
+
     pub fn task_identity(&self, task_id: TaskId) -> Result<TaskIdentity, KernelOperationError> {
         let state = self.registry().state.read();
         let record = state
@@ -1597,6 +1739,43 @@ impl Kernel {
     ) -> bool {
         self.post_signal_to_authorized_target_inner(target, signal, siginfo, false)
             .is_posted()
+    }
+
+    /// Deliver a host-operator signal to one exact Linux task generation.
+    ///
+    /// Host peer authentication happens at the carrier-control boundary, so
+    /// this path deliberately does not borrow a guest caller's credentials. It
+    /// still preserves Linux namespace-init protection and never follows a
+    /// recycled numeric pid because the complete [`TaskKey`] is required.
+    pub(crate) fn post_carrier_control_signal(
+        &self,
+        target: TaskKey,
+        signal: LinuxSignal,
+    ) -> CarrierControlSignalPost {
+        let task = {
+            let state = self.registry().state.read();
+            let Some(record) = state.tasks.get(&target.id) else {
+                return CarrierControlSignalPost::Missing;
+            };
+            if record.task.key() != target || record.task.lifecycle() != TaskLifecycle::Live {
+                return CarrierControlSignalPost::Missing;
+            }
+            Arc::clone(&record.task)
+        };
+        let init = TaskId::from_abi_positive(carrick_abi::LINUX_BOOTSTRAP_PID as i32).ok();
+        if Some(target.id) == init
+            && crate::namespace::pid::is_init_protected_default_signal(signal.raw())
+            && task.shared().sighand().disposition(signal)
+                == super::objects::SignalDisposition::Default
+            && !task.accepts_unhandled_signal(signal)
+        {
+            return CarrierControlSignalPost::AcceptedProtectedInit;
+        }
+        if self.post_signal_to_task_key(target, signal, None) {
+            CarrierControlSignalPost::Posted
+        } else {
+            CarrierControlSignalPost::Missing
+        }
     }
 
     pub(crate) fn post_guest_thread_signal_to_authorized_target(
@@ -2393,7 +2572,25 @@ impl Kernel {
             diagnostic_name,
             vfork_relationship,
             failpoint,
+            external_peer_root: false,
         })
+    }
+
+    pub(crate) fn reserve_external_peer_root(
+        self: &Arc<Self>,
+        source: &KernelContext,
+        plan: ClonePlan,
+        diagnostic_name: String,
+    ) -> Result<ForkReservation, KernelOperationError> {
+        if plan.fork_parent() != ForkParentMode::Caller
+            || plan.vfork() != VforkMode::None
+            || plan.pidfd() != ForkPidfdMode::None
+        {
+            return Err(KernelOperationError::InvalidExternalPeerRootPlan);
+        }
+        let mut reservation = self.reserve_fork(source, plan, diagnostic_name, None)?;
+        reservation.external_peer_root = true;
+        Ok(reservation)
     }
 
     #[cfg(test)]
@@ -3950,6 +4147,8 @@ pub enum KernelOperationError {
     FileTableDraining,
     #[error("shared-mm fork cannot accept a replacement backend")]
     UnexpectedForkMmBackend,
+    #[error("external peer-root admission requires a plain copied task without vfork or pidfd")]
+    InvalidExternalPeerRootPlan,
     #[error("task {0:?} has no parent to inherit for CLONE_PARENT")]
     CloneParentUnavailable(TaskId),
     #[error("selected fork parent exited before commit")]
@@ -4361,6 +4560,224 @@ mod tests {
                 .contains(sigusr1.raw()),
             "the reused PID must not receive child A's authorized signal",
         );
+    }
+
+    #[test]
+    fn carrier_control_honors_default_signal_protection_for_namespace_init() {
+        let (kernel, root) = bootstrap(carrick_abi::LINUX_BOOTSTRAP_PID as i32);
+        let sigterm = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGTERM).expect("SIGTERM");
+
+        assert_eq!(
+            kernel.post_carrier_control_signal(root.task().key(), sigterm),
+            CarrierControlSignalPost::AcceptedProtectedInit,
+        );
+        assert!(
+            !root
+                .shared()
+                .pending_signals()
+                .present()
+                .contains(carrick_abi::LINUX_SIGTERM),
+            "a default-protected signal must not enter init's pending queue",
+        );
+    }
+
+    #[test]
+    fn carrier_control_signal_is_bound_to_the_exact_task_generation() {
+        let (kernel, root) = bootstrap(8_101);
+        let stale = root.task().key();
+        let sigkill = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGKILL).expect("SIGKILL");
+
+        kernel
+            .exit_task_key_eventually(stale, LinuxWaitStatus::from_wait_encoding(0))
+            .expect("exit old root generation");
+
+        assert_eq!(
+            kernel.post_carrier_control_signal(stale, sigkill),
+            CarrierControlSignalPost::Missing,
+        );
+    }
+
+    #[test]
+    fn external_peer_root_has_no_init_wait_edge_and_retains_only_stdio_files() {
+        let (kernel, root) = bootstrap(carrick_abi::LINUX_BOOTSTRAP_PID as i32);
+        let sentinel = FileSlotNumber::for_open_fd(91).expect("sentinel fd");
+        let description = Arc::new(FileDescription::regular(
+            kernel
+                .object_ids()
+                .file_description_id()
+                .expect("sentinel description"),
+        ));
+        assert!(
+            root.resources()
+                .files()
+                .install(sentinel, description, false)
+                .is_none()
+        );
+        root.resources().files().lock_closed_stdio()[1] = true;
+        let rebound_stdout = FileSlotNumber::for_open_fd(1).expect("stdout fd");
+        let rebound_description = Arc::new(FileDescription::regular(
+            kernel
+                .object_ids()
+                .file_description_id()
+                .expect("stdout description"),
+        ));
+        assert!(
+            root.resources()
+                .files()
+                .install(rebound_stdout, rebound_description, false)
+                .is_none()
+        );
+        let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("plain peer plan");
+        let reservation = kernel
+            .reserve_external_peer_root(&root, plan, "external-peer".to_owned())
+            .expect("reserve peer root");
+        let mut prepared = reservation
+            .prepare_reference(ThreadId::synthetic_for_tests(9_191))
+            .expect("prepare peer root");
+        prepared.retain_stdio_only().expect("select exec files");
+        let child = prepared
+            .commit()
+            .expect("publish peer root")
+            .start_child()
+            .expect("start peer root")
+            .into_parts()
+            .0;
+
+        assert_eq!(child.task().parent(), None);
+        assert!(!child.resources().files().lock_closed_stdio()[1]);
+        assert!(
+            child
+                .resources()
+                .files()
+                .capture_slot_authority(rebound_stdout)
+                .is_none(),
+            "external exec stdout must be a fresh capture endpoint",
+        );
+        assert!(
+            child
+                .resources()
+                .files()
+                .capture_slot_authority(sentinel)
+                .is_none(),
+            "external exec must not inherit an init-open sentinel fd",
+        );
+        kernel
+            .exit_task(
+                child.task().key().id,
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("exit peer root");
+        assert_eq!(
+            kernel
+                .wait_child(
+                    root.task().key().id,
+                    Some(child.task().key().id),
+                    WaitMode::Observe
+                )
+                .expect("init wait query"),
+            WaitOutcome::NoChild,
+        );
+        assert!(
+            !root
+                .shared()
+                .pending_signals()
+                .present()
+                .contains(carrick_abi::LINUX_SIGCHLD),
+        );
+    }
+
+    #[test]
+    fn controlling_tty_uses_kernel_session_and_foreground_group() {
+        let (kernel, root) = bootstrap(carrick_abi::LINUX_BOOTSTRAP_PID as i32);
+        kernel.initialize_launch_controlling_tty(&root);
+        assert_eq!(
+            kernel.tty_foreground_process_group(&root),
+            Ok(root.task().process_group())
+        );
+        assert_eq!(kernel.tty_session(&root), Ok(root.task().session()));
+        assert!(!kernel.tty_caller_is_background(&root));
+        kernel.tty_detach(&root).expect("detach controlling tty");
+        assert_eq!(
+            kernel.tty_foreground_process_group(&root),
+            Err(TtyControlError::NotControlling)
+        );
+        assert_eq!(
+            kernel.tty_session(&root),
+            Err(TtyControlError::NotControlling),
+            "ordinary tty queries must not implicitly reacquire after TIOCNOTTY",
+        );
+    }
+
+    #[test]
+    fn non_session_leader_cannot_acquire_controlling_tty() {
+        let (kernel, root) = bootstrap(carrick_abi::LINUX_BOOTSTRAP_PID as i32);
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(9_011),
+                "non-session-leader".to_string(),
+                None,
+            )
+            .expect("fork child");
+
+        assert_ne!(child.task().key().id.raw(), child.task().session().raw());
+        assert_eq!(
+            kernel.tty_acquire(&child, false),
+            Err(TtyControlError::Permission),
+        );
+    }
+
+    #[test]
+    fn relay_signal_posts_to_exact_kernel_foreground_group() {
+        let (kernel, root) = bootstrap(carrick_abi::LINUX_BOOTSTRAP_PID as i32);
+        kernel.initialize_launch_controlling_tty(&root);
+        let winch = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGWINCH).expect("WINCH");
+        assert_eq!(kernel.post_signal_to_tty_foreground(winch), 1);
+        assert!(
+            root.shared()
+                .pending_signals()
+                .present()
+                .contains(carrick_abi::LINUX_SIGWINCH)
+        );
+    }
+
+    #[test]
+    fn relay_signal_waits_for_controlling_foreground_group_then_flushes() {
+        let (kernel, root) = bootstrap(carrick_abi::LINUX_BOOTSTRAP_PID as i32);
+        crate::kernel::tty::prepare();
+        crate::kernel::tty::route_foreground_signal(carrick_abi::LINUX_SIGQUIT);
+        crate::kernel::tty::install(&kernel);
+        for signum in [
+            carrick_abi::LINUX_SIGINT,
+            carrick_abi::LINUX_SIGTSTP,
+            carrick_abi::LINUX_SIGWINCH,
+        ] {
+            crate::kernel::tty::route_foreground_signal(signum);
+        }
+        assert!(
+            !root
+                .shared()
+                .pending_signals()
+                .present()
+                .contains(carrick_abi::LINUX_SIGINT),
+            "relay delivery must not guess before controlling-tty initialization",
+        );
+
+        kernel.initialize_launch_controlling_tty(&root);
+        let present = root.shared().pending_signals().present();
+        for signum in [
+            carrick_abi::LINUX_SIGINT,
+            carrick_abi::LINUX_SIGQUIT,
+            carrick_abi::LINUX_SIGTSTP,
+            carrick_abi::LINUX_SIGWINCH,
+        ] {
+            assert!(
+                present.contains(signum),
+                "the acknowledged foreground route must flush early signal {signum}",
+            );
+        }
     }
 
     #[test]

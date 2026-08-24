@@ -289,6 +289,7 @@ pub(super) struct ForkRequest {
 pub(super) struct ProcessForkAttempt {
     pub(super) request: ForkRequest,
     pub(super) coordinator: Option<ProcessForkCoordinator>,
+    pub(super) external_exec: Option<crate::kernel::control::ExecWork>,
 }
 
 pub(super) struct PreparedVforkSuspension {
@@ -305,6 +306,7 @@ pub(super) enum PreparedInProcessFork {
     Retry {
         request: ForkRequest,
         coordinator: Option<ProcessForkCoordinator>,
+        external_exec: Option<crate::kernel::control::ExecWork>,
         _subscription: ProcessForkRetrySubscription,
     },
 }
@@ -410,7 +412,9 @@ where
         let ProcessForkAttempt {
             request,
             coordinator,
+            mut external_exec,
         } = attempt;
+        let is_external_exec = external_exec.is_some();
         let Some(parent_process) = kernel.hvpatch_process.as_ref() else {
             return Err(RuntimeError::Configuration(
                 "in-process fork requested without hvpatch process context".to_owned(),
@@ -443,7 +447,11 @@ where
             match process_barrier.subscribe_quiesce(
                 observed,
                 Arc::new(move |_| {
-                    let _ = wake_scheduler.wake(wake_thread);
+                    let _ = if is_external_exec {
+                        wake_scheduler.wake_control(wake_thread)
+                    } else {
+                        wake_scheduler.wake(wake_thread)
+                    };
                 }),
             ) {
                 carrick_thread::fork_quiesce::QuiesceEnrollment::Ready(_) => continue,
@@ -460,7 +468,11 @@ where
             match process_barrier.subscribe_quiesced_progress(
                 observed,
                 Arc::new(move |_| {
-                    let _ = wake_scheduler.wake(wake_thread);
+                    let _ = if is_external_exec {
+                        wake_scheduler.wake_control(wake_thread)
+                    } else {
+                        wake_scheduler.wake(wake_thread)
+                    };
                 }),
             ) {
                 carrick_thread::fork_quiesce::QuiesceProgressEnrollment::Ready(_) => continue,
@@ -511,6 +523,7 @@ where
                             return Ok(PreparedInProcessFork::Retry {
                                 request,
                                 coordinator: None,
+                                external_exec,
                                 _subscription: subscription,
                             });
                         }
@@ -543,12 +556,17 @@ where
                     let subscription = parent_process.kernel_graph().subscribe_reservation_change(
                         observed,
                         Arc::new(move || {
-                            let _ = wake_scheduler.wake(wake_thread);
+                            let _ = if is_external_exec {
+                                wake_scheduler.wake_control(wake_thread)
+                            } else {
+                                wake_scheduler.wake(wake_thread)
+                            };
                         }),
                     );
                     return Ok(PreparedInProcessFork::Retry {
                         request,
                         coordinator: Some(coordinator),
+                        external_exec,
                         _subscription: ProcessForkRetrySubscription::Reservation {
                             _subscription: subscription,
                         },
@@ -625,6 +643,7 @@ where
             return Ok(PreparedInProcessFork::Retry {
                 request,
                 coordinator: Some(coordinator),
+                external_exec,
                 _subscription: progress_subscription.unwrap_or_else(|| std::process::abort()),
             });
         }
@@ -670,12 +689,21 @@ where
         // a cycle with a sibling which starts exit concurrently: the fork owns
         // the task and waits for the sibling registration, while the sibling
         // remains registered waiting for the task reservation.
-        let reservation = match parent_process.kernel_graph().reserve_fork(
-            parent_context,
-            clone_plan,
-            format!("hvpatch-child-of-{}", parent_process.pid()),
-            None,
-        ) {
+        let reservation_result = if is_external_exec {
+            parent_process.kernel_graph().reserve_external_peer_root(
+                parent_context,
+                clone_plan,
+                format!("carrier-exec-peer-of-{}", parent_process.pid()),
+            )
+        } else {
+            parent_process.kernel_graph().reserve_fork(
+                parent_context,
+                clone_plan,
+                format!("hvpatch-child-of-{}", parent_process.pid()),
+                None,
+            )
+        };
+        let reservation = match reservation_result {
             Ok(reservation) => reservation,
             Err(error) => {
                 if quiesced {
@@ -761,6 +789,13 @@ where
                 )));
             }
         };
+        if is_external_exec {
+            prepared_fork.retain_stdio_only().map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "prepare logical exec selected file table: {error}"
+                ))
+            })?;
+        }
         let child_mm_id = prepared_fork.child_mm_id();
         let mut inventory_transaction = None;
         let mut inventory_reserve =
@@ -802,7 +837,11 @@ where
             match crate::fork_quiesce::subscribe_topology_release(
                 observed,
                 Arc::new(move |_| {
-                    let _ = wake_scheduler.wake(wake_thread);
+                    let _ = if is_external_exec {
+                        wake_scheduler.wake_control(wake_thread)
+                    } else {
+                        wake_scheduler.wake(wake_thread)
+                    };
                 }),
             ) {
                 carrick_thread::fork_quiesce::TopologyReleaseEnrollment::Ready(_) => continue,
@@ -818,6 +857,7 @@ where
                     return Ok(PreparedInProcessFork::Retry {
                         request,
                         coordinator: None,
+                        external_exec,
                         _subscription: ProcessForkRetrySubscription::Topology {
                             _subscription: subscription,
                         },
@@ -935,6 +975,25 @@ where
                 return Err(error);
             }
         };
+        if external_exec
+            .as_mut()
+            .is_some_and(|work| !work.begin_publication())
+        {
+            ops.abort(prepared_backend)
+                .unwrap_or_else(|_| std::process::abort());
+            if !shares_mm {
+                ops.rollback_parent(memory)
+                    .unwrap_or_else(|_| std::process::abort());
+            }
+            rollback_pidfd(installed_pidfd);
+            if quiesced {
+                process_barrier.end_quiesce();
+            }
+            process_barrier.end_fork();
+            return Ok(PreparedInProcessFork::Complete(Some(
+                crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+            )));
+        }
         let _inventory_abandon = inventory_transaction.map(|tx| {
             InventoryAbandon::new(parent_process.kernel_graph().frame_inventory(), [Some(tx)])
         });
@@ -950,6 +1009,10 @@ where
             parent_process.pid() as u32,
             child_pid as u32,
         );
+        if external_exec.is_some() {
+            child_dispatcher.set_stream_stdio(false);
+            child_dispatcher.enable_external_exec_capture();
+        }
         let child_exit_signal = i32::try_from(request.exit_signal)
             .ok()
             .filter(|signal| *signal != 0);
@@ -1108,6 +1171,9 @@ where
             kernel.hvpatch_runtime.clone(),
             child_exit_signal,
         ));
+        if let Some(work) = external_exec {
+            child_kernel.install_external_exec_work(work)?;
+        }
         let task_state = crate::kernel::objects::MigratableTaskState {
             cpu,
             mm: child_mm_id,
@@ -1217,7 +1283,7 @@ where
                 tracing::error!(child_pid, %error, "capture process-fork worker grant");
                 std::process::abort();
             });
-        let shape = if request.clone_parent {
+        let shape = if is_external_exec || request.clone_parent {
             executor::HvpatchSubmissionShape::PeerRoot {
                 grant: (grant_thread, grant_generation),
             }
@@ -1244,6 +1310,9 @@ where
             logical.result.clone(),
             logical.completion.clone(),
         );
+        if let Err(error) = child_kernel.admit_external_exec(child_context.task().key()) {
+            return Err(ops.fail_stop(error));
+        }
         if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::DormantHandle)
         {
             return Err(ops.fail_stop(error));

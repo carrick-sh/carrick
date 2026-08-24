@@ -11,10 +11,9 @@
 //!     wait PROMPTLY — no 50ms poll, and no reliance on `SA_RESTART`/EINTR
 //!     (a queue event, not a Unix signal).
 //!
-//! Each thread owns its own `kqueue` (a kqueue is NOT shared and is NOT
-//! inherited across fork — `host_signal::reinit_after_fork` + a fresh waiter
-//! handle that). On non-macOS targets (the type-check-only stubs) this degrades
-//! to a bounded `poll` loop.
+//! Each carrier thread owns its own `kqueue`; logical guest process creation
+//! never duplicates it through a host fork. On non-macOS targets (the
+//! type-check-only stubs) this degrades to a bounded `poll` loop.
 
 use carrick_abi::LinuxErrno;
 use std::os::fd::RawFd;
@@ -149,7 +148,7 @@ impl PinnedWaitFds {
 }
 
 /// Outcome of `wait_proc_exit`'s kqueue fast path.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 enum ProcExitWait {
     /// The wait resolved (child exited, signal pending, or fork quiesce began).
     Done(WaitResult),
@@ -165,7 +164,7 @@ pub fn is_internal_kick_signal(signum: i32) -> bool {
     crate::host_signal::is_xsig_nudge(signum)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn child_ptrace_trap_stop_ready(pid: i32) -> bool {
     if pid <= 0 {
         return false;
@@ -190,7 +189,7 @@ fn child_ptrace_trap_stop_ready(pid: i32) -> bool {
             || (info.si_code == libc::CLD_STOPPED && info.si_status == libc::SIGTRAP))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn any_direct_child_ptrace_trap_stop_ready() -> bool {
     crate::guest_cpu::direct_children_for_wait(std::process::id())
         .into_iter()
@@ -202,7 +201,7 @@ fn any_direct_child_ptrace_trap_stop_ready() -> bool {
 /// waiter. The neutral process table can intentionally outlive a host zombie
 /// (namespace bookkeeping and failed guest copies both defer final release),
 /// but an any-child kqueue park must never arm that stale pid forever.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn host_direct_children_for_wait(waiter_pid: u32) -> Vec<u32> {
     crate::guest_cpu::direct_children_for_wait(waiter_pid)
         .into_iter()
@@ -212,7 +211,7 @@ fn host_direct_children_for_wait(waiter_pid: u32) -> Vec<u32> {
         .collect()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn child_status_ready(pid: i32) -> bool {
     if pid > 0
         && (crate::guest_cpu::child_has_ptrace_stop_pending(pid as u32)
@@ -692,7 +691,7 @@ impl ThreadWaiter {
     /// `libc::waitid`. Any-child waits use the bounded `P_ALL` fallback because
     /// kqueue cannot watch a sentinel pid. The runtime re-dispatches the waitid
     /// on `Ready` to reap.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", test))]
     pub fn wait_proc_exit(&self, pid: i32, block_mask: carrick_abi::SigBlockMask) -> WaitResult {
         if self.should_interrupt(block_mask) {
             return WaitResult::Interrupted;
@@ -745,6 +744,15 @@ impl ThreadWaiter {
         self.wait_proc_exit_fallback(pid, block_mask)
     }
 
+    /// Host-process child waiting is retired from the product carrier. Logical
+    /// guest waits are resolved by Carrick's kernel graph; reaching this legacy
+    /// outcome in a product build must return to the dispatcher without probing
+    /// or controlling a host process.
+    #[cfg(all(target_os = "macos", not(test)))]
+    pub fn wait_proc_exit(&self, _pid: i32, _block_mask: carrick_abi::SigBlockMask) -> WaitResult {
+        WaitResult::Interrupted
+    }
+
     #[cfg(target_os = "macos")]
     pub fn wait_proc_exit_with_dispatch_pending<F>(
         &self,
@@ -770,7 +778,7 @@ impl ThreadWaiter {
     /// a signal becomes pending, or a fork quiesce begins. Returns `KqueueDead`
     /// (without touching the kqueue further) if `kevent` reports the kqueue fd
     /// itself is invalid — the caller then falls back to a direct poll.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", test))]
     fn wait_proc_exit_kqueue(
         &self,
         kq: &Kqueue,
@@ -902,7 +910,7 @@ impl ThreadWaiter {
     /// `NOTE_EXIT` watch per direct child, then re-dispatch `wait4(-1)` when any
     /// watch fires. This avoids the old 50 ms `waitid(P_ALL, WNOHANG)` polling
     /// fallback in serial fork/wait-any loops such as LTP `getpid01`.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", test))]
     fn wait_proc_exit_any_kqueue(
         &self,
         kq: &Kqueue,
@@ -1014,7 +1022,7 @@ impl ThreadWaiter {
     /// between 50 ms signal-recheck slices parked on the signal pipes. Returns
     /// `Ready` when the child is reapable, `Interrupted` on a pending signal or
     /// fork quiesce. Not a busy spin: each idle slice sleeps in `poll()`.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", test))]
     fn wait_proc_exit_fallback(
         &self,
         pid: i32,

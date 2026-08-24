@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use carrick_guest_mem::{Aarch64SyscallFrame, Gpa, GuestMemory};
-use carrick_hal::{ForkOutcome, SyscallTrap};
+use carrick_hal::SyscallTrap;
 use carrick_mem::memory::AddressSpace;
 
 use crate::trap_engine::{KvmTrapEngine, new_kvm_trap_engine};
@@ -26,16 +26,11 @@ const SYS_WRITE: u64 = 64;
 const SYS_WRITEV: u64 = 66;
 const SYS_EXIT: u64 = 93;
 const SYS_EXIT_GROUP: u64 = 94;
-const SYS_CLONE: u64 = 220; // aarch64 has no `fork`; libc `fork()` -> clone(SIGCHLD)
 const SYS_EXECVE: u64 = 221;
-const SYS_WAIT4: u64 = 260;
 /// `-ENOENT` (Linux). Returned when an `execve` target can't be loaded.
 const NEG_ENOENT: i64 = -2;
 /// `-ENOSYS` (Linux). Returned for any syscall the MVP doesn't service.
 const NEG_ENOSYS: i64 = -38;
-/// `CLONE_VM` — set in `clone`'s flags for thread/vfork creation. The thin shim
-/// only services the plain `fork()` shape (no CLONE_VM); threads are Task 5.
-const CLONE_VM: u64 = 0x0000_0100;
 
 /// Boot the freestanding aarch64 ELF at `path` under KVM and run it to exit.
 /// Returns the guest's exit code.
@@ -98,43 +93,12 @@ pub fn run_elf_kvm(path: impl AsRef<Path>) -> Result<i32, String> {
             SYS_READ => sys_read(&mut engine, &frame)?,
             SYS_WRITE => sys_write(&engine, &frame)?,
             SYS_WRITEV => sys_writev(&engine, &frame)?,
-            SYS_CLONE => sys_clone(&mut engine, &frame)?,
-            SYS_WAIT4 => sys_wait4(&mut engine, &frame)?,
-            // exit/exit_group: a forked CHILD must terminate the real host
-            // process with this code so the parent's host wait4 reaps it (the
-            // exit code travels via the OS, not a Rust return). The top-level
-            // process returns the code to its caller instead.
-            SYS_EXIT | SYS_EXIT_GROUP => {
-                let code = frame.x0 as i32;
-                if engine.is_forked_child() {
-                    // SAFETY: _exit(2) terminates this forked child immediately
-                    // (no atexit/stdio flush — guest stdio already drained).
-                    unsafe { libc::_exit(code & 0xff) };
-                }
-                return Ok(code);
-            }
+            SYS_EXIT | SYS_EXIT_GROUP => return Ok(frame.x0 as i32),
             _ => NEG_ENOSYS,
         };
         engine
             .complete_syscall(ret)
             .map_err(|e| format!("complete_syscall: {e}"))?;
-    }
-}
-
-/// `clone(flags, child_stack, ...)` — the thin shim only handles the plain
-/// `fork()` shape (`clone(SIGCHLD)`, no `CLONE_VM`). On the PARENT side, returns
-/// the child pid; on the CHILD side, `engine.fork()` already set x0 = 0 and swapped
-/// in the rebuilt VM, so `complete_syscall(0)` is a harmless re-write of 0. Any
-/// thread/`CLONE_VM` clone is ENOSYS here (threads are Task 5; the full dispatcher
-/// drives them in Task 7).
-fn sys_clone(engine: &mut KvmTrapEngine, frame: &Aarch64SyscallFrame) -> Result<i64, String> {
-    if frame.x0 & CLONE_VM != 0 {
-        return Ok(NEG_ENOSYS);
-    }
-    match engine.fork().map_err(|e| format!("fork: {e}"))? {
-        ForkOutcome::Parent { child_pid } => Ok(i64::from(child_pid)),
-        // x0 is already 0 in the child; report 0 so complete_syscall keeps it 0.
-        ForkOutcome::Child => Ok(0),
     }
 }
 
@@ -261,28 +225,6 @@ fn sys_read(engine: &mut KvmTrapEngine, frame: &Aarch64SyscallFrame) -> Result<i
         .write_bytes(buf_guest, &buf[..n as usize])
         .map_err(|e| format!("read: guest write: {e}"))?;
     Ok(n as i64)
-}
-
-/// `wait4(pid, *status, options, *rusage)` — a real host `wait4`. The forked
-/// child is a genuine host process, so the host reaps it directly; the exit
-/// status is copied back into the guest's `*status` word.
-fn sys_wait4(engine: &mut KvmTrapEngine, frame: &Aarch64SyscallFrame) -> Result<i64, String> {
-    let pid = frame.x0 as i32;
-    let status_ptr = frame.x1;
-    let options = frame.x2 as i32;
-    let mut status: libc::c_int = 0;
-    // SAFETY: a host wait4 with a host-owned `&mut status`; rusage is null.
-    let reaped = unsafe { libc::wait4(pid, &mut status, options, std::ptr::null_mut()) };
-    if reaped < 0 {
-        let e = unsafe { *libc::__errno_location() };
-        return Ok(-i64::from(e));
-    }
-    if status_ptr != 0 {
-        engine
-            .write_bytes(status_ptr, &status.to_le_bytes())
-            .map_err(|e| format!("wait4 status write: {e}"))?;
-    }
-    Ok(i64::from(reaped))
 }
 
 /// `write(fd, buf, count)` — copy the guest buffer to a host fd.
