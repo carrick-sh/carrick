@@ -1042,7 +1042,7 @@ impl SyscallDispatcher {
         /// graph so reparenting is observable.
         ///
         /// There is deliberately no host fallback below this. `libc::getppid()`
-        /// names the carrier's Darwin parent — a shell, or the NsSupervisor —
+        /// names the carrier's Darwin parent — usually a shell or CLI launcher —
         /// which is one five-digit value shared by every guest process, and the
         /// pid-namespace translation built on it was the same value wearing a
         /// guest-shaped number. The fork-time `virtual_ppid` snapshot went too:

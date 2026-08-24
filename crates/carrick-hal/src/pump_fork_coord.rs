@@ -1,29 +1,20 @@
-//! The platform-NEUTRAL fork-coordinator state machine, generic over a backend's
-//! async-signal-pump primitive ([`HostSignalPump`]).
+//! Platform-neutral startup control for a backend's async signal pump.
 //!
-//! Every backend stops + joins its host signal pump before `libc::fork` (the pump
-//! holds process-global locks a fork would strand in the child) and recreates it
-//! on the three post-fork paths. That state machine was written twice — the
-//! kick+futex backends' `GenericForkCoordinator` (self-pipe
-//! pump, always-on; `crate::fork_coord`, cfg-empty on macOS) and HVF's
-//! `ForkCoordinator` (kqueue pump, lazy). They differ
-//! ONLY in the pump PRIMITIVE and two policies (always-on vs lazy; whether the
-//! child's pump reinit is owned by the coordinator or by the runtime), all of
-//! which are exactly the [`HostSignalPump`] methods. This is the one shared
-//! [`HostForkCoordinator`]; each backend supplies a `HostSignalPump`.
+//! HVPatch models guest processes inside one Carrick kernel and one VM carrier,
+//! so this seam deliberately contains no host-fork lifecycle. Backends supply
+//! only the primitive needed to install their handler and start their pump.
 
 use std::sync::Arc;
 
 #[cfg(test)]
 use crate::threaded::SharedFutexLocation;
-use crate::threaded::{HostForkCoordinator, PreparedHostFork};
+use crate::threaded::SignalPumpControl;
 use crate::{PlatformFutex, VcpuRegistry};
 
-/// A backend's async host-signal PUMP primitive — the per-backend residue of the
-/// shared [`PumpForkCoordinator`] state machine. Self-pipe (KVM/bhyve/NVMM) or
-/// kqueue (HVF); the coordinator never names the concrete pump.
+/// A backend's async host-signal pump primitive. Self-pipe (KVM/bhyve/NVMM) or
+/// kqueue (HVF); the controller never names the concrete pump.
 ///
-/// `Default` so [`PumpForkCoordinator::new`] can build the pump (every impl is
+/// `Default` so [`SignalPumpController::new`] can build the pump (every impl is
 /// either a zero-sized marker or a `Mutex<Option<…>>` that defaults to empty).
 pub trait HostSignalPump: Send + Sync + Default {
     /// Install the backend's kick-signal handler + cross-process xsig ring, before
@@ -33,51 +24,20 @@ pub trait HostSignalPump: Send + Sync + Default {
 
     /// Start the async pump (idempotent) against this registry + futex.
     fn start(&self, registry: &Arc<dyn VcpuRegistry>, futex: &Arc<dyn PlatformFutex>);
-
-    /// Stop + join the pump before `libc::fork`; returns whether one was running.
-    fn stop_for_fork(&self) -> bool;
-
-    /// Whether a pump is considered "installed" INDEPENDENT of
-    /// [`stop_for_fork`](Self::stop_for_fork)'s return — `true` for an ALWAYS-ON
-    /// backend (a process-global handler stays installed even when the pump thread
-    /// is stopped), `false` for a LAZY backend (HVF: a pump exists only while a tty
-    /// needs it). ORed with `stop_for_fork`'s return to decide `had_signal_pump`.
-    fn installed_independent_of_stop(&self) -> bool;
-
-    /// Block the pump's signals across the fork window (an async handler firing
-    /// between stop and reinit would poke a half-rebuilt pump). Default no-op — a
-    /// backend with no signal-based pump wake needs nothing here.
-    fn block_signals_for_fork(&self) {}
-
-    /// Restore the signal mask after the fork window. Default no-op.
-    fn restore_signals_after_fork(&self) {}
-
-    /// Child-side re-arm. `had` is whether the parent had a pump. An ALWAYS-ON
-    /// backend rebuilds its inherited self-pipe + respawns UNCONDITIONALLY (the
-    /// process-global pipe came across stale); a LAZY backend whose child self-pipe
-    /// reinit is owned by the runtime respawns only `if had`.
-    fn reinit_child(
-        &self,
-        had: bool,
-        registry: &Arc<dyn VcpuRegistry>,
-        futex: &Arc<dyn PlatformFutex>,
-    );
 }
 
-/// The one [`HostForkCoordinator`] for every backend, generic over its
-/// [`HostSignalPump`]. Replaces the per-backend `GenericForkCoordinator` /
-/// HVF `ForkCoordinator` copies of this state machine.
-pub struct PumpForkCoordinator<P: HostSignalPump> {
+/// The one [`SignalPumpControl`] implementation for every backend.
+pub struct SignalPumpController<P: HostSignalPump> {
     pump: P,
 }
 
-impl<P: HostSignalPump> Default for PumpForkCoordinator<P> {
+impl<P: HostSignalPump> Default for SignalPumpController<P> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<P: HostSignalPump> PumpForkCoordinator<P> {
+impl<P: HostSignalPump> SignalPumpController<P> {
     pub fn new() -> Self {
         Self { pump: P::default() }
     }
@@ -88,100 +48,32 @@ impl<P: HostSignalPump> PumpForkCoordinator<P> {
     }
 }
 
-impl<P: HostSignalPump> HostForkCoordinator for PumpForkCoordinator<P> {
+impl<P: HostSignalPump> SignalPumpControl for SignalPumpController<P> {
     fn start_signal_pump(&self, registry: &Arc<dyn VcpuRegistry>, futex: &Arc<dyn PlatformFutex>) {
         self.pump.ensure_handler();
         self.pump.start(registry, futex);
-    }
-
-    fn prepare_host_fork(&self) -> PreparedHostFork {
-        // STOP + JOIN the pump before `libc::fork` (it holds process-global locks a
-        // fork would strand). `had_signal_pump` = it was running OR an always-on
-        // handler is installed; if so, block the pump's signals across the window.
-        let was_running = self.pump.stop_for_fork();
-        let had_signal_pump = was_running || self.pump.installed_independent_of_stop();
-        if had_signal_pump {
-            self.pump.block_signals_for_fork();
-        }
-        PreparedHostFork { had_signal_pump }
-    }
-
-    fn restart_after_parent_fork(
-        &self,
-        prepared: PreparedHostFork,
-        registry: &Arc<dyn VcpuRegistry>,
-        futex: &Arc<dyn PlatformFutex>,
-        child_exit_needs_signal_pump: bool,
-    ) {
-        if prepared.had_signal_pump || child_exit_needs_signal_pump {
-            self.start_signal_pump(registry, futex);
-        }
-        self.pump.restore_signals_after_fork();
-    }
-
-    fn restart_after_child_fork(
-        &self,
-        prepared: PreparedHostFork,
-        registry: &Arc<dyn VcpuRegistry>,
-        futex: &Arc<dyn PlatformFutex>,
-    ) {
-        if prepared.had_signal_pump {
-            self.pump.ensure_handler();
-        }
-        self.pump
-            .reinit_child(prepared.had_signal_pump, registry, futex);
-        self.pump.restore_signals_after_fork();
-    }
-
-    fn restart_after_fork_error(
-        &self,
-        prepared: PreparedHostFork,
-        registry: &Arc<dyn VcpuRegistry>,
-        futex: &Arc<dyn PlatformFutex>,
-    ) {
-        if prepared.had_signal_pump {
-            self.start_signal_pump(registry, futex);
-        }
-        self.pump.restore_signals_after_fork();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    /// A lazy/HVF-shaped inert pump: tracks whether a pump is "running" and counts
-    /// the lifecycle calls, with no real OS state. (`installed_independent_of_stop`
-    /// = false → lazy semantics.)
+    /// Inert backend pump that records startup delegation without touching OS state.
     #[derive(Default)]
-    struct InertLazyPump {
-        running: Mutex<bool>,
+    struct InertPump {
+        handler_installs: AtomicUsize,
         starts: AtomicUsize,
-        reinits: AtomicUsize,
     }
-    impl HostSignalPump for InertLazyPump {
-        fn ensure_handler(&self) {}
+    impl HostSignalPump for InertPump {
+        fn ensure_handler(&self) {
+            self.handler_installs.fetch_add(1, Ordering::SeqCst);
+        }
         fn start(&self, _r: &Arc<dyn VcpuRegistry>, _f: &Arc<dyn PlatformFutex>) {
-            *self.running.lock().unwrap() = true;
             self.starts.fetch_add(1, Ordering::SeqCst);
-        }
-        fn stop_for_fork(&self) -> bool {
-            let mut g = self.running.lock().unwrap();
-            let was = *g;
-            *g = false;
-            was
-        }
-        fn installed_independent_of_stop(&self) -> bool {
-            false
-        }
-        fn reinit_child(&self, had: bool, r: &Arc<dyn VcpuRegistry>, f: &Arc<dyn PlatformFutex>) {
-            self.reinits.fetch_add(1, Ordering::SeqCst);
-            if had {
-                self.start(r, f);
-            }
         }
     }
 
@@ -246,51 +138,13 @@ mod tests {
         (Arc::new(InertRegistry), Arc::new(InertFutex))
     }
 
-    /// The LAZY state machine: a child with no inherited pump stays pump-free; a
-    /// child that inherited one restarts; the parent restarts on `child_exit`.
     #[test]
-    fn lazy_pump_state_machine() {
+    fn controller_installs_handler_and_starts_pump() {
         let (r, f) = ctx();
-        let c = PumpForkCoordinator::<InertLazyPump>::new();
+        let controller = SignalPumpController::<InertPump>::new();
 
-        c.start_signal_pump(&r, &f);
-        assert!(*c.pump().running.lock().unwrap(), "start runs the pump");
-
-        // Fork with a live pump: prepare stops it (had=true), child restarts it.
-        let prepared = c.prepare_host_fork();
-        assert!(prepared.had_signal_pump, "live pump → had");
-        assert!(
-            !*c.pump().running.lock().unwrap(),
-            "prepare stopped the pump"
-        );
-        c.restart_after_child_fork(prepared, &r, &f);
-        assert!(
-            *c.pump().running.lock().unwrap(),
-            "child restarts inherited pump"
-        );
-
-        // Fork with NO pump: prepare had=false, child stays pump-free.
-        c.stop_for_fork_for_test();
-        let prepared = c.prepare_host_fork();
-        assert!(!prepared.had_signal_pump, "no pump → !had");
-        c.restart_after_child_fork(prepared, &r, &f);
-        assert!(
-            !*c.pump().running.lock().unwrap(),
-            "lazy child with no inherited pump stays pump-free"
-        );
-
-        // Parent restarts on child-exit need even with no prior pump.
-        let prepared = c.prepare_host_fork();
-        c.restart_after_parent_fork(prepared, &r, &f, /* child_exit */ true);
-        assert!(
-            *c.pump().running.lock().unwrap(),
-            "child-exit need restarts parent pump"
-        );
-    }
-
-    impl PumpForkCoordinator<InertLazyPump> {
-        fn stop_for_fork_for_test(&self) {
-            self.pump.stop_for_fork();
-        }
+        controller.start_signal_pump(&r, &f);
+        assert_eq!(controller.pump().handler_installs.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.pump().starts.load(Ordering::SeqCst), 1);
     }
 }

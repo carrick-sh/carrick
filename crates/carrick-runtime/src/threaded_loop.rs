@@ -13,7 +13,7 @@ use crate::run_result::{RunResult, RuntimeError};
 /// `run_vcpu_until_exit`, result assembly) differing only in the four host
 /// trait objects each backend plugs in. `HostBackend` is that seam — a backend
 /// is now one ~25-line impl, NOT a copied loop. Each method supplies the host's
-/// BEST primitive (its own futex, fork coordinator, kicker, timer delivery) —
+/// BEST primitive (its own futex, signal pump, kicker, timer delivery) —
 /// never a lowest-common-denominator.
 ///
 /// The kicker is `Arc<dyn VcpuRegistry>` and the engine's `KickHandle` is
@@ -34,9 +34,9 @@ pub trait HostBackend: Send + Sync + 'static {
         table: std::sync::Arc<crate::thread::FutexTable>,
     ) -> std::sync::Arc<dyn carrick_hal::PlatformFutex>;
 
-    /// This host's fork coordinator (signal-pump stop/join across `libc::fork`,
-    /// kick-handler + xsig-ring install). Boxed object-safe for `KernelState`.
-    fn make_fork_coordinator(&self) -> Box<dyn carrick_hal::HostForkCoordinator>;
+    /// This host's start-only signal-pump control (kick-handler + xsig-ring
+    /// install). Boxed object-safe for `KernelState`.
+    fn make_signal_pump(&self) -> Box<dyn carrick_hal::SignalPumpControl>;
 
     /// The live-vCPU kick registry. Both current backends use the neutral
     /// `GenericVcpuRegistry`; a host may override (e.g. a bulk-kick primitive).
@@ -251,8 +251,8 @@ where
             factory_host.make_futex(table)
         },
     );
-    let fork_coordinator: Arc<dyn carrick_hal::HostForkCoordinator> =
-        Arc::from(host_for_factory.make_fork_coordinator());
+    let signal_pump: Arc<dyn carrick_hal::SignalPumpControl> =
+        Arc::from(host_for_factory.make_signal_pump());
     // The live-vCPU registry. Constructing the kicker installs the kick-signal
     // handler (idempotent) so a cross-thread `pthread_kill` forces a target
     // vCPU out of its run ioctl. Built before the kernel so the signal-arrival
@@ -298,7 +298,7 @@ where
     };
     let kernel = Arc::new(KernelState::new(
         dispatcher,
-        fork_coordinator,
+        signal_pump,
         signal_arrival,
         hvpatch_process,
         None,
@@ -328,10 +328,12 @@ where
     let threads: Arc<parking_lot::Mutex<Vec<crate::vcpu_loop::VcpuThreadHandle>>> =
         Arc::new(parking_lot::Mutex::new(Vec::new()));
     // Install the kick handler / start the host's signal pump up front via the
-    // coordinator, so a process-directed signal is observable regardless of
+    // controller, so a process-directed signal is observable regardless of
     // whether a guest has forked yet. HVF gates this on a tty (lazy pump).
     if host_for_factory.start_pump_eagerly() {
-        kernel.fork.start_signal_pump(&kicker, &platform_futex);
+        kernel
+            .signal_pump
+            .start_signal_pump(&kicker, &platform_futex);
     }
 
     // Wire wall-clock timer signals (setitimer/alarm/timer_settime): the

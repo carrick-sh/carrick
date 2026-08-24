@@ -2,10 +2,9 @@
 //! -d`, `ps`, `stop`, `kill`, and `rm`.
 //!
 //! Carrick is **daemonless**: there is no `carrickd`. Each detached container
-//! is its own process tree rooted at a per-container NsSupervisor (the parent
-//! half of the runtime fork — see [`crate::namespace::supervisor`]). This
-//! module is just a filesystem registry: one directory per container under a
-//! shared root, holding a JSON state file plus the captured stdout/stderr log.
+//! is owned by its one VM carrier. This module is just a filesystem registry:
+//! one directory per container under a shared root, holding a JSON state file
+//! plus the captured stdout/stderr log.
 //! `ps`/`stop`/`kill`/`rm` are pure CLI operations over this directory — they
 //! read state, send signals to the recorded pids, and unlink. Nothing needs to
 //! be running for them to work; if no container is detached, nothing is alive.
@@ -29,8 +28,14 @@ pub enum ContainerStatus {
     Exited,
 }
 
-/// One container's persisted state. Written by the detached supervisor and read
-/// by the lifecycle CLI subcommands. Field set is intentionally small and
+/// Fail-closed status used when the sole carrier disappeared without writing a
+/// terminal receipt (for example after SIGKILL, abort, or host failure). With no
+/// daemon or helper process there is no surviving `waitpid(2)` authority that
+/// can recover the exact signal; fabricating exit 0 would be materially wrong.
+pub const UNKNOWN_CARRIER_EXIT_CODE: i32 = 255;
+
+/// One container's persisted state. Written by the detached carrier and read by
+/// the lifecycle CLI subcommands. Field set is intentionally small and
 /// host-meaningful (the pids are HOST pids — what the CLI signals).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerState {
@@ -43,11 +48,11 @@ pub struct ContainerState {
     /// argv of the container command (for `ps` display).
     pub command: Vec<String>,
     pub status: ContainerStatus,
-    /// Host pid of the NsSupervisor (the detached process the CLI waits on /
-    /// signals for whole-container control). 0 until known.
+    /// Compatibility alias for the carrier host pid. New carrier-only launches
+    /// write the same pid to this and `init_pid`; 0 until known.
     pub supervisor_pid: i32,
-    /// Host pid of the guest-init (ns-pid 1) — the target of `stop`/`kill`. 0
-    /// until known.
+    /// Host pid of the carrier that owns logical guest-init (ns-pid 1) — the
+    /// target of `stop`/`kill`. 0 until known.
     pub init_pid: i32,
     /// Unix epoch seconds when the container was created (stamped by the
     /// caller, since the runtime forbids `SystemTime::now` in some contexts).
@@ -412,8 +417,9 @@ pub fn list() -> Vec<ContainerState> {
             continue;
         }
         if let Some(id) = entry.file_name().to_str()
-            && let Ok(state) = ContainerState::load(id)
+            && let Ok(mut state) = ContainerState::load(id)
         {
+            let _ = reconcile_terminal_state(&mut state);
             out.push(state);
         }
     }
@@ -505,6 +511,26 @@ pub fn reconciled_status(state: &ContainerState) -> ContainerStatus {
     }
 }
 
+/// Persist the fail-closed terminal transition for a carrier that disappeared
+/// before it could write its own exact receipt. Exact normal exits are still
+/// published by the carrier through [`mark_exited`]. An uncatchable death has no
+/// surviving status owner in the one-carrier design, so it is recorded as 255
+/// rather than the old supervisor-era false success. Auto-remove entries are
+/// removed during the same reconciliation.
+pub fn reconcile_terminal_state(state: &mut ContainerState) -> ContainerStatus {
+    if state.status != ContainerStatus::Running || pid_alive(state.init_pid) {
+        return state.status;
+    }
+    state.status = ContainerStatus::Exited;
+    state.exit_code.get_or_insert(UNKNOWN_CARRIER_EXIT_CODE);
+    if state.auto_remove {
+        let _ = ContainerState::remove(&state.id);
+    } else {
+        let _ = state.persist();
+    }
+    state.status
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +601,8 @@ mod tests {
             config: RunConfig::default(),
         };
         assert_eq!(reconciled_status(&s), ContainerStatus::Exited);
+        assert_eq!(reconcile_terminal_state(&mut s), ContainerStatus::Exited);
+        assert_eq!(s.exit_code, Some(UNKNOWN_CARRIER_EXIT_CODE));
         s.status = ContainerStatus::Created;
         assert_eq!(reconciled_status(&s), ContainerStatus::Created);
     }

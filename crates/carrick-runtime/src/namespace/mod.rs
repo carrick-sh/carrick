@@ -15,7 +15,6 @@
 
 pub mod pid;
 pub mod process;
-pub mod supervisor;
 pub mod user;
 
 /// A namespace identity. Doubles as the inode-like number rendered in the

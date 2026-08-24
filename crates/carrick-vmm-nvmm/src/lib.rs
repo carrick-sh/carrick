@@ -49,6 +49,6 @@ pub use nvmm::{
     NvmmCapability, NvmmError, NvmmMachine, NvmmResult, NvmmVcpu, NvmmX64State, NvmmX86ExitIo,
 };
 pub use nvmm_futex::{NvmmFutex, make_nvmm_futex};
-pub use nvmm_threaded_glue::{NvmmForkCoordinator, NvmmTimerDelivery};
+pub use nvmm_threaded_glue::{NvmmSignalPumpControl, NvmmTimerDelivery};
 pub use nvmm_x86_engine::{NVMM_X86_LAYOUT, NvmmVmm, bring_up};
 pub use run_elf::run_elf_nvmm;

@@ -53,10 +53,9 @@
 //!   halves together. It loads the image, installs the EL0 trampoline / EL1
 //!   vectors / stage-1 page tables, then drives the trap → dispatch → complete
 //!   loop until the guest exits. It also owns the fork/clone model
-//!   (`libc::fork` for guest processes, one host thread + one HVF vCPU per guest
-//!   thread), fault-to-signal translation, the interactive pty bridge
-//!   ([`pty_relay`]/[`interactive_supervisor`]), and the namespace supervisor
-//!   ([`namespace::supervisor`]). Start reading at [`runtime`].
+//!   (logical Carrick-kernel tasks for guest processes, one host thread per
+//!   guest thread), fault-to-signal translation, and the interactive pty bridge
+//!   ([`pty_relay`]/[`interactive_supervisor`]). Start reading at [`runtime`].
 //!
 //! # The leaf-crate re-exports
 //!
@@ -73,9 +72,9 @@
 //!
 //! - **HVF is not fork-safe.** A VM live in the parent at `libc::fork(2)` makes
 //!   the child's `hv_vm_create` return `HV_BUSY`. Every fork in carrick is
-//!   therefore choreographed: the namespace supervisor forks *before* any VM
-//!   exists, and a guest `fork(2)` from a multithreaded guest first quiesces all
-//!   sibling vCPUs, tears the VM down, forks, and rebuilds. See [`runtime`].
+//!   therefore avoided on the carrier-only HVPatch path: guest `fork(2)` creates
+//!   a logical Carrick-kernel task and never clones the host carrier. See
+//!   [`runtime`].
 //! - **A forked child must `_exit`, never unwind.** It shares the parent's fd
 //!   table; dropping an fd-owning value on the way out double-closes an inherited
 //!   fd and trips std's IO-safety abort (`SIGABRT`). The lifecycle code branches
@@ -89,8 +88,8 @@
 // carrick-cli), and its rustdoc is built with `--document-private-items` so the
 // Big Theory Statements above and on each module can cross-link the internal
 // run-loop / lifecycle items they describe (`run_vcpu_until_exit`,
-// `maybe_fork_ns_supervisor`, `SupervisorRole`, `ThreadRuntimeState::handle_fork`,
-// …). Those items are deliberately NOT public API; allow the internal doc links
+// `run_vcpu_until_exit`, `ThreadRuntimeState`, …). Those items are deliberately
+// NOT public API; allow the internal doc links
 // rather than widen the public surface just to satisfy rustdoc.
 #![allow(rustdoc::private_intra_doc_links)]
 

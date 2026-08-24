@@ -26,8 +26,7 @@
 //!    runtime child, sets that child's pgrp as the tty foreground, and then runs
 //!    the byte relay ([`PtyRelay`]) until the child exits
 //!    ([`InteractiveParentKind::Supervisor`]). There is **one supervisor per
-//!    interactive run** — this is not a shared daemon (same no-daemon principle
-//!    as [`namespace::supervisor`](crate::namespace::supervisor)).
+//!    interactive run** — this is not a shared daemon.
 //! 3. **Runtime child** — the carrick guest runtime
 //!    ([`InteractiveChild`]). It `setpgid`s into its own group and, after a
 //!    ready/ack handshake with the supervisor (so the supervisor has set the

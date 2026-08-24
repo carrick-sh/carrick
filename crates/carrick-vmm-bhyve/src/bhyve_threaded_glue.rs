@@ -1,18 +1,15 @@
 //! Lean bhyve impls of the threaded-loop coordinator traits.
 //!
-//! `BhyveForkCoordinator` is now the shared
-//! [`carrick_hal::GenericForkCoordinator`] parameterized by [`crate::BhyveGlue`]:
-//! the stop+join-the-pump-across-`libc::fork` lifecycle, the idempotent
-//! kick-handler install, the xsignal-ring init, and the 5 restart paths were
-//! byte-identical across KVM/bhyve/NVMM and now live in carrick-hal. bhyve supplies
-//! only `BhyveGlue`. `BhyveTimerDelivery` stays here (bhyve has no kqueue itimer).
+//! `BhyveSignalPumpControl` is the shared
+//! [`carrick_hal::GenericSignalPumpControl`] parameterized by [`crate::BhyveGlue`].
+//! `BhyveTimerDelivery` stays here (bhyve has no kqueue itimer).
 
 use std::sync::Arc;
 
 use carrick_hal::VcpuRegistry;
 
-/// The bhyve host-fork coordinator: the shared generic + bhyve's glue.
-pub type BhyveForkCoordinator = carrick_hal::GenericForkCoordinator<crate::BhyveGlue>;
+/// The bhyve signal-pump controller: the shared generic + bhyve's glue.
+pub type BhyveSignalPumpControl = carrick_hal::GenericSignalPumpControl<crate::BhyveGlue>;
 
 // `BhyveSignalArrival` was byte-identical to KVM's; both collapsed into the
 // shared `carrick_hal::GenericSignalArrival` (kicker + futex wake). The bhyve run

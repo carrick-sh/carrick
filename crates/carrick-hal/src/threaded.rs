@@ -1745,51 +1745,14 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     fn fresh_fork_kicker(&self) -> Arc<dyn VcpuRegistry>;
 }
 
-/// A token produced by [`HostForkCoordinator::prepare_host_fork`] and traded
-/// back in to one of the `restart_after_*` methods. Plain data (no
-/// hypervisor-specific state): it records whether a signal pump was running so
-/// the post-fork restart can recreate one only when needed.
-pub struct PreparedHostFork {
-    pub had_signal_pump: bool,
-}
-
-/// Coordinates carrick-owned HOST state that must not be left mid-flight across
-/// a real host `fork(2)` — principally the process-directed signal-pump daemon
-/// thread, which `fork(2)` would otherwise strand (it carries only the calling
-/// thread into the child). The shared threaded loop drives it through this
-/// object-safe trait so the loop never names the concrete `ForkCoordinator`.
+/// Object-safe startup control for a backend's process-directed signal pump.
 ///
-/// The registry / futex arguments are the object-safe [`VcpuRegistry`] /
-/// [`PlatformFutex`] the loop already holds; the concrete impl restarts its pump
-/// against them.
-pub trait HostForkCoordinator: Send + Sync {
+/// HVPatch keeps guest process identity and lifecycle inside Carrick's kernel;
+/// guest `fork(2)` therefore has no host-fork window to coordinate. The shared
+/// loop retains only the one operation it actually needs: idempotently starting
+/// the backend pump against the live vCPU registry and futex implementation.
+pub trait SignalPumpControl: Send + Sync {
     /// Start the process-directed signal pump (idempotent) against the given
     /// registry + futex, if one is not already running.
     fn start_signal_pump(&self, registry: &Arc<dyn VcpuRegistry>, futex: &Arc<dyn PlatformFutex>);
-    /// Stop + join the signal pump before `libc::fork`, returning a token that
-    /// records whether a pump was running.
-    fn prepare_host_fork(&self) -> PreparedHostFork;
-    /// Parent-side post-fork restart: recreate the pump if one was running OR if
-    /// the parent now needs one to deliver a child-exit signal.
-    fn restart_after_parent_fork(
-        &self,
-        prepared: PreparedHostFork,
-        registry: &Arc<dyn VcpuRegistry>,
-        futex: &Arc<dyn PlatformFutex>,
-        child_exit_needs_signal_pump: bool,
-    );
-    /// Child-side post-fork restart: recreate the pump only if the parent had one.
-    fn restart_after_child_fork(
-        &self,
-        prepared: PreparedHostFork,
-        registry: &Arc<dyn VcpuRegistry>,
-        futex: &Arc<dyn PlatformFutex>,
-    );
-    /// Error-path restart (fork failed): recreate the pump if one was running.
-    fn restart_after_fork_error(
-        &self,
-        prepared: PreparedHostFork,
-        registry: &Arc<dyn VcpuRegistry>,
-        futex: &Arc<dyn PlatformFutex>,
-    );
 }

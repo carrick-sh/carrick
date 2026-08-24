@@ -126,8 +126,8 @@ pub struct SignalPump {
 
 /// Exit signal the pump thread raises when its loop ends: `flag` for lock-free
 /// checks, `mu`/`cv` so `stop_inner` can WAIT for the exit event instead of
-/// sleep-polling (the old 1 ms poll put a full sleep quantum — ~1.3 ms — into
-/// EVERY fork's `prepare_host_fork()`, measured as fork-lifecycle phase 52).
+/// sleep-polling. The bounded stop path remains useful for orderly controller
+/// teardown even though guest fork no longer stops and restarts the host pump.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct ExitSignal {
     flag: std::sync::atomic::AtomicBool,
@@ -790,9 +790,8 @@ mod tests {
 
     /// `SignalPump::stop` must be BOUNDED even when the pump can no longer be
     /// woken. The CPython forkserver-from-forkserver `test_parent_process`
-    /// deadlock was exactly this: a worker forking server B called
-    /// `prepare_host_fork -> stop()`, whose single pipe-wake raced and was lost,
-    /// so `join()` blocked forever and wedged the whole host fork. With BOTH wake
+    /// deadlock was exactly this: a pump stop whose single pipe-wake raced and
+    /// was lost, so `join()` blocked forever. With BOTH wake
     /// channels severed, stop must still return (by detaching) rather than hang.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]

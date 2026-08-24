@@ -18,7 +18,7 @@
 //! lands.
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use carrick_kernel::arena::{ARENA_PATH_ENV, KernelArena};
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
@@ -34,14 +34,14 @@ use super::NsId;
 /// Member is alive and (so far as we know) parented within the namespace.
 pub const MEMBER_ALIVE: u32 = FLAG_ALIVE;
 /// Member's namespace-parent died; `getppid` should report ns-pid 1 (design
-/// §3.6). Set by the NsSupervisor.
+/// §3.6). Set from the Carrick kernel graph.
 pub const MEMBER_ORPHANED: u32 = FLAG_ORPHANED;
 /// Member has exited; `exit_status` holds the harvested bare exit code (the
 /// multiplexer's `PollEvent::exit_status`: WEXITSTATUS, or 128+signal for a
 /// signal death) so the ns-init can report it for an orphaned grandchild (§3.4).
 pub const MEMBER_DEAD: u32 = FLAG_DEAD;
 
-/// Number of process records scanned by the namespace supervisor.
+/// Number of process records in the shared namespace table.
 pub const MEMBER_SLOTS: usize = PROCESS_RECORDS;
 
 /// ns-pid 1 — the namespace init (`pid_namespaces(7)`).
@@ -82,57 +82,11 @@ pub fn requested() -> bool {
     REQUESTED.load(Ordering::Relaxed)
 }
 
-/// Whether to fork the NsSupervisor PROCESS (orphan reaping + teardown). This
-/// is gated separately from [`request`] because the supervisor becomes the
-/// fork PARENT and returns the run's result — which carries NO buffered
-/// stdout/stderr. So it is only enabled for streaming output paths (raw / tty /
-/// detached), where the guest writes straight to inherited fds; the buffered
-/// JSON-envelope path keeps running the guest in-process (translation still
-/// works via the region) and gets its output back as before.
-static SUPERVISOR_REQUESTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Request the forking NsSupervisor (streaming-output container runs only).
-pub fn request_supervisor() {
-    REQUESTED.store(true, Ordering::Relaxed);
-    SUPERVISOR_REQUESTED.store(true, Ordering::Relaxed);
-}
-
-/// Whether the forking NsSupervisor was requested.
-pub fn supervisor_requested() -> bool {
-    SUPERVISOR_REQUESTED.load(Ordering::Relaxed)
-}
-
-/// The write end of the member-registration pipe, inherited across fork. A
-/// freshly-forked guest writes one byte here after registering, waking the
-/// NsSupervisor to arm an exit watch on it (design §3.5). −1 until set up.
-static REG_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
-
-/// Publish the registration pipe's write fd (called pre-fork in the supervisor
-/// setup so every descendant inherits it).
-pub fn set_reg_pipe_write(fd: i32) {
-    REG_PIPE_WRITE.store(fd, Ordering::Relaxed);
-}
-
-/// Notify the NsSupervisor that a new member registered: write one byte to the
-/// registration pipe (non-blocking; a full pipe is fine — the supervisor also
-/// rescans on a periodic timeout). No-op if the pipe is not set up.
-pub fn notify_registration() {
-    let fd = REG_PIPE_WRITE.load(Ordering::Relaxed);
-    if fd >= 0 {
-        let byte = [1u8];
-        // SAFETY: writing one byte to a pipe fd; ignore EAGAIN/short write.
-        unsafe {
-            libc::write(fd, byte.as_ptr().cast(), 1);
-        }
-    }
-}
-
 /// Activate the arena process section for PID namespace membership, WITHOUT yet
-/// knowing the init's host pid. Must be called **once, before the NsSupervisor
-/// fork** (design §3.3) so both the supervisor parent and the guest-init child
-/// inherit the same physical pages. The child then calls [`set_init`] with its
-/// own pid. Returns `false` only if the arena cannot be initialized.
+/// knowing the init's host pid. Must be called before guest task creation so the
+/// carrier's kernel graph and any late namespace joiners share the same arena.
+/// The carrier then calls [`set_init`] with its own pid. Returns `false` only if
+/// the arena cannot be initialized.
 /// Idempotent — returns `true` if the region already exists.
 pub fn alloc_region() -> bool {
     if !REGION.load(Ordering::Acquire).is_null() {
@@ -186,9 +140,8 @@ fn persist_detached_arena_path() {
     }
 }
 
-/// Record the init's host pid (ns-pid 1) in an already-allocated region and
-/// pre-register it as the first member. Called by the guest-init child after
-/// the supervisor fork, where `std::process::id()` is its own host pid (§3.7).
+/// Record the carrier's host pid as the namespace init (ns-pid 1) in an
+/// already-allocated region and pre-register it as the first member.
 pub fn set_init(init_host_pid: u32) {
     let Some(region) = region() else { return };
     region
@@ -391,7 +344,7 @@ pub fn self_ns_pid() -> u32 {
 /// `/proc/self/status` shows as `PPid:`.
 ///
 /// Same authority and same reason as [`self_ns_pid`]: the host `getppid()` names
-/// the carrier's Darwin parent (a shell, or the NsSupervisor), which is one
+/// the carrier's Darwin parent (usually a shell or CLI launcher), which is one
 /// value shared by every guest process and is not a guest pid at all. The kernel
 /// graph also observes reparenting, which a fork-time snapshot cannot: an orphan
 /// whose parent exited must report its new reaper. A caller with no parent in
@@ -425,8 +378,8 @@ pub fn self_ns_ppid() -> u32 {
             .and_then(|r| r.host_to_ns(parent))
             .unwrap_or(NS_INIT_PID);
     }
-    // Explicit orphan flag (set by the NsSupervisor the instant it sees the
-    // parent die) — fast, race-free reparent-to-init.
+    // Explicit orphan flag retained for compatibility with process-table
+    // readers; the kernel graph is the authority for new logical tasks.
     if is_orphaned(self_host) {
         return NS_INIT_PID;
     }
@@ -569,10 +522,9 @@ pub fn should_drop_signal_to_init(target_host_pid: u32, signum: i32) -> bool {
     is_default_lethal(signum) && !init_handles(signum)
 }
 
-/// Whether the NsSupervisor has flagged `host_pid`'s ns-parent as dead, so its
+/// Whether the namespace record marks `host_pid`'s parent as dead, so its
 /// `getppid()` should report ns-pid 1 (the ns-init) per `pid_namespaces(7)`
-/// reparent-to-init semantics (§3.6). Always false until the NsSupervisor
-/// (Phase 3) sets orphan flags.
+/// reparent-to-init semantics (§3.6).
 pub fn is_orphaned(host_pid: u32) -> bool {
     region()
         .and_then(|r| r.flags_of(host_pid))
@@ -587,13 +539,10 @@ pub fn allocate_child_ns_pid_pre_fork() -> Option<u32> {
     region().map(|r| r.alloc_ns_pid())
 }
 
-/// Notify the namespace supervisor after a pre-registered child record has had
-/// its host pid published by the fork parent.
-pub fn notify_child_registered() {
-    if enabled() {
-        notify_registration();
-    }
-}
+/// Compatibility hook for the retiring host-fork path. Namespace membership is
+/// now read directly from the shared kernel arena, so publication needs no
+/// registration-pipe wake.
+pub fn notify_child_registered() {}
 
 /// Register a freshly-forked child in the active ns: allocate its ns-pid and
 /// record the host↔ns mapping + its ns-parent. Returns the child's ns-pid (to
@@ -613,8 +562,6 @@ pub fn register_child(child_host_pid: u32, parent_host_pid: u32) -> u32 {
             // process (visible via the host tree), it just lacks a stable ns-pid
             // entry; report the allocated number anyway (monotonic, unique).
             let _ = r.register(child_host_pid, ns_pid, parent_host_pid);
-            // Wake the NsSupervisor to arm an exit watch on the new member.
-            notify_registration();
             ns_pid
         }
         None => child_host_pid,
@@ -810,7 +757,7 @@ impl NsSharedRegion {
     }
 
     /// Mark every live member whose ns-parent is `dead_host_pid` as orphaned
-    /// (design §3.6 step 3). Called by the NsSupervisor on a parent's death.
+    /// (design §3.6 step 3).
     pub fn mark_children_orphaned(&self, dead_host_pid: u32) {
         for slot in self.member_records() {
             let host_pid = slot.host_pid.load(Ordering::Acquire);
@@ -861,14 +808,14 @@ impl NsSharedRegion {
     }
 
     /// Release records whose owner host pid is FULLY gone (no live process and
-    /// no zombie — `is_gone` is the supervisor's `kill(pid, 0) == ESRCH`
+    /// no zombie — `is_gone` is a `kill(pid, 0) == ESRCH`
     /// re-check, the same liveness discipline as the vCPU-permit reaper's
     /// backstop) and whose exit no live guest waiter can still consume.
     ///
-    /// This is the NsSupervisor's leak backstop for fork children that are
+    /// This is the legacy host-process leak backstop for fork children that are
     /// never waited on (SIGCHLD set to SIG_IGN, or the parent exited without a
     /// subreaper reap): their terminal reap never runs `unregister_reaped`, so
-    /// only the supervisor can return those records to the section before it
+    /// only a liveness sweep can return those records to the section before it
     /// exhausts. Records that still carry a consumable exit — a published
     /// adopted exit status (`exit_ready`), or a harvested §3.4 status on a
     /// dead ns member — are kept while their waiter (the recorded parent, or

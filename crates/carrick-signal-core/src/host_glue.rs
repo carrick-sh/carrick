@@ -207,15 +207,14 @@ pub fn install_xsig_nudge_handler<G: HostSignalGlue>() {
     }
 }
 
-/// Initialise the xsignal ring + install the nudge handler for backend `G`. MUST
-/// run pre-fork so the `MAP_SHARED` ring is inherited by every child. `xsig_init`
-/// no-ops on an already-mapped ring; the caller (`GenericForkCoordinator`) guards
-/// the handler install with a `Once`, so the post-fork re-assert is free.
+/// Initialise the xsignal ring + install the nudge handler for backend `G` before
+/// starting its signal pump. `xsig_init` is idempotent, so repeated start
+/// requests can safely re-assert the handler.
 pub fn init_xsig<G: HostSignalGlue>() {
     crate::xsig::xsig_init();
     // The FASYNC (signal-driven I/O) registry shares the same pre-fork lifetime
-    // requirement: it must be MAP_SHARED-mapped before any guest fork so every
-    // process inherits ONE table (a writer process looks up a reader's arming).
+    // requirement: writers and readers share one table across the external
+    // signal transport boundary.
     crate::fasync::fasync_init();
     install_xsig_nudge_handler::<G>();
 }
