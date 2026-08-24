@@ -174,6 +174,52 @@ layers in one afternoon, each proven live:
      sigtimedwaitintr×2, mtforkcorrupt-musl — probe-by-probe
      correctness work, no shared mechanism claimed.
 
+## SESSION 6 CLOSE — GATE 16: 825/838 + 40/40 (98.4%), the stack-smash family collapses
+
+**Session arc: 783/834 → 806/838 → 825/838 + 40/40** (logs gate14/15/16
+in target/perf/). Twenty-one rows cleared between 15 and 16, two churn
+arrivals. The two hunt-C workers landed (director-verified, both-libc
+batteries on the HONEST transport — a worker's `-v` volume-mount "gnu
+verification" returns empty output and is VOID; only the base64|sh
+injection transport measures):
+
+- **epolled merged (4549480c)**: ET rearm — buffered-byte availability
+  is authoritative over the synthetic kqueue readiness count. Cleared
+  epollcluster×2 AND the deterministic
+  `epoll_et_read_growth_does_not_rearm_latched_read_level` host test.
+- **sigeintr merged (abb7af03 + framing)**: the polarity-trap
+  restructure (park masks come from `SigBlockMask::for_signal_wait`;
+  wait_set is semantically the WAITED SET, EMPTY for sigsuspend), the
+  rt_sigtimedwait pre-park deliverable gate, host-signal preservation on
+  readiness, Linux `sig_task_ignored` semantics for init (blocked or
+  awaited signals are not dropped), and a TRANSITIONAL host-pid→
+  bootstrap-task bridge at the signal-target boundary (see below).
+  **This cleared far beyond its brief: killfault, sigbadstack,
+  sigunblockpending, xprocsigign, rtsigqueueinfo, alarmretval,
+  futexwakeexact-musl, ltpcheckpoint, mtforkcorrupt, hugepage,
+  dirrenamecache, loopbacksubnet, syncfilerange, vforkvmshare — the
+  ENTIRE hunt-B load-coupled crash family. The stack-smash census went
+  20 → 2: the guest-stack corruption WAS mis-masked signal delivery.**
+
+**Identity finding banked**: raw-lane `getpid` still answers the CARRIER
+host pid (`logical_pid()`'s `std::process::id` fallback) while the
+kernel graph numbers the bootstrap task 1 — sigtimedwaitintr's
+fork-killer proved a child cannot kill its parent by observed pid. The
+transitional bridge in `hvpatch_process_signal_target` carries a
+comment naming its deletion condition: answer getpid from the kernel
+graph (the identity-and-scope migration), then delete the arm.
+
+**THE FINAL 13**: the ABBA-cycle family — execfromthread×2,
+vforkexecthread×2, setidthreadchurn×2 (the mapped five-layer surgery
+below, WIP patch banked); stable value-diffs coredumpfile×2 +
+mqnotifycrossproc×2; churn residue clone3pidfdsig(134), killreap(134),
+brkheapgrow-gnu(139).
+
+Criterion-4 state: doc gate FIXED this session (stale links); deny/
+check-matrix/check/fmt/clippy green; lint-domains awaits the deliberate
+census reconciliation (LAST); the parallel-phase reactor flake is on the
+defect list; test-integration's epoll red test now green.
+
 ### OWNER RULING (2026-08-24): carrick owns guest epoll; the host kqueue is a wake source, not the authority
 
 Verbatim direction: "Intra carrick should have its own epoll, outside we
