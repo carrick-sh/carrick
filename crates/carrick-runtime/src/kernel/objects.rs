@@ -3860,6 +3860,21 @@ impl Task {
             .collect()
     }
 
+    pub(crate) fn accepts_unhandled_signal(&self, signal: super::ids::LinuxSignal) -> bool {
+        let threads = self.threads.lock();
+        for (_, thread) in threads.values() {
+            if thread.signal_state.lock().blocked().contains(signal.raw()) {
+                return true;
+            }
+            if let Some(continuation) = thread.execution.lock().blocked_continuation.as_ref() {
+                if continuation.is_waiting_for_signal(signal) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub(super) fn retire_thread(&self, key: ThreadKey) -> Option<ThreadRef> {
         let mut threads = self.threads.lock();
         if threads
