@@ -3241,8 +3241,14 @@ const PROBE_HELPERS: &[&str] = &["probeinit"];
 /// behind futexforkrequeue's all-waiters-ETIMEDOUT shape: fork children must
 /// share one wait queue with the parent on a shared anonymous word) moves the
 /// denominator from 462 to 463 and the gating rows from 872 to 874 — 437
-/// conformance sources under both variants.
-const PROBE_SOURCE_COUNT: usize = 463;
+/// conformance sources under both variants. `forkstackstorm` (the fork-storm
+/// stack-COW integrity reducer that pinned the teardown-ordering defect and
+/// the false refault-livelock detector) and `tlsswitch` (TPIDR_EL0/stack
+/// sentinel/TLS-tid integrity across executor multiplexing, regression cover
+/// for the migrating stack-smash family) move the denominator from 463 to 465
+/// and the gating rows from 874 to 878 — 439 conformance sources under both
+/// variants.
+const PROBE_SOURCE_COUNT: usize = 465;
 
 /// The only topology-specific runners accepted by closure inventory parsing.
 /// Every source not listed here must use `generic`; keeping this as one mapping
@@ -4991,9 +4997,9 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     assert_eq!(sources.len(), PROBE_SOURCE_COUNT);
     let generic = validate_closure_probe_rows(&inventory(), &sources)
         .expect("checked-in closure probe inventory must match the source denominator");
-    assert_eq!(generic.len(), 417);
-    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 437);
-    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 874);
+    assert_eq!(generic.len(), 419);
+    assert_eq!(generic.len() + DEDICATED_PROBE_RUNNERS.len(), 439);
+    assert_eq!(2 * (generic.len() + DEDICATED_PROBE_RUNNERS.len()), 878);
 
     let mut typo = inventory();
     typo.get_mut("bridge_tcp_peer")

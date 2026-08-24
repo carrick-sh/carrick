@@ -599,6 +599,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "forkstackstorm": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "forksnapshot": {
     "class": "conformance",
     "excluded": false,
@@ -2145,6 +2150,11 @@
     "runner": "generic"
   },
   "timeschildren": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
+  "tlsswitch": {
     "class": "conformance",
     "excluded": false,
     "runner": "generic"
