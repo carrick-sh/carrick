@@ -371,6 +371,8 @@ mod tests {
                 control_observation_epoch: 0,
                 close_observation_epoch: 0,
                 pending_commands: None,
+                need_resched: None,
+                hardware_kick_published: None,
             }]
         }
 

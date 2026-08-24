@@ -487,6 +487,13 @@ pub struct DebugExecutorRow {
     pub control_observation_epoch: u64,
     pub close_observation_epoch: u64,
     pub pending_commands: Option<usize>,
+    /// The worker kick's need_resched flag (`None` when the kick
+    /// implementation exposes no debug view).
+    pub need_resched: Option<bool>,
+    /// Whether an exact hardware kick is currently published for the bound
+    /// quantum (`None` when not exposed). A poked executor whose hardware
+    /// slot is empty can only observe need_resched at its next host trap.
+    pub hardware_kick_published: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

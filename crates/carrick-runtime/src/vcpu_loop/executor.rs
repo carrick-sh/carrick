@@ -2099,6 +2099,14 @@ impl ExecutorKick for WorkerKick {
     fn current_binding(&self) -> Option<ExecutorBinding> {
         *self.binding.lock()
     }
+
+    fn debug_need_resched(&self) -> Option<bool> {
+        Some(self.need_resched.load(Ordering::Acquire))
+    }
+
+    fn debug_hardware_kick_published(&self) -> Option<bool> {
+        Some(self.hardware.lock().is_some())
+    }
 }
 
 #[derive(Debug)]
@@ -2462,7 +2470,14 @@ impl crate::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebugAuxProvi
         entries
             .into_iter()
             .map(
-                |(id, binding, control_observation_epoch, close_observation_epoch)| {
+                |(
+                    id,
+                    binding,
+                    control_observation_epoch,
+                    close_observation_epoch,
+                    need_resched,
+                    hardware_kick_published,
+                )| {
                     crate::kernel::debug::DebugExecutorRow {
                         id: id.raw(),
                         epoch: binding.as_ref().map(|b| b.executor_epoch()),
@@ -2475,6 +2490,8 @@ impl crate::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebugAuxProvi
                         control_observation_epoch,
                         close_observation_epoch,
                         pending_commands: None,
+                        need_resched,
+                        hardware_kick_published,
                     }
                 },
             )
