@@ -6,7 +6,7 @@
 //!
 //! There is no `carrickd`. Docker keeps a long-lived daemon that owns every
 //! container's process and state; carrick has nothing of the kind. The model
-//! here is podman-style: **a detached container is its own process tree, and the
+//! here is podman-style: **a detached container is one VM carrier, and the
 //! source of truth is the on-disk registry**, not a running service. All the
 //! "control-plane" subcommands in this module are therefore pure reads and
 //! signals against that registry — they never talk to a daemon because there
@@ -14,11 +14,11 @@
 //!
 //! The registry lives in `carrick_runtime::container`: a directory per
 //! container holding a serialized [`ContainerState`] (id, name, image, command,
-//! status, supervisor/init pids, exit code, and the full [`RunConfig`] needed to
-//! relaunch) and an `output.log`. The key consequence is that a container's
-//! *liveness* is not a field we trust blindly — a supervisor can die without
-//! updating its entry — so reads go through `container::reconciled_status`,
-//! which cross-checks the recorded init pid against the live host process table.
+//! status, compatibility pid fields that both name the carrier, exit code, and
+//! the full [`RunConfig`] needed to relaunch) and an `output.log`. Liveness is
+//! not trusted blindly: the carrier writes exact normal terminal receipts, and
+//! a dead carrier without a receipt is reconciled to fail-closed exit 255. No
+//! helper remains to recover an uncatchable signal's exact wait status.
 //!
 //! ## The detach handshake (`run -d`, shared with `start`)
 //!
@@ -29,9 +29,9 @@
 //! user's shell. The CHILD becomes the container's lifetime:
 //! `setsid()` → redirect stdio (stdin←`/dev/null`, stdout/stderr→`output.log`,
 //! so `carrick logs` can replay it) → export `CARRICK_CONTAINER_ID` → run the
-//! engine, which forks the real `NsSupervisor` + guest-init, records the live
-//! pids (status → `Running`), blocks until exit, and marks the entry `Exited`
-//! (or removes it for `--rm`). `run_supervised_child` is the shared post-fork
+//! engine in that same process. The carrier records itself as `Running`, owns
+//! every logical guest task, and marks the entry `Exited` (or removes it for
+//! `--rm`) on normal completion. `run_detached_carrier` is the shared post-fork
 //! body; `start`/`restart` reuse it, additionally setting `CARRICK_EXEC_OVERLAY`
 //! to re-attach an already-extracted rootfs overlay instead of re-extracting.
 //!
@@ -49,20 +49,18 @@
 //! entrypoint+cmd on relaunch rather than double-applying the image's
 //! entrypoint. `reset_for_relaunch` clears volatile state (status/pids and the
 //! stale `exit_code` and `region_path`) while preserving the overlay path and
-//! the stop config. A relaunch forks a *fresh* supervisor + region over the
-//! *same* overlay, which is why the stale region file is unlinked first (a
+//! the stop config. A relaunch creates a *fresh* carrier + compatibility region
+//! over the *same* overlay, which is why the stale region file is unlinked first (a
 //! reused region keeps dead members).
 //!
-//! ## `exec`: join, don't fork a supervisor
+//! ## Transitional `exec` topology
 //!
-//! `exec` is the one lifecycle command that does NOT fork a supervisor — the
-//! target container already has one. It runs the command in *this* process,
-//! pointing the runtime at the container's existing overlay
-//! (`CARRICK_EXEC_OVERLAY`) and pid region (`CARRICK_JOIN_REGION`) so the
-//! command shares the container's filesystem and PID namespace. This requires a
-//! container started with `--fs host` (a memory overlay isn't joinable) and,
-//! for namespace sharing, `--pid private` (host-pid containers have no region
-//! to join).
+//! `exec` still runs a second runtime process and points it at the container's
+//! existing overlay (`CARRICK_EXEC_OVERLAY`) and pid region
+//! (`CARRICK_JOIN_REGION`) so the command shares filesystem and legacy
+//! PID-region state. This is explicitly
+//! transitional and does not satisfy the carrier-only invariant; carrier
+//! control must replace it with logical in-kernel task admission.
 //!
 //! ## Signals are HOST signals
 //!
@@ -90,7 +88,7 @@ use carrick_runtime::container::{self, ContainerState, ContainerStatus, RunConfi
 
 use crate::runtime_util::{human_age, human_size, truncate_str};
 
-/// Detach into the background and run the container under its own supervisor,
+/// Detach into the background and run the container as one VM carrier,
 /// printing the container id and returning. Mirrors `docker run -d`.
 ///
 /// Flow (daemonless, podman-style):
@@ -98,10 +96,8 @@ use crate::runtime_util::{human_age, human_size, truncate_str};
 ///  2. `fork()`. The PARENT prints the id and returns (the user's shell is
 ///     freed). The CHILD `setsid()`s, redirects stdio (stdin←/dev/null,
 ///     stdout/stderr→the container log), exports `CARRICK_CONTAINER_ID`, and
-///     runs the engine — which forks the NsSupervisor + guest-init. The child
-///     becomes the supervisor, records the live pids (status → Running), and
-///     blocks until the container exits, then marks the entry Exited (or
-///     removes it for `--rm`).
+///     runs the engine in that same carrier process, records itself as Running,
+///     and blocks until the logical guest-init exits.
 pub(crate) fn run_detached(
     req: carrick_engine::CliRunRequest,
     store: carrick_image::ImageStore,
@@ -136,7 +132,7 @@ pub(crate) fn run_detached(
         return Ok(());
     }
     // CHILD: first launch — extract the rootfs (attach_overlay = None).
-    run_supervised_child(req, store, &id, &log, None);
+    run_detached_carrier(req, store, &id, &log, None);
 }
 
 fn now_secs() -> u64 {
@@ -276,12 +272,12 @@ fn resolve_request_image(
     )?)
 }
 
-/// The post-fork CHILD body shared by `run -d` and `start`: become a session
+/// The post-fork carrier body shared by `run -d` and `start`: become a session
 /// leader, redirect stdio to the container log, point the runtime at this
 /// container (`CARRICK_CONTAINER_ID`), optionally attach an already-extracted
 /// overlay (`attach_overlay` — set on `start`/`restart` to skip re-extraction),
 /// run the engine, and exit with the container's code. Never returns.
-fn run_supervised_child(
+fn run_detached_carrier(
     req: carrick_engine::CliRunRequest,
     store: carrick_image::ImageStore,
     id: &str,
@@ -526,8 +522,8 @@ fn for_each_container<T: std::fmt::Display>(
 }
 
 /// `carrick start` — (re)launch one or more created/stopped containers, reusing
-/// their persisted config + overlay. Daemonless restart = a fresh fork +
-/// supervisor + region over the SAME overlay.
+/// their persisted config + overlay. Daemonless restart = a fresh carrier +
+/// compatibility region over the SAME overlay.
 pub(crate) fn start(
     store: &carrick_image::ImageStore,
     _attach: bool,
@@ -564,7 +560,7 @@ fn start_one(store: &carrick_image::ImageStore, spec: &str) -> anyhow::Result<St
     // re-extraction, preserving the container's writes); otherwise this is the
     // first start and the runtime extracts the rootfs.
     let attach_overlay = state.config.scratch_path.clone();
-    // A relaunch forks a FRESH supervisor + region; unlink the stale region file
+    // A relaunch creates a FRESH carrier + region; unlink the stale region file
     // so alloc_region maps a clean, seeded one (a reused file keeps dead members).
     if let Some(region) = &state.config.region_path {
         let _ = std::fs::remove_file(region);
@@ -574,7 +570,7 @@ fn start_one(store: &carrick_image::ImageStore, spec: &str) -> anyhow::Result<St
 
     let req = rebuild_request_from_state(&state);
     // Surface an unrunnable platform (e.g. an amd64 container on a host that
-    // lost Rosetta) here in the foreground, before forking the supervisor —
+    // lost Rosetta) here in the foreground, before creating the carrier —
     // `Engine::resolve`'s re-check otherwise fires inside the detached child,
     // where its actionable message is swallowed to the container log.
     carrick_engine::check_platform_runnable(carrick_engine::request_platform(&req))
@@ -588,11 +584,11 @@ fn start_one(store: &carrick_image::ImageStore, spec: &str) -> anyhow::Result<St
     if pid > 0 {
         return Ok(id);
     }
-    run_supervised_child(req, store.clone(), &id, &log, attach_overlay.as_deref());
+    run_detached_carrier(req, store.clone(), &id, &log, attach_overlay.as_deref());
 }
 
-/// Reset a container's volatile state for a relaunch. The supervisor overwrites
-/// status/supervisor_pid/init_pid on takeover but NOT exit_code, so a stale
+/// Reset a container's volatile state for a relaunch. The carrier overwrites
+/// status and both compatibility pid fields on takeover but NOT exit_code, so a stale
 /// `Some(code)` would otherwise persist into the new Running entry; region_path
 /// is cleared because the relaunch maps a fresh region.
 fn reset_for_relaunch(state: &mut ContainerState) {
@@ -1038,7 +1034,7 @@ fn rm_one(spec: &str, force: bool) -> anyhow::Result<String> {
         unsafe {
             libc::kill(state.init_pid, libc::SIGKILL);
         }
-        // Give teardown a brief moment so the supervisor cleans up too.
+        // Give the carrier a brief moment to complete its own teardown.
         for _ in 0..20 {
             if !container::pid_alive(state.init_pid) {
                 break;
@@ -1109,8 +1105,8 @@ pub(crate) fn stop_grace_secs(flag: Option<u64>, config_timeout: Option<u64>) ->
 /// `carrick exec [-i] [-t] [-u] [-w] [-e] <container> <cmd>...` — run a command
 /// in a running container, sharing its filesystem (the persisted overlay) and
 /// PID namespace (the file-backed region). Requires the container to have been
-/// started with `--fs host`. Runs in this process (no supervisor fork — the
-/// container already has one) and exits with the command's code.
+/// started with `--fs host`. Transitional: this creates a second runtime
+/// process and must move behind the carrier control endpoint.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec(
     store: carrick_image::ImageStore,
@@ -1137,7 +1133,7 @@ pub(crate) fn exec(
         );
     };
     // Tell the runtime to ATTACH this container's overlay + JOIN its pid region
-    // (instead of creating a new overlay / forking a supervisor).
+    // instead of creating a new overlay. This still creates a peer runtime.
     // SAFETY: single-threaded CLI, before any runtime/fork.
     unsafe {
         std::env::set_var("CARRICK_EXEC_OVERLAY", &scratch);
@@ -1241,7 +1237,9 @@ pub(crate) fn exec(
 
 /// `carrick wait <container>...` — block until each container stops, then print
 /// its exit code (like `docker wait`). An already-exited container returns
-/// immediately; a `--rm` container that was auto-removed reports 0.
+/// immediately; a `--rm` container that was already removed reports 0. If the
+/// sole carrier died before it could write an exact terminal receipt, persist
+/// and report the fail-closed unknown status 255 rather than fabricating 0.
 pub(crate) fn wait(containers: &[String]) -> anyhow::Result<()> {
     for_each_container(
         containers,
@@ -1253,25 +1251,14 @@ pub(crate) fn wait(containers: &[String]) -> anyhow::Result<()> {
 fn wait_one(spec: &str) -> anyhow::Result<i32> {
     let id = container::resolve(spec).map_err(anyhow::Error::msg)?;
     loop {
-        let Ok(state) = ContainerState::load(&id) else {
+        let Ok(mut state) = ContainerState::load(&id) else {
             // Gone (e.g. a `--rm` container removed on exit): nothing to wait on.
             return Ok(0);
         };
-        if state.status == ContainerStatus::Exited {
-            return Ok(state.exit_code.unwrap_or(0));
-        }
-        if container::reconciled_status(&state) == ContainerStatus::Exited {
-            // The init died but the supervisor hasn't recorded the code yet;
-            // give it a brief window, then fall back to whatever is on disk.
-            for _ in 0..50 {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                if let Ok(s) = ContainerState::load(&id)
-                    && s.status == ContainerStatus::Exited
-                {
-                    return Ok(s.exit_code.unwrap_or(0));
-                }
-            }
-            return Ok(state.exit_code.unwrap_or(0));
+        if container::reconcile_terminal_state(&mut state) == ContainerStatus::Exited {
+            return Ok(state
+                .exit_code
+                .unwrap_or(container::UNKNOWN_CARRIER_EXIT_CODE));
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }

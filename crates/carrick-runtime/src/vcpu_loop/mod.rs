@@ -14,7 +14,7 @@
 //! fork/exec VM surgery, per-thread materialisation, the private/shared futex
 //! backend — is reached only through the [`carrick_hal`] traits
 //! ([`ThreadedEngine`], [`VcpuRegistry`], [`PlatformFutex`],
-//! [`HostForkCoordinator`]), so this module names no concrete backend.
+//! [`SignalPumpControl`]), so this module names no concrete backend.
 //!
 //! # The two futex paths (the key seam)
 //!
@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
-use carrick_hal::{HostForkCoordinator, PlatformFutex, ThreadedEngine, VcpuRegistry};
+use carrick_hal::{PlatformFutex, SignalPumpControl, ThreadedEngine, VcpuRegistry};
 
 use crate::compat::CompatReporter;
 use crate::dispatch::{
@@ -1347,13 +1347,12 @@ impl Drop for ExecCloneAdmission {
 }
 
 /// Shared kernel-half state for the threaded loop: the syscall dispatcher, the
-/// compat reporter, and the host-fork coordinator (held object-safe so this is
-/// cross-platform). Built by the macOS setup wrapper with the boxed HVF
-/// `ForkCoordinator`.
+/// compat reporter, and the start-only signal-pump controller (held object-safe
+/// so this is cross-platform).
 pub(crate) struct KernelState {
     pub(crate) dispatcher: SyscallDispatcher,
     pub(crate) reporter: CompatReporter,
-    pub(crate) fork: Arc<dyn HostForkCoordinator>,
+    pub(crate) signal_pump: Arc<dyn SignalPumpControl>,
     /// Per-backend signal ARRIVAL / wake mechanism (kicker+futex on KVM, the
     /// kqueue pump / self-pipe / xsig ring on HVF). The neutral pending STORE is
     /// carrick-signal-core; this is only how an async signal physically wakes a
@@ -1397,7 +1396,7 @@ pub(crate) struct KernelState {
 impl KernelState {
     pub(crate) fn new(
         dispatcher: SyscallDispatcher,
-        fork: Arc<dyn HostForkCoordinator>,
+        signal_pump: Arc<dyn SignalPumpControl>,
         signal_arrival: Arc<dyn carrick_hal::SignalArrival>,
         hvpatch_process: Option<crate::hvpatch::ProcessContext>,
         inherited_hvpatch_runtime: Option<Arc<HvpatchRuntimeDirectory>>,
@@ -1416,7 +1415,7 @@ impl KernelState {
         Self {
             dispatcher,
             reporter: CompatReporter::default(),
-            fork,
+            signal_pump,
             signal_arrival,
             hvpatch_process,
             process_exiting: std::sync::atomic::AtomicBool::new(false),
@@ -5102,7 +5101,7 @@ where
                 };
                 if self.kernel.dispatcher.take_signal_pump_request() {
                     self.kernel
-                        .fork
+                        .signal_pump
                         .start_signal_pump(&self.state.kicker, &self.state.platform_futex);
                 }
                 return self.service_outcome(engine, control, frame, outcome);
@@ -5504,7 +5503,7 @@ where
             .service_threaded_syscall(&self.kernel, engine, frame)?;
         if self.kernel.dispatcher.take_signal_pump_request() {
             self.kernel
-                .fork
+                .signal_pump
                 .start_signal_pump(&self.state.kicker, &self.state.platform_futex);
         }
         self.service_outcome(engine, control, frame, outcome)
@@ -8318,42 +8317,11 @@ mod tests {
         }
     }
 
-    struct EndpointTestForkCoordinator;
+    struct EndpointTestSignalPump;
 
-    impl HostForkCoordinator for EndpointTestForkCoordinator {
+    impl SignalPumpControl for EndpointTestSignalPump {
         fn start_signal_pump(
             &self,
-            _registry: &Arc<dyn VcpuRegistry>,
-            _futex: &Arc<dyn PlatformFutex>,
-        ) {
-        }
-
-        fn prepare_host_fork(&self) -> carrick_hal::PreparedHostFork {
-            carrick_hal::PreparedHostFork {
-                had_signal_pump: false,
-            }
-        }
-
-        fn restart_after_parent_fork(
-            &self,
-            _prepared: carrick_hal::PreparedHostFork,
-            _registry: &Arc<dyn VcpuRegistry>,
-            _futex: &Arc<dyn PlatformFutex>,
-            _child_exit_needs_signal_pump: bool,
-        ) {
-        }
-
-        fn restart_after_child_fork(
-            &self,
-            _prepared: carrick_hal::PreparedHostFork,
-            _registry: &Arc<dyn VcpuRegistry>,
-            _futex: &Arc<dyn PlatformFutex>,
-        ) {
-        }
-
-        fn restart_after_fork_error(
-            &self,
-            _prepared: carrick_hal::PreparedHostFork,
             _registry: &Arc<dyn VcpuRegistry>,
             _futex: &Arc<dyn PlatformFutex>,
         ) {
@@ -8433,7 +8401,7 @@ mod tests {
             .expect("install packaged scheduler route");
         let kernel = Arc::new(KernelState::new(
             dispatcher,
-            Arc::new(EndpointTestForkCoordinator),
+            Arc::new(EndpointTestSignalPump),
             Arc::new(EndpointTestSignalArrival),
             None,
             None,
@@ -8475,7 +8443,7 @@ mod tests {
             .expect("install packaged scheduler route");
         let kernel = Arc::new(KernelState::new(
             dispatcher,
-            Arc::new(EndpointTestForkCoordinator),
+            Arc::new(EndpointTestSignalPump),
             Arc::new(EndpointTestSignalArrival),
             None,
             None,
@@ -8685,7 +8653,7 @@ mod tests {
             dispatcher.bind_hvpatch_process(process.clone());
             let kernel = Arc::new(KernelState::new(
                 dispatcher,
-                Arc::new(EndpointTestForkCoordinator),
+                Arc::new(EndpointTestSignalPump),
                 Arc::new(EndpointTestSignalArrival),
                 Some(process.clone()),
                 None,
@@ -9058,7 +9026,7 @@ mod tests {
             dispatcher.bind_hvpatch_process(process.clone());
             let kernel = Arc::new(KernelState::new(
                 dispatcher,
-                Arc::new(EndpointTestForkCoordinator),
+                Arc::new(EndpointTestSignalPump),
                 Arc::new(EndpointTestSignalArrival),
                 Some(process.clone()),
                 None,
@@ -9235,7 +9203,7 @@ mod tests {
         let directory = HvpatchRuntimeDirectory::default();
         let kernel = Arc::new(KernelState::new(
             dispatcher,
-            Arc::new(EndpointTestForkCoordinator),
+            Arc::new(EndpointTestSignalPump),
             Arc::new(EndpointTestSignalArrival),
             None,
             None,
@@ -9462,7 +9430,7 @@ mod tests {
     fn persistent_terminal_claim_has_one_owner_and_retries_without_blocking() {
         let kernel = KernelState::new(
             SyscallDispatcher::new(),
-            Arc::new(EndpointTestForkCoordinator),
+            Arc::new(EndpointTestSignalPump),
             Arc::new(EndpointTestSignalArrival),
             None,
             None,
@@ -9621,7 +9589,7 @@ mod tests {
         dispatcher.bind_hvpatch_process(process);
         let runtime = KernelState::new(
             dispatcher,
-            Arc::new(EndpointTestForkCoordinator),
+            Arc::new(EndpointTestSignalPump),
             Arc::new(EndpointTestSignalArrival),
             None,
             None,

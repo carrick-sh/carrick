@@ -61,7 +61,7 @@ pub trait HostSignalGlue: 'static {
     fn poke();
 
     /// Install this backend's vCPU-KICK signal handler (idempotent). UNLIKE the
-    /// other methods this is a SETUP call (the shared `GenericForkCoordinator`
+    /// other methods this is a SETUP call (the shared signal-pump controller
     /// invokes it from normal context, never from a signal handler), so it may
     /// install a `sigaction`. The kick handler is the no-op whose only job is to
     /// EINTR the backend's run-loop ioctl (KVM_RUN / vm_run / nvmm_vcpu_run) — see

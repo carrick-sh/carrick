@@ -6,7 +6,7 @@
 //! All OTHER signal-arrival mechanics — host-handler install, the cross-process
 //! xsig MAP_SHARED ring, sender recording (SI_USER si_pid), child-exit watch,
 //! per-tid wake, and the fork reset — are delivered by the backend's
-//! `host_signal::*` free-function seam and the [`crate::HostForkCoordinator`],
+//! `host_signal::*` free-function seam and the [`crate::SignalPumpControl`],
 //! NOT through this trait. The dispatcher reaches those directly, so they never
 //! needed an object-safe abstraction here.
 

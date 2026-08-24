@@ -78,16 +78,13 @@
 //! is a Dekker pattern on `quiescing` ↔ `in_guest` (SeqCst), so neither side
 //! misses the other.
 //!
-//! # PID-namespace placement and the supervisor
+//! # PID-namespace placement
 //!
-//! A container `carrick run` that requests PID-ns placement forks the
-//! [`namespace::supervisor`](crate::namespace::supervisor) **before any VM
-//! exists** ([`maybe_fork_ns_supervisor`]):
-//! the parent becomes the userspace stand-in for the Linux kernel (orphan
-//! reparenting, exit-status harvest, teardown) and never creates a VM; the child
-//! continues into HVF as the guest-init (ns-pid 1). The three outcomes are
-//! [`SupervisorRole`]. `run-elf` never requests placement, so this is a no-op
-//! there.
+//! A container `carrick run` that requests PID-ns placement initializes the
+//! kernel arena and namespace table directly in the one VM carrier. Guest
+//! processes remain logical Carrick-kernel tasks; launch placement never forks
+//! a host namespace-supervisor process. `run-elf` never requests placement, so
+//! it stays in the identity namespace.
 //!
 //! # Faults are signals
 //!
@@ -581,110 +578,19 @@ where
     )
 }
 
-/// The caller's role after [`maybe_fork_ns_supervisor`].
-#[allow(clippy::large_enum_variant)]
-enum SupervisorRole {
-    /// PARENT (NsSupervisor): it ran the kqueue loop until the guest-init exited;
-    /// the result carries the init's exit code to propagate up.
-    Parent(RunResult),
-    /// CHILD (guest-init, ns-pid 1): continue into HVF and run the guest. A
-    /// post-fork error here must `_exit`, NOT unwind — unwinding through
-    /// fd-bearing `Drop`s in the forked child double-closes an inherited fd and
-    /// trips std's IO-safety abort (SIGABRT).
-    ForkedInit,
-    /// No fork happened — placement was not requested, or region/pipe/fork setup
-    /// failed (degraded to running the guest in-process). Errors propagate normally.
-    InProcess,
-}
-
-/// Fork the per-container NsSupervisor before any HVF VM exists, if PID-ns
-/// placement was requested. See [`SupervisorRole`] for the three outcomes.
-fn maybe_fork_ns_supervisor() -> Result<SupervisorRole, RuntimeError> {
-    if !crate::namespace::pid::supervisor_requested() {
-        return Ok(SupervisorRole::InProcess);
-    }
-    // Allocate the shared member table + the registration pipe BEFORE the fork
-    // so both processes inherit them. On any setup failure, degrade to running
-    // the guest in-process without a supervisor (identity-ish placement still
-    // works for the common single-process case via the region if it allocated).
-    if !crate::namespace::pid::alloc_region() {
-        return Ok(SupervisorRole::InProcess);
-    }
-    let mut pipe_fds = [0i32; 2];
-    // SAFETY: standard pipe(2) into a 2-element array.
-    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
-        return Ok(SupervisorRole::InProcess);
-    }
-    let (pipe_read, pipe_write) = (pipe_fds[0], pipe_fds[1]);
-    // Make BOTH ends non-blocking: the write end so a guest's registration
-    // notify never blocks on a full pipe; the READ end so the supervisor's
-    // drain loop terminates on EAGAIN instead of blocking forever once the
-    // pending bytes are consumed (the supervisor rescans on a timeout anyway).
-    // SAFETY: fcntl on our own pipe fds.
-    unsafe {
-        let fl_w = libc::fcntl(pipe_write, libc::F_GETFL);
-        libc::fcntl(pipe_write, libc::F_SETFL, fl_w | libc::O_NONBLOCK);
-        let fl_r = libc::fcntl(pipe_read, libc::F_GETFL);
-        libc::fcntl(pipe_read, libc::F_SETFL, fl_r | libc::O_NONBLOCK);
-    }
-    crate::namespace::pid::set_reg_pipe_write(pipe_write);
-
-    // SAFETY: fork(2). We are single-threaded at this point in the run path
-    // (the HVF VM + sibling vCPU threads do not exist yet — that is the whole
-    // reason the supervisor fork happens HERE), so fork is safe.
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        // Fork failed: close the pipe and run without a supervisor.
-        unsafe {
-            libc::close(pipe_read);
-            libc::close(pipe_write);
-        }
-        crate::namespace::pid::set_reg_pipe_write(-1);
-        return Ok(SupervisorRole::InProcess);
-    }
-    if pid == 0 {
-        // CHILD: the guest-init (ns-pid 1). Close the supervisor's read end,
-        // fill the region's init slot with our pid, and continue into HVF.
-        unsafe {
-            libc::close(pipe_read);
-        }
-        crate::namespace::pid::set_init(std::process::id());
-        return Ok(SupervisorRole::ForkedInit);
-    }
-    // PARENT: the NsSupervisor. Close the write end (only members write), run
-    // the kqueue loop until the init exits, then propagate its status.
-    unsafe {
-        libc::close(pipe_write);
-    }
-    crate::namespace::pid::set_reg_pipe_write(-1);
-    // Detached runs (`carrick run -d`) set CARRICK_CONTAINER_ID before launch.
-    // The supervisor owns the container's lifetime, so it records the live
-    // init/supervisor pids (status → Running) here and marks the registry entry
-    // Exited (or removes it, for --rm) when the init exits. A foreground run has
-    // no id set, so this is a no-op (the CLI handles foreground status itself).
-    let container_id = std::env::var("CARRICK_CONTAINER_ID").ok();
-    if let Some(id) = container_id.as_deref()
-        && let Ok(mut state) = crate::container::ContainerState::load(id)
-    {
+/// Publish a detached container as owned by this carrier. The persisted schema
+/// still exposes both historical pid fields, so both temporarily name the
+/// carrier until that compatibility surface is migrated.
+fn publish_carrier_running() -> Option<String> {
+    let id = std::env::var("CARRICK_CONTAINER_ID").ok()?;
+    if let Ok(mut state) = crate::container::ContainerState::load(&id) {
+        let carrier_pid = std::process::id() as i32;
         state.status = crate::container::ContainerStatus::Running;
-        state.supervisor_pid = std::process::id() as i32;
-        state.init_pid = pid;
+        state.supervisor_pid = carrier_pid;
+        state.init_pid = carrier_pid;
         let _ = state.persist();
     }
-    let exit = crate::namespace::supervisor::run(pid, pipe_read);
-    let code = crate::namespace::supervisor::status_to_exit_code(exit.init_status);
-    if let Some(id) = container_id.as_deref() {
-        crate::container::mark_exited(id, code);
-    }
-    Ok(SupervisorRole::Parent(RunResult {
-        exit_code: code,
-        terminating_signal: None,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        traps: 0,
-        report: Default::default(),
-        trap_limit_hit: false,
-    }))
+    Some(id)
 }
 
 fn finalize_persistent_hvf_run<Destroy, Record, Publish>(
@@ -723,28 +629,18 @@ fn run_address_space_with_hvf_and_dispatcher(
 ) -> Result<RunResult, RuntimeError> {
     let _ = crate::ulock::preinit_waiter_table();
     ensure_kernel_arena_path_env()?;
-    // Kernel arena MUST exist before the supervisor split and any guest fork so
-    // every descendant inherits one shared mapping.
+    // The carrier owns the kernel arena and PID-namespace placement directly.
+    // Guest fork/clone creates logical Carrick-kernel tasks, never a host
+    // namespace-supervisor process.
     let _ = carrick_kernel::arena::KernelArena::init_global();
-    // PID-namespace placement (container runs only): fork the NsSupervisor
-    // BEFORE creating the HVF VM. macOS HVF state is not fork-safe — a VM live
-    // in the parent at fork(2) makes the child's hv_vm_create return HV_BUSY
-    // (see HvfTrapEngine::fork). So the supervisor (the parent) must never
-    // create a VM: it forks here, the CHILD goes on to HvfTrapEngine::new() and
-    // runs the guest as ns-pid 1, and the PARENT runs the kqueue supervisor
-    // loop and exits with the init's status (docs/namespaces-design.md §3.2).
-    // `run-elf` never requests placement, so this is a no-op there.
-    let role = maybe_fork_ns_supervisor()?;
-    if let SupervisorRole::Parent(result) = role {
-        return Ok(result);
+    if crate::namespace::pid::requested() && !crate::namespace::pid::enabled() {
+        let _ = crate::namespace::pid::init(std::process::id());
     }
-    dispatcher.activate_file_authority().map_err(|error| {
-        RuntimeError::Configuration(format!("activate per-run FileAuthority: {error}"))
-    })?;
-    let forked_init = matches!(role, SupervisorRole::ForkedInit);
-    // Run the guest. In the forked guest-init, errors must NOT unwind (see below),
-    // so capture the fallible tail in a closure and branch on the role.
+    let container_id = publish_carrier_running();
     let run = (move || -> Result<RunResult, RuntimeError> {
+        dispatcher.activate_file_authority().map_err(|error| {
+            RuntimeError::Configuration(format!("activate per-run FileAuthority: {error}"))
+        })?;
         // Build the engine (create VM + vCPU, map the address space, park at the EL0
         // trampoline) — the shared `Aarch64EngineCore<HvfAarch64Vmm>` bring-up.
         let mut trap = crate::trap::new_hvf_trap_engine(&image)?;
@@ -784,24 +680,11 @@ fn run_address_space_with_hvf_and_dispatcher(
             },
         )
     })();
-    match run {
-        Ok(r) => Ok(r),
-        Err(e) if forked_init => {
-            // Forked guest-init: a post-fork failure (HVF VM creation / mapping)
-            // must terminate WITHOUT unwinding. The forked child shares the
-            // parent's fd table; dropping fd-owning state on the way out
-            // double-closes an inherited fd and aborts via std's IO-safety check
-            // (SIGABRT). Print the error (stderr is inherited + unbuffered) and
-            // `_exit` with docker's "couldn't start the container" code (125) —
-            // the NsSupervisor parent harvests this and propagates it.
-            eprintln!("carrick: {e}");
-            // SAFETY: `_exit` is async-signal-safe and skips atexit/Drop cleanup,
-            // which is exactly what a forked child must do. Nothing is buffered
-            // (stderr written above; the guest never started).
-            unsafe { libc::_exit(125) };
-        }
-        Err(e) => Err(e),
+    if let Some(id) = container_id.as_deref() {
+        let exit_code = run.as_ref().map_or(125, |result| result.exit_code);
+        crate::container::mark_exited(id, exit_code);
     }
+    run
 }
 
 fn ensure_kernel_arena_path_env() -> Result<(), RuntimeError> {
@@ -2004,7 +1887,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
 // `run_vcpu_until_exit`/`service_signals_threaded`/`deliver_pending_signal`/
 // `shared_futex_wait` (now `PlatformFutex::shared_wait`) all live there. Only the
 // HVF SETUP WRAPPER (`run_threaded_hvf_loop`) stays here, building the concrete
-// HVF kicker / futex table / `ForkCoordinator` and threading them in.
+// HVF kicker / futex table / signal-pump control and threading them in.
 // ===================================================================
 
 use crate::thread::{FutexTable, ThreadId};
@@ -2015,7 +1898,7 @@ use std::sync::Arc;
 /// through `run_vcpu_until_exit`. Thread-creating clones spawn sibling host
 /// threads that run the same function on their own vCPU.
 /// HVF's [`crate::threaded_loop::HostBackend`]: `hvf_futex`, the kqueue
-/// `ForkCoordinator`, `VcpuKicker`, `HvfTimerDelivery`, the `HvfSignalArrival`
+/// signal-pump control, `VcpuKicker`, `HvfTimerDelivery`, the `HvfSignalArrival`
 /// kqueue-pump wake, and HVF's pre-loop setup (default cross-process signal
 /// handlers + a termios-restore guard) with a tty-gated LAZY pump.
 struct HvfHostBackend;
@@ -2025,8 +1908,8 @@ impl crate::threaded_loop::HostBackend for HvfHostBackend {
         Arc::new(crate::threaded_impl::hvf_futex(table))
     }
 
-    fn make_fork_coordinator(&self) -> Box<dyn carrick_hal::HostForkCoordinator> {
-        Box::new(crate::fork_coord::ForkCoordinator::new())
+    fn make_signal_pump(&self) -> Box<dyn carrick_hal::SignalPumpControl> {
+        Box::new(crate::fork_coord::HvfSignalPumpControl::new())
     }
 
     fn make_kicker(&self) -> Arc<dyn carrick_hal::VcpuRegistry> {
@@ -2605,6 +2488,122 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_host_process_creation_inventory_is_exact_and_shrinking() {
+        use std::collections::BTreeMap;
+
+        fn visit_rs_files(root: &Path, current: &Path, files: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(current).expect("read runtime source directory") {
+                let path = entry.expect("runtime source entry").path();
+                if path.is_dir() {
+                    visit_rs_files(root, &path, files);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    files.push(
+                        path.strip_prefix(root)
+                            .expect("relative source path")
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+
+        let expected: BTreeMap<&str, [usize; 3]> = BTreeMap::from([
+            ("apfs.rs", [0, 0, 1]),
+            ("deadlock_watchdog.rs", [0, 0, 1]),
+            ("dispatch/ioring.rs", [1, 0, 0]),
+            ("dispatch/mem/tests.rs", [5, 0, 0]),
+            ("dispatch/signal.rs", [0, 0, 3]),
+            ("dispatch/sysv.rs", [1, 0, 0]),
+            ("dispatch/tests.rs", [3, 0, 0]),
+            ("exec_stamps.rs", [1, 0, 0]),
+            ("fs_backend.rs", [1, 1, 1]),
+            ("interactive_supervisor.rs", [3, 0, 0]),
+            ("network/socket_namespace.rs", [7, 0, 0]),
+            ("run_state.rs", [1, 0, 0]),
+            ("vcpu_loop/signal.rs", [2, 0, 0]),
+            ("vfs/proc.rs", [1, 0, 0]),
+            ("vfs/resolvconf.rs", [0, 0, 1]),
+        ]);
+        let patterns = [
+            ["unsafe { libc::", "fork()"].concat(),
+            ["libc::posix_", "spawn("].concat(),
+            ["Command", "::new("].concat(),
+        ];
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        visit_rs_files(&source_root, &source_root, &mut files);
+        let mut observed = BTreeMap::new();
+        for relative in files {
+            let source = std::fs::read_to_string(source_root.join(&relative))
+                .expect("read runtime source file");
+            let counts = patterns
+                .each_ref()
+                .map(|pattern| source.matches(pattern).count());
+            if counts != [0, 0, 0] {
+                observed.insert(relative.to_string_lossy().into_owned(), counts);
+            }
+        }
+        let expected: BTreeMap<String, [usize; 3]> = expected
+            .into_iter()
+            .map(|(path, counts)| (path.to_owned(), counts))
+            .collect();
+        assert_eq!(
+            observed, expected,
+            "runtime host-process creation changed; classify the exact call as a test, explicit operator boundary, or retirement regression before updating this shrinking inventory"
+        );
+    }
+
+    #[test]
+    fn namespace_supervisor_launch_surface_is_deleted() {
+        let runtime_source = include_str!("runtime.rs");
+        let execute_source = include_str!("execute.rs");
+        let pid_source = include_str!("namespace/pid.rs");
+        let namespace_source = include_str!("namespace/mod.rs");
+
+        for forbidden in [
+            ["Supervisor", "Role"].concat(),
+            ["maybe_fork_ns_", "supervisor"].concat(),
+        ] {
+            assert!(
+                !runtime_source.contains(&forbidden),
+                "runtime launch must not retain namespace-supervisor surface `{forbidden}`"
+            );
+        }
+        let launch_source = runtime_source
+            .split("fn run_address_space_with_hvf_and_dispatcher")
+            .nth(1)
+            .and_then(|tail| tail.split("fn ensure_kernel_arena_path_env").next())
+            .expect("HVPatch runtime launch source");
+        assert!(
+            !launch_source.contains(&["libc::", "fork"].concat()),
+            "HVPatch runtime launch must not create a host process"
+        );
+        for forbidden in [
+            "request_supervisor",
+            "supervisor_requested",
+            "REG_PIPE_WRITE",
+            "set_reg_pipe_write",
+            "notify_registration",
+        ] {
+            assert!(
+                !execute_source.contains(forbidden) && !pid_source.contains(forbidden),
+                "carrier-only PID placement must delete {forbidden}"
+            );
+        }
+        assert!(
+            !namespace_source.contains("pub mod supervisor"),
+            "carrier-only namespace module must not compile the retired supervisor"
+        );
+        assert!(
+            !std::path::Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/namespace/supervisor.rs"
+            ))
+            .exists(),
+            "retired namespace supervisor implementation must stay deleted"
+        );
+    }
 
     #[test]
     fn setup_failure_has_one_vm_teardown_and_runtime_error_artifact() {

@@ -138,15 +138,14 @@ pub fn arm() {
                 // No global syscall progress for the window: a true deadlock.
                 let pid = unsafe { libc::getpid() };
                 // Eligibility gate: only a process that has actually dispatched a
-                // guest syscall holds deadlock-relevant state. The ns-supervisor
-                // and orchestrator parent just park in `kevent`/`poll` and never
-                // `tick()` — without this gate one of THEM can win the bounded
+                // guest syscall holds deadlock-relevant state. An orchestrator
+                // parent can just park in `poll` and never `tick()` — without
+                // this gate it can win the bounded
                 // claim and core its own useless parked state, leaving the truly
-                // stuck go-build guests un-cored. (Observed: a core that was only
-                // `namespace::supervisor::run` in `kevent`, ring `total=0`.)
+                // stuck guest carrier un-cored.
                 if !local_ticked() {
                     eprintln!(
-                        "DEADLOCK WATCHDOG pid={pid}: tree-wide stall ({ms}ms) but this process never dispatched a guest syscall (supervisor/orchestrator) — deferring the core to a stuck guest"
+                        "DEADLOCK WATCHDOG pid={pid}: tree-wide stall ({ms}ms) but this process never dispatched a guest syscall (orchestrator) — deferring the core to a stuck carrier"
                     );
                     return;
                 }

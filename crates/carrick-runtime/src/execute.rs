@@ -189,11 +189,11 @@ pub struct Runtime;
 
 impl Runtime {
     pub fn execute(spec: &RunSpec) -> Result<RunResult, RuntimeError> {
-        // Guardrail: execute() forks (PID-namespace NsSupervisor, interactive
-        // session, and guest fork(2)). A live tokio runtime must NOT survive into
-        // here — its blocking-pool threads don't survive fork, so a forked child
-        // deadlocks in BlockingPool::shutdown. Callers resolve the image under
-        // tokio, DROP the runtime, then call execute.
+        // Guardrail: execute() may still enter the separately-scoped
+        // interactive-session boundary. A live tokio runtime must NOT survive
+        // into here — its blocking-pool threads do not survive that host fork,
+        // so the interactive child would deadlock in BlockingPool::shutdown.
+        // Callers resolve the image under tokio, DROP the runtime, then execute.
         debug_assert!(
             tokio::runtime::Handle::try_current().is_err(),
             "tokio runtime must not be live when Runtime::execute is called \
@@ -212,15 +212,9 @@ impl Runtime {
         // pids, and an ns-filtered /proc — the headline docker-run behavior
         // (docs/namespaces-design.md §1.0, §5.2). `run-elf` bypasses
         // Runtime::execute entirely, so it stays in the identity namespace.
-        // `--pid=host` opts out (shares the host pid ns, like docker), leaving
-        // the guest with host pids and no supervisor.
-        //
-        // The forking NsSupervisor (orphan reaping + teardown) is enabled only
-        // for STREAMING output paths (raw / tty), where the guest writes to
-        // inherited fds: the supervisor becomes the fork parent and returns the
-        // run result, which carries no buffered stdout/stderr. The default
-        // buffered JSON-envelope path keeps the guest in-process (translation
-        // still works) so its captured output is returned as before.
+        // `--pid=host` opts out (shares the host pid ns, like docker). Private
+        // placement is always initialized inside the single VM carrier; output
+        // mode never creates a host namespace-supervisor process.
         match spec.pid {
             PidMode::Host => {} // share the host pid ns — no placement.
             PidMode::Private => {
@@ -232,8 +226,6 @@ impl Runtime {
                             "failed to join container namespace at {region}"
                         )));
                     }
-                } else if spec.raw || spec.tty {
-                    crate::namespace::pid::request_supervisor();
                 } else {
                     crate::namespace::pid::request();
                 }

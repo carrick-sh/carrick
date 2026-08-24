@@ -41,7 +41,7 @@ pub mod run_elf;
 pub mod trap_engine;
 
 pub use kvm::{KvmVcpu, KvmVm};
-pub use kvm_fork_coord::KvmForkCoordinator;
+pub use kvm_fork_coord::KvmSignalPumpControl;
 pub use kvm_futex::{KvmFutex, make_kvm_futex};
 pub use kvm_kicker::{KvmKickHandle, KvmKicker, install_kvm_kick_handler};
 pub use timer_delivery::KvmTimerDelivery;

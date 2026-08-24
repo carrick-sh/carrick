@@ -1102,7 +1102,7 @@ where
         child_dispatcher.bind_hvpatch_process(child_process.clone());
         let child_kernel = Arc::new(KernelState::new(
             child_dispatcher,
-            Arc::clone(&kernel.fork),
+            Arc::clone(&kernel.signal_pump),
             Arc::clone(&kernel.signal_arrival),
             Some(child_process.clone()),
             kernel.hvpatch_runtime.clone(),

@@ -1,16 +1,15 @@
 //! NVMM impls of the shared threaded-loop coordinator traits.
 //!
-//! `NvmmForkCoordinator` is now the shared
-//! [`carrick_hal::GenericForkCoordinator`] parameterized by [`crate::NvmmGlue`]
-//! (the fork/pump/xsig lifecycle was byte-identical across KVM/bhyve/NVMM).
+//! `NvmmSignalPumpControl` is the shared
+//! [`carrick_hal::GenericSignalPumpControl`] parameterized by [`crate::NvmmGlue`].
 //! `NvmmTimerDelivery` stays here (NetBSD posix/itimer arming).
 
 use std::sync::Arc;
 
 use carrick_hal::VcpuRegistry;
 
-/// The NVMM host-fork coordinator: the shared generic + NVMM's glue.
-pub type NvmmForkCoordinator = carrick_hal::GenericForkCoordinator<crate::NvmmGlue>;
+/// The NVMM signal-pump controller: the shared generic + NVMM's glue.
+pub type NvmmSignalPumpControl = carrick_hal::GenericSignalPumpControl<crate::NvmmGlue>;
 
 pub struct NvmmTimerDelivery {
     pub kicker: Arc<dyn VcpuRegistry>,
