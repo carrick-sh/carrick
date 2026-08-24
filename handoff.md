@@ -267,6 +267,37 @@ the sequential gate MASKS them, per the documented trap):
   epollcluster gate rows, pinned by a fast host test. Handed to the
   `epolled` worker as its red-first anchor.
 
+### GATE 17 — 818/838 + 39/40: eight REAL clears, and the churn class is now THE story
+
+Gate 17 (log `target/perf/gate17.log`, artifact `53e53be4`) after the
+executor-condvar fix (`3bec273a`), coredump2 (`a483a727`, oracle-MATCH
+all 32 lines — director-verified with `scripts/run-probe.sh`), and
+mqnotify (`77a8888d`):
+
+- **All 8 targeted rows cleared**: execfromthread×2 (the ABBA fix — the
+  probe went 0/12 → 13/15 → merged; residual is ONLY the pre-existing
+  killreap clause), coredumpfile×2, mqnotifycrossproc×2, plus
+  brkheapgrow + clone3pidfdsig churn-returns.
+- **BUT 15 rows flipped newly red and bridge_loopback_isolation dropped
+  the scenario phase to 39/40.** ATTRIBUTION DONE: every sampled flip is
+  green 3/3 standalone in the GATE'S OWN injection transport at HEAD
+  (vforkpid also gnu) — zero regressions from this window; the churn
+  class's amplitude simply jumped (2 → 15 flips between consecutive
+  gates). Two lessons banked: (a) attribution MUST use the gate's
+  injection transport — vforkpid's `getpid_stable_after_vfork` is red
+  3/3 in the RAW lane at every recent commit (the banked raw-lane
+  host-pid getpid quirk: getpid answers the carrier host pid and is not
+  stable across vfork there) while green in the gate lane; (b) the gate
+  pass-count now OSCILLATES (825→818) on same-quality code — "probes
+  pass RELIABLY" (the ecosystems directive's precondition) is therefore
+  BLOCKED ON THE CHURN CLASS, not on more row-fixes. The churn hunt
+  (load-coupled flips, the reactor-flake family, the remaining
+  killreap/drop-MM-authority clause at mm_root_slot 0x9A00200000) is
+  the highest-leverage next work, alongside the two REAL remaining
+  timeout rows (vforkexecthread×2, setidthreadchurn×2 — a different
+  mechanism from execfromthread's: the vfork-suspended leader and the
+  set*id broadcast under churn threads).
+
 ### OWNER DIRECTIVE (2026-08-24): after the probes, the ECOSYSTEMS gate
 
 Once the conformance probes pass RELIABLY (the closure gate green and
