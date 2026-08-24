@@ -3,7 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use host_authority_escape_syntax::{Finding, scan_source};
+use host_authority_escape_syntax::{
+    CarrierProcessFinding, Finding, scan_carrier_process_source, scan_source,
+};
 
 const CHECKED_NON_SOURCE_SYMLINKS: &[(&str, &str)] = &[
     ("crates/carrick-cli/fixtures", "../../fixtures"),
@@ -18,14 +20,22 @@ enum OutputFormat {
     Text,
 }
 
+#[derive(Clone, Copy)]
+enum ScanMode {
+    EscapeHatches,
+    CarrierProcesses,
+}
+
 struct Options {
     root: PathBuf,
     format: OutputFormat,
+    mode: ScanMode,
 }
 
 fn parse_options() -> Result<Options, String> {
     let mut root = None;
     let mut format = OutputFormat::Text;
+    let mut mode = ScanMode::EscapeHatches;
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -46,8 +56,21 @@ fn parse_options() -> Result<Options, String> {
                     _ => return Err(format!("unsupported output format: {value}")),
                 };
             }
+            "--mode" => {
+                let value = arguments.next().ok_or_else(|| {
+                    "--mode requires escape-hatches or carrier-processes".to_owned()
+                })?;
+                mode = match value.as_str() {
+                    "escape-hatches" => ScanMode::EscapeHatches,
+                    "carrier-processes" => ScanMode::CarrierProcesses,
+                    _ => return Err(format!("unsupported scan mode: {value}")),
+                };
+            }
             "-h" | "--help" => {
-                println!("usage: host-authority-escape-syntax --root PATH [--format json|text]");
+                println!(
+                    "usage: host-authority-escape-syntax --root PATH \
+                     [--format json|text] [--mode escape-hatches|carrier-processes]"
+                );
                 return Err(String::new());
             }
             _ => return Err(format!("unknown argument: {argument}")),
@@ -56,6 +79,7 @@ fn parse_options() -> Result<Options, String> {
     Ok(Options {
         root: root.ok_or_else(|| "--root is required".to_owned())?,
         format,
+        mode,
     })
 }
 
@@ -145,12 +169,61 @@ fn scan(options: &Options) -> Result<Vec<(String, Finding)>, String> {
     Ok(findings)
 }
 
+fn scan_carrier_processes(
+    options: &Options,
+) -> Result<Vec<(String, CarrierProcessFinding)>, String> {
+    let root = options
+        .root
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve {}: {error}", options.root.display()))?;
+    let crates = root.join("crates");
+    if !crates.is_dir() {
+        return Err(format!("missing Rust scan root: {}", crates.display()));
+    }
+    let mut files = Vec::new();
+    collect_rust_files(&root, &crates, &mut files)?;
+    files.sort();
+    let mut findings = Vec::new();
+    for path in files {
+        let relative = path
+            .strip_prefix(&root)
+            .map_err(|error| format!("cannot relativize {}: {error}", path.display()))?;
+        let relative = relative
+            .to_str()
+            .ok_or_else(|| format!("non-UTF-8 scan path: {}", path.display()))?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let source = fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let file_findings =
+            scan_carrier_process_source(&source).map_err(|error| format!("{relative}: {error}"))?;
+        findings.extend(
+            file_findings
+                .into_iter()
+                .map(|finding| (relative.clone(), finding)),
+        );
+    }
+    findings.sort();
+    Ok(findings)
+}
+
 fn run() -> Result<(), String> {
     let options = parse_options()?;
-    for (path, finding) in scan(&options)? {
-        match options.format {
-            OutputFormat::Json => println!("{}", finding.render_json(&path)),
-            OutputFormat::Text => println!("{}", finding.render_text(&path)),
+    match options.mode {
+        ScanMode::EscapeHatches => {
+            for (path, finding) in scan(&options)? {
+                match options.format {
+                    OutputFormat::Json => println!("{}", finding.render_json(&path)),
+                    OutputFormat::Text => println!("{}", finding.render_text(&path)),
+                }
+            }
+        }
+        ScanMode::CarrierProcesses => {
+            for (path, finding) in scan_carrier_processes(&options)? {
+                match options.format {
+                    OutputFormat::Json => println!("{}", finding.render_json(&path)),
+                    OutputFormat::Text => println!("{}", finding.render_text(&path)),
+                }
+            }
         }
     }
     Ok(())

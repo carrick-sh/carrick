@@ -1,4 +1,6 @@
-use host_authority_escape_syntax::{Finding, scan_source};
+use host_authority_escape_syntax::{
+    CarrierProcessFindingKind, Finding, scan_carrier_process_source, scan_source,
+};
 
 fn shapes(source: &str) -> Vec<(&'static str, String)> {
     scan_source(source)
@@ -6,6 +8,323 @@ fn shapes(source: &str) -> Vec<(&'static str, String)> {
         .into_iter()
         .map(|finding| (finding.kind.as_str(), finding.detail))
         .collect()
+}
+
+#[test]
+fn carrier_process_scan_resolves_aliases_and_skips_cfg_test_items() {
+    let source = r#"
+use libc::fork as birth;
+use std::process::Command as HostCommand;
+
+fn production() {
+    let _ = unsafe { birth() };
+    let _ = HostCommand::new("helper");
+    let _ = unsafe { libc::kill(7, 0) };
+}
+
+#[cfg(test)]
+mod tests {
+    fn fixture() {
+        let _ = unsafe { libc::fork() };
+        let _ = std::process::Command::new("fixture");
+    }
+}
+"#;
+    let findings = scan_carrier_process_source(source).unwrap();
+    let kinds: Vec<_> = findings.iter().map(|finding| finding.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            CarrierProcessFindingKind::Fork,
+            CarrierProcessFindingKind::ProcessCommand,
+            CarrierProcessFindingKind::KillProbe,
+        ]
+    );
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding.enclosing_item == "production")
+    );
+}
+
+#[test]
+fn carrier_process_scan_finds_all_direct_process_boundaries() {
+    let source = r#"
+fn production() {
+    unsafe {
+        libc::vfork();
+        libc::posix_spawn(0 as _, 0 as _, 0 as _, 0 as _, 0 as _, 0 as _);
+        libc::kill(1, 9);
+        libc::killpg(1, 9);
+        libc::waitpid(1, 0 as _, 0);
+        libc::wait4(1, 0 as _, 0, 0 as _);
+        libc::waitid(0, 0, 0 as _, 0);
+        libc::setpgid(0, 0);
+        libc::setsid();
+    }
+}
+"#;
+    let findings = scan_carrier_process_source(source).unwrap();
+    let kinds: Vec<_> = findings.iter().map(|finding| finding.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            CarrierProcessFindingKind::Vfork,
+            CarrierProcessFindingKind::PosixSpawn,
+            CarrierProcessFindingKind::Kill,
+            CarrierProcessFindingKind::Killpg,
+            CarrierProcessFindingKind::Waitpid,
+            CarrierProcessFindingKind::Wait4,
+            CarrierProcessFindingKind::Waitid,
+            CarrierProcessFindingKind::Setpgid,
+            CarrierProcessFindingKind::Setsid,
+        ]
+    );
+}
+
+#[test]
+fn carrier_process_scan_does_not_hide_mixed_cfg_or_macro_bodies() {
+    let source = r#"
+#[cfg(any(test, feature = "product"))]
+fn mixed_configuration_is_product() {
+    unsafe { libc::fork(); }
+}
+
+macro_rules! product_birth {
+    () => {{ unsafe { libc::vfork() } }};
+}
+
+#[cfg(all(unix, test))]
+fn provably_test_only() {
+    unsafe { libc::posix_spawn(0 as _, 0 as _, 0 as _, 0 as _, 0 as _, 0 as _); }
+}
+
+mod tests {
+    fn a_name_is_not_a_cfg() {
+        unsafe { libc::killpg(1, 9); }
+    }
+}
+"#;
+    let findings = scan_carrier_process_source(source).unwrap();
+    let kinds: Vec<_> = findings.iter().map(|finding| finding.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            CarrierProcessFindingKind::Fork,
+            CarrierProcessFindingKind::Vfork,
+            CarrierProcessFindingKind::Killpg,
+        ]
+    );
+}
+
+#[test]
+fn carrier_process_scan_omits_cfg_test_statement_blocks_inside_macros() {
+    let source = r#"
+macro_rules! syscall_table {
+    () => {{
+        #[cfg(not(test))]
+        return 0;
+        #[cfg(test)]
+        {
+            unsafe { libc::wait4(1, 0 as _, 0, 0 as _); }
+        }
+    }};
+}
+"#;
+    let findings = scan_carrier_process_source(source).unwrap();
+    assert!(findings.is_empty(), "unexpected findings: {findings:?}");
+}
+
+#[test]
+fn carrier_process_scan_omits_cfg_test_impl_macro_bodies() {
+    let source = r#"
+#[cfg(test)]
+impl Dispatcher {
+    define_syscall! {
+        fn legacy_wait() {
+            unsafe { libc::wait4(7, core::ptr::null_mut(), 0, core::ptr::null_mut()); }
+        }
+    }
+}
+"#;
+    let findings = scan_carrier_process_source(source).unwrap();
+    assert!(findings.is_empty(), "unexpected findings: {findings:?}");
+}
+
+#[test]
+fn carrier_process_scan_resolves_imports_declared_after_the_call_site() {
+    let source = r#"
+fn production() {
+    let _ = unsafe { late_birth() };
+    let _ = LateCommand::new("helper");
+}
+
+use libc::fork as late_birth;
+use std::process::Command as LateCommand;
+"#;
+    let findings = scan_carrier_process_source(source).unwrap();
+    let kinds: Vec<_> = findings.iter().map(|finding| finding.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            CarrierProcessFindingKind::Fork,
+            CarrierProcessFindingKind::ProcessCommand,
+        ]
+    );
+}
+
+#[test]
+fn carrier_process_scan_descends_into_impl_item_macro_bodies() {
+    let source = r#"
+impl Dispatcher {
+    define_syscall! {
+        fn legacy_wait() {
+            unsafe { libc::wait4(7, core::ptr::null_mut(), 0, core::ptr::null_mut()); }
+        }
+    }
+}
+"#;
+    let findings = scan_carrier_process_source(source).unwrap();
+    assert_eq!(findings.len(), 1, "unexpected findings: {findings:?}");
+    assert_eq!(findings[0].kind, CarrierProcessFindingKind::Wait4);
+}
+
+#[test]
+fn carrier_process_scan_resolves_aliases_inside_impl_item_macros() {
+    let source = r#"
+use libc as host;
+use std::process as process_alias;
+impl Dispatcher {
+    define_syscall! {
+        fn legacy_wait() {
+            unsafe { host::wait4(7, core::ptr::null_mut(), 0, core::ptr::null_mut()); }
+            let _ = process_alias::Command::new("helper");
+        }
+    }
+}
+"#;
+    let findings = scan_carrier_process_source(source).unwrap();
+    let kinds: Vec<_> = findings.iter().map(|finding| finding.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            CarrierProcessFindingKind::ProcessCommand,
+            CarrierProcessFindingKind::Wait4,
+        ]
+    );
+}
+
+#[test]
+fn carrier_process_scan_resolves_grouped_and_extern_crate_namespaces() {
+    let source = r#"
+extern crate libc as raw_host;
+use libc::{self as grouped_host};
+use std::process::{self as grouped_process};
+
+fn production() {
+    unsafe {
+        raw_host::forkx_np(0);
+        raw_host::fexecve(3, core::ptr::null(), core::ptr::null());
+        grouped_host::wait3(core::ptr::null_mut(), 0, core::ptr::null_mut());
+    }
+    let _ = grouped_process::Command::new("helper");
+}
+"#;
+    let findings = scan_carrier_process_source(source).unwrap();
+    let kinds: Vec<_> = findings.iter().map(|finding| finding.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            CarrierProcessFindingKind::Fork,
+            CarrierProcessFindingKind::ProcessCommand,
+            CarrierProcessFindingKind::Exec,
+            CarrierProcessFindingKind::Wait,
+        ]
+    );
+}
+
+#[test]
+fn carrier_process_scan_omits_current_cfg_test_dispatch_proc_host_control() {
+    let source = include_str!("../../../../crates/carrick-runtime/src/dispatch/proc.rs");
+    let findings = scan_carrier_process_source(source).unwrap();
+    assert!(
+        findings.is_empty(),
+        "all remaining host wait/ptrace compatibility is cfg(test): {findings:?}"
+    );
+}
+
+#[test]
+fn carrier_process_scan_resolves_namespace_glob_and_type_aliases() {
+    let source = r#"
+use libc as host;
+use libc::*;
+use std::process as process_alias;
+use std::process::*;
+type HostCommand = std::process::Command;
+
+fn production() {
+    unsafe { host::fork(); }
+    unsafe { vfork(); }
+    let _ = process_alias::Command::new("one");
+    let _ = Command::new("two");
+    let _ = HostCommand::new("three");
+}
+"#;
+    let findings = scan_carrier_process_source(source).unwrap();
+    let kinds: Vec<_> = findings.iter().map(|finding| finding.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            CarrierProcessFindingKind::Fork,
+            CarrierProcessFindingKind::Vfork,
+            CarrierProcessFindingKind::ProcessCommand,
+            CarrierProcessFindingKind::ProcessCommand,
+            CarrierProcessFindingKind::ProcessCommand,
+        ]
+    );
+}
+
+#[test]
+fn carrier_process_scan_finds_extern_link_names_and_extended_process_apis() {
+    let source = r#"
+unsafe extern "C" {
+    #[link_name = "fork"]
+    fn hidden_birth() -> i32;
+}
+
+fn production() {
+    unsafe {
+        libc::clone(core::ptr::null_mut(), core::ptr::null_mut(), 0, core::ptr::null_mut());
+        libc::forkpty(core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut());
+        libc::system(core::ptr::null());
+        libc::popen(core::ptr::null(), core::ptr::null());
+        libc::daemon(0, 0);
+        libc::execve(core::ptr::null(), core::ptr::null(), core::ptr::null());
+        libc::wait(core::ptr::null_mut());
+        libc::ptrace(0, 0, core::ptr::null_mut(), 0);
+        libc::pthread_kill(core::mem::zeroed(), 1);
+        carrick_portable::ptrace(0, 7, 0, 0);
+    }
+}
+"#;
+    let findings = scan_carrier_process_source(source).unwrap();
+    let kinds: Vec<_> = findings.iter().map(|finding| finding.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            CarrierProcessFindingKind::Fork,
+            CarrierProcessFindingKind::Clone,
+            CarrierProcessFindingKind::Forkpty,
+            CarrierProcessFindingKind::System,
+            CarrierProcessFindingKind::Popen,
+            CarrierProcessFindingKind::Daemon,
+            CarrierProcessFindingKind::Exec,
+            CarrierProcessFindingKind::PthreadKill,
+            CarrierProcessFindingKind::Wait,
+            CarrierProcessFindingKind::Ptrace,
+            CarrierProcessFindingKind::Ptrace,
+        ]
+    );
 }
 
 #[test]
