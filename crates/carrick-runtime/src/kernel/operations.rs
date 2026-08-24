@@ -1830,6 +1830,7 @@ impl Kernel {
             if !publish() {
                 return false;
             }
+            record.task.record_task_event();
             Arc::clone(&record.task)
         };
         task.wake();
