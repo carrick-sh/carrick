@@ -50,7 +50,7 @@ class CarrierOnlyProcessInvariantTest(unittest.TestCase):
                     "forbidden_product_process_creation",
                 )
 
-    def test_guest_process_control_is_forbidden_but_carrier_liveness_is_typed(self):
+    def test_guest_process_control_and_pid_liveness_probes_are_forbidden(self):
         self.assertEqual(
             GATE.classify(
                 finding(
@@ -69,7 +69,7 @@ class CarrierOnlyProcessInvariantTest(unittest.TestCase):
                     "kill_probe",
                 )
             ),
-            "carrier_substrate",
+            "forbidden_guest_to_host_process_control",
         )
         self.assertEqual(
             GATE.classify(
