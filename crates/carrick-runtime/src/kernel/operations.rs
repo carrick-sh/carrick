@@ -1319,6 +1319,7 @@ impl Kernel {
                     ))
                     && target_sighand.disposition(signal)
                         == super::objects::SignalDisposition::Default
+                    && !target.accepts_unhandled_signal(signal)
             })
         {
             return ExactSignalTargetAuthorization::DropProtectedInit;
