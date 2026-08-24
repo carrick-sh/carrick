@@ -332,6 +332,7 @@ pub struct Kernel {
     /// would merge every guest's keys together. Key SERIALS are only meaningful
     /// because this allocator is VM-wide.
     keyrings: crate::keyring::KeyringService,
+    pub(super) debug_aux_provider: Mutex<Option<Weak<dyn super::debug::KernelDebugAuxProvider>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -891,9 +892,28 @@ impl Kernel {
             pending_file_closes: Mutex::new(Vec::new()),
             reservation_gate: ReservationGate::default(),
             keyrings: crate::keyring::KeyringService::new(),
+            debug_aux_provider: Mutex::new(None),
         });
         let context = KernelContext::capture(kernel.clone(), task, leader, TaskRevision::INITIAL);
         Ok((kernel, context))
+    }
+
+    pub fn register_debug_aux_provider(
+        &self,
+        provider: &Arc<dyn super::debug::KernelDebugAuxProvider>,
+    ) {
+        *self.debug_aux_provider.lock() = Some(Arc::downgrade(provider));
+    }
+
+    pub fn unregister_debug_aux_provider(&self) {
+        *self.debug_aux_provider.lock() = None;
+    }
+
+    pub fn debug_aux_provider(&self) -> Option<Arc<dyn super::debug::KernelDebugAuxProvider>> {
+        self.debug_aux_provider
+            .lock()
+            .as_ref()
+            .and_then(Weak::upgrade)
     }
 
     /// The VM-wide keyring store. See the field docs for why it lives here.
