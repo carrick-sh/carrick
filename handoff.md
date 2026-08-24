@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-22 (session 2 — Phase 1 collapse)
+**Updated:** 2026-08-24 (session 7 — churn tail cornered: one fork-window stack-corruption bug)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -77,6 +77,127 @@ Restore it verbatim once the objective above closes:
 > 
 > The goal is still active. Do not mark it complete, bless a baseline, weaken the
 > denominator, add an excuse, accept a retry, or start final performance work.
+
+## SESSION 7 — 2026-08-24: the churn tail is ONE bug, and it is cornered
+
+**Owner re-affirmation (binding):** "part of all of this rewrite was to remove
+load coupled issues." Load-coupled failure is the defect class the HVPatch
+rewrite exists to eliminate — the residual gate churn is primary defect work,
+never flake to retry away. The bar is zero flips under load. (Recorded in
+memory `feedback_load_sensitivity_first_class` as well.) Owner also ruled: no
+bisecting the recent COW/frame commits — fix forward, use history as context.
+
+### Gate 19 (target/perf/gate19.log): 827/838 + 40/40 — and the flip set is DISJOINT from gate 18's
+
+Eleven flips (accounting, bsd_signal_xlate, fchmoddir, forksplicestage, icmp,
+vdsogtod musl; chmodfollowsymlink, futexwakeexact, tmpfilewrite, vforkvmshare,
+waitexitstorm gnu). ZERO overlap with gate 18's eight — even mmapdevzero and
+udpreuseaddr ("deterministic value diffs") passed. All eight gate-18 rows are
+green 3/3 standalone; killreap is 0/10 serial and 0/40 under an 8-lane
+homogeneous load rig. The churn roves freely: one systemic load-coupled
+mechanism, not per-probe bugs.
+
+### THE FAMILY: `*** stack smashing detected ***` — transient fork-window stack corruption
+
+Grepping all gate logs: gates 15–19 carried 20 / 2 / 29 / 12 / ~8 smash rows.
+All the recent COW/frame-inventory commits (370c100c…d6291590) landed BEFORE
+gate 15 — the per-gate variance is load noise on one constant defect. Evidence
+chain, each step reproducible from the rigs below:
+
+1. **Reducer:** 8 concurrent lanes looping victim probes through THE injection
+   transport hit a smash within minutes (first-iteration hits twice). Rig:
+   scratchpad `smashrig/` shape; victims and probes rove.
+2. **Guest core capture:** transport extended with
+   `cd /tmp && ulimit -c unlimited; /tmp/p; rc=$?; [ $rc -ge 128 ] && base64
+   /tmp/core*` — the guest hands its own core out over stdout. Two cores
+   captured, BYTE-IDENTICAL situation: the victim is always **dash's fork
+   child (pid 5-ish) between fork() and execve()**, cursig=6, the probe never
+   ran. No guest ASLR ⇒ all addresses stable across runs: stack page
+   0xfffffef000, glibc guard `__stack_chk_guard` = ld.so+0x3fb50 =
+   0x8c0003fb50 (x4 at abort holds exactly that address).
+3. **Both canary copies are CORRECT at capture time** — the guard value equals
+   the AT_RANDOM-derived canary, and every visible stack canary slot matches.
+   The corrupting read/write is TRANSIENT: it heals before the core is cut.
+   (Also: one gate-19 flip's runtime core capture failed "live core read has
+   no current backing … stage1=None semantic_mapping=false" for a libc VA —
+   the capture-path region list and the mm disagree; separate but adjacent.)
+4. **DTrace perturbs it away** (6 clean traced tries vs first-try untraced
+   hit). Durable discriminator script kept:
+   `scripts/dtrace/vfork-smash-signal-injections.d`.
+5. **VA-watch specimens** (CARRICK_FORK_DEBUG_VA on the canary VA
+   0xfffffef588, instrumentation now committed as cd73c99b): a fork child's
+   host-serviced write (`ensure_frame_cow_write`, GuestVisible, oldset-shaped)
+   routes **Direct with `armed=false`** at the canary VA while its stage-1
+   translation is still the LINEAR fork-lineage IPA (no dynamic-alias row —
+   no COW split ever happened there). A Direct host write through a
+   still-shared frame writes the parent's live stack.
+
+### The cornered defect (two concrete leads, one likely root)
+
+The final instrumented run (any fork-heavy transport, no smash needed) shows:
+
+- `[ROUTEDBG pid=Some(1) mm=Some(1) slot=None] … intent=PrivilegedInternal
+  armed=false armed_len=0 route=Direct` — the ROOT process's engine carries a
+  **completely empty `cow_armed` set** (`armed_len=0`) while it has live
+  forked children, and host-side writes route Direct into its stack.
+- `[ROUTEDBG pid=Some(3) mm=Some(157) slot=Some((9a00000000,200000))] …
+  armed_len=0 … translation=Some(9c08dff588)` — same for a fork child, whose
+  translation is fork-lineage.
+- `[ARMDBG parent]` and `[ARMDBG child-build]` NEVER fire on a fork-heavy run:
+  **the production HVPatch fork path does not pass through
+  `fork_process_spec`'s arm sites at all** (engine.rs:3203 /
+  trap.rs `build_process_builder`'s `child_cow_armed.arm`). Yet guest-side COW
+  faults DO resolve in production (probes pass), so the guest fault path gets
+  its arms from somewhere else — while the HOST-write gate
+  (`ensure_frame_cow_write`) consults an engine whose `cow_armed` is empty.
+  This is the `docs/identity-and-scope-domains.md` class: two authorities for
+  one mm's COW-arm state, and the host-write router reads the wrong one.
+
+Mechanism consistent with every observation: the parent (or a sibling child)
+keeps host-writing fork-shared stack frames Direct (wait4 status, sigprocmask
+oldset, PrivilegedInternal maintenance) because its router sees no arms; both
+processes run the same dash code at the same depths so most interleave is
+silent; where their paths diverge, a canary slot in the SHARED frame gets
+clobbered between a child's prologue store and epilogue check → smash; the
+child's own next COW split heals the page → cores look clean.
+
+### Next steps (in order, for the successor)
+
+1. Find where production HVPatch fork actually creates/arms the per-task
+   `cow_armed` (the `HvpatchPreparedCarrierTaskState` flow, trap.rs ~6881–8457
+   — `task_mm.cow_armed` at ~8152) and why the engines servicing
+   `ensure_frame_cow_write` (root pid 1: `slot=None`, `mm=1`) hold an EMPTY
+   set. Instrument: `[ARMDBG]`-style print wherever `task_mm.cow_armed` is
+   populated; run the fork-heavy transport with CARRICK_FORK_DEBUG_VA set —
+   no smash required, `armed_len=0` on pid 1 is the defect signature.
+2. Fix shape: one authority — the host-write router must consult the SAME
+   per-mm COW-arm state the guest fault path resolves against (per-mm Arc,
+   keyed by the mm, not by whichever engine object services the write), or
+   route host writes through the stage-1-authoritative writable check
+   (`live_stage1_names_writable_private_mapping`) instead of `cow_armed`.
+3. Red-first: the 8-lane rig is the reducer (minutes to a specimen); after
+   the fix, run the rig long (30+ min) AND two consecutive full gates; the
+   reliability bar is zero smash rows and flip amplitude ~0 across gates.
+4. Then the OWNER DIRECTIVE below (ecosystems ≥ last bless) unblocks.
+
+### Banked this session (designs settled, not implemented)
+
+- **EL1 mailbox doorbell for the CANCELED-at-EL1 kick loss** (trap.rs:18513
+  swallow): add a `doorbell: AtomicU32` at mailbox offset 184 (from
+  `reserved`, carrick-aarch64/src/mailbox.rs); the sync-vector dispatcher
+  checks it right after the x16 save (before any handler clobbers x0) and
+  branches to the mailbox slow path when rung (2-word stub after the
+  fallthrough `hvc;eret`, budget verified: 1 identity syscall + gettid, ~48
+  of 128 slot bytes used); host side: `MailboxBinding` tracks its doorbell
+  host address in an Arc cell updated in `rebind`, `VcpuKickHandle::kick`
+  rings it before `hv_vcpus_exit`, `run_to_exit` clears it on every
+  host-bound exit and NEVER on the EL1 `continue`. Fail-safe: unrung
+  doorbell = byte-identical behavior. Layout tests in carrick-mem must be
+  updated red-first (`mailbox_vector_*`, `shim_dispatcher_fits_*`).
+- The smash-rig transports (plain, core-extracting, VA-watch) live in this
+  session's scratchpad `smashrig/ corerig/ vawatch/ stackwatch*/` — the
+  shapes are documented above and in the committed instrumentation; recreate
+  in ~20 lines of zsh if needed.
 
 ## SESSION 6 — 2026-08-23 (in progress): gate 14 tallied
 
