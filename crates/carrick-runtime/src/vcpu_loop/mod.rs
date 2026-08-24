@@ -2003,6 +2003,15 @@ enum HvpatchBlockInput {
     Vfork {
         child: crate::kernel::TaskKey,
         wait: crate::kernel::VforkParentWait,
+        activation: executor::PreparedVforkChildActivation,
+    },
+}
+
+enum HvpatchContinuationInput {
+    Dispatch(DispatchOutcome),
+    Vfork {
+        child: crate::kernel::TaskKey,
+        wait: crate::kernel::VforkParentWait,
     },
 }
 
@@ -2669,7 +2678,7 @@ enum HvpatchCloneFailpoint {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
-enum HvpatchProcessFailpoint {
+pub(crate) enum HvpatchProcessFailpoint {
     ParentCopyout = 1,
     BackendCommit = 2,
     KernelCommit = 3,
@@ -2692,7 +2701,7 @@ fn install_hvpatch_clone_failpoint(phase: HvpatchCloneFailpoint) {
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-fn install_hvpatch_process_failpoint(phase: HvpatchProcessFailpoint) {
+pub(crate) fn install_hvpatch_process_failpoint(phase: HvpatchProcessFailpoint) {
     HVPATCH_PROCESS_FAILPOINT.store(phase as u8, std::sync::atomic::Ordering::Release);
 }
 
@@ -2718,7 +2727,9 @@ fn check_hvpatch_clone_failpoint(phase: HvpatchCloneFailpoint) -> Result<(), Run
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn check_hvpatch_process_failpoint(phase: HvpatchProcessFailpoint) -> Result<(), RuntimeError> {
+pub(crate) fn check_hvpatch_process_failpoint(
+    phase: HvpatchProcessFailpoint,
+) -> Result<(), RuntimeError> {
     #[cfg(test)]
     if HVPATCH_PROCESS_FAILPOINT
         .compare_exchange(
@@ -2871,6 +2882,7 @@ where
                     HvpatchBlockInput::Vfork {
                         child: suspension.child,
                         wait: suspension.wait,
+                        activation: suspension.activation,
                     },
                 )?;
                 self.phase = HvpatchProductionPhase::ResumeBlocked {
@@ -5691,7 +5703,7 @@ impl<E: 'static> HvpatchLoopJob<E> {
         };
         let exit = production.poll(engine, control);
         job.suspended = match exit {
-            executor::ExecutorExit::BlockedContinuation(_)
+            executor::ExecutorExit::BlockedContinuation { .. }
             | executor::ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::HostWait) => {
                 Some(HvpatchLoopSuspension::BlockedContinuation)
             }
@@ -6493,7 +6505,7 @@ where
         kernel: &Kernel,
         lease: &crate::kernel::objects::ThreadExecutionLease,
         request: SyscallRequest,
-        input: HvpatchBlockInput,
+        input: HvpatchContinuationInput,
     ) -> Result<continuation::BlockedContinuation, RuntimeError> {
         let directory = kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
             RuntimeError::Configuration(
@@ -6520,10 +6532,10 @@ where
         )
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let mut continuation = match input {
-            HvpatchBlockInput::Dispatch(outcome) => {
+            HvpatchContinuationInput::Dispatch(outcome) => {
                 continuation::BlockedContinuation::from_dispatch_outcome(outcome, capture)
             }
-            HvpatchBlockInput::Vfork { child, wait } => {
+            HvpatchContinuationInput::Vfork { child, wait } => {
                 continuation::BlockedContinuation::from_vfork_parent(capture, child, wait)
             }
         }
@@ -6540,9 +6552,25 @@ where
         request: SyscallRequest,
         input: HvpatchBlockInput,
     ) -> Result<executor::ExecutorExit, RuntimeError> {
-        self.prepare_hvpatch_continuation(kernel, lease, request, input)
-            .map(Box::new)
-            .map(executor::ExecutorExit::BlockedContinuation)
+        let (continuation_input, vfork_activation) = match input {
+            HvpatchBlockInput::Dispatch(outcome) => {
+                (HvpatchContinuationInput::Dispatch(outcome), None)
+            }
+            HvpatchBlockInput::Vfork {
+                child,
+                wait,
+                activation,
+            } => (
+                HvpatchContinuationInput::Vfork { child, wait },
+                Some(activation),
+            ),
+        };
+        let continuation =
+            self.prepare_hvpatch_continuation(kernel, lease, request, continuation_input)?;
+        Ok(executor::ExecutorExit::BlockedContinuation {
+            continuation: Box::new(continuation),
+            vfork_activation,
+        })
     }
 
     fn resume_persistent_continuation(
@@ -7076,14 +7104,14 @@ fn finish_persistent_process_handles(
     Ok(())
 }
 
-struct PersistentProcessMemberPublication {
+pub(crate) struct PersistentProcessMemberPublication {
     threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
     completion: continuation::JobId,
     armed: bool,
 }
 
 impl PersistentProcessMemberPublication {
-    fn new(
+    pub(crate) fn new(
         threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
         terminal_settlement: &HvpatchExternalTerminalSettlement,
     ) -> Self {
@@ -7095,7 +7123,7 @@ impl PersistentProcessMemberPublication {
         }
     }
 
-    fn commit(mut self) {
+    pub(crate) fn commit(mut self) {
         self.armed = false;
     }
 }
