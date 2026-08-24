@@ -9897,6 +9897,20 @@ impl HvfVmState {
         inventory: &mut HvpatchFrameInventory,
         split: &CowInventorySplit,
     ) -> Result<bool, TrapError> {
+        if let Some(existing) = inventory.extents.get(&split.new_key) {
+            let stage2_references = inventory
+                .frames
+                .lock()
+                .stage2_references
+                .get(&(existing.stage2_base, existing.stage2_length))
+                .copied();
+            return Err(TrapError::Hypervisor(format!(
+                "HVPatch COW new inventory extent collided before backend mutation: \
+                 new_key={:?} existing={existing:?} existing_stage2_references={stage2_references:?} \
+                 old_key={:?} fragments={:?}",
+                split.new_key, split.old_key, split.fragments,
+            )));
+        }
         let removed = inventory.extents.remove(&split.old_key).ok_or_else(|| {
             TrapError::Hypervisor("HVPatch COW old inventory mapping disappeared".to_owned())
         })?;
@@ -9964,6 +9978,20 @@ impl HvfVmState {
             ));
         }
         Ok(retire_old_stage2)
+    }
+
+    fn retire_stage2_candidate_if_unreferenced(
+        frames: &std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+        candidate: (u64, u64),
+        retire: impl FnOnce() -> Result<(), TrapError>,
+    ) -> Result<bool, TrapError> {
+        let registry = frames.lock();
+        if registry.stage2_references.contains_key(&candidate) {
+            return Ok(false);
+        }
+        retire()?;
+        drop(registry);
+        Ok(true)
     }
 
     fn stage_mapping(
@@ -10570,12 +10598,16 @@ impl HvfVmState {
             return Ok(());
         }
         // The runtime holds the process-wide HVPatch topology lock across this
-        // method. Select exact extents whose final logical owner is this mm;
-        // global shared aliases are therefore retired by their actual last
-        // owner rather than being omitted merely because they are globally
-        // addressed outside this mm's stage-1 root slot.
-        let extents = {
-            let inventory = task.frame_inventory.lock();
+        // method. Stage the backend inventory retirement BEFORE recycling any
+        // physical extent. The old order sampled `stage2_references`, dropped
+        // that lock, recycled the IPA, and only later removed this mm's
+        // references. A sibling publication in that window could retain the
+        // old extent after its global owner was gone; the allocator then handed
+        // the IPA to a COW transaction whose per-mm inventory still contained
+        // that key (`HVPatch COW new inventory extent collided`).
+        let ledger = std::sync::Arc::clone(&task.frame_inventory.ledger);
+        let (candidates, frames, retirement_commit) = {
+            let mut inventory = ledger.lock();
             if inventory.extents.is_empty() {
                 if task.mappings.is_empty() {
                     return Ok(());
@@ -10590,11 +10622,38 @@ impl HvfVmState {
                     "HVPatch retirement began without frame inventory reservation".to_owned(),
                 ));
             }
-            final_exec_physical_extents(&inventory)?
+            let candidates = inventory
+                .extents
+                .values()
+                .map(|extent| (extent.stage2_base, extent.stage2_length))
+                .collect::<std::collections::BTreeSet<_>>();
+            let frames = std::sync::Arc::clone(&inventory.frames);
+            let mut reservation = inventory.retirement_reservation.take().unwrap_or_else(|| {
+                eprintln!("carrick: FATAL: validated HVPatch retirement reservation disappeared");
+                std::process::abort();
+            });
+            if let Err(error) = Self::stage_retirement(&mut inventory, &mut reservation) {
+                eprintln!("carrick: FATAL: stage inventory before HVPatch retirement: {error}");
+                std::process::abort();
+            }
+            (candidates, frames, reservation.commit(()))
         };
 
-        for &(ipa, size) in &extents {
-            Self::retire_stage2_extent_from_mappings(&mut task.mappings, ipa, size as u64)?;
+        // `stage_mapping` increments the same registry while holding this exact
+        // lock. Recheck each stale candidate and keep the lock through owner
+        // removal/allocator release: publication either wins first and keeps
+        // the extent live, or retirement wins first and no later publication
+        // can inherit the recycled owner.
+        let mut extents = std::collections::BTreeSet::new();
+        for &(ipa, length) in &candidates {
+            if Self::retire_stage2_candidate_if_unreferenced(&frames, (ipa, length), || {
+                Self::retire_stage2_extent_from_mappings(&mut task.mappings, ipa, length)
+            })? {
+                extents.insert((
+                    ipa,
+                    usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?,
+                ));
+            }
         }
         mutate_external_alias_state(|_, registry| {
             registry.retain(|alias| {
@@ -10622,16 +10681,7 @@ impl HvfVmState {
         std::mem::forget(retained_backings);
         task.mm_root_slot = None;
 
-        let mut inventory = task.frame_inventory.lock();
-        let mut reservation = inventory.retirement_reservation.take().unwrap_or_else(|| {
-            eprintln!("carrick: FATAL: validated HVPatch retirement reservation disappeared");
-            std::process::abort();
-        });
-        if let Err(error) = Self::stage_retirement(&mut inventory, &mut reservation) {
-            eprintln!("carrick: FATAL: stage inventory after HVPatch retirement: {error}");
-            std::process::abort();
-        }
-        inventory.retirement_commit = Some(reservation.commit(()));
+        ledger.lock().retirement_commit = Some(retirement_commit);
         Ok(())
     }
 
@@ -21391,6 +21441,112 @@ mod frame_inventory_backend_tests {
             std::collections::BTreeSet::from([frame])
         );
         assert_eq!(final_owner.stage2_leases, leases);
+    }
+
+    #[test]
+    fn stale_stage2_retirement_candidate_rechecks_under_the_publication_lock() {
+        let frames =
+            std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+        let candidate = (0xa100_0000_0000, CowArmedRanges::COMPOUND_SIZE);
+        frames.lock().stage2_references.insert(candidate, 1);
+        let retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let retired_in_callback = std::sync::Arc::clone(&retired);
+
+        assert!(
+            !HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, candidate, move || {
+                retired_in_callback.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },)
+            .unwrap(),
+            "a sibling publication that wins after the candidate snapshot keeps the lease live",
+        );
+        assert!(!retired.load(std::sync::atomic::Ordering::SeqCst));
+
+        frames.lock().stage2_references.remove(&candidate);
+        let frames_in_callback = std::sync::Arc::clone(&frames);
+        assert!(
+            HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, candidate, move || {
+                assert!(
+                    frames_in_callback.try_lock().is_none(),
+                    "the shared publication registry must stay locked through IPA recycle",
+                );
+                Ok(())
+            },)
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn cow_collision_is_rejected_before_backend_inventory_mutation() {
+        let old_frame = carrick_hal::FrameId::from_kernel_allocation(id(81));
+        let old_mapping = carrick_hal::MappingId::from_kernel_allocation(id(82));
+        let existing_frame = carrick_hal::FrameId::from_kernel_allocation(id(83));
+        let existing_mapping = carrick_hal::MappingId::from_kernel_allocation(id(84));
+        let new_frame = carrick_hal::FrameId::from_kernel_allocation(id(85));
+        let new_mapping = carrick_hal::MappingId::from_kernel_allocation(id(86));
+        let old_key = (0xa200_0000_0000, CowArmedRanges::COMPOUND_SIZE);
+        let new_key = (old_key.0 + CowArmedRanges::COMPOUND_SIZE, old_key.1);
+        let old = InventoryExtent {
+            frame: old_frame,
+            mapping: old_mapping,
+            backing: InventoryBackingIdentity::Private(81),
+            stage2_base: old_key.0,
+            stage2_length: old_key.1,
+        };
+        let existing = InventoryExtent {
+            frame: existing_frame,
+            mapping: existing_mapping,
+            backing: InventoryBackingIdentity::Private(83),
+            stage2_base: new_key.0,
+            stage2_length: new_key.1,
+        };
+        let mut inventory = HvpatchFrameInventory::default();
+        inventory.extents.insert(old_key, old);
+        inventory.extents.insert(new_key, existing);
+        {
+            let mut frames = inventory.frames.lock();
+            frames.references.insert(old_frame, 1);
+            frames.references.insert(existing_frame, 1);
+            frames
+                .extent_references
+                .insert((old_frame, old_key.0, old_key.1), 1);
+            frames
+                .extent_references
+                .insert((existing_frame, new_key.0, new_key.1), 1);
+            frames.stage2_references.insert(old_key, 1);
+            frames.stage2_references.insert(new_key, 1);
+        }
+        let split = CowInventorySplit {
+            old_key,
+            old,
+            fragments: Vec::new(),
+            new_key,
+            new_extent: InventoryExtent {
+                frame: new_frame,
+                mapping: new_mapping,
+                backing: InventoryBackingIdentity::Private(85),
+                stage2_base: new_key.0,
+                stage2_length: new_key.1,
+            },
+            retire_old_frame: false,
+        };
+
+        let error = HvfVmState::commit_cow_inventory_split(&mut inventory, &split)
+            .expect_err("colliding COW extent must fail closed");
+        assert!(error.to_string().contains("before backend mutation"));
+        assert_eq!(
+            inventory.extents.get(&old_key).unwrap().mapping,
+            old_mapping
+        );
+        assert_eq!(
+            inventory.extents.get(&new_key).unwrap().mapping,
+            existing_mapping
+        );
+        let frames = inventory.frames.lock();
+        assert_eq!(frames.references.get(&old_frame), Some(&1));
+        assert_eq!(frames.references.get(&existing_frame), Some(&1));
+        assert_eq!(frames.stage2_references.get(&old_key), Some(&1));
+        assert_eq!(frames.stage2_references.get(&new_key), Some(&1));
     }
 
     /// A frame this mm has finished with, which a SIBLING mm still maps.
