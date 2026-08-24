@@ -174,10 +174,40 @@ layers in one afternoon, each proven live:
      sigtimedwaitintr×2, mtforkcorrupt-musl — probe-by-probe
      correctness work, no shared mechanism claimed.
 
+### CRITERION-4 LEDGER — the full `just ci` state, read from files
+
+`target/perf/ci-session6.log` (sequential run, died at step 3) plus
+`target/perf/ci-session6-rest.log` (each later step run individually —
+the sequential gate MASKS them, per the documented trap):
+
+- fmt-check ✓, clippy ✓, deny ✓, check-matrix ✓, check ✓.
+- **lint-domains ✗** — host-authority census drift, ~525 catalog entries
+  across 15+ files (proc.rs 56, probes.rs 56, trap.rs 46, …):
+  the deliberately-LAST reconciliation item; never bulk re-bless.
+- **doc ✗** — stale intra-doc links to DELETED items (the welded loop's
+  `run_vcpu_until_exit`, `spawn_clone_thread`, `bootstrap_signal_send`,
+  `Self::system_ns`, …): mechanical cleanup, good small-worker fodder.
+- **test ✗ (flake)** — `idle_256_indefinite_waits_use_one_blocking_poll_
+  without_probe_storm` failed under the parallel phase, passes 4/4
+  isolated: the RECURRENCE of the documented load-coupled reactor flake
+  (session-4 watch item). Now seen twice — it graduates from "watch" to
+  a real defect-list row (blocking reactor misses its control nudge
+  under CPU contention).
+- **test-integration ✗ (REAL, deterministic)** —
+  `syscall_net_epoll::epoll_et_read_growth_does_not_rearm_latched_read_level`
+  red 3/3 isolated on unmodified main (assertion at
+  syscall_net_epoll.rs:1876): the SAME ET-rearm defect as the
+  epollcluster gate rows, pinned by a fast host test. Handed to the
+  `epolled` worker as its red-first anchor.
+
 ### NEXT STEPS AFTER SESSION 6 (supersedes the close-out list below)
 
-1. **Read `target/perf/ci-session6.log`** (full `just ci` launched at
-   session end) — criterion 4's file-read requirement; fix anything red.
+1. ~~Read the ci logs~~ DONE — ledger above. Workers `epolled`
+   (ET rearm; deterministic host-test anchor) and `sigeintr`
+   (sigtimedwaitintr/shmnestedfork EINTR family) dispatched at
+   `cbf1dffc` in `.worktrees/{epolled,sigeintr}`; review their results
+   per the director loop (Gate 1 schema, Gate 2 diff + rebuild at their
+   exact commit, battery re-run).
 2. **The ABBA cycle's fifth layer** (section below): study the
    SubmissionAuthority/generation-observer lifecycle for retired-task
    threads FIRST, then land the parked WIP
