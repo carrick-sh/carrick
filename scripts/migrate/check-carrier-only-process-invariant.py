@@ -236,11 +236,6 @@ CARRIER_SUBSTRATE_LIMITS = {
         "kill_probe",
     ): 1,
     (
-        PurePosixPath("crates/carrick-runtime/src/kernel/control/endpoint.rs"),
-        "process_is_alive",
-        "kill_probe",
-    ): 1,
-    (
         PurePosixPath("crates/carrick-runtime/src/kernel/debug/endpoint.rs"),
         "process_is_alive",
         "kill_probe",

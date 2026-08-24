@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -100,8 +101,22 @@ impl ControlEndpoint {
                 if owner.nonce == nonce {
                     return Ok(());
                 }
-                if process_is_alive(owner.pid) {
-                    return Err(EndpointError::OwnedByLiveProcess { pid: owner.pid });
+                // The persisted PID is diagnostic metadata, never liveness
+                // authority: Darwin may already have reused it. The endpoint
+                // itself is the authenticated resource. Refuse to replace any
+                // listener that still accepts connections; only a missing or
+                // refused socket proves this owner record is stale enough to
+                // clean up under the serialized lifecycle transaction.
+                match UnixStream::connect(&self.socket) {
+                    Ok(_stream) => {
+                        return Err(EndpointError::OwnedByLiveProcess { pid: owner.pid });
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                        ) => {}
+                    Err(error) => return Err(error.into()),
                 }
                 remove_file(&self.socket)?;
                 remove_file(&self.owner_path())?;
@@ -147,11 +162,6 @@ impl ControlEndpoint {
             .ok_or_else(|| EndpointError::InvalidOwner("owner record is missing".to_owned()))?;
         if owner.nonce != nonce {
             return Err(EndpointError::StaleOwnerNonce);
-        }
-        if !process_is_alive(owner.pid) {
-            return Err(EndpointError::InvalidOwner(
-                "owner process is no longer live".to_owned(),
-            ));
         }
         Ok(CurrentOwner {
             pid: owner.pid,
@@ -231,14 +241,6 @@ fn remove_file(path: &Path) -> Result<(), EndpointError> {
     }
 }
 
-fn process_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
 #[cfg(test)]
 pub(super) fn test_endpoint(container_id: &str) -> (tempfile::TempDir, ControlEndpoint) {
     let temp = tempfile::Builder::new()
@@ -248,4 +250,84 @@ pub(super) fn test_endpoint(container_id: &str) -> (tempfile::TempDir, ControlEn
     let endpoint =
         ControlEndpoint::in_base(temp.path().to_path_buf(), container_id).expect("endpoint");
     (temp, endpoint)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixListener;
+
+    use super::*;
+
+    #[test]
+    fn claim_refuses_a_connected_endpoint_without_using_recorded_pid_liveness() {
+        let (_temp, endpoint) = test_endpoint("connected-owner");
+        let first = ControlNonce([0x31; 16]);
+        endpoint.claim(first).expect("initial claim");
+        let _listener = UnixListener::bind(endpoint.socket_path()).expect("bind listener");
+        endpoint
+            .publish_bound_owner(first)
+            .expect("publish first owner");
+
+        // A persisted PID is intentionally not consulted. Even if it cannot
+        // name a live process, the accepting socket is authoritative and a
+        // second incarnation must fail closed.
+        let mut owner: OwnerRecord =
+            serde_json::from_slice(&fs::read(endpoint.owner_path()).expect("read owner record"))
+                .expect("decode owner record");
+        owner.pid = 0;
+        fs::write(
+            endpoint.owner_path(),
+            serde_json::to_vec(&owner).expect("encode owner record"),
+        )
+        .expect("replace diagnostic pid");
+
+        assert!(matches!(
+            endpoint.claim(ControlNonce([0x32; 16])),
+            Err(EndpointError::OwnedByLiveProcess { pid: 0 })
+        ));
+    }
+
+    #[test]
+    fn claim_reclaims_a_stale_record_only_after_the_endpoint_refuses_connect() {
+        let (_temp, endpoint) = test_endpoint("stale-owner");
+        let first = ControlNonce([0x41; 16]);
+        endpoint.claim(first).expect("initial claim");
+        let listener = UnixListener::bind(endpoint.socket_path()).expect("bind listener");
+        endpoint
+            .publish_bound_owner(first)
+            .expect("publish first owner");
+        drop(listener);
+
+        endpoint
+            .claim(ControlNonce([0x42; 16]))
+            .expect("refused stale endpoint is reclaimable");
+        assert!(!endpoint.socket_path().exists());
+        assert!(!endpoint.owner_path().exists());
+    }
+
+    #[test]
+    fn current_owner_is_a_nonce_bound_record_not_a_pid_liveness_probe() {
+        let (_temp, endpoint) = test_endpoint("record-owner");
+        let nonce = ControlNonce([0x51; 16]);
+        endpoint.claim(nonce).expect("initial claim");
+        let _listener = UnixListener::bind(endpoint.socket_path()).expect("bind listener");
+        endpoint.publish_bound_owner(nonce).expect("publish owner");
+        let mut owner: OwnerRecord =
+            serde_json::from_slice(&fs::read(endpoint.owner_path()).expect("read owner record"))
+                .expect("decode owner record");
+        owner.pid = u32::MAX;
+        fs::write(
+            endpoint.owner_path(),
+            serde_json::to_vec(&owner).expect("encode owner record"),
+        )
+        .expect("replace diagnostic pid");
+
+        assert_eq!(
+            endpoint.current_owner(nonce).expect("nonce-bound owner"),
+            CurrentOwner {
+                pid: u32::MAX,
+                nonce,
+            }
+        );
+    }
 }
