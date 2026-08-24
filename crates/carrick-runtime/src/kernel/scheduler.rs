@@ -80,6 +80,18 @@ pub trait ExecutorKick: Send + Sync + std::fmt::Debug {
     /// nudge may occur only inside the successful exact-binding branch.
     fn deliver_exact(&self, token: ExecutorKickToken) -> bool;
 
+    /// Debug view of the kick's need_resched flag; `None` when the
+    /// implementation exposes none. Observability only.
+    fn debug_need_resched(&self) -> Option<bool> {
+        None
+    }
+
+    /// Debug view of whether an exact hardware kick is published for the
+    /// bound quantum; `None` when not exposed. Observability only.
+    fn debug_hardware_kick_published(&self) -> Option<bool> {
+        None
+    }
+
     fn current_binding(&self) -> Option<ExecutorBinding>;
 }
 
@@ -1955,9 +1967,17 @@ impl Scheduler {
             .collect()
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn snapshot_executor_entries(
         &self,
-    ) -> Vec<(ExecutorId, Option<ExecutorBinding>, u64, u64)> {
+    ) -> Vec<(
+        ExecutorId,
+        Option<ExecutorBinding>,
+        u64,
+        u64,
+        Option<bool>,
+        Option<bool>,
+    )> {
         let state = self.executors.state.lock();
         state
             .entries
@@ -1968,6 +1988,8 @@ impl Scheduler {
                     entry.kick.current_binding(),
                     entry.control_observation_epoch.load(Ordering::Acquire),
                     entry.close_observation_epoch.load(Ordering::Acquire),
+                    entry.kick.debug_need_resched(),
+                    entry.kick.debug_hardware_kick_published(),
                 )
             })
             .collect()
