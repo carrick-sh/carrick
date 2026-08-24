@@ -78,6 +78,156 @@ Restore it verbatim once the objective above closes:
 > The goal is still active. Do not mark it complete, bless a baseline, weaken the
 > denominator, add an excuse, accept a retry, or start final performance work.
 
+## SESSION 6 — 2026-08-23 (in progress): gate 14 tallied
+
+**GATE 14** (`target/perf/gate14.log`, fresh signed build of `88aad2fb`):
+**783/834 generic + 40/40 scenarios** — best of the campaign (gate 13: 781).
+
+- **Cleared since 13 (15 rows)**: sigsuspendxthread×2, threadcommname×2,
+  threadstatstate×2, the gnu-only four (devnullseek, iouringsqpoll,
+  mmapmunmap, vdsosymbols-gnu), futexwaiterstates×2, clone3pidfdsig,
+  siglongjmpaltstack, waitidsiuid — the session-5 fixes all landed.
+- **Newly red (13 rows, the load-coupled churn class)**: EIGHT share one
+  crash signature — guest `*** stack smashing detected ***` (stack canary
+  corruption): usernsisolation-gnu, waitrestart-gnu, aliassize, connrefused,
+  ltpcheckpoint, lutimesym, mtsigrelease, vdsosymbols-musl. Plus killrt
+  SIGSEGV(139), clonefsumask 45s-timeout, execsocket, shmlinkat,
+  mtforkcorrupt-gnu. The stack-smash signature PRE-EXISTS (gate 13 had 16
+  hits on different probes) and MIGRATES between probes run-to-run — it is
+  the dominant mechanism of the churn tail and is guest-stack memory
+  corruption under carrier load, most plausibly a signal-frame or COW/stack
+  fault write landing wrong under concurrency. This is now the named target
+  of the load-coupled hunt, alongside the settle/claim seam.
+
+### Session 6 — TWO ROOTS FIXED: teardown ordering + the false refault-livelock
+
+The `forkstackstorm` reducer (red 4/4 serial, no gate load) peeled three
+layers in one afternoon, each proven live:
+
+1. **fix(runtime) `5f3ed913` — pool shutdown raced the terminal owner.**
+   Under exit_group the terminal OWNER can be any sibling; the root MAIN
+   thread's job then completes as a claim LOSER (`ThreadDone`), and
+   `VcpuLoopLaunch::wait`'s `shutdown_on_wait` closed the executor pool
+   under the still-running owner. Every late wake died "run queue is
+   closed" and `take_process_terminal`'s 5s bound reported "terminal
+   owner did not complete teardown" — AFTER a successful guest run. Fix:
+   `wait_deferring_pool_shutdown` + threaded_loop orders root wait →
+   join process topology → take_process_terminal → pool shutdown. Also:
+   the owner's own failure is now logged (was silently `Err(())` →
+   "sibling-owned process termination failed" with no cause), and
+   `join_process_threads`' terminal clause now carries the child error
+   payloads (`36806ebe`).
+2. **fix(runtime) `bbfd25c6` — the COW refault-livelock detector was
+   WRONG, and it was killing carriers on legitimate fork loops.**
+   `note_cow_resolution` keyed on (FAR, ESR); a fork loop re-COWs the
+   SAME stack slot once per iteration (fork re-arms the span, the wait
+   loop rewrites the slot) with a FRESH frame each time — COWDBG showed
+   the resolved IPA changing every fault. Four forks = false trip =
+   whole-carrier Configuration failure. This was the root of
+   waitexitstorm, futexwakeexact, forkstackstorm, and plausibly much of
+   the "HVPatch process child panicked" family. Fix: typed
+   `carrick_hal::CowFaultResolution { NotCow, Resolved{translation} }`
+   threaded through HAL → aarch64 vmm/engine → HVF; detector keys on
+   the (FAR, ESR, post-resolution translation) TRIPLE. waitexitstorm +
+   futexwakeexact + forkstackstorm 3/3 green both lanes after.
+3. **Instrument landed (worker `schedtable`, merged `dd800e44`)**: kernel
+   debug snapshot now has `scheduler`, `run-queue`, `executor`,
+   `executor-receipt` tables, receipts on `Scheduler::take`'s three
+   silent discard paths, and `exec_invalidation_pending` on thread rows.
+   Live-verified. COWDBG prints (CARRICK_FORK_DEBUG_VA-gated) now cover
+   the COW route decision.
+4. **Denominator 463 → 465** (`forkstackstorm`, `tlsswitch` admitted;
+   rows 874 → 878). tlsswitch (TPIDR/stack-sentinel/TLS-tid integrity,
+   24 threads) is GREEN standalone — the stale-TPIDR hypothesis for the
+   stack-smash family did not reproduce; the COW-detector fix is the
+   stronger explanation for the 133/134 churn (stack-smash rows may
+   have been collateral of mid-run carrier deaths — re-measure at gate
+   15 before hunting further).
+5. **GATE 15 (log `target/perf/gate15.log`, artifact `6ba47cb9`):
+   806/838 generic + 40/40 scenarios (96.2%)** — the campaign's largest
+   single-session jump (783/834 → 806/838 on a +4 denominator). THIRTY-ONE
+   rows cleared: both ptrace rows ×2 libcs, killfault/killreap/coredumpbit/
+   execpermitchurn/mprotectexec/epolletmanyhup/waitexitstorm/forkfpreclaim/
+   waitrestart-gnu/futexwakeexact-gnu/clonefsumask/mtforkcorrupt-gnu/
+   shmlinkat/usernsisolation/execsocket + the gate-14 churn members
+   (mtsigrelease, connrefused, aliassize, lutimesym, killrt, vdsosymbols).
+   The exit-125 "child panicked" family was indeed the false
+   refault-livelock. The remaining 32 decompose into exactly THREE hunts:
+   - **(A) 7 timeouts** — execfromthread×2, vforkexecthread×2,
+     setidthreadchurn×2, forkstackstorm-musl (times out ONLY under gate
+     load; 3/3 green serial): the settle/claim seam + signal-broadcast-
+     under-yield-churn family. Instrument (run-queue/executor-receipt
+     tables + discard receipts) is merged and staged.
+   - **(B) 13 load-coupled guest crashes** (133/134/139, migrating,
+     never reproducing serially): killfault-gnu, sigbadstack,
+     sigunblockpending, rtsigqueueinfo, xprocsigign, alarmretval,
+     killreap-musl, futexwakeexact-musl, dirrenamecache, hugepage,
+     ltpcheckpoint, loopbacksubnet, syncfilerange, vforkvmshare. Stack-
+     smash census UNCHANGED at ~20 (the detector fix did NOT explain it)
+     — signal-family names dominate: prime suspect is signal delivery
+     under carrier load corrupting guest state (sigframe write at a
+     stale SP/context, or restore during quantum switch). tlsswitch
+     (TPIDR detectors) is green standalone AND passed in this gate —
+     next instrument needs gate-shaped load.
+   - **(C) 12 stable exit-0 value-diffs**: coredumpfile×2,
+     epollcluster×2, mqnotifycrossproc×2, shmnestedfork×2,
+     sigtimedwaitintr×2, mtforkcorrupt-musl — probe-by-probe
+     correctness work, no shared mechanism claimed.
+
+### Session 6 working state (live)
+
+- **CLOSED, NOT A DEFECT — container procfs "Pid: 2" (close-out step 4)**:
+  the procpid worker refuted the premise with a Docker differential. The
+  session-5 reducer `sh -c 'grep ... /proc/self/status; echo $$'` FORKS
+  grep as task 2, so status correctly renders the READER's pid (2) while
+  `$$` is the shell's pid (1) — Docker prints the same shape
+  (`Pid: 7, PPid: 1, shellpid=1`). The shell reading status via a builtin
+  redirect renders `Pid: 1, PPid: 0` under carrick, matching Linux; probe
+  `procselfpid` passes in the container lane. Zero code changes; the
+  renderer is correct. (One drive-by note: `just clippy` flags a
+  pre-existing `empty_line_after_doc_comments` at
+  `crates/carrick-aarch64/src/engine.rs:3537` — fix with the next lint
+  sweep.)
+
+- **Workers dispatched** (antigravity, AGY_RUN_ID=session6, worktrees
+  `.worktrees/schedtable` + `.worktrees/procpid`, both based at `88aad2fb`):
+  `schedtable` = the executor-pool debug tables (scheduler/run-queue/
+  executor/executor-receipt) PLUS receipts on `Scheduler::take`'s three
+  silent row-discard paths — the prerequisite instrument for the
+  settle/claim hunt. `procpid` = the container `/proc/self/status` Pid-2
+  defect (step 4 of the close-out list).
+- **New reducers written (compile-checked both libcs, NOT yet run/admitted)**:
+  `conformance-probes/src/bin/tlsswitch.rs` — 24 threads > executor pool,
+  per-iteration `mrs TPIDR_EL0` + stack sentinel + TLS-tid detectors, aimed
+  at a stale context restore; `conformance-probes/src/bin/forkstackstorm.rs`
+  — fork×60 under 8 stack-churning threads, child verifies inherited+rewritten
+  stack patterns, aimed at the fork-COW stack seam. Run these serially on an
+  idle machine FIRST — if either is red standalone the gate-load ingredient
+  is unnecessary and the hunt has a deterministic reducer.
+- **Working hypothesis for the stack-smash family** (to prove or kill): the
+  gate's 133/134 crash rows and futexwakeexact's COW refault-livelock
+  (far=0xfffffefaXX = guest stack, esr=0x9200004f write-permission fault)
+  are one seam — HVPatch COW resolution on stack pages under concurrency,
+  either resolving against a stale generation (refault) or copying wrong
+  bytes (silent canary corruption). The aarch64 canary lives TPIDR-relative,
+  so a stale TPIDR_EL0 restore is the rival hypothesis; `tlsswitch`
+  discriminates. Note also the exec path's `set_sys_reg(TPIDR_EL0, 0)` at
+  `carrick-vmm-hvf/src/trap.rs:18166` — verify it can never land on a
+  multiplexed vCPU whose loaded context belongs to another thread.
+- **Settle/claim static map (session 6)**: `settle_execution_lease`
+  (objects.rs:5257) OVERRIDES any settlement to `Exited` when
+  `exec_invalidation_pending` is set — settling with no Queue action; the
+  flag is set by `invalidate_execution_for_exec` only on SwitchingOut
+  predecessors (via `transfer_runner_to`, objects.rs:5655). `take()`
+  (scheduler.rs:971) silently discards rows on generation/state mismatch,
+  claim-generation mismatch, or `claim_runnable` error (incl.
+  `claim_runnable_without_cpu_state` when task_state is absent) — all
+  currently receipt-less. The exec ASID ack-wait runs BETWEEN save and
+  settle, so the survivor is still claimed then; the loss is at/after
+  `settle_runnable_successor`. The discard receipts decide between:
+  row-never-enqueued (settlement overridden), row-enqueued-then-discarded
+  (generation advanced without re-enqueue), and claim-succeeded-then-lost.
+
 ## SESSION CLOSE-OUT — 2026-08-23 (sessions 4–5, CONCLUDED)
 
 **This is the authoritative hand-off. Everything below this section is
