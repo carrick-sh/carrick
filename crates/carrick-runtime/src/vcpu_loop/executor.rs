@@ -2199,6 +2199,19 @@ impl PoolControl {
             pending.push((target, response_rx));
         }
         drop(workers);
+        // `WorkerKick::poke_control` reaches only a RUNNING quantum (it sets
+        // need_resched and kicks live vCPU hardware). An executor IDLE in
+        // `Scheduler::take` holds no hardware and checks need_resched only
+        // inside a quantum, so its InvalidateAsid command sat unserviced until
+        // it next happened to receive work — for a quiet carrier, never. The
+        // exec-from-thread survivor in a forked process (which retires an
+        // ASID; the root process's exec does not) then waited forever for
+        // that idle peer's ack: execfromthread's container wedge, sampled
+        // live as one executor parked in `invalidate_after_exec`'s
+        // recv_timeout and another in `Scheduler::take`'s condvar. Poke the
+        // queue control so every idle executor bounces out with ControlPoked,
+        // services its command channel at loop-top, and acks.
+        self.scheduler.poke_executor_control();
         if !pending.is_empty() {
             self.scheduler.poke_executor_control();
         }
@@ -2217,6 +2230,7 @@ impl PoolControl {
     /// it must not be lost (shutdown stalls) or treated as an error (it is
     /// routine at pool shutdown).
     fn consume_invalidation_acks_servicing<E: PersistentExecutor>(
+        &self,
         retirement: &crate::hvpatch::Stage1MmRetirement,
         pending: Vec<(
             ExecutorId,
@@ -2229,6 +2243,12 @@ impl PoolControl {
         commands: &mpsc::Receiver<WorkerCommand>,
     ) -> Result<bool, String> {
         let mut stop_seen = false;
+        // Re-poke cadence: the dispatch-side queue poke can race an executor
+        // that is between its epoch check and its condvar enroll, or one that
+        // re-enters `Scheduler::take` after servicing an unrelated poke.
+        // Waiting here is fail-open without a periodic re-poke — the peer
+        // never re-checks its command channel and the ack never comes.
+        let mut ticks_since_poke = 0u32;
         for (target, response) in pending {
             let ack = loop {
                 match response.recv_timeout(std::time::Duration::from_millis(1)) {
@@ -2238,58 +2258,65 @@ impl PoolControl {
                             "ASID retirement executor {target:?} lost acknowledgement"
                         ));
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => loop {
-                        match commands.try_recv() {
-                            Ok(WorkerCommand::InvalidateAsid {
-                                generation,
-                                response: peer_response,
-                            }) => {
-                                if let Err(error) = boundary.audit_runtime(backend) {
-                                    let message = format!(
-                                        "executor {current:?} failed boundary audit before ASID invalidation: {error}"
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        ticks_since_poke += 1;
+                        if ticks_since_poke >= 20 {
+                            ticks_since_poke = 0;
+                            self.scheduler.poke_executor_control();
+                        }
+                        loop {
+                            match commands.try_recv() {
+                                Ok(WorkerCommand::InvalidateAsid {
+                                    generation,
+                                    response: peer_response,
+                                }) => {
+                                    if let Err(error) = boundary.audit_runtime(backend) {
+                                        let message = format!(
+                                            "executor {current:?} failed boundary audit before ASID invalidation: {error}"
+                                        );
+                                        let _ = peer_response.send(Err(message.clone()));
+                                        return Err(message);
+                                    }
+                                    if let Err(error) = backend.invalidate_asid(generation) {
+                                        let message = format!(
+                                            "executor {current:?} failed ASID generation {} invalidation: {error}",
+                                            generation.generation()
+                                        );
+                                        let _ = peer_response.send(Err(message.clone()));
+                                        return Err(message);
+                                    }
+                                    receipts.record(
+                                        current,
+                                        ExecutorPoolEvent::InvalidatedAsid {
+                                            generation: generation.generation(),
+                                        },
                                     );
-                                    let _ = peer_response.send(Err(message.clone()));
-                                    return Err(message);
-                                }
-                                if let Err(error) = backend.invalidate_asid(generation) {
-                                    let message = format!(
-                                        "executor {current:?} failed ASID generation {} invalidation: {error}",
-                                        generation.generation()
-                                    );
-                                    let _ = peer_response.send(Err(message.clone()));
-                                    return Err(message);
-                                }
-                                receipts.record(
-                                    current,
-                                    ExecutorPoolEvent::InvalidatedAsid {
-                                        generation: generation.generation(),
-                                    },
-                                );
-                                probe_executor_lifecycle(
+                                    probe_executor_lifecycle(
                                     current,
                                     crate::probes::HvpatchExecutorLifecyclePhase::InvalidateAsid,
                                     None,
                                     None,
                                     generation.generation(),
                                 );
-                                let _ = peer_response.send(Ok(
-                                    crate::hvpatch::InvalidationAck::new(current, generation),
-                                ));
-                            }
-                            Ok(WorkerCommand::Stop) => stop_seen = true,
-                            Ok(WorkerCommand::Initialize | WorkerCommand::Run) => {
-                                return Err(
+                                    let _ = peer_response.send(Ok(
+                                        crate::hvpatch::InvalidationAck::new(current, generation),
+                                    ));
+                                }
+                                Ok(WorkerCommand::Stop) => stop_seen = true,
+                                Ok(WorkerCommand::Initialize | WorkerCommand::Run) => {
+                                    return Err(
                                     "executor received an invalid owner-thread command during                                      ASID acknowledgement wait"
                                         .to_owned(),
                                 );
-                            }
-                            Err(mpsc::TryRecvError::Empty) => break,
-                            Err(mpsc::TryRecvError::Disconnected) => {
-                                stop_seen = true;
-                                break;
+                                }
+                                Err(mpsc::TryRecvError::Empty) => break,
+                                Err(mpsc::TryRecvError::Disconnected) => {
+                                    stop_seen = true;
+                                    break;
+                                }
                             }
                         }
-                    },
+                    }
                 }
             };
             retirement
@@ -2352,7 +2379,7 @@ impl PoolControl {
                 .acknowledge(crate::hvpatch::InvalidationAck::new(current, generation))
                 .map_err(|error| error.to_string())?;
         }
-        Self::consume_invalidation_acks_servicing(
+        self.consume_invalidation_acks_servicing(
             retirement, pending, current, backend, boundary, receipts, commands,
         )
     }
