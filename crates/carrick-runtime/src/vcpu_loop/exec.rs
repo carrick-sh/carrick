@@ -938,6 +938,22 @@ where
         // any pre-replacement failure abandons both runtime records and
         // dropping `prepared_kernel_exec` rolls back Kernel preparation.
         let _inventory_abandon = if let Some(process) = kernel.hvpatch_process.as_ref() {
+            // Answer "is the predecessor mm shared with a live sharer?" from
+            // the AUTHORITY (MmResources lease sharing), freshly per exec,
+            // and hand it to the backend BEFORE the sizing below reads
+            // `exec_retires_old_mm`. The backend flag was never set in
+            // production, so every vfork-shared exec retired the shared mm
+            // out from under the surviving child (vforkexecthread: the
+            // child's load-barrier fetch walked all-zero descriptors).
+            let predecessor_shared = !process
+                .mm_resources()
+                .is_final_owner(process.task_key())
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "resolve exec predecessor mm sharing: {error}"
+                    ))
+                })?;
+            engine.mark_exec_predecessor_shared(predecessor_shared);
             let (mut old_extent_count, replacement_extent_count) =
                 engine.frame_inventory_exec_extent_counts(&img);
             if inventory_failure_injection

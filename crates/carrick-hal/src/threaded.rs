@@ -1501,6 +1501,17 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
         ))
     }
 
+    /// Declare whether the exec predecessor mm is still owned by a LIVE
+    /// sharer (a vfork / `CLONE_VM` relative). Shared predecessors retire
+    /// NOTHING at exec: the replacement gets a fresh ledger and the old
+    /// root slot, tables and extents stay whole for the sharer. The
+    /// authority is `MmResources` lease sharing, computed fresh per exec —
+    /// the backend flag existed but was NEVER SET in production, so every
+    /// vfork-shared exec retired the shared mm and the surviving child's
+    /// stage-1 walk read zeroed tables (vforkexecthread: barrier fetch
+    /// fault at LINUX_EL1_LOAD_BARRIER_BASE, all four descriptors 0x0).
+    fn mark_exec_predecessor_shared(&mut self, _shared: bool) {}
+
     fn complete_task_load_barrier(&mut self) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "backend does not expose the required task-load DSB/ISB barrier".to_owned(),

@@ -5430,6 +5430,14 @@ impl HvfVmState {
         Ok(())
     }
 
+    /// See `carrick_hal::ThreadedEngine::mark_exec_predecessor_shared`. The
+    /// flag drives `exec_retires_old_mm`, the fresh-ledger split in
+    /// `begin_exec_inventory`, and `execve_rebuild`'s `shared_projection`;
+    /// `execve_rebuild` clears it after capturing the projection.
+    pub(crate) fn mark_exec_predecessor_shared(&mut self, shared: bool) {
+        self.shared_process_mm = shared;
+    }
+
     pub(crate) fn swap_persistent_executor_local(&mut self, other: &mut Self) {
         std::mem::swap(&mut self._vm, &mut other._vm);
         std::mem::swap(&mut self.carrier_mappings, &mut other.carrier_mappings);
