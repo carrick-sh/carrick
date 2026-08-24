@@ -252,7 +252,9 @@ fn build_response(
     let selected = request.selected();
     match kernel.snapshot(deadline) {
         Ok(snapshot) => {
-            let projected = KernelDebugSnapshot::project(&snapshot, &selected);
+            let aux = kernel.debug_aux_provider();
+            let projected =
+                KernelDebugSnapshot::project_with_aux(&snapshot, &selected, aux.as_deref());
             ServerResponse::Snapshot(Box::new(projected))
         }
         Err(error) => ServerResponse::Error {

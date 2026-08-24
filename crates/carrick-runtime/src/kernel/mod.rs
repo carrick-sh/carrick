@@ -47,8 +47,8 @@ pub use core::{
 };
 pub use debug::{
     ClientError as KernelDebugClientError, DebugEndpoint,
-    EndpointError as KernelDebugEndpointError, KernelDebugDtoError, KernelDebugRequest,
-    KernelDebugServer, KernelDebugSnapshot, KernelDebugTable,
+    EndpointError as KernelDebugEndpointError, KernelDebugAuxProvider, KernelDebugDtoError,
+    KernelDebugRequest, KernelDebugServer, KernelDebugSnapshot, KernelDebugTable,
     ServerError as KernelDebugServerError, UnknownTable as UnknownKernelTable,
     fetch as kernel_debug_fetch,
 };

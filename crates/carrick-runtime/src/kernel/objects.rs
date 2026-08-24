@@ -4170,6 +4170,10 @@ impl ExecutorId {
         Self(raw)
     }
 
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
     pub(crate) const fn raw_for_probe(self) -> u32 {
         self.0
     }
@@ -4700,6 +4704,10 @@ impl Thread {
 
     pub fn execution_state(&self) -> ThreadExecutionState {
         self.execution.lock().state
+    }
+
+    pub fn exec_invalidation_pending(&self) -> bool {
+        self.execution.lock().exec_invalidation_pending
     }
 
     /// Hold this exact execution generation stable while a scheduler commits
