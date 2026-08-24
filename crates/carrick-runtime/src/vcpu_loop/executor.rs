@@ -1890,8 +1890,19 @@ pub struct ExecutorPoolReceipt {
 #[derive(Debug, Default)]
 struct ReceiptState {
     next_sequence: u64,
-    events: Vec<ExecutorPoolReceipt>,
+    /// Bounded window of the most recent receipts. Unbounded growth turned
+    /// a syscall-churn livelock (setidthreadchurn: ~10^5 quantum events/s)
+    /// into a memory leak; the window still holds far more history than any
+    /// diagnosis has needed (the debug table reads the last 500).
+    events: std::collections::VecDeque<ExecutorPoolReceipt>,
+    /// Lifetime lifecycle counters, exact regardless of window eviction —
+    /// the pool shutdown report MUST NOT count by scanning the window.
+    created: usize,
+    destroyed: usize,
 }
+
+/// Retained receipt-window capacity (see [`ReceiptState::events`]).
+const RECEIPT_WINDOW: usize = 4096;
 
 #[derive(Debug, Default)]
 struct ReceiptLog(Mutex<ReceiptState>);
@@ -1904,15 +1915,30 @@ impl ReceiptLog {
             .checked_add(1)
             .unwrap_or_else(|| std::process::abort());
         let sequence = state.next_sequence;
-        state.events.push(ExecutorPoolReceipt {
+        match event {
+            ExecutorPoolEvent::Created => state.created += 1,
+            ExecutorPoolEvent::Destroyed => state.destroyed += 1,
+            _ => {}
+        }
+        state.events.push_back(ExecutorPoolReceipt {
             sequence,
             executor,
             event,
         });
+        while state.events.len() > RECEIPT_WINDOW {
+            state.events.pop_front();
+        }
     }
 
     fn snapshot(&self) -> Vec<ExecutorPoolReceipt> {
-        self.0.lock().events.clone()
+        self.0.lock().events.iter().cloned().collect()
+    }
+
+    /// Exact lifetime (created, destroyed) counts, independent of the
+    /// bounded receipt window.
+    fn lifecycle_counts(&self) -> (usize, usize) {
+        let state = self.0.lock();
+        (state.created, state.destroyed)
     }
 }
 
@@ -2924,14 +2950,7 @@ where
         }
         self.scheduler.wait_closed();
         let events = self.receipts.snapshot();
-        let created = events
-            .iter()
-            .filter(|event| event.event == ExecutorPoolEvent::Created)
-            .count();
-        let destroyed = events
-            .iter()
-            .filter(|event| event.event == ExecutorPoolEvent::Destroyed)
-            .count();
+        let (created, destroyed) = self.receipts.lifecycle_counts();
         let report = ExecutorPoolReport {
             events,
             created,

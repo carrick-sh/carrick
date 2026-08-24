@@ -2850,8 +2850,27 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         Ok(())
     }
 
+    fn mark_exec_predecessor_shared(&mut self, shared: bool) {
+        self.vm.mark_exec_predecessor_shared(shared);
+    }
+
     fn complete_task_load_barrier(&mut self) -> Result<(), TrapError> {
-        Self::complete_task_load_on_vcpu(&mut self.vcpu)
+        Self::complete_task_load_on_vcpu(&mut self.vcpu).map_err(|error| {
+            // A barrier failure is a stage-1 story: append the live TTBR and
+            // the four walked descriptors for the barrier base so the death
+            // carries its own page-table forensics (the vforkexecthread hunt
+            // needed exactly this to see WHICH level of the shared old root
+            // went invalid under a sibling exec).
+            match self
+                .diagnostic_fault_page_tables(carrick_mem::memory::LINUX_EL1_LOAD_BARRIER_BASE)
+            {
+                Some((ttbr, descriptors)) => TrapError::Hypervisor(format!(
+                    "{error} [barrier walk: ttbr0={ttbr:#x} l0={:#x} l1={:#x} l2={:#x} l3={:#x}]",
+                    descriptors[0], descriptors[1], descriptors[2], descriptors[3]
+                )),
+                None => error,
+            }
+        })
     }
 
     fn supports_in_process_fork(&self) -> bool {

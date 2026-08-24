@@ -1091,6 +1091,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             .prepare_exec_address_space(root_slot_base, root_slot_size, asid)
     }
 
+    fn mark_exec_predecessor_shared(&mut self, shared: bool) {
+        self.state.mark_exec_predecessor_shared(shared);
+    }
+
     fn sparse_mmap_arena_enabled(&self) -> bool {
         self.state.sparse_mmap_arena_enabled()
     }

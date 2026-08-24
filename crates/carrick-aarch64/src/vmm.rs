@@ -381,6 +381,9 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         ))
     }
 
+    /// See `carrick_hal::ThreadedEngine::mark_exec_predecessor_shared`.
+    fn mark_exec_predecessor_shared(&mut self, _shared: bool) {}
+
     /// Whether this backend keeps the hidden mmap arena as invalid stage-1
     /// coverage and materializes only committed VMA backing. HVPatch overrides;
     /// mature HVF VMM and KVM preserve their eager mappings.
