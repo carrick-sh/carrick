@@ -9,7 +9,6 @@ use super::*;
 #[derive(Clone)]
 struct Harness {
     transport: Arc<dyn FileAuthorityTransport>,
-    ipc: Option<IpcFileAuthority>,
     epoch: AuthorityEpoch,
     client: ClientIdentity,
     next_request: u64,
@@ -20,25 +19,13 @@ impl Harness {
     fn new() -> Self {
         let epoch = AuthorityEpoch::for_run(7).expect("authority epoch");
         let transport = DirectFileAuthority::for_run(FileAuthorityCore::for_run(epoch));
-        Self::with_transport(epoch, Arc::new(transport), None)
+        Self::with_transport(epoch, Arc::new(transport))
     }
 
-    fn new_ipc() -> Self {
-        let epoch = AuthorityEpoch::for_run(8).expect("authority epoch");
-        let transport = IpcFileAuthority::for_model_tests(FileAuthorityCore::for_run(epoch))
-            .expect("IPC authority");
-        Self::with_transport(epoch, Arc::new(transport.clone()), Some(transport))
-    }
-
-    fn with_transport(
-        epoch: AuthorityEpoch,
-        transport: Arc<dyn FileAuthorityTransport>,
-        ipc: Option<IpcFileAuthority>,
-    ) -> Self {
+    fn with_transport(epoch: AuthorityEpoch, transport: Arc<dyn FileAuthorityTransport>) -> Self {
         let client = client(1, 1001, 1);
         let mut harness = Self {
             transport,
-            ipc,
             epoch,
             client,
             next_request: 1,
@@ -54,7 +41,6 @@ impl Harness {
     fn peer(&self, id: u64, host_pid: u32, generation: u32) -> Self {
         let mut peer = Self {
             transport: self.transport.clone(),
-            ipc: self.ipc.clone(),
             epoch: self.epoch,
             client: client(id, host_pid, generation),
             next_request: 1,
@@ -307,29 +293,12 @@ fn transport_model_trace(mut harness: Harness) -> Vec<Outcome> {
     outcomes
 }
 
-fn normalize_trace_description_ids(trace: &mut [Outcome]) {
-    let canonical = FileDescriptionId::from_registry_allocation(std::num::NonZeroU64::MIN);
-    for outcome in trace {
-        match outcome {
-            Outcome::Installed { description, .. } | Outcome::Closed { description, .. } => {
-                *description = canonical
-            }
-            Outcome::Slot(slot) => slot.description = canonical,
-            Outcome::Description(description) => description.description = canonical,
-            _ => {}
-        }
-    }
-}
-
 #[test]
-fn direct_and_ipc_transports_produce_identical_model_trace() {
-    let mut direct = transport_model_trace(Harness::new());
-    let mut ipc = transport_model_trace(Harness::new_ipc());
-    // Separate per-run cores allocate globally collision-free description IDs;
-    // compare relational semantics rather than unrelated absolute identities.
-    normalize_trace_description_ids(&mut direct);
-    normalize_trace_description_ids(&mut ipc);
-    assert_eq!(direct, ipc);
+fn direct_transport_executes_the_complete_model_trace() {
+    let trace = transport_model_trace(Harness::new());
+    assert_eq!(trace.len(), 11);
+    assert!(matches!(trace.first(), Some(Outcome::TableCreated { .. })));
+    assert!(matches!(trace.last(), Some(Outcome::ExecSucceeded { .. })));
 }
 
 fn host_capability_lease_model(mut harness: Harness, disposition: CapabilityLeaseDisposition) {
@@ -1049,13 +1018,9 @@ fn event_counter_saturation_model(mut harness: Harness) {
 }
 
 #[test]
-fn direct_and_ipc_pipe_streams_preserve_shared_state_and_endpoint_lifetime() {
-    for ipc in [false, true] {
-        let mut harness = if ipc {
-            Harness::new_ipc()
-        } else {
-            Harness::new()
-        };
+fn direct_pipe_streams_preserve_shared_state_and_endpoint_lifetime() {
+    {
+        let mut harness = Harness::new();
         let table = harness.create_table();
         let (pipe, read_fd, write_fd, write_description) = match harness.send(
             Command::CreatePipeAndInstall {
@@ -1169,13 +1134,9 @@ fn direct_and_ipc_pipe_streams_preserve_shared_state_and_endpoint_lifetime() {
 }
 
 #[test]
-fn direct_and_ipc_signalfd_masks_are_authority_owned() {
-    for ipc in [false, true] {
-        let mut harness = if ipc {
-            Harness::new_ipc()
-        } else {
-            Harness::new()
-        };
+fn direct_signalfd_masks_are_authority_owned() {
+    {
+        let mut harness = Harness::new();
         let table = harness.create_table();
         let initial = carrick_abi::SigSet::from_raw(0x12);
         let updated = carrick_abi::SigSet::from_raw(0x24);
@@ -1223,13 +1184,9 @@ fn direct_and_ipc_signalfd_masks_are_authority_owned() {
 }
 
 #[test]
-fn direct_and_ipc_timer_expiration_is_authority_owned() {
-    for ipc in [false, true] {
-        let mut harness = if ipc {
-            Harness::new_ipc()
-        } else {
-            Harness::new()
-        };
+fn direct_timer_expiration_is_authority_owned() {
+    {
+        let mut harness = Harness::new();
         let table = harness.create_table();
         let (timer_fd, description) = match harness.send(
             Command::CreateTimerAndInstall {
@@ -1299,15 +1256,13 @@ fn direct_and_ipc_timer_expiration_is_authority_owned() {
 }
 
 #[test]
-fn direct_and_ipc_event_counter_saturation_matches_linux() {
+fn direct_event_counter_saturation_matches_linux() {
     event_counter_saturation_model(Harness::new());
-    event_counter_saturation_model(Harness::new_ipc());
 }
 
 #[test]
-fn direct_and_ipc_transports_match_epoll_model() {
+fn direct_transports_match_epoll_model() {
     epoll_model(Harness::new());
-    epoll_model(Harness::new_ipc());
 }
 
 fn epoll_lifecycle_model(mut parent: Harness) {
@@ -1569,13 +1524,8 @@ fn epoll_duplicate_registration_model(mut harness: Harness) {
 }
 
 #[test]
-fn direct_and_ipc_epoll_rejects_sixth_nesting_level() {
-    for ipc in [false, true] {
-        let mut harness = if ipc {
-            Harness::new_ipc()
-        } else {
-            Harness::new()
-        };
+fn direct_epoll_rejects_sixth_nesting_level() {
+    for mut harness in [Harness::new()] {
         let table = harness.create_table();
         let mut epolls = Vec::new();
         for minimum in 3..=9 {
@@ -1629,31 +1579,23 @@ fn direct_and_ipc_epoll_rejects_sixth_nesting_level() {
 }
 
 #[test]
-fn direct_and_ipc_epoll_allows_duplicate_descriptor_registrations() {
+fn direct_epoll_allows_duplicate_descriptor_registrations() {
     epoll_duplicate_registration_model(Harness::new());
-    epoll_duplicate_registration_model(Harness::new_ipc());
 }
 
 #[test]
-fn direct_and_ipc_epoll_lifecycle_tracks_forked_tables() {
+fn direct_epoll_lifecycle_tracks_forked_tables() {
     epoll_lifecycle_model(Harness::new());
-    epoll_lifecycle_model(Harness::new_ipc());
 }
 
 #[test]
-fn direct_and_ipc_transports_match_bounded_table_mutations() {
+fn direct_transports_match_bounded_table_mutations() {
     bounded_table_mutation_model(Harness::new());
-    bounded_table_mutation_model(Harness::new_ipc());
 }
 
 #[test]
-fn direct_and_ipc_host_streams_own_io_and_poll_capabilities() {
-    for ipc in [false, true] {
-        let mut harness = if ipc {
-            Harness::new_ipc()
-        } else {
-            Harness::new()
-        };
+fn direct_host_streams_own_io_and_poll_capabilities() {
+    for mut harness in [Harness::new()] {
         let table = harness.create_table();
         let mut fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -1728,13 +1670,8 @@ fn direct_and_ipc_host_streams_own_io_and_poll_capabilities() {
 }
 
 #[test]
-fn direct_and_ipc_io_uring_owns_both_backing_capabilities() {
-    for ipc in [false, true] {
-        let mut harness = if ipc {
-            Harness::new_ipc()
-        } else {
-            Harness::new()
-        };
+fn direct_io_uring_owns_both_backing_capabilities() {
+    for mut harness in [Harness::new()] {
         let table = harness.create_table();
         let data = tempfile::tempfile().expect("data file");
         data.set_len(4096).expect("size data");
@@ -1797,13 +1734,9 @@ fn direct_and_ipc_io_uring_owns_both_backing_capabilities() {
 }
 
 #[test]
-fn direct_and_ipc_mapping_attachments_outlive_slots_and_split_on_unmap() {
-    for ipc in [false, true] {
-        let mut harness = if ipc {
-            Harness::new_ipc()
-        } else {
-            Harness::new()
-        };
+fn direct_mapping_attachments_outlive_slots_and_split_on_unmap() {
+    {
+        let mut harness = Harness::new();
         let table = harness.create_table();
         let file = tempfile::NamedTempFile::new().expect("temporary host file");
         let owned: OwnedFd = file.into_file().into();
@@ -1936,9 +1869,9 @@ fn direct_and_ipc_mapping_attachments_outlive_slots_and_split_on_unmap() {
 }
 
 #[test]
-fn direct_and_ipc_transports_transfer_scoped_host_capability_leases() {
+fn direct_transports_transfer_scoped_host_capability_leases() {
     host_capability_lease_model(Harness::new(), CapabilityLeaseDisposition::Commit);
-    host_capability_lease_model(Harness::new_ipc(), CapabilityLeaseDisposition::Abort);
+    host_capability_lease_model(Harness::new(), CapabilityLeaseDisposition::Abort);
 }
 
 fn rejected_host_adoption_closes_transferred_capability(mut harness: Harness) {
@@ -1973,9 +1906,8 @@ fn rejected_host_adoption_closes_transferred_capability(mut harness: Harness) {
 }
 
 #[test]
-fn rejected_direct_and_ipc_adoptions_close_transferred_capabilities() {
+fn rejected_direct_adoptions_close_transferred_capabilities() {
     rejected_host_adoption_closes_transferred_capability(Harness::new());
-    rejected_host_adoption_closes_transferred_capability(Harness::new_ipc());
 }
 
 fn client_exit_reclaims_owned_capability_leases(mut owner: Harness) {
@@ -2046,133 +1978,8 @@ fn client_exit_reclaims_owned_capability_leases(mut owner: Harness) {
 }
 
 #[test]
-fn client_exit_reclaims_direct_and_ipc_capability_leases() {
+fn client_exit_reclaims_direct_capability_leases() {
     client_exit_reclaims_owned_capability_leases(Harness::new());
-    client_exit_reclaims_owned_capability_leases(Harness::new_ipc());
-}
-
-#[test]
-fn native_reexec_successor_endpoint_is_authenticated_and_cloexec() {
-    let epoch = AuthorityEpoch::for_run(25).expect("epoch");
-    let (transport, binding) =
-        IpcFileAuthority::spawn_per_run(FileAuthorityCore::for_run(epoch), epoch)
-            .expect("spawn per-run helper");
-    let successor = transport
-        .prepare_single_use_reexec_successor(0xfeed)
-        .expect("prepare successor");
-    assert_eq!(successor.nonce(), 0xfeed);
-    for fd in [
-        successor.socket_fd(),
-        successor.process_lock_fd(),
-        successor.lifetime_write_fd(),
-    ] {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
-    }
-    let successor = successor.adopt(0xfeed).expect("adopt successor");
-    let request = Request {
-        epoch,
-        client: binding.client,
-        request_id: RequestId::from_client_sequence(3).expect("request"),
-        expected_generation: binding.generation,
-        command: Command::ListSlots {
-            table: binding.table,
-            after: None,
-            maximum: SlotPageLimit::bounded(1).expect("limit"),
-        },
-    };
-    assert!(matches!(
-        successor
-            .execute(request)
-            .expect("successor request")
-            .outcome,
-        Outcome::SlotPage { .. }
-    ));
-}
-
-#[test]
-fn inherited_helper_endpoint_serializes_cross_process_requests() {
-    let epoch = AuthorityEpoch::for_run(24).expect("epoch");
-    let (transport, binding) =
-        IpcFileAuthority::spawn_per_run(FileAuthorityCore::for_run(epoch), epoch)
-            .expect("spawn per-run helper");
-    let shared = transport.clone();
-    let child = unsafe { libc::fork() };
-    assert!(child >= 0);
-    if child == 0 {
-        let request = Request {
-            epoch,
-            client: binding.client,
-            request_id: RequestId::from_client_sequence(4).expect("request"),
-            expected_generation: binding.generation,
-            command: Command::ListSlots {
-                table: binding.table,
-                after: None,
-                maximum: SlotPageLimit::bounded(1).expect("limit"),
-            },
-        };
-        let ok = shared
-            .execute(request)
-            .is_ok_and(|response| matches!(response.outcome, Outcome::SlotPage { .. }));
-        unsafe { libc::_exit(if ok { 0 } else { 1 }) };
-    }
-    let request = Request {
-        epoch,
-        client: binding.client,
-        request_id: RequestId::from_client_sequence(3).expect("request"),
-        expected_generation: binding.generation,
-        command: Command::ListSlots {
-            table: binding.table,
-            after: None,
-            maximum: SlotPageLimit::bounded(1).expect("limit"),
-        },
-    };
-    assert!(matches!(
-        transport.execute(request).expect("parent request").outcome,
-        Outcome::SlotPage { .. }
-    ));
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(child, &raw mut status, 0) }, child);
-    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
-}
-
-#[test]
-fn per_run_helper_bootstraps_authenticated_root_binding() {
-    let epoch = AuthorityEpoch::for_run(23).expect("epoch");
-    let (transport, binding) =
-        IpcFileAuthority::spawn_per_run(FileAuthorityCore::for_run(epoch), epoch)
-            .expect("spawn per-run helper");
-    assert_eq!(binding.epoch, epoch);
-    let request = Request {
-        epoch,
-        client: binding.client,
-        request_id: RequestId::from_client_sequence(3).expect("request"),
-        expected_generation: binding.generation,
-        command: Command::ListSlots {
-            table: binding.table,
-            after: None,
-            maximum: SlotPageLimit::bounded(1).expect("limit"),
-        },
-    };
-    assert!(matches!(
-        transport.execute(request).expect("list root table").outcome,
-        Outcome::SlotPage { slots, .. } if slots.is_empty()
-    ));
-}
-
-#[test]
-fn ipc_authority_death_fails_closed() {
-    let mut harness = Harness::new_ipc();
-    harness
-        .ipc
-        .as_ref()
-        .expect("IPC transport")
-        .terminate_model_server();
-    let request = harness.request(Command::CreateTable, ObjectGeneration::INITIAL);
-    assert_eq!(
-        harness.execute(request),
-        Err(AuthorityFatal::TransportUnavailable)
-    );
 }
 
 #[test]

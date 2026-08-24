@@ -7,34 +7,73 @@ use carrick_kernel::domains::{HostPid, ProcessGeneration};
 pub(crate) use crate::kernel::{FileDescriptionId, FileSlotNumber, FileTableId};
 
 macro_rules! nonzero_domain {
-    ($name:ident, $constructor:ident) => {
+    ($name:ident) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         #[repr(transparent)]
         pub(crate) struct $name(NonZeroU64);
-
-        impl $name {
-            pub(crate) fn $constructor(raw: u64) -> Result<Self, InvalidAuthorityDomain> {
-                NonZeroU64::new(raw)
-                    .map(Self)
-                    .ok_or(InvalidAuthorityDomain::Zero(stringify!($name)))
-            }
-
-            pub(crate) const fn raw(self) -> u64 {
-                self.0.get()
-            }
-        }
     };
 }
 
-nonzero_domain!(AuthorityEpoch, for_run);
-nonzero_domain!(ClientId, for_process_client);
-nonzero_domain!(RequestId, from_client_sequence);
-nonzero_domain!(VfsObjectId, from_snapshot);
-nonzero_domain!(CapabilityLeaseId, from_snapshot);
-nonzero_domain!(MappingAttachmentId, from_snapshot);
-nonzero_domain!(PipeId, from_snapshot);
+nonzero_domain!(AuthorityEpoch);
+nonzero_domain!(ClientId);
+nonzero_domain!(RequestId);
+nonzero_domain!(VfsObjectId);
+nonzero_domain!(CapabilityLeaseId);
+nonzero_domain!(MappingAttachmentId);
+nonzero_domain!(PipeId);
+
+impl AuthorityEpoch {
+    pub(crate) fn for_run(raw: u64) -> Result<Self, InvalidAuthorityDomain> {
+        NonZeroU64::new(raw)
+            .map(Self)
+            .ok_or(InvalidAuthorityDomain::Zero("AuthorityEpoch"))
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn raw(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl ClientId {
+    pub(crate) fn for_process_client(raw: u64) -> Result<Self, InvalidAuthorityDomain> {
+        NonZeroU64::new(raw)
+            .map(Self)
+            .ok_or(InvalidAuthorityDomain::Zero("ClientId"))
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn raw(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl RequestId {
+    pub(crate) fn from_client_sequence(raw: u64) -> Result<Self, InvalidAuthorityDomain> {
+        NonZeroU64::new(raw)
+            .map(Self)
+            .ok_or(InvalidAuthorityDomain::Zero("RequestId"))
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn raw(self) -> u64 {
+        self.0.get()
+    }
+}
 
 impl VfsObjectId {
+    #[cfg(test)]
+    pub(crate) fn from_snapshot(raw: u64) -> Result<Self, InvalidAuthorityDomain> {
+        NonZeroU64::new(raw)
+            .map(Self)
+            .ok_or(InvalidAuthorityDomain::Zero("VfsObjectId"))
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn raw(self) -> u64 {
+        self.0.get()
+    }
+
     pub(super) const fn from_authority_allocation(raw: NonZeroU64) -> Self {
         Self(raw)
     }
@@ -65,16 +104,6 @@ pub(crate) struct InterestGeneration(std::num::NonZeroU32);
 impl InterestGeneration {
     pub(super) const fn from_authority_allocation(raw: std::num::NonZeroU32) -> Self {
         Self(raw)
-    }
-
-    pub(crate) fn from_snapshot(raw: u32) -> Result<Self, InvalidAuthorityDomain> {
-        std::num::NonZeroU32::new(raw)
-            .map(Self)
-            .ok_or(InvalidAuthorityDomain::Zero("InterestGeneration"))
-    }
-
-    pub(crate) const fn raw(self) -> u32 {
-        self.0.get()
     }
 }
 
@@ -120,12 +149,14 @@ pub(crate) struct ObjectGeneration(NonZeroU64);
 impl ObjectGeneration {
     pub(crate) const INITIAL: Self = Self(NonZeroU64::MIN);
 
+    #[cfg(test)]
     pub(crate) fn from_snapshot(raw: u64) -> Result<Self, InvalidAuthorityDomain> {
         NonZeroU64::new(raw)
             .map(Self)
             .ok_or(InvalidAuthorityDomain::Zero("ObjectGeneration"))
     }
 
+    #[cfg(test)]
     pub(crate) const fn raw(self) -> u64 {
         self.0.get()
     }
@@ -138,10 +169,12 @@ pub(crate) struct Revision(u64);
 impl Revision {
     pub(crate) const ZERO: Self = Self(0);
 
+    #[cfg(test)]
     pub(super) const fn from_wire(raw: u64) -> Self {
         Self(raw)
     }
 
+    #[cfg(test)]
     pub(crate) const fn raw(self) -> u64 {
         self.0
     }
@@ -159,6 +192,7 @@ impl Revision {
 pub(crate) struct NofileAllocationCeiling(u32);
 
 impl NofileAllocationCeiling {
+    #[cfg(test)]
     pub(crate) const fn from_captured_soft_limit(raw: u32) -> Self {
         Self(raw)
     }
@@ -177,6 +211,7 @@ impl DescriptorFlags {
     pub(crate) const NONE: Self = Self(0);
     pub(crate) const CLOSE_ON_EXEC: Self = Self(1);
 
+    #[cfg(test)]
     pub(crate) fn from_linux_bits(raw: u32) -> Result<Self, AuthorityError> {
         if raw & !Self::CLOSE_ON_EXEC.0 != 0 {
             return Err(AuthorityError::InvalidDescriptorFlags);
@@ -184,6 +219,7 @@ impl DescriptorFlags {
         Ok(Self(raw))
     }
 
+    #[cfg(test)]
     pub(crate) const fn raw(self) -> u32 {
         self.0
     }
@@ -224,10 +260,12 @@ impl AccessMode {
 pub(crate) struct StatusFlags(u64);
 
 impl StatusFlags {
+    #[cfg(test)]
     pub(crate) const fn from_linux_bits(raw: u64) -> Self {
         Self(raw)
     }
 
+    #[cfg(test)]
     pub(crate) const fn raw(self) -> u64 {
         self.0
     }
@@ -271,6 +309,7 @@ impl ByteCount {
 pub(crate) struct CanonicalPath(String);
 
 impl CanonicalPath {
+    #[cfg(test)]
     pub(crate) fn absolute(path: impl Into<String>) -> Result<Self, AuthorityError> {
         let path = path.into();
         if !path.starts_with('/')
@@ -291,6 +330,13 @@ impl CanonicalPath {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "seek commands are retained for the in-carrier file dispatch cutover"
+    )
+)]
 pub(crate) enum SeekWhence {
     Start,
     Current,
@@ -308,10 +354,12 @@ pub(crate) struct EpollInterestKey {
 pub(crate) struct EpollUserData(u64);
 
 impl EpollUserData {
+    #[cfg(test)]
     pub(crate) const fn from_guest(raw: u64) -> Self {
         Self(raw)
     }
 
+    #[cfg(test)]
     pub(crate) const fn raw(self) -> u64 {
         self.0
     }
@@ -334,8 +382,10 @@ pub(crate) struct EpollReadyEvent {
 pub(crate) struct EpollEventLimit(u16);
 
 impl EpollEventLimit {
+    #[cfg(test)]
     pub(crate) const MAX: u16 = 256;
 
+    #[cfg(test)]
     pub(crate) fn bounded(raw: u16) -> Result<Self, AuthorityError> {
         if raw == 0 || raw > Self::MAX {
             return Err(AuthorityError::InvalidEpollEventLimit);
@@ -355,23 +405,46 @@ pub(crate) enum PipeEnd {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "PTY-backed host streams are retained for the in-carrier file dispatch cutover"
+)]
 pub(crate) enum PtyRole {
     Master,
     Slave,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "host-stream adoption is retained for the in-carrier file dispatch cutover"
+    )
+)]
 pub(crate) enum HostStreamKind {
     Pipe {
         end: PipeEnd,
         bidirectional: bool,
     },
+    #[allow(
+        dead_code,
+        reason = "PTY adoption has no constructor until its in-carrier dispatch cutover"
+    )]
     Pty(PtyRole),
+    #[allow(
+        dead_code,
+        reason = "socket adoption has no constructor until its in-carrier dispatch cutover"
+    )]
     Socket {
         family: i32,
         socket_type: i32,
         protocol: i32,
     },
+    #[allow(
+        dead_code,
+        reason = "character-device adoption has no constructor until its in-carrier dispatch cutover"
+    )]
     CharacterDevice,
 }
 
@@ -380,8 +453,10 @@ pub(crate) enum HostStreamKind {
 pub(crate) struct PipeCapacity(u32);
 
 impl PipeCapacity {
+    #[cfg(test)]
     pub(crate) const MAX: u32 = 1024 * 1024;
 
+    #[cfg(test)]
     pub(crate) fn bounded(raw: u32) -> Result<Self, AuthorityError> {
         if raw == 0 || raw > Self::MAX {
             return Err(AuthorityError::InvalidPipeCapacity);
@@ -395,12 +470,26 @@ impl PipeCapacity {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "slot replacement is retained for the in-carrier file dispatch cutover"
+    )
+)]
 pub(crate) enum SameSlotBehavior {
     ReturnUnchanged,
     Reject,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "slot-range mutation is retained for the in-carrier file dispatch cutover"
+    )
+)]
 pub(crate) enum SlotRangeAction {
     Close,
     SetCloseOnExec,
@@ -426,6 +515,13 @@ impl SlotPageLimit {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "capability leases are retained for the in-carrier file dispatch cutover"
+    )
+)]
 pub(crate) enum CapabilityLeasePurpose {
     MappingSource,
     PollSource,
@@ -464,16 +560,19 @@ impl HostErrno {
         Self(raw)
     }
 
-    pub(crate) const fn from_host(raw: NonZeroI32) -> Self {
-        Self(raw)
-    }
-
     pub(crate) const fn raw(self) -> i32 {
         self.0.get()
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "capability-lease release is retained for the in-carrier file dispatch cutover"
+    )
+)]
 pub(crate) enum CapabilityLeaseDisposition {
     Commit,
     Abort,
@@ -503,12 +602,32 @@ impl MappingRange {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "mapping-lease finalization is retained for the in-carrier mmap cutover"
+    )
+)]
 pub(crate) enum MappingLeaseDisposition {
-    Commit { range: MappingRange },
+    Commit {
+        range: MappingRange,
+    },
+    #[allow(
+        dead_code,
+        reason = "mapping abort has no constructor until the in-carrier mmap cutover"
+    )]
     Abort,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "mapping attachment release is retained for the in-carrier mmap cutover"
+    )
+)]
 pub(crate) enum MappingRelease {
     Whole,
     Range(MappingRange),
@@ -524,6 +643,13 @@ pub(crate) struct Request {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "typed commands are retained as the in-carrier file dispatch cutover contract"
+    )
+)]
 pub(crate) enum Command {
     RegisterClient,
     ExitClient,
@@ -713,6 +839,10 @@ pub(crate) enum Command {
         target_fd: FileSlotNumber,
         registration: EpollRegistration,
     },
+    #[allow(
+        dead_code,
+        reason = "epoll delete has no constructor until the in-carrier epoll cutover"
+    )]
     EpollCtlDelete {
         table: FileTableId,
         epoll_fd: FileSlotNumber,
@@ -721,6 +851,10 @@ pub(crate) enum Command {
     EpollRevalidateHostPlan {
         plan: EpollHostPlan,
     },
+    #[allow(
+        dead_code,
+        reason = "readiness observation has no constructor until the in-carrier epoll cutover"
+    )]
     ObserveReadiness {
         table: FileTableId,
         fd: FileSlotNumber,
@@ -732,6 +866,10 @@ pub(crate) enum Command {
         epoll_fd: FileSlotNumber,
         maximum: EpollEventLimit,
     },
+    #[allow(
+        dead_code,
+        reason = "epoll IO acknowledgement has no constructor until the in-carrier epoll cutover"
+    )]
     EpollAcknowledgeIo {
         table: FileTableId,
         fd: FileSlotNumber,
@@ -1190,8 +1328,22 @@ pub(crate) enum AuthorityError {
     TableNotBound,
     #[error("file descriptor limit is exhausted")]
     NofileExceeded,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "descriptor-bit decoding is retained for the in-carrier file dispatch cutover"
+        )
+    )]
     #[error("file descriptor flags contain unknown bits")]
     InvalidDescriptorFlags,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "canonical-path decoding is retained for the in-carrier VFS cutover"
+        )
+    )]
     #[error("canonical path is invalid")]
     InvalidCanonicalPath,
     #[error("VFS path already exists")]
@@ -1238,6 +1390,13 @@ pub(crate) enum AuthorityError {
     EpollInterestNotFound,
     #[error("epoll interest would create a cycle or exceed nesting depth")]
     EpollLoop,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "epoll bounds validation is retained for the in-carrier epoll cutover"
+        )
+    )]
     #[error("epoll event limit is zero or exceeds its protocol bound")]
     InvalidEpollEventLimit,
     #[error("description is not an event counter")]
@@ -1282,14 +1441,8 @@ pub(crate) enum AuthorityFatal {
     IdentityExhausted,
     #[error("file authority invariant was violated: {0}")]
     InvariantViolation(&'static str),
-    #[error("file authority could not encode a protocol frame: {0}")]
-    EncodingFailure(&'static str),
-    #[error("file authority protocol frame is malformed: {0}")]
-    MalformedFrame(&'static str),
     #[error("file authority transport is unavailable")]
     TransportUnavailable,
-    #[error("file authority response does not match its request")]
-    ResponseMismatch,
     #[error("file authority capability count does not match the operation")]
     CapabilityMismatch,
 }
