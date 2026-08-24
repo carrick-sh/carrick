@@ -1227,11 +1227,11 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 Ok(Aarch64Exit::MaintenanceDone) => break Ok(()),
                 Ok(Aarch64Exit::Kicked) => continue,
                 Ok(other) => {
+                    // The full exit payload (FAR/ESR/ELR for a fault) is the
+                    // whole diagnosis when the barrier dies — the bare
+                    // variant name cost the vforkexecthread hunt a round.
                     break Err(TrapError::UnexpectedExit {
-                        reason: format!(
-                            "{} during EL1 task-load barrier",
-                            exit_variant_name(&other)
-                        ),
+                        reason: format!("{other:?} during EL1 task-load barrier"),
                     });
                 }
                 Err(error) => break Err(error),

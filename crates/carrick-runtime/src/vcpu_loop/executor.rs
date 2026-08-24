@@ -3115,10 +3115,18 @@ where
         Ok(Ok(())) => None,
         Ok(Err(error)) => {
             retired = true;
+            // An executor dying mid-run shrinks the pool for the rest of the
+            // carrier's life and its cause was previously visible ONLY at
+            // pool shutdown (inside the join) — a wedge that never reaches
+            // shutdown showed nothing (the vforkexecthread hunt found a dead
+            // executor purely from waiters=9 in the scheduler table). Name
+            // the death when it happens.
+            tracing::error!(index, %error, "executor worker died");
             Some(error)
         }
         Err(_) => {
             retired = true;
+            tracing::error!(index, "executor worker panicked outside containment");
             Some("executor post-create lifecycle panicked; exact lease failed closed".to_owned())
         }
     };
