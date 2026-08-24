@@ -267,6 +267,35 @@ the collections policy doc refined by the owner):
   /proc/self/status renders Pid: 2 while getpid()=1 for the container
   shell (stale namespace translation in the procfs renderer).
 
+### execfromthread endgame: one wedge mode FIXED, the second fully mapped
+
+The container wedge decomposed into TWO distinct modes, both proven by
+live thread-stack samples of the wedged carrier (sample the CHILD —
+the outer process is the NsSupervisor, the documented attach trap):
+
+1. **FIXED (idle-executor ASID ack)**: `WorkerKick::poke_control` only
+   reaches a RUNNING quantum; an executor idle in `Scheduler::take`
+   never serviced its `InvalidateAsid` command, so an exec that
+   retires an ASID (forked process's exec — root retires none, hence
+   raw immunity) waited forever for the ack. Fixed: the invalidation
+   dispatch also pokes the scheduler queue control, and the ack wait
+   re-pokes every ~20ms. First-ever container passes followed.
+2. **OPEN (lost successor enqueue)**: remaining wedges sample as ALL
+   executors idle in `take` with an empty queue — the exec SURVIVOR's
+   runnable row is lost. The suspect protocol, read and mapped:
+   `settle_runnable_successor` extracts the successor only when the
+   thread's `ThreadSchedulerAction::Queue{key}` equals the RETARGETED
+   `running.key.thread`, and `take_row`'s claim path SILENTLY discards
+   rows whose claim generation mismatches (`finish_claim; continue` —
+   the session-2 "understood, not modified" note is now load-bearing).
+   After `retarget_running_exec` swaps thread/generation mid-quantum,
+   one of these two seams drops the survivor. Reducer: the container
+   execfromthread run wedges ~50% post-fix (was ~100%); guest recipe
+   in the session log. NEXT: red-first surgery on the settle/claim
+   generation transaction for retargeted rows, with an executor-pool
+   debug table (receipts + queue rows) added to `carrick debug` FIRST
+   so the drop is observed, not inferred.
+
 ### GATE 13 (2026-08-23, log target/perf/gate13.log): 781/834 + 40/40 — and the tail is now LOAD
 
 781 PASS / 53 FAIL on the new 834-row denominator (463 sources; the
