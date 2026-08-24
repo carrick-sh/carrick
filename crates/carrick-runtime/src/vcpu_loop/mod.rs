@@ -1985,6 +1985,14 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// whose read end the suspended PARENT blocks on. `None` on the parent and on
     /// ordinary (non-vfork) children.
     vfork_release_fd: Option<i32>,
+    /// The one-shot runtime-withdrawal memo for
+    /// `handle_persistent_thread_exit` Busy retries (see
+    /// `PersistentThreadExitDisposition`).
+    thread_exit_withdrawn: bool,
+    /// Live reservation-change subscription while a thread exit is parked
+    /// on `PersistentThreadExitDisposition::Busy`; dropped when the retry
+    /// runs.
+    thread_exit_retry_subscription: Option<crate::kernel::ReservationChangeSubscription>,
     /// The engine is passed as `&mut E` to each method, so no field owns it; this
     /// pins the generic parameter to the struct.
     _engine: std::marker::PhantomData<fn() -> E>,
@@ -2190,6 +2198,15 @@ enum HvpatchProductionPhase {
         request: HvpatchCloneThreadRequest,
         prepared: Option<crate::kernel::PreparedThreadClone>,
         _subscription: Option<crate::kernel::ReservationChangeSubscription>,
+    },
+    /// A guest thread exit found the kernel task reservation held
+    /// (`ProcessThreadExit::Busy`). The job parked with a
+    /// reservation-change subscription (stored on the runtime state) and
+    /// re-runs the exit with this code on resume. The executor stays free
+    /// to service peer commands in between — blocking it in the exit wait
+    /// deadlocked against an exec survivor's ASID-ack collection.
+    RetryThreadExit {
+        code: i32,
     },
     ResumeBlocked {
         frame: carrick_hal::RawSyscall,
@@ -3098,6 +3115,103 @@ where
         self.finish(terminal.into_result())
     }
 
+    /// Complete or park a guest thread's logical exit. `Busy` parks the
+    /// job with a reservation-change subscription and schedules a retry
+    /// through `HvpatchProductionPhase::RetryThreadExit` — the executor
+    /// must NOT block in the exit wait, because the reservation holder (an
+    /// exec survivor's terminal path) may be waiting for this exact
+    /// executor's ASID acknowledgement (the execfromthread ABBA wedge).
+    fn settle_persistent_thread_exit(
+        &mut self,
+        engine: &mut E,
+        code: i32,
+        context: crate::kernel::KernelContext,
+        disposition: threads::PersistentThreadExitDisposition,
+    ) -> executor::ExecutorExit {
+        match disposition {
+            threads::PersistentThreadExitDisposition::Done(VcpuLoopOutcome::ThreadDone) => {
+                self.finish(Ok(VcpuLoopOutcome::ThreadDone))
+            }
+            threads::PersistentThreadExitDisposition::Done(
+                outcome @ VcpuLoopOutcome::ProcessExit(_),
+            ) => {
+                self.terminal_runtime = PersistentTerminalRuntimeState::Withdrawn;
+                self.begin_persistent_process_terminal(
+                    engine,
+                    PersistentTerminal::from_outcome(outcome),
+                    context,
+                )
+            }
+            threads::PersistentThreadExitDisposition::Done(VcpuLoopOutcome::TrapLimit(_)) => {
+                std::process::abort()
+            }
+            threads::PersistentThreadExitDisposition::Busy { observed_epoch } => {
+                if self.kernel.process_exiting()
+                    || thread_should_finish_for_exec_replacement(
+                        &self.state.registry,
+                        self.state.this_tid,
+                    )
+                {
+                    // Ownership passed (see the drain gate): the process
+                    // terminal or an exec replacement retires this thread's
+                    // row; parking would strand past retirement.
+                    return self.finish(Ok(VcpuLoopOutcome::ThreadDone));
+                }
+                self.park_thread_exit_retry(
+                    &context,
+                    observed_epoch,
+                    HvpatchProductionPhase::RetryThreadExit { code },
+                )
+            }
+        }
+    }
+
+    /// Park a Busy thread exit as a Blocked job subscribed to the kernel
+    /// reservation-change epoch, retrying through `retry_phase`. The wake
+    /// is the plain key-addressed `Scheduler::wake`: while the task is
+    /// LIVE it rolls the submission authority correctly, and the drain
+    /// invariant (the terminal owner's sibling drain waits for member jobs
+    /// and wakes removed members BEFORE the task exit commits) guarantees
+    /// the task is live whenever this park still needs a wake. A wake that
+    /// races retirement anyway fails with UnknownThread and is discarded —
+    /// never an abort (only a generation-observer bypass can abort, which
+    /// this path does not do).
+    fn park_thread_exit_retry(
+        &mut self,
+        context: &crate::kernel::KernelContext,
+        observed_epoch: u64,
+        retry_phase: HvpatchProductionPhase,
+    ) -> executor::ExecutorExit {
+        let scheduler = self
+            .kernel
+            .hvpatch_runtime
+            .as_ref()
+            .unwrap_or_else(|| std::process::abort())
+            .continuation_services(context.kernel())
+            .0;
+        let thread = context.thread().key();
+        let callback: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
+            let woke = scheduler.wake(thread);
+            tracing::info!(?thread, ?woke, "thread-exit retry wake");
+        });
+        // A `None` subscription means the epoch already moved and the
+        // callback (wake) already fired — parking is still correct: the
+        // pending wake resumes the retry immediately.
+        self.state.thread_exit_retry_subscription = context
+            .kernel()
+            .subscribe_reservation_change(observed_epoch, callback);
+        tracing::info!(
+            thread = ?context.thread().key(),
+            observed_epoch,
+            "thread-exit retry parks"
+        );
+        self.phase = retry_phase;
+        self.suspend(
+            HvpatchLoopSuspension::TerminalSiblingDrain,
+            executor::ExecutorExit::Blocked(crate::kernel::objects::BlockedReason::ChildState),
+        )
+    }
+
     fn begin_persistent_process_terminal(
         &mut self,
         engine: &mut E,
@@ -3125,6 +3239,7 @@ where
                 return self.finish(Ok(VcpuLoopOutcome::ThreadDone));
             }
             ProcessExitClaim::Pending => {
+                tracing::info!(tid = ?self.state.this_tid, "process-terminal claim PENDING parks");
                 let scheduler = self
                     .kernel
                     .hvpatch_runtime
@@ -4185,23 +4300,13 @@ where
                     .as_ref()
                     .unwrap_or_else(|| std::process::abort())
                     .retain_exact();
-                match self.state.handle_persistent_thread_exit(
+                let disposition = self.state.handle_persistent_thread_exit(
                     &self.kernel,
                     engine,
                     code,
                     self.traps,
-                ) {
-                    VcpuLoopOutcome::ThreadDone => self.finish(Ok(VcpuLoopOutcome::ThreadDone)),
-                    outcome @ VcpuLoopOutcome::ProcessExit(_) => {
-                        self.terminal_runtime = PersistentTerminalRuntimeState::Withdrawn;
-                        self.begin_persistent_process_terminal(
-                            engine,
-                            PersistentTerminal::from_outcome(outcome),
-                            context,
-                        )
-                    }
-                    VcpuLoopOutcome::TrapLimit(_) => std::process::abort(),
-                }
+                );
+                self.settle_persistent_thread_exit(engine, code, context, disposition)
             }
             DispatchOutcome::Exit { code } => {
                 let context = self
@@ -4714,10 +4819,32 @@ where
             );
         }
         if !self.phase.is_terminal_transition() && (self.kernel.process_exiting() || exec_finish) {
-            let _ = self
+            match self
                 .state
-                .handle_persistent_thread_exit(&self.kernel, engine, 0, self.traps);
-            return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
+                .handle_persistent_thread_exit(&self.kernel, engine, 0, self.traps)
+            {
+                // The drain path always finishes ThreadDone: the terminal
+                // owner or exec survivor owns the task's end, so a
+                // registry-derived process-exit claim is discarded here
+                // exactly as it always was.
+                threads::PersistentThreadExitDisposition::Done(_) => {
+                    return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
+                }
+                threads::PersistentThreadExitDisposition::Busy { observed_epoch } => {
+                    // Ownership passed: on this drain path the thread is
+                    // here BECAUSE an exec replacement or the process
+                    // terminal is retiring it — the Busy holder is (or is
+                    // superseded by) the very transaction that retires this
+                    // thread's kernel row. Its own exit_thread is redundant,
+                    // and parking for the holder STRANDS: the retirement
+                    // makes every registry-addressed wake UnknownThread
+                    // (measured live — parks at observed_epoch with three
+                    // later publishes, final wake Err(UnknownThread), 10/12
+                    // teardown hangs). Finish; the owner retires the row.
+                    let _ = observed_epoch;
+                    return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
+                }
+            }
         }
 
         self.state
@@ -4849,6 +4976,28 @@ where
                         ))
                     }
                 };
+            }
+            HvpatchProductionPhase::RetryThreadExit { code } => {
+                // Drop the reservation subscription for this attempt; a
+                // fresh one is installed if the retry parks again.
+                self.state.thread_exit_retry_subscription = None;
+                let context = self
+                    .state
+                    .service_kernel_context
+                    .as_ref()
+                    .ok_or_else(|| {
+                        RuntimeError::Configuration(
+                            "persistent thread-exit retry lost exact Kernel context".to_owned(),
+                        )
+                    })?
+                    .retain_exact();
+                let disposition = self.state.handle_persistent_thread_exit(
+                    &self.kernel,
+                    engine,
+                    code,
+                    self.traps,
+                );
+                return Ok(self.settle_persistent_thread_exit(engine, code, context, disposition));
             }
             HvpatchProductionPhase::ResumeBlocked {
                 frame,
@@ -5671,6 +5820,8 @@ where
             max_traps,
             trace: std::env::var_os("CARRICK_TRACE_TRAPS").is_some(),
             vfork_release_fd: None,
+            thread_exit_withdrawn: false,
+            thread_exit_retry_subscription: None,
             _engine: std::marker::PhantomData,
         }
     }
