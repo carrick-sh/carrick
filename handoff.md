@@ -174,6 +174,76 @@ layers in one afternoon, each proven live:
      sigtimedwaitintr×2, mtforkcorrupt-musl — probe-by-probe
      correctness work, no shared mechanism claimed.
 
+### THE EXECFROMTHREAD ABBA CYCLE — four edges mapped live, WIP parked
+
+The hunt for hunt-family (A) ran four instrumented rounds deep after gate
+15 and is CLEANLY PARKED: full diagnosis below, WIP at
+`target/perf/execfromthread-abba-wip.patch` (693 lines, compiles, NOT
+mergeable — read the edges first). Reducer: the GATE transport exactly —
+`base64 < probe | carrick run --raw --fs host ubuntu:24.04 /bin/sh -c
+'base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p'` (my earlier
+`-v dir:/p` transport exits 0 silently and does NOT reproduce — transport
+matters).
+
+**Edge 1 (the core deadlock, sampled live, executor table receipts)**:
+during exec-from-thread, the drained LEADER reaches
+`handle_persistent_thread_exit` → `ProcessContext::exit_thread` → kernel
+graph answers TaskBusy (the exec's reservation) → parks the EXECUTOR HOST
+THREAD on `wait_for_reservation_change`'s condvar (hvpatch/mod.rs:849) —
+that executor never services its command channel again. Meanwhile the
+exec SURVIVOR's executor holds the reservation and waits in
+`invalidate_after_exec` for ASID acks from ALL peers — including the
+parked one. Nine of ten acks, forever. (A second amplifier: an
+EL1-fast-path sched_yield storm never VM-exits, and trap.rs:18513's
+CANCELED-at-EL1 `continue` consumes the one-shot `hv_vcpus_exit` kick —
+`EL1_KICK_RESUMED` — so kicks into a storm are lossy; the executor
+debug table proved need_resched=TRUE + hw=TRUE with the quantum still
+running.)
+
+**Edge 2 (hit by the WIP's park fix)**: parking the exit as a
+continuation (mirroring the RetryCloneThread TaskBusy pattern —
+subscription → suspend → retry phase) works, BUT the reservation-change
+subscription callbacks run SYNCHRONOUSLY inside
+`TaskSetReservation::commit` → `publish_reservation_change` — under the
+caller's registry WRITE guard — and the callback's `Scheduler::wake` →
+`exact_thread_for_scheduler` takes the registry lock SHARED:
+self-deadlock (executor-8 sampled inside its own clone commit in
+`lock_shared_slow`). The `Drop` arm of TaskSetReservation always had the
+correct order (drop guard, then publish); `commit` is the outlier. The
+WIP's `PendingReservationPublication` #[must_use] token (3 call sites)
+fixes this half and is likely correct in isolation — the clone path's
+existing subscription callback carries the SAME latent deadlock today.
+
+**Edge 3 (hit next)**: with 1+2 fixed the probe COMPLETES (all report
+lines true 12/12) but the run hangs at teardown: the parked leader's
+FINAL wake is lost because `Scheduler::wake` resolves the thread via
+`exact_thread_for_scheduler` — after the leader's own TASK exit retires
+the graph rows, the lookup answers UnknownThread and the callback's
+`let _ =` swallows it. The WIP's `wake_exact_thread(&Arc<Thread>)`
+addresses the wake by object.
+
+**Edge 4 (where the WIP stops)**: the Arc-addressed wake then trips
+"scheduler generation observer lost exact transition ... run qu[eue...]"
+(instant rc=134) — the wake path's `observe_generation_transition` /
+submission-authority lifecycle rejects transitions for a thread whose
+run-queue enrollment is gone. The next owner must FIRST understand the
+SubmissionAuthority + generation-observer lifecycle for retired-task
+threads (kernel/scheduler.rs observers, `wake_admissions`), then decide:
+either the retry park must be cancelled/completed at task retirement
+(the task-exit path force-completes parked member continuations), or
+the wake path must tolerate retired enrollment. The first shape is
+probably the honest one: a parked thread of a retiring task should be
+CANCELLED by the task exit, not woken later.
+
+Also for the next owner: the reservation-condvar park (edge 1) is a
+CLASS — audit other executor-context callers of
+`wait_for_reservation_change` (`context_for_linux_tid` retry loops,
+exit_thread's TaskBusy spin was one of two in ProcessContext). And the
+CANCELED-at-EL1 kick loss (trap.rs:18513) is real regardless: any
+one-shot kick into an EL1-fast-path storm is lossy; periodic re-delivery
+(the WIP's ack-wait re-poke) or an EL1-visible doorbell in the mailbox
+is the durable fix.
+
 ### Session 6 working state (live)
 
 - **CLOSED, NOT A DEFECT — container procfs "Pid: 2" (close-out step 4)**:
