@@ -3832,10 +3832,10 @@ impl SyscallDispatcher {
                                 } else {
                                     0
                                 };
-                                let observed_read_avail = if edge_readiness_count > 0 {
-                                    edge_readiness_count
-                                } else {
+                                let observed_read_avail = if read_avail > 0 {
                                     read_avail
+                                } else {
+                                    edge_readiness_count
                                 };
                                 let clear_write_backpressure =
                                     write_backpressured && raw & LINUX_EPOLLOUT != 0;
