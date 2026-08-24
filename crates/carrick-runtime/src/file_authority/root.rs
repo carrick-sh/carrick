@@ -10,47 +10,11 @@ use super::{
 };
 use super::{ClientId, ClientIdentity};
 
-/// Process placement strategy for the per-run file authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FileAuthorityPlacement {
-    /// In-process direct authority for unified VM carrier execution (HVPatch).
-    InProcess,
-    /// Detached helper process spawned via double-fork for host-fork execution lanes.
-    DetachedHelper,
-}
-
-pub(crate) const FILE_AUTHORITY_HELPER_ENV: &str = "CARRICK_FILE_AUTHORITY_HELPER";
-
-impl FileAuthorityPlacement {
-    /// Resolve the authority placement for a given execution backend request.
-    ///
-    /// HVPatch defaults to `InProcess`. An opt-out hatch (`CARRICK_FILE_AUTHORITY_HELPER=1`)
-    /// restores the detached helper process for bisection/debugging.
-    pub(crate) fn for_backend(backend: carrick_spec::ExecBackendRequest) -> Self {
-        if helper_hatch_enabled() {
-            return Self::DetachedHelper;
-        }
-        match backend {
-            carrick_spec::ExecBackendRequest::HvPatch => Self::InProcess,
-        }
-    }
-
-    /// Default placement for the current runtime lane.
-    pub(crate) fn for_current_lane() -> Self {
-        Self::for_backend(carrick_spec::ExecBackendRequest::HvPatch)
-    }
-}
-
-fn helper_hatch_enabled() -> bool {
-    std::env::var_os(FILE_AUTHORITY_HELPER_ENV)
-        .is_some_and(|val| val == "1" || val.to_string_lossy().eq_ignore_ascii_case("true"))
-}
-
 /// The one authenticated FileAuthority endpoint retained by a dispatcher run.
 ///
-/// The helper and root table are live before any guest host fork. Syscall
-/// families are attached to this root incrementally; until a family is cut
-/// over, this object owns no guest-visible backing from that family.
+/// The in-carrier core and root table are live before any guest task starts.
+/// Syscall families are attached to this root incrementally; until a family is
+/// cut over, this object owns no guest-visible backing from that family.
 pub(crate) struct FileAuthorityRun {
     transport: Arc<dyn FileAuthorityTransport>,
     binding: FileAuthorityBinding,
@@ -67,38 +31,11 @@ impl std::fmt::Debug for FileAuthorityRun {
 }
 
 impl FileAuthorityRun {
-    /// Start the per-run file authority for the current execution lane.
-    ///
-    /// HVPatch and in-process execution lanes use direct in-memory authority (`DirectFileAuthority`).
-    /// Host-fork execution lanes retain the detached helper (`IpcFileAuthority::spawn_per_run`).
+    /// Start the per-run, in-carrier file authority.
     pub(crate) fn launch() -> Result<Arc<Self>, AuthorityFatal> {
-        Self::launch_with_placement(FileAuthorityPlacement::for_current_lane())
-    }
-
-    /// Start the per-run file authority with a specific placement strategy.
-    pub(crate) fn launch_with_placement(
-        placement: FileAuthorityPlacement,
-    ) -> Result<Arc<Self>, AuthorityFatal> {
         let epoch = run_epoch()?;
-        let (transport, binding) = match placement {
-            FileAuthorityPlacement::InProcess => {
-                let (transport, binding) = direct_root(epoch)?;
-                (
-                    Arc::new(transport) as Arc<dyn FileAuthorityTransport>,
-                    binding,
-                )
-            }
-            FileAuthorityPlacement::DetachedHelper => {
-                let (transport, binding) = super::IpcFileAuthority::spawn_per_run(
-                    FileAuthorityCore::for_run(epoch),
-                    epoch,
-                )?;
-                (
-                    Arc::new(transport) as Arc<dyn FileAuthorityTransport>,
-                    binding,
-                )
-            }
-        };
+        let (transport, binding) = direct_root(epoch)?;
+        let transport = Arc::new(transport) as Arc<dyn FileAuthorityTransport>;
 
         // Root registration and root-table creation consumed requests 1-2.
         let authority = Self::with_transport(transport, binding, 3);
@@ -316,23 +253,30 @@ mod tests {
     }
 
     #[test]
-    fn placement_defaults_to_in_process_for_hvpatch() {
-        assert_eq!(
-            FileAuthorityPlacement::for_backend(carrick_spec::ExecBackendRequest::HvPatch),
-            FileAuthorityPlacement::InProcess
-        );
-        assert_eq!(
-            FileAuthorityPlacement::for_current_lane(),
-            FileAuthorityPlacement::InProcess
-        );
-    }
-
-    #[test]
-    fn launch_with_in_process_placement_succeeds() {
-        let authority = FileAuthorityRun::launch_with_placement(FileAuthorityPlacement::InProcess)
-            .expect("launch in-process authority");
+    fn launch_creates_in_carrier_authority() {
+        let authority = FileAuthorityRun::launch().expect("launch in-carrier authority");
         let binding = authority.binding();
         assert_eq!(binding.client.id.raw(), 1);
         assert_eq!(binding.generation, ObjectGeneration::INITIAL);
+    }
+
+    #[test]
+    fn file_authority_has_no_host_helper_process_path() {
+        let production_root = include_str!("root.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production FileAuthority root source");
+        let module_surface = include_str!("mod.rs");
+        for retired in [
+            concat!("Detached", "Helper"),
+            concat!("CARRICK_FILE_AUTHORITY_", "HELPER"),
+            concat!("Ipc", "FileAuthority"),
+            concat!("spawn_", "per_run"),
+        ] {
+            assert!(
+                !production_root.contains(retired) && !module_surface.contains(retired),
+                "FileAuthority retained retired host-helper authority `{retired}`"
+            );
+        }
     }
 }
