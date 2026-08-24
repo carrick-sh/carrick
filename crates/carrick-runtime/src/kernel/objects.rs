@@ -5596,7 +5596,7 @@ impl Thread {
     }
 
     /// Guest SYSTEM CPU (µs) this thread has accumulated — carrick's own CPU
-    /// spent servicing this thread's syscalls. See [`Self::system_ns`].
+    /// spent servicing this thread's syscalls. See `system_ns`.
     pub fn system_cpu_us(&self) -> u64 {
         self.cpu_accounting.system_ns.load(Ordering::Acquire) / 1000
     }
