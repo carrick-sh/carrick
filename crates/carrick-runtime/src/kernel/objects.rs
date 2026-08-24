@@ -2590,6 +2590,7 @@ pub struct Task {
     /// the generation lets that same boundary reconcile the authoritative
     /// pending state before it enters guest code.
     wake_generation: AtomicU64,
+    task_event_generation: AtomicU64,
     wake_listeners: Arc<Mutex<BTreeMap<u64, TaskWakeListener>>>,
     next_wake_listener: AtomicU64,
     /// Linux's per-process OOM-killer bias, `/proc/<pid>/oom_score_adj`
@@ -2811,6 +2812,7 @@ impl Task {
             cpu: TaskCpu::default(),
             waker: Mutex::new(None),
             wake_generation: AtomicU64::new(0),
+            task_event_generation: AtomicU64::new(0),
             wake_listeners: Arc::new(Mutex::new(BTreeMap::new())),
             next_wake_listener: AtomicU64::new(1),
             oom_score_adj: AtomicI32::new(0),
@@ -3171,6 +3173,14 @@ impl Task {
 
     pub fn wake_generation(&self) -> u64 {
         self.wake_generation.load(Ordering::Acquire)
+    }
+
+    pub fn record_task_event(&self) -> u64 {
+        self.task_event_generation.fetch_add(1, Ordering::AcqRel)
+    }
+
+    pub fn task_event_generation(&self) -> u64 {
+        self.task_event_generation.load(Ordering::Acquire)
     }
 
     pub fn subscribe_wake(
