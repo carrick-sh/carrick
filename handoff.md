@@ -344,18 +344,34 @@ the graph rows, the lookup answers UnknownThread and the callback's
 `let _ =` swallows it. The WIP's `wake_exact_thread(&Arc<Thread>)`
 addresses the wake by object.
 
-**Edge 4 (where the WIP stops)**: the Arc-addressed wake then trips
-"scheduler generation observer lost exact transition ... run qu[eue...]"
-(instant rc=134) — the wake path's `observe_generation_transition` /
-submission-authority lifecycle rejects transitions for a thread whose
-run-queue enrollment is gone. The next owner must FIRST understand the
-SubmissionAuthority + generation-observer lifecycle for retired-task
-threads (kernel/scheduler.rs observers, `wake_admissions`), then decide:
-either the retry park must be cancelled/completed at task retirement
-(the task-exit path force-completes parked member continuations), or
-the wake path must tolerate retired enrollment. The first shape is
-probably the honest one: a parked thread of a retiring task should be
-CANCELLED by the task exit, not woken later.
+**Edge 4 (where the WIP stops)**: the Arc-addressed wake trips
+"scheduler generation observer lost exact transition" (instant rc=134).
+**The lifecycle study is DONE and the design is settled** (2026-08-24):
+the generation observer is `HvpatchTaskBindingDirectory::transition`
+(executor.rs:1282), which on every Runnable transition ROLLS the
+binding's `SubmissionAuthority` to the successor generation
+(`rollover_exact`/`reactivate_exact` — run-queue enrollment). A wake
+after the task exit retired the (thread, generation) binding row has
+nothing to roll — the observer refuses, and it is RIGHT to refuse:
+**no queue-mediated wake can span task retirement.** The pre-WIP
+blocking condvar "worked" only because condvar notification is
+key-independent and survives retirement. Therefore:
+
+1. KEEP the WIP's non-blocking `exit_thread` + park/retry and the
+   deferred `PendingReservationPublication` (edge 2's fix is correct
+   and the clone path shares its latent deadlock).
+2. REVERT `wake_exact_thread` — wrong tool, the observer proved it.
+3. The retry park must be a REAL continuation registered with the
+   CarrierWaitService (today it settles bare `Blocked(ChildState)`,
+   `continuation: None` — invisible to every cancellation path), so
+   that the kernel task-exit's `cancel_continuation_slot(ThreadExit)`
+   machinery — "THE single door" — completes it when the task retires.
+   Live-task retries keep the plain key-addressed `scheduler.wake`
+   from the reservation subscription (the task is alive then, so the
+   binding rolls fine).
+4. The residual `drop MM authority (holder=registration-cleanup)` 134s
+   seen during WIP rounds must be re-attributed after 1–3 land — they
+   may have been consequences of the malformed park ordering.
 
 Also for the next owner: the reservation-condvar park (edge 1) is a
 CLASS — audit other executor-context callers of
