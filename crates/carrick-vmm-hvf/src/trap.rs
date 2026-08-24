@@ -11195,6 +11195,20 @@ impl HvfVmState {
     }
 
     pub(crate) fn arm_frame_cow_ranges(&mut self, ranges: &[carrick_aarch64::vmm::ForkCowRange]) {
+        if let Some(debug_va) = fork_debug_va()
+            && let Some(range) = ranges
+                .iter()
+                .find(|range| debug_va >= range.va && debug_va < range.va + range.len as u64)
+        {
+            eprintln!(
+                "[ARMDBG parent pid={:?} mm={:?} slot={:x?}] arm covers watch: va={:#x} len={:#x}",
+                self.cow_identity.map(|identity| identity.linux_pid),
+                self.cow_identity.map(|identity| identity.mm),
+                self.mm_root_slot,
+                range.va,
+                range.len,
+            );
+        }
         self.cow_armed.lock().arm(ranges);
     }
 
@@ -12391,6 +12405,16 @@ impl HvfVmState {
         // fork from a broad arena descriptor), but carrying that arm into the
         // following `protect_range(PROT_WRITE)` would immediately force the
         // newly published leaves back to RO and fail their deferred receipt.
+        if let Some(debug_va) = fork_debug_va()
+            && debug_va >= page_va
+            && debug_va < page_va.saturating_add(span_len as u64)
+        {
+            eprintln!(
+                "[DISARMDBG retained-reuse pid={:?} mm={:?}] span=({page_va:#x},{span_len:#x})",
+                self.cow_identity.map(|identity| identity.linux_pid),
+                self.cow_identity.map(|identity| identity.mm),
+            );
+        }
         self.cow_armed.lock().disarm(CowArmedSpan {
             va: page_va,
             len: span_len,
@@ -13056,6 +13080,18 @@ impl HvfVmState {
                 CowArmedRanges::COMPOUND_SIZE as usize as u64,
             ),
         });
+        if let Some(debug_va) = fork_debug_va()
+            && debug_va >= span.va
+            && debug_va < span.va.saturating_add(span.len as u64)
+        {
+            eprintln!(
+                "[DISARMDBG split pid={:?} mm={:?}] span=({:#x},{:#x}) new_ipa={new_ipa:#x}",
+                self.cow_identity.map(|identity| identity.linux_pid),
+                self.cow_identity.map(|identity| identity.mm),
+                span.va,
+                span.len,
+            );
+        }
         self.cow_armed.lock().disarm(span);
         Ok(true)
     }
@@ -13155,11 +13191,52 @@ impl HvfVmState {
                 && current <= debug_va
                 && debug_va < end.min(current.saturating_add(CowArmedRanges::COMPOUND_SIZE))
             {
+                // Co-ownership audit for the watched VA: which physical frame
+                // would a Direct write land in, and does any OTHER mm scope
+                // still name that frame? A Direct GuestVisible write into a
+                // frame another live mm reads is the fork-child stack-smash
+                // corruption shape.
+                let translation = self.translate_va(debug_va);
+                let mapping = self.mapping_for_range(debug_va, 1).map(|mapping| {
+                    (
+                        mapping.start,
+                        mapping.ipa,
+                        mapping.host_addr as usize,
+                        mapping.sharing,
+                    )
+                });
+                let target_ipa =
+                    mapping.map(|(start, ipa, _, _)| ipa.wrapping_add(debug_va - start));
+                let co_owners: Vec<_> = target_ipa
+                    .map(|ipa| {
+                        alias_registry()
+                            .lock()
+                            .iter()
+                            .filter(|alias| {
+                                let base = alias.physical_ipa;
+                                let end = base.saturating_add(alias.physical_size as u64);
+                                ipa >= base
+                                    && ipa < end
+                                    && alias.ownership_scope
+                                        != alias_ownership_scope(
+                                            GuestMappingSharing::Private,
+                                            self.mm_root_slot,
+                                        )
+                            })
+                            .map(|alias| (alias.start, alias.physical_ipa, alias.ownership_scope))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 eprintln!(
-                    "[ROUTEDBG pid={:?}] va={current:#x} intent={intent:?} armed={armed} \
+                    "[ROUTEDBG pid={:?} mm={:?} slot={:x?}] va={current:#x} intent={intent:?} \
+                     armed={armed} armed_len={} \
                      no_source={retained_output_has_no_physical_source} \
-                     shared={retained_output_source_is_shared} route={route:?}",
+                     shared={retained_output_source_is_shared} route={route:?} \
+                     translation={translation:x?} mapping={mapping:x?} co_owners={co_owners:x?}",
                     self.cow_identity.map(|identity| identity.linux_pid),
+                    self.cow_identity.map(|identity| identity.mm),
+                    self.mm_root_slot,
+                    self.cow_armed.lock().ranges.len(),
                 );
             }
             match route {
@@ -14787,6 +14864,15 @@ impl HvfVmState {
         len: usize,
     ) -> Result<(), TrapError> {
         if !self.persistent_vm_lifecycle {
+            if let Some(debug_va) = fork_debug_va()
+                && debug_va >= va
+                && debug_va < va.saturating_add(len as u64)
+            {
+                eprintln!(
+                    "[DISARMDBG alias-unmap-legacy pid={:?}] va={va:#x} len={len:#x}",
+                    self.cow_identity.map(|identity| identity.linux_pid),
+                );
+            }
             self.cow_armed.lock().disarm(CowArmedSpan {
                 va,
                 len,
@@ -14856,6 +14942,18 @@ impl HvfVmState {
             debug_assert_eq!(actual, planned_leases);
             let mut armed = self.cow_armed.lock();
             for span in disarm_spans {
+                if let Some(debug_va) = fork_debug_va()
+                    && debug_va >= span.va
+                    && debug_va < span.va.saturating_add(span.len as u64)
+                {
+                    eprintln!(
+                        "[DISARMDBG alias-unmap pid={:?} mm={:?}] span=({:#x},{:#x})",
+                        self.cow_identity.map(|identity| identity.linux_pid),
+                        self.cow_identity.map(|identity| identity.mm),
+                        span.va,
+                        span.len,
+                    );
+                }
                 armed.disarm(span);
             }
             return Ok(());
@@ -17150,6 +17248,20 @@ impl HvfVmState {
         };
         let mut child_cow_armed = self.cow_armed.lock().clone();
         child_cow_armed.arm(cow_ranges);
+        if let Some(debug_va) = fork_debug_va() {
+            let covered = child_cow_armed
+                .ranges
+                .iter()
+                .any(|range| debug_va >= range.va && debug_va < range.va + range.len as u64);
+            eprintln!(
+                "[ARMDBG child-build parent_pid={:?} parent_mm={:?} child_slot={:x} \
+                 ranges={} watch_covered={covered}]",
+                self.cow_identity.map(|identity| identity.linux_pid),
+                self.cow_identity.map(|identity| identity.mm),
+                request.root_slot_base,
+                child_cow_armed.ranges.len(),
+            );
+        }
         let spec = ProcessSpec {
             vm: (*self._vm).clone(),
             mappings,
