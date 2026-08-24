@@ -335,6 +335,26 @@ Deterministic, fully instrumented (2026-08-24, post-gate-17):
    (the remaining timeout pair) is likely UNRELATED (no vfork) — hunt
    it separately with the same executor-death logging now in place.
 
+### SETIDTHREADCHURN IS THE CHURN CLASS IN A BOTTLE — livelock, sampled
+
+The last timeout pair is NOT a deadlock: at a live wedge ALL TEN
+executors are busy spinning the claim/load/audit/settle cycle
+(`audit_runtime`, `current_signal_mask`, `audit_backend_hardware`,
+`ReceiptLog::record` dominate every stack), the signal PUMP is stuck in
+`snapshot_vcpu_from → Scheduler::enqueue_exact → mutexwait` behind the
+storm, no executor dies (the new death log is silent), and the kernel
+debug snapshot is starved ("kernel snapshot authority is busy" — the 2s
+deadline loses to churning locks). musl `__synccall`'s per-thread
+signal handshake under 8 yield-churn threads never converges — the
+delivery/handshake work is drowned by quantum churn. THIS PROBE IS THE
+LOAD-COUPLED CHURN CLASS REPRODUCED SERIALLY: root-causing why the
+scheduler churns without converging here (fairness? signal-delivery
+work always losing the claim race? per-quantum overhead — note
+`ReceiptLog` also grows UNBOUNDED, a leak to cap) is the same hunt as
+the gate-reliability blocker. Next instruments: a receipts-window diff
+across 1s of churn (claims/settles per thread, signal deliveries), and
+the trap-frequency profile (`carrick trace --profile`) over the storm.
+
 ### OWNER DIRECTIVE (2026-08-24): after the probes, the ECOSYSTEMS gate
 
 Once the conformance probes pass RELIABLY (the closure gate green and
