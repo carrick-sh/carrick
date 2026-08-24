@@ -296,6 +296,7 @@ pub(super) struct PreparedVforkSuspension {
     pub(super) request: SyscallRequest,
     pub(super) child: crate::kernel::TaskKey,
     pub(super) wait: crate::kernel::VforkParentWait,
+    pub(super) activation: executor::PreparedVforkChildActivation,
 }
 
 pub(super) enum PreparedInProcessFork {
@@ -1273,21 +1274,30 @@ where
             Arc::clone(&child_threads),
             &logical.terminal_settlement,
         );
-        dormant
-            .activate(
-                &runtime.continuation_services(child_context.kernel()).0,
+        let (_, vfork_parent_wait) = started.into_parts();
+        let (scheduler, _) = runtime.continuation_services(child_context.kernel());
+        let activation = if vfork_parent_wait.is_some() {
+            Some(executor::PreparedVforkChildActivation::new(
+                dormant,
+                Arc::clone(&scheduler),
                 Arc::clone(child_context.thread()),
                 proof,
-            )
-            .unwrap_or_else(|error| {
-                tracing::error!(child_pid, %error, "activate process child logical job");
-                std::process::abort();
-            });
-        member_publication.commit();
-        if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::Activation) {
-            return Err(ops.fail_stop(error));
-        }
-        let (_, vfork_parent_wait) = started.into_parts();
+                member_publication,
+            ))
+        } else {
+            dormant
+                .activate(&scheduler, Arc::clone(child_context.thread()), proof)
+                .unwrap_or_else(|error| {
+                    tracing::error!(child_pid, %error, "activate process child logical job");
+                    std::process::abort();
+                });
+            member_publication.commit();
+            if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::Activation)
+            {
+                return Err(ops.fail_stop(error));
+            }
+            None
+        };
         if quiesced {
             process_barrier.end_quiesce();
         }
@@ -1333,12 +1343,14 @@ where
             )
             .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
             .with_current_guest_sp(ops.guest_sp(memory));
+            let activation = activation.unwrap_or_else(|| std::process::abort());
             return Ok(PreparedInProcessFork::SuspendVfork(
                 PreparedVforkSuspension {
                     child_pid,
                     request,
                     child: child_key,
                     wait,
+                    activation,
                 },
             ));
         }

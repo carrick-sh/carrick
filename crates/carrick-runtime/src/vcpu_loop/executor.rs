@@ -1193,6 +1193,7 @@ pub(crate) enum HvpatchSubmissionShape {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HvpatchActivationProof {
     thread: ThreadKey,
     generation: ExecutionGeneration,
@@ -1276,6 +1277,107 @@ impl Drop for PreparedHvpatchSubmission {
                 bindings.remove(&self.key);
             }
         }
+    }
+}
+
+#[cfg(test)]
+static VFORK_ACTIVATION_HOOK: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
+    parking_lot::Mutex::new(None);
+
+#[cfg(test)]
+struct TestHookGuard;
+
+#[cfg(test)]
+impl Drop for TestHookGuard {
+    fn drop(&mut self) {
+        *VFORK_ACTIVATION_HOOK.lock() = None;
+    }
+}
+
+pub(crate) struct PreparedVforkChildActivation {
+    dormant: PreparedHvpatchSubmission,
+    scheduler: Arc<Scheduler>,
+    child_thread: Arc<crate::kernel::Thread>,
+    proof: HvpatchActivationProof,
+    member_publication: super::PersistentProcessMemberPublication,
+}
+
+impl PreparedVforkChildActivation {
+    pub(crate) fn new(
+        dormant: PreparedHvpatchSubmission,
+        scheduler: Arc<Scheduler>,
+        child_thread: Arc<crate::kernel::Thread>,
+        proof: HvpatchActivationProof,
+        member_publication: super::PersistentProcessMemberPublication,
+    ) -> Self {
+        Self {
+            dormant,
+            scheduler,
+            child_thread,
+            proof,
+            member_publication,
+        }
+    }
+
+    pub(crate) fn activate(self) -> Result<(), TrapError> {
+        let Self {
+            dormant,
+            scheduler,
+            child_thread,
+            proof,
+            member_publication,
+        } = self;
+        let fail_unpublished_child = |error: TrapError| {
+            scheduler
+                .fail_runnable_exact(
+                    child_thread.key(),
+                    proof.generation,
+                    ExecutionFailure::SnapshotRestoreFailed,
+                )
+                .unwrap_or_else(|cleanup_error| {
+                    tracing::error!(%error, %cleanup_error, "vfork child activation rollback failed");
+                    std::process::abort();
+                });
+            error
+        };
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Err(error) =
+            super::check_hvpatch_process_failpoint(super::HvpatchProcessFailpoint::Activation)
+        {
+            return Err(fail_unpublished_child(TrapError::Hypervisor(
+                error.to_string(),
+            )));
+        }
+
+        dormant
+            .activate(&scheduler, Arc::clone(&child_thread), proof)
+            .map_err(fail_unpublished_child)?;
+
+        #[cfg(test)]
+        if let Some(hook) = VFORK_ACTIVATION_HOOK.lock().as_ref() {
+            hook();
+        }
+
+        member_publication.commit();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_test_hook(hook: impl Fn() + Send + Sync + 'static) -> TestHookGuard {
+        *VFORK_ACTIVATION_HOOK.lock() = Some(Box::new(hook));
+        TestHookGuard
+    }
+}
+
+impl std::fmt::Debug for PreparedVforkChildActivation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedVforkChildActivation")
+            .field("child_thread", &self.child_thread.key())
+            .field("proof_thread", &self.proof.thread)
+            .field("proof_generation", &self.proof.generation)
+            .finish()
     }
 }
 
@@ -1548,10 +1650,13 @@ impl<B: PersistentTaskBinding> RunnableTask<'_, B> {
 }
 
 #[derive(Debug)]
-pub enum ExecutorExit {
+pub(crate) enum ExecutorExit {
     Syscall,
     Blocked(BlockedReason),
-    BlockedContinuation(Box<crate::vcpu_loop::continuation::BlockedContinuation>),
+    BlockedContinuation {
+        continuation: Box<crate::vcpu_loop::continuation::BlockedContinuation>,
+        vfork_activation: Option<PreparedVforkChildActivation>,
+    },
     Yielded,
     Preempted,
     Quiesced,
@@ -3741,7 +3846,10 @@ where
                     .settle_blocked(running, reason)
                     .map(|()| ExecutorPoolEvent::SettledBlocked { thread, generation })
             }
-            ExecutorExit::BlockedContinuation(continuation) => {
+            ExecutorExit::BlockedContinuation {
+                continuation,
+                vfork_activation,
+            } => {
                 let mut registration = control.wait_service.prepare_registration(&continuation);
                 if let Err(error) = control.wait_service.enroll(&mut registration) {
                     let settlement = fail_running_and_retire::<F::TaskBinding, _>(
@@ -3752,6 +3860,18 @@ where
                         receipts,
                     );
                     return Err(with_settlement_error(error.to_string(), settlement));
+                }
+                if let Some(activation) = vfork_activation {
+                    if let Err(error) = activation.activate() {
+                        let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                            resolver.as_ref(),
+                            scheduler,
+                            running,
+                            ExecutionFailure::SnapshotRestoreFailed,
+                            receipts,
+                        );
+                        return Err(with_settlement_error(error.to_string(), settlement));
+                    }
                 }
                 drop(submission_authority);
                 scheduler
@@ -4055,6 +4175,8 @@ pub(crate) mod tests {
         required_continuation_sequence: parking_lot::Mutex<Option<u64>>,
         blocked_continuation:
             parking_lot::Mutex<Option<crate::vcpu_loop::continuation::BlockedContinuation>>,
+        blocked_vfork_activation: parking_lot::Mutex<Option<super::PreparedVforkChildActivation>>,
+        terminal_settlement_notification: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
         descendant: parking_lot::Mutex<Option<DescendantPublication>>,
     }
 
@@ -4072,6 +4194,8 @@ pub(crate) mod tests {
                 load_identity: parking_lot::Mutex::new(None),
                 required_continuation_sequence: parking_lot::Mutex::new(None),
                 blocked_continuation: parking_lot::Mutex::new(None),
+                blocked_vfork_activation: parking_lot::Mutex::new(None),
+                terminal_settlement_notification: parking_lot::Mutex::new(None),
                 descendant: parking_lot::Mutex::new(None),
             })
         }
@@ -4118,6 +4242,19 @@ pub(crate) mod tests {
         ) {
             *self.blocked_continuation.lock() = Some(continuation);
         }
+
+        fn block_with_vfork_continuation(
+            &self,
+            continuation: crate::vcpu_loop::continuation::BlockedContinuation,
+            vfork_activation: super::PreparedVforkChildActivation,
+        ) {
+            *self.blocked_continuation.lock() = Some(continuation);
+            *self.blocked_vfork_activation.lock() = Some(vfork_activation);
+        }
+
+        fn notify_on_terminal_settlement(&self, notification: std::sync::mpsc::Sender<()>) {
+            *self.terminal_settlement_notification.lock() = Some(notification);
+        }
     }
 
     impl PersistentTaskBinding for FakeBinding {
@@ -4144,6 +4281,14 @@ pub(crate) mod tests {
             }
             Ok(())
         }
+
+        fn after_terminal_settlement(&self) {
+            if let Some(notification) = self.terminal_settlement_notification.lock().take() {
+                notification
+                    .send(())
+                    .expect("publish fake terminal settlement");
+            }
+        }
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4169,7 +4314,7 @@ pub(crate) mod tests {
     /// fake backend when a task loads onto an executor.
     type InheritedStateRow = (u64, u64, u64, u64, u64);
 
-    #[derive(Clone, Debug, Default)]
+    #[derive(Clone, Default)]
     struct FakeFactory {
         bindings: Arc<parking_lot::Mutex<BTreeMap<ThreadKey, Arc<FakeBinding>>>>,
         authorities: Arc<
@@ -4192,6 +4337,7 @@ pub(crate) mod tests {
         concurrent_loads: Arc<parking_lot::Mutex<BTreeSet<(ThreadKey, ExecutionGeneration)>>>,
         inherited_state: Arc<parking_lot::Mutex<Vec<InheritedStateRow>>>,
         retired_bindings: Arc<parking_lot::Mutex<Vec<(ThreadKey, ExecutionGeneration)>>>,
+        directory: Arc<parking_lot::Mutex<Option<Arc<HvpatchTaskBindingDirectory>>>>,
     }
 
     impl FakeFactory {
@@ -4204,6 +4350,10 @@ pub(crate) mod tests {
                 asid_generation: mm.raw(),
             });
             self.bindings.lock().insert(context.thread().key(), binding);
+        }
+
+        fn install_directory(&self, directory: Arc<HvpatchTaskBindingDirectory>) {
+            *self.directory.lock() = Some(directory);
         }
 
         fn record(
@@ -4244,8 +4394,23 @@ pub(crate) mod tests {
         }
 
         fn retire(&self, thread: ThreadKey, generation: ExecutionGeneration) {
+            if let Some(dir) = self.directory.lock().as_ref() {
+                dir.retire(thread, generation);
+            }
             self.authorities.lock().remove(&(thread, generation));
             self.retired_bindings.lock().push((thread, generation));
+        }
+
+        fn cancel_dormant(
+            &self,
+            scheduler: &Scheduler,
+            failure: ExecutionFailure,
+        ) -> Result<usize, TrapError> {
+            if let Some(dir) = self.directory.lock().as_ref() {
+                dir.cancel_dormant(scheduler, failure)
+            } else {
+                Ok(0)
+            }
         }
 
         fn take_submission_authority(
@@ -4705,12 +4870,18 @@ pub(crate) mod tests {
                         ))
                     }
                 }
-                Step::Block => match binding.blocked_continuation.lock().take() {
-                    Some(continuation) => {
-                        Ok(ExecutorExit::BlockedContinuation(Box::new(continuation)))
+                Step::Block => {
+                    let continuation = binding.blocked_continuation.lock().take();
+                    let vfork_activation = binding.blocked_vfork_activation.lock().take();
+                    if let Some(continuation) = continuation {
+                        Ok(ExecutorExit::BlockedContinuation {
+                            continuation: Box::new(continuation),
+                            vfork_activation,
+                        })
+                    } else {
+                        Ok(ExecutorExit::Blocked(BlockedReason::HostWait))
                     }
-                    None => Ok(ExecutorExit::Blocked(BlockedReason::HostWait)),
-                },
+                }
                 Step::Yield => Ok(ExecutorExit::Yielded),
                 Step::Preempt => Ok(ExecutorExit::Preempted),
                 Step::Exit => Ok(ExecutorExit::Exited),
@@ -8108,6 +8279,368 @@ pub(crate) mod tests {
             context.thread().execution_state(),
             ThreadExecutionState::Failed {
                 reason: ExecutionFailure::SnapshotSaveFailed,
+                ..
+            }
+        ));
+    }
+
+    struct VforkTestFixture {
+        kernel: Arc<Kernel>,
+        parent: KernelContext,
+        child: KernelContext,
+        parent_generation: ExecutionGeneration,
+        child_generation: ExecutionGeneration,
+        wait: crate::kernel::VforkParentWait,
+        scheduler: Arc<Scheduler>,
+        factory: Arc<FakeFactory>,
+        parent_binding: Arc<FakeBinding>,
+        parent_authority: Option<SubmissionAuthority>,
+        directory: Arc<HvpatchTaskBindingDirectory>,
+        dormant: Option<super::PreparedHvpatchSubmission>,
+        child_proof: HvpatchActivationProof,
+        child_threads: Arc<parking_lot::Mutex<Vec<crate::vcpu_loop::VcpuThreadHandle>>>,
+        terminal_settlement: super::super::HvpatchExternalTerminalSettlement,
+    }
+
+    impl VforkTestFixture {
+        fn new(parent_tid: i32, child_tid: i32) -> Self {
+            let (kernel, parent) = bootstrap(parent_tid);
+            let plan = ClonePlan::from_flags(LinuxCloneFlags::VFORK | LinuxCloneFlags::VM).unwrap();
+            let published = kernel
+                .reserve_fork(&parent, plan, "vfork-fixture".to_owned(), None)
+                .unwrap()
+                .prepare_reference(ThreadId::synthetic_for_tests(child_tid))
+                .unwrap()
+                .commit()
+                .unwrap();
+            let child_ref = published.context().unwrap().retain_exact();
+            let child_state = task_state(&child_ref, 20);
+            let child_generation = child_ref
+                .thread()
+                .publish_initial_task_state(child_state.clone())
+                .unwrap();
+            let hvpatch_child_binding = hvpatch_test_binding(&child_ref, &child_state, 20);
+
+            let scheduler = Arc::new(Scheduler::new(kernel.clone()));
+            let factory = Arc::new(FakeFactory::default());
+            let parent_binding = FakeBinding::new(10, [Step::Block, Step::Exit]);
+            let fake_child_binding = FakeBinding::new(20, [Step::Exit]);
+            factory.install(&parent, Arc::clone(&parent_binding));
+            factory.install(&child_ref, Arc::clone(&fake_child_binding));
+            let parent_generation = publish(&parent, 10);
+            let parent_authority = scheduler
+                .admit_root(parent.thread().key(), parent_generation)
+                .expect("admit root");
+
+            let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+            factory.install_directory(Arc::clone(&directory));
+            let dormant = directory
+                .prepare_submission(
+                    &scheduler,
+                    HvpatchSubmissionShape::Descendant {
+                        grant: (parent.thread().key(), parent_generation),
+                    },
+                    Some(&parent_authority),
+                    Arc::clone(child_ref.thread()),
+                    child_generation,
+                    Arc::clone(&hvpatch_child_binding),
+                )
+                .unwrap();
+
+            let (child_context, wait) = published.into_parts().unwrap();
+            let wait = wait.unwrap();
+            let child = child_context;
+            let start_gate = child
+                .thread()
+                .take_opened_start_gate(child_generation)
+                .unwrap();
+            let child_proof = HvpatchActivationProof::validate(
+                &child,
+                &child_state,
+                child_generation,
+                hvpatch_child_binding.identity(),
+                start_gate,
+            )
+            .unwrap();
+
+            let child_threads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let terminal_settlement = super::super::HvpatchExternalTerminalSettlement::new(
+                crate::vcpu_loop::HvpatchLoopResult::pending(),
+                crate::vcpu_loop::continuation::LogicalJobCompletion::pending(),
+            );
+
+            Self {
+                kernel,
+                parent,
+                child,
+                parent_generation,
+                child_generation,
+                wait,
+                scheduler,
+                factory,
+                parent_binding,
+                parent_authority: Some(parent_authority),
+                directory,
+                dormant: Some(dormant),
+                child_proof,
+                child_threads,
+                terminal_settlement,
+            }
+        }
+
+        fn make_activation(
+            &mut self,
+            proof: Option<HvpatchActivationProof>,
+        ) -> super::PreparedVforkChildActivation {
+            let member_pub = super::super::PersistentProcessMemberPublication::new(
+                Arc::clone(&self.child_threads),
+                &self.terminal_settlement,
+            );
+            let dormant = self.dormant.take().expect("dormant submission");
+            super::PreparedVforkChildActivation::new(
+                dormant,
+                Arc::clone(&self.scheduler),
+                Arc::clone(self.child.thread()),
+                proof.unwrap_or(self.child_proof),
+                member_pub,
+            )
+        }
+
+        fn make_continuation(&self) -> crate::vcpu_loop::continuation::BlockedContinuation {
+            let parent_capture = crate::vcpu_loop::continuation::ContinuationCapture::new(
+                &self.parent,
+                self.parent_generation,
+                SyscallRequest::new(220, SyscallArgs([0; 6])),
+                crate::vcpu_loop::continuation::RestartClass::Never,
+                crate::vcpu_loop::continuation::ContinuationBackend::Hvpatch,
+            )
+            .unwrap();
+            crate::vcpu_loop::continuation::BlockedContinuation::from_vfork_parent(
+                parent_capture,
+                self.child.task().key(),
+                self.wait.clone(),
+            )
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn vfork_deferred_child_activation_runs_after_parent_backend_saved() {
+        let mut fixture = VforkTestFixture::new(14_501, 24_501);
+        let continuation = fixture.make_continuation();
+        let activation = fixture.make_activation(None);
+
+        let parent_key = fixture.parent.thread().key();
+        let factory_events = Arc::clone(&fixture.factory.events);
+        let save_observed_at_activation = Arc::new(AtomicBool::new(false));
+        let observed_flag = Arc::clone(&save_observed_at_activation);
+        let kernel = Arc::clone(&fixture.kernel);
+        let child = fixture.child.retain_exact();
+        let (terminal_tx, terminal_rx) = std::sync::mpsc::channel();
+        fixture
+            .parent_binding
+            .notify_on_terminal_settlement(terminal_tx);
+
+        let _guard = super::PreparedVforkChildActivation::set_test_hook(move || {
+            let events = factory_events.lock().clone();
+            let parent_saved = events.iter().any(|e| {
+                e.kind == BackendEventKind::Save && e.task.is_some_and(|(k, _)| k == parent_key)
+            });
+            observed_flag.store(parent_saved, Ordering::SeqCst);
+            kernel
+                .exit_task(
+                    child.task().key().id,
+                    crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                    None,
+                )
+                .unwrap();
+        });
+
+        fixture
+            .parent_binding
+            .block_with_vfork_continuation(continuation, activation);
+
+        let pool = start_pool(
+            Arc::clone(&fixture.scheduler),
+            Arc::clone(&fixture.factory),
+            1,
+        );
+        let parent_auth = fixture.parent_authority.take().unwrap();
+        parent_auth
+            .publish(&fixture.scheduler, Arc::clone(fixture.parent.thread()))
+            .unwrap();
+        drop(parent_auth);
+
+        terminal_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("parent terminal settlement after vfork release");
+
+        pool.shutdown().expect("clean pool shutdown");
+
+        assert!(
+            save_observed_at_activation.load(Ordering::SeqCst),
+            "Parent backend must be saved before child activation runs"
+        );
+    }
+
+    #[test]
+    fn vfork_release_during_child_activation_preserves_wake_edge_through_parent_settlement() {
+        let mut fixture = VforkTestFixture::new(14_502, 24_502);
+        let continuation = fixture.make_continuation();
+        let activation = fixture.make_activation(None);
+
+        let kernel = Arc::clone(&fixture.kernel);
+        let child = fixture.child.retain_exact();
+        let (terminal_tx, terminal_rx) = std::sync::mpsc::channel();
+        fixture
+            .parent_binding
+            .notify_on_terminal_settlement(terminal_tx);
+
+        // Release vfork during activation (after dormant.activate succeeds, before parent blocked settlement)
+        let _guard = super::PreparedVforkChildActivation::set_test_hook(move || {
+            kernel
+                .exit_task(
+                    child.task().key().id,
+                    crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                    None,
+                )
+                .unwrap();
+        });
+
+        fixture
+            .parent_binding
+            .block_with_vfork_continuation(continuation, activation);
+
+        let pool = start_pool(
+            Arc::clone(&fixture.scheduler),
+            Arc::clone(&fixture.factory),
+            1,
+        );
+        let parent_auth = fixture.parent_authority.take().unwrap();
+        parent_auth
+            .publish(&fixture.scheduler, Arc::clone(fixture.parent.thread()))
+            .unwrap();
+        drop(parent_auth);
+
+        terminal_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("released vfork parent terminal settlement");
+
+        let report = pool
+            .shutdown()
+            .expect("clean pool shutdown when release edge preserved");
+        let _ = report;
+
+        assert!(matches!(
+            fixture.parent.thread().execution_state(),
+            ThreadExecutionState::Exited { .. }
+        ));
+    }
+
+    #[test]
+    fn vfork_child_activation_failure_rolls_back_and_fails_parent_claim() {
+        let mut fixture = VforkTestFixture::new(14_503, 24_503);
+        let continuation = fixture.make_continuation();
+
+        // Invalid proof with mismatched thread
+        let invalid_proof = HvpatchActivationProof {
+            thread: fixture.parent.thread().key(),
+            generation: fixture.child_generation,
+            identity: TaskLoadIdentity {
+                abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                version: 1,
+                mm: fixture.child.shared().mm().id(),
+                asid_generation: fixture.child.shared().mm().id().raw(),
+            },
+        };
+        let activation = fixture.make_activation(Some(invalid_proof));
+
+        fixture
+            .parent_binding
+            .block_with_vfork_continuation(continuation, activation);
+
+        let pool = start_pool(
+            Arc::clone(&fixture.scheduler),
+            Arc::clone(&fixture.factory),
+            1,
+        );
+        let parent_auth = fixture.parent_authority.take().unwrap();
+        parent_auth
+            .publish(&fixture.scheduler, Arc::clone(fixture.parent.thread()))
+            .unwrap();
+        drop(parent_auth);
+
+        let _ = pool.shutdown();
+
+        // Child dormant submission rolled back (not present in directory)
+        assert!(
+            <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+                fixture.directory.as_ref(),
+                fixture.child.thread().key(),
+                fixture.child_generation,
+            )
+            .is_err()
+        );
+        // Child member publication rolled back
+        assert!(fixture.child_threads.lock().is_empty());
+        assert!(matches!(
+            fixture.child.thread().execution_state(),
+            ThreadExecutionState::Failed { .. }
+        ));
+        // Parent is in exact Failed state, not stranded in Blocked
+        assert!(matches!(
+            fixture.parent.thread().execution_state(),
+            ThreadExecutionState::Failed {
+                reason: ExecutionFailure::SnapshotRestoreFailed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn vfork_child_activation_failpoint_rolls_back_and_fails_parent_claim() {
+        let mut fixture = VforkTestFixture::new(14_504, 24_504);
+        let continuation = fixture.make_continuation();
+        let activation = fixture.make_activation(None);
+
+        super::super::install_hvpatch_process_failpoint(
+            super::super::HvpatchProcessFailpoint::Activation,
+        );
+
+        fixture
+            .parent_binding
+            .block_with_vfork_continuation(continuation, activation);
+
+        let pool = start_pool(
+            Arc::clone(&fixture.scheduler),
+            Arc::clone(&fixture.factory),
+            1,
+        );
+        let parent_auth = fixture.parent_authority.take().unwrap();
+        parent_auth
+            .publish(&fixture.scheduler, Arc::clone(fixture.parent.thread()))
+            .unwrap();
+        drop(parent_auth);
+
+        let _ = pool.shutdown();
+
+        assert!(
+            <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+                fixture.directory.as_ref(),
+                fixture.child.thread().key(),
+                fixture.child_generation,
+            )
+            .is_err()
+        );
+        assert!(fixture.child_threads.lock().is_empty());
+        assert!(matches!(
+            fixture.child.thread().execution_state(),
+            ThreadExecutionState::Failed { .. }
+        ));
+        assert!(matches!(
+            fixture.parent.thread().execution_state(),
+            ThreadExecutionState::Failed {
+                reason: ExecutionFailure::SnapshotRestoreFailed,
                 ..
             }
         ));
