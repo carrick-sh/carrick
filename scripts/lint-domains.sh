@@ -50,3 +50,4 @@ done
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 python3 "$script_dir/migrate/check-host-authority-escape-hatches.py" --root .
+python3 "$script_dir/migrate/check-carrier-only-process-invariant.py" --root .

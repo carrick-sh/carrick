@@ -53,6 +53,12 @@ build-debug *ARGS:
 run *ARGS: build
     ./target/release/carrick {{ARGS}}
 
+# Build/sign the exact HVF artifact, prove its entitlement/DOF identity, then
+# enforce one run-ID-scoped Carrick carrier in every supported topology. This is
+# intentionally red while `carrick exec` still starts a peer VM/carrier.
+carrier-topology-gate *ARGS: build
+    python3 scripts/conformance/carrier-topology-gate.py {{ARGS}}
+
 # Fast unsigned debug build (cannot run a guest — for compile-checking only).
 check *ARGS:
     cargo build -p carrick-cli {{_platform_features}} {{ARGS}}

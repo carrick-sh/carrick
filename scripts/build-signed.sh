@@ -50,8 +50,20 @@ if [ "$debug_sign" != "0" ]; then
     echo "build-signed: DEBUG signing (hypervisor + get-task-allow) — debuggable; do not ship" >&2
 fi
 
+source_head=$(git rev-parse --verify HEAD)
+if git diff --quiet HEAD --; then
+    source_tree=$(git rev-parse 'HEAD^{tree}')
+    source_state=clean
+else
+    source_tree=dirty
+    source_state=dirty
+fi
+
 # shellcheck disable=SC2086
-cargo build --release $cargo_args
+CARRICK_BUILD_SOURCE_HEAD="$source_head" \
+    CARRICK_BUILD_SOURCE_TREE="$source_tree" \
+    CARRICK_BUILD_SOURCE_STATE="$source_state" \
+    cargo build --release $cargo_args
 
 built="${CARGO_TARGET_DIR:-target}/release/carrick"
 signed="target/release/carrick"
