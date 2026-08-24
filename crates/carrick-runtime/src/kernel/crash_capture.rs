@@ -183,7 +183,14 @@ impl CrashQuorum {
                 None if thread.is_crash_safe_point_participant() => {
                     return CrashQuorumPoll::Waiting(thread.key().tid);
                 }
-                None => {}
+                None => {
+                    if let Some(registers) = thread.parked_registers() {
+                        collected.push(CrashRegisterFile {
+                            tid: thread.key().tid,
+                            registers,
+                        });
+                    }
+                }
             }
         }
         CrashQuorumPoll::Complete(collected)
