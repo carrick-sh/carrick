@@ -2532,6 +2532,16 @@ fn hvpatch_process_signal_target(
     kernel: &crate::kernel::Kernel,
     pid: i32,
 ) -> Option<crate::kernel::TaskKey> {
+    // TRANSITIONAL identity bridge: in the raw (non-namespaced) lane
+    // `getpid(2)` still answers the CARRIER's host pid (`logical_pid()`
+    // falls back to `std::process::id()` — the retired 1:1 model's
+    // numbering), while the kernel graph numbers the same process
+    // `LINUX_BOOTSTRAP_PID`. A forked child killing its parent by that
+    // observed pid must reach the bootstrap task or the signal silently
+    // resolves to nothing (sigtimedwaitintr's fork_killer hung exactly
+    // there). The real fix is answering getpid from the kernel graph in
+    // the HVPatch lane — the documented identity-and-scope migration —
+    // after which this arm is dead and must be deleted.
     let target = if u32::try_from(pid).is_ok_and(|p| p == std::process::id()) {
         crate::kernel::TaskId::from_abi_positive(carrick_abi::LINUX_BOOTSTRAP_PID as i32).ok()?
     } else {
