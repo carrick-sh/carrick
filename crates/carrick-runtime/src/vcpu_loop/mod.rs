@@ -5,9 +5,9 @@
 //!
 //! Carrick binds one host thread and one engine vCPU to each guest thread, all
 //! sharing ONE process VM (stage-2 mappings are visible to every vCPU). The MAIN
-//! guest thread enters [`run_vcpu_until_exit`]; a thread-creating `clone(2)`
+//! guest thread enters `run_vcpu_until_exit`; a thread-creating `clone(2)`
 //! spawns a sibling host thread that builds its own vCPU in the same VM and runs
-//! the same function ([`ThreadRuntimeState::spawn_clone_thread`]).
+//! the same function (`ThreadRuntimeState::spawn_clone_thread`).
 //!
 //! Shared kernel-half state lives behind [`KernelState`] (an `Arc`, each
 //! subsystem internally synchronised). The engine-specific lifecycle — kick,
@@ -20,7 +20,7 @@
 //!
 //! The loop threads BOTH a CONCRETE `Arc<carrick_thread::thread::FutexTable>`
 //! (the process-private futex table, used UNCHANGED by `dispatch_threaded` and
-//! [`ThreadRuntimeState::complete_futex_wait`] so the generation-snapshot
+//! `ThreadRuntimeState::complete_futex_wait` so the generation-snapshot
 //! lost-wake handshake stays byte-identical) AND an object-safe
 //! `Arc<dyn PlatformFutex>` (used only for the SHARED-futex ops and the
 //! signal-pending notifications, which differ HVF-ulock vs KVM-`SYS_futex`). On
@@ -30,11 +30,11 @@
 //!
 //! See the original prose in `runtime.rs`: a guest `fork(2)` from a
 //! multithreaded guest quiesces every other live vCPU at its lock-safe run-loop
-//! top ([`ThreadRuntimeState::handle_fork`]); a stage-1 page-table edit is a
+//! top (`ThreadRuntimeState::handle_fork`); a stage-1 page-table edit is a
 //! lighter Pause-Modify-Resume that keeps every vCPU alive
 //! ([`ThreadRuntimeState::pt_pause`]). The `in_guest` ↔ `quiescing` Dekker
 //! handshake (SeqCst on both sides) is preserved verbatim in
-//! [`run_vcpu_until_exit`].
+//! `run_vcpu_until_exit`.
 
 use std::collections::BTreeMap;
 use std::os::fd::IntoRawFd;

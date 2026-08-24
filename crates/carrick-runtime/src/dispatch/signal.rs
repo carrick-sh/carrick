@@ -2554,7 +2554,7 @@ fn hvpatch_owns_specific_thread_signal(hvpatch_lane: bool) -> bool {
     hvpatch_lane
 }
 
-/// Same as [`bootstrap_signal_send`] but the caller passes its own current
+/// Same as `bootstrap_signal_send` but the caller passes its own current
 /// euid so we can enforce Linux's kill(2) permission check across guest
 /// processes. `None` means "skip the check" (used by the self-target /
 /// process-group cases that don't cross processes).
