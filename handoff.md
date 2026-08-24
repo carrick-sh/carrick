@@ -174,6 +174,31 @@ layers in one afternoon, each proven live:
      sigtimedwaitintr×2, mtforkcorrupt-musl — probe-by-probe
      correctness work, no shared mechanism claimed.
 
+### NEXT STEPS AFTER SESSION 6 (supersedes the close-out list below)
+
+1. **Read `target/perf/ci-session6.log`** (full `just ci` launched at
+   session end) — criterion 4's file-read requirement; fix anything red.
+2. **The ABBA cycle's fifth layer** (section below): study the
+   SubmissionAuthority/generation-observer lifecycle for retired-task
+   threads FIRST, then land the parked WIP
+   (`target/perf/execfromthread-abba-wip.patch`) with the
+   task-exit-cancels-parked-members design. Clears execfromthread×2,
+   vforkexecthread×2, likely setidthreadchurn×2 and
+   forkstackstorm-under-load — 7 gate rows.
+3. **Hunt B — the 13 load-coupled guest crashes** (stack-smash census
+   ~20, unchanged by the detector fix): signal-family dominated;
+   reproduce with a deliberate load rig (N parallel serial-probe loops
+   as an INSTRUMENT, not a verdict), catch a 134 with
+   CARRICK_FORK_DEBUG_VA/COWDBG + the executor tables.
+4. **Hunt C — the 12 stable exit-0 value-diffs**: coredumpfile×2,
+   epollcluster×2, mqnotifycrossproc×2, shmnestedfork×2,
+   sigtimedwaitintr×2, mtforkcorrupt-musl. Independent; good antigravity
+   worker fodder (one probe per turn, both lanes + both libcs in every
+   battery).
+5. Criterion 1 remnants (runner-gate deletions) and NsSupervisor Stage 2
+   (`docs/hvpatch-carrier-only-process-plan.md`), then the census
+   `--refresh-candidate` reconciliation LAST.
+
 ### THE EXECFROMTHREAD ABBA CYCLE — four edges mapped live, WIP parked
 
 The hunt for hunt-family (A) ran four instrumented rounds deep after gate
