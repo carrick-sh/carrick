@@ -298,6 +298,43 @@ mqnotify (`77a8888d`):
   mechanism from execfromthread's: the vfork-suspended leader and the
   set*id broadcast under churn threads).
 
+### VFORKEXECTHREAD ROOT DIAGNOSED — the shared old root dangles over rebuilt page tables
+
+Deterministic, fully instrumented (2026-08-24, post-gate-17):
+
+1. The wedge: stage2 waits forever in `waitpid(-1)` because the VFORK
+   CHILD's thread silently died: kernel snapshot shows thread (6,322)
+   `Failed { SnapshotRestoreFailed }` and `waiters=9` — an EXECUTOR DIED
+   loading the child (executor deaths were silent until shutdown; now
+   logged at once, `diagnostics` commit).
+2. The death, 3/3 deterministic: "EL0Fault { syndrome: 0x82000407
+   (instruction abort, translation fault LEVEL 3), elr=far=0x2d001e0200
+   } during EL1 task-load barrier" — 0x2d001e0200 IS
+   `LINUX_EL1_LOAD_BARRIER_BASE` (`LINUX_EL1_MAINT_BASE + 0x200`): the
+   vfork child's task-load barrier faults on its FIRST instruction —
+   the child's stage-1 root no longer translates the EL1 maintenance
+   page.
+3. The sharing accounting is CORRECT: `MmResources::commit_exec` sees
+   the vfork child's lease (`publish_shared_child` Arc) and returns
+   retirement=None — the old root/ASID survive. What does NOT survive:
+   the old root's CONTENTS. The exec builds the replacement image's
+   stage-1 tables in the per-process `LINUX_PAGE_TABLES` arena that the
+   OLD root's intermediate entries point into — after the rebuild, the
+   shared old root is a DANGLING TOP over rewritten table pages, and
+   any walk through it (the barrier fetch first) hits a level-3 miss.
+   This is the AGENTS.md stage-1 transaction rule violated by exec
+   specifically for the vfork-share case.
+4. Fix direction: when the predecessor mm is shared (a live vfork
+   child), the exec must build the replacement's page tables in
+   DISJOINT storage (a fresh table allocation, as `prepare_child`'s
+   pooled root already is) instead of rebuilding over the shared arena
+   — or equivalently give the vfork child its own copy/ownership of the
+   old tables before the rebuild. Core stage-1 transactional surgery:
+   design against `publish_stage1_root`, the `LINUX_PAGE_TABLES`
+   allocation model, and the rollback contract. `setidthreadchurn`
+   (the remaining timeout pair) is likely UNRELATED (no vfork) — hunt
+   it separately with the same executor-death logging now in place.
+
 ### OWNER DIRECTIVE (2026-08-24): after the probes, the ECOSYSTEMS gate
 
 Once the conformance probes pass RELIABLY (the closure gate green and
