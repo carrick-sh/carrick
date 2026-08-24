@@ -427,6 +427,18 @@ pub(crate) enum ProcessThreadExit {
     Retired(RetiredThreadResources),
     AlreadyRetired,
     LastThread,
+    /// The kernel graph holds a task reservation (a sibling's exec/fork/exit
+    /// transaction in flight). The caller must NOT block an executor waiting
+    /// for it: an exec survivor's ASID-ack wait can be the reservation
+    /// holder, and it needs THIS executor back at its command-service point
+    /// (the execfromthread ABBA wedge: leader parked on the reservation
+    /// condvar inside its exit while the survivor's executor waited for the
+    /// leader's ack). Carries the observed reservation epoch so the caller
+    /// can subscribe for the change and park as a scheduler-visible retry,
+    /// exactly like the thread-clone TaskBusy path.
+    Busy {
+        observed_epoch: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -846,29 +858,35 @@ impl ProcessContext {
             owner: context.task().key(),
             files: context.resources().files(),
         };
-        loop {
-            let observed = self.kernel_graph().reservation_epoch();
-            match self.kernel_graph().exit_thread(&context, None) {
-                Ok(_) => return Ok(ProcessThreadExit::Retired(retired)),
-                Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
-                    self.kernel_graph().wait_for_reservation_change(observed);
-                }
-                Err(crate::kernel::KernelOperationError::LastThreadRequiresTaskExit(_)) => {
-                    return Ok(ProcessThreadExit::LastThread);
-                }
-                Err(crate::kernel::KernelOperationError::UnknownThread(_))
-                    if !context.exact_thread_is_live() =>
-                {
-                    return Ok(ProcessThreadExit::AlreadyRetired);
-                }
-                Err(crate::kernel::KernelOperationError::ParentExited)
-                | Err(crate::kernel::KernelOperationError::UnknownTask(_))
-                    if !self.kernel_graph().task_is_live(self.task_id()) =>
-                {
-                    return Ok(ProcessThreadExit::AlreadyRetired);
-                }
-                Err(error) => return Err(error),
+        let observed = self.kernel_graph().reservation_epoch();
+        match self.kernel_graph().exit_thread(&context, None) {
+            Ok(_) => Ok(ProcessThreadExit::Retired(retired)),
+            Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
+                // NEVER park the executor host thread on the reservation
+                // condvar here: the holder can be an exec survivor's
+                // terminal path waiting for THIS executor's ASID ack — a
+                // cycle observed live (executor-2 in this condvar,
+                // executor-4 in `invalidate_after_exec`'s recv, nine of
+                // ten acks). The caller parks as a retryable job instead.
+                Ok(ProcessThreadExit::Busy {
+                    observed_epoch: observed,
+                })
             }
+            Err(crate::kernel::KernelOperationError::LastThreadRequiresTaskExit(_)) => {
+                Ok(ProcessThreadExit::LastThread)
+            }
+            Err(crate::kernel::KernelOperationError::UnknownThread(_))
+                if !context.exact_thread_is_live() =>
+            {
+                Ok(ProcessThreadExit::AlreadyRetired)
+            }
+            Err(crate::kernel::KernelOperationError::ParentExited)
+            | Err(crate::kernel::KernelOperationError::UnknownTask(_))
+                if !self.kernel_graph().task_is_live(self.task_id()) =>
+            {
+                Ok(ProcessThreadExit::AlreadyRetired)
+            }
+            Err(error) => Err(error),
         }
     }
 

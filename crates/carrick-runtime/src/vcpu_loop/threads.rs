@@ -379,17 +379,27 @@ where
     }
 
     pub(super) fn handle_persistent_thread_exit(
-        &self,
+        &mut self,
         kernel: &Kernel,
         engine: &mut E,
         code: i32,
         traps: usize,
-    ) -> VcpuLoopOutcome {
-        self.trace_hvpatch_thread_terminal(
-            carrick_observability::probes::HvpatchThreadTerminalReason::GuestThreadExit,
-            code,
-        );
-        let mut last = self.withdraw_persistent_terminal_owner_runtime(kernel, engine);
+    ) -> PersistentThreadExitDisposition {
+        // Runtime withdrawal (registry exit, kick unregister, host-signal
+        // forget) runs EXACTLY ONCE across Busy retries: it is not
+        // re-entrant, and the registry census it returns is only
+        // meaningful on the first pass.
+        let mut last = if self.thread_exit_withdrawn {
+            false
+        } else {
+            self.trace_hvpatch_thread_terminal(
+                carrick_observability::probes::HvpatchThreadTerminalReason::GuestThreadExit,
+                code,
+            );
+            let last = self.withdraw_persistent_terminal_owner_runtime(kernel, engine);
+            self.thread_exit_withdrawn = true;
+            last
+        };
         if !last && let Some(process) = kernel.hvpatch_process.as_ref() {
             match process.exit_thread(self.linux_tid) {
                 Ok(crate::hvpatch::ProcessThreadExit::Retired(retired)) => {
@@ -401,17 +411,32 @@ where
                     );
                 }
                 Ok(crate::hvpatch::ProcessThreadExit::AlreadyRetired) => {}
+                Ok(crate::hvpatch::ProcessThreadExit::Busy { observed_epoch }) => {
+                    return PersistentThreadExitDisposition::Busy { observed_epoch };
+                }
                 Ok(crate::hvpatch::ProcessThreadExit::LastThread) | Err(_) => last = true,
             }
         }
-        if last {
+        PersistentThreadExitDisposition::Done(if last {
             VcpuLoopOutcome::ProcessExit(Box::new(assemble_run_result(
                 kernel, code, None, traps, false,
             )))
         } else {
             VcpuLoopOutcome::ThreadDone
-        }
+        })
     }
+}
+
+/// What became of a persistent guest thread's logical exit.
+pub(super) enum PersistentThreadExitDisposition {
+    /// The exit completed; the job finishes with this outcome.
+    Done(VcpuLoopOutcome),
+    /// The kernel graph holds a task reservation (a sibling exec/fork/exit
+    /// transaction). The job parks as a scheduler-visible retry subscribed
+    /// to the reservation-change epoch — blocking the executor here
+    /// deadlocks against a holder that needs this executor's
+    /// command-service point (the execfromthread ABBA wedge).
+    Busy { observed_epoch: u64 },
 }
 
 pub(super) fn wake_removed_persistent_sibling_threads(

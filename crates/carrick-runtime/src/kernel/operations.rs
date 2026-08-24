@@ -374,14 +374,42 @@ impl TaskSetReservation {
         }
     }
 
-    fn commit(&mut self, state: &mut RegistryState) -> Result<(), KernelOperationError> {
+    fn commit(
+        &mut self,
+        state: &mut RegistryState,
+    ) -> Result<PendingReservationPublication, KernelOperationError> {
         self.validate(state)?;
         for task_id in &self.task_ids {
             state.reservations.remove(task_id);
         }
         self.active = false;
+        // Publication is DEFERRED to the returned token: reservation-change
+        // subscribers run synchronously in `publish_reservation_change`, and
+        // a subscriber's wake path takes the registry lock shared
+        // (`Scheduler::wake` -> `exact_thread_for_scheduler`). Publishing
+        // here — under the caller's registry WRITE guard — self-deadlocked
+        // the carrier once a subscriber existed for the committing task
+        // (executor-8 sampled in `lock_shared_slow` inside its own clone
+        // commit). The `Drop` arm below always had the correct order:
+        // release the lock, then publish.
+        Ok(PendingReservationPublication {
+            kernel: Arc::clone(&self.kernel),
+        })
+    }
+}
+
+/// Deferred `publish_reservation_change` handed out by
+/// [`TaskSetReservation::commit`]. Consume it with [`Self::publish`] AFTER
+/// the registry write guard is released — subscriber callbacks may re-enter
+/// the registry lock.
+#[must_use = "reservation-change subscribers are not notified until publish() runs after the registry guard drops"]
+pub(crate) struct PendingReservationPublication {
+    kernel: Arc<Kernel>,
+}
+
+impl PendingReservationPublication {
+    pub(crate) fn publish(self) {
         self.kernel.publish_reservation_change();
-        Ok(())
     }
 }
 
@@ -788,8 +816,9 @@ impl PreparedFork {
             if let Some(parent_record) = state.tasks.get_mut(&child_parent_task.key().id) {
                 parent_record.revision = next_child_parent_revision;
             }
-            operation.commit(&mut state)?;
+            operation.commit(&mut state)?
         }
+        .publish();
 
         Ok(PublishedFork {
             started: Some(StartedFork {
@@ -1039,7 +1068,7 @@ impl PreparedThreadClone {
             reservation,
             failpoint,
         } = reservation;
-        let published_revision = {
+        let published_and_pending = {
             let mut state = kernel.registry().state.write();
             if let Some(publication) = publication.as_ref() {
                 publication.validate(&state)?;
@@ -1070,11 +1099,16 @@ impl PreparedThreadClone {
             record.thread_claims.insert(tid, claim);
             record.revision = published_revision;
             kernel.observe_thread_publication(&thread, &resources, published_revision);
-            if let Some(publication) = publication.as_mut() {
-                publication.commit(&mut state)?;
-            }
-            published_revision
+            let pending_publication = match publication.as_mut() {
+                Some(publication) => Some(publication.commit(&mut state)?),
+                None => None,
+            };
+            (published_revision, pending_publication)
         };
+        let (published_revision, pending_publication) = published_and_pending;
+        if let Some(pending) = pending_publication {
+            pending.publish();
+        }
         Ok(PublishedThreadClone {
             started: Some(StartedThreadClone {
                 context: KernelContext::from_parts(
@@ -3510,8 +3544,9 @@ impl Kernel {
         let subscribers = self.exit_subscribers.take(prepared.task);
         drop(state);
         let mut state = self.registry().state.write();
-        prepared.reservation.commit(&mut state)?;
+        let pending_publication = prepared.reservation.commit(&mut state)?;
         drop(state);
+        pending_publication.publish();
         // Queue the parent's exit notification after the exit reservation is
         // committed. If notify_parent ran before commit, a parent that woke
         // immediately would see TaskBusy in wait_child_matching and park in

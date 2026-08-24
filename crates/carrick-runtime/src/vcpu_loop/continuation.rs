@@ -4709,9 +4709,20 @@ mod tests {
             !thread_exit.contains("live_count()"),
             "persistent thread exit must route from the atomic withdrawal result"
         );
-        assert!(thread_exit.contains("VcpuLoopOutcome::ThreadDone"));
-        assert!(thread_exit.contains("VcpuLoopOutcome::ProcessExit"));
-        assert!(thread_exit.contains("begin_persistent_process_terminal"));
+        assert!(
+            thread_exit.contains("settle_persistent_thread_exit"),
+            "the ThreadExit arm must route through the shared settle seam"
+        );
+        let settle_seam = production
+            .split_once("fn settle_persistent_thread_exit")
+            .expect("thread-exit settle seam")
+            .1
+            .split_once("fn park_thread_exit_retry")
+            .expect("end thread-exit settle seam")
+            .0;
+        assert!(settle_seam.contains("VcpuLoopOutcome::ThreadDone"));
+        assert!(settle_seam.contains("VcpuLoopOutcome::ProcessExit"));
+        assert!(settle_seam.contains("begin_persistent_process_terminal"));
         assert!(
             !terminal_finalizer
                 .contains("let topology = crate::fork_quiesce::acquire_topology_lock")

@@ -267,6 +267,22 @@ the sequential gate MASKS them, per the documented trap):
   epollcluster gate rows, pinned by a fast host test. Handed to the
   `epolled` worker as its red-first anchor.
 
+### OWNER DIRECTIVE (2026-08-24): after the probes, the ECOSYSTEMS gate
+
+Once the conformance probes pass RELIABLY (the closure gate green and
+stable across repeated runs, not one lucky pass), the next objective
+before any further tail-chasing is: **the ecosystems suite (go, cpython,
+node, LTP — the full `just conformance` surface) must at least MATCH the
+last blessed baseline** (`scripts/conformance/baseline.jsonl` +
+`baseline.kvm.jsonl` overlay; verdict semantics per
+docs/conformance-testing.md). Method constraints stand: carrick-only
+routine runs against the committed oracle cache, two-phase
+carrick/Docker serialization when the oracle must refresh, a binary
+REBUILT after every merge it claims to cover, and probe-vs-baseline
+regressions attributed against unmodified main before being called
+regressions. LTP parity is NOT workload coverage — the ecosystems are
+the point.
+
 ### NEXT STEPS AFTER SESSION 6 (supersedes the close-out list below)
 
 1. ~~Read the ci logs~~ DONE — ledger above. Workers `epolled`
