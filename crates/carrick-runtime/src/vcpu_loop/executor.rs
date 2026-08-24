@@ -1866,6 +1866,12 @@ pub enum ExecutorPoolEvent {
         thread: ThreadKey,
         generation: ExecutionGeneration,
     },
+    DiscardedRow {
+        thread: ThreadKey,
+        row_generation: ExecutionGeneration,
+        observed_state: String,
+        reason: String,
+    },
     Failed {
         thread: ThreadKey,
         generation: ExecutionGeneration,
@@ -1907,6 +1913,27 @@ impl ReceiptLog {
 
     fn snapshot(&self) -> Vec<ExecutorPoolReceipt> {
         self.0.lock().events.clone()
+    }
+}
+
+impl crate::kernel::scheduler::DiscardRecorder for ReceiptLog {
+    fn record_discard(
+        &self,
+        executor: ExecutorId,
+        thread: ThreadKey,
+        row_generation: ExecutionGeneration,
+        observed_state: String,
+        reason: String,
+    ) {
+        self.record(
+            executor,
+            ExecutorPoolEvent::DiscardedRow {
+                thread,
+                row_generation,
+                observed_state,
+                reason,
+            },
+        );
     }
 }
 
@@ -2229,6 +2256,7 @@ impl PoolControl {
     /// returned so the caller can honor shutdown after the terminal settles —
     /// it must not be lost (shutdown stalls) or treated as an error (it is
     /// routine at pool shutdown).
+    #[allow(clippy::too_many_arguments)]
     fn consume_invalidation_acks_servicing<E: PersistentExecutor>(
         &self,
         retirement: &crate::hvpatch::Stage1MmRetirement,
@@ -2385,6 +2413,192 @@ impl PoolControl {
     }
 }
 
+struct HvpatchKernelDebugAuxProvider {
+    scheduler: Arc<Scheduler>,
+    receipts: Arc<ReceiptLog>,
+}
+
+impl HvpatchKernelDebugAuxProvider {
+    fn new(scheduler: Arc<Scheduler>, receipts: Arc<ReceiptLog>) -> Self {
+        Self {
+            scheduler,
+            receipts,
+        }
+    }
+}
+
+impl crate::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebugAuxProvider {
+    fn scheduler_rows(&self) -> Vec<crate::kernel::debug::DebugSchedulerRow> {
+        let (lifecycle, queued_len, claimed, waiters, control_epoch, need_resched, snapshot_count) =
+            self.scheduler.scheduler_summary();
+        vec![crate::kernel::debug::DebugSchedulerRow {
+            lifecycle,
+            queued_len,
+            claimed,
+            waiters,
+            control_epoch,
+            need_resched,
+            snapshot_count,
+        }]
+    }
+
+    fn run_queue_rows(&self) -> Vec<crate::kernel::debug::DebugRunQueueRow> {
+        let rows = self.scheduler.snapshot_run_queue_rows();
+        rows.into_iter()
+            .enumerate()
+            .map(|(position, (thread, generation, closing_authorized))| {
+                crate::kernel::debug::DebugRunQueueRow {
+                    position,
+                    thread: crate::kernel::debug::dto::thread_key(thread),
+                    generation: generation.raw(),
+                    closing_authorized,
+                }
+            })
+            .collect()
+    }
+
+    fn executor_rows(&self) -> Vec<crate::kernel::debug::DebugExecutorRow> {
+        let entries = self.scheduler.snapshot_executor_entries();
+        entries
+            .into_iter()
+            .map(
+                |(id, binding, control_observation_epoch, close_observation_epoch)| {
+                    crate::kernel::debug::DebugExecutorRow {
+                        id: id.raw(),
+                        epoch: binding.as_ref().map(|b| b.executor_epoch()),
+                        current_binding: binding.map(|b| {
+                            crate::kernel::debug::DebugExecutorBindingRow {
+                                thread: crate::kernel::debug::dto::thread_key(b.thread()),
+                                generation: b.generation().raw(),
+                            }
+                        }),
+                        control_observation_epoch,
+                        close_observation_epoch,
+                        pending_commands: None,
+                    }
+                },
+            )
+            .collect()
+    }
+
+    fn executor_receipt_rows(
+        &self,
+    ) -> (
+        Vec<crate::kernel::debug::DebugExecutorReceiptRow>,
+        Option<crate::kernel::debug::DebugExecutorReceiptSummary>,
+    ) {
+        let receipts = self.receipts.snapshot();
+        let total = receipts.len();
+        let start = total.saturating_sub(500);
+        let slice = &receipts[start..];
+        let returned = slice.len();
+        let rows = slice
+            .iter()
+            .map(|r| {
+                let (event_name, thread, generation, observed_state, reason) = match &r.event {
+                    ExecutorPoolEvent::Created => ("Created", None, None, None, None),
+                    ExecutorPoolEvent::AuditPassed => ("AuditPassed", None, None, None, None),
+                    ExecutorPoolEvent::Claimed { thread, generation } => (
+                        "Claimed",
+                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(generation.raw()),
+                        None,
+                        None,
+                    ),
+                    ExecutorPoolEvent::Loaded { thread, generation } => (
+                        "Loaded",
+                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(generation.raw()),
+                        None,
+                        None,
+                    ),
+                    ExecutorPoolEvent::InvalidatedAsid { generation } => {
+                        ("InvalidatedAsid", None, Some(*generation), None, None)
+                    }
+                    ExecutorPoolEvent::OrdinarySyscall { thread, generation } => (
+                        "OrdinarySyscall",
+                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(generation.raw()),
+                        None,
+                        None,
+                    ),
+                    ExecutorPoolEvent::KickDelivered { thread, generation } => (
+                        "KickDelivered",
+                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(generation.raw()),
+                        None,
+                        None,
+                    ),
+                    ExecutorPoolEvent::Saved { thread, generation } => (
+                        "Saved",
+                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(generation.raw()),
+                        None,
+                        None,
+                    ),
+                    ExecutorPoolEvent::SettledBlocked { thread, generation } => (
+                        "SettledBlocked",
+                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(generation.raw()),
+                        None,
+                        None,
+                    ),
+                    ExecutorPoolEvent::SettledRunnable { thread, generation } => (
+                        "SettledRunnable",
+                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(generation.raw()),
+                        None,
+                        None,
+                    ),
+                    ExecutorPoolEvent::SettledExited { thread, generation } => (
+                        "SettledExited",
+                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(generation.raw()),
+                        None,
+                        None,
+                    ),
+                    ExecutorPoolEvent::DiscardedRow {
+                        thread,
+                        row_generation,
+                        observed_state,
+                        reason,
+                    } => (
+                        "DiscardedRow",
+                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(row_generation.raw()),
+                        Some(observed_state.clone()),
+                        Some(reason.clone()),
+                    ),
+                    ExecutorPoolEvent::Failed { thread, generation } => (
+                        "Failed",
+                        Some(crate::kernel::debug::dto::thread_key(*thread)),
+                        Some(generation.raw()),
+                        None,
+                        None,
+                    ),
+                    ExecutorPoolEvent::Destroyed => ("Destroyed", None, None, None, None),
+                    ExecutorPoolEvent::Joined => ("Joined", None, None, None, None),
+                };
+                crate::kernel::debug::DebugExecutorReceiptRow {
+                    sequence: r.sequence,
+                    executor: r.executor.raw(),
+                    event: event_name.to_owned(),
+                    thread,
+                    generation,
+                    observed_state,
+                    reason,
+                }
+            })
+            .collect();
+        let summary = Some(crate::kernel::debug::DebugExecutorReceiptSummary {
+            total,
+            returned,
+            message: format!("showing last {returned} of {total} receipts"),
+        });
+        (rows, summary)
+    }
+}
+
 pub(crate) struct ExecutorPool<F, R>
 where
     F: PersistentExecutorFactory,
@@ -2397,6 +2611,7 @@ where
     receipts: Arc<ReceiptLog>,
     _factory: std::marker::PhantomData<F>,
     resolver: Arc<R>,
+    _debug_aux_provider: Arc<dyn crate::kernel::debug::KernelDebugAuxProvider>,
     #[cfg(test)]
     control: Arc<PoolControl>,
 }
@@ -2609,12 +2824,23 @@ where
             }
         }
 
+        scheduler.install_discard_recorder(
+            Arc::clone(&receipts) as Arc<dyn crate::kernel::scheduler::DiscardRecorder>
+        );
+        let debug_aux_provider: Arc<dyn crate::kernel::debug::KernelDebugAuxProvider> = Arc::new(
+            HvpatchKernelDebugAuxProvider::new(Arc::clone(&scheduler), Arc::clone(&receipts)),
+        );
+        scheduler
+            .kernel()
+            .register_debug_aux_provider(&debug_aux_provider);
+
         Ok(Self {
             scheduler,
             handles,
             receipts,
             _factory: std::marker::PhantomData,
             resolver,
+            _debug_aux_provider: debug_aux_provider,
             #[cfg(test)]
             control,
         })
@@ -2637,6 +2863,7 @@ where
     }
 
     pub fn shutdown(self) -> Result<ExecutorPoolReport, ExecutorPoolShutdownError> {
+        self.scheduler.kernel().unregister_debug_aux_provider();
         self.scheduler.close();
         let mut failures = Vec::new();
         if let Err(error) = self

@@ -17,8 +17,14 @@ pub mod wire;
 
 pub use client::{ClientError, fetch, fetch_at};
 pub use dto::{
-    KERNEL_DEBUG_REQUEST_SCHEMA, KERNEL_DEBUG_RESPONSE_SCHEMA, KernelDebugDtoError,
-    KernelDebugRequest, KernelDebugSnapshot, KernelDebugTable, UnknownTable,
+    DebugAltstack, DebugClass, DebugCredentialsRow, DebugExecutorBindingRow,
+    DebugExecutorReceiptRow, DebugExecutorReceiptSummary, DebugExecutorRow,
+    DebugFileDescriptionRow, DebugFileSlotRow, DebugFileTableRow, DebugFrameRow, DebugFsContextRow,
+    DebugMappingRow, DebugMmRow, DebugProcessGroupRow, DebugRunQueueRow, DebugSchedulerRow,
+    DebugSessionRow, DebugSighandRow, DebugTaskRow, DebugTaskSharedRow, DebugTaskSignalRow,
+    DebugThreadResourcesRow, DebugThreadRow, DebugThreadSignalRow, DebugVmaRow, DebugZombieRow,
+    KERNEL_DEBUG_REQUEST_SCHEMA, KERNEL_DEBUG_RESPONSE_SCHEMA, KernelDebugAuxProvider,
+    KernelDebugDtoError, KernelDebugRequest, KernelDebugSnapshot, KernelDebugTable, UnknownTable,
 };
 pub use endpoint::{DebugEndpoint, EndpointError};
 pub use server::{KernelDebugServer, ServerError};
@@ -291,11 +297,161 @@ mod tests {
         );
     }
 
+    #[test]
+    fn new_scheduler_and_executor_tables_parse_and_wire_names() {
+        for (name, expected) in [
+            ("scheduler", KernelDebugTable::Scheduler),
+            ("run-queue", KernelDebugTable::RunQueue),
+            ("executor", KernelDebugTable::Executor),
+            ("executor-receipt", KernelDebugTable::ExecutorReceipt),
+        ] {
+            assert_eq!(
+                KernelDebugTable::parse(name).expect("known table"),
+                expected
+            );
+            assert_eq!(expected.wire_name(), name);
+        }
+    }
+
+    #[test]
+    fn aux_provider_absent_returns_empty_tables_with_marker() {
+        let (_temp, endpoint) = scoped_endpoint("k1-debug-aux-absent");
+        let kernel = kernel_with_root();
+        let mut server =
+            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+
+        let wanted = vec![
+            KernelDebugTable::Scheduler,
+            KernelDebugTable::RunQueue,
+            KernelDebugTable::Executor,
+            KernelDebugTable::ExecutorReceipt,
+        ];
+        let snapshot = fetch_at(&endpoint, Some(wanted.clone())).expect("fetch snapshot");
+
+        assert_eq!(snapshot.provider_absent, Some(true));
+        assert_eq!(snapshot.scheduler.as_deref(), Some(&[][..]));
+        assert_eq!(snapshot.run_queue.as_deref(), Some(&[][..]));
+        assert_eq!(snapshot.executors.as_deref(), Some(&[][..]));
+        assert_eq!(snapshot.executor_receipts.as_deref(), Some(&[][..]));
+        server.shutdown();
+    }
+
+    struct MockAuxProvider;
+
+    impl KernelDebugAuxProvider for MockAuxProvider {
+        fn scheduler_rows(&self) -> Vec<DebugSchedulerRow> {
+            vec![DebugSchedulerRow {
+                lifecycle: "open".to_owned(),
+                queued_len: 1,
+                claimed: 0,
+                waiters: 0,
+                control_epoch: 0,
+                need_resched: false,
+                snapshot_count: 0,
+            }]
+        }
+
+        fn run_queue_rows(&self) -> Vec<DebugRunQueueRow> {
+            vec![DebugRunQueueRow {
+                position: 0,
+                thread: dto::DebugThreadKey { tid: 1, serial: 1 },
+                generation: 1,
+                closing_authorized: false,
+            }]
+        }
+
+        fn executor_rows(&self) -> Vec<DebugExecutorRow> {
+            vec![DebugExecutorRow {
+                id: 1,
+                epoch: Some(1),
+                current_binding: Some(DebugExecutorBindingRow {
+                    thread: dto::DebugThreadKey { tid: 1, serial: 1 },
+                    generation: 1,
+                }),
+                control_observation_epoch: 0,
+                close_observation_epoch: 0,
+                pending_commands: None,
+            }]
+        }
+
+        fn executor_receipt_rows(
+            &self,
+        ) -> (
+            Vec<DebugExecutorReceiptRow>,
+            Option<DebugExecutorReceiptSummary>,
+        ) {
+            (
+                vec![DebugExecutorReceiptRow {
+                    sequence: 1,
+                    executor: 1,
+                    event: "Created".to_owned(),
+                    thread: None,
+                    generation: None,
+                    observed_state: None,
+                    reason: None,
+                }],
+                Some(DebugExecutorReceiptSummary {
+                    total: 1,
+                    returned: 1,
+                    message: "showing last 1 of 1 receipts".to_owned(),
+                }),
+            )
+        }
+    }
+
+    #[test]
+    fn aux_provider_present_populates_aux_tables_and_marker() {
+        let (_temp, endpoint) = scoped_endpoint("k1-debug-aux-present");
+        let kernel = kernel_with_root();
+        let provider: Arc<dyn KernelDebugAuxProvider> = Arc::new(MockAuxProvider);
+        kernel.register_debug_aux_provider(&provider);
+        let mut server =
+            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+
+        let wanted = vec![
+            KernelDebugTable::Scheduler,
+            KernelDebugTable::RunQueue,
+            KernelDebugTable::Executor,
+            KernelDebugTable::ExecutorReceipt,
+        ];
+        let snapshot = fetch_at(&endpoint, Some(wanted.clone())).expect("fetch snapshot");
+
+        assert_eq!(snapshot.provider_absent, Some(false));
+        assert_eq!(snapshot.scheduler.as_ref().map(|v| v.len()), Some(1));
+        assert_eq!(snapshot.run_queue.as_ref().map(|v| v.len()), Some(1));
+        assert_eq!(snapshot.executors.as_ref().map(|v| v.len()), Some(1));
+        assert_eq!(
+            snapshot.executor_receipts.as_ref().map(|v| v.len()),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot.executor_receipt_summary.as_ref().map(|s| s.total),
+            Some(1)
+        );
+        server.shutdown();
+    }
+
+    #[test]
+    fn thread_row_carries_exec_invalidation_pending() {
+        let (_temp, endpoint) = scoped_endpoint("k1-debug-thread-inval");
+        let kernel = kernel_with_root();
+        let mut server =
+            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+
+        let snapshot =
+            fetch_at(&endpoint, Some(vec![KernelDebugTable::Thread])).expect("fetch snapshot");
+        let threads = snapshot.threads.expect("threads present");
+        assert_eq!(threads.len(), 1);
+        assert!(!threads[0].exec_invalidation_pending);
+        server.shutdown();
+    }
+
     fn empty_snapshot() -> KernelDebugSnapshot {
         KernelDebugSnapshot {
             schema: KERNEL_DEBUG_RESPONSE_SCHEMA.to_owned(),
             snapshot_schema_version: crate::kernel::snapshot::KERNEL_SNAPSHOT_V1_SCHEMA,
             registry_epoch: 0,
+            provider_absent: None,
             tasks: None,
             zombies: None,
             threads: None,
@@ -315,6 +471,11 @@ mod tests {
             sighands: None,
             task_signals: None,
             thread_signals: None,
+            scheduler: None,
+            run_queue: None,
+            executors: None,
+            executor_receipts: None,
+            executor_receipt_summary: None,
         }
     }
 }
