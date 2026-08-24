@@ -112,6 +112,7 @@ pub struct ThreadSnapshotRow {
     pub file_table: Option<FileTableId>,
     pub fs_context: Option<FsContextId>,
     pub credentials: Option<CredentialsId>,
+    pub exec_invalidation_pending: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -546,6 +547,7 @@ impl Kernel {
                 fs_context: (class == ObjectSnapshotClass::Live).then_some(fs.id()),
                 credentials: (class == ObjectSnapshotClass::Live)
                     .then_some(thread_credentials.id()),
+                exec_invalidation_pending: thread.exec_invalidation_pending(),
             });
         }
 

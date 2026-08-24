@@ -3530,11 +3530,11 @@ fn core_resume_pair(pending_resume_pc: Option<u64>, snapshot: &Aarch64VcpuSnapsh
     }
 }
 
-/// Translate a mutable MAP_SHARED futex through the live stage-1 graph.
-///
-/// Kept separate from `syscall_buffer_ipa`: ordinary high-VA syscall buffers
-/// are intentionally resolved by semantic VA inside several backends, while a
-/// futex key must name the physical backing shared by every address space.
+// Translate a mutable MAP_SHARED futex through the live stage-1 graph.
+//
+// Kept separate from `syscall_buffer_ipa`: ordinary high-VA syscall buffers
+// are intentionally resolved by semantic VA inside several backends, while a
+// futex key must name the physical backing shared by every address space.
 
 /// Cached `CARRICK_FORK_DEBUG_VA` (parsed once). `std::env::var` serializes on
 /// std's process-wide environment lock; the shared-futex classification gate

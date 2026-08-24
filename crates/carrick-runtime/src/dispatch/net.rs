@@ -5488,9 +5488,7 @@ impl SyscallDispatcher {
                             },
                             _ => None,
                         }
-                    } else if is_stdio_fd(p.fd) {
-                        Some((p.fd, p.events, false))
-                    } else if p.fd < 0 {
+                    } else if is_stdio_fd(p.fd) || p.fd < 0 {
                         Some((p.fd, p.events, false))
                     } else {
                         None

@@ -48,12 +48,16 @@ pub enum KernelDebugTable {
     Sighand,
     TaskSignal,
     ThreadSignal,
+    Scheduler,
+    RunQueue,
+    Executor,
+    ExecutorReceipt,
 }
 
 impl KernelDebugTable {
     /// Every table, in wire order. Used for an unfiltered request and to
     /// validate that a filtered response carries exactly what was asked for.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 23] = [
         Self::Task,
         Self::Zombie,
         Self::Thread,
@@ -73,6 +77,10 @@ impl KernelDebugTable {
         Self::Sighand,
         Self::TaskSignal,
         Self::ThreadSignal,
+        Self::Scheduler,
+        Self::RunQueue,
+        Self::Executor,
+        Self::ExecutorReceipt,
     ];
 
     /// Parse a CLI `--table` value. Unknown names are rejected by name rather
@@ -105,6 +113,10 @@ impl KernelDebugTable {
             Self::Sighand => "sighand",
             Self::TaskSignal => "task-signal",
             Self::ThreadSignal => "thread-signal",
+            Self::Scheduler => "scheduler",
+            Self::RunQueue => "run-queue",
+            Self::Executor => "executor",
+            Self::ExecutorReceipt => "executor-receipt",
         }
     }
 }
@@ -217,6 +229,7 @@ pub struct DebugThreadRow {
     pub file_table: Option<u64>,
     pub fs_context: Option<u64>,
     pub credentials: Option<u64>,
+    pub exec_invalidation_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -437,6 +450,78 @@ pub struct DebugAltstack {
     pub size: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugSchedulerRow {
+    pub lifecycle: String,
+    pub queued_len: usize,
+    pub claimed: usize,
+    pub waiters: usize,
+    pub control_epoch: u64,
+    pub need_resched: bool,
+    pub snapshot_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugRunQueueRow {
+    pub position: usize,
+    pub thread: DebugThreadKey,
+    pub generation: u64,
+    pub closing_authorized: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugExecutorBindingRow {
+    pub thread: DebugThreadKey,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugExecutorRow {
+    pub id: u32,
+    pub epoch: Option<u64>,
+    pub current_binding: Option<DebugExecutorBindingRow>,
+    pub control_observation_epoch: u64,
+    pub close_observation_epoch: u64,
+    pub pending_commands: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugExecutorReceiptRow {
+    pub sequence: u64,
+    pub executor: u32,
+    pub event: String,
+    pub thread: Option<DebugThreadKey>,
+    pub generation: Option<u64>,
+    pub observed_state: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugExecutorReceiptSummary {
+    pub total: usize,
+    pub returned: usize,
+    pub message: String,
+}
+
+/// Dynamic provider for carrier-owned scheduler and executor tables.
+pub trait KernelDebugAuxProvider: Send + Sync {
+    fn scheduler_rows(&self) -> Vec<DebugSchedulerRow>;
+    fn run_queue_rows(&self) -> Vec<DebugRunQueueRow>;
+    fn executor_rows(&self) -> Vec<DebugExecutorRow>;
+    fn executor_receipt_rows(
+        &self,
+    ) -> (
+        Vec<DebugExecutorReceiptRow>,
+        Option<DebugExecutorReceiptSummary>,
+    );
+}
+
 /// The response. Every table is `Option` so a filtered request produces a
 /// response whose absent tables are explicit rather than empty.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -445,6 +530,8 @@ pub struct KernelDebugSnapshot {
     pub schema: String,
     pub snapshot_schema_version: u16,
     pub registry_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_absent: Option<bool>,
     pub tasks: Option<Vec<DebugTaskRow>>,
     pub zombies: Option<Vec<DebugZombieRow>>,
     pub threads: Option<Vec<DebugThreadRow>>,
@@ -464,6 +551,12 @@ pub struct KernelDebugSnapshot {
     pub sighands: Option<Vec<DebugSighandRow>>,
     pub task_signals: Option<Vec<DebugTaskSignalRow>>,
     pub thread_signals: Option<Vec<DebugThreadSignalRow>>,
+    pub scheduler: Option<Vec<DebugSchedulerRow>>,
+    pub run_queue: Option<Vec<DebugRunQueueRow>>,
+    pub executors: Option<Vec<DebugExecutorRow>>,
+    pub executor_receipts: Option<Vec<DebugExecutorReceiptRow>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_receipt_summary: Option<DebugExecutorReceiptSummary>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -496,11 +589,53 @@ impl KernelDebugSnapshot {
     /// Project a coherent kernel snapshot onto the wire, keeping only the
     /// requested tables.
     pub fn project(snapshot: &KernelSnapshotV1, selected: &BTreeSet<KernelDebugTable>) -> Self {
+        Self::project_with_aux(snapshot, selected, None)
+    }
+
+    /// Project a coherent kernel snapshot and auxiliary scheduler/executor
+    /// tables onto the wire, keeping only the requested tables.
+    pub fn project_with_aux(
+        snapshot: &KernelSnapshotV1,
+        selected: &BTreeSet<KernelDebugTable>,
+        aux: Option<&dyn KernelDebugAuxProvider>,
+    ) -> Self {
         let want = |table: KernelDebugTable| selected.contains(&table);
+        let has_aux_table = want(KernelDebugTable::Scheduler)
+            || want(KernelDebugTable::RunQueue)
+            || want(KernelDebugTable::Executor)
+            || want(KernelDebugTable::ExecutorReceipt);
+        let (
+            scheduler,
+            run_queue,
+            executors,
+            executor_receipts,
+            executor_receipt_summary,
+            provider_absent,
+        ) = match aux {
+            Some(provider) => (
+                want(KernelDebugTable::Scheduler).then(|| provider.scheduler_rows()),
+                want(KernelDebugTable::RunQueue).then(|| provider.run_queue_rows()),
+                want(KernelDebugTable::Executor).then(|| provider.executor_rows()),
+                want(KernelDebugTable::ExecutorReceipt).then(|| provider.executor_receipt_rows().0),
+                want(KernelDebugTable::ExecutorReceipt)
+                    .then(|| provider.executor_receipt_rows().1)
+                    .flatten(),
+                has_aux_table.then_some(false),
+            ),
+            None => (
+                want(KernelDebugTable::Scheduler).then(Vec::new),
+                want(KernelDebugTable::RunQueue).then(Vec::new),
+                want(KernelDebugTable::Executor).then(Vec::new),
+                want(KernelDebugTable::ExecutorReceipt).then(Vec::new),
+                None,
+                has_aux_table.then_some(true),
+            ),
+        };
         Self {
             schema: KERNEL_DEBUG_RESPONSE_SCHEMA.to_owned(),
             snapshot_schema_version: snapshot.schema_version,
             registry_epoch: snapshot.registry_epoch,
+            provider_absent,
             tasks: want(KernelDebugTable::Task).then(|| {
                 snapshot
                     .tasks
@@ -552,6 +687,7 @@ impl KernelDebugSnapshot {
                         file_table: row.file_table.map(|id| id.raw()),
                         fs_context: row.fs_context.map(|id| id.raw()),
                         credentials: row.credentials.map(|id| id.raw()),
+                        exec_invalidation_pending: row.exec_invalidation_pending,
                     })
                     .collect()
             }),
@@ -840,6 +976,11 @@ impl KernelDebugSnapshot {
                     })
                     .collect()
             }),
+            scheduler,
+            run_queue,
+            executors,
+            executor_receipts,
+            executor_receipt_summary,
         }
     }
 
@@ -881,6 +1022,13 @@ impl KernelDebugSnapshot {
         note(
             KernelDebugTable::ThreadSignal,
             self.thread_signals.is_some(),
+        );
+        note(KernelDebugTable::Scheduler, self.scheduler.is_some());
+        note(KernelDebugTable::RunQueue, self.run_queue.is_some());
+        note(KernelDebugTable::Executor, self.executors.is_some());
+        note(
+            KernelDebugTable::ExecutorReceipt,
+            self.executor_receipts.is_some(),
         );
         present
     }
@@ -1098,6 +1246,15 @@ impl KernelDebugSnapshot {
             }
         }
 
+        let _ = unique_sorted("scheduler", self.scheduler.as_deref(), |_| 0)?;
+        let _ = unique_sorted("run-queue", self.run_queue.as_deref(), |row| row.position)?;
+        let _ = unique_sorted("executor", self.executors.as_deref(), |row| row.id)?;
+        let _ = unique_sorted(
+            "executor-receipt",
+            self.executor_receipts.as_deref(),
+            |row| row.sequence,
+        )?;
+
         Ok(())
     }
 }
@@ -1132,14 +1289,14 @@ fn backing_kind_name(backing: &FileDescriptionBackingSnapshot) -> &'static str {
     }
 }
 
-fn task_key(key: super::super::objects::TaskKey) -> DebugTaskKey {
+pub(crate) fn task_key(key: super::super::objects::TaskKey) -> DebugTaskKey {
     DebugTaskKey {
         id: key.id.raw(),
         serial: key.serial.raw(),
     }
 }
 
-fn thread_key(key: super::super::objects::ThreadKey) -> DebugThreadKey {
+pub(crate) fn thread_key(key: super::super::objects::ThreadKey) -> DebugThreadKey {
     DebugThreadKey {
         tid: key.tid.raw(),
         serial: key.serial.raw(),

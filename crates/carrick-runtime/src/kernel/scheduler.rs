@@ -83,6 +83,17 @@ pub trait ExecutorKick: Send + Sync + std::fmt::Debug {
     fn current_binding(&self) -> Option<ExecutorBinding>;
 }
 
+pub(crate) trait DiscardRecorder: Send + Sync {
+    fn record_discard(
+        &self,
+        executor: ExecutorId,
+        thread: ThreadKey,
+        row_generation: ExecutionGeneration,
+        observed_state: String,
+        reason: String,
+    );
+}
+
 pub(crate) trait SchedulerGenerationObserver: Send + Sync {
     fn transition(
         &self,
@@ -186,6 +197,8 @@ impl ExecutorRegistration {
 #[derive(Debug)]
 struct ExecutorEntry {
     kick: Arc<dyn ExecutorKick>,
+    close_observation_epoch: Arc<AtomicU64>,
+    control_observation_epoch: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -219,11 +232,20 @@ impl ExecutorDirectory {
             .checked_add(1)
             .ok_or(RunQueueError::ExecutorIdExhausted)?;
         let id = ExecutorId::from_scheduler(raw);
-        state.entries.insert(id, ExecutorEntry { kick });
+        let close_observation_epoch = Arc::new(AtomicU64::new(0));
+        let control_observation_epoch = Arc::new(AtomicU64::new(0));
+        state.entries.insert(
+            id,
+            ExecutorEntry {
+                kick,
+                close_observation_epoch: Arc::clone(&close_observation_epoch),
+                control_observation_epoch: Arc::clone(&control_observation_epoch),
+            },
+        );
         Ok(ExecutorRegistration {
             id,
-            close_observation_epoch: Arc::new(AtomicU64::new(0)),
-            control_observation_epoch: Arc::new(AtomicU64::new(0)),
+            close_observation_epoch,
+            control_observation_epoch,
         })
     }
 
@@ -363,6 +385,7 @@ enum QueueLifecycle {
 struct QueueRow {
     key: QueueKey,
     thread: Arc<Thread>,
+    closing_authorized: bool,
 }
 
 #[derive(Debug)]
@@ -971,9 +994,11 @@ impl RunQueue {
     pub(crate) fn take(
         &self,
         executor: &ExecutorRegistration,
+        recorder: Option<&dyn DiscardRecorder>,
     ) -> Result<QueueClaim, RunQueueError> {
         loop {
             let row = self.take_row(executor)?;
+            let observed_state = row.thread.execution_diagnostic();
             if row.thread.key() != row.key.thread
                 || row.thread.execution_state().generation() != Some(row.key.generation)
                 || !matches!(
@@ -981,17 +1006,45 @@ impl RunQueue {
                     super::objects::ThreadExecutionState::Runnable { .. }
                 )
             {
+                if let Some(recorder) = recorder {
+                    recorder.record_discard(
+                        executor.id,
+                        row.key.thread,
+                        row.key.generation,
+                        observed_state,
+                        "stale_row_generation_or_state_mismatch".to_owned(),
+                    );
+                }
                 self.inner.finish_claim();
                 continue;
             }
             let lease = match row.thread.claim_runnable(executor.id) {
                 Ok(lease) if lease.generation() == row.key.generation => lease,
                 Ok(lease) => {
+                    let lease_generation = lease.generation();
+                    if let Some(recorder) = recorder {
+                        recorder.record_discard(
+                            executor.id,
+                            row.key.thread,
+                            row.key.generation,
+                            observed_state,
+                            format!("lease_generation_mismatch (lease={lease_generation:?})"),
+                        );
+                    }
                     drop(lease);
                     self.inner.finish_claim();
                     continue;
                 }
-                Err(_) => {
+                Err(error) => {
+                    if let Some(recorder) = recorder {
+                        recorder.record_discard(
+                            executor.id,
+                            row.key.thread,
+                            row.key.generation,
+                            observed_state,
+                            format!("claim_error: {error}"),
+                        );
+                    }
                     self.inner.finish_claim();
                     continue;
                 }
@@ -1199,6 +1252,7 @@ pub struct Scheduler {
     snapshot_count: AtomicU64,
     generation_transition: Mutex<()>,
     generation_observer: Mutex<Option<Arc<dyn SchedulerGenerationObserver>>>,
+    discard_recorder: Mutex<Option<Arc<dyn DiscardRecorder>>>,
     #[cfg(test)]
     continuation_settlement_barriers:
         Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
@@ -1224,9 +1278,14 @@ impl Scheduler {
             snapshot_count: AtomicU64::new(0),
             generation_transition: Mutex::new(()),
             generation_observer: Mutex::new(None),
+            discard_recorder: Mutex::new(None),
             #[cfg(test)]
             continuation_settlement_barriers: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn install_discard_recorder(&self, recorder: Arc<dyn DiscardRecorder>) {
+        *self.discard_recorder.lock() = Some(recorder);
     }
 
     pub(crate) fn install_generation_observer(
@@ -1484,10 +1543,14 @@ impl Scheduler {
         key: QueueKey,
         closing_authorized: bool,
     ) -> Result<bool, RunQueueError> {
-        let inserted = self
-            .queue
-            .inner
-            .enqueue(QueueRow { key, thread }, closing_authorized)?;
+        let inserted = self.queue.inner.enqueue(
+            QueueRow {
+                key,
+                thread,
+                closing_authorized,
+            },
+            closing_authorized,
+        )?;
         if inserted && self.executors.has_running() {
             self.need_resched.store(true, Ordering::Release);
         }
@@ -1495,7 +1558,8 @@ impl Scheduler {
     }
 
     pub fn take(&self, executor: &ExecutorRegistration) -> Result<RunnableThread, RunQueueError> {
-        let QueueClaim { row, lease } = self.queue.take(executor)?;
+        let recorder = self.discard_recorder.lock().clone();
+        let QueueClaim { row, lease } = self.queue.take(executor, recorder.as_deref())?;
         let binding = ExecutorBinding {
             executor: executor.id,
             executor_epoch: lease.executor_epoch(),
@@ -1551,7 +1615,7 @@ impl Scheduler {
         self.observe_generation_transition(running.thread_key(), predecessor, successor, kind)?;
         self.executors.unbind(running.binding);
         drop(_transition);
-        self.apply_settlement_action(&running.thread, action)?;
+        self.apply_settlement_action(Some(running.binding.executor), &running.thread, action)?;
         running.finish_claim();
         Ok(())
     }
@@ -1598,7 +1662,7 @@ impl Scheduler {
             at_clear.wait();
             release.wait();
         }
-        self.apply_settlement_action(&running.thread, action)?;
+        self.apply_settlement_action(Some(running.binding.executor), &running.thread, action)?;
         running.finish_claim();
         Ok(())
     }
@@ -1784,7 +1848,7 @@ impl Scheduler {
         self.executors.unbind(running.binding);
         drop(_transition);
         self.snapshot_count.fetch_add(1, Ordering::Relaxed);
-        self.apply_settlement_action(&running.thread, action)?;
+        self.apply_settlement_action(Some(running.binding.executor), &running.thread, action)?;
         running.finish_claim();
         Ok(successor)
     }
@@ -1816,6 +1880,7 @@ impl Scheduler {
 
     fn apply_settlement_action(
         &self,
+        executor: Option<ExecutorId>,
         thread: &Arc<Thread>,
         action: ThreadSchedulerAction,
     ) -> Result<(), SchedulerError> {
@@ -1826,18 +1891,86 @@ impl Scheduler {
                 generation,
                 closing_authorized,
             } => {
-                self.enqueue_exact(
+                if let Err(error) = self.enqueue_exact(
                     Arc::clone(thread),
                     QueueKey {
                         thread: key,
                         generation,
                     },
                     closing_authorized,
-                )?;
+                ) {
+                    if let Some(recorder) = self.discard_recorder.lock().as_ref() {
+                        let exec_id = executor.unwrap_or_else(|| ExecutorId::from_scheduler(1));
+                        recorder.record_discard(
+                            exec_id,
+                            key,
+                            generation,
+                            thread.execution_diagnostic(),
+                            format!("enqueue_error: {error}"),
+                        );
+                    }
+                    return Err(error.into());
+                }
             }
             ThreadSchedulerAction::Kick { .. } | ThreadSchedulerAction::None => {}
         }
         Ok(())
+    }
+
+    pub fn kernel(&self) -> &Arc<Kernel> {
+        &self.kernel
+    }
+
+    pub fn scheduler_summary(&self) -> (String, usize, usize, usize, u64, bool, u64) {
+        let state = self.queue.inner.state.lock();
+        let lifecycle = match state.lifecycle {
+            QueueLifecycle::Open => "open",
+            QueueLifecycle::Closing => "closing",
+            QueueLifecycle::Closed => "closed",
+        }
+        .to_owned();
+        let queued_len = state.rows.len();
+        let claimed = state.claimed;
+        let waiters = state.waiters;
+        let control_epoch = self.queue.inner.control_epoch.load(Ordering::Acquire);
+        let need_resched = self.need_resched();
+        let snapshot_count = self.snapshot_count();
+        (
+            lifecycle,
+            queued_len,
+            claimed,
+            waiters,
+            control_epoch,
+            need_resched,
+            snapshot_count,
+        )
+    }
+
+    pub fn snapshot_run_queue_rows(&self) -> Vec<(ThreadKey, ExecutionGeneration, bool)> {
+        let state = self.queue.inner.state.lock();
+        state
+            .rows
+            .iter()
+            .map(|row| (row.key.thread, row.key.generation, row.closing_authorized))
+            .collect()
+    }
+
+    pub fn snapshot_executor_entries(
+        &self,
+    ) -> Vec<(ExecutorId, Option<ExecutorBinding>, u64, u64)> {
+        let state = self.executors.state.lock();
+        state
+            .entries
+            .iter()
+            .map(|(id, entry)| {
+                (
+                    *id,
+                    entry.kick.current_binding(),
+                    entry.control_observation_epoch.load(Ordering::Acquire),
+                    entry.close_observation_epoch.load(Ordering::Acquire),
+                )
+            })
+            .collect()
     }
 
     pub fn binding_for_thread(&self, thread: ThreadKey) -> Option<ExecutorBinding> {
@@ -3048,5 +3181,84 @@ mod tests {
             (context.thread().key(), 1)
         );
         drop(kernel);
+    }
+
+    #[test]
+    fn stale_or_mismatched_row_records_discard_receipt() {
+        let (kernel, context) = bootstrap(12_115);
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        publish(&context, 19);
+        let generation = context.thread().execution_state().generation().unwrap();
+        let key = QueueKey {
+            thread: context.thread().key(),
+            generation,
+        };
+
+        type DiscardRecord = (
+            crate::kernel::objects::ExecutorId,
+            crate::kernel::objects::ThreadKey,
+            crate::kernel::objects::ExecutionGeneration,
+            String,
+            String,
+        );
+        struct TestDiscardRecorder(parking_lot::Mutex<Vec<DiscardRecord>>);
+        impl super::DiscardRecorder for TestDiscardRecorder {
+            fn record_discard(
+                &self,
+                executor: crate::kernel::objects::ExecutorId,
+                thread: crate::kernel::objects::ThreadKey,
+                row_generation: crate::kernel::objects::ExecutionGeneration,
+                observed_state: String,
+                reason: String,
+            ) {
+                self.0
+                    .lock()
+                    .push((executor, thread, row_generation, observed_state, reason));
+            }
+        }
+
+        let recorder = Arc::new(TestDiscardRecorder(parking_lot::Mutex::new(Vec::new())));
+        scheduler
+            .install_discard_recorder(Arc::clone(&recorder) as Arc<dyn super::DiscardRecorder>);
+
+        // Enqueue row
+        scheduler
+            .enqueue_exact(Arc::clone(context.thread()), key, false)
+            .unwrap();
+        // Transition thread to blocked (so generation/state in row becomes stale)
+        let lease = context
+            .thread()
+            .claim_runnable(crate::kernel::objects::ExecutorId::from_scheduler(1))
+            .unwrap();
+        context
+            .thread()
+            .scheduler_park_from_executor(lease, BlockedReason::HostWait)
+            .unwrap();
+
+        // Register executor
+        let kick = Arc::new(RecordingKick::default());
+        let executor = scheduler.register_executor(kick).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sched_clone = Arc::new(scheduler);
+        let exec_clone = executor.clone();
+        let s = Arc::clone(&sched_clone);
+        let thread = std::thread::spawn(move || {
+            let res = s.take(&exec_clone);
+            tx.send(res.is_ok()).unwrap();
+        });
+
+        // Wait briefly for take to process stale row and block waiting on queue
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let discards = recorder.0.lock().clone();
+        assert_eq!(discards.len(), 1);
+        assert_eq!(discards[0].1, context.thread().key());
+        assert_eq!(discards[0].2, generation);
+        assert_eq!(discards[0].4, "stale_row_generation_or_state_mismatch");
+
+        // Now wake thread so take can finish
+        sched_clone.wake(context.thread().key()).unwrap();
+        assert!(rx.recv().unwrap());
+        thread.join().unwrap();
     }
 }
