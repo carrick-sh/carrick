@@ -1299,7 +1299,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         far: u64,
         ttbr0: u64,
         flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
-    ) -> Result<bool, TrapError> {
+    ) -> Result<carrick_hal::CowFaultResolution, TrapError> {
         self.state
             .resolve_frame_cow_fault(syndrome, far, ttbr0, flush_stage1)
     }

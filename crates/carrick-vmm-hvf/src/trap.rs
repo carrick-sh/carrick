@@ -12479,6 +12479,21 @@ impl HvfVmState {
                 }
                 _ => false,
             };
+            if let Some(debug_va) = fork_debug_va()
+                && align_down(fault_va, 4 * 1024) == align_down(debug_va, 4 * 1024)
+            {
+                eprintln!(
+                    "[COWDBG pid={} tid={}] UNARMED fault va={fault_va:#x} mm={:?} \
+                     mapping={:?} write_denied={write_denied} \
+                     private_writable={private_writable_mapping} \
+                     live_leaf_writable={live_leaf_is_writable} armed_count={}",
+                    identity.linux_pid,
+                    identity.linux_tid,
+                    identity.mm,
+                    mapping.map(|m| (m.start, m.end, m.ipa, m.guest_writable, m.sharing)),
+                    armed.len(),
+                );
+            }
             match unarmed_permission_fault_route(
                 private_writable_mapping,
                 write_denied,
@@ -12534,6 +12549,14 @@ impl HvfVmState {
                 .ipa
                 .checked_add(fault_va.checked_sub(mapping.start)?)
         });
+        if let Some(debug_va) = fork_debug_va()
+            && align_down(fault_va, 4 * 1024) == align_down(debug_va, 4 * 1024)
+        {
+            eprintln!(
+                "[COWDBG pid={} tid={}] ARMED fault va={fault_va:#x} mm={:?} span=({:#x},{:#x}) old_fault_ipa={old_fault_ipa:?}",
+                identity.linux_pid, identity.linux_tid, identity.mm, span.va, span.len,
+            );
+        }
         let semantic_offset = fault_va.checked_sub(span.va).ok_or_else(|| {
             TrapError::Hypervisor("HVPatch COW fault precedes its armed span".to_owned())
         })?;
@@ -13035,12 +13058,12 @@ impl HvfVmState {
         far: u64,
         ttbr0: u64,
         flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
-    ) -> Result<bool, TrapError> {
+    ) -> Result<carrick_hal::CowFaultResolution, TrapError> {
         if !is_stage1_cow_write_fault(syndrome) {
-            return Ok(false);
+            return Ok(carrick_hal::CowFaultResolution::NotCow);
         }
         let fault_va = strip_pointer_tag(far);
-        self.perform_frame_cow(
+        let resolved = self.perform_frame_cow(
             fault_va,
             carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible,
             FrameCowTrigger {
@@ -13050,7 +13073,18 @@ impl HvfVmState {
                 ttbr0,
             },
             flush_stage1,
-        )
+        )?;
+        if !resolved {
+            return Ok(carrick_hal::CowFaultResolution::NotCow);
+        }
+        // The refault livelock detector keys on this live post-resolution
+        // translation: a fork loop legitimately re-COWs the same VA to a
+        // FRESH frame every iteration (fork re-arms the span, the wait loop
+        // rewrites the same stack slot), so (FAR, ESR) alone cannot prove
+        // the resolver made no progress.
+        Ok(carrick_hal::CowFaultResolution::Resolved {
+            translation: self.translate_va(fault_va),
+        })
     }
 
     pub(crate) fn ensure_frame_cow_write(

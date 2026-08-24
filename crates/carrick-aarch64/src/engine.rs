@@ -2604,7 +2604,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         vm.refresh_vcpu_after_frame_cow(vcpu)
     }
 
-    fn resolve_frame_cow_fault(&mut self, syndrome: u64, far: u64) -> Result<bool, TrapError> {
+    fn resolve_frame_cow_fault(
+        &mut self,
+        syndrome: u64,
+        far: u64,
+    ) -> Result<carrick_hal::CowFaultResolution, TrapError> {
         // Serialize the actual hardware root/ASID and live descriptors for every
         // attempted COW, including the fast EL0-abort route that never reaches
         // the runtime's generic fault diagnostic arm. This is structural proof
@@ -2626,12 +2630,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let carrier_root = vm.carrier_maintenance_root().ok();
         let mut flush = || Self::run_stage1_maintenance_on(vcpu, process_asid, carrier_root);
         let ttbr0 = fault_page_tables.map_or(0, |(ttbr, _)| ttbr);
-        let handled = vm.resolve_frame_cow_fault(syndrome, far, ttbr0, &mut flush)?;
-        if handled {
+        let resolution = vm.resolve_frame_cow_fault(syndrome, far, ttbr0, &mut flush)?;
+        if matches!(resolution, carrick_hal::CowFaultResolution::Resolved { .. }) {
             vm.refresh_vcpu_after_frame_cow(vcpu)?;
             self.last_fault_esr = 0;
         }
-        Ok(handled)
+        Ok(resolution)
     }
 
     fn begin_process_inventory(
