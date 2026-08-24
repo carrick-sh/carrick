@@ -428,7 +428,25 @@ fn spawn_signal_pump_inner(
                         }
                     }
                 }
-                let n = match kq.wait(&[], &mut out, None) {
+                // A pending signal whose one delivery kick was swallowed at
+                // an EL1 boundary (the sched_yield fast path never VM-exits,
+                // and a CANCELED exit at EL1 consumes the one-shot
+                // hv_vcpus_exit) is otherwise NEVER retried: the publication
+                // generation is unchanged, so this pump blocked forever while
+                // the guest's __synccall handshake starved
+                // (setidthreadchurn's 45 s livelock). While durable pending
+                // state remains after a reconcile, wait on a short cadence —
+                // every retry kick is a fresh chance to land in an EL0
+                // window. With nothing owed, block indefinitely as before (a
+                // poll would keep the idle process SRUN).
+                let owed = crate::host_signal::has_process_pending()
+                    || !crate::host_signal::pending_thread_tids().is_empty();
+                let retry_timeout = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 1_000_000,
+                };
+                let timeout = if owed { Some(&retry_timeout) } else { None };
+                let n = match kq.wait(&[], &mut out, timeout) {
                     Ok(n) => n,
                     Err(errno) => {
                         if errno == libc::EINTR {
@@ -437,6 +455,12 @@ fn spawn_signal_pump_inner(
                         break;
                     }
                 };
+                if n == 0 && owed {
+                    // Timeout with pending state: re-deliver regardless of the
+                    // (unchanged) publication generation.
+                    reconcile_durable_signal_state(kicker.as_ref(), futex.as_ref());
+                    continue;
+                }
                 for event in out.iter().take(n) {
                     if event.is_read() {
                         crate::host_signal::drain_pump_pipe();

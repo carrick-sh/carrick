@@ -4300,6 +4300,37 @@ where
             }
             DispatchOutcome::SchedulerYield => {
                 self.state.complete_returned(engine, 0)?;
+                // Linux delivers pending signals on the return-to-user edge of
+                // EVERY syscall — sched_yield included. This arm skipped the
+                // service, so a thread looping on sched_yield NEVER took a
+                // pending unblocked signal: musl's __synccall broadcast
+                // (SIGSYNCCALL, rt signal 34) sat pending on a yield-storming
+                // sibling forever and set*id hung for its full 45 s budget
+                // (setidthreadchurn — kernel snapshot showed the pending
+                // signal on a Running thread across ~200k yield quanta).
+                let context = self
+                    .state
+                    .service_kernel_context
+                    .as_ref()
+                    .unwrap_or_else(|| std::process::abort())
+                    .retain_exact();
+                if let Some(outcome) = service_signals_threaded(
+                    &self.kernel,
+                    &context,
+                    engine,
+                    self.state.this_tid,
+                    self.state.fatal_image_generation,
+                    Some(0),
+                    None,
+                    self.state.continuation_restart.take(),
+                    self.state.reserved_signal.take(),
+                    self.traps,
+                )? {
+                    return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                }
+                if let Some(exit) = self.suspend_for_job_control(engine, control)? {
+                    return Ok(exit);
+                }
                 self.suspend(
                     HvpatchLoopSuspension::SchedulerYield,
                     executor::ExecutorExit::Yielded,
