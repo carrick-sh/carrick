@@ -298,6 +298,22 @@ mqnotify (`77a8888d`):
   mechanism from execfromthread's: the vfork-suspended leader and the
   set*id broadcast under churn threads).
 
+### GATE 18 — 830/838 + 40/40 (99.0%): both timeout families dead, churn halved
+
+After the vfork-share exec fix (`shared_process_mm` wired from
+MmResources authority), the sched_yield return-edge signal delivery, the
+pump's pending-retry cadence, and the bounded receipt window: NINETEEN
+rows cleared (vforkexecthread×2, setidthreadchurn×2, and most of the
+churn class — killfault, signals, signalexit, procsignalmulti, procstat,
+sysvmsgwake, bigread, iovecedge, ptracekillcont, futexwakeexact-gnu,
+dirrenamecache, bindunixnode, unlinkatbindmount, clone3signalflight,
+vforkpid). Churn amplitude 15 → 7 flips; stack-smash census 12; scenario
+phase 40/40. THE YIELD-EDGE DELIVERY GAP WAS A MAJOR CHURN DRIVER, as
+predicted. Remaining 8: killreap (the drop-while-active clause, hunt
+below), killrt/vmsplicepipe (133), setpgidparentgroup/epollinmemwake
+(134), clonefsumask-gnu (timeout), mmapdevzero/udpreuseaddr (exit-0
+value diffs).
+
 ### VFORKEXECTHREAD ROOT DIAGNOSED — the shared old root dangles over rebuilt page tables
 
 Deterministic, fully instrumented (2026-08-24, post-gate-17):
