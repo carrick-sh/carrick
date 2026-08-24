@@ -174,6 +174,27 @@ layers in one afternoon, each proven live:
      sigtimedwaitintr×2, mtforkcorrupt-musl — probe-by-probe
      correctness work, no shared mechanism claimed.
 
+### OWNER RULING (2026-08-24): carrick owns guest epoll; the host kqueue is a wake source, not the authority
+
+Verbatim direction: "Intra carrick should have its own epoll, outside we
+need a pattern for it." The guest-facing epoll emulation must keep its
+OWN state machine — interest list, per-registration readiness and ET
+latch, the computed report set — and the host kqueue degrades to a pure
+edge/wake SOURCE whose events only UPDATE that state and never answer
+readiness directly. Today readiness authority is entangled with the host
+object (the epoll instance's kqueue fd readability, synthetic readiness
+counters), and the whole failure family is patches on that entanglement:
+the ET-rearm defect (epollcluster + the epoll_et_read_growth host test,
+fixed 2026-08-24 by making buffered bytes authoritative over the
+synthetic count — a step in this direction), the two ORDER-SENSITIVE
+latch-leak host tests ("latch-masked ET readiness must not leave the
+epoll kqueue fd readable" — flaky in-batch on unmodified main), the
+node EVFILT_USER consumed-count bug, and the epoll-ET HUP/EOF wake
+registry. The rearchitecture is the real fix for the family and for the
+epollcluster/epolletmanyhup residue; design it as its own plan (typed
+domains: guest-visible readiness vs host-kqueue state are TWO domains
+sharing one representation today — the documented shipped-bug shape).
+
 ### CRITERION-4 LEDGER — the full `just ci` state, read from files
 
 `target/perf/ci-session6.log` (sequential run, died at step 3) plus
