@@ -3240,6 +3240,7 @@ where
         if !barrier.is_quiescing() {
             return Ok(None);
         }
+        let _ = self.state.stash_parked_registers(engine);
         if self
             .state
             .publish_crash_registers_if_requested(engine)
@@ -3247,9 +3248,19 @@ where
         {
             self.state.withdraw_from_crash_capture();
         }
-        let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
-            RuntimeError::Configuration("quiescing HVPatch task lost Kernel context".to_owned())
-        })?;
+        let context = match self.state.service_kernel_context.as_ref() {
+            Some(context) => context.retain_exact(),
+            None => self
+                .kernel
+                .dispatcher
+                .capture_kernel_context(self.state.linux_tid)
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "quiescing HVPatch task lost Kernel context: {error}"
+                    ))
+                })?,
+        };
+        self.state.service_kernel_context = Some(context.retain_exact());
         let scheduler = self
             .kernel
             .hvpatch_runtime
@@ -4097,6 +4108,7 @@ where
         outcome: DispatchOutcome,
     ) -> Result<executor::ExecutorExit, RuntimeError> {
         if continuation::is_blocking_dispatch_outcome(&outcome) {
+            let _ = self.state.stash_parked_registers(engine);
             let request = SyscallRequest::from_raw(frame)
                 .with_guest_abi(<E::Arch as carrick_hal::GuestArch>::linux_guest_abi())
                 .with_current_guest_sp(engine.get_reg(carrick_hal::Reg::Sp).ok());
@@ -5080,6 +5092,9 @@ where
                 )? {
                     return Ok(self.enter_terminal_with_outcome(engine, outcome));
                 }
+                if let Some(exit) = self.suspend_for_process_quiesce(engine, control)? {
+                    return Ok(exit);
+                }
                 if let Some(exit) = self.suspend_for_job_control(engine, control)? {
                     return Ok(exit);
                 }
@@ -5764,6 +5779,15 @@ where
             .and_then(|authority| authority.collecting())
     }
 
+    fn stash_parked_registers(&self, engine: &E) -> Result<(), RuntimeError> {
+        if let Ok(Some(registers)) = engine.aarch64_core_registers() {
+            if let Some(thread) = self.kernel_thread.as_ref() {
+                thread.stash_parked_registers(registers);
+            }
+        }
+        Ok(())
+    }
+
     fn publish_crash_registers_if_requested(&self, engine: &E) -> Result<(), RuntimeError> {
         let Some(mut generation) = self.collecting_crash_generation() else {
             return Ok(());
@@ -6289,7 +6313,6 @@ where
         request: SyscallRequest,
         input: HvpatchBlockInput,
     ) -> Result<continuation::BlockedContinuation, RuntimeError> {
-        self.withdraw_from_crash_capture();
         let directory = kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
             RuntimeError::Configuration(
                 "HVPatch blocking continuation has no shared runtime directory".to_owned(),

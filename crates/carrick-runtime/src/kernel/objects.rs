@@ -3661,6 +3661,7 @@ impl Task {
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
             cpu_accounting: Arc::new(ThreadCpuAccounting::default()),
             crash_vote: Mutex::new(None),
+            parked_registers: Mutex::new(None),
             crash_safe_point_participant: AtomicBool::new(false),
             thread_keyring: Mutex::new(None),
         })
@@ -3688,6 +3689,7 @@ impl Task {
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
             cpu_accounting: Arc::new(ThreadCpuAccounting::default()),
             crash_vote: Mutex::new(None),
+            parked_registers: Mutex::new(None),
             crash_safe_point_participant: AtomicBool::new(false),
             thread_keyring: Mutex::new(None),
         })
@@ -3715,6 +3717,7 @@ impl Task {
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
             cpu_accounting: Arc::new(ThreadCpuAccounting::default()),
             crash_vote: Mutex::new(None),
+            parked_registers: Mutex::new(None),
             crash_safe_point_participant: AtomicBool::new(false),
             thread_keyring: Mutex::new(None),
         })
@@ -3746,6 +3749,7 @@ impl Task {
             // the replacement without a second charge or a timing race.
             cpu_accounting: Arc::clone(&caller.cpu_accounting),
             crash_vote: Mutex::new(None),
+            parked_registers: Mutex::new(None),
             crash_safe_point_participant: AtomicBool::new(false),
             thread_keyring: Mutex::new(None),
         })
@@ -4624,6 +4628,10 @@ pub struct Thread {
     /// from a park it cannot publish from. The generation prevents a delayed
     /// sibling from contaminating a later capture attempt.
     crash_vote: Mutex<Option<(CrashCaptureGeneration, CrashRegisterVote)>>,
+    /// Exact architectural registers stashed when this thread parks / blocks /
+    /// suspends. Collected for core publication if a sibling crashes while
+    /// this thread is not on an active vCPU lease.
+    parked_registers: Mutex<Option<carrick_hal::Aarch64CoreRegisters>>,
     /// True exactly while this thread has a live vCPU loop, and therefore can
     /// still REACH a crash safe point. A thread published into the task graph
     /// whose host loop was cancelled before it started, or whose loop has
@@ -5573,6 +5581,16 @@ impl Thread {
             .as_ref()
             .filter(|(voted, _)| *voted == generation)
             .map(|(_, vote)| vote.clone())
+    }
+
+    /// Stash exact architectural registers when parking/suspending.
+    pub(crate) fn stash_parked_registers(&self, registers: carrick_hal::Aarch64CoreRegisters) {
+        *self.parked_registers.lock() = Some(registers);
+    }
+
+    /// Read stashed parked registers if present.
+    pub(crate) fn parked_registers(&self) -> Option<carrick_hal::Aarch64CoreRegisters> {
+        *self.parked_registers.lock()
     }
 
     /// Mark that this thread's vCPU loop is live, so it can reach a crash safe
