@@ -443,6 +443,23 @@ mod generic_registry_tests {
     }
 }
 
+/// Outcome of a stage-1 COW write-fault resolution attempt.
+///
+/// `Resolved.translation` is the live post-resolution stage-1 output for the
+/// fault VA (`None` when the resolver cannot name it). The refault livelock
+/// detector keys on it: a recurring identical `(FAR, ESR)` whose resolved
+/// translation ALSO repeats proves the resolver made no progress, while a
+/// fork loop legitimately re-COWs the same VA to a fresh frame each
+/// iteration — fork re-arms the parent's span and the wait loop rewrites the
+/// same stack slot, so `(FAR, ESR)` alone is not evidence of a livelock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CowFaultResolution {
+    /// Not a COW-resolvable fault; ordinary fault delivery proceeds.
+    NotCow,
+    /// The mm now owns a writable frame for the fault; retry the instruction.
+    Resolved { translation: Option<u64> },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FutexOutcome {
     Woken,
@@ -1347,11 +1364,16 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
         Ok(())
     }
 
-    /// Resolve a synchronous stage-1 write-permission fault. `Ok(true)` means
-    /// the exact mm now owns a writable copied frame and the instruction should
-    /// be retried; `Ok(false)` leaves ordinary fault delivery unchanged.
-    fn resolve_frame_cow_fault(&mut self, _syndrome: u64, _far: u64) -> Result<bool, TrapError> {
-        Ok(false)
+    /// Resolve a synchronous stage-1 write-permission fault.
+    /// [`CowFaultResolution::Resolved`] means the exact mm now owns a writable
+    /// frame for the fault and the instruction should be retried;
+    /// [`CowFaultResolution::NotCow`] leaves ordinary fault delivery unchanged.
+    fn resolve_frame_cow_fault(
+        &mut self,
+        _syndrome: u64,
+        _far: u64,
+    ) -> Result<CowFaultResolution, TrapError> {
+        Ok(CowFaultResolution::NotCow)
     }
 
     /// Arm the exact child-map transaction before any backend/topology lock is

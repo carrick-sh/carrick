@@ -620,8 +620,8 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         _far: u64,
         _ttbr0: u64,
         _flush_stage1: &mut dyn FnMut() -> Result<(), TrapError>,
-    ) -> Result<bool, TrapError> {
-        Ok(false)
+    ) -> Result<carrick_hal::CowFaultResolution, TrapError> {
+        Ok(carrick_hal::CowFaultResolution::NotCow)
     }
 
     /// Refresh per-vCPU host pointers whose guest VA may have moved to a new

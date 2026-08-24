@@ -38,9 +38,9 @@ pub use futex::{
 };
 pub mod threaded;
 pub use threaded::{
-    Aarch64CoreRegisters, FrameCowAuthority, FrameCowIdentity, FrameCowQuiesce, FutexOutcome,
-    GenericVcpuRegistry, GuestEntryRegs, GuestWaitRegisters, HostForkCoordinator, HostVa,
-    HvpatchChildKernelToken, HvpatchChildTokenIssuer, HvpatchChildTokenVerifier,
+    Aarch64CoreRegisters, CowFaultResolution, FrameCowAuthority, FrameCowIdentity, FrameCowQuiesce,
+    FutexOutcome, GenericVcpuRegistry, GuestEntryRegs, GuestWaitRegisters, HostForkCoordinator,
+    HostVa, HvpatchChildKernelToken, HvpatchChildTokenIssuer, HvpatchChildTokenVerifier,
     HvpatchVerifiedChildKernelBinding, InGuestFlag, PlatformFutex, PreparedHostFork,
     ProcessForkRequest, RegAccess, SharedFutexLocation, ThreadId, ThreadedEngine, VcpuKick,
     VcpuKickDyn, VcpuRegistry, X86SignalXstate, X86XstateCapabilities, X86XstateComponent,

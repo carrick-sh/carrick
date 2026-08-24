@@ -1964,7 +1964,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// and wedging every peer waiting in `consume_invalidation_acks` — seen
     /// live on `futexforkrequeue` (core: ffr-livelock-76407). Fail closed
     /// with a named clause instead of spinning.
-    cow_refault_watch: Option<(u64, u64, u32)>,
+    cow_refault_watch: Option<(u64, u64, Option<u64>, u32)>,
     reserved_signal: Option<continuation::ReservedSignal>,
     this_tid: ThreadId,
     threads: Arc<Mutex<Vec<VcpuThreadHandle>>>,
@@ -5095,8 +5095,10 @@ where
                 // descriptor pair immediately before its typed trigger. Do not
                 // duplicate that pair here: the structural consumer joins and
                 // consumes one sequence per attempted fault.
-                if engine.resolve_frame_cow_fault(syndrome, far)? {
-                    self.state.note_cow_resolution(far, syndrome)?;
+                if let carrick_hal::CowFaultResolution::Resolved { translation } =
+                    engine.resolve_frame_cow_fault(syndrome, far)?
+                {
+                    self.state.note_cow_resolution(far, syndrome, translation)?;
                     return Ok(executor::ExecutorExit::Syscall);
                 }
                 return Err(RuntimeError::Trap(TrapError::GuestAtEl1 {
@@ -5113,8 +5115,10 @@ where
                 from_el0_direct,
                 ..
             }) => {
-                if engine.resolve_frame_cow_fault(syndrome, far)? {
-                    self.state.note_cow_resolution(far, syndrome)?;
+                if let carrick_hal::CowFaultResolution::Resolved { translation } =
+                    engine.resolve_frame_cow_fault(syndrome, far)?
+                {
+                    self.state.note_cow_resolution(far, syndrome, translation)?;
                     return Ok(executor::ExecutorExit::Syscall);
                 }
                 // The fault probes are load-bearing instruments, not debug
@@ -5704,26 +5708,42 @@ where
     /// Publish both process-visible and per-thread state at the points that
     /// already maintain the thread registry on mature lanes.
     /// Record one "successfully resolved" COW fault and fail closed if the
-    /// IDENTICAL (FAR, ESR) fault keeps recurring: a correct resolution must
-    /// change the faulting translation, so the second identical fault already
-    /// proves the resolver lied, and the historical behaviour was a silent
-    /// 100% CPU refault loop that also starved `InvalidateAsid` servicing.
+    /// IDENTICAL (FAR, ESR, resolved-translation) triple keeps recurring: a
+    /// correct resolution must change the faulting translation, so a repeat
+    /// that lands on the SAME output proves the resolver made no progress,
+    /// and the historical behaviour was a silent 100% CPU refault loop that
+    /// also starved `InvalidateAsid` servicing. (FAR, ESR) alone is NOT
+    /// evidence: a fork loop legitimately re-COWs the same VA once per
+    /// iteration — fork re-arms the parent's span and the wait loop rewrites
+    /// the same stack slot — with a FRESH frame every time (waitexitstorm,
+    /// futexwakeexact and forkstackstorm all tripped the old pair-keyed
+    /// detector on exactly that shape, at ~4 forks per run).
     /// The threshold of 4 is pure paranoia headroom over "impossible twice".
-    fn note_cow_resolution(&mut self, far: u64, syndrome: u64) -> Result<(), RuntimeError> {
+    fn note_cow_resolution(
+        &mut self,
+        far: u64,
+        syndrome: u64,
+        translation: Option<u64>,
+    ) -> Result<(), RuntimeError> {
         const COW_REFAULT_LIMIT: u32 = 4;
         match &mut self.cow_refault_watch {
-            Some((last_far, last_esr, count)) if *last_far == far && *last_esr == syndrome => {
+            Some((last_far, last_esr, last_translation, count))
+                if *last_far == far
+                    && *last_esr == syndrome
+                    && *last_translation == translation =>
+            {
                 *count += 1;
                 if *count >= COW_REFAULT_LIMIT {
                     return Err(RuntimeError::Configuration(format!(
                         "HVPatch COW resolution did not satisfy the faulting access: \
-                         identical fault recurred {count} times \
-                         (far={far:#x} esr={syndrome:#x} tid={}) — refault livelock",
+                         identical fault recurred {count} times with unchanged resolution \
+                         (far={far:#x} esr={syndrome:#x} translation={translation:?} tid={}) \
+                         — refault livelock",
                         self.this_tid
                     )));
                 }
             }
-            _ => self.cow_refault_watch = Some((far, syndrome, 1)),
+            _ => self.cow_refault_watch = Some((far, syndrome, translation, 1)),
         }
         Ok(())
     }
