@@ -116,6 +116,7 @@ pub struct ContinuationCapture {
     task: TaskKey,
     task_revision: TaskRevision,
     task_wake_generation: u64,
+    task_event_generation: u64,
     mm: MmId,
     asid_generation: u64,
     persistent_signal_mask: SigSet,
@@ -155,6 +156,7 @@ impl ContinuationCapture {
             task: context.task().key(),
             task_revision: context.revision(),
             task_wake_generation: context.task().wake_generation(),
+            task_event_generation: context.task().task_event_generation(),
             mm,
             asid_generation,
             persistent_signal_mask: signal_authority.blocked(),
@@ -196,6 +198,7 @@ impl ContinuationCapture {
             task: context.task().key(),
             task_revision: context.revision(),
             task_wake_generation: context.task().wake_generation(),
+            task_event_generation: context.task().task_event_generation(),
             mm,
             asid_generation,
             persistent_signal_mask: signal_authority.blocked(),
@@ -217,6 +220,7 @@ pub struct ContinuationAuthority {
     task: TaskKey,
     task_revision: TaskRevision,
     task_wake_generation: u64,
+    task_event_generation: u64,
     execution: ExecutionGeneration,
     syscall: SyscallFrame,
     restart: RestartClass,
@@ -234,6 +238,7 @@ impl ContinuationAuthority {
             task: capture.task,
             task_revision: capture.task_revision,
             task_wake_generation: capture.task_wake_generation,
+            task_event_generation: capture.task_event_generation,
             execution: capture.execution,
             syscall: capture.syscall,
             restart: capture.restart,
@@ -362,6 +367,7 @@ struct OwnedFdRegistration {
 
 fn own_wait_fds(fds: &WaitFds) -> Result<Vec<OwnedFdRegistration>, ContinuationBuildError> {
     fds.iter()
+        .filter(|fd| fd.fd() >= 0)
         .map(|fd| {
             let owned = unsafe { libc::fcntl(fd.fd(), libc::F_DUPFD_CLOEXEC, 0) };
             if owned < 0 {
@@ -2051,6 +2057,7 @@ struct SignalReadinessProbe {
     kernel: Weak<Kernel>,
     task_ref: Weak<Task>,
     observed_task_wake: u64,
+    observed_task_event: u64,
     task: TaskKey,
     thread: ThreadKey,
     temporary: Option<WaitSigMask>,
@@ -2073,6 +2080,7 @@ impl SignalReadinessProbe {
             kernel: state.authority.kernel.clone(),
             task_ref: state.authority.task_ref.clone(),
             observed_task_wake: state.authority.task_wake_generation,
+            observed_task_event: state.authority.task_event_generation,
             task: state.authority.task,
             thread: state.authority.thread,
             temporary: state.signal_masks.temporary,
@@ -2409,7 +2417,7 @@ impl CarrierWaitServiceInner {
     }
 
     fn publish_task_wake(&self, token: ContinuationWakeToken) {
-        let probe = {
+        let (probe, task_event_fired) = {
             let state = self.state.lock();
             let Some(entry) = state
                 .entries
@@ -2424,10 +2432,19 @@ impl CarrierWaitServiceInner {
             ) {
                 return;
             }
-            entry.signal_readiness.clone()
+            let task_event_fired = entry
+                .signal_readiness
+                .task_ref
+                .upgrade()
+                .is_some_and(|task| {
+                    task.task_event_generation() != entry.signal_readiness.observed_task_event
+                });
+            (entry.signal_readiness.clone(), task_event_fired)
         };
         if let Some(event) = probe.event() {
             self.publish_event(token, event);
+        } else if task_event_fired {
+            self.publish_event(token, ContinuationEvent::Ready);
         }
     }
 
@@ -5792,6 +5809,47 @@ mod tests {
             );
             assert!(result.is_ok(), "fd-less wait should accept empty authority");
         }
+    }
+
+    #[test]
+    fn hvpatch_synthetic_negative_fd_wait_accepts_slot_authority_and_task_event_wakes() {
+        let (kernel, context) = bootstrap(15_229);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let service = CarrierWaitService::new(scheduler);
+        let authority = install_test_fd_authority(&context, 3);
+        let generation = publish(&context, 0x556);
+        let fds = WaitFds::raw_one(-1, 0).with_slot_authorities(vec![authority]);
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnPollFds {
+                fds,
+                timeout: None,
+                on_timeout: 0,
+                sig_mask: WaitSigMask::NONE,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("synthetic fd continuation");
+        let mut registration = service.prepare_registration(&continuation);
+        service
+            .enroll(&mut registration)
+            .expect("enroll synthetic fd wait");
+        assert_eq!(
+            service
+                .inner
+                .state
+                .lock()
+                .entries
+                .get(&registration.wake_token().continuation())
+                .expect("entry")
+                .state,
+            RegistrationState::Enrolled
+        );
+
+        let target = context.task().key();
+        kernel.publish_task_event_and_wake(target, || true);
+
+        let event = await_event(&service, registration.wake_token()).expect("task event wake");
+        assert!(matches!(event, ContinuationEvent::Ready));
     }
 
     #[test]
