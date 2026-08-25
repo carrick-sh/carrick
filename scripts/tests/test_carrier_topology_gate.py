@@ -94,6 +94,45 @@ class CarrierTopologyGateTests(unittest.TestCase):
             MODULE.reject_stopped_or_zombie(rows, {10, 11, 12})
         MODULE.reject_stopped_or_zombie({10: "S", 11: "R+"}, {10, 11})
 
+    def test_live_state_census_graces_terminal_publication_race_but_is_bounded(self):
+        pending = MODULE.advance_live_state_census(
+            {10: "S", 11: "Z"}, {10, 11}, {}, 5.0, zombie_grace=1.0
+        )
+        self.assertEqual(pending, {11: 5.0})
+        pending = MODULE.advance_live_state_census(
+            {10: "S", 11: "Z"}, {10, 11}, pending, 5.999, zombie_grace=1.0
+        )
+        self.assertEqual(pending, {11: 5.0})
+        with self.assertRaisesRegex(MODULE.TopologyError, "retained Z state"):
+            MODULE.advance_live_state_census(
+                {10: "S", 11: "Z"}, {10, 11}, pending, 6.0, zombie_grace=1.0
+            )
+
+        # Once proc:::exit is visible, the PID leaves the DTrace-live set and
+        # its pending publication-race row is pruned.
+        self.assertEqual(
+            MODULE.advance_live_state_census(
+                {10: "S", 11: "Z"}, {10}, pending, 5.5, zombie_grace=1.0
+            ),
+            {},
+        )
+        with self.assertRaisesRegex(MODULE.TopologyError, "forbidden T state"):
+            MODULE.advance_live_state_census(
+                {10: "T"}, {10}, {}, 5.0, zombie_grace=1.0
+            )
+
+    def test_terminal_census_allows_only_dtrace_proven_exited_zombies(self):
+        self.assertEqual(
+            MODULE.classify_terminal_states(
+                {10: "Z", 11: "R"}, {10, 11}, {10}
+            ),
+            {10},
+        )
+        with self.assertRaisesRegex(MODULE.TopologyError, "unproven-zombie"):
+            MODULE.classify_terminal_states({10: "Z"}, {10}, set())
+        with self.assertRaisesRegex(MODULE.TopologyError, "stopped"):
+            MODULE.classify_terminal_states({10: "T"}, {10}, {10})
+
     def test_partial_lineage_cleanup_targets_unexited_owned_pids(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "partial.raw"

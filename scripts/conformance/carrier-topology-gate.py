@@ -30,6 +30,7 @@ DEFAULT_BINARY = ROOT / "target/release/carrick"
 DEFAULT_IMAGE = "ubuntu:24.04"
 LINEAGE_SCRIPT = ROOT / "scripts/dtrace/carrier-topology-lineage.d"
 API_CARRIER_COUNT = 2
+ZOMBIE_GRACE_SECONDS = 1.0
 ARM_BIRTHS = {
     "foreground-private": 0,
     "tty": 0,
@@ -197,6 +198,82 @@ def reject_stopped_or_zombie(states: dict[int, str], tracked: set[int]) -> None:
         raise TopologyError(f"tracked topology entered forbidden T/Z state: {bad}")
 
 
+def advance_live_state_census(
+    states: dict[int, str],
+    tracked: set[int],
+    pending_zombies: dict[int, float],
+    now: float,
+    zombie_grace: float = ZOMBIE_GRACE_SECONDS,
+) -> dict[int, float]:
+    """Reject stopped or persistently-zombie PIDs still live in the DTrace ledger.
+
+    ``proc:::exit`` fires before the exiting process is reaped. Consequently a
+    normal child can appear as ``Z`` to one ``ps`` sample before the EXIT record
+    becomes visible in the trace stream. Keep that publication/reap window
+    bounded per PID, and let the next DTrace-live census prune the row as soon as
+    EXIT is visible. A stopped process has no corresponding terminal race and
+    remains an immediate failure.
+    """
+
+    stopped = {
+        pid: states[pid]
+        for pid in tracked & states.keys()
+        if states[pid][:1] == "T"
+    }
+    if stopped:
+        raise TopologyError(f"tracked topology entered forbidden T state: {stopped}")
+
+    zombies = {
+        pid: states[pid]
+        for pid in tracked & states.keys()
+        if states[pid][:1] == "Z"
+    }
+    next_pending = {
+        pid: first_seen
+        for pid, first_seen in pending_zombies.items()
+        if pid in zombies
+    }
+    for pid in zombies:
+        next_pending.setdefault(pid, now)
+    overdue = {
+        pid: zombies[pid]
+        for pid, first_seen in next_pending.items()
+        if now - first_seen >= zombie_grace
+    }
+    if overdue:
+        raise TopologyError(
+            f"tracked topology retained Z state past {zombie_grace:.3f}s grace: {overdue}"
+        )
+    return next_pending
+
+
+def classify_terminal_states(
+    states: dict[int, str], tracked: set[int], proven_exited: set[int]
+) -> set[int]:
+    """Return DTrace-proven terminal zombies; reject all other T/Z states."""
+
+    stopped = {
+        pid: states[pid]
+        for pid in tracked & states.keys()
+        if states[pid][:1] == "T"
+    }
+    unproven_zombies = {
+        pid: states[pid]
+        for pid in tracked & states.keys()
+        if states[pid][:1] == "Z" and pid not in proven_exited
+    }
+    if stopped or unproven_zombies:
+        raise TopologyError(
+            "terminal topology contains stopped or unproven-zombie PID(s): "
+            f"T={stopped} Z={unproven_zombies}"
+        )
+    return {
+        pid
+        for pid in tracked & states.keys()
+        if states[pid][:1] == "Z" and pid in proven_exited
+    }
+
+
 def validate_source_binding(
     head: str, tree: str, dirty: bool, marker: dict[str, Any]
 ) -> None:
@@ -347,6 +424,8 @@ class StateMonitor:
         self.samples = 0
         self.max_live = 0
         self.live_sizes: set[int] = set()
+        self.pending_zombies: dict[int, float] = {}
+        self.zombie_samples = 0
         self.thread = threading.Thread(target=self._run, name="topology-state-monitor")
 
     def start(self) -> None:
@@ -362,6 +441,7 @@ class StateMonitor:
                 live = _partial_live_pids(self.trace_path)
                 self.max_live = max(self.max_live, len(live))
                 if not live:
+                    self.pending_zombies.clear()
                     continue
                 result = subprocess.run(
                     ["ps", "-p", ",".join(str(pid) for pid in sorted(live)), "-o", "pid=", "-o", "state="],
@@ -369,7 +449,14 @@ class StateMonitor:
                     capture_output=True,
                 )
                 states = parse_ps_states(result.stdout)
-                reject_stopped_or_zombie(states, live)
+                self.pending_zombies = advance_live_state_census(
+                    states,
+                    live,
+                    self.pending_zombies,
+                    time.monotonic(),
+                )
+                if self.pending_zombies:
+                    self.zombie_samples += 1
                 self.samples += 1
                 self.live_sizes.add(len(live))
             except Exception as error:  # preserved and failed by the arm owner
@@ -666,12 +753,23 @@ class Campaign:
                     f"state census never sampled required live topology {required_live}: "
                     f"samples={monitor.samples} live_sizes={sorted(monitor.live_sizes)}"
                 )
-            final_states = subprocess.run(
-                ["ps", "-p", ",".join(str(pid) for pid in sorted(ledger.all_pids)), "-o", "pid=", "-o", "state="],
-                text=True,
-                capture_output=True,
-            ).stdout
-            reject_stopped_or_zombie(parse_ps_states(final_states), ledger.all_pids)
+            terminal_zombie_samples = 0
+            terminal_deadline = time.monotonic() + ZOMBIE_GRACE_SECONDS
+            while True:
+                final_states = _pid_states(ledger.all_pids)
+                terminal_zombies = classify_terminal_states(
+                    final_states, ledger.all_pids, ledger.exited
+                )
+                if not terminal_zombies:
+                    break
+                terminal_zombie_samples += 1
+                if time.monotonic() >= terminal_deadline:
+                    raise TopologyError(
+                        "DTrace-proven exited PID(s) remained zombies past "
+                        f"{ZOMBIE_GRACE_SECONDS:.3f}s reap grace: "
+                        f"{sorted(terminal_zombies)}"
+                    )
+                time.sleep(0.02)
             self.record(
                 record="lineage",
                 arm=label,
@@ -681,6 +779,8 @@ class Campaign:
                 exec_names=ledger.exec_names,
                 exited=sorted(ledger.exited),
                 state_samples=monitor.samples,
+                live_zombie_samples=monitor.zombie_samples,
+                terminal_zombie_samples=terminal_zombie_samples,
                 max_live=monitor.max_live,
                 observed_live_sizes=sorted(monitor.live_sizes),
                 trace_path=str(trace_path),
