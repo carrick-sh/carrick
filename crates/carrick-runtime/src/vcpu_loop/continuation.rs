@@ -2940,6 +2940,12 @@ impl CarrierWaitService {
         registration.enrolled = true;
         drop(state);
         self.install_producer_subscriptions(registration.token)?;
+        // A producer edge may already be reflected in authoritative state by
+        // the time the continuation captures its observed generations. In
+        // that case subscription is correctly installed at the new generation
+        // but has no later edge to report. Sample once after every subscription
+        // is live so pre-capture signals/readiness cannot strand the task.
+        let _ = self.recheck_registration(registration)?;
         self.inner.nudge_reactor();
         Ok(())
     }
@@ -3061,9 +3067,11 @@ impl CarrierWaitService {
         Ok(())
     }
 
-    /// Durable post-enrollment sample. The product path calls this before the
-    /// destructive backend save; the shared reactor repeats the same probe
-    /// afterward, closing both sides of the registration window.
+    /// Durable post-enrollment sample. [`Self::enroll`] calls this after every
+    /// producer subscription is installed; explicit callers may repeat it
+    /// before a destructive backend save. The shared reactor repeats the same
+    /// readiness probes afterward, closing both sides of the registration
+    /// window.
     pub fn recheck_registration(
         &self,
         registration: &ContinuationRegistration,
@@ -3998,6 +4006,58 @@ mod tests {
     ) -> Result<ContinuationEvent, WaitServiceError> {
         let service = service.clone();
         block_on(async move { service.event(token).await })
+    }
+
+    #[test]
+    fn enrollment_samples_signal_pending_before_continuation_capture() {
+        let (kernel, context) = bootstrap(15_470);
+        let generation = publish(&context, 0x915);
+        let signal = crate::kernel::LinuxSignal::for_signal_number(crate::linux_abi::LINUX_SIGKILL)
+            .expect("SIGKILL");
+
+        // Reproduce the procladder last-child race: the parent posts SIGKILL
+        // before this child reaches pause(2), so continuation capture observes
+        // the already-advanced task-wake generation. Subscription alone cannot
+        // report that older edge; enrollment must sample authoritative pending
+        // signal state after installing every producer subscription.
+        context
+            .signal_authority()
+            .enqueue_task_standard(signal, None);
+        context.task().wake();
+
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::empty(),
+                timeout: None,
+                on_timeout: 0,
+                sig_mask: WaitSigMask::NONE,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("pause-shaped continuation");
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        let service = CarrierWaitService::new(scheduler);
+        let mut registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
+        service
+            .enroll(&mut registration)
+            .expect("enroll continuation with preexisting SIGKILL");
+
+        let state = service.inner.state.lock();
+        let entry = state
+            .entries
+            .get(&token.continuation)
+            .expect("live continuation registration");
+        assert_eq!(entry.state, RegistrationState::Ready);
+        assert_eq!(
+            entry
+                .event
+                .as_ref()
+                .and_then(ContinuationEvent::reserved_signal)
+                .map(ReservedSignal::signum),
+            Some(crate::linux_abi::LINUX_SIGKILL),
+            "preexisting fatal signal must prevent the child from parking"
+        );
     }
 
     #[test]
