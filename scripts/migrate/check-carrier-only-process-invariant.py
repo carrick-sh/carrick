@@ -113,7 +113,6 @@ REVIEWED_OPERATOR_LIMITS = {
     (PurePosixPath("crates/carrick-cli/src/debug.rs"), "collect_scoped_processes", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/debug.rs"), "terminate_scoped_run", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/debug.rs"), "dump_lldb", "kill"): 1,
-    (PurePosixPath("crates/carrick-cli/src/debug.rs"), "stop_scoped_processes", "kill"): 1,
     (PurePosixPath("crates/carrick-cli/src/debug.rs"), "terminate_scoped_run", "kill"): 3,
     (
         PurePosixPath("crates/carrick-cli/src/native_profile_qualification.rs"),
