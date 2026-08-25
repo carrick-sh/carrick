@@ -288,6 +288,24 @@ mod task_only_carrier_directory_tests {
         }
     }
 
+    #[test]
+    fn prepared_abort_rolls_back_inventory_before_dropping_carrier_leases() {
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let state = HvpatchCarrierTaskState::Test {
+            rollbacks,
+            order: Some(Arc::clone(&order)),
+        };
+        let task = HvpatchPreparedTaskAuthority {
+            abort_order: Some(Arc::clone(&order)),
+            ..HvpatchPreparedTaskAuthority::default()
+        };
+
+        abort_prepared_task_and_carrier(task, state).unwrap();
+
+        assert_eq!(&*order.lock(), &["inventory", "carrier"]);
+    }
+
     fn owner_key(
         directory: &HvpatchCarrierTaskStateDirectory,
         generation: u64,
@@ -1988,20 +2006,25 @@ fn carrier_stage2_leases()
     CELL.get_or_init(|| parking_lot::Mutex::new(std::collections::BTreeMap::new()))
 }
 
-/// Publish a carrier-owned lease and return its key. Fails closed on a
-/// duplicate: two owners for one extent is the double-release shape itself.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn register_carrier_stage2_lease(lease: GlobalFrameStage2Lease) -> Result<(u64, u64), TrapError> {
-    let key = lease.key();
-    let mut leases = carrier_stage2_leases().lock();
-    if leases.contains_key(&key) {
-        return Err(TrapError::Hypervisor(format!(
-            "carrier stage-2 lease collision at IPA 0x{:x} size {}",
-            key.0, key.1
-        )));
+fn register_carrier_stage2_leases(
+    leases: &mut Vec<GlobalFrameStage2Lease>,
+) -> Result<Vec<(u64, u64)>, TrapError> {
+    let keys: Vec<_> = leases.iter().map(GlobalFrameStage2Lease::key).collect();
+    let mut distinct = std::collections::BTreeSet::new();
+    let mut registered = carrier_stage2_leases().lock();
+    for &key in &keys {
+        if !distinct.insert(key) || registered.contains_key(&key) {
+            return Err(TrapError::Hypervisor(format!(
+                "carrier stage-2 lease collision at IPA 0x{:x} size {}",
+                key.0, key.1
+            )));
+        }
     }
-    leases.insert(key, lease);
-    Ok(key)
+    for (key, lease) in keys.iter().copied().zip(leases.drain(..)) {
+        registered.insert(key, lease);
+    }
+    Ok(keys)
 }
 
 /// Take the carrier-owned lease for an exact extent, if one is published.
@@ -4059,6 +4082,7 @@ struct InventoryLeaseRetirement {
     mappings: Vec<((u64, u64), InventoryExtent)>,
     frames: std::collections::BTreeSet<carrick_hal::FrameId>,
     stage2_leases: std::collections::BTreeSet<(u64, u64)>,
+    stage2_population_complete: std::collections::BTreeMap<(u64, u64), bool>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4102,6 +4126,34 @@ struct InventoryFrameRegistry {
     references: std::collections::BTreeMap<carrick_hal::FrameId, usize>,
     extent_references: std::collections::BTreeMap<(carrick_hal::FrameId, u64, u64), usize>,
     stage2_references: std::collections::BTreeMap<(u64, u64), usize>,
+    /// One-shot handoffs for physical leases whose backend population reached
+    /// zero while the Kernel still reported mappings outside that population.
+    /// The carrier destructor consumes a token and leaves the lease parked; a
+    /// later exact retirement may then take that parked lease normally.
+    authority_retained_stage2: std::collections::BTreeSet<(u64, u64)>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// Reconcile the conservative carrier handoff after the caller has applied its
+/// complete stage-2 reference-count mutation while holding `frames`.
+///
+/// Numeric references protect a live lease directly. A zero count needs the
+/// one-shot token only when Kernel authority reports mappings outside that
+/// backend population, and only for a lease actually owned by the carrier
+/// registry; global host-owner leases retain their independent generation-bound
+/// retirement path.
+fn reconcile_carrier_stage2_authority_retention(
+    frames: &mut InventoryFrameRegistry,
+    lease: (u64, u64),
+    authority_population_complete: bool,
+) {
+    if authority_population_complete {
+        frames.authority_retained_stage2.remove(&lease);
+    } else if !frames.stage2_references.contains_key(&lease)
+        && carrier_stage2_leases().lock().contains_key(&lease)
+    {
+        frames.authority_retained_stage2.insert(lease);
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4877,6 +4929,7 @@ impl HvfTaskState {
             && frames.references.is_empty()
             && frames.extent_references.is_empty()
             && frames.stage2_references.is_empty()
+            && frames.authority_retained_stage2.is_empty()
             && inventory.alias_reservation.is_none()
             && inventory.alias_commit.is_none()
             && inventory.alias_staged.is_empty()
@@ -6379,12 +6432,38 @@ enum HvpatchCarrierMmAuthority {
         // `hv_vm_unmap` while the carrier VM below is alive. Retirement may
         // have taken some already; this is the backstop for the rest.
         stage2_lease_keys: Vec<(u64, u64)>,
+        frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
         _vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     },
     #[cfg(test)]
     Test {
         order: std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>,
     },
+    #[cfg(test)]
+    LeaseTest {
+        stage2_lease_keys: Vec<(u64, u64)>,
+        frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+    },
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retire_carrier_stage2_lease_keys(
+    stage2_lease_keys: &mut Vec<(u64, u64)>,
+    frames: &std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+) {
+    let mut frames = frames.lock();
+    for key in std::mem::take(stage2_lease_keys) {
+        let authority_retained = frames.authority_retained_stage2.remove(&key);
+        if frames.stage2_references.contains_key(&key) || authority_retained {
+            // Another MM still names this physical lease, or the Kernel reported
+            // a mapping outside the backend population. Consume the one-shot
+            // handoff and leave the process-global carrier registry as owner;
+            // a later exact retirement takes it through
+            // `retire_stage2_extent_from_mappings`.
+            continue;
+        }
+        drop(take_carrier_stage2_lease(key.0, key.1));
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6392,15 +6471,22 @@ impl Drop for HvpatchCarrierMmAuthority {
     fn drop(&mut self) {
         match self {
             Self::Live {
-                stage2_lease_keys, ..
+                stage2_lease_keys,
+                frames,
+                ..
             } => {
-                for key in std::mem::take(stage2_lease_keys) {
-                    drop(take_carrier_stage2_lease(key.0, key.1));
-                }
+                retire_carrier_stage2_lease_keys(stage2_lease_keys, frames);
             }
             #[cfg(test)]
             Self::Test { order } => {
                 order.lock().push("carrier");
+            }
+            #[cfg(test)]
+            Self::LeaseTest {
+                stage2_lease_keys,
+                frames,
+            } => {
+                retire_carrier_stage2_lease_keys(stage2_lease_keys, frames);
             }
         }
     }
@@ -6411,6 +6497,26 @@ struct HvpatchCarrierTaskRow {
     _mm: Option<std::sync::Arc<HvpatchCarrierMmAuthority>>,
     #[cfg(test)]
     rollbacks: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn rollback_failed_directory_publication(
+    task_mm: &std::sync::Arc<HvpatchTaskMmAuthority>,
+    row: HvpatchCarrierTaskRow,
+    carrier_mm: Option<std::sync::Arc<HvpatchCarrierMmAuthority>>,
+) -> Result<
+    (
+        HvpatchCarrierTaskRow,
+        Option<std::sync::Arc<HvpatchCarrierMmAuthority>>,
+    ),
+    TrapError,
+> {
+    #[cfg(test)]
+    if let Some(rollbacks) = &row.rollbacks {
+        rollbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    task_mm.rollback_unpublished_before_carrier_drop()?;
+    Ok((row, carrier_mm))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6492,6 +6598,8 @@ struct HvpatchPreparedTaskAuthority {
     pending_aliases: Vec<AliasBacking>,
     #[cfg(test)]
     drop_order: Option<std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>>,
+    #[cfg(test)]
+    abort_order: Option<std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6546,6 +6654,13 @@ impl HvpatchTaskInventoryAuthority {
             | Self::Active { ledger, .. } => Some(std::sync::Arc::clone(ledger)),
             Self::Absent | Self::Retired => None,
         }
+    }
+
+    fn shared_frame_registry(
+        &self,
+    ) -> Option<std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>> {
+        self.shared_runtime_ledger()
+            .map(|ledger| std::sync::Arc::clone(&ledger.lock().frames))
     }
 
     fn apply_process_inventory(
@@ -7045,6 +7160,10 @@ impl HvpatchTaskMmAuthority {
         self.inventory.lock().retire_exec_predecessor();
     }
 
+    fn rollback_unpublished_before_carrier_drop(&self) -> Result<(), TrapError> {
+        self.inventory.lock().rollback_unpublished()
+    }
+
     fn bind_kernel_mm(&self, mm: std::num::NonZeroU64) -> Result<(), TrapError> {
         let mut bound = self.kernel_mm.lock();
         match *bound {
@@ -7085,8 +7204,9 @@ impl Drop for HvpatchTaskMmAuthority {
             order.lock().push("task");
         }
         // `mappings` (and their host owners) drop only after the inventory is
-        // retired.  The registration removes the carrier MM first, so its
-        // stage-2 leases have already unmapped before this destructor runs.
+        // retired. The registration removes the carrier MM first: zero-reference
+        // stage-2 leases unmap there, while referenced leases stay parked in the
+        // process-global carrier registry for the later exact retirement.
     }
 }
 
@@ -7113,26 +7233,40 @@ impl HvpatchPreparedTaskAuthority {
         }
     }
 
-    fn abort(self) -> Result<(), TrapError> {
-        let mut this = self;
+    fn rollback_unpublished_inventory(&mut self) -> Result<(), TrapError> {
         // Pending aliases have never touched either global registry.  The
         // publication receipt owns exact preimages only after commit.
-        this.inventory.rollback_unpublished()?;
+        self.inventory.rollback_unpublished()?;
+        #[cfg(test)]
+        if let Some(order) = &self.abort_order {
+            order.lock().push("inventory");
+        }
         Ok(())
+    }
+
+    fn abort(mut self) -> Result<(), TrapError> {
+        self.rollback_unpublished_inventory()
     }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn abort_prepared_task_and_carrier(
-    task: HvpatchPreparedTaskAuthority,
+    mut task: HvpatchPreparedTaskAuthority,
     state: HvpatchCarrierTaskState,
 ) -> Result<(), TrapError> {
-    // Carrier teardown owns stage-2 and must complete before task teardown can
-    // release an owned host mapping backing that stage-2 entry.
+    // The backend ledger must forget every unpublished mapping BEFORE the
+    // carrier leases can return their IPAs to the allocator. Keep `task` alive
+    // until after carrier teardown so its host mappings still back any installed
+    // stage-2 entries while the leases unmap them.
+    task.rollback_unpublished_inventory()
+        .unwrap_or_else(|error| {
+            eprintln!("carrick: FATAL: rollback prepared HVPatch inventory before carrier teardown: {error}");
+            std::process::abort();
+        });
     let state_result = state.abort();
-    let task_result = task.abort();
+    drop(task);
     state_result?;
-    task_result
+    Ok(())
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -7672,6 +7806,15 @@ impl HvpatchCarrierTaskStateDirectory {
                 "cross-directory HVPatch carrier token rejected".to_owned(),
             ));
         }
+        let frames = task_mm
+            .inventory
+            .lock()
+            .shared_frame_registry()
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "exec replacement has no shared HVPatch frame registry".to_owned(),
+                )
+            })?;
         let mut inner = self.inner.lock();
         if inner
             .task_mms
@@ -7688,6 +7831,7 @@ impl HvpatchCarrierTaskStateDirectory {
             Some(HvpatchCarrierMmAuthority::Live { _vm, .. }) => {
                 Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
                     stage2_lease_keys,
+                    frames,
                     _vm: _vm.clone(),
                 }))
             }
@@ -7696,6 +7840,12 @@ impl HvpatchCarrierTaskStateDirectory {
                 Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Test {
                     order: std::sync::Arc::clone(order),
                 }))
+            }
+            #[cfg(test)]
+            Some(HvpatchCarrierMmAuthority::LeaseTest { .. }) => {
+                return Err(TrapError::Hypervisor(
+                    "test carrier lease authority cannot be exec-rebound".to_owned(),
+                ));
             }
             None => None,
         };
@@ -8140,6 +8290,19 @@ impl HvpatchCarrierTaskStateDirectory {
             abort_prepared_task_and_carrier(task, state)?;
             return Err(error);
         }
+        let carrier_frames = match &state {
+            #[cfg(test)]
+            HvpatchCarrierTaskState::Test { .. } => None,
+            _ => match task.inventory.shared_frame_registry() {
+                Some(frames) => Some(frames),
+                None => {
+                    abort_prepared_task_and_carrier(task, state)?;
+                    return Err(TrapError::Hypervisor(
+                        "prepared HVPatch task has no shared frame registry".to_owned(),
+                    ));
+                }
+            },
+        };
         let nonce = match self.next.fetch_update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
@@ -8246,6 +8409,11 @@ impl HvpatchCarrierTaskStateDirectory {
                     Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
                         _vm: vm,
                         stage2_lease_keys: Vec::new(),
+                        frames: std::sync::Arc::clone(
+                            carrier_frames
+                                .as_ref()
+                                .unwrap_or_else(|| std::process::abort()),
+                        ),
                     }))
                 }),
                 None,
@@ -8255,34 +8423,38 @@ impl HvpatchCarrierTaskStateDirectory {
                     Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
                         _vm: vm,
                         stage2_lease_keys: Vec::new(),
+                        frames: std::sync::Arc::clone(
+                            carrier_frames
+                                .as_ref()
+                                .unwrap_or_else(|| std::process::abort()),
+                        ),
                     }))
                 }),
                 None,
             ),
-            HvpatchCarrierTaskState::Process { vm, stage2_leases } => {
-                let mut stage2_lease_keys = Vec::with_capacity(stage2_leases.len());
-                for lease in stage2_leases {
-                    match register_carrier_stage2_lease(lease) {
-                        Ok(key) => stage2_lease_keys.push(key),
-                        Err(error) => {
-                            for key in stage2_lease_keys {
-                                drop(take_carrier_stage2_lease(key.0, key.1));
-                            }
-                            abort_prepared_task_and_carrier(
-                                task,
-                                HvpatchCarrierTaskState::Process {
-                                    vm,
-                                    stage2_leases: Vec::new(),
-                                },
-                            )?;
-                            return Err(error);
-                        }
+            HvpatchCarrierTaskState::Process {
+                vm,
+                mut stage2_leases,
+            } => {
+                let stage2_lease_keys = match register_carrier_stage2_leases(&mut stage2_leases) {
+                    Ok(keys) => keys,
+                    Err(error) => {
+                        abort_prepared_task_and_carrier(
+                            task,
+                            HvpatchCarrierTaskState::Process { vm, stage2_leases },
+                        )?;
+                        return Err(error);
                     }
-                }
+                };
                 (
                     Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
                         _vm: vm,
                         stage2_lease_keys,
+                        frames: std::sync::Arc::clone(
+                            carrier_frames
+                                .as_ref()
+                                .unwrap_or_else(|| std::process::abort()),
+                        ),
                     })),
                     None,
                 )
@@ -8326,13 +8498,16 @@ impl HvpatchCarrierTaskStateDirectory {
                 .states
                 .remove(&key)
                 .unwrap_or_else(|| std::process::abort());
-            #[cfg(test)]
-            if let Some(rollbacks) = &row.rollbacks {
-                rollbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
+            drop(inner);
+            let (row, carrier_mm) = rollback_failed_directory_publication(
+                &task_mm, row, carrier_mm,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("carrick: FATAL: rollback failed HVPatch directory publication: {error}");
+                std::process::abort();
+            });
             drop(row);
             drop(carrier_mm);
-            drop(inner);
             task_mm.record_holder(HvpatchTaskMmHolder::FailpointRollback);
             drop(task_mm);
             return Err(TrapError::Hypervisor(
@@ -8386,8 +8561,11 @@ impl HvpatchCarrierTaskState {
         match self {
             Self::Sibling { .. } | Self::SharedProcess { .. } | Self::Process { .. } => Ok(()),
             #[cfg(test)]
-            Self::Test { rollbacks, .. } => {
+            Self::Test { rollbacks, order } => {
                 rollbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(order) = order {
+                    order.lock().push("carrier");
+                }
                 Ok(())
             }
         }
@@ -8492,6 +8670,7 @@ struct ExecAuthorityFingerprint {
     frame_references: Vec<(carrick_hal::FrameId, usize)>,
     extent_references: Vec<((carrick_hal::FrameId, u64, u64), usize)>,
     stage2_references: Vec<((u64, u64), usize)>,
+    authority_retained_stage2: Vec<(u64, u64)>,
     mappings: Vec<ExecMappingFingerprint>,
     allocator: ExecAllocatorFingerprint,
     replay_mappings: Vec<ReplayMappingKey>,
@@ -9036,6 +9215,7 @@ impl HvfVmState {
             .iter()
             .map(|(&key, &value)| (key, value))
             .collect();
+        let authority_retained_stage2 = frames.authority_retained_stage2.iter().copied().collect();
         drop(frames);
         drop(inventory);
         let owners = global_frame_host_owners()
@@ -9092,6 +9272,7 @@ impl HvfVmState {
             frame_references,
             extent_references,
             stage2_references,
+            authority_retained_stage2,
             mappings,
             allocator,
             replay_mappings,
@@ -9337,6 +9518,7 @@ impl HvfVmState {
             }
         }
         let mut stage2_leases = std::collections::BTreeSet::new();
+        let mut stage2_population_complete = std::collections::BTreeMap::new();
         for (&lease, &removed) in &removed_leases {
             let live = registry
                 .stage2_references
@@ -9356,6 +9538,7 @@ impl HvfVmState {
                 .iter()
                 .filter(|(_, extent)| (extent.stage2_base, extent.stage2_length) == lease)
                 .all(|(_, extent)| complete_frames.contains(&extent.frame));
+            stage2_population_complete.insert(lease, all_frame_populations_complete);
             if removed == live && all_frame_populations_complete {
                 stage2_leases.insert(lease);
             }
@@ -9364,6 +9547,7 @@ impl HvfVmState {
             mappings,
             frames,
             stage2_leases,
+            stage2_population_complete,
         })
     }
 
@@ -9441,6 +9625,9 @@ impl HvfVmState {
                     "HVPatch retired stage-2 lease {lease:?} retains backend references"
                 )));
             }
+        }
+        for (&lease, &population_complete) in &retirement.stage2_population_complete {
+            reconcile_carrier_stage2_authority_retention(&mut registry, lease, population_complete);
         }
         Ok(())
     }
@@ -9582,6 +9769,11 @@ impl HvfVmState {
                 "HVPatch COW retired old frame retains backend mappings".to_owned(),
             ));
         }
+        reconcile_carrier_stage2_authority_retention(
+            &mut frames,
+            (split.old.stage2_base, split.old.stage2_length),
+            split.retirement.backend_frame_references_complete,
+        );
         let retire_old_stage2 = split.retirement.backend_frame_references_complete
             && !frames
                 .stage2_references
@@ -9842,6 +10034,7 @@ impl HvfVmState {
             }
         }
         let mut retired_stage2 = std::collections::BTreeSet::new();
+        let mut stage2_population_complete = std::collections::BTreeMap::new();
         for (&lease, &local) in &local_stage2_references {
             let global = frames
                 .stage2_references
@@ -9862,6 +10055,7 @@ impl HvfVmState {
                 .values()
                 .filter(|extent| (extent.stage2_base, extent.stage2_length) == lease)
                 .all(|extent| complete_frames.contains(&extent.frame));
+            stage2_population_complete.insert(lease, all_frame_populations_complete);
             if global == local && all_frame_populations_complete {
                 retired_stage2.insert(lease);
             }
@@ -9905,6 +10099,9 @@ impl HvfVmState {
             } else {
                 frames.stage2_references.insert(lease, remaining);
             }
+        }
+        for (&lease, &population_complete) in &stage2_population_complete {
+            reconcile_carrier_stage2_authority_retention(&mut frames, lease, population_complete);
         }
         drop(frames);
         // Record what this mm owned BEFORE dropping it, so the authority can
@@ -17221,21 +17418,16 @@ impl HvfVmState {
                         stage2_leases.push(stage2_lease);
                     }
                 }
-                let mut stage2_lease_keys = Vec::with_capacity(stage2_leases.len());
-                for lease in stage2_leases {
-                    match register_carrier_stage2_lease(lease) {
-                        Ok(key) => stage2_lease_keys.push(key),
-                        Err(error) => {
-                            for key in stage2_lease_keys {
-                                drop(take_carrier_stage2_lease(key.0, key.1));
-                            }
-                            eprintln!(
-                                "carrick: FATAL: register carrier stage2 lease for exec: {error}"
-                            );
-                            std::process::abort();
-                        }
-                    }
-                }
+                let stage2_lease_keys = register_carrier_stage2_leases(&mut stage2_leases)
+                    .unwrap_or_else(|error| {
+                        // Replacement inventory already names every candidate.
+                        // Fail-stop before unwinding can drop their leases or host
+                        // backings out from under that published authority.
+                        eprintln!(
+                            "carrick: FATAL: register carrier stage2 lease for exec: {error}"
+                        );
+                        std::process::abort();
+                    });
                 let mapped_task_mappings: Vec<HvpatchTaskMappingState> = self
                     .mappings
                     .iter()
@@ -19023,6 +19215,15 @@ mod vm_create_admission_tests {
 mod frame_inventory_backend_tests {
     use super::*;
 
+    fn register_carrier_lease(lease: GlobalFrameStage2Lease) -> (u64, u64) {
+        let key = lease.key();
+        assert_eq!(
+            register_carrier_stage2_leases(&mut vec![lease]).unwrap(),
+            vec![key]
+        );
+        key
+    }
+
     enum TestFrameMappingCount {
         Exact(usize),
         Error,
@@ -19852,6 +20053,7 @@ mod frame_inventory_backend_tests {
             frame_references: vec![(frame, 1)],
             extent_references: vec![((frame, 0x9000, 0x1000), 1)],
             stage2_references: vec![((0x9000, 0x1000), 1)],
+            authority_retained_stage2: Vec::new(),
             mappings: vec![ExecMappingFingerprint {
                 start: 0x4000,
                 ipa: 0x9000,
@@ -19896,6 +20098,9 @@ mod frame_inventory_backend_tests {
         assert_drift(before.clone(), |after| after.frame_references[0].1 += 1);
         assert_drift(before.clone(), |after| after.extent_references[0].1 += 1);
         assert_drift(before.clone(), |after| after.stage2_references[0].1 += 1);
+        assert_drift(before.clone(), |after| {
+            after.authority_retained_stage2.push((0xa000, 0x1000))
+        });
         assert_drift(before.clone(), |after| {
             after.mappings[0].guest_writable = false
         });
@@ -20420,6 +20625,54 @@ mod frame_inventory_backend_tests {
     }
 
     #[test]
+    fn carrier_drop_preserves_a_zero_backend_ref_lease_retained_by_kernel_authority() {
+        let (mut task, _, _) = process_retirement_task(TestFrameMappingCount::Exact(2));
+        let key = (
+            task.mappings[0].physical_ipa,
+            task.mappings[0].physical_size as u64,
+        );
+        let mut mapping_lease = task.mappings[0]
+            .stage2_lease
+            .take()
+            .expect("fixture mapping lease");
+        mapping_lease.active = false;
+        drop(mapping_lease);
+        register_carrier_lease(GlobalFrameStage2Lease::fixed(key.0, key.1));
+        let frames = std::sync::Arc::clone(&task.frame_inventory.lock().frames);
+
+        HvfVmState::retire_task_state_process_mappings(&mut task)
+            .expect("retire the backend's final known row");
+
+        {
+            let frames = frames.lock();
+            assert!(!frames.stage2_references.contains_key(&key));
+            assert!(
+                frames.authority_retained_stage2.contains(&key),
+                "kernel/backend disagreement must survive a zero backend count",
+            );
+        }
+        drop(HvpatchCarrierMmAuthority::LeaseTest {
+            stage2_lease_keys: vec![key],
+            frames: std::sync::Arc::clone(&frames),
+        });
+        assert!(
+            carrier_stage2_leases().lock().contains_key(&key),
+            "carrier teardown must not override authority-retained physical ownership",
+        );
+        assert!(
+            !frames.lock().authority_retained_stage2.contains(&key),
+            "carrier teardown consumes the one-shot authority-retained handoff",
+        );
+        assert!(
+            HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, key, || {
+                HvfVmState::retire_stage2_extent_from_mappings(&mut [], key.0, key.1)
+            })
+            .unwrap(),
+        );
+        assert!(!carrier_stage2_leases().lock().contains_key(&key));
+    }
+
+    #[test]
     fn process_retirement_retires_the_exact_last_authoritative_mapping() {
         let (mut task, frame, _) = process_retirement_task(TestFrameMappingCount::Exact(1));
 
@@ -20462,6 +20715,7 @@ mod frame_inventory_backend_tests {
         let new_mapping = carrick_hal::MappingId::from_kernel_allocation(id(54));
         let old_key = (0xa090_0000_0000, 0x4000);
         let new_key = (0xa092_0000_0000, 0x4000);
+        register_carrier_lease(GlobalFrameStage2Lease::fixed(old_key.0, old_key.1));
         let old = InventoryExtent {
             frame: old_frame,
             mapping: old_mapping,
@@ -20515,6 +20769,79 @@ mod frame_inventory_backend_tests {
             !stage2_retired.load(std::sync::atomic::Ordering::SeqCst),
             "physical stage-2 retirement must follow authoritative frame retirement",
         );
+        let frames = std::sync::Arc::clone(&inventory.frames);
+        assert!(
+            !frames.lock().stage2_references.contains_key(&old_key),
+            "the COW split must remove its last backend reference",
+        );
+        drop(HvpatchCarrierMmAuthority::LeaseTest {
+            stage2_lease_keys: vec![old_key],
+            frames: std::sync::Arc::clone(&frames),
+        });
+        assert!(
+            carrier_stage2_leases().lock().contains_key(&old_key),
+            "carrier teardown must preserve a COW lease retained by Kernel authority",
+        );
+        assert!(
+            HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, old_key, || {
+                HvfVmState::retire_stage2_extent_from_mappings(&mut [], old_key.0, old_key.1)
+            })
+            .unwrap(),
+        );
+        assert!(!carrier_stage2_leases().lock().contains_key(&old_key));
+    }
+
+    #[test]
+    fn alias_retirement_keeps_carrier_lease_when_kernel_population_is_incomplete() {
+        let frame = carrick_hal::FrameId::from_kernel_allocation(id(55));
+        let mapping = carrick_hal::MappingId::from_kernel_allocation(id(56));
+        let key = (0xa094_0000_0000, 0x4000);
+        let extent = InventoryExtent {
+            frame,
+            mapping,
+            backing: InventoryBackingIdentity::Private(55),
+            stage2_base: key.0,
+            stage2_length: key.1,
+        };
+        let mut inventory = HvpatchFrameInventory::default();
+        inventory.extents.insert(key, extent);
+        {
+            let mut frames = inventory.frames.lock();
+            frames.references.insert(frame, 1);
+            frames.extent_references.insert((frame, key.0, key.1), 1);
+            frames.stage2_references.insert(key, 1);
+        }
+        register_carrier_lease(GlobalFrameStage2Lease::fixed(key.0, key.1));
+        let frames = std::sync::Arc::clone(&inventory.frames);
+        let retirement = HvfVmState::inventory_lease_retirement_shape(
+            &inventory,
+            &std::collections::BTreeSet::from([key]),
+            &|_| Ok(Some(2)),
+        )
+        .expect("plan alias retirement with an out-of-population Kernel mapping");
+        assert!(retirement.stage2_leases.is_empty());
+
+        HvfVmState::commit_inventory_lease_retirement(&mut inventory, &retirement)
+            .expect("commit alias backend retirement");
+        assert!(
+            !frames.lock().stage2_references.contains_key(&key),
+            "alias retirement must remove its last backend reference",
+        );
+        drop(HvpatchCarrierMmAuthority::LeaseTest {
+            stage2_lease_keys: vec![key],
+            frames: std::sync::Arc::clone(&frames),
+        });
+        assert!(
+            carrier_stage2_leases().lock().contains_key(&key),
+            "carrier teardown must preserve an alias lease retained by Kernel authority",
+        );
+        assert!(
+            HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, key, || {
+                HvfVmState::retire_stage2_extent_from_mappings(&mut [], key.0, key.1)
+            })
+            .unwrap(),
+        );
+        assert!(!carrier_stage2_leases().lock().contains_key(&key));
     }
 
     #[test]
@@ -20547,6 +20874,167 @@ mod frame_inventory_backend_tests {
                 Ok(())
             },)
             .unwrap(),
+        );
+    }
+
+    #[test]
+    fn final_carrier_mm_drop_keeps_a_backend_referenced_stage2_lease_live() {
+        let frames =
+            std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+        let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
+        let key = lease.key();
+        register_carrier_lease(lease);
+        frames.lock().stage2_references.insert(key, 1);
+        drop(HvpatchCarrierMmAuthority::LeaseTest {
+            stage2_lease_keys: vec![key],
+            frames: std::sync::Arc::clone(&frames),
+        });
+
+        assert!(
+            global_frame_ipa_allocator().lock().is_live(key.0, key.1),
+            "a final carrier-MM drop must not recycle an extent another MM still references",
+        );
+        assert!(
+            carrier_stage2_leases().lock().contains_key(&key),
+            "the retained lease must stay discoverable for later exact retirement",
+        );
+
+        frames.lock().stage2_references.remove(&key);
+        assert!(
+            HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, key, || {
+                HvfVmState::retire_stage2_extent_from_mappings(&mut [], key.0, key.1)
+            })
+            .unwrap(),
+        );
+        assert!(!global_frame_ipa_allocator().lock().is_live(key.0, key.1));
+        assert!(!carrier_stage2_leases().lock().contains_key(&key));
+    }
+
+    #[test]
+    fn final_carrier_mm_drop_releases_an_unreferenced_stage2_lease_once() {
+        let frames =
+            std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+        let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
+        let key = lease.key();
+        register_carrier_lease(lease);
+
+        drop(HvpatchCarrierMmAuthority::LeaseTest {
+            stage2_lease_keys: vec![key],
+            frames,
+        });
+
+        assert!(!global_frame_ipa_allocator().lock().is_live(key.0, key.1));
+        assert!(!carrier_stage2_leases().lock().contains_key(&key));
+    }
+
+    #[test]
+    fn carrier_lease_batch_collision_publishes_nothing_and_retains_every_candidate() {
+        let existing_key = (0x7e10_0000_0000, 0x4000);
+        register_carrier_lease(GlobalFrameStage2Lease::fixed(
+            existing_key.0,
+            existing_key.1,
+        ));
+        let reserved = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
+        let reserved_key = reserved.key();
+        let mut candidates = vec![
+            reserved,
+            GlobalFrameStage2Lease::fixed(existing_key.0, existing_key.1),
+        ];
+
+        let error = register_carrier_stage2_leases(&mut candidates)
+            .expect_err("an existing carrier key must reject the complete batch");
+
+        assert!(error.to_string().contains("collision"));
+        assert_eq!(
+            candidates.len(),
+            2,
+            "registration failure retains ownership"
+        );
+        assert!(
+            !carrier_stage2_leases().lock().contains_key(&reserved_key),
+            "no prefix of a rejected lease batch may become visible",
+        );
+        assert!(
+            global_frame_ipa_allocator()
+                .lock()
+                .is_live(reserved_key.0, reserved_key.1),
+            "the caller must keep every rejected candidate live until inventory rollback",
+        );
+
+        drop(candidates);
+        drop(
+            carrier_stage2_leases()
+                .lock()
+                .remove(&existing_key)
+                .expect("remove collision fixture"),
+        );
+    }
+
+    #[test]
+    fn directory_failpoint_rolls_back_inventory_before_final_carrier_drop() {
+        let frame = carrick_hal::FrameId::from_kernel_allocation(id(301));
+        let mapping = carrick_hal::MappingId::from_kernel_allocation(id(302));
+        let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
+        let key = lease.key();
+        register_carrier_lease(lease);
+        let mut inventory = HvpatchFrameInventory::default();
+        let extent = InventoryExtent {
+            frame,
+            mapping,
+            backing: InventoryBackingIdentity::Private(301),
+            stage2_base: key.0,
+            stage2_length: key.1,
+        };
+        inventory.extents.insert(key, extent);
+        {
+            let mut frames = inventory.frames.lock();
+            frames.references.insert(frame, 1);
+            frames.extent_references.insert((frame, key.0, key.1), 1);
+            frames.stage2_references.insert(key, 1);
+        }
+        let frames = std::sync::Arc::clone(&inventory.frames);
+        let ledger = std::sync::Arc::new(parking_lot::Mutex::new(inventory));
+        let task_mm = std::sync::Arc::new(HvpatchTaskMmAuthority {
+            mappings: Vec::new(),
+            mm_root_slot: Some((0x7e20_0000_0000, 0x20_0000)),
+            inventory: parking_lot::Mutex::new(HvpatchTaskInventoryAuthority::ProcessPrepared {
+                ledger: std::sync::Arc::clone(&ledger),
+                staged: vec![(key, extent)],
+                commit: None,
+                challenge: None,
+            }),
+            kernel_mm: parking_lot::Mutex::new(None),
+            cow_armed: None,
+            cow_deferred_publications: None,
+            pending_receipts: Vec::new(),
+            alias_receipts: parking_lot::Mutex::new(Vec::new()),
+            last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::FailpointRollback),
+            drop_order: None,
+        });
+        let carrier = std::sync::Arc::new(HvpatchCarrierMmAuthority::LeaseTest {
+            stage2_lease_keys: vec![key],
+            frames,
+        });
+        let row = HvpatchCarrierTaskRow {
+            _mm: Some(carrier),
+            rollbacks: None,
+        };
+
+        let (row, carrier_mm) = rollback_failed_directory_publication(&task_mm, row, None).unwrap();
+        drop(row);
+        drop(carrier_mm);
+
+        let ledger = ledger.lock();
+        assert!(ledger.extents.is_empty());
+        assert!(ledger.frames.lock().stage2_references.is_empty());
+        drop(ledger);
+        assert!(
+            !carrier_stage2_leases().lock().contains_key(&key),
+            "rollback must expose zero refs before the final carrier drain",
+        );
+        assert!(
+            !global_frame_ipa_allocator().lock().is_live(key.0, key.1),
+            "a failed directory publication must return its reserved IPA",
         );
     }
 
