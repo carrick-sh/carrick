@@ -1345,6 +1345,17 @@ where
         );
         let (_, vfork_parent_wait) = started.into_parts();
         let (scheduler, _) = runtime.continuation_services(child_context.kernel());
+        // The committed Kernel row is authoritative now, but a non-vfork
+        // child may run and exit as soon as `activate` publishes it to the
+        // scheduler. Snapshot and emit the fork lifecycle identity before that
+        // edge: forkstackstorm's `_exit` children otherwise legitimately win
+        // the race, making this required event disappear and leaking a warning
+        // into guest-visible conformance output.
+        child_process.trace_lifecycle(
+            carrick_observability::probes::HvpatchGuestLifecyclePhase::Fork,
+            child_tid,
+            0,
+        );
         let activation = if vfork_parent_wait.is_some() {
             Some(executor::PreparedVforkChildActivation::new(
                 dormant,
@@ -1377,11 +1388,6 @@ where
         // replace a vfork-suspended caller.
         drop(fork_clone_admission);
         drop(process_fork_admission);
-        child_process.trace_lifecycle(
-            carrick_observability::probes::HvpatchGuestLifecyclePhase::Fork,
-            child_tid,
-            0,
-        );
         crate::event_ring::rec(crate::event_ring::FORK, child_pid, 0, 0);
         emit_fork_runtime_stage(
             carrick_observability::probes::HvpatchForkRuntimeStagePhase::Publication,
