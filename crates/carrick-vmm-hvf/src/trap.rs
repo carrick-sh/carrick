@@ -10497,13 +10497,49 @@ impl HvfVmState {
         // can inherit the recycled owner.
         let mut extents = std::collections::BTreeSet::new();
         for &(ipa, length) in &candidates {
+            let size = usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?;
+            let matching_generations: std::collections::BTreeSet<u64> = task
+                .mappings
+                .iter()
+                .filter(|mapping| mapping.physical_ipa == ipa && mapping.physical_size == size)
+                .map(|mapping| mapping.owner_generation)
+                .collect();
+            let owner_generation = match matching_generations.len() {
+                0 => 0,
+                1 => match matching_generations.into_iter().next() {
+                    Some(generation) => generation,
+                    None => continue,
+                },
+                _ => {
+                    // Ambiguous owner generations for the same physical extent; fail closed / retain backing.
+                    continue;
+                }
+            };
+            if owner_generation == 0 && is_reusable_global_frame_extent(ipa, length) {
+                // A reusable extent is born with a registered owner generation.
+                // Absence at selection is incomplete authority, never permission
+                // for delayed cleanup to remove a later incarnation by bare key.
+                continue;
+            }
+            if global_frame_host_owner_generation(ipa, length) != owner_generation {
+                continue;
+            }
             if Self::retire_stage2_candidate_if_unreferenced(&frames, (ipa, length), || {
-                Self::retire_stage2_extent_from_mappings(&mut task.mappings, ipa, length)
-            })? {
-                extents.insert((
+                if owner_generation == 0 {
+                    Self::retire_stage2_extent_from_mappings(&mut task.mappings, ipa, length)
+                } else if retire_global_frame_host_owner_if_generation(
                     ipa,
-                    usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?,
-                ));
+                    length,
+                    owner_generation,
+                ) {
+                    Ok(())
+                } else {
+                    Err(TrapError::Hypervisor(format!(
+                        "HVPatch process retirement owner generation drifted at IPA 0x{ipa:x} size {size}"
+                    )))
+                }
+            })? {
+                extents.insert((ipa, size));
             }
         }
         mutate_external_alias_state(|_, registry| {
@@ -20705,6 +20741,76 @@ mod frame_inventory_backend_tests {
             HvfVmState::take_task_state_retirement_inventory(&mut task).is_none(),
             "a failed authority query must not publish a retirement commit",
         );
+    }
+
+    #[test]
+    fn process_retirement_rejects_a_recycled_owner_generation() {
+        let lease_key = (0x1240_0000_u64, 0x4000_usize);
+        let successor_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            lease_key.1,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .unwrap();
+        let successor = GlobalFrameHostOwner {
+            _mapping: successor_host,
+            _lease: GlobalFrameStage2Lease::fixed(lease_key.0, lease_key.1 as u64),
+            perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+            generation: next_global_frame_owner_generation(),
+        };
+        let successor_generation = successor.generation;
+        let stale_generation = successor_generation.wrapping_add(1);
+        assert_ne!(stale_generation, successor_generation);
+        assert!(
+            global_frame_host_owners()
+                .lock()
+                .insert((lease_key.0, lease_key.1 as u64), successor)
+                .is_none()
+        );
+
+        let (mut task, frame, mapping) = process_retirement_task(TestFrameMappingCount::Exact(1));
+        task.mappings[0].physical_ipa = lease_key.0;
+        task.mappings[0].physical_size = lease_key.1;
+        task.mappings[0].owner_generation = stale_generation;
+        task.mappings[0].stage2_lease = None;
+        {
+            let mut inventory = task.frame_inventory.lock();
+            let old_key = (0xa080_0000_0000, 0x4000);
+            inventory.extents.remove(&old_key);
+            inventory.extents.insert(
+                (lease_key.0, lease_key.1 as u64),
+                InventoryExtent {
+                    frame,
+                    mapping,
+                    backing: InventoryBackingIdentity::Private(41),
+                    stage2_base: lease_key.0,
+                    stage2_length: lease_key.1 as u64,
+                },
+            );
+            let mut frames = inventory.frames.lock();
+            frames
+                .extent_references
+                .remove(&(frame, old_key.0, old_key.1));
+            frames
+                .extent_references
+                .insert((frame, lease_key.0, lease_key.1 as u64), 1);
+            frames.stage2_references.remove(&old_key);
+            frames
+                .stage2_references
+                .insert((lease_key.0, lease_key.1 as u64), 1);
+        }
+
+        HvfVmState::retire_task_state_process_mappings(&mut task)
+            .expect("process-terminal retirement should succeed");
+        assert_eq!(
+            global_frame_host_owner_generation(lease_key.0, lease_key.1 as u64),
+            successor_generation,
+            "stale process cleanup must not retire a newer owner of the recycled key",
+        );
+        let successor = global_frame_host_owners()
+            .lock()
+            .remove(&(lease_key.0, lease_key.1 as u64))
+            .expect("remove successor owner after test");
+        drop(successor);
     }
 
     #[test]
