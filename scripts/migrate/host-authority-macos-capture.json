@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "source_head": "6e53ff2492a047ea2c3dd8bbdffe513d4a16e64b",
+  "source_head": "e1e6ad37ae3623a4f34eb9f47ea1b006a89de5ac",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
