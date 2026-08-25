@@ -340,7 +340,9 @@ const KNOWN_GAP_EXACT_OVERRIDES: &[(&str, &[&str])] = &[
 /// sides run at the SAME privilege. Without this the oracle ran e.g. the
 /// fanotify suites holding CAP_SYS_ADMIN while carrick modelled the bare
 /// Docker default set and answered EPERM — a harness asymmetry that reads as
-/// a carrick gap.
+/// a carrick gap. Docker security options are intentionally not serialized
+/// here: `engine::carrick_argv` mirrors those from `docker_flags` at runtime and
+/// is their single authority.
 fn carrick_flags_for(name: &str) -> Vec<String> {
     let mut flags = vec!["--raw".to_string(), "--fs".to_string(), "host".to_string()];
     if let Some(docker) = docker_flag_overrides(name) {
@@ -351,14 +353,6 @@ fn carrick_flags_for(name: &str) -> Vec<String> {
             {
                 flags.push("--cap-add".to_string());
                 flags.push(cap.clone());
-            } else if flag == "--security-opt"
-                && let Some(opt) = it.next()
-            {
-                flags.push("--security-opt".to_string());
-                flags.push(opt.clone());
-            } else if flag.starts_with("--security-opt=") {
-                flags.push("--security-opt".to_string());
-                flags.push(flag.trim_start_matches("--security-opt=").to_string());
             } else if flag.starts_with("--cap-add=") {
                 flags.push("--cap-add".to_string());
                 flags.push(flag.trim_start_matches("--cap-add=").to_string());
@@ -897,6 +891,22 @@ mod tests {
                 "{name} tests the rejection path and must stay unprivileged"
             );
         }
+    }
+
+    #[test]
+    fn carrick_flags_serialize_capabilities_not_docker_security_options() {
+        for name in ["ltp-add_key01", "ltp-clone301"] {
+            assert_eq!(
+                carrick_flags_for(name),
+                vec!["--raw", "--fs", "host"],
+                "{name} must leave Docker seccomp mirroring to carrick_argv"
+            );
+        }
+        assert_eq!(
+            carrick_flags_for("ltp-fanotify01"),
+            vec!["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"],
+            "capability mirroring must remain while security-opt stays runtime-owned"
+        );
     }
 
     #[test]
