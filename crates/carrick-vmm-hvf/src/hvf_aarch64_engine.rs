@@ -2225,11 +2225,23 @@ mod task_only_materializer_tests {
             .nth(1)
             .and_then(|tail| tail.split("struct ProcessInventoryDesc").next())
             .expect("process mapping drop shape");
+        let stage2_lease = process_mapping_shape
+            .find("stage2_lease: Option<GlobalFrameStage2Lease>")
+            .expect("process mapping owns its stage-2 lease");
+        let host_backing = process_mapping_shape
+            .find("host: ProcessMappingHost")
+            .expect("process mapping owns its host backing");
         assert!(
-            process_mapping_shape.find("stage2_lease").unwrap()
-                < process_mapping_shape.find("host: ForkMappingHost").unwrap(),
+            stage2_lease < host_backing,
             "stage2 lease must drop before host backing"
         );
+        let process_host_shape = trap
+            .split("enum ProcessMappingHost")
+            .nth(1)
+            .and_then(|tail| tail.split("impl ProcessMappingHost").next())
+            .expect("process mapping host owner shape");
+        assert!(process_host_shape.contains("Owned(crate::host_mapping::OwnedHostMapping)"));
+        assert!(!trap.contains("ForkMappingHost"));
         let compatibility_process = trap
             .split("pub(crate) fn from_process_spec")
             .nth(1)
