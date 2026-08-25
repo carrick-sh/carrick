@@ -1947,6 +1947,9 @@ pub enum ExecutorPoolEvent {
     InvalidatedAsid {
         generation: u64,
     },
+    TopologyRetrying {
+        operation: carrick_observability::probes::HvpatchTopologyOperation,
+    },
     OrdinarySyscall {
         thread: ThreadKey,
         generation: ExecutionGeneration,
@@ -2501,11 +2504,20 @@ impl PoolControl {
         &self,
         retirement: &crate::hvpatch::Stage1MmRetirement,
     ) -> Result<(), String> {
+        self.invalidate_external_timeout(retirement, std::time::Duration::from_secs(5))
+    }
+
+    #[cfg(test)]
+    fn invalidate_external_timeout(
+        &self,
+        retirement: &crate::hvpatch::Stage1MmRetirement,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
         let pending = self
             .dispatch_invalidation_commands(retirement.asid_generation(), retirement.pending())?;
         for (target, response) in pending {
-            let ack = response.recv().map_err(|_| {
-                format!("ASID retirement executor {target:?} lost acknowledgement")
+            let ack = response.recv_timeout(timeout).map_err(|error| {
+                format!("ASID retirement executor {target:?} acknowledgement timed out: {error}")
             })??;
             retirement
                 .acknowledge(ack)
@@ -2726,6 +2738,9 @@ impl crate::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebugAuxProvi
                     ),
                     ExecutorPoolEvent::Destroyed => ("Destroyed", None, None, None, None),
                     ExecutorPoolEvent::Joined => ("Joined", None, None, None, None),
+                    ExecutorPoolEvent::TopologyRetrying { .. } => {
+                        ("TopologyRetrying", None, None, None, None)
+                    }
                 };
                 crate::kernel::debug::DebugExecutorReceiptRow {
                     sequence: r.sequence,
@@ -3010,6 +3025,16 @@ where
         self.control.invalidate_external(retirement)
     }
 
+    #[cfg(test)]
+    pub(crate) fn invalidate_asid_retirement_timeout(
+        &self,
+        retirement: &crate::hvpatch::Stage1MmRetirement,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        self.control
+            .invalidate_external_timeout(retirement, timeout)
+    }
+
     pub fn shutdown(self) -> Result<ExecutorPoolReport, ExecutorPoolShutdownError> {
         self.scheduler.kernel().unregister_debug_aux_provider();
         self.scheduler.close();
@@ -3082,6 +3107,22 @@ where
         let authority = self.scheduler.admit_root(thread.key(), generation)?;
         self.resolver
             .publish_test_root(&self.scheduler, thread, authority)
+    }
+
+    #[cfg(test)]
+    pub fn wait_for_event(
+        &self,
+        predicate: impl Fn(&ExecutorPoolEvent) -> bool,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if self.receipts.snapshot().iter().any(|r| predicate(&r.event)) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Err("timed out waiting for executor pool event".to_owned())
     }
 }
 
@@ -4026,8 +4067,7 @@ fn acquire_process_retire_topology_lock_servicing<E: PersistentExecutor>(
     receipts: &ReceiptLog,
 ) -> Result<(carrick_thread::fork_quiesce::TopologyLockGuard, bool), String> {
     let mut deferred_stop = false;
-    let mut backoff = std::time::Duration::from_micros(50);
-    let max_backoff = std::time::Duration::from_millis(5);
+    let mut recorded_retry = false;
     loop {
         if let Some(guard) = carrick_thread::fork_quiesce::try_acquire_topology_lock(
             carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
@@ -4036,11 +4076,20 @@ fn acquire_process_retire_topology_lock_servicing<E: PersistentExecutor>(
         ) {
             return Ok((guard, deferred_stop));
         }
+        if !recorded_retry {
+            receipts.record(
+                executor,
+                ExecutorPoolEvent::TopologyRetrying {
+                    operation:
+                        carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
+                },
+            );
+            recorded_retry = true;
+        }
         let stop_seen =
             service_owner_thread_commands(backend, executor, commands, boundary, receipts)?;
         deferred_stop |= stop_seen;
-        std::thread::sleep(backoff);
-        backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
+        std::hint::spin_loop();
     }
 }
 
@@ -4238,8 +4287,9 @@ pub(crate) mod tests {
         descendant: parking_lot::Mutex<Option<DescendantPublication>>,
         pending_address_space_retirement:
             parking_lot::Mutex<Option<crate::hvpatch::PendingAddressSpaceRetirement>>,
-        retire_detached_address_space_gate: parking_lot::Mutex<Option<Arc<Barrier>>>,
-        retire_detached_address_space_resume: parking_lot::Mutex<Option<Arc<Barrier>>>,
+        retire_detached_address_space_gate: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        retire_detached_address_space_resume:
+            parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     }
 
     impl FakeBinding {
@@ -4362,11 +4412,11 @@ pub(crate) mod tests {
         }
 
         fn retire_detached_address_space(&self) -> Result<(), TrapError> {
-            if let Some(gate) = self.retire_detached_address_space_gate.lock().clone() {
-                gate.wait();
+            if let Some(gate) = self.retire_detached_address_space_gate.lock().take() {
+                let _ = gate.send(());
             }
-            if let Some(resume) = self.retire_detached_address_space_resume.lock().clone() {
-                resume.wait();
+            if let Some(resume) = self.retire_detached_address_space_resume.lock().take() {
+                let _ = resume.recv_timeout(std::time::Duration::from_secs(5));
             }
             Ok(())
         }
@@ -8734,16 +8784,32 @@ pub(crate) mod tests {
         ));
     }
 
+    struct TerminalRetirementTestCleanup {
+        resume_tx: Option<std::sync::mpsc::Sender<()>>,
+        pool: Option<ExecutorPool<FakeFactory, FakeFactory>>,
+    }
+
+    impl Drop for TerminalRetirementTestCleanup {
+        fn drop(&mut self) {
+            if let Some(resume) = self.resume_tx.take() {
+                let _ = resume.send(());
+            }
+            if let Some(pool) = self.pool.take() {
+                let _ = pool.shutdown();
+            }
+        }
+    }
+
     #[test]
     fn terminal_retirement_holds_topology_lock_across_detached_cleanup_and_release() {
         let (process, context) = crate::hvpatch::process_context_for_tests(14_990);
         let scheduler = Arc::new(Scheduler::new(Arc::clone(context.kernel())));
         let factory = Arc::new(FakeFactory::default());
         let binding = FakeBinding::new(99, [Step::Exit]);
-        let entered_cleanup = Arc::new(Barrier::new(2));
-        let resume_cleanup = Arc::new(Barrier::new(2));
-        *binding.retire_detached_address_space_gate.lock() = Some(Arc::clone(&entered_cleanup));
-        *binding.retire_detached_address_space_resume.lock() = Some(Arc::clone(&resume_cleanup));
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *binding.retire_detached_address_space_gate.lock() = Some(gate_tx);
+        *binding.retire_detached_address_space_resume.lock() = Some(resume_rx);
         let tid = ThreadId::from_guest_supplied_tid(context.thread().key().tid.raw());
         let pending = process
             .begin_address_space_retirement(0, tid, None)
@@ -8752,11 +8818,17 @@ pub(crate) mod tests {
         factory.install(&context, Arc::clone(&binding));
 
         let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        let mut cleanup = TerminalRetirementTestCleanup {
+            resume_tx: Some(resume_tx),
+            pool: Some(pool),
+        };
         let generation = publish(&context, 99);
         let authority = enqueue_root(&scheduler, &context, generation);
         drop(authority);
 
-        entered_cleanup.wait();
+        gate_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker must reach detached cleanup gate");
 
         // While detached terminal cleanup is running, the executor must hold the
         // ProcessRetire topology lock. Concurrent attempts to acquire topology
@@ -8766,23 +8838,28 @@ pub(crate) mod tests {
             process.pid(),
             context.thread().key().tid.raw(),
         );
-        assert!(
-            try_fork.is_none(),
-            "while detached terminal cleanup is running, InProcessFork must fail to acquire topology lock"
-        );
 
         let try_cow = carrick_thread::fork_quiesce::try_acquire_topology_lock(
             carrick_observability::probes::HvpatchTopologyOperation::FrameCow,
             process.pid(),
             context.thread().key().tid.raw(),
         );
+
+        // Always release the worker and shut down the pool before asserting
+        if let Some(resume) = cleanup.resume_tx.take() {
+            let _ = resume.send(());
+        }
+        let pool = cleanup.pool.take().expect("pool");
+        pool.shutdown().expect("pool shutdown");
+
+        assert!(
+            try_fork.is_none(),
+            "while detached terminal cleanup is running, InProcessFork must fail to acquire topology lock"
+        );
         assert!(
             try_cow.is_none(),
             "while detached terminal cleanup is running, FrameCow must fail to acquire topology lock"
         );
-
-        resume_cleanup.wait();
-        pool.shutdown().expect("pool shutdown");
 
         let try_after = carrick_thread::fork_quiesce::try_acquire_topology_lock(
             carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
@@ -8793,6 +8870,20 @@ pub(crate) mod tests {
             try_after.is_some(),
             "after terminal retirement completes, topology lock must be released"
         );
+    }
+
+    struct ContendedRetirementTestCleanup {
+        held_topology: Option<carrick_thread::fork_quiesce::TopologyLockGuard>,
+        pool: Option<ExecutorPool<FakeFactory, FakeFactory>>,
+    }
+
+    impl Drop for ContendedRetirementTestCleanup {
+        fn drop(&mut self) {
+            drop(self.held_topology.take());
+            if let Some(pool) = self.pool.take() {
+                let _ = pool.shutdown();
+            }
+        }
     }
 
     #[test]
@@ -8816,13 +8907,35 @@ pub(crate) mod tests {
         );
 
         let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
-        let executor_id = pool.executor_ids()[0];
+        let mut cleanup = ContendedRetirementTestCleanup {
+            held_topology: Some(held_topology),
+            pool: Some(pool),
+        };
+        let executor_id = cleanup.pool.as_ref().unwrap().executor_ids()[0];
         let generation = publish(&context, 101);
         let authority = enqueue_root(&scheduler, &context, generation);
         drop(authority);
 
-        // Give the executor time to enter the retirement topology acquisition retry loop
-        std::thread::sleep(Duration::from_millis(50));
+        // Deterministically wait for the worker to reach the topology acquisition TryMiss retry loop
+        cleanup
+            .pool
+            .as_ref()
+            .unwrap()
+            .wait_for_event(
+                |event| {
+                    matches!(
+                        event,
+                        ExecutorPoolEvent::TopologyRetrying {
+                            operation:
+                                carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
+                        }
+                    )
+                },
+                Duration::from_secs(5),
+            )
+            .expect(
+                "worker must reach topology TryMiss retry loop before invalidation command is sent",
+            );
 
         // While topology is held by a peer, perform ASID invalidation targeting this executor
         let (proc2, _ctx2) = crate::hvpatch::process_context_for_tests(14_992);
@@ -8840,14 +8953,19 @@ pub(crate) mod tests {
             .retirement()
             .expect("last MM owner retirement authority");
 
-        pool.invalidate_asid_retirement(retirement2)
+        cleanup
+            .pool
+            .as_ref()
+            .unwrap()
+            .invalidate_asid_retirement_timeout(retirement2, Duration::from_secs(5))
             .expect("executor must service InvalidateAsid while waiting for topology lock");
         assert!(retirement2.pending().is_empty());
         retired2.complete().expect("complete second retirement");
 
         // Release the topology lock so the executor can acquire it and finish
-        drop(held_topology);
+        drop(cleanup.held_topology.take());
 
+        let pool = cleanup.pool.take().expect("pool");
         pool.shutdown().expect("pool shutdown");
 
         assert!(matches!(
