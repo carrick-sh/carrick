@@ -99,6 +99,7 @@ pub(crate) struct CommittedExecTransition {
     successor_thread: ThreadKey,
     successor_mm: MmId,
     successor_asid_generation: Option<u64>,
+    publication_receipt: ExecPublicationReceipt,
 }
 
 impl CommittedExecTransition {
@@ -140,8 +141,23 @@ impl CommittedExecTransition {
             successor_thread: self.successor_thread,
             successor_mm: self.successor_mm,
             successor_asid_generation,
+            publication_receipt: self.publication_receipt,
         })
     }
+
+    fn into_reference_parts(self) -> (KernelContext, ExecPublicationReceipt) {
+        (self.context, self.publication_receipt)
+    }
+}
+
+/// Non-cloneable proof of the exact Kernel exec publication whose HVPatch
+/// successor still needs to become runnable before a vfork parent may resume.
+pub(crate) struct ExecPublicationReceipt {
+    domain: Arc<super::core::KernelDomain>,
+    task: TaskKey,
+    revision: TaskRevision,
+    successor_thread: ThreadKey,
+    successor_mm: MmId,
 }
 
 pub(crate) struct CommittedExecSchedulerParts {
@@ -152,6 +168,7 @@ pub(crate) struct CommittedExecSchedulerParts {
     pub(crate) successor_thread: ThreadKey,
     pub(crate) successor_mm: MmId,
     pub(crate) successor_asid_generation: u64,
+    pub(crate) publication_receipt: ExecPublicationReceipt,
 }
 
 impl PreparedExec {
@@ -335,8 +352,11 @@ impl Kernel {
         prepared: PreparedExec,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<KernelContext, ExecError> {
-        self.commit_exec_transition(prepared, failpoint)
-            .map(|transition| transition.context)
+        let (context, publication_receipt) = self
+            .commit_exec_transition(prepared, failpoint)?
+            .into_reference_parts();
+        self.release_vfork_after_exec_publication(publication_receipt)?;
+        Ok(context)
     }
 
     pub(crate) fn commit_exec_transition(
@@ -450,17 +470,12 @@ impl Kernel {
             &prepared.resources,
             revision,
         );
-        let vfork_release = record.vfork_release.take();
         reservations.remove(&prepared.task.id);
         prepared.guard.commit_reservation();
         drop(state);
         drop(old_threads);
         self.retire_file_table_after_exec(&old_files, &prepared.resources.files());
         self.retire_mm_io_state_if_unreferenced(&prepared.old_mm);
-        if let Some(release) = vfork_release {
-            release.release(VforkReleaseReason::Exec);
-        }
-
         let context = KernelContext::from_parts(
             self.clone(),
             task,
@@ -469,15 +484,59 @@ impl Kernel {
             prepared.resources,
             revision,
         );
+        let successor_thread = context.thread().key();
+        let successor_mm = context.shared().mm().id();
         Ok(CommittedExecTransition {
             task: task_key,
             predecessor_thread,
             predecessor_mm,
-            successor_thread: context.thread().key(),
-            successor_mm: context.shared().mm().id(),
+            successor_thread,
+            successor_mm,
             context,
             successor_asid_generation: None,
+            publication_receipt: ExecPublicationReceipt {
+                domain: Arc::clone(self.domain()),
+                task: task_key,
+                revision,
+                successor_thread,
+                successor_mm,
+            },
         })
+    }
+
+    /// Consume one exact committed-exec publication and release its vfork
+    /// parent only after the caller has published the matching successor.
+    pub(crate) fn release_vfork_after_exec_publication(
+        self: &Arc<Self>,
+        receipt: ExecPublicationReceipt,
+    ) -> Result<(), ExecError> {
+        if !Arc::ptr_eq(self.domain(), &receipt.domain) {
+            return Err(ExecError::StalePublication);
+        }
+        let release = {
+            let mut state = self.registry().state.write();
+            let record = state
+                .tasks
+                .get_mut(&receipt.task.id)
+                .ok_or(ExecError::StalePublication)?;
+            let successor = record
+                .task
+                .thread(receipt.successor_thread.tid)
+                .ok_or(ExecError::StalePublication)?;
+            if record.task.key() != receipt.task
+                || record.revision != receipt.revision
+                || successor.key() != receipt.successor_thread
+                || successor.task_key() != receipt.task
+                || record.task.shared().mm().id() != receipt.successor_mm
+            {
+                return Err(ExecError::StalePublication);
+            }
+            record.vfork_release.take()
+        };
+        if let Some(release) = release {
+            release.release(VforkReleaseReason::Exec);
+        }
+        Ok(())
     }
 
     /// Release retired thread IDs after runner/context references drain. Every
@@ -528,6 +587,8 @@ pub enum ExecError {
     WrongTask,
     #[error("prepared exec revision is stale")]
     StalePreparation,
+    #[error("committed exec publication receipt is stale or foreign")]
+    StalePublication,
     #[error("thread-group leader claim is missing")]
     LeaderClaimMissing,
     #[error("task revision space is exhausted")]
