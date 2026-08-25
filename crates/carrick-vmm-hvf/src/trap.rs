@@ -3995,7 +3995,14 @@ struct CowInventorySplitShape {
     old_key: (u64, u64),
     old: InventoryExtent,
     fragments: Vec<(u64, u64)>,
+    retirement: CowInventoryRetirementDecision,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug)]
+struct CowInventoryRetirementDecision {
     retire_old_frame: bool,
+    backend_frame_references_complete: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4025,7 +4032,7 @@ struct CowInventorySplit {
     fragments: Vec<CowInventoryFragment>,
     new_key: (u64, u64),
     new_extent: InventoryExtent,
-    retire_old_frame: bool,
+    retirement: CowInventoryRetirementDecision,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4437,14 +4444,28 @@ impl HvpatchFrameInventoryState {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn final_exec_physical_extents(
     inventory: &HvpatchFrameInventory,
+    authority_mapping_count: &dyn Fn(carrick_hal::FrameId) -> Result<Option<usize>, TrapError>,
 ) -> Result<std::collections::BTreeSet<(u64, usize)>, TrapError> {
     let frames = inventory.frames.lock();
     let mut physical = std::collections::BTreeSet::new();
     let mut local_stage2_references = std::collections::BTreeMap::new();
+    let mut candidate_frames = std::collections::BTreeSet::new();
     for extent in inventory.extents.values() {
         *local_stage2_references
             .entry((extent.stage2_base, extent.stage2_length))
             .or_insert(0usize) += 1;
+        candidate_frames.insert(extent.frame);
+    }
+    let mut complete_frames = std::collections::BTreeSet::new();
+    for frame in candidate_frames {
+        let backend = frames.references.get(&frame).copied().ok_or_else(|| {
+            TrapError::Hypervisor(format!(
+                "HVPatch exec frame {frame:?} has no backend reference"
+            ))
+        })?;
+        if authority_mapping_count(frame)? == Some(backend) {
+            complete_frames.insert(frame);
+        }
     }
     for (lease, local) in local_stage2_references {
         let references = frames
@@ -4456,7 +4477,12 @@ fn final_exec_physical_extents(
                     "HVPatch stage-2 lease {lease:?} has no backend reference"
                 ))
             })?;
-        if references == local {
+        let all_frame_populations_complete = inventory
+            .extents
+            .values()
+            .filter(|extent| (extent.stage2_base, extent.stage2_length) == lease)
+            .all(|extent| complete_frames.contains(&extent.frame));
+        if references == local && all_frame_populations_complete {
             physical.insert((
                 lease.0,
                 usize::try_from(lease.1).map_err(|_| TrapError::MappingTooLarge(lease.1))?,
@@ -9149,7 +9175,7 @@ impl HvfVmState {
         inventory: &HvpatchFrameInventory,
         compound_gpa: u64,
         retain_compound: bool,
-        authority_mapping_count: impl Fn(carrick_hal::FrameId) -> Option<usize>,
+        authority_mapping_count: impl Fn(carrick_hal::FrameId) -> Result<Option<usize>, TrapError>,
     ) -> Result<CowInventorySplitShape, TrapError> {
         let compound_end = compound_gpa
             .checked_add(CowArmedRanges::COMPOUND_SIZE)
@@ -9190,14 +9216,18 @@ impl HvfVmState {
                     old.frame
                 ))
             })?;
-        let retire_old_frame = global_references == 1
-            && fragments.is_empty()
-            && authority_mapping_count(old.frame) == Some(1);
+        let authoritative_references = authority_mapping_count(old.frame)?;
+        let backend_frame_references_complete = authoritative_references == Some(global_references);
+        let retire_old_frame =
+            global_references == 1 && fragments.is_empty() && authoritative_references == Some(1);
         Ok(CowInventorySplitShape {
             old_key,
             old,
             fragments,
-            retire_old_frame,
+            retirement: CowInventoryRetirementDecision {
+                retire_old_frame,
+                backend_frame_references_complete,
+            },
         })
     }
 
@@ -9213,7 +9243,7 @@ impl HvfVmState {
     fn inventory_lease_retirement_shape(
         inventory: &HvpatchFrameInventory,
         leases: &std::collections::BTreeSet<(u64, u64)>,
-        authority_mapping_count: &dyn Fn(carrick_hal::FrameId) -> Option<usize>,
+        authority_mapping_count: &dyn Fn(carrick_hal::FrameId) -> Result<Option<usize>, TrapError>,
     ) -> Result<InventoryLeaseRetirement, TrapError> {
         let mappings: Vec<_> = inventory
             .extents
@@ -9231,6 +9261,7 @@ impl HvfVmState {
         }
         let registry = inventory.frames.lock();
         let mut frames = std::collections::BTreeSet::new();
+        let mut complete_frames = std::collections::BTreeSet::new();
         for (&frame, &removed) in &removed_frames {
             let live = registry.references.get(&frame).copied().ok_or_else(|| {
                 TrapError::Hypervisor(format!(
@@ -9242,13 +9273,17 @@ impl HvfVmState {
                     "HVPatch alias retirement frame {frame:?} reference underflow"
                 )));
             }
+            let authoritative = authority_mapping_count(frame)?;
+            if authoritative == Some(live) {
+                complete_frames.insert(frame);
+            }
             // Both populations must agree. `removed == live` says this mm
             // dropped the last backend reference it knows about; the authority
             // count says no OTHER mm still maps the frame. Requiring both can
             // only decline a retirement, never invent one, and a frame left
             // live is reclaimed by a later unmap where a wrong retirement
             // aborts the whole carrier.
-            if removed == live && authority_mapping_count(frame) == Some(removed) {
+            if removed == live && authoritative == Some(removed) {
                 frames.insert(frame);
             }
         }
@@ -9268,7 +9303,11 @@ impl HvfVmState {
                     "HVPatch alias retirement stage-2 lease {lease:?} reference underflow"
                 )));
             }
-            if removed == live {
+            let all_frame_populations_complete = mappings
+                .iter()
+                .filter(|(_, extent)| (extent.stage2_base, extent.stage2_length) == lease)
+                .all(|(_, extent)| complete_frames.contains(&extent.frame));
+            if removed == live && all_frame_populations_complete {
                 stage2_leases.insert(lease);
             }
         }
@@ -9362,7 +9401,7 @@ impl HvfVmState {
         old_key: (u64, u64),
         old: InventoryExtent,
         fragment_shapes: &[(u64, u64)],
-        retire_old_frame: bool,
+        retirement: CowInventoryRetirementDecision,
         new_gpa: u64,
         new_backing: InventoryBackingIdentity,
     ) -> Result<CowInventorySplit, TrapError> {
@@ -9397,7 +9436,7 @@ impl HvfVmState {
             CowArmedRanges::COMPOUND_SIZE,
             permissions,
         )?;
-        if retire_old_frame {
+        if retirement.retire_old_frame {
             reservation
                 .push(carrick_hal::FrameInventoryEvent::RetireFrame {
                     transaction,
@@ -9418,7 +9457,7 @@ impl HvfVmState {
                 stage2_base: new_gpa,
                 stage2_length: CowArmedRanges::COMPOUND_SIZE,
             },
-            retire_old_frame,
+            retirement,
         })
     }
 
@@ -9489,14 +9528,15 @@ impl HvfVmState {
             &mut frames.stage2_references,
             (split.new_extent.stage2_base, split.new_extent.stage2_length),
         )?;
-        if split.retire_old_frame && frames.references.contains_key(&split.old.frame) {
+        if split.retirement.retire_old_frame && frames.references.contains_key(&split.old.frame) {
             return Err(TrapError::Hypervisor(
                 "HVPatch COW retired old frame retains backend mappings".to_owned(),
             ));
         }
-        let retire_old_stage2 = !frames
-            .stage2_references
-            .contains_key(&(split.old.stage2_base, split.old.stage2_length));
+        let retire_old_stage2 = split.retirement.backend_frame_references_complete
+            && !frames
+                .stage2_references
+                .contains_key(&(split.old.stage2_base, split.old.stage2_length));
         if retire_old_stage2 {
             // `stage_mapping` publishes a sibling reference while holding this
             // same registry lock. Keep it through physical-owner removal and
@@ -9681,7 +9721,8 @@ impl HvfVmState {
     fn stage_retirement(
         inventory: &mut HvpatchFrameInventory,
         reservation: &mut carrick_hal::FrameInventoryReservation,
-    ) -> Result<(), TrapError> {
+        authority_mapping_count: &dyn Fn(carrick_hal::FrameId) -> Result<Option<usize>, TrapError>,
+    ) -> Result<std::collections::BTreeSet<(u64, u64)>, TrapError> {
         let transaction = reservation.transaction();
         let mut local_frame_references =
             std::collections::BTreeMap::<carrick_hal::FrameId, usize>::new();
@@ -9715,6 +9756,7 @@ impl HvfVmState {
 
         let mut frames = inventory.frames.lock();
         let mut retired = std::collections::BTreeSet::new();
+        let mut complete_frames = std::collections::BTreeSet::new();
         for (&frame, &local) in &local_frame_references {
             let global = frames.references.get(&frame).copied().ok_or_else(|| {
                 TrapError::Hypervisor(format!("HVPatch frame {frame:?} has no backend reference"))
@@ -9724,7 +9766,16 @@ impl HvfVmState {
                     "HVPatch frame {frame:?} backend reference count underflow"
                 )));
             }
-            if global == local {
+            let authoritative = authority_mapping_count(frame)?;
+            if authoritative == Some(global) {
+                complete_frames.insert(frame);
+            }
+            // `frames.references` is backend bookkeeping; `RetireFrame` is a
+            // claim about the kernel authority's VM-wide mapping population.
+            // A sibling mm can therefore keep the frame live even when this
+            // retirement removes every backend reference visible here. Require
+            // exact agreement before emitting the irreversible frame event.
+            if global == local && authoritative == Some(local) {
                 retired.insert(frame);
             }
         }
@@ -9741,6 +9792,7 @@ impl HvfVmState {
                 )));
             }
         }
+        let mut retired_stage2 = std::collections::BTreeSet::new();
         for (&lease, &local) in &local_stage2_references {
             let global = frames
                 .stage2_references
@@ -9755,6 +9807,14 @@ impl HvfVmState {
                 return Err(TrapError::Hypervisor(format!(
                     "HVPatch stage-2 lease {lease:?} reference count underflow"
                 )));
+            }
+            let all_frame_populations_complete = inventory
+                .extents
+                .values()
+                .filter(|extent| (extent.stage2_base, extent.stage2_length) == lease)
+                .all(|extent| complete_frames.contains(&extent.frame));
+            if global == local && all_frame_populations_complete {
+                retired_stage2.insert(lease);
             }
         }
         for &frame in &retired {
@@ -9809,7 +9869,7 @@ impl HvfVmState {
         expected.dedup();
         inventory.retirement_expected = expected;
         inventory.extents.clear();
-        Ok(())
+        Ok(retired_stage2)
     }
 
     pub(crate) fn frame_inventory_extent_count(&self) -> usize {
@@ -10134,6 +10194,11 @@ impl HvfVmState {
         if !task.persistent_vm_lifecycle {
             return Ok(());
         }
+        let authority = task.cow_authority.as_ref().cloned().ok_or_else(|| {
+            TrapError::Hypervisor(
+                "HVPatch process retirement has no frame inventory authority".to_owned(),
+            )
+        })?;
         // The runtime holds the process-wide HVPatch topology lock across this
         // method. Stage the backend inventory retirement BEFORE recycling any
         // physical extent. The old order sampled `stage2_references`, dropped
@@ -10159,20 +10224,23 @@ impl HvfVmState {
                     "HVPatch retirement began without frame inventory reservation".to_owned(),
                 ));
             }
-            let candidates = inventory
-                .extents
-                .values()
-                .map(|extent| (extent.stage2_base, extent.stage2_length))
-                .collect::<std::collections::BTreeSet<_>>();
             let frames = std::sync::Arc::clone(&inventory.frames);
             let mut reservation = inventory.retirement_reservation.take().unwrap_or_else(|| {
                 eprintln!("carrick: FATAL: validated HVPatch retirement reservation disappeared");
                 std::process::abort();
             });
-            if let Err(error) = Self::stage_retirement(&mut inventory, &mut reservation) {
-                eprintln!("carrick: FATAL: stage inventory before HVPatch retirement: {error}");
-                std::process::abort();
-            }
+            let authoritative_mapping_count = |frame| {
+                authority.frame_mapping_count(frame).map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "query process-terminal frame mapping count: {error}"
+                    ))
+                })
+            };
+            let candidates = Self::stage_retirement(
+                &mut inventory,
+                &mut reservation,
+                &authoritative_mapping_count,
+            )?;
             (candidates, frames, reservation.commit(()))
         };
 
@@ -12168,14 +12236,18 @@ impl HvfVmState {
             old_key: old_inventory_key,
             old: old_inventory_extent,
             fragments: fragment_shapes,
-            retire_old_frame,
+            retirement,
         } = {
             let inventory = self.frame_inventory.lock();
             Self::cow_inventory_split_shape(
                 &inventory,
                 old_physical_ipa,
                 retain_old_compound,
-                |frame| authority.frame_mapping_count(frame).ok().flatten(),
+                |frame| {
+                    authority.frame_mapping_count(frame).map_err(|error| {
+                        TrapError::Hypervisor(format!("query COW frame mapping count: {error}"))
+                    })
+                },
             )?
         };
         let old_frame = old_inventory_extent.frame;
@@ -12215,7 +12287,7 @@ impl HvfVmState {
         let mapping_candidates = fragment_shapes.len().saturating_add(1);
         let event_count = 1usize
             .saturating_add(mapping_candidates.saturating_mul(2))
-            .saturating_add(usize::from(retire_old_frame));
+            .saturating_add(usize::from(retirement.retire_old_frame));
         let mut reservation = authority
             .reserve(1, mapping_candidates, event_count)
             .map_err(|error| {
@@ -12283,7 +12355,7 @@ impl HvfVmState {
             old_inventory_key,
             old_inventory_extent,
             &fragment_shapes,
-            retire_old_frame,
+            retirement,
             new_physical_ipa,
             backing,
         ) {
@@ -14454,7 +14526,11 @@ impl HvfVmState {
         let retirement = {
             let inventory = self.frame_inventory.lock();
             Self::inventory_lease_retirement_shape(&inventory, &planned_leases, &|frame| {
-                authority.frame_mapping_count(frame).ok().flatten()
+                authority.frame_mapping_count(frame).map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "query alias-retirement frame mapping count: {error}"
+                    ))
+                })
             })?
         };
         if retirement.mappings.is_empty() {
@@ -16755,7 +16831,22 @@ impl HvfVmState {
             // edge sets before touching stage-2. The switch helper restores the
             // exact predecessor on every ordinary failure, so backend inventory,
             // owners and mapping rows remain unchanged until this succeeds.
-            let extents = final_exec_physical_extents(&self.frame_inventory.lock())?;
+            let authority = self.cow_authority.as_ref().cloned().ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "HVPatch exec retirement has no frame inventory authority".to_owned(),
+                )
+            })?;
+            let authoritative_mapping_count = |frame| {
+                authority.frame_mapping_count(frame).map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "query exec-retirement frame mapping count: {error}"
+                    ))
+                })
+            };
+            let extents = final_exec_physical_extents(
+                &self.frame_inventory.lock(),
+                &authoritative_mapping_count,
+            )?;
             let replacement = plan
                 .mappings
                 .iter()
@@ -16858,8 +16949,22 @@ impl HvfVmState {
                 lease.mark_mapped();
             }
             if let Some((Some(retired), _)) = inventory_reservations.as_mut() {
+                let authority = self.cow_authority.as_ref().cloned().ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "HVPatch exec retirement has no frame inventory authority".to_owned(),
+                    )
+                })?;
+                let authoritative_mapping_count = |frame| {
+                    authority.frame_mapping_count(frame).map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "query exec-retirement frame mapping count: {error}"
+                        ))
+                    })
+                };
                 let mut inventory = self.frame_inventory.lock();
-                if let Err(error) = Self::stage_retirement(&mut inventory, retired) {
+                if let Err(error) =
+                    Self::stage_retirement(&mut inventory, retired, &authoritative_mapping_count)
+                {
                     eprintln!("carrick: FATAL: stage inventory after HVPatch exec unmap: {error}");
                     std::process::abort();
                 }
@@ -18858,6 +18963,59 @@ mod vm_create_admission_tests {
 mod frame_inventory_backend_tests {
     use super::*;
 
+    enum TestFrameMappingCount {
+        Exact(usize),
+        Error,
+    }
+
+    impl carrick_hal::FrameCowAuthority for TestFrameMappingCount {
+        fn quiesce(
+            &self,
+        ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok(Box::new(()))
+        }
+
+        fn reserve(
+            &self,
+            _frame_candidates: usize,
+            _mapping_candidates: usize,
+            _event_count: usize,
+        ) -> Result<carrick_hal::FrameInventoryReservation, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Err(Box::new(std::io::Error::other("unused test reserve")))
+        }
+
+        fn apply(
+            &self,
+            _commit: carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err(Box::new(std::io::Error::other("unused test apply")))
+        }
+
+        fn mapping_is_live(
+            &self,
+            _mapping: carrick_hal::MappingId,
+            _frame: carrick_hal::FrameId,
+            _gpa: carrick_guest_mem::Gpa,
+            _length: carrick_hal::FrameLength,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(false)
+        }
+
+        fn frame_mapping_count(
+            &self,
+            _frame: carrick_hal::FrameId,
+        ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
+            match self {
+                Self::Exact(count) => Ok(Some(*count)),
+                Self::Error => Err(Box::new(std::io::Error::other(
+                    "injected mapping-count failure",
+                ))),
+            }
+        }
+    }
+
     fn exec_mapping_for_order(guest_start: u64, mapped_size: u64) -> GuestMapping {
         GuestMapping {
             guest_start,
@@ -19940,7 +20098,7 @@ mod frame_inventory_backend_tests {
             registry.stage2_references.insert(lease, 3);
         }
         let leases = std::collections::BTreeSet::from([lease]);
-        let authority_agrees = |_frame| Some(2usize);
+        let authority_agrees = |_frame| Ok(Some(2usize));
         let shared =
             HvfVmState::inventory_lease_retirement_shape(&inventory, &leases, &authority_agrees)
                 .unwrap();
@@ -19960,6 +20118,184 @@ mod frame_inventory_backend_tests {
             std::collections::BTreeSet::from([frame])
         );
         assert_eq!(final_owner.stage2_leases, leases);
+    }
+
+    fn process_retirement_task(
+        authority: TestFrameMappingCount,
+    ) -> (HvfTaskState, carrick_hal::FrameId, carrick_hal::MappingId) {
+        let frame = carrick_hal::FrameId::from_kernel_allocation(id(41));
+        let mapping = carrick_hal::MappingId::from_kernel_allocation(id(42));
+        let key = (0xa080_0000_0000, 0x4000);
+        let mut task = hvpatch_task_state_test_fixture(12, key.0, 12);
+        task.cow_authority = Some(std::sync::Arc::new(authority));
+        task.mappings[0].physical_ipa = key.0;
+        task.mappings[0].physical_size = key.1 as usize;
+        task.mappings[0].stage2_lease = Some(GlobalFrameStage2Lease::fixed(key.0, key.1));
+        {
+            let mut inventory = task.frame_inventory.lock();
+            inventory.initialized = true;
+            inventory.extents.insert(
+                key,
+                InventoryExtent {
+                    frame,
+                    mapping,
+                    backing: InventoryBackingIdentity::Private(41),
+                    stage2_base: key.0,
+                    stage2_length: key.1,
+                },
+            );
+            {
+                let mut frames = inventory.frames.lock();
+                // This mm's backend ledger is the only one that still names the
+                // frame, but the kernel authority reports a second live mapping
+                // in another mm. The stage-2 reference remains shared as well,
+                // so this pure inventory test performs no HVF unmap.
+                frames.references.insert(frame, 1);
+                frames.extent_references.insert((frame, key.0, key.1), 1);
+                frames.stage2_references.insert(key, 1);
+            }
+            let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).unwrap();
+            inventory.retirement_reservation = Some(
+                carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+                    carrick_hal::FrameInventoryProvenance::from_kernel_entropy([93; 32]),
+                    carrick_hal::FrameInventoryBatch::prepare(
+                        carrick_hal::KernelTransactionId::from_kernel_allocation(id(93)),
+                        capacity,
+                    )
+                    .unwrap(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            );
+        }
+        (task, frame, mapping)
+    }
+
+    #[test]
+    fn process_retirement_does_not_retire_a_frame_still_mapped_by_another_mm() {
+        let (mut task, frame, mapping) = process_retirement_task(TestFrameMappingCount::Exact(2));
+
+        HvfVmState::retire_task_state_process_mappings(&mut task)
+            .expect("stage process-terminal retirement");
+        let commit = HvfVmState::take_task_state_retirement_inventory(&mut task)
+            .expect("process-terminal retirement commit");
+        assert!(commit.batch().events().iter().any(|event| {
+            matches!(
+                event,
+                carrick_hal::FrameInventoryEvent::UnmapMapping {
+                    mapping: retired,
+                    ..
+                } if *retired == mapping
+            )
+        }));
+        assert!(
+            commit.batch().events().iter().all(|event| !matches!(
+                event,
+                carrick_hal::FrameInventoryEvent::RetireFrame {
+                    frame: retired,
+                    ..
+                } if *retired == frame
+            )),
+            "a process terminal must not retire a frame another mm still maps",
+        );
+    }
+
+    #[test]
+    fn process_retirement_retires_the_exact_last_authoritative_mapping() {
+        let (mut task, frame, _) = process_retirement_task(TestFrameMappingCount::Exact(1));
+
+        HvfVmState::retire_task_state_process_mappings(&mut task)
+            .expect("stage last-owner process-terminal retirement");
+        let commit = HvfVmState::take_task_state_retirement_inventory(&mut task)
+            .expect("last-owner process-terminal retirement commit");
+        assert!(commit.batch().events().iter().any(|event| {
+            matches!(
+                event,
+                carrick_hal::FrameInventoryEvent::RetireFrame {
+                    frame: retired,
+                    ..
+                } if *retired == frame
+            )
+        }));
+    }
+
+    #[test]
+    fn process_retirement_fails_when_the_authoritative_mapping_count_is_unavailable() {
+        let (mut task, _, _) = process_retirement_task(TestFrameMappingCount::Error);
+
+        let error = HvfVmState::retire_task_state_process_mappings(&mut task)
+            .expect_err("an unavailable VM-wide mapping count must fail retirement");
+        assert!(
+            error.to_string().contains("injected mapping-count failure"),
+            "the authority-query cause must remain visible: {error}",
+        );
+        assert!(
+            HvfVmState::take_task_state_retirement_inventory(&mut task).is_none(),
+            "a failed authority query must not publish a retirement commit",
+        );
+    }
+
+    #[test]
+    fn cow_split_keeps_stage2_when_the_authority_keeps_the_old_frame_live() {
+        let old_frame = carrick_hal::FrameId::from_kernel_allocation(id(51));
+        let old_mapping = carrick_hal::MappingId::from_kernel_allocation(id(52));
+        let new_frame = carrick_hal::FrameId::from_kernel_allocation(id(53));
+        let new_mapping = carrick_hal::MappingId::from_kernel_allocation(id(54));
+        let old_key = (0xa090_0000_0000, 0x4000);
+        let new_key = (0xa092_0000_0000, 0x4000);
+        let old = InventoryExtent {
+            frame: old_frame,
+            mapping: old_mapping,
+            backing: InventoryBackingIdentity::Private(51),
+            stage2_base: old_key.0,
+            stage2_length: old_key.1,
+        };
+        let mut inventory = HvpatchFrameInventory::default();
+        inventory.extents.insert(old_key, old);
+        {
+            let mut frames = inventory.frames.lock();
+            frames.references.insert(old_frame, 1);
+            frames
+                .extent_references
+                .insert((old_frame, old_key.0, old_key.1), 1);
+            frames.stage2_references.insert(old_key, 1);
+        }
+        let shape =
+            HvfVmState::cow_inventory_split_shape(&inventory, old_key.0, false, |_| Ok(Some(2)))
+                .expect("plan COW with a sibling-mm authority mapping");
+        assert!(
+            !shape.retirement.backend_frame_references_complete,
+            "the planner must carry the backend/authority mismatch into commit",
+        );
+        let split = CowInventorySplit {
+            old_key,
+            old,
+            fragments: Vec::new(),
+            new_key,
+            new_extent: InventoryExtent {
+                frame: new_frame,
+                mapping: new_mapping,
+                backing: InventoryBackingIdentity::Private(53),
+                stage2_base: new_key.0,
+                stage2_length: new_key.1,
+            },
+            // The kernel authority reports another mm still maps old_frame.
+            retirement: shape.retirement,
+        };
+        let stage2_retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = std::sync::Arc::clone(&stage2_retired);
+
+        let retired = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, move || {
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("commit authority-retained COW split");
+
+        assert!(!retired, "the old stage-2 extent must remain installed");
+        assert!(
+            !stage2_retired.load(std::sync::atomic::Ordering::SeqCst),
+            "physical stage-2 retirement must follow authoritative frame retirement",
+        );
     }
 
     #[test]
@@ -20047,7 +20383,10 @@ mod frame_inventory_backend_tests {
                 stage2_base: new_key.0,
                 stage2_length: new_key.1,
             },
-            retire_old_frame: false,
+            retirement: CowInventoryRetirementDecision {
+                retire_old_frame: false,
+                backend_frame_references_complete: true,
+            },
         };
 
         let error = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(()))
@@ -20105,7 +20444,10 @@ mod frame_inventory_backend_tests {
                 stage2_base: new_key.0,
                 stage2_length: new_key.1,
             },
-            retire_old_frame: true,
+            retirement: CowInventoryRetirementDecision {
+                retire_old_frame: true,
+                backend_frame_references_complete: true,
+            },
         };
         let frames = std::sync::Arc::clone(&inventory.frames);
 
@@ -20160,7 +20502,7 @@ mod frame_inventory_backend_tests {
         let leases = std::collections::BTreeSet::from([lease]);
 
         // Two mms map the frame; this transaction unmaps one of them.
-        let sibling_still_maps = |_frame| Some(2usize);
+        let sibling_still_maps = |_frame| Ok(Some(2usize));
         let shape =
             HvfVmState::inventory_lease_retirement_shape(&inventory, &leases, &sibling_still_maps)
                 .unwrap();
@@ -20170,9 +20512,26 @@ mod frame_inventory_backend_tests {
             "a frame a sibling mm still maps must not be retired: {:?}",
             shape.frames
         );
+        assert!(
+            shape.stage2_leases.is_empty(),
+            "a stage-2 lease whose backend frame population is incomplete must stay mapped",
+        );
 
         // Last mm out does retire it.
-        let last_owner = |_frame| Some(1usize);
+        let unavailable = |_frame| {
+            Err(TrapError::Hypervisor(
+                "injected alias mapping-count failure".to_owned(),
+            ))
+        };
+        let error = HvfVmState::inventory_lease_retirement_shape(&inventory, &leases, &unavailable)
+            .expect_err("alias retirement must fail when authority is unavailable");
+        assert!(
+            error
+                .to_string()
+                .contains("injected alias mapping-count failure")
+        );
+
+        let last_owner = |_frame| Ok(Some(1usize));
         let shape =
             HvfVmState::inventory_lease_retirement_shape(&inventory, &leases, &last_owner).unwrap();
         assert_eq!(shape.frames, std::collections::BTreeSet::from([frame]));
@@ -20206,7 +20565,7 @@ mod frame_inventory_backend_tests {
         }
 
         let shape =
-            HvfVmState::cow_inventory_split_shape(&inventory, physical_ipa, true, |_| Some(1))
+            HvfVmState::cow_inventory_split_shape(&inventory, physical_ipa, true, |_| Ok(Some(1)))
                 .expect("partial semantic COW split shape");
 
         assert_eq!(
@@ -20215,7 +20574,7 @@ mod frame_inventory_backend_tests {
             "a sibling leaf still naming the source frame keeps its exact physical compound live",
         );
         assert!(
-            !shape.retire_old_frame,
+            !shape.retirement.retire_old_frame,
             "the source frame cannot retire while this mm retains one of its sibling leaves",
         );
     }
@@ -20328,7 +20687,8 @@ mod frame_inventory_backend_tests {
             frames.stage2_references.insert((0x8000, 0x4000), 1);
         }
 
-        let extents = final_exec_physical_extents(&inventory).unwrap();
+        let authoritative = |frame| Ok(Some(if frame == shared { 2 } else { 1 }));
+        let extents = final_exec_physical_extents(&inventory, &authoritative).unwrap();
         assert_eq!(
             extents,
             std::collections::BTreeSet::from([(0x8000, 0x4000)])
@@ -20342,7 +20702,15 @@ mod frame_inventory_backend_tests {
             .lock()
             .stage2_references
             .insert((0x4000, 0x4000), 1);
-        let extents = final_exec_physical_extents(&inventory).unwrap();
+        let incomplete_authority = |frame| Ok(Some(if frame == shared { 3 } else { 1 }));
+        let extents = final_exec_physical_extents(&inventory, &incomplete_authority).unwrap();
+        assert_eq!(
+            extents,
+            std::collections::BTreeSet::from([(0x8000, 0x4000)]),
+            "exec must retain a lease when authoritative frame mappings exceed backend references",
+        );
+
+        let extents = final_exec_physical_extents(&inventory, &authoritative).unwrap();
         assert_eq!(
             extents,
             std::collections::BTreeSet::from([(0x4000, 0x4000), (0x8000, 0x4000)])
