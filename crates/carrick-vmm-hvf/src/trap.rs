@@ -5281,6 +5281,10 @@ struct PendingExecStage2Cleanup {
     frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
     /// Semantic alias ownership of the address space replaced by exec.
     mm_root_slot: Option<(u64, u64)>,
+    /// Immutable exact Kernel identity captured before exec replaces the task.
+    predecessor_identity: HvpatchCarrierTaskIdentity,
+    /// Never-reused predecessor MM identity from the matching COW binding.
+    predecessor_mm: u64,
     shared_projection: bool,
     armed: bool,
 }
@@ -5294,12 +5298,41 @@ unsafe impl Send for PendingExecStage2Cleanup {}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PendingExecStage2Cleanup {
     fn retire(&mut self) -> Result<(), TrapError> {
+        self.retire_with(&mut |event| {
+            crate::probes::hvpatch_exec_predecessor_classification(event);
+        })
+    }
+
+    fn retire_with(
+        &mut self,
+        publish: &mut dyn FnMut(
+            carrick_observability::probes::HvpatchExecPredecessorClassification,
+        ),
+    ) -> Result<(), TrapError> {
+        let identity = self.predecessor_identity;
+        let classification =
+            carrick_observability::probes::HvpatchExecPredecessorClassification::new(
+                carrick_observability::probes::HvpatchExecPredecessorClassificationPhase::CleanupConsumed,
+                identity.task_serial,
+                identity.thread_serial,
+                identity.linux_pid,
+                identity.linux_tid,
+                self.predecessor_mm,
+                u32::from(identity.asid),
+                self.shared_projection,
+            )
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "construct deferred HVPatch exec predecessor classification: {error}"
+                ))
+            })?;
         if self.shared_projection {
             // A CLONE_VM process edge owns only unowned descriptors into the
             // parent's still-live MM. Exec drops that projection; it must not
             // unmap stage-2, retire aliases, or release parent backing.
             self.mappings.clear();
             self.armed = false;
+            publish(classification);
             return Ok(());
         }
         let mut retired_extents = std::collections::BTreeSet::new();
@@ -5352,6 +5385,7 @@ impl PendingExecStage2Cleanup {
         }
         std::mem::forget(retained_backings);
         self.armed = false;
+        publish(classification);
         Ok(())
     }
 }
@@ -18122,8 +18156,46 @@ impl HvfVmState {
         );
         let drop_backings_started = std::time::Instant::now();
         if self.persistent_vm_lifecycle {
-            let predecessor_mappings = std::mem::take(&mut self.mappings);
+            let predecessor_cow_identity = self.cow_identity.ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "HVPatch exec predecessor cleanup lacks exact COW identity".to_owned(),
+                )
+            })?;
+            let predecessor_identity = self
+                .registration
+                .as_ref()
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "HVPatch exec predecessor cleanup lacks exact task registration".to_owned(),
+                    )
+                })?
+                .expected_identity;
+            if predecessor_identity.linux_pid != predecessor_cow_identity.linux_pid
+                || predecessor_identity.linux_tid != predecessor_cow_identity.linux_tid
+                || predecessor_identity.asid != predecessor_cow_identity.asid
+            {
+                return Err(TrapError::Hypervisor(
+                    "HVPatch exec predecessor task registration/COW identity mismatch".to_owned(),
+                ));
+            }
             let shared_projection = self.shared_process_mm;
+            let predecessor_classification =
+                carrick_observability::probes::HvpatchExecPredecessorClassification::new(
+                    carrick_observability::probes::HvpatchExecPredecessorClassificationPhase::BackendCaptured,
+                    predecessor_identity.task_serial,
+                    predecessor_identity.thread_serial,
+                    predecessor_identity.linux_pid,
+                    predecessor_identity.linux_tid,
+                    predecessor_cow_identity.mm,
+                    u32::from(predecessor_identity.asid),
+                    shared_projection,
+                )
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "construct backend HVPatch exec predecessor classification: {error}"
+                    ))
+                })?;
+            let predecessor_mappings = std::mem::take(&mut self.mappings);
             let predecessor_frames = std::sync::Arc::clone(&self.frame_inventory.lock().frames);
             let predecessor_extents = retired_physical_extents
                 .iter()
@@ -18141,6 +18213,8 @@ impl HvfVmState {
                     extents: predecessor_extents,
                     frames: predecessor_frames,
                     mm_root_slot: predecessor_mm_root_slot,
+                    predecessor_identity,
+                    predecessor_mm: predecessor_cow_identity.mm,
                     shared_projection,
                     armed: true,
                 })
@@ -18149,6 +18223,7 @@ impl HvfVmState {
                 eprintln!("carrick: FATAL: overlapping detached exec predecessor cleanup");
                 std::process::abort();
             }
+            crate::probes::hvpatch_exec_predecessor_classification(predecessor_classification);
         } else {
             // Preserve mature VMM's historical leak-until-process-exit discipline:
             // the old VM was raw-destroyed and sibling/alias projections may still
@@ -20096,6 +20171,21 @@ mod vm_create_admission_tests {
 mod frame_inventory_backend_tests {
     use super::*;
 
+    fn predecessor_test_identity(task: &HvfTaskState) -> (HvpatchCarrierTaskIdentity, u64) {
+        let cow = task.cow_identity.expect("fixture COW identity");
+        (
+            HvpatchCarrierTaskIdentity {
+                task_serial: u64::try_from(cow.linux_pid).unwrap(),
+                thread_serial: u64::try_from(cow.linux_tid).unwrap(),
+                execution_generation: 1,
+                linux_pid: cow.linux_pid,
+                linux_tid: cow.linux_tid,
+                asid: cow.asid,
+            },
+            cow.mm,
+        )
+    }
+
     fn global_frame_allocator_test_lock() -> &'static parking_lot::Mutex<()> {
         static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
         &LOCK
@@ -20618,11 +20708,14 @@ mod frame_inventory_backend_tests {
         mapping.host_mapping = Some(host);
         mapping.stage2_lease = Some(lease);
         let mut task = hvpatch_task_state_test_fixture(7, 0x4000, 7);
+        let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
         task.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
             mappings: vec![mapping],
             extents: [((0x1234_0000, 0x4000), 0)].into_iter().collect(),
             frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
             mm_root_slot: task.mm_root_slot,
+            predecessor_identity,
+            predecessor_mm,
             shared_projection: false,
             armed: true,
         });
@@ -20633,6 +20726,42 @@ mod frame_inventory_backend_tests {
         assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!alias_backing_is_live(host_addr as usize));
         assert!(task.pending_exec_stage2_cleanup.is_none());
+    }
+
+    #[test]
+    fn shared_exec_predecessor_cleanup_retains_and_emits_exact_classification() {
+        let task = hvpatch_task_state_test_fixture(19, 0x4000, 23);
+        let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
+        let mut cleanup = PendingExecStage2Cleanup {
+            mappings: Vec::new(),
+            extents: std::collections::BTreeMap::new(),
+            frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
+            mm_root_slot: task.mm_root_slot,
+            predecessor_identity,
+            predecessor_mm,
+            shared_projection: true,
+            armed: true,
+        };
+        let mut observed = Vec::new();
+
+        cleanup
+            .retire_with(&mut |event| observed.push(event))
+            .expect("retire shared predecessor projection");
+
+        assert_eq!(observed.len(), 1);
+        let event = observed[0];
+        assert_eq!(
+            event.phase(),
+            carrick_observability::probes::HvpatchExecPredecessorClassificationPhase::CleanupConsumed
+        );
+        assert_eq!(event.linux_pid(), predecessor_identity.linux_pid);
+        assert_eq!(event.linux_tid(), predecessor_identity.linux_tid);
+        assert_eq!(event.task_serial(), predecessor_identity.task_serial);
+        assert_eq!(event.thread_serial(), predecessor_identity.thread_serial);
+        assert_eq!(event.mm(), predecessor_mm);
+        assert_eq!(event.asid(), u32::from(predecessor_identity.asid));
+        assert!(event.shared());
+        assert!(!cleanup.armed);
     }
 
     #[test]
@@ -20666,6 +20795,7 @@ mod frame_inventory_backend_tests {
             .stage2_references
             .insert((lease_key.0, lease_key.1 as u64), 1);
         let mut task = hvpatch_task_state_test_fixture(17, 0x4000, 17);
+        let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
         let predecessor_scope = task.mm_root_slot.expect("predecessor MM root slot");
         let sibling_scope = (
             predecessor_scope.0 + predecessor_scope.1,
@@ -20709,6 +20839,8 @@ mod frame_inventory_backend_tests {
             extents: [(lease_key, 0)].into_iter().collect(),
             frames,
             mm_root_slot: task.mm_root_slot,
+            predecessor_identity,
+            predecessor_mm,
             shared_projection: false,
             armed: true,
         });
@@ -20764,6 +20896,7 @@ mod frame_inventory_backend_tests {
         );
 
         let mut task = hvpatch_task_state_test_fixture(18, 0x4000, 18);
+        let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
         task.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
             mappings: vec![thread_sibling_tests::mapped_region(
                 lease_key.0,
@@ -20775,6 +20908,8 @@ mod frame_inventory_backend_tests {
                 .collect(),
             frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
             mm_root_slot: task.mm_root_slot,
+            predecessor_identity,
+            predecessor_mm,
             shared_projection: false,
             armed: true,
         });

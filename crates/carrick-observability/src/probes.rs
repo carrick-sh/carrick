@@ -399,6 +399,8 @@ pub enum HvpatchGuestLifecycleError {
     InvalidTtbr0,
     #[error("hvpatch structural frame receipt contains a zero identity")]
     InvalidFrameReceipt,
+    #[error("hvpatch exec predecessor identity contains a zero serial or mm")]
+    InvalidPredecessorIdentity,
 }
 
 impl HvpatchGuestLifecycle {
@@ -1014,6 +1016,221 @@ pub enum HvpatchExecBackingPhase {
 impl HvpatchExecBackingPhase {
     pub const fn raw(self) -> u32 {
         self as u32
+    }
+}
+
+/// Where one immutable exec-predecessor classification was observed.
+///
+/// These ordinals are part of the DTrace provider ABI; append, never renumber.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchExecPredecessorClassificationPhase {
+    /// The runtime computed sharing from the authoritative Kernel MM leases.
+    AuthorityComputed = 0,
+    /// The HVF backend captured that classification with its COW identity.
+    BackendCaptured = 1,
+    /// Deferred stage-2 retirement consumed the captured classification.
+    CleanupConsumed = 2,
+}
+
+impl HvpatchExecPredecessorClassificationPhase {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Typed source record for `hvpatch-exec-predecessor-classification`.
+///
+/// The Linux PID/TID, never-reused `MmId`, and architectural ASID identify the
+/// exact predecessor. `shared` is immutable across all three phase firings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchExecPredecessorClassification {
+    phase: HvpatchExecPredecessorClassificationPhase,
+    task_serial: u64,
+    thread_serial: u64,
+    linux_pid: i32,
+    linux_tid: i32,
+    mm: u64,
+    asid: u32,
+    shared: bool,
+}
+
+impl HvpatchExecPredecessorClassification {
+    pub fn new(
+        phase: HvpatchExecPredecessorClassificationPhase,
+        task_serial: u64,
+        thread_serial: u64,
+        linux_pid: i32,
+        linux_tid: i32,
+        mm: u64,
+        asid: u32,
+        shared: bool,
+    ) -> Result<Self, HvpatchGuestLifecycleError> {
+        if linux_pid <= 0 || linux_tid <= 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidTaskIdentity);
+        }
+        if task_serial == 0 || thread_serial == 0 || mm == 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidPredecessorIdentity);
+        }
+        if asid == 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidAsid);
+        }
+        Ok(Self {
+            phase,
+            task_serial,
+            thread_serial,
+            linux_pid,
+            linux_tid,
+            mm,
+            asid,
+            shared,
+        })
+    }
+
+    pub const fn phase(self) -> HvpatchExecPredecessorClassificationPhase {
+        self.phase
+    }
+
+    pub const fn task_serial(self) -> u64 {
+        self.task_serial
+    }
+
+    pub const fn thread_serial(self) -> u64 {
+        self.thread_serial
+    }
+
+    pub const fn linux_pid(self) -> i32 {
+        self.linux_pid
+    }
+
+    pub const fn linux_tid(self) -> i32 {
+        self.linux_tid
+    }
+
+    pub const fn mm(self) -> u64 {
+        self.mm
+    }
+
+    pub const fn asid(self) -> u32 {
+        self.asid
+    }
+
+    pub const fn shared(self) -> bool {
+        self.shared
+    }
+}
+
+/// Low-rate lifecycle of one exact HVPatch MM lease edge.
+///
+/// These ordinals are part of the DTrace provider ABI; append, never renumber.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HvpatchMmLeasePhase {
+    SharedChildPublished = 0,
+    TaskEdgeRetiredShared = 1,
+    TaskEdgeRetiredFinal = 2,
+    ExecObserved = 3,
+    ExecCommitPreShared = 4,
+    ExecCommitPreFinal = 5,
+}
+
+impl HvpatchMmLeasePhase {
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Primary, five-scalar MM lease lifecycle record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchMmLeaseLifecycle {
+    phase: HvpatchMmLeasePhase,
+    task_pid: i32,
+    task_serial: u64,
+    asid: u32,
+    owner_count: u32,
+}
+
+impl HvpatchMmLeaseLifecycle {
+    pub fn new(
+        phase: HvpatchMmLeasePhase,
+        task_pid: i32,
+        task_serial: u64,
+        asid: u32,
+        owner_count: u32,
+    ) -> Result<Self, HvpatchGuestLifecycleError> {
+        if task_pid <= 0 || task_serial == 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidTaskIdentity);
+        }
+        if asid == 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidAsid);
+        }
+        Ok(Self {
+            phase,
+            task_pid,
+            task_serial,
+            asid,
+            owner_count,
+        })
+    }
+
+    pub const fn phase(self) -> HvpatchMmLeasePhase {
+        self.phase
+    }
+    pub const fn task_pid(self) -> i32 {
+        self.task_pid
+    }
+    pub const fn task_serial(self) -> u64 {
+        self.task_serial
+    }
+    pub const fn asid(self) -> u32 {
+        self.asid
+    }
+    pub const fn owner_count(self) -> u32 {
+        self.owner_count
+    }
+}
+
+/// Phase-specific exact relation for an MM lease lifecycle record.
+///
+/// For `SharedChildPublished`, `related` is the parent TaskKey. For
+/// `ExecObserved`, it is the executing ThreadKey. Other phases emit no relation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchMmLeaseRelation {
+    phase: HvpatchMmLeasePhase,
+    task_serial: u64,
+    related_pid: i32,
+    related_serial: u64,
+}
+
+impl HvpatchMmLeaseRelation {
+    pub fn new(
+        phase: HvpatchMmLeasePhase,
+        task_serial: u64,
+        related_pid: i32,
+        related_serial: u64,
+    ) -> Result<Self, HvpatchGuestLifecycleError> {
+        if task_serial == 0 || related_pid <= 0 || related_serial == 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidTaskIdentity);
+        }
+        Ok(Self {
+            phase,
+            task_serial,
+            related_pid,
+            related_serial,
+        })
+    }
+
+    pub const fn phase(self) -> HvpatchMmLeasePhase {
+        self.phase
+    }
+    pub const fn task_serial(self) -> u64 {
+        self.task_serial
+    }
+    pub const fn related_pid(self) -> i32 {
+        self.related_pid
+    }
+    pub const fn related_serial(self) -> u64 {
+        self.related_serial
     }
 }
 
@@ -1969,6 +2186,93 @@ mod hvpatch_guest_probe_abi {
             assert!(
                 source.matches(declaration).count() >= 2,
                 "missing exec backing ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_predecessor_classification_provider_and_stub_keep_the_same_typed_shape() {
+        let source = include_str!("probes.rs");
+        let compact = source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        for provider in [
+            "fn hvpatch__exec__predecessor__classification(_: u32, _: u64, _: u64, _: u64, _: u32) {}",
+            "fn hvpatch__exec__predecessor__classification__identity(_: u32, _: u64, _: u64, _: i32, _: i32,) {}",
+            "fn hvpatch__exec__predecessor__classification__asid(_: u32, _: u64, _: u64, _: u32) {}",
+        ] {
+            let provider = provider
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>();
+            assert!(
+                compact.matches(&provider).count() >= 2,
+                "missing <=5-arg provider ABI {provider}"
+            );
+        }
+        let stub = "stub!(hvpatch_exec_predecessor_classification(event: super::HvpatchExecPredecessorClassification));";
+        assert!(source.matches(stub).count() >= 2, "missing typed stub ABI");
+    }
+
+    #[test]
+    fn exec_predecessor_classification_keeps_identity_and_sharing_typed() {
+        let event = HvpatchExecPredecessorClassification::new(
+            HvpatchExecPredecessorClassificationPhase::BackendCaptured,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            true,
+        )
+        .expect("valid predecessor classification");
+        assert_eq!(
+            event.phase(),
+            HvpatchExecPredecessorClassificationPhase::BackendCaptured
+        );
+        assert_eq!(event.task_serial(), 40);
+        assert_eq!(event.thread_serial(), 41);
+        assert_eq!(event.linux_pid(), 42);
+        assert_eq!(event.linux_tid(), 43);
+        assert_eq!(event.mm(), 44);
+        assert_eq!(event.asid(), 45);
+        assert!(event.shared());
+        assert_eq!(
+            HvpatchExecPredecessorClassificationPhase::AuthorityComputed.raw(),
+            0
+        );
+        assert_eq!(
+            HvpatchExecPredecessorClassificationPhase::BackendCaptured.raw(),
+            1
+        );
+        assert_eq!(
+            HvpatchExecPredecessorClassificationPhase::CleanupConsumed.raw(),
+            2
+        );
+    }
+
+    #[test]
+    fn mm_lease_lifecycle_provider_and_stub_stay_below_macos_arg5() {
+        let source = include_str!("probes.rs");
+        let compact = source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        for declaration in [
+            "fn hvpatch__mm__lease__lifecycle(_: u32, _: i32, _: u64, _: u32, _: u32) {}",
+            "fn hvpatch__mm__lease__relation(_: u32, _: u64, _: i32, _: u64) {}",
+            "stub!(hvpatch_mm_lease_lifecycle(event: super::HvpatchMmLeaseLifecycle));",
+            "stub!(hvpatch_mm_lease_relation(event: super::HvpatchMmLeaseRelation));",
+        ] {
+            let declaration = declaration
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>();
+            assert!(
+                compact.matches(&declaration).count() >= 2,
+                "missing MM lease ABI {declaration}"
             );
         }
     }
@@ -4390,6 +4694,27 @@ mod real {
         /// Linux guest VA, global-frame IPA, mapped bytes, and lookup plus
         /// allocation/copy elapsed nanoseconds.
         fn hvpatch__exec__backing(_: u32, _: u64, _: u64, _: u64, _: u64) {}
+        /// Immutable exec-predecessor classification at authority computation,
+        /// backend capture, and deferred cleanup consumption. Args: phase
+        /// (0=authority computed, 1=backend captured, 2=cleanup consumed), exact
+        /// Task/Thread serials, never-reused MmId, and shared projection.
+        fn hvpatch__exec__predecessor__classification(_: u32, _: u64, _: u64, _: u64, _: u32) {}
+        /// Companion exact Linux identity for the classification.
+        /// macOS USDT arg5 is not usable, so every split record stays below it.
+        fn hvpatch__exec__predecessor__classification__identity(
+            _: u32,
+            _: u64,
+            _: u64,
+            _: i32,
+            _: i32,
+        ) {
+        }
+        /// Companion architectural ASID for the exact phase/task/MM join.
+        fn hvpatch__exec__predecessor__classification__asid(_: u32, _: u64, _: u64, _: u32) {}
+        /// Exact task edge and owner census at MM lease lifecycle boundaries.
+        fn hvpatch__mm__lease__lifecycle(_: u32, _: i32, _: u64, _: u32, _: u32) {}
+        /// Parent TaskKey or executing ThreadKey relation for a lifecycle event.
+        fn hvpatch__mm__lease__relation(_: u32, _: u64, _: i32, _: u64) {}
         /// Raw stage-2 exec transition. Args: phase (0=unmap begin, 1=unmap
         /// end, 2=map begin, 3=map end), IPA, size, guest VA (`UINT64_MAX`
         /// when the unmap ledger has only an IPA extent), and raw HVF rc.
@@ -5591,6 +5916,53 @@ mod real {
             event.ipa_start(),
             event.mapped_size(),
             event.elapsed_ns()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_exec_predecessor_classification(
+        event: super::HvpatchExecPredecessorClassification,
+    ) {
+        carrick_usdt::hvpatch__exec__predecessor__classification__identity!(|| (
+            event.phase().raw(),
+            event.task_serial(),
+            event.mm(),
+            event.linux_pid(),
+            event.linux_tid()
+        ));
+        carrick_usdt::hvpatch__exec__predecessor__classification__asid!(|| (
+            event.phase().raw(),
+            event.task_serial(),
+            event.mm(),
+            event.asid()
+        ));
+        carrick_usdt::hvpatch__exec__predecessor__classification!(|| (
+            event.phase().raw(),
+            event.task_serial(),
+            event.thread_serial(),
+            event.mm(),
+            u32::from(event.shared())
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_mm_lease_lifecycle(event: super::HvpatchMmLeaseLifecycle) {
+        carrick_usdt::hvpatch__mm__lease__lifecycle!(|| (
+            event.phase().raw(),
+            event.task_pid(),
+            event.task_serial(),
+            event.asid(),
+            event.owner_count()
+        ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_mm_lease_relation(event: super::HvpatchMmLeaseRelation) {
+        carrick_usdt::hvpatch__mm__lease__relation!(|| (
+            event.phase().raw(),
+            event.task_serial(),
+            event.related_pid(),
+            event.related_serial()
         ));
     }
 
@@ -7146,6 +7518,9 @@ mod stub {
     stub!(hvpatch_fork_snapshot_end(child_pid: i32, local_regions: u64, candidate_regions: u64, added_regions: u64, added_bytes: u64));
     stub!(hvpatch_fork_snapshot_shape(child_pid: i32, private_added_regions: u64, shared_added_regions: u64, largest_added_bytes: u64, root_slot_used_bytes: u64));
     stub!(hvpatch_exec_backing(event: super::HvpatchExecBacking));
+    stub!(hvpatch_exec_predecessor_classification(event: super::HvpatchExecPredecessorClassification));
+    stub!(hvpatch_mm_lease_lifecycle(event: super::HvpatchMmLeaseLifecycle));
+    stub!(hvpatch_mm_lease_relation(event: super::HvpatchMmLeaseRelation));
     stub!(hvpatch_exec_stage2(event: super::HvpatchExecStage2));
     stub!(hvpatch_exec_replace_stage(event: super::HvpatchExecReplaceStage));
     stub!(hvpatch_exec_runtime_stage(event: super::HvpatchExecRuntimeStage));

@@ -8,7 +8,23 @@ use super::stage1_mm::{
     PreparedStage1Mm, Stage1MmBackend, Stage1MmError, Stage1MmLease, Stage1MmPool,
     Stage1MmRetirement,
 };
-use crate::kernel::{Stage1RootError, TaskKey};
+use crate::kernel::{Stage1RootError, TaskKey, ThreadKey};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExecOwnerObservation {
+    owner_count: u32,
+}
+
+impl ExecOwnerObservation {
+    #[cfg(test)]
+    pub(crate) const fn owner_count(self) -> u32 {
+        self.owner_count
+    }
+
+    pub(crate) const fn final_owner(self) -> bool {
+        self.owner_count == 1
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct RetiredStage1Mm {
@@ -94,6 +110,50 @@ pub(crate) struct MmResources {
 }
 
 impl MmResources {
+    fn owner_count(state: &MmResourceState, lease: &Arc<Stage1MmLease>) -> u32 {
+        u32::try_from(
+            state
+                .leases
+                .values()
+                .filter(|candidate| Arc::ptr_eq(candidate, lease))
+                .count(),
+        )
+        .unwrap_or_else(|_| std::process::abort())
+    }
+
+    fn publish_lifecycle(
+        phase: carrick_observability::probes::HvpatchMmLeasePhase,
+        task: TaskKey,
+        lease: &Stage1MmLease,
+        owner_count: u32,
+    ) {
+        let event = carrick_observability::probes::HvpatchMmLeaseLifecycle::new(
+            phase,
+            task.id.raw(),
+            task.serial.raw(),
+            u32::from(lease.binding().asid.raw()),
+            owner_count,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        crate::probes::hvpatch_mm_lease_lifecycle(event);
+    }
+
+    fn publish_relation(
+        phase: carrick_observability::probes::HvpatchMmLeasePhase,
+        task: TaskKey,
+        related_pid: i32,
+        related_serial: u64,
+    ) {
+        let event = carrick_observability::probes::HvpatchMmLeaseRelation::new(
+            phase,
+            task.serial.raw(),
+            related_pid,
+            related_serial,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        crate::probes::hvpatch_mm_lease_relation(event);
+    }
+
     pub(crate) fn new_root(
         stage1_root: u64,
     ) -> Result<(Self, Arc<Stage1MmBackend>), MmResourcesError> {
@@ -176,7 +236,20 @@ impl MmResources {
             .cloned()
             .ok_or(MmResourcesError::UnknownTask(parent))?;
         let backend = lease.backend();
-        state.leases.insert(child, lease);
+        state.leases.insert(child, Arc::clone(&lease));
+        let owner_count = Self::owner_count(&state, &lease);
+        Self::publish_relation(
+            carrick_observability::probes::HvpatchMmLeasePhase::SharedChildPublished,
+            child,
+            parent.id.raw(),
+            parent.serial.raw(),
+        );
+        Self::publish_lifecycle(
+            carrick_observability::probes::HvpatchMmLeasePhase::SharedChildPublished,
+            child,
+            &lease,
+            owner_count,
+        );
         Ok(backend)
     }
 
@@ -209,6 +282,32 @@ impl MmResources {
             .any(|(other, candidate)| *other != task && Arc::ptr_eq(candidate, lease)))
     }
 
+    pub(crate) fn observe_exec_owners(
+        &self,
+        task: TaskKey,
+        thread: ThreadKey,
+    ) -> Result<ExecOwnerObservation, MmResourcesError> {
+        let state = self.state.lock();
+        let lease = state
+            .leases
+            .get(&task)
+            .ok_or(MmResourcesError::UnknownTask(task))?;
+        let owner_count = Self::owner_count(&state, lease);
+        Self::publish_relation(
+            carrick_observability::probes::HvpatchMmLeasePhase::ExecObserved,
+            task,
+            thread.tid.raw(),
+            thread.serial.raw(),
+        );
+        Self::publish_lifecycle(
+            carrick_observability::probes::HvpatchMmLeasePhase::ExecObserved,
+            task,
+            lease,
+            owner_count,
+        );
+        Ok(ExecOwnerObservation { owner_count })
+    }
+
     pub(crate) fn prepare_exec(&self, task: TaskKey) -> Result<PreparedStage1Mm, MmResourcesError> {
         if !self.state.lock().leases.contains_key(&task) {
             return Err(MmResourcesError::UnknownTask(task));
@@ -233,6 +332,17 @@ impl MmResources {
             .leases
             .iter()
             .any(|(other_task, other)| *other_task != task && Arc::ptr_eq(other, &predecessor));
+        let predecessor_owner_count = Self::owner_count(&state, &predecessor);
+        Self::publish_lifecycle(
+            if shared {
+                carrick_observability::probes::HvpatchMmLeasePhase::ExecCommitPreShared
+            } else {
+                carrick_observability::probes::HvpatchMmLeasePhase::ExecCommitPreFinal
+            },
+            task,
+            &predecessor,
+            predecessor_owner_count,
+        );
         let retirement = if shared {
             None
         } else {
@@ -270,6 +380,17 @@ impl MmResources {
         };
         state.leases.remove(&task);
         state.retired.insert(task);
+        let remaining_owner_count = Self::owner_count(&state, &lease);
+        Self::publish_lifecycle(
+            if shared {
+                carrick_observability::probes::HvpatchMmLeasePhase::TaskEdgeRetiredShared
+            } else {
+                carrick_observability::probes::HvpatchMmLeasePhase::TaskEdgeRetiredFinal
+            },
+            task,
+            &lease,
+            remaining_owner_count,
+        );
         Ok(RetiredStage1Mm { retirement })
     }
 }
@@ -279,12 +400,19 @@ mod tests {
     use std::num::NonZeroU64;
 
     use super::*;
-    use crate::kernel::{TaskId, TaskSerial};
+    use crate::kernel::{LinuxTid, TaskId, TaskSerial, ThreadKey, ThreadSerial};
 
     fn task(raw: i32, serial: u64) -> TaskKey {
         TaskKey {
             id: TaskId::for_root_bootstrap(raw).unwrap(),
             serial: TaskSerial::from_registry_allocation(NonZeroU64::new(serial).unwrap()),
+        }
+    }
+
+    fn thread(raw: i32, serial: u64) -> ThreadKey {
+        ThreadKey {
+            tid: LinuxTid::from_abi_positive(raw).unwrap(),
+            serial: ThreadSerial::from_registry_allocation(NonZeroU64::new(serial).unwrap()),
         }
     }
 
@@ -349,6 +477,10 @@ mod tests {
         let (resources, parent_backend) = resources(parent, 3);
         let old = parent_backend.binding();
         resources.publish_shared_child(parent, child).unwrap();
+
+        let observation = resources.observe_exec_owners(child, thread(63, 3)).unwrap();
+        assert_eq!(observation.owner_count(), 2);
+        assert!(!observation.final_owner());
 
         let prepared = resources.prepare_exec(child).unwrap();
         let replacement_root = prepared.root_slot().unwrap().base();

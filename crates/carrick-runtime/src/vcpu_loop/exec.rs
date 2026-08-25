@@ -943,14 +943,44 @@ where
             // production, so every vfork-shared exec retired the shared mm
             // out from under the surviving child (vforkexecthread: the
             // child's load-barrier fetch walked all-zero descriptors).
-            let predecessor_shared = !process
+            let predecessor_owners = process
                 .mm_resources()
-                .is_final_owner(process.task_key())
+                .observe_exec_owners(process.task_key(), exec_kernel_context.thread().key())
                 .map_err(|error| {
                     RuntimeError::Configuration(format!(
                         "resolve exec predecessor mm sharing: {error}"
                     ))
                 })?;
+            let predecessor_shared = !predecessor_owners.final_owner();
+            let predecessor_binding = process.mm_binding().ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "HVPatch exec predecessor has no exact MM binding".to_owned(),
+                )
+            })?;
+            if exec_kernel_context.task().key() != process.task_key()
+                || exec_kernel_context.shared().mm().id() != old_mm_id
+            {
+                return Err(RuntimeError::Configuration(
+                    "HVPatch exec predecessor ProcessContext/MM binding drifted".to_owned(),
+                ));
+            }
+            let predecessor_classification =
+                carrick_observability::probes::HvpatchExecPredecessorClassification::new(
+                    carrick_observability::probes::HvpatchExecPredecessorClassificationPhase::AuthorityComputed,
+                    exec_kernel_context.task().key().serial.raw(),
+                    exec_kernel_context.thread().key().serial.raw(),
+                    exec_kernel_context.task().key().id.raw(),
+                    exec_kernel_context.thread().key().tid.raw(),
+                    old_mm_id.raw(),
+                    u32::from(predecessor_binding.asid.raw()),
+                    predecessor_shared,
+                )
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "construct authoritative HVPatch exec predecessor classification: {error}"
+                    ))
+                })?;
+            crate::probes::hvpatch_exec_predecessor_classification(predecessor_classification);
             engine.mark_exec_predecessor_shared(predecessor_shared);
             let (mut old_extent_count, replacement_extent_count) =
                 engine.frame_inventory_exec_extent_counts(&img);
