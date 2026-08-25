@@ -26,8 +26,9 @@ use std::time::Instant;
 use carrick_kernel::arena::{ArenaError, KernelArena};
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 use carrick_kernel::process::{
-    FLAG_ADOPTED, FLAG_ALIVE, ProcessRecord, ProcessRecordRef, ProcessSection, REGISTERING,
-    VirtualPtraceControl, VirtualPtraceState,
+    FLAG_ADOPTED, FLAG_ALIVE, ProcessRecord, ProcessRecordRef, ProcessRecordTransitionAction,
+    ProcessRecordTransitionError, ProcessSection, REGISTERING, VirtualPtraceControl,
+    VirtualPtraceState,
 };
 
 /// Per-vCPU accumulated guest execution nanoseconds, one atomic slot per vCPU
@@ -555,20 +556,18 @@ fn set_adopted(record: &ProcessRecord, adopted: bool) {
     }
 }
 
+#[cfg(test)]
 fn release_child_record(r: ProcessRecordRef) {
     process_section().release(r);
-}
-
-fn release_child_pid(pid: u32) {
-    if let Some(r) = find_child_record(pid) {
-        release_child_record(r);
-    }
 }
 
 fn iter_child_records() -> impl Iterator<Item = &'static ProcessRecord> {
     process_records().iter().filter(|record| {
         let pid = record_pid(record);
-        pid != 0 && pid != REGISTERING && !record_is_tid_entry(record)
+        pid != 0
+            && pid != REGISTERING
+            && !record_is_tid_entry(record)
+            && !record.transition_claimed()
     })
 }
 
@@ -649,25 +648,13 @@ fn record_guest_ns(record: &ProcessRecord) -> u64 {
     record.guest_ns.load(Ordering::Acquire)
 }
 
+#[cfg(test)]
 fn record_ns_pid(record: &ProcessRecord) -> u32 {
     record.ns_pid.load(Ordering::Acquire)
 }
 
 fn record_exit_status(record: &ProcessRecord) -> i32 {
     record.exit_status.load(Ordering::Acquire) as u32 as i32
-}
-
-fn ref_for_record(record: &ProcessRecord) -> Option<ProcessRecordRef> {
-    let base = process_records().as_ptr() as usize;
-    let ptr = std::ptr::from_ref(record) as usize;
-    let index = (ptr.checked_sub(base)?) / std::mem::size_of::<ProcessRecord>();
-    record_generation(record).map(|generation| ProcessRecordRef { index, generation })
-}
-
-fn release_record(record: &ProcessRecord) {
-    if let Some(r) = ref_for_record(record) {
-        release_child_record(r);
-    }
 }
 
 fn store_exit_status(record: &ProcessRecord, status: i32) {
@@ -1202,6 +1189,16 @@ pub enum AdoptedChildWait {
     Pending(u32),
 }
 
+enum AdoptedChildScan {
+    NoMatch,
+    Pending(u32),
+    Reaped {
+        pid: u32,
+        status: i32,
+        guest_ns: u64,
+    },
+}
+
 /// Classify this waiter's adopted-child state for `target_pid` in a SINGLE
 /// table scan, reaping a ready child if one is found.
 ///
@@ -1213,39 +1210,84 @@ pub enum AdoptedChildWait {
 /// closes that window: `false` → `Pending` (park and re-classify; the flip is
 /// one-way), `true` → reap now.
 pub fn adopted_child_wait(waiter_pid: u32, target_pid: i32) -> Option<AdoptedChildWait> {
-    let mut pending = None;
-    for record in iter_child_records() {
-        let pid = record_host_pid(record);
-        if !adopted_flag(record) {
-            continue;
-        }
-        if record_parent_pid(record) != waiter_pid {
-            continue;
-        }
-        if target_pid > 0 && pid != target_pid as u32 {
-            continue;
-        }
-        if record_exit_ready(record) {
-            let status = record_exit_status(record);
-            let ns = record_guest_ns(record);
-            if record_ns_pid(record) == 0 {
-                release_record(record);
-            } else {
-                record.guest_ns.store(0, Ordering::Release);
-                clear_virtual_ptrace(record);
-                store_exit_ready(record, false);
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let mut pending = None;
+        let mut busy = false;
+        for (index, record) in process_records().iter().enumerate() {
+            let pid = record_host_pid(record);
+            if pid == 0 || pid == REGISTERING || record_is_tid_entry(record) {
+                continue;
             }
-            return Some(AdoptedChildWait::Reaped {
-                pid,
-                status,
-                guest_ns: ns,
-            });
+            let Some(generation) = record_generation(record) else {
+                continue;
+            };
+            let record_ref = ProcessRecordRef { index, generation };
+            match process_section().with_record_transition(
+                record_ref,
+                HostPid::new(pid),
+                |record| {
+                    if !adopted_flag(record)
+                        || record_parent_pid(record) != waiter_pid
+                        || (target_pid > 0 && pid != target_pid as u32)
+                    {
+                        return (
+                            AdoptedChildScan::NoMatch,
+                            ProcessRecordTransitionAction::Preserve,
+                        );
+                    }
+                    if !record_exit_ready(record) {
+                        return (
+                            AdoptedChildScan::Pending(pid),
+                            ProcessRecordTransitionAction::Preserve,
+                        );
+                    }
+                    let status = record_exit_status(record);
+                    let guest_ns = record_guest_ns(record);
+                    record.guest_ns.store(0, Ordering::Release);
+                    clear_virtual_ptrace(record);
+                    store_exit_ready(record, false);
+                    (
+                        AdoptedChildScan::Reaped {
+                            pid,
+                            status,
+                            guest_ns,
+                        },
+                        ProcessRecordTransitionAction::RetireIfNamespaceUnowned,
+                    )
+                },
+            ) {
+                Ok((AdoptedChildScan::NoMatch, _)) => {}
+                Ok((AdoptedChildScan::Pending(pid), _)) => {
+                    pending.get_or_insert(pid);
+                }
+                Ok((
+                    AdoptedChildScan::Reaped {
+                        pid,
+                        status,
+                        guest_ns,
+                    },
+                    _,
+                )) => {
+                    return Some(AdoptedChildWait::Reaped {
+                        pid,
+                        status,
+                        guest_ns,
+                    });
+                }
+                Err(ProcessRecordTransitionError::Stale) => {}
+                Err(ProcessRecordTransitionError::Busy) => busy = true,
+            }
         }
-        if pending.is_none() {
-            pending = Some(pid);
+        if !busy {
+            return pending.map(AdoptedChildWait::Pending);
         }
+        if Instant::now() >= deadline {
+            eprintln!("carrick: adopted-child record transition did not quiesce");
+            std::process::abort();
+        }
+        std::thread::yield_now();
     }
-    pending.map(AdoptedChildWait::Pending)
 }
 
 /// Reap an adopted child that has published its exit, or `None`. A `wait4`
@@ -1331,16 +1373,35 @@ pub fn direct_children_for_wait(waiter_pid: u32) -> Vec<u32> {
 /// published until the terminal namespace reap releases them. Non-namespace
 /// child metadata remains owned by this table and is freed here.
 pub fn reap_child_guest_ns(pid: u32) -> u64 {
-    if let Some(record) = child_record(pid) {
-        let ns = record_guest_ns(record);
-        record.guest_ns.store(0, Ordering::Release);
-        clear_virtual_ptrace(record);
-        if record_ns_pid(record) == 0 {
-            release_child_pid(pid);
+    let Some(record_ref) = find_child_record(pid) else {
+        return 0;
+    };
+    reap_child_guest_ns_ref(pid, record_ref)
+}
+
+fn reap_child_guest_ns_ref(pid: u32, record_ref: ProcessRecordRef) -> u64 {
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match process_section().with_record_transition(record_ref, HostPid::new(pid), |record| {
+            let guest_ns = record_guest_ns(record);
+            record.guest_ns.store(0, Ordering::Release);
+            clear_virtual_ptrace(record);
+            (
+                guest_ns,
+                ProcessRecordTransitionAction::RetireIfNamespaceUnowned,
+            )
+        }) {
+            Ok((guest_ns, _)) => return guest_ns,
+            Err(ProcessRecordTransitionError::Stale) => return 0,
+            Err(ProcessRecordTransitionError::Busy) if Instant::now() < deadline => {
+                std::thread::yield_now();
+            }
+            Err(ProcessRecordTransitionError::Busy) => {
+                eprintln!("carrick: guest CPU record transition did not quiesce for pid {pid}");
+                std::process::abort();
+            }
         }
-        return ns;
     }
-    0
 }
 
 /// Accumulate a reaped child's CPU (microseconds) into this process's
@@ -2053,6 +2114,74 @@ mod tests {
 
         // Consumed exactly once: a further wait is a genuine ECHILD.
         assert_eq!(adopted_child_wait(parent, child as i32), None);
+    }
+
+    #[test]
+    fn adopted_child_reap_waits_for_transition_and_consumes_once() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let parent = 919_193;
+        let child = 919_194;
+
+        let _ = reap_child_guest_ns(child);
+        register_for_test(child, parent, 0, true);
+        record_child_exit_status(child, 9876, 0x0900, false);
+        let record_ref = find_child_record(child).expect("adopted child record");
+        let record = record_for_ref(record_ref).expect("live adopted child record");
+        assert!(record.try_claim_transition());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            tx.send(adopted_child_wait(parent, child as i32)).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(25))
+                .is_err(),
+            "reap must wait rather than clean metadata outside the transition"
+        );
+
+        record.release_transition();
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1))
+                .expect("reap completes after transition unlock"),
+            Some(AdoptedChildWait::Reaped {
+                pid: child,
+                status: 0x0900,
+                guest_ns: 9876,
+            })
+        );
+        join.join().unwrap();
+        assert_eq!(
+            adopted_child_wait(parent, child as i32),
+            None,
+            "the transition-held cleanup must make a second reap impossible"
+        );
+    }
+
+    #[test]
+    fn guest_cpu_stale_ref_cannot_drain_same_numeric_pid_reuse() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        init_child_table();
+        let parent = 919_195;
+        let child = 919_196;
+
+        let _ = reap_child_guest_ns(child);
+        register_for_test(child, parent, 0, false);
+        let old_ref = find_child_record(child).expect("old child record");
+        let old_record = record_for_ref(old_ref).expect("live old child record");
+        old_record.guest_ns.store(111, Ordering::Release);
+        release_child_record(old_ref);
+
+        register_for_test(child, parent, 0, false);
+        let new_ref = find_child_record(child).expect("replacement child record");
+        assert_ne!(new_ref.generation, old_ref.generation);
+        let new_record = record_for_ref(new_ref).expect("live replacement record");
+        new_record.guest_ns.store(777, Ordering::Release);
+
+        assert_eq!(reap_child_guest_ns_ref(child, old_ref), 0);
+        assert_eq!(record_guest_ns(new_record), 777);
+        assert_eq!(record_generation(new_record), Some(new_ref.generation));
+        release_child_record(new_ref);
     }
 
     #[test]

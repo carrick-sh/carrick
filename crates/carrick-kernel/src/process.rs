@@ -29,6 +29,9 @@ bitflags! {
         /// `carrick exec`; every arena reader must honor the carrier's owner
         /// domain rather than infer it from its own process-local state.
         const OWNER_GUEST_TASK = 1 << 4;
+        /// One lifecycle authority is changing record ownership or releasing
+        /// the slot. This bit is an internal lock, not guest-visible state.
+        const RECORD_TRANSITION = 1 << 31;
     }
 }
 
@@ -37,6 +40,7 @@ pub const FLAG_ORPHANED: u32 = ProcessFlags::ORPHANED.bits();
 pub const FLAG_DEAD: u32 = ProcessFlags::DEAD.bits();
 pub const FLAG_ADOPTED: u32 = ProcessFlags::ADOPTED.bits();
 pub const FLAG_OWNER_GUEST_TASK: u32 = ProcessFlags::OWNER_GUEST_TASK.bits();
+pub const FLAG_RECORD_TRANSITION: u32 = ProcessFlags::RECORD_TRANSITION.bits();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -187,6 +191,19 @@ pub struct ProcessRecordRef {
     pub generation: ProcessGeneration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessRecordTransitionAction {
+    Preserve,
+    Retire,
+    RetireIfNamespaceUnowned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessRecordTransitionError {
+    Busy,
+    Stale,
+}
+
 impl ProcessSection {
     /// Claim a free record, fill via the closure, and publish `host_pid` last.
     pub fn claim(
@@ -249,21 +266,104 @@ impl ProcessSection {
         }
     }
 
-    pub fn release(&self, r: ProcessRecordRef) {
-        if let Some(record) = self.record_for_ref(r) {
-            if std::env::var_os("CARRICK_RUNSTATE_DEBUG").is_some() {
-                eprintln!(
-                    "[RUNSTATE] release idx={} host_pid={} gen={}\n{}",
-                    r.index,
-                    record.host_pid.load(Ordering::Acquire),
-                    record.generation.load(Ordering::Acquire),
-                    std::backtrace::Backtrace::force_capture(),
-                );
-            }
-            record.clear_body_for_claim();
-            record.generation.store(0, Ordering::Release);
-            record.host_pid.store(0, Ordering::Release);
+    pub fn release(&self, r: ProcessRecordRef) -> bool {
+        let Some(record) = self.record_for_ref(r) else {
+            return false;
+        };
+        if !record.try_claim_transition() {
+            return false;
         }
+        if record.generation.load(Ordering::Acquire) != r.generation.raw() {
+            record.release_transition();
+            return false;
+        }
+        self.release_claimed(r, record);
+        true
+    }
+
+    /// Release a record only when no namespace member owns it.
+    ///
+    /// Namespace adoption and task retirement share the record, so checking
+    /// `ns_pid == 0` and releasing later is racy. The transition bit makes the
+    /// ownership verdict and release one critical section. A failed claim or a
+    /// published/in-progress namespace owner leaves the record untouched.
+    pub fn release_if_namespace_unowned(
+        &self,
+        r: ProcessRecordRef,
+        expected_host_pid: HostPid,
+    ) -> bool {
+        let Some(record) = self.record_for_ref(r) else {
+            return false;
+        };
+        if !record.try_claim_transition() {
+            return false;
+        }
+        let owns_record = record.generation.load(Ordering::Acquire) == r.generation.raw()
+            && record.host_pid.load(Ordering::Acquire) == expected_host_pid.raw()
+            && record.ns_pid.load(Ordering::Acquire) == 0;
+        if !owns_record {
+            record.release_transition();
+            return false;
+        }
+        self.release_claimed(r, record);
+        true
+    }
+
+    /// Inspect and update one exact record while holding its lifecycle claim.
+    ///
+    /// The closure may mutate record-local metadata. If it requests retirement,
+    /// the slot is released only when namespace identity is still unpublished;
+    /// otherwise the namespace-owned record is preserved and unlocked. This
+    /// composes classification, cleanup, and release without a check-then-write
+    /// window against reuse.
+    pub fn with_record_transition<T>(
+        &self,
+        r: ProcessRecordRef,
+        expected_host_pid: HostPid,
+        update: impl FnOnce(&ProcessRecord) -> (T, ProcessRecordTransitionAction),
+    ) -> Result<(T, bool), ProcessRecordTransitionError> {
+        let Some(record) = self.record_for_ref(r) else {
+            return Err(ProcessRecordTransitionError::Stale);
+        };
+        if !record.try_claim_transition() {
+            return Err(ProcessRecordTransitionError::Busy);
+        }
+        let owns_record = record.generation.load(Ordering::Acquire) == r.generation.raw()
+            && record.host_pid.load(Ordering::Acquire) == expected_host_pid.raw();
+        if !owns_record {
+            record.release_transition();
+            return Err(ProcessRecordTransitionError::Stale);
+        }
+
+        let (value, action) = update(record);
+        let released = action == ProcessRecordTransitionAction::Retire
+            || (action == ProcessRecordTransitionAction::RetireIfNamespaceUnowned
+                && record.ns_pid.load(Ordering::Acquire) == 0);
+        if released {
+            self.release_claimed(r, record);
+        } else {
+            record.release_transition();
+        }
+        Ok((value, released))
+    }
+
+    fn release_claimed(&self, r: ProcessRecordRef, record: &ProcessRecord) {
+        if std::env::var_os("CARRICK_RUNSTATE_DEBUG").is_some() {
+            eprintln!(
+                "[RUNSTATE] release idx={} host_pid={} gen={}\n{}",
+                r.index,
+                record.host_pid.load(Ordering::Acquire),
+                record.generation.load(Ordering::Acquire),
+                std::backtrace::Backtrace::force_capture(),
+            );
+        }
+        // Unpublish the lookup key before clearing either namespace identity or
+        // generation. A registrar that did not win the transition claim cannot
+        // attach to a half-released record.
+        record.host_pid.store(REGISTERING, Ordering::Release);
+        record.generation.store(0, Ordering::Release);
+        record.clear_body_for_claim();
+        record.host_pid.store(0, Ordering::Release);
     }
 
     fn record_for_ref(&self, r: ProcessRecordRef) -> Option<&ProcessRecord> {
@@ -278,6 +378,35 @@ impl ProcessSection {
 }
 
 impl ProcessRecord {
+    /// Try to become the sole lifecycle authority for this record.
+    pub fn try_claim_transition(&self) -> bool {
+        let mut flags = self.flags.load(Ordering::Acquire);
+        loop {
+            if flags & FLAG_RECORD_TRANSITION != 0 {
+                return false;
+            }
+            match self.flags.compare_exchange_weak(
+                flags,
+                flags | FLAG_RECORD_TRANSITION,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => flags = actual,
+            }
+        }
+    }
+
+    /// Relinquish a lifecycle transition without releasing the record.
+    pub fn release_transition(&self) {
+        self.flags
+            .fetch_and(!FLAG_RECORD_TRANSITION, Ordering::Release);
+    }
+
+    pub fn transition_claimed(&self) -> bool {
+        self.flags.load(Ordering::Acquire) & FLAG_RECORD_TRANSITION != 0
+    }
+
     fn clear_body_for_claim(&self) {
         self.ns_pid.store(0, Ordering::Relaxed);
         self.parent_host_pid.store(0, Ordering::Relaxed);
@@ -370,6 +499,30 @@ mod tests {
         assert!(s.find(HostPid::new(REGISTERING)).is_none());
         s.publish_host_pid(r, HostPid::new(600));
         assert!(s.find(HostPid::new(600)).is_some());
+    }
+
+    #[test]
+    fn namespace_owner_or_transition_blocks_conditional_release() {
+        let arena = KernelArena::create().unwrap();
+        let s = &arena.layout().processes;
+        let generation = arena.allocate_generation();
+        let r = s
+            .claim(Some(HostPid::new(601)), generation, |_| {})
+            .unwrap();
+        let record = &s.records[r.index];
+
+        assert!(record.try_claim_transition());
+        assert!(!s.release_if_namespace_unowned(r, HostPid::new(601)));
+        assert_eq!(record.generation.load(Ordering::Acquire), generation.raw());
+        record.release_transition();
+
+        record.ns_pid.store(2, Ordering::Release);
+        assert!(!s.release_if_namespace_unowned(r, HostPid::new(601)));
+        assert_eq!(record.host_pid.load(Ordering::Acquire), 601);
+
+        record.ns_pid.store(0, Ordering::Release);
+        assert!(s.release_if_namespace_unowned(r, HostPid::new(601)));
+        assert!(s.find(HostPid::new(601)).is_none());
     }
 
     #[test]

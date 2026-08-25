@@ -44,7 +44,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use carrick_kernel::arena::{ArenaError, KernelArena};
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
-use carrick_kernel::process::{ProcessRecord, ProcessRecordRef, ProcessSection};
+#[cfg(test)]
+use carrick_kernel::process::REGISTERING;
+use carrick_kernel::process::{
+    ProcessRecord, ProcessRecordRef, ProcessRecordTransitionAction, ProcessRecordTransitionError,
+    ProcessSection,
+};
 
 /// Published guest run-state of a process. The encoded value lives in the high
 /// 8 bits of a shared `u64` slot whose low bits hold the owning host pid.
@@ -294,10 +299,12 @@ pub fn clear_guest_process(pid: i32) {
         return;
     }
     let section = processes();
-    let Some(r) = find_record(section, pid, false) else {
-        return;
-    };
-    // Clear ONLY the run-state word, never the record.
+    // Namespace membership and run-state share one physical record, but the
+    // carrier-only HVPatch lane does not create namespace metadata for each
+    // logical process. Such a run-state-only record has no later owner to
+    // reclaim it: retaining 4,096 exited children exhausted the process
+    // section in one carrier. Release those records here; preserve a record
+    // with a nonzero ns-pid until its consuming wait retires namespace state.
     //
     // This `ProcessSection` is SHARED with the PID-namespace member table —
     // `namespace/pid.rs` takes `&KernelArena::init_global().layout().processes`,
@@ -311,12 +318,51 @@ pub fn clear_guest_process(pid: i32) {
     // `waitpid` EINTR plus "Main test process might have exit!", reproducing
     // standalone on a quiet host. Clearing the word restores 7/7.
     //
-    // Zeroing the word is all this owes: `published()` skips a record whose
-    // `unpack` yields no pid, so a dead process stops answering
-    // `/proc/<pid>/stat`. Slot reclamation belongs to whoever claimed it.
-    section.records[r.index]
-        .run_state
-        .store(0, Ordering::Release);
+    // Clear every matching process-kind record rather than trusting a
+    // first-match lookup: an old seed/publish race could have left a duplicate,
+    // and retaining either duplicate still leaks one slot per exited task.
+    let records: Vec<_> = section
+        .records
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| {
+            if record.host_pid.load(Ordering::Acquire) != pid {
+                return None;
+            }
+            let generation = record.generation.load(Ordering::Acquire);
+            if generation == 0 {
+                return None;
+            }
+            let raw = record.run_state.load(Ordering::Acquire);
+            (raw & KIND_TID == 0 && (raw & PID_MASK) as u32 == pid).then_some(ProcessRecordRef {
+                index,
+                generation: ProcessGeneration::new(generation),
+            })
+        })
+        .collect();
+    for record_ref in records {
+        // Namespace adoption and process retirement must be one atomic
+        // ownership decision. The section helper claims the record transition,
+        // revalidates generation/host identity, and releases only while ns_pid
+        // is still unpublished. A namespace adopter that owns or completed the
+        // transition wins; this path then clears only its run-state word.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match section.with_record_transition(record_ref, HostPid::new(pid), |record| {
+                record.run_state.store(0, Ordering::Release);
+                ((), ProcessRecordTransitionAction::RetireIfNamespaceUnowned)
+            }) {
+                Ok(_) | Err(ProcessRecordTransitionError::Stale) => break,
+                Err(ProcessRecordTransitionError::Busy) if std::time::Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(ProcessRecordTransitionError::Busy) => {
+                    eprintln!("carrick: process record transition did not quiesce for pid {pid}");
+                    std::process::abort();
+                }
+            }
+        }
+    }
 }
 
 fn cached_record(
@@ -770,6 +816,100 @@ mod tests {
         assert_eq!(published(worker_tid), Some(RunState::Running));
         wipe_id(task_pid);
         wipe_id(worker_tid);
+    }
+
+    #[test]
+    fn clearing_hvpatch_process_releases_run_state_only_record() {
+        let pid = 0x0BAD_C003;
+        wipe_id(pid);
+        publish_task_thread(pid as i32, pid as i32, RunState::Running);
+        assert!(
+            processes().find(HostPid::new(pid)).is_some(),
+            "HVPatch leader publish must claim one process record"
+        );
+
+        clear_guest_process(pid as i32);
+
+        assert_eq!(published(pid), None);
+        assert!(
+            processes().find(HostPid::new(pid)).is_none(),
+            "a run-state-only logical process has no namespace owner to reclaim its record"
+        );
+        wipe_id(pid);
+    }
+
+    #[test]
+    fn clearing_namespace_process_preserves_member_record() {
+        let pid = 0x0BAD_C004;
+        wipe_id(pid);
+        let generation = KernelArena::global().allocate_generation();
+        let record = processes()
+            .claim(Some(HostPid::new(pid)), generation, |record| {
+                record.ns_pid.store(42, Ordering::Relaxed);
+                record
+                    .run_state
+                    .store(pack(pid, RunState::Running), Ordering::Relaxed);
+            })
+            .expect("claim namespace-owned process record");
+
+        clear_guest_process(pid as i32);
+
+        assert_eq!(published(pid), None);
+        let retained = &processes().records[record.index];
+        assert_eq!(retained.host_pid.load(Ordering::Acquire), pid);
+        assert_eq!(
+            retained.generation.load(Ordering::Acquire),
+            generation.raw()
+        );
+        assert_eq!(retained.ns_pid.load(Ordering::Acquire), 42);
+        assert_eq!(retained.run_state.load(Ordering::Acquire), 0);
+        processes().release(record);
+        wipe_id(pid);
+    }
+
+    #[test]
+    fn namespace_adoption_claim_defeats_concurrent_process_retirement() {
+        let pid = 0x0BAD_C005;
+        wipe_id(pid);
+        let generation = KernelArena::global().allocate_generation();
+        let record_ref = processes()
+            .claim(Some(HostPid::new(pid)), generation, |record| {
+                record
+                    .run_state
+                    .store(pack(pid, RunState::Running), Ordering::Relaxed);
+            })
+            .expect("claim process record awaiting namespace adoption");
+        let record = &processes().records[record_ref.index];
+        assert!(
+            record.try_claim_transition(),
+            "namespace adoption owns the record transition"
+        );
+        record.ns_pid.store(REGISTERING, Ordering::Release);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            clear_guest_process(pid as i32);
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(25))
+                .is_err(),
+            "retirement must wait rather than write outside the adoption claim"
+        );
+
+        assert_eq!(record.host_pid.load(Ordering::Acquire), pid);
+        assert_eq!(record.generation.load(Ordering::Acquire), generation.raw());
+        assert_eq!(record.ns_pid.load(Ordering::Acquire), REGISTERING);
+        assert_ne!(record.run_state.load(Ordering::Acquire), 0);
+
+        record.ns_pid.store(42, Ordering::Release);
+        record.release_transition();
+        rx.recv_timeout(std::time::Duration::from_secs(1))
+            .expect("retirement completes after namespace publication");
+        join.join().unwrap();
+        assert_eq!(record.run_state.load(Ordering::Acquire), 0);
+        processes().release(record_ref);
+        wipe_id(pid);
     }
 
     #[test]
