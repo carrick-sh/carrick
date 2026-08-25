@@ -4817,20 +4817,28 @@ impl Thread {
                 generation: predecessor,
                 ..
             } => {
-                let generation = predecessor
-                    .next()
-                    .ok_or(ThreadExecutionError::GenerationExhausted)?;
-                if let Some(continuation) = execution.blocked_continuation.as_ref() {
-                    continuation.publish_ready_event(
-                        crate::vcpu_loop::continuation::ContinuationEvent::Ready,
-                    );
-                }
-                execution.state = ThreadExecutionState::Runnable { generation };
-                ThreadSchedulerAction::Queue {
-                    key: self.key,
-                    predecessor: Some(predecessor),
-                    generation,
-                    closing_authorized: true,
+                if execution
+                    .blocked_continuation
+                    .as_ref()
+                    .is_some_and(|continuation| !continuation.accepts_scheduler_wake_now())
+                {
+                    ThreadSchedulerAction::None
+                } else {
+                    let generation = predecessor
+                        .next()
+                        .ok_or(ThreadExecutionError::GenerationExhausted)?;
+                    if let Some(continuation) = execution.blocked_continuation.as_ref() {
+                        continuation.publish_ready_event(
+                            crate::vcpu_loop::continuation::ContinuationEvent::Ready,
+                        );
+                    }
+                    execution.state = ThreadExecutionState::Runnable { generation };
+                    ThreadSchedulerAction::Queue {
+                        key: self.key,
+                        predecessor: Some(predecessor),
+                        generation,
+                        closing_authorized: true,
+                    }
                 }
             }
             ThreadExecutionState::Runnable { generation } => {
@@ -4840,6 +4848,7 @@ impl Thread {
                 // producer must still publish into the preserved continuation.
                 if execution.control_quantum.is_some()
                     && let Some(continuation) = execution.blocked_continuation.as_ref()
+                    && continuation.accepts_scheduler_wake_now()
                 {
                     continuation.publish_ready_event(
                         crate::vcpu_loop::continuation::ContinuationEvent::Ready,
@@ -5568,9 +5577,14 @@ impl Thread {
                 ExecutionSettlement::Blocked(reason) => {
                     execution.task_state = lease.task_state.take();
                     execution.blocked_continuation = lease.blocked_continuation.take();
-                    if wake_pending || control_pending {
+                    let generic_wake_ready = wake_pending
+                        && execution
+                            .blocked_continuation
+                            .as_ref()
+                            .is_none_or(|continuation| continuation.accepts_scheduler_wake_now());
+                    if generic_wake_ready || control_pending {
                         if let Some(continuation) = execution.blocked_continuation.as_ref() {
-                            if wake_pending {
+                            if generic_wake_ready {
                                 continuation.publish_ready_event(
                                     crate::vcpu_loop::continuation::ContinuationEvent::Ready,
                                 );
@@ -5597,8 +5611,10 @@ impl Thread {
                 ExecutionSettlement::BlockedContinuation(reason, continuation) => {
                     execution.task_state = lease.task_state.take();
                     let continuation_id = continuation.id();
-                    if wake_pending || control_pending {
-                        if wake_pending {
+                    let generic_wake_ready =
+                        wake_pending && continuation.accepts_scheduler_wake_now();
+                    if generic_wake_ready || control_pending {
+                        if generic_wake_ready {
                             continuation.publish_ready_event(
                                 crate::vcpu_loop::continuation::ContinuationEvent::Ready,
                             );
