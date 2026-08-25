@@ -357,7 +357,7 @@ fn run_lldb_deadline(
             if pids.iter().any(MatchedProcess::is_stopped) {
                 write_ps_log(&ps_log, &pids)?;
                 let why = format!("stopped-before-signal-{signum}");
-                let dumped = dump_lldb(&LldbDumpContext {
+                dump_lldb(&LldbDumpContext {
                     run_id: &run_id,
                     why: &why,
                     exe: &exe,
@@ -367,13 +367,13 @@ fn run_lldb_deadline(
                     ps_log: &ps_log,
                     no_core,
                 })?;
-                terminate_scoped_run(&run_id, &dumped, &mut child)?;
+                terminate_scoped_run(&run_id, &mut child)?;
                 return Ok(124);
             }
         }
         if started.elapsed() >= deadline {
             let why = format!("deadline-{deadline_seconds}s");
-            let pids = dump_lldb(&LldbDumpContext {
+            dump_lldb(&LldbDumpContext {
                 run_id: &run_id,
                 why: &why,
                 exe: &exe,
@@ -383,7 +383,7 @@ fn run_lldb_deadline(
                 ps_log: &ps_log,
                 no_core,
             })?;
-            terminate_scoped_run(&run_id, &pids, &mut child)?;
+            terminate_scoped_run(&run_id, &mut child)?;
             return Ok(124);
         }
         thread::sleep(Duration::from_millis(200));
@@ -470,8 +470,19 @@ struct LldbDumpContext<'a> {
 }
 
 fn dump_lldb(ctx: &LldbDumpContext<'_>) -> anyhow::Result<Vec<MatchedProcess>> {
-    let pids = stop_scoped_processes(ctx.run_id)?;
+    // LLDB must perform the Mach task stop itself.  Pre-stopping a macOS
+    // process with SIGSTOP makes `attach` fail after acquiring the task port
+    // because LLDB cannot complete its own pause handshake.  The unified
+    // HVPatch kernel has one carrier, so collecting the scoped target without
+    // a host-process freeze is also the exact architecture we need to inspect.
+    let pids = collect_scoped_processes(ctx.run_id)?;
     write_ps_log(ctx.ps_log, &pids)?;
+
+    // The live debug server can project scheduler state and the exact executor
+    // receipt ledger only while the carrier is running.  Capture it before
+    // LLDB freezes the task; the backtraces/core remain the fallback when the
+    // coherent snapshot itself reports a named busy/timeout failure.
+    let kernel_capture = capture_hvpatch_kernel_snapshot(ctx);
 
     let mut log = OpenOptions::new()
         .create(true)
@@ -479,6 +490,10 @@ fn dump_lldb(ctx: &LldbDumpContext<'_>) -> anyhow::Result<Vec<MatchedProcess>> {
         .open(ctx.lldb_log)
         .with_context(|| format!("failed to open {}", ctx.lldb_log.display()))?;
     writeln!(log, "RUN_ID={} WHY={}", ctx.run_id, ctx.why)?;
+    match kernel_capture {
+        Ok(path) => writeln!(log, "KERNEL_SNAPSHOT={}", path.display())?,
+        Err(error) => writeln!(log, "KERNEL_SNAPSHOT_ERROR={error:#}")?,
+    }
     writeln!(log, "PS_MATCHES:")?;
     let mut attach_order = pids.clone();
     let parent_pids = pids
@@ -502,6 +517,14 @@ fn dump_lldb(ctx: &LldbDumpContext<'_>) -> anyhow::Result<Vec<MatchedProcess>> {
 
     for process in &attach_order {
         if process.pid == std::process::id() as libc::pid_t {
+            continue;
+        }
+        if !scoped_process_still_matches(ctx.run_id, process)? {
+            writeln!(
+                log,
+                "===== lldb skip pid={} reason=scoped-process-identity-changed =====",
+                process.pid
+            )?;
             continue;
         }
         writeln!(
@@ -536,6 +559,18 @@ fn dump_lldb(ctx: &LldbDumpContext<'_>) -> anyhow::Result<Vec<MatchedProcess>> {
         )?;
     }
     Ok(pids)
+}
+
+fn capture_hvpatch_kernel_snapshot(ctx: &LldbDumpContext<'_>) -> anyhow::Result<PathBuf> {
+    let snapshot = carrick_runtime::kernel::kernel_debug_fetch(ctx.run_id, None)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let path = ctx
+        .out_dir
+        .join(format!("{}.kernel-debug.json", ctx.run_id));
+    let bytes = serde_json::to_vec_pretty(&snapshot).context("serialize kernel debug snapshot")?;
+    fs::write(&path, bytes)
+        .with_context(|| format!("failed to write kernel snapshot {}", path.display()))?;
+    Ok(path)
 }
 
 fn run_lldb_attach(
@@ -576,26 +611,6 @@ fn run_lldb_attach(
         .stderr(Stdio::from(stderr))
         .status()
         .context("failed to run lldb")
-}
-
-fn stop_scoped_processes(run_id: &str) -> anyhow::Result<Vec<MatchedProcess>> {
-    let self_pid = std::process::id() as libc::pid_t;
-    for _ in 0..3 {
-        let pids = collect_scoped_processes(run_id)?;
-        for process in &pids {
-            if process.pid == self_pid || process.is_stopped() {
-                continue;
-            }
-            // SAFETY: the pid set is selected by the scoped carrick run-id in
-            // the process title. ESRCH is benign because hot fork/exit paths can
-            // race the diagnostic freeze loop.
-            unsafe {
-                libc::kill(process.pid, libc::SIGSTOP);
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    collect_scoped_processes(run_id)
 }
 
 fn collect_scoped_processes(run_id: &str) -> anyhow::Result<Vec<MatchedProcess>> {
@@ -653,17 +668,25 @@ fn write_ps_log(path: &Path, pids: &[MatchedProcess]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn terminate_scoped_run(
-    run_id: &str,
-    pids: &[MatchedProcess],
-    child: &mut Child,
-) -> anyhow::Result<()> {
+fn scoped_process_still_matches(run_id: &str, expected: &MatchedProcess) -> anyhow::Result<bool> {
+    Ok(collect_scoped_processes(run_id)?.iter().any(|current| {
+        current.pid == expected.pid
+            && current.ppid == expected.ppid
+            && current.command == expected.command
+    }))
+}
+
+fn terminate_scoped_run(run_id: &str, child: &mut Child) -> anyhow::Result<()> {
     let kill_script = Path::new("scripts").join("sudo").join("kill.sh");
     if kill_script.exists() {
         let _ = Command::new(&kill_script).arg(run_id).status();
     }
 
-    for process in pids {
+    // Never signal the snapshot captured before LLDB work: a process may have
+    // exited and its numeric PID may have been reused while a core was being
+    // written.  Re-resolve the run-id-qualified set immediately before each
+    // signal phase instead.
+    for process in collect_scoped_processes(run_id)? {
         // SAFETY: same scoped pid set as below; resume stopped diagnostic
         // targets so SIGTERM can run normal cleanup before the SIGKILL fallback.
         unsafe {
@@ -676,7 +699,7 @@ fn terminate_scoped_run(
         }
     }
     if wait_for_child(child, Duration::from_secs(2))?.is_none() {
-        for process in pids {
+        for process in collect_scoped_processes(run_id)? {
             // SAFETY: same scoped pid set as above; SIGKILL is the final cleanup
             // after the graceful deadline expires.
             unsafe {
@@ -878,6 +901,65 @@ mod tests {
     #[test]
     fn deadline_capture_keeps_enough_event_history_for_cross_thread_waits() {
         assert_eq!(lldb_eventring_capture_command(), "carrick eventring 8192");
+    }
+
+    #[test]
+    fn deadline_capture_leaves_running_targets_for_lldb_to_stop() {
+        let source = include_str!("debug.rs");
+        let start = source.find("fn dump_lldb(").expect("dump_lldb");
+        let end = source[start..]
+            .find("fn run_lldb_attach(")
+            .map(|offset| start + offset)
+            .expect("run_lldb_attach");
+        let body = &source[start..end];
+
+        assert!(body.contains("collect_scoped_processes(ctx.run_id)?"));
+        assert!(!body.contains("stop_scoped_processes(ctx.run_id)?"));
+    }
+
+    #[test]
+    fn deadline_capture_collects_kernel_ledger_before_lldb_freezes_the_carrier() {
+        let source = include_str!("debug.rs");
+        let start = source.find("fn dump_lldb(").expect("dump_lldb");
+        let end = source[start..]
+            .find("fn run_lldb_attach(")
+            .map(|offset| start + offset)
+            .expect("run_lldb_attach");
+        let body = &source[start..end];
+
+        let kernel = body
+            .find("capture_hvpatch_kernel_snapshot(ctx)")
+            .expect("kernel snapshot capture");
+        let lldb = body.find("run_lldb_attach(").expect("lldb attach");
+        assert!(kernel < lldb, "kernel snapshot must precede LLDB attach");
+    }
+
+    #[test]
+    fn deadline_capture_revalidates_scoped_identity_before_attach_and_signal() {
+        let source = include_str!("debug.rs");
+        let dump_start = source.find("fn dump_lldb(").expect("dump_lldb");
+        let dump_end = source[dump_start..]
+            .find("fn capture_hvpatch_kernel_snapshot(")
+            .map(|offset| dump_start + offset)
+            .expect("kernel snapshot helper");
+        let dump = &source[dump_start..dump_end];
+        assert!(dump.contains("scoped_process_still_matches(ctx.run_id, process)?"));
+
+        let terminate_start = source
+            .find("fn terminate_scoped_run(")
+            .expect("terminate_scoped_run");
+        let terminate_end = source[terminate_start..]
+            .find("fn wait_for_child(")
+            .map(|offset| terminate_start + offset)
+            .expect("wait_for_child");
+        let terminate = &source[terminate_start..terminate_end];
+        assert_eq!(
+            terminate
+                .matches("collect_scoped_processes(run_id)?")
+                .count(),
+            2
+        );
+        assert!(!terminate.contains("for process in pids"));
     }
 
     #[test]
