@@ -2141,7 +2141,13 @@ impl SignalReadinessProbe {
         }
     }
 
-    fn event(&self) -> Option<ContinuationEvent> {
+    /// Interpret an actual task-wake edge. Process waits deliberately use a
+    /// generic task wake as a redispatch hint because the authoritative child
+    /// or host-process state is consumed by the syscall itself. That rule must
+    /// not leak into enrollment's state-only readiness sample: doing so makes
+    /// every quiet wait4 continuation immediately runnable and livelocks the
+    /// carrier without any producer event.
+    fn event_after_task_wake(&self) -> Option<ContinuationEvent> {
         if matches!(
             self.family,
             ContinuationFamily::WaitOnProcExit
@@ -2150,6 +2156,12 @@ impl SignalReadinessProbe {
         ) {
             return Some(ContinuationEvent::Ready);
         }
+        self.event()
+    }
+
+    /// Sample authoritative signal state without assuming that a producer
+    /// edge occurred. This is safe to call during continuation enrollment.
+    fn event(&self) -> Option<ContinuationEvent> {
         let kernel = self.kernel.upgrade()?;
         let context = kernel.context(self.task.id, self.thread.tid).ok()?;
         if context.task().key() != self.task || context.thread().key() != self.thread {
@@ -2523,7 +2535,7 @@ impl CarrierWaitServiceInner {
                 });
             (entry.signal_readiness.clone(), task_event_fired)
         };
-        if let Some(event) = probe.event() {
+        if let Some(event) = probe.event_after_task_wake() {
             self.publish_event(token, event);
         } else if task_event_fired && probe.family != ContinuationFamily::VforkParent {
             self.publish_event(token, ContinuationEvent::Ready);
@@ -5333,6 +5345,54 @@ mod tests {
         assert_eq!(
             continuation.child_selector(),
             Some(ChildSelector::AnyChildOf(context.task().key()))
+        );
+    }
+
+    #[test]
+    fn hvpatch_child_enrollment_requires_a_real_task_event() {
+        let (kernel, context) = bootstrap(15_021);
+        let generation = publish(&context, 0x301);
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnHvpatchChild {
+                target: None,
+                sig_mask: WaitSigMask::NONE,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("kernel child continuation");
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let service = CarrierWaitService::new(scheduler);
+        let mut registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
+        service
+            .enroll(&mut registration)
+            .expect("enroll quiet child wait");
+
+        assert_eq!(
+            service
+                .inner
+                .state
+                .lock()
+                .entries
+                .get(&token.continuation)
+                .expect("live child registration")
+                .state,
+            RegistrationState::Enrolled,
+            "enrollment polling must not manufacture child readiness"
+        );
+
+        assert!(kernel.publish_task_event_and_wake(context.task().key(), || true));
+        assert_eq!(
+            service
+                .inner
+                .state
+                .lock()
+                .entries
+                .get(&token.continuation)
+                .expect("woken child registration")
+                .state,
+            RegistrationState::Ready,
+            "a real task event must redispatch the child wait"
         );
     }
 
