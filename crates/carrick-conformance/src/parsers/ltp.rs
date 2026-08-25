@@ -25,6 +25,9 @@ impl LtpParser {
         }
 
         let text = super::strip_carrick_banners(&raw.combined());
+        if let Some(result) = parse_legacy_closure_protocol(&text, raw.exit_code) {
+            return result;
+        }
         let (
             Ok(modern),
             Ok(old),
@@ -166,6 +169,224 @@ impl LtpParser {
             result,
             ids,
         }
+    }
+}
+
+fn parse_legacy_closure_protocol(text: &str, exit_code: i32) -> Option<SuiteResult> {
+    let has_fcntl11 = text
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some("fcntl11"));
+    if has_fcntl11 {
+        return Some(parse_fcntl11_protocol(text, exit_code));
+    }
+
+    let has_setfsuid04 = text
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some("setfsuid04"));
+    if has_setfsuid04 {
+        return Some(parse_setfsuid04_protocol(text, exit_code));
+    }
+
+    let has_fcntl01 = text
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some("fcntl01"));
+    if has_fcntl01 {
+        return Some(parse_fcntl01_protocol(text, exit_code));
+    }
+
+    None
+}
+
+fn parse_fcntl11_protocol(text: &str, exit_code: i32) -> SuiteResult {
+    let Ok(marker) = Regex::new(r"^fcntl11\s+\d+\s+TINFO\s*:\s+(Enter|Exit) block ([1-9])$") else {
+        return none_result();
+    };
+    let Ok(tmpdir) =
+        Regex::new(r"^fcntl11\s+\d+\s+TINFO\s*:\s+Using /tmp/LTP_\S+ as tmpdir \(.+ filesystem\)$")
+    else {
+        return none_result();
+    };
+    let Ok(failure) = Regex::new(r"^fcntl11\s+\d+\s+(TFAIL|TBROK)\s*:") else {
+        return none_result();
+    };
+
+    let mut next_block = 1usize;
+    let mut open_block = None;
+    let mut outcomes = [Outcome::Ok; 9];
+    let mut saw_tmpdir = false;
+
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        if tmpdir.is_match(line) {
+            if saw_tmpdir || open_block.is_some() {
+                return none_result();
+            }
+            saw_tmpdir = true;
+            continue;
+        }
+        if let Some(caps) = marker.captures(line) {
+            let Some(block) = caps
+                .get(2)
+                .and_then(|value| value.as_str().parse::<usize>().ok())
+            else {
+                return none_result();
+            };
+            let entering = caps.get(1).is_some_and(|value| value.as_str() == "Enter");
+            if entering && open_block.is_none() && block == next_block {
+                open_block = Some(block);
+                continue;
+            }
+            if !entering && open_block == Some(block) {
+                open_block = None;
+                next_block += 1;
+                continue;
+            }
+            return none_result();
+        }
+        if let Some(caps) = failure.captures(line) {
+            let Some(block) = open_block else {
+                return none_result();
+            };
+            outcomes[block - 1] = match caps.get(1).map(|value| value.as_str()) {
+                Some("TFAIL") => Outcome::Fail,
+                Some("TBROK") => Outcome::Broken,
+                _ => return none_result(),
+            };
+            continue;
+        }
+        return none_result();
+    }
+
+    if !saw_tmpdir || open_block.is_some() || next_block != 10 {
+        return none_result();
+    }
+    protocol_result("fcntl11", &outcomes, exit_code)
+}
+
+fn parse_setfsuid04_protocol(text: &str, exit_code: i32) -> SuiteResult {
+    let Ok(tmpdir) = Regex::new(
+        r"^setfsuid04\s+\d+\s+TINFO\s*:\s+Using /tmp/LTP_\S+ as tmpdir \(.+ filesystem\)$",
+    ) else {
+        return none_result();
+    };
+    let Ok(terminal) = Regex::new(r"^setfsuid04\s+\d+\s+TINFO\s*:\s+Child process returned TPASS$")
+    else {
+        return none_result();
+    };
+    let expected = [
+        "open failed with EACCESS as expected",
+        "open failed with EACCESS as expected",
+        "open call succeeded",
+        "open call succeeded",
+    ];
+    let lines: Vec<_> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if exit_code != 0
+        || lines.len() != expected.len() + 2
+        || !tmpdir.is_match(lines[0])
+        || lines[1..5] != expected
+        || !terminal.is_match(lines[5])
+    {
+        return none_result();
+    }
+
+    let ids = [
+        ("ltp:setfsuid04:deny-1#1", Outcome::Ok),
+        ("ltp:setfsuid04:deny-2#1", Outcome::Ok),
+        ("ltp:setfsuid04:restore-root-1#1", Outcome::Ok),
+        ("ltp:setfsuid04:restore-root-2#1", Outcome::Ok),
+    ];
+    fixed_protocol_result(&ids, SuiteOutcome::Success)
+}
+
+fn parse_fcntl01_protocol(text: &str, exit_code: i32) -> SuiteResult {
+    let Ok(tmpdir) =
+        Regex::new(r"^fcntl01\s+\d+\s+TINFO\s*:\s+Using /tmp/LTP_\S+ as tmpdir \(.+ filesystem\)$")
+    else {
+        return none_result();
+    };
+    let Ok(failure) = Regex::new(r"^fcntl01\s+\d+\s+(TFAIL|TBROK)\s*:") else {
+        return none_result();
+    };
+    let lines: Vec<_> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if lines.len() == 1 && tmpdir.is_match(lines[0]) && exit_code == 0 {
+        return fixed_protocol_result(&[("ltp:fcntl01:1#1", Outcome::Ok)], SuiteOutcome::Success);
+    }
+    let failure_line = match lines.as_slice() {
+        [line] if failure.is_match(line) => *line,
+        [tmpdir_line, line] if tmpdir.is_match(tmpdir_line) && failure.is_match(line) => *line,
+        _ => return none_result(),
+    };
+    if let Some(caps) = failure.captures(failure_line) {
+        let outcome = match caps.get(1).map(|value| value.as_str()) {
+            Some("TFAIL") => Outcome::Fail,
+            Some("TBROK") => Outcome::Broken,
+            _ => return none_result(),
+        };
+        return fixed_protocol_result(&[("ltp:fcntl01:1#1", outcome)], SuiteOutcome::Failure);
+    }
+    none_result()
+}
+
+fn protocol_result(binary: &str, outcomes: &[Outcome], exit_code: i32) -> SuiteResult {
+    let ids: Vec<_> = outcomes
+        .iter()
+        .enumerate()
+        .map(|(index, outcome)| (format!("ltp:{binary}:block-{}#1", index + 1), *outcome))
+        .collect();
+    let result = if exit_code == 0
+        && outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, Outcome::Ok))
+    {
+        SuiteOutcome::Success
+    } else {
+        SuiteOutcome::Failure
+    };
+    owned_protocol_result(ids, result)
+}
+
+fn fixed_protocol_result(ids: &[(&str, Outcome)], result: SuiteOutcome) -> SuiteResult {
+    owned_protocol_result(
+        ids.iter()
+            .map(|(id, outcome)| ((*id).to_string(), *outcome)),
+        result,
+    )
+}
+
+fn owned_protocol_result(
+    ids: impl IntoIterator<Item = (String, Outcome)>,
+    result: SuiteOutcome,
+) -> SuiteResult {
+    let mut collected = BTreeMap::new();
+    let mut totals = Totals::default();
+    for (id, outcome) in ids {
+        collected.insert(id, outcome);
+        match outcome {
+            Outcome::Ok => totals.passed += 1,
+            Outcome::Fail => totals.failed += 1,
+            Outcome::Broken => totals.broken += 1,
+            Outcome::Conf => totals.skipped += 1,
+            _ => {}
+        }
+    }
+    totals.n = totals.passed + totals.failed + totals.broken;
+    SuiteResult {
+        totals,
+        result,
+        ids: collected,
+    }
+}
+
+fn none_result() -> SuiteResult {
+    SuiteResult {
+        totals: Totals::default(),
+        result: SuiteOutcome::None,
+        ids: BTreeMap::new(),
     }
 }
 
@@ -676,5 +897,123 @@ loop.c:10: TPASS: iteration ok
         ] {
             assert_ne!(closure(text).result, SuiteOutcome::Success, "{text}");
         }
+    }
+
+    /// Catches a parser mutation that treats any clean `fcntl11` TINFO trail
+    /// as success instead of requiring each ordered, closed source block.
+    #[test]
+    fn closure_parses_only_complete_fcntl11_block_protocols() {
+        let transcript = concat!(
+            "fcntl11     0  TINFO  :  Using /tmp/LTP_fcnoOUnef as tmpdir (overlayfs filesystem)\n",
+            "fcntl11     0  TINFO  :  Enter block 1\n",
+            "fcntl11     0  TINFO  :  Exit block 1\n",
+            "fcntl11     0  TINFO  :  Enter block 2\n",
+            "fcntl11     0  TINFO  :  Exit block 2\n",
+            "fcntl11     0  TINFO  :  Enter block 3\n",
+            "fcntl11     0  TINFO  :  Exit block 3\n",
+            "fcntl11     0  TINFO  :  Enter block 4\n",
+            "fcntl11     0  TINFO  :  Exit block 4\n",
+            "fcntl11     0  TINFO  :  Enter block 5\n",
+            "fcntl11     0  TINFO  :  Exit block 5\n",
+            "fcntl11     0  TINFO  :  Enter block 6\n",
+            "fcntl11     0  TINFO  :  Exit block 6\n",
+            "fcntl11     0  TINFO  :  Enter block 7\n",
+            "fcntl11     0  TINFO  :  Exit block 7\n",
+            "fcntl11     0  TINFO  :  Enter block 8\n",
+            "fcntl11     0  TINFO  :  Exit block 8\n",
+            "fcntl11     0  TINFO  :  Enter block 9\n",
+            "fcntl11     0  TINFO  :  Exit block 9\n",
+        );
+        let parsed = closure(transcript);
+        assert_eq!(parsed.result, SuiteOutcome::Success, "{parsed:?}");
+        assert_eq!(parsed.ids.len(), 9);
+        assert_eq!(parsed.ids["ltp:fcntl11:block-1#1"], Outcome::Ok);
+        assert_eq!(parsed.ids["ltp:fcntl11:block-9#1"], Outcome::Ok);
+
+        let missing = closure(&transcript.replace("Exit block 8\n", ""));
+        assert_eq!(missing.result, SuiteOutcome::None, "{missing:?}");
+
+        let failed = closure(&transcript.replace(
+            "fcntl11     0  TINFO  :  Exit block 4\n",
+            "fcntl11     0  TFAIL  :  block 4 failed\nfcntl11     0  TINFO  :  Exit block 4\n",
+        ));
+        assert_eq!(failed.result, SuiteOutcome::Failure, "{failed:?}");
+        assert_eq!(failed.ids["ltp:fcntl11:block-4#1"], Outcome::Fail);
+
+        let mut nonzero = raw(transcript);
+        nonzero.exit_code = 1;
+        assert_ne!(
+            LtpParser.parse_closure(&nonzero).result,
+            SuiteOutcome::Success
+        );
+    }
+
+    /// Catches a parser mutation that accepts a partial or reordered
+    /// `setfsuid04` child transcript as a complete four-check result.
+    #[test]
+    fn closure_parses_only_complete_setfsuid04_child_protocols() {
+        let transcript = concat!(
+            "setfsuid04    0  TINFO  :  Using /tmp/LTP_setErzYVz as tmpdir (overlayfs filesystem)\n",
+            "open failed with EACCESS as expected\n",
+            "open failed with EACCESS as expected\n",
+            "open call succeeded\n",
+            "open call succeeded\n",
+            "setfsuid04    0  TINFO  :  Child process returned TPASS\n",
+        );
+        let parsed = closure(transcript);
+        assert_eq!(parsed.result, SuiteOutcome::Success, "{parsed:?}");
+        assert_eq!(parsed.ids.len(), 4);
+        assert_eq!(parsed.ids["ltp:setfsuid04:deny-1#1"], Outcome::Ok);
+        assert_eq!(parsed.ids["ltp:setfsuid04:restore-root-2#1"], Outcome::Ok);
+
+        for malformed in [
+            transcript.replace("open call succeeded\n", ""),
+            transcript.replacen(
+                "open failed with EACCESS as expected\nopen failed with EACCESS as expected\nopen call succeeded\n",
+                "open failed with EACCESS as expected\nopen call succeeded\nopen failed with EACCESS as expected\n",
+                1,
+            ),
+            transcript.replace("Child process returned TPASS\n", ""),
+            transcript.replace(
+                "Child process returned TPASS\n",
+                "Child process returned TFAIL\n",
+            ),
+        ] {
+            let parsed = closure(&malformed);
+            assert_eq!(parsed.result, SuiteOutcome::None, "{parsed:?}");
+        }
+    }
+
+    /// Catches a generic clean-exit/TINFO fallback that would classify an
+    /// unrelated old-API binary as the exact 20260529 `fcntl01` source.
+    #[test]
+    fn closure_parses_only_the_fcntl01_source_protocol() {
+        let success =
+            "fcntl01     0  TINFO  :  Using /tmp/LTP_fcns4AFCO as tmpdir (overlayfs filesystem)\n";
+        let parsed = closure(success);
+        assert_eq!(parsed.result, SuiteOutcome::Success, "{parsed:?}");
+        assert_eq!(
+            parsed.ids,
+            BTreeMap::from([("ltp:fcntl01:1#1".to_string(), Outcome::Ok,)])
+        );
+
+        for (transcript, expected) in [
+            ("fcntl01     0  TFAIL  :  fcntl failed\n", Outcome::Fail),
+            ("fcntl01     0  TBROK  :  setup failed\n", Outcome::Broken),
+        ] {
+            let parsed = closure(transcript);
+            assert_eq!(parsed.result, SuiteOutcome::Failure, "{parsed:?}");
+            assert_eq!(parsed.ids["ltp:fcntl01:1#1"], expected);
+        }
+
+        for malformed in [
+            "fcntl01     0  TINFO  :  Using /tmp/not-ltp as tmpdir (overlayfs filesystem)\n",
+            "mmap10     0  TINFO  :  start tests.\n",
+        ] {
+            assert_eq!(closure(malformed).result, SuiteOutcome::None);
+        }
+        let mut nonzero = raw(success);
+        nonzero.exit_code = 1;
+        assert_eq!(LtpParser.parse_closure(&nonzero).result, SuiteOutcome::None);
     }
 }
