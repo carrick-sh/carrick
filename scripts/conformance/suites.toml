@@ -7360,7 +7360,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -7372,7 +7372,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -7384,7 +7384,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -7396,7 +7396,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -7408,7 +7408,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -8373,7 +8373,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -8385,7 +8385,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -9498,7 +9498,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9510,7 +9510,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9522,7 +9522,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9534,7 +9534,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9546,7 +9546,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9558,7 +9558,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9570,7 +9570,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9582,7 +9582,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9594,7 +9594,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9606,7 +9606,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9618,7 +9618,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9630,7 +9630,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9642,7 +9642,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9654,7 +9654,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9666,7 +9666,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9678,7 +9678,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9690,7 +9690,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9702,7 +9702,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9714,7 +9714,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9726,7 +9726,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9738,7 +9738,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9750,7 +9750,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9762,7 +9762,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9774,7 +9774,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -9787,7 +9787,7 @@ tier = "full"
 weight = "light"
 timeout_s = 40
 known_gaps = ["summary"]
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -13712,7 +13712,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -13724,7 +13724,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -13736,7 +13736,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -13748,7 +13748,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -13760,7 +13760,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -13772,7 +13772,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -13784,7 +13784,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -13796,7 +13796,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -13808,7 +13808,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -16754,7 +16754,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -16766,7 +16766,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -16778,7 +16778,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_ADMIN"]
 
 [[suite]]
@@ -16813,7 +16813,7 @@ tier = "full"
 weight = "light"
 timeout_s = 40
 known_gaps = ["summary"]
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_PTRACE"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_PTRACE"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_PTRACE"]
 
 [[suite]]
@@ -16826,7 +16826,7 @@ tier = "full"
 weight = "light"
 timeout_s = 40
 known_gaps = ["summary"]
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_PTRACE"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_PTRACE"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_PTRACE"]
 
 [[suite]]
@@ -18587,7 +18587,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -18599,7 +18599,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -18611,7 +18611,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -18623,7 +18623,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -18635,7 +18635,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -18647,7 +18647,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--security-opt", "seccomp=unconfined"]
 
 [[suite]]
@@ -20708,7 +20708,7 @@ tier = "full"
 weight = "light"
 timeout_s = 40
 known_gaps = ["summary"]
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_RESOURCE"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_RESOURCE"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_RESOURCE"]
 
 [[suite]]
@@ -20720,7 +20720,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_RESOURCE"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_RESOURCE"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_RESOURCE"]
 
 [[suite]]
@@ -20732,7 +20732,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_RESOURCE"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_RESOURCE"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_RESOURCE"]
 
 [[suite]]
@@ -20744,7 +20744,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_RESOURCE"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_RESOURCE"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_RESOURCE"]
 
 [[suite]]
@@ -20756,7 +20756,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "host", "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_RESOURCE"]
+carrick_flags = ["--raw", "--fs", "host", "--cap-add", "SYS_RESOURCE"]
 docker_flags = ["--security-opt", "seccomp=unconfined", "--cap-add", "SYS_RESOURCE"]
 
 [[suite]]

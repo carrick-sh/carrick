@@ -751,9 +751,10 @@ mod tests {
         assert_eq!(platform, Some("linux/amd64"));
     }
 
-    fn has_unconfined(argv: &[String]) -> bool {
+    fn unconfined_pair_count(argv: &[String]) -> usize {
         argv.windows(2)
-            .any(|w| w[0] == "--security-opt" && w[1] == "seccomp=unconfined")
+            .filter(|w| w[0] == "--security-opt" && w[1] == "seccomp=unconfined")
+            .count()
     }
 
     #[test]
@@ -763,15 +764,22 @@ mod tests {
         // must run the carrick side unconfined too — otherwise carrick's
         // default container policy (the Docker default-seccomp model) would be
         // compared against an unconfined oracle.
-        let mut suite = Suite::for_test("localhost:5050/ltp:arm64", &["add_key01"]);
-        suite.docker_flags = vec![
-            "--security-opt".to_string(),
-            "seccomp=unconfined".to_string(),
-        ];
-        let argv = carrick_argv(&suite, "target/release/carrick", "conf-1");
-        assert!(
-            has_unconfined(&argv),
-            "carrick side must mirror the oracle's seccomp=unconfined: {argv:?}"
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/conformance/suites.toml"
+        ))
+        .unwrap();
+        let manifest = crate::manifest::Manifest::from_toml(&text).unwrap();
+        let suite = manifest
+            .suite
+            .iter()
+            .find(|suite| suite.name == "ltp-add_key01")
+            .unwrap();
+        let argv = carrick_argv(suite, "target/release/carrick", "conf-1");
+        assert_eq!(
+            unconfined_pair_count(&argv),
+            1,
+            "carrick side must mirror the oracle's seccomp exactly once: {argv:?}"
         );
 
         // The one-token docker spelling must be recognized too — a manifest
@@ -780,9 +788,10 @@ mod tests {
         let mut suite = Suite::for_test("localhost:5050/ltp:arm64", &["add_key01"]);
         suite.docker_flags = vec!["--security-opt=seccomp=unconfined".to_string()];
         let argv = carrick_argv(&suite, "target/release/carrick", "conf-1");
-        assert!(
-            has_unconfined(&argv),
-            "one-token --security-opt= spelling must forward too: {argv:?}"
+        assert_eq!(
+            unconfined_pair_count(&argv),
+            1,
+            "one-token --security-opt= spelling must forward exactly once: {argv:?}"
         );
     }
 
