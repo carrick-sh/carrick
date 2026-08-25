@@ -186,23 +186,15 @@ pub fn classify_closure(
     docker_timed_out: bool,
 ) -> Classification {
     let carrick = &align_descriptor_residue(carrick, docker);
-    // Parity is OUTCOME EQUALITY, not all-pass: a test the ORACLE itself
-    // skips (env-dependent cpython/go skips, LTP TCONF) or fails
-    // (privilege-dependent LTP rows) is exact parity when carrick reproduces
-    // it row for row — the earlier all-Ok requirement barred ~600
-    // perfect-agreement suites from MATCH forever (multiprocessing_spawn at
-    // 323/323 + 47 matched skips; 390 identically-failing LTP suites), which
-    // no amount of carrick work could close. Only PARSED outcomes compare:
-    // Truncated/Empty/None never match, however equal — a deadline or empty
-    // capture is never a pass. Timeouts, one-sided skips, and result-kind
-    // divergence all remain INCOMPLETE.
-    let comparable =
-        |side: &SuiteResult| matches!(side.result, SuiteOutcome::Success | SuiteOutcome::Failure);
+    // Closure is stronger than regression parity: both sides must contain a
+    // non-empty all-pass observation. Native failures, broken assertions and
+    // skips are missing oracle evidence, even when Carrick reproduces them.
+    // True non-applicability must be encoded explicitly in the frozen suite
+    // declaration rather than smuggled through as a matched skip.
     if !carrick_timed_out
         && !docker_timed_out
-        && comparable(carrick)
-        && comparable(docker)
-        && carrick.result == docker.result
+        && carrick.is_strict_closure_success()
+        && docker.is_strict_closure_success()
         && carrick.ids == docker.ids
         && carrick.totals.n == docker.totals.n
         && carrick.totals.passed == docker.totals.passed
@@ -417,31 +409,66 @@ mod tests {
             super::suite(&[])
         }
 
-        /// A test the ORACLE ITSELF skips (env-dependent cpython/go skips,
-        /// LTP TCONF) is parity when carrick skips it identically — the old
-        /// all-Ok requirement barred ~200 perfect-agreement suites
-        /// (multiprocessing_spawn at 323/323 + 47 matched skips) from MATCH
-        /// forever, which no amount of carrick work could close.
+        /// Closure cannot call an unexercised assertion parity. Applicability
+        /// must be made explicit in the frozen declaration instead of being
+        /// hidden behind an equal skip on both sides.
         #[test]
-        fn matched_skips_are_parity() {
+        fn matched_skips_are_incomplete() {
             let side = result(
                 &[("a#1", Outcome::Ok), ("b#1", Outcome::Conf)],
                 SuiteOutcome::Success,
             );
             let got = classify_closure(&s(), &side, false, &side.clone(), false);
-            assert_eq!(got.verdict, Verdict::Match);
+            assert_eq!(got.verdict, Verdict::Incomplete);
         }
 
-        /// A suite Docker itself FAILS (privilege-dependent LTP rows) is
-        /// parity when carrick fails identically, row for row.
+        /// A native-oracle failure is not Linux-conformance evidence, even when
+        /// Carrick reproduces it exactly.
         #[test]
-        fn matched_failures_are_parity() {
+        fn matched_failures_are_incomplete() {
             let side = result(
                 &[("a#1", Outcome::Ok), ("b#1", Outcome::Fail)],
                 SuiteOutcome::Failure,
             );
             let got = classify_closure(&s(), &side, false, &side.clone(), false);
-            assert_eq!(got.verdict, Verdict::Match);
+            assert_eq!(got.verdict, Verdict::Incomplete);
+        }
+
+        /// Parser totals are independently fail-closed: a broken assertion
+        /// cannot disappear merely because the parsed id map contains only Ok.
+        #[test]
+        fn matched_broken_totals_are_incomplete() {
+            let mut side = result(&[("a#1", Outcome::Ok)], SuiteOutcome::Success);
+            side.totals.broken = 1;
+            let got = classify_closure(&s(), &side, false, &side.clone(), false);
+            assert_eq!(got.verdict, Verdict::Incomplete);
+        }
+
+        #[test]
+        fn matched_empty_assertion_inventory_is_incomplete() {
+            let side = result(&[], SuiteOutcome::Success);
+            let got = classify_closure(&s(), &side, false, &side.clone(), false);
+            assert_eq!(got.verdict, Verdict::Incomplete);
+        }
+
+        #[test]
+        fn matched_non_ok_assertions_are_incomplete() {
+            for outcome in [
+                Outcome::Fail,
+                Outcome::Error,
+                Outcome::Skipped,
+                Outcome::Xfail,
+                Outcome::Uxsuccess,
+                Outcome::Broken,
+                Outcome::Conf,
+                Outcome::Other,
+                Outcome::Absent,
+            ] {
+                let mut side = result(&[("a#1", Outcome::Ok)], SuiteOutcome::Success);
+                side.ids.insert("a#1".into(), outcome);
+                let got = classify_closure(&s(), &side, false, &side.clone(), false);
+                assert_eq!(got.verdict, Verdict::Incomplete, "{outcome:?}");
+            }
         }
 
         /// Result-kind divergence is never parity, even with equal ids.
