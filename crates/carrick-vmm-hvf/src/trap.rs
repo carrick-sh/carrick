@@ -811,6 +811,7 @@ mod task_only_carrier_directory_tests {
                         backing: InventoryBackingIdentity::Private(index as u64 + 1),
                         stage2_base: 0x1000_0000 + index as u64 * 0x4000,
                         stage2_length: 0x4000,
+                        stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
                     },
                 );
             }
@@ -1899,6 +1900,68 @@ fn semantic_extent_size(start: u64, end: u64) -> usize {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn split_local_mapping_rows_for_unmap(mappings: &mut Vec<HvfMappedRegion>, va: u64, len: usize) {
+    let Some(end) = va.checked_add(len as u64) else {
+        return;
+    };
+    let mut tails = Vec::new();
+    for row in mappings.iter_mut() {
+        if !row.is_dynamic_alias {
+            continue;
+        }
+        let row_size = semantic_extent_size(row.start, row.end);
+        let Some(row_end) = row.start.checked_add(row_size as u64) else {
+            continue;
+        };
+        if row_end <= va || row.start >= end {
+            continue;
+        }
+        let head_survives = row.start < va;
+        let tail_survives = row_end > end;
+        if !head_survives && !tail_survives {
+            continue;
+        }
+        if tail_survives {
+            let delta = end.saturating_sub(row.start);
+            tails.push(HvfMappedRegion {
+                start: end,
+                end: row.end,
+                ipa: row.ipa.saturating_add(delta),
+                physical_ipa: row.physical_ipa,
+                physical_size: row.physical_size,
+                host_addr: row.host_addr.wrapping_add(delta as usize),
+                size: usize::try_from(row_end.saturating_sub(end)).unwrap_or_default(),
+                perms: row.perms,
+                memory: None,
+                host_mapping: None,
+                stage2_lease: None,
+                is_dynamic_alias: true,
+                sharing: row.sharing,
+                guest_writable: row.guest_writable,
+                shared_key_base: row.shared_key_base,
+                shared_key_offset: row.shared_key_offset.saturating_add(delta),
+                owner_generation: row.owner_generation,
+            });
+        }
+        if head_survives {
+            row.end = va;
+            row.size = usize::try_from(va.saturating_sub(row.start)).unwrap_or_default();
+        } else {
+            // Only the tail survives: advance this row onto it and let the
+            // pushed fragment be dropped below.
+            let delta = end.saturating_sub(row.start);
+            row.ipa = row.ipa.saturating_add(delta);
+            row.host_addr = row.host_addr.wrapping_add(delta as usize);
+            row.shared_key_offset = row.shared_key_offset.saturating_add(delta);
+            row.start = end;
+            row.size = usize::try_from(row_end.saturating_sub(end)).unwrap_or_default();
+            tails.pop();
+        }
+    }
+    mappings.append(&mut tails);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn is_kernel_only_stage1_range(start: u64, len: usize) -> bool {
     let end = start.saturating_add(len as u64);
     start >= crate::memory::LINUX_KERNEL_REGION_BASE
@@ -1964,10 +2027,19 @@ fn next_global_frame_owner_generation() -> u64 {
 /// live, so a row records the incarnation it was actually published against.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn global_frame_host_owner_generation(ipa: u64, length: u64) -> u64 {
+    global_frame_host_owner_identity(ipa, length).map_or(0, |(_, generation)| generation)
+}
+
+/// The exact host pointer and generation currently owning a reusable extent.
+///
+/// Retirement diagnostics and inventory authentication need the complete
+/// identity. A generation or a recycled host pointer alone is insufficient.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn global_frame_host_owner_identity(ipa: u64, length: u64) -> Option<(usize, u64)> {
     global_frame_host_owners()
         .lock()
         .get(&(ipa, length))
-        .map_or(0, |owner| owner.generation)
+        .map(|owner| (owner._mapping.as_ptr() as usize, owner.generation))
 }
 
 // SAFETY: the mapping is process-address-space state. Its address is stable,
@@ -1998,10 +2070,17 @@ fn global_frame_host_owners()
 /// released exactly once, by whichever of retirement or carrier teardown
 /// reaches it first.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct CarrierStage2LeaseOwner {
+    lease: GlobalFrameStage2Lease,
+    host_addr: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn carrier_stage2_leases()
--> &'static parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), GlobalFrameStage2Lease>> {
+-> &'static parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), CarrierStage2LeaseOwner>> {
     static CELL: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), GlobalFrameStage2Lease>>,
+        parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), CarrierStage2LeaseOwner>>,
     > = std::sync::OnceLock::new();
     CELL.get_or_init(|| parking_lot::Mutex::new(std::collections::BTreeMap::new()))
 }
@@ -2009,28 +2088,87 @@ fn carrier_stage2_leases()
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn register_carrier_stage2_leases(
     leases: &mut Vec<GlobalFrameStage2Lease>,
+    owner_hosts: &std::collections::BTreeMap<(u64, u64), usize>,
 ) -> Result<Vec<(u64, u64)>, TrapError> {
     let keys: Vec<_> = leases.iter().map(GlobalFrameStage2Lease::key).collect();
     let mut distinct = std::collections::BTreeSet::new();
     let mut registered = carrier_stage2_leases().lock();
-    for &key in &keys {
+    for (&key, lease) in keys.iter().zip(leases.iter()) {
         if !distinct.insert(key) || registered.contains_key(&key) {
             return Err(TrapError::Hypervisor(format!(
                 "carrier stage-2 lease collision at IPA 0x{:x} size {}",
                 key.0, key.1
             )));
         }
+        let host_addr = owner_hosts.get(&key).copied().unwrap_or_default();
+        if host_addr == 0 || !lease.active || !lease.mapped {
+            return Err(TrapError::Hypervisor(format!(
+                "carrier stage-2 lease {key:?} has no exact active mapped host owner: host=0x{host_addr:x} active={} mapped={}",
+                lease.active, lease.mapped
+            )));
+        }
     }
     for (key, lease) in keys.iter().copied().zip(leases.drain(..)) {
-        registered.insert(key, lease);
+        registered.insert(
+            key,
+            CarrierStage2LeaseOwner {
+                lease,
+                host_addr: owner_hosts[&key],
+            },
+        );
     }
     Ok(keys)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn carrier_stage2_lease_owner_matches(ipa: u64, length: u64, host_addr: usize) -> bool {
+    carrier_stage2_leases()
+        .lock()
+        .get(&(ipa, length))
+        .is_some_and(|owner| {
+            owner.lease.active && owner.lease.mapped && owner.host_addr == host_addr
+        })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn collect_carrier_stage2_owner_hosts(
+    identities: impl IntoIterator<Item = ((u64, u64), usize)>,
+) -> Result<std::collections::BTreeMap<(u64, u64), usize>, TrapError> {
+    let mut owners = std::collections::BTreeMap::new();
+    for (key, host_addr) in identities {
+        if let Some(previous) = owners.insert(key, host_addr)
+            && previous != host_addr
+        {
+            return Err(TrapError::Hypervisor(format!(
+                "carrier stage-2 lease {key:?} has conflicting host owners 0x{previous:x} and 0x{host_addr:x}"
+            )));
+        }
+    }
+    Ok(owners)
 }
 
 /// Take the carrier-owned lease for an exact extent, if one is published.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn take_carrier_stage2_lease(ipa: u64, length: u64) -> Option<GlobalFrameStage2Lease> {
-    carrier_stage2_leases().lock().remove(&(ipa, length))
+    carrier_stage2_leases()
+        .lock()
+        .remove(&(ipa, length))
+        .map(|owner| owner.lease)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn take_carrier_stage2_lease_if_owner(
+    ipa: u64,
+    length: u64,
+    host_addr: usize,
+) -> Option<GlobalFrameStage2Lease> {
+    let mut owners = carrier_stage2_leases().lock();
+    let matches = owners.get(&(ipa, length)).is_some_and(|owner| {
+        owner.lease.active && owner.lease.mapped && owner.host_addr == host_addr
+    });
+    matches
+        .then(|| owners.remove(&(ipa, length)).map(|owner| owner.lease))
+        .flatten()
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2255,18 +2393,24 @@ fn is_reusable_global_frame_extent(ipa: u64, length: u64) -> bool {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mapped_region_stage2_owner_identity(
+    mapping: &HvfMappedRegion,
+) -> Option<InventoryStage2OwnerIdentity> {
+    let semantic_offset = usize::try_from(mapping.ipa.checked_sub(mapping.physical_ipa)?).ok()?;
+    let host_addr = (mapping.host_addr as usize).checked_sub(semantic_offset)?;
+    Some(InventoryStage2OwnerIdentity {
+        host_addr,
+        generation: mapping.owner_generation,
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn global_frame_region_owner_matches(mapping: &HvfMappedRegion) -> bool {
-    let Some(semantic_offset) = mapping.ipa.checked_sub(mapping.physical_ipa) else {
-        return false;
-    };
-    let Ok(semantic_offset) = usize::try_from(semantic_offset) else {
-        return false;
-    };
-    let Some(physical_host_addr) = (mapping.host_addr as usize).checked_sub(semantic_offset) else {
+    let Some(identity) = mapped_region_stage2_owner_identity(mapping) else {
         return false;
     };
     let locally_owned = mapping.host_mapping.as_ref().is_some_and(|owner| {
-        owner.as_ptr() as usize == physical_host_addr && owner.len() == mapping.physical_size
+        owner.as_ptr() as usize == identity.host_addr && owner.len() == mapping.physical_size
     }) && mapping.stage2_lease.as_ref().is_some_and(|lease| {
         lease.active
             && lease.mapped
@@ -2278,8 +2422,8 @@ fn global_frame_region_owner_matches(mapping: &HvfMappedRegion) -> bool {
     global_frame_host_owner_matches(
         mapping.physical_ipa,
         mapping.physical_size as u64,
-        physical_host_addr,
-        mapping.owner_generation,
+        identity.host_addr,
+        identity.generation,
     )
 }
 
@@ -2735,6 +2879,17 @@ fn retained_private_reuse_alias_fragment(
                 <= entry
                     .physical_ipa
                     .saturating_add(entry.physical_size as u64)
+            && match global_frame_host_owner_identity(
+                entry.physical_ipa,
+                entry.physical_size as u64,
+            ) {
+                Some((host_addr, generation)) => {
+                    entry.owner_generation != 0
+                        && host_addr == entry.physical_host_addr
+                        && generation == entry.owner_generation
+                }
+                None => entry.owner_generation == 0,
+            }
     })?;
     let physical_offset = usize::try_from(ipa.checked_sub(source.physical_ipa)?).ok()?;
     Some(AliasBacking {
@@ -2752,10 +2907,7 @@ fn retained_private_reuse_alias_fragment(
         inventory_backing: source.inventory_backing,
         shared_key_base: 0,
         shared_key_offset: 0,
-        owner_generation: global_frame_host_owner_generation(
-            source.physical_ipa,
-            source.physical_size as u64,
-        ),
+        owner_generation: source.owner_generation,
     })
 }
 
@@ -4040,6 +4192,23 @@ enum InventoryBackingIdentity {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InventoryStage2OwnerIdentity {
+    /// Base host pointer for the complete `stage2_base/stage2_length` lease.
+    host_addr: usize,
+    /// Exact global-owner incarnation, or zero for a local/carrier lease.
+    generation: u64,
+}
+
+#[cfg(test)]
+impl InventoryStage2OwnerIdentity {
+    const TEST_UNOWNED: Self = Self {
+        host_addr: 0,
+        generation: 0,
+    };
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Copy, Debug)]
 struct InventoryExtent {
     frame: carrick_hal::FrameId,
@@ -4050,6 +4219,10 @@ struct InventoryExtent {
     /// the original host/HVF extent remains installed exactly once.
     stage2_base: u64,
     stage2_length: u64,
+    /// Physical owner authenticated when this inventory mapping was published.
+    /// Retirement consumes this identity instead of reconstructing authority
+    /// from historical per-executor mapping rows.
+    stage2_owner: InventoryStage2OwnerIdentity,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4059,6 +4232,14 @@ struct CowInventorySplitShape {
     old: InventoryExtent,
     fragments: Vec<(u64, u64)>,
     retirement: CowInventoryRetirementDecision,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug)]
+struct CowInventoryReplacementStage {
+    gpa: u64,
+    backing: InventoryBackingIdentity,
+    stage2_owner: InventoryStage2OwnerIdentity,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4077,6 +4258,7 @@ struct InventoryMappingStage {
     backing: InventoryBackingIdentity,
     inherited_frame: Option<carrick_hal::FrameId>,
     stage2_lease: Option<(u64, u64)>,
+    stage2_owner: InventoryStage2OwnerIdentity,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -5630,6 +5812,8 @@ struct GlobalFrameStage2Lease {
     release_ipa: bool,
     #[cfg(test)]
     drop_backing_audit: Option<(usize, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+    #[cfg(test)]
+    backend_map_installed: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -5644,6 +5828,8 @@ impl GlobalFrameStage2Lease {
             release_ipa: true,
             #[cfg(test)]
             drop_backing_audit: None,
+            #[cfg(test)]
+            backend_map_installed: false,
         })
     }
 
@@ -5656,10 +5842,21 @@ impl GlobalFrameStage2Lease {
             release_ipa: false,
             #[cfg(test)]
             drop_backing_audit: None,
+            #[cfg(test)]
+            backend_map_installed: false,
         }
     }
 
     fn mark_mapped(&mut self) {
+        self.mapped = true;
+        #[cfg(test)]
+        {
+            self.backend_map_installed = true;
+        }
+    }
+
+    #[cfg(test)]
+    fn mark_test_mapped_without_backend(&mut self) {
         self.mapped = true;
     }
 
@@ -5681,7 +5878,11 @@ impl Drop for GlobalFrameStage2Lease {
         if !self.active {
             return;
         }
-        if self.mapped {
+        #[cfg(not(test))]
+        let unmap_backend = self.mapped;
+        #[cfg(test)]
+        let unmap_backend = self.backend_map_installed;
+        if unmap_backend {
             let size = usize::try_from(self.length).unwrap_or_else(|_| {
                 eprintln!("carrick: FATAL: global frame stage-2 lease is too large");
                 std::process::abort();
@@ -6079,6 +6280,7 @@ struct ProcessInventoryDesc {
     inherited_mapping: Option<carrick_hal::MappingId>,
     backing: InventoryBackingIdentity,
     stage2_lease: (u64, u64),
+    stage2_owner: InventoryStage2OwnerIdentity,
     sharing: GuestMappingSharing,
     guest_writable: bool,
     shared_mm: bool,
@@ -8455,16 +8657,33 @@ impl HvpatchCarrierTaskStateDirectory {
                 vm,
                 mut stage2_leases,
             } => {
-                let stage2_lease_keys = match register_carrier_stage2_leases(&mut stage2_leases) {
-                    Ok(keys) => keys,
-                    Err(error) => {
-                        abort_prepared_task_and_carrier(
-                            task,
-                            HvpatchCarrierTaskState::Process { vm, stage2_leases },
-                        )?;
-                        return Err(error);
-                    }
-                };
+                let owner_hosts =
+                    match collect_carrier_stage2_owner_hosts(task.mappings.iter().map(|mapping| {
+                        (
+                            (mapping.physical_ipa, mapping.physical_size as u64),
+                            mapping.physical_host_addr as usize,
+                        )
+                    })) {
+                        Ok(owners) => owners,
+                        Err(error) => {
+                            abort_prepared_task_and_carrier(
+                                task,
+                                HvpatchCarrierTaskState::Process { vm, stage2_leases },
+                            )?;
+                            return Err(error);
+                        }
+                    };
+                let stage2_lease_keys =
+                    match register_carrier_stage2_leases(&mut stage2_leases, &owner_hosts) {
+                        Ok(keys) => keys,
+                        Err(error) => {
+                            abort_prepared_task_and_carrier(
+                                task,
+                                HvpatchCarrierTaskState::Process { vm, stage2_leases },
+                            )?;
+                            return Err(error);
+                        }
+                    };
                 (
                     Some(std::sync::Arc::new(HvpatchCarrierMmAuthority::Live {
                         _vm: vm,
@@ -9345,6 +9564,53 @@ impl HvfVmState {
         Ok(())
     }
 
+    fn retire_unowned_stage2_extent_from_mappings(
+        mappings: &mut [HvfMappedRegion],
+        ipa: u64,
+        length: u64,
+        host_addr: usize,
+    ) -> Result<(), TrapError> {
+        let expected = InventoryStage2OwnerIdentity {
+            host_addr,
+            generation: 0,
+        };
+        if let Some(live) = global_frame_host_owner_identity(ipa, length) {
+            return Err(TrapError::Hypervisor(format!(
+                "unowned stage-2 retirement {ipa:#x}/{length:#x} found live global owner {live:?}"
+            )));
+        }
+        if let Some(lease) = mappings.iter_mut().find_map(|mapping| {
+            let exact_owner = mapped_region_stage2_owner_identity(mapping) == Some(expected);
+            let exact_lease = mapping
+                .stage2_lease
+                .as_ref()
+                .is_some_and(|lease| lease.key() == (ipa, length) && lease.active && lease.mapped);
+            (exact_owner && exact_lease)
+                .then(|| mapping.stage2_lease.take())
+                .flatten()
+        }) {
+            drop(lease);
+            return Ok(());
+        }
+        if let Some(lease) = take_carrier_stage2_lease_if_owner(ipa, length, host_addr) {
+            drop(lease);
+            return Ok(());
+        }
+        if is_reusable_global_frame_extent(ipa, length) {
+            return Err(TrapError::Hypervisor(format!(
+                "unowned reusable stage-2 retirement {ipa:#x}/{length:#x} lost exact mapped local/carrier owner 0x{host_addr:x}"
+            )));
+        }
+        let size = usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?;
+        let rc = unsafe { inventory_hv_vm_unmap(ipa, size) };
+        if rc != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "retire unowned HVPatch stage-2 extent IPA 0x{ipa:x} size {size} failed: 0x{rc:x}"
+            )));
+        }
+        Ok(())
+    }
+
     fn inventory_generation(raw: u64) -> carrick_hal::MappingGeneration {
         let Some(raw) = std::num::NonZeroU64::new(raw) else {
             std::process::abort();
@@ -9657,8 +9923,7 @@ impl HvfVmState {
         old: InventoryExtent,
         fragment_shapes: &[(u64, u64)],
         retirement: CowInventoryRetirementDecision,
-        new_gpa: u64,
-        new_backing: InventoryBackingIdentity,
+        replacement: CowInventoryReplacementStage,
     ) -> Result<CowInventorySplit, TrapError> {
         let transaction = reservation.transaction();
         reservation
@@ -9687,7 +9952,7 @@ impl HvfVmState {
         let new_mapping = Self::push_exact_mapping_events(
             reservation,
             new_frame,
-            new_gpa,
+            replacement.gpa,
             CowArmedRanges::COMPOUND_SIZE,
             permissions,
         )?;
@@ -9704,13 +9969,14 @@ impl HvfVmState {
             old_key,
             old,
             fragments,
-            new_key: (new_gpa, CowArmedRanges::COMPOUND_SIZE),
+            new_key: (replacement.gpa, CowArmedRanges::COMPOUND_SIZE),
             new_extent: InventoryExtent {
                 frame: new_frame,
                 mapping: new_mapping,
-                backing: new_backing,
-                stage2_base: new_gpa,
+                backing: replacement.backing,
+                stage2_base: replacement.gpa,
                 stage2_length: CowArmedRanges::COMPOUND_SIZE,
+                stage2_owner: replacement.stage2_owner,
             },
             retirement,
         })
@@ -9771,6 +10037,7 @@ impl HvfVmState {
                     backing: split.old.backing,
                     stage2_base: split.old.stage2_base,
                     stage2_length: split.old.stage2_length,
+                    stage2_owner: split.old.stage2_owner,
                 },
             );
         }
@@ -9843,6 +10110,7 @@ impl HvfVmState {
             backing,
             inherited_frame,
             stage2_lease,
+            stage2_owner,
         } = stage;
         if inventory.extents.contains_key(&(gpa, length)) {
             return Err(TrapError::Hypervisor(format!(
@@ -9912,11 +10180,23 @@ impl HvfVmState {
                     "HVPatch physical extent {extent_key:?} reference count exhausted"
                 ))
             })?;
-        frames.references.insert(frame, frame_references);
-        frames
-            .extent_references
-            .insert(extent_key, extent_references);
         let stage2_lease = stage2_lease.unwrap_or((gpa, length));
+        match global_frame_host_owner_identity(stage2_lease.0, stage2_lease.1) {
+            Some(live)
+                if stage2_owner.generation != 0
+                    && live == (stage2_owner.host_addr, stage2_owner.generation) => {}
+            Some(live) => {
+                return Err(TrapError::Hypervisor(format!(
+                    "HVPatch inventory stage-2 owner is not live: lease={stage2_lease:?} owner={stage2_owner:?} live={live:?}"
+                )));
+            }
+            None if stage2_owner.generation == 0 => {}
+            None => {
+                return Err(TrapError::Hypervisor(format!(
+                    "HVPatch inventory stage-2 owner is not live: lease={stage2_lease:?} owner={stage2_owner:?} live=None"
+                )));
+            }
+        }
         let stage2_references = frames
             .stage2_references
             .get(&stage2_lease)
@@ -9928,6 +10208,14 @@ impl HvfVmState {
                     "HVPatch stage-2 lease {stage2_lease:?} reference count exhausted"
                 ))
             })?;
+        // Owner authentication and every fallible count calculation complete
+        // before the shared registry is mutated. A rejected publication has no
+        // InventoryExtent for rollback to discover, so partial insertion here
+        // would manufacture phantom frame authority permanently.
+        frames.references.insert(frame, frame_references);
+        frames
+            .extent_references
+            .insert(extent_key, extent_references);
         frames
             .stage2_references
             .insert(stage2_lease, stage2_references);
@@ -9941,6 +10229,7 @@ impl HvfVmState {
             backing,
             stage2_base: stage2_lease.0,
             stage2_length: stage2_lease.1,
+            stage2_owner,
         };
         inventory.extents.insert((gpa, length), extent);
         Ok(extent)
@@ -10163,6 +10452,12 @@ impl HvfVmState {
             if !mapping_belongs_to_task_inventory(self.persistent_vm_lifecycle, region) {
                 continue;
             }
+            let stage2_owner = mapped_region_stage2_owner_identity(region).ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "HVPatch initial inventory region IPA 0x{:x} has invalid physical owner offset",
+                    region.physical_ipa
+                ))
+            })?;
             Self::stage_mapping(
                 &mut inventory,
                 &mut reservation,
@@ -10173,6 +10468,7 @@ impl HvfVmState {
                     backing: Self::private_backing_identity(),
                     inherited_frame: None,
                     stage2_lease: None,
+                    stage2_owner,
                 },
             )?;
         }
@@ -10473,7 +10769,7 @@ impl HvfVmState {
         // the IPA to a COW transaction whose per-mm inventory still contained
         // that key (`HVPatch COW new inventory extent collided`).
         let ledger = std::sync::Arc::clone(&task.frame_inventory.ledger);
-        let (candidates, frames, retirement_commit) = {
+        let (candidates, frames, retirement_commit, stage2_owners) = {
             let mut inventory = ledger.lock();
             if inventory.extents.is_empty() {
                 if task.mappings.is_empty() {
@@ -10490,48 +10786,104 @@ impl HvfVmState {
                 ));
             }
 
-            // Validate every physical candidate extent in inventory before performing any logical mutation:
+            // Validate every physical candidate extent in inventory before
+            // performing any logical mutation. The inventory records the
+            // owner identity that was live at publication; `task.mappings`
+            // deliberately retains historical rows and therefore cannot be
+            // used to reconstruct one generation at terminal retirement.
+            let mut stage2_owners = std::collections::BTreeMap::new();
             for extent in inventory.extents.values() {
                 let ipa = extent.stage2_base;
                 let length = extent.stage2_length;
                 let size =
                     usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?;
-                let matching_generations: std::collections::BTreeSet<u64> = task
+                let lease = (ipa, length);
+                if let Some(previous) = stage2_owners.insert(lease, extent.stage2_owner)
+                    && previous != extent.stage2_owner
+                {
+                    return Err(TrapError::Hypervisor(format!(
+                        "HVPatch process retirement lease {lease:?} has conflicting inventory owner identities {previous:?} and {:?}",
+                        extent.stage2_owner
+                    )));
+                }
+                let matching_rows: Vec<_> = task
                     .mappings
                     .iter()
                     .filter(|mapping| mapping.physical_ipa == ipa && mapping.physical_size == size)
-                    .map(|mapping| mapping.owner_generation)
+                    .filter_map(|mapping| {
+                        mapped_region_stage2_owner_identity(mapping).map(|identity| {
+                            (
+                                identity,
+                                mapping
+                                    .stage2_lease
+                                    .as_ref()
+                                    .map(|lease| (lease.key(), lease.active, lease.mapped)),
+                                mapping.is_dynamic_alias,
+                            )
+                        })
+                    })
                     .collect();
-                let expected_gen = match matching_generations.iter().next().copied() {
-                    Some(generation) if matching_generations.len() == 1 => generation,
-                    None => {
+                if !matching_rows
+                    .iter()
+                    .any(|(identity, _, _)| *identity == extent.stage2_owner)
+                {
+                    return Err(TrapError::Hypervisor(format!(
+                        "HVPatch process retirement lease {lease:?} inventory owner {:?} has no exact task mapping; rows={matching_rows:?}",
+                        extent.stage2_owner
+                    )));
+                }
+                let live_owner = global_frame_host_owner_identity(ipa, length);
+                if extent.stage2_owner.generation == 0 {
+                    if live_owner.is_some() {
                         return Err(TrapError::Hypervisor(format!(
-                            "HVPatch process retirement extent at IPA 0x{ipa:x} size {size} has no matching task mapping"
+                            "HVPatch process retirement unowned lease {lease:?} unexpectedly has live global owner {live_owner:?}"
                         )));
                     }
-                    _ => {
+                    let local_lease = matching_rows.iter().any(|(identity, local, _)| {
+                        *identity == extent.stage2_owner
+                            && local.is_some_and(|(key, active, mapped)| {
+                                key == lease && active && mapped
+                            })
+                    });
+                    let carrier_lease = carrier_stage2_lease_owner_matches(
+                        ipa,
+                        length,
+                        extent.stage2_owner.host_addr,
+                    );
+                    if is_reusable_global_frame_extent(ipa, length)
+                        && !local_lease
+                        && !carrier_lease
+                    {
                         return Err(TrapError::Hypervisor(format!(
-                            "HVPatch process retirement extent at IPA 0x{ipa:x} size {size} has ambiguous owner generations"
-                        )));
-                    }
-                };
-                let current_gen = global_frame_host_owner_generation(ipa, length);
-                if expected_gen == 0 {
-                    if is_reusable_global_frame_extent(ipa, length) {
-                        return Err(TrapError::Hypervisor(format!(
-                            "HVPatch process retirement reusable extent at IPA 0x{ipa:x} size {size} has unexpected zero owner generation"
-                        )));
-                    }
-                    if current_gen != 0 {
-                        return Err(TrapError::Hypervisor(format!(
-                            "HVPatch process retirement unowned extent at IPA 0x{ipa:x} size {size} has unexpected live owner generation {current_gen}"
+                            "HVPatch process retirement reusable unowned lease {lease:?} has no exact local or carrier lease"
                         )));
                     }
                 } else {
-                    if current_gen == 0 {
-                        return Err(TrapError::Hypervisor(format!(
-                            "HVPatch process retirement owned extent at IPA 0x{ipa:x} size {size} expected generation {expected_gen} but owner is absent"
-                        )));
+                    match live_owner {
+                        Some(live)
+                            if live
+                                == (
+                                    extent.stage2_owner.host_addr,
+                                    extent.stage2_owner.generation,
+                                ) => {}
+                        Some((live_host, live_generation))
+                            if live_generation == extent.stage2_owner.generation =>
+                        {
+                            return Err(TrapError::Hypervisor(format!(
+                                "HVPatch process retirement owner pointer drifted for lease {lease:?}: inventory={:?} live=({live_host}, {live_generation})",
+                                extent.stage2_owner
+                            )));
+                        }
+                        // A different live generation is a successor owner.
+                        // This stale mm may retire its logical inventory but
+                        // must leave the successor's physical lease untouched.
+                        Some(_) => {}
+                        None => {
+                            return Err(TrapError::Hypervisor(format!(
+                                "HVPatch process retirement owned lease {lease:?} expected inventory owner {:?} but the owner is absent",
+                                extent.stage2_owner
+                            )));
+                        }
                     }
                 }
             }
@@ -10553,7 +10905,7 @@ impl HvfVmState {
                 &mut reservation,
                 &authoritative_mapping_count,
             )?;
-            (candidates, frames, reservation.commit(()))
+            (candidates, frames, reservation.commit(()), stage2_owners)
         };
 
         // `stage_mapping` increments the same registry while holding this exact
@@ -10562,51 +10914,55 @@ impl HvfVmState {
         // the extent live, or retirement wins first and no later publication
         // can inherit the recycled owner.
         let mut extents = std::collections::BTreeSet::new();
+        let mut superseded_owners = std::collections::BTreeMap::new();
         for &(ipa, length) in &candidates {
             let size = usize::try_from(length).map_err(|_| TrapError::MappingTooLarge(length))?;
-            let matching_generations: std::collections::BTreeSet<u64> = task
-                .mappings
-                .iter()
-                .filter(|mapping| mapping.physical_ipa == ipa && mapping.physical_size == size)
-                .map(|mapping| mapping.owner_generation)
-                .collect();
-            let owner_generation = match matching_generations.iter().next().copied() {
-                Some(generation) if matching_generations.len() == 1 => generation,
-                _ => {
+            let lease = (ipa, length);
+            let owner = stage2_owners.get(&lease).copied().ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "HVPatch process retirement candidate {lease:?} lost inventory owner identity"
+                ))
+            })?;
+            let live_owner = global_frame_host_owner_identity(ipa, length);
+            if owner.generation == 0 {
+                if live_owner.is_some() {
                     return Err(TrapError::Hypervisor(format!(
-                        "HVPatch process retirement candidate IPA 0x{ipa:x} size {size} has ambiguous owner generations"
+                        "HVPatch process retirement unowned candidate {lease:?} unexpectedly has live global owner {live_owner:?}"
                     )));
                 }
-            };
-            let current_gen = global_frame_host_owner_generation(ipa, length);
-            if owner_generation == 0 {
-                if current_gen != 0 {
-                    return Err(TrapError::Hypervisor(format!(
-                        "HVPatch process retirement unowned candidate IPA 0x{ipa:x} size {size} has unexpected live owner generation {current_gen}"
-                    )));
-                }
-                if Self::retire_stage2_candidate_if_unreferenced(&frames, (ipa, length), || {
-                    Self::retire_stage2_extent_from_mappings(&mut task.mappings, ipa, length)
+                if Self::retire_stage2_candidate_if_unreferenced(&frames, lease, || {
+                    Self::retire_unowned_stage2_extent_from_mappings(
+                        &mut task.mappings,
+                        ipa,
+                        length,
+                        owner.host_addr,
+                    )
                 })? {
                     extents.insert((ipa, size));
                 }
-            } else if current_gen == owner_generation {
-                if Self::retire_stage2_candidate_if_unreferenced(&frames, (ipa, length), || {
-                    if retire_global_frame_host_owner_if_generation(ipa, length, owner_generation) {
+            } else if live_owner == Some((owner.host_addr, owner.generation)) {
+                if Self::retire_stage2_candidate_if_unreferenced(&frames, lease, || {
+                    if retire_global_frame_host_owner_if_generation(ipa, length, owner.generation) {
                         Ok(())
                     } else {
                         Err(TrapError::Hypervisor(format!(
-                            "HVPatch process retirement owner generation drifted at IPA 0x{ipa:x} size {size}"
+                            "HVPatch process retirement owner identity drifted for lease {lease:?}"
                         )))
                     }
                 })? {
                     extents.insert((ipa, size));
                 }
-            } else if current_gen != 0 {
-                // Stale cleanup: a successor owner (generation `current_gen`) is live; leave it untouched.
+            } else if let Some((live_host, live_generation)) = live_owner {
+                if live_generation == owner.generation {
+                    return Err(TrapError::Hypervisor(format!(
+                        "HVPatch process retirement candidate owner pointer drifted for lease {lease:?}: inventory={owner:?} live=({live_host}, {live_generation})"
+                    )));
+                }
+                // Stale cleanup: a successor owner is live; leave it untouched.
+                superseded_owners.insert(lease, owner);
             } else {
                 return Err(TrapError::Hypervisor(format!(
-                    "HVPatch process retirement owned candidate IPA 0x{ipa:x} size {size} expected generation {owner_generation} but owner is absent"
+                    "HVPatch process retirement owned candidate {lease:?} expected inventory owner {owner:?} but the owner is absent"
                 )));
             }
         }
@@ -10615,7 +10971,13 @@ impl HvfVmState {
                 if alias_is_owned_by_process(alias.ownership_scope, task.mm_root_slot) {
                     false
                 } else if matches!(alias.ownership_scope, AliasOwnershipScope::Global) {
+                    let key = (alias.physical_ipa, alias.physical_size as u64);
+                    let retired_exact_owner = superseded_owners.get(&key).is_some_and(|owner| {
+                        owner.host_addr == alias.physical_host_addr
+                            && owner.generation == alias.owner_generation
+                    });
                     !extents.contains(&(alias.physical_ipa, alias.physical_size))
+                        && !retired_exact_owner
                 } else {
                     true
                 }
@@ -11727,6 +12089,10 @@ impl HvfVmState {
                     backing: Self::private_backing_identity(),
                     inherited_frame: None,
                     stage2_lease: Some((physical_ipa, physical_len)),
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr: physical_host as usize,
+                        generation: owner_generation,
+                    },
                 },
             )?
         };
@@ -12179,6 +12545,10 @@ impl HvfVmState {
                     backing,
                     inherited_frame: None,
                     stage2_lease: Some((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE)),
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr: new_host_ptr as usize,
+                        generation: owner_generation,
+                    },
                 },
             )?
         };
@@ -12697,8 +13067,14 @@ impl HvfVmState {
             old_inventory_extent,
             &fragment_shapes,
             retirement,
-            new_physical_ipa,
-            backing,
+            CowInventoryReplacementStage {
+                gpa: new_physical_ipa,
+                backing,
+                stage2_owner: InventoryStage2OwnerIdentity {
+                    host_addr: new_host_ptr as usize,
+                    generation: owner_generation,
+                },
+            },
         ) {
             Ok(split) => split,
             Err(error) => {
@@ -13908,6 +14284,10 @@ impl HvfVmState {
                     backing: inventory_backing,
                     inherited_frame: None,
                     stage2_lease: None,
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr: host as usize,
+                        generation: owner_generation,
+                    },
                 },
             ) {
                 Ok(extent) => {
@@ -14722,67 +15102,7 @@ impl HvfVmState {
     /// registry drops such an entry outright, and excluding a dead row from
     /// fork is correct.
     fn split_local_rows_for_unmap(&mut self, va: u64, len: usize) {
-        let Some(end) = va.checked_add(len as u64) else {
-            return;
-        };
-        let mut tails: Vec<HvfMappedRegion> = Vec::new();
-        for row in &mut self.mappings {
-            if !row.is_dynamic_alias {
-                continue;
-            }
-            let row_size = semantic_extent_size(row.start, row.end);
-            let Some(row_end) = row.start.checked_add(row_size as u64) else {
-                continue;
-            };
-            if row_end <= va || row.start >= end {
-                continue;
-            }
-            let head_survives = row.start < va;
-            let tail_survives = row_end > end;
-            if !head_survives && !tail_survives {
-                continue;
-            }
-            if tail_survives {
-                let delta = end.saturating_sub(row.start);
-                tails.push(HvfMappedRegion {
-                    start: end,
-                    end: row.end,
-                    ipa: row.ipa.saturating_add(delta),
-                    physical_ipa: row.physical_ipa,
-                    physical_size: row.physical_size,
-                    host_addr: row.host_addr.wrapping_add(delta as usize),
-                    size: usize::try_from(row_end.saturating_sub(end)).unwrap_or_default(),
-                    perms: row.perms,
-                    memory: None,
-                    host_mapping: None,
-                    stage2_lease: None,
-                    is_dynamic_alias: true,
-                    sharing: row.sharing,
-                    guest_writable: row.guest_writable,
-                    shared_key_base: row.shared_key_base,
-                    shared_key_offset: row.shared_key_offset.saturating_add(delta),
-                    owner_generation: global_frame_host_owner_generation(
-                        row.physical_ipa,
-                        row.physical_size as u64,
-                    ),
-                });
-            }
-            if head_survives {
-                row.end = va;
-                row.size = usize::try_from(va.saturating_sub(row.start)).unwrap_or_default();
-            } else {
-                // Only the tail survives: advance this row onto it and let the
-                // pushed fragment be dropped below.
-                let delta = end.saturating_sub(row.start);
-                row.ipa = row.ipa.saturating_add(delta);
-                row.host_addr = row.host_addr.wrapping_add(delta as usize);
-                row.shared_key_offset = row.shared_key_offset.saturating_add(delta);
-                row.start = end;
-                row.size = usize::try_from(row_end.saturating_sub(end)).unwrap_or_default();
-                tails.pop();
-            }
-        }
-        self.mappings.append(&mut tails);
+        split_local_mapping_rows_for_unmap(&mut self.mappings, va, len);
     }
 
     pub(crate) fn unregister_process_alias(
@@ -16169,6 +16489,7 @@ impl HvfVmState {
                             inherited_mapping: Some(extent.mapping),
                             backing: extent.backing,
                             stage2_lease: (extent.stage2_base, extent.stage2_length),
+                            stage2_owner: extent.stage2_owner,
                             sharing: mapping.sharing,
                             guest_writable: mapping.guest_writable,
                             shared_mm: request.shares_mm,
@@ -16367,6 +16688,10 @@ impl HvfVmState {
                 inherited_mapping: None,
                 backing: inventory_backing,
                 stage2_lease: (physical_ipa, mapping.physical_size as u64),
+                stage2_owner: InventoryStage2OwnerIdentity {
+                    host_addr: physical_host_addr as usize,
+                    generation: 0,
+                },
                 sharing: GuestMappingSharing::Private,
                 guest_writable: mapping.guest_writable,
                 shared_mm: false,
@@ -16730,6 +17055,7 @@ impl HvfVmState {
                         backing: mapping.backing,
                         inherited_frame: mapping.inherited_frame,
                         stage2_lease: Some(mapping.stage2_lease),
+                        stage2_owner: mapping.stage2_owner,
                     },
                 ) {
                     Ok(staged) => staged,
@@ -16969,6 +17295,7 @@ impl HvfVmState {
                         backing: mapping.backing,
                         inherited_frame: mapping.inherited_frame,
                         stage2_lease: Some(mapping.stage2_lease),
+                        stage2_owner: mapping.stage2_owner,
                     },
                 ) {
                     Ok(staged) => staged,
@@ -17461,6 +17788,14 @@ impl HvfVmState {
                 let mut inventory = self.frame_inventory.lock();
                 let mut staged_mappings = Vec::with_capacity(self.mappings.len());
                 for region in &self.mappings {
+                    let stage2_owner = mapped_region_stage2_owner_identity(region)
+                        .unwrap_or_else(|| {
+                            eprintln!(
+                                "carrick: FATAL: HVPatch exec inventory region IPA 0x{:x} has invalid physical owner offset",
+                                region.physical_ipa
+                            );
+                            std::process::abort();
+                        });
                     let staged = match Self::stage_mapping(
                         &mut inventory,
                         &mut replacement,
@@ -17471,6 +17806,7 @@ impl HvfVmState {
                             backing: Self::private_backing_identity(),
                             inherited_frame: None,
                             stage2_lease: None,
+                            stage2_owner,
                         },
                     ) {
                         Ok(staged) => staged,
@@ -17490,22 +17826,41 @@ impl HvfVmState {
             let retired_commit = retired.map(|retired| retired.commit(()));
             let fallback_replacement_commit = if self.registration.is_some() {
                 let replacement_challenge = replacement_commit.receipt_challenge();
+                let owner_hosts = collect_carrier_stage2_owner_hosts(self.mappings.iter().map(
+                    |mapping| {
+                        let owner = mapped_region_stage2_owner_identity(mapping).unwrap_or_else(|| {
+                            eprintln!(
+                                "carrick: FATAL: exec carrier lease has invalid physical host offset"
+                            );
+                            std::process::abort();
+                        });
+                        (
+                            (mapping.physical_ipa, mapping.physical_size as u64),
+                            owner.host_addr,
+                        )
+                    },
+                ))
+                .unwrap_or_else(|error| {
+                    eprintln!("carrick: FATAL: collect exec carrier lease owners: {error}");
+                    std::process::abort();
+                });
                 let mut stage2_leases = Vec::new();
                 for region in &mut self.mappings {
                     if let Some(stage2_lease) = region.stage2_lease.take() {
                         stage2_leases.push(stage2_lease);
                     }
                 }
-                let stage2_lease_keys = register_carrier_stage2_leases(&mut stage2_leases)
-                    .unwrap_or_else(|error| {
-                        // Replacement inventory already names every candidate.
-                        // Fail-stop before unwinding can drop their leases or host
-                        // backings out from under that published authority.
-                        eprintln!(
-                            "carrick: FATAL: register carrier stage2 lease for exec: {error}"
-                        );
-                        std::process::abort();
-                    });
+                let stage2_lease_keys =
+                    register_carrier_stage2_leases(&mut stage2_leases, &owner_hosts)
+                        .unwrap_or_else(|error| {
+                            // Replacement inventory already names every candidate.
+                            // Fail-stop before unwinding can drop their leases or host
+                            // backings out from under that published authority.
+                            eprintln!(
+                                "carrick: FATAL: register carrier stage2 lease for exec: {error}"
+                            );
+                            std::process::abort();
+                        });
                 let mapped_task_mappings: Vec<HvpatchTaskMappingState> = self
                     .mappings
                     .iter()
@@ -19295,10 +19650,12 @@ mod frame_inventory_backend_tests {
         &LOCK
     }
 
-    fn register_carrier_lease(lease: GlobalFrameStage2Lease) -> (u64, u64) {
+    fn register_carrier_lease(mut lease: GlobalFrameStage2Lease, host_addr: usize) -> (u64, u64) {
         let key = lease.key();
+        lease.mark_test_mapped_without_backend();
+        let owners = std::collections::BTreeMap::from([(key, host_addr)]);
         assert_eq!(
-            register_carrier_stage2_leases(&mut vec![lease]).unwrap(),
+            register_carrier_stage2_leases(&mut vec![lease], &owners).unwrap(),
             vec![key]
         );
         key
@@ -20025,6 +20382,7 @@ mod frame_inventory_backend_tests {
                     backing: InventoryBackingIdentity::Private(9),
                     stage2_base: 0x9000_0000,
                     stage2_length: 0x4000,
+                    stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
                 },
             );
         }
@@ -20588,6 +20946,7 @@ mod frame_inventory_backend_tests {
                     backing: InventoryBackingIdentity::Private(9),
                     stage2_base: lease.0,
                     stage2_length: lease.1,
+                    stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
                 },
             );
         }
@@ -20663,6 +21022,7 @@ mod frame_inventory_backend_tests {
             "production publication must retain a mapped stage-2 lease"
         );
         owner._lease.mapped = false;
+        owner._lease.backend_map_installed = false;
     }
 
     fn process_retirement_task(
@@ -20678,9 +21038,20 @@ mod frame_inventory_backend_tests {
         let mapping = carrick_hal::MappingId::from_kernel_allocation(id(42));
         let key = next_test_physical_key(0x4000);
         let generation = next_global_frame_owner_generation();
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .unwrap();
+        let host_addr = host.as_ptr();
         let mut task = hvpatch_task_state_test_fixture(12, key.0, 12);
         task.cow_authority = Some(std::sync::Arc::new(authority));
+        task.mappings[0].start = key.0;
+        task.mappings[0].end = key.0 + key.1;
+        task.mappings[0].ipa = key.0;
         task.mappings[0].physical_ipa = key.0;
+        task.mappings[0].host_addr = host_addr;
+        task.mappings[0].size = key.1 as usize;
         task.mappings[0].physical_size = key.1 as usize;
         task.mappings[0].owner_generation = generation;
         task.mappings[0].stage2_lease = Some(GlobalFrameStage2Lease::fixed(key.0, key.1));
@@ -20695,6 +21066,10 @@ mod frame_inventory_backend_tests {
                     backing: InventoryBackingIdentity::Private(41),
                     stage2_base: key.0,
                     stage2_length: key.1,
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr: host_addr as usize,
+                        generation,
+                    },
                 },
             );
             {
@@ -20721,11 +21096,6 @@ mod frame_inventory_backend_tests {
                 ),
             );
         }
-        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-            key.1 as usize,
-            crate::host_mapping::HostMappingKind::FrameCow,
-        )
-        .unwrap();
         let owner = GlobalFrameHostOwner {
             _mapping: host,
             _lease: GlobalFrameStage2Lease::fixed(key.0, key.1),
@@ -20780,7 +21150,12 @@ mod frame_inventory_backend_tests {
         let key = (0x7e00_0000_0000_u64, 0x4000_u64);
         let mut task = hvpatch_task_state_test_fixture(12, key.0, 12);
         task.cow_authority = Some(std::sync::Arc::new(TestFrameMappingCount::Exact(2)));
+        task.mappings[0].start = key.0;
+        task.mappings[0].end = key.0 + key.1;
+        task.mappings[0].ipa = key.0;
         task.mappings[0].physical_ipa = key.0;
+        task.mappings[0].host_addr = 0x1000usize as *mut u8;
+        task.mappings[0].size = key.1 as usize;
         task.mappings[0].physical_size = key.1 as usize;
         task.mappings[0].owner_generation = 0;
         task.mappings[0].stage2_lease = None;
@@ -20795,6 +21170,10 @@ mod frame_inventory_backend_tests {
                     backing: InventoryBackingIdentity::Private(41),
                     stage2_base: key.0,
                     stage2_length: key.1,
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr: 0x1000,
+                        generation: 0,
+                    },
                 },
             );
             {
@@ -20817,7 +21196,7 @@ mod frame_inventory_backend_tests {
                 ),
             );
         }
-        register_carrier_lease(GlobalFrameStage2Lease::fixed(key.0, key.1));
+        register_carrier_lease(GlobalFrameStage2Lease::fixed(key.0, key.1), 0x1000);
         let frames = std::sync::Arc::clone(&task.frame_inventory.lock().frames);
 
         HvfVmState::retire_task_state_process_mappings(&mut task)
@@ -20892,12 +21271,15 @@ mod frame_inventory_backend_tests {
     fn process_retirement_rejects_a_recycled_owner_generation() {
         let (mut task, _frame, _mapping, key, _guard) =
             process_retirement_task(TestFrameMappingCount::Exact(1));
+        let stale_host = task.mappings[0].host_addr as usize;
+        let stale_generation = task.mappings[0].owner_generation;
 
         let successor_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             key.1 as usize,
             crate::host_mapping::HostMappingKind::FrameCow,
         )
         .unwrap();
+        let successor_host_addr = successor_host.as_ptr() as usize;
         let successor = GlobalFrameHostOwner {
             _mapping: successor_host,
             _lease: GlobalFrameStage2Lease::fixed(key.0, key.1),
@@ -20905,11 +21287,36 @@ mod frame_inventory_backend_tests {
             generation: next_global_frame_owner_generation(),
         };
         let successor_generation = successor.generation;
-        let stale_generation = successor_generation.wrapping_add(1);
         assert_ne!(stale_generation, successor_generation);
         global_frame_host_owners().lock().insert(key, successor);
 
-        task.mappings[0].owner_generation = stale_generation;
+        let alias = |start, host_addr, owner_generation| AliasBacking {
+            start,
+            ipa: key.0,
+            host_addr,
+            size: key.1 as usize,
+            physical_ipa: key.0,
+            physical_host_addr: host_addr,
+            physical_size: key.1 as usize,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+            guest_writable: true,
+            sharing: GuestMappingSharing::GlobalShared,
+            ownership_scope: AliasOwnershipScope::Global,
+            inventory_backing: InventoryBackingIdentity::SharedAnon(owner_generation),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation,
+        };
+        let stale_alias = alias(key.0 + 0x1000_0000, stale_host, stale_generation);
+        let successor_alias = alias(
+            key.0 + 0x2000_0000,
+            successor_host_addr,
+            successor_generation,
+        );
+        alias_registry()
+            .lock()
+            .extend([stale_alias, successor_alias]);
+
         task.mappings[0].stage2_lease = None;
 
         HvfVmState::retire_task_state_process_mappings(&mut task)
@@ -20919,11 +21326,90 @@ mod frame_inventory_backend_tests {
             successor_generation,
             "stale process cleanup must not retire a newer owner of the recycled key",
         );
+        {
+            let registry = alias_registry().lock();
+            assert!(
+                !registry.contains(&stale_alias),
+                "stale logical aliases must retire with the superseded inventory owner"
+            );
+            assert!(
+                registry.contains(&successor_alias),
+                "successor-generation aliases must remain live"
+            );
+        }
+        alias_registry()
+            .lock()
+            .retain(|alias| *alias != successor_alias);
         let successor = global_frame_host_owners()
             .lock()
             .remove(&key)
             .expect("remove successor owner after test");
         drop(successor);
+    }
+
+    #[test]
+    fn process_retirement_uses_inventory_owner_identity_not_stale_mapping_rows() {
+        let (mut task, _frame, _mapping, key, _guard) =
+            process_retirement_task(TestFrameMappingCount::Exact(1));
+        let live_generation = task.mappings[0].owner_generation;
+        assert_ne!(live_generation, 0);
+
+        for stale_generation in [
+            live_generation.saturating_sub(1),
+            live_generation.saturating_sub(2),
+        ] {
+            let mut stale = hvpatch_task_state_test_fixture(13, key.0, 13)
+                .mappings
+                .pop()
+                .unwrap();
+            stale.start = key.0;
+            stale.end = key.0 + key.1;
+            stale.ipa = key.0;
+            stale.physical_ipa = key.0;
+            stale.host_addr = 0x1_0000usize as *mut u8;
+            stale.size = key.1 as usize;
+            stale.physical_size = key.1 as usize;
+            stale.owner_generation = stale_generation;
+            stale.is_dynamic_alias = true;
+            stale.stage2_lease = None;
+            task.mappings.insert(0, stale);
+        }
+
+        HvfVmState::retire_task_state_process_mappings(&mut task)
+            .expect("the inventory's exact live owner must outrank stale descriptor rows");
+        assert_eq!(
+            global_frame_host_owner_generation(key.0, key.1),
+            0,
+            "terminal retirement must remove the exact owner named by inventory",
+        );
+    }
+
+    #[test]
+    fn process_retirement_rejects_matching_generation_with_wrong_host_pointer() {
+        let (mut task, _frame, _mapping, key, _guard) =
+            process_retirement_task(TestFrameMappingCount::Exact(1));
+        let live = global_frame_host_owner_identity(key.0, key.1).expect("test owner is published");
+        let wrong_host = live.0 + key.1 as usize;
+        task.mappings[0].host_addr = wrong_host as *mut u8;
+        task.frame_inventory
+            .lock()
+            .extents
+            .get_mut(&key)
+            .expect("inventory extent")
+            .stage2_owner
+            .host_addr = wrong_host;
+
+        let error = HvfVmState::retire_task_state_process_mappings(&mut task)
+            .expect_err("a generation match must not hide a host-pointer mismatch");
+        assert!(
+            error.to_string().contains("owner pointer drifted"),
+            "the exact identity mismatch must remain visible: {error}"
+        );
+        assert_eq!(
+            global_frame_host_owner_identity(key.0, key.1),
+            Some(live),
+            "failed authentication must leave the live owner untouched",
+        );
     }
 
     #[test]
@@ -20947,6 +21433,183 @@ mod frame_inventory_backend_tests {
         assert!(
             !global_frame_host_owners().lock().contains_key(&key),
             "rejected owner must not be published"
+        );
+    }
+
+    #[test]
+    fn stage_mapping_owner_rejection_leaves_all_reference_maps_unchanged() {
+        let key = next_test_physical_key(0x4000);
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("allocate live owner backing");
+        let live_host_addr = host.as_ptr() as usize;
+        let live = GlobalFrameHostOwner {
+            _mapping: host,
+            _lease: GlobalFrameStage2Lease::fixed(key.0, key.1),
+            perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+            generation: next_global_frame_owner_generation(),
+        };
+        assert!(
+            global_frame_host_owners()
+                .lock()
+                .insert(key, live)
+                .is_none()
+        );
+
+        let frame = carrick_hal::FrameId::from_kernel_allocation(id(301));
+        let mapping = carrick_hal::MappingId::from_kernel_allocation(id(302));
+        let transaction = carrick_hal::KernelTransactionId::from_kernel_allocation(id(303));
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).unwrap();
+        let mut reservation = carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+            carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x33; 32]),
+            carrick_hal::FrameInventoryBatch::prepare(transaction, capacity).unwrap(),
+            vec![frame],
+            vec![mapping],
+        );
+        let mut inventory = HvpatchFrameInventory::default();
+        let error = HvfVmState::stage_mapping(
+            &mut inventory,
+            &mut reservation,
+            InventoryMappingStage {
+                gpa: key.0,
+                length: key.1,
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+                backing: InventoryBackingIdentity::Private(301),
+                inherited_frame: None,
+                stage2_lease: Some(key),
+                // A generation-zero publication must not borrow a live global
+                // owner merely because its numeric lease key and host pointer
+                // match.
+                stage2_owner: InventoryStage2OwnerIdentity {
+                    host_addr: live_host_addr,
+                    generation: 0,
+                },
+            },
+        )
+        .expect_err("owner mismatch must reject the inventory publication");
+        assert!(error.to_string().contains("owner is not live"));
+        assert!(inventory.extents.is_empty());
+        let frames = inventory.frames.lock();
+        assert!(frames.references.is_empty());
+        assert!(frames.extent_references.is_empty());
+        assert!(frames.stage2_references.is_empty());
+        drop(frames);
+
+        drop(global_frame_host_owners().lock().remove(&key));
+    }
+
+    #[test]
+    fn retained_private_reuse_requires_and_preserves_exact_owner_generation() {
+        let key = next_test_physical_key(0x4000);
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            key.1 as usize,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("allocate live owner backing");
+        let host_addr = host.as_ptr() as usize;
+        let generation = next_global_frame_owner_generation();
+        let owner = GlobalFrameHostOwner {
+            _mapping: host,
+            _lease: GlobalFrameStage2Lease::fixed(key.0, key.1),
+            perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+            generation,
+        };
+        assert!(
+            global_frame_host_owners()
+                .lock()
+                .insert(key, owner)
+                .is_none()
+        );
+
+        let source = AliasBacking {
+            start: 0x5000_0000,
+            ipa: key.0,
+            host_addr,
+            size: 0x1000,
+            physical_ipa: key.0,
+            physical_host_addr: host_addr,
+            physical_size: key.1 as usize,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope: AliasOwnershipScope::Root,
+            inventory_backing: InventoryBackingIdentity::Private(401),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: generation.saturating_sub(1),
+        };
+        assert!(
+            retained_private_reuse_alias_fragment(
+                &[source],
+                source.start + 0x1000,
+                key.0 + 0x1000,
+                0x1000,
+                None,
+            )
+            .is_none(),
+            "a stale source must not launder itself through the live successor owner"
+        );
+
+        let exact = AliasBacking {
+            owner_generation: generation,
+            ..source
+        };
+        let reused = retained_private_reuse_alias_fragment(
+            &[exact],
+            exact.start + 0x1000,
+            key.0 + 0x1000,
+            0x1000,
+            None,
+        )
+        .expect("the exact live source may republish its missing semantic fragment");
+        assert_eq!(reused.owner_generation, generation);
+        assert_eq!(reused.physical_host_addr, host_addr);
+
+        drop(global_frame_host_owners().lock().remove(&key));
+    }
+
+    #[test]
+    fn partial_unmap_preserves_stale_generation_on_both_local_fragments() {
+        let start = 0x6000_0000;
+        let ipa = 0xa200_0000_0000;
+        let mut mappings = vec![HvfMappedRegion {
+            start,
+            end: start + 0xc000,
+            ipa,
+            physical_ipa: ipa,
+            host_addr: 0x4000_0000usize as *mut u8,
+            size: 0xc000,
+            physical_size: 0xc000,
+            perms: applevisor::memory::MemPerms::ReadWrite,
+            memory: None,
+            host_mapping: None,
+            stage2_lease: None,
+            is_dynamic_alias: true,
+            sharing: GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: 77,
+        }];
+
+        split_local_mapping_rows_for_unmap(&mut mappings, start + 0x4000, 0x4000);
+        mappings.sort_by_key(|mapping| mapping.start);
+        assert_eq!(mappings.len(), 2);
+        assert_eq!(mappings[0].owner_generation, 77);
+        assert_eq!(mappings[1].owner_generation, 77);
+        assert_eq!(
+            (mappings[0].start, mappings[0].end),
+            (start, start + 0x4000)
+        );
+        assert_eq!(
+            (mappings[1].start, mappings[1].end),
+            (start + 0x8000, start + 0xc000)
         );
     }
 
@@ -20987,6 +21650,8 @@ mod frame_inventory_backend_tests {
             region.owner_generation, owner_generation,
             "helper must stamp the registered owner generation on the region"
         );
+        let stage2_owner = mapped_region_stage2_owner_identity(&region)
+            .expect("published exec region has a physical owner identity");
         disarm_test_owner_stage2_unmap(key, owner_generation);
 
         let frame = carrick_hal::FrameId::from_kernel_allocation(id(41));
@@ -21005,6 +21670,7 @@ mod frame_inventory_backend_tests {
                     backing: InventoryBackingIdentity::Private(41),
                     stage2_base: key.0,
                     stage2_length: key.1,
+                    stage2_owner,
                 },
             );
             {
@@ -21072,13 +21738,14 @@ mod frame_inventory_backend_tests {
         let new_mapping = carrick_hal::MappingId::from_kernel_allocation(id(54));
         let old_key = (0xa090_0000_0000, 0x4000);
         let new_key = (0xa092_0000_0000, 0x4000);
-        register_carrier_lease(GlobalFrameStage2Lease::fixed(old_key.0, old_key.1));
+        register_carrier_lease(GlobalFrameStage2Lease::fixed(old_key.0, old_key.1), 0x1000);
         let old = InventoryExtent {
             frame: old_frame,
             mapping: old_mapping,
             backing: InventoryBackingIdentity::Private(51),
             stage2_base: old_key.0,
             stage2_length: old_key.1,
+            stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
         };
         let mut inventory = HvpatchFrameInventory::default();
         inventory.extents.insert(old_key, old);
@@ -21108,6 +21775,7 @@ mod frame_inventory_backend_tests {
                 backing: InventoryBackingIdentity::Private(53),
                 stage2_base: new_key.0,
                 stage2_length: new_key.1,
+                stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
             },
             // The kernel authority reports another mm still maps old_frame.
             retirement: shape.retirement,
@@ -21159,6 +21827,7 @@ mod frame_inventory_backend_tests {
             backing: InventoryBackingIdentity::Private(55),
             stage2_base: key.0,
             stage2_length: key.1,
+            stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
         };
         let mut inventory = HvpatchFrameInventory::default();
         inventory.extents.insert(key, extent);
@@ -21168,7 +21837,7 @@ mod frame_inventory_backend_tests {
             frames.extent_references.insert((frame, key.0, key.1), 1);
             frames.stage2_references.insert(key, 1);
         }
-        register_carrier_lease(GlobalFrameStage2Lease::fixed(key.0, key.1));
+        register_carrier_lease(GlobalFrameStage2Lease::fixed(key.0, key.1), 0x1000);
         let frames = std::sync::Arc::clone(&inventory.frames);
         let retirement = HvfVmState::inventory_lease_retirement_shape(
             &inventory,
@@ -21241,7 +21910,7 @@ mod frame_inventory_backend_tests {
             std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
         let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
         let key = lease.key();
-        register_carrier_lease(lease);
+        register_carrier_lease(lease, 0x1000);
         frames.lock().stage2_references.insert(key, 1);
         drop(HvpatchCarrierMmAuthority::LeaseTest {
             stage2_lease_keys: vec![key],
@@ -21275,7 +21944,7 @@ mod frame_inventory_backend_tests {
             std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
         let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
         let key = lease.key();
-        register_carrier_lease(lease);
+        register_carrier_lease(lease, 0x1000);
 
         drop(HvpatchCarrierMmAuthority::LeaseTest {
             stage2_lease_keys: vec![key],
@@ -21287,21 +21956,93 @@ mod frame_inventory_backend_tests {
     }
 
     #[test]
+    fn carrier_stage2_registration_rejects_unmapped_or_missing_host_owner() {
+        let key = next_test_physical_key(0x4000);
+        let mut unmapped = vec![GlobalFrameStage2Lease::fixed(key.0, key.1)];
+        let owners = std::collections::BTreeMap::from([(key, 0x1000)]);
+        let error = register_carrier_stage2_leases(&mut unmapped, &owners)
+            .expect_err("an unmapped carrier lease cannot authenticate retirement");
+        assert!(error.to_string().contains("mapped=false"));
+        assert_eq!(unmapped.len(), 1);
+        assert!(!carrier_stage2_leases().lock().contains_key(&key));
+
+        unmapped[0].mark_test_mapped_without_backend();
+        unmapped[0].active = false;
+        let error = register_carrier_stage2_leases(&mut unmapped, &owners)
+            .expect_err("an inactive mapped carrier lease cannot authenticate retirement");
+        assert!(error.to_string().contains("active=false"));
+        assert_eq!(unmapped.len(), 1);
+        assert!(!carrier_stage2_leases().lock().contains_key(&key));
+
+        unmapped[0].active = true;
+        let error =
+            register_carrier_stage2_leases(&mut unmapped, &std::collections::BTreeMap::new())
+                .expect_err("a mapped key without its exact host owner is still insufficient");
+        assert!(error.to_string().contains("host=0x0"));
+        assert_eq!(unmapped.len(), 1);
+        assert!(!carrier_stage2_leases().lock().contains_key(&key));
+    }
+
+    #[test]
+    fn unowned_retirement_rejects_an_unmapped_local_lease() {
+        let _allocator_test_guard = global_frame_allocator_test_lock().lock();
+        let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
+        let key = lease.key();
+        let mut mappings = vec![HvfMappedRegion {
+            start: 0x7000_0000,
+            end: 0x7000_4000,
+            ipa: key.0,
+            physical_ipa: key.0,
+            host_addr: 0x5000_0000usize as *mut u8,
+            size: key.1 as usize,
+            physical_size: key.1 as usize,
+            perms: applevisor::memory::MemPerms::ReadWriteExec,
+            memory: None,
+            host_mapping: None,
+            stage2_lease: Some(lease),
+            is_dynamic_alias: false,
+            sharing: GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: 0,
+        }];
+        let error = HvfVmState::retire_unowned_stage2_extent_from_mappings(
+            &mut mappings,
+            key.0,
+            key.1,
+            0x5000_0000,
+        )
+        .expect_err("a numeric local key without a mapped lease is not ownership");
+        assert!(
+            error
+                .to_string()
+                .contains("lost exact mapped local/carrier owner")
+        );
+        assert!(mappings[0].stage2_lease.is_some());
+    }
+
+    #[test]
     fn carrier_lease_batch_collision_publishes_nothing_and_retains_every_candidate() {
         let _allocator_test_guard = global_frame_allocator_test_lock().lock();
         let existing_key = (0x7e10_0000_0000, 0x4000);
-        register_carrier_lease(GlobalFrameStage2Lease::fixed(
-            existing_key.0,
-            existing_key.1,
-        ));
+        register_carrier_lease(
+            GlobalFrameStage2Lease::fixed(existing_key.0, existing_key.1),
+            0x1000,
+        );
         let reserved = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
         let reserved_key = reserved.key();
         let mut candidates = vec![
             reserved,
             GlobalFrameStage2Lease::fixed(existing_key.0, existing_key.1),
         ];
+        for candidate in &mut candidates {
+            candidate.mark_test_mapped_without_backend();
+        }
 
-        let error = register_carrier_stage2_leases(&mut candidates)
+        let owners =
+            std::collections::BTreeMap::from([(reserved_key, 0x2000), (existing_key, 0x1000)]);
+        let error = register_carrier_stage2_leases(&mut candidates, &owners)
             .expect_err("an existing carrier key must reject the complete batch");
 
         assert!(error.to_string().contains("collision"));
@@ -21337,7 +22078,7 @@ mod frame_inventory_backend_tests {
         let mapping = carrick_hal::MappingId::from_kernel_allocation(id(302));
         let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
         let key = lease.key();
-        register_carrier_lease(lease);
+        register_carrier_lease(lease, 0x1000);
         let mut inventory = HvpatchFrameInventory::default();
         let extent = InventoryExtent {
             frame,
@@ -21345,6 +22086,7 @@ mod frame_inventory_backend_tests {
             backing: InventoryBackingIdentity::Private(301),
             stage2_base: key.0,
             stage2_length: key.1,
+            stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
         };
         inventory.extents.insert(key, extent);
         {
@@ -21415,6 +22157,7 @@ mod frame_inventory_backend_tests {
             backing: InventoryBackingIdentity::Private(81),
             stage2_base: old_key.0,
             stage2_length: old_key.1,
+            stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
         };
         let existing = InventoryExtent {
             frame: existing_frame,
@@ -21422,6 +22165,7 @@ mod frame_inventory_backend_tests {
             backing: InventoryBackingIdentity::Private(83),
             stage2_base: new_key.0,
             stage2_length: new_key.1,
+            stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
         };
         let mut inventory = HvpatchFrameInventory::default();
         inventory.extents.insert(old_key, old);
@@ -21450,6 +22194,7 @@ mod frame_inventory_backend_tests {
                 backing: InventoryBackingIdentity::Private(85),
                 stage2_base: new_key.0,
                 stage2_length: new_key.1,
+                stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
             },
             retirement: CowInventoryRetirementDecision {
                 retire_old_frame: false,
@@ -21476,6 +22221,99 @@ mod frame_inventory_backend_tests {
     }
 
     #[test]
+    fn cow_split_commit_preserves_old_owner_and_publishes_replacement_owner() {
+        let compound = CowArmedRanges::COMPOUND_SIZE;
+        let old_key = (0x7000_0000, compound * 3);
+        let old_stage2 = (0xa280_0000_0000, compound * 3);
+        let new_key = (old_key.0 + compound, compound);
+        let new_stage2 = (0xa290_0000_0000, compound);
+        let old_owner = InventoryStage2OwnerIdentity {
+            host_addr: 0x5100_0000,
+            generation: 41,
+        };
+        let new_owner = InventoryStage2OwnerIdentity {
+            host_addr: 0x5200_0000,
+            generation: 42,
+        };
+        let old_frame = carrick_hal::FrameId::from_kernel_allocation(id(87));
+        let old_mapping = carrick_hal::MappingId::from_kernel_allocation(id(88));
+        let new_frame = carrick_hal::FrameId::from_kernel_allocation(id(89));
+        let new_mapping = carrick_hal::MappingId::from_kernel_allocation(id(90));
+        let old = InventoryExtent {
+            frame: old_frame,
+            mapping: old_mapping,
+            backing: InventoryBackingIdentity::Private(87),
+            stage2_base: old_stage2.0,
+            stage2_length: old_stage2.1,
+            stage2_owner: old_owner,
+        };
+        let mut inventory = HvpatchFrameInventory::default();
+        inventory.extents.insert(old_key, old);
+        {
+            let mut frames = inventory.frames.lock();
+            frames.references.insert(old_frame, 1);
+            frames
+                .extent_references
+                .insert((old_frame, old_key.0, old_key.1), 1);
+            frames.stage2_references.insert(old_stage2, 1);
+        }
+        let fragments = vec![
+            CowInventoryFragment {
+                gpa: old_key.0,
+                length: compound,
+                mapping: carrick_hal::MappingId::from_kernel_allocation(id(91)),
+            },
+            CowInventoryFragment {
+                gpa: old_key.0 + compound * 2,
+                length: compound,
+                mapping: carrick_hal::MappingId::from_kernel_allocation(id(92)),
+            },
+        ];
+        let split = CowInventorySplit {
+            old_key,
+            old,
+            fragments,
+            new_key,
+            new_extent: InventoryExtent {
+                frame: new_frame,
+                mapping: new_mapping,
+                backing: InventoryBackingIdentity::Private(89),
+                stage2_base: new_stage2.0,
+                stage2_length: new_stage2.1,
+                stage2_owner: new_owner,
+            },
+            retirement: CowInventoryRetirementDecision {
+                retire_old_frame: false,
+                backend_frame_references_complete: true,
+            },
+        };
+
+        assert!(
+            !HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(())).unwrap()
+        );
+        assert_eq!(
+            inventory
+                .extents
+                .get(&(old_key.0, compound))
+                .unwrap()
+                .stage2_owner,
+            old_owner
+        );
+        assert_eq!(
+            inventory
+                .extents
+                .get(&(old_key.0 + compound * 2, compound))
+                .unwrap()
+                .stage2_owner,
+            old_owner
+        );
+        assert_eq!(
+            inventory.extents.get(&new_key).unwrap().stage2_owner,
+            new_owner
+        );
+    }
+
+    #[test]
     fn cow_stage2_recycle_holds_the_publication_lock() {
         let old_frame = carrick_hal::FrameId::from_kernel_allocation(id(91));
         let old_mapping = carrick_hal::MappingId::from_kernel_allocation(id(92));
@@ -21489,6 +22327,7 @@ mod frame_inventory_backend_tests {
             backing: InventoryBackingIdentity::Private(91),
             stage2_base: old_key.0,
             stage2_length: old_key.1,
+            stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
         };
         let mut inventory = HvpatchFrameInventory::default();
         inventory.extents.insert(old_key, old);
@@ -21511,6 +22350,7 @@ mod frame_inventory_backend_tests {
                 backing: InventoryBackingIdentity::Private(93),
                 stage2_base: new_key.0,
                 stage2_length: new_key.1,
+                stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
             },
             retirement: CowInventoryRetirementDecision {
                 retire_old_frame: true,
@@ -21557,6 +22397,7 @@ mod frame_inventory_backend_tests {
                 backing: InventoryBackingIdentity::Private(11),
                 stage2_base: lease.0,
                 stage2_length: lease.1,
+                stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
             },
         );
         {
@@ -21619,6 +22460,7 @@ mod frame_inventory_backend_tests {
                 backing: InventoryBackingIdentity::Private(1),
                 stage2_base: physical_ipa,
                 stage2_length: CowArmedRanges::COMPOUND_SIZE,
+                stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
             },
         );
         {
@@ -21731,6 +22573,7 @@ mod frame_inventory_backend_tests {
                 },
                 stage2_base: 0x4000,
                 stage2_length: 0x4000,
+                stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
             },
         );
         inventory.extents.insert(
@@ -21741,6 +22584,7 @@ mod frame_inventory_backend_tests {
                 backing: InventoryBackingIdentity::Private(1),
                 stage2_base: 0x8000,
                 stage2_length: 0x4000,
+                stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
             },
         );
         {
@@ -21797,6 +22641,7 @@ mod frame_inventory_backend_tests {
             backing,
             stage2_base: ipa,
             stage2_length: size,
+            stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
         };
         let parent_inventory = std::collections::BTreeMap::from([((ipa, size), extent)]);
         let mapping = |sharing| ThreadMappingDesc {
@@ -23606,6 +24451,7 @@ mod tag_strip_tests {
                 backing: alias.inventory_backing,
                 stage2_base: alias.physical_ipa,
                 stage2_length: alias.physical_size as u64,
+                stage2_owner: super::InventoryStage2OwnerIdentity::TEST_UNOWNED,
             },
         )]);
         let child_source = super::ThreadMappingDesc::from_alias(alias).unwrap();
@@ -23725,6 +24571,7 @@ mod tag_strip_tests {
             backing: alias.inventory_backing,
             stage2_base: alias.physical_ipa,
             stage2_length: alias.physical_size as u64,
+            stage2_owner: super::InventoryStage2OwnerIdentity::TEST_UNOWNED,
         };
         let inventory = std::collections::BTreeMap::from([(
             (alias.physical_ipa, alias.physical_size as u64),
@@ -23861,6 +24708,7 @@ mod tag_strip_tests {
                 backing: alias.inventory_backing,
                 stage2_base: alias.physical_ipa,
                 stage2_length: alias.physical_size as u64,
+                stage2_owner: super::InventoryStage2OwnerIdentity::TEST_UNOWNED,
             },
         )]);
         assert_eq!(
@@ -23927,6 +24775,7 @@ mod tag_strip_tests {
                 backing: alias.inventory_backing,
                 stage2_base: alias.physical_ipa,
                 stage2_length: alias.physical_size as u64,
+                stage2_owner: super::InventoryStage2OwnerIdentity::TEST_UNOWNED,
             },
         )]);
         assert_eq!(
