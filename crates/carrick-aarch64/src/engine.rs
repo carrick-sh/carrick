@@ -3360,12 +3360,17 @@ fn diagnostic_resume_pc(pending_resume_pc: Option<u64>, live_pc: u64) -> u64 {
 /// EL0: its live PC/PSTATE are current and ELR/SPSR still describe the last
 /// exception (often the pthread entry trampoline). A thread blocked while its
 /// syscall is dispatched is parked in EL1, so the saved ELR/SPSR pair is the
-/// current Linux user state instead. The engine's pending-syscall authority
-/// distinguishes those states without inferring from register values. The
-/// runtime separately binds a synchronous fatal owner's raw ELR/SPSR to its
+/// current Linux user state instead. The pending-syscall marker normally names
+/// that state, but a fatal signal can claim the task after dispatch clears the
+/// marker and before the EL1 vector returns to EL0. PSTATE.M is architectural
+/// authority for that window: any non-EL0 current exception level must publish
+/// the saved ELR/SPSR pair, never Carrick's internal vector PC in a Linux core.
+/// The runtime separately binds a synchronous fatal owner's raw ELR/SPSR to its
 /// exact `FatalSignalRecord`.
 fn core_resume_pair(pending_resume_pc: Option<u64>, snapshot: &Aarch64VcpuSnapshot) -> (u64, u64) {
-    if pending_resume_pc.is_some() {
+    if pending_resume_pc.is_some()
+        || !carrick_hal::aarch64::ExecLevel::from_pstate(snapshot.pstate).is_guest()
+    {
         (
             pending_resume_pc.unwrap_or(snapshot.elr_el1),
             snapshot.spsr_el1,
@@ -3866,6 +3871,21 @@ mod tests {
             core_resume_pair(Some(snapshot.elr_el1), &snapshot),
             (snapshot.elr_el1, snapshot.spsr_el1),
             "a dispatcher-blocked vCPU is parked in EL1 with its EL0 pair in ELR/SPSR"
+        );
+    }
+
+    #[test]
+    fn core_resume_pair_uses_saved_el0_state_when_fatal_capture_runs_in_el1() {
+        let mut snapshot = sample();
+        snapshot.pc = 0x2d_0001_0aa0;
+        snapshot.pstate = 0x6040_03c5;
+        snapshot.elr_el1 = 0x88_0000_9538;
+        snapshot.spsr_el1 = 0x6000_03c0;
+
+        assert_eq!(
+            core_resume_pair(None, &snapshot),
+            (snapshot.elr_el1, snapshot.spsr_el1),
+            "a fatal signal raised before returning from the EL1 syscall vector must publish the Linux-visible EL0 pair"
         );
     }
 
