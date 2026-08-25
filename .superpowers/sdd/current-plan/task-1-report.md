@@ -87,3 +87,60 @@ No Docker, Carrick guest, or `carrick-cli` build was run.
 - Commit: `fix(conformance): parse legacy ltp closure protocols` (the final
   local commit containing this report; resolve its exact hash with
   `git rev-parse HEAD`).
+
+## Fix round 1/5 — tmpdir ordering and fcntl01 failure coverage
+
+Base: `049730d0`.
+
+### Files changed
+
+- `crates/carrick-conformance/src/parsers/ltp.rs`
+- `.superpowers/sdd/current-plan/task-1-report.md` (this appended evidence)
+
+### RED evidence
+
+I added a mutation assertion derived from the `fill-14443-d08/d09` `fcntl11`
+receipts: move the tmpdir TINFO line after the completed block-9 pair. It must
+be non-cacheable because the banner is not the first protocol line.
+
+```sh
+env RUSTC_WRAPPER= cargo test -p carrick-conformance \
+  closure_parses_only_complete_fcntl11_block_protocols
+```
+
+Result: exit 101, 0 passed / 1 failed. The unmodified parser incorrectly
+returned Success with all nine block identities, which proves the test catches
+the reviewed mutation.
+
+The requested realistic `fcntl01` tmpdir-plus-TFAIL and tmpdir-plus-TBROK
+coverage was added to the existing source-protocol test. The base parser
+already handled those two-line failure transcripts, so those added assertions
+were green coverage rather than a new red condition.
+
+### GREEN evidence
+
+After requiring the `fcntl11` tmpdir banner to be the first nonblank line:
+
+```sh
+env RUSTC_WRAPPER= cargo test -p carrick-conformance closure_parses_only_
+env RUSTC_WRAPPER= cargo test -p carrick-conformance
+env RUSTC_WRAPPER= cargo fmt --all -- --check
+git diff --check
+```
+
+Results: focused parser tests 3 passed / 0 failed (exit 0); full package suite
+162 passed / 0 failed (exit 0); format and diff checks passed (exit 0).
+
+### Self-review
+
+- `fcntl11` consumes its required tmpdir line before all marker parsing, so a
+  late or duplicate banner is an unknown protocol line and returns None.
+- The `fcntl01` tests now cover the real tmpdir banner followed by either
+  TFAIL or TBROK, with the same stable identity and the appropriate failure
+  outcome.
+- No Docker, Carrick guest, `carrick-cli` build, or unrelated source file was
+  touched.
+
+### Concerns
+
+- Commit: pending the requested narrow fix commit.
