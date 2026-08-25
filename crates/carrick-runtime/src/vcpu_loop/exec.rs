@@ -1287,6 +1287,13 @@ where
                 .map(Some);
             }
         };
+        // Linux detaches every SysV shared-memory mapping only after exec has
+        // crossed its no-return boundary. Preparation failures above preserve
+        // the old image and its attachment set; a committed replacement owns
+        // neither the old VMAs nor their `shm_nattch` charges.
+        kernel
+            .dispatcher
+            .cleanup_sysv_shm_attachments_on_process_exit();
         if replacement_asid_load.is_some()
             && let Err(error) = engine.complete_task_load_barrier()
         {
