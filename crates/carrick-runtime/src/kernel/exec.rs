@@ -3,7 +3,9 @@ use std::sync::Arc;
 use carrick_hal::{KernelTransactionId, ThreadId};
 
 use super::address::MmBackend;
-use super::core::{Kernel, KernelContext, RetiredThreadRecord, TaskRevision, VforkReleaseReason};
+use super::core::{
+    Kernel, KernelContext, KernelTaskBinding, RetiredThreadRecord, TaskRevision, VforkReleaseReason,
+};
 use super::ids::{LinuxTid, MmId};
 use super::objects::{
     ExecDrain, FileTable, FileTableExecFreeze, Mm, ObjectGraphError, PreparedThreadSet, TaskKey,
@@ -226,6 +228,60 @@ impl Kernel {
         self.prepare_exec_with_optional_backend(context, Some(backend), None, failpoint)
     }
 
+    /// Select the current caller from an exact task binding and reserve exec in
+    /// the same registry write critical section.
+    ///
+    /// HVPatch uses this after its runtime sibling drain: a loser may retire
+    /// between an ordinary context capture and exec reservation, advancing the
+    /// task revision while leaving the selected survivor otherwise unchanged.
+    pub fn prepare_exec_for_binding_with_mm_backend(
+        self: &Arc<Self>,
+        binding: &KernelTaskBinding,
+        tid: LinuxTid,
+        backend: Arc<dyn MmBackend>,
+        failpoint: Option<KernelFailpoint>,
+    ) -> Result<(PreparedExec, KernelContext), ExecError> {
+        self.sweep_retired_threads();
+        if !Arc::ptr_eq(self, binding.kernel()) {
+            return Err(ExecError::ForeignContext);
+        }
+        let transaction = self.object_ids().transaction_id()?;
+        let context = {
+            let mut state = self.registry().state.write();
+            let (task, thread, shared, resources, revision) = {
+                let record = state
+                    .tasks
+                    .get(&binding.task_id())
+                    .ok_or(ExecError::TaskExited)?;
+                if record.task.key() != binding.task_key() {
+                    return Err(ExecError::ForeignContext);
+                }
+                let thread = record.task.thread(tid).ok_or(ExecError::CallerExited)?;
+                (
+                    Arc::clone(&record.task),
+                    Arc::clone(&thread),
+                    record.task.shared(),
+                    thread.resources(),
+                    record.revision,
+                )
+            };
+            if state.reservations.contains_key(&binding.task_id()) {
+                return Err(ExecError::TaskBusy);
+            }
+            state.reservations.insert(binding.task_id(), transaction);
+            KernelContext::from_parts(self.clone(), task, thread, shared, resources, revision)
+        };
+        let prepared = self.prepare_exec_after_reservation(
+            &context,
+            Some(backend),
+            None,
+            failpoint,
+            transaction,
+            context.revision,
+        )?;
+        Ok((prepared, context))
+    }
+
     /// Prepare an exec whose surviving host runner is re-keyed while the Linux
     /// caller is promoted to the thread-group leader. Native x86 uses this
     /// because its backend `ThreadId` follows the post-exec host-thread key;
@@ -278,6 +334,25 @@ impl Kernel {
                 .insert(context.task.key().id, transaction);
             revision
         };
+        self.prepare_exec_after_reservation(
+            context,
+            backend,
+            replacement_registry_id,
+            failpoint,
+            transaction,
+            revision,
+        )
+    }
+
+    fn prepare_exec_after_reservation(
+        self: &Arc<Self>,
+        context: &KernelContext,
+        backend: Option<Arc<dyn MmBackend>>,
+        replacement_registry_id: Option<ThreadId>,
+        failpoint: Option<KernelFailpoint>,
+        transaction: KernelTransactionId,
+        revision: TaskRevision,
+    ) -> Result<PreparedExec, ExecError> {
         let reservation = ExecReservation {
             kernel: self.clone(),
             task: context.task.key(),
