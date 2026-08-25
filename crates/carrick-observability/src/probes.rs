@@ -1044,6 +1044,45 @@ impl HvpatchExecPredecessorClassificationPhase {
 /// The Linux PID/TID, never-reused `MmId`, and architectural ASID identify the
 /// exact predecessor. `shared` is immutable across all three phase firings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HvpatchExecPredecessorIdentity {
+    task_serial: u64,
+    thread_serial: u64,
+    linux_pid: i32,
+    linux_tid: i32,
+    mm: u64,
+    asid: u32,
+}
+
+impl HvpatchExecPredecessorIdentity {
+    pub fn new(
+        task_serial: u64,
+        thread_serial: u64,
+        linux_pid: i32,
+        linux_tid: i32,
+        mm: u64,
+        asid: u32,
+    ) -> Result<Self, HvpatchGuestLifecycleError> {
+        if linux_pid <= 0 || linux_tid <= 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidTaskIdentity);
+        }
+        if task_serial == 0 || thread_serial == 0 || mm == 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidPredecessorIdentity);
+        }
+        if asid == 0 {
+            return Err(HvpatchGuestLifecycleError::InvalidAsid);
+        }
+        Ok(Self {
+            task_serial,
+            thread_serial,
+            linux_pid,
+            linux_tid,
+            mm,
+            asid,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HvpatchExecPredecessorClassification {
     phase: HvpatchExecPredecessorClassificationPhase,
     task_serial: u64,
@@ -1058,31 +1097,17 @@ pub struct HvpatchExecPredecessorClassification {
 impl HvpatchExecPredecessorClassification {
     pub fn new(
         phase: HvpatchExecPredecessorClassificationPhase,
-        task_serial: u64,
-        thread_serial: u64,
-        linux_pid: i32,
-        linux_tid: i32,
-        mm: u64,
-        asid: u32,
+        identity: HvpatchExecPredecessorIdentity,
         shared: bool,
     ) -> Result<Self, HvpatchGuestLifecycleError> {
-        if linux_pid <= 0 || linux_tid <= 0 {
-            return Err(HvpatchGuestLifecycleError::InvalidTaskIdentity);
-        }
-        if task_serial == 0 || thread_serial == 0 || mm == 0 {
-            return Err(HvpatchGuestLifecycleError::InvalidPredecessorIdentity);
-        }
-        if asid == 0 {
-            return Err(HvpatchGuestLifecycleError::InvalidAsid);
-        }
         Ok(Self {
             phase,
-            task_serial,
-            thread_serial,
-            linux_pid,
-            linux_tid,
-            mm,
-            asid,
+            task_serial: identity.task_serial,
+            thread_serial: identity.thread_serial,
+            linux_pid: identity.linux_pid,
+            linux_tid: identity.linux_tid,
+            mm: identity.mm,
+            asid: identity.asid,
             shared,
         })
     }
@@ -2219,12 +2244,8 @@ mod hvpatch_guest_probe_abi {
     fn exec_predecessor_classification_keeps_identity_and_sharing_typed() {
         let event = HvpatchExecPredecessorClassification::new(
             HvpatchExecPredecessorClassificationPhase::BackendCaptured,
-            40,
-            41,
-            42,
-            43,
-            44,
-            45,
+            HvpatchExecPredecessorIdentity::new(40, 41, 42, 43, 44, 45)
+                .expect("valid predecessor identity"),
             true,
         )
         .expect("valid predecessor classification");

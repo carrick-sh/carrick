@@ -1250,6 +1250,19 @@ pub struct FrameCowIdentity {
     pub asid: u16,
 }
 
+/// Exact kernel-graph identity of the address space an in-place `execve`
+/// replaces. Unlike a carrier-directory registration, this also exists for
+/// the bootstrap task that entered the persistent executor pool directly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecPredecessorIdentity {
+    pub task_serial: u64,
+    pub thread_serial: u64,
+    pub linux_pid: i32,
+    pub linux_tid: i32,
+    pub mm: u64,
+    pub asid: u16,
+}
+
 /// Opaque Kernel-issued authority for activating one exact HVPatch child.
 /// The embedded COW authority owns the exact runtime kicker/tid binding; safe
 /// consumers can inspect identity but cannot replace any component.
@@ -1375,6 +1388,16 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + GuestMemory + Send {
     /// Bind the exact Kernel MM and ASID allocation generations that authorize
     /// scheduler snapshots produced by this engine.
     fn bind_task_snapshot_identity(&mut self, _mm_generation: u64, _asid_generation: u64) {}
+
+    /// Bind the exact kernel-graph identity whose address space the next
+    /// destructive `execve` will replace. The runtime publishes this only
+    /// after its execution lease is retired and immediately before replacement.
+    fn bind_exec_predecessor_identity(
+        &mut self,
+        _identity: ExecPredecessorIdentity,
+    ) -> Result<(), TrapError> {
+        Ok(())
+    }
 
     /// Consume the exact, engine-local duration accumulated by backend run
     /// calls since the previous receipt. The value is never addressed through

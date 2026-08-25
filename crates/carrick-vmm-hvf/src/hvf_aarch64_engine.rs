@@ -1085,6 +1085,13 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             .prepare_exec_address_space(root_slot_base, root_slot_size, asid)
     }
 
+    fn bind_exec_predecessor_identity(
+        &mut self,
+        identity: carrick_hal::ExecPredecessorIdentity,
+    ) -> Result<(), TrapError> {
+        self.state.bind_exec_predecessor_identity(identity)
+    }
+
     fn mark_exec_predecessor_shared(&mut self, shared: bool) {
         self.state.mark_exec_predecessor_shared(shared);
     }
