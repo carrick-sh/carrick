@@ -19290,6 +19290,11 @@ mod vm_create_admission_tests {
 mod frame_inventory_backend_tests {
     use super::*;
 
+    fn global_frame_allocator_test_lock() -> &'static parking_lot::Mutex<()> {
+        static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        &LOCK
+    }
+
     fn register_carrier_lease(lease: GlobalFrameStage2Lease) -> (u64, u64) {
         let key = lease.key();
         assert_eq!(
@@ -20398,6 +20403,7 @@ mod frame_inventory_backend_tests {
 
     #[test]
     fn reserved_global_stage2_lease_rolls_back_before_map() {
+        let _allocator_test_guard = global_frame_allocator_test_lock().lock();
         let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
         let key = lease.key();
         assert_eq!(
@@ -20946,6 +20952,7 @@ mod frame_inventory_backend_tests {
 
     #[test]
     fn exec_replacement_terminal_retirement_releases_exact_owner_and_reuses_lease() {
+        let _allocator_test_guard = global_frame_allocator_test_lock().lock();
         let mut lease =
             GlobalFrameStage2Lease::reserve(0x4000, 0x4000).expect("reserve global frame IPA");
         let key = lease.key();
@@ -21229,6 +21236,7 @@ mod frame_inventory_backend_tests {
 
     #[test]
     fn final_carrier_mm_drop_keeps_a_backend_referenced_stage2_lease_live() {
+        let _allocator_test_guard = global_frame_allocator_test_lock().lock();
         let frames =
             std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
         let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
@@ -21262,6 +21270,7 @@ mod frame_inventory_backend_tests {
 
     #[test]
     fn final_carrier_mm_drop_releases_an_unreferenced_stage2_lease_once() {
+        let _allocator_test_guard = global_frame_allocator_test_lock().lock();
         let frames =
             std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
         let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
@@ -21279,6 +21288,7 @@ mod frame_inventory_backend_tests {
 
     #[test]
     fn carrier_lease_batch_collision_publishes_nothing_and_retains_every_candidate() {
+        let _allocator_test_guard = global_frame_allocator_test_lock().lock();
         let existing_key = (0x7e10_0000_0000, 0x4000);
         register_carrier_lease(GlobalFrameStage2Lease::fixed(
             existing_key.0,
@@ -21322,6 +21332,7 @@ mod frame_inventory_backend_tests {
 
     #[test]
     fn directory_failpoint_rolls_back_inventory_before_final_carrier_drop() {
+        let _allocator_test_guard = global_frame_allocator_test_lock().lock();
         let frame = carrick_hal::FrameId::from_kernel_allocation(id(301));
         let mapping = carrick_hal::MappingId::from_kernel_allocation(id(302));
         let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();

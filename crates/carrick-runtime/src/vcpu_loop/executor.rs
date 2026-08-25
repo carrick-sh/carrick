@@ -4068,6 +4068,8 @@ fn acquire_process_retire_topology_lock_servicing<E: PersistentExecutor>(
 ) -> Result<(carrick_thread::fork_quiesce::TopologyLockGuard, bool), String> {
     let mut deferred_stop = false;
     let mut recorded_retry = false;
+    let mut backoff = std::time::Duration::from_micros(50);
+    let max_backoff = std::time::Duration::from_millis(5);
     loop {
         if let Some(guard) = carrick_thread::fork_quiesce::try_acquire_topology_lock(
             carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
@@ -4089,7 +4091,8 @@ fn acquire_process_retire_topology_lock_servicing<E: PersistentExecutor>(
         let stop_seen =
             service_owner_thread_commands(backend, executor, commands, boundary, receipts)?;
         deferred_stop |= stop_seen;
-        std::hint::spin_loop();
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(max_backoff);
     }
 }
 
