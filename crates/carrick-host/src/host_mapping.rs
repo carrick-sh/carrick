@@ -2,6 +2,9 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostMappingKind {
+    /// Guest-private anonymous RAM. The host mapping is still `MAP_SHARED` so
+    /// HVF and Carrick observe one backing; per-mm stage-1 ownership supplies
+    /// guest privacy and COW isolation.
     PrivateAnon,
     SharedAnon,
     /// One HVPatch writer-owned compound frame. Host `MAP_SHARED` is required
@@ -22,6 +25,13 @@ pub enum HostMappingKind {
     PrivateFile,
 }
 
+const fn anonymous_mapping_share_flag(_kind: HostMappingKind) -> libc::c_int {
+    // Host mapping kind records guest/kernel ownership, not host mmap COW.
+    // Anonymous buffers handed to hv_vm_map must stay on one VM object so
+    // Carrick host accesses and HVF guest accesses cannot diverge.
+    libc::MAP_SHARED
+}
+
 /// RAII owner for host virtual memory that backs a guest HVF mapping.
 ///
 /// The trap engine still performs `hv_vm_map`/`hv_vm_unmap` explicitly; this
@@ -35,14 +45,7 @@ pub struct OwnedHostMapping {
 
 impl OwnedHostMapping {
     pub fn map_shared_anon(len: usize, kind: HostMappingKind) -> Result<Self, std::io::Error> {
-        // EXPERIMENT: map private guest RAM as MAP_PRIVATE so host fork(2)
-        // COW-isolates it for free (cheap fork) — testing whether MAP_PRIVATE
-        // stays coherent under hv_vm_map (the disputed "desync"). Shared regions
-        // (aperture, signal rings, shared files) MUST stay MAP_SHARED.
-        let share = match kind {
-            HostMappingKind::PrivateAnon => libc::MAP_PRIVATE,
-            _ => libc::MAP_SHARED,
-        };
+        let share = anonymous_mapping_share_flag(kind);
         #[allow(deprecated)] // MAP_NORESERVE: removed in FreeBSD 11, harmless no-op elsewhere
         let host = unsafe {
             libc::mmap(
@@ -149,10 +152,7 @@ impl OwnedHostMapping {
     /// shared anonymous mapping process-scoped while a shared file mapping uses
     /// a VM-global IPA. Callers must make that policy decision separately.
     pub fn shares_across_host_fork(&self) -> bool {
-        matches!(
-            self.kind,
-            HostMappingKind::SharedAnon | HostMappingKind::SharedFile
-        )
+        !matches!(self.kind, HostMappingKind::PrivateFile)
     }
 }
 
@@ -176,6 +176,15 @@ mod tests {
     /// Serialize the mmap tests so none maps during another's freed-address check.
     /// Poison-recovering so a panic in one test doesn't cascade-fail the others.
     static MMAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn private_anon_uses_host_shared_backing_for_hvf_coherence() {
+        assert_eq!(
+            anonymous_mapping_share_flag(HostMappingKind::PrivateAnon),
+            libc::MAP_SHARED,
+            "guest-private identity comes from stage-1 ownership; its host backing must stay shared with HVF",
+        );
+    }
 
     #[test]
     fn owned_host_mapping_unmaps_on_drop() {
