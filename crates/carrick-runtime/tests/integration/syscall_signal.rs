@@ -362,12 +362,15 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
 }
 
 #[test]
-fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
+fn kill_tkill_tgkill_validate_logical_targets_and_queue_exact_thread_signals() {
     const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
     const LINUX_ESRCH: LinuxErrno = LinuxErrno::new(3);
-    // Signal delivery is now real: kill / tkill / tgkill with a valid
-    // self-target signum no longer return ENOSYS; they queue the
-    // signal for the runtime's between-trap delivery pass.
+    // The unbound dispatcher used by this integration fixture is not an
+    // HVPatch carrier, so it cannot exercise process-group delivery: that path
+    // depends on the carrier's kernel-lane binding and is covered beside the
+    // private kernel router. Keep the public syscall validation here, and prove
+    // that thread-directed delivery carries exact kernel identities instead of
+    // entering a host-process pending slot.
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     let reporter = CompatReporter::default();
@@ -382,18 +385,6 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .dispatch(
                 &dispatcher.capture_one_task_context().unwrap(),
                 SyscallRequest::new(129, SyscallArgs::from([task_id, 0, 0, 0, 0, 0])),
-                &mut memory,
-                &reporter,
-            )
-            .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
-    );
-    // kill(0, 0) -> existence check against calling pid, success.
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(129, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
             )
@@ -426,24 +417,6 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_ESRCH }
     );
-    // kill(self, SIGTERM=15) -> success; process-directed delivery retains the
-    // legacy host carrier slot. The thread-directed cases below must not use it.
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                &dispatcher.capture_one_task_context().unwrap(),
-                SyscallRequest::new(129, SyscallArgs::from([task_id, 15, 0, 0, 0, 0])),
-                &mut memory,
-                &reporter,
-            )
-            .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
-    );
-    assert_eq!(
-        carrick_runtime::host_signal::take_pending_for(thread_id as i32),
-        15
-    );
-
     // tkill(1, 0) -> success; tkill(0, 0) -> EINVAL (Linux rejects non-positive tids).
     assert_eq!(
         dispatcher

@@ -1169,6 +1169,20 @@ impl SyscallDispatcher {
         if !crate::dispatch::hvpatch_lane_active() || pid > 0 {
             return None;
         }
+        Some(self.kernel_group_signal(ctx, pid, signum))
+    }
+
+    /// Resolve a non-positive `kill(2)` selector exclusively through Carrick's
+    /// kernel graph. Kept separate from the carrier-lane discriminator so unit
+    /// tests can exercise the authority itself without mutating the
+    /// process-global HVPATCH_LANE flag and contaminating parallel tests.
+    fn kernel_group_signal<M: GuestMemory>(
+        &self,
+        ctx: &SyscallCtx<M>,
+        pid: i32,
+        signum: u64,
+    ) -> DispatchOutcome {
+        debug_assert!(pid <= 0, "kernel group signal requires a group selector");
         let kernel = ctx.kernel.kernel();
         let caller = ctx.kernel.task();
         let targets = if pid == -1 {
@@ -1188,7 +1202,7 @@ impl SyscallDispatcher {
                     crate::kernel::ProcessGroupId::from_abi_positive(p).map_err(|_| ())
                 }) {
                     Ok(group) => group,
-                    Err(()) => return Some(DispatchOutcome::errno(LINUX_ESRCH)),
+                    Err(()) => return DispatchOutcome::errno(LINUX_ESRCH),
                 }
             };
             kernel.task_keys_in_process_group(group)
@@ -1198,7 +1212,7 @@ impl SyscallDispatcher {
         } else {
             match crate::kernel::LinuxSignal::for_signal_number(signum as i32) {
                 Ok(signal) => Some(signal),
-                Err(_) => return Some(DispatchOutcome::errno(LINUX_EINVAL)),
+                Err(_) => return DispatchOutcome::errno(LINUX_EINVAL),
             }
         };
         // Linux fills si_pid/si_uid with the SENDER's identity for a
@@ -1228,13 +1242,13 @@ impl SyscallDispatcher {
             }
         }
         if accepted != 0 {
-            return Some(DispatchOutcome::Returned { value: 0 });
+            return DispatchOutcome::Returned { value: 0 };
         }
-        Some(DispatchOutcome::errno(if denied != 0 {
+        DispatchOutcome::errno(if denied != 0 {
             LINUX_EPERM
         } else {
             LINUX_ESRCH
-        }))
+        })
     }
 
     /// Route every positive HVPatch task target through the kernel, including
@@ -2749,6 +2763,40 @@ mod tests {
             carrick_abi::LINUX_BOOTSTRAP_PID as i32,
         ));
         assert!(!hvpatch_owns_specific_thread_signal(false));
+    }
+
+    #[test]
+    fn kernel_group_signal_validates_logical_membership_without_host_transport() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("context");
+        let reporter = crate::compat::CompatReporter::default();
+        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0; 64]);
+        let cx = crate::dispatch::SyscallCtx {
+            kernel: &context,
+            request: crate::dispatch::SyscallRequest::new(
+                129,
+                crate::dispatch::SyscallArgs::from([0, 0, 0, 0, 0, 0]),
+            ),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+        };
+
+        assert_eq!(
+            dispatcher.kernel_group_signal(&cx, 0, 0),
+            DispatchOutcome::Returned { value: 0 },
+            "kill(0, 0) must find the caller in its logical process group"
+        );
+        assert_eq!(
+            dispatcher.kernel_group_signal(&cx, 0, 65),
+            DispatchOutcome::errno(LINUX_EINVAL),
+            "group delivery validates the Linux signal number before posting"
+        );
+        assert_eq!(
+            dispatcher.kernel_group_signal(&cx, -99, 0),
+            DispatchOutcome::errno(LINUX_ESRCH),
+            "an absent logical process group must not fall through to a host selector"
+        );
     }
 
     #[test]
