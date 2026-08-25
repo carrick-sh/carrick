@@ -213,16 +213,15 @@ fn parse_fcntl11_protocol(text: &str, exit_code: i32) -> SuiteResult {
     let mut next_block = 1usize;
     let mut open_block = None;
     let mut outcomes = [Outcome::Ok; 9];
-    let mut saw_tmpdir = false;
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let Some(first) = lines.next() else {
+        return none_result();
+    };
+    if !tmpdir.is_match(first) {
+        return none_result();
+    }
 
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        if tmpdir.is_match(line) {
-            if saw_tmpdir || open_block.is_some() {
-                return none_result();
-            }
-            saw_tmpdir = true;
-            continue;
-        }
+    for line in lines {
         if let Some(caps) = marker.captures(line) {
             let Some(block) = caps
                 .get(2)
@@ -256,7 +255,7 @@ fn parse_fcntl11_protocol(text: &str, exit_code: i32) -> SuiteResult {
         return none_result();
     }
 
-    if !saw_tmpdir || open_block.is_some() || next_block != 10 {
+    if open_block.is_some() || next_block != 10 {
         return none_result();
     }
     protocol_result("fcntl11", &outcomes, exit_code)
@@ -933,6 +932,12 @@ loop.c:10: TPASS: iteration ok
         let missing = closure(&transcript.replace("Exit block 8\n", ""));
         assert_eq!(missing.result, SuiteOutcome::None, "{missing:?}");
 
+        let tmpdir =
+            "fcntl11     0  TINFO  :  Using /tmp/LTP_fcnoOUnef as tmpdir (overlayfs filesystem)\n";
+        let late_tmpdir = format!("{}{}", transcript.replacen(tmpdir, "", 1), tmpdir);
+        let late = closure(&late_tmpdir);
+        assert_eq!(late.result, SuiteOutcome::None, "{late:?}");
+
         let failed = closure(&transcript.replace(
             "fcntl11     0  TINFO  :  Exit block 4\n",
             "fcntl11     0  TFAIL  :  block 4 failed\nfcntl11     0  TINFO  :  Exit block 4\n",
@@ -1002,6 +1007,14 @@ loop.c:10: TPASS: iteration ok
             ("fcntl01     0  TBROK  :  setup failed\n", Outcome::Broken),
         ] {
             let parsed = closure(transcript);
+            assert_eq!(parsed.result, SuiteOutcome::Failure, "{parsed:?}");
+            assert_eq!(parsed.ids["ltp:fcntl01:1#1"], expected);
+        }
+        for (failure, expected) in [
+            ("fcntl01     0  TFAIL  :  fcntl failed\n", Outcome::Fail),
+            ("fcntl01     0  TBROK  :  setup failed\n", Outcome::Broken),
+        ] {
+            let parsed = closure(&format!("{success}{failure}"));
             assert_eq!(parsed.result, SuiteOutcome::Failure, "{parsed:?}");
             assert_eq!(parsed.ids["ltp:fcntl01:1#1"], expected);
         }
