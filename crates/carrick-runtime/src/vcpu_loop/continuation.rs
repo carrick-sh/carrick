@@ -2117,12 +2117,6 @@ impl SignalReadinessProbe {
     }
 
     fn event(&self) -> Option<ContinuationEvent> {
-        // Linux keeps a vfork parent suspended until the exact child exec/exit
-        // gate releases it. Generic task events and even deliverable signals
-        // may become pending, but they must not complete the vfork syscall.
-        if self.family == ContinuationFamily::VforkParent {
-            return None;
-        }
         if matches!(
             self.family,
             ContinuationFamily::WaitOnProcExit
@@ -2138,6 +2132,37 @@ impl SignalReadinessProbe {
         }
         let authority = context.signal_authority();
         let host_signum = crate::host_signal::take_pending_for(self.thread.tid.raw());
+        if self.family == ContinuationFamily::VforkParent {
+            // Linux waits for vfork completion in TASK_KILLABLE. That means
+            // only SIGKILL may interrupt the wait; caught signals and other
+            // default actions stay pending until the exact child exec/exit
+            // gate releases the parent. Reserve SIGKILL as a typed signal
+            // event so the delivery tail terminates the parent without ever
+            // manufacturing a successful vfork return.
+            if host_signum != 0 && host_signum != crate::linux_abi::LINUX_SIGKILL {
+                crate::host_signal::publish_pending_for(self.thread.tid.raw(), host_signum);
+            }
+            let kill_only = WaitSigMask::Replace(
+                SigSet::EMPTY
+                    .complement()
+                    .without(crate::linux_abi::LINUX_SIGKILL),
+            );
+            let reservation = if host_signum == crate::linux_abi::LINUX_SIGKILL {
+                authority.reserve_deliverable_for_wait_with_host_slot(
+                    kill_only,
+                    self.thread.tid.raw(),
+                    host_signum,
+                )
+            } else {
+                authority.reserve_deliverable_for_wait(kill_only)
+            };
+            return reservation.map(|reservation| {
+                ContinuationEvent::ReservedSignal(ReservedSignal::from_kernel_reservation(
+                    authority,
+                    reservation,
+                ))
+            });
+        }
         if let Some(wait_set) = self.wait_set {
             if host_signum != 0 && wait_set.contains(host_signum) {
                 crate::host_signal::publish_pending_for(self.thread.tid.raw(), host_signum);
@@ -2475,7 +2500,7 @@ impl CarrierWaitServiceInner {
         };
         if let Some(event) = probe.event() {
             self.publish_event(token, event);
-        } else if task_event_fired {
+        } else if task_event_fired && probe.family != ContinuationFamily::VforkParent {
             self.publish_event(token, ContinuationEvent::Ready);
         }
     }
@@ -2935,9 +2960,7 @@ impl CarrierWaitService {
                 }
             }
         }
-        if signal.family != ContinuationFamily::VforkParent
-            && let Some(task) = signal.task_ref.upgrade()
-        {
+        if let Some(task) = signal.task_ref.upgrade() {
             let callback_weak = weak.clone();
             match task.subscribe_wake(
                 signal.observed_task_wake,
@@ -6570,6 +6593,68 @@ mod tests {
                 .completion,
             ContinuationCompletion::Return(i64::from(child.task().key().id.raw()))
         );
+
+        let published = kernel
+            .reserve_fork(&fresh, plan, "reactor killable vfork".to_owned(), None)
+            .expect("reserve killable vfork")
+            .prepare_reference(ThreadId::synthetic_for_tests(15_235))
+            .expect("prepare killable vfork")
+            .commit()
+            .expect("commit killable vfork");
+        let (kill_child, kill_wait) = published.into_parts().expect("start killable vfork child");
+        let kill_wait = kill_wait.expect("killable parent wait");
+        let kill_context = fresh
+            .task_binding()
+            .capture(fresh.thread().key().tid)
+            .expect("current killable vfork parent");
+        let mut killable_vfork = BlockedContinuation::from_vfork_parent(
+            capture(&kill_context, generation, ContinuationBackend::Hvpatch),
+            kill_child.task().key(),
+            kill_wait.clone(),
+        )
+        .expect("killable vfork continuation");
+        let mut kill_registration = service.prepare_registration(&killable_vfork);
+        service
+            .enroll(&mut kill_registration)
+            .expect("enroll killable vfork");
+        kill_context.signal_authority().enqueue_thread_standard(
+            crate::kernel::LinuxSignal::for_signal_number(crate::linux_abi::LINUX_SIGKILL)
+                .expect("SIGKILL"),
+            None,
+        );
+        kill_context.task().wake();
+        let kill_event = await_event(&service, kill_registration.wake_token())
+            .expect("SIGKILL interrupts TASK_KILLABLE vfork wait");
+        assert!(matches!(
+            &kill_event,
+            ContinuationEvent::ReservedSignal(signal)
+                if signal.signum() == crate::linux_abi::LINUX_SIGKILL
+        ));
+        assert_eq!(kill_wait.released_reason(), None);
+        killable_vfork
+            .attach_registration(kill_registration)
+            .expect("attach SIGKILL vfork registration");
+        let kill_result = killable_vfork
+            .resume(kill_event, &kill_context)
+            .expect("resume vfork for fatal signal delivery");
+        assert_eq!(
+            kill_result.completion,
+            ContinuationCompletion::Errno(crate::linux_abi::LINUX_EINTR)
+        );
+        assert_eq!(
+            kill_result
+                .reserved_signal()
+                .expect("reserved fatal signal")
+                .signum(),
+            crate::linux_abi::LINUX_SIGKILL
+        );
+        kernel
+            .exit_task(
+                kill_child.task().key().id,
+                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("retire killable vfork child after parent cancellation");
     }
 
     #[test]
