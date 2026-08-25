@@ -16,8 +16,14 @@
  * a COW trigger for a handled permission fault.
  *
  * PERTURBATION: low but nonzero. Only fault-path, typed trigger, and stage-2
- * lifecycle plus signal publication/delivery USDTs fire; no syscall, COW-copy,
- * or inventory hot path is instrumented. Once a trigger identifies Linux tid
+ * lifecycle, topology-lock ownership, selected mmap-family syscall entry, plus
+ * signal publication/delivery USDTs fire; no COW-copy or inventory hot path is
+ * instrumented. mmap-family entry carries the canonical AArch64 number and a
+ * host pointer to six u64 arguments; 214=brk, 215=munmap, 216=mremap,
+ * 222=mmap, and 226=mprotect. The
+ * topology ABI is operation, phase, guest pid/tid, elapsed ns; operation 7 is
+ * process retirement, 8 alias map, 9 frame COW, and 10 alias unmap. Once a
+ * trigger identifies Linux tid
  * 4, the script also records that forker's syscall-boundary register tuple;
  * this is intentionally a reducer-specific diagnostic and increases
  * perturbation on that one thread.
@@ -82,6 +88,40 @@ carrick*:::hvpatch-global-frame-stage2
     this->phase == 0 ? global_frame_host[arg1] = arg3 : 0;
     printf("HVPATCHFAULT1|stage2|ts=%d|host_pid=%d|host_tid=%d|phase=%d|ipa=%x|length=%x|host=%x|perms=%x\n",
         timestamp, pid, tid, (uint32_t)arg0, arg1, arg2, arg3, arg4);
+}
+
+carrick*:::hvpatch-topology-lock
+/(pid == $target || progenyof($target))/
+{
+    printf("HVPATCHFAULT1|topology|ts=%d|host_pid=%d|host_tid=%d|operation=%d|phase=%d|linux_pid=%d|linux_tid=%d|elapsed_ns=%d\n",
+        timestamp, pid, tid, (uint32_t)arg0, (uint32_t)arg1,
+        (int32_t)arg2, (int32_t)arg3, arg4);
+}
+
+carrick*:::syscall-entry
+/(pid == $target || progenyof($target)) &&
+ (arg0 == 214 || arg0 == 215 || arg0 == 216 || arg0 == 222 || arg0 == 226)/
+{
+    this->a = (uint64_t *)copyin(arg2, 48);
+    printf("HVPATCHFAULT1|mmap_syscall|ts=%d|host_pid=%d|host_tid=%d|nr=%d|name=%s|a0=%x|a1=%x|a2=%x|a3=%x|a4=%x|a5=%x\n",
+        timestamp, pid, tid, (uint64_t)arg0, copyinstr(arg1), this->a[0],
+        this->a[1], this->a[2], this->a[3], this->a[4], this->a[5]);
+}
+
+carrick*:::syscall-return
+/(pid == $target || progenyof($target)) &&
+ (arg0 == 214 || arg0 == 215 || arg0 == 216 || arg0 == 222 || arg0 == 226)/
+{
+    printf("HVPATCHFAULT1|mmap_return|ts=%d|host_pid=%d|host_tid=%d|nr=%d|name=%s|retval=%x|errno=%d\n",
+        timestamp, pid, tid, (uint64_t)arg0, copyinstr(arg1), arg2,
+        (int32_t)arg3);
+}
+
+carrick*:::pt-alias-receipt
+/(pid == $target || progenyof($target))/
+{
+    printf("HVPATCHFAULT1|receipt|ts=%d|host_pid=%d|host_tid=%d|va=%x|leaf=%x|expected_ipa=%x|expected_ap=%x|phase=%d\n",
+        timestamp, pid, tid, arg0, arg1, arg2, arg3, (uint32_t)arg4);
 }
 
 carrick*:::hvpatch-fork-frame
