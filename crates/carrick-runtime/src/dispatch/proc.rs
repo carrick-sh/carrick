@@ -3368,7 +3368,14 @@ impl SyscallDispatcher {
                             return Ok(DispatchOutcome::errno(LINUX_EINTR));
                         }
                         return Ok(DispatchOutcome::WaitOnHvpatchChild {
-                            target: (pid.0 != -1).then_some(pid.0),
+                            // Only a positive pid is an exact child selector.
+                            // `0`, `-1`, and `-pgid` are group/broad Linux wait
+                            // selectors; the continuation intentionally wakes
+                            // broadly and this handler re-applies the exact
+                            // group filter on redispatch. Publishing a
+                            // nonpositive value as an exact task id makes the
+                            // continuation reject it as `StaleChildSelector`.
+                            target: (pid.0 > 0).then_some(pid.0),
                             sig_mask: carrick_abi::WaitSigMask::Additive(non_interrupting),
                         });
                     }
@@ -4797,6 +4804,390 @@ mod hvpatch_identity_tests {
         assert_eq!(child.subreaper_ancestor, 41);
         assert_eq!(child.child_subreaper, 0);
         assert_eq!(child.child_subreaper_owner, 0);
+    }
+}
+
+#[cfg(test)]
+mod kernel_process_dispatch_tests {
+    use super::*;
+    use crate::compat::CompatReporter;
+    use crate::kernel::{ClonePlan, KernelContext, LinuxWaitStatus};
+    use crate::thread::ThreadId;
+
+    const INFO_ADDR: u64 = 0x4000;
+    const SYS_WAITID: u64 = 95;
+    const SYS_PTRACE: u64 = 117;
+    const SYS_WAIT4: u64 = 260;
+    const LINUX_P_ALL: u64 = 0;
+    const LINUX_P_PID: u64 = 1;
+    const LINUX_P_PGID: u64 = 2;
+    const LINUX_WNOHANG: u64 = 1;
+    const LINUX_WSTOPPED: u64 = 2;
+    const LINUX_WEXITED: u64 = 4;
+    const LINUX_WNOWAIT: u64 = 0x0100_0000;
+
+    fn bound_dispatcher(
+        root_pid: i32,
+    ) -> (
+        HvpatchLaneScope,
+        SyscallDispatcher,
+        crate::hvpatch::ProcessContext,
+        KernelContext,
+    ) {
+        let lane = HvpatchLaneScope::force(false);
+        let (process, _) = crate::hvpatch::process_context_for_tests(root_pid);
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.bind_hvpatch_process(process.clone());
+        let root = dispatcher
+            .capture_one_task_context()
+            .expect("bound HVPatch root context");
+        (lane, dispatcher, process, root)
+    }
+
+    fn refreshed(context: &KernelContext) -> KernelContext {
+        context
+            .kernel()
+            .context(context.task().key().id, context.thread().key().tid)
+            .expect("refresh kernel context")
+    }
+
+    fn fork_child(parent: &KernelContext, registry_id: i32) -> KernelContext {
+        parent
+            .kernel()
+            .reserve_fork(
+                parent,
+                ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty()).unwrap(),
+                format!("wait-child-{registry_id}"),
+                None,
+            )
+            .unwrap()
+            .prepare_reference(ThreadId::synthetic_for_tests(registry_id))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0
+    }
+
+    fn dispatch(
+        dispatcher: &mut SyscallDispatcher,
+        context: &KernelContext,
+        memory: &mut LinearMemory,
+        number: u64,
+        args: [u64; 6],
+    ) -> DispatchOutcome {
+        dispatcher
+            .dispatch(
+                context,
+                SyscallRequest::new(number, SyscallArgs::from(args)),
+                memory,
+                &CompatReporter::default(),
+            )
+            .unwrap()
+    }
+
+    fn siginfo_i32(memory: &LinearMemory, offset: u64) -> i32 {
+        i32::from_ne_bytes(
+            memory
+                .read_bytes(INFO_ADDR + offset, 4)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn kernel_wait_dispatch_validates_and_reports_echild() {
+        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_001);
+        let mut memory = LinearMemory::new(INFO_ADDR, vec![0; 0x100]);
+
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_WAITID,
+                [LINUX_P_ALL, 0, 0, LINUX_WEXITED, 0, 0],
+            ),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD),
+        );
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_WAITID,
+                [99, 0, 0, LINUX_WEXITED, 0, 0],
+            ),
+            DispatchOutcome::errno(LINUX_EINVAL),
+        );
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_WAITID,
+                [LINUX_P_ALL, 0, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::errno(LINUX_EINVAL),
+        );
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_WAIT4,
+                [u64::MAX, 0, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_ECHILD),
+        );
+    }
+
+    #[test]
+    fn kernel_blocking_waits_park_on_logical_children() {
+        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_011);
+        let child = fork_child(&root, 61_012);
+        let root = refreshed(&root);
+        let child_pid = child.task().key().id.raw();
+        let mut memory = LinearMemory::new(INFO_ADDR, vec![0; 0x100]);
+
+        assert!(matches!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_WAIT4,
+                [child_pid as u64, 0, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::WaitOnHvpatchChild {
+                target: Some(target),
+                ..
+            } if target == child_pid
+        ));
+        assert!(matches!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_WAITID,
+                [LINUX_P_PID, child_pid as u64, 0, LINUX_WEXITED, 0, 0],
+            ),
+            DispatchOutcome::WaitOnHvpatchChild {
+                target: Some(target),
+                ..
+            } if target == child_pid
+        ));
+    }
+
+    #[test]
+    fn kernel_process_group_waits_use_a_broad_wake_selector() {
+        let (_lane, mut dispatcher, process, root) = bound_dispatcher(61_021);
+        let _child = fork_child(&root, 61_022);
+        let root = refreshed(&root);
+        let process_group = process.process_group().unwrap();
+        let mut memory = LinearMemory::new(INFO_ADDR, vec![0; 0x100]);
+
+        for pid in [0_i32, -process_group] {
+            assert!(matches!(
+                dispatch(
+                    &mut dispatcher,
+                    &root,
+                    &mut memory,
+                    SYS_WAIT4,
+                    [pid as u64, 0, 0, 0, 0, 0],
+                ),
+                DispatchOutcome::WaitOnHvpatchChild { target: None, .. }
+            ));
+        }
+        assert!(matches!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_WAITID,
+                [LINUX_P_PGID, 0, 0, LINUX_WEXITED, 0, 0],
+            ),
+            DispatchOutcome::WaitOnHvpatchChild { target: None, .. }
+        ));
+    }
+
+    #[test]
+    fn kernel_waitid_filters_unrequested_stop_and_finds_exited_sibling() {
+        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_031);
+        let stopped = fork_child(&root, 61_032);
+        let root = refreshed(&root);
+        let exited = fork_child(&root, 61_033);
+        let root = refreshed(&root);
+        let stopped_pid = stopped.task().key().id.raw();
+        let exited_pid = exited.task().key().id.raw();
+        let sigstop =
+            crate::kernel::LinuxSignal::for_signal_number(crate::linux_abi::LINUX_SIGSTOP).unwrap();
+        assert!(
+            root.kernel()
+                .stop_task_for_job_control(stopped.task().key().id, sigstop, None)
+        );
+        root.kernel()
+            .prepare_task_exit(
+                exited.task().key().id,
+                LinuxWaitStatus::from_wait_encoding(23 << 8),
+                None,
+            )
+            .unwrap()
+            .commit()
+            .unwrap();
+        let mut memory = LinearMemory::new(INFO_ADDR, vec![0; 0x100]);
+
+        for idtype in [LINUX_P_ALL, LINUX_P_PGID] {
+            memory.write_bytes(INFO_ADDR, &[0; 28]).unwrap();
+            assert_eq!(
+                dispatch(
+                    &mut dispatcher,
+                    &root,
+                    &mut memory,
+                    SYS_WAITID,
+                    [
+                        idtype,
+                        0,
+                        INFO_ADDR,
+                        LINUX_WEXITED | LINUX_WNOHANG | LINUX_WNOWAIT,
+                        0,
+                        0,
+                    ],
+                ),
+                DispatchOutcome::Returned { value: 0 },
+            );
+            assert_eq!(siginfo_i32(&memory, 16), exited_pid);
+            assert_eq!(siginfo_i32(&memory, 24), 23);
+        }
+
+        memory.write_bytes(INFO_ADDR, &[0xff; 28]).unwrap();
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_WAITID,
+                [
+                    LINUX_P_PID,
+                    stopped_pid as u64,
+                    INFO_ADDR,
+                    LINUX_WEXITED | LINUX_WNOHANG,
+                    0,
+                    0,
+                ],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert_eq!(memory.read_bytes(INFO_ADDR, 28).unwrap(), vec![0; 28]);
+
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_WAIT4,
+                [
+                    stopped_pid as u64,
+                    INFO_ADDR + 0x40,
+                    LINUX_WSTOPPED,
+                    0,
+                    0,
+                    0
+                ],
+            ),
+            DispatchOutcome::Returned {
+                value: i64::from(stopped_pid),
+            },
+        );
+        assert_eq!(
+            i32::from_ne_bytes(
+                memory
+                    .read_bytes(INFO_ADDR + 0x40, 4)
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
+            ),
+            (crate::linux_abi::LINUX_SIGSTOP << 8) | 0x7f,
+        );
+    }
+
+    #[test]
+    fn kernel_ptrace_stop_wait_and_control_are_task_scoped() {
+        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_041);
+        let child = fork_child(&root, 61_042);
+        let root = refreshed(&root);
+        let child_pid = child.task().key().id.raw();
+        let signal = crate::kernel::LinuxSignal::for_signal_number(12).unwrap();
+        assert!(root.kernel().claim_ptrace_traceme(&child));
+        assert!(
+            root.kernel()
+                .stop_task_for_ptrace(child.task().key().id, signal)
+        );
+        let mut memory = LinearMemory::new(INFO_ADDR, vec![0; 0x100]);
+
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_WAIT4,
+                [child_pid as u64, INFO_ADDR + 0x40, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned {
+                value: i64::from(child_pid),
+            },
+        );
+        assert_eq!(
+            i32::from_ne_bytes(
+                memory
+                    .read_bytes(INFO_ADDR + 0x40, 4)
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
+            ),
+            (12 << 8) | 0x7f,
+        );
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [7, child_pid as u64, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+    }
+
+    #[test]
+    fn kernel_ptrace_attach_reports_guest_target_semantics() {
+        let (_lane, mut dispatcher, _process, root) = bound_dispatcher(61_051);
+        let child = fork_child(&root, 61_052);
+        let root = refreshed(&root);
+        let child_pid = child.task().key().id.raw();
+        let mut memory = LinearMemory::new(INFO_ADDR, vec![0; 0x100]);
+
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_ATTACH, child_pid as u64, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::errno(crate::linux_abi::LINUX_EPERM),
+        );
+        assert_eq!(
+            dispatch(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PTRACE,
+                [LINUX_PTRACE_ATTACH, 99_999, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::errno(LINUX_ESRCH),
+        );
     }
 }
 

@@ -5162,6 +5162,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn logical_group_wait_dispatch_builds_an_any_child_continuation() {
+        let _lane = crate::dispatch::HvpatchLaneScope::force(false);
+        let (process, root) = crate::hvpatch::process_context_for_tests(15_025);
+        let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
+        dispatcher.bind_hvpatch_process(process);
+        let _child = root
+            .kernel()
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).unwrap(),
+                "group-wait-child".to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_reference(ThreadId::synthetic_for_tests(15_026))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0;
+        let root = root
+            .kernel()
+            .context(root.task().key().id, root.thread().key().tid)
+            .unwrap();
+        let generation = publish(&root, 0x325);
+        let mut memory = crate::dispatch::LinearMemory::new(0x4000, vec![0; 0x100]);
+        let outcome = dispatcher
+            .dispatch(
+                &root,
+                SyscallRequest::new(260, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &crate::compat::CompatReporter::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            &outcome,
+            DispatchOutcome::WaitOnHvpatchChild { target: None, .. }
+        ));
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            outcome,
+            capture(&root, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("group wait must build without StaleChildSelector");
+        assert_eq!(
+            continuation.child_selector(),
+            Some(ChildSelector::AnyChildOf(root.task().key()))
+        );
+    }
+
     struct RaceFixture {
         scheduler: Arc<Scheduler>,
         service: Arc<CarrierWaitService>,
