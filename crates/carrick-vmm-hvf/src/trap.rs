@@ -2100,6 +2100,24 @@ fn retire_global_frame_host_owner(ipa: u64, length: u64) -> bool {
     retired
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retire_global_frame_host_owner_if_generation(
+    ipa: u64,
+    length: u64,
+    expected_generation: u64,
+) -> bool {
+    let owner = {
+        let mut owners = global_frame_host_owners().lock();
+        match owners.get(&(ipa, length)) {
+            Some(owner) if owner.generation == expected_generation => owners.remove(&(ipa, length)),
+            _ => None,
+        }
+    };
+    let retired = owner.is_some();
+    drop(owner);
+    retired
+}
+
 /// Authenticate a non-owning mapping/alias row against the exact live global
 /// owner, not merely against the current host VM map.
 ///
@@ -4671,7 +4689,12 @@ pub(crate) struct HvfTaskState {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct PendingExecStage2Cleanup {
     mappings: Vec<HvfMappedRegion>,
-    extents: std::collections::BTreeSet<(u64, usize)>,
+    /// Physical candidates selected at exec publication, bound to the exact
+    /// global-owner incarnation observed at that boundary.
+    extents: std::collections::BTreeMap<(u64, usize), u64>,
+    /// Shared backend reference authority rechecked immediately before recycle.
+    frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+    /// Semantic alias ownership of the address space replaced by exec.
     mm_root_slot: Option<(u64, u64)>,
     shared_projection: bool,
     armed: bool,
@@ -4694,23 +4717,49 @@ impl PendingExecStage2Cleanup {
             self.armed = false;
             return Ok(());
         }
-        for &(ipa, size) in &self.extents {
-            HvfVmState::retire_stage2_extent_from_mappings(&mut self.mappings, ipa, size as u64)?;
+        let mut retired_extents = std::collections::BTreeSet::new();
+        for (&(ipa, size), &owner_generation) in &self.extents {
+            let lease = (ipa, size as u64);
+            if owner_generation == 0 && is_reusable_global_frame_extent(ipa, size as u64) {
+                // A reusable extent is born with a registered owner generation.
+                // Absence at selection is incomplete authority, never permission
+                // for delayed cleanup to remove a later incarnation by bare key.
+                continue;
+            }
+            if global_frame_host_owner_generation(ipa, size as u64) != owner_generation {
+                continue;
+            }
+            if HvfVmState::retire_stage2_candidate_if_unreferenced(&self.frames, lease, || {
+                if owner_generation == 0 {
+                    HvfVmState::retire_stage2_extent_from_mappings(
+                        &mut self.mappings,
+                        ipa,
+                        size as u64,
+                    )
+                } else if retire_global_frame_host_owner_if_generation(
+                    ipa,
+                    size as u64,
+                    owner_generation,
+                ) {
+                    Ok(())
+                } else {
+                    Err(TrapError::Hypervisor(format!(
+                        "HVPatch exec predecessor owner generation drifted at IPA 0x{ipa:x} size {size}"
+                    )))
+                }
+            })? {
+                retired_extents.insert((ipa, size));
+            }
         }
         mutate_external_alias_state(|_, registry| {
             registry.retain(|alias| {
                 !alias_is_owned_by_process(alias.ownership_scope, self.mm_root_slot)
-                    && !self
-                        .extents
-                        .contains(&(alias.physical_ipa, alias.physical_size))
+                    && !retired_extents.contains(&(alias.physical_ipa, alias.physical_size))
             });
         });
         let mut retained_backings = Vec::new();
         for mapping in self.mappings.drain(..) {
-            if self
-                .extents
-                .contains(&(mapping.physical_ipa, mapping.physical_size))
-            {
+            if retired_extents.contains(&(mapping.physical_ipa, mapping.physical_size)) {
                 drop(mapping);
             } else {
                 retained_backings.push(mapping);
@@ -17012,11 +17061,22 @@ impl HvfVmState {
         if self.persistent_vm_lifecycle {
             let predecessor_mappings = std::mem::take(&mut self.mappings);
             let shared_projection = self.shared_process_mm;
+            let predecessor_frames = std::sync::Arc::clone(&self.frame_inventory.lock().frames);
+            let predecessor_extents = retired_physical_extents
+                .iter()
+                .map(|&(ipa, size)| {
+                    (
+                        (ipa, size),
+                        global_frame_host_owner_generation(ipa, size as u64),
+                    )
+                })
+                .collect();
             if self
                 .pending_exec_stage2_cleanup
                 .replace(PendingExecStage2Cleanup {
                     mappings: predecessor_mappings,
-                    extents: retired_physical_extents.clone(),
+                    extents: predecessor_extents,
+                    frames: predecessor_frames,
                     mm_root_slot: predecessor_mm_root_slot,
                     shared_projection,
                     armed: true,
@@ -19470,8 +19530,9 @@ mod frame_inventory_backend_tests {
         let mut task = hvpatch_task_state_test_fixture(7, 0x4000, 7);
         task.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
             mappings: vec![mapping],
-            extents: [(0x1234_0000, 0x4000)].into_iter().collect(),
-            mm_root_slot: Some((7 << 20, 0x20_0000)),
+            extents: [((0x1234_0000, 0x4000), 0)].into_iter().collect(),
+            frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
+            mm_root_slot: task.mm_root_slot,
             shared_projection: false,
             armed: true,
         });
@@ -19482,6 +19543,164 @@ mod frame_inventory_backend_tests {
         assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!alias_backing_is_live(host_addr as usize));
         assert!(task.pending_exec_stage2_cleanup.is_none());
+    }
+
+    #[test]
+    fn exec_predecessor_cleanup_rechecks_a_republished_stage2_reference() {
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            0x4000,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .unwrap();
+        let host_addr = host.as_ptr();
+        let lease_key = (0x1238_0000_u64, 0x4000_usize);
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut lease = GlobalFrameStage2Lease::fixed(lease_key.0, lease_key.1 as u64);
+        lease.drop_backing_audit = Some((host_addr as usize, std::sync::Arc::clone(&observed)));
+        let mut mapping = thread_sibling_tests::mapped_region(
+            lease_key.0,
+            lease_key.0 + lease_key.1 as u64,
+            lease_key.0,
+        );
+        mapping.host_addr = host_addr;
+        mapping.host_mapping = Some(host);
+        mapping.stage2_lease = Some(lease);
+
+        // Exec selected this extent while it was unreferenced. Before deferred
+        // cleanup runs, another MM publishes a reference into the shared backend
+        // registry. The stale selection must not drop that MM's physical lease.
+        let frames =
+            std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+        frames
+            .lock()
+            .stage2_references
+            .insert((lease_key.0, lease_key.1 as u64), 1);
+        let mut task = hvpatch_task_state_test_fixture(17, 0x4000, 17);
+        let predecessor_scope = task.mm_root_slot.expect("predecessor MM root slot");
+        let sibling_scope = (
+            predecessor_scope.0 + predecessor_scope.1,
+            predecessor_scope.1,
+        );
+        let predecessor_ipa = 0x2238_0000_u64;
+        let sibling_ipa = 0x3238_0000_u64;
+        let alias = |ipa, ownership_scope| AliasBacking {
+            start: ipa,
+            ipa,
+            host_addr: host_addr as usize,
+            size: lease_key.1,
+            physical_ipa: lease_key.0,
+            physical_host_addr: host_addr as usize,
+            physical_size: lease_key.1,
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            guest_writable: true,
+            sharing: GuestMappingSharing::Private,
+            ownership_scope,
+            inventory_backing: InventoryBackingIdentity::Private(lease_key.0),
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: 0,
+        };
+        register_shared_alias(alias(
+            predecessor_ipa,
+            AliasOwnershipScope::MmRootSlot {
+                base: predecessor_scope.0,
+                size: predecessor_scope.1,
+            },
+        ));
+        register_shared_alias(alias(
+            sibling_ipa,
+            AliasOwnershipScope::MmRootSlot {
+                base: sibling_scope.0,
+                size: sibling_scope.1,
+            },
+        ));
+        task.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
+            mappings: vec![mapping],
+            extents: [(lease_key, 0)].into_iter().collect(),
+            frames,
+            mm_root_slot: task.mm_root_slot,
+            shared_projection: false,
+            armed: true,
+        });
+
+        HvfVmState::retire_task_state_exec_predecessor(&mut task)
+            .expect("recheck deferred predecessor cleanup");
+        assert!(
+            !observed.load(std::sync::atomic::Ordering::SeqCst),
+            "a republished stage-2 reference must keep its exact lease alive",
+        );
+        assert!(
+            alias_backing_is_live(host_addr as usize),
+            "a republished stage-2 reference must keep its host backing alive",
+        );
+        let aliases = alias_registry().lock();
+        assert!(
+            !aliases.iter().any(|alias| alias.ipa == predecessor_ipa),
+            "exec must remove semantic aliases owned by the predecessor MM",
+        );
+        assert!(
+            aliases.iter().any(|alias| alias.ipa == sibling_ipa),
+            "exec must retain the sibling MM alias for the shared live extent",
+        );
+        drop(aliases);
+        mutate_external_alias_state(|replay, registry| {
+            registry.retain(|alias| alias.ipa != predecessor_ipa && alias.ipa != sibling_ipa);
+            replay.retain(|(ipa, _, _, _)| *ipa != lease_key.0);
+        });
+    }
+
+    #[test]
+    fn exec_predecessor_cleanup_rejects_a_recycled_owner_generation() {
+        let lease_key = (0x123c_0000_u64, 0x4000_usize);
+        let successor_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            lease_key.1,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .unwrap();
+        let successor = GlobalFrameHostOwner {
+            _mapping: successor_host,
+            _lease: GlobalFrameStage2Lease::fixed(lease_key.0, lease_key.1 as u64),
+            perms: u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+            generation: next_global_frame_owner_generation(),
+        };
+        let successor_generation = successor.generation;
+        let stale_generation = successor_generation.wrapping_add(1);
+        assert_ne!(stale_generation, successor_generation);
+        assert!(
+            global_frame_host_owners()
+                .lock()
+                .insert((lease_key.0, lease_key.1 as u64), successor)
+                .is_none()
+        );
+
+        let mut task = hvpatch_task_state_test_fixture(18, 0x4000, 18);
+        task.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
+            mappings: vec![thread_sibling_tests::mapped_region(
+                lease_key.0,
+                lease_key.0 + lease_key.1 as u64,
+                lease_key.0,
+            )],
+            extents: [((lease_key.0, lease_key.1), stale_generation)]
+                .into_iter()
+                .collect(),
+            frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
+            mm_root_slot: task.mm_root_slot,
+            shared_projection: false,
+            armed: true,
+        });
+
+        HvfVmState::retire_task_state_exec_predecessor(&mut task)
+            .expect("reject recycled exec predecessor owner");
+        assert_eq!(
+            global_frame_host_owner_generation(lease_key.0, lease_key.1 as u64),
+            successor_generation,
+            "stale cleanup must not retire a newer owner of the recycled key",
+        );
+        let successor = global_frame_host_owners()
+            .lock()
+            .remove(&(lease_key.0, lease_key.1 as u64))
+            .expect("remove successor owner after test");
+        drop(successor);
     }
 
     #[test]
