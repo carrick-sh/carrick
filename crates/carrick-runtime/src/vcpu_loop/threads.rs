@@ -451,7 +451,7 @@ pub(super) fn wake_removed_persistent_sibling_threads(
         {
             continue;
         }
-        if let Err(error) = scheduler.wake(thread.key())
+        if let Err(error) = scheduler.wake_control(thread.key())
             && !matches!(error, crate::kernel::SchedulerError::UnknownThread)
             && !matches!(
                 thread.execution_state(),

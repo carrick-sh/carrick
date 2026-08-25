@@ -7075,6 +7075,13 @@ where
         request: SyscallRequest,
         input: HvpatchBlockInput,
     ) -> Result<executor::ExecutorExit, RuntimeError> {
+        let native_syscall_number = request.native_number.raw();
+        let block_args = [
+            request.arg(0),
+            request.arg(1),
+            request.arg(2),
+            request.arg(3),
+        ];
         let (continuation_input, vfork_activation) = match input {
             HvpatchBlockInput::Dispatch(outcome) => {
                 (HvpatchContinuationInput::Dispatch(outcome), None)
@@ -7090,6 +7097,17 @@ where
         };
         let continuation =
             self.prepare_hvpatch_continuation(kernel, lease, request, continuation_input)?;
+        if let Some(pid) = self.hvpatch_task_pid
+            && pid == self.linux_tid.raw()
+        {
+            crate::event_ring::rec_hvpatch_blocked_continuation(
+                pid,
+                self.linux_tid.raw(),
+                native_syscall_number,
+                continuation.family().event_code(),
+                block_args,
+            );
+        }
         Ok(executor::ExecutorExit::BlockedContinuation {
             continuation: Box::new(continuation),
             vfork_activation,
@@ -10459,7 +10477,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_exec_stop_wakes_the_exact_blocked_leader_generation() {
+    fn persistent_exec_stop_control_wakes_unreleased_vfork_parent_without_guest_readiness() {
         let (process, root) = crate::hvpatch::process_context_for_tests(70_103);
         let plan = crate::kernel::ClonePlan::from_flags(
             carrick_abi::LinuxCloneFlags::THREAD
@@ -10488,17 +10506,55 @@ mod tests {
             .thread()
             .publish_initial_task_state(sibling_state)
             .expect("publish sibling state");
+        let executor = crate::kernel::objects::ExecutorId::for_transitional_thread(
+            ThreadId::synthetic_for_tests(71),
+        )
+        .expect("test executor");
         let lease = root
             .thread()
-            .claim_runnable(
-                crate::kernel::objects::ExecutorId::for_transitional_thread(
-                    ThreadId::synthetic_for_tests(71),
-                )
-                .expect("test executor"),
-            )
+            .claim_runnable(executor)
             .expect("claim leader");
+        let published = process
+            .kernel_graph()
+            .reserve_fork(
+                &root,
+                crate::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::VFORK | carrick_abi::LinuxCloneFlags::VM,
+                )
+                .expect("vfork plan"),
+                "persistent exec-stop vfork parent".to_owned(),
+                None,
+            )
+            .expect("reserve vfork")
+            .prepare_reference(ThreadId::synthetic_for_tests(70_105))
+            .expect("prepare vfork child")
+            .commit()
+            .expect("publish vfork child");
+        let (vfork_child, vfork_wait) = published.into_parts().expect("start vfork child");
+        let current = root
+            .task_binding()
+            .capture(root.thread().key().tid)
+            .expect("recapture vfork parent");
+        let continuation = continuation::BlockedContinuation::from_vfork_parent(
+            continuation::ContinuationCapture::from_lease(
+                &current,
+                &lease,
+                SyscallRequest::new(220, crate::compat::SyscallArgs([0; 6])),
+                continuation::RestartClass::RestartSyscall,
+                continuation::ContinuationBackend::Hvpatch,
+            )
+            .expect("capture vfork parent"),
+            vfork_child.task().key(),
+            vfork_wait.expect("vfork parent wait"),
+        )
+        .expect("construct vfork parent continuation");
         root.thread()
-            .park_from_executor(lease, crate::kernel::objects::BlockedReason::ChildState)
+            .scheduler_park_continuation_from_executor(
+                lease,
+                crate::kernel::objects::BlockedReason::ChildState,
+                continuation,
+            )
+            .map_err(|(error, _)| error)
             .expect("block vfork leader");
         let directory = HvpatchRuntimeDirectory::default();
         let (scheduler, _) = directory.continuation_services(root.kernel());
@@ -10515,6 +10571,21 @@ mod tests {
             crate::kernel::objects::ThreadExecutionState::Runnable { .. }
         ));
         assert_eq!(scheduler.queued_len(), 1);
+        let claimed = root
+            .thread()
+            .claim_runnable(executor)
+            .expect("claim control-woken vfork parent");
+        assert!(
+            claimed
+                .blocked_continuation()
+                .expect("preserved vfork continuation")
+                .ready_event()
+                .is_err(),
+            "terminal control wake must not manufacture guest vfork readiness",
+        );
+        root.thread()
+            .exit_from_executor(claimed)
+            .expect("retire control-woken vfork parent");
     }
 
     #[test]
