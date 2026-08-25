@@ -6201,6 +6201,27 @@ fn frame_cow_write_route(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn next_frame_cow_write_probe(
+    intent: carrick_aarch64::vmm::FrameCowWriteIntent,
+    current: u64,
+    end: u64,
+) -> u64 {
+    // A 16 KiB physical frame may carry four independently mapped Linux 4 KiB
+    // pages. Backing maintenance runs while reused leaves are invalid, and
+    // those four outputs can therefore name a mixture of live, shared, and
+    // retired owners. Classify each Linux page. Guest-visible writes retain the
+    // compound step because one armed COW transaction resolves that whole span.
+    let granule = if intent == carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance {
+        0x1000
+    } else {
+        CowArmedRanges::COMPOUND_SIZE
+    };
+    align_down(current, granule)
+        .saturating_add(granule)
+        .min(end)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Copy, Debug)]
 struct FrameCowTrigger {
     class: carrick_observability::probes::HvpatchFrameCowTriggerClass,
@@ -14194,9 +14215,7 @@ impl HvfVmState {
                 }
                 FrameCowWriteRoute::Direct => {}
             }
-            let next = align_down(current, CowArmedRanges::COMPOUND_SIZE)
-                .saturating_add(CowArmedRanges::COMPOUND_SIZE);
-            current = next.min(end);
+            current = next_frame_cow_write_probe(intent, current, end);
         }
         Ok(())
     }
@@ -23883,6 +23902,32 @@ mod frame_inventory_backend_tests {
             frame_cow_write_route(FrameCowWriteIntent::BackingMaintenance, false, false, false),
             FrameCowWriteRoute::Direct,
             "an unshared retained frame is this mm's own; direct scrub is correct",
+        );
+
+        // Linux can reuse a 4 KiB hole inside one 16 KiB HVF compound while
+        // adjacent pages still name different live or retired owners. A
+        // backing-maintenance scrub must therefore classify every Linux page;
+        // jumping to the next compound after a Direct first page skipped a
+        // later retired output, and mmap subsequently made that dead IPA valid
+        // (`mtforkcorrupt`: VA 0x60000aa000, ESR 0x93cb8047).
+        let compound = 0x0600_000a_8000;
+        assert_eq!(
+            next_frame_cow_write_probe(
+                FrameCowWriteIntent::BackingMaintenance,
+                compound,
+                compound + CowArmedRanges::COMPOUND_SIZE,
+            ),
+            compound + 0x1000,
+            "backing maintenance must inspect every 4 KiB Linux page in a mixed HVF compound",
+        );
+        assert_eq!(
+            next_frame_cow_write_probe(
+                FrameCowWriteIntent::GuestVisible,
+                compound,
+                compound + CowArmedRanges::COMPOUND_SIZE,
+            ),
+            compound + CowArmedRanges::COMPOUND_SIZE,
+            "ordinary guest-visible writes retain compound-granular progress",
         );
 
         let va = 0x0600_000a_9000;
