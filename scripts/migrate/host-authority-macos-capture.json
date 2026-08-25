@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "source_head": "7aa600976743928aaf6aa3b350eb8355bd000e40",
+  "source_head": "e6113df56fcf673a3bbd51aa93a23c0e396212ca",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
@@ -84,7 +84,7 @@
   },
   "catalog_sha256": "78bbda851abe90bc1336e6aee5124545142860fa02fcba739f65a0b1f0f8baba",
   "profiles_sha256": "638f4e5c37af02b7a4520133d6e7e96384b1235be11f3336eb6d69e95c079828",
-  "rows_sha256": "f1341bb8abe697f63b93609f20c0361b0dace3be3b833e87d8354aaa9a5fcc66",
+  "rows_sha256": "eb879556d073f272d36ddc46b6aa3bf59598e116a3ccf6bdfc9adbeb032b096e",
   "rows": [
     {
       "catalog_id": "HA-CATALOG-HVF-VCPUS-EXIT",
@@ -11734,15 +11734,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 14461,
-        "byte_start": 14436,
+        "byte_end": 15765,
+        "byte_start": 15740,
         "column": 18,
         "column_end": 43,
         "column_start": 18,
         "file": "crates/carrick-vmm-hvf/src/vcpu_kick.rs",
-        "line": 324,
-        "line_end": 324,
-        "line_start": 324
+        "line": 352,
+        "line_end": 352,
+        "line_start": 352
       }
     },
     {
