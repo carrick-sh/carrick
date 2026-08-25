@@ -194,10 +194,20 @@ pub trait VcpuRegistry: Send + Sync {
     /// neither be kicked nor counted as in-guest until it registers again.
     fn unregister(&self, tid: ThreadId);
     fn kick(&self, tid: ThreadId);
+    /// Kick `tid` only when its run loop still reports that it is entering or
+    /// executing guest code. Returns whether a kick was issued.
+    ///
+    /// Signal-pump retries use this after the initial unconditional delivery:
+    /// a vCPU in host code has already reached a pending-signal safe point and
+    /// must not be kicked repeatedly for an unchanged pending bit.
+    fn kick_if_in_guest(&self, tid: ThreadId) -> bool;
     /// Kick every registered vCPU (including the caller's, if registered). The
     /// process-directed signal pump uses this to nudge every in-guest thread to
     /// re-check pending at its next safe point.
     fn kick_all(&self);
+    /// Kick only registrations currently entering or executing guest code.
+    /// Returns whether at least one kick was issued.
+    fn kick_all_in_guest(&self) -> bool;
     fn kick_all_except(&self, except: ThreadId);
     fn any_other_in_guest(&self, except: ThreadId) -> bool;
     fn count(&self) -> usize;
@@ -280,10 +290,34 @@ impl VcpuRegistry for GenericVcpuRegistry {
         }
     }
 
+    fn kick_if_in_guest(&self, tid: ThreadId) -> bool {
+        let registrations = self.lock();
+        let Some(entry) = registrations.get(&tid) else {
+            return false;
+        };
+        if !entry.is_in_guest() {
+            return false;
+        }
+        entry.kick.kick();
+        true
+    }
+
     fn kick_all(&self) {
         for entry in self.lock().values() {
             entry.kick.kick();
         }
+    }
+
+    fn kick_all_in_guest(&self) -> bool {
+        let registrations = self.lock();
+        let mut kicked = false;
+        for entry in registrations.values() {
+            if entry.is_in_guest() {
+                entry.kick.kick();
+                kicked = true;
+            }
+        }
+        kicked
     }
 
     fn kick_all_except(&self, except: ThreadId) {
