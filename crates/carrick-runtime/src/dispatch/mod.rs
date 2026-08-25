@@ -2409,9 +2409,10 @@ pub struct SyscallDispatcher {
     /// survives in-process execve — per-process-tree, like a seccomp filter.
     /// See [`crate::container_policy`].
     container_policy: Option<crate::container_policy::ContainerPolicy>,
-    /// SysV shared-memory registry (per-process; host-file-backed so forked
-    /// guests share segments by inode through `/tmp/carrick-shm/`).
-    sysv: Mutex<sysv::SysvShmState>,
+    /// SysV IPC namespace shared by every logical process in this run.
+    sysv: Arc<sysv::SysvIpcNamespace>,
+    /// Per-process shmat/shmdt bookkeeping, inherited by value at fork.
+    sysv_process: Mutex<sysv::SysvProcessAttachments>,
     /// POSIX message queue registry (in-memory, fork-coherent).
     pub(crate) mqueue: Arc<mqueue::MqueueRegistry>,
     /// Active network namespace provider lease for this run. Host mode uses a
@@ -3632,6 +3633,7 @@ impl SyscallDispatcher {
         process.bind_vma_source(self.vma_snapshot_source());
         *self.kernel_binding.write() = process.task_binding();
         *self.timer_delivery.write() = Some(process.process_timer_delivery());
+        self.commit_sysv_fork_inheritance();
         // HVPatch multiplexes Linux tasks inside one host PID, so the mature
         // one-task adapter's host-PID credential projection is inapplicable.
         crate::cred_ipc::unpublish();
@@ -3988,7 +3990,8 @@ impl SyscallDispatcher {
             fs: self.fs.fork_clone(),
             seccomp: self.seccomp.fork_clone(),
             container_policy: self.container_policy.clone(),
-            sysv: Mutex::new(self.sysv.lock().fork_clone()),
+            sysv: Arc::clone(&self.sysv),
+            sysv_process: Mutex::new(self.fork_sysv_process_attachments()),
             mqueue: Arc::clone(&self.mqueue),
             network: Arc::clone(&self.network),
             page_geometry: self.page_geometry,
@@ -4154,7 +4157,8 @@ impl SyscallDispatcher {
             // Unconfined until a frontend applies a policy: bare run-elf boots
             // and unit tests keep today's handler-honest behavior.
             container_policy: None,
-            sysv: Mutex::new(sysv::SysvShmState::new()),
+            sysv: Arc::new(sysv::SysvIpcNamespace::new()),
+            sysv_process: Mutex::new(sysv::SysvProcessAttachments::default()),
             mqueue: Arc::new(mqueue::MqueueRegistry::default()),
             network: std::sync::Arc::new(crate::network::RuntimeNetwork::host_default()),
             page_geometry: crate::page_profile::PageGeometry {

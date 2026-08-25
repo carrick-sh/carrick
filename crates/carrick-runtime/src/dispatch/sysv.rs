@@ -59,7 +59,7 @@ const LINUX_MSQID_DS_SIZE: usize = 120;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 /// Linux aarch64 `struct ipc64_perm` (UAPI, `include/uapi/asm-generic/ipcbuf.h`).
@@ -296,6 +296,10 @@ impl ShmPermMode {
 #[derive(Clone, Debug)]
 pub(super) struct ShmSegment {
     pub path: PathBuf,
+    /// Generation-exact attachment counter receipt. The public key path is
+    /// reusable immediately after `IPC_RMID`, while this inode-qualified path
+    /// remains owned by the tombstoned generation until its final detach.
+    nattch_path: PathBuf,
     pub key: i32,
     pub size: usize,
     /// Guest-visible SysV shm permission/mode bits.
@@ -323,6 +327,14 @@ pub(super) struct ShmSegment {
     pub cpid: i32,
     /// Guest namespace pid of the last shmat/shmdt operator.
     pub lpid: i32,
+    /// `IPC_RMID` makes the id unavailable immediately, but Linux retains the
+    /// object while an already-authorized attach transaction or a live mapping
+    /// still owns it. Keeping the tombstone in the namespace also prevents a
+    /// recycled host inode from being mistaken for this generation.
+    removed: bool,
+    /// Attach transactions that authenticated this exact segment before
+    /// dropping the namespace lock but have not committed or rolled back yet.
+    pending_attaches: u64,
 }
 
 impl ShmSegment {
@@ -625,9 +637,58 @@ impl SemSet {
 
 pub(crate) struct HostAliasShmatCommit {
     pub(super) va: u64,
-    pub(super) shmid: i32,
     pub(super) atime: u64,
     pub(super) lpid: i32,
+    reservation: PendingShmat,
+}
+
+/// Owned authority for one `shmat` that authenticated and opened an exact
+/// segment generation. Dropping any unconsumed host-alias transaction rolls
+/// this reservation back, so sibling `IPC_RMID` can never erase the metadata
+/// required by a later successful alias install.
+#[derive(Debug)]
+pub(super) struct PendingShmat {
+    namespace: std::sync::Arc<SysvIpcNamespace>,
+    shmid: i32,
+    path: PathBuf,
+    armed: bool,
+}
+
+impl PendingShmat {
+    fn commit(mut self, atime: u64, lpid: i32) -> Result<i32, ()> {
+        let mut state = self.namespace.state.lock();
+        let segment = state.segments.get_mut(&self.shmid).ok_or(())?;
+        if segment.path != self.path || segment.pending_attaches == 0 {
+            return Err(());
+        }
+        segment.pending_attaches -= 1;
+        segment.nattch = adjust_shm_nattch(segment, 1);
+        segment.atime = atime;
+        segment.lpid = lpid;
+        self.armed = false;
+        Ok(self.shmid)
+    }
+}
+
+impl Drop for PendingShmat {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = self.namespace.state.lock();
+        let should_remove = state.segments.get_mut(&self.shmid).is_some_and(|segment| {
+            if segment.path != self.path || segment.pending_attaches == 0 {
+                std::process::abort();
+            }
+            segment.pending_attaches -= 1;
+            segment.removed && segment.pending_attaches == 0 && segment.nattch == 0
+        });
+        if should_remove {
+            if let Some(segment) = state.segments.remove(&self.shmid) {
+                let _ = std::fs::remove_file(segment.nattch_path);
+            }
+        }
+    }
 }
 
 #[derive(Default, Debug)]
@@ -636,13 +697,6 @@ pub(super) struct SysvShmState {
     /// Populated lazily: a shmat against a known key but unfamiliar shmid
     /// resolves through the filesystem and inserts on the fly.
     pub segments: HashMap<i32, ShmSegment>,
-    /// Map guest VA (returned from shmat) → shmid so shmdt can find which
-    /// segment to decrement when given just an address.
-    pub attachments: HashMap<u64, i32>,
-    /// SysV attachment starts that have been passed to remap_file_pages(2).
-    /// Linux no longer accepts those addresses as shmdt(2) segment starts; LTP
-    /// shmctl05 depends on that EINVAL path while racing IPC_RMID.
-    pub remapped_attachments: HashSet<u64>,
     /// Counter for IPC_PRIVATE segment filenames (combined with pid for
     /// uniqueness — fork-safe because each forked carrick process has its
     /// own pid).
@@ -663,26 +717,11 @@ impl SysvShmState {
     pub(super) fn new() -> Self {
         Self {
             segments: HashMap::new(),
-            attachments: HashMap::new(),
-            remapped_attachments: HashSet::new(),
             private_counter: AtomicU32::new(1),
             message_queues: HashSet::new(),
             semaphores: HashMap::new(),
             sem_keys: HashMap::new(),
             next_sem_scan_index: 0,
-        }
-    }
-
-    pub(super) fn fork_clone(&self) -> Self {
-        Self {
-            segments: self.segments.clone(),
-            attachments: self.attachments.clone(),
-            remapped_attachments: self.remapped_attachments.clone(),
-            private_counter: AtomicU32::new(self.private_counter.load(Ordering::Relaxed)),
-            message_queues: self.message_queues.clone(),
-            semaphores: self.semaphores.clone(),
-            sem_keys: self.sem_keys.clone(),
-            next_sem_scan_index: self.next_sem_scan_index,
         }
     }
 
@@ -715,6 +754,57 @@ impl SysvShmState {
 
     fn key_name(key: i32) -> String {
         format!("{}-key-{}", sysv_run_scope(), key as u32)
+    }
+}
+
+/// One SysV IPC namespace shared by every logical HVPatch process. Linux fork
+/// does not copy the namespace: children see the same segments, queues, and
+/// semaphore sets, including objects created after the fork.
+#[derive(Debug)]
+pub(super) struct SysvIpcNamespace {
+    pub(super) state: Mutex<SysvShmState>,
+    cleanup_claimed: AtomicBool,
+}
+
+impl SysvIpcNamespace {
+    pub(super) fn new() -> Self {
+        Self {
+            state: Mutex::new(SysvShmState::new()),
+            cleanup_claimed: AtomicBool::new(false),
+        }
+    }
+
+    fn claim_cleanup(&self) -> bool {
+        self.cleanup_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
+/// Per-process attachment bookkeeping. The backing namespace is shared, but
+/// shmat/shmdt state belongs to one Linux process and is inherited by value at
+/// fork just like its VMA graph.
+#[derive(Clone, Debug)]
+pub(super) struct SysvProcessAttachments {
+    /// Map guest VA (returned from shmat) → shmid so shmdt can find which
+    /// segment to decrement when given just an address.
+    attachments: HashMap<u64, i32>,
+    /// Attachment starts passed to remap_file_pages(2). Linux no longer
+    /// accepts them as shmdt(2) segment starts.
+    remapped_attachments: HashSet<u64>,
+    /// A fork snapshot becomes chargeable only after authoritative child
+    /// publication. This prevents every recoverable pre-publication failure
+    /// from leaking one `shm_nattch` per inherited mapping.
+    inheritance_committed: bool,
+}
+
+impl Default for SysvProcessAttachments {
+    fn default() -> Self {
+        Self {
+            attachments: HashMap::new(),
+            remapped_attachments: HashSet::new(),
+            inheritance_committed: true,
+        }
     }
 }
 
@@ -840,9 +930,9 @@ fn scoped_host_sem_key_for_scope(scope: &str, key: i32) -> libc::key_t {
     scoped as libc::key_t
 }
 
-fn shm_nattch_path(path: &std::path::Path) -> PathBuf {
+fn shm_nattch_path_for_generation(path: &std::path::Path, inode: u64) -> PathBuf {
     let mut out = path.as_os_str().to_os_string();
-    out.push(".nattch");
+    out.push(format!(".nattch-{inode}"));
     PathBuf::from(out)
 }
 
@@ -1883,7 +1973,7 @@ fn with_shm_nattch_file<R>(
     use std::io::{Read, Seek, SeekFrom};
     use std::os::fd::AsRawFd;
 
-    let path = shm_nattch_path(&segment.path);
+    let path = &segment.nattch_path;
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1933,6 +2023,36 @@ fn adjust_shm_nattch(segment: &ShmSegment, delta: i64) -> u64 {
     })
 }
 
+/// Drop one live attachment and finalize a tombstoned generation at its exact
+/// last-owner edge. Every decrement path uses this helper so metadata and the
+/// inode-qualified receipt cannot diverge.
+fn decrement_shm_attachment(
+    state: &mut SysvShmState,
+    shmid: i32,
+    lpid: i32,
+    dtime: Option<u64>,
+) -> bool {
+    let remove = state.segments.get_mut(&shmid).is_some_and(|segment| {
+        segment.nattch = adjust_shm_nattch(segment, -1);
+        segment.lpid = lpid;
+        if let Some(dtime) = dtime {
+            segment.dtime = dtime;
+        }
+        segment.removed && segment.pending_attaches == 0 && segment.nattch == 0
+    });
+    if remove && let Some(segment) = state.segments.remove(&shmid) {
+        let _ = std::fs::remove_file(segment.nattch_path);
+    }
+    state.segments.contains_key(&shmid) || remove
+}
+
+fn active_shm_segment_for_path<'a>(state: &'a SysvShmState, path: &Path) -> Option<&'a ShmSegment> {
+    state
+        .segments
+        .values()
+        .find(|segment| !segment.removed && segment.path == path)
+}
+
 /// Open (or create) the backing file for `key`, ftruncate to `size`, and
 /// return (shmid, path, mode). On error returns `Err(linux_errno)`.
 ///
@@ -1969,7 +2089,7 @@ pub(super) fn shmget_open(
             if exclusive && create {
                 return Err(crate::linux_abi::LINUX_EEXIST);
             }
-            if let Some(existing) = state.segments.values().find(|segment| segment.path == path) {
+            if let Some(existing) = active_shm_segment_for_path(state, &path) {
                 let wants_read = flags & 0o400 != 0;
                 let wants_write = flags & 0o200 != 0;
                 if (wants_read && !existing.can_read(creds))
@@ -2015,7 +2135,8 @@ pub(super) fn shmget_open(
     // Use the lower 31 bits of the inode as shmid — Linux shmid_t is i32.
     // Inodes on macOS are 64-bit (HFS+ / APFS) but the low 31 bits give us
     // 2 billion values per fs which is plenty per session.
-    let shmid = (st.st_ino as i32).max(1); // never 0 (would collide with shmctl(IPC_RMID))
+    let inode = st.st_ino as u64;
+    let shmid = (inode as i32).max(1); // never 0 (would collide with shmctl(IPC_RMID))
     let actual_size = if size > 0 { size } else { st.st_size as usize };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2032,6 +2153,7 @@ pub(super) fn shmget_open(
         })
         .or_insert(ShmSegment {
             path: path.clone(),
+            nattch_path: shm_nattch_path_for_generation(&path, inode),
             key,
             size: actual_size,
             mode,
@@ -2045,26 +2167,50 @@ pub(super) fn shmget_open(
             dtime: 0,
             cpid: creator,
             lpid: 0,
+            removed: false,
+            pending_attaches: 0,
         });
     unsafe { libc::close(fd) };
     Ok(shmid)
 }
 
-/// Open the backing file for `shmid` and return a host fd suitable for
-/// mmap(MAP_SHARED). Caller owns the fd. On error returns `Err(linux_errno)`.
-pub(super) fn shmat_open_fd(
-    state: &mut SysvShmState,
+/// Authenticate and pin one exact segment generation, then open its backing
+/// file for `mmap(MAP_SHARED)`. The returned reservation must travel with the
+/// host-alias transaction: commit charges the live attachment, while Drop
+/// rolls the pin back. `IPC_RMID` may tombstone the id after this function
+/// returns, but cannot invalidate this already-authorized attach.
+pub(super) fn reserve_shmat(
+    namespace: &std::sync::Arc<SysvIpcNamespace>,
+    creds: &crate::kernel::Credentials,
     shmid: i32,
-) -> Result<(i32, usize), LinuxErrno> {
+    needs_write: bool,
+) -> Result<(i32, usize, PendingShmat), LinuxErrno> {
+    let mut state = namespace.state.lock();
     let segment = state
         .segments
-        .get(&shmid)
-        .cloned()
+        .get_mut(&shmid)
         .ok_or(crate::linux_abi::LINUX_EINVAL)?;
+    if segment.removed {
+        return Err(crate::linux_abi::LINUX_EINVAL);
+    }
+    if !segment.can_read(creds) || (needs_write && !segment.can_write(creds)) {
+        return Err(LINUX_EACCES);
+    }
+    let pending_attaches = segment
+        .pending_attaches
+        .checked_add(1)
+        .ok_or(LINUX_ENOSPC)?;
     let path_cstr = std::ffi::CString::new(segment.path.as_os_str().as_encoded_bytes())
         .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
     let fd = unsafe { libc::open(path_cstr.as_ptr(), libc::O_RDWR) }.host_syscall_errno()?;
-    Ok((fd, segment.size))
+    segment.pending_attaches = pending_attaches;
+    let reservation = PendingShmat {
+        namespace: std::sync::Arc::clone(namespace),
+        shmid,
+        path: segment.path.clone(),
+        armed: true,
+    };
+    Ok((fd, segment.size, reservation))
 }
 
 /// Unlink the backing file for `shmid`. Existing mmaps remain valid (Linux
@@ -2072,16 +2218,23 @@ pub(super) fn shmat_open_fd(
 pub(super) fn shmctl_rmid(state: &mut SysvShmState, shmid: i32) -> Result<(), LinuxErrno> {
     let segment = state
         .segments
-        .remove(&shmid)
+        .get_mut(&shmid)
+        .filter(|segment| !segment.removed)
         .ok_or(crate::linux_abi::LINUX_EINVAL)?;
+    segment.removed = true;
     let path_cstr = std::ffi::CString::new(segment.path.as_os_str().as_encoded_bytes())
         .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
     let rc = unsafe { libc::unlink(path_cstr.as_ptr()) };
-    let _ = std::fs::remove_file(shm_nattch_path(&segment.path));
     if rc != 0 {
         // Already gone is fine; anything else is a real error but we
         // already removed our entry, so return success — the segment is
         // gone from the user's perspective.
+    }
+    let remove_now = segment.pending_attaches == 0 && segment.nattch == 0;
+    if remove_now {
+        if let Some(segment) = state.segments.remove(&shmid) {
+            let _ = std::fs::remove_file(segment.nattch_path);
+        }
     }
     Ok(())
 }
@@ -2161,21 +2314,18 @@ fn sysvipc_msg_table_from_files() -> String {
 
 impl SyscallDispatcher {
     pub(super) fn commit_host_alias_shmat(&self, commit: HostAliasShmatCommit) {
-        let mut state = self.sysv.lock();
-        if state.attachments.contains_key(&commit.va) || !state.segments.contains_key(&commit.shmid)
-        {
+        let mut process = self.sysv_process.lock();
+        if process.attachments.contains_key(&commit.va) {
             // The host mapping is already installed. Alias exclusion proves no
-            // legitimate shmat/shmdt/shmctl mutation can intervene here, so an
-            // occupied VA or vanished segment is irrecoverable corruption.
+            // legitimate shmat/shmdt mutation can intervene here, so an
+            // occupied VA is irrecoverable corruption.
             std::process::abort();
         }
-        state.attachments.insert(commit.va, commit.shmid);
-        let Some(segment) = state.segments.get_mut(&commit.shmid) else {
-            std::process::abort();
-        };
-        segment.nattch = adjust_shm_nattch(segment, 1);
-        segment.atime = commit.atime;
-        segment.lpid = commit.lpid;
+        let shmid = commit
+            .reservation
+            .commit(commit.atime, commit.lpid)
+            .unwrap_or_else(|()| std::process::abort());
+        process.attachments.insert(commit.va, shmid);
     }
 
     #[allow(dead_code)]
@@ -2184,7 +2334,7 @@ impl SyscallDispatcher {
     }
 
     pub(crate) fn sysvipc_shm_table(&self) -> String {
-        let state = self.sysv.lock();
+        let state = self.sysv.state.lock();
         let mut rows = String::from(
             "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n",
         );
@@ -2217,7 +2367,7 @@ impl SyscallDispatcher {
     }
 
     pub(crate) fn sysvipc_sem_table(&self) -> String {
-        let state = self.sysv.lock();
+        let state = self.sysv.state.lock();
         let mut rows = String::from(
             "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n",
         );
@@ -2250,8 +2400,9 @@ impl SyscallDispatcher {
         addr: u64,
         end: u64,
     ) -> Result<bool, LinuxErrno> {
-        let mut state = self.sysv.lock();
-        for (attached, shmid) in state.attachments.clone() {
+        let mut process = self.sysv_process.lock();
+        let state = self.sysv.state.lock();
+        for (attached, shmid) in process.attachments.clone() {
             let Some(segment) = state.segments.get(&shmid) else {
                 return Err(crate::linux_abi::LINUX_EIDRM);
             };
@@ -2259,14 +2410,14 @@ impl SyscallDispatcher {
                 continue;
             };
             if addr >= attached && end <= attached_end {
-                state.remapped_attachments.insert(attached);
+                process.remapped_attachments.insert(attached);
                 return Ok(true);
             }
         }
         Ok(false)
     }
 
-    fn cleanup_sysv_shm_attachments_on_process_exit(&self) {
+    pub(crate) fn cleanup_sysv_shm_attachments_on_process_exit(&self) {
         // Lock ORDER: `identity_pid()` takes the proc lock, and the /proc
         // renderers (`synthetic_proc_context` -> `/proc/sysvipc/shm`) take
         // proc THEN sysv — so taking sysv first here and proc second is the
@@ -2276,27 +2427,69 @@ impl SyscallDispatcher {
         // wanting sysv, and a third thread wedged behind them delivering
         // SIGTERM. Resolve identity BEFORE touching the sysv lock.
         let lpid = self.identity_pid() as i32;
-        let mut state = self.sysv.lock();
-        let ids = state
-            .attachments
-            .drain()
-            .map(|(_, shmid)| shmid)
-            .collect::<Vec<_>>();
+        let (ids, charged) = {
+            let mut process = self.sysv_process.lock();
+            let charged = process.inheritance_committed;
+            let ids = process
+                .attachments
+                .drain()
+                .map(|(_, shmid)| shmid)
+                .collect::<Vec<_>>();
+            process.remapped_attachments.clear();
+            (ids, charged)
+        };
+        if !charged {
+            return;
+        }
+        let mut state = self.sysv.state.lock();
         for shmid in ids {
-            if let Some(seg) = state.segments.get_mut(&shmid) {
-                seg.nattch = adjust_shm_nattch(seg, -1);
-                seg.lpid = lpid;
+            let _ = decrement_shm_attachment(&mut state, shmid, lpid, None);
+        }
+    }
+
+    /// Fork one logical process's attachment table while retaining one shared
+    /// IPC namespace. The returned snapshot is deliberately uncharged until
+    /// authoritative child publication calls `commit_sysv_fork_inheritance`.
+    pub(super) fn fork_sysv_process_attachments(&self) -> SysvProcessAttachments {
+        let mut process = self.sysv_process.lock().clone();
+        process.inheritance_committed = false;
+        process
+    }
+
+    /// Charge every inherited attachment exactly once after the child task and
+    /// its process context are authoritative. All recoverable fork failpoints
+    /// occur before this boundary and therefore leave `shm_nattch` unchanged.
+    pub(super) fn commit_sysv_fork_inheritance(&self) {
+        let mut process = self.sysv_process.lock();
+        if process.inheritance_committed {
+            return;
+        }
+        let mut state = self.sysv.state.lock();
+        for shmid in process.attachments.values() {
+            if let Some(segment) = state.segments.get_mut(shmid) {
+                segment.nattch = adjust_shm_nattch(segment, 1);
             }
         }
+        process.inheritance_committed = true;
     }
 
     pub(crate) fn cleanup_sysv_ipc_on_process_exit(&self) {
         self.cleanup_sysv_shm_attachments_on_process_exit();
-        if self.is_forked_guest_process() {
+        if self.hvpatch_process().is_some() || self.is_forked_guest_process() {
+            return;
+        }
+        self.cleanup_sysv_ipc_on_run_exit();
+    }
+
+    /// Retire the shared SysV namespace exactly once after the HVPatch process
+    /// topology and executor pool are fully joined. Logical process exit must
+    /// never call this: the root may exit while descendants still use objects.
+    pub(crate) fn cleanup_sysv_ipc_on_run_exit(&self) {
+        if !self.sysv.claim_cleanup() {
             return;
         }
         let shm_segments = {
-            let mut state = self.sysv.lock();
+            let mut state = self.sysv.state.lock();
             SysvIpcService::cleanup_process_exit(&mut state);
             state.semaphores.clear();
             state.sem_keys.clear();
@@ -2308,7 +2501,7 @@ impl SyscallDispatcher {
         };
         for segment in shm_segments {
             let _ = std::fs::remove_file(&segment.path);
-            let _ = std::fs::remove_file(shm_nattch_path(&segment.path));
+            let _ = std::fs::remove_file(&segment.nattch_path);
         }
     }
 
@@ -2318,8 +2511,9 @@ impl SyscallDispatcher {
             let key = key as i32;
             let size = size as usize;
             let creds = this.cred_snapshot();
-            let mut state = this.sysv.lock();
-            match shmget_open(&mut state, &creds, key, size, flags, this.identity_pid() as i32) {
+            let creator = this.identity_pid() as i32;
+            let mut state = this.sysv.state.lock();
+            match shmget_open(&mut state, &creds, key, size, flags, creator) {
                 Ok(shmid) => Ok(DispatchOutcome::Returned { value: shmid as i64 }),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
@@ -2340,21 +2534,14 @@ impl SyscallDispatcher {
                 // while the transaction is deliberately non-destructive.
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let (host_fd, size) = {
-                let mut state = this.sysv.lock();
-                match shmat_open_fd(&mut state, shmid) {
+            let creds = this.cred_snapshot();
+            let lpid = this.identity_pid() as i32;
+            let needs_write = !attach_flags.contains(ShmAttachFlags::RDONLY);
+            let (host_fd, size, reservation) =
+                match reserve_shmat(&this.sysv, &creds, shmid, needs_write) {
                     Ok(v) => v,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                }
-            };
-            let creds = this.cred_snapshot();
-            if let Some(segment) = this.sysv.lock().segments.get(&shmid).cloned() {
-                let needs_write = !attach_flags.contains(ShmAttachFlags::RDONLY);
-                if !segment.can_read(&creds) || (needs_write && !segment.can_write(&creds)) {
-                    unsafe { libc::close(host_fd) };
-                    return Ok(DispatchOutcome::errno(LINUX_EACCES));
-                }
-            }
+                };
 
             // mmap_min_addr floor (default 64 KiB): a process may not place a
             // mapping in the first 64 KiB of the address space. do_shmat sets
@@ -2374,21 +2561,27 @@ impl SyscallDispatcher {
             let hvf_page = crate::trap::HVF_PAGE_SIZE;
             let map_len = align_up_u64(size as u64, hvf_page).unwrap_or(size as u64);
             if addr == 0 && !attach_flags.contains(ShmAttachFlags::RDONLY) {
-                let mut state = this.sysv.lock();
-                if let Some(va) = state.remapped_attachments.iter().next().copied() {
-                    let old_shmid = state.attachments.insert(va, shmid);
+                let mut process = this.sysv_process.lock();
+                let mut state = this.sysv.state.lock();
+                if let Some(va) = process.remapped_attachments.iter().next().copied() {
+                    let old_shmid = process.attachments.insert(va, shmid);
                     if old_shmid != Some(shmid) {
-                        if let Some(old) = old_shmid.and_then(|old| state.segments.get_mut(&old)) {
-                            old.nattch = adjust_shm_nattch(old, -1);
+                        if let Some(old_shmid) = old_shmid {
+                            let _ = decrement_shm_attachment(&mut state, old_shmid, lpid, None);
                         }
-                        if let Some(seg) = state.segments.get_mut(&shmid) {
-                            seg.nattch = adjust_shm_nattch(seg, 1);
-                            seg.atime = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            seg.lpid = this.identity_pid() as i32;
-                        }
+                        drop(state);
+                        reservation
+                            .commit(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
+                                lpid,
+                            )
+                            .unwrap_or_else(|()| std::process::abort());
+                    } else {
+                        drop(state);
+                        drop(reservation);
                     }
                     unsafe { libc::close(host_fd) };
                     return Ok(DispatchOutcome::Returned { value: va as i64 });
@@ -2404,7 +2597,7 @@ impl SyscallDispatcher {
             let requested_va = (addr != 0).then_some(addr & !(linux_page_size - 1));
             if let Some(va) = requested_va
                 && (this.guest_vma_overlaps(va, map_len)
-                    || this.sysv.lock().attachments.contains_key(&va))
+                    || this.sysv_process.lock().attachments.contains_key(&va))
             {
                 // Without SHM_REMAP Linux refuses to replace any existing VMA.
                 // Check before consuming a monotonic alias IPA or touching a host
@@ -2426,7 +2619,7 @@ impl SyscallDispatcher {
                 crate::memory::LINUX_HIGH_VA_THRESHOLD
                     + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE)
             });
-            if this.sysv.lock().attachments.contains_key(&va) {
+            if this.sysv_process.lock().attachments.contains_key(&va) {
                 unsafe { libc::close(host_fd) };
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
@@ -2465,12 +2658,12 @@ impl SyscallDispatcher {
                 },
                 HostAliasShmatCommit {
                     va,
-                    shmid,
                     atime: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0),
-                    lpid: this.identity_pid() as i32,
+                    lpid,
+                    reservation,
                 },
             ));
 
@@ -2505,11 +2698,12 @@ impl SyscallDispatcher {
         fn shmdt(this, cx, addr: u64) {
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch();
             let (shmid, len) = {
-                let state = this.sysv.lock();
-                if state.remapped_attachments.contains(&addr) {
+                let process = this.sysv_process.lock();
+                let state = this.sysv.state.lock();
+                if process.remapped_attachments.contains(&addr) {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                let Some(shmid) = state.attachments.get(&addr).copied() else {
+                let Some(shmid) = process.attachments.get(&addr).copied() else {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
                 let Some(segment) = state.segments.get(&shmid) else {
@@ -2538,9 +2732,10 @@ impl SyscallDispatcher {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let lpid = this.identity_pid() as i32;
-            let mut state = this.sysv.lock();
-            if state.remapped_attachments.contains(&addr)
-                || state.attachments.get(&addr).copied() != Some(shmid)
+            let mut process = this.sysv_process.lock();
+            let mut state = this.sysv.state.lock();
+            if process.remapped_attachments.contains(&addr)
+                || process.attachments.get(&addr).copied() != Some(shmid)
             {
                 // Alias exclusion makes this impossible unless bookkeeping was
                 // mutated outside the contract. The backend unmap has already
@@ -2548,15 +2743,15 @@ impl SyscallDispatcher {
                 // leave two irreconcilable owners.
                 std::process::abort();
             }
-            let Some(seg) = state.segments.get_mut(&shmid) else {
+            if !state.segments.contains_key(&shmid) {
                 // The backend alias is gone and the attachment still names this
                 // segment, so there is no recoverable bookkeeping state.
                 std::process::abort();
-            };
-            seg.nattch = adjust_shm_nattch(seg, -1);
-            seg.dtime = dtime;
-            seg.lpid = lpid;
-            state.attachments.remove(&addr);
+            }
+            if !decrement_shm_attachment(&mut state, shmid, lpid, Some(dtime)) {
+                std::process::abort();
+            }
+            process.attachments.remove(&addr);
             drop(state);
             this.mark_vma_dispatch(&mut host_alias_dispatch);
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -2574,9 +2769,12 @@ impl SyscallDispatcher {
             let creds = this.cred_snapshot();
             match cmd {
                 LINUX_IPC_RMID => {
-                    let mut state = this.sysv.lock();
-                    if let Some(segment) = state.segments.get(&shmid)
-                        && !segment.can_write(&creds)
+                    let mut state = this.sysv.state.lock();
+                    let Some(segment) = state.segments.get(&shmid).filter(|segment| !segment.removed)
+                    else {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    };
+                    if !segment.can_write(&creds)
                     {
                         if segment.mode.is_empty_perms() {
                             let _ = shmctl_rmid(&mut state, shmid);
@@ -2589,8 +2787,8 @@ impl SyscallDispatcher {
                     }
                 }
                 LINUX_IPC_STAT => {
-                    let state = this.sysv.lock();
-                    let segment = match state.segments.get(&shmid) {
+                    let state = this.sysv.state.lock();
+                    let segment = match state.segments.get(&shmid).filter(|segment| !segment.removed) {
                         Some(s) => s.clone(),
                         None => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
                     };
@@ -2637,8 +2835,8 @@ impl SyscallDispatcher {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    let mut state = this.sysv.lock();
-                    match state.segments.get_mut(&shmid) {
+                    let mut state = this.sysv.state.lock();
+                    match state.segments.get_mut(&shmid).filter(|segment| !segment.removed) {
                         Some(seg) => {
                             if !seg.can_write(&creds) {
                                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
@@ -2651,8 +2849,8 @@ impl SyscallDispatcher {
                     }
                 }
                 LINUX_SHM_LOCK | LINUX_SHM_UNLOCK => {
-                    let mut state = this.sysv.lock();
-                    match state.segments.get_mut(&shmid) {
+                    let mut state = this.sysv.state.lock();
+                    match state.segments.get_mut(&shmid).filter(|segment| !segment.removed) {
                         Some(segment) if !segment.can_write(&creds) => {
                             Ok(DispatchOutcome::errno(LINUX_EPERM))
                         }
@@ -2669,10 +2867,16 @@ impl SyscallDispatcher {
                     // segment at that index into `buf` and returns the
                     // shmid. LTP shmctl01 builds an index→shmid mapping by
                     // iterating SHM_STAT(0..N).
-                    let state = this.sysv.lock();
-                    let mut ids: Vec<i32> = state.segments.keys().copied().collect();
+                    let state = this.sysv.state.lock();
+                    let mut ids: Vec<i32> = state
+                        .segments
+                        .iter()
+                        .filter_map(|(id, segment)| (!segment.removed).then_some(*id))
+                        .collect();
                     ids.sort();
-                    let target_id = if cmd == LINUX_SHM_STAT_ANY && state.segments.contains_key(&shmid) {
+                    let target_id = if cmd == LINUX_SHM_STAT_ANY
+                        && state.segments.get(&shmid).is_some_and(|segment| !segment.removed)
+                    {
                         shmid
                     } else {
                         let idx = shmid as usize; // SHM_STAT uses the first arg as idx
@@ -2699,7 +2903,7 @@ impl SyscallDispatcher {
                     // Aggregate info. Linux fills `struct shminfo`
                     // (IPC_INFO) or `struct shm_info` (SHM_INFO). Return
                     // values: max shmid INDEX currently in use (Linux).
-                    let state = this.sysv.lock();
+                    let state = this.sysv.state.lock();
                     let used_ids = state.segments.len() as i64;
                     if buf != 0 {
                         let mut bytes = [0u8; 72];
@@ -2738,7 +2942,7 @@ impl SyscallDispatcher {
                 Ok(key) => key,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            let mut state = this.sysv.lock();
+            let mut state = this.sysv.state.lock();
             match SysvIpcService::msgget(&mut state, &creds, key, msgflg) {
                 Ok(id) => Ok(DispatchOutcome::Returned { value: id.as_i64() }),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -2930,7 +3134,7 @@ impl SyscallDispatcher {
             let exclusive = create_flags.contains(IpcCreateFlags::EXCL);
             let creds = this.cred_snapshot();
             {
-                let state = this.sysv.lock();
+                let state = this.sysv.state.lock();
                 if key != LINUX_IPC_PRIVATE
                     && let Some(guest_semid) = state.sem_keys.get(&key).copied()
                     && let Some(existing) = state.semaphores.get(&guest_semid)
@@ -2963,7 +3167,7 @@ impl SyscallDispatcher {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let mut state = this.sysv.lock();
+            let mut state = this.sysv.state.lock();
             let Ok((guest_semid, scan_index)) = state.allocate_sem_id() else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
             };
@@ -3413,7 +3617,7 @@ fn sysv_msgctl<M: GuestMemory>(
             }
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(msg_queue_wait_path(&path));
-            this.sysv.lock().message_queues.remove(&msqid);
+            this.sysv.state.lock().message_queues.remove(&msqid);
             carrick_thread::platform_futex::carrier_shared_futex_table()
                 .wake(msqid.raw() as u64, u32::MAX);
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -3763,7 +3967,7 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
         };
         let (sem_set, wait_counts) = {
-            let state = self.sysv.lock();
+            let state = self.sysv.state.lock();
             let meta = state.semaphores.get(&guest_semid).ok_or(LINUX_EINVAL);
             match meta {
                 Ok(meta) => (meta.clone(), Arc::clone(&meta.logical_wait_counts)),
@@ -3794,7 +3998,7 @@ impl SyscallDispatcher {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             if let Some(pid) = logical_operator
-                && let Some(meta) = self.sysv.lock().semaphores.get_mut(&guest_semid)
+                && let Some(meta) = self.sysv.state.lock().semaphores.get_mut(&guest_semid)
             {
                 meta.record_logical_semop(pid, sops);
                 meta.otime = now;
@@ -3846,7 +4050,7 @@ impl SyscallDispatcher {
             Ok(guest_semid) => guest_semid,
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
         };
-        let mut state = self.sysv.lock();
+        let mut state = self.sysv.state.lock();
         let Some(meta) = state.semaphores.get_mut(&guest_semid) else {
             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
         };
@@ -4050,7 +4254,7 @@ impl SyscallDispatcher {
         cx: &mut SyscallCtx<M>,
         arg: u64,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let state = self.sysv.lock();
+        let state = self.sysv.state.lock();
         let used_sets = state.semaphores.len() as u32;
         let used_sems = state
             .semaphores
@@ -4096,7 +4300,7 @@ impl SyscallDispatcher {
         arg: u64,
         creds: &crate::kernel::Credentials,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let state = self.sysv.lock();
+        let state = self.sysv.state.lock();
         let Some((guest_semid, meta)) = state
             .semaphores
             .iter()
@@ -4211,10 +4415,11 @@ mod ipc_set_tests {
         file.as_file()
             .set_len(size as u64)
             .expect("size temporary shm backing");
-        dispatcher.sysv.lock().segments.insert(
+        dispatcher.sysv.state.lock().segments.insert(
             shmid,
             ShmSegment {
                 path: file.path().to_path_buf(),
+                nattch_path: file.path().with_extension(format!("nattch-{shmid}")),
                 key: 0,
                 size,
                 mode: ShmPermMode::requested(0o600),
@@ -4228,9 +4433,195 @@ mod ipc_set_tests {
                 dtime: 0,
                 cpid: 1,
                 lpid: 0,
+                removed: false,
+                pending_attaches: 0,
             },
         );
         file
+    }
+
+    #[test]
+    fn logical_fork_shares_namespace_but_retires_only_its_own_attachments() {
+        let parent = SyscallDispatcher::new();
+        let shmid = 4901;
+        let addr = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+        let _backing = insert_test_shm_segment(&parent, shmid, LINUX_PAGE_SIZE as usize);
+        parent.sysv_process.lock().attachments.insert(addr, shmid);
+        parent
+            .sysv
+            .state
+            .lock()
+            .segments
+            .get_mut(&shmid)
+            .expect("parent segment")
+            .nattch = 1;
+
+        let child = parent.fork_clone_in_process(
+            crate::thread::ThreadId::synthetic_for_tests(1),
+            crate::thread::ThreadId::synthetic_for_tests(2),
+            1,
+            2,
+        );
+        assert!(Arc::ptr_eq(&parent.sysv, &child.sysv));
+        assert_eq!(
+            parent.sysv.state.lock().segments[&shmid].nattch,
+            1,
+            "an unpublished fork snapshot must not charge inherited attachments",
+        );
+        assert!(!child.sysv_process.lock().inheritance_committed);
+        child.commit_sysv_fork_inheritance();
+        assert_eq!(
+            parent.sysv.state.lock().segments[&shmid].nattch,
+            2,
+            "authoritative child publication charges one inherited attachment",
+        );
+        assert_eq!(
+            child.sysv_process.lock().attachments.get(&addr),
+            Some(&shmid)
+        );
+
+        parent.cleanup_sysv_shm_attachments_on_process_exit();
+        assert!(parent.sysv_process.lock().attachments.is_empty());
+        assert_eq!(
+            child.sysv_process.lock().attachments.get(&addr),
+            Some(&shmid)
+        );
+        assert_eq!(
+            parent.sysv.state.lock().segments[&shmid].nattch,
+            1,
+            "logical parent exit must preserve the child's namespace object and attachment",
+        );
+
+        let child_only_shmid = 4902;
+        let _child_backing =
+            insert_test_shm_segment(&child, child_only_shmid, LINUX_PAGE_SIZE as usize);
+        assert!(
+            parent
+                .sysv
+                .state
+                .lock()
+                .segments
+                .contains_key(&child_only_shmid),
+            "objects created after fork must be visible through the shared namespace",
+        );
+
+        let state = parent.sysv.state.lock();
+        assert_ne!(
+            state.private_name(),
+            state.private_name(),
+            "shared IPC_PRIVATE allocation must not collide across logical processes",
+        );
+    }
+
+    #[test]
+    fn unpublished_fork_drop_does_not_leak_inherited_nattch() {
+        let parent = SyscallDispatcher::new();
+        let shmid = 4903;
+        let addr = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+        let _backing = insert_test_shm_segment(&parent, shmid, LINUX_PAGE_SIZE as usize);
+        parent.sysv_process.lock().attachments.insert(addr, shmid);
+        parent
+            .sysv
+            .state
+            .lock()
+            .segments
+            .get_mut(&shmid)
+            .unwrap()
+            .nattch = 1;
+
+        let child = parent.fork_clone_in_process(
+            crate::thread::ThreadId::synthetic_for_tests(1),
+            crate::thread::ThreadId::synthetic_for_tests(2),
+            1,
+            2,
+        );
+        drop(child);
+        assert_eq!(parent.sysv.state.lock().segments[&shmid].nattch, 1);
+    }
+
+    #[test]
+    fn pending_shmat_survives_sibling_rmid_and_commits_exact_generation() {
+        let dispatcher = SyscallDispatcher::new();
+        let shmid = 4904;
+        let va = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+        let _backing = insert_test_shm_segment(&dispatcher, shmid, LINUX_PAGE_SIZE as usize);
+        let creds = dispatcher.cred_snapshot();
+        let (fd, _, reservation) = reserve_shmat(&dispatcher.sysv, &creds, shmid, true)
+            .expect("reserve exact segment generation");
+        unsafe { libc::close(fd) };
+        shmctl_rmid(&mut dispatcher.sysv.state.lock(), shmid).expect("tombstone segment");
+        assert_eq!(
+            reserve_shmat(&dispatcher.sysv, &creds, shmid, true).unwrap_err(),
+            LINUX_EINVAL,
+            "the tombstoned id rejects new attaches",
+        );
+
+        dispatcher.commit_host_alias_shmat(HostAliasShmatCommit {
+            va,
+            atime: 99,
+            lpid: 100,
+            reservation,
+        });
+        assert_eq!(
+            dispatcher.sysv_process.lock().attachments.get(&va),
+            Some(&shmid)
+        );
+        let state = dispatcher.sysv.state.lock();
+        let segment = state.segments.get(&shmid).expect("live removed segment");
+        assert!(segment.removed);
+        assert_eq!((segment.pending_attaches, segment.nattch), (0, 1));
+        drop(state);
+
+        dispatcher.cleanup_sysv_shm_attachments_on_process_exit();
+        assert!(!dispatcher.sysv.state.lock().segments.contains_key(&shmid));
+    }
+
+    #[test]
+    fn removed_and_recreated_same_key_generations_keep_independent_receipts() {
+        let directory = tempfile::tempdir().expect("generation receipt directory");
+        let public_path = directory.path().join("key-7");
+        let old_receipt = directory.path().join("key-7.nattch-101");
+        let new_receipt = directory.path().join("key-7.nattch-202");
+        let make_segment = |receipt: PathBuf, mode: u32, removed: bool| ShmSegment {
+            path: public_path.clone(),
+            nattch_path: receipt,
+            key: 7,
+            size: LINUX_PAGE_SIZE as usize,
+            mode: ShmPermMode::requested(mode as u64),
+            uid: NsUid::ROOT,
+            gid: NsGid::ROOT,
+            cuid: NsUid::ROOT,
+            cgid: NsGid::ROOT,
+            nattch: 0,
+            ctime: 1,
+            atime: 0,
+            dtime: 0,
+            cpid: 1,
+            lpid: 0,
+            removed,
+            pending_attaches: 0,
+        };
+        let old = make_segment(old_receipt.clone(), 0o400, true);
+        let new = make_segment(new_receipt.clone(), 0o600, false);
+        assert_eq!(adjust_shm_nattch(&old, 1), 1);
+        assert_eq!(adjust_shm_nattch(&new, 1), 1);
+        assert_eq!(adjust_shm_nattch(&old, 1), 2);
+        assert_eq!(read_shm_nattch(&old), 2);
+        assert_eq!(read_shm_nattch(&new), 1);
+
+        let mut state = SysvShmState::new();
+        state.segments.insert(101, old);
+        state.segments.insert(202, new);
+        let active = active_shm_segment_for_path(&state, &public_path)
+            .expect("replacement generation owns same-key lookup");
+        assert_eq!(active.mode.perms(), 0o600);
+
+        assert!(decrement_shm_attachment(&mut state, 101, 8, None));
+        assert!(old_receipt.exists());
+        assert!(decrement_shm_attachment(&mut state, 101, 9, None));
+        assert!(!state.segments.contains_key(&101));
+        assert!(!old_receipt.exists());
+        assert!(new_receipt.exists());
     }
 
     #[test]
@@ -4612,10 +5003,11 @@ mod ipc_set_tests {
             let dispatcher = SyscallDispatcher::new();
             let shmid = 4240;
             let addr = crate::memory::LINUX_HIGH_VA_THRESHOLD;
-            dispatcher.sysv.lock().segments.insert(
+            dispatcher.sysv.state.lock().segments.insert(
                 shmid,
                 ShmSegment {
                     path: PathBuf::from("/tmp/carrick-shm/test-failing-shmdt"),
+                    nattch_path: PathBuf::from("/tmp/carrick-shm/test-failing-shmdt.nattch"),
                     key: 0,
                     size: LINUX_PAGE_SIZE as usize,
                     mode: ShmPermMode::requested(0o600),
@@ -4629,9 +5021,15 @@ mod ipc_set_tests {
                     dtime: 3,
                     cpid: 4,
                     lpid: 5,
+                    removed: false,
+                    pending_attaches: 0,
                 },
             );
-            dispatcher.sysv.lock().attachments.insert(addr, shmid);
+            dispatcher
+                .sysv_process
+                .lock()
+                .attachments
+                .insert(addr, shmid);
             let mut memory = FailingUnmapMemory::new(0x1000, 0x1000);
             let _ = dispatcher.dispatch_normalized(
                 &dispatcher.capture_one_task_context().unwrap(),
@@ -4654,10 +5052,11 @@ mod ipc_set_tests {
         let shmid = 4245;
         let addr = crate::memory::LINUX_HIGH_VA_THRESHOLD;
         let len = crate::trap::HVF_PAGE_SIZE;
-        dispatcher.sysv.lock().segments.insert(
+        dispatcher.sysv.state.lock().segments.insert(
             shmid,
             ShmSegment {
                 path: PathBuf::from("/tmp/carrick-shm/test-successful-shmdt"),
+                nattch_path: PathBuf::from("/tmp/carrick-shm/test-successful-shmdt.nattch"),
                 key: 0,
                 size: LINUX_PAGE_SIZE as usize,
                 mode: ShmPermMode::requested(0o600),
@@ -4671,9 +5070,15 @@ mod ipc_set_tests {
                 dtime: 0,
                 cpid: 4,
                 lpid: 5,
+                removed: false,
+                pending_attaches: 0,
             },
         );
-        dispatcher.sysv.lock().attachments.insert(addr, shmid);
+        dispatcher
+            .sysv_process
+            .lock()
+            .attachments
+            .insert(addr, shmid);
         let range = crate::vfs::GuestMemoryRange::new(GuestVa(addr), GuestVa(addr + len))
             .expect("shmat metadata range");
         let writable_memfd = kernel_file_description(std::sync::Arc::new(
@@ -4715,8 +5120,14 @@ mod ipc_set_tests {
             .expect("successful shmdt dispatch");
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
         assert!(!dispatcher.range_has_mapping_metadata_for_test(addr, len));
-        let state = dispatcher.sysv.lock();
-        assert!(!state.attachments.contains_key(&addr));
+        assert!(
+            !dispatcher
+                .sysv_process
+                .lock()
+                .attachments
+                .contains_key(&addr)
+        );
+        let state = dispatcher.sysv.state.lock();
         let segment = state.segments.get(&shmid).expect("detached segment");
         assert_eq!(segment.nattch, 0);
         assert_ne!(segment.dtime, 0);
@@ -4759,7 +5170,7 @@ mod ipc_set_tests {
             .expect("shmat is claimed")
             .expect("overlap rejection dispatch");
         assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
-        assert!(dispatcher.sysv.lock().attachments.is_empty());
+        assert!(dispatcher.sysv_process.lock().attachments.is_empty());
     }
 
     #[test]
@@ -4792,17 +5203,18 @@ mod ipc_set_tests {
             .expect("shmat is claimed")
             .expect("boot overlap rejection dispatch");
         assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
-        assert!(dispatcher.sysv.lock().attachments.is_empty());
+        assert!(dispatcher.sysv_process.lock().attachments.is_empty());
     }
 
     #[test]
     fn aborted_host_alias_leaves_sysv_attachment_and_nattch_exact() {
         let dispatcher = SyscallDispatcher::new();
         let shmid = 4241;
-        dispatcher.sysv.lock().segments.insert(
+        dispatcher.sysv.state.lock().segments.insert(
             shmid,
             ShmSegment {
                 path: PathBuf::from("/tmp/carrick-shm/test-pending-shmat"),
+                nattch_path: PathBuf::from("/tmp/carrick-shm/test-pending-shmat.nattch"),
                 key: 0,
                 size: LINUX_PAGE_SIZE as usize,
                 mode: ShmPermMode::requested(0o600),
@@ -4816,6 +5228,8 @@ mod ipc_set_tests {
                 dtime: 3,
                 cpid: 4,
                 lpid: 5,
+                removed: false,
+                pending_attaches: 1,
             },
         );
         let va = crate::memory::LINUX_HIGH_VA_THRESHOLD;
@@ -4840,14 +5254,19 @@ mod ipc_set_tests {
             },
             HostAliasShmatCommit {
                 va,
-                shmid,
                 atime: 99,
                 lpid: 100,
+                reservation: PendingShmat {
+                    namespace: std::sync::Arc::clone(&dispatcher.sysv),
+                    shmid,
+                    path: PathBuf::from("/tmp/carrick-shm/test-pending-shmat"),
+                    armed: true,
+                },
             },
         ));
         {
-            let state = dispatcher.sysv.lock();
-            assert!(!state.attachments.contains_key(&va));
+            assert!(!dispatcher.sysv_process.lock().attachments.contains_key(&va));
+            let state = dispatcher.sysv.state.lock();
             let segment = state.segments.get(&shmid).expect("pending segment");
             assert_eq!((segment.nattch, segment.atime, segment.lpid), (7, 2, 5));
         }
@@ -4855,8 +5274,8 @@ mod ipc_set_tests {
             .claim()
             .expect("claim pending host alias install");
         drop(install);
-        let state = dispatcher.sysv.lock();
-        assert!(!state.attachments.contains_key(&va));
+        assert!(!dispatcher.sysv_process.lock().attachments.contains_key(&va));
+        let state = dispatcher.sysv.state.lock();
         let segment = state.segments.get(&shmid).expect("aborted segment");
         assert_eq!((segment.nattch, segment.atime, segment.lpid), (7, 2, 5));
     }
@@ -4875,10 +5294,11 @@ mod ipc_set_tests {
         // Seed a segment with an initial mode of 0o600. IPC_SET/IPC_STAT operate
         // purely on carrick's metadata, so no host backing file is needed.
         let shmid: i32 = 4242;
-        dispatcher.sysv.lock().segments.insert(
+        dispatcher.sysv.state.lock().segments.insert(
             shmid,
             ShmSegment {
                 path: PathBuf::from("/tmp/carrick-shm/test-ipc-set"),
+                nattch_path: PathBuf::from("/tmp/carrick-shm/test-ipc-set.nattch"),
                 key: 0,
                 size: 4096,
                 mode: ShmPermMode::requested(0o600),
@@ -4892,6 +5312,8 @@ mod ipc_set_tests {
                 dtime: 0,
                 cpid: 1,
                 lpid: 0,
+                removed: false,
+                pending_attaches: 0,
             },
         );
 

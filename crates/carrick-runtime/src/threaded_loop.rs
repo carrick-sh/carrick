@@ -430,6 +430,14 @@ where
         host_for_factory.make_timer_delivery(Arc::clone(&kicker), main_tid),
     );
 
+    // Finish every fallible control-plane setup step before the logical job is
+    // launched. Returning after launch but before the join path would detach a
+    // live carrier owner and skip run-wide namespace retirement.
+    if let Some(exec) = control_exec.as_ref() {
+        kernel.install_control_exec_waker(exec, root_linux_tid)?;
+    }
+    let owns_hvpatch_run = kernel.hvpatch_process.is_some();
+
     let launch = crate::vcpu_loop::launch_persistent_hvpatch_job(
         Arc::clone(&kernel),
         engine,
@@ -445,9 +453,6 @@ where
         carrick_hal::InGuestFlag::for_guest_thread(),
         max_traps,
     );
-    if let Some(exec) = control_exec {
-        kernel.install_control_exec_waker(&exec, root_linux_tid)?;
-    }
     let (outcome, pool_shutdown) = launch.wait_deferring_pool_shutdown();
     // Process children are not Linux thread-group siblings of their creator.
     // The outer root run, which owns the shared HVPatch VM lifetime, joins the
@@ -466,6 +471,13 @@ where
         Some(shutdown) => shutdown.shutdown(),
         None => Ok(()),
     };
+    // All logical processes and persistent executors are now joined. Retire
+    // the shared SysV namespace before any earlier terminal error can return;
+    // a root process may have exited before descendants, so per-process exit
+    // is never sufficient authority for this run-wide cleanup.
+    if owns_hvpatch_run {
+        kernel.dispatcher.cleanup_sysv_ipc_on_run_exit();
+    }
     let outcome = outcome?;
     process_join?;
 
