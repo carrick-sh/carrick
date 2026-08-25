@@ -3543,6 +3543,11 @@ where
             tracing::error!(%failure, "publish persistent failure Kernel exit");
             std::process::abort();
         }
+        // The logical process is no longer runnable. Drop its carrier-wide
+        // run-state publication now; run-state-only records are reclaimed here,
+        // while namespace-owned records retain their zombie metadata until a
+        // consuming wait reaps them.
+        crate::run_state::clear_guest_process(process.pid());
         if let Some(prepared) = prepared_core {
             if core_dumped {
                 crate::probes::hvpatch_core_lifecycle(

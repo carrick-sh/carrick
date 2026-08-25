@@ -24,7 +24,7 @@ use carrick_kernel::arena::{ARENA_PATH_ENV, KernelArena};
 use carrick_kernel::domains::{HostPid, ProcessGeneration};
 use carrick_kernel::process::{
     FLAG_ALIVE, FLAG_DEAD, FLAG_ORPHANED, PROCESS_RECORDS, ProcessRecord, ProcessRecordRef,
-    ProcessSection, REGISTERING,
+    ProcessRecordTransitionAction, ProcessRecordTransitionError, ProcessSection, REGISTERING,
 };
 #[cfg(test)]
 use carrick_kernel::process::{VirtualPtraceControl, VirtualPtraceState};
@@ -51,6 +51,9 @@ pub const NS_INIT_PID: u32 = 1;
 /// unpublished; the real host pid is release-stored only after the rest of the
 /// slot is initialized.
 pub const HOST_PID_REGISTERING: u32 = REGISTERING;
+/// Sentinel used while namespace adoption or process retirement owns the
+/// transition of a shared process record. Readers must treat it as unpublished.
+pub(crate) const NS_PID_REGISTERING: u32 = REGISTERING;
 const RUN_STATE_KIND_TID: u64 = 1 << 40;
 
 pub type MemberSlot = ProcessRecord;
@@ -628,12 +631,26 @@ impl NsSharedRegion {
     /// Claim or reuse a process record for a namespace member. Returns the
     /// record index, or `None` if the process section is full.
     pub fn register(&self, host_pid: u32, ns_pid: u32, parent_host_pid: u32) -> Option<usize> {
-        if let Some(i) = self.slot_of(host_pid) {
-            return Some(i);
-        }
-        if let Some((i, record)) = self.reusable_record_for(host_pid) {
-            fill_member(record, ns_pid, parent_host_pid);
-            return Some(i);
+        let transition_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if let Some(i) = self.slot_of(host_pid) {
+                return Some(i);
+            }
+            if let Some((i, record)) = self.reusable_record_for(host_pid) {
+                fill_member(record, ns_pid, parent_host_pid);
+                return Some(i);
+            }
+            // A matching record whose transition is owned by registration or
+            // retirement is not a free-slot verdict. Retry until it either
+            // publishes namespace identity or unpublishes its host key; falling
+            // through here would create a duplicate member for one host pid.
+            if !self.has_process_record_for(host_pid) {
+                break;
+            }
+            if std::time::Instant::now() >= transition_deadline {
+                return None;
+            }
+            std::thread::yield_now();
         }
         let generation = KernelArena::global().allocate_generation();
         let claimed = self
@@ -682,7 +699,10 @@ impl NsSharedRegion {
             return None;
         }
         self.section.records.iter().position(|s| {
-            s.host_pid.load(Ordering::Acquire) == host_pid && s.ns_pid.load(Ordering::Acquire) != 0
+            let ns_pid = s.ns_pid.load(Ordering::Acquire);
+            s.host_pid.load(Ordering::Acquire) == host_pid
+                && ns_pid != 0
+                && ns_pid != NS_PID_REGISTERING
         })
     }
 
@@ -791,18 +811,47 @@ impl NsSharedRegion {
         let record = &self.section.records[i];
         let generation = record.generation.load(Ordering::Acquire);
         if generation != 0 {
-            self.section.release(ProcessRecordRef {
-                index: i,
-                generation: ProcessGeneration::new(generation),
-            });
-        } else {
-            record.ns_pid.store(0, Ordering::Release);
-            record.exec_generation.store(0, Ordering::Release);
-            record.flags.fetch_and(!MEMBER_DEAD, Ordering::AcqRel);
-            record.flags.fetch_and(!MEMBER_ORPHANED, Ordering::AcqRel);
-            record.exit_status.store(0, Ordering::Relaxed);
+            return self.unregister_reaped_ref(
+                host_pid,
+                ProcessRecordRef {
+                    index: i,
+                    generation: ProcessGeneration::new(generation),
+                },
+            );
         }
-        true
+        if record.try_claim_transition() {
+            let ns_pid = record.ns_pid.load(Ordering::Acquire);
+            let still_member = record.host_pid.load(Ordering::Acquire) == host_pid
+                && ns_pid != 0
+                && ns_pid != NS_PID_REGISTERING;
+            if still_member {
+                record.ns_pid.store(0, Ordering::Release);
+                record.exec_generation.store(0, Ordering::Release);
+                record.flags.fetch_and(!MEMBER_DEAD, Ordering::AcqRel);
+                record.flags.fetch_and(!MEMBER_ORPHANED, Ordering::AcqRel);
+                record.exit_status.store(0, Ordering::Relaxed);
+            }
+            record.release_transition();
+            return still_member;
+        }
+        false
+    }
+
+    fn unregister_reaped_ref(&self, host_pid: u32, record_ref: ProcessRecordRef) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match self
+                .section
+                .with_record_transition(record_ref, HostPid::new(host_pid), |_| {
+                    ((), ProcessRecordTransitionAction::Retire)
+                }) {
+                Ok(_) | Err(ProcessRecordTransitionError::Stale) => return true,
+                Err(ProcessRecordTransitionError::Busy) if std::time::Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(ProcessRecordTransitionError::Busy) => return false,
+            }
+        }
     }
 
     /// Release records whose owner host pid is FULLY gone (no live process and
@@ -829,6 +878,10 @@ impl NsSharedRegion {
         for (index, record) in self.section.records.iter().enumerate() {
             let host_pid = record.host_pid.load(Ordering::Acquire);
             if host_pid == 0 || host_pid == HOST_PID_REGISTERING || host_pid == init {
+                continue;
+            }
+            let ns_pid = record.ns_pid.load(Ordering::Acquire);
+            if ns_pid == NS_PID_REGISTERING || record.transition_claimed() {
                 continue;
             }
             // Run-state TID entries carry thread ids, not process pids; the
@@ -879,11 +932,17 @@ impl NsSharedRegion {
             }
             // Generation-checked release: a concurrent reuse of this slot
             // (new generation) makes the release a no-op.
-            self.section.release(ProcessRecordRef {
+            let record_ref = ProcessRecordRef {
                 index,
                 generation: ProcessGeneration::new(generation),
-            });
-            released += 1;
+            };
+            let did_release = if ns_pid == 0 {
+                self.section
+                    .release_if_namespace_unowned(record_ref, HostPid::new(host_pid))
+            } else {
+                self.section.release(record_ref)
+            };
+            released += usize::from(did_release);
         }
         released
     }
@@ -908,9 +967,11 @@ impl NsSharedRegion {
     fn member_records(&self) -> impl Iterator<Item = &ProcessRecord> {
         self.section.records.iter().filter(|record| {
             let host_pid = record.host_pid.load(Ordering::Acquire);
+            let ns_pid = record.ns_pid.load(Ordering::Acquire);
             host_pid != 0
                 && host_pid != HOST_PID_REGISTERING
-                && record.ns_pid.load(Ordering::Acquire) != 0
+                && ns_pid != 0
+                && ns_pid != NS_PID_REGISTERING
         })
     }
 
@@ -918,17 +979,42 @@ impl NsSharedRegion {
         if host_pid == 0 || host_pid == HOST_PID_REGISTERING {
             return None;
         }
-        self.section.records.iter().enumerate().find(|(_, record)| {
+        self.section
+            .records
+            .iter()
+            .enumerate()
+            .find_map(|(index, record)| {
+                if record.host_pid.load(Ordering::Acquire) != host_pid
+                    || record.generation.load(Ordering::Acquire) == 0
+                    || record.run_state.load(Ordering::Acquire) & RUN_STATE_KIND_TID != 0
+                    || !record.try_claim_transition()
+                {
+                    return None;
+                }
+                let still_reusable = record.host_pid.load(Ordering::Acquire) == host_pid
+                    && record.generation.load(Ordering::Acquire) != 0
+                    && record.ns_pid.load(Ordering::Acquire) == 0
+                    && record.run_state.load(Ordering::Acquire) & RUN_STATE_KIND_TID == 0;
+                if still_reusable {
+                    record.ns_pid.store(NS_PID_REGISTERING, Ordering::Release);
+                    Some((index, record))
+                } else {
+                    record.release_transition();
+                    None
+                }
+            })
+    }
+
+    fn has_process_record_for(&self, host_pid: u32) -> bool {
+        self.section.records.iter().any(|record| {
             record.host_pid.load(Ordering::Acquire) == host_pid
                 && record.generation.load(Ordering::Acquire) != 0
-                && record.ns_pid.load(Ordering::Acquire) == 0
                 && record.run_state.load(Ordering::Acquire) & RUN_STATE_KIND_TID == 0
         })
     }
 }
 
 fn fill_member(record: &ProcessRecord, ns_pid: u32, parent_host_pid: u32) {
-    record.ns_pid.store(ns_pid, Ordering::Relaxed);
     record
         .parent_host_pid
         .store(parent_host_pid, Ordering::Relaxed);
@@ -948,6 +1034,13 @@ fn fill_member(record: &ProcessRecord, ns_pid: u32, parent_host_pid: u32) {
     record.flags.fetch_or(MEMBER_ALIVE, Ordering::AcqRel);
     record.flags.fetch_and(!MEMBER_ORPHANED, Ordering::AcqRel);
     record.flags.fetch_and(!MEMBER_DEAD, Ordering::AcqRel);
+    // Publish namespace identity last. For a reused run-state record the
+    // sentinel is the ownership claim that excludes concurrent retirement;
+    // for a new record host_pid itself remains unpublished until this closure
+    // returns. Either way readers cannot observe partially initialized member
+    // metadata.
+    record.ns_pid.store(ns_pid, Ordering::Release);
+    record.release_transition();
 }
 
 /// A PID namespace descriptor — the per-process attribute (inherited at fork via
@@ -1049,6 +1142,169 @@ mod tests {
             "stale ADOPTED flag must not survive member reuse"
         );
         section.release(r);
+    }
+
+    #[test]
+    fn reusable_record_claim_has_single_winner() {
+        let region = test_region();
+        let section = region.section;
+        let pid = 0x51F1_0002u32;
+        let generation = ProcessGeneration::new(42);
+        let claimed = section
+            .claim(Some(HostPid::new(pid)), generation, |_| {})
+            .expect("claim reusable process record");
+
+        let (_, record) = region
+            .reusable_record_for(pid)
+            .expect("first namespace adoption must claim the reusable record");
+        assert_eq!(
+            record.ns_pid.load(Ordering::Acquire),
+            REGISTERING,
+            "the winning adopter must exclude a concurrent adopter or retirement"
+        );
+        assert!(
+            region.reusable_record_for(pid).is_none(),
+            "only one transition may own a reusable process record"
+        );
+
+        record.ns_pid.store(0, Ordering::Release);
+        record.release_transition();
+        section.release(claimed);
+    }
+
+    #[test]
+    fn public_register_waits_for_in_progress_adoption_instead_of_duplicating() {
+        let region = test_region();
+        let section = region.section;
+        let pid = 0x51F1_0003u32;
+        let generation = ProcessGeneration::new(43);
+        let claimed = section
+            .claim(Some(HostPid::new(pid)), generation, |_| {})
+            .expect("claim reusable process record");
+        let record = &section.records[claimed.index];
+        assert!(record.try_claim_transition());
+        record.ns_pid.store(NS_PID_REGISTERING, Ordering::Release);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            tx.send(region.register(pid, 43, 998)).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(25))
+                .is_err(),
+            "a losing registrar must wait, not publish a duplicate record"
+        );
+
+        record.ns_pid.store(42, Ordering::Release);
+        record.release_transition();
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1))
+                .expect("waiting registrar completes after publication"),
+            Some(claimed.index)
+        );
+        join.join().unwrap();
+        assert_eq!(
+            section
+                .records
+                .iter()
+                .filter(|candidate| {
+                    candidate.host_pid.load(Ordering::Acquire) == pid
+                        && candidate.ns_pid.load(Ordering::Acquire) != 0
+                })
+                .count(),
+            1
+        );
+        section.release(claimed);
+    }
+
+    #[test]
+    fn sweep_preserves_record_owned_by_namespace_transition() {
+        let region = test_region();
+        let section = region.section;
+        let pid = 0x51F1_0004u32;
+        let generation = ProcessGeneration::new(44);
+        let claimed = section
+            .claim(Some(HostPid::new(pid)), generation, |record| {
+                record.flags.fetch_or(
+                    carrick_kernel::process::FLAG_OWNER_GUEST_TASK,
+                    Ordering::Relaxed,
+                );
+            })
+            .expect("claim process record for transition sweep test");
+        let record = &section.records[claimed.index];
+        assert!(record.try_claim_transition());
+        record.ns_pid.store(NS_PID_REGISTERING, Ordering::Release);
+
+        assert_eq!(region.sweep_dead_owner_records(&|_| true), 0);
+        assert_eq!(record.host_pid.load(Ordering::Acquire), pid);
+        assert_eq!(record.generation.load(Ordering::Acquire), generation.raw());
+
+        record.ns_pid.store(42, Ordering::Release);
+        record.release_transition();
+        section.release(claimed);
+    }
+
+    #[test]
+    fn unregister_reaped_waits_for_member_publication_transition() {
+        let region = test_region();
+        let section = region.section;
+        let pid = 0x51F1_0005u32;
+        let generation = ProcessGeneration::new(45);
+        let claimed = section
+            .claim(Some(HostPid::new(pid)), generation, |record| {
+                record.ns_pid.store(42, Ordering::Release);
+                record.flags.fetch_or(MEMBER_DEAD, Ordering::Relaxed);
+            })
+            .expect("claim reaped namespace member");
+        let record = &section.records[claimed.index];
+        assert!(record.try_claim_transition());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            tx.send(region.unregister_reaped(pid)).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(25))
+                .is_err(),
+            "reap must not report success while member publication owns the record"
+        );
+
+        record.release_transition();
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(1))
+                .expect("reap completes after publication unlock")
+        );
+        join.join().unwrap();
+        assert!(section.find(HostPid::new(pid)).is_none());
+    }
+
+    #[test]
+    fn unregister_stale_ref_cannot_release_same_numeric_pid_reuse() {
+        let region = test_region();
+        let section = region.section;
+        let pid = 0x51F1_0006u32;
+        let old = section
+            .claim(
+                Some(HostPid::new(pid)),
+                ProcessGeneration::new(46),
+                |record| record.ns_pid.store(42, Ordering::Release),
+            )
+            .expect("claim old namespace member");
+        assert!(section.release(old));
+        let new = section
+            .claim(
+                Some(HostPid::new(pid)),
+                ProcessGeneration::new(47),
+                |record| record.ns_pid.store(43, Ordering::Release),
+            )
+            .expect("claim same-numeric-pid replacement member");
+
+        assert!(region.unregister_reaped_ref(pid, old));
+        let replacement = &section.records[new.index];
+        assert_eq!(replacement.generation.load(Ordering::Acquire), 47);
+        assert_eq!(replacement.host_pid.load(Ordering::Acquire), pid);
+        assert_eq!(replacement.ns_pid.load(Ordering::Acquire), 43);
+        assert!(section.release(new));
     }
 
     fn test_region() -> NsSharedRegion {
