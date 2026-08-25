@@ -3776,7 +3776,7 @@ where
             }
         }
         if let Some(retirement) = terminal_retirement {
-            let cleanup = if let Some(stage1) = retirement.retirement() {
+            if let Some(stage1) = retirement.retirement() {
                 match control.invalidate_after_exec(
                     stage1,
                     executor_id,
@@ -3800,11 +3800,39 @@ where
                         ));
                     }
                 }
+            }
+            let (_topology, stop_seen) = match acquire_process_retire_topology_lock_servicing(
+                retirement.guest_pid(),
+                retirement.guest_tid().raw(),
+                backend,
+                executor_id,
+                commands,
+                boundary,
+                receipts,
+            ) {
+                Ok(acquired) => acquired,
+                Err(error) => {
+                    let settlement = fail_running_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                        receipts,
+                    );
+                    return Err(with_settlement_error(
+                        format!("terminal topology acquisition failed: {error}"),
+                        settlement,
+                    ));
+                }
+            };
+            deferred_stop |= stop_seen;
+            let cleanup = if retirement.retirement().is_some() {
                 binding.retire_detached_address_space()
             } else {
                 binding.retire_detached_shared_mm_edge()
             };
             if let Err(error) = cleanup {
+                drop(_topology);
                 let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                     resolver.as_ref(),
                     scheduler,
@@ -3818,6 +3846,7 @@ where
                 ));
             }
             if let Err(error) = retirement.complete() {
+                drop(_topology);
                 let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                     resolver.as_ref(),
                     scheduler,
@@ -3830,6 +3859,7 @@ where
                     settlement,
                 ));
             }
+            drop(_topology);
         }
         if let Some(authority) = submission_authority.take() {
             if let Err(authority) = resolver.restore_submission_authority(authority) {
@@ -3983,6 +4013,34 @@ fn service_owner_thread_commands<E: PersistentExecutor>(
                 return Err("executor received an invalid owner-thread command".to_owned());
             }
         }
+    }
+}
+
+fn acquire_process_retire_topology_lock_servicing<E: PersistentExecutor>(
+    pid: i32,
+    tid: i32,
+    backend: &mut E,
+    executor: ExecutorId,
+    commands: &mpsc::Receiver<WorkerCommand>,
+    boundary: &WorkerBoundaryAudit,
+    receipts: &ReceiptLog,
+) -> Result<(carrick_thread::fork_quiesce::TopologyLockGuard, bool), String> {
+    let mut deferred_stop = false;
+    let mut backoff = std::time::Duration::from_micros(50);
+    let max_backoff = std::time::Duration::from_millis(5);
+    loop {
+        if let Some(guard) = carrick_thread::fork_quiesce::try_acquire_topology_lock(
+            carrick_observability::probes::HvpatchTopologyOperation::ProcessRetire,
+            pid,
+            tid,
+        ) {
+            return Ok((guard, deferred_stop));
+        }
+        let stop_seen =
+            service_owner_thread_commands(backend, executor, commands, boundary, receipts)?;
+        deferred_stop |= stop_seen;
+        std::thread::sleep(backoff);
+        backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
     }
 }
 
@@ -4178,6 +4236,10 @@ pub(crate) mod tests {
         blocked_vfork_activation: parking_lot::Mutex<Option<super::PreparedVforkChildActivation>>,
         terminal_settlement_notification: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
         descendant: parking_lot::Mutex<Option<DescendantPublication>>,
+        pending_address_space_retirement:
+            parking_lot::Mutex<Option<crate::hvpatch::PendingAddressSpaceRetirement>>,
+        retire_detached_address_space_gate: parking_lot::Mutex<Option<Arc<Barrier>>>,
+        retire_detached_address_space_resume: parking_lot::Mutex<Option<Arc<Barrier>>>,
     }
 
     impl FakeBinding {
@@ -4197,6 +4259,9 @@ pub(crate) mod tests {
                 blocked_vfork_activation: parking_lot::Mutex::new(None),
                 terminal_settlement_notification: parking_lot::Mutex::new(None),
                 descendant: parking_lot::Mutex::new(None),
+                pending_address_space_retirement: parking_lot::Mutex::new(None),
+                retire_detached_address_space_gate: parking_lot::Mutex::new(None),
+                retire_detached_address_space_resume: parking_lot::Mutex::new(None),
             })
         }
 
@@ -4288,6 +4353,22 @@ pub(crate) mod tests {
                     .send(())
                     .expect("publish fake terminal settlement");
             }
+        }
+
+        fn take_address_space_retirement(
+            &self,
+        ) -> Option<crate::hvpatch::PendingAddressSpaceRetirement> {
+            self.pending_address_space_retirement.lock().take()
+        }
+
+        fn retire_detached_address_space(&self) -> Result<(), TrapError> {
+            if let Some(gate) = self.retire_detached_address_space_gate.lock().clone() {
+                gate.wait();
+            }
+            if let Some(resume) = self.retire_detached_address_space_resume.lock().clone() {
+                resume.wait();
+            }
+            Ok(())
         }
     }
 
@@ -5148,13 +5229,20 @@ pub(crate) mod tests {
         let terminal_invalidate = terminal
             .find("invalidate_after_exec")
             .expect("terminal exact TLBI fanout");
+        let topology_acquire = terminal
+            .find("acquire_process_retire_topology_lock_servicing")
+            .expect("terminal topology acquisition");
         let detached_cleanup = terminal
             .find("retire_detached_address_space")
             .expect("detached stage-2/inventory cleanup");
         let terminal_release = terminal
             .find("retirement.complete()")
             .expect("terminal ASID/root release");
-        assert!(terminal_invalidate < detached_cleanup && detached_cleanup < terminal_release);
+        assert!(
+            terminal_invalidate < topology_acquire
+                && topology_acquire < detached_cleanup
+                && detached_cleanup < terminal_release
+        );
         let pre_load = worker_loop
             .split("if let Err(error) = backend.load(&task)")
             .next()
@@ -8643,6 +8731,128 @@ pub(crate) mod tests {
                 reason: ExecutionFailure::SnapshotRestoreFailed,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn terminal_retirement_holds_topology_lock_across_detached_cleanup_and_release() {
+        let (process, context) = crate::hvpatch::process_context_for_tests(14_990);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(context.kernel())));
+        let factory = Arc::new(FakeFactory::default());
+        let binding = FakeBinding::new(99, [Step::Exit]);
+        let entered_cleanup = Arc::new(Barrier::new(2));
+        let resume_cleanup = Arc::new(Barrier::new(2));
+        *binding.retire_detached_address_space_gate.lock() = Some(Arc::clone(&entered_cleanup));
+        *binding.retire_detached_address_space_resume.lock() = Some(Arc::clone(&resume_cleanup));
+        let tid = ThreadId::from_guest_supplied_tid(context.thread().key().tid.raw());
+        let pending = process
+            .begin_address_space_retirement(0, tid, None)
+            .expect("pending retirement");
+        *binding.pending_address_space_retirement.lock() = Some(pending);
+        factory.install(&context, Arc::clone(&binding));
+
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        let generation = publish(&context, 99);
+        let authority = enqueue_root(&scheduler, &context, generation);
+        drop(authority);
+
+        entered_cleanup.wait();
+
+        // While detached terminal cleanup is running, the executor must hold the
+        // ProcessRetire topology lock. Concurrent attempts to acquire topology
+        // locks for fork or COW must fail.
+        let try_fork = carrick_thread::fork_quiesce::try_acquire_topology_lock(
+            carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
+            process.pid(),
+            context.thread().key().tid.raw(),
+        );
+        assert!(
+            try_fork.is_none(),
+            "while detached terminal cleanup is running, InProcessFork must fail to acquire topology lock"
+        );
+
+        let try_cow = carrick_thread::fork_quiesce::try_acquire_topology_lock(
+            carrick_observability::probes::HvpatchTopologyOperation::FrameCow,
+            process.pid(),
+            context.thread().key().tid.raw(),
+        );
+        assert!(
+            try_cow.is_none(),
+            "while detached terminal cleanup is running, FrameCow must fail to acquire topology lock"
+        );
+
+        resume_cleanup.wait();
+        pool.shutdown().expect("pool shutdown");
+
+        let try_after = carrick_thread::fork_quiesce::try_acquire_topology_lock(
+            carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
+            process.pid(),
+            context.thread().key().tid.raw(),
+        );
+        assert!(
+            try_after.is_some(),
+            "after terminal retirement completes, topology lock must be released"
+        );
+    }
+
+    #[test]
+    fn terminal_retirement_topology_acquisition_services_owner_commands_while_contended() {
+        let (process, context) = crate::hvpatch::process_context_for_tests(14_991);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(context.kernel())));
+        let factory = Arc::new(FakeFactory::default());
+        let binding = FakeBinding::new(101, [Step::Exit]);
+        let tid = ThreadId::from_guest_supplied_tid(context.thread().key().tid.raw());
+        let pending = process
+            .begin_address_space_retirement(0, tid, None)
+            .expect("pending retirement");
+        *binding.pending_address_space_retirement.lock() = Some(pending);
+        factory.install(&context, Arc::clone(&binding));
+
+        // Hold the topology lock before the executor reaches terminal retirement
+        let held_topology = carrick_thread::fork_quiesce::acquire_topology_lock(
+            carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
+            process.pid(),
+            context.thread().key().tid.raw(),
+        );
+
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        let executor_id = pool.executor_ids()[0];
+        let generation = publish(&context, 101);
+        let authority = enqueue_root(&scheduler, &context, generation);
+        drop(authority);
+
+        // Give the executor time to enter the retirement topology acquisition retry loop
+        std::thread::sleep(Duration::from_millis(50));
+
+        // While topology is held by a peer, perform ASID invalidation targeting this executor
+        let (proc2, _ctx2) = crate::hvpatch::process_context_for_tests(14_992);
+        let lease2 = proc2.stage1_mm_lease().expect("exact MM lease");
+        lease2
+            .begin_asid_load(executor_id)
+            .expect("load admission")
+            .mark_resident()
+            .expect("resident executor");
+        let retired2 = proc2
+            .mm_resources()
+            .retire(proc2.task_key())
+            .expect("retire process MM");
+        let retirement2 = retired2
+            .retirement()
+            .expect("last MM owner retirement authority");
+
+        pool.invalidate_asid_retirement(retirement2)
+            .expect("executor must service InvalidateAsid while waiting for topology lock");
+        assert!(retirement2.pending().is_empty());
+        retired2.complete().expect("complete second retirement");
+
+        // Release the topology lock so the executor can acquire it and finish
+        drop(held_topology);
+
+        pool.shutdown().expect("pool shutdown");
+
+        assert!(matches!(
+            context.thread().execution_state(),
+            ThreadExecutionState::Exited { .. }
         ));
     }
 }

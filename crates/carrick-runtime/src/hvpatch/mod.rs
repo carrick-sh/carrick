@@ -389,6 +389,7 @@ pub(crate) struct RetiredThreadResources {
     files: std::sync::Arc<crate::kernel::FileTable>,
 }
 
+#[derive(Debug)]
 pub struct PendingAddressSpaceRetirement {
     retired: RetiredStage1Mm,
     pid: i32,
@@ -400,6 +401,14 @@ pub struct PendingAddressSpaceRetirement {
 impl PendingAddressSpaceRetirement {
     pub(crate) fn retirement(&self) -> Option<&Stage1MmRetirement> {
         self.retired.retirement()
+    }
+
+    pub(crate) fn guest_pid(&self) -> i32 {
+        self.pid
+    }
+
+    pub(crate) fn guest_tid(&self) -> crate::thread::ThreadId {
+        self.tid
     }
 
     pub(crate) fn complete(self) -> Result<(), String> {
