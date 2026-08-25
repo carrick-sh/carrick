@@ -2246,7 +2246,7 @@ mod tests {
     }
 
     #[test]
-    fn destructive_exec_releases_the_vfork_parent_gate() {
+    fn destructive_exec_defers_vfork_parent_release_until_scheduler_publication() {
         let (parent, root) = authoritative_root();
         let prepared_mm = parent.mm_resources().prepare_child().unwrap();
         let stage1_root = prepared_mm.binding().stage1_root.gpa().raw();
@@ -2283,11 +2283,12 @@ mod tests {
             .commit_exec(prepared_exec, stage1_root, test_vma_source())
             .unwrap();
         assert_eq!(committed.thread().key().tid, leader_tid);
+        assert_eq!(wait.released_reason(), None);
+        finalize_test_child(&child, 0, child_tid);
         assert_eq!(
             wait.released_reason(),
-            Some(crate::kernel::VforkReleaseReason::Exec)
+            Some(crate::kernel::VforkReleaseReason::Exit)
         );
-        finalize_test_child(&child, 0, child_tid);
     }
 
     #[test]

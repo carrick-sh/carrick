@@ -1767,7 +1767,7 @@ impl Scheduler {
         lease: ThreadExecutionLease,
         publish: impl FnOnce(&super::exec::CommittedExecSchedulerParts) -> Result<T, String>,
     ) -> Result<T, String> {
-        let _transition = self.generation_transition.lock();
+        let generation_transition = self.generation_transition.lock();
         let committed = committed
             .into_scheduler_parts()
             .map_err(|error| error.to_string())?;
@@ -1831,6 +1831,10 @@ impl Scheduler {
         };
         running.binding = successor;
         running.lease = Some(lease);
+        drop(generation_transition);
+        self.kernel
+            .release_vfork_after_exec_publication(committed.publication_receipt)
+            .map_err(|error| error.to_string())?;
         Ok(published)
     }
 
@@ -2821,8 +2825,86 @@ mod tests {
     }
 
     #[test]
+    fn vfork_exec_release_follows_exact_scheduler_retarget() {
+        let (kernel, parent) = bootstrap(11_075);
+        let published = kernel
+            .reserve_fork(
+                &parent,
+                ClonePlan::from_flags(LinuxCloneFlags::VFORK | LinuxCloneFlags::VM)
+                    .expect("vfork plan"),
+                "scheduler vfork exec".to_owned(),
+                None,
+            )
+            .expect("reserve vfork")
+            .prepare_reference(ThreadId::synthetic_for_tests(21_075))
+            .expect("prepare vfork")
+            .commit()
+            .expect("publish vfork");
+        let (first, wait) = published.into_parts().expect("start vfork child");
+        let wait = wait.expect("vfork parent wait");
+        publish(&first, 75);
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let kick = Arc::new(RecordingKick::default());
+        let registration = scheduler.register_executor(kick).unwrap();
+        scheduler.make_runnable(first.thread().key()).unwrap();
+        let mut running = scheduler.take(&registration).unwrap();
+        let prepared = kernel
+            .prepare_exec_with_registry_id(&first, ThreadId::synthetic_for_tests(31_075), None)
+            .unwrap();
+        let old_lease = running.take_lease();
+        first.thread().exit_from_executor(old_lease).unwrap();
+        let committed = kernel.commit_exec_transition(prepared, None).unwrap();
+        let replacement = committed.context().retain_exact();
+        let replacement_mm = replacement.shared().mm().id();
+        let committed = committed
+            .attach_successor_asid_generation(replacement_mm, replacement_mm.raw())
+            .unwrap();
+        assert_eq!(
+            wait.released_reason(),
+            None,
+            "Kernel exec publication is not the HVPatch successor publication"
+        );
+        replacement
+            .thread()
+            .publish_initial_task_state(task_state(&replacement, 76))
+            .unwrap();
+        let replacement_lease = replacement
+            .thread()
+            .claim_runnable(registration.id())
+            .unwrap();
+
+        scheduler
+            .retarget_running_exec(&mut running, committed, replacement_lease, |_| {
+                Ok::<_, String>(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            wait.released_reason(),
+            Some(crate::kernel::VforkReleaseReason::Exec)
+        );
+        scheduler.settle_exited(running).unwrap();
+        scheduler.unregister_executor(&registration).unwrap();
+    }
+
+    #[test]
     fn exec_retarget_rejects_lease_asid_identity_not_minted_by_transition() {
-        let (kernel, first) = bootstrap(11_075);
+        let (kernel, parent) = bootstrap(11_076);
+        let published = kernel
+            .reserve_fork(
+                &parent,
+                ClonePlan::from_flags(LinuxCloneFlags::VFORK | LinuxCloneFlags::VM)
+                    .expect("vfork plan"),
+                "scheduler wrong-ASID vfork exec".to_owned(),
+                None,
+            )
+            .expect("reserve vfork")
+            .prepare_reference(ThreadId::synthetic_for_tests(21_076))
+            .expect("prepare vfork")
+            .commit()
+            .expect("publish vfork");
+        let (first, wait) = published.into_parts().expect("start vfork child");
+        let wait = wait.expect("vfork parent wait");
         publish(&first, 75);
         let scheduler = Scheduler::new(Arc::clone(&kernel));
         let kick = Arc::new(RecordingKick::default());
@@ -2865,6 +2947,22 @@ mod tests {
             replacement.thread().execution_state(),
             ThreadExecutionState::Failed { .. }
         ));
+        assert_eq!(
+            wait.released_reason(),
+            None,
+            "failed retarget must leave the vfork parent blocked"
+        );
+        kernel
+            .exit_task(
+                first.task().key().id,
+                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("exit exact committed child");
+        assert_eq!(
+            wait.released_reason(),
+            Some(crate::kernel::VforkReleaseReason::Exit)
+        );
         scheduler.unregister_executor(&registration).unwrap();
     }
 
