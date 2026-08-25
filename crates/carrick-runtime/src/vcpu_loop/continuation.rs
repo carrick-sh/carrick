@@ -558,6 +558,20 @@ impl ContinuationFamily {
             Self::VforkParent => 16,
         }
     }
+
+    /// Whether a published task event is a producer edge for this wait.
+    ///
+    /// Synthetic logical descriptors have no host fd to poll, so their
+    /// producers publish into the descriptor and signal readiness through the
+    /// task-event generation. Other families have exact producer generations
+    /// (futex/shared-word/vfork), timers, or signal state and must not turn an
+    /// unrelated task event into successful completion.
+    const fn accepts_task_event(self) -> bool {
+        matches!(
+            self,
+            Self::WaitOnFds | Self::WaitOnFdsSelect | Self::WaitOnPollFds
+        )
+    }
 }
 
 pub const fn is_blocking_dispatch_outcome(outcome: &DispatchOutcome) -> bool {
@@ -2537,7 +2551,7 @@ impl CarrierWaitServiceInner {
         };
         if let Some(event) = probe.event_after_task_wake() {
             self.publish_event(token, event);
-        } else if task_event_fired && probe.family != ContinuationFamily::VforkParent {
+        } else if task_event_fired && probe.family.accepts_task_event() {
             self.publish_event(token, ContinuationEvent::Ready);
         }
     }
@@ -5393,6 +5407,50 @@ mod tests {
                 .state,
             RegistrationState::Ready,
             "a real task event must redispatch the child wait"
+        );
+    }
+
+    #[test]
+    fn futex_wait_ignores_unrelated_task_event_until_generation_changes() {
+        let (kernel, context) = bootstrap(15_022);
+        let generation = publish(&context, 0x302);
+        let futex = Arc::new(FutexTable::new());
+        let address = 0xcafe;
+        let mut continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::FutexWait {
+                wait: futex.prepare_wait(address),
+                timeout: None,
+            },
+            capture(&context, generation, ContinuationBackend::Hvpatch),
+        )
+        .expect("futex continuation");
+        continuation.bind_product_futex(&futex);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let service = CarrierWaitService::new(scheduler);
+        let mut registration = service.prepare_registration(&continuation);
+        let token = registration.wake_token();
+        service
+            .enroll(&mut registration)
+            .expect("enroll futex wait");
+
+        assert!(kernel.publish_task_event_and_wake(context.task().key(), || true));
+        assert_eq!(
+            service
+                .inner
+                .state
+                .lock()
+                .entries
+                .get(&token.continuation())
+                .expect("futex registration after unrelated task event")
+                .state,
+            RegistrationState::Enrolled,
+            "an unrelated task event must not manufacture futex readiness",
+        );
+
+        assert_eq!(futex.wake(address, 1), 1);
+        assert_eq!(
+            await_event(&service, token).expect("exact futex generation wake"),
+            ContinuationEvent::Ready,
         );
     }
 
