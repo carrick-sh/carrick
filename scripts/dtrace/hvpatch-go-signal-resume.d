@@ -3,8 +3,8 @@
  *
  * WHAT: records Go's exact tgkill(2) request, Linux signal delivery, AArch64
  * sigframe inject/restore, guest exit/exit_group requests, typed Carrick
- * thread-loop terminal reasons, and terminal
- * guest-fault register tuples needed to
+ * thread-loop terminal reasons, persistent-executor task switches, and
+ * terminal guest-fault register tuples needed to
  * decide whether SIGURG async preemption is lost before kernel publication,
  * between publication and delivery, during rt_sigreturn, or after the restored
  * guest context resumes.  The host pid/tid, source/target Linux pid/tid,
@@ -25,6 +25,13 @@
  *   (0 guest exit, 1 loop-top exec replacement, 2 post-wait exec replacement,
  *   3 vfork parent terminal cancellation, 4 process-terminal loser), and
  *   reason-specific detail.
+ * - hvpatch-executor-lifecycle: executor ID, stable phase (0 create, 1 load,
+ *   2 save, 3 switch, 4 destroy, 5 ASID invalidation), Carrick thread serial,
+ *   execution generation, and ASID generation. A save/load between restore and
+ *   fault means host-thread identity alone does not identify the logical task.
+ * - vcpu-fault: ESR, ELR, FAR, guest x30, guest SP_EL0, and a legacy sixth
+ *   process-ID field. macOS does not expose a reliable sixth USDT argument, so
+ *   this consumer deliberately reads only args 0..4; x30 and SP are reliable.
  * - vcpu-fault-regs: ESR, ELR, FAR, instruction, Rn, X[Rn].
  * - vcpu-fault-gprs: x0..x5 for the immediately preceding vcpu-fault-regs.
  *
@@ -39,7 +46,7 @@
 
 dtrace:::BEGIN
 {
-    printf("HVPATCHGOSIG1|header|version=2\n");
+    printf("HVPATCHGOSIG1|header|version=3\n");
 }
 
 carrick*:::hvpatch-syscall-service-begin
@@ -106,6 +113,14 @@ carrick*:::hvpatch-thread-terminal
         (int32_t)arg2, (uint32_t)arg3, (int32_t)arg4);
 }
 
+carrick*:::hvpatch-executor-lifecycle
+/(pid == $target || progenyof($target))/
+{
+    printf("HVPATCHGOSIG1|executor_lifecycle|ts=%llu|host_pid=%d|host_tid=%d|executor=%u|phase=%u|thread_serial=%llu|execution_generation=%llu|asid_generation=%llu\n",
+        timestamp, pid, tid, (uint32_t)arg0, (uint32_t)arg1,
+        (uint64_t)arg2, (uint64_t)arg3, (uint64_t)arg4);
+}
+
 carrick*:::signal-inject
 /(pid == $target || progenyof($target))/
 {
@@ -118,6 +133,14 @@ carrick*:::signal-restore
 {
     printf("HVPATCHGOSIG1|restore|ts=%llu|host_pid=%d|host_tid=%d|saved_pc=0x%llx|frame_sp=0x%llx|magic=0x%llx\n",
         timestamp, pid, tid, arg0, arg1, arg2);
+}
+
+carrick*:::vcpu-fault
+/(pid == $target || progenyof($target))/
+{
+    self->fault_elr = arg1;
+    printf("HVPATCHGOSIG1|fault_core|ts=%llu|host_pid=%d|host_tid=%d|esr=0x%llx|elr=0x%llx|far=0x%llx|x30=0x%llx|sp=0x%llx\n",
+        timestamp, pid, tid, arg0, arg1, arg2, arg3, arg4);
 }
 
 carrick*:::vcpu-fault-regs
