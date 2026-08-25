@@ -1,6 +1,6 @@
 # Carrick exact conformance closure handoff
 
-**Updated:** 2026-08-25 (session 8 — final closure candidate reduced to three red rows)
+**Updated:** 2026-08-25 (session 8 — host-subprocess retirement closed; core roadmap restored)
 
 **Canonical host/lane:** macOS, Apple Silicon, HVF/HVPatch, Linux arm64 guest
 
@@ -26,7 +26,7 @@ only when all five hold together on one clean-tree signed artifact:
    ASID-maintenance fault.
 3. **The shell reducer exits 0.**
    `carrick run ubuntu:24.04 --raw --fs host /bin/sh -c '/bin/echo hi'` exits 0,
-   ten runs running, with `/bin/bash -c` clean as the fork-not-vfork control.
+   ten runs in a row, with `/bin/bash -c` clean as the fork-not-vfork control.
 4. **`just ci` green end to end**, status read from a FILE and never from a
    pipe, including `lint-domains` with the host-authority census reconciled by
    reviewing or eliminating what survives deletion — never a bulk re-bless.
@@ -46,7 +46,7 @@ Spec: `docs/superpowers/specs/2026-08-22-hvpatch-fork-lifecycle-closure-design.m
 Plan: `docs/superpowers/plans/2026-08-22-hvpatch-fork-lifecycle-closure.md`
 Baseline: `docs/perf-results/2026-08-22-fork-closure-baseline.md`
 
-### SUSPENDED prior objective — final fork-lifecycle closure still red
+### RESTORED objective — fork-lifecycle prerequisite is closed
 
 The exact-conformance-and-performance objective below governed this file until
 2026-08-22. It was **suspended** because it was unmeasurable in that state:
@@ -55,12 +55,14 @@ kernel cannot tear down a process. Percentages and ratios measured against that
 are noise. Its first clause — "make the conformance gate fail closed and freeze
 the declared surface" — was also quietly falsified: two probes had no binaries
 and were being silently skipped, so the frozen surface was not being measured.
-Criterion 5 above will fix that permanently, but the final Session 8 closure
-run is still red in three rows. Keep this objective suspended until those rows
-close on one signed artifact. Do not divert into retired API cleanup: the
-remaining work is kernel-emulation diagnosis in exec, clone/fs, and ptrace.
+Session 8 has now closed all five prerequisite criteria on one signed artifact:
+the file-backed CI status is `0`, the fail-closed probe closure is **838/838
+generic + 40/40 dedicated**, the 40-run fork-lifecycle stress and shell controls
+are green, and scoped cleanup is empty. The objective below is therefore active
+again. Do not divert into retired API cleanup; resume the 2,127-suite core
+emulation roadmap, correctness first and performance only after exact parity.
 
-Restore verbatim once the three final reducers close:
+Restored verbatim after the three final reducers closed:
 
 > On the canonical macOS/HVF arm64 HVPatch lane, first make the conformance gate
 > fail closed and freeze the current 2,127-suite declared surface; then achieve
@@ -81,14 +83,13 @@ Restore verbatim once the three final reducers close:
 > The goal is still active. Do not mark it complete, bless a baseline, weaken the
 > denominator, add an excuse, accept a retry, or start final performance work.
 
-## SESSION 8 — 2026-08-25: final closure candidate is 835/838
+## SESSION 8 — 2026-08-25: host-subprocess retirement closed at 838/838 + 40/40
 
-This remains prerequisite work, not completion of Carrick's 2,127-suite
-correctness and <=2x roadmap. The HVPatch kernel now has one shipped execution
-path and the legacy host-process-per-guest-process machinery is retired. Two
-late kernel bugs were fixed red-first, but the final closure artifact exposed
-three remaining kernel-emulation reducers, so the five-item objective is not
-closed yet.
+This closes the prerequisite, not Carrick's 2,127-suite correctness and <=2x
+roadmap. The HVPatch kernel now has one shipped execution path and the legacy
+host-process-per-guest-process machinery is retired. The final three
+kernel-emulation reducers were fixed red-first, reviewed, and closed on the
+same signed artifact that passed the exhaustive probe and lifecycle gates.
 
 ### What closed
 
@@ -107,11 +108,34 @@ closed yet.
    as a real task wake, and `WaitOnHvpatchChild` therefore self-woke forever.
    Enrollment now samples real signal state; only the task-wake path performs
    unconditional process-wait redispatch.
+5. **exec-from-thread revision race:** the runtime previously captured the
+   surviving Kernel context and only later reserved exec. A late sibling
+   retirement advanced the task revision between those operations, so a valid
+   nonleader exec failed closed as a foreign context. HVPatch now selects the
+   exact live Linux TID and installs the exec reservation under one registry
+   write lock; every later ownership check uses that atomically selected
+   context.
+6. **futex false readiness / clonefsumask timeout:** a task event from sibling
+   thread retirement completed every non-vfork continuation, including a
+   private futex wait, before the real clear-child-TID wake. The continuation
+   was then discarded and the exact later wake was lost. Task-event readiness
+   is now typed to FD-wait families; futex waits require their own generation
+   edge.
+7. **ptrace early-resume race:** the tracer could consume the stop and issue
+   `PTRACE_KILL` before the tracee settled its stop boundary. The tracee then
+   re-entered EL0 before consuming SIGKILL. A typed ptrace resume command now
+   preserves the stop until tracee settlement and services the queued signal
+   synchronously before guest entry. Codex review additionally shortened the
+   registry-lock scope before task-local settlement locks.
 
-The final two fixes are `80ab3cf3` (retired-page reuse) and `ab31aedc`
+The two preceding fixes are `80ab3cf3` (retired-page reuse) and `ab31aedc`
 (enrollment versus task wake). Durable mmap-publication topology tracing is
 `42e690c8`. The reviewed four-row census-coordinate reconciliation is
 `fb824575`, with its independent compiler receipt bound by `90299822`.
+The three closing reducers are `c3e77911` (atomic exec survivor), `d9505f1c`
+(exact futex wake authority), and `157ed0e2` (ptrace stop settlement). Their
+seven coordinate-only authority-census moves are reviewed in `045d5bb5` and
+the compiler receipt is bound by `d6269323`.
 
 ### Debug receipts and red-first proof
 
@@ -132,57 +156,90 @@ The final two fixes are `80ab3cf3` (retired-page reuse) and `ab31aedc`
   `sudo -n scripts/sudo/kill.sh handoff-session8-mtforkcorrupt-postfix-stress`
   and proved zero remaining run-ID processes. `sudo -n -l` was checked before
   debug work; the required Carrick/lsof/dtruss/lldb/dtrace scopes are NOPASSWD.
+- The load-only `clonefsumask` wedge was captured with `carrick debug
+  lldb-snapshot` under
+  `target/perf/handoff-session8-clonefsumask-load-snapshot/`. The carrier ring
+  showed the parent futex continuation falsely settling on a sibling task
+  event, then the real `FUTEXWAKE` returning one after the continuation was
+  gone. `futex_wait_ignores_unrelated_task_event_until_generation_changes`
+  failed in the broken state and passes after the typed wake split.
+- `nonleader_exec_preparation_reselects_survivor_after_leader_retirement`
+  failed with the exact foreign-context error and now passes.
+  `ptrace_resume_before_tracee_settlement_keeps_the_stop_authoritative` failed
+  because early resume erased the stop and now proves atomic SIGKILL handoff.
+- The combined runtime battery passed **1,743/1,743** outside the restrictive
+  sandbox; formatting, diff checks, and focused clippy were green before the
+  signed closure build.
 
-### Closing receipts (current final candidate)
+### Closing receipts (accepted artifact)
 
 The closing commands are file-backed; never infer their status from a pipe:
 
 ```sh
 target/perf/run-file-backed-gate.sh \
-  target/perf/handoff-session8-just-ci-final.log \
-  target/perf/handoff-session8-just-ci-final.status \
+  target/perf/handoff-session8-postreducers-just-ci-v2.log \
+  target/perf/handoff-session8-postreducers-just-ci-v2.status \
   env RUSTC_WRAPPER= RUST_TEST_THREADS=1 just ci
 
 target/perf/run-file-backed-gate.sh \
-  target/perf/handoff-session8-conformance-probes-closure-final.log \
-  target/perf/handoff-session8-conformance-probes-closure-final.status \
-  env RUSTC_WRAPPER= RUST_TEST_THREADS=1 just conformance-probes-closure
+  target/perf/handoff-session8-postreducers-conformance-probes-closure.log \
+  target/perf/handoff-session8-postreducers-conformance-probes-closure.status \
+  env RUSTC_WRAPPER= RUST_TEST_THREADS=1 CARRICK_PROBE_WORKERS=1 \
+  just conformance-probes-closure
 ```
 
-The CI status is `0`. The closure status is currently `1`: 835 of 838 generic
-rows passed and the scenario phase did not run after the generic gate failed.
-The three reds in
-`target/perf/handoff-session8-conformance-probes-closure-final.log` are:
+Both status files contain exactly `0`. Token-based machine counting of the
+completed closure receipt is **838 generic PASS / 40 scenario PASS / 0 FAIL /
+0 SKIP / 0 gating DIFF**. (An anchored line count sees 837 because Rust prefixes
+the first PASS with `test conformance_probes ...`; counting the structured token
+is the correct complete count.) The serial generic phase completed in 616.79 s
+and the dedicated driver reports 40 rows, zero red.
 
-- `arm64:musl:execfromthread`: SIGABRT after authoritative Kernel exec rejected
-  a foreign/internally inconsistent context, followed by an active MM drop;
-- `arm64:gnu:clonefsumask`: silent 45-second timeout;
-- `arm64:gnu:ptracekillcont`: exit 0, but `kill_handler_ok=false` instead of
-  Linux's `true`.
+The closure-built artifact remained byte-identical through every subsequent
+control. Exact identity is recorded in
+`target/perf/handoff-session8-final-artifact-provenance.txt`:
 
-After fixing them, both status files must contain exactly `0`. The closure log
-must machine-count
-838 generic passes, 40 scenario passes, zero failures, zero skips, and zero
-gating DIFF records. The closure build is the artifact subsequently exercised
-by 40 serial MUSL `mtforkcorrupt` runs, ten `/bin/sh -c '/bin/echo hi'` runs,
-and one `/bin/bash -c '/bin/echo hi'` control. Exact final artifact identity is
-recorded in `target/perf/handoff-session8-final-artifact-provenance.txt`; stress
-and shell logs are under `target/perf/handoff-session8-final-artifact-mtfork/`
-and `target/perf/handoff-session8-final-artifact-shell/`.
+- source `d6269323236c2ad540386f0e6d6974e8410f3feb`, clean tree;
+- SHA-256 `e4f2cb683265dc07fdaaefd5e502050e74535f8eeb30913aef02b06a2200038d`;
+- CDHash `0ddd94eea999496218d14f84c49e2b518df23939`;
+- LC_UUID `DDAB1F26-A735-326F-A566-4828706378D1`;
+- hypervisor entitlement and `__TEXT,__dof_carrick` present.
 
-Acceptance is fail-closed: if either status is nonzero, any closure count
-differs, any stress row lacks all three true markers, any shell row is not the
-single line `hi`, the binary lacks the hypervisor entitlement or
-`__dof_carrick`, or a run-ID process remains, this session is not closed and
-the first failing receipt is the next reducer.
+The controller-only commit that records this receipt necessarily postdates the
+artifact source above; it changes `handoff.md` and no compiled input. Keep the
+artifact bound to `d6269323` rather than pretending a later documentation HEAD
+produced the same link.
 
-### Resume direction after the three reds close
+Artifact-bound controls passed: **40/40** serial MUSL `mtforkcorrupt` rows with
+`thread_started=true`, `forks_done=true`, and `canaries_intact=true`; **10/10**
+`/bin/sh -c '/bin/echo hi'`; and **1/1** `/bin/bash` control. All 51 status
+files are `0`, all output checks are exact, all 51 scoped cleanup receipts say
+zero processes, the final process census found no Carrick/conformance process,
+and the post-control binary SHA-256 is unchanged. Receipts are under
+`target/perf/handoff-session8-final-artifact-mtfork/` and
+`target/perf/handoff-session8-final-artifact-shell/`. The independent
+file-backed re-audit is
+`target/perf/handoff-session8-final-retirement-audit.{log,status}`; its status
+is `0` and it records the accepted SHA, 40 + 11 zero statuses, 51 zero scoped
+cleanups, and a zero global Carrick/conformance process census.
 
-With those receipts green, return to the restored core-emulation roadmap above:
-freeze and execute the declared 2,127-suite surface, close exact assertion-level
-parity with no skips/excuses/retry acceptance, and only then attack the <=2x
-performance gate. Continue to lead diagnosis with `carrick trace`; use
-`carrick debug lldb-snapshot`/cores when tracing perturbs or misses the failure.
+The three reducers also passed a one-carrier load control: ten batches of eight
+logical guest processes per reducer (80 executions each), exact semantic marker
+counts, no false markers, and zero scoped leftovers under
+`target/perf/handoff-session8-postreducers-single-carrier-stress/`.
+
+Acceptance is closed. Any future change to source or binary invalidates this
+artifact-specific receipt and must rerun both exhaustive gates and controls;
+do not reuse these counts for a later link.
+
+### Current direction — core emulation roadmap resumed
+
+The retirement receipts are green, so return to the restored core-emulation
+roadmap above: freeze and execute the declared 2,127-suite surface, close exact
+assertion-level parity with no skips/excuses/retry acceptance, and only then
+attack the <=2x performance gate. Continue to lead diagnosis with `carrick
+trace`; use `carrick debug lldb-snapshot`/cores when tracing perturbs or misses
+the failure.
 The retired API and legacy subprocess architecture are no longer the active
 workstream.
 
