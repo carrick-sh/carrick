@@ -448,6 +448,7 @@ mod task_only_carrier_directory_tests {
             kernel_mm: parking_lot::Mutex::new(None),
             cow_armed: Some(Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()))),
             cow_deferred_publications: Some(Arc::new(parking_lot::Mutex::new(Vec::new()))),
+            pending_publication_receipts: parking_lot::Mutex::new(vec![receipt]),
             pending_receipts: vec![receipt],
             alias_receipts: parking_lot::Mutex::new(Vec::new()),
             last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Test),
@@ -500,6 +501,22 @@ mod task_only_carrier_directory_tests {
         );
         assert_eq!(task_mm.pending_receipts[0].child_mapping, mapping);
         assert_eq!(task_mm.pending_receipts[0].frame, frame);
+
+        let reloaded = registration
+            .runtime_task_state(
+                Arc::new(parking_lot::Mutex::new(None)),
+                Arc::new(MemoryProtections::default()),
+            )
+            .unwrap();
+        assert!(
+            reloaded.pending_fork_frame_receipts.is_empty(),
+            "an executor reload must not republish a fork receipt whose mapping may have been superseded by COW",
+        );
+        assert_eq!(
+            task_mm.pending_receipts.len(),
+            1,
+            "one-shot publication must not consume retirement authentication",
+        );
     }
 
     #[test]
@@ -1293,6 +1310,7 @@ mod task_only_carrier_directory_tests {
             kernel_mm: parking_lot::Mutex::new(std::num::NonZeroU64::new(102)),
             cow_armed: None,
             cow_deferred_publications: None,
+            pending_publication_receipts: parking_lot::Mutex::new(Vec::new()),
             pending_receipts: Vec::new(),
             alias_receipts: parking_lot::Mutex::new(Vec::new()),
             last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Test),
@@ -6716,11 +6734,29 @@ fn inherited_fork_inventory_extents(
     mapping: &ThreadMappingDesc,
     inventory: &std::collections::BTreeMap<(u64, u64), InventoryExtent>,
 ) -> Vec<((u64, u64), InventoryExtent)> {
+    let expected_owner = mapping
+        .ipa
+        .checked_sub(mapping.physical_ipa)
+        .and_then(|offset| usize::try_from(offset).ok())
+        .and_then(|offset| (mapping.host_addr as usize).checked_sub(offset))
+        .map(|host_addr| InventoryStage2OwnerIdentity {
+            host_addr,
+            generation: mapping.owner_generation,
+        });
+    let live_owner =
+        global_frame_host_owner_identity(mapping.physical_ipa, mapping.physical_size as u64);
     inventory
         .iter()
         .filter(|(_, extent)| {
             (extent.stage2_base, extent.stage2_length)
                 == (mapping.physical_ipa, mapping.physical_size as u64)
+                && (mapping.owner_generation == 0
+                    || (expected_owner == Some(extent.stage2_owner)
+                        && live_owner
+                            == Some((
+                                extent.stage2_owner.host_addr,
+                                extent.stage2_owner.generation,
+                            ))))
         })
         .map(|(&key, &extent)| (key, extent))
         .collect()
@@ -7731,6 +7767,10 @@ pub(crate) struct HvpatchTaskMmAuthority {
     cow_armed: Option<std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>>,
     cow_deferred_publications:
         Option<std::sync::Arc<parking_lot::Mutex<Vec<PendingFrameCowPublication>>>>,
+    /// One-shot observation copy. Retirement keeps `pending_receipts` for its
+    /// exact Kernel receipt challenge, but an executor reload must never
+    /// republish an older fork mapping after COW or munmap supersedes it.
+    pending_publication_receipts: parking_lot::Mutex<Vec<PendingForkFrameReceipt>>,
     pending_receipts: Vec<PendingForkFrameReceipt>,
     alias_receipts: parking_lot::Mutex<Vec<AliasPublicationReceipt>>,
     last_holder: parking_lot::Mutex<HvpatchTaskMmHolder>,
@@ -7745,6 +7785,7 @@ impl HvpatchTaskMmAuthority {
         mut prepared: HvpatchPreparedTaskAuthority,
         alias_receipt: AliasPublicationReceipt,
     ) -> Self {
+        let pending_receipts = std::mem::take(&mut prepared.pending_receipts);
         Self {
             mappings: std::mem::take(&mut prepared.mappings),
             mm_root_slot: prepared.mm_root_slot,
@@ -7752,7 +7793,8 @@ impl HvpatchTaskMmAuthority {
             kernel_mm: parking_lot::Mutex::new(None),
             cow_armed: prepared.cow_armed.take(),
             cow_deferred_publications: prepared.cow_deferred_publications.take(),
-            pending_receipts: std::mem::take(&mut prepared.pending_receipts),
+            pending_publication_receipts: parking_lot::Mutex::new(pending_receipts.clone()),
+            pending_receipts,
             alias_receipts: parking_lot::Mutex::new(vec![alias_receipt]),
             last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Registration),
             #[cfg(test)]
@@ -8590,7 +8632,9 @@ impl HvpatchTaskRegistration {
             cow_identity: Some(cow_identity),
             cow_armed,
             cow_deferred_publications,
-            pending_fork_frame_receipts: task_mm.pending_receipts.clone(),
+            pending_fork_frame_receipts: std::mem::take(
+                &mut *task_mm.pending_publication_receipts.lock(),
+            ),
             pending_process_aliases: Vec::new(),
             cow_rollback_scratch: None,
             registration: None,
@@ -11217,7 +11261,33 @@ impl HvfVmState {
             // deliberately retains historical rows and therefore cannot be
             // used to reconstruct one generation at terminal retirement.
             let mut stage2_owners = std::collections::BTreeMap::new();
-            for extent in inventory.extents.values() {
+            for (&(gpa, mapping_length), extent) in &inventory.extents {
+                let exact_live = authority
+                    .mapping_is_live(
+                        extent.mapping,
+                        extent.frame,
+                        carrick_guest_mem::Gpa(gpa),
+                        carrick_hal::FrameLength::from_mapping_extent(
+                            std::num::NonZeroU64::new(mapping_length).ok_or_else(|| {
+                                TrapError::Hypervisor(
+                                    "HVPatch process retirement inventory has zero-length mapping"
+                                        .to_owned(),
+                                )
+                            })?,
+                        ),
+                    )
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "authenticate HVPatch process retirement mapping {:?} for retiring mm: {error}",
+                            extent.mapping
+                        ))
+                    })?;
+                if !exact_live {
+                    return Err(TrapError::Hypervisor(format!(
+                        "HVPatch process retirement mapping {:?} is not exact-live for retiring mm",
+                        extent.mapping
+                    )));
+                }
                 let ipa = extent.stage2_base;
                 let length = extent.stage2_length;
                 let size =
@@ -11248,15 +11318,6 @@ impl HvfVmState {
                         })
                     })
                     .collect();
-                if !matching_rows
-                    .iter()
-                    .any(|(identity, _, _)| *identity == extent.stage2_owner)
-                {
-                    return Err(TrapError::Hypervisor(format!(
-                        "HVPatch process retirement lease {lease:?} inventory owner {:?} has no exact task mapping; rows={matching_rows:?}",
-                        extent.stage2_owner
-                    )));
-                }
                 let live_owner = global_frame_host_owner_identity(ipa, length);
                 if extent.stage2_owner.generation == 0 {
                     if live_owner.is_some() {
@@ -11275,6 +11336,14 @@ impl HvfVmState {
                         length,
                         extent.stage2_owner.host_addr,
                     );
+                    // Generation-zero extents have no global owner identity to
+                    // authenticate. They therefore still require an exact
+                    // live task or carrier lease. Nonzero extents are different:
+                    // the inventory captured their complete host/generation
+                    // identity at publication and the global-owner comparison
+                    // below authenticates it directly. A detached task-only
+                    // reload may legitimately omit a duplicate runtime-created
+                    // mapping row while retaining that inventory authority.
                     if is_reusable_global_frame_extent(ipa, length)
                         && !local_lease
                         && !carrier_lease
@@ -18281,6 +18350,7 @@ impl HvfVmState {
                     cow_deferred_publications: Some(std::sync::Arc::clone(
                         &self.cow_deferred_publications,
                     )),
+                    pending_publication_receipts: parking_lot::Mutex::new(Vec::new()),
                     pending_receipts: Vec::new(),
                     alias_receipts: parking_lot::Mutex::new(Vec::new()),
                     last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::ExecRebind),
@@ -20044,6 +20114,7 @@ mod frame_inventory_backend_tests {
 
     enum TestFrameMappingCount {
         Exact(usize),
+        ExactButMappingNotLive(usize),
         Error,
     }
 
@@ -20079,7 +20150,7 @@ mod frame_inventory_backend_tests {
             _gpa: carrick_guest_mem::Gpa,
             _length: carrick_hal::FrameLength,
         ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(false)
+            Ok(!matches!(self, Self::ExactButMappingNotLive(_)))
         }
 
         fn frame_mapping_count(
@@ -20087,7 +20158,7 @@ mod frame_inventory_backend_tests {
             _frame: carrick_hal::FrameId,
         ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
             match self {
-                Self::Exact(count) => Ok(Some(*count)),
+                Self::Exact(count) | Self::ExactButMappingNotLive(count) => Ok(Some(*count)),
                 Self::Error => Err(Box::new(std::io::Error::other(
                     "injected mapping-count failure",
                 ))),
@@ -21766,6 +21837,71 @@ mod frame_inventory_backend_tests {
     }
 
     #[test]
+    fn process_retirement_uses_inventory_owner_when_task_local_rows_are_absent() {
+        let (mut task, frame, mapping, key, _guard) =
+            process_retirement_task(TestFrameMappingCount::Exact(1));
+        let live = global_frame_host_owner_identity(key.0, key.1)
+            .expect("the inventory owner must remain globally authenticated");
+
+        // A detached task-only backend is reconstructed from the MM authority's
+        // publication snapshot. Runtime-created extents remain authoritative in
+        // the inventory but need not have a duplicate row in that snapshot.
+        // The carrier/global owner retains the physical lease in this state.
+        task.mappings[0].stage2_lease = None;
+        task.mappings.clear();
+
+        HvfVmState::retire_task_state_process_mappings(&mut task)
+            .expect("the exact inventory/global owner pair is sufficient authority");
+        let commit = HvfVmState::take_task_state_retirement_inventory(&mut task)
+            .expect("rowless process-terminal retirement commit");
+        assert!(commit.batch().events().iter().any(|event| {
+            matches!(
+                event,
+                carrick_hal::FrameInventoryEvent::UnmapMapping {
+                    mapping: retired,
+                    ..
+                } if *retired == mapping
+            )
+        }));
+        assert!(commit.batch().events().iter().any(|event| {
+            matches!(
+                event,
+                carrick_hal::FrameInventoryEvent::RetireFrame {
+                    frame: retired,
+                    ..
+                } if *retired == frame
+            )
+        }));
+        assert_eq!(
+            global_frame_host_owner_identity(key.0, key.1),
+            None,
+            "retirement must consume the exact globally authenticated owner {live:?}",
+        );
+    }
+
+    #[test]
+    fn process_retirement_rejects_rowless_inventory_not_owned_by_the_retiring_mm() {
+        let (mut task, _frame, _mapping, key, _guard) =
+            process_retirement_task(TestFrameMappingCount::ExactButMappingNotLive(1));
+        let live =
+            global_frame_host_owner_identity(key.0, key.1).expect("the physical owner starts live");
+        task.mappings[0].stage2_lease = None;
+        task.mappings.clear();
+
+        let error = HvfVmState::retire_task_state_process_mappings(&mut task)
+            .expect_err("physical identity alone must not authorize another MM's mapping");
+        assert!(
+            error.to_string().contains("not exact-live for retiring mm"),
+            "unexpected rowless MM-authentication error: {error}"
+        );
+        assert_eq!(
+            global_frame_host_owner_identity(key.0, key.1),
+            Some(live),
+            "failed MM authentication must not consume the physical owner",
+        );
+    }
+
+    #[test]
     fn process_retirement_rejects_matching_generation_with_wrong_host_pointer() {
         let (mut task, _frame, _mapping, key, _guard) =
             process_retirement_task(TestFrameMappingCount::Exact(1));
@@ -22490,6 +22626,7 @@ mod frame_inventory_backend_tests {
             kernel_mm: parking_lot::Mutex::new(None),
             cow_armed: None,
             cow_deferred_publications: None,
+            pending_publication_receipts: parking_lot::Mutex::new(Vec::new()),
             pending_receipts: Vec::new(),
             alias_receipts: parking_lot::Mutex::new(Vec::new()),
             last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::FailpointRollback),
@@ -23089,6 +23226,90 @@ mod frame_inventory_backend_tests {
             HvfVmState::shared_anon_backing_identity(),
             HvfVmState::shared_anon_backing_identity(),
             "independent shared-anonymous mappings must never deduplicate globally"
+        );
+    }
+
+    #[test]
+    fn fork_inventory_inheritance_rejects_a_stale_owner_generation() {
+        let lease_ipa = next_test_physical_key(0x8000).0;
+        let lease_length = 0x8000;
+        let stale_generation = next_global_frame_owner_generation();
+        let current_generation = next_global_frame_owner_generation();
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            lease_length as usize,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .expect("test host owner");
+        let current_host = host.as_ptr() as usize;
+        let owner = GlobalFrameHostOwner {
+            _mapping: host,
+            _lease: GlobalFrameStage2Lease::fixed(lease_ipa, lease_length),
+            perms: u64::from(applevisor::memory::MemPerms::ReadWrite),
+            generation: current_generation,
+        };
+        assert!(
+            global_frame_host_owners()
+                .lock()
+                .insert((lease_ipa, lease_length), owner)
+                .is_none()
+        );
+        let _guard = TestGlobalFrameOwnerGuard {
+            key: (lease_ipa, lease_length),
+            generation: current_generation,
+        };
+        let mut mapping = ThreadMappingDesc {
+            start: 0x1382_9000_0000,
+            ipa: lease_ipa,
+            end: 0x1382_9000_4000,
+            host_addr: current_host as *mut u8,
+            size: 0x4000,
+            physical_ipa: lease_ipa,
+            physical_host_addr: current_host as *mut u8,
+            physical_size: lease_length as usize,
+            perms: applevisor::memory::MemPerms::ReadWrite,
+            is_dynamic_alias: true,
+            sharing: GuestMappingSharing::Private,
+            guest_writable: true,
+            shared_key_base: 0,
+            shared_key_offset: 0,
+            owner_generation: current_generation,
+        };
+        let extent = |mapping_id, generation| super::InventoryExtent {
+            frame: carrick_hal::FrameId::from_kernel_allocation(id(mapping_id + 100)),
+            mapping: carrick_hal::MappingId::from_kernel_allocation(id(mapping_id)),
+            backing: InventoryBackingIdentity::Private(mapping_id),
+            stage2_base: lease_ipa,
+            stage2_length: lease_length,
+            stage2_owner: super::InventoryStage2OwnerIdentity {
+                host_addr: current_host,
+                generation,
+            },
+        };
+        let stale = extent(9201, stale_generation);
+        let current = extent(9202, current_generation);
+        let inventory = std::collections::BTreeMap::from([
+            ((lease_ipa, 0x4000), stale),
+            ((lease_ipa + 0x4000, 0x4000), current),
+        ]);
+
+        let inherited = inherited_fork_inventory_extents(&mapping, &inventory);
+        assert_eq!(
+            inherited
+                .iter()
+                .map(|(key, extent)| (*key, extent.mapping))
+                .collect::<Vec<_>>(),
+            vec![((lease_ipa + 0x4000, 0x4000), current.mapping)],
+            "fork must not launder a superseded inventory owner through a recycled physical lease",
+        );
+
+        mapping.owner_generation = stale_generation;
+        let mutually_stale = std::collections::BTreeMap::from([(
+            (lease_ipa, 0x4000),
+            extent(9203, stale_generation),
+        )]);
+        assert!(
+            inherited_fork_inventory_extents(&mapping, &mutually_stale).is_empty(),
+            "matching stale metadata must not survive a newer live owner incarnation",
         );
     }
 

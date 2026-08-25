@@ -250,10 +250,26 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         gpa: carrick_guest_mem::Gpa,
         length: carrick_hal::FrameLength,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self
-            .kernel
-            .frame_inventory()
-            .mapping_is_live_exact(self.mm, mapping, frame, gpa, length))
+        let inventory = self.kernel.frame_inventory();
+        if inventory.mapping_is_live_exact(self.mm, mapping, frame, gpa, length) {
+            return Ok(true);
+        }
+        let candidates: Vec<_> = inventory
+            .snapshot()
+            .mappings
+            .into_iter()
+            .filter(|row| {
+                row.mapping == mapping
+                    || row.frame == frame
+                    || (row.gpa == gpa && row.length == length)
+            })
+            .take(16)
+            .collect();
+        Err(Box::new(std::io::Error::other(format!(
+            "frame mapping is not exact-live: expected mm={:?} mapping={mapping:?} frame={frame:?} gpa={gpa:?} length={} candidates={candidates:?}",
+            self.mm,
+            length.raw(),
+        ))))
     }
 
     fn frame_mapping_count(
