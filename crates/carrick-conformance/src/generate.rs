@@ -43,7 +43,13 @@ const GO_SMOKE: &[&str] = &["runtime", "sync", "context", "time"];
 
 /// CPython modules that make steady progress but exceed the default full-suite
 /// budget under the four-worker HVF matrix run.
-const CPYTHON_SLOW: &[&str] = &["test_tarfile"];
+const CPYTHON_SLOW: &[&str] = &[
+    "test_concurrent_futures",
+    "test_multiprocessing_fork",
+    "test_multiprocessing_forkserver",
+    "test_multiprocessing_spawn",
+    "test_tarfile",
+];
 
 /// Go packages whose test suites are CPU-bound-slow (not stuck) under nested
 /// KVM or full-load HVF — toolchain subprocess churn (importers' compile/cgo),
@@ -55,6 +61,7 @@ const GO_SLOW: &[&str] = &[
     "net/http",
     "net/netip",
 ];
+const GO_EXTENDED: &[&str] = &["go/internal/gcimporter", "go/types"];
 const GO_RUNTIME_SMOKE_RE: &str = "^(Test(FinalizerRegisterABI|UserArena.*|BitCursor|Callers.*|FPUnwindAfterRecovery|Chan|NonblockRecvRace|NonblockSelectRace2?|SelfSelect|SelectStress|SelectFairness|MultiConsumer|ShrinkStackDuringBlockedSend|NoShrinkStackWhileParking|SelectDuplicateChannel|SelectStackAdjust))$";
 /// LTP testcases in the fast tier (proven MATCH).
 const LTP_SMOKE: &[&str] = &[
@@ -85,6 +92,14 @@ const LTP_CMD_OVERRIDES: &[(&str, &[&str])] = &[
         "fcntl14_64",
         &["/opt/ltp/testcases/bin/fcntl14_64", "-n", "200"],
     ),
+    (
+        "ioctl02",
+        &["/opt/ltp/testcases/bin/ioctl02", "-d", "/dev/tty0"],
+    ),
+    (
+        "test_ioctl",
+        &["/opt/ltp/testcases/bin/ioctl02", "-d", "/dev/tty0"],
+    ),
 ];
 
 /// Oracle-fidelity docker_flags that must survive `--generate-suites`.
@@ -112,6 +127,38 @@ const DOCKER_FLAG_OVERRIDES: &[(&str, &[&str])] = &[
     // policy. EXACT name, not a prefix: setpriority02 tests the EPERM/EACCES
     // rejections and needs the capability ABSENT.
     ("ltp-setpriority01", &["--cap-add", "SYS_NICE"]),
+    // These restore_wallclock tests must be allowed to adjust wall time so the
+    // oracle reaches their Linux assertions. Keep the overrides exact-name:
+    // settimeofday02 and stime02 exercise rejection paths and must remain
+    // without SYS_TIME.
+    ("ltp-clock_adjtime01", &["--cap-add", "SYS_TIME"]),
+    ("ltp-clock_adjtime02", &["--cap-add", "SYS_TIME"]),
+    ("ltp-clock_settime01", &["--cap-add", "SYS_TIME"]),
+    ("ltp-clock_settime02", &["--cap-add", "SYS_TIME"]),
+    ("ltp-clock_settime03", &["--cap-add", "SYS_TIME"]),
+    ("ltp-clock_settime04", &["--cap-add", "SYS_TIME"]),
+    ("ltp-settimeofday01", &["--cap-add", "SYS_TIME"]),
+    ("ltp-stime01", &["--cap-add", "SYS_TIME"]),
+    // Docker Desktop exposes the required numbered tty only to privileged
+    // containers. Both frozen declarations intentionally run the same binary
+    // and remain distinct suites for stable inventory identity.
+    ("ltp-ioctl02", &["--privileged"]),
+    ("ltp-test_ioctl", &["--privileged"]),
+    // These tests write security.* xattrs. Docker drops the privilege their
+    // LTP root metadata implies, so grant it explicitly instead of recording
+    // the under-privileged oracle's setup failure as a Carrick gap.
+    ("ltp-fgetxattr02", &["--privileged"]),
+    ("ltp-flistxattr01", &["--cap-add", "SYS_ADMIN"]),
+    ("ltp-flistxattr02", &["--cap-add", "SYS_ADMIN"]),
+    ("ltp-flistxattr03", &["--cap-add", "SYS_ADMIN"]),
+    ("ltp-lgetxattr01", &["--cap-add", "SYS_ADMIN"]),
+    ("ltp-lgetxattr02", &["--cap-add", "SYS_ADMIN"]),
+    ("ltp-listxattr01", &["--cap-add", "SYS_ADMIN"]),
+    ("ltp-listxattr02", &["--cap-add", "SYS_ADMIN"]),
+    ("ltp-listxattr03", &["--cap-add", "SYS_ADMIN"]),
+    ("ltp-llistxattr01", &["--cap-add", "SYS_ADMIN"]),
+    ("ltp-llistxattr02", &["--cap-add", "SYS_ADMIN"]),
+    ("ltp-llistxattr03", &["--cap-add", "SYS_ADMIN"]),
     ("ltp-clone301", &["--security-opt", "seccomp=unconfined"]),
     ("ltp-clone302", &["--security-opt", "seccomp=unconfined"]),
 ];
@@ -241,11 +288,9 @@ const KNOWN_GAP_PREFIX_OVERRIDES: &[(&str, &[&str])] = &[("ltp-pidfd_getfd", &["
 /// a visible capacity/virtualization gap until Carrick owns the semaphore
 /// service or virtualizes the tunables honestly.
 ///
-/// The xattr/listxattr rows below are oracle-broken on the current Docker/LTP
-/// image because Linux container security policy blocks setup of the
-/// `security.*` xattrs these tests need. Carrick's host-backed xattr behavior is
-/// tracked separately; keep the affected rows report-only instead of gating on
-/// container setup failures.
+/// fsetxattr02 TCONFs on CONFIG_BLK_DEV_RAM, which Carrick deliberately does not
+/// declare. The other xattr/listxattr rows run with the explicit oracle
+/// privilege above and are genuinely gated, so they must not appear here.
 ///
 /// futex_cmp_requeue01's high-fanout process-shared cases require Linux's
 /// atomic source dequeue + destination enqueue semantics. Carrick's Darwin
@@ -283,20 +328,8 @@ const KNOWN_GAP_EXACT_OVERRIDES: &[(&str, &[&str])] = &[
     ("ltp-bind06", &["summary"]),
     ("ltp-delete_module02", &["summary"]),
     ("ltp-fanotify25", &["summary"]),
-    ("ltp-fgetxattr02", &["summary"]),
-    ("ltp-flistxattr01", &["summary"]),
-    ("ltp-flistxattr02", &["summary"]),
-    ("ltp-flistxattr03", &["summary"]),
     ("ltp-fsetxattr02", &["summary"]),
     ("ltp-futex_cmp_requeue01", &["summary"]),
-    ("ltp-lgetxattr01", &["summary"]),
-    ("ltp-lgetxattr02", &["summary"]),
-    ("ltp-listxattr01", &["summary"]),
-    ("ltp-listxattr02", &["summary"]),
-    ("ltp-listxattr03", &["summary"]),
-    ("ltp-llistxattr01", &["summary"]),
-    ("ltp-llistxattr02", &["summary"]),
-    ("ltp-llistxattr03", &["summary"]),
     ("ltp-setrlimit01", &["summary"]),
     ("ltp-semget05", &["summary"]),
 ];
@@ -432,7 +465,13 @@ fn cpython_timeout_s(module: &str) -> u64 {
 }
 
 fn go_timeout_s(pkg: &str) -> u64 {
-    if GO_SLOW.contains(&pkg) { 540 } else { 180 }
+    if GO_SLOW.contains(&pkg) {
+        540
+    } else if GO_EXTENDED.contains(&pkg) {
+        360
+    } else {
+        180
+    }
 }
 
 fn ltp_timeout_s(bin: &str) -> u64 {
@@ -751,7 +790,8 @@ fn build() -> (Vec<Suite>, (usize, usize, usize)) {
 pub fn generate_suites(out_path: &Path, check_only: bool) -> anyhow::Result<()> {
     let (suite, (c, g, l)) = build();
     let total = suite.len();
-    eprintln!("counts: cpython={c} go={g} ltp={l} node=3 go-build=1  TOTAL={total}");
+    let reported_go = reported_go_count(g);
+    eprintln!("counts: cpython={c} go={reported_go} ltp={l} node=3 go-build=1  TOTAL={total}");
     if check_only {
         return Ok(());
     }
@@ -763,6 +803,10 @@ pub fn generate_suites(out_path: &Path, check_only: bool) -> anyhow::Result<()> 
     std::fs::write(out_path, format!("{header}{body}"))?;
     eprintln!("wrote {} ({total} suites)", out_path.display());
     Ok(())
+}
+
+fn reported_go_count(discovered_go_packages: usize) -> usize {
+    discovered_go_packages + 1
 }
 
 #[cfg(test)]
@@ -779,10 +823,30 @@ mod tests {
     }
 
     #[test]
+    fn committed_extended_timeouts_survive_regen() {
+        for module in [
+            "test_concurrent_futures",
+            "test_multiprocessing_fork",
+            "test_multiprocessing_forkserver",
+            "test_multiprocessing_spawn",
+        ] {
+            assert_eq!(cpython_timeout_s(module), 600, "{module}");
+        }
+        for package in ["go/internal/gcimporter", "go/types"] {
+            assert_eq!(go_timeout_s(package), 360, "{package}");
+        }
+    }
+
+    #[test]
     fn ordinary_suites_keep_default_budgets() {
         assert_eq!(cpython_timeout_s("test_json"), 300);
         assert_eq!(go_timeout_s("net/url"), 180);
         assert_eq!(ltp_timeout_s("gettid01"), 40);
+    }
+
+    #[test]
+    fn reported_go_count_includes_the_go_build_suite() {
+        assert_eq!(reported_go_count(193), 194);
     }
 
     #[test]
@@ -799,6 +863,144 @@ mod tests {
             ltp_cmd("fcntl14_64"),
             vec!["/opt/ltp/testcases/bin/fcntl14_64", "-n", "200"]
         );
+    }
+
+    #[test]
+    fn time_oracle_capabilities_are_exact_and_mirrored() {
+        for name in [
+            "ltp-clock_adjtime01",
+            "ltp-clock_adjtime02",
+            "ltp-clock_settime01",
+            "ltp-clock_settime02",
+            "ltp-clock_settime03",
+            "ltp-clock_settime04",
+            "ltp-settimeofday01",
+            "ltp-stime01",
+        ] {
+            assert_eq!(
+                docker_flag_overrides(name),
+                Some(vec!["--cap-add".into(), "SYS_TIME".into()]),
+                "{name} must grant the Docker oracle SYS_TIME"
+            );
+            assert_eq!(
+                carrick_flags_for(name),
+                vec!["--raw", "--fs", "host", "--cap-add", "SYS_TIME"],
+                "{name} must mirror SYS_TIME onto Carrick"
+            );
+        }
+
+        for name in ["ltp-settimeofday02", "ltp-stime02"] {
+            assert_eq!(docker_flag_overrides(name), None, "{name}");
+            assert_eq!(
+                carrick_flags_for(name),
+                vec!["--raw", "--fs", "host"],
+                "{name} tests the rejection path and must stay unprivileged"
+            );
+        }
+    }
+
+    #[test]
+    fn ioctl_oracle_invocations_are_exact_and_gated() {
+        let expected_cmd = vec!["/opt/ltp/testcases/bin/ioctl02", "-d", "/dev/tty0"];
+        for (bin, suite) in [("ioctl02", "ltp-ioctl02"), ("test_ioctl", "ltp-test_ioctl")] {
+            assert_eq!(ltp_cmd(bin), expected_cmd, "{suite}");
+            assert_eq!(
+                docker_flag_overrides(suite),
+                Some(vec!["--privileged".into()]),
+                "{suite} must expose /dev/tty0 to the Docker oracle"
+            );
+            assert_eq!(known_gap_overrides(suite), None, "{suite}");
+        }
+        assert_eq!(docker_flag_overrides("ltp-ioctl01"), None);
+    }
+
+    #[test]
+    fn xattr_oracle_privileges_survive_regen_without_gaps() {
+        assert_eq!(
+            docker_flag_overrides("ltp-fgetxattr02"),
+            Some(vec!["--privileged".into()])
+        );
+        assert_eq!(
+            carrick_flags_for("ltp-fgetxattr02"),
+            vec!["--raw", "--fs", "host"]
+        );
+        assert_eq!(known_gap_overrides("ltp-fgetxattr02"), None);
+
+        for name in [
+            "ltp-flistxattr01",
+            "ltp-flistxattr02",
+            "ltp-flistxattr03",
+            "ltp-lgetxattr01",
+            "ltp-lgetxattr02",
+            "ltp-listxattr01",
+            "ltp-listxattr02",
+            "ltp-listxattr03",
+            "ltp-llistxattr01",
+            "ltp-llistxattr02",
+            "ltp-llistxattr03",
+        ] {
+            assert_eq!(
+                docker_flag_overrides(name),
+                Some(vec!["--cap-add".into(), "SYS_ADMIN".into()]),
+                "{name}"
+            );
+            assert_eq!(
+                carrick_flags_for(name),
+                vec!["--raw", "--fs", "host", "--cap-add", "SYS_ADMIN"],
+                "{name}"
+            );
+            assert_eq!(known_gap_overrides(name), None, "{name}");
+        }
+
+        assert_eq!(
+            known_gap_overrides("ltp-fsetxattr02"),
+            Some(vec!["summary".into()])
+        );
+    }
+
+    #[test]
+    fn committed_manifest_preserves_time_and_ioctl_oracle_fidelity() {
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/conformance/suites.toml"
+        ))
+        .unwrap();
+        let m = Manifest::from_toml(&text).unwrap();
+        let find = |name: &str| m.suite.iter().find(|s| s.name == name).unwrap();
+
+        for name in [
+            "ltp-clock_adjtime01",
+            "ltp-clock_adjtime02",
+            "ltp-clock_settime01",
+            "ltp-clock_settime02",
+            "ltp-clock_settime03",
+            "ltp-clock_settime04",
+            "ltp-settimeofday01",
+            "ltp-stime01",
+        ] {
+            let suite = find(name);
+            assert_eq!(suite.docker_flags, ["--cap-add", "SYS_TIME"], "{name}");
+            assert_eq!(
+                suite.carrick_flags,
+                ["--raw", "--fs", "host", "--cap-add", "SYS_TIME"],
+                "{name}"
+            );
+        }
+        for name in ["ltp-settimeofday02", "ltp-stime02"] {
+            let suite = find(name);
+            assert!(suite.docker_flags.is_empty(), "{name}");
+            assert_eq!(suite.carrick_flags, ["--raw", "--fs", "host"], "{name}");
+        }
+
+        let expected_cmd = ["/opt/ltp/testcases/bin/ioctl02", "-d", "/dev/tty0"];
+        for name in ["ltp-ioctl02", "ltp-test_ioctl"] {
+            let suite = find(name);
+            assert_eq!(suite.cmd, expected_cmd, "{name}");
+            assert_eq!(suite.docker_flags, ["--privileged"], "{name}");
+            assert!(suite.known_gaps.is_empty(), "{name}");
+        }
+        assert!(find("ltp-ioctl01").docker_flags.is_empty());
+        assert_eq!(m.suite.len(), 2_127);
     }
 
     /// `node-libuv` must not acquire `--user` from either override table.
@@ -1112,10 +1314,7 @@ mod tests {
             known_gap_overrides("ltp-semget05"),
             Some(vec!["summary".into()])
         );
-        assert_eq!(
-            known_gap_overrides("ltp-llistxattr01"),
-            Some(vec!["summary".into()])
-        );
+        assert_eq!(known_gap_overrides("ltp-llistxattr01"), None);
         assert_eq!(known_gap_overrides("ltp-setrlimit02"), None);
         assert_eq!(known_gap_overrides("ltp-setrlimit03"), None);
         assert_eq!(known_gap_overrides("ltp-setrlimit04"), None);
