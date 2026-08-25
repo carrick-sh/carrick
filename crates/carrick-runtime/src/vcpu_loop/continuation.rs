@@ -535,6 +535,31 @@ pub enum ContinuationFamily {
     VforkParent,
 }
 
+impl ContinuationFamily {
+    /// Stable event-ring representation. Keep this explicit rather than
+    /// depending on Rust's enum layout: cores and LLDB scripts outlive builds.
+    pub(crate) const fn event_code(self) -> u8 {
+        match self {
+            Self::FutexWait => 1,
+            Self::FutexWaitv => 2,
+            Self::SharedFutexWait => 3,
+            Self::SharedFutexWaitv => 4,
+            Self::WaitOnSharedWord => 5,
+            Self::WaitOnFds => 6,
+            Self::WaitOnFdsSelect => 7,
+            Self::WaitOnPollFds => 8,
+            Self::BlockingHostWrite => 9,
+            Self::BlockingRecordLock => 10,
+            Self::WaitOnProcExit => 11,
+            Self::WaitOnProcState => 12,
+            Self::WaitOnHvpatchChild => 13,
+            Self::WaitOnSignals => 14,
+            Self::WaitOnSleep => 15,
+            Self::VforkParent => 16,
+        }
+    }
+}
+
 pub const fn is_blocking_dispatch_outcome(outcome: &DispatchOutcome) -> bool {
     matches!(
         outcome,
@@ -5068,6 +5093,20 @@ mod tests {
         ContinuationFamily::WaitOnSignals,
         ContinuationFamily::WaitOnSleep,
     ];
+
+    #[test]
+    fn continuation_family_event_codes_are_stable_unique_and_nonzero() {
+        let mut families = DISPATCH_FAMILIES.to_vec();
+        families.push(ContinuationFamily::VforkParent);
+        let mut codes = families
+            .into_iter()
+            .map(ContinuationFamily::event_code)
+            .collect::<Vec<_>>();
+        assert!(codes.iter().all(|code| *code != 0));
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes, (1_u8..=16).collect::<Vec<_>>());
+    }
 
     fn assert_send_static<T: Send + 'static>(_: &T) {}
 

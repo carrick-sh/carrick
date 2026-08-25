@@ -5448,18 +5448,19 @@ impl HvfTaskState {
         if let Some(registration) = self.registration.as_ref() {
             let registered = registration.expected_identity;
             if predecessor_identity.task_serial != registered.task_serial
-                || predecessor_identity.thread_serial != registered.thread_serial
                 || predecessor_identity.linux_pid != registered.linux_pid
-                || predecessor_identity.linux_tid != registered.linux_tid
-                || predecessor_identity.asid != registered.asid
             {
                 return Err(TrapError::Hypervisor(
                     "HVPatch exec predecessor Kernel/registration identity mismatch".to_owned(),
                 ));
             }
+            if registration.cow_identity != Some(predecessor_cow_identity) {
+                return Err(TrapError::Hypervisor(
+                    "HVPatch exec predecessor registration/COW identity mismatch".to_owned(),
+                ));
+            }
         }
         if predecessor_identity.linux_pid != predecessor_cow_identity.linux_pid
-            || predecessor_identity.linux_tid != predecessor_cow_identity.linux_tid
             || predecessor_identity.mm != predecessor_cow_identity.mm
             || predecessor_identity.asid != predecessor_cow_identity.asid
         {
@@ -20290,6 +20291,178 @@ mod frame_inventory_backend_tests {
             .expect("bound bootstrap predecessor identity");
         assert_eq!(observed, identity);
         assert!(task.pending_exec_predecessor_identity.is_none());
+    }
+
+    #[test]
+    fn exec_predecessor_accepts_current_kernel_identity_over_stale_registration_birth_fields() {
+        let (mut task, current_kernel, current_cow) = exec_predecessor_authority_test_fixture();
+        assert_eq!(
+            task.take_exec_predecessor_identity(current_cow)
+                .expect("current Kernel/COW authority outranks stale registration birth fields"),
+            current_kernel,
+        );
+    }
+
+    #[test]
+    fn exec_predecessor_rejects_registration_cow_backend_identity_mismatch() {
+        let (mut task, _, current_cow) = exec_predecessor_authority_test_fixture();
+        task.registration
+            .as_mut()
+            .expect("fixture registration")
+            .cow_identity
+            .as_mut()
+            .expect("fixture registered COW identity")
+            .linux_tid += 1;
+
+        let error = task
+            .take_exec_predecessor_identity(current_cow)
+            .expect_err("foreign backend COW identity must fail closed");
+        assert!(matches!(
+            error,
+            TrapError::Hypervisor(message)
+                if message == "HVPatch exec predecessor registration/COW identity mismatch"
+        ));
+    }
+
+    #[test]
+    fn exec_predecessor_rejects_each_retained_authority_anchor_mismatch() {
+        const KERNEL_REGISTRATION: &str =
+            "HVPatch exec predecessor Kernel/registration identity mismatch";
+        const REGISTRATION_COW: &str =
+            "HVPatch exec predecessor registration/COW identity mismatch";
+        const KERNEL_COW: &str = "HVPatch exec predecessor Kernel/COW identity mismatch";
+
+        let (mut task, _, cow) = exec_predecessor_authority_test_fixture();
+        task.registration
+            .as_mut()
+            .unwrap()
+            .expected_identity
+            .task_serial += 1;
+        assert_exec_predecessor_mismatch(task, cow, KERNEL_REGISTRATION);
+
+        let (mut task, _, cow) = exec_predecessor_authority_test_fixture();
+        task.registration
+            .as_mut()
+            .unwrap()
+            .expected_identity
+            .linux_pid += 1;
+        assert_exec_predecessor_mismatch(task, cow, KERNEL_REGISTRATION);
+
+        let (mut task, _, cow) = exec_predecessor_authority_test_fixture();
+        task.pending_exec_predecessor_identity
+            .as_mut()
+            .unwrap()
+            .linux_pid += 1;
+        task.registration
+            .as_mut()
+            .unwrap()
+            .expected_identity
+            .linux_pid += 1;
+        assert_exec_predecessor_mismatch(task, cow, KERNEL_COW);
+
+        let (mut task, _, cow) = exec_predecessor_authority_test_fixture();
+        task.pending_exec_predecessor_identity.as_mut().unwrap().mm += 1;
+        assert_exec_predecessor_mismatch(task, cow, KERNEL_COW);
+
+        let (mut task, _, cow) = exec_predecessor_authority_test_fixture();
+        task.pending_exec_predecessor_identity
+            .as_mut()
+            .unwrap()
+            .asid += 1;
+        assert_exec_predecessor_mismatch(task, cow, KERNEL_COW);
+
+        for mutate in [
+            |identity: &mut carrick_hal::FrameCowIdentity| identity.linux_pid += 1,
+            |identity: &mut carrick_hal::FrameCowIdentity| identity.linux_tid += 1,
+            |identity: &mut carrick_hal::FrameCowIdentity| identity.mm += 1,
+            |identity: &mut carrick_hal::FrameCowIdentity| identity.asid += 1,
+        ] {
+            let (mut task, _, cow) = exec_predecessor_authority_test_fixture();
+            mutate(
+                task.registration
+                    .as_mut()
+                    .unwrap()
+                    .cow_identity
+                    .as_mut()
+                    .unwrap(),
+            );
+            assert_exec_predecessor_mismatch(task, cow, REGISTRATION_COW);
+        }
+
+        let (mut task, _, cow) = exec_predecessor_authority_test_fixture();
+        task.registration.as_mut().unwrap().cow_identity = None;
+        assert_exec_predecessor_mismatch(task, cow, REGISTRATION_COW);
+    }
+
+    fn assert_exec_predecessor_mismatch(
+        mut task: HvfTaskState,
+        current_cow: carrick_hal::FrameCowIdentity,
+        expected: &str,
+    ) {
+        let error = task
+            .take_exec_predecessor_identity(current_cow)
+            .expect_err("foreign predecessor authority must fail closed");
+        assert!(matches!(
+            error,
+            TrapError::Hypervisor(message) if message == expected
+        ));
+    }
+
+    fn exec_predecessor_authority_test_fixture() -> (
+        HvfTaskState,
+        carrick_hal::ExecPredecessorIdentity,
+        carrick_hal::FrameCowIdentity,
+    ) {
+        let mut task = hvpatch_task_state_test_fixture(200, 0x4000, 73);
+        let current_cow = carrick_hal::FrameCowIdentity {
+            linux_pid: 41,
+            // This field is paired to the persistent backend/kicker ThreadId;
+            // nonleader exec may promote the current Kernel Linux TID to 41
+            // while this backend identity remains 73.
+            linux_tid: 73,
+            mm: 200,
+            asid: 8,
+        };
+        task.cow_identity = Some(current_cow);
+        let directory = std::sync::Arc::new(HvpatchCarrierTaskStateDirectory::default());
+        let (_, child_token_verifier) = carrick_hal::HvpatchChildTokenIssuer::new_pair();
+        task.registration = Some(HvpatchTaskRegistration {
+            directory: std::sync::Arc::clone(&directory),
+            key: HvpatchCarrierTaskStateKey {
+                directory_instance: directory.instance,
+                task_serial: 41,
+                thread_serial: 73,
+                execution_generation: 1,
+                nonce: std::num::NonZeroU64::new(1).unwrap(),
+            },
+            expected_identity: HvpatchCarrierTaskIdentity {
+                task_serial: 41,
+                thread_serial: 73,
+                execution_generation: 1,
+                linux_pid: 41,
+                linux_tid: 73,
+                asid: 7,
+            },
+            task_mm: None,
+            cow_authority: None,
+            cow_identity: Some(current_cow),
+            cow_authority_identity: None,
+            child_token_verifier,
+        });
+        let current_kernel = carrick_hal::ExecPredecessorIdentity {
+            task_serial: 41,
+            thread_serial: 99,
+            linux_pid: 41,
+            linux_tid: 41,
+            mm: 200,
+            asid: 8,
+        };
+        bind_exec_predecessor_identity_slot(
+            &mut task.pending_exec_predecessor_identity,
+            current_kernel,
+        )
+        .expect("bind current Kernel predecessor identity");
+        (task, current_kernel, current_cow)
     }
 
     fn global_frame_allocator_test_lock() -> &'static parking_lot::Mutex<()> {

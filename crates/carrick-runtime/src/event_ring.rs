@@ -164,6 +164,32 @@ pub const ARWRITE: u8 = 40;
 pub const ARMAGIC: u8 = 41;
 /// Thread or process clone spawn outcome. `a` is parent PID, `b` child TID, `c` errno (0 = success).
 pub const CLONESPAWN: u8 = 42;
+/// HVPatch scheduler claim. `a` is guest PID, `b` guest TID, and `c` the
+/// persistent executor id. This fires before backend load so an uninstrumented
+/// core can distinguish a row that was never claimed from one stuck in load.
+pub const HVPEXEC_CLAIM: u8 = 43;
+/// HVPatch backend load and hardware audit completed for the exact claimed
+/// guest PID/TID on executor `c`.
+pub const HVPEXEC_LOAD: u8 = 44;
+/// HVPatch process-leader quantum boundary. `c` is the exact non-syscall
+/// boundary code decoded below. Paired with settlement, this distinguishes a
+/// task still executing from one handed back to the scheduler.
+pub const HVPEXEC_BOUNDARY: u8 = 45;
+/// HVPatch process-leader state after successful scheduler settlement. `c` is
+/// the authoritative `ThreadExecutionState` class, not merely the requested
+/// boundary disposition.
+pub const HVPEXEC_SETTLEMENT: u8 = 46;
+/// HVPatch process-leader blocking-continuation construction. `a` is guest
+/// PID, `b` guest TID, and `c` packs the guest-native syscall number in
+/// bits 0..23 and the stable continuation-family code in bits 24..31.
+pub const HVPBLOCK: u8 = 47;
+pub const HVPBLOCK_NR_OVERFLOW: u32 = 0x00ff_ffff;
+/// Full-width raw syscall argument 0 for an immediately preceding HVPBLOCK.
+/// `a:b` is the u64 value and `c` is the guest TID join key.
+pub const HVPBLOCK_ARG0: u8 = 48;
+/// Raw low 32 bits of syscall arguments 1 and 2 for HVPBLOCK. `a` is arg1,
+/// `b` is arg2, and `c` is the guest TID join key.
+pub const HVPBLOCK_ARGS: u8 = 49;
 
 const HVPWAIT_ID_MASK: u32 = 0x00ff_ffff;
 
@@ -419,6 +445,59 @@ pub fn rec_hvpatch_process_exit_end(pid: i32, tid: i32, exit_code: i32) {
     rec(HVPPEXIT_END, pid, tid, exit_code);
 }
 
+#[inline]
+pub fn rec_hvpatch_executor_claim(pid: i32, tid: i32, executor: u32) {
+    rec(
+        HVPEXEC_CLAIM,
+        pid,
+        tid,
+        executor.min(i32::MAX as u32) as i32,
+    );
+}
+
+#[inline]
+pub fn rec_hvpatch_executor_load(pid: i32, tid: i32, executor: u32) {
+    rec(HVPEXEC_LOAD, pid, tid, executor.min(i32::MAX as u32) as i32);
+}
+
+#[inline]
+pub fn rec_hvpatch_executor_boundary(pid: i32, tid: i32, boundary: i32) {
+    rec(HVPEXEC_BOUNDARY, pid, tid, boundary);
+}
+
+#[inline]
+pub fn rec_hvpatch_executor_settlement(pid: i32, tid: i32, state: i32) {
+    rec(HVPEXEC_SETTLEMENT, pid, tid, state);
+}
+
+#[inline]
+pub fn rec_hvpatch_blocked_continuation(
+    pid: i32,
+    tid: i32,
+    syscall_number: u64,
+    family: u8,
+    args: [u64; 4],
+) {
+    let syscall = u32::try_from(syscall_number)
+        .ok()
+        .filter(|number| *number < HVPBLOCK_NR_OVERFLOW)
+        .unwrap_or(HVPBLOCK_NR_OVERFLOW);
+    let packed = syscall | (u32::from(family) << 24);
+    rec(HVPBLOCK, pid, tid, packed as i32);
+    rec(
+        HVPBLOCK_ARG0,
+        args[0] as u32 as i32,
+        (args[0] >> 32) as u32 as i32,
+        tid,
+    );
+    rec(
+        HVPBLOCK_ARGS,
+        args[1] as u32 as i32,
+        args[2] as u32 as i32,
+        tid,
+    );
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventRecord {
     pub logical_index: u64,
@@ -462,7 +541,7 @@ pub enum RingReadError {
 
 #[cfg(any(test, feature = "event-ring-dump"))]
 const fn known_kind(kind: u8) -> bool {
-    kind >= BIND && kind <= FDREF
+    kind >= BIND && kind <= HVPBLOCK_ARGS
 }
 
 #[cfg(any(test, feature = "event-ring-dump"))]
@@ -629,7 +708,7 @@ fn maybe_start_watchdog() {
         });
 }
 
-#[cfg(feature = "event-ring-dump")]
+#[cfg(any(test, feature = "event-ring-dump"))]
 fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
     match kind {
         BIND => format!("BIND     gfd={a} hfd={b} pathhash={c:#010x}"),
@@ -800,6 +879,73 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
         FDOWNER => format!("FDOWNER pid={a} tid={b} gfd={c}"),
         FDREF => format!("FDREF    pid={a} gfd={b} refs_before={c}"),
         CLONESPAWN => format!("CLONESPAWN parent_pid={a} child_tid={b} errno={c}"),
+        HVPEXEC_CLAIM => format!("HVPEXEC  pid={a} tid={b} executor={c} phase=claim"),
+        HVPEXEC_LOAD => format!("HVPEXEC  pid={a} tid={b} executor={c} phase=load"),
+        HVPEXEC_BOUNDARY => format!(
+            "HVPEXEC  pid={a} tid={b} phase=boundary reason={}",
+            match c {
+                1 => "blocked-child",
+                2 => "blocked-host",
+                3 => "blocked-continuation",
+                4 => "yielded",
+                5 => "preempted",
+                6 => "quiesced",
+                7 => "exited",
+                8 => "invalid-state",
+                _ => "unknown",
+            }
+        ),
+        HVPEXEC_SETTLEMENT => format!(
+            "HVPEXEC  pid={a} tid={b} phase=settlement state={}",
+            match c {
+                1 => "runnable",
+                2 => "blocked-child",
+                3 => "blocked-host",
+                4 => "exited",
+                5 => "failed",
+                6 => "running",
+                7 => "switching-out",
+                8 => "uninitialized",
+                _ => "unknown",
+            }
+        ),
+        HVPBLOCK => {
+            let packed = c as u32;
+            let native_nr = packed & 0x00ff_ffff;
+            let number = if native_nr == HVPBLOCK_NR_OVERFLOW {
+                "overflow".to_owned()
+            } else {
+                native_nr.to_string()
+            };
+            let family = match packed >> 24 {
+                1 => "futex-wait",
+                2 => "futex-waitv",
+                3 => "shared-futex-wait",
+                4 => "shared-futex-waitv",
+                5 => "shared-word",
+                6 => "fds",
+                7 => "select",
+                8 => "poll",
+                9 => "host-write",
+                10 => "record-lock",
+                11 => "proc-exit",
+                12 => "proc-state",
+                13 => "child",
+                14 => "signals",
+                15 => "sleep",
+                16 => "vfork-parent",
+                _ => "unknown",
+            };
+            format!("HVPBLOCK pid={a} tid={b} native_nr={number} family={family}")
+        }
+        HVPBLOCK_ARG0 => format!(
+            "HVPBLOCKARG0 tid={c} arg0={:#018x}",
+            (a as u32 as u64) | ((b as u32 as u64) << 32)
+        ),
+        HVPBLOCK_ARGS => format!(
+            "HVPBLOCKARGS tid={c} arg1={:#x} arg2={}",
+            a as u32, b as u32
+        ),
         _ => String::new(),
     }
 }
@@ -1213,6 +1359,66 @@ mod tests {
         rec_hvpatch_process_exit_end(62_809, 62_809, 0);
         assert!(contains_event(HVPPEXIT_BEGIN, 62_809, 62_809, 0));
         assert!(contains_event(HVPPEXIT_END, 62_809, 62_809, 0));
+    }
+
+    #[test]
+    fn hvpatch_executor_records_exact_guest_claim_and_load_boundaries() {
+        rec_hvpatch_executor_claim(62_809, 62_809, 7);
+        rec_hvpatch_executor_load(62_809, 62_809, 7);
+        assert!(contains_event(HVPEXEC_CLAIM, 62_809, 62_809, 7));
+        assert!(contains_event(HVPEXEC_LOAD, 62_809, 62_809, 7));
+    }
+
+    #[test]
+    fn hvpatch_executor_records_process_leader_boundary_and_settlement() {
+        rec_hvpatch_executor_boundary(62_809, 62_809, 5);
+        rec_hvpatch_executor_settlement(62_809, 62_809, 2);
+        assert!(contains_event(HVPEXEC_BOUNDARY, 62_809, 62_809, 5));
+        assert!(contains_event(HVPEXEC_SETTLEMENT, 62_809, 62_809, 2));
+    }
+
+    #[test]
+    fn hvpatch_blocked_continuation_preserves_syscall_and_family() {
+        rec_hvpatch_blocked_continuation(
+            62_809,
+            62_809,
+            202,
+            3,
+            [
+                0x0000_0088_0006_0a70,
+                0x0000_0001_0000_0081,
+                0x0000_0002_0000_0002,
+                0,
+            ],
+        );
+        assert!(contains_event(
+            HVPBLOCK,
+            62_809,
+            62_809,
+            (3_i32 << 24) | 202
+        ));
+        assert!(contains_event(HVPBLOCK_ARG0, 0x0006_0a70, 0x88, 62_809));
+        assert!(contains_event(HVPBLOCK_ARGS, 0x81, 2, 62_809));
+        assert_eq!(
+            decode(HVPBLOCK, 62_809, 62_809, (3_i32 << 24) | 202),
+            "HVPBLOCK pid=62809 tid=62809 native_nr=202 family=shared-futex-wait"
+        );
+        assert_eq!(
+            decode(HVPBLOCK_ARG0, 0x0006_0a70, 0x88, 62_809),
+            "HVPBLOCKARG0 tid=62809 arg0=0x0000008800060a70"
+        );
+        assert_eq!(
+            decode(HVPBLOCK_ARGS, 0x81, 2, 62_809),
+            "HVPBLOCKARGS tid=62809 arg1=0x81 arg2=2"
+        );
+
+        rec_hvpatch_blocked_continuation(62_809, 62_809, u64::MAX, 4, [0; 4]);
+        assert!(contains_event(
+            HVPBLOCK,
+            62_809,
+            62_809,
+            ((4_u32 << 24) | HVPBLOCK_NR_OVERFLOW) as i32
+        ));
     }
 
     #[test]

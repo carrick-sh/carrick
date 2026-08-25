@@ -17,7 +17,7 @@ use crate::dispatch::SyscallDispatcher;
 use crate::kernel::SchedulerError;
 use crate::kernel::objects::{
     BlockedReason, ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState,
-    ThreadExecutionLease, ThreadKey,
+    ThreadExecutionLease, ThreadExecutionState, ThreadKey,
 };
 use crate::kernel::{
     ExecutorBinding, ExecutorKick, ExecutorKickToken, ExecutorRegistration, MmId, RunnableThread,
@@ -3419,6 +3419,33 @@ where
             executor_id,
             ExecutorPoolEvent::Claimed { thread, generation },
         );
+        let kernel_task = running.thread().task();
+        let event_ring_identity = kernel_task
+            .as_ref()
+            .and_then(|task| process_leader_event_identity(task.key().id.raw(), thread.tid.raw()));
+        if let Some((pid, tid)) = event_ring_identity {
+            crate::event_ring::rec_hvpatch_executor_claim(pid, tid, executor_id.raw_for_probe());
+        }
+        if let Some(task) = kernel_task.as_ref() {
+            // A scheduler claim is evidence even when the claimed snapshot is
+            // malformed. Preserve the non-reused task/thread/generation join
+            // and use zero only for the authority field that could not be
+            // validated; the subsequent load path still fails closed.
+            let asid_generation = executor_claim_probe_asid_generation(
+                running
+                    .lease()
+                    .task_state_authority()
+                    .ok()
+                    .map(|(_, asid_generation)| asid_generation),
+            );
+            crate::probes::hvpatch_executor_claim(
+                task.key().serial.raw(),
+                thread.serial.raw(),
+                executor_id.raw_for_probe(),
+                generation.raw(),
+                asid_generation,
+            );
+        }
         if let Err(error) = boundary.audit_runtime(backend) {
             let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                 resolver.as_ref(),
@@ -3486,6 +3513,9 @@ where
             executor_id,
             ExecutorPoolEvent::Loaded { thread, generation },
         );
+        if let Some((pid, tid)) = event_ring_identity {
+            crate::event_ring::rec_hvpatch_executor_load(pid, tid, executor_id.raw_for_probe());
+        }
         probe_executor_lifecycle(
             executor_id,
             crate::probes::HvpatchExecutorLifecyclePhase::Load,
@@ -3651,6 +3681,16 @@ where
             }
             break exit;
         };
+        let post_run_event_identity = running.thread().task().as_ref().and_then(|task| {
+            process_leader_event_identity(task.key().id.raw(), running.thread_key().tid.raw())
+        });
+        if let Some((pid, tid)) = post_run_event_identity {
+            crate::event_ring::rec_hvpatch_executor_boundary(
+                pid,
+                tid,
+                executor_boundary_event_code(&exit),
+            );
+        }
         if matches!(exit, ExecutorExit::InvalidState) {
             let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                 resolver.as_ref(),
@@ -3910,6 +3950,7 @@ where
                 );
             }
         }
+        let settlement_thread = Arc::clone(running.thread());
         let settlement = match exit {
             ExecutorExit::Blocked(reason) => {
                 drop(submission_authority);
@@ -3976,6 +4017,13 @@ where
         };
         match settlement {
             Ok(event) => {
+                if let Some((pid, tid)) = post_run_event_identity {
+                    crate::event_ring::rec_hvpatch_executor_settlement(
+                        pid,
+                        tid,
+                        thread_settlement_event_code(settlement_thread.execution_state()),
+                    );
+                }
                 if matches!(event, ExecutorPoolEvent::SettledExited { .. }) {
                     binding.after_terminal_settlement();
                 }
@@ -4000,6 +4048,54 @@ where
         }
         receipts.record(executor_id, ExecutorPoolEvent::AuditPassed);
         std::thread::yield_now();
+    }
+}
+
+fn executor_boundary_event_code(exit: &ExecutorExit) -> i32 {
+    match exit {
+        ExecutorExit::Blocked(BlockedReason::ChildState) => 1,
+        ExecutorExit::Blocked(BlockedReason::HostWait) => 2,
+        ExecutorExit::BlockedContinuation { .. } => 3,
+        ExecutorExit::Yielded => 4,
+        ExecutorExit::Preempted => 5,
+        ExecutorExit::Quiesced => 6,
+        ExecutorExit::Exited => 7,
+        ExecutorExit::InvalidState => 8,
+        ExecutorExit::Syscall => 0,
+    }
+}
+
+fn thread_settlement_event_code(state: ThreadExecutionState) -> i32 {
+    match state {
+        ThreadExecutionState::Runnable { .. } => 1,
+        ThreadExecutionState::Blocked {
+            reason: BlockedReason::ChildState,
+            ..
+        } => 2,
+        ThreadExecutionState::Blocked {
+            reason: BlockedReason::HostWait,
+            ..
+        } => 3,
+        ThreadExecutionState::Exited { .. } => 4,
+        ThreadExecutionState::Failed { .. } => 5,
+        ThreadExecutionState::Running { .. } => 6,
+        ThreadExecutionState::SwitchingOut { .. } => 7,
+        ThreadExecutionState::Uninitialized => 8,
+    }
+}
+
+const fn executor_claim_probe_asid_generation(validated: Option<u64>) -> u64 {
+    match validated {
+        Some(asid_generation) => asid_generation,
+        None => 0,
+    }
+}
+
+const fn process_leader_event_identity(task_pid: i32, tid: i32) -> Option<(i32, i32)> {
+    if task_pid == tid {
+        Some((task_pid, tid))
+    } else {
+        None
     }
 }
 
@@ -4219,6 +4315,7 @@ pub(crate) mod tests {
         HvpatchSubmissionShape, HvpatchTaskBindingDirectory, PersistentExecutor,
         PersistentExecutorFactory, PersistentTaskBinding, ReceiptLog, RunnableTask, SavedRunnable,
         TaskBindingResolver, TaskLoadIdentity, WorkerBoundaryAudit, WorkerKick,
+        executor_claim_probe_asid_generation, process_leader_event_identity,
         restore_worker_vcpu_before_binding_publication, retire_failed_hvpatch_clone_authority,
     };
     use crate::compat::SyscallArgs;
@@ -5216,6 +5313,18 @@ pub(crate) mod tests {
         )
         .expect("bootstrap input");
         Kernel::bootstrap_root(input).expect("kernel")
+    }
+
+    #[test]
+    fn executor_event_ring_excludes_nonleader_quantum_churn() {
+        assert_eq!(process_leader_event_identity(5, 5), Some((5, 5)));
+        assert_eq!(process_leader_event_identity(5, 6), None);
+    }
+
+    #[test]
+    fn executor_claim_probe_keeps_invalid_snapshot_claims_observable() {
+        assert_eq!(executor_claim_probe_asid_generation(Some(17)), 17);
+        assert_eq!(executor_claim_probe_asid_generation(None), 0);
     }
 
     #[test]

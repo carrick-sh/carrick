@@ -2787,7 +2787,7 @@ mod hvpatch_guest_probe_abi {
     }
 
     #[test]
-    fn hvpatch_executor_lifecycle_provider_keeps_exact_generation_identity() {
+    fn hvpatch_executor_lifecycle_provider_keeps_exact_claim_and_generation_identity() {
         assert_eq!(HvpatchExecutorLifecyclePhase::Create.raw(), 0);
         assert_eq!(HvpatchExecutorLifecyclePhase::Load.raw(), 1);
         assert_eq!(HvpatchExecutorLifecyclePhase::Save.raw(), 2);
@@ -2798,6 +2798,8 @@ mod hvpatch_guest_probe_abi {
         for declaration in [
             "fn hvpatch__executor__lifecycle(_: u32, _: u32, _: u64, _: u64, _: u64) {}",
             "stub!(hvpatch_executor_lifecycle(",
+            "fn hvpatch__executor__claim(_: u64, _: u64, _: u32, _: u64, _: u64) {}",
+            "stub!(hvpatch_executor_claim(",
         ] {
             assert!(
                 source.matches(declaration).count() >= 2,
@@ -4953,6 +4955,12 @@ mod real {
         /// Persistent executor identity and exact task/ASID generation at one
         /// owner-thread lifecycle boundary.
         fn hvpatch__executor__lifecycle(_: u32, _: u32, _: u64, _: u64, _: u64) {}
+        /// Exact scheduler claim before backend load. Args: TaskSerial,
+        /// ThreadSerial, executor id, execution generation, and validated ASID
+        /// generation (zero when snapshot authority is invalid/unavailable).
+        /// TaskSerial joins the earlier guest-lifecycle identity without
+        /// assuming TaskSerial == ThreadSerial for a process leader.
+        fn hvpatch__executor__claim(_: u64, _: u64, _: u32, _: u64, _: u64) {}
         /// Linux clone TID-output publication: reserved tid, stable output-role
         /// ordinal, guest address, and stable backend memory-result ordinal.
         fn mn__clone__tid__output(_: i32, _: u32, _: u64, _: u32) {}
@@ -5614,6 +5622,26 @@ mod real {
             executor,
             phase.raw(),
             thread_serial,
+            execution_generation,
+            asid_generation
+        ));
+    }
+
+    /// Exact scheduler claim before backend audit/load. `asid_generation` is
+    /// zero only when the claimed snapshot's authority could not be validated;
+    /// task/thread serials and execution generation remain authoritative so a
+    /// malformed claim cannot disappear from the trace.
+    pub fn hvpatch_executor_claim(
+        task_serial: u64,
+        thread_serial: u64,
+        executor: u32,
+        execution_generation: u64,
+        asid_generation: u64,
+    ) {
+        carrick_usdt::hvpatch__executor__claim!(|| (
+            task_serial,
+            thread_serial,
+            executor,
             execution_generation,
             asid_generation
         ));
@@ -7508,6 +7536,13 @@ mod stub {
         executor: u32,
         phase: super::HvpatchExecutorLifecyclePhase,
         thread_serial: u64,
+        execution_generation: u64,
+        asid_generation: u64
+    ));
+    stub!(hvpatch_executor_claim(
+        task_serial: u64,
+        thread_serial: u64,
+        executor: u32,
         execution_generation: u64,
         asid_generation: u64
     ));
