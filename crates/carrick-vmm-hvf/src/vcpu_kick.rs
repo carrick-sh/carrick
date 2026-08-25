@@ -310,6 +310,34 @@ fn reconcile_durable_signal_state_until_stable(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn durable_signal_retry_is_owed() -> bool {
+    crate::host_signal::has_process_pending()
+        || crate::host_signal::xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE)
+        || !crate::host_signal::pending_thread_tids().is_empty()
+}
+
+/// Retry only the HVF kick half of durable signal delivery, and only for vCPUs
+/// still entering or executing guest code. The initial reconciliation already
+/// notified futex waiters and carrier continuations; repeating those broad wake
+/// paths for an unchanged blocked pending bit turns the pump into a 1 kHz spin.
+/// A vCPU still in guest code is the one case where the one-shot
+/// `hv_vcpus_exit` may have landed at an EL1 boundary and needs another chance.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retry_durable_signal_kicks(kicker: &dyn carrick_hal::VcpuRegistry) -> bool {
+    if crate::host_signal::has_process_pending()
+        || crate::host_signal::xsig_has_unblocked_for_self(carrick_abi::SigBlockMask::NONE)
+    {
+        return kicker.kick_all_in_guest();
+    }
+
+    let mut kicked = false;
+    for tid in crate::host_signal::pending_thread_tids() {
+        kicked |= kicker.kick_if_in_guest(carrick_hal::ThreadId::from_wire_key(tid));
+    }
+    kicked
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn spawn_signal_pump_inner(
     kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
     futex: std::sync::Arc<dyn carrick_hal::PlatformFutex>,
@@ -387,6 +415,11 @@ fn spawn_signal_pump_inner(
             // state can predate this pump and therefore its local sequence.
             let mut observed_publication =
                 reconcile_durable_signal_state_until_stable(kicker.as_ref(), futex.as_ref());
+            // A publication gets one unconditional reconciliation. Further
+            // retry is useful only while a target remains in guest code; the
+            // first timeout below discovers that state without repeatedly
+            // waking parked host-side waiters.
+            let mut retry_armed = durable_signal_retry_is_owed();
             thread_ready.raise();
             while thread_running.load(std::sync::atomic::Ordering::SeqCst) {
                 // Pipes and kqueue user events are notifications, never the
@@ -400,6 +433,7 @@ fn spawn_signal_pump_inner(
                         kicker.as_ref(),
                         futex.as_ref(),
                     );
+                    retry_armed = durable_signal_retry_is_owed();
                 }
                 // Reconcile registered timers with the armed slots BEFORE waiting,
                 // so a just-armed (or re-armed) timer is registered in this
@@ -434,18 +468,20 @@ fn spawn_signal_pump_inner(
                 // hv_vcpus_exit) is otherwise NEVER retried: the publication
                 // generation is unchanged, so this pump blocked forever while
                 // the guest's __synccall handshake starved
-                // (setidthreadchurn's 45 s livelock). While durable pending
-                // state remains after a reconcile, wait on a short cadence —
-                // every retry kick is a fresh chance to land in an EL0
-                // window. With nothing owed, block indefinitely as before (a
-                // poll would keep the idle process SRUN).
-                let owed = crate::host_signal::has_process_pending()
-                    || !crate::host_signal::pending_thread_tids().is_empty();
+                // (setidthreadchurn's 45 s livelock). After a publication,
+                // briefly arm a short cadence; each timeout retries only vCPUs
+                // still reporting in-guest and disarms as soon as none remain.
+                // With no viable retry target, block indefinitely as before (a
+                // poll would keep an idle process SRUN).
                 let retry_timeout = libc::timespec {
                     tv_sec: 0,
                     tv_nsec: 1_000_000,
                 };
-                let timeout = if owed { Some(&retry_timeout) } else { None };
+                let timeout = if retry_armed {
+                    Some(&retry_timeout)
+                } else {
+                    None
+                };
                 let n = match kq.wait(&[], &mut out, timeout) {
                     Ok(n) => n,
                     Err(errno) => {
@@ -455,10 +491,11 @@ fn spawn_signal_pump_inner(
                         break;
                     }
                 };
-                if n == 0 && owed {
-                    // Timeout with pending state: re-deliver regardless of the
-                    // (unchanged) publication generation.
-                    reconcile_durable_signal_state(kicker.as_ref(), futex.as_ref());
+                if n == 0 && retry_armed {
+                    // A one-shot HVF exit can be swallowed at EL1. Retry only
+                    // vCPUs that are still in guest code; once every target is
+                    // back in host code, disarm the timeout and genuinely park.
+                    retry_armed = retry_durable_signal_kicks(kicker.as_ref());
                     continue;
                 }
                 for event in out.iter().take(n) {
@@ -759,6 +796,54 @@ mod tests {
             crate::linux_abi::LINUX_SIGUSR1
         );
         crate::host_signal::forget_thread(tid.raw());
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn wake_pump_retries_only_vcpus_still_executing_guest_code() {
+        let _g = crate::host_signal::pump_state_test_guard();
+        crate::host_signal::reset_after_supervisor_fork();
+        crate::host_signal::clear_proc_pending();
+        crate::host_signal::publish_process_signal(crate::linux_abi::LINUX_SIGINT);
+
+        let registry = std::sync::Arc::new(VcpuKicker::new());
+        let parked_kicks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let running_kicks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let parked = carrick_hal::InGuestFlag::for_guest_thread();
+        let running = carrick_hal::InGuestFlag::for_guest_thread();
+        running.enter_guest();
+        registry.register(
+            carrick_hal::ThreadId::synthetic_for_tests(0x7055),
+            Box::new(CountingKick(std::sync::Arc::clone(&parked_kicks))),
+            &parked,
+        );
+        registry.register(
+            carrick_hal::ThreadId::synthetic_for_tests(0x7056),
+            Box::new(CountingKick(std::sync::Arc::clone(&running_kicks))),
+            &running,
+        );
+        let futex: std::sync::Arc<dyn carrick_hal::PlatformFutex> = std::sync::Arc::new(
+            crate::threaded_impl::hvf_futex(std::sync::Arc::new(crate::thread::FutexTable::new())),
+        );
+
+        let pump = spawn_signal_wake_pump(registry, futex);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while running_kicks.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "signal pump did not retry the in-guest vCPU"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            parked_kicks.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "retry delivery must not kick a vCPU parked in host code"
+        );
+
+        running.leave_guest();
+        pump.stop();
+        crate::host_signal::clear_proc_pending();
     }
 
     // On non-macOS, handles carry no live id, so kicks are no-ops; we still

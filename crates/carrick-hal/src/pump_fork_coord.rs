@@ -88,7 +88,13 @@ mod tests {
         }
         fn unregister(&self, _t: crate::ThreadId) {}
         fn kick(&self, _t: crate::ThreadId) {}
+        fn kick_if_in_guest(&self, _t: crate::ThreadId) -> bool {
+            false
+        }
         fn kick_all(&self) {}
+        fn kick_all_in_guest(&self) -> bool {
+            false
+        }
         fn kick_all_except(&self, _e: crate::ThreadId) {}
         fn any_other_in_guest(&self, _e: crate::ThreadId) -> bool {
             false
