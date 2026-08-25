@@ -2160,8 +2160,14 @@ mod tests {
         ExecutorBinding, ExecutorKick, ExecutorKickToken, QueueKey, RunQueueError, Scheduler,
         WakeDisposition,
     };
+    use crate::compat::SyscallArgs;
+    use crate::dispatch::SyscallRequest;
     use crate::kernel::objects::{BlockedReason, MigratableTaskState, ThreadExecutionState};
     use crate::kernel::{ClonePlan, Kernel, KernelContext, RootBootstrap};
+    use crate::vcpu_loop::continuation::{
+        BlockedContinuation, CarrierWaitService, ContinuationBackend, ContinuationCapture,
+        RestartClass,
+    };
 
     fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
         let input = RootBootstrap::for_reference_model(
@@ -3041,6 +3047,109 @@ mod tests {
             context.thread().execution_state(),
             ThreadExecutionState::Blocked { .. }
         ));
+    }
+
+    #[test]
+    fn generic_wake_racing_vfork_settlement_cannot_resume_parent() {
+        let (kernel, parent) = bootstrap(12_122);
+        publish(&parent, 30);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let wait_service = CarrierWaitService::new(Arc::clone(&scheduler));
+        let executor = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        scheduler.make_runnable(parent.thread().key()).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+
+        let published = kernel
+            .reserve_fork(
+                &parent,
+                ClonePlan::from_flags(LinuxCloneFlags::VFORK | LinuxCloneFlags::VM)
+                    .expect("vfork plan"),
+                "scheduler vfork wake race".to_owned(),
+                None,
+            )
+            .expect("reserve vfork")
+            .prepare_reference(ThreadId::synthetic_for_tests(22_122))
+            .expect("prepare vfork")
+            .commit()
+            .expect("publish vfork");
+        let (child, wait) = published.into_parts().expect("start vfork child");
+        let current = parent
+            .task_binding()
+            .capture(parent.thread().key().tid)
+            .expect("recapture vfork parent");
+        let continuation = BlockedContinuation::from_vfork_parent(
+            ContinuationCapture::from_lease(
+                &current,
+                running.lease(),
+                SyscallRequest::new(220, SyscallArgs([0; 6])),
+                RestartClass::RestartSyscall,
+                ContinuationBackend::Hvpatch,
+            )
+            .expect("capture running vfork parent"),
+            child.task().key(),
+            wait.expect("vfork parent wait"),
+        )
+        .expect("vfork continuation");
+        let mut registration = wait_service.prepare_registration(&continuation);
+        wait_service
+            .enroll(&mut registration)
+            .expect("enroll vfork continuation");
+
+        scheduler
+            .wake(parent.thread().key())
+            .expect("generic wake races vfork switch-out");
+        scheduler
+            .settle_blocked_continuation(running, continuation, registration)
+            .expect("settle vfork parent");
+
+        assert!(
+            matches!(
+                parent.thread().execution_state(),
+                ThreadExecutionState::Blocked { .. }
+            ),
+            "generic wake_pending must not resume a vfork parent before exact child release",
+        );
+        assert_eq!(scheduler.queued_len(), 0);
+
+        assert_eq!(
+            scheduler
+                .wake(parent.thread().key())
+                .expect("generic wake of blocked vfork parent"),
+            WakeDisposition::Pending,
+        );
+        assert!(matches!(
+            parent.thread().execution_state(),
+            ThreadExecutionState::Blocked { .. }
+        ));
+        assert_eq!(scheduler.queued_len(), 0);
+
+        kernel
+            .exit_task(
+                child.task().key().id,
+                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("publish exact vfork child release");
+        assert!(matches!(
+            parent.thread().execution_state(),
+            ThreadExecutionState::Runnable { .. }
+        ));
+        assert_eq!(scheduler.queued_len(), 1);
+        let released = scheduler
+            .take(&executor)
+            .expect("take released vfork parent");
+        assert_eq!(
+            released
+                .lease()
+                .blocked_continuation()
+                .expect("released vfork continuation")
+                .ready_event()
+                .expect("exact release event"),
+            crate::vcpu_loop::continuation::ContinuationEvent::Ready,
+        );
+        scheduler.settle_exited(released).unwrap();
     }
 
     #[test]

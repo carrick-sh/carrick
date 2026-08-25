@@ -993,6 +993,23 @@ impl BlockedContinuation {
         }
     }
 
+    /// Whether a generic scheduler wake is itself a completion edge.
+    ///
+    /// A vfork parent has exactly one producer: its child's exec/exit release
+    /// gate. Retry, signal, and task-event wakes may schedule control work but
+    /// must never manufacture guest readiness for that continuation.
+    pub(crate) const fn accepts_generic_scheduler_wake(&self) -> bool {
+        !matches!(self, Self::VforkParent(_))
+    }
+
+    /// Whether the scheduler may queue this continuation for the current wake.
+    /// Exact producers publish into the registration before calling
+    /// `Scheduler::wake`, so an already-ready vfork release remains runnable
+    /// even though unrelated generic wakes are rejected.
+    pub(crate) fn accepts_scheduler_wake_now(&self) -> bool {
+        self.accepts_generic_scheduler_wake() || self.ready_event().is_ok()
+    }
+
     pub fn id(&self) -> ContinuationId {
         self.state().id
     }
@@ -1269,6 +1286,14 @@ impl BlockedContinuation {
         event: ContinuationEvent,
         context: &KernelContext,
     ) -> Result<ContinuationResult, ContinuationResumeError> {
+        if event == ContinuationEvent::Ready
+            && matches!(
+                &self.state().detail,
+                ContinuationDetail::Vfork { wait, .. } if wait.released_reason().is_none()
+            )
+        {
+            return Err(ContinuationResumeError::PrematureVforkRelease);
+        }
         self.authorize_resume(ResumeContext {
             thread: context.thread().key(),
             task: context.task().key(),
@@ -1620,6 +1645,7 @@ pub enum ContinuationResumeError {
     StaleAddressSpace,
     MissingContinuation,
     StaleFileSlot,
+    PrematureVforkRelease,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2091,6 +2117,12 @@ impl SignalReadinessProbe {
     }
 
     fn event(&self) -> Option<ContinuationEvent> {
+        // Linux keeps a vfork parent suspended until the exact child exec/exit
+        // gate releases it. Generic task events and even deliverable signals
+        // may become pending, but they must not complete the vfork syscall.
+        if self.family == ContinuationFamily::VforkParent {
+            return None;
+        }
         if matches!(
             self.family,
             ContinuationFamily::WaitOnProcExit
@@ -2903,7 +2935,9 @@ impl CarrierWaitService {
                 }
             }
         }
-        if let Some(task) = signal.task_ref.upgrade() {
+        if signal.family != ContinuationFamily::VforkParent
+            && let Some(task) = signal.task_ref.upgrade()
+        {
             let callback_weak = weak.clone();
             match task.subscribe_wake(
                 signal.observed_task_wake,
@@ -5103,6 +5137,10 @@ mod tests {
         assert_eq!(continuation.family(), ContinuationFamily::VforkParent);
         assert_eq!(continuation.vfork_child(), Some(child.task().key()));
         assert_send_static(&continuation);
+        assert!(matches!(
+            continuation.resume(ContinuationEvent::Ready, &current),
+            Err(ContinuationResumeError::PrematureVforkRelease)
+        ));
 
         let probe = Arc::new(AtomicUsize::new(0));
         let make = || {
@@ -5115,8 +5153,22 @@ mod tests {
             continuation.install_cleanup_probe(Arc::clone(&probe));
             continuation
         };
-        let ready = make()
-            .resume(ContinuationEvent::Ready, &current)
+        let mut specimens = std::iter::repeat_with(make).take(6).collect::<Vec<_>>();
+
+        kernel
+            .exit_task(
+                child.task().key().id,
+                crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .expect("publish exact vfork child release");
+        let fresh = context
+            .task_binding()
+            .capture(context.thread().key().tid)
+            .expect("recapture parent after exact vfork release");
+        let ready = specimens
+            .remove(0)
+            .resume(ContinuationEvent::Ready, &fresh)
             .expect("vfork release result");
         assert_eq!(
             ready.completion,
@@ -5128,9 +5180,9 @@ mod tests {
             CancellationCause::ProcessExit,
             CancellationCause::Quiesce,
         ] {
-            assert_eq!(make().cancel(cause).cleanup_count(), 1);
+            assert_eq!(specimens.remove(0).cancel(cause).cleanup_count(), 1);
         }
-        drop(make());
+        drop(specimens.pop().expect("drop specimen"));
         assert_eq!(probe.load(Ordering::SeqCst), 6);
     }
 
@@ -6461,6 +6513,37 @@ mod tests {
         .expect("vfork continuation");
         let mut registration = service.prepare_registration(&vfork);
         service.enroll(&mut registration).expect("enroll vfork");
+        let vfork_token = registration.wake_token();
+        kernel.publish_task_event_and_wake(context.task().key(), || true);
+        assert_eq!(
+            service
+                .inner
+                .state
+                .lock()
+                .entries
+                .get(&vfork_token.continuation())
+                .expect("vfork registration after unrelated parent task event")
+                .state,
+            RegistrationState::Enrolled,
+            "a parent task event must not release vfork before the exact child exec/exit gate",
+        );
+        context.signal_authority().enqueue_thread_standard(
+            crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1"),
+            None,
+        );
+        context.task().wake();
+        assert_eq!(
+            service
+                .inner
+                .state
+                .lock()
+                .entries
+                .get(&vfork_token.continuation())
+                .expect("vfork registration after deliverable parent signal")
+                .state,
+            RegistrationState::Enrolled,
+            "a deliverable parent signal must remain pending until the exact vfork child release",
+        );
         kernel
             .exit_task(
                 child.task().key().id,
