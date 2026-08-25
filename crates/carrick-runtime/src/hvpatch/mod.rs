@@ -688,6 +688,7 @@ impl ProcessContext {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_exec(
         &self,
         context: &crate::kernel::KernelContext,
@@ -695,6 +696,14 @@ impl ProcessContext {
         if context.task().key() != self.task_key() {
             return Err("exec context belongs to another HVPatch task generation".to_owned());
         }
+        self.prepare_exec_for_linux_tid(context.thread().key().tid)
+            .map(|(prepared, _context)| prepared)
+    }
+
+    pub(crate) fn prepare_exec_for_linux_tid(
+        &self,
+        tid: crate::kernel::LinuxTid,
+    ) -> Result<(PreparedProcessExec, crate::kernel::KernelContext), String> {
         let current_backend = std::sync::Arc::clone(&self.mm_backend.read());
         let replacement_mm = self
             .resources
@@ -702,19 +711,22 @@ impl ProcessContext {
             .map_err(|error| error.to_string())?;
         let backend = replacement_mm.backend();
         let kernel_backend: std::sync::Arc<dyn crate::kernel::MmBackend> = backend.clone();
-        let kernel = self
+        let (kernel, context) = self
             .kernel_graph()
-            .prepare_exec_with_mm_backend(context, kernel_backend, None)
+            .prepare_exec_for_binding_with_mm_backend(&self.binding, tid, kernel_backend, None)
             .map_err(|error| error.to_string())?;
         let old_vmas = current_backend
             .prepare_vma_freeze(std::time::Instant::now() + std::time::Duration::from_secs(1))
             .map_err(|error| error.to_string())?;
-        Ok(PreparedProcessExec {
-            kernel,
-            backend,
-            replacement_mm,
-            old_vmas,
-        })
+        Ok((
+            PreparedProcessExec {
+                kernel,
+                backend,
+                replacement_mm,
+                old_vmas,
+            },
+            context,
+        ))
     }
 
     pub(crate) fn commit_exec(
@@ -2338,6 +2350,42 @@ mod tests {
                 .binding),
             process.mm_binding()
         );
+    }
+
+    #[test]
+    fn nonleader_exec_preparation_reselects_survivor_after_leader_retirement() {
+        let (process, root) = authoritative_root();
+        let sibling = process
+            .kernel_graph()
+            .reserve_thread_clone(
+                &root,
+                crate::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::THREAD
+                        | carrick_abi::LinuxCloneFlags::SIGHAND
+                        | carrick_abi::LinuxCloneFlags::VM,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(crate::thread::ThreadId::synthetic_for_tests(10_002))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .start_thread()
+            .unwrap();
+        let selected_survivor = sibling.context().retain_exact();
+        let leader_tid = crate::kernel::LinuxTid::for_task_leader(process.task_id());
+        let current_leader = process.context_for_linux_tid(leader_tid).unwrap();
+
+        process
+            .kernel_graph()
+            .exit_thread(&current_leader, None)
+            .unwrap();
+
+        process
+            .prepare_exec(&selected_survivor)
+            .expect("exec preparation must atomically reselect the live survivor");
     }
 
     #[test]
