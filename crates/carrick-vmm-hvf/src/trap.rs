@@ -5191,6 +5191,7 @@ pub(crate) struct HvfTaskState {
     mm_root_slot: Option<(u64, u64)>,
     pending_exec_mm_root_slot: Option<(u64, u64)>,
     pending_exec_asid: Option<u16>,
+    pending_exec_predecessor_identity: Option<carrick_hal::ExecPredecessorIdentity>,
     pending_exec_stage2_cleanup: Option<PendingExecStage2Cleanup>,
     /// A distinct Linux process edge onto another process's live CLONE_VM MM.
     /// Exit/exec drops this projection without retiring shared stage-2 state.
@@ -5282,7 +5283,7 @@ struct PendingExecStage2Cleanup {
     /// Semantic alias ownership of the address space replaced by exec.
     mm_root_slot: Option<(u64, u64)>,
     /// Immutable exact Kernel identity captured before exec replaces the task.
-    predecessor_identity: HvpatchCarrierTaskIdentity,
+    predecessor_identity: carrick_hal::ExecPredecessorIdentity,
     /// Never-reused predecessor MM identity from the matching COW binding.
     predecessor_mm: u64,
     shared_projection: bool,
@@ -5313,12 +5314,19 @@ impl PendingExecStage2Cleanup {
         let classification =
             carrick_observability::probes::HvpatchExecPredecessorClassification::new(
                 carrick_observability::probes::HvpatchExecPredecessorClassificationPhase::CleanupConsumed,
-                identity.task_serial,
-                identity.thread_serial,
-                identity.linux_pid,
-                identity.linux_tid,
-                self.predecessor_mm,
-                u32::from(identity.asid),
+                carrick_observability::probes::HvpatchExecPredecessorIdentity::new(
+                    identity.task_serial,
+                    identity.thread_serial,
+                    identity.linux_pid,
+                    identity.linux_tid,
+                    self.predecessor_mm,
+                    u32::from(identity.asid),
+                )
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "construct deferred HVPatch exec predecessor identity: {error}"
+                    ))
+                })?,
                 self.shared_projection,
             )
             .map_err(|error| {
@@ -5425,6 +5433,43 @@ pub(crate) fn swap_hvpatch_task_state(live: &mut HvfTaskState, parked: &mut HvfT
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfTaskState {
+    fn take_exec_predecessor_identity(
+        &mut self,
+        predecessor_cow_identity: carrick_hal::FrameCowIdentity,
+    ) -> Result<carrick_hal::ExecPredecessorIdentity, TrapError> {
+        let predecessor_identity =
+            self.pending_exec_predecessor_identity
+                .take()
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "HVPatch exec predecessor cleanup lacks bound Kernel identity".to_owned(),
+                    )
+                })?;
+        if let Some(registration) = self.registration.as_ref() {
+            let registered = registration.expected_identity;
+            if predecessor_identity.task_serial != registered.task_serial
+                || predecessor_identity.thread_serial != registered.thread_serial
+                || predecessor_identity.linux_pid != registered.linux_pid
+                || predecessor_identity.linux_tid != registered.linux_tid
+                || predecessor_identity.asid != registered.asid
+            {
+                return Err(TrapError::Hypervisor(
+                    "HVPatch exec predecessor Kernel/registration identity mismatch".to_owned(),
+                ));
+            }
+        }
+        if predecessor_identity.linux_pid != predecessor_cow_identity.linux_pid
+            || predecessor_identity.linux_tid != predecessor_cow_identity.linux_tid
+            || predecessor_identity.mm != predecessor_cow_identity.mm
+            || predecessor_identity.asid != predecessor_cow_identity.asid
+        {
+            return Err(TrapError::Hypervisor(
+                "HVPatch exec predecessor Kernel/COW identity mismatch".to_owned(),
+            ));
+        }
+        Ok(predecessor_identity)
+    }
+
     pub(crate) fn runtime_authorities_match(
         &self,
         page_tables: &std::sync::Arc<
@@ -5531,6 +5576,7 @@ impl HvfTaskState {
             mm_root_slot: None,
             pending_exec_mm_root_slot: None,
             pending_exec_asid: None,
+            pending_exec_predecessor_identity: None,
             pending_exec_stage2_cleanup: None,
             shared_process_mm: false,
             last_exit_class: 0,
@@ -5686,6 +5732,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
         mm_root_slot: Some((mm_slot << 20, 0x20_0000)),
         pending_exec_mm_root_slot: None,
         pending_exec_asid: None,
+        pending_exec_predecessor_identity: None,
         pending_exec_stage2_cleanup: None,
         shared_process_mm: false,
         last_exit_class: 0,
@@ -5751,6 +5798,31 @@ pub(crate) fn audit_hvpatch_neutral_task_state_for_test(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn bind_exec_predecessor_identity_slot(
+    pending: &mut Option<carrick_hal::ExecPredecessorIdentity>,
+    identity: carrick_hal::ExecPredecessorIdentity,
+) -> Result<(), TrapError> {
+    if identity.task_serial == 0
+        || identity.thread_serial == 0
+        || identity.linux_pid <= 0
+        || identity.linux_tid <= 0
+        || identity.mm == 0
+        || identity.asid == 0
+    {
+        return Err(TrapError::Hypervisor(
+            "invalid exact HVPatch exec predecessor identity".to_owned(),
+        ));
+    }
+    if pending.is_some() {
+        return Err(TrapError::Hypervisor(
+            "duplicate exact HVPatch exec predecessor identity".to_owned(),
+        ));
+    }
+    *pending = Some(identity);
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
     pub(crate) fn prepare_exec_address_space(
         &mut self,
@@ -5771,6 +5843,13 @@ impl HvfVmState {
         self.pending_exec_mm_root_slot = Some((root_slot_base, root_slot_size));
         self.pending_exec_asid = Some(asid);
         Ok(())
+    }
+
+    pub(crate) fn bind_exec_predecessor_identity(
+        &mut self,
+        identity: carrick_hal::ExecPredecessorIdentity,
+    ) -> Result<(), TrapError> {
+        bind_exec_predecessor_identity_slot(&mut self.pending_exec_predecessor_identity, identity)
     }
 
     /// See `carrick_hal::ThreadedEngine::mark_exec_predecessor_shared`. The
@@ -8650,6 +8729,7 @@ impl HvpatchTaskRegistration {
             mm_root_slot: task_mm.mm_root_slot,
             pending_exec_mm_root_slot: None,
             pending_exec_asid: None,
+            pending_exec_predecessor_identity: None,
             pending_exec_stage2_cleanup: None,
             shared_process_mm,
             last_exit_class: 0,
@@ -11588,6 +11668,7 @@ impl HvfVmState {
                 mm_root_slot: None,
                 pending_exec_mm_root_slot: None,
                 pending_exec_asid: None,
+                pending_exec_predecessor_identity: None,
                 pending_exec_stage2_cleanup: None,
                 shared_process_mm: false,
                 last_exit_class: 0,
@@ -16643,6 +16724,7 @@ impl HvfVmState {
                 mm_root_slot,
                 pending_exec_mm_root_slot: None,
                 pending_exec_asid: None,
+                pending_exec_predecessor_identity: None,
                 pending_exec_stage2_cleanup: None,
                 shared_process_mm: false,
                 last_exit_class: 0,
@@ -17729,6 +17811,7 @@ impl HvfVmState {
                 mm_root_slot: Some(spec.mm_root_slot),
                 pending_exec_mm_root_slot: None,
                 pending_exec_asid: None,
+                pending_exec_predecessor_identity: None,
                 pending_exec_stage2_cleanup: None,
                 shared_process_mm: false,
                 last_exit_class: 0,
@@ -18161,33 +18244,25 @@ impl HvfVmState {
                     "HVPatch exec predecessor cleanup lacks exact COW identity".to_owned(),
                 )
             })?;
-            let predecessor_identity = self
-                .registration
-                .as_ref()
-                .ok_or_else(|| {
-                    TrapError::Hypervisor(
-                        "HVPatch exec predecessor cleanup lacks exact task registration".to_owned(),
-                    )
-                })?
-                .expected_identity;
-            if predecessor_identity.linux_pid != predecessor_cow_identity.linux_pid
-                || predecessor_identity.linux_tid != predecessor_cow_identity.linux_tid
-                || predecessor_identity.asid != predecessor_cow_identity.asid
-            {
-                return Err(TrapError::Hypervisor(
-                    "HVPatch exec predecessor task registration/COW identity mismatch".to_owned(),
-                ));
-            }
+            let predecessor_identity =
+                self.take_exec_predecessor_identity(predecessor_cow_identity)?;
             let shared_projection = self.shared_process_mm;
             let predecessor_classification =
                 carrick_observability::probes::HvpatchExecPredecessorClassification::new(
                     carrick_observability::probes::HvpatchExecPredecessorClassificationPhase::BackendCaptured,
-                    predecessor_identity.task_serial,
-                    predecessor_identity.thread_serial,
-                    predecessor_identity.linux_pid,
-                    predecessor_identity.linux_tid,
-                    predecessor_cow_identity.mm,
-                    u32::from(predecessor_identity.asid),
+                    carrick_observability::probes::HvpatchExecPredecessorIdentity::new(
+                        predecessor_identity.task_serial,
+                        predecessor_identity.thread_serial,
+                        predecessor_identity.linux_pid,
+                        predecessor_identity.linux_tid,
+                        predecessor_cow_identity.mm,
+                        u32::from(predecessor_identity.asid),
+                    )
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "construct backend HVPatch exec predecessor identity: {error}"
+                        ))
+                    })?,
                     shared_projection,
                 )
                 .map_err(|error| {
@@ -20171,19 +20246,50 @@ mod vm_create_admission_tests {
 mod frame_inventory_backend_tests {
     use super::*;
 
-    fn predecessor_test_identity(task: &HvfTaskState) -> (HvpatchCarrierTaskIdentity, u64) {
+    fn predecessor_test_identity(
+        task: &HvfTaskState,
+    ) -> (carrick_hal::ExecPredecessorIdentity, u64) {
         let cow = task.cow_identity.expect("fixture COW identity");
         (
-            HvpatchCarrierTaskIdentity {
+            carrick_hal::ExecPredecessorIdentity {
                 task_serial: u64::try_from(cow.linux_pid).unwrap(),
                 thread_serial: u64::try_from(cow.linux_tid).unwrap(),
-                execution_generation: 1,
                 linux_pid: cow.linux_pid,
                 linux_tid: cow.linux_tid,
+                mm: cow.mm,
                 asid: cow.asid,
             },
             cow.mm,
         )
+    }
+
+    #[test]
+    fn bootstrap_exec_predecessor_uses_bound_kernel_identity_without_registration() {
+        let mut task = hvpatch_task_state_test_fixture(31, 0x4000, 31);
+        let (identity, _) = predecessor_test_identity(&task);
+        assert!(task.registration.is_none());
+        bind_exec_predecessor_identity_slot(&mut task.pending_exec_predecessor_identity, identity)
+            .expect("bind bootstrap predecessor identity");
+        let mut duplicate = identity;
+        duplicate.thread_serial += 1;
+        assert!(
+            bind_exec_predecessor_identity_slot(
+                &mut task.pending_exec_predecessor_identity,
+                duplicate,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            task.pending_exec_predecessor_identity,
+            Some(identity),
+            "duplicate bind must not replace the first exact identity",
+        );
+
+        let observed = task
+            .take_exec_predecessor_identity(task.cow_identity.unwrap())
+            .expect("bound bootstrap predecessor identity");
+        assert_eq!(observed, identity);
+        assert!(task.pending_exec_predecessor_identity.is_none());
     }
 
     fn global_frame_allocator_test_lock() -> &'static parking_lot::Mutex<()> {

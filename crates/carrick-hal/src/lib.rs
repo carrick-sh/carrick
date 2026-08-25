@@ -38,13 +38,13 @@ pub use futex::{
 };
 pub mod threaded;
 pub use threaded::{
-    Aarch64CoreRegisters, CowFaultResolution, FrameCowAuthority, FrameCowIdentity, FrameCowQuiesce,
-    FutexOutcome, GenericVcpuRegistry, GuestEntryRegs, GuestWaitRegisters, HostVa,
-    HvpatchChildKernelToken, HvpatchChildTokenIssuer, HvpatchChildTokenVerifier,
-    HvpatchVerifiedChildKernelBinding, InGuestFlag, PlatformFutex, ProcessForkRequest, RegAccess,
-    SharedFutexLocation, SignalPumpControl, ThreadId, ThreadedEngine, VcpuKick, VcpuKickDyn,
-    VcpuRegistry, X86SignalXstate, X86XstateCapabilities, X86XstateComponent,
-    aarch64_signal_pstate_source, read_aarch64_syscall_frame,
+    Aarch64CoreRegisters, CowFaultResolution, ExecPredecessorIdentity, FrameCowAuthority,
+    FrameCowIdentity, FrameCowQuiesce, FutexOutcome, GenericVcpuRegistry, GuestEntryRegs,
+    GuestWaitRegisters, HostVa, HvpatchChildKernelToken, HvpatchChildTokenIssuer,
+    HvpatchChildTokenVerifier, HvpatchVerifiedChildKernelBinding, InGuestFlag, PlatformFutex,
+    ProcessForkRequest, RegAccess, SharedFutexLocation, SignalPumpControl, ThreadId,
+    ThreadedEngine, VcpuKick, VcpuKickDyn, VcpuRegistry, X86SignalXstate, X86XstateCapabilities,
+    X86XstateComponent, aarch64_signal_pstate_source, read_aarch64_syscall_frame,
 };
 pub mod sigframe;
 pub mod signal_arrival;

@@ -2411,6 +2411,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.asid_generation = asid_generation;
     }
 
+    fn bind_exec_predecessor_identity(
+        &mut self,
+        identity: carrick_hal::ExecPredecessorIdentity,
+    ) -> Result<(), TrapError> {
+        self.vm.bind_exec_predecessor_identity(identity)
+    }
+
     fn take_guest_run_receipt_ns(&mut self) -> u64 {
         std::mem::take(&mut self.pending_guest_run_receipt_ns)
     }

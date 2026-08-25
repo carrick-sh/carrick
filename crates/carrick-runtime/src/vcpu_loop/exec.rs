@@ -931,6 +931,7 @@ where
         };
         let old_mm_id = prepared_kernel_exec.old_mm_id();
         let replacement_mm_id = prepared_kernel_exec.replacement_mm_id();
+        let mut exec_predecessor_identity = None;
         // Allocate both complete transaction envelopes before proc-state
         // mutation or topology/backend locking. Dropping the guard on
         // any pre-replacement failure abandons both runtime records and
@@ -964,15 +965,30 @@ where
                     "HVPatch exec predecessor ProcessContext/MM binding drifted".to_owned(),
                 ));
             }
+            let predecessor_identity = carrick_hal::ExecPredecessorIdentity {
+                task_serial: exec_kernel_context.task().key().serial.raw(),
+                thread_serial: exec_kernel_context.thread().key().serial.raw(),
+                linux_pid: exec_kernel_context.task().key().id.raw(),
+                linux_tid: exec_kernel_context.thread().key().tid.raw(),
+                mm: old_mm_id.raw(),
+                asid: predecessor_binding.asid.raw(),
+            };
             let predecessor_classification =
                 carrick_observability::probes::HvpatchExecPredecessorClassification::new(
                     carrick_observability::probes::HvpatchExecPredecessorClassificationPhase::AuthorityComputed,
-                    exec_kernel_context.task().key().serial.raw(),
-                    exec_kernel_context.thread().key().serial.raw(),
-                    exec_kernel_context.task().key().id.raw(),
-                    exec_kernel_context.thread().key().tid.raw(),
-                    old_mm_id.raw(),
-                    u32::from(predecessor_binding.asid.raw()),
+                    carrick_observability::probes::HvpatchExecPredecessorIdentity::new(
+                        predecessor_identity.task_serial,
+                        predecessor_identity.thread_serial,
+                        predecessor_identity.linux_pid,
+                        predecessor_identity.linux_tid,
+                        predecessor_identity.mm,
+                        u32::from(predecessor_identity.asid),
+                    )
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "construct authoritative HVPatch exec predecessor identity: {error}"
+                        ))
+                    })?,
                     predecessor_shared,
                 )
                 .map_err(|error| {
@@ -981,6 +997,7 @@ where
                     ))
                 })?;
             crate::probes::hvpatch_exec_predecessor_classification(predecessor_classification);
+            exec_predecessor_identity = Some(predecessor_identity);
             engine.mark_exec_predecessor_shared(predecessor_shared);
             let (mut old_extent_count, replacement_extent_count) =
                 engine.frame_inventory_exec_extent_counts(&img);
@@ -1184,6 +1201,16 @@ where
             return Err(RuntimeError::Configuration(format!(
                 "reject exec before backend replacement: {error}"
             )));
+        }
+        if let Some(identity) = exec_predecessor_identity
+            && let Err(error) = engine.bind_exec_predecessor_identity(identity)
+        {
+            return Self::exec_failed_past_no_return(
+                kernel,
+                engine,
+                &format!("bind exact HVPatch exec predecessor identity: {error}"),
+            )
+            .map(Some);
         }
         if let Err(error) = engine.execve_into(&img) {
             return Self::exec_failed_past_no_return(

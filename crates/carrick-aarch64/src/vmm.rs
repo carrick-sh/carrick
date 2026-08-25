@@ -381,6 +381,13 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         ))
     }
 
+    fn bind_exec_predecessor_identity(
+        &mut self,
+        _identity: carrick_hal::ExecPredecessorIdentity,
+    ) -> Result<(), TrapError> {
+        Ok(())
+    }
+
     /// See `carrick_hal::ThreadedEngine::mark_exec_predecessor_shared`.
     fn mark_exec_predecessor_shared(&mut self, _shared: bool) {}
 
