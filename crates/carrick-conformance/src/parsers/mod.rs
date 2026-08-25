@@ -131,6 +131,21 @@ impl SuiteResult {
             ids: BTreeMap::new(),
         }
     }
+
+    /// Whether this result is admissible as exact closure evidence. Regression
+    /// comparison may preserve native failures and skips, but closure requires
+    /// a non-empty assertion inventory in which every applicable assertion ran
+    /// and passed.
+    pub fn is_strict_closure_success(&self) -> bool {
+        self.result == SuiteOutcome::Success
+            && !self.ids.is_empty()
+            && self.totals.n > 0
+            && self.totals.passed == self.totals.n
+            && self.totals.failed == 0
+            && self.totals.broken == 0
+            && self.totals.skipped == 0
+            && self.ids.values().all(|outcome| *outcome == Outcome::Ok)
+    }
 }
 
 pub trait VerdictParser {

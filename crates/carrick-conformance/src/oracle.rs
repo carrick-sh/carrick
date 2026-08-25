@@ -182,6 +182,9 @@ impl OracleCache {
             }
             result.ids = ids;
         }
+        if profile == ParserProfile::ClosureV3 && !result.is_strict_closure_success() {
+            return None;
+        }
         Some(result)
     }
 
@@ -199,9 +202,13 @@ impl OracleCache {
         platform: crate::lane::DockerPlatform,
         profile: ParserProfile,
     ) -> Option<u64> {
-        self.by_key
-            .get(&oracle_key_for_profile(suite, platform, profile))
-            .and_then(|record| record.elapsed_ms)
+        let record = self
+            .by_key
+            .get(&oracle_key_for_profile(suite, platform, profile))?;
+        if profile == ParserProfile::ClosureV3 && !record.result.is_strict_closure_success() {
+            return None;
+        }
+        record.elapsed_ms
     }
 
     /// Cache a freshly-run docker result. Refuses a non-comparable (crashed /
@@ -231,7 +238,7 @@ impl OracleCache {
         result: SuiteResult,
         elapsed_ms: Option<u64>,
     ) -> bool {
-        if !is_cacheable(&result) {
+        if !is_cacheable_for_profile(profile, &result) {
             return false;
         }
         let key = oracle_key_for_profile(suite, platform, profile);
@@ -331,6 +338,20 @@ impl OracleCache {
 /// rejected separately by [`OracleCache::insert_fresh`].
 fn is_cacheable(result: &SuiteResult) -> bool {
     matches!(result.result, SuiteOutcome::Success | SuiteOutcome::Failure)
+}
+
+/// Closure evidence must show that every applicable native assertion actually
+/// ran and passed. Equal failures/skips belong to regression comparison, not to
+/// the fail-closed closure oracle.
+fn is_closure_cacheable(result: &SuiteResult) -> bool {
+    result.is_strict_closure_success()
+}
+
+fn is_cacheable_for_profile(profile: ParserProfile, result: &SuiteResult) -> bool {
+    match profile {
+        ParserProfile::Regression => is_cacheable(result),
+        ParserProfile::ClosureV3 => is_closure_cacheable(result),
+    }
 }
 
 /// Parse the committed JSONL cache body into records keyed by determinant,
@@ -584,6 +605,93 @@ mod tests {
         assert_eq!(
             reloaded.get_elapsed_ms_for_profile(&s, platform, ParserProfile::ClosureV3),
             Some(7)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn closure_profile_refuses_failure_skip_and_broken_oracles() {
+        let path = std::env::temp_dir().join(format!(
+            "carrick-oracle-closure-refusal-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let suite = base_suite();
+        let platform = crate::lane::DockerPlatform::LinuxArm64;
+        let mut cache = OracleCache::load(&path);
+
+        let failed = result(&[("t", Outcome::Fail)], SuiteOutcome::Failure);
+        assert!(!cache.insert_for_profile(
+            &suite,
+            platform,
+            ParserProfile::ClosureV3,
+            failed.clone(),
+            Some(1),
+        ));
+
+        let skipped = result(&[("t", Outcome::Conf)], SuiteOutcome::Success);
+        assert!(!cache.insert_for_profile(
+            &suite,
+            platform,
+            ParserProfile::ClosureV3,
+            skipped,
+            Some(1),
+        ));
+
+        let mut broken = result(&[("t", Outcome::Ok)], SuiteOutcome::Success);
+        broken.totals.broken = 1;
+        assert!(!cache.insert_for_profile(
+            &suite,
+            platform,
+            ParserProfile::ClosureV3,
+            broken,
+            Some(1),
+        ));
+        assert!(!cache.dirty());
+
+        assert!(cache.insert_for_profile(
+            &suite,
+            platform,
+            ParserProfile::Regression,
+            failed,
+            Some(1),
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn closure_profile_refuses_preexisting_nonpassing_record_on_read() {
+        let path = std::env::temp_dir().join(format!(
+            "carrick-oracle-closure-read-refusal-{}.jsonl",
+            std::process::id()
+        ));
+        let suite = base_suite();
+        let platform = crate::lane::DockerPlatform::LinuxArm64;
+        let key = oracle_key_for_profile(&suite, platform, ParserProfile::ClosureV3);
+        let record = OracleRecord {
+            name: suite.name.clone(),
+            key: key.clone(),
+            result: result(&[("t", Outcome::Conf)], SuiteOutcome::Success),
+            elapsed_ms: Some(1),
+        };
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .expect("seed historical closure record");
+
+        let cache = OracleCache::load(&path);
+        assert!(
+            cache
+                .get_for_profile(&suite, platform, ParserProfile::ClosureV3)
+                .is_none(),
+            "historical closure rows with skips must become cache misses"
+        );
+        assert!(
+            cache
+                .get_elapsed_ms_for_profile(&suite, platform, ParserProfile::ClosureV3)
+                .is_none(),
+            "invalid historical closure rows must not retain usable timing evidence"
         );
         let _ = std::fs::remove_file(&path);
     }
