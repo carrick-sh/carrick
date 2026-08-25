@@ -10,6 +10,9 @@
  * - carrick*:::hvpatch-syscall-service-begin is four scalar CTF values:
  *   int32 linux_pid, int32 linux_tid, uint32 ASID, uint64 syscall number.
  * - carrick*:::hvpatch-syscall-service-clear repeats those four scalars.
+ * - carrick*:::hvpatch-syscall-args fires immediately after an enabled
+ *   service-begin on the same host thread: arg0 syscall number, arg1..arg4
+ *   guest args 0..3. For futex those are uaddr, op, val, and timeout/uaddr2.
  * - carrick*:::futex-route is five scalar CTF values: uint32 host pid,
  *   uint64 guest address, int32 command, int32 shared, uint64 host address.
  * - carrick*:::mn-admit is three scalar CTF values: int32 Linux tid,
@@ -40,6 +43,15 @@ carrick*:::hvpatch-syscall-service-begin
     linux_pid[pid, tid] = (int)arg0;
     linux_tid[pid, tid] = (int)arg1;
     asid[pid, tid] = (uint32_t)arg2;
+}
+
+carrick*:::hvpatch-syscall-args
+/(pid == $target || progenyof($target)) &&
+ syscall_active[pid, tid] != 0 && arg0 == 98/
+{
+    printf("HVPATCHFUTEX1|phase=args|host_pid=%d|host_tid=%d|linux_pid=%d|linux_tid=%d|asid=%u|uaddr=%#x|op=%#x|val=%u|arg3=%#x\n",
+        pid, tid, linux_pid[pid, tid], linux_tid[pid, tid], asid[pid, tid],
+        arg1, arg2, (uint32_t)arg3, arg4);
 }
 
 carrick*:::futex-route

@@ -451,6 +451,31 @@ def _format_hvpatch_wait_register(label: str, low: int, high: int, wait_id: int)
     value = (low & 0xFFFFFFFF) | ((high & 0xFFFFFFFF) << 32)
     return f"id={wait_id & 0xFFFFFF:#08x} {label}={value:#018x}"
 
+
+def _format_hvpatch_blocked_continuation(pid: int, tid: int, packed: int) -> str:
+    packed &= 0xFFFFFFFF
+    family = {
+        1: "futex-wait",
+        2: "futex-waitv",
+        3: "shared-futex-wait",
+        4: "shared-futex-waitv",
+        5: "shared-word",
+        6: "fds",
+        7: "select",
+        8: "poll",
+        9: "host-write",
+        10: "record-lock",
+        11: "proc-exit",
+        12: "proc-state",
+        13: "child",
+        14: "signals",
+        15: "sleep",
+        16: "vfork-parent",
+    }.get((packed >> 24) & 0xFF, "unknown")
+    native_nr = packed & 0xFFFFFF
+    syscall = "overflow" if native_nr == 0xFFFFFF else str(native_nr)
+    return f"pid={pid} tid={tid} native_nr={syscall} family={family}"
+
 # kind -> (name, formatter(a, b, c))
 _EVENTRING_KINDS = {
     1: ("BIND", lambda a, b, c: f"gfd={a} hfd={b} pathhash={c & 0xffffffff:#010x}"),
@@ -549,6 +574,33 @@ _EVENTRING_KINDS = {
     40: ("ARWRITE", lambda a, b, c: f"hfd={a} off={b} n={c}"),
     41: ("ARMAGIC", lambda a, b, c: f"hfd={a} off={b} n={c}"),
     42: ("CLONESPAWN", lambda a, b, c: f"parent_pid={a} child_tid={b} errno={c}"),
+    43: ("HVPEXEC", lambda a, b, c: f"pid={a} tid={b} executor={c} phase=claim"),
+    44: ("HVPEXEC", lambda a, b, c: f"pid={a} tid={b} executor={c} phase=load"),
+    45: (
+        "HVPEXEC",
+        lambda a, b, c: (
+            f"pid={a} tid={b} phase=boundary reason="
+            f"{('unknown', 'blocked-child', 'blocked-host', 'blocked-continuation', 'yielded', 'preempted', 'quiesced', 'exited', 'invalid-state')[c] if 0 <= c < 9 else 'unknown'}"
+        ),
+    ),
+    46: (
+        "HVPEXEC",
+        lambda a, b, c: (
+            f"pid={a} tid={b} phase=settlement state="
+            f"{('unknown', 'runnable', 'blocked-child', 'blocked-host', 'exited', 'failed', 'running', 'switching-out', 'uninitialized')[c] if 0 <= c < 9 else 'unknown'}"
+        ),
+    ),
+    47: ("HVPBLOCK", _format_hvpatch_blocked_continuation),
+    48: (
+        "HVPBLOCKARG0",
+        lambda a, b, c: (
+            f"tid={c} arg0={((a & 0xffffffff) | ((b & 0xffffffff) << 32)):#018x}"
+        ),
+    ),
+    49: (
+        "HVPBLOCKARGS",
+        lambda a, b, c: f"tid={c} arg1={a & 0xffffffff:#x} arg2={b & 0xffffffff}",
+    ),
 }
 
 
