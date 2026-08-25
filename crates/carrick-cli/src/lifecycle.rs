@@ -84,7 +84,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use carrick_runtime::container::{
-    self, CarrierControlState, ContainerState, ContainerStatus, RunConfig, StopSignalAbi,
+    self, CarrierControlState, CarrierTerminalReceipt, ContainerState, ContainerStatus, RunConfig,
+    StopSignalAbi,
 };
 use carrick_runtime::kernel::control::{ControlOperation, ControlOutcome};
 
@@ -939,6 +940,14 @@ fn await_detached_ready(id: &str, child_pid: libc::pid_t) -> anyhow::Result<()> 
                 return Ok(());
             }
             if state.status == ContainerStatus::Exited {
+                if container::terminal_receipt(id)?
+                    .as_ref()
+                    .is_some_and(|receipt| {
+                        exact_clean_terminal_receipt_for_child(&state, child_pid, receipt)
+                    })
+                {
+                    return Ok(());
+                }
                 bail!(
                     "container {} exited before carrier control became ready (status {})",
                     container::short_id(id),
@@ -985,6 +994,23 @@ fn await_detached_ready(id: &str, child_pid: libc::pid_t) -> anyhow::Result<()> 
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
+}
+
+/// A successful one-shot container may publish Running and its exact terminal
+/// receipt between two 25 ms readiness polls. Accept that only when the exited
+/// state and durable receipt authenticate the exact spawned carrier
+/// incarnation; a bare exit status zero is never readiness authority.
+fn exact_clean_terminal_receipt_for_child(
+    state: &ContainerState,
+    child_pid: libc::pid_t,
+    receipt: &CarrierTerminalReceipt,
+) -> bool {
+    state.status == ContainerStatus::Exited
+        && state.init_pid == child_pid
+        && state.control.is_none()
+        && state.exit_code == Some(0)
+        && state.terminal_control.as_ref() == Some(&receipt.control)
+        && receipt.exit_code == 0
 }
 
 fn published_control_for_child(
@@ -2482,10 +2508,10 @@ mod tests {
         CARRIER_LAUNCH_GRANT_FD, ContainerState, ContainerStatus, InitialContainerMetadata,
         RunConfig, StopSignalAbi, apply_initial_metadata, bridge_network_attachments,
         build_control_exec_request, build_created_state, carrier_entry_argv,
-        configured_stop_signal, launch_grant_pipe, new_container_id, parse_exec_numeric_user,
-        parse_signal, ps_row_json, published_control_for_child, rebuild_request_from_state,
-        render_format, reset_for_relaunch, resolve_stop_signal, select_tail, stop_grace_secs,
-        validate_published_port_availability,
+        configured_stop_signal, exact_clean_terminal_receipt_for_child, launch_grant_pipe,
+        new_container_id, parse_exec_numeric_user, parse_signal, ps_row_json,
+        published_control_for_child, rebuild_request_from_state, render_format, reset_for_relaunch,
+        resolve_stop_signal, select_tail, stop_grace_secs, validate_published_port_availability,
     };
 
     fn sample_state() -> ContainerState {
@@ -2617,6 +2643,61 @@ mod tests {
         assert!(published_control_for_child(&state, 6).is_some());
         state.control = None;
         assert!(published_control_for_child(&state, 6).is_none());
+    }
+
+    #[test]
+    fn detached_readiness_accepts_only_an_exact_clean_terminal_receipt() {
+        let mut state = sample_state();
+        state.exit_code = Some(0);
+        let control = carrick_runtime::container::CarrierControlState {
+            schema: carrick_runtime::kernel::control::CARRIER_CONTROL_STATE_SCHEMA.to_owned(),
+            owner_nonce: carrick_runtime::kernel::control::ControlNonce::fresh().expect("nonce"),
+            init: carrick_runtime::kernel::control::ControlTaskKey { pid: 1, serial: 7 },
+        };
+        state.terminal_control = Some(control.clone());
+        let receipt = carrick_runtime::container::CarrierTerminalReceipt {
+            control: control.clone(),
+            exit_code: 0,
+        };
+        assert!(exact_clean_terminal_receipt_for_child(&state, 6, &receipt));
+
+        let mut wrong_child = state.clone();
+        wrong_child.init_pid = 9;
+        assert!(!exact_clean_terminal_receipt_for_child(
+            &wrong_child,
+            6,
+            &receipt
+        ));
+        let mut live_control = state.clone();
+        live_control.control = Some(control.clone());
+        assert!(!exact_clean_terminal_receipt_for_child(
+            &live_control,
+            6,
+            &receipt
+        ));
+        let mut bare_exit = state.clone();
+        bare_exit.terminal_control = None;
+        assert!(!exact_clean_terminal_receipt_for_child(
+            &bare_exit, 6, &receipt
+        ));
+        let mut nonzero = state.clone();
+        nonzero.exit_code = Some(1);
+        assert!(!exact_clean_terminal_receipt_for_child(
+            &nonzero, 6, &receipt
+        ));
+        let mismatched = carrick_runtime::container::CarrierTerminalReceipt {
+            control: carrick_runtime::container::CarrierControlState {
+                owner_nonce: carrick_runtime::kernel::control::ControlNonce::fresh()
+                    .expect("different nonce"),
+                ..control
+            },
+            exit_code: 0,
+        };
+        assert!(!exact_clean_terminal_receipt_for_child(
+            &state,
+            6,
+            &mismatched
+        ));
     }
 
     #[test]
