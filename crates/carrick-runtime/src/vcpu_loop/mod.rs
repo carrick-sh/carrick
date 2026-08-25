@@ -3902,7 +3902,7 @@ where
 
     fn suspend_for_job_control(
         &mut self,
-        _engine: &E,
+        engine: &mut E,
         _control: &executor::HvpatchQuantumControl<'_, '_>,
     ) -> Result<Option<executor::ExecutorExit>, RuntimeError> {
         let context = match self.state.service_kernel_context.as_ref() {
@@ -3922,7 +3922,12 @@ where
             }
         };
         let task = context.task();
-        if !task.is_job_control_stopped() {
+        let ptrace_stop_settled = match context.kernel().settle_task_ptrace_stop(task.key().id) {
+            crate::kernel::objects::PtraceStopSettlement::NotPtraceStopped => false,
+            crate::kernel::objects::PtraceStopSettlement::Stopped
+            | crate::kernel::objects::PtraceStopSettlement::Resumed { .. } => true,
+        };
+        if !task.is_job_control_stopped() && !ptrace_stop_settled {
             return Ok(None);
         }
         self.state.withdraw_from_crash_capture();
@@ -3950,13 +3955,13 @@ where
             match enrollment {
                 crate::kernel::objects::TaskWakeEnrollment::Ready(_) => {
                     if !task.is_job_control_stopped() {
-                        return Ok(None);
+                        break;
                     }
                     continue;
                 }
                 crate::kernel::objects::TaskWakeEnrollment::Subscribed(subscription) => {
                     if !task.is_job_control_stopped() {
-                        return Ok(None);
+                        break;
                     }
                     self.phase = HvpatchProductionPhase::ResumeJobControlStop {
                         _subscription: subscription,
@@ -3970,6 +3975,22 @@ where
                     return Ok(Some(exit));
                 }
             }
+        }
+        if ptrace_stop_settled
+            && let Some(outcome) = service_signals_threaded(
+                &self.kernel,
+                &context,
+                engine,
+                self.state.this_tid,
+                self.state.fatal_image_generation,
+                None,
+                None,
+                None,
+                None,
+                self.traps,
+            )?
+        {
+            return Ok(Some(self.enter_terminal_with_outcome(engine, outcome)));
         }
         Ok(None)
     }

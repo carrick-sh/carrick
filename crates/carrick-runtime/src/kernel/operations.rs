@@ -16,9 +16,9 @@ use super::core::{
 };
 use super::ids::{LinuxSignal, LinuxTid, MmId, ObjectIdError, ProcessGroupId, SessionId, TaskId};
 use super::objects::{
-    Credentials, FileTable, LinuxWaitStatus, Mm, ObjectGraphError, ProcessGroup, Session, Task,
-    TaskJobControlEvent, TaskKey, TaskLifecycle, TaskRef, TaskShared, TaskSharedCloneError,
-    ThreadKey, ThreadRef, ThreadResources, Zombie,
+    Credentials, FileTable, LinuxWaitStatus, Mm, ObjectGraphError, ProcessGroup,
+    PtraceStopSettlement, Session, Task, TaskJobControlEvent, TaskKey, TaskLifecycle, TaskRef,
+    TaskShared, TaskSharedCloneError, ThreadKey, ThreadRef, ThreadResources, Zombie,
 };
 use super::registry::{IdError, TaskReservation, ThreadClaim, ThreadReservation};
 
@@ -1599,6 +1599,17 @@ impl Kernel {
         }
         task.wake();
         true
+    }
+
+    pub(crate) fn settle_task_ptrace_stop(&self, target: TaskId) -> PtraceStopSettlement {
+        let task = {
+            let state = self.registry().state.read();
+            let Some(record) = state.tasks.get(&target) else {
+                return PtraceStopSettlement::NotPtraceStopped;
+            };
+            Arc::clone(&record.task)
+        };
+        task.settle_ptrace_stop()
     }
 
     pub(crate) fn detach_task_from_ptrace(&self, tracer: TaskKey, target: TaskId) -> bool {
@@ -5612,6 +5623,57 @@ mod tests {
                 .wait_child(root.task().key().id, Some(child_id), WaitMode::Observe)
                 .expect("resumed child remains live"),
             WaitOutcome::StillRunning,
+        );
+    }
+
+    #[test]
+    fn ptrace_resume_before_tracee_settlement_keeps_the_stop_authoritative() {
+        let (kernel, root) = bootstrap(1);
+        let child = kernel
+            .fork_task(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan"),
+                ThreadId::synthetic_for_tests(7_089),
+                "ptrace early-resume child".to_owned(),
+                None,
+            )
+            .expect("fork child");
+        let child_id = child.task().key().id;
+        let stop_signal =
+            LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGUSR2).expect("SIGUSR2");
+        let kill_signal =
+            LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGKILL).expect("SIGKILL");
+
+        assert!(kernel.claim_ptrace_traceme(&child));
+        assert!(kernel.stop_task_for_ptrace(child_id, stop_signal));
+        assert!(matches!(
+            kernel
+                .wait_child(root.task().key().id, Some(child_id), WaitMode::Consume)
+                .expect("plain wait sees ptrace stop"),
+            WaitOutcome::Stopped { signal, .. } if signal == stop_signal
+        ));
+        assert!(kernel.resume_task_from_ptrace(root.task().key(), child_id, Some(kill_signal),));
+
+        assert!(
+            kernel.task_is_job_control_stopped(child_id),
+            "a tracer command cannot erase the stop before the tracee settles its return edge"
+        );
+        assert_eq!(
+            kernel.settle_task_ptrace_stop(child_id),
+            PtraceStopSettlement::Resumed {
+                signal: Some(kill_signal),
+            },
+            "settlement must hand the already-recorded tracer command to the tracee"
+        );
+        assert!(!kernel.task_is_job_control_stopped(child_id));
+        assert!(
+            child
+                .task()
+                .shared()
+                .pending_signals()
+                .take_lowest_in(SigSet::EMPTY.with(kill_signal.raw()))
+                .is_some(),
+            "SIGKILL remains queued until the tracee services the resume command"
         );
     }
 
