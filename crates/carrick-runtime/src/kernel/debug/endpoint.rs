@@ -30,12 +30,15 @@
 //! A leftover socket from a crashed run must not permanently poison the run
 //! ID, and a *live* run's socket must never be stolen by a second server. The
 //! owner record next to the socket carries the owning host PID and a per-server
-//! nonce; reclamation requires proof that the recorded owner is gone AND that
-//! the record is not our own.
+//! nonce. Reclamation and release serialize through a persistent advisory lock;
+//! teardown removes paths only when the owner record still names that exact
+//! nonce, so a delayed predecessor cannot unlink a successor incarnation.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -44,6 +47,7 @@ const DIRECTORY_MODE: u32 = 0o700;
 const SOCKET_MODE: u32 = 0o600;
 const OWNER_RECORD: &str = "owner.json";
 const SOCKET_NAME: &str = "snapshot.sock";
+const LIFECYCLE_LOCK: &str = "lifecycle.lock";
 /// Hex characters of the run digest kept in the path. 32 hex = 128 bits.
 const RUN_TOKEN_HEX: usize = 32;
 
@@ -142,20 +146,25 @@ impl DebugEndpoint {
 
     /// Create the directory chain with 0700 and claim the socket path.
     ///
-    /// Fails closed when a live server already owns it. Reclaims only when the
-    /// recorded owner PID is dead and the record is not this server's own.
+    /// Fails closed when a live server already owns it. A stale record may be
+    /// reclaimed when its PID is dead or its exact rendezvous is no longer
+    /// connectable. Claim and release serialize so a delayed predecessor can
+    /// never unlink the successor it made room for.
     pub fn claim(&self, nonce: u64) -> Result<(), EndpointError> {
         create_private_dir(&self.base, &self.directory)?;
+        let _lifecycle = self.lock_lifecycle()?;
 
         if let Some(owner) = self.read_owner()? {
             if owner.nonce == nonce {
                 // Our own record. Nothing to reclaim, nothing to steal.
                 return Ok(());
             }
-            if process_is_alive(owner.pid) {
+            if endpoint_owner_is_live(owner.pid, &self.socket) {
                 return Err(EndpointError::OwnedByLiveProcess { pid: owner.pid });
             }
-            // Recorded owner is gone and is not us: reclaim.
+            // A numeric PID can be recycled long after a normal Carrick exit
+            // leaves an owner record behind. Only a live process plus a
+            // connectable listener authenticates the endpoint incarnation.
             remove_if_present(&self.socket)?;
             remove_if_present(&self.owner_record_path())?;
         } else {
@@ -192,10 +201,35 @@ impl DebugEndpoint {
         Ok(())
     }
 
-    /// Best-effort teardown. A failure here must not mask a run's real result.
-    pub fn release(&self) {
+    /// Best-effort teardown of one exact server incarnation. A failure here
+    /// must not mask a run's real result, and a mismatched owner must never be
+    /// removed.
+    pub fn release(&self, nonce: u64) {
+        let Ok(_lifecycle) = self.lock_lifecycle() else {
+            return;
+        };
+        let Ok(Some(owner)) = self.read_owner() else {
+            return;
+        };
+        if owner.pid != std::process::id() || owner.nonce != nonce {
+            return;
+        }
         let _ = remove_if_present(&self.socket);
         let _ = remove_if_present(&self.owner_record_path());
+    }
+
+    fn lock_lifecycle(&self) -> Result<EndpointLifecycleLock, EndpointError> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(self.directory.join(LIFECYCLE_LOCK))?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(EndpointError::Io(io::Error::last_os_error()));
+        }
+        Ok(EndpointLifecycleLock(file))
     }
 
     fn read_owner(&self) -> Result<Option<OwnerRecord>, EndpointError> {
@@ -216,6 +250,14 @@ impl DebugEndpoint {
 struct OwnerRecord {
     pid: u32,
     nonce: u64,
+}
+
+struct EndpointLifecycleLock(fs::File);
+
+impl Drop for EndpointLifecycleLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 /// Hash the run ID so the path carries a token, never the identity itself.
@@ -281,6 +323,30 @@ fn process_is_alive(pid: u32) -> bool {
         return true;
     }
     io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Authenticate the owner record against the live rendezvous, not a numeric
+/// PID alone. Normal process exit cannot run destructors for a process-wide
+/// static server, so stale records are expected; macOS can later reuse their
+/// PIDs for unrelated processes. A successful connect proves a listener still
+/// owns this exact socket path. Definitive stale-socket errors permit reclaim;
+/// unfamiliar failures remain fail-closed.
+fn endpoint_owner_is_live(pid: u32, socket: &Path) -> bool {
+    if !process_is_alive(pid) {
+        return false;
+    }
+    match UnixStream::connect(socket) {
+        Ok(_) => true,
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOENT) | Some(libc::ECONNREFUSED) | Some(libc::ENOTSOCK)
+            ) =>
+        {
+            false
+        }
+        Err(_) => true,
+    }
 }
 
 #[cfg(test)]
@@ -383,6 +449,8 @@ pub(super) mod tests {
     fn a_live_owner_is_never_stolen() {
         let (_temp, endpoint) = scoped_endpoint("run-live-owner");
         endpoint.claim(1).expect("claim");
+        let _listener = std::os::unix::net::UnixListener::bind(endpoint.socket_path())
+            .expect("live endpoint listener");
         // The current process is unambiguously alive.
         endpoint.write_owner(1).expect("write owner");
         let error = endpoint
@@ -391,6 +459,50 @@ pub(super) mod tests {
         assert!(
             matches!(error, EndpointError::OwnedByLiveProcess { .. }),
             "expected live-owner refusal, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_recycled_live_pid_without_a_listener_is_reclaimed() {
+        let (_temp, endpoint) = scoped_endpoint("run-recycled-owner-pid");
+        endpoint.claim(1).expect("claim");
+        endpoint.write_owner(1).expect("write stale owner");
+        fs::write(endpoint.socket_path(), b"stale").expect("seed stale socket");
+
+        endpoint
+            .claim(2)
+            .expect("a recycled numeric pid cannot authenticate a dead endpoint");
+        assert!(!endpoint.socket_path().exists());
+        assert!(!endpoint.owner_record_path().exists());
+    }
+
+    #[test]
+    fn an_old_incarnation_cannot_release_a_new_listener() {
+        let (_temp, endpoint) = scoped_endpoint("run-incarnation-release");
+        endpoint.claim(1).expect("claim old incarnation");
+        let old_listener = std::os::unix::net::UnixListener::bind(endpoint.socket_path())
+            .expect("bind old listener");
+        endpoint.write_owner(1).expect("publish old owner");
+
+        drop(old_listener);
+        endpoint.claim(2).expect("reclaim closed old listener");
+        let _new_listener = std::os::unix::net::UnixListener::bind(endpoint.socket_path())
+            .expect("bind successor listener");
+        endpoint.write_owner(2).expect("publish successor owner");
+
+        // This is the delayed teardown performed by the old server thread.
+        endpoint.release(1);
+        assert!(
+            std::os::unix::net::UnixStream::connect(endpoint.socket_path()).is_ok(),
+            "old teardown must not unlink the successor incarnation",
+        );
+        assert_eq!(
+            endpoint
+                .read_owner()
+                .expect("read successor owner")
+                .unwrap()
+                .nonce,
+            2,
         );
     }
 

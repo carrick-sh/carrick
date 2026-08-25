@@ -57,6 +57,8 @@ pub struct KernelDebugServer {
     /// while inheriting none of its threads. Without this guard the child's
     /// `Drop` would unlink the PARENT's live socket.
     owner_pid: u32,
+    /// Exact endpoint incarnation. Release is conditional on this nonce.
+    nonce: u64,
 }
 
 impl KernelDebugServer {
@@ -95,7 +97,7 @@ impl KernelDebugServer {
             .spawn(move || {
                 serve_loop(&listener, &kernel, &thread_shutdown);
                 drop(listener);
-                thread_endpoint.release();
+                thread_endpoint.release(nonce);
             })?;
 
         Ok(Self {
@@ -103,6 +105,7 @@ impl KernelDebugServer {
             shutdown,
             join: Some(join),
             owner_pid: std::process::id(),
+            nonce,
         })
     }
 
@@ -163,7 +166,7 @@ impl KernelDebugServer {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
-        self.endpoint.release();
+        self.endpoint.release(self.nonce);
     }
 }
 
