@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "source_head": "ed085a9f2f36d733e6ee52f736b2e818f2245863",
+  "source_head": "f7ef14ccefcbba6eb008b2686429dbc34fffb631",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
@@ -84,7 +84,7 @@
   },
   "catalog_sha256": "78bbda851abe90bc1336e6aee5124545142860fa02fcba739f65a0b1f0f8baba",
   "profiles_sha256": "638f4e5c37af02b7a4520133d6e7e96384b1235be11f3336eb6d69e95c079828",
-  "rows_sha256": "38d3183a9b70dc31224901f7284b3788e33d128c4a9b95a1a847995f5ec9c252",
+  "rows_sha256": "22a12c5414cbd80a2cc1a41a3b0300c5ef7528a6e7bd3d28ede0b12532d0b454",
   "rows": [
     {
       "catalog_id": "HA-CATALOG-HVF-VCPUS-EXIT",
@@ -1041,15 +1041,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 813714,
-        "byte_start": 813702,
+        "byte_end": 815065,
+        "byte_start": 815053,
         "column": 21,
         "column_end": 33,
         "column_start": 21,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 18737,
-        "line_end": 18737,
-        "line_start": 18737
+        "line": 18779,
+        "line_end": 18779,
+        "line_start": 18779
       }
     },
     {
@@ -1062,15 +1062,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 816345,
-        "byte_start": 816333,
+        "byte_end": 817696,
+        "byte_start": 817684,
         "column": 36,
         "column_end": 48,
         "column_start": 36,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 18783,
-        "line_end": 18783,
-        "line_start": 18783
+        "line": 18825,
+        "line_end": 18825,
+        "line_start": 18825
       }
     },
     {
@@ -1083,15 +1083,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 818662,
-        "byte_start": 818650,
+        "byte_end": 820013,
+        "byte_start": 820001,
         "column": 25,
         "column_end": 37,
         "column_start": 25,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 18824,
-        "line_end": 18824,
-        "line_start": 18824
+        "line": 18866,
+        "line_end": 18866,
+        "line_start": 18866
       }
     },
     {
