@@ -5962,6 +5962,27 @@ fn fork_mapping_disposition(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn fork_frame_receipt_kind(
+    disposition: ForkMappingDisposition,
+    start: u64,
+    size: usize,
+) -> Option<carrick_observability::probes::HvpatchForkFrameKind> {
+    use carrick_observability::probes::HvpatchForkFrameKind;
+
+    match disposition {
+        ForkMappingDisposition::SharedFrameWritable => Some(HvpatchForkFrameKind::Shared),
+        ForkMappingDisposition::SharedFrameReadOnly
+            if !is_kernel_only_stage1_range(start, size) =>
+        {
+            Some(HvpatchForkFrameKind::PrivateCow)
+        }
+        ForkMappingDisposition::SharedFrameReadOnly
+        | ForkMappingDisposition::IndependentPageTables
+        | ForkMappingDisposition::IndependentKernelState => None,
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn is_stage1_cow_write_fault(syndrome: u64) -> bool {
     const EXCEPTION_CLASS_MASK: u64 = 0x3f;
     const DATA_ABORT_LOWER_EL: u64 = 0x24;
@@ -5975,10 +5996,16 @@ fn is_stage1_cow_write_fault(syndrome: u64) -> bool {
 }
 
 fn frame_cow_write_is_denied(
-    write_denied: bool,
+    protection_denied: bool,
+    guest_writable: bool,
     intent: carrick_aarch64::vmm::FrameCowWriteIntent,
 ) -> bool {
-    write_denied && intent == carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible
+    intent == carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible
+        && (protection_denied || !guest_writable)
+}
+
+fn frame_cow_preserves_guest_protection(intent: carrick_aarch64::vmm::FrameCowWriteIntent) -> bool {
+    intent != carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6681,9 +6708,7 @@ struct ProcessInventoryDesc {
     backing: InventoryBackingIdentity,
     stage2_lease: (u64, u64),
     stage2_owner: InventoryStage2OwnerIdentity,
-    sharing: GuestMappingSharing,
-    guest_writable: bool,
-    shared_mm: bool,
+    fork_frame_receipt_kind: Option<carrick_observability::probes::HvpatchForkFrameKind>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -13220,7 +13245,19 @@ impl HvfVmState {
         // its fresh VMA permission. It still splits/repoints the frame, while
         // the page-table publication below deliberately preserves the denied
         // descriptor until mmap's later `protect_range` commit.
-        if frame_cow_write_is_denied(self.protections.range_write_denied(fault_va, 1), intent) {
+        let source_guest_writable = self
+            .mapping_for_range(fault_va, 1)
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "HVPatch COW VA 0x{fault_va:x} has no semantic mapping authority"
+                ))
+            })?
+            .guest_writable;
+        if frame_cow_write_is_denied(
+            self.protections.range_write_denied(fault_va, 1),
+            source_guest_writable,
+            intent,
+        ) {
             return Ok(false);
         }
         // `span.va` can name the host-granule prefix of a semantic fragment
@@ -13461,7 +13498,7 @@ impl HvfVmState {
         // 1.75 MiB one per transaction (see `cow_rollback_scratch`).
         let mut rollback_scratch = self.cow_rollback_scratch.take();
         let mut rollback_page_tables = None;
-        let mut preserved_denied_receipt = None;
+        let mut preserved_protection_receipt = None;
         let page_table_result = (|| {
             const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
             const AP_MASK: u64 = 0b11 << 6;
@@ -13498,7 +13535,7 @@ impl HvfVmState {
                 let span_end = span.va.saturating_add(span.len as u64);
                 let mut page_va = span.va & !(PAGE_SIZE - 1);
                 while page_va < span_end {
-                    if !self.protections.range_write_denied(page_va, 1) {
+                    if source_guest_writable && !self.protections.range_write_denied(page_va, 1) {
                         manager
                             .set_writable_preserving_attributes(page_va, PAGE_SIZE as usize)
                             .map_err(|error| {
@@ -13519,7 +13556,6 @@ impl HvfVmState {
             // compound must name the new global frame IPA, and its AP bits must
             // match the EL1-only/user regime.  Fail closed while the old armed
             // range and inventory reservation are still intact.
-            let expected_ap = if span.kernel_only { 0 } else { AP_USER_RW };
             let span_end = span.va.checked_add(span.len as u64).ok_or_else(|| {
                 TrapError::Hypervisor("HVPatch COW stage-1 span overflow".to_owned())
             })?;
@@ -13534,6 +13570,23 @@ impl HvfVmState {
                     )));
                 }
                 let leaf = live[3];
+                let page_is_valid = leaf & VALID != 0;
+                let page_should_be_writable =
+                    source_guest_writable && !self.protections.range_write_denied(page_va, 1);
+                let expected_ap = if span.kernel_only {
+                    0
+                } else if page_should_be_writable {
+                    AP_USER_RW
+                } else {
+                    rollback_page_tables
+                        .as_ref()
+                        .map(|snapshot| snapshot.debug_walk(page_va)[3] & AP_MASK)
+                        .ok_or_else(|| {
+                            TrapError::Hypervisor(
+                                "HVPatch COW rollback pre-image is absent".to_owned(),
+                            )
+                        })?
+                };
                 let expected_ipa = new_ipa
                     .checked_add(page_va.checked_sub(span.va).ok_or_else(|| {
                         TrapError::Hypervisor("HVPatch COW page offset underflow".to_owned())
@@ -13541,11 +13594,8 @@ impl HvfVmState {
                     .ok_or_else(|| {
                         TrapError::Hypervisor("HVPatch COW leaf IPA overflow".to_owned())
                     })?;
-                let page_is_writable = (span.kernel_only
-                    || !self.protections.range_write_denied(page_va, 1))
-                    && (leaf & VALID != 0);
                 if leaf & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
-                    || (page_is_writable
+                    || (page_is_valid
                         && (leaf & 0b11 != TYPE_TABLE_OR_PAGE
                             || leaf & AP_MASK != expected_ap
                             || (!span.kernel_only && leaf & NON_GLOBAL == 0)))
@@ -13554,10 +13604,11 @@ impl HvfVmState {
                         "HVPatch COW stage-1 leaf authentication failed at VA 0x{page_va:x}: leaf=0x{leaf:x} expected_ipa=0x{expected_ipa:x} expected_ap=0x{expected_ap:x}"
                     )));
                 }
-                if page_is_writable && page_va == receipt_va {
-                    crate::probes::pt_alias_receipt(page_va, leaf, expected_ipa, expected_ap, 2);
+                if page_va == receipt_va && frame_cow_preserves_guest_protection(intent) {
+                    preserved_protection_receipt =
+                        Some((page_va, leaf, expected_ipa, leaf & AP_MASK));
                 } else if page_va == receipt_va {
-                    preserved_denied_receipt = Some((page_va, leaf, expected_ipa, leaf & AP_MASK));
+                    crate::probes::pt_alias_receipt(page_va, leaf, expected_ipa, expected_ap, 2);
                 }
                 // Reuse the durable descriptor-walk probe so a signed live
                 // capture can bind the COW receipt to the exact published PTE.
@@ -13687,7 +13738,7 @@ impl HvfVmState {
         // commit — is now a false promise, and would fail the authentication
         // that completes this mapping.
         self.supersede_cow_receipts("frame-cow", span.va, span.len as u64);
-        if let Some((va, leaf, expected_ipa, expected_ap)) = preserved_denied_receipt {
+        if let Some((va, leaf, expected_ipa, expected_ap)) = preserved_protection_receipt {
             crate::probes::pt_alias_receipt(va, leaf, expected_ipa, expected_ap, 3);
             if intent == carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance {
                 self.cow_deferred_publications
@@ -13710,7 +13761,7 @@ impl HvfVmState {
             physical_host_addr: new_host_ptr as usize,
             physical_size: CowArmedRanges::COMPOUND_SIZE as usize,
             perms: u64::from(stage2_perms),
-            guest_writable: true,
+            guest_writable: source_guest_writable,
             sharing: GuestMappingSharing::Private,
             ownership_scope: alias_ownership_scope(GuestMappingSharing::Private, self.mm_root_slot),
             inventory_backing: backing,
@@ -13733,7 +13784,7 @@ impl HvfVmState {
             stage2_lease: None,
             is_dynamic_alias: true,
             sharing: GuestMappingSharing::Private,
-            guest_writable: true,
+            guest_writable: source_guest_writable,
             shared_key_base: 0,
             shared_key_offset: 0,
             owner_generation,
@@ -16814,6 +16865,8 @@ impl HvfVmState {
                     continue;
                 };
                 let raw = u64::from(mapping.perms);
+                let fork_frame_receipt_kind =
+                    fork_frame_receipt_kind(disposition, mapping.start, mapping.size);
                 for ((gpa, length), extent) in &inherited {
                     if inherited_inventory_ids.insert(extent.mapping) {
                         inventory_mappings.push(ProcessInventoryDesc {
@@ -16829,9 +16882,7 @@ impl HvfVmState {
                             backing: extent.backing,
                             stage2_lease: (extent.stage2_base, extent.stage2_length),
                             stage2_owner: extent.stage2_owner,
-                            sharing: mapping.sharing,
-                            guest_writable: mapping.guest_writable,
-                            shared_mm: request.shares_mm,
+                            fork_frame_receipt_kind,
                         });
                     }
                 }
@@ -17031,9 +17082,7 @@ impl HvfVmState {
                     host_addr: physical_host_addr as usize,
                     generation: 0,
                 },
-                sharing: GuestMappingSharing::Private,
-                guest_writable: mapping.guest_writable,
-                shared_mm: false,
+                fork_frame_receipt_kind: None,
             });
         }
         emit_stage(
@@ -17416,17 +17465,14 @@ impl HvfVmState {
                     }
                 };
                 staged_inventory_mappings.push(((mapping.gpa, mapping.length), staged));
-                if let (Some(parent_mapping), Some(frame)) =
-                    (mapping.inherited_mapping, mapping.inherited_frame)
-                    && (mapping.guest_writable || mapping.sharing.shares_across_fork())
-                {
+                if let (Some(parent_mapping), Some(frame), Some(kind)) = (
+                    mapping.inherited_mapping,
+                    mapping.inherited_frame,
+                    mapping.fork_frame_receipt_kind,
+                ) {
                     pending_receipts.push(PendingForkFrameReceipt {
                         transaction: process_transaction,
-                        kind: if mapping.shared_mm || mapping.sharing.shares_across_fork() {
-                            carrick_observability::probes::HvpatchForkFrameKind::Shared
-                        } else {
-                            carrick_observability::probes::HvpatchForkFrameKind::PrivateCow
-                        },
+                        kind,
                         parent_mapping,
                         child_mapping: staged.mapping,
                         frame,
@@ -17655,15 +17701,11 @@ impl HvfVmState {
                     }
                 };
                 staged_mappings.push(((mapping.gpa, mapping.length), staged));
-                if let (Some(parent_mapping), Some(frame)) =
-                    (mapping.inherited_mapping, mapping.inherited_frame)
-                    && (mapping.guest_writable || mapping.sharing.shares_across_fork())
-                {
-                    let kind = if mapping.shared_mm || mapping.sharing.shares_across_fork() {
-                        carrick_observability::probes::HvpatchForkFrameKind::Shared
-                    } else {
-                        carrick_observability::probes::HvpatchForkFrameKind::PrivateCow
-                    };
+                if let (Some(parent_mapping), Some(frame), Some(kind)) = (
+                    mapping.inherited_mapping,
+                    mapping.inherited_frame,
+                    mapping.fork_frame_receipt_kind,
+                ) {
                     pending_fork_frame_receipts.push(PendingForkFrameReceipt {
                         transaction: process_transaction,
                         kind,
@@ -23051,6 +23093,46 @@ mod frame_inventory_backend_tests {
     }
 
     #[test]
+    fn fork_receipts_cover_read_only_user_cow_but_not_independent_kernel_frames() {
+        use carrick_observability::probes::HvpatchForkFrameKind;
+
+        assert_eq!(
+            fork_frame_receipt_kind(
+                ForkMappingDisposition::SharedFrameReadOnly,
+                crate::vdso::LINUX_VVAR_BASE,
+                HVF_PAGE_SIZE as usize,
+            ),
+            Some(HvpatchForkFrameKind::PrivateCow),
+            "the inherited read-only vvar frame is internally COWed for the child RNG stamp",
+        );
+        assert_eq!(
+            fork_frame_receipt_kind(
+                ForkMappingDisposition::SharedFrameWritable,
+                0x1382_8ed0_0000,
+                HVF_PAGE_SIZE as usize,
+            ),
+            Some(HvpatchForkFrameKind::Shared),
+        );
+        assert_eq!(
+            fork_frame_receipt_kind(
+                ForkMappingDisposition::SharedFrameReadOnly,
+                crate::memory::LINUX_SYSCALL_MAILBOX_BASE,
+                HVF_PAGE_SIZE as usize,
+            ),
+            None,
+            "EL1-only read-only frames never enter the user COW authority",
+        );
+        assert_eq!(
+            fork_frame_receipt_kind(
+                ForkMappingDisposition::IndependentKernelState,
+                crate::memory::LINUX_SYSCALL_MAILBOX_BASE,
+                HVF_PAGE_SIZE as usize,
+            ),
+            None,
+        );
+    }
+
+    #[test]
     fn cow_fault_classifier_accepts_only_el0_write_permission_aborts() {
         const DATA_ABORT_LOWER_EL: u64 = 0x24 << 26;
         const WRITE: u64 = 1 << 6;
@@ -23068,21 +23150,41 @@ mod frame_inventory_backend_tests {
     }
 
     #[test]
-    fn backing_maintenance_cow_bypasses_stale_unmapped_permission() {
+    fn cow_intents_preserve_guest_write_authority_while_internal_writes_bypass_it() {
         use carrick_aarch64::vmm::FrameCowWriteIntent;
 
         assert!(frame_cow_write_is_denied(
             true,
+            true,
+            FrameCowWriteIntent::GuestVisible,
+        ));
+        assert!(frame_cow_write_is_denied(
+            false,
+            false,
+            FrameCowWriteIntent::GuestVisible,
+        ));
+        assert!(!frame_cow_write_is_denied(
+            false,
+            true,
             FrameCowWriteIntent::GuestVisible,
         ));
         assert!(
-            !frame_cow_write_is_denied(true, FrameCowWriteIntent::BackingMaintenance),
+            !frame_cow_write_is_denied(true, false, FrameCowWriteIntent::BackingMaintenance),
             "an internal zero scrub must split the frame before mmap publishes the new VMA permission",
         );
         assert!(
-            !frame_cow_write_is_denied(true, FrameCowWriteIntent::PrivilegedInternal),
+            !frame_cow_write_is_denied(true, false, FrameCowWriteIntent::PrivilegedInternal),
             "a Carrick-owned unchecked write must split without changing guest permissions",
         );
+        assert!(!frame_cow_preserves_guest_protection(
+            FrameCowWriteIntent::GuestVisible,
+        ));
+        assert!(frame_cow_preserves_guest_protection(
+            FrameCowWriteIntent::BackingMaintenance,
+        ));
+        assert!(frame_cow_preserves_guest_protection(
+            FrameCowWriteIntent::PrivilegedInternal,
+        ));
     }
 
     #[test]
