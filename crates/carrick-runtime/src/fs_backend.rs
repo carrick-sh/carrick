@@ -2246,7 +2246,17 @@ fn is_retired_scratch(path: &Path) -> bool {
 
 enum ScratchCleanupWork {
     Remove(PathBuf),
-    Discover(PathBuf),
+    Discover {
+        root: PathBuf,
+        #[cfg(test)]
+        observer: Option<ScratchDiscoveryObserver>,
+    },
+}
+
+#[cfg(test)]
+struct ScratchDiscoveryObserver {
+    before_root_lock: std::sync::Arc<std::sync::Barrier>,
+    cleanup_complete: std::sync::Arc<std::sync::Barrier>,
 }
 
 fn scratch_cleanup_sender() -> &'static Option<std::sync::mpsc::SyncSender<ScratchCleanupWork>> {
@@ -2262,9 +2272,21 @@ fn scratch_cleanup_sender() -> &'static Option<std::sync::mpsc::SyncSender<Scrat
                         ScratchCleanupWork::Remove(path) => {
                             let _ = std::fs::remove_dir_all(path);
                         }
-                        ScratchCleanupWork::Discover(root) => {
-                            for retired in discover_orphans(&root, None) {
+                        ScratchCleanupWork::Discover {
+                            root,
+                            #[cfg(test)]
+                            observer,
+                        } => {
+                            for retired in discover_orphans_after_root_lock(
+                                &root,
+                                #[cfg(test)]
+                                observer.as_ref(),
+                            ) {
                                 let _ = std::fs::remove_dir_all(retired);
+                            }
+                            #[cfg(test)]
+                            if let Some(observer) = observer {
+                                observer.cleanup_complete.wait();
                             }
                         }
                     }
@@ -2286,8 +2308,49 @@ fn enqueue_scratch_cleanup(path: PathBuf) {
 
 fn enqueue_orphan_discovery(root: PathBuf) {
     if let Some(sender) = scratch_cleanup_sender() {
-        let _ = sender.try_send(ScratchCleanupWork::Discover(root));
+        let _ = sender.try_send(ScratchCleanupWork::Discover {
+            root,
+            #[cfg(test)]
+            observer: None,
+        });
     }
+}
+
+#[cfg(test)]
+fn enqueue_orphan_discovery_observed(root: PathBuf, observer: ScratchDiscoveryObserver) {
+    scratch_cleanup_sender()
+        .as_ref()
+        .expect("scratch cleanup worker")
+        .send(ScratchCleanupWork::Discover {
+            root,
+            observer: Some(observer),
+        })
+        .expect("enqueue observed scratch discovery");
+}
+
+fn discover_orphans_after_root_lock(
+    scratch_root: &Path,
+    #[cfg(test)] observer: Option<&ScratchDiscoveryObserver>,
+) -> Vec<PathBuf> {
+    let root_lock_path = scratch_root.join(".carrick.sweep.lock");
+    let Ok(root_lock_file) = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&root_lock_path)
+    else {
+        return Vec::new();
+    };
+    let mut root_lock = fd_lock::RwLock::new(root_lock_file);
+    #[cfg(test)]
+    if let Some(observer) = observer {
+        observer.before_root_lock.wait();
+    }
+    let Ok(_root_guard) = root_lock.write() else {
+        return Vec::new();
+    };
+    discover_orphans(scratch_root, None)
 }
 
 impl std::fmt::Debug for HostFsBackend {
@@ -7647,6 +7710,51 @@ mod tests {
                 "cleanup worker did not reclaim orphan trash"
             );
         }
+    }
+
+    #[test]
+    fn background_discovery_cannot_retire_a_scratch_under_the_root_creation_lock() {
+        let root = tempfile::TempDir::new().expect("discovery race root");
+        let root_lock_path = root.path().join(".carrick.sweep.lock");
+        let root_lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&root_lock_path)
+            .expect("open root creation lock");
+        let mut root_lock = fd_lock::RwLock::new(root_lock_file);
+        let root_guard = root_lock.write().expect("hold root creation lock");
+
+        // Reproduce HostFsBackend::new_in's exact visible interval: the
+        // TempDir and lockfile exist, but acquire_lockfile has not flocked the
+        // per-run file yet. Only the root creation lock makes this live.
+        let scratch = root.path().join("scratch-being-created");
+        std::fs::create_dir(&scratch).expect("create in-flight scratch");
+        std::fs::write(scratch.join(".carrick.lock"), b"")
+            .expect("publish not-yet-flocked scratch lockfile");
+
+        let before_root_lock = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let cleanup_complete = std::sync::Arc::new(std::sync::Barrier::new(2));
+        enqueue_orphan_discovery_observed(
+            root.path().to_path_buf(),
+            ScratchDiscoveryObserver {
+                before_root_lock: std::sync::Arc::clone(&before_root_lock),
+                cleanup_complete: std::sync::Arc::clone(&cleanup_complete),
+            },
+        );
+        before_root_lock.wait();
+
+        assert!(
+            scratch.exists(),
+            "background discovery bypassed the root creation lock and retired a live scratch",
+        );
+        drop(root_guard);
+        cleanup_complete.wait();
+        assert!(
+            !scratch.exists(),
+            "background discovery did not run after the root creation lock was released",
+        );
     }
 
     fn count_retired_entries(root: &Path) -> usize {
