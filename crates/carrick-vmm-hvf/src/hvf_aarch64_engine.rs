@@ -566,6 +566,7 @@ impl HvpatchTaskOnlyEngineState {
         let (page_tables, protections) = self.runtime_projection.clone_authorities()?;
         let mut task = self._backend.runtime_task_state(page_tables, protections)?;
         self._backend.activate()?;
+        task.publish_pending_fork_frame_receipts();
         task.registration = self._backend.take_registration();
         if self.parked_task.lock().replace(task).is_some() {
             std::process::abort();
@@ -1851,6 +1852,39 @@ mod task_only_materializer_tests {
             .0;
         assert!(detach.contains("into_injected_task_only_backend"));
         assert!(detach.contains("runtime_projection.put(projection)"));
+    }
+
+    #[test]
+    fn task_only_child_activation_publishes_receipts_after_inventory_activation() {
+        let source = include_str!("hvf_aarch64_engine.rs");
+        let activate_child = source
+            .split_once("pub fn activate_child(&mut self) -> Result<(), TrapError> {")
+            .expect("task-only child activation")
+            .1
+            .split_once("\n    pub fn retire(self)")
+            .expect("end of task-only child activation")
+            .0;
+        let activate = activate_child
+            .find("self._backend.activate()?;")
+            .expect("inventory activation");
+        let publish = activate_child
+            .find("task.publish_pending_fork_frame_receipts();")
+            .expect("fork-frame receipt publication");
+        let park = activate_child
+            .find("task.registration = self._backend.take_registration();")
+            .expect("activated task parking handoff");
+
+        assert_eq!(
+            activate_child
+                .matches("task.publish_pending_fork_frame_receipts();")
+                .count(),
+            1,
+            "activation must publish the observation copy exactly once"
+        );
+        assert!(
+            activate < publish && publish < park,
+            "receipts must publish only after inventory activation and before parking"
+        );
     }
 
     #[test]

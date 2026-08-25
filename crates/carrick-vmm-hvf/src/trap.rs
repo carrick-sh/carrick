@@ -270,6 +270,317 @@ mod task_only_carrier_directory_tests {
         }
     }
 
+    struct LiveForkReceiptAuthority {
+        calls: Arc<AtomicUsize>,
+        mapping: carrick_hal::MappingId,
+        frame: carrick_hal::FrameId,
+        ipa: u64,
+        length: u64,
+    }
+
+    impl carrick_hal::FrameCowAuthority for LiveForkReceiptAuthority {
+        fn quiesce(
+            &self,
+        ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok(Box::new(()))
+        }
+
+        fn reserve(
+            &self,
+            _frame_candidates: usize,
+            _mapping_candidates: usize,
+            _event_count: usize,
+        ) -> Result<carrick_hal::FrameInventoryReservation, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Err(Box::new(std::io::Error::other("unused test reserve")))
+        }
+
+        fn apply(
+            &self,
+            _commit: carrick_hal::FrameInventoryCommit<()>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err(Box::new(std::io::Error::other("unused test apply")))
+        }
+
+        fn mapping_is_live(
+            &self,
+            mapping: carrick_hal::MappingId,
+            frame: carrick_hal::FrameId,
+            gpa: carrick_guest_mem::Gpa,
+            length: carrick_hal::FrameLength,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            assert_eq!(mapping, self.mapping);
+            assert_eq!(frame, self.frame);
+            assert_eq!(gpa, carrick_guest_mem::Gpa(self.ipa));
+            assert_eq!(length.raw(), self.length);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+
+        fn frame_mapping_count(
+            &self,
+            _frame: carrick_hal::FrameId,
+        ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn pending_fork_frame_publication_authenticates_and_drains_exactly_once() {
+        let mapping =
+            carrick_hal::MappingId::from_kernel_allocation(std::num::NonZeroU64::new(42).unwrap());
+        let parent_mapping =
+            carrick_hal::MappingId::from_kernel_allocation(std::num::NonZeroU64::new(41).unwrap());
+        let frame =
+            carrick_hal::FrameId::from_kernel_allocation(std::num::NonZeroU64::new(17).unwrap());
+        let ipa = 0xa0_0000_0000;
+        let length = 0x4000;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut task = HvfTaskState::neutral();
+        task.cow_authority = Some(Arc::new(LiveForkReceiptAuthority {
+            calls: Arc::clone(&calls),
+            mapping,
+            frame,
+            ipa,
+            length,
+        }));
+        task.cow_identity = Some(carrick_hal::FrameCowIdentity {
+            linux_pid: 123,
+            linux_tid: 124,
+            mm: 9,
+            asid: 7,
+        });
+        task.pending_fork_frame_receipts
+            .push(PendingForkFrameReceipt {
+                transaction: carrick_hal::KernelTransactionId::from_kernel_allocation(
+                    std::num::NonZeroU64::new(101).unwrap(),
+                ),
+                kind: carrick_observability::probes::HvpatchForkFrameKind::PrivateCow,
+                parent_mapping,
+                child_mapping: mapping,
+                frame,
+                ipa,
+                length,
+            });
+
+        let mut events = Vec::new();
+        task.publish_pending_fork_frame_receipts_with(&mut |event| events.push(event));
+        task.publish_pending_fork_frame_receipts_with(&mut |event| events.push(event));
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(task.pending_fork_frame_receipts.is_empty());
+        assert_eq!(
+            events,
+            vec![
+                carrick_observability::probes::HvpatchForkFrameShare::new(
+                    123,
+                    124,
+                    9,
+                    7,
+                    carrick_observability::probes::HvpatchForkFrameKind::PrivateCow,
+                    parent_mapping.raw(),
+                    mapping.raw(),
+                    frame.raw(),
+                    ipa,
+                    length,
+                )
+                .unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_pending_fork_frame_publication_needs_no_authority_and_emits_nothing() {
+        let mut task = HvfTaskState::neutral();
+        let mut events = Vec::new();
+
+        task.publish_pending_fork_frame_receipts_with(&mut |event| events.push(event));
+
+        assert!(events.is_empty());
+        assert!(task.cow_authority.is_none());
+        assert!(task.cow_identity.is_none());
+    }
+
+    #[test]
+    fn runtime_task_receipt_copy_drains_without_discharging_mm_authority() {
+        let mapping =
+            carrick_hal::MappingId::from_kernel_allocation(std::num::NonZeroU64::new(52).unwrap());
+        let parent_mapping =
+            carrick_hal::MappingId::from_kernel_allocation(std::num::NonZeroU64::new(51).unwrap());
+        let frame =
+            carrick_hal::FrameId::from_kernel_allocation(std::num::NonZeroU64::new(27).unwrap());
+        let ipa = 0xb0_0000_0000;
+        let length = 0x4000;
+        let receipt = PendingForkFrameReceipt {
+            transaction: carrick_hal::KernelTransactionId::from_kernel_allocation(
+                std::num::NonZeroU64::new(102).unwrap(),
+            ),
+            kind: carrick_observability::probes::HvpatchForkFrameKind::PrivateCow,
+            parent_mapping,
+            child_mapping: mapping,
+            frame,
+            ipa,
+            length,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cow_authority: Arc<dyn carrick_hal::FrameCowAuthority> =
+            Arc::new(LiveForkReceiptAuthority {
+                calls: Arc::clone(&calls),
+                mapping,
+                frame,
+                ipa,
+                length,
+            });
+        let cow_identity = carrick_hal::FrameCowIdentity {
+            linux_pid: 223,
+            linux_tid: 224,
+            mm: 19,
+            asid: 17,
+        };
+        let ledger = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+        let task_mm = Arc::new(HvpatchTaskMmAuthority {
+            mappings: Vec::new(),
+            mm_root_slot: Some((0xb1_0000_0000, 0x20_0000)),
+            inventory: parking_lot::Mutex::new(HvpatchTaskInventoryAuthority::SiblingShared {
+                ledger,
+            }),
+            kernel_mm: parking_lot::Mutex::new(None),
+            cow_armed: Some(Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()))),
+            cow_deferred_publications: Some(Arc::new(parking_lot::Mutex::new(Vec::new()))),
+            pending_receipts: vec![receipt],
+            alias_receipts: parking_lot::Mutex::new(Vec::new()),
+            last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::Test),
+            drop_order: None,
+        });
+        let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
+        let (_, child_token_verifier) = carrick_hal::HvpatchChildTokenIssuer::new_pair();
+        let registration = HvpatchTaskRegistration {
+            directory: Arc::clone(&directory),
+            key: HvpatchCarrierTaskStateKey {
+                directory_instance: directory.instance,
+                task_serial: 223,
+                thread_serial: 224,
+                execution_generation: 1,
+                nonce: std::num::NonZeroU64::new(1).unwrap(),
+            },
+            expected_identity: HvpatchCarrierTaskIdentity {
+                task_serial: 223,
+                thread_serial: 224,
+                execution_generation: 1,
+                linux_pid: 223,
+                linux_tid: 224,
+                asid: 17,
+            },
+            task_mm: Some(Arc::clone(&task_mm)),
+            cow_authority: Some(cow_authority),
+            cow_identity: Some(cow_identity),
+            cow_authority_identity: None,
+            child_token_verifier,
+        };
+        let mut runtime = registration
+            .runtime_task_state(
+                Arc::new(parking_lot::Mutex::new(None)),
+                Arc::new(MemoryProtections::default()),
+            )
+            .unwrap();
+
+        assert_eq!(runtime.pending_fork_frame_receipts.len(), 1);
+        assert_eq!(task_mm.pending_receipts.len(), 1);
+        let mut events = Vec::new();
+        runtime.publish_pending_fork_frame_receipts_with(&mut |event| events.push(event));
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(events.len(), 1);
+        assert!(runtime.pending_fork_frame_receipts.is_empty());
+        assert_eq!(
+            task_mm.pending_receipts.len(),
+            1,
+            "publication must not consume the authoritative retirement receipts"
+        );
+        assert_eq!(task_mm.pending_receipts[0].child_mapping, mapping);
+        assert_eq!(task_mm.pending_receipts[0].frame, frame);
+    }
+
+    #[test]
+    fn bind_frame_cow_authenticates_and_drains_pending_receipts() {
+        let mapping =
+            carrick_hal::MappingId::from_kernel_allocation(std::num::NonZeroU64::new(62).unwrap());
+        let parent_mapping =
+            carrick_hal::MappingId::from_kernel_allocation(std::num::NonZeroU64::new(61).unwrap());
+        let frame =
+            carrick_hal::FrameId::from_kernel_allocation(std::num::NonZeroU64::new(37).unwrap());
+        let ipa = 0xc0_0000_0000;
+        let length = 0x4000;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let authority: Arc<dyn carrick_hal::FrameCowAuthority> =
+            Arc::new(LiveForkReceiptAuthority {
+                calls: Arc::clone(&calls),
+                mapping,
+                frame,
+                ipa,
+                length,
+            });
+        let identity = carrick_hal::FrameCowIdentity {
+            linux_pid: 323,
+            linux_tid: 324,
+            mm: 29,
+            asid: 27,
+        };
+        let mut task = HvfTaskState::neutral();
+        task.pending_fork_frame_receipts
+            .push(PendingForkFrameReceipt {
+                transaction: carrick_hal::KernelTransactionId::from_kernel_allocation(
+                    std::num::NonZeroU64::new(103).unwrap(),
+                ),
+                kind: carrick_observability::probes::HvpatchForkFrameKind::PrivateCow,
+                parent_mapping,
+                child_mapping: mapping,
+                frame,
+                ipa,
+                length,
+            });
+
+        task.bind_frame_cow(Arc::clone(&authority), identity);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(task.pending_fork_frame_receipts.is_empty());
+        assert!(Arc::ptr_eq(
+            task.cow_authority.as_ref().unwrap(),
+            &authority
+        ));
+        assert_eq!(task.cow_identity, Some(identity));
+    }
+
+    #[test]
+    fn pending_fork_frame_authentication_false_and_error_paths_fail_closed() {
+        let source = include_str!("trap.rs");
+        let helper = source
+            .rsplit_once("fn publish_pending_fork_frame_receipts_with(")
+            .expect("fork-frame publication helper")
+            .1
+            .split_once("pub(crate) fn publish_pending_fork_frame_receipts")
+            .expect("end of fork-frame publication helper")
+            .0;
+        let false_branch = helper
+            .split_once("Ok(false) => {")
+            .expect("false live-mapping result")
+            .1
+            .split_once("Err(error) => {")
+            .expect("end of false live-mapping result")
+            .0;
+        let error_branch = helper
+            .split_once("Err(error) => {")
+            .expect("mapping authority error")
+            .1
+            .split_once("\n            }\n            let event")
+            .expect("end of mapping authority error")
+            .0;
+
+        assert!(false_branch.contains("std::process::abort();"));
+        assert!(error_branch.contains("std::process::abort();"));
+    }
+
     fn identity(generation: u64) -> HvpatchCarrierTaskIdentity {
         HvpatchCarrierTaskIdentity {
             task_serial: 41,
@@ -5071,6 +5382,95 @@ impl HvfTaskState {
     ) -> bool {
         std::sync::Arc::ptr_eq(page_tables, &self.page_tables)
             && std::sync::Arc::ptr_eq(protections, &self.protections)
+    }
+
+    fn publish_pending_fork_frame_receipts_with(
+        &mut self,
+        publish: &mut dyn FnMut(carrick_observability::probes::HvpatchForkFrameShare),
+    ) {
+        // This task-local vector is the observation copy made by
+        // `runtime_task_state`. The MM authority retains its original receipts
+        // for exact retirement authentication, so draining here is publication
+        // exactly once without discharging the Kernel obligation.
+        if self.pending_fork_frame_receipts.is_empty() {
+            return;
+        }
+        let authority = self.cow_authority.as_ref().unwrap_or_else(|| {
+            eprintln!("carrick: FATAL: pending fork-frame receipt has no COW authority");
+            std::process::abort();
+        });
+        let identity = self.cow_identity.unwrap_or_else(|| {
+            eprintln!("carrick: FATAL: pending fork-frame receipt has no COW identity");
+            std::process::abort();
+        });
+        for receipt in std::mem::take(&mut self.pending_fork_frame_receipts) {
+            let length = carrick_hal::FrameLength::from_mapping_extent(
+                std::num::NonZeroU64::new(receipt.length).unwrap_or_else(|| {
+                    eprintln!("carrick: FATAL: pending fork-frame receipt has zero length");
+                    std::process::abort();
+                }),
+            );
+            match authority.mapping_is_live(
+                receipt.child_mapping,
+                receipt.frame,
+                carrick_guest_mem::Gpa(receipt.ipa),
+                length,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!(
+                        "carrick: FATAL: fork-frame receipt child mapping {:?} is not live",
+                        receipt.child_mapping
+                    );
+                    std::process::abort();
+                }
+                Err(error) => {
+                    eprintln!(
+                        "carrick: FATAL: authenticate fork-frame receipt mapping {:?}: {error}",
+                        receipt.child_mapping
+                    );
+                    std::process::abort();
+                }
+            }
+            let event = carrick_observability::probes::HvpatchForkFrameShare::new(
+                identity.linux_pid,
+                identity.linux_tid,
+                identity.mm,
+                u32::from(identity.asid),
+                receipt.kind,
+                receipt.parent_mapping.raw(),
+                receipt.child_mapping.raw(),
+                receipt.frame.raw(),
+                receipt.ipa,
+                receipt.length,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("carrick: FATAL: construct authenticated fork-frame receipt: {error}");
+                std::process::abort();
+            });
+            publish(event);
+        }
+    }
+
+    pub(crate) fn publish_pending_fork_frame_receipts(&mut self) {
+        self.publish_pending_fork_frame_receipts_with(&mut |event| {
+            crate::probes::hvpatch_fork_frame_share(event);
+        });
+    }
+
+    pub(crate) fn bind_frame_cow(
+        &mut self,
+        authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+        identity: carrick_hal::FrameCowIdentity,
+    ) {
+        self.cow_authority = Some(std::sync::Arc::clone(&authority));
+        self.cow_identity = Some(identity);
+        self.publish_pending_fork_frame_receipts();
+        if let Some(ref mut reg) = self.registration {
+            reg.cow_authority = Some(authority);
+            reg.cow_identity = Some(identity);
+            reg.cow_authority_identity = None;
+        }
     }
 
     fn neutral() -> Self {
@@ -11634,67 +12034,6 @@ impl HvfVmState {
             ),
         });
         Ok(())
-    }
-
-    pub(crate) fn bind_frame_cow(
-        &mut self,
-        authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
-        identity: carrick_hal::FrameCowIdentity,
-    ) {
-        for receipt in std::mem::take(&mut self.pending_fork_frame_receipts) {
-            let length = carrick_hal::FrameLength::from_mapping_extent(
-                std::num::NonZeroU64::new(receipt.length).unwrap_or_else(|| {
-                    eprintln!("carrick: FATAL: pending fork-frame receipt has zero length");
-                    std::process::abort();
-                }),
-            );
-            match authority.mapping_is_live(
-                receipt.child_mapping,
-                receipt.frame,
-                carrick_guest_mem::Gpa(receipt.ipa),
-                length,
-            ) {
-                Ok(true) => {}
-                Ok(false) => {
-                    eprintln!(
-                        "carrick: FATAL: fork-frame receipt child mapping {:?} is not live",
-                        receipt.child_mapping
-                    );
-                    std::process::abort();
-                }
-                Err(error) => {
-                    eprintln!(
-                        "carrick: FATAL: authenticate fork-frame receipt mapping {:?}: {error}",
-                        receipt.child_mapping
-                    );
-                    std::process::abort();
-                }
-            }
-            let event = carrick_observability::probes::HvpatchForkFrameShare::new(
-                identity.linux_pid,
-                identity.linux_tid,
-                identity.mm,
-                u32::from(identity.asid),
-                receipt.kind,
-                receipt.parent_mapping.raw(),
-                receipt.child_mapping.raw(),
-                receipt.frame.raw(),
-                receipt.ipa,
-                receipt.length,
-            )
-            .unwrap_or_else(|error| {
-                eprintln!("carrick: FATAL: construct authenticated fork-frame receipt: {error}");
-                std::process::abort();
-            });
-            crate::probes::hvpatch_fork_frame_share(event);
-        }
-        self.cow_authority = Some(std::sync::Arc::clone(&authority));
-        self.cow_identity = Some(identity);
-        if let Some(ref mut reg) = self.registration {
-            reg.cow_authority = Some(authority);
-            reg.cow_identity = Some(identity);
-            reg.cow_authority_identity = None;
-        }
     }
 
     pub(crate) fn apply_exec_inventory(
